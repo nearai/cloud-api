@@ -509,6 +509,7 @@ impl ports::ConversationServiceTrait for ConversationServiceImpl {
         // Create a minimal response for backfilled items
         // Response items require a response_id, so we create a placeholder response
         let backfill_response_request = crate::responses::models::CreateResponseRequest {
+            tee: None,
             model: "backfill".to_string(), // Special model name for backfilled items
             input: None,
             instructions: None,

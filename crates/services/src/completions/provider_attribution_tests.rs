@@ -274,3 +274,90 @@ async fn failed_providers_do_not_record_served_attribution() {
         "terminal provider failures must not record successful usage"
     );
 }
+
+#[tokio::test]
+async fn accepted_tool_iterations_share_attempt_budget_without_leaking_to_other_requests() {
+    use crate::provider_registry::{accepted_request::ACCEPTED, ModelRoutingPolicy};
+    use inference_providers::{mock::MockProvider, responses_raw::ResponsesRawResponse};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let pool = crate::inference_provider_pool::InferenceProviderPool::new(
+        None,
+        config::ExternalProvidersConfig::default(),
+    );
+    let calls = Arc::new(AtomicUsize::new(0));
+    let captured = calls.clone();
+    pool.register_provider(
+        "accepted-budget".into(),
+        Arc::new(
+            MockProvider::new_accept_all().with_responses_handler(move |_| {
+                captured.fetch_add(1, Ordering::SeqCst);
+                ResponsesRawResponse {
+                    status: reqwest::StatusCode::OK,
+                    headers: Default::default(),
+                    body: Box::pin(futures::stream::empty()),
+                }
+            }),
+        ),
+    )
+    .await;
+    let mut model = test_model("accepted-budget");
+    let (service, _) =
+        completion_service_with_mock_providers("accepted-budget", false, false).await;
+    model.input_cost_per_token += 7;
+    model.aliases = vec!["accepted-alias".into()];
+    let mut accepted = pool.accept_request(model.clone()).await;
+    Arc::get_mut(&mut accepted).unwrap().policy = Some(ModelRoutingPolicy {
+        default_tee_requirement: inference_providers::routing::TeeRequirement::Any,
+        mixed_routing_enabled: true,
+        max_attempts: 1,
+        deadline_ms: 10_000,
+        max_attempt_cost_microusd: None,
+        max_total_cost_microusd: None,
+        allow_negative_margin: true,
+    });
+    ACCEPTED
+        .scope(Some(accepted.clone()), async {
+            assert_eq!(
+                service
+                    .get_model("accepted-alias")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .input_cost_per_token,
+                model.input_cost_per_token
+            );
+            let snapshot =
+                crate::provider_registry::accepted_request::for_model("accepted-alias").unwrap();
+            assert_eq!(
+                snapshot.model.input_cost_per_token,
+                model.input_cost_per_token
+            );
+            pool.responses_raw("accepted-budget", serde_json::json!({"store":false}), true)
+                .await
+                .unwrap();
+            let second = pool
+                .responses_raw("accepted-budget", serde_json::json!({"store":false}), true)
+                .await;
+            assert!(
+                second.is_err(),
+                "a follow-up must not reset the accepted attempt budget"
+            );
+        })
+        .await;
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(accepted.budget.lock().await.attempts, 1);
+    assert!(crate::provider_registry::accepted_request::for_model("accepted-budget").is_none());
+    assert_ne!(
+        service
+            .get_model("accepted-budget")
+            .await
+            .unwrap()
+            .unwrap()
+            .input_cost_per_token,
+        model.input_cost_per_token
+    );
+    pool.responses_raw("accepted-budget", serde_json::json!({"store":false}), true)
+        .await
+        .unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+}

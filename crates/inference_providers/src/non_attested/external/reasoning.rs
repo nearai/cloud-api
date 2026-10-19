@@ -11,31 +11,10 @@ fn invalid(message: &str) -> CompletionError {
 }
 
 pub(crate) fn effort(fields: &HashMap<String, Value>) -> Result<Option<String>, CompletionError> {
-    let mut selected: Option<&str> = None;
-    for value in [
-        fields.get("reasoning_effort"),
-        fields.get("reasoning").and_then(|v| v.get("effort")),
-        fields.get("output_config").and_then(|v| v.get("effort")),
-    ]
-    .into_iter()
-    .flatten()
-    .filter(|v| !v.is_null())
-    {
-        let value = value
-            .as_str()
-            .filter(|v| {
-                matches!(
-                    *v,
-                    "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
-                )
-            })
-            .ok_or_else(|| invalid("Invalid reasoning effort"))?;
-        if selected.is_some_and(|existing| existing != value) {
-            return Err(invalid("Conflicting reasoning effort fields"));
-        }
-        selected = Some(value);
-    }
-    Ok(selected.map(str::to_owned))
+    Ok(
+        crate::routing::ReasoningEffort::from_fields(fields)?
+            .map(|value| value.as_str().to_owned()),
+    )
 }
 
 pub(crate) fn validate(
@@ -83,6 +62,15 @@ pub(crate) fn normalize_chat(
             if object.is_empty() {
                 fields.remove("reasoning");
             }
+        }
+    }
+    if let Some(output_config) = fields
+        .get_mut("output_config")
+        .and_then(Value::as_object_mut)
+    {
+        output_config.remove("effort");
+        if output_config.is_empty() {
+            fields.remove("output_config");
         }
     }
     Ok(())

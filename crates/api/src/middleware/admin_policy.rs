@@ -37,6 +37,12 @@ pub(crate) fn admin_operation(method: &Method, matched_path: &str) -> AdminOpera
             path,
             "/admin/models"
                 | "/admin/providers"
+                | "/admin/provider-attempts/{request_id}"
+                | "/admin/organizations/{org_id}/inference-policy"
+                | "/admin/provider-accounts"
+                | "/admin/models/{model_name}/routes"
+                | "/admin/provider-routes/{id}/cost-profiles"
+                | "/admin/models/{model_name}/routing-policy"
                 | "/admin/providers/{id}/models"
                 | "/admin/models/pricing-changes"
                 | "/admin/models/{model_name}/history"

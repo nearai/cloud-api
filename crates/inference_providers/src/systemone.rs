@@ -28,6 +28,8 @@ pub struct ChoiceCriterion(pub Option<Content>);
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(deny_unknown_fields)]
 pub struct SystemOneRequest {
+    #[serde(default, skip_serializing)]
+    pub tee: Option<crate::routing::TeeRequirement>,
     pub model: String,
     pub state: Content,
     pub questions: BTreeMap<String, Question>,

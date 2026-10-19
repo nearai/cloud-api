@@ -458,6 +458,26 @@ fn db_organization_to_service_organization(
 // Implement the workspace service layer trait
 #[async_trait]
 impl services::workspace::ports::WorkspaceRepository for WorkspaceRepository {
+    async fn organization_requires_tee(
+        &self,
+        organization_id: Uuid,
+    ) -> Result<bool, RepositoryError> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .context("Failed to get database connection")
+            .map_err(RepositoryError::PoolError)?;
+        let row = client
+            .query_opt(
+                "SELECT tee_required FROM organization_inference_policies WHERE organization_id=$1",
+                &[&organization_id],
+            )
+            .await
+            .map_err(map_db_error)?;
+        Ok(row.is_some_and(|row| row.get("tee_required")))
+    }
+
     async fn get_by_id(
         &self,
         workspace_id: services::workspace::WorkspaceId,

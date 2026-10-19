@@ -1086,6 +1086,11 @@ pub enum ListModelsError {
 /// Chat completions errors
 #[derive(Debug, Error, Clone, Serialize, Deserialize)]
 pub enum CompletionError {
+    #[error("Upstream temporarily unavailable (HTTP {status_code})")]
+    RetryableUpstream {
+        status_code: u16,
+        retry_after_ms: u64,
+    },
     #[error("Failed to perform completion: {0}")]
     CompletionError(String),
     #[error("HTTP error {status_code}: {message}")]
@@ -1201,6 +1206,8 @@ pub enum ImageGenerationError {
 /// Parameters for image edit requests
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImageEditParams {
+    #[serde(default, skip_serializing)]
+    pub tee: Option<crate::routing::TeeRequirement>,
     /// Model ID to use for editing
     pub model: String,
     /// Text prompt describing the edits to make

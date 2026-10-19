@@ -15,6 +15,7 @@ use utoipa::IntoParams;
 
 #[derive(Clone)]
 pub struct ModelsAppState {
+    pub inference_provider_pool: Arc<services::inference_provider_pool::InferenceProviderPool>,
     pub models_service: Arc<dyn ModelsServiceTrait + Send + Sync>,
 }
 
@@ -103,6 +104,16 @@ pub async fn list_models(
     let offset_usize = offset as usize;
     let limit_usize = limit as usize;
 
+    let mut capabilities = std::collections::HashMap::new();
+    for model in all_models.iter().skip(offset_usize).take(limit_usize) {
+        capabilities.insert(
+            model.model_name.clone(),
+            app_state
+                .inference_provider_pool
+                .routing_capabilities(model)
+                .await,
+        );
+    }
     // Convert to API models, slicing the cached list in memory. This is
     // sub-microsecond for the ~few-dozen-element catalog.
     let api_models: Vec<ModelWithPricing> = all_models
@@ -110,7 +121,7 @@ pub async fn list_models(
         .skip(offset_usize)
         .take(limit_usize)
         .map(|model| ModelWithPricing {
-            model_id: model.model_name,
+            model_id: model.model_name.clone(),
             input_cost_per_token: DecimalPrice {
                 amount: model.input_cost_per_token,
                 scale: 9,
@@ -135,6 +146,7 @@ pub async fn list_models(
                 .text_pricing
                 .map(|profile| serde_json::to_value(profile).expect("text pricing serializes")),
             metadata: ModelMetadata {
+                routing: capabilities.remove(&model.model_name),
                 verifiable: model.verifiable,
                 context_length: model.context_length,
                 model_display_name: model.model_display_name,
@@ -231,6 +243,12 @@ pub async fn get_model_by_name(
             }
         })?;
 
+    let routing = Some(
+        app_state
+            .inference_provider_pool
+            .routing_capabilities(&model)
+            .await,
+    );
     // Convert to API model
     let api_model = ModelWithPricing {
         model_id: model.model_name,
@@ -258,6 +276,7 @@ pub async fn get_model_by_name(
             .text_pricing
             .map(|profile| serde_json::to_value(profile).expect("text pricing serializes")),
         metadata: ModelMetadata {
+            routing,
             verifiable: model.verifiable,
             context_length: model.context_length,
             model_display_name: model.model_display_name,
@@ -400,6 +419,12 @@ mod tests {
     async fn get_model_by_name_uses_public_resolver_for_public_detail() {
         let service = Arc::new(PublicResolverService::default());
         let app_state = ModelsAppState {
+            inference_provider_pool: Arc::new(
+                services::inference_provider_pool::InferenceProviderPool::new(
+                    None,
+                    config::ExternalProvidersConfig::default(),
+                ),
+            ),
             models_service: service.clone(),
         };
 

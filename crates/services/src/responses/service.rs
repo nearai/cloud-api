@@ -142,7 +142,7 @@ impl ResponseServiceImpl {
 impl ports::ResponseServiceTrait for ResponseServiceImpl {
     async fn create_response_stream(
         &self,
-        request: models::CreateResponseRequest,
+        mut request: models::CreateResponseRequest,
         user_id: crate::UserId,
         api_key_id: String,
         request_id: uuid::Uuid,
@@ -189,6 +189,36 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
                 .validate_endpoint(crate::models::InferenceEndpoint::Responses)
                 .map_err(|message| errors::ResponseError::InvalidParams(message.into()))?;
         }
+        // Resolve omission once before spawning the tool loop. Later catalog
+        // edits cannot silently change an accepted TEE request to plaintext.
+        use inference_providers::routing::TeeRequirement;
+        let catalog_default = if model
+            .as_ref()
+            .is_some_and(|model| model.verifiable || model.attestation_supported)
+        {
+            TeeRequirement::Required
+        } else {
+            TeeRequirement::Any
+        };
+        request.tee = Some(if client_pub_key.is_some() || model_pub_key.is_some() {
+            TeeRequirement::Required
+        } else {
+            self.inference_provider_pool
+                .accepted_tee_requirement(
+                    model
+                        .as_ref()
+                        .map_or(request.model.as_str(), |model| model.model_name.as_str()),
+                    request.tee,
+                    catalog_default,
+                )
+                .await
+        });
+
+        let accepted = if let Some(model) = model.clone() {
+            Some(self.inference_provider_pool.accept_request(model).await)
+        } else {
+            None
+        };
 
         // Create a channel for streaming events
         let (mut tx, rx) = mpsc::unbounded::<models::ResponseStreamEvent>();
@@ -209,105 +239,108 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
         let model_pub_key_clone = model_pub_key.clone();
         let encryption_version_clone = encryption_version.clone();
 
-        tokio::spawn(async move {
-            let mut tool_registry = tools::ToolRegistry::new();
-            if let Some(provider) = web_search_provider {
-                tool_registry.register(Arc::new(tools::WebSearchToolExecutor::new(provider)));
-            }
-            if let Some(provider) = web_context_search_provider {
-                tool_registry
-                    .register(Arc::new(tools::WebContextSearchToolExecutor::new(provider)));
-            }
-            if let Some(provider) = file_search_provider {
-                tool_registry.register(Arc::new(tools::FileSearchToolExecutor::new(provider)));
-            }
-            // Note: MCP executor is added later after connecting to servers
-
-            // Shared tracker so the outer error handler can read accumulated
-            // usage after `ctx` is dropped on Err from process_response_stream.
-            let usage_tracker = crate::responses::service_helpers::UsageTracker::new();
-
-            let context = ProcessStreamContext {
-                request,
-                model,
-                user_id,
-                api_key_id,
-                request_id,
-                organization_id,
-                workspace_id,
-                fallback_enabled,
-                request_priority,
-                body_hash,
-                signing_algo: signing_algo_clone,
-                client_pub_key: client_pub_key_clone,
-                model_pub_key: model_pub_key_clone,
-                encryption_version: encryption_version_clone,
-                response_repository,
-                response_items_repository,
-                completion_service,
-                conversation_service,
-                file_service,
-                organization_service,
-                source_registry: None,
-                web_search_failure_count: 0,
-                mcp_executor: None,
-                mcp_client_factory,
-                tool_registry,
-            };
-
-            if let Err(e) =
-                Self::process_response_stream(tx.clone(), context, usage_tracker.clone()).await
-            {
-                let status_code = e.http_status_code();
-                if e.is_client_caused() {
-                    // Client-caused (invalid params, model chat-template rejection,
-                    // bad tool call, ...). The client gets a structured 4xx /
-                    // response.failed event — not an infra failure, so keep the
-                    // ERROR stream clean for real incidents.
-                    tracing::warn!(
-                        status_code,
-                        "Client error processing response stream: {:?}",
-                        e
-                    );
-                } else {
-                    tracing::error!(status_code, "Error processing response stream: {:?}", e);
+        tokio::spawn(crate::provider_registry::accepted_request::ACCEPTED.scope(
+            accepted,
+            async move {
+                let mut tool_registry = tools::ToolRegistry::new();
+                if let Some(provider) = web_search_provider {
+                    tool_registry.register(Arc::new(tools::WebSearchToolExecutor::new(provider)));
                 }
+                if let Some(provider) = web_context_search_provider {
+                    tool_registry
+                        .register(Arc::new(tools::WebContextSearchToolExecutor::new(provider)));
+                }
+                if let Some(provider) = file_search_provider {
+                    tool_registry.register(Arc::new(tools::FileSearchToolExecutor::new(provider)));
+                }
+                // Note: MCP executor is added later after connecting to servers
 
-                // Attach accumulated usage so downstream (e.g. non-streaming
-                // route fallback, billing) can bill for partial work done
-                // before the failure.
-                let usage = if usage_tracker.has_data() {
-                    Some(usage_tracker.snapshot())
-                } else {
-                    None
+                // Shared tracker so the outer error handler can read accumulated
+                // usage after `ctx` is dropped on Err from process_response_stream.
+                let usage_tracker = crate::responses::service_helpers::UsageTracker::new();
+
+                let context = ProcessStreamContext {
+                    request,
+                    model,
+                    user_id,
+                    api_key_id,
+                    request_id,
+                    organization_id,
+                    workspace_id,
+                    fallback_enabled,
+                    request_priority,
+                    body_hash,
+                    signing_algo: signing_algo_clone,
+                    client_pub_key: client_pub_key_clone,
+                    model_pub_key: model_pub_key_clone,
+                    encryption_version: encryption_version_clone,
+                    response_repository,
+                    response_items_repository,
+                    completion_service,
+                    conversation_service,
+                    file_service,
+                    organization_service,
+                    source_registry: None,
+                    web_search_failure_count: 0,
+                    mcp_executor: None,
+                    mcp_client_factory,
+                    tool_registry,
                 };
 
-                let error_event = models::ResponseStreamEvent {
-                    event_type: "response.failed".to_string(),
-                    sequence_number: None,
-                    response: None,
-                    output_index: None,
-                    content_index: None,
-                    item: None,
-                    item_id: None,
-                    part: None,
-                    delta: None,
-                    text: Some(e.to_string()),
-                    error: Some(e.response_error()),
-                    status_code: Some(e.http_status_code()),
-                    logprobs: None,
-                    obfuscation: None,
-                    annotation_index: None,
-                    annotation: None,
-                    conversation_title: None,
-                    usage,
-                };
-                let result = tx.send(error_event).await;
-                if let Err(e) = result {
-                    tracing::error!("Error sending error event: {e:?}");
+                if let Err(e) =
+                    Self::process_response_stream(tx.clone(), context, usage_tracker.clone()).await
+                {
+                    let status_code = e.http_status_code();
+                    if e.is_client_caused() {
+                        // Client-caused (invalid params, model chat-template rejection,
+                        // bad tool call, ...). The client gets a structured 4xx /
+                        // response.failed event — not an infra failure, so keep the
+                        // ERROR stream clean for real incidents.
+                        tracing::warn!(
+                            status_code,
+                            "Client error processing response stream: {:?}",
+                            e
+                        );
+                    } else {
+                        tracing::error!(status_code, "Error processing response stream: {:?}", e);
+                    }
+
+                    // Attach accumulated usage so downstream (e.g. non-streaming
+                    // route fallback, billing) can bill for partial work done
+                    // before the failure.
+                    let usage = if usage_tracker.has_data() {
+                        Some(usage_tracker.snapshot())
+                    } else {
+                        None
+                    };
+
+                    let error_event = models::ResponseStreamEvent {
+                        event_type: "response.failed".to_string(),
+                        sequence_number: None,
+                        response: None,
+                        output_index: None,
+                        content_index: None,
+                        item: None,
+                        item_id: None,
+                        part: None,
+                        delta: None,
+                        text: Some(e.to_string()),
+                        error: Some(e.response_error()),
+                        status_code: Some(e.http_status_code()),
+                        logprobs: None,
+                        obfuscation: None,
+                        annotation_index: None,
+                        annotation: None,
+                        conversation_title: None,
+                        usage,
+                    };
+                    let result = tx.send(error_event).await;
+                    if let Err(e) = result {
+                        tracing::error!("Error sending error event: {e:?}");
+                    }
                 }
-            }
-        });
+            },
+        ));
 
         Ok(Box::pin(rx))
     }
@@ -1440,6 +1473,12 @@ impl ResponseServiceImpl {
 
             // Prepare extra params with tools and encryption headers
             let mut extra = std::collections::HashMap::new();
+            if let Some(tee) = process_context.request.tee {
+                extra.insert(
+                    "tee".into(),
+                    serde_json::to_value(tee).expect("TEE requirement serializes"),
+                );
+            }
             if let Some(effort) = process_context
                 .request
                 .reasoning
@@ -3308,6 +3347,11 @@ impl ResponseServiceImpl {
         workspace_id_domain: crate::workspace::WorkspaceId,
     ) -> Result<(), errors::ResponseError> {
         // Extract text prompt from request
+        if process_context.client_pub_key.is_some() {
+            return Err(errors::ResponseError::InvalidParams(
+                "Image responses do not support client encryption".into(),
+            ));
+        }
         let prompt = Self::extract_prompt_from_request(&process_context.request)?;
 
         // Determine if this is image editing or generation
@@ -3316,6 +3360,9 @@ impl ResponseServiceImpl {
 
         // Build encryption headers
         let mut extra_params = std::collections::HashMap::new();
+        if let Some(tee) = process_context.request.tee {
+            extra_params.insert("tee".into(), serde_json::json!(tee));
+        }
         if let Some(model_pub_key) = &process_context.model_pub_key {
             extra_params.insert(
                 crate::common::encryption_headers::MODEL_PUB_KEY.to_string(),
@@ -3325,9 +3372,15 @@ impl ResponseServiceImpl {
 
         // Call the appropriate image API
         let response = if has_input_image {
+            if process_context.model_pub_key.is_some() {
+                return Err(errors::ResponseError::InvalidParams(
+                    "Image editing does not support signing-key pinning".into(),
+                ));
+            }
             let image_bytes =
                 Self::extract_input_image_from_request(&process_context.request).await?;
             let params = inference_providers::ImageEditParams {
+                tee: process_context.request.tee,
                 model: process_context.request.model.clone(),
                 image: std::sync::Arc::new(image_bytes),
                 prompt,

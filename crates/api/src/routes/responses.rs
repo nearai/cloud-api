@@ -309,6 +309,11 @@ async fn create_legacy_response(
     OpenAiJson(mut request): OpenAiJson<CreateResponseRequest>,
 ) -> axum::response::Response {
     let service = state.response_service.clone();
+    // Background tasks do not inherit task-local authentication context. Carry
+    // the stronger requirement explicitly through every persisted tool loop.
+    if api_key.tee_required {
+        request.tee = Some(inference_providers::routing::TeeRequirement::Required);
+    }
     let attestation_service = state.attestation_service.clone();
     debug!(
         "Create response request from api key: {:?}",

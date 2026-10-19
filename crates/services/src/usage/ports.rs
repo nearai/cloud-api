@@ -180,7 +180,8 @@ impl StopReason {
     /// Map from inference provider CompletionError to StopReason
     pub fn from_completion_error(err: &inference_providers::CompletionError) -> Self {
         match err {
-            inference_providers::CompletionError::HttpError { status_code, .. } => {
+            inference_providers::CompletionError::HttpError { status_code, .. }
+            | inference_providers::CompletionError::RetryableUpstream { status_code, .. } => {
                 match status_code {
                     408 => StopReason::Timeout,
                     429 => StopReason::RateLimited,

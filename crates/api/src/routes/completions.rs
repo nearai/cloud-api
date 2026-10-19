@@ -313,7 +313,8 @@ fn analyze_multipart_error(e: &axum::extract::multipart::MultipartError) -> (Sta
 fn completion_stream_error_category(e: &inference_providers::CompletionError) -> &'static str {
     match e {
         inference_providers::CompletionError::CompletionError(_) => "completion_error",
-        inference_providers::CompletionError::HttpError { .. } => "http_error",
+        inference_providers::CompletionError::HttpError { .. }
+        | inference_providers::CompletionError::RetryableUpstream { .. } => "http_error",
         inference_providers::CompletionError::InvalidResponse(_) => "invalid_response",
         inference_providers::CompletionError::NoPubKeyProvider(_) => "stale_pubkey",
         inference_providers::CompletionError::Unknown(_) => "unknown",
@@ -330,11 +331,14 @@ fn completion_stream_error_category(e: &inference_providers::CompletionError) ->
 /// explicitly instead of silently defaulting to `server_error`.
 fn completion_stream_error_openai_type(e: &inference_providers::CompletionError) -> &'static str {
     match e {
-        inference_providers::CompletionError::HttpError { status_code, .. } => match *status_code {
-            429 => "rate_limit_exceeded",
-            400..=499 => "invalid_request_error",
-            _ => "server_error",
-        },
+        inference_providers::CompletionError::HttpError { status_code, .. }
+        | inference_providers::CompletionError::RetryableUpstream { status_code, .. } => {
+            match *status_code {
+                429 => "rate_limit_exceeded",
+                400..=499 => "invalid_request_error",
+                _ => "server_error",
+            }
+        }
         // Client supplied an unfetchable/undecodable image or video: a 400-class
         // bad-input error, surfaced to the client as invalid_request_error to
         // match the non-stream path (map_provider_error -> InvalidParams -> 400).
@@ -3287,9 +3291,20 @@ pub async fn models(
             )
         })?;
 
+    let mut data = Vec::with_capacity(models.len());
+    for model in models {
+        let routing = app_state
+            .completion_service
+            .get_inference_provider_pool()
+            .routing_capabilities(&model)
+            .await;
+        let mut info = model_with_pricing_to_info(model);
+        info.routing = Some(routing);
+        data.push(info);
+    }
     let response = ModelsResponse {
         object: "list".to_string(),
-        data: models.into_iter().map(model_with_pricing_to_info).collect(),
+        data,
     };
     Ok(ResponseJson(response))
 }
@@ -3418,6 +3433,7 @@ fn model_with_pricing_to_info(model: services::models::ModelWithPricing) -> Mode
     };
 
     ModelInfo {
+        routing: None,
         id: model.model_name,
         object: "model".to_string(),
         created: model.created_at.timestamp(),
@@ -5239,6 +5255,9 @@ pub async fn image_generations(
     let mut extra = std::collections::HashMap::new();
     insert_encryption_headers(&encryption_headers, &mut extra);
     insert_request_id_header(correlation, &mut extra);
+    if let Some(tee) = request.tee {
+        extra.insert("tee".into(), serde_json::json!(tee));
+    }
 
     let params = inference_providers::ImageGenerationParams {
         model: request.model.clone(),
@@ -5423,6 +5442,7 @@ pub async fn audio_transcriptions(
     let mut filename: Option<String> = None;
     let mut language: Option<String> = None;
     let mut response_format: Option<String> = None;
+    let mut tee: Option<inference_providers::routing::TeeRequirement> = None;
     let mut temperature: Option<f32> = None;
     let mut timestamp_granularities: Option<Vec<String>> = None;
 
@@ -5460,6 +5480,26 @@ pub async fn audio_transcriptions(
                             .into_response();
                     }
                 }
+            }
+            "tee" => {
+                tee = match field.text().await.ok().as_deref() {
+                    Some("required") if tee.is_none() => {
+                        Some(inference_providers::routing::TeeRequirement::Required)
+                    }
+                    Some("any") if tee.is_none() => {
+                        Some(inference_providers::routing::TeeRequirement::Any)
+                    }
+                    _ => {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            ResponseJson(ErrorResponse::new(
+                                "tee must occur once and be required or any".into(),
+                                "invalid_request_error".into(),
+                            )),
+                        )
+                            .into_response()
+                    }
+                };
             }
             "model" => {
                 if let Ok(value) = field.text().await {
@@ -5572,6 +5612,9 @@ pub async fn audio_transcriptions(
     let mut extra = std::collections::HashMap::new();
     insert_encryption_headers(&encryption_headers, &mut extra);
     insert_request_id_header(correlation, &mut extra);
+    if let Some(tee) = tee {
+        extra.insert("tee".into(), serde_json::json!(tee));
+    }
 
     let requested_response_format = request.response_format.clone();
     let provider_response_format = match requested_response_format.as_deref() {
@@ -5824,6 +5867,7 @@ pub async fn image_edits(
     let mut image: Option<Vec<u8>> = None;
     let mut size: Option<String> = None;
     let mut response_format: Option<String> = None;
+    let mut tee: Option<inference_providers::routing::TeeRequirement> = None;
 
     // Parse multipart form data
     loop {
@@ -5868,6 +5912,26 @@ pub async fn image_edits(
                         }
 
                         image = Some(bytes);
+                    }
+                    "tee" => {
+                        tee = match field.text().await.ok().as_deref() {
+                            Some("required") if tee.is_none() => {
+                                Some(inference_providers::routing::TeeRequirement::Required)
+                            }
+                            Some("any") if tee.is_none() => {
+                                Some(inference_providers::routing::TeeRequirement::Any)
+                            }
+                            _ => {
+                                return (
+                                    StatusCode::BAD_REQUEST,
+                                    ResponseJson(ErrorResponse::new(
+                                        "tee must occur once and be required or any".into(),
+                                        "invalid_request_error".into(),
+                                    )),
+                                )
+                                    .into_response()
+                            }
+                        };
                     }
                     "model" => match field.text().await {
                         Ok(text) => model = text,
@@ -6043,6 +6107,7 @@ pub async fn image_edits(
 
     // Convert API request to provider params
     let params = inference_providers::ImageEditParams {
+        tee,
         model: request.model.clone(),
         prompt: request.prompt.clone(),
         image: Arc::new(request.image),
@@ -6213,6 +6278,7 @@ mod rerank_response_options_tests {
         return_documents: Option<bool>,
     ) -> crate::models::RerankRequest {
         crate::models::RerankRequest {
+            tee: None,
             model: "Qwen/Qwen3-Reranker-0.6B".to_string(),
             query: "capital of France".to_string(),
             documents: vec![
@@ -6388,6 +6454,9 @@ pub async fn rerank(
     let mut extra = std::collections::HashMap::new();
     insert_encryption_headers(&encryption_headers, &mut extra);
     insert_request_id_header(correlation, &mut extra);
+    if let Some(tee) = request.tee {
+        extra.insert("tee".into(), serde_json::json!(tee));
+    }
 
     let params = inference_providers::RerankParams {
         model: request.model.clone(),
@@ -7898,6 +7967,9 @@ pub async fn score(
                 let mut extra = std::collections::HashMap::new();
                 insert_encryption_headers(&encryption_headers, &mut extra);
                 insert_request_id_header(correlation, &mut extra);
+                if let Some(tee) = request.tee {
+                    extra.insert("tee".into(), serde_json::json!(tee));
+                }
 
                 inference_providers::ScoreParams {
                     model: request.model.clone(),

@@ -289,6 +289,11 @@ impl ExternalBackend for AnthropicBackend {
             .map_err(map_raw_transport_error)?;
 
         if !response.status.is_success() {
+            if let Some(error) =
+                crate::routing::retry_after_headers(response.status.as_u16(), &response.headers)
+            {
+                return Err(error);
+            }
             let status_code = response.status.as_u16();
             let error_text = collect_raw_body(&mut response)
                 .await
@@ -327,6 +332,11 @@ impl ExternalBackend for AnthropicBackend {
             .map_err(map_raw_transport_error)?;
 
         if !response.status.is_success() {
+            if let Some(error) =
+                crate::routing::retry_after_headers(response.status.as_u16(), &response.headers)
+            {
+                return Err(error);
+            }
             let status_code = response.status.as_u16();
             let error_text = collect_raw_body(&mut response)
                 .await

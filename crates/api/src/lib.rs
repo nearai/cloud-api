@@ -915,19 +915,15 @@ pub async fn init_inference_providers(
         }
     }
 
-    // Load external providers (OpenAI, Anthropic, Gemini, etc.)
-    match models_source.fetch_external_models().await {
-        Ok(models) if !models.is_empty() => {
-            tracing::info!(count = models.len(), "Loading external providers");
-            if let Err(e) = pool.load_external_providers(models).await {
-                tracing::warn!(error = %e, "Failed to load some external providers");
-            }
-        }
-        Ok(_) => {}
-        Err(e) => {
-            tracing::warn!(error = %e, "Failed to fetch external models");
-        }
-    }
+    pool.set_attempt_repository(Arc::new(
+        database::repositories::provider_registry::ProviderRegistryRepository::new(
+            database.pool().clone(),
+        ),
+    ));
+    // Load policy and approved routes before admitting requests.
+    pool.refresh_external_providers(models_source.as_ref())
+        .await
+        .expect("Unable to load provider registry and routing policy");
 
     // Registry changes converge independently of potentially slow fleet discovery.
     let registry_pool = pool.clone();
@@ -1034,7 +1030,13 @@ pub async fn init_inference_providers_with_mocks(
     );
 
     // Create a MockProvider that accepts all models (using new_accept_all)
-    let mock_provider = Arc::new(MockProvider::new_accept_all());
+    // These fixtures stand in for the NEAR catalog fleet (including its fake
+    // signing keys); plaintext vendor fixtures register their own providers.
+    let mock_provider = Arc::new(
+        MockProvider::new_accept_all()
+            .with_tier(inference_providers::ProviderTier::Near)
+            .with_provider_source(inference_providers::ProviderSource::Vllm),
+    );
     let mock_provider_trait: Arc<dyn inference_providers::InferenceProvider + Send + Sync> =
         mock_provider.clone();
 
@@ -1298,7 +1300,10 @@ pub fn build_app_with_config_and_options(
     let attestation_routes =
         build_attestation_routes(app_state.clone(), &auth_components.auth_state_middleware);
 
-    let model_routes = build_model_routes(domain_services.models_service.clone());
+    let model_routes = build_model_routes(
+        domain_services.models_service.clone(),
+        domain_services.inference_provider_pool.clone(),
+    );
 
     let services_routes = build_services_routes(database.pool().clone());
 
@@ -2104,8 +2109,14 @@ pub fn build_internal_routes(app_state: AppState) -> Router {
         .with_state(app_state)
 }
 
-pub fn build_model_routes(models_service: Arc<dyn ModelsServiceTrait>) -> Router {
-    let models_app_state = ModelsAppState { models_service };
+pub fn build_model_routes(
+    models_service: Arc<dyn ModelsServiceTrait>,
+    inference_provider_pool: Arc<services::inference_provider_pool::InferenceProviderPool>,
+) -> Router {
+    let models_app_state = ModelsAppState {
+        models_service,
+        inference_provider_pool,
+    };
 
     Router::new()
         // Public endpoints - no auth required
@@ -2267,7 +2278,7 @@ fn build_admin_routes_with_options(
     // `/v1/admin/organizations/{org_id}/concurrent-limit`.
     let admin_service = Arc::new(AdminServiceImpl::new(
         admin_repository as Arc<dyn services::admin::AdminRepository>,
-        services.models_service as Arc<dyn services::models::ModelsServiceTrait>,
+        services.models_service.clone() as Arc<dyn services::models::ModelsServiceTrait>,
         services.completion_service.clone()
             as Arc<dyn services::completions::CompletionServiceTrait>,
         services::email::sender_from_config(&config.invitation_email)
@@ -2286,7 +2297,15 @@ fn build_admin_routes_with_options(
         config.infra.cost_per_gpu_hour_usd,
     ));
 
+    services
+        .inference_provider_pool
+        .set_attempt_repository(Arc::new(
+            database::repositories::provider_registry::ProviderRegistryRepository::new(
+                database.pool().clone(),
+            ),
+        ));
     let admin_app_state = AdminAppState {
+        models_service: services.models_service.clone(),
         provider_registry: Arc::new(
             database::repositories::provider_registry::ProviderRegistryRepository::new(
                 database.pool().clone(),
@@ -2326,9 +2345,18 @@ fn build_admin_routes_with_options(
 
     // Classify read operations in middleware::admin_policy when adding admin routes.
     let admin_routes = Router::new()
+        .route("/admin/models/{model_name}/routing-policy", axum::routing::get(crate::routes::providers::routing_policy).put(crate::routes::providers::update_routing_policy))
+        .route("/admin/provider-attempts/{request_id}", axum::routing::get(crate::routes::providers::attempts))
+        .route("/admin/provider-attempts/{id}/settlement", axum::routing::post(crate::routes::providers::settle_attempt))
+        .route("/admin/organizations/{org_id}/inference-policy", axum::routing::get(crate::routes::providers::organization_policy).put(crate::routes::providers::save_organization_policy))
+        .route("/admin/provider-accounts", axum::routing::get(crate::routes::providers::accounts).put(crate::routes::providers::save_account))
+        .route("/admin/models/{model_name}/routes", axum::routing::get(crate::routes::providers::model_routes).put(crate::routes::providers::save_route))
+        .route("/admin/provider-routes/{id}/cost-profiles", axum::routing::get(crate::routes::providers::cost_profiles).post(crate::routes::providers::save_cost_profile))
         .route("/admin/providers", axum::routing::get(crate::routes::providers::list).post(crate::routes::providers::create))
+        .route("/admin/providers/import-legacy", axum::routing::post(crate::routes::providers::import_legacy))
         .route("/admin/providers/{id}", axum::routing::put(crate::routes::providers::update))
         .route("/admin/providers/{id}/models", axum::routing::get(crate::routes::providers::models).put(crate::routes::providers::approve))
+        .route("/admin/providers/{id}/inventory", axum::routing::put(crate::routes::providers::save_inventory))
         .route("/admin/providers/{id}/sync", axum::routing::post(crate::routes::providers::sync))
         .route("/admin/models/{model_name}/archive", axum::routing::put(crate::routes::providers::archive_model))
         .route(

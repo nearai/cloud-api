@@ -38,9 +38,13 @@ pub async fn request_correlation_middleware(mut request: Request<Body>, next: Ne
         path = %path,
     );
 
-    let mut response = async move { next.run(request).await }
-        .instrument(span)
-        .await;
+    let mut response = async move {
+        services::provider_registry::ACCEPTED_REQUEST_ID
+            .scope(request_id, next.run(request))
+            .await
+    }
+    .instrument(span)
+    .await;
     if let Ok(value) = HeaderValue::from_str(&request_id.to_string()) {
         response.headers_mut().insert(REQUEST_ID_HEADER, value);
         prevent_request_id_caching(response.headers_mut());

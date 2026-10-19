@@ -132,6 +132,7 @@ async fn get_admin_user_by_id(
 /// Authenticated API key with workspace and organization context
 #[derive(Clone, Debug)]
 pub struct AuthenticatedApiKey {
+    pub tee_required: bool,
     pub api_key: services::workspace::ApiKey,
     pub workspace: services::workspace::Workspace,
     pub organization: services::organization::Organization,
@@ -240,8 +241,11 @@ pub async fn auth_middleware_with_workspace_context(
         Ok(authenticated_api_key) => {
             debug!("Adding authenticated API key with workspace context to request");
             let mut request = request;
+            let tee_required = authenticated_api_key.tee_required;
             request.extensions_mut().insert(authenticated_api_key);
-            Ok(next.run(request).await)
+            Ok(services::provider_registry::ORGANIZATION_TEE_REQUIRED
+                .scope(tee_required, next.run(request))
+                .await)
         }
         Err(error) => Err(error),
     }
@@ -851,11 +855,25 @@ async fn authenticate_api_key_with_context(
         .await
     {
         Ok(Some((workspace, organization))) => {
+            let tee_required = state
+                .workspace_repository
+                .organization_requires_tee(organization.id.0)
+                .await
+                .map_err(|_| {
+                    (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        axum::Json(crate::models::ErrorResponse::new(
+                            "Organization inference policy unavailable".into(),
+                            "policy_unavailable".into(),
+                        )),
+                    )
+                })?;
             debug!(
                 "Resolved workspace_id={} organization_id={} workspace_active={} organization_active={} for API key",
                 workspace.id, organization.id, workspace.is_active, organization.is_active
             );
             Ok(AuthenticatedApiKey {
+                tee_required,
                 api_key: validated_api_key,
                 workspace,
                 organization,

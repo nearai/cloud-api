@@ -1632,6 +1632,35 @@ impl ModelRepository {
 // Implement ExternalModelsSource trait for periodic refresh of external providers
 #[async_trait]
 impl services::inference_provider_pool::ExternalModelsSource for ModelRepository {
+    async fn fetch_disabled_models(&self) -> Result<std::collections::HashSet<String>, String> {
+        Ok(self
+            .pool
+            .get()
+            .await
+            .map_err(|error| error.to_string())?
+            .query(
+                "SELECT model_name FROM models WHERE archived_at IS NOT NULL OR NOT is_active",
+                &[],
+            )
+            .await
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .map(|row| row.get(0))
+            .collect())
+    }
+
+    async fn fetch_routing_policies(
+        &self,
+    ) -> Result<
+        std::collections::HashMap<String, services::provider_registry::ModelRoutingPolicy>,
+        String,
+    > {
+        crate::repositories::provider_registry::ProviderRegistryRepository::new(self.pool.clone())
+            .routing_policies()
+            .await
+            .map_err(|error| error.to_string())
+    }
+
     async fn fetch_external_models(&self) -> Result<Vec<(String, serde_json::Value)>, String> {
         crate::repositories::provider_registry::ProviderRegistryRepository::new(self.pool.clone())
             .routes()

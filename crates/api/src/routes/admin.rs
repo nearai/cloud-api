@@ -185,6 +185,7 @@ pub(crate) fn is_valid_openrouter_slug(slug: &str) -> bool {
 
 #[derive(Clone)]
 pub struct AdminAppState {
+    pub models_service: Arc<dyn services::models::ModelsServiceTrait>,
     pub provider_registry:
         Arc<database::repositories::provider_registry::ProviderRegistryRepository>,
     pub provider_models_repository: Arc<database::repositories::ModelRepository>,
@@ -1090,6 +1091,7 @@ pub async fn batch_upsert_models(
                 .text_pricing
                 .map(|profile| serde_json::to_value(profile).expect("text pricing serializes")),
             metadata: ModelMetadata {
+                routing: None,
                 verifiable: updated_model.verifiable,
                 context_length: updated_model.context_length,
                 model_display_name: updated_model.model_display_name,
@@ -1215,6 +1217,7 @@ pub async fn list_models(
                 .text_pricing
                 .map(|profile| serde_json::to_value(profile).expect("text pricing serializes")),
             metadata: ModelMetadata {
+                routing: None,
                 verifiable: model.verifiable,
                 context_length: model.context_length,
                 model_display_name: model.model_display_name,
@@ -1907,6 +1910,7 @@ pub async fn deprecate_model(
             .text_pricing
             .map(|profile| serde_json::to_value(profile).expect("text pricing serializes")),
         metadata: ModelMetadata {
+            routing: None,
             verifiable: m.verifiable,
             context_length: m.context_length,
             model_display_name: m.model_display_name,

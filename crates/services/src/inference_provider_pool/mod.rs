@@ -303,8 +303,15 @@ struct ProviderLatencyState {
 }
 
 /// Routing hints derived from the request content to guide provider selection.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct ChatRoutingHints {
+    pub policy_resolved: bool,
+    pub request_id: Option<uuid::Uuid>,
+    pub output_tokens: Option<u64>,
+    /// Accepted customer pricing estimate, never recomputed from live prices.
+    pub customer_cost_microusd: Option<i64>,
+    pub tee: Option<inference_providers::routing::TeeRequirement>,
+    pub reasoning_effort: Option<inference_providers::routing::ReasoningEffort>,
     /// Consistent hash of the first PREFIX_HASH_MESSAGES messages for KV-cache routing.
     /// When set, provider selection within the leading tier uses this hash instead of
     /// pure round-robin, so requests with the same prefix tend to land on the same backend.
@@ -433,6 +440,15 @@ impl Drop for RediscoveryRun {
 #[async_trait::async_trait]
 pub trait ExternalModelsSource: Send + Sync {
     async fn fetch_external_models(&self) -> Result<Vec<(String, serde_json::Value)>, String>;
+    async fn fetch_disabled_models(&self) -> Result<HashSet<String>, String> {
+        Ok(HashSet::new())
+    }
+
+    async fn fetch_routing_policies(
+        &self,
+    ) -> Result<HashMap<String, crate::provider_registry::ModelRoutingPolicy>, String> {
+        Ok(HashMap::new())
+    }
 
     /// Fetch models that have a direct inference URL configured.
     /// Returns (model_name, inference_url, context_length) triples for active models with inference_url set.
@@ -907,6 +923,9 @@ fn apply_pin_update(
 /// Both mappings are updated together under a single lock to ensure consistency
 #[derive(Clone)]
 struct ProviderMappings {
+    route_runtime: HashMap<usize, crate::provider_registry::entities::RouteRuntime>,
+    disabled_models: HashSet<String>,
+    registry_refreshed_at: Option<std::time::Instant>,
     /// Map of model name -> list of providers (for load balancing)
     model_to_providers: HashMap<String, Vec<Arc<InferenceProviderTrait>>>,
     /// Map of model signing public key -> list of providers (for load balancing when multiple instances share the same key)
@@ -916,6 +935,9 @@ struct ProviderMappings {
 impl ProviderMappings {
     fn new() -> Self {
         Self {
+            route_runtime: HashMap::new(),
+            disabled_models: HashSet::new(),
+            registry_refreshed_at: None,
             model_to_providers: HashMap::new(),
             pubkey_to_providers: HashMap::new(),
         }
@@ -936,6 +958,7 @@ struct PoolPlacement {
 }
 
 struct CachedExternalProvider {
+    route_id: Option<uuid::Uuid>,
     config: serde_json::Value,
     provider: Arc<InferenceProviderTrait>,
     backend_type: String,
@@ -950,6 +973,10 @@ pub struct InferenceProviderPool {
     /// Configuration for external providers (API keys, timeouts, etc.)
     external_configs: ExternalProvidersConfig,
     external_provider_cache: Arc<RwLock<HashMap<String, Vec<CachedExternalProvider>>>>,
+    routing_policies: Arc<RwLock<HashMap<String, crate::provider_registry::ModelRoutingPolicy>>>,
+    attempt_repository:
+        Arc<std::sync::OnceLock<Arc<dyn crate::provider_registry::entities::AttemptRepository>>>,
+
     /// Round-robin index for each model.
     /// Uses std::sync::RwLock because operations are instant HashMap lookups/inserts.
     load_balancer_index: Arc<std::sync::RwLock<HashMap<String, usize>>>,
@@ -1377,6 +1404,8 @@ impl InferenceProviderPool {
             provider_mappings: Arc::new(RwLock::new(ProviderMappings::new())),
             external_configs,
             external_provider_cache: Arc::new(RwLock::new(HashMap::new())),
+            routing_policies: Arc::new(RwLock::new(HashMap::new())),
+            attempt_repository: Arc::new(std::sync::OnceLock::new()),
             load_balancer_index: Arc::new(std::sync::RwLock::new(HashMap::new())),
             chat_id_mapping: Arc::new(RwLock::new(HashMap::new())),
             refresh_task_handle: Arc::new(Mutex::new(None)),
@@ -1584,6 +1613,164 @@ impl InferenceProviderPool {
         result
     }
 
+    pub fn set_attempt_repository(
+        &self,
+        repository: Arc<dyn crate::provider_registry::entities::AttemptRepository>,
+    ) {
+        let _ = self.attempt_repository.set(repository);
+    }
+
+    async fn record_non_chat_usage(
+        &self,
+        attempt: Option<crate::provider_registry::entities::InferenceAttempt>,
+        usage: Option<serde_json::Value>,
+    ) {
+        let (Some(mut attempt), Some(mut usage), Some(repository)) =
+            (attempt, usage, self.attempt_repository.get())
+        else {
+            return;
+        };
+        let input = usage
+            .get("prompt_tokens")
+            .or_else(|| usage.get("input_tokens"))
+            .and_then(serde_json::Value::as_i64);
+        let Some(input) = input.filter(|tokens| (0..=i64::from(i32::MAX)).contains(tokens)) else {
+            return;
+        };
+        let output = usage
+            .get("completion_tokens")
+            .or_else(|| usage.get("output_tokens"))
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(0);
+        if !(0..=i64::from(i32::MAX)).contains(&output) {
+            return;
+        }
+        usage["prompt_tokens"] = input.into();
+        usage["completion_tokens"] = output.into();
+        usage["total_tokens"] = (input + output).into();
+        attempt.usage = serde_json::from_value(usage).ok();
+        if repository.finish(&attempt).await.is_err() {
+            tracing::error!(request_id=%attempt.request_id,"Provider usage estimate persistence failed");
+        }
+    }
+
+    pub async fn routing_capabilities(
+        &self,
+        model: &crate::models::ModelWithPricing,
+    ) -> crate::provider_registry::capabilities::RoutingCapabilities {
+        use crate::provider_registry::capabilities::{RouteCapabilities, RoutingCapabilities};
+        use inference_providers::routing::TeeRequirement;
+        let _generation = self.external_provider_reload_generation.lock().await;
+        let policies = self.routing_policies.read().await;
+        let policy = policies.get(&model.model_name);
+        let default_tee_requirement = policy.map_or(
+            if model.verifiable || model.attestation_supported {
+                TeeRequirement::Required
+            } else {
+                TeeRequirement::Any
+            },
+            |policy| policy.default_tee_requirement,
+        );
+        let mappings = self.provider_mappings.read().await;
+        let stale = mappings
+            .registry_refreshed_at
+            .is_some_and(|at| at.elapsed() > Duration::from_secs(60));
+        let mut profiles = Vec::new();
+        if !mappings.disabled_models.contains(&model.model_name) {
+            for provider in mappings
+                .model_to_providers
+                .get(&model.model_name)
+                .into_iter()
+                .flatten()
+            {
+                let route = mappings
+                    .route_runtime
+                    .get(&(Arc::as_ptr(provider) as *const () as usize));
+                if (stale && route.is_some())
+                    || (default_tee_requirement == TeeRequirement::Required
+                        && policy.is_none_or(|policy| !policy.mixed_routing_enabled)
+                        && !provider.tier().is_attested())
+                {
+                    continue;
+                }
+                profiles.push(RouteCapabilities {
+                    route_id: route.map(|route| route.route_id),
+                    deployment_id: route.map(|route| route.deployment_id),
+                    tee_supported: provider.tier().is_attested(),
+                    reasoning_efforts: provider.reasoning_efforts().map(|efforts| efforts.to_vec()),
+                    native_responses: provider.supports_responses_raw(),
+                    native_anthropic: provider.supports_anthropic_raw(),
+                });
+            }
+        }
+        profiles.sort_by_key(|profile| {
+            (
+                profile.route_id,
+                profile.deployment_id,
+                profile.tee_supported,
+            )
+        });
+        RoutingCapabilities {
+            default_tee_requirement,
+            profiles,
+        }
+    }
+
+    pub(crate) async fn accept_request(
+        &self,
+        model: crate::models::ModelWithPricing,
+    ) -> Arc<crate::provider_registry::accepted_request::AcceptedRequest> {
+        let _generation = self.external_provider_reload_generation.lock().await;
+        let policy = self
+            .routing_policies
+            .read()
+            .await
+            .get(&model.model_name)
+            .cloned();
+        let deadline = policy
+            .as_ref()
+            .map(|policy| tokio::time::Instant::now() + Duration::from_millis(policy.deadline_ms));
+        let routes = self
+            .provider_mappings
+            .read()
+            .await
+            .route_runtime
+            .values()
+            .map(|route| (route.route_id, route.clone()))
+            .collect();
+        Arc::new(
+            crate::provider_registry::accepted_request::AcceptedRequest {
+                id: uuid::Uuid::new_v4(),
+                model,
+                policy,
+                routes,
+                deadline,
+                budget: tokio::sync::Mutex::new(Default::default()),
+            },
+        )
+    }
+
+    pub async fn accepted_tee_requirement(
+        &self,
+        model: &str,
+        requested: Option<inference_providers::routing::TeeRequirement>,
+        catalog_default: inference_providers::routing::TeeRequirement,
+    ) -> inference_providers::routing::TeeRequirement {
+        use inference_providers::routing::TeeRequirement;
+        let _generation = self.external_provider_reload_generation.lock().await;
+        let policies = self.routing_policies.read().await;
+        let policy = policies.get(model);
+        let default = policy.map_or(catalog_default, |policy| policy.default_tee_requirement);
+        if crate::provider_registry::organization_requires_tee()
+            || (default == TeeRequirement::Required
+                && policy.is_none_or(|policy| !policy.mixed_routing_enabled))
+        {
+            TeeRequirement::Required
+        } else {
+            requested.unwrap_or(default)
+        }
+    }
+
     /// Replace only non-attested external registrations from a complete catalog snapshot.
     pub async fn refresh_external_providers(
         &self,
@@ -1591,19 +1778,40 @@ impl InferenceProviderPool {
     ) -> Result<(), String> {
         let mut generation = self.external_provider_reload_generation.lock().await;
         *generation = generation.wrapping_add(1);
+        let policies = source.fetch_routing_policies().await?;
+        let disabled_models = source.fetch_disabled_models().await?;
         let models = source.fetch_external_models().await?;
+        *self.routing_policies.write().await = policies;
         let names: HashSet<_> = models.iter().map(|(name, _)| name.clone()).collect();
-        let result = self.load_external_providers_inner(models).await;
-        self.provider_mappings
-            .write()
+        let owned_providers: HashSet<usize> = self
+            .external_provider_cache
+            .read()
             .await
-            .model_to_providers
-            .retain(|name, providers| {
-                names.contains(name)
-                    || providers.iter().any(|provider| {
-                        provider.provider_source() != inference_providers::ProviderSource::External
-                    })
+            .values()
+            .flatten()
+            .map(|entry| Arc::as_ptr(&entry.provider) as *const () as usize)
+            .collect();
+        let result = self.load_external_providers_inner(models).await;
+        {
+            let mut mappings = self.provider_mappings.write().await;
+            mappings.disabled_models = disabled_models;
+            mappings.registry_refreshed_at = Some(std::time::Instant::now());
+            mappings.model_to_providers.retain(|name, providers| {
+                if !names.contains(name) {
+                    providers.retain(|provider| {
+                        !owned_providers.contains(&(Arc::as_ptr(provider) as *const () as usize))
+                    });
+                }
+                !providers.is_empty()
             });
+            let live: HashSet<usize> = mappings
+                .model_to_providers
+                .values()
+                .flatten()
+                .map(|provider| Arc::as_ptr(provider) as *const () as usize)
+                .collect();
+            mappings.route_runtime.retain(|ptr, _| live.contains(ptr));
+        }
         self.external_provider_cache
             .write()
             .await
@@ -1630,17 +1838,34 @@ impl InferenceProviderPool {
         let mut replacements: HashMap<String, Vec<Arc<InferenceProviderTrait>>> = HashMap::new();
         let mut cache = self.external_provider_cache.write().await;
         let mut refreshed_cache: HashMap<String, Vec<CachedExternalProvider>> = HashMap::new();
-        for (model_name, provider_config) in models {
+        for (model_name, mut provider_config) in models {
+            let runtime: Option<crate::provider_registry::entities::RouteRuntime> = provider_config
+                .as_object_mut()
+                .and_then(|config| config.remove("_registry_route"))
+                .map(serde_json::from_value)
+                .transpose()
+                .map_err(|_| "Invalid registry route metadata".to_string())?;
+            let route_id = runtime.as_ref().map(|route| route.route_id);
             // Never overwrite a pinned (out-of-band, attested) provider with a
             // DB-discovered external one (the external refresh routes here).
-            if pinned.contains(&model_name) {
+            if pinned.contains(&model_name) && runtime.is_none() {
                 warn!(model = %model_name, "Skipping external provider for a pinned (attested) model");
                 continue;
             }
             let candidates = replacements.entry(model_name.clone()).or_default();
             let cached = cache
                 .get(&model_name)
-                .and_then(|entries| entries.iter().find(|entry| entry.config == provider_config))
+                .and_then(|entries| {
+                    entries.iter().find(|entry| {
+                        entry.config == provider_config
+                            && (entry.route_id == route_id
+                                || entry.route_id.is_none()
+                                || route_id.is_none())
+                            && !candidates
+                                .iter()
+                                .any(|provider| Arc::ptr_eq(provider, &entry.provider))
+                    })
+                })
                 .map(|entry| (entry.provider.clone(), entry.backend_type.clone()));
             let result = cached.map(Ok).unwrap_or_else(|| {
                 self.create_external_provider(&model_name, provider_config.clone())
@@ -1648,7 +1873,19 @@ impl InferenceProviderPool {
             let cache_entries = refreshed_cache.entry(model_name.clone()).or_default();
             match result {
                 Ok((provider, backend_type)) => {
+                    if let Some(runtime) = runtime {
+                        mappings
+                            .route_runtime
+                            .insert(Arc::as_ptr(&provider) as *const () as usize, runtime);
+                    } else {
+                        // Rollback can reuse the same connection handle while
+                        // returning ownership to the sanitized legacy loader.
+                        mappings
+                            .route_runtime
+                            .remove(&(Arc::as_ptr(&provider) as *const () as usize));
+                    }
                     cache_entries.push(CachedExternalProvider {
+                        route_id,
                         config: provider_config,
                         provider: provider.clone(),
                         backend_type: backend_type.clone(),
@@ -1675,7 +1912,18 @@ impl InferenceProviderPool {
             }
         }
         drop(cache);
-        for (name, providers) in replacements {
+        for (name, mut providers) in replacements {
+            if let Some(existing) = mappings.model_to_providers.get(&name) {
+                providers.extend(
+                    existing
+                        .iter()
+                        .filter(|provider| {
+                            provider.provider_source()
+                                != inference_providers::ProviderSource::External
+                        })
+                        .cloned(),
+                );
+            }
             if providers.is_empty() {
                 mappings.model_to_providers.remove(&name);
             } else {
@@ -2843,9 +3091,26 @@ impl InferenceProviderPool {
         hints: &ChatRoutingHints,
     ) -> Option<Vec<Arc<InferenceProviderTrait>>> {
         let mappings = self.provider_mappings.read().await;
+        if mappings.disabled_models.contains(model_id) {
+            return Some(Vec::new());
+        }
+        let registry_stale = mappings
+            .registry_refreshed_at
+            .is_some_and(|at| at.elapsed() > Duration::from_secs(60));
 
         // Get providers by model_id first
         let model_providers = mappings.model_to_providers.get(model_id)?.clone();
+        let model_providers: Vec<_> = model_providers
+            .into_iter()
+            .filter(|provider| {
+                let route = mappings
+                    .route_runtime
+                    .get(&(Arc::as_ptr(provider) as *const () as usize));
+                (!registry_stale || route.is_none())
+                    && (!hints.fallback_disabled
+                        || route.is_none_or(|route| route.role != "fallback"))
+            })
+            .collect();
 
         // Filter by model_pub_key if provided
         let providers = if let Some(pub_key) = model_pub_key {
@@ -2877,23 +3142,45 @@ impl InferenceProviderPool {
         };
         drop(mappings);
 
-        // Trust-tier safety: a model that can be served by an attested provider
-        // (NEAR's own fleet `Near`, or an attested third party like Chutes
-        // `Attested3p`) is a *verifiable* model and must NEVER fall back to a
-        // non-attested (plaintext) provider — that would silently break the
-        // verifiable promise. So whenever any attested provider is present, drop
-        // every `NonAttested` one: a verifiable request then fails closed (only
-        // attested providers are ever tried) instead of downgrading to plaintext
-        // when the attested backends are unhealthy. Pure non-attested models (no
-        // attested provider at all, e.g. OpenAI/Anthropic) are unaffected.
-        let providers = if providers.iter().any(|p| p.tier().is_attested()) {
-            providers
-                .into_iter()
-                .filter(|p| p.tier().is_attested())
-                .collect::<Vec<_>>()
+        let catalog_policy = self.routing_policies.read().await.get(model_id).cloned();
+        let default_tee = catalog_policy
+            .as_ref()
+            .map(|policy| policy.default_tee_requirement)
+            .unwrap_or_else(|| {
+                if providers
+                    .iter()
+                    .any(|provider| provider.tier().is_attested())
+                {
+                    inference_providers::routing::TeeRequirement::Required
+                } else {
+                    inference_providers::routing::TeeRequirement::Any
+                }
+            });
+        // The rollout gate prevents a mixed route becoming reachable before all
+        // serving replicas understand the policy. Key pins always strengthen it.
+        let effective_tee = if hints.policy_resolved {
+            hints.tee.unwrap_or(default_tee)
+        } else if catalog_policy
+            .as_ref()
+            .is_some_and(|policy| !policy.mixed_routing_enabled)
+            && default_tee == inference_providers::routing::TeeRequirement::Required
+        {
+            default_tee
         } else {
-            providers
+            hints.tee.unwrap_or(default_tee)
         };
+        let requires_tee = crate::provider_registry::organization_requires_tee()
+            || model_pub_key.is_some()
+            || effective_tee == inference_providers::routing::TeeRequirement::Required;
+        let providers: Vec<_> = providers
+            .into_iter()
+            .filter(|provider| {
+                (!requires_tee || provider.tier().is_attested())
+                    && hints
+                        .reasoning_effort
+                        .is_none_or(|effort| provider.accepts_reasoning_effort(effort))
+            })
+            .collect();
 
         let providers = if hints.fallback_disabled {
             providers
@@ -3072,6 +3359,7 @@ impl InferenceProviderPool {
         };
 
         match error {
+            error @ CompletionError::RetryableUpstream { .. } => error,
             CompletionError::HttpError {
                 status_code,
                 message,
@@ -3115,6 +3403,10 @@ impl InferenceProviderPool {
     /// Safe to log: contains no caller-controlled content.
     fn classify_error_kind(error: &CompletionError) -> &'static str {
         match error {
+            CompletionError::RetryableUpstream {
+                status_code: 429, ..
+            } => "http_429",
+            CompletionError::RetryableUpstream { .. } => "http_5xx",
             CompletionError::CompletionError(_) => "completion_error",
             CompletionError::HttpError { status_code, .. } => match status_code {
                 500..=599 => "http_5xx",
@@ -3277,6 +3569,7 @@ impl InferenceProviderPool {
     /// the label directly so the rationale is visible in production logs.
     fn classify_retry_decision(error: &CompletionError) -> &'static str {
         match error {
+            CompletionError::RetryableUpstream { .. } => "retryable_upstream_cooldown",
             CompletionError::CompletionError(msg) => {
                 let lower = msg.to_lowercase();
                 let is_inference_timeout = (lower.contains("operation timed out")
@@ -3391,7 +3684,7 @@ impl InferenceProviderPool {
     /// So when the operation streams and ANY provider can stream, drop the ones that
     /// can't. If NONE can stream (e.g. a Chutes-only model with streaming off), keep
     /// the list as-is so the provider's own clear error still surfaces.
-    /// Operation names (as passed to [`Self::retry_with_fallback`]) that produce a
+    /// Operation names (as passed to [`Self::retry_with_fallback_caps`]) that produce a
     /// streamed response and therefore need a streaming-capable provider. Kept as an
     /// EXPLICIT list rather than a `_stream` name-suffix convention so a new
     /// streaming op must be added here deliberately (a silently-misnamed op no longer
@@ -3497,8 +3790,20 @@ impl InferenceProviderPool {
                 if complete_names.contains(name) {
                     continue; // still discovery-served; the merge handled it this cycle
                 }
+                let mut retained = pinned.clone();
+                if let Some(current) = mappings.model_to_providers.get(name) {
+                    retained.extend(
+                        current
+                            .iter()
+                            .filter(|provider| {
+                                mappings.route_runtime.contains_key(&ptr(provider))
+                                    && !pinned.iter().any(|pinned| Arc::ptr_eq(pinned, provider))
+                            })
+                            .cloned(),
+                    );
+                }
                 let pinned_ptrs: std::collections::HashSet<usize> =
-                    pinned.iter().map(&ptr).collect();
+                    retained.iter().map(&ptr).collect();
                 let cur_ptrs: std::collections::HashSet<usize> = mappings
                     .model_to_providers
                     .get(name)
@@ -3511,9 +3816,7 @@ impl InferenceProviderPool {
                 // set (compare pointer SETS, not lengths — a future partial overwrite
                 // could match on length but differ in membership).
                 if cur_ptrs != pinned_ptrs {
-                    mappings
-                        .model_to_providers
-                        .insert(name.clone(), pinned.clone());
+                    mappings.model_to_providers.insert(name.clone(), retained);
                 }
             }
             // Shared-Arc guard: providers are cached per-URL, so two model names can
@@ -3547,6 +3850,7 @@ impl InferenceProviderPool {
     /// Returns both the result and the provider that succeeded (for chat_id mapping).
     /// If model_pub_key is provided, routes to the specific provider by signing public key.
     /// Thin wrapper that requests no extra capability (see [`Self::retry_with_fallback_caps`]).
+    #[cfg(test)]
     async fn retry_with_fallback<T, F, Fut>(
         &self,
         model_id: &str,
@@ -3569,7 +3873,7 @@ impl InferenceProviderPool {
         .await
     }
 
-    /// As [`Self::retry_with_fallback`], but filters the provider list to those that
+    /// Filters the provider list to those that
     /// can serve the request's capabilities before the fallback loop: streaming
     /// (by `operation_name`) and — when `needs_client_e2ee` — client-facing E2EE. A
     /// capability-incapable provider is dropped only when a capable sibling exists,
@@ -3590,6 +3894,47 @@ impl InferenceProviderPool {
         F: Fn(Arc<InferenceProviderTrait>) -> Fut,
         Fut: std::future::Future<Output = Result<T, CompletionError>>,
     {
+        // Accept policy, candidate handles, and cost revisions from one pool
+        // generation. Release before upstream I/O so refresh stays independent
+        // of slow requests and retries retain their accepted snapshot.
+        let snapshot_guard = self.external_provider_reload_generation.lock().await;
+        let accepted = crate::provider_registry::accepted_request::for_model(model_id);
+        let policy = if let Some(accepted) = &accepted {
+            accepted.policy.clone()
+        } else {
+            self.routing_policies.read().await.get(model_id).cloned()
+        };
+        let mut effective_hints = hints.clone();
+        if let Some(policy) = &policy {
+            effective_hints.tee = Some(
+                if crate::provider_registry::organization_requires_tee()
+                    || needs_client_e2ee
+                    || model_pub_key.is_some()
+                    || (!policy.mixed_routing_enabled
+                        && policy.default_tee_requirement
+                            == inference_providers::routing::TeeRequirement::Required)
+                {
+                    inference_providers::routing::TeeRequirement::Required
+                } else {
+                    hints.tee.unwrap_or(policy.default_tee_requirement)
+                },
+            );
+            effective_hints.policy_resolved = true;
+        }
+        if needs_client_e2ee
+            || model_pub_key.is_some()
+            || crate::provider_registry::organization_requires_tee()
+        {
+            effective_hints.tee = Some(inference_providers::routing::TeeRequirement::Required);
+        }
+        let hints = &effective_hints;
+        let request_deadline = if let Some(accepted) = &accepted {
+            accepted.deadline
+        } else {
+            policy.as_ref().map(|policy| {
+                tokio::time::Instant::now() + Duration::from_millis(policy.deadline_ms)
+            })
+        };
         let providers = match self
             .get_providers_with_fallback(model_id, model_pub_key, hints)
             .await
@@ -3645,22 +3990,86 @@ impl InferenceProviderPool {
             }
         };
 
+        if providers.is_empty() && hints.reasoning_effort.is_some() {
+            return Err(inference_providers::routing::invalid("No eligible provider supports the requested reasoning effort and security requirements"));
+        }
         let providers = Self::filter_streaming_capable(providers, operation_name);
         let providers = Self::filter_client_e2ee_capable(providers, needs_client_e2ee);
-        let providers = if operation_name == "systemone" {
+        let providers = if matches!(
+            operation_name,
+            "systemone" | "responses_raw" | "anthropic_raw"
+        ) {
             let capable: Vec<_> = providers
                 .into_iter()
-                .filter(|provider| provider.supports_systemone())
+                .filter(|provider| match operation_name {
+                    "responses_raw" => provider.supports_responses_raw(),
+                    "anthropic_raw" => provider.supports_anthropic_raw(),
+                    _ => provider.supports_systemone(),
+                })
                 .collect();
             if capable.is_empty() {
                 return Err(CompletionError::CompletionError(format!(
-                    "No System One provider available for model '{model_id}'"
+                    "No {operation_name} provider available for model '{model_id}'"
                 )));
             }
             capable
         } else {
             providers
         };
+        let mut route_snapshot = self.provider_mappings.read().await.route_runtime.clone();
+        if let Some(accepted) = &accepted {
+            // New route versions cannot alter the accepted procurement rates.
+            for route in route_snapshot.values_mut() {
+                if let Some(snapshot) = accepted.routes.get(&route.route_id) {
+                    route.cost_profile_id = snapshot.cost_profile_id;
+                    route.cost_rates = snapshot.cost_rates.clone();
+                } else {
+                    route.cost_profile_id = None;
+                    route.cost_rates = None;
+                }
+            }
+        }
+        drop(snapshot_guard);
+        // Serialize reservations for a request, including concurrent tool calls.
+        // The guard is released when dispatch returns, before body consumption.
+        let mut accepted_budget = if let Some(accepted) = &accepted {
+            Some(accepted.budget.lock().await)
+        } else {
+            None
+        };
+        if let Some(budget) = &mut accepted_budget {
+            if budget.attempts == 0 {
+                budget.customer_cost = hints.customer_cost_microusd;
+            }
+        }
+        let customer_cost = accepted_budget
+            .as_ref()
+            .map_or(hints.customer_cost_microusd, |budget| budget.customer_cost);
+        let mut providers = providers;
+        // Eligibility has already enforced security and effort. Cost is only an
+        // ordering signal among those candidates, never a reason to weaken it.
+        providers.sort_by_key(|provider| {
+            route_snapshot
+                .get(&(Arc::as_ptr(provider) as *const () as usize))
+                .and_then(|route| route.cost_rates.as_ref())
+                .and_then(|rates| {
+                    rates.estimate_usd(
+                        u64::from(hints.estimated_tokens.unwrap_or(0)),
+                        hints.output_tokens.unwrap_or(4096),
+                    )
+                })
+                .unwrap_or(i64::MAX)
+        });
+        let ledger = self.attempt_repository.get();
+        let request_id = accepted
+            .as_ref()
+            .map_or_else(uuid::Uuid::new_v4, |accepted| accepted.id);
+        let mut reserved_cost = accepted_budget
+            .as_ref()
+            .map_or(0, |budget| budget.reserved_cost);
+        let mut reserved_cost_known = accepted_budget
+            .as_ref()
+            .is_none_or(|budget| budget.cost_known);
         let has_near_primary = providers
             .iter()
             .any(|provider| provider.tier() == inference_providers::ProviderTier::Near);
@@ -3800,7 +4209,7 @@ impl InferenceProviderPool {
         // and prevents the regex matchers in classify_retry_decision from
         // being defeated by sanitization.
         let mut last_retry_decision: Option<&'static str> = None;
-        let mut total_attempts: usize = 0;
+        let mut total_attempts = accepted_budget.as_ref().map_or(0, |budget| budget.attempts);
         let mut retry_count: usize = 0;
         let started_at = std::time::Instant::now();
         // Snapshot the full model→providers count once. Reading it again at the
@@ -3838,7 +4247,84 @@ impl InferenceProviderPool {
                     }
                 }
 
+                if policy
+                    .as_ref()
+                    .is_some_and(|policy| total_attempts >= policy.max_attempts as usize)
+                {
+                    return Err(last_error.unwrap_or_else(|| CompletionError::HttpError {
+                        status_code: 503,
+                        message: "Routing attempt budget exhausted".into(),
+                        is_external: false,
+                    }));
+                }
+                if request_deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
+                {
+                    return Err(CompletionError::Timeout {
+                        operation: operation_name.into(),
+                        timeout_seconds: policy.as_ref().unwrap().deadline_ms.div_ceil(1000),
+                    });
+                }
+                let route = route_snapshot.get(&(Arc::as_ptr(provider) as *const () as usize));
+                if route.is_some_and(|route| {
+                    route
+                        .context_limit
+                        .zip(hints.estimated_tokens)
+                        .is_some_and(|(limit, tokens)| u64::from(tokens) > limit as u64)
+                        || route
+                            .output_limit
+                            .zip(hints.output_tokens)
+                            .is_some_and(|(limit, tokens)| tokens > limit as u64)
+                }) {
+                    continue;
+                }
+                let estimated_cost =
+                    route
+                        .and_then(|route| route.cost_rates.as_ref())
+                        .and_then(|rates| {
+                            hints.output_tokens.zip(hints.estimated_tokens).and_then(
+                                |(output, input)| rates.estimate_usd(u64::from(input), output),
+                            )
+                        });
+                if let Some(policy) = &policy {
+                    if policy
+                        .max_attempt_cost_microusd
+                        .is_some_and(|ceiling| estimated_cost.is_none_or(|cost| cost > ceiling))
+                        || policy.max_total_cost_microusd.is_some_and(|ceiling| {
+                            estimated_cost
+                                .and_then(|cost| reserved_cost.checked_add(cost))
+                                .is_none_or(|cost| cost > ceiling)
+                        })
+                        || (route.is_some()
+                            && total_attempts > 0
+                            && !policy.allow_negative_margin
+                            && (!reserved_cost_known
+                                || estimated_cost.is_none_or(|cost| {
+                                    customer_cost.is_none_or(|revenue| {
+                                        reserved_cost.saturating_add(cost) > revenue
+                                    })
+                                })))
+                    {
+                        continue;
+                    }
+                }
+                if let Some(route) = route {
+                    let ledger = ledger.ok_or_else(|| {
+                        CompletionError::CompletionError("Attempt ledger unavailable".into())
+                    })?;
+                    if !ledger.claim_quota(&route.quota_group).await.map_err(|_| {
+                        CompletionError::CompletionError("Provider health state unavailable".into())
+                    })? {
+                        continue;
+                    }
+                }
+                reserved_cost = reserved_cost.saturating_add(estimated_cost.unwrap_or(0));
+                reserved_cost_known &= estimated_cost.is_some();
                 total_attempts += 1;
+                if let Some(budget) = &mut accepted_budget {
+                    budget.attempts = total_attempts;
+                    budget.reserved_cost = reserved_cost;
+                    budget.cost_known = reserved_cost_known;
+                }
                 tracing::debug!(
                     model_id = %model_id,
                     attempt = attempt + 1,
@@ -3851,7 +4337,132 @@ impl InferenceProviderPool {
                     retry_count
                 );
 
-                match provider_fn(provider.clone()).await {
+                let mut ledger_attempt =
+                    route.map(
+                        |route| crate::provider_registry::entities::InferenceAttempt {
+                            request_id,
+                            accepted_request_id: hints.request_id.or_else(|| {
+                                crate::provider_registry::ACCEPTED_REQUEST_ID
+                                    .try_with(|id| *id)
+                                    .ok()
+                            }),
+                            started_at: chrono::Utc::now(),
+                            usage: None,
+                            attempt_index: total_attempts as i32,
+                            route: route.clone(),
+                            effective_tee: if model_pub_key.is_some() || needs_client_e2ee {
+                                inference_providers::routing::TeeRequirement::Required
+                            } else {
+                                hints
+                                    .tee
+                                    .or_else(|| {
+                                        policy.as_ref().map(|policy| policy.default_tee_requirement)
+                                    })
+                                    .unwrap_or(if provider.tier().is_attested() {
+                                        inference_providers::routing::TeeRequirement::Required
+                                    } else {
+                                        inference_providers::routing::TeeRequirement::Any
+                                    })
+                            },
+                            reasoning_effort: hints
+                                .reasoning_effort
+                                .map(|effort| effort.as_str().to_owned()),
+                            outcome: "started".into(),
+                            fallback_reason: last_retry_decision.map(str::to_owned),
+                            estimated_cost_microusd: estimated_cost,
+                            latency_ms: None,
+                        },
+                    );
+                if let Some(attempt) = &ledger_attempt {
+                    let ledger = ledger.ok_or_else(|| {
+                        CompletionError::CompletionError("Attempt ledger unavailable".into())
+                    })?;
+                    ledger.start(attempt).await.map_err(|_| {
+                        CompletionError::CompletionError("Unable to record provider attempt".into())
+                    })?;
+                }
+                let attempt_started = std::time::Instant::now();
+                let result = if let Some(deadline) = request_deadline {
+                    tokio::time::timeout_at(deadline, provider_fn(provider.clone()))
+                        .await
+                        .unwrap_or_else(|_| {
+                            Err(CompletionError::Timeout {
+                                operation: operation_name.into(),
+                                timeout_seconds: policy
+                                    .as_ref()
+                                    .unwrap()
+                                    .deadline_ms
+                                    .div_ceil(1000),
+                            })
+                        })
+                } else {
+                    provider_fn(provider.clone()).await
+                };
+                if let Some(attempt) = &ledger_attempt {
+                    let cooldown_ms = match &result {
+                        Ok(_) => None,
+                        Err(CompletionError::RetryableUpstream { retry_after_ms, .. }) => {
+                            Some(*retry_after_ms)
+                        }
+                        Err(CompletionError::HttpError {
+                            status_code: 401 | 403,
+                            ..
+                        }) => {
+                            tracing::error!(deployment_id=%attempt.route.deployment_id,"Provider credentials quarantined");
+                            Some(300_000)
+                        }
+                        Err(error)
+                            if Self::classify_retry_decision(error).starts_with("retryable_")
+                                || matches!(error, CompletionError::Timeout { .. }) =>
+                        {
+                            Some(1000)
+                        }
+                        Err(_) => None,
+                    };
+                    if ledger
+                        .unwrap()
+                        .record_health(&attempt.route.quota_group, attempt.started_at, cooldown_ms)
+                        .await
+                        .is_err()
+                    {
+                        tracing::error!(deployment_id=%attempt.route.deployment_id,"Provider circuit update failed");
+                    }
+                }
+                // Retry metadata has been consumed by the shared circuit; retain
+                // the existing HTTP status contract for all caller mappings.
+                let result = result.map_err(|error| match error {
+                    CompletionError::RetryableUpstream { status_code, .. } => {
+                        CompletionError::HttpError {
+                            status_code,
+                            message: "Upstream temporarily unavailable".into(),
+                            is_external: true,
+                        }
+                    }
+                    error => error,
+                });
+                if let Some(attempt) = &mut ledger_attempt {
+                    attempt.outcome = match &result {
+                        Ok(_)
+                            if matches!(
+                                operation_name,
+                                "chat_completion_stream" | "responses_raw" | "anthropic_raw"
+                            ) =>
+                        {
+                            "streaming"
+                        }
+                        Ok(_) => "success",
+                        Err(error) => Self::classify_error_kind(error),
+                    }
+                    .into();
+                    attempt.latency_ms =
+                        Some(attempt_started.elapsed().as_millis().min(i64::MAX as u128) as i64);
+                    if ledger.unwrap().finish(attempt).await.is_err() {
+                        // The pre-dispatch row remains unknown; never erase it or
+                        // retry a successful inference because accounting failed.
+                        tracing::error!(request_id=%request_id, attempt_index=attempt.attempt_index, "Provider attempt outcome persistence failed");
+                    }
+                }
+                match result {
                     Ok(result) => {
                         // Reset failure counter on success
                         {
@@ -3925,6 +4536,13 @@ impl InferenceProviderPool {
                             );
                         }
                         return Ok(ServedProviderResult {
+                            routing_deadline: request_deadline.map(|deadline| {
+                                (
+                                    deadline,
+                                    policy.as_ref().unwrap().deadline_ms.div_ceil(1000),
+                                )
+                            }),
+                            attempt: ledger_attempt,
                             value: result,
                             provider: provider.clone(),
                             provider_attribution: served_provider_attribution(
@@ -3934,6 +4552,19 @@ impl InferenceProviderPool {
                         });
                     }
                     Err(e) => {
+                        let error_detail = if matches!(
+                            operation_name,
+                            "embeddings"
+                                | "privacy_classify"
+                                | "rerank"
+                                | "score"
+                                | "responses_raw"
+                                | "anthropic_raw"
+                        ) {
+                            "Upstream operation failed".to_string()
+                        } else {
+                            Self::sanitize_error_message(&e.to_string())
+                        };
                         let tier = provider.tier();
                         let provider_source = provider.provider_source();
                         let is_fallback =
@@ -3988,6 +4619,10 @@ impl InferenceProviderPool {
                             if (400..=499).contains(status_code)
                                 && *status_code != 429
                                 && *status_code != 408
+                                // Deployment credentials are operator state,
+                                // not an invalid customer request. The shared
+                                // circuit above quarantines this deployment.
+                                && !(route.is_some() && matches!(*status_code, 401 | 403))
                                 && !Self::is_model_not_found_error(*status_code, message)
                                 && !ctx_400_falls_through
                             {
@@ -3995,7 +4630,7 @@ impl InferenceProviderPool {
                                     model_id = %model_id,
                                     attempt = attempt + 1,
                                     status_code,
-                                    error_detail = %e,
+                                    error_detail = %error_detail,
                                     operation = operation_name,
                                     "Client error from provider, not retrying"
                                 );
@@ -4076,7 +4711,7 @@ impl InferenceProviderPool {
                                 model_id = %model_id,
                                 attempt = attempt + 1,
                                 retry_decision,
-                                error_detail = %e,
+                                error_detail = %error_detail,
                                 operation = operation_name,
                                 "Client media-fetch failure, not retrying or trying other providers"
                             );
@@ -4145,7 +4780,7 @@ impl InferenceProviderPool {
                             retry = retry_count,
                             error_kind,
                             retry_decision,
-                            error_detail = %e,
+                            error_detail = %error_detail,
                             operation = operation_name,
                             "Provider failed, will try next provider if available"
                         );
@@ -4200,7 +4835,12 @@ impl InferenceProviderPool {
                 .map(|d| d.starts_with("retryable_"))
                 .unwrap_or(false);
 
-            if !is_retryable || retry_count >= MAX_RETRIES {
+            if !is_retryable
+                || retry_count >= MAX_RETRIES
+                || policy
+                    .as_ref()
+                    .is_some_and(|policy| total_attempts >= policy.max_attempts as usize)
+            {
                 break;
             }
             retry_count += 1;
@@ -4228,6 +4868,11 @@ impl InferenceProviderPool {
                 operation = operation_name,
                 "Retrying after {}", reason
             );
+            if request_deadline
+                .is_some_and(|deadline| tokio::time::Instant::now() + delay >= deadline)
+            {
+                break;
+            }
             tokio::time::sleep(delay).await;
         }
         // Pull the diagnostic fields once so both branches share them.
@@ -4498,6 +5143,31 @@ impl InferenceProviderPool {
         mut hints: ChatRoutingHints,
     ) -> Result<AttributedChatCompletionStream, CompletionError> {
         let model_id = params.model.clone();
+        hints.output_tokens = params
+            .max_completion_tokens
+            .or(params.max_tokens)
+            .and_then(|tokens| u64::try_from(tokens).ok());
+        hints.reasoning_effort =
+            inference_providers::routing::ReasoningEffort::from_fields(&params.extra)?;
+        if let Some(tee) =
+            inference_providers::routing::TeeRequirement::from_value(params.extra.get("tee"))?
+        {
+            hints.tee = Some(tee);
+        }
+        params.extra.remove("tee");
+        if let Some(original) = params
+            .original_request
+            .as_mut()
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            original.remove("tee");
+        }
+        if params
+            .extra
+            .contains_key(encryption_headers::CLIENT_PUB_KEY)
+        {
+            hints.tee = Some(inference_providers::routing::TeeRequirement::Required);
+        }
 
         // Extract model_pub_key from params.extra for routing
         let model_pub_key_str = params
@@ -4568,7 +5238,18 @@ impl InferenceProviderPool {
                 },
             )
             .await?;
-        let stream = served.value;
+        let stream = if let (Some(attempt), Some(repository)) =
+            (served.attempt, self.attempt_repository.get())
+        {
+            crate::provider_registry::attempt_stream::track(
+                served.value,
+                attempt,
+                repository.clone(),
+                served.routing_deadline,
+            )
+        } else {
+            served.value
+        };
         let provider = served.provider.clone();
         let provider_attribution = served.provider_attribution;
 
@@ -4692,6 +5373,32 @@ impl InferenceProviderPool {
         mut hints: ChatRoutingHints,
     ) -> Result<AttributedChatCompletion, CompletionError> {
         let model_id = params.model.clone();
+        hints.output_tokens = params
+            .max_completion_tokens
+            .or(params.max_tokens)
+            .and_then(|tokens| u64::try_from(tokens).ok());
+        hints.reasoning_effort =
+            inference_providers::routing::ReasoningEffort::from_fields(&params.extra)?;
+        if let Some(tee) =
+            inference_providers::routing::TeeRequirement::from_value(params.extra.get("tee"))?
+        {
+            hints.tee = Some(tee);
+        }
+        params.extra.remove("tee");
+        if let Some(original) = params
+            .original_request
+            .as_mut()
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            original.remove("tee");
+        }
+        if params
+            .extra
+            .contains_key(encryption_headers::CLIENT_PUB_KEY)
+        {
+            hints.tee = Some(inference_providers::routing::TeeRequirement::Required);
+        }
+
         // Non-streaming requests may carry policy hints such as
         // `fallback_disabled`, but do not carry the stream-side prefix hash or
         // token estimate. Multi-capacity models still get context routing
@@ -4741,6 +5448,14 @@ impl InferenceProviderPool {
                 },
             )
             .await?;
+        if let (Some(mut attempt), Some(repository)) =
+            (served.attempt, self.attempt_repository.get())
+        {
+            attempt.usage = Some(served.value.response.usage.clone());
+            if repository.finish(&attempt).await.is_err() {
+                tracing::error!(request_id=%attempt.request_id,"Provider usage persistence failed");
+            }
+        }
         let response = served.value;
         let provider = served.provider;
         let provider_attribution = served.provider_attribution;
@@ -4783,6 +5498,7 @@ impl InferenceProviderPool {
         fallback_disabled: bool,
     ) -> Result<AttributedSystemOne, CompletionError> {
         let hints = ChatRoutingHints {
+            tee: request.tee,
             fallback_disabled,
             ..Default::default()
         };
@@ -4849,6 +5565,19 @@ impl InferenceProviderPool {
         request_hash: String,
     ) -> Result<AttributedImageGeneration, ImageGenerationError> {
         let model_id = params.model.clone();
+        let tee = inference_providers::routing::TeeRequirement::from_value(params.extra.get("tee"))
+            .map_err(|_| ImageGenerationError::HttpError {
+                status_code: 400,
+                message: "Invalid tee requirement".into(),
+            })?;
+        params.extra.remove("tee");
+        let needs_client_e2ee = params
+            .extra
+            .contains_key(encryption_headers::CLIENT_PUB_KEY);
+        let hints = ChatRoutingHints {
+            tee,
+            ..Default::default()
+        };
 
         // Extract model_pub_key from params.extra for routing before any cloning.
         // This ensures the key is removed from params.extra so it won't be passed to the provider,
@@ -4870,16 +5599,23 @@ impl InferenceProviderPool {
         let cloned_params = params.clone();
 
         let served = self
-            .retry_with_fallback(&model_id, "image_generation", model_pub_key, |provider| {
-                let params = cloned_params.clone();
-                let request_hash = request_hash.clone();
-                async move {
-                    provider
-                        .image_generation(params, request_hash)
-                        .await
-                        .map_err(|e| CompletionError::CompletionError(e.to_string()))
-                }
-            })
+            .retry_with_fallback_caps(
+                &model_id,
+                "image_generation",
+                model_pub_key,
+                needs_client_e2ee,
+                &hints,
+                |provider| {
+                    let params = cloned_params.clone();
+                    let request_hash = request_hash.clone();
+                    async move {
+                        provider
+                            .image_generation(params, request_hash)
+                            .await
+                            .map_err(|e| CompletionError::CompletionError(e.to_string()))
+                    }
+                },
+            )
             .await
             .map_err(|e| ImageGenerationError::GenerationError(e.to_string()))?;
         let response = served.value;
@@ -4903,10 +5639,29 @@ impl InferenceProviderPool {
 
     pub async fn audio_transcription(
         &self,
-        params: AudioTranscriptionParams,
+        mut params: AudioTranscriptionParams,
         request_hash: String,
     ) -> Result<AudioTranscriptionResponse, AudioTranscriptionError> {
         let model_id = params.model.clone();
+        let tee = inference_providers::routing::TeeRequirement::from_value(params.extra.get("tee"))
+            .map_err(|_| AudioTranscriptionError::HttpError {
+                status_code: 400,
+                message: "Invalid tee requirement".into(),
+            })?;
+        params.extra.remove("tee");
+        let needs_client_e2ee = params
+            .extra
+            .contains_key(encryption_headers::CLIENT_PUB_KEY);
+        let model_pub_key = params
+            .extra
+            .get(encryption_headers::MODEL_PUB_KEY)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+        let hints = ChatRoutingHints {
+            tee,
+            ..Default::default()
+        };
+
         let file_size_kb = params.file_bytes.len() / 1024;
 
         tracing::debug!(
@@ -4917,52 +5672,59 @@ impl InferenceProviderPool {
         );
 
         let served = self
-            .retry_with_fallback(&model_id, "audio_transcription", None, |provider| {
-                let params = params.clone();
-                let request_hash = request_hash.clone();
-                async move {
-                    provider
-                        .audio_transcription(params, request_hash)
-                        .await
-                        // Classify the provider's failure so the structured HTTP
-                        // status survives retry/fallback only where that is
-                        // correct. Genuine client-input 4xx (400/413/415/422)
-                        // stay structured: the route returns invalid_request_error
-                        // and the pool fast-returns without wasting fallback on a
-                        // payload that fails everywhere. 5xx/429 stay structured
-                        // too, so retry, failover, and the service status mapping
-                        // work. Provider-infra 4xx — 401/403 (our creds), 404
-                        // (missing/stale route), 408 (timeout) — are NOT client
-                        // input: drop them to a generic provider failure so the
-                        // request can fall through to other providers and surfaces
-                        // as a 5xx server error, not misleading bad-audio guidance.
-                        // is_external=false: this is our own vLLM whisper backend.
-                        .map_err(|e| match e {
-                            AudioTranscriptionError::HttpError {
-                                status_code,
-                                message,
-                            } if is_client_audio_input_status(status_code)
-                                || status_code >= 500
-                                || status_code == 429 =>
-                            {
-                                CompletionError::HttpError {
+            .retry_with_fallback_caps(
+                &model_id,
+                "audio_transcription",
+                model_pub_key.as_deref(),
+                needs_client_e2ee,
+                &hints,
+                |provider| {
+                    let params = params.clone();
+                    let request_hash = request_hash.clone();
+                    async move {
+                        provider
+                            .audio_transcription(params, request_hash)
+                            .await
+                            // Classify the provider's failure so the structured HTTP
+                            // status survives retry/fallback only where that is
+                            // correct. Genuine client-input 4xx (400/413/415/422)
+                            // stay structured: the route returns invalid_request_error
+                            // and the pool fast-returns without wasting fallback on a
+                            // payload that fails everywhere. 5xx/429 stay structured
+                            // too, so retry, failover, and the service status mapping
+                            // work. Provider-infra 4xx — 401/403 (our creds), 404
+                            // (missing/stale route), 408 (timeout) — are NOT client
+                            // input: drop them to a generic provider failure so the
+                            // request can fall through to other providers and surfaces
+                            // as a 5xx server error, not misleading bad-audio guidance.
+                            // is_external=false: this is our own vLLM whisper backend.
+                            .map_err(|e| match e {
+                                AudioTranscriptionError::HttpError {
                                     status_code,
                                     message,
-                                    is_external: false,
+                                } if is_client_audio_input_status(status_code)
+                                    || status_code >= 500
+                                    || status_code == 429 =>
+                                {
+                                    CompletionError::HttpError {
+                                        status_code,
+                                        message,
+                                        is_external: false,
+                                    }
                                 }
-                            }
-                            AudioTranscriptionError::HttpError {
-                                status_code,
-                                message,
-                            } => CompletionError::CompletionError(format!(
-                                "HTTP error {status_code}: {message}"
-                            )),
-                            AudioTranscriptionError::TranscriptionError(msg) => {
-                                CompletionError::CompletionError(msg)
-                            }
-                        })
-                }
-            })
+                                AudioTranscriptionError::HttpError {
+                                    status_code,
+                                    message,
+                                } => CompletionError::CompletionError(format!(
+                                    "HTTP error {status_code}: {message}"
+                                )),
+                                AudioTranscriptionError::TranscriptionError(msg) => {
+                                    CompletionError::CompletionError(msg)
+                                }
+                            })
+                    }
+                },
+            )
             .await
             .map_err(|e| match e {
                 // Carry the structured status back out for the codes kept
@@ -5011,6 +5773,10 @@ impl InferenceProviderPool {
         request_hash: String,
     ) -> Result<AttributedImageEdit, ImageEditError> {
         let model_id = params.model.clone();
+        let hints = ChatRoutingHints {
+            tee: params.tee,
+            ..Default::default()
+        };
 
         tracing::debug!(
             model = %model_id,
@@ -5023,7 +5789,7 @@ impl InferenceProviderPool {
         let params = Arc::new(params);
 
         let served = self
-            .retry_with_fallback(&model_id, "image_edit", None, |provider| {
+            .retry_with_fallback_caps(&model_id, "image_edit", None, false, &hints, |provider| {
                 let params = params.clone();
                 let request_hash = request_hash.clone();
                 async move {
@@ -5054,8 +5820,26 @@ impl InferenceProviderPool {
         })
     }
 
-    pub async fn rerank(&self, params: RerankParams) -> Result<RerankResponse, RerankError> {
+    pub async fn rerank(&self, mut params: RerankParams) -> Result<RerankResponse, RerankError> {
         let model_id = params.model.clone();
+        let tee = inference_providers::routing::TeeRequirement::from_value(params.extra.get("tee"))
+            .map_err(|_| RerankError::HttpError {
+                status_code: 400,
+                message: "Invalid tee requirement".into(),
+            })?;
+        params.extra.remove("tee");
+        let needs_client_e2ee = params
+            .extra
+            .contains_key(encryption_headers::CLIENT_PUB_KEY);
+        let model_pub_key = params
+            .extra
+            .get(encryption_headers::MODEL_PUB_KEY)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+        let hints = ChatRoutingHints {
+            tee,
+            ..Default::default()
+        };
 
         tracing::debug!(
             model = %model_id,
@@ -5063,48 +5847,55 @@ impl InferenceProviderPool {
             "Starting rerank request"
         );
 
-        let providers = match self
-            .get_providers_with_fallback(&model_id, None, &ChatRoutingHints::default())
+        let served = self
+            .retry_with_fallback_caps(
+                &model_id,
+                "rerank",
+                model_pub_key.as_deref(),
+                needs_client_e2ee,
+                &hints,
+                |provider| {
+                    let params = params.clone();
+                    async move {
+                        provider.rerank(params).await.map_err(|error| match error {
+                            RerankError::HttpError { status_code, .. } => {
+                                CompletionError::HttpError {
+                                    status_code,
+                                    message: "Upstream rerank request failed".into(),
+                                    is_external: true,
+                                }
+                            }
+                            RerankError::GenerationError(_) => CompletionError::CompletionError(
+                                "Upstream rerank transport failed".into(),
+                            ),
+                        })
+                    }
+                },
+            )
             .await
-        {
-            Some(p) => p,
-            None => {
-                return Err(RerankError::GenerationError(format!(
-                    "Model '{}' not found in provider pool",
-                    model_id
-                )));
-            }
-        };
-
-        // Try reranking with each provider (with fallback)
-        let mut last_error = None;
-        for provider in providers {
-            match provider.rerank(params.clone()).await {
-                Ok(response) => {
-                    tracing::info!(
-                        model = %model_id,
-                        result_count = response.results.len(),
-                        "Rerank completed successfully"
-                    );
-                    return Ok(response);
+            .map_err(|error| match error {
+                CompletionError::HttpError {
+                    status_code,
+                    message,
+                    ..
+                } => RerankError::HttpError {
+                    status_code,
+                    message,
+                },
+                error => {
+                    RerankError::GenerationError(Self::sanitize_error_message(&error.to_string()))
                 }
-                Err(e) => {
-                    tracing::warn!(
-                        model = %model_id,
-                        error = %e,
-                        "Rerank failed with provider, trying next"
-                    );
-                    last_error = Some(e);
-                }
-            }
-        }
-
-        // All providers failed
-        let error_msg = last_error
-            .map(|e| Self::sanitize_error_message(&e.to_string()))
-            .unwrap_or_else(|| "No providers available for reranking".to_string());
-
-        Err(RerankError::GenerationError(error_msg))
+            })?;
+        self.record_non_chat_usage(
+            served.attempt,
+            served
+                .value
+                .usage
+                .as_ref()
+                .and_then(|usage| serde_json::to_value(usage).ok()),
+        )
+        .await;
+        Ok(served.value)
     }
 
     pub async fn embeddings(
@@ -5115,58 +5906,230 @@ impl InferenceProviderPool {
     ) -> Result<bytes::Bytes, inference_providers::EmbeddingError> {
         tracing::debug!(model = %model, "Starting embeddings request");
 
-        let providers = match self
-            .get_providers_with_fallback(model, None, &ChatRoutingHints::default())
-            .await
-        {
-            Some(p) => p,
-            None => {
-                return Err(inference_providers::EmbeddingError::RequestFailed(format!(
-                    "Model '{}' not found in provider pool",
-                    model
-                )));
+        let mut routing_body: serde_json::Value = serde_json::from_slice(&body).map_err(|_| {
+            inference_providers::EmbeddingError::HttpError {
+                status_code: 400,
+                message: "Invalid JSON request".into(),
             }
+        })?;
+        let tee = inference_providers::routing::TeeRequirement::from_value(routing_body.get("tee"))
+            .map_err(|_| inference_providers::EmbeddingError::HttpError {
+                status_code: 400,
+                message: "Invalid tee requirement".into(),
+            })?;
+        let body = if tee.is_some() {
+            routing_body.as_object_mut().unwrap().remove("tee");
+            bytes::Bytes::from(serde_json::to_vec(&routing_body).expect("JSON value serialization"))
+        } else {
+            body
+        };
+        let needs_client_e2ee = extra.contains_key(encryption_headers::CLIENT_PUB_KEY);
+        let model_pub_key = extra
+            .get(encryption_headers::MODEL_PUB_KEY)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+        let hints = ChatRoutingHints {
+            tee,
+            ..Default::default()
         };
 
-        // Try with each provider (with fallback)
-        let mut last_error = None;
-        for provider in providers {
-            match provider.embeddings_raw(body.clone(), extra.clone()).await {
-                Ok(response) => {
-                    tracing::info!(model = %model, "Embeddings completed successfully");
-                    return Ok(response);
-                }
-                Err(e) => {
-                    tracing::warn!(model = %model, error = %e, "Embeddings failed with provider, trying next");
-                    last_error = Some(e);
-                }
-            }
-        }
-
-        // Preserve the HttpError variant so the caller can see the upstream
-        // status code and propagate a meaningful response (e.g. 400 for a
-        // client-side parameter error). Collapsing to RequestFailed loses the
-        // status code and forces every upstream error to surface as 502.
-        Err(match last_error {
-            Some(inference_providers::EmbeddingError::HttpError {
-                status_code,
-                message,
-            }) => inference_providers::EmbeddingError::HttpError {
-                status_code,
-                message: Self::sanitize_error_message(&message),
-            },
-            Some(inference_providers::EmbeddingError::RequestFailed(msg)) => {
-                inference_providers::EmbeddingError::RequestFailed(Self::sanitize_error_message(
-                    &msg,
-                ))
-            }
-            None => inference_providers::EmbeddingError::RequestFailed(
-                "No providers available for embeddings".to_string(),
-            ),
-        })
+        let served = self
+            .retry_with_fallback_caps(
+                model,
+                "embeddings",
+                model_pub_key.as_deref(),
+                needs_client_e2ee,
+                &hints,
+                |provider| {
+                    let body = body.clone();
+                    let extra = extra.clone();
+                    async move {
+                        provider
+                            .embeddings_raw(body, extra)
+                            .await
+                            .map_err(|error| match error {
+                                inference_providers::EmbeddingError::HttpError {
+                                    status_code,
+                                    message,
+                                } => CompletionError::HttpError {
+                                    status_code,
+                                    message,
+                                    is_external: true,
+                                },
+                                inference_providers::EmbeddingError::RequestFailed(message) => {
+                                    CompletionError::CompletionError(message)
+                                }
+                            })
+                    }
+                },
+            )
+            .await
+            .map_err(|error| match error {
+                CompletionError::HttpError {
+                    status_code,
+                    message,
+                    ..
+                } => inference_providers::EmbeddingError::HttpError {
+                    status_code,
+                    message,
+                },
+                error => inference_providers::EmbeddingError::RequestFailed(
+                    Self::sanitize_error_message(&error.to_string()),
+                ),
+            })?;
+        self.record_non_chat_usage(
+            served.attempt,
+            serde_json::from_slice::<serde_json::Value>(&served.value)
+                .ok()
+                .and_then(|body| body.get("usage").cloned()),
+        )
+        .await;
+        Ok(served.value)
     }
 
-    /// Dispatch native Responses once, without falling back to Chat Completions.
+    /// Native transports share eligibility, quotas and pre-commit retry bounds.
+    /// The final upstream HTTP response retains its original headers and bytes.
+    async fn dispatch_native_raw(
+        &self,
+        model: &str,
+        mut body: serde_json::Value,
+        fallback_enabled: bool,
+        anthropic: Option<AnthropicRawRequest>,
+    ) -> Result<
+        (
+            inference_providers::responses_raw::ResponsesRawResponse,
+            crate::usage::ProviderAttribution,
+        ),
+        CompletionError,
+    > {
+        use futures::TryStreamExt;
+        let fields = serde_json::from_value(body.clone())
+            .map_err(|_| inference_providers::routing::invalid("Request must be an object"))?;
+        let reasoning_effort = inference_providers::routing::ReasoningEffort::from_fields(&fields)?;
+        let tee = inference_providers::routing::TeeRequirement::from_value(body.get("tee"))?;
+        if let Some(body) = body.as_object_mut() {
+            body.remove("tee");
+        }
+        let operation = if anthropic.is_some() {
+            "anthropic_raw"
+        } else {
+            "responses_raw"
+        };
+        // Hold at most one unconsumed error response. Clearing it before each
+        // dispatch prevents a later transport failure from returning old bytes.
+        let rejected = std::sync::Mutex::new(None);
+        let served = self
+            .retry_with_fallback_caps(
+                model,
+                operation,
+                None,
+                false,
+                &ChatRoutingHints {
+                    tee,
+                    reasoning_effort,
+                    fallback_disabled: !fallback_enabled,
+                    ..Default::default()
+                },
+                |provider| {
+                    let body = body.clone();
+                    let mut anthropic = anthropic.clone();
+                    let rejected = &rejected;
+                    async move {
+                        *rejected.lock().unwrap() = None;
+                        let response = if let Some(request) = &mut anthropic {
+                            request.body = body;
+                            let response =
+                                provider
+                                    .anthropic_raw(request.clone())
+                                    .await
+                                    .map_err(|error| match error {
+                                        AnthropicRawError::InvalidRequest(_) => {
+                                            inference_providers::routing::invalid(
+                                                "Invalid native Anthropic request",
+                                            )
+                                        }
+                                        AnthropicRawError::UnsupportedProvider => {
+                                            CompletionError::HttpError {
+                                                status_code: 501,
+                                                message: "Native Anthropic transport unsupported"
+                                                    .into(),
+                                                is_external: true,
+                                            }
+                                        }
+                                        AnthropicRawError::Transport(_) => {
+                                            CompletionError::HttpError {
+                                                status_code: 503,
+                                                message: "Upstream transport failed".into(),
+                                                is_external: true,
+                                            }
+                                        }
+                                    })?;
+                            inference_providers::responses_raw::ResponsesRawResponse {
+                                status: response.status,
+                                headers: response.headers,
+                                body: Box::pin(response.body.map_err(|_| {
+                                    CompletionError::CompletionError(
+                                        "Upstream stream failed".into(),
+                                    )
+                                })),
+                            }
+                        } else {
+                            provider.responses_raw(body).await?
+                        };
+                        if !response.status.is_success() {
+                            let error = inference_providers::routing::retry_after_headers(
+                                response.status.as_u16(),
+                                &response.headers,
+                            )
+                            .unwrap_or_else(|| {
+                                CompletionError::HttpError {
+                                    status_code: response.status.as_u16(),
+                                    message: "Upstream HTTP request failed".into(),
+                                    is_external: true,
+                                }
+                            });
+                            *rejected.lock().unwrap() = Some((response, provider));
+                            return Err(error);
+                        }
+                        Ok(response)
+                    }
+                },
+            )
+            .await;
+        match served {
+            Ok(mut served) => {
+                if let (Some(attempt), Some(repository)) =
+                    (served.attempt, self.attempt_repository.get())
+                {
+                    served.value.body = crate::provider_registry::attempt_stream::track_raw(
+                        served.value.body,
+                        attempt,
+                        repository.clone(),
+                        served.routing_deadline,
+                    );
+                }
+                Ok((served.value, served.provider_attribution))
+            }
+            Err(error) => {
+                // Only return retained upstream bytes when the terminal failure
+                // is that HTTP response. Budget/deadline/security failures remain
+                // gateway failures and cannot expose an earlier response.
+                if let CompletionError::HttpError { status_code, .. } = &error {
+                    if let Some((response, provider)) = rejected.into_inner().unwrap() {
+                        if response.status.as_u16() == *status_code {
+                            let attribution = served_provider_attribution(
+                                provider.as_ref(),
+                                self.is_registered_fallback_provider(model, &provider),
+                            );
+                            return Ok((response, attribution));
+                        }
+                    }
+                }
+                Err(error)
+            }
+        }
+    }
+
     pub async fn responses_raw(
         &self,
         model: &str,
@@ -5179,56 +6142,38 @@ impl InferenceProviderPool {
         ),
         CompletionError,
     > {
-        let providers = self
-            .get_providers_with_fallback(
-                model,
-                None,
-                &ChatRoutingHints {
-                    fallback_disabled: !fallback_enabled,
-                    ..Default::default()
-                },
-            )
+        self.dispatch_native_raw(model, body, fallback_enabled, None)
             .await
-            .ok_or_else(|| {
-                CompletionError::CompletionError("No native Responses provider".into())
-            })?;
-        let provider = providers
-            .into_iter()
-            .find(|p| p.supports_responses_raw())
-            .ok_or_else(|| {
-                CompletionError::CompletionError("No native Responses provider".into())
-            })?;
-        let attribution = served_provider_attribution(
-            provider.as_ref(),
-            self.is_registered_fallback_provider(model, &provider),
-        );
-        let response = provider.responses_raw(body).await?;
-        Ok((response, attribution))
     }
 
-    /// Dispatch one native Anthropic request without retrying or crossing
-    /// protocol/provider boundaries.
     pub async fn anthropic_raw(
         &self,
         model: &str,
         request: AnthropicRawRequest,
     ) -> Result<AttributedAnthropicRawResponse, AnthropicRawError> {
-        tracing::debug!(model = %model, endpoint = ?request.endpoint, "Starting native Anthropic request");
-
-        let providers = self
-            .get_providers_with_fallback(model, None, &ChatRoutingHints::default())
+        use futures::TryStreamExt;
+        let (response, provider_attribution) = self
+            .dispatch_native_raw(model, request.body.clone(), true, Some(request))
             .await
-            .ok_or(AnthropicRawError::UnsupportedProvider)?;
-        let provider = providers
-            .into_iter()
-            .find(|provider| provider.supports_anthropic_raw())
-            .ok_or(AnthropicRawError::UnsupportedProvider)?;
-
-        let provider_attribution = served_provider_attribution(provider.as_ref(), false);
-        let response = provider.anthropic_raw(request).await?;
-
+            .map_err(|error| match error {
+                CompletionError::CompletionError(_) => AnthropicRawError::UnsupportedProvider,
+                CompletionError::HttpError {
+                    status_code: 400,
+                    message,
+                    ..
+                } => AnthropicRawError::InvalidRequest(message),
+                _ => AnthropicRawError::Transport("Native Anthropic routing failed".into()),
+            })?;
         Ok(AttributedAnthropicRawResponse {
-            response,
+            response: inference_providers::AnthropicRawResponse {
+                status: response.status,
+                headers: response.headers,
+                body: Box::pin(
+                    response
+                        .body
+                        .map_err(|_| AnthropicRawError::Transport("Upstream stream failed".into())),
+                ),
+            },
             provider_attribution,
         })
     }
@@ -5241,118 +6186,169 @@ impl InferenceProviderPool {
     ) -> Result<bytes::Bytes, inference_providers::PrivacyClassifyError> {
         tracing::debug!(model = %model, "Starting privacy classify request");
 
-        let providers = match self
-            .get_providers_with_fallback(model, None, &ChatRoutingHints::default())
-            .await
-        {
-            Some(p) => p,
-            None => {
-                return Err(inference_providers::PrivacyClassifyError::RequestFailed(
-                    format!("Model '{}' not found in provider pool", model),
-                ));
+        let mut routing_body: serde_json::Value = serde_json::from_slice(&body).map_err(|_| {
+            inference_providers::PrivacyClassifyError::HttpError {
+                status_code: 400,
+                message: "Invalid JSON request".into(),
             }
+        })?;
+        let tee = inference_providers::routing::TeeRequirement::from_value(routing_body.get("tee"))
+            .map_err(|_| inference_providers::PrivacyClassifyError::HttpError {
+                status_code: 400,
+                message: "Invalid tee requirement".into(),
+            })?;
+        let body = if tee.is_some() {
+            routing_body.as_object_mut().unwrap().remove("tee");
+            bytes::Bytes::from(serde_json::to_vec(&routing_body).expect("JSON value serialization"))
+        } else {
+            body
+        };
+        let needs_client_e2ee = extra.contains_key(encryption_headers::CLIENT_PUB_KEY);
+        let model_pub_key = extra
+            .get(encryption_headers::MODEL_PUB_KEY)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+        let hints = ChatRoutingHints {
+            tee,
+            ..Default::default()
         };
 
-        let mut last_error = None;
-        for provider in providers {
-            match provider
-                .privacy_classify_raw(body.clone(), extra.clone())
-                .await
-            {
-                Ok(response) => {
-                    tracing::debug!(model = %model, "Privacy classify completed successfully");
-                    return Ok(response);
-                }
-                Err(e) => {
-                    // Privacy-filter error messages may embed the upstream
-                    // response body (HttpError carries the verbatim text).
-                    // A misbehaving filter that echoes its input would
-                    // route customer PII straight to application logs.
-                    // Log only the category + status code.
-                    tracing::warn!(
-                        model = %model,
-                        error_category = %Self::privacy_classify_error_category(&e),
-                        "Privacy classify failed with provider, trying next"
-                    );
-                    last_error = Some(e);
-                }
-            }
-        }
-
-        // Final user-facing error: only the status code escapes; no
-        // upstream response body. (`sanitize_error_message` would still
-        // include the body via Display, so we route around it.)
-        let error_msg = last_error
-            .as_ref()
-            .map(|e| match e {
-                inference_providers::PrivacyClassifyError::HttpError { status_code, .. } => {
-                    format!("PII detector returned HTTP {status_code}")
-                }
-                inference_providers::PrivacyClassifyError::RequestFailed(_) => {
-                    "PII detector unreachable".to_string()
+        let served = self
+            .retry_with_fallback_caps(model, "privacy_classify", model_pub_key.as_deref(), needs_client_e2ee, &hints, |provider| {
+                let body = body.clone();
+                let extra = extra.clone();
+                async move {
+                    provider
+                        .privacy_classify_raw(body, extra)
+                        .await
+                        .map_err(|error| {
+                            tracing::warn!(error_category=%Self::privacy_classify_error_category(&error), "Privacy classify upstream failed");
+                            match error {
+                            inference_providers::PrivacyClassifyError::HttpError {
+                                status_code,
+                                ..
+                            } => CompletionError::HttpError {
+                                status_code,
+                                message: "Upstream privacy_classify request failed".into(),
+                                is_external: true,
+                            },
+                            inference_providers::PrivacyClassifyError::RequestFailed(_) => {
+                                CompletionError::CompletionError(
+                                    "Upstream privacy_classify transport failed".into(),
+                                )
+                            }
+                            }
+                        })
                 }
             })
-            .unwrap_or_else(|| "No providers available for privacy classify".to_string());
-
-        Err(inference_providers::PrivacyClassifyError::RequestFailed(
-            error_msg,
-        ))
+            .await
+            .map_err(|error| match error {
+                CompletionError::HttpError {
+                    status_code,
+                    message,
+                    ..
+                } => inference_providers::PrivacyClassifyError::HttpError {
+                    status_code,
+                    message,
+                },
+                error => inference_providers::PrivacyClassifyError::RequestFailed(
+                    Self::sanitize_error_message(&error.to_string()),
+                ),
+            })?;
+        self.record_non_chat_usage(
+            served.attempt,
+            serde_json::from_slice::<serde_json::Value>(&served.value)
+                .ok()
+                .and_then(|body| body.get("usage").cloned()),
+        )
+        .await;
+        Ok(served.value)
     }
 
     pub async fn score(
         &self,
-        params: inference_providers::ScoreParams,
+        mut params: inference_providers::ScoreParams,
         request_hash: String,
     ) -> Result<inference_providers::ScoreResponse, inference_providers::ScoreError> {
         let model_id = params.model.clone();
+        let tee = inference_providers::routing::TeeRequirement::from_value(params.extra.get("tee"))
+            .map_err(|_| inference_providers::ScoreError::HttpError {
+                status_code: 400,
+                message: "Invalid tee requirement".into(),
+            })?;
+        params.extra.remove("tee");
+        let needs_client_e2ee = params
+            .extra
+            .contains_key(encryption_headers::CLIENT_PUB_KEY);
+        let model_pub_key = params
+            .extra
+            .get(encryption_headers::MODEL_PUB_KEY)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+        let hints = ChatRoutingHints {
+            tee,
+            ..Default::default()
+        };
 
         tracing::debug!(model = %model_id, "Starting score request");
 
-        let providers = match self
-            .get_providers_with_fallback(&model_id, None, &ChatRoutingHints::default())
+        let served = self
+            .retry_with_fallback_caps(
+                &model_id,
+                "score",
+                model_pub_key.as_deref(),
+                needs_client_e2ee,
+                &hints,
+                |provider| {
+                    let params = params.clone();
+                    let request_hash = request_hash.clone();
+                    async move {
+                        provider
+                            .score(params, request_hash)
+                            .await
+                            .map_err(|error| match error {
+                                inference_providers::ScoreError::HttpError {
+                                    status_code, ..
+                                } => CompletionError::HttpError {
+                                    status_code,
+                                    message: "Upstream score request failed".into(),
+                                    is_external: true,
+                                },
+                                inference_providers::ScoreError::GenerationError(_) => {
+                                    CompletionError::CompletionError(
+                                        "Upstream score transport failed".into(),
+                                    )
+                                }
+                            })
+                    }
+                },
+            )
             .await
-        {
-            Some(p) => p,
-            None => {
-                return Err(inference_providers::ScoreError::GenerationError(format!(
-                    "Model '{}' not found in provider pool",
-                    model_id
-                )));
-            }
-        };
-
-        // Try scoring with each provider (with fallback)
-        let mut last_error = None;
-        for provider in providers {
-            match provider.score(params.clone(), request_hash.clone()).await {
-                Ok(response) => {
-                    tracing::info!(
-                        model = %model_id,
-                        "Score completed successfully"
-                    );
-                    return Ok(response);
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        model = %model_id,
-                        error = %e,
-                        "Score failed with provider, trying next"
-                    );
-                    last_error = Some(e);
-                }
-            }
-        }
-
-        // All providers failed
-        let error_msg = last_error
-            .map(|e| Self::sanitize_error_message(&e.to_string()))
-            .unwrap_or_else(|| "No providers available for scoring".to_string());
-
-        Err(inference_providers::ScoreError::GenerationError(error_msg))
+            .map_err(|error| match error {
+                CompletionError::HttpError {
+                    status_code,
+                    message,
+                    ..
+                } => inference_providers::ScoreError::HttpError {
+                    status_code,
+                    message,
+                },
+                error => inference_providers::ScoreError::GenerationError(
+                    Self::sanitize_error_message(&error.to_string()),
+                ),
+            })?;
+        self.record_non_chat_usage(
+            served.attempt,
+            served
+                .value
+                .usage
+                .as_ref()
+                .and_then(|usage| serde_json::to_value(usage).ok()),
+        )
+        .await;
+        Ok(served.value)
     }
 
-    /// Create an external provider from a model name and provider config JSON.
-    /// Returns a tuple of (provider Arc, backend_type string) without inserting it into any map.
     fn create_external_provider(
         &self,
         model_name: &str,
@@ -5363,6 +6359,17 @@ impl InferenceProviderPool {
             &provider_config,
         )
         .map_err(str::to_string)?;
+        if let Some(reference) = provider_config
+            .as_object_mut()
+            .and_then(|object| object.remove("credential_env"))
+        {
+            let key = reference
+                .as_str()
+                .and_then(|name| std::env::var(name).ok())
+                .filter(|key| !key.is_empty())
+                .ok_or_else(|| "Provider credential reference unavailable".to_string())?;
+            provider_config["api_key"] = key.into();
+        }
 
         // Extract and remove per-model api_key after validating the complete raw
         // shape, then deserialize the remaining backend-specific configuration.
@@ -6169,7 +7176,15 @@ impl InferenceProviderPool {
                             warn!(model = %model, "Skipping eviction of a pinned (attested) provider");
                             continue;
                         }
-                        mappings.model_to_providers.remove(model);
+                        if let Some(providers) = mappings.model_to_providers.get_mut(model) {
+                            providers.retain(|provider| {
+                                !evicted_provider_ptrs
+                                    .contains(&(Arc::as_ptr(provider) as *const () as usize))
+                            });
+                            if providers.is_empty() {
+                                mappings.model_to_providers.remove(model);
+                            }
+                        }
                     }
                     // Prune pubkey_to_providers of entries pointing at the
                     // evicted provider Arcs. Otherwise evicted providers stay
@@ -6330,6 +7345,19 @@ impl InferenceProviderPool {
             for (model_name, providers) in
                 Self::merge_discovered_and_pinned(model_providers, &pinned_providers)
             {
+                let mut providers = providers;
+                if let Some(existing) = mappings.model_to_providers.get(&model_name) {
+                    providers.extend(
+                        existing
+                            .iter()
+                            .filter(|provider| {
+                                mappings
+                                    .route_runtime
+                                    .contains_key(&(Arc::as_ptr(provider) as *const () as usize))
+                            })
+                            .cloned(),
+                    );
+                }
                 mappings.model_to_providers.insert(model_name, providers);
             }
 
@@ -8371,6 +9399,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn registry_reasoning_filters_incompatible_routes_before_dispatch() {
+        use inference_providers::routing::ReasoningEffort;
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+        pool.load_external_providers(vec![
+            ("shared".into(), serde_json::json!({"backend":"openai_compatible","base_url":"https://low.example/v1","api_key":"fixture","reasoning_efforts":["low"]})),
+            ("shared".into(), serde_json::json!({"backend":"openai_compatible","base_url":"https://high.example/v1","api_key":"fixture","reasoning_efforts":["high"]})),
+        ]).await.unwrap();
+        let all = pool.get_providers_for_model("shared").await.unwrap();
+        for (effort, index) in [(ReasoningEffort::Low, 0), (ReasoningEffort::High, 1)] {
+            let selected = pool
+                .get_providers_with_fallback(
+                    "shared",
+                    None,
+                    &ChatRoutingHints {
+                        reasoning_effort: Some(effort),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(selected.len(), 1);
+            assert!(Arc::ptr_eq(&selected[0], &all[index]));
+        }
+        let mut params = fallback_params("shared");
+        params
+            .extra
+            .insert("reasoning_effort".into(), serde_json::json!("max"));
+        assert!(matches!(
+            pool.chat_completion(params, "test".into()).await,
+            Err(CompletionError::HttpError {
+                status_code: 400,
+                is_external: false,
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
     async fn external_registry_groups_routes_and_reuses_unchanged_providers() {
         let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
         let routes = vec![
@@ -9812,7 +10878,8 @@ mod tests {
         let model_id = "test-model".to_string();
 
         // Register a provider with known pubkeys
-        let mock_provider = Arc::new(MockProvider::new());
+        let mock_provider =
+            Arc::new(MockProvider::new().with_tier(inference_providers::ProviderTier::Near));
         pool.register_provider(model_id.clone(), mock_provider.clone())
             .await;
 
@@ -9880,7 +10947,8 @@ mod tests {
         let model_id = "test-e2ee-model".to_string();
 
         // Register provider (fetches attestation, stores pubkeys)
-        let mock_provider = Arc::new(MockProvider::new());
+        let mock_provider =
+            Arc::new(MockProvider::new().with_tier(inference_providers::ProviderTier::Near));
         pool.register_provider(model_id.clone(), mock_provider)
             .await;
 
@@ -9924,7 +10992,7 @@ mod tests {
         // Given: a registered provider and a request pinned to its ECDSA key.
         let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
         let model_id = "Qwen/Qwen3-30B-A3B-Instruct-2507".to_string();
-        let mock = Arc::new(MockProvider::new());
+        let mock = Arc::new(MockProvider::new().with_tier(inference_providers::ProviderTier::Near));
         pool.register_provider(model_id.clone(), mock.clone()).await;
         let pinned_key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
         let mut params = fallback_params(&model_id);
@@ -9957,7 +11025,7 @@ mod tests {
         // Given: a registered provider and a streaming request pinned to its ECDSA key.
         let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
         let model_id = "Qwen/Qwen3-30B-A3B-Instruct-2507".to_string();
-        let mock = Arc::new(MockProvider::new());
+        let mock = Arc::new(MockProvider::new().with_tier(inference_providers::ProviderTier::Near));
         pool.register_provider(model_id.clone(), mock.clone()).await;
         let pinned_key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
         let mut params = fallback_params(&model_id);
@@ -13514,6 +14582,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn native_retry_bounds_preserve_http_bytes_and_never_replay_committed_bodies() {
+        use futures::StreamExt;
+        use inference_providers::{mock::MockProvider, responses_raw::ResponsesRawResponse};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let captured = calls.clone();
+        let provider = Arc::new(
+            MockProvider::new_accept_all().with_responses_handler(move |_| {
+                let call = captured.fetch_add(1, Ordering::SeqCst);
+                ResponsesRawResponse {
+                    status: if call < 2 {
+                        reqwest::StatusCode::TOO_MANY_REQUESTS
+                    } else {
+                        reqwest::StatusCode::OK
+                    },
+                    headers: [(
+                        reqwest::header::RETRY_AFTER,
+                        reqwest::header::HeaderValue::from_static("0"),
+                    )]
+                    .into_iter()
+                    .collect(),
+                    body: Box::pin(futures::stream::iter([
+                        Ok(bytes::Bytes::from_static(b"verbatim upstream body")),
+                        Err(CompletionError::CompletionError("body disconnected".into())),
+                    ])),
+                }
+            }),
+        );
+        pool.register_provider("native/bounded".into(), provider)
+            .await;
+        pool.routing_policies.write().await.insert(
+            "native/bounded".into(),
+            crate::provider_registry::ModelRoutingPolicy {
+                default_tee_requirement: inference_providers::routing::TeeRequirement::Any,
+                mixed_routing_enabled: true,
+                max_attempts: 1,
+                deadline_ms: 10000,
+                max_attempt_cost_microusd: None,
+                max_total_cost_microusd: None,
+                allow_negative_margin: true,
+            },
+        );
+        let (mut rejected, _) = pool
+            .responses_raw("native/bounded", serde_json::json!({"store":false}), true)
+            .await
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(rejected.status, reqwest::StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(rejected.headers["retry-after"], "0");
+        assert_eq!(
+            rejected.body.next().await.unwrap().unwrap(),
+            "verbatim upstream body"
+        );
+        pool.routing_policies
+            .write()
+            .await
+            .get_mut("native/bounded")
+            .unwrap()
+            .max_attempts = 2;
+        let (mut served, _) = pool
+            .responses_raw("native/bounded", serde_json::json!({"store":false}), true)
+            .await
+            .unwrap();
+        assert_eq!(served.status, reqwest::StatusCode::OK);
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        assert_eq!(
+            served.body.next().await.unwrap().unwrap(),
+            "verbatim upstream body"
+        );
+        assert!(served.body.next().await.unwrap().is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
     async fn native_responses_honors_fallback_policy_and_attribution() {
         use inference_providers::{
             mock::MockProvider, responses_raw::ResponsesRawResponse, ProviderTier,
@@ -14073,5 +15216,127 @@ mod tests {
                 "new URL fingerprint state must be created after a URL change"
             );
         }
+    }
+    #[tokio::test]
+    async fn registry_routes_survive_pinned_fleet_pruning() {
+        use inference_providers::mock::MockProvider;
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+        let pinned: Arc<InferenceProviderTrait> =
+            Arc::new(MockProvider::new().with_tier(inference_providers::ProviderTier::Attested3p));
+        let registry: Arc<InferenceProviderTrait> = Arc::new(MockProvider::new());
+        let stale: Arc<InferenceProviderTrait> =
+            Arc::new(MockProvider::new().with_tier(inference_providers::ProviderTier::Near));
+        pool.register_pinned_provider(
+            "mixed".into(),
+            pinned.clone(),
+            None,
+            ProviderPoolRole::Fallback,
+        )
+        .await;
+        {
+            let mut mappings = pool.provider_mappings.write().await;
+            mappings.model_to_providers.insert(
+                "mixed".into(),
+                vec![pinned.clone(), registry.clone(), stale],
+            );
+            mappings.route_runtime.insert(
+                Arc::as_ptr(&registry) as *const () as usize,
+                crate::provider_registry::entities::RouteRuntime {
+                    account_id: None,
+                    deployment_revision: None,
+                    route_id: uuid::Uuid::new_v4(),
+                    deployment_id: uuid::Uuid::new_v4(),
+                    quota_group: "group".into(),
+                    revision: 1,
+                    context_limit: None,
+                    output_limit: None,
+                    role: "primary".into(),
+                    cost_profile_id: None,
+                    cost_rates: None,
+                },
+            );
+        }
+        pool.prune_stale_pinned(&HashSet::new()).await;
+        let mappings = pool.provider_mappings.read().await;
+        let retained = &mappings.model_to_providers["mixed"];
+        assert_eq!(retained.len(), 2);
+        assert!(retained
+            .iter()
+            .any(|provider| Arc::ptr_eq(provider, &registry)));
+        assert!(retained
+            .iter()
+            .any(|provider| Arc::ptr_eq(provider, &pinned)));
+    }
+    #[tokio::test]
+    async fn registry_cutover_and_rollback_reuse_legacy_handle() {
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+        let config = serde_json::json!({"backend":"openai_compatible","base_url":"https://example.invalid/v1","model_name":"upstream","api_key":"fixture"});
+        pool.load_external_providers(vec![("imported".into(), config.clone())])
+            .await
+            .unwrap();
+        let original =
+            pool.provider_mappings.read().await.model_to_providers["imported"][0].clone();
+        let mut imported = config.clone();
+        imported["_registry_route"] = serde_json::json!({
+            "route_id":uuid::Uuid::new_v4(),"deployment_id":uuid::Uuid::new_v4(),"quota_group":"fixture",
+            "revision":1,"context_limit":null,"output_limit":null,"role":"primary","cost_profile_id":null,"cost_rates":null
+        });
+        pool.load_external_providers(vec![("imported".into(), imported)])
+            .await
+            .unwrap();
+        {
+            let mappings = pool.provider_mappings.read().await;
+            assert!(Arc::ptr_eq(
+                &original,
+                &mappings.model_to_providers["imported"][0]
+            ));
+            assert!(mappings
+                .route_runtime
+                .contains_key(&(Arc::as_ptr(&original) as *const () as usize)));
+        }
+        pool.load_external_providers(vec![("imported".into(), config)])
+            .await
+            .unwrap();
+        let mappings = pool.provider_mappings.read().await;
+        assert!(Arc::ptr_eq(
+            &original,
+            &mappings.model_to_providers["imported"][0]
+        ));
+        assert!(!mappings
+            .route_runtime
+            .contains_key(&(Arc::as_ptr(&original) as *const () as usize)));
+    }
+    #[tokio::test]
+    async fn non_chat_requirements_filter_plaintext_before_dispatch() {
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+        pool.register_provider(
+            "plain".into(),
+            Arc::new(inference_providers::mock::MockProvider::new_accept_all()),
+        )
+        .await;
+        let params = RerankParams {
+            model: "plain".into(),
+            query: "q".into(),
+            documents: vec!["d".into()],
+            extra: HashMap::new(),
+        };
+        assert!(pool.rerank(params.clone()).await.is_ok());
+        let mut required = params;
+        required
+            .extra
+            .insert("tee".into(), serde_json::json!("required"));
+        assert!(pool.rerank(required).await.is_err());
+        let body = bytes::Bytes::from_static(br#"{"model":"plain","input":"x","tee":"required"}"#);
+        assert!(pool
+            .embeddings("plain", body, HashMap::new())
+            .await
+            .is_err());
+        let params = inference_providers::ScoreParams {
+            model: "plain".into(),
+            text_1: "a".into(),
+            text_2: "b".into(),
+            extra: HashMap::from([("tee".into(), serde_json::json!("required"))]),
+        };
+        assert!(pool.score(params, "fixture".into()).await.is_err());
     }
 }

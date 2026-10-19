@@ -202,6 +202,7 @@ async fn multipart_operations_fail_before_sending_a_policy_free_request() {
         Err(AudioTranscriptionError::TranscriptionError(message)) if message.contains("mandatory routing")
     ));
     let params = ImageEditParams {
+        tee: None,
         model: "test-model".into(),
         prompt: "synthetic".into(),
         image: Arc::new(vec![1, 2, 3]),

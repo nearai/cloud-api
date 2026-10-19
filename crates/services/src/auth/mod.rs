@@ -1155,6 +1155,12 @@ mod tests {
     struct StubWorkspaceRepo;
     #[async_trait]
     impl WorkspaceRepository for StubWorkspaceRepo {
+        async fn organization_requires_tee(
+            &self,
+            _organization_id: uuid::Uuid,
+        ) -> Result<bool, crate::common::RepositoryError> {
+            Ok(false)
+        }
         async fn get_by_id(&self, _: WorkspaceId) -> Result<Option<Workspace>, RepositoryError> {
             unimplemented!()
         }

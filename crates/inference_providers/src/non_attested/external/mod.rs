@@ -137,11 +137,24 @@ pub fn validate_external_provider_config(config: &serde_json::Value) -> Result<(
         "gemini" | "typesafe" => &["backend", "base_url", "model_name", "api_key"],
         _ => return Err("unsupported external provider backend"),
     };
-    if config
-        .keys()
-        .any(|key| key != "reasoning_efforts" && !allowed_fields.contains(&key.as_str()))
-    {
+    if config.keys().any(|key| {
+        key != "reasoning_efforts"
+            && key != "credential_env"
+            && !allowed_fields.contains(&key.as_str())
+    }) {
         return Err("external provider config contains an unsupported field");
+    }
+    if let Some(reference) = config.get("credential_env") {
+        if config.contains_key("api_key")
+            || !reference.as_str().is_some_and(|name| {
+                name.ends_with("_API_KEY")
+                    && name
+                        .bytes()
+                        .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == b'_')
+            })
+        {
+            return Err("credential_env must name an API key environment variable and cannot accompany api_key");
+        }
     }
     if let Some(efforts) = config
         .get("reasoning_efforts")
@@ -496,6 +509,14 @@ impl InferenceProvider for ExternalProvider {
         self.backend
             .systemone(&self.config, &self.model_name, request)
             .await
+    }
+
+    fn reasoning_efforts(&self) -> Option<&[String]> {
+        if self.backend.backend_type() == "typesafe" {
+            Some(&[])
+        } else {
+            self.reasoning_efforts.as_deref()
+        }
     }
 
     fn provider_source(&self) -> crate::ProviderSource {

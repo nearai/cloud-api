@@ -936,6 +936,9 @@ impl CompletionServiceImpl {
         &self,
         identifier: &str,
     ) -> Result<Option<crate::models::ModelWithPricing>, anyhow::Error> {
+        if let Some(accepted) = crate::provider_registry::accepted_request::for_model(identifier) {
+            return Ok(Some(accepted.model.clone()));
+        }
         crate::models::resolve_model_cached(
             &self.model_resolve_cache,
             self.models_repository.as_ref(),
@@ -1075,18 +1078,65 @@ impl CompletionServiceImpl {
         changed
     }
 
+    /// Routing uses the accepted catalog snapshot, never the serving route's
+    /// procurement rates. This is a planning estimate, not the final bill.
+    fn routing_customer_cost(
+        model: &crate::models::ModelWithPricing,
+        params: &inference_providers::ChatCompletionParams,
+        tier: Option<TextServiceTier>,
+    ) -> Option<i64> {
+        let input = i32::try_from(estimate_input_tokens(&params.messages)).ok()?;
+        let output = i32::try_from(params.max_completion_tokens.or(params.max_tokens)?).ok()?;
+        if output < 0 {
+            return None;
+        }
+        let nanos = if let Some(profile) = &model.text_pricing {
+            crate::usage::compute_profiled_text_cost(
+                input,
+                output,
+                0,
+                0,
+                tier.unwrap_or(TextServiceTier::Default),
+                None,
+                profile,
+            )
+            .ok()?
+            .cost
+            .total_cost
+        } else {
+            i64::from(input)
+                .checked_mul(model.input_cost_per_token)?
+                .checked_add(i64::from(output).checked_mul(model.output_cost_per_token)?)?
+        };
+        (nanos >= 0).then_some(nanos / 1000)
+    }
+
     fn apply_deepseek_v4_flash_thinking_compat(
         model_name: &str,
         params: &mut inference_providers::ChatCompletionParams,
-    ) {
+    ) -> Result<(), ports::CompletionError> {
         if model_name != DEEPSEEK_V4_FLASH_MODEL {
-            return;
+            return Ok(());
         }
 
         let has_json_object = Self::is_json_object_response_format(&params.extra);
         let has_forced_tool_choice = Self::has_forced_function_tool_choice(&params.tool_choice);
         if !has_json_object && !has_forced_tool_choice {
-            return;
+            return Ok(());
+        }
+
+        let effort = inference_providers::routing::ReasoningEffort::from_fields(&params.extra)
+            .map_err(|_| {
+                ports::CompletionError::InvalidParams(
+                    "Invalid or conflicting reasoning effort".into(),
+                )
+            })?;
+        if effort
+            .is_some_and(|effort| effort != inference_providers::routing::ReasoningEffort::None)
+        {
+            return Err(ports::CompletionError::InvalidParams(
+                "This model cannot preserve explicit reasoning with JSON object output or forced tool choice".into(),
+            ));
         }
 
         if Self::disable_chat_template_thinking(&mut params.extra) {
@@ -1102,6 +1152,7 @@ impl CompletionServiceImpl {
                 "Disabled DeepSeek-V4-Flash SGLang thinking for OpenAI-compatible response contract"
             );
         }
+        Ok(())
     }
 
     /// Get the concurrent request limit for an organization (cached)
@@ -1279,6 +1330,18 @@ impl CompletionServiceImpl {
         organization_id: Uuid,
     ) -> ports::CompletionError {
         match error {
+            inference_providers::CompletionError::RetryableUpstream { status_code, .. } => {
+                Self::map_provider_error(
+                    model,
+                    &inference_providers::CompletionError::HttpError {
+                        status_code: *status_code,
+                        message: "Upstream temporarily unavailable".into(),
+                        is_external: true,
+                    },
+                    operation,
+                    organization_id,
+                )
+            }
             inference_providers::CompletionError::HttpError {
                 status_code,
                 message,
@@ -1881,7 +1944,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             );
             chat_params.model = canonical_name.clone();
         }
-        Self::apply_deepseek_v4_flash_thinking_compat(canonical_name, &mut chat_params);
+        Self::apply_deepseek_v4_flash_thinking_compat(canonical_name, &mut chat_params)?;
 
         let counter = self
             .try_acquire_concurrent_slot(organization_id, model.id, canonical_name)
@@ -1910,10 +1973,17 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
 
         // Compute routing hints from the request messages for adaptive load balancing.
         let routing_hints = super::inference_provider_pool::ChatRoutingHints {
+            request_id: Some(request_id),
+            customer_cost_microusd: Self::routing_customer_cost(
+                &model,
+                &chat_params,
+                requested_service_tier,
+            ),
             prefix_hash: Some(compute_prefix_hash(&chat_params.messages)),
             estimated_tokens: Some(estimate_input_tokens(&chat_params.messages)),
             fallback_disabled: !request.fallback_enabled,
             request_priority: chat_params.request_priority,
+            ..Default::default()
         };
 
         // Get the LLM stream
@@ -2087,7 +2157,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             );
             chat_params.model = canonical_name.clone();
         }
-        Self::apply_deepseek_v4_flash_thinking_compat(canonical_name, &mut chat_params);
+        Self::apply_deepseek_v4_flash_thinking_compat(canonical_name, &mut chat_params)?;
 
         let organization_id = request.organization_id;
         let counter = self
@@ -2115,12 +2185,18 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         let provider_start_time = Instant::now();
         // Read before `chat_params` moves into the call below.
         let request_priority = chat_params.request_priority;
+        let estimated_tokens = estimate_input_tokens(&chat_params.messages);
+        let customer_cost_microusd =
+            Self::routing_customer_cost(&model, &chat_params, requested_service_tier);
         let result = self
             .inference_provider_pool
             .chat_completion_with_attribution_and_hints(
                 chat_params,
                 request.body_hash.clone(),
                 super::inference_provider_pool::ChatRoutingHints {
+                    request_id: Some(request.request_id),
+                    estimated_tokens: Some(estimated_tokens),
+                    customer_cost_microusd,
                     fallback_disabled: !request.fallback_enabled,
                     request_priority,
                     ..Default::default()
@@ -4155,7 +4231,8 @@ mod tests {
         CompletionServiceImpl::apply_deepseek_v4_flash_thinking_compat(
             DEEPSEEK_V4_FLASH_MODEL,
             &mut params,
-        );
+        )
+        .unwrap();
 
         let kwargs = thinking_kwargs(&params);
         assert_eq!(kwargs["thinking"], serde_json::json!(false));
@@ -4179,7 +4256,8 @@ mod tests {
         CompletionServiceImpl::apply_deepseek_v4_flash_thinking_compat(
             DEEPSEEK_V4_FLASH_MODEL,
             &mut params,
-        );
+        )
+        .unwrap();
 
         let kwargs = thinking_kwargs(&params);
         assert_eq!(kwargs["thinking"], serde_json::json!(false));
@@ -4200,11 +4278,39 @@ mod tests {
         CompletionServiceImpl::apply_deepseek_v4_flash_thinking_compat(
             DEEPSEEK_V4_FLASH_MODEL,
             &mut params,
-        );
+        )
+        .unwrap();
 
         let kwargs = thinking_kwargs(&params);
         assert_eq!(kwargs["thinking"], serde_json::json!(true));
         assert_eq!(kwargs["enable_thinking"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn deepseek_compat_rejects_explicit_reasoning_instead_of_weakening_it() {
+        let mut params = chat_params_for_compat_tests(DEEPSEEK_V4_FLASH_MODEL);
+        params
+            .extra
+            .insert("reasoning".into(), serde_json::json!({"effort": "high"}));
+        params.extra.insert(
+            "response_format".into(),
+            serde_json::json!({"type": "json_object"}),
+        );
+        params.extra.insert(
+            "chat_template_kwargs".into(),
+            serde_json::json!({"thinking": true}),
+        );
+        assert!(
+            CompletionServiceImpl::apply_deepseek_v4_flash_thinking_compat(
+                DEEPSEEK_V4_FLASH_MODEL,
+                &mut params,
+            )
+            .is_err()
+        );
+        assert_eq!(
+            thinking_kwargs(&params)["thinking"],
+            serde_json::json!(true)
+        );
     }
 
     #[test]
@@ -4222,7 +4328,8 @@ mod tests {
         CompletionServiceImpl::apply_deepseek_v4_flash_thinking_compat(
             "Qwen/Qwen3.6-35B-A3B-FP8",
             &mut params,
-        );
+        )
+        .unwrap();
 
         let kwargs = thinking_kwargs(&params);
         assert_eq!(kwargs["thinking"], serde_json::json!(true));

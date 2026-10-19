@@ -123,6 +123,7 @@ mod tests {
 
     fn create_test_request() -> CreateResponseRequest {
         CreateResponseRequest {
+            tee: None,
             model: "test".to_string(),
             input: None,
             instructions: None,
@@ -149,6 +150,7 @@ mod tests {
 
     fn create_request_with_conversation(conv_id: &str) -> CreateResponseRequest {
         CreateResponseRequest {
+            tee: None,
             model: "test".to_string(),
             input: None,
             instructions: None,

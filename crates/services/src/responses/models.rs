@@ -40,6 +40,9 @@ impl From<Uuid> for ResponseItemId {
 /// Request to create a response
 #[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct CreateResponseRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<String>)]
+    pub tee: Option<inference_providers::routing::TeeRequirement>,
     pub model: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub input: Option<ResponseInput>,
@@ -1577,6 +1580,7 @@ mod tests {
     #[test]
     fn test_create_response_request_rejects_non_positive_max_output_tokens() {
         let base_request = CreateResponseRequest {
+            tee: None,
             model: "gpt-4".to_string(),
             input: None,
             instructions: None,
@@ -1648,6 +1652,7 @@ mod tests {
 
         // Test that valid metadata passes validation
         let request_with_small_metadata = CreateResponseRequest {
+            tee: None,
             model: "gpt-4".to_string(),
             input: None,
             instructions: None,
@@ -1679,6 +1684,7 @@ mod tests {
         // Test that metadata exceeding the limit fails validation
         let large_string = "x".repeat(MAX_METADATA_SIZE_BYTES + 1);
         let request_with_large_metadata = CreateResponseRequest {
+            tee: None,
             model: "gpt-4".to_string(),
             input: None,
             instructions: None,
@@ -1714,6 +1720,7 @@ mod tests {
     fn test_create_response_request_validates_without_metadata() {
         // Test that request without metadata passes validation
         let request_without_metadata = CreateResponseRequest {
+            tee: None,
             model: "gpt-4".to_string(),
             input: None,
             instructions: None,
@@ -1823,6 +1830,7 @@ mod tests {
 
         // Test that valid input message metadata passes validation
         let request_with_small_input_metadata = CreateResponseRequest {
+            tee: None,
             model: "gpt-4".to_string(),
             input: Some(ResponseInput::Items(vec![ResponseInputItem::Message {
                 role: "user".to_string(),
@@ -1858,6 +1866,7 @@ mod tests {
         // Test that input message metadata exceeding the limit fails validation
         let large_string = "x".repeat(MAX_METADATA_SIZE_BYTES + 1);
         let request_with_large_input_metadata = CreateResponseRequest {
+            tee: None,
             model: "gpt-4".to_string(),
             input: Some(ResponseInput::Items(vec![ResponseInputItem::Message {
                 role: "user".to_string(),

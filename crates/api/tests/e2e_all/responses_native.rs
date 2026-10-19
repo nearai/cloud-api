@@ -55,7 +55,8 @@ async fn native_flow(prefix: &str, enabled: bool) {
                 "modelDisplayName":"Routing fixture","modelDescription":"Native Responses test",
                 "contextLength":10000,"maxOutputLength":1000,"isActive":true,"ownedBy":"openai",
                 "aliases":if name == &model {vec![alias.clone()]} else {vec![]},
-                "verifiable":false,"inputModalities":["text"],"outputModalities":["text"]
+                "verifiable":false,"providerType":"external","attestationSupported":false,
+                "inputModalities":["text"],"outputModalities":["text"]
             }))
             .unwrap(),
         );

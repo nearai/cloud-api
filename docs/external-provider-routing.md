@@ -48,13 +48,14 @@ restricts inference routing to eligible endpoints and fails if none are availabl
 It does not describe Cloud API conversation storage or separate plugin/tool
 retention policies.
 
-## Provider registry (issue #1273, first rollout stage)
+## Provider registry (issue #1273, staged implementation)
 
 Providers can be configured independently of catalog models. This stage manages
 non-attested external adapters (`openai_compatible`, `anthropic`, `gemini`, and
 `typesafe`). Existing NEAR/Chutes/Tinfoil registration and trust policy are
-unchanged. Mixed-trust request policy, procurement prices, and new retry policy
-remain later stages of #1273.
+retained. The registry also stores explicit routing policy, independent routes,
+procurement cost versions, and attempt records. This is not completion evidence
+for all of #1273; the outstanding acceptance gates are listed below.
 
 ### Configure a provider
 
@@ -193,3 +194,149 @@ The `provider_registry_` E2E tests exercise admin handlers, real PostgreSQL and
 route registration. Separate opt-in tests exercise public OpenRouter discovery
 and credentialed provider discovery; missing credentials are not a passing test.
 No upstream inference results are fabricated by these management tests.
+
+For local management tests, use the debug-only `DEV=true` setting when dstack
+is unavailable. Server startup also requires `BRAVE_SEARCH_PRO_API_KEY`; an
+unused placeholder is sufficient for these tests, which do not invoke search:
+
+```sh
+DEV=true BRAVE_SEARCH_PRO_API_KEY=unused-management-test-placeholder \
+DATABASE_HOST=localhost DATABASE_USERNAME=postgres DATABASE_PASSWORD=postgres \
+TEST_DATABASE_NAME=cloud_api_provider_registry_e2e \
+cargo test -p api --test e2e_all provider_registry_ -- --test-threads=1
+```
+
+To run public discovery, replace the test filter with
+`provider_registry_public_openrouter_discovery_preserves_approval` and add
+`--ignored` after `--`. This verifies discovery and retained admin decisions,
+not upstream inference or vendor streaming compatibility.
+
+### Accounts, manual inventory, and independent routes
+
+`GET/PUT /v1/admin/provider-accounts` manages stable vendor/account identities.
+The PUT body is `{ "account": { "id", "name", "vendor", "account_reference", "archived" }, "change_reason" }`.
+Deployments reference `account_id`; account and deployment archives both remove
+routes from eligibility. Deployment `quota_group` groups shared upstream quotas;
+otherwise the credential reference or deployment UUID supplies the group.
+
+`PUT /v1/admin/providers/{id}/inventory` accepts `upstream_model`, `available`,
+`archived`, nullable `reasoning_efforts`, `provenance`, and `change_reason`.
+It creates inventory without creating or approving a catalog route. Manual
+inventory survives missing discovery results. TypeSafe requires this manual path.
+
+`GET/PUT /v1/admin/models/{model_name}/routes` manages independent routes. PUT
+accepts `{ "route": { "id", "model_id", "inventory_id", "approved", "enabled",
+"archived", "reasoning_efforts", "context_limit", "output_limit", "role" },
+"change_reason" }`. Identity fields are immutable; `role` is `primary` or
+`fallback`. Multiple catalog models may use the same inventory entry. The legacy
+mapping API only revokes mappings it still owns when remapping inventory.
+
+### Routing policy and cost controls
+
+`GET/PUT /v1/admin/models/{model_name}/routing-policy` reads or updates policy.
+PUT wraps `policy` and a required `change_reason`. Policy includes:
+
+- `default_tee_requirement`: `required` or `any`. Migration preserves existing
+  TEE catalog defaults; request `tee` is validated before dispatch.
+- `mixed_routing_enabled`: defaults false. Deploy compatible binaries on every
+  replica before enabling mixed routes. A key pin or encrypted chat request
+  strengthens the request to TEE even when it requests `any`.
+- `max_attempts` (1–16) and `deadline_ms` (100–600000).
+- Optional `max_attempt_cost_microusd` and `max_total_cost_microusd`.
+- `allow_negative_margin`: explicit permission for retries whose planned
+  cumulative procurement spend exceeds the accepted customer-price estimate.
+
+`GET/POST /v1/admin/provider-routes/{id}/cost-profiles` manages versioned costs.
+POST wraps `rates` and `change_reason`. Rates include `currency`, `billing_unit`
+(`million_tokens`), `input_microunits`, `output_microunits`, nullable
+`cache_read_microunits`/`cache_write_microunits`, and `provenance`. Integers represent
+millionths of currency per million tokens. Updating creates a new version and
+closes the prior interval; it does not change catalog customer prices.
+
+Only eligible routes are cost-ranked. The shared retry path reserves each
+attempt's estimate, including failed attempts. A configured cost ceiling rejects
+unknown costs, unsupported currencies, or missing token bounds before dispatch.
+Responses tool iterations retain an internal request-owned customer-price and
+procurement-rate snapshot, deadline, and aggregate attempt/spend reservation.
+Follow-ups cannot reset reservations or raise the initial customer-cost estimate.
+Caller-supplied correlation IDs do not share budget state between requests.
+These are planning limits, not guarantees about vendor invoices or tokenizer
+estimation. Native Responses and Anthropic transports use the same pre-commit
+retry bounds and shared health. Final HTTP status, headers, and body bytes are
+preserved. Successful native bodies record EOF, failure, timeout, or cancellation
+without replaying committed output; native token-cost reconciliation and
+non-token billing units remain incomplete.
+
+Rate limits and transient failures update shared PostgreSQL cooldowns; bounded
+`Retry-After` is honored. Credential failures quarantine the quota group. Expired
+cooldowns admit a single half-open probe across replicas. Registry snapshots
+refresh every 30 seconds and registered external routes fail closed after 60
+seconds without a successful refresh. Accepted streams are never retried by the
+stream observer; cancellation leaves cost unknown unless explicitly reconciled.
+
+### Attempt audit and reconciliation
+
+`GET /v1/admin/provider-attempts/{request_id}` returns up to 1000 attempts linked
+to the accepted request UUID. Entries identify route/deployment/cost revisions,
+policy requirements, outcome, token usage where observed, and separate estimated
+and actual costs. No prompt or response content is stored in this ledger.
+
+`POST /v1/admin/provider-attempts/{id}/settlement` accepts
+`{ "actual_cost_microusd": 7, "evidence": "invoice reference" }`. Settlement is
+idempotent for identical evidence and amount, rejects conflicting repeats, and
+retains the upstream outcome even for billed failed requests. It never changes
+customer usage charges. Without reconciliation, an observed usage calculation
+is `estimated`, and an unobserved/failed/cancelled charge remains `unknown`.
+
+### Outstanding full-issue acceptance gates
+
+Do not treat the management or transport-fixture tests as proof of full #1273.
+Remaining work includes registry-authoritative import and rollback for all legacy
+NEAR/long-context/Chutes/Tinfoil sources; native token-cost reconciliation and non-token billing units; stable actual
+deployment attribution in customer usage and responses; and process-level real-vendor and
+verifier-backed TEE acceptance evidence. Live acceptance requires provisioned
+upstreams and credential references. The current mocks prove management and
+transport behavior only.
+
+### Staged legacy external import
+
+`POST /v1/admin/providers/import-legacy` accepts `model_name`, `credential_env`,
+`phase` (`plan`, `shadow`, `cutover`, or `rollback`), and `change_reason`.
+Provision the credential reference on every replica first. An existing inline
+key must match that reference. Import responses and audit snapshots never
+contain the resolved key. Global-key legacy configurations require an explicit
+reference, rather than silently borrowing a different account's adapter key.
+
+`plan` validates without writing. `shadow` records stable deployment, inventory,
+and route identities while the legacy configuration still serves; shadow routes
+are excluded from serving. `cutover` requires the unchanged shadow snapshot and
+makes registry routes authoritative for that model. It removes the inline key
+from the current catalog configuration and retains a sanitized rollback config.
+`rollback` restores the legacy loader using the credential reference. Identical
+repeated transitions do not duplicate import audit records. Existing catalog
+UUIDs, aliases, archives, activation, and customer prices are preserved. When
+runtime configuration is identical, cutover and rollback reuse the existing
+provider handle. This workflow covers external adapters only; it does not
+migrate verifier-backed fleet or third-party provider constructors.
+
+### Organization policy
+
+`GET/PUT /v1/admin/organizations/{org_id}/inference-policy` manages a stronger
+organization requirement. PUT accepts `tee_required` and `change_reason` and
+records an audit row. Authentication reads this policy without a stale policy
+cache and fails closed if the lookup fails. The authenticated dispatch scope
+requires TEE regardless of caller `tee: any`. Responses carries this constraint
+explicitly into background tasks and resolves omitted TEE defaults before the
+tool loop, so task spawning or a later catalog edit cannot weaken it.
+
+### Public route capabilities
+
+`GET /v1/models`, `/v1/model/list`, and `/v1/model/{name-or-alias}` expose
+`routing` (under `metadata` for the latter two). It contains the default TEE
+requirement and route-specific profiles with stable registry route/deployment IDs,
+TEE transport availability, native protocol support, and reasoning efforts.
+Reasoning efforts are null when unknown and an empty list when explicitly
+unsupported. Profiles disappear when routes are withdrawn or the registry
+snapshot becomes stale; public HTTP caches can delay listing updates. These
+capabilities describe configured transports, not verification of a particular
+response. Actual verification still depends on the serving transport's verifier.

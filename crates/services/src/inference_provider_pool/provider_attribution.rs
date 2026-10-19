@@ -38,6 +38,8 @@ pub struct AttributedAnthropicRawResponse {
 }
 
 pub(super) struct ServedProviderResult<T> {
+    pub(super) routing_deadline: Option<(tokio::time::Instant, u64)>,
+    pub(super) attempt: Option<crate::provider_registry::entities::InferenceAttempt>,
     pub(super) value: T,
     pub(super) provider: Arc<dyn InferenceProvider + Send + Sync>,
     pub(super) provider_attribution: crate::usage::ProviderAttribution,

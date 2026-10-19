@@ -678,6 +678,7 @@ mod tests {
 
     fn request_with_tools(tools: Vec<ResponseTool>) -> CreateResponseRequest {
         CreateResponseRequest {
+            tee: None,
             model: "test".to_string(),
             input: None,
             instructions: None,
@@ -1163,6 +1164,7 @@ mod tests {
         use crate::responses::models::CreateResponseRequest;
 
         let request = CreateResponseRequest {
+            tee: None,
             model: "test".to_string(),
             input: None,
             instructions: None,

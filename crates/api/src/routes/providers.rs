@@ -11,6 +11,26 @@ use services::provider_registry::{
 use uuid::Uuid;
 
 type ApiError = (StatusCode, Json<ErrorResponse>);
+
+#[utoipa::path(put,path="/v1/admin/providers/{id}/inventory",tag="Admin",params(("id"=Uuid,Path)),request_body=services::provider_registry::ManualInventoryEntry,responses((status=204)),security(("session_token"=[])))]
+pub async fn save_inventory(
+    State(state): State<AdminAppState>,
+    Path(id): Path<Uuid>,
+    Extension(actor): Extension<AdminUser>,
+    Json(entry): Json<services::provider_registry::ManualInventoryEntry>,
+) -> Result<StatusCode, ApiError> {
+    require_provider(&state, id).await?;
+    entry
+        .validate()
+        .map_err(|e| error(StatusCode::BAD_REQUEST, &e.to_string()))?;
+    state
+        .provider_registry
+        .save_inventory(id, &entry, actor.0.id)
+        .await
+        .map_err(internal)?;
+    reload(&state).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
 fn error(status: StatusCode, message: &str) -> ApiError {
     (
         status,
@@ -184,15 +204,322 @@ pub async fn archive_model(
         )
         .await
         .map_err(internal)?;
+    state.models_service.invalidate_models_cache().await;
+    state
+        .inference_provider_pool
+        .invalidate_periodic_provider_refreshes()
+        .await;
     let model = state
         .provider_models_repository
         .get_by_internal_name(&name)
         .await
         .map_err(internal)?
         .ok_or_else(|| error(StatusCode::NOT_FOUND, "Model not found"))?;
-    let mut batch = crate::models::BatchUpdateModelApiRequest::new();
-    batch.insert(name,serde_json::from_value(serde_json::json!({"isActive":model.is_active,"changeReason":request.change_reason.unwrap_or_else(|| "Model unarchived".into())})).map_err(internal)?);
-    let _ = crate::routes::admin::batch_upsert_models(State(state), Extension(actor), Json(batch))
-        .await?;
+    state
+        .inference_provider_pool
+        .refresh_pinned_provider_roles_from_catalog(
+            &name,
+            &model.provider_type,
+            model.inference_url.is_some(),
+        );
+    if model.is_active && model.provider_type != "external" {
+        if let Some(url) = &model.inference_url {
+            let endpoints = services::inference_provider_pool::expand_inference_endpoints(
+                &name,
+                url,
+                u32::try_from(model.context_length).ok(),
+                model.provider_config.as_ref(),
+            );
+            state
+                .inference_provider_pool
+                .load_inference_url_models(endpoints, true)
+                .await;
+        }
+    }
+    reload(&state).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(serde::Deserialize, utoipa::ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RoutingPolicyUpdate {
+    pub policy: services::provider_registry::ModelRoutingPolicy,
+    pub change_reason: String,
+}
+
+#[utoipa::path(get,path="/v1/admin/models/{model_name}/routing-policy",tag="Admin",params(("model_name"=String,Path)),responses((status=200,body=services::provider_registry::ModelRoutingPolicy)),security(("session_token"=[])))]
+pub async fn routing_policy(
+    State(state): State<AdminAppState>,
+    Path(name): Path<String>,
+) -> Result<Json<services::provider_registry::ModelRoutingPolicy>, ApiError> {
+    state
+        .provider_registry
+        .routing_policies()
+        .await
+        .map_err(internal)?
+        .remove(&name)
+        .map(Json)
+        .ok_or_else(|| error(StatusCode::NOT_FOUND, "Model not found"))
+}
+
+#[utoipa::path(put,path="/v1/admin/models/{model_name}/routing-policy",tag="Admin",params(("model_name"=String,Path)),request_body=RoutingPolicyUpdate,responses((status=204)),security(("session_token"=[])))]
+pub async fn update_routing_policy(
+    State(state): State<AdminAppState>,
+    Path(name): Path<String>,
+    Extension(actor): Extension<AdminUser>,
+    Json(request): Json<RoutingPolicyUpdate>,
+) -> Result<StatusCode, ApiError> {
+    if state
+        .provider_models_repository
+        .get_by_internal_name(&name)
+        .await
+        .map_err(internal)?
+        .is_none()
+    {
+        return Err(error(StatusCode::NOT_FOUND, "Model not found"));
+    }
+    state
+        .provider_registry
+        .save_routing_policy(&name, &request.policy, &request.change_reason, actor.0.id)
+        .await
+        .map_err(|_| {
+            error(
+                StatusCode::BAD_REQUEST,
+                "Invalid routing policy or change reason",
+            )
+        })?;
+    reload(&state).await?;
+    state.models_service.invalidate_models_cache().await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(serde::Deserialize, utoipa::ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AccountMutation {
+    pub account: services::provider_registry::entities::ProviderAccount,
+    pub change_reason: String,
+}
+
+#[derive(serde::Deserialize, utoipa::ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RouteMutation {
+    pub route: services::provider_registry::entities::ModelRoute,
+    pub change_reason: String,
+}
+
+#[derive(serde::Deserialize, utoipa::ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CostMutation {
+    pub rates: services::provider_registry::entities::RouteCostRates,
+    pub change_reason: String,
+}
+
+#[utoipa::path(get,path="/v1/admin/provider-accounts",tag="Admin",responses((status=200,body=Vec<services::provider_registry::entities::ProviderAccount>)),security(("session_token"=[])))]
+pub async fn accounts(
+    State(state): State<AdminAppState>,
+) -> Result<Json<Vec<services::provider_registry::entities::ProviderAccount>>, ApiError> {
+    Ok(Json(
+        state.provider_registry.accounts().await.map_err(internal)?,
+    ))
+}
+
+#[utoipa::path(put,path="/v1/admin/provider-accounts",tag="Admin",request_body=AccountMutation,responses((status=204)),security(("session_token"=[])))]
+pub async fn save_account(
+    State(state): State<AdminAppState>,
+    Extension(actor): Extension<AdminUser>,
+    Json(request): Json<AccountMutation>,
+) -> Result<StatusCode, ApiError> {
+    state
+        .provider_registry
+        .save_account(&request.account, actor.0.id, &request.change_reason)
+        .await
+        .map_err(|_| error(StatusCode::BAD_REQUEST, "Invalid account or change reason"))?;
+    reload(&state).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[utoipa::path(get,path="/v1/admin/models/{model_name}/routes",tag="Admin",params(("model_name"=String,Path)),responses((status=200,body=Vec<services::provider_registry::entities::ModelRoute>)),security(("session_token"=[])))]
+pub async fn model_routes(
+    State(state): State<AdminAppState>,
+    Path(name): Path<String>,
+) -> Result<Json<Vec<services::provider_registry::entities::ModelRoute>>, ApiError> {
+    if state
+        .provider_models_repository
+        .get_by_internal_name(&name)
+        .await
+        .map_err(internal)?
+        .is_none()
+    {
+        return Err(error(StatusCode::NOT_FOUND, "Model not found"));
+    }
+    Ok(Json(
+        state
+            .provider_registry
+            .model_routes(&name)
+            .await
+            .map_err(internal)?,
+    ))
+}
+
+#[utoipa::path(put,path="/v1/admin/models/{model_name}/routes",tag="Admin",params(("model_name"=String,Path)),request_body=RouteMutation,responses((status=204)),security(("session_token"=[])))]
+pub async fn save_route(
+    State(state): State<AdminAppState>,
+    Path(name): Path<String>,
+    Extension(actor): Extension<AdminUser>,
+    Json(request): Json<RouteMutation>,
+) -> Result<StatusCode, ApiError> {
+    let model = state
+        .provider_models_repository
+        .get_by_internal_name(&name)
+        .await
+        .map_err(internal)?
+        .ok_or_else(|| error(StatusCode::NOT_FOUND, "Model not found"))?;
+    if model.id != request.route.model_id {
+        return Err(error(
+            StatusCode::BAD_REQUEST,
+            "Route model does not match path",
+        ));
+    }
+    state
+        .provider_registry
+        .save_route(&request.route, actor.0.id, &request.change_reason)
+        .await
+        .map_err(|_| {
+            error(
+                StatusCode::BAD_REQUEST,
+                "Invalid route, identity, security policy or change reason",
+            )
+        })?;
+    reload(&state).await?;
+    state.models_service.invalidate_models_cache().await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[utoipa::path(get,path="/v1/admin/provider-routes/{id}/cost-profiles",tag="Admin",params(("id"=Uuid,Path)),responses((status=200,body=Vec<serde_json::Value>)),security(("session_token"=[])))]
+pub async fn cost_profiles(
+    State(state): State<AdminAppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
+    Ok(Json(
+        state
+            .provider_registry
+            .cost_profiles(id)
+            .await
+            .map_err(internal)?,
+    ))
+}
+
+#[utoipa::path(post,path="/v1/admin/provider-routes/{id}/cost-profiles",tag="Admin",params(("id"=Uuid,Path)),request_body=CostMutation,responses((status=201,body=Uuid)),security(("session_token"=[])))]
+pub async fn save_cost_profile(
+    State(state): State<AdminAppState>,
+    Path(id): Path<Uuid>,
+    Extension(actor): Extension<AdminUser>,
+    Json(request): Json<CostMutation>,
+) -> Result<(StatusCode, Json<Uuid>), ApiError> {
+    let id = state
+        .provider_registry
+        .save_cost_profile(id, &request.rates, actor.0.id, &request.change_reason)
+        .await
+        .map_err(|_| {
+            error(
+                StatusCode::BAD_REQUEST,
+                "Invalid route, cost rates or change reason",
+            )
+        })?;
+    reload(&state).await?;
+    Ok((StatusCode::CREATED, Json(id)))
+}
+
+#[utoipa::path(get,path="/v1/admin/provider-attempts/{request_id}",tag="Admin",params(("request_id"=Uuid,Path)),responses((status=200,body=Vec<serde_json::Value>)),security(("session_token"=[])))]
+pub async fn attempts(
+    State(state): State<AdminAppState>,
+    Path(request_id): Path<Uuid>,
+) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
+    Ok(Json(
+        state
+            .provider_registry
+            .attempts(request_id)
+            .await
+            .map_err(internal)?,
+    ))
+}
+
+#[derive(serde::Deserialize, utoipa::ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AttemptSettlement {
+    pub actual_cost_microusd: i64,
+    /// Non-secret invoice or reconciliation reference; never customer content.
+    pub evidence: String,
+}
+
+#[utoipa::path(post,path="/v1/admin/provider-attempts/{id}/settlement",tag="Admin",params(("id"=Uuid,Path)),request_body=AttemptSettlement,responses((status=204)),security(("session_token"=[])))]
+pub async fn settle_attempt(
+    State(state): State<AdminAppState>,
+    Path(id): Path<Uuid>,
+    Extension(actor): Extension<AdminUser>,
+    Json(request): Json<AttemptSettlement>,
+) -> Result<StatusCode, ApiError> {
+    state
+        .provider_registry
+        .settle_attempt(
+            id,
+            request.actual_cost_microusd,
+            &request.evidence,
+            actor.0.id,
+        )
+        .await
+        .map_err(|_| error(StatusCode::BAD_REQUEST, "Invalid or conflicting settlement"))?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[utoipa::path(post,path="/v1/admin/providers/import-legacy",tag="Admin",request_body=services::provider_registry::LegacyExternalImport,responses((status=200,body=serde_json::Value)),security(("session_token"=[])))]
+pub async fn import_legacy(
+    State(state): State<AdminAppState>,
+    Extension(actor): Extension<AdminUser>,
+    Json(request): Json<services::provider_registry::LegacyExternalImport>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let report = state.provider_registry.import_external(&request, actor.0.id).await
+        .map_err(|_| error(StatusCode::BAD_REQUEST, "Import requires an unchanged legacy external configuration, provisioned credential reference, and valid phase"))?;
+    if request.phase != "plan" {
+        state.models_service.invalidate_models_cache().await;
+        reload(&state).await?;
+    }
+    Ok(Json(report))
+}
+
+#[derive(serde::Deserialize, utoipa::ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct OrganizationTeePolicyUpdate {
+    pub tee_required: bool,
+    pub change_reason: String,
+}
+
+#[utoipa::path(get,path="/v1/admin/organizations/{org_id}/inference-policy",tag="Admin",params(("org_id"=Uuid,Path)),responses((status=200,body=serde_json::Value)),security(("session_token"=[])))]
+pub async fn organization_policy(
+    State(state): State<AdminAppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    Ok(Json(
+        serde_json::json!({"tee_required":state.provider_registry.organization_tee_policy(id).await.map_err(internal)?}),
+    ))
+}
+
+#[utoipa::path(put,path="/v1/admin/organizations/{org_id}/inference-policy",tag="Admin",params(("org_id"=Uuid,Path)),request_body=OrganizationTeePolicyUpdate,responses((status=204)),security(("session_token"=[])))]
+pub async fn save_organization_policy(
+    State(state): State<AdminAppState>,
+    Path(id): Path<Uuid>,
+    Extension(actor): Extension<AdminUser>,
+    Json(request): Json<OrganizationTeePolicyUpdate>,
+) -> Result<StatusCode, ApiError> {
+    state
+        .provider_registry
+        .save_organization_tee_policy(id, request.tee_required, actor.0.id, &request.change_reason)
+        .await
+        .map_err(|_| {
+            error(
+                StatusCode::BAD_REQUEST,
+                "Invalid organization policy or change reason",
+            )
+        })?;
     Ok(StatusCode::NO_CONTENT)
 }

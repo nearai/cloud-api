@@ -65,6 +65,7 @@ pub mod non_attested;
 pub mod placement_io;
 pub mod responses_raw;
 pub mod rotation;
+pub mod routing;
 pub mod spki_verifier;
 pub mod sse_parser;
 pub mod systemone;
@@ -424,6 +425,17 @@ pub struct DiscoveryPush {
 
 #[async_trait]
 pub trait InferenceProvider {
+    /// None permits documented upstream validation; Some([]) explicitly rejects
+    /// effort controls. Selection checks this before sending customer content.
+    fn reasoning_efforts(&self) -> Option<&[String]> {
+        None
+    }
+
+    fn accepts_reasoning_effort(&self, effort: routing::ReasoningEffort) -> bool {
+        self.reasoning_efforts()
+            .is_none_or(|levels| levels.iter().any(|level| level == effort.as_str()))
+    }
+
     /// Lists all available models from this provider
     ///
     /// Returns a list of `ModelInfo` structs containing model details like ID, name,

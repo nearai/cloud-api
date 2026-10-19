@@ -176,6 +176,7 @@ mod tests {
             .collect();
 
         CreateResponseRequest {
+            tee: None,
             model: "test".to_string(),
             input: None,
             instructions: None,
@@ -202,6 +203,7 @@ mod tests {
 
     fn create_test_request_no_tools() -> CreateResponseRequest {
         CreateResponseRequest {
+            tee: None,
             model: "test".to_string(),
             input: None,
             instructions: None,
@@ -311,6 +313,7 @@ mod tests {
 
     fn create_test_request_with_code_interpreter() -> CreateResponseRequest {
         CreateResponseRequest {
+            tee: None,
             model: "test".to_string(),
             input: None,
             instructions: None,
@@ -337,6 +340,7 @@ mod tests {
 
     fn create_test_request_with_computer() -> CreateResponseRequest {
         CreateResponseRequest {
+            tee: None,
             model: "test".to_string(),
             input: None,
             instructions: None,

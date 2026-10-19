@@ -123,6 +123,11 @@ pub enum ApiKeyOrderDirection {
 // Repository trait for workspace data access
 #[async_trait]
 pub trait WorkspaceRepository: Send + Sync {
+    async fn organization_requires_tee(
+        &self,
+        organization_id: Uuid,
+    ) -> Result<bool, RepositoryError>;
+
     async fn get_by_id(
         &self,
         workspace_id: WorkspaceId,

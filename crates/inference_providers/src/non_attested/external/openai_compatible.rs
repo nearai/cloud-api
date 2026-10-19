@@ -205,7 +205,7 @@ impl ExternalBackend for OpenAiCompatibleBackend {
             .json(&body)
             .send()
             .await
-            .map_err(|e| CompletionError::CompletionError(e.to_string()))?;
+            .map_err(crate::routing::transport_error)?;
         Ok(crate::responses_raw::ResponsesRawResponse {
             status: response.status(),
             headers: response.headers().clone(),
@@ -272,9 +272,12 @@ impl ExternalBackend for OpenAiCompatibleBackend {
             .json(&streaming_params)
             .send()
             .await
-            .map_err(|e| CompletionError::CompletionError(e.to_string()))?;
+            .map_err(crate::routing::transport_error)?;
 
         if !response.status().is_success() {
+            if let Some(error) = crate::routing::retry_after_error(&response) {
+                return Err(error);
+            }
             let status = response.status();
             let status_code = status.as_u16();
             let error_text = response
@@ -346,9 +349,12 @@ impl ExternalBackend for OpenAiCompatibleBackend {
             .json(&non_streaming_params)
             .send()
             .await
-            .map_err(|e| CompletionError::CompletionError(e.to_string()))?;
+            .map_err(crate::routing::transport_error)?;
 
         if !response.status().is_success() {
+            if let Some(error) = crate::routing::retry_after_error(&response) {
+                return Err(error);
+            }
             let status = response.status();
             let status_code = status.as_u16();
             let error_text = response

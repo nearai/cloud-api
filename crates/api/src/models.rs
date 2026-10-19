@@ -426,6 +426,10 @@ fn validate_image_size(size: &str) -> Result<(), String> {
 /// Request for image generation
 #[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct ImageGenerationRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<String>)]
+    pub tee: Option<inference_providers::routing::TeeRequirement>,
+
     /// Model ID to use for generation
     pub model: String,
     /// Text prompt describing the image to generate
@@ -527,6 +531,10 @@ pub struct ImageEditRequest {
 /// Schema for image edit request documentation in OpenAPI
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ImageEditRequestSchema {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<String>)]
+    pub tee: Option<inference_providers::routing::TeeRequirement>,
+
     /// Image file to edit (file upload)
     #[schema(format = Binary)]
     pub image: String,
@@ -619,6 +627,10 @@ pub struct ImageData {
 /// This represents the multipart/form-data fields
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct AudioTranscriptionRequestSchema {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<String>)]
+    pub tee: Option<inference_providers::routing::TeeRequirement>,
+
     /// Audio file (required) - binary audio data
     pub file: String, // Placeholder for binary data in OpenAPI
 
@@ -958,6 +970,10 @@ fn is_supported_audio_transcription_language(language: &str) -> bool {
 /// Request for document reranking
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct RerankRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<String>)]
+    pub tee: Option<inference_providers::routing::TeeRequirement>,
+
     /// Model ID to use for reranking
     pub model: String,
     /// Query to rerank documents against
@@ -1183,6 +1199,9 @@ pub struct ModelPricing {
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct ModelInfo {
+    /// Route-specific capabilities; not a statement of actual request verification.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routing: Option<services::provider_registry::capabilities::RoutingCapabilities>,
     pub id: String,
     pub object: String,
     pub created: i64,
@@ -1742,6 +1761,9 @@ impl ErrorResponse {
 /// Request to create a response
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct CreateResponseRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<String>)]
+    pub tee: Option<inference_providers::routing::TeeRequirement>,
     pub model: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub input: Option<ResponseInput>,
@@ -3920,6 +3942,9 @@ impl ModelArchitecture {
 /// Model metadata
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct ModelMetadata {
+    /// Route-specific capabilities; not a statement of actual request verification.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routing: Option<services::provider_registry::capabilities::RoutingCapabilities>,
     pub verifiable: bool,
     #[serde(rename = "contextLength")]
     pub context_length: i32,
@@ -5677,6 +5702,7 @@ mod tests {
 
     fn image_gen_req_with_size(size: Option<&str>) -> ImageGenerationRequest {
         ImageGenerationRequest {
+            tee: None,
             model: "black-forest-labs/FLUX.2-klein-4B".to_string(),
             prompt: "x".to_string(),
             n: Some(1),
@@ -5829,6 +5855,10 @@ const MAX_SCORE_TEXT_LENGTH: usize = 100_000;
 /// Request for text similarity scoring
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ScoreRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<String>)]
+    pub tee: Option<inference_providers::routing::TeeRequirement>,
+
     /// Model ID to use for scoring
     pub model: String,
     /// First text to compare

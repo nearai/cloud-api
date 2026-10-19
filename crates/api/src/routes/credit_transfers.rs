@@ -137,9 +137,14 @@ pub fn routes(
 #[serde(deny_unknown_fields)]
 pub struct CreateTransferRequest {
     pub recipient_organization_id: Uuid,
-    /// Only payment or staking_farm; integer nano-USD amount must be positive.
+    /// payment, staking_farm, or grant (grant requires explicit policy opt-in).
     pub source_credit_type: String,
-    pub amount: i64,
+    /// Positive nano-USD amount; mutually exclusive with recipient_cumulative.
+    pub amount: Option<i64>,
+    /// Nonnegative target for this sender, recipient, and payout program.
+    pub recipient_cumulative: Option<i64>,
+    /// Required for cumulative targets; optional for amount sends.
+    pub payout_program: Option<String>,
     #[serde(default)]
     pub memo: String,
     #[serde(default)]
@@ -152,12 +157,12 @@ pub struct CreateTransferRequest {
     tag = "Credits",
     params(
         ("org_id" = Uuid, Path, description = "Sender organization"),
-        ("Idempotency-Key" = String, Header, description = "Generate a UUID once in the client before sending and reuse it on retries; required, 1–100 characters")
+        ("Idempotency-Key" = String, Header, description = "Generate a UUID once in the client before sending and reuse it on retries; required for amount sends, prohibited for cumulative targets; 1–100 characters")
     ),
     request_body = CreateTransferRequest,
     responses(
         (status = 201, description = "Delivered; includes sender accounting only", body = Value),
-        (status = 200, description = "Original committed response replay", body = Value),
+        (status = 200, description = "Original committed response replay or cumulative target already reached", body = Value),
         (status = 409, description = "idempotency_conflict, insufficient_posted_capacity or sender_not_reconciled", body = ErrorResponse)
     ),
     security(("session_token" = []), ("organization_credential" = []))
@@ -176,6 +181,8 @@ pub async fn create(
         recipient_organization_id: request.recipient_organization_id,
         source_credit_type: request.source_credit_type,
         amount: request.amount,
+        recipient_cumulative: request.recipient_cumulative,
+        payout_program: request.payout_program,
         memo: request.memo,
         metadata: request.metadata,
     };
@@ -188,7 +195,13 @@ pub async fn create(
         .transfer(org, &actor, key, &request)
         .await
         .map_err(error)?;
-    record_outcome(if replay { "replay" } else { "created" });
+    record_outcome(if result["no_op"] == true {
+        "no_op"
+    } else if replay {
+        "replay"
+    } else {
+        "created"
+    });
     tracing::info!(replay, "Credit transfer completed");
     Ok((
         if replay {
@@ -495,7 +508,8 @@ pub struct TransferConstraintsSchema {
     /// Lifetime nano-USD budget. Rotation and configuration updates never reset usage.
     #[schema(minimum = 0)]
     max_total_amount: Option<i64>,
-    /// Omitted/null permits payment and staking_farm; an empty list permits neither.
+    /// Policy default: payment and staking_farm. Grant requires explicit policy opt-in.
+    /// Credential omission adds no restriction; an empty list permits no sources.
     allowed_source_types: Option<Vec<String>>,
     /// Omitted/null permits any recipient; an empty list permits none. At most 1,000 IDs.
     allowed_recipient_ids: Option<Vec<Uuid>>,

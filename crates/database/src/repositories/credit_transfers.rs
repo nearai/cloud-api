@@ -27,7 +27,9 @@ fn reject<T>(code: &'static str) -> anyhow::Result<T> {
 pub struct TransferRequest {
     pub recipient_organization_id: Uuid,
     pub source_credit_type: String,
-    pub amount: i64,
+    pub amount: Option<i64>,
+    pub recipient_cumulative: Option<i64>,
+    pub payout_program: Option<String>,
     #[serde(default)]
     pub memo: String,
     #[serde(default)]
@@ -37,9 +39,20 @@ pub struct TransferRequest {
 impl TransferRequest {
     pub fn validate(&self, sender: Uuid, key: &str) -> anyhow::Result<Value> {
         if sender == self.recipient_organization_id
-            || !matches!(self.source_credit_type.as_str(), "payment" | "staking_farm")
-            || self.amount <= 0
-            || key.trim().is_empty()
+            || !matches!(
+                self.source_credit_type.as_str(),
+                "payment" | "staking_farm" | "grant"
+            )
+            || !matches!(
+                (self.amount, self.recipient_cumulative),
+                (Some(1..), None) | (None, Some(0..))
+            )
+            || (self.amount.is_some() && key.trim().is_empty())
+            || (self.recipient_cumulative.is_some()
+                && (self.payout_program.is_none() || !key.is_empty()))
+            || self.payout_program.as_ref().is_some_and(|program| {
+                program.is_empty() || program.len() > 100 || program.trim() != program
+            })
             || key.trim().chars().count() > 100
             || self.memo.len() > 2000
         {
@@ -83,6 +96,8 @@ impl TransferRequest {
             "recipient_organization_id": self.recipient_organization_id,
             "source_credit_type": self.source_credit_type,
             "amount": self.amount,
+            "recipient_cumulative": self.recipient_cumulative,
+            "payout_program": self.payout_program,
             "memo": self.memo,
             "metadata": metadata,
         }))
@@ -116,6 +131,15 @@ pub struct TransferPolicy {
 
 fn default_send_quota() -> i64 {
     60
+}
+
+impl TransferPolicy {
+    fn allows_source(&self, source: &str) -> bool {
+        match &self.constraints.allowed_source_types {
+            Some(types) => types.iter().any(|kind| kind == source),
+            None => matches!(source, "payment" | "staking_farm"),
+        }
+    }
 }
 
 impl Default for TransferPolicy {
@@ -241,9 +265,70 @@ impl CreditTransferRepository {
         if !transfer_policy.enabled {
             return reject("sender_not_enabled");
         }
+        // Even a no-op must respect source and recipient restrictions before
+        // revealing the current program total. Monetary ceilings apply to delta.
+        if !transfer_policy.allows_source(&request.source_credit_type)
+            || !transfer_policy
+                .constraints
+                .allows(0, &request.source_credit_type, recipient, 0)
+        {
+            return reject("organization_transfer_limit_exceeded");
+        }
+        if !recipient_active {
+            return reject("organization_unavailable");
+        }
+
+        if credential_id.is_some()
+            && !authorization
+                .constraints
+                .allows(0, &request.source_credit_type, recipient, 0)
+        {
+            return reject("credential_transfer_limit_exceeded");
+        }
+
+        // Organization locks serialize every source and credential in a program.
+        // Tagged amount sends contribute too; untagged sends remain independent.
+        let program_total: i64 = if let Some(program) = &request.payout_program {
+            tx.query_one(
+                r#"
+                SELECT LEAST(COALESCE(SUM(amount), 0), 9223372036854775807)::BIGINT
+                FROM organization_credit_transfers
+                WHERE sender_organization_id = $1
+                  AND recipient_organization_id = $2
+                  AND payout_program = $3
+                "#,
+                &[&sender, &recipient, &program],
+            )
+            .await?
+            .get(0)
+        } else {
+            0
+        };
+        let amount = request.amount.unwrap_or_else(|| {
+            request
+                .recipient_cumulative
+                .unwrap()
+                .saturating_sub(program_total)
+                .max(0)
+        });
+        if amount == 0 {
+            return Ok((
+                json!({
+                    "sender_organization_id": sender,
+                    "recipient_organization_id": recipient,
+                    "payout_program": request.payout_program,
+                    "recipient_cumulative": program_total,
+                    "amount": 0,
+                    "no_op": true,
+                    "delivered": true,
+                }),
+                true,
+            ));
+        }
+
         let organization_spent = transferred_amount(&tx, sender, None).await?;
         if !transfer_policy.constraints.allows(
-            request.amount,
+            amount,
             &request.source_credit_type,
             recipient,
             organization_spent,
@@ -253,16 +338,13 @@ impl CreditTransferRepository {
         if let Some(id) = credential_id {
             let spent = transferred_amount(&tx, sender, Some(id)).await?;
             if !authorization.constraints.allows(
-                request.amount,
+                amount,
                 &request.source_credit_type,
                 recipient,
                 spent,
             ) {
                 return reject("credential_transfer_limit_exceeded");
             }
-        }
-        if !recipient_active {
-            return reject("organization_unavailable");
         }
 
         let balance = tx
@@ -314,7 +396,7 @@ impl CreditTransferRepository {
         if source
             .get::<_, i64>("effective_capacity")
             .saturating_sub(source.get::<_, i64>("consumed"))
-            < request.amount
+            < amount
         {
             return reject("insufficient_posted_capacity");
         }
@@ -350,7 +432,7 @@ impl CreditTransferRepository {
             )
             .await?
             .get(0);
-        if incoming_before.checked_add(request.amount).is_none() {
+        if incoming_before.checked_add(amount).is_none() {
             return reject("capacity_overflow");
         }
 
@@ -360,7 +442,7 @@ impl CreditTransferRepository {
                VALUES ($1, $2, $3)
                ON CONFLICT (organization_id, credit_type) DO UPDATE
                SET outgoing = organization_credit_transfer_totals.outgoing + EXCLUDED.outgoing"#,
-            &[&sender, &request.source_credit_type, &request.amount],
+            &[&sender, &request.source_credit_type, &amount],
         )
             .await?;
         let incoming: i64 = tx
@@ -370,7 +452,7 @@ impl CreditTransferRepository {
                ON CONFLICT (organization_id, credit_type) DO UPDATE
                SET incoming = organization_credit_transfer_totals.incoming + EXCLUDED.incoming
                RETURNING incoming"#,
-            &[&recipient, &request.amount],
+            &[&recipient, &amount],
         )
             .await?
             .get(0);
@@ -413,7 +495,9 @@ impl CreditTransferRepository {
             "recipient_organization_id": recipient,
             "source_credit_type": request.source_credit_type,
             "destination_credit_type": "transfer",
-            "amount": request.amount,
+            "amount": amount,
+            "payout_program": request.payout_program,
+            "recipient_cumulative": request.payout_program.as_ref().map(|_| program_total.saturating_add(amount)),
             "memo": request.memo,
             "metadata": terms["metadata"],
             "created_at": created_at,
@@ -433,15 +517,15 @@ impl CreditTransferRepository {
                 id, sender_organization_id, recipient_organization_id, source_credit_type,
                 amount, idempotency_key, terms, actor_id, actor_kind, credential_id,
                 policy_version, source_limit_id, recipient_limit_id, staking_evidence,
-                result, recipient_snapshot, created_at
-            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)"#,
+                result, recipient_snapshot, created_at, payout_program
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)"#,
             &[
                 &id,
                 &sender,
                 &recipient,
                 &request.source_credit_type,
-                &request.amount,
-                &key,
+                &amount,
+                &(!key.is_empty()).then_some(key),
                 &terms,
                 &actor_id,
                 &actor_kind,
@@ -453,6 +537,7 @@ impl CreditTransferRepository {
                 &result,
                 &recipient_snapshot,
                 &created_at,
+                &request.payout_program,
             ],
         )
         .await?;
@@ -534,7 +619,7 @@ impl CreditTransferRepository {
             .saturating_sub(recent)
             .max(0);
         let mut sources = Vec::new();
-        for source in ["payment", "staking_farm"] {
+        for source in ["payment", "staking_farm", "grant"] {
             let available = credits
                 .as_array()
                 .unwrap()
@@ -545,7 +630,7 @@ impl CreditTransferRepository {
                 })
                 .and_then(|credit| credit["available"].as_i64())
                 .unwrap_or(0);
-            let allowed = policy.credits_transfer.constraints.allows_source(source)
+            let allowed = policy.credits_transfer.allows_source(source)
                 && authorization.constraints.allows_source(source);
             let maximum = if can_send && allowed && sends_remaining > 0 {
                 available
@@ -634,7 +719,8 @@ impl CreditTransferRepository {
             .map(|row| {
                 let mut result: Value = row.get("result");
                 if row.get::<_, Uuid>("sender_organization_id") == org {
-                    result["idempotency_key"] = row.get::<_, String>("idempotency_key").into();
+                    result["idempotency_key"] =
+                        json!(row.get::<_, Option<String>>("idempotency_key"));
                 } else {
                     result.as_object_mut().unwrap().remove("sender_snapshot");
                     result.as_object_mut().unwrap().remove("staking_evidence");
@@ -805,7 +891,7 @@ mod tests {
             assert!(serde_json::from_value::<TransferRequest>(invalid_payload).is_err());
         }
 
-        for source in ["grant", "postpay", "transfer"] {
+        for source in ["postpay", "transfer"] {
             let mut invalid = request.clone();
             invalid.source_credit_type = source.into();
 

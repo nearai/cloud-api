@@ -75,6 +75,27 @@ impl OrganizationLimitsRepository {
                 )));
             }
 
+            // Distributed credits remain spendable by recipients. A general
+            // limit replacement cannot erase the source backing those credits.
+            let outgoing: i64 = transaction
+                .query_one(
+                    r#"
+                    SELECT COALESCE((
+                        SELECT outgoing FROM organization_credit_transfer_totals
+                        WHERE organization_id = $1 AND credit_type = $2
+                    ), 0)::BIGINT
+                    "#,
+                    &[&organization_id, &request.credit_type],
+                )
+                .await
+                .map_err(map_db_error)?
+                .get(0);
+            if request.spend_limit < outgoing {
+                return Err(RepositoryError::ValidationFailed(
+                    "Credit limit cannot be below credits already transferred out".into(),
+                ));
+            }
+
             let now = Utc::now();
 
             // Close any existing active limits of the same credit_type (set effective_until to now)

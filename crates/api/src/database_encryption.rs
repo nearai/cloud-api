@@ -129,7 +129,20 @@ struct ApprovedGroup {
 }
 
 const APPROVED: &[ApprovedGroup] = &[
-    ApprovedGroup { table: "organization_credit_transfers", columns: &["source_credit_type", "idempotency_key", "terms", "actor_kind", "staking_evidence", "result", "recipient_snapshot"], reason: "Immutable billing ledger, canonical retry terms and restricted accounting snapshots; memo and metadata are visible to both parties and must not contain secrets" },
+    ApprovedGroup {
+        table: "organization_credit_transfers",
+        columns: &[
+            "source_credit_type",
+            "payout_program",
+            "idempotency_key",
+            "terms",
+            "actor_kind",
+            "staking_evidence",
+            "result",
+            "recipient_snapshot",
+        ],
+        reason: "Immutable billing ledger, payout program identifiers, canonical retry terms and restricted accounting snapshots; program identifiers, memo and metadata are visible to both parties and must not contain secrets",
+    },
     ApprovedGroup { table: "organization_policies", columns: &["policy", "change_reason"], reason: "Administrator billing authorization audit" },
     ApprovedGroup { table: "organization_policy_audit", columns: &["policy", "change_reason"], reason: "Immutable administrator billing authorization audit" },
     ApprovedGroup { table: "organization_credential_audit", columns: &["action", "configuration"], reason: "Immutable organization credential configuration audit; no secrets or token hashes" },

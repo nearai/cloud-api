@@ -676,6 +676,12 @@ impl AdminService for AdminServiceImpl {
             .update_organization_limits(organization_id, limits)
             .await
             .map_err(|e| {
+                if let Some(crate::common::RepositoryError::ValidationFailed(message)) =
+                    e.downcast_ref::<crate::common::RepositoryError>()
+                {
+                    return AdminError::InvalidLimits(message.clone());
+                }
+
                 let error_msg = e.to_string();
                 if error_msg.contains("Organization not found") {
                     AdminError::OrganizationNotFound(format!(

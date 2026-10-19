@@ -132,6 +132,17 @@ impl Default for CreditAllocationConfig {
 impl CreditAllocationConfig {
     pub fn from_env() -> Result<Self, String> {
         let defaults = Self::default();
+        // A pinned historical label must not silently acquire a new default
+        // allocation order when the binary is upgraded.
+        if env::var("CREDIT_USAGE_ORDER").is_err()
+            && env::var("CREDIT_ALLOCATION_POLICY_VERSION")
+                .is_ok_and(|version| version.trim() != defaults.policy_version)
+        {
+            return Err(
+                "Set CREDIT_USAGE_ORDER explicitly when pinning a nondefault CREDIT_ALLOCATION_POLICY_VERSION"
+                    .into(),
+            );
+        }
         let priority = env::var("CREDIT_USAGE_ORDER")
             .unwrap_or_else(|_| defaults.priority.join(","))
             .split(',')
@@ -1860,6 +1871,10 @@ mod tests {
 
         std::env::set_var("CREDIT_ALLOCATION_POLICY_VERSION", "");
         assert!(CreditAllocationConfig::from_env().is_err());
+        std::env::set_var("CREDIT_ALLOCATION_POLICY_VERSION", "v1");
+        assert!(CreditAllocationConfig::from_env().is_err());
+
+        std::env::set_var("CREDIT_USAGE_ORDER", defaults.priority.join(","));
         std::env::set_var("CREDIT_ALLOCATION_POLICY_VERSION", "v".repeat(50));
         assert_eq!(
             CreditAllocationConfig::from_env()

@@ -257,7 +257,10 @@ constraints are `max_amount_per_transfer`, `max_total_amount`,
 `allowed_source_types`, and `allowed_recipient_ids` (at most 1,000 UUIDs).
 Omitting a constraint adds no restriction; an empty allowlist permits nothing,
 and a zero monetary limit blocks new sends. Organization policy and credential
-constraints both apply. Neither can permit grant, postpay, or transfer as a source.
+constraints both apply. Postpay and received transfer credits can never be sources. Grant requires an
+explicit `grant` entry in the organization policy `allowed_source_types`; omitting
+that policy allowlist permits only payment and staking. Credential restrictions
+can narrow the policy but cannot enable a source the policy disallows.
 A per-credential limit bounds an integration, not the owners who can create more
 credentials; the organization policy is the aggregate budget boundary.
 
@@ -294,13 +297,46 @@ or `Authorization: Bearer oc_...`, plus a required `Idempotency-Key` header:
 }
 ```
 
-Amounts are positive integer nano-USD. Only the explicitly chosen `payment` or
-already-posted `staking_farm` source can fund a send. Grants, postpay, future
-staking rewards, and received `transfer` capacity cannot fund it. Staking source
+Amounts are positive integer nano-USD. The explicitly chosen `payment`, already-posted `staking_farm`, or explicitly
+admin-approved `grant` source funds a send. Postpay, future staking rewards, and
+received `transfer` capacity cannot fund it. Distributed grants arrive as ordinary
+nontransferable `transfer` capacity, preserving the single-hop rule. Staking source
 limits must come from `house-of-stake`. Sync externally accrued rewards separately
 and retry if posted capacity is insufficient. Network operations never run inside
 the transfer transaction. Evidence reports the sync observation time separately
 from the chain accrual cutoff (currently unknown/null).
+
+For cumulative payouts, omit `amount` and `Idempotency-Key` and provide a named
+program and nonnegative target in nano-USD:
+
+```json
+{
+  "recipient_organization_id": "explicit-recipient-organization-uuid",
+  "source_credit_type": "payment",
+  "payout_program": "partner-rewards-2026",
+  "recipient_cumulative": 100000000000
+}
+```
+
+The total is scoped to **sender + recipient + payout program**, across credentials
+and funding sources. Program names are exact, nonempty strings of at most 100
+bytes, with no surrounding whitespace. An amount-based send may include the
+same `payout_program` and will count toward that total. Untagged sends do not
+count toward any program. Use a new program name for a separate payout schedule;
+renaming a program starts an independent total.
+
+Under the organization accounting locks, the server calculates the positive
+difference between the target and all completed transfers in that program. Only
+that difference consumes source capacity, budgets, and send quota. Concurrent
+or out-of-order targets cannot overpay the highest accepted target. A reached or
+lower target returns 200 with `amount: 0`, `no_op: true`, and the current
+`recipient_cumulative`; it creates no ledger row and consumes no quota. A positive
+difference returns 201 and records the actual amount and resulting program total.
+Cumulative calls require current transfer authorization, an active recipient,
+and an enabled organization source policy, including on no-ops. Unlike an exact
+amount replay, they evaluate the current target instead of replaying an earlier
+response. Retrying the same target after a timeout is safe without an idempotency
+key; supplying a key in cumulative mode is rejected to avoid mixed retry semantics.
 
 Creation returns 201; an exact replay returns 200 with the original result even
 if balances or sender policy have since changed. Keys are trimmed, nonempty,
@@ -398,3 +434,17 @@ Transient database/lock errors return 503; retry with the original key.
 
 Reversals, chargebacks, fees, expiry, claims by email, bulk sends, automatic
 recipient selection, and per-reseller attribution of recipient usage are excluded.
+
+Recipient spending attribution is intentionally deferred. Transfer history proves
+who funded a recipient and each payout program's delivered total; it does not prove
+which sender funded a later inference request. Recipients currently share one
+transfer credit pool. A follow-up needs immutable funding lots linked to transfer
+IDs, a documented consumption ordering rule across senders/programs, allocation
+records linking usage to those lots, and privacy-aware reporting. It must preserve
+existing historical allocations and the one-active-transfer-limit invariant.
+
+Source limit replacement rejects a gross limit below credits already distributed
+from that source. Reducing available capacity must retain that backing; external
+manual corruption is still detected by reconciliation. When setting a custom
+`CREDIT_ALLOCATION_POLICY_VERSION`, explicitly set `CREDIT_USAGE_ORDER` too so an
+old policy version cannot silently acquire the new five-type default order.

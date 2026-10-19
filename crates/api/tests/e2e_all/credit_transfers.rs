@@ -59,7 +59,13 @@ async fn transfer_credentials_policy_replays_and_validation() {
         .put(&policy_path)
         .add_header("Authorization", format!("Bearer {readonly}"))
         .add_header("User-Agent", MOCK_USER_AGENT)
-        .json(&json!({"policy": {"credentials": {"enabled": true}, "credits_transfer": {"enabled": true}}, "reason": "Reviewed"}))
+        .json(&json!({
+            "policy": {
+                "credentials": {"enabled": true},
+                "credits_transfer": {"enabled": true}
+            },
+            "reason": "Reviewed"
+        }))
         .await;
 
     assert_eq!(denied.status_code(), StatusCode::FORBIDDEN);
@@ -68,7 +74,13 @@ async fn transfer_credentials_policy_replays_and_validation() {
         .put(&policy_path)
         .add_header("Authorization", authorization.clone())
         .add_header("User-Agent", MOCK_USER_AGENT)
-        .json(&json!({"policy": {"credentials": {"enabled": true}, "credits_transfer": {"enabled": true}}, "reason": "Reviewed"}))
+        .json(&json!({
+            "policy": {
+                "credentials": {"enabled": true},
+                "credits_transfer": {"enabled": true}
+            },
+            "reason": "Reviewed"
+        }))
         .await;
 
     assert_eq!(enabled.status_code(), StatusCode::OK);
@@ -177,10 +189,18 @@ async fn transfer_credentials_policy_replays_and_validation() {
     assert_eq!(reconciliation.status_code(), StatusCode::OK);
     assert_eq!(reconciliation.json::<Value>()["consistent"], true);
 
-    let disabled_management = server.put(&policy_path)
+    let disabled_management = server
+        .put(&policy_path)
         .add_header("Authorization", authorization.clone())
         .add_header("User-Agent", MOCK_USER_AGENT)
-        .json(&json!({"policy": {"credentials": {"enabled": false}, "credits_transfer": {"enabled": true}}, "reason": "Stop issuing credentials"})).await;
+        .json(&json!({
+            "policy": {
+                "credentials": {"enabled": false},
+                "credits_transfer": {"enabled": true}
+            },
+            "reason": "Stop issuing credentials"
+        }))
+        .await;
     assert_eq!(disabled_management.status_code(), StatusCode::OK);
     let blocked_rotation = server
         .post(&format!(
@@ -216,4 +236,87 @@ async fn transfer_credentials_policy_replays_and_validation() {
         .json(&body)
         .await;
     assert_eq!(refused.status_code(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn cumulative_program_payouts_apply_credential_limits_to_delta() {
+    let (server, _) = setup_test_server_with_config_and_database(|_| {}).await;
+    let sender = create_org(&server).await;
+    let recipient = create_org(&server).await;
+    add_credits_with_type(
+        &server,
+        &sender.id,
+        "payment",
+        None,
+        100,
+        "USD",
+        &get_session_id(),
+    )
+    .await;
+    let authorization = format!("Bearer {}", get_session_id());
+    let path = format!("/v1/organizations/{}/credit/transfer", sender.id);
+    let enabled = server
+        .put(&format!("/v1/admin/organizations/{}/policy", sender.id))
+        .add_header("Authorization", authorization.clone())
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .json(&json!({
+            "policy": {
+                "credentials": {"enabled": true},
+                "credits_transfer": {"enabled": true, "max_sends_per_minute": 2}
+            },
+            "reason": "Program payout test"
+        }))
+        .await;
+    assert_eq!(enabled.status_code(), StatusCode::OK);
+
+    let credential = server.post(&format!("/v1/organizations/{}/credentials", sender.id))
+        .add_header("Authorization", authorization.clone())
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .json(&json!({
+            "name": "Program worker",
+            "permissions": ["credits:transfer"],
+            "constraints": {"credits:transfer": {"max_amount_per_transfer": 30, "max_total_amount": 50}},
+            "expires_at": chrono::Utc::now() + chrono::Duration::hours(1)
+        })).await;
+    assert_eq!(credential.status_code(), StatusCode::OK);
+    let bearer = format!(
+        "Bearer {}",
+        credential.json::<Value>()["token"].as_str().unwrap()
+    );
+
+    for (target, status, delta) in [
+        (30, StatusCode::CREATED, 30),
+        (50, StatusCode::CREATED, 20),
+        (50, StatusCode::OK, 0),
+        (20, StatusCode::OK, 0),
+    ] {
+        let response = server
+            .post(&path)
+            .add_header("Authorization", bearer.clone())
+            .json(&json!({
+                "recipient_organization_id": recipient.id,
+                "source_credit_type": "payment",
+                "payout_program": "monthly-rewards",
+                "recipient_cumulative": target
+            }))
+            .await;
+
+        assert_eq!(response.status_code(), status);
+        assert_eq!(response.json::<Value>()["amount"], delta);
+    }
+
+    let exceeded = server
+        .post(&path)
+        .add_header("Authorization", bearer)
+        .json(&json!({
+            "recipient_organization_id": recipient.id,
+            "source_credit_type": "payment",
+            "payout_program": "monthly-rewards",
+            "recipient_cumulative": 60
+        }))
+        .await;
+    assert_eq!(exceeded.status_code(), StatusCode::CONFLICT);
+    assert!(exceeded
+        .text()
+        .contains("credential_transfer_limit_exceeded"));
 }

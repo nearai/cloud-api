@@ -47,7 +47,7 @@ CREATE INDEX organization_credentials_by_org ON organization_credentials (organi
 CREATE INDEX organization_credential_audit_by_org ON organization_credential_audit (organization_id, created_at, id);
 CREATE TABLE organization_credit_transfer_totals (
     organization_id UUID NOT NULL REFERENCES organizations(id),
-    credit_type TEXT NOT NULL CHECK (credit_type IN ('payment', 'staking_farm', 'transfer')),
+    credit_type TEXT NOT NULL CHECK (credit_type IN ('payment', 'staking_farm', 'grant', 'transfer')),
     outgoing BIGINT NOT NULL DEFAULT 0 CHECK (outgoing >= 0),
     incoming BIGINT NOT NULL DEFAULT 0 CHECK (incoming >= 0),
     PRIMARY KEY (organization_id, credit_type),
@@ -58,9 +58,10 @@ CREATE TABLE organization_credit_transfers (
     id UUID PRIMARY KEY,
     sender_organization_id UUID NOT NULL REFERENCES organizations(id),
     recipient_organization_id UUID NOT NULL REFERENCES organizations(id),
-    source_credit_type TEXT NOT NULL CHECK (source_credit_type IN ('payment', 'staking_farm')),
+    source_credit_type TEXT NOT NULL CHECK (source_credit_type IN ('payment', 'staking_farm', 'grant')),
     amount BIGINT NOT NULL CHECK (amount > 0),
-    idempotency_key VARCHAR(100) NOT NULL CHECK (length(btrim(idempotency_key)) > 0),
+    payout_program VARCHAR(100),
+    idempotency_key VARCHAR(100) CHECK (length(btrim(idempotency_key)) > 0),
     terms JSONB NOT NULL,
     actor_id UUID NOT NULL,
     actor_kind TEXT NOT NULL CHECK (actor_kind IN ('owner_session', 'credits:transfer')),
@@ -367,3 +368,7 @@ COMMENT ON FUNCTION record_organization_usage(
     BIGINT, BIGINT, BIGINT, VARCHAR, INTEGER, DOUBLE PRECISION, UUID, VARCHAR,
     VARCHAR, UUID, INTEGER, TEXT, TEXT, BOOLEAN, JSONB, TEXT, TEXT, TEXT[], VARCHAR
 ) IS 'Atomically post an inference usage charge and credit allocation under a short organization lock.';
+
+CREATE INDEX idx_credit_transfers_payout_program
+    ON organization_credit_transfers (sender_organization_id, recipient_organization_id, payout_program)
+    WHERE payout_program IS NOT NULL;

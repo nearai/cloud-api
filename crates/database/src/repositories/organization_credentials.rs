@@ -36,10 +36,10 @@ impl TransferConstraints {
         if self.max_amount_per_transfer.is_some_and(|n| n < 0)
             || self.max_total_amount.is_some_and(|n| n < 0)
             || self.allowed_source_types.as_ref().is_some_and(|types| {
-                types.len() > 2
+                types.len() > 3
                     || types
                         .iter()
-                        .any(|t| !matches!(t.as_str(), "payment" | "staking_farm"))
+                        .any(|t| !matches!(t.as_str(), "payment" | "staking_farm" | "grant"))
             })
             || self
                 .allowed_recipient_ids

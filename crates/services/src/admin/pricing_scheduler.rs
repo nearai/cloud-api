@@ -208,6 +208,7 @@ impl ModelPricingScheduler {
             owned_by: None,
             provider_type: None,
             provider_config: None,
+            expected_provider_config: None,
             attestation_supported: None,
             input_modalities: None,
             output_modalities: None,

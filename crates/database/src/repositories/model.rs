@@ -393,6 +393,13 @@ impl ModelRepository {
         let text_pricing_value: Option<serde_json::Value> =
             update_request.text_pricing.clone().flatten();
         let text_pricing_clear: bool = matches!(update_request.text_pricing, Some(None));
+        // Compare-and-set for provider_config: when the caller merged its write
+        // into a stored snapshot, update only while the row still holds it, or
+        // already holds the value being written (an idempotent write loses
+        // nothing, e.g. two identical creates racing).
+        let provider_config_check: bool = update_request.expected_provider_config.is_some();
+        let expected_provider_config: Option<serde_json::Value> =
+            update_request.expected_provider_config.clone().flatten();
 
         let row = retry_db!("upsert_model_pricing", {
             let client = self
@@ -405,7 +412,7 @@ impl ModelRepository {
             let row = if existing.is_some() {
                 // Model exists - do UPDATE (partial updates work)
                 let updated_row = client
-                    .query_one(
+                    .query_opt(
                         r#"
                         UPDATE models SET
                             input_cost_per_token = COALESCE($2, input_cost_per_token),
@@ -440,6 +447,9 @@ impl ModelRepository {
                             is_listed = COALESCE($37, is_listed),
                             updated_at = NOW()
                         WHERE model_name = $1
+                          AND (NOT $38
+                               OR provider_config IS NOT DISTINCT FROM $39
+                               OR provider_config IS NOT DISTINCT FROM $14)
                         RETURNING id, model_name, model_display_name, model_description, model_icon,
                                   input_cost_per_token, output_cost_per_token, cost_per_image, cache_read_cost_per_token, text_pricing,
                                   context_length, verifiable, is_active, owned_by, created_at, updated_at,
@@ -484,10 +494,17 @@ impl ModelRepository {
                             &successor_value,
                             &successor_clear,
                             &update_request.is_listed,
+                            &provider_config_check,
+                            &expected_provider_config,
                         ],
                     )
                     .await
                     .map_err(map_db_error)?;
+                // No row: provider_config changed since the caller read it.
+                // Returned as None so the retry loop does not re-run the write.
+                let Some(updated_row) = updated_row else {
+                    return Ok(None);
+                };
 
                 // Record history: close previous history record and insert new one
                 let model_id: uuid::Uuid = updated_row.get("id");
@@ -502,7 +519,7 @@ impl ModelRepository {
                 .await
                 .map_err(RepositoryError::DatabaseError)?;
 
-                updated_row
+                Some(updated_row)
             } else {
                 // Model doesn't exist - do INSERT with ON CONFLICT to handle race conditions
                 // Use INSERT ... ON CONFLICT to handle race conditions where another
@@ -637,11 +654,12 @@ impl ModelRepository {
                 .await
                 .map_err(RepositoryError::DatabaseError)?;
 
-                inserted_row
+                Some(inserted_row)
             };
 
             Ok(row)
         })?;
+        let row = row.ok_or(RepositoryError::TransactionConflict)?;
 
         Ok(self.row_to_model(&row))
     }

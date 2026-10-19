@@ -517,6 +517,18 @@ fn not_found(message: impl Into<String>, code: &str) -> (StatusCode, ResponseJso
 ///
 /// Upserts (inserts or updates) pricing and metadata for one or more models. Only authenticated admins can perform this operation.
 /// The body should be an array of objects where each key is a model name and the value is the model data.
+///
+/// `providerConfig` on an existing model merges into the stored config at the top level:
+/// keys sent replace stored keys, a key sent as `null` is removed, and omitted keys are kept.
+/// A new model stores `providerConfig` as sent.
+///
+/// `providerConfig.api_key` is returned as `"***"` by admin reads. Sending `"***"` back keeps
+/// the stored key, and is rejected with 400 when no key is stored. Changing `backend` or
+/// `base_url` while keeping a stored key is rejected; send `api_key` again, or `null` to use
+/// the server key, which is only sent to the provider's official HTTPS host.
+///
+/// A `providerConfig` write applies only if the stored config has not changed since it was
+/// read for the merge; otherwise it fails with 409 and can be retried.
 #[utoipa::path(
     patch,
     path = "/v1/admin/models",
@@ -526,6 +538,7 @@ fn not_found(message: impl Into<String>, code: &str) -> (StatusCode, ResponseJso
         (status = 200, description = "Models upserted successfully", body = Vec<ModelWithPricing>),
         (status = 400, description = "Invalid request", body = ErrorResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 409, description = "providerConfig changed concurrently; retry", body = ErrorResponse),
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
     security(
@@ -553,31 +566,10 @@ pub async fn batch_upsert_models(
         ));
     }
 
-    // Validate all pricing fields are non-negative to prevent incorrect billing
+    // Validate all pricing fields are non-negative to prevent incorrect billing.
+    // `providerConfig` is validated by the service layer after it is merged
+    // into the stored config, since a partial write is not a full config.
     for (model_name, request) in &batch_request {
-        if let Some(config) = &request.provider_config {
-            // Backend-less configs belong to non-external features such as
-            // long-context routing. The service layer repeats this validation
-            // against the merged stored provider type, which covers partial
-            // updates that omit `providerType`.
-            if request.provider_type.as_deref() == Some("external")
-                || config.get("backend").is_some()
-                || config.get("enforced_request_body").is_some()
-            {
-                inference_providers::non_attested::external::validate_external_provider_config(
-                    config,
-                )
-                .map_err(|error| {
-                    (
-                        StatusCode::BAD_REQUEST,
-                        ResponseJson(ErrorResponse::new(
-                            format!("model '{model_name}': {error}"),
-                            "invalid_request".to_string(),
-                        )),
-                    )
-                })?;
-            }
-        }
         let validate_price = |price: &Option<DecimalPriceRequest>, field: &str| {
             if let Some(p) = price {
                 p.validate().map_err(|e| {
@@ -826,6 +818,8 @@ pub async fn batch_upsert_models(
                         owned_by: request.owned_by.clone(),
                         provider_type: request.provider_type.clone(),
                         provider_config: request.provider_config.clone(),
+                        // Set by the service from the stored row it merges into.
+                        expected_provider_config: None,
                         attestation_supported: request.attestation_supported,
                         input_modalities: request.input_modalities.clone(),
                         output_modalities: request.output_modalities.clone(),
@@ -884,9 +878,14 @@ pub async fn batch_upsert_models(
                     StatusCode::BAD_REQUEST,
                     ResponseJson(ErrorResponse::new(msg, "invalid_pricing".to_string())),
                 ),
-                services::admin::AdminError::InvalidDeprecation(msg) => (
+                services::admin::AdminError::InvalidDeprecation(msg)
+                | services::admin::AdminError::InvalidParams(msg) => (
                     StatusCode::BAD_REQUEST,
                     ResponseJson(ErrorResponse::new(msg, "invalid_request".to_string())),
+                ),
+                services::admin::AdminError::ModelUpdateConflict(msg) => (
+                    StatusCode::CONFLICT,
+                    ResponseJson(ErrorResponse::new(msg, "conflict".to_string())),
                 ),
                 services::admin::AdminError::Unauthorized(msg) => (
                     StatusCode::UNAUTHORIZED,
@@ -2439,7 +2438,8 @@ fn admin_error_to_response(
             StatusCode::NOT_FOUND,
             ResponseJson(ErrorResponse::new(msg, "not_found".to_string())),
         ),
-        services::admin::AdminError::PricingChangeConflict(msg) => (
+        services::admin::AdminError::PricingChangeConflict(msg)
+        | services::admin::AdminError::ModelUpdateConflict(msg) => (
             StatusCode::CONFLICT,
             ResponseJson(ErrorResponse::new(msg, "conflict".to_string())),
         ),

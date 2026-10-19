@@ -444,7 +444,8 @@ mod tests {
         let _ = pool
             .load_external_providers(vec![(
                 "m-tf".to_string(),
-                serde_json::json!({"backend": "openai_compatible", "base_url": "https://example.invalid"}),
+                serde_json::json!({"backend": "openai_compatible", "base_url": "https://example.invalid",
+                    "api_key": "sk-test-key"}),
             )])
             .await;
         assert!(!pool.has_provider("m-tf").await);
@@ -465,7 +466,8 @@ mod tests {
         let _ = pool
             .load_external_providers(vec![(
                 "m-ch".to_string(),
-                serde_json::json!({"backend": "openai_compatible", "base_url": "https://example.invalid"}),
+                serde_json::json!({"backend": "openai_compatible", "base_url": "https://example.invalid",
+                    "api_key": "sk-test-key"}),
             )])
             .await;
         assert!(pool.has_provider("m-ch").await);

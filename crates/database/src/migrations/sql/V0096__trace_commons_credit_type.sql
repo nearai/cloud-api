@@ -16,15 +16,22 @@
 -- position the application's priority gives it. No transfer totals row can
 -- exist for trace_commons, so its effective capacity equals its limit.
 -- No rows are changed.
+--
+-- The new CHECKs accept a superset of the old values, so no existing row can
+-- fail them. NOT VALID skips the full-table scan, which would otherwise hold
+-- ACCESS EXCLUSIVE on usage_credit_allocations, a table written on every
+-- funded posting, until this migration commits. New rows are still checked.
+
+SET LOCAL lock_timeout = '5s';
 
 ALTER TABLE usage_credit_allocations
     DROP CONSTRAINT usage_credit_allocations_credit_type_check;
 ALTER TABLE usage_credit_allocations
     ADD CONSTRAINT usage_credit_allocations_credit_type_check
-    CHECK (credit_type IN ('grant', 'postpay', 'staking_farm', 'payment', 'transfer', 'trace_commons'));
+    CHECK (credit_type IN ('grant', 'postpay', 'staking_farm', 'payment', 'transfer', 'trace_commons')) NOT VALID;
 
 ALTER TABLE organization_credit_consumption
     DROP CONSTRAINT organization_credit_consumption_credit_type_check;
 ALTER TABLE organization_credit_consumption
     ADD CONSTRAINT organization_credit_consumption_credit_type_check
-    CHECK (credit_type IN ('grant', 'postpay', 'staking_farm', 'payment', 'transfer', 'trace_commons'));
+    CHECK (credit_type IN ('grant', 'postpay', 'staking_farm', 'payment', 'transfer', 'trace_commons')) NOT VALID;

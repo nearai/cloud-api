@@ -60,7 +60,7 @@ fn resolve_provider_config(
     let stored_config = stored.flatten();
     let stored_key = stored_config
         .and_then(|config| config.get("api_key"))
-        .filter(|key| key.as_str().is_some_and(|key| key != REDACTED_API_KEY))
+        .filter(|key| !key.is_null() && key.as_str() != Some(REDACTED_API_KEY))
         .cloned();
     let sent_key = patch.get("api_key");
     let sent_redacted_key = sent_key.and_then(serde_json::Value::as_str) == Some(REDACTED_API_KEY);
@@ -1683,6 +1683,10 @@ mod provider_config_tests {
 
         let config = update(&stored_external(), json!({"api_key": "***"})).unwrap();
         assert_eq!(config, stored_external());
+
+        // Admin reads redact any non-null key, so any non-null key round-trips.
+        let stored = json!({"api_key": {"token": "secret"}});
+        assert_eq!(update(&stored, json!({"api_key": "***"})).unwrap(), stored);
     }
 
     #[test]

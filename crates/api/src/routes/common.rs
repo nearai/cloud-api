@@ -564,13 +564,13 @@ pub fn validate_encryption_headers(
 
 /// Redact sensitive fields (e.g. `api_key`) from a `provider_config` JSON value.
 ///
-/// Replaces a stored `api_key` with `"***"` so callers can tell whether one is
-/// configured without exposing the actual value. A `null` key stays `null`, so
+/// Replaces any stored `api_key` value with `"***"` so callers can tell whether
+/// one is configured without exposing it. A `null` key stays `null`, so
 /// writing a read back never sends `"***"` for a model without a key.
 pub fn redact_provider_config(config: Option<serde_json::Value>) -> Option<serde_json::Value> {
     config.map(|mut v| {
         if let Some(obj) = v.as_object_mut() {
-            if obj.get("api_key").is_some_and(serde_json::Value::is_string) {
+            if obj.get("api_key").is_some_and(|key| !key.is_null()) {
                 obj.insert(
                     "api_key".to_string(),
                     serde_json::Value::String(services::admin::REDACTED_API_KEY.to_string()),
@@ -688,6 +688,27 @@ pub fn analytics_error_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn redact_provider_config_hides_every_present_key() {
+        for key in [
+            serde_json::json!("sk-secret"),
+            serde_json::json!({"token": "secret"}),
+            serde_json::json!(["secret"]),
+            serde_json::json!(42),
+        ] {
+            let redacted = redact_provider_config(Some(serde_json::json!({"api_key": key})));
+            assert_eq!(redacted, Some(serde_json::json!({"api_key": "***"})));
+        }
+        assert_eq!(
+            redact_provider_config(Some(serde_json::json!({"api_key": null}))),
+            Some(serde_json::json!({"api_key": null}))
+        );
+        assert_eq!(
+            redact_provider_config(Some(serde_json::json!({"base_url": "https://x"}))),
+            Some(serde_json::json!({"base_url": "https://x"}))
+        );
+    }
 
     #[test]
     fn map_organization_error_staking_wallet_bound_returns_conflict() {

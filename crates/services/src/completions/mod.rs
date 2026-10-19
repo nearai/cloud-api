@@ -121,6 +121,7 @@ where
     inner: S,
     attestation_service: Arc<dyn AttestationServiceTrait>,
     usage_service: Arc<dyn UsageServiceTrait + Send + Sync>,
+    pricing_snapshot: Option<crate::usage::ModelPricing>,
     metrics_service: Arc<dyn MetricsServiceTrait>,
     // IDs for usage tracking (database) and tracing
     request_id: Uuid,
@@ -405,6 +406,7 @@ where
             first_token_time.map(|first_token| first_token.duration_since(self.service_start_time));
         let stream_completed = self.stream_completed;
         let provider_attribution = self.provider_attribution;
+        let pricing_snapshot = self.pricing_snapshot.clone();
         let cache_write = self
             .cache_write_cost_per_token
             .filter(|_| anthropic_cache_write_tokens > 0)
@@ -463,6 +465,7 @@ where
                         last_finish_reason.as_ref(),
                     ));
                     let usage_request = RecordUsageServiceRequest {
+                        pricing_snapshot,
                         discount: None,
                         organization_id,
                         workspace_id,
@@ -1755,6 +1758,7 @@ impl CompletionServiceImpl {
         workspace_id: Uuid,
         api_key_id: Uuid,
         model_id: Uuid,
+        pricing_snapshot: crate::usage::ModelPricing,
         model_name: String,
         inference_type: crate::usage::ports::InferenceType,
         service_start_time: Instant,
@@ -1780,6 +1784,7 @@ impl CompletionServiceImpl {
             .record_latency(METRIC_LATENCY_QUEUE_TIME, queue_time, &tags_str);
 
         let intercepted_stream = InterceptStream {
+            pricing_snapshot: Some(pricing_snapshot),
             inner: llm_stream,
             attestation_service: self.attestation_service.clone(),
             usage_service: self.usage_service.clone(),
@@ -2032,6 +2037,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
                 workspace_id,
                 api_key_id,
                 model.id,
+                (&model).into(),
                 model.model_name.clone(),
                 inference_type,
                 service_start_time,
@@ -2315,6 +2321,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
 
         usage_service
             .record_usage(RecordUsageServiceRequest {
+                pricing_snapshot: Some((&model).into()),
                 discount: None,
                 organization_id,
                 workspace_id,
@@ -2369,6 +2376,31 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         params: inference_providers::AudioTranscriptionParams,
         request_hash: String,
     ) -> Result<inference_providers::AudioTranscriptionResponse, ports::CompletionError> {
+        Ok(self
+            .audio_transcription_with_attribution(
+                organization_id,
+                model_id,
+                model_name,
+                params,
+                request_hash,
+            )
+            .await?
+            .response)
+    }
+
+    async fn audio_transcription_with_attribution(
+        &self,
+        organization_id: uuid::Uuid,
+        model_id: uuid::Uuid,
+        model_name: &str,
+        params: inference_providers::AudioTranscriptionParams,
+        request_hash: String,
+    ) -> Result<
+        crate::inference_provider_pool::AttributedInference<
+            inference_providers::AudioTranscriptionResponse,
+        >,
+        ports::CompletionError,
+    > {
         // Acquire concurrent request slot to enforce organization limits
         let counter = self
             .try_acquire_concurrent_slot(organization_id, model_id, model_name)
@@ -2382,7 +2414,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         let result = tokio::time::timeout(
             timeout_duration,
             self.inference_provider_pool
-                .audio_transcription(params, request_hash),
+                .audio_transcription_with_attribution(params, request_hash),
         )
         .await;
 
@@ -2433,6 +2465,22 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         model_name: &str,
         params: inference_providers::RerankParams,
     ) -> Result<inference_providers::RerankResponse, ports::CompletionError> {
+        Ok(self
+            .try_rerank_with_attribution(organization_id, model_id, model_name, params)
+            .await?
+            .response)
+    }
+
+    async fn try_rerank_with_attribution(
+        &self,
+        organization_id: Uuid,
+        model_id: Uuid,
+        model_name: &str,
+        params: inference_providers::RerankParams,
+    ) -> Result<
+        crate::inference_provider_pool::AttributedInference<inference_providers::RerankResponse>,
+        ports::CompletionError,
+    > {
         // Acquire concurrent request slot to enforce organization limits
         let counter = self
             .try_acquire_concurrent_slot(organization_id, model_id, model_name)
@@ -2443,7 +2491,10 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
 
         // Call inference provider pool
         // The guard will automatically release the slot when this function returns or panics
-        let result = self.inference_provider_pool.rerank(params).await;
+        let result = self
+            .inference_provider_pool
+            .rerank_with_attribution(params)
+            .await;
 
         // Map provider errors to service errors with proper status codes
         result.map_err(|e| match e {
@@ -2486,13 +2537,30 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         body: bytes::Bytes,
         extra: std::collections::HashMap<String, serde_json::Value>,
     ) -> Result<bytes::Bytes, ports::CompletionError> {
+        Ok(self
+            .try_embeddings_with_attribution(organization_id, model_id, model_name, body, extra)
+            .await?
+            .response)
+    }
+
+    async fn try_embeddings_with_attribution(
+        &self,
+        organization_id: Uuid,
+        model_id: Uuid,
+        model_name: &str,
+        body: bytes::Bytes,
+        extra: std::collections::HashMap<String, serde_json::Value>,
+    ) -> Result<
+        crate::inference_provider_pool::AttributedInference<bytes::Bytes>,
+        ports::CompletionError,
+    > {
         let counter = self
             .try_acquire_concurrent_slot(organization_id, model_id, model_name)
             .await?;
         let _guard = ConcurrentSlotGuard::new(counter);
 
         self.inference_provider_pool
-            .embeddings(model_name, body, extra)
+            .embeddings_with_attribution(model_name, body, extra)
             .await
             .map_err(|e| match e {
                 inference_providers::EmbeddingError::RequestFailed(msg) => {
@@ -2534,13 +2602,36 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         body: bytes::Bytes,
         extra: std::collections::HashMap<String, serde_json::Value>,
     ) -> Result<bytes::Bytes, ports::CompletionError> {
+        Ok(self
+            .try_privacy_classify_with_attribution(
+                organization_id,
+                model_id,
+                model_name,
+                body,
+                extra,
+            )
+            .await?
+            .response)
+    }
+
+    async fn try_privacy_classify_with_attribution(
+        &self,
+        organization_id: Uuid,
+        model_id: Uuid,
+        model_name: &str,
+        body: bytes::Bytes,
+        extra: std::collections::HashMap<String, serde_json::Value>,
+    ) -> Result<
+        crate::inference_provider_pool::AttributedInference<bytes::Bytes>,
+        ports::CompletionError,
+    > {
         let counter = self
             .try_acquire_concurrent_slot(organization_id, model_id, model_name)
             .await?;
         let _guard = ConcurrentSlotGuard::new(counter);
 
         self.inference_provider_pool
-            .privacy_classify(model_name, body, extra)
+            .privacy_classify_with_attribution(model_name, body, extra)
             .await
             .map_err(|e| match e {
                 inference_providers::PrivacyClassifyError::RequestFailed(msg) => {
@@ -2582,6 +2673,23 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         request_hash: String,
         params: inference_providers::ScoreParams,
     ) -> Result<inference_providers::ScoreResponse, ports::CompletionError> {
+        Ok(self
+            .try_score_with_attribution(organization_id, model_id, model_name, request_hash, params)
+            .await?
+            .response)
+    }
+
+    async fn try_score_with_attribution(
+        &self,
+        organization_id: Uuid,
+        model_id: Uuid,
+        model_name: &str,
+        request_hash: String,
+        params: inference_providers::ScoreParams,
+    ) -> Result<
+        crate::inference_provider_pool::AttributedInference<inference_providers::ScoreResponse>,
+        ports::CompletionError,
+    > {
         // Acquire concurrent request slot to enforce organization limits
         let counter = self
             .try_acquire_concurrent_slot(organization_id, model_id, model_name)
@@ -2594,7 +2702,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         // The guard will automatically release the slot when this function returns or panics
         let result = self
             .inference_provider_pool
-            .score(params, request_hash)
+            .score_with_attribution(params, request_hash)
             .await;
 
         // Map provider errors to service errors with proper status codes
@@ -2718,6 +2826,7 @@ mod tests {
     > {
         let now = Instant::now();
         InterceptStream {
+            pricing_snapshot: None,
             inner: stream::iter(events),
             attestation_service: Arc::new(MockAttestationService),
             usage_service: Arc::new(MockUsageService),
@@ -2936,6 +3045,7 @@ mod tests {
 
         let now = Instant::now();
         let mut intercept_stream = InterceptStream {
+            pricing_snapshot: None,
             inner: stream,
             attestation_service,
             usage_service,
@@ -3110,6 +3220,7 @@ mod tests {
         };
         let stream = stream::iter(vec![Ok(usage_chunk)]);
         let intercept_stream = InterceptStream {
+            pricing_snapshot: None,
             inner: stream,
             attestation_service: Arc::new(MockAttestationService),
             usage_service: usage_service.clone(),
@@ -3265,6 +3376,7 @@ mod tests {
         let provider_start_time = Instant::now() - Duration::from_millis(25);
 
         let intercept_stream = InterceptStream {
+            pricing_snapshot: None,
             inner: stream,
             attestation_service,
             usage_service: usage_service.clone(),
@@ -3394,6 +3506,7 @@ mod tests {
 
         let now = Instant::now();
         let intercept_stream = InterceptStream {
+            pricing_snapshot: None,
             inner: stream,
             attestation_service,
             usage_service: usage_service.clone(),
@@ -3605,6 +3718,7 @@ mod tests {
                 stream::iter::<Vec<Result<SSEEvent, inference_providers::CompletionError>>>(vec![]);
 
             let _intercept_stream = InterceptStream {
+                pricing_snapshot: None,
                 inner: stream,
                 attestation_service,
                 usage_service,

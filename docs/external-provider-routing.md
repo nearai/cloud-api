@@ -293,9 +293,9 @@ is `estimated`, and an unobserved/failed/cancelled charge remains `unknown`.
 
 Do not treat the management or transport-fixture tests as proof of full #1273.
 Remaining work includes registry-authoritative import and rollback for all legacy
-NEAR/long-context/Chutes/Tinfoil sources; non-token billing units; stable actual
-deployment attribution for every non-chat path and public inference response; and process-level real-vendor and
-verifier-backed TEE acceptance evidence. Live acceptance requires provisioned
+NEAR/long-context/Chutes/Tinfoil sources; non-token billing units; complete auxiliary
+inference billing and attribution; public inference-response deployment IDs; and
+process-level real-vendor and verifier-backed TEE acceptance evidence. Live acceptance requires provisioned
 upstreams and credential references. The current mocks prove management and
 transport behavior only.
 
@@ -347,3 +347,10 @@ Usage rows and usage history/report APIs carry nullable `served_route_id` and
 records the pair atomically with the debit, validates that it belongs to the
 billed model, and preserves it on duplicate submissions. Historical/legacy
 rows remain null; no security or deployment identity is guessed retroactively.
+
+Primary API inference billing carries the accepted catalog rate snapshot through
+provider completion and asynchronous stream finalization. Usage rows retain it
+in `billingDetails.accepted_catalog_pricing`; provider cost profiles cannot alter
+those customer rates. Trusted external usage reporters retain the documented
+current-catalog pricing behavior. Auxiliary auto-redaction and Responses image
+billing still need full acceptance coverage.

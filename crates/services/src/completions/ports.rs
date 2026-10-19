@@ -208,6 +208,27 @@ pub trait CompletionServiceTrait: Send + Sync {
         request_hash: String,
     ) -> Result<inference_providers::AudioTranscriptionResponse, CompletionError>;
 
+    async fn audio_transcription_with_attribution(
+        &self,
+        organization_id: uuid::Uuid,
+        model_id: uuid::Uuid,
+        model_name: &str,
+        params: inference_providers::AudioTranscriptionParams,
+        request_hash: String,
+    ) -> Result<
+        crate::inference_provider_pool::AttributedInference<
+            inference_providers::AudioTranscriptionResponse,
+        >,
+        CompletionError,
+    > {
+        Ok(crate::inference_provider_pool::AttributedInference {
+            response: self
+                .audio_transcription(organization_id, model_id, model_name, params, request_hash)
+                .await?,
+            provider_attribution: crate::usage::ProviderAttribution::default(),
+        })
+    }
+
     /// Execute a rerank request with proper concurrent request limiting.
     ///
     /// Each organization has a per-model concurrent request limit (default: 64).
@@ -222,6 +243,24 @@ pub trait CompletionServiceTrait: Send + Sync {
         params: inference_providers::RerankParams,
     ) -> Result<inference_providers::RerankResponse, CompletionError>;
 
+    async fn try_rerank_with_attribution(
+        &self,
+        organization_id: Uuid,
+        model_id: Uuid,
+        model_name: &str,
+        params: inference_providers::RerankParams,
+    ) -> Result<
+        crate::inference_provider_pool::AttributedInference<inference_providers::RerankResponse>,
+        CompletionError,
+    > {
+        Ok(crate::inference_provider_pool::AttributedInference {
+            response: self
+                .try_rerank(organization_id, model_id, model_name, params)
+                .await?,
+            provider_attribution: crate::usage::ProviderAttribution::default(),
+        })
+    }
+
     /// Execute an embeddings request as a raw passthrough with concurrent request limiting.
     async fn try_embeddings(
         &self,
@@ -232,6 +271,23 @@ pub trait CompletionServiceTrait: Send + Sync {
         extra: std::collections::HashMap<String, serde_json::Value>,
     ) -> Result<bytes::Bytes, CompletionError>;
 
+    async fn try_embeddings_with_attribution(
+        &self,
+        organization_id: Uuid,
+        model_id: Uuid,
+        model_name: &str,
+        body: bytes::Bytes,
+        extra: std::collections::HashMap<String, serde_json::Value>,
+    ) -> Result<crate::inference_provider_pool::AttributedInference<bytes::Bytes>, CompletionError>
+    {
+        Ok(crate::inference_provider_pool::AttributedInference {
+            response: self
+                .try_embeddings(organization_id, model_id, model_name, body, extra)
+                .await?,
+            provider_attribution: crate::usage::ProviderAttribution::default(),
+        })
+    }
+
     /// Execute a privacy classification request as a raw passthrough with concurrent request limiting.
     async fn try_privacy_classify(
         &self,
@@ -241,6 +297,23 @@ pub trait CompletionServiceTrait: Send + Sync {
         body: bytes::Bytes,
         extra: std::collections::HashMap<String, serde_json::Value>,
     ) -> Result<bytes::Bytes, CompletionError>;
+
+    async fn try_privacy_classify_with_attribution(
+        &self,
+        organization_id: Uuid,
+        model_id: Uuid,
+        model_name: &str,
+        body: bytes::Bytes,
+        extra: std::collections::HashMap<String, serde_json::Value>,
+    ) -> Result<crate::inference_provider_pool::AttributedInference<bytes::Bytes>, CompletionError>
+    {
+        Ok(crate::inference_provider_pool::AttributedInference {
+            response: self
+                .try_privacy_classify(organization_id, model_id, model_name, body, extra)
+                .await?,
+            provider_attribution: crate::usage::ProviderAttribution::default(),
+        })
+    }
 
     /// Execute a score request with proper concurrent request limiting.
     ///
@@ -256,6 +329,25 @@ pub trait CompletionServiceTrait: Send + Sync {
         request_hash: String,
         params: inference_providers::ScoreParams,
     ) -> Result<inference_providers::ScoreResponse, CompletionError>;
+
+    async fn try_score_with_attribution(
+        &self,
+        organization_id: Uuid,
+        model_id: Uuid,
+        model_name: &str,
+        request_hash: String,
+        params: inference_providers::ScoreParams,
+    ) -> Result<
+        crate::inference_provider_pool::AttributedInference<inference_providers::ScoreResponse>,
+        CompletionError,
+    > {
+        Ok(crate::inference_provider_pool::AttributedInference {
+            response: self
+                .try_score(organization_id, model_id, model_name, request_hash, params)
+                .await?,
+            provider_attribution: crate::usage::ProviderAttribution::default(),
+        })
+    }
 
     /// Resolve an active model by canonical name or alias (for capability checks, etc.).
     async fn get_model(

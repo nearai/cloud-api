@@ -143,6 +143,7 @@ pub async fn systemone(
         let inference_id = hash_inference_id_to_uuid(decision_id);
         let usage = &served.response.response.usage;
         let usage_request = RecordUsageServiceRequest {
+            pricing_snapshot: Some((&model).into()),
             organization_id: api_key.organization.id.0,
             workspace_id: api_key.workspace.id.0,
             api_key_id,

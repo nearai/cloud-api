@@ -50,10 +50,6 @@ async fn setup_profiled_model(
     model: &str,
     aliases: &[&str],
 ) {
-    let provider_trait: Arc<dyn InferenceProvider + Send + Sync> = provider;
-    pool.register_provider(model.to_string(), provider_trait)
-        .await;
-
     let mut batch = api::models::BatchUpdateModelApiRequest::new();
     batch.insert(
         model.to_string(),
@@ -66,6 +62,8 @@ async fn setup_profiled_model(
             "isActive": true,
             "aliases": aliases,
             "ownedBy": "openai",
+            "providerType": "external",
+            "verifiable": false,
             "attestationSupported": false,
             "inputModalities": ["text", "image"],
             "outputModalities": ["text"]
@@ -73,6 +71,9 @@ async fn setup_profiled_model(
         .unwrap(),
     );
     let models = admin_batch_upsert_models(server, batch, get_session_id()).await;
+    let provider_trait: Arc<dyn InferenceProvider + Send + Sync> = provider;
+    pool.register_provider(model.to_string(), provider_trait)
+        .await;
     assert_eq!(models.len(), 1);
     assert_eq!(models[0].input_cost_per_token.amount, 5_000);
     assert_eq!(

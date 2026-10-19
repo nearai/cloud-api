@@ -218,6 +218,16 @@ async fn fallback_chutes_attribution_reaches_usage_request() {
 
     let requests = wait_for_usage_requests(&usage_service, 1).await;
     assert_eq!(requests.len(), 1, "expected one usage request");
+    let accepted = requests[0]
+        .pricing_snapshot
+        .as_ref()
+        .expect("accepted pricing must reach billing");
+    assert_eq!(accepted.id, requests[0].model_id);
+    assert_eq!(
+        accepted.input_cost_per_token,
+        test_model(model_name).input_cost_per_token
+    );
+
     let attribution = requests[0].provider_attribution;
     assert!(!response.response.id.is_empty());
     assert_eq!(
@@ -244,6 +254,16 @@ async fn primary_near_attribution_reaches_usage_request() {
 
     let requests = wait_for_usage_requests(&usage_service, 1).await;
     assert_eq!(requests.len(), 1, "expected one usage request");
+    let accepted = requests[0]
+        .pricing_snapshot
+        .as_ref()
+        .expect("accepted pricing must reach billing");
+    assert_eq!(accepted.id, requests[0].model_id);
+    assert_eq!(
+        accepted.input_cost_per_token,
+        test_model(model_name).input_cost_per_token
+    );
+
     let attribution = requests[0].provider_attribution;
     assert!(!response.response.id.is_empty());
     assert_eq!(

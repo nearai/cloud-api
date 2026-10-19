@@ -163,6 +163,7 @@ impl NativeUsage {
 
 #[derive(Clone)]
 struct NativeBillingContext {
+    pricing_snapshot: Option<services::usage::ModelPricing>,
     usage_service: Arc<dyn UsageServiceTrait + Send + Sync>,
     organization_id: Uuid,
     workspace_id: Uuid,
@@ -546,6 +547,7 @@ async fn handle_request(
     };
 
     let billing = billing_seed.map(|seed| NativeBillingContext {
+        pricing_snapshot: Some((&model).into()),
         usage_service: app_state.usage_service,
         organization_id: api_key.organization.id.0,
         workspace_id: api_key.workspace.id.0,
@@ -1123,6 +1125,7 @@ async fn record_native_usage(
     // upstream response carried no id.
     let inference_id = usage.inference_id().unwrap_or_else(Uuid::new_v4);
     let request = RecordUsageServiceRequest {
+        pricing_snapshot: context.pricing_snapshot.clone(),
         discount: None,
         organization_id: context.organization_id,
         workspace_id: context.workspace_id,
@@ -1900,6 +1903,7 @@ redact-thinking-2026-02-12";
 
     fn billing_context(usage_service: Arc<RecordingUsageService>) -> NativeBillingContext {
         NativeBillingContext {
+            pricing_snapshot: None,
             usage_service,
             organization_id: Uuid::new_v4(),
             workspace_id: Uuid::new_v4(),

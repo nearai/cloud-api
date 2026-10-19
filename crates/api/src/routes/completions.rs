@@ -172,6 +172,7 @@ struct ImageUsageRecord<'a> {
     workspace_id: Uuid,
     api_key_id: Uuid,
     model_id: Uuid,
+    pricing_snapshot: services::usage::ModelPricing,
     provider_request_id: &'a str,
     image_count: i32,
     provider_attribution: services::usage::ProviderAttribution,
@@ -183,6 +184,7 @@ fn build_image_usage_request(
     record: ImageUsageRecord<'_>,
 ) -> services::usage::RecordUsageServiceRequest {
     services::usage::RecordUsageServiceRequest {
+        pricing_snapshot: Some(record.pricing_snapshot),
         organization_id: record.organization_id,
         workspace_id: record.workspace_id,
         api_key_id: record.api_key_id,
@@ -879,6 +881,7 @@ async fn bill_auto_redact_classify(
     };
 
     let usage_request = services::usage::RecordUsageServiceRequest {
+        pricing_snapshot: Some((&model).into()),
         organization_id: api_key.organization.id.0,
         workspace_id: api_key.workspace.id.0,
         api_key_id,
@@ -5331,6 +5334,7 @@ pub async fn image_generations(
             };
 
             let usage_request = build_image_usage_request(ImageUsageRecord {
+                pricing_snapshot: (&model).into(),
                 organization_id,
                 workspace_id,
                 api_key_id,
@@ -5641,7 +5645,7 @@ pub async fn audio_transcriptions(
     // Call completion service which handles concurrent request limiting
     match app_state
         .completion_service
-        .audio_transcription(
+        .audio_transcription_with_attribution(
             organization_id,
             model_id,
             &model_name,
@@ -5650,7 +5654,9 @@ pub async fn audio_transcriptions(
         )
         .await
     {
-        Ok(response) => {
+        Ok(served) => {
+            let provider_attribution = served.provider_attribution;
+            let response = served.response;
             // Record usage for audio transcription SYNCHRONOUSLY before returning response
             // Critical for financial accuracy: if usage recording fails, client gets 500 error
             // rather than 200 success. This prevents lost revenue and maintains audit trail.
@@ -5684,6 +5690,7 @@ pub async fn audio_transcriptions(
 
             let inference_id = uuid::Uuid::new_v4();
             let usage_request = services::usage::RecordUsageServiceRequest {
+                pricing_snapshot: Some((&model).into()),
                 organization_id,
                 workspace_id,
                 api_key_id,
@@ -5704,7 +5711,7 @@ pub async fn audio_transcriptions(
                 response_id: None,
                 image_count: None,
                 discount: None,
-                provider_attribution: services::usage::ProviderAttribution::default(),
+                provider_attribution,
             };
 
             // Record usage synchronously - fail the request if usage recording fails
@@ -6176,6 +6183,7 @@ pub async fn image_edits(
             };
 
             let usage_request = build_image_usage_request(ImageUsageRecord {
+                pricing_snapshot: (&model).into(),
                 organization_id,
                 workspace_id,
                 api_key_id,
@@ -6470,10 +6478,12 @@ pub async fn rerank(
     // This prevents resource exhaustion and ensures fair usage. Returns 429 if limit exceeded.
     match app_state
         .completion_service
-        .try_rerank(organization_id, model_id, &request.model, params)
+        .try_rerank_with_attribution(organization_id, model_id, &request.model, params)
         .await
     {
-        Ok(mut response) => {
+        Ok(served) => {
+            let provider_attribution = served.provider_attribution;
+            let mut response = served.response;
             apply_rerank_response_options(&request, &mut response);
 
             // Record usage for rerank SYNCHRONOUSLY to ensure billing accuracy
@@ -6568,6 +6578,7 @@ pub async fn rerank(
 
             let inference_id = uuid::Uuid::new_v4();
             let usage_request = services::usage::RecordUsageServiceRequest {
+                pricing_snapshot: Some((&model).into()),
                 organization_id,
                 workspace_id,
                 api_key_id,
@@ -6588,7 +6599,7 @@ pub async fn rerank(
                 response_id: None,
                 image_count: None,
                 discount: None,
-                provider_attribution: services::usage::ProviderAttribution::default(),
+                provider_attribution,
             };
 
             // Record usage synchronously - this is billing-critical and must succeed
@@ -6825,10 +6836,12 @@ pub async fn embeddings(
 
     match app_state
         .completion_service
-        .try_embeddings(organization_id, model_id, &model_name, body, extra)
+        .try_embeddings_with_attribution(organization_id, model_id, &model_name, body, extra)
         .await
     {
-        Ok(response_bytes) => {
+        Ok(served) => {
+            let provider_attribution = served.provider_attribution;
+            let response_bytes = served.response;
             // Minimal deserialization: extract only usage for billing
             #[derive(serde::Deserialize)]
             struct UsageExtract {
@@ -6919,6 +6932,7 @@ pub async fn embeddings(
 
             let inference_id = uuid::Uuid::new_v4();
             let usage_request = services::usage::RecordUsageServiceRequest {
+                pricing_snapshot: Some((&model).into()),
                 organization_id,
                 workspace_id,
                 api_key_id,
@@ -6939,7 +6953,7 @@ pub async fn embeddings(
                 response_id: None,
                 image_count: None,
                 discount: None,
-                provider_attribution: services::usage::ProviderAttribution::default(),
+                provider_attribution,
             };
 
             if let Err(e) = app_state.usage_service.record_usage(usage_request).await {
@@ -7148,10 +7162,12 @@ pub async fn privacy_classify(
 
     match app_state
         .completion_service
-        .try_privacy_classify(organization_id, model_id, &model_name, body, extra)
+        .try_privacy_classify_with_attribution(organization_id, model_id, &model_name, body, extra)
         .await
     {
-        Ok(response_bytes) => {
+        Ok(served) => {
+            let provider_attribution = served.provider_attribution;
+            let response_bytes = served.response;
             // Privacy filter response shape:
             //   { "model": "...", "data": [{ "index": i, "spans": [...], "usage": { "input_tokens": N } }, ...] }
             // Sum per-item input_tokens for billing.
@@ -7257,6 +7273,7 @@ pub async fn privacy_classify(
 
             let inference_id = uuid::Uuid::new_v4();
             let usage_request = services::usage::RecordUsageServiceRequest {
+                pricing_snapshot: Some((&model).into()),
                 organization_id,
                 workspace_id,
                 api_key_id,
@@ -7277,7 +7294,7 @@ pub async fn privacy_classify(
                 response_id: None,
                 image_count: None,
                 discount: None,
-                provider_attribution: services::usage::ProviderAttribution::default(),
+                provider_attribution,
             };
 
             if let Err(e) = app_state.usage_service.record_usage(usage_request).await {
@@ -7590,9 +7607,9 @@ pub async fn privacy_redact(
         }
     };
 
-    let response_bytes = match app_state
+    let (response_bytes, provider_attribution) = match app_state
         .completion_service
-        .try_privacy_classify(
+        .try_privacy_classify_with_attribution(
             organization_id,
             model_id,
             &model_name,
@@ -7601,7 +7618,7 @@ pub async fn privacy_redact(
         )
         .await
     {
-        Ok(b) => b,
+        Ok(served) => (served.response, served.provider_attribution),
         Err(e) => {
             let (status_code, error_type, message) = match e {
                 services::completions::ports::CompletionError::RateLimitExceeded(msg) => {
@@ -7784,6 +7801,7 @@ pub async fn privacy_redact(
 
     let inference_id = uuid::Uuid::new_v4();
     let usage_request = services::usage::RecordUsageServiceRequest {
+        pricing_snapshot: Some((&model).into()),
         organization_id,
         workspace_id,
         api_key_id,
@@ -7808,7 +7826,7 @@ pub async fn privacy_redact(
         response_id: None,
         image_count: None,
         discount: None,
-        provider_attribution: services::usage::ProviderAttribution::default(),
+        provider_attribution,
     };
 
     if let Err(e) = app_state.usage_service.record_usage(usage_request).await {
@@ -7952,7 +7970,7 @@ pub async fn score(
     // This prevents resource exhaustion and ensures fair usage. Returns 429 if limit exceeded.
     match app_state
         .completion_service
-        .try_score(
+        .try_score_with_attribution(
             organization_id,
             model_id,
             &request.model,
@@ -7981,7 +7999,9 @@ pub async fn score(
         )
         .await
     {
-        Ok(response) => {
+        Ok(served) => {
+            let provider_attribution = served.provider_attribution;
+            let response = served.response;
             // Record usage for score SYNCHRONOUSLY to ensure billing accuracy
             // This is critical for revenue tracking and must complete before returning response
             let organization_id = api_key.organization.id.0;
@@ -8007,6 +8027,7 @@ pub async fn score(
 
             // Score requests don't have traditional token counts - use input token count as 1
             let usage_request = services::usage::ports::RecordUsageServiceRequest {
+                pricing_snapshot: Some((&model).into()),
                 organization_id,
                 workspace_id,
                 api_key_id,
@@ -8027,7 +8048,7 @@ pub async fn score(
                 response_id: None,
                 image_count: None,
                 discount: None,
-                provider_attribution: services::usage::ProviderAttribution::default(),
+                provider_attribution,
             };
 
             // Record usage with timeout to prevent blocking responses
@@ -8046,6 +8067,7 @@ pub async fn score(
                     );
                     let usage_service_clone = app_state.usage_service.clone();
                     let usage_request_retry = services::usage::ports::RecordUsageServiceRequest {
+                        pricing_snapshot: Some((&model).into()),
                         organization_id,
                         workspace_id,
                         api_key_id,
@@ -8066,7 +8088,7 @@ pub async fn score(
                         response_id: None,
                         image_count: None,
                         discount: None,
-                        provider_attribution: services::usage::ProviderAttribution::default(),
+                        provider_attribution,
                     };
                     tokio::spawn(async move {
                         if let Err(e) = usage_service_clone.record_usage(usage_request_retry).await
@@ -8088,6 +8110,7 @@ pub async fn score(
                     );
                     let usage_service_clone = app_state.usage_service.clone();
                     let usage_request_retry = services::usage::ports::RecordUsageServiceRequest {
+                        pricing_snapshot: Some((&model).into()),
                         organization_id,
                         workspace_id,
                         api_key_id,
@@ -8108,7 +8131,7 @@ pub async fn score(
                         response_id: None,
                         image_count: None,
                         discount: None,
-                        provider_attribution: services::usage::ProviderAttribution::default(),
+                        provider_attribution,
                     };
                     tokio::spawn(async move {
                         if let Err(e) = usage_service_clone.record_usage(usage_request_retry).await

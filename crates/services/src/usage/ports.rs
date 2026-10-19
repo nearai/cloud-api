@@ -602,6 +602,9 @@ pub struct CacheWriteBilling {
 
 #[derive(Debug, Clone)]
 pub struct RecordUsageServiceRequest {
+    /// Immutable catalog rates accepted before dispatch. Trusted legacy reporters
+    /// may omit this and explicitly use current catalog prices.
+    pub pricing_snapshot: Option<ModelPricing>,
     pub organization_id: Uuid,
     pub workspace_id: Uuid,
     pub api_key_id: Uuid,
@@ -838,7 +841,7 @@ pub struct RecordUsageDbRequest {
 
 /// Model pricing information
 /// All costs use fixed scale of 9 (nano-dollars) and USD currency
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ModelPricing {
     pub id: Uuid,
     pub model_name: String, // Canonical model name
@@ -850,6 +853,20 @@ pub struct ModelPricing {
     /// tokens billed at `x` (`Some(0)` = genuinely free).
     pub cache_read_cost_per_token: Option<i64>,
     pub text_pricing: Option<TextPricingProfile>,
+}
+
+impl From<&crate::models::ModelWithPricing> for ModelPricing {
+    fn from(model: &crate::models::ModelWithPricing) -> Self {
+        Self {
+            id: model.id,
+            model_name: model.model_name.clone(),
+            input_cost_per_token: model.input_cost_per_token,
+            output_cost_per_token: model.output_cost_per_token,
+            cost_per_image: model.cost_per_image,
+            cache_read_cost_per_token: model.cache_read_cost_per_token,
+            text_pricing: model.text_pricing.clone(),
+        }
+    }
 }
 
 /// Organization spending limit

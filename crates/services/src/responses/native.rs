@@ -135,6 +135,7 @@ impl NativeResponsesService {
                 NativeResponsesError::Provider("Native OpenAI Responses request failed")
             })?;
         let billing = Billing {
+            pricing_snapshot: (&model).into(),
             service: self.clone(),
             request_hash: context.request_hash,
             organization_id: context.organization_id,
@@ -153,6 +154,7 @@ impl NativeResponsesService {
 }
 
 struct Billing {
+    pricing_snapshot: crate::usage::ModelPricing,
     service: NativeResponsesService,
     request_hash: String,
     organization_id: Uuid,
@@ -290,6 +292,7 @@ impl Billing {
         let id = usage.id.clone();
         if let Some(tokens) = usage.tokens {
             let request = RecordUsageServiceRequest {
+                pricing_snapshot: Some(self.pricing_snapshot.clone()),
                 discount: None,
                 organization_id: self.organization_id,
                 workspace_id: self.workspace_id,

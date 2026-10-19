@@ -998,3 +998,82 @@ async fn provider_registry_organization_requirement_cannot_be_weakened() {
     assert_eq!(response.status_code(), StatusCode::BAD_GATEWAY);
     assert_eq!(response.json::<Value>()["error"]["type"], "bad_gateway");
 }
+
+#[tokio::test]
+async fn provider_registry_audio_usage_keeps_serving_identity_and_accepted_price() {
+    use wiremock::{matchers::path, Mock, MockServer, ResponseTemplate};
+    let upstream = MockServer::start().await;
+    Mock::given(path("/audio/transcriptions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(std::time::Duration::from_secs(3))
+                .set_body_json(json!({"text":"transport fixture", "duration":1.0})),
+        )
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    let (server, _, _, db) = crate::common::setup_test_server_with_pool_and_config(|config| {
+        config.external_providers.timeout_seconds = 10
+    })
+    .await;
+    let name = catalog(&server, true).await;
+    let mut definition = definition();
+    definition["config"]["base_url"] = json!(upstream.uri());
+    let provider = create(&server, definition).await;
+    approve(&server, provider, &name, true, false).await;
+    let org = crate::common::setup_org_with_credits(&server, 10_000_000_000).await;
+    let key = crate::common::get_api_key_for_org(&server, org.id.clone()).await;
+    let price_edited = std::sync::atomic::AtomicBool::new(false);
+    let request = async {
+        let response = server
+            .post("/v1/audio/transcriptions")
+            .add_header("Authorization", format!("Bearer {key}"))
+            .multipart(
+                axum_test::multipart::MultipartForm::new()
+                    .add_text("model", name.clone())
+                    .add_part(
+                        "file",
+                        axum_test::multipart::Part::bytes(vec![0u8; 128]).file_name("fixture.wav"),
+                    ),
+            )
+            .await;
+        assert!(
+            price_edited.load(std::sync::atomic::Ordering::SeqCst),
+            "price edit must finish before inference returns"
+        );
+        response
+    };
+    let edit_prices = async {
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while upstream.received_requests().await.unwrap().is_empty() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let mut batch = api::models::BatchUpdateModelApiRequest::new();
+        batch.insert(
+            name.clone(),
+            serde_json::from_value(json!({
+                "inputCostPerToken":{"amount":20_000_000,"currency":"USD"}
+            }))
+            .unwrap(),
+        );
+        admin_batch_upsert_models(&server, batch, get_session_id()).await;
+        price_edited.store(true, std::sync::atomic::Ordering::SeqCst);
+    };
+    let (response, ()) = tokio::join!(request, edit_prices);
+    assert_eq!(response.status_code(), 200, "{}", response.text());
+    let usage = db.pool().get().await.unwrap().query_one("SELECT served_route_id,served_deployment_id,total_cost,billing_details FROM organization_usage_log WHERE model_name=$1", &[&name]).await.unwrap();
+    assert_eq!(
+        usage.get::<_, Option<Uuid>>("served_deployment_id"),
+        Some(provider)
+    );
+    assert!(usage.get::<_, Option<Uuid>>("served_route_id").is_some());
+    assert_eq!(usage.get::<_, i64>("total_cost"), 1_000_000);
+    assert_eq!(
+        usage.get::<_, Value>("billing_details")["accepted_catalog_pricing"]
+            ["input_cost_per_token"],
+        1_000_000
+    );
+}

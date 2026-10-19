@@ -57,3 +57,10 @@ pub(super) fn served_provider_attribution(
         served_via_fallback,
     }
 }
+
+/// Successful non-chat response with the actual serving identity.
+#[derive(Debug)]
+pub struct AttributedInference<T> {
+    pub response: T,
+    pub provider_attribution: crate::usage::ProviderAttribution,
+}

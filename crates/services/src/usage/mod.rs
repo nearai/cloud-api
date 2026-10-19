@@ -270,15 +270,25 @@ impl UsageServiceTrait for UsageServiceImpl {
             .min(request.input_tokens.saturating_sub(cache_read_tokens))
             .max(0);
 
-        // Look up the model to get pricing (model_id is already a UUID)
-        let model = self
-            .model_repository
-            .get_model_by_id(request.model_id)
-            .await
-            .map_err(|e| UsageError::InternalError(format!("Failed to get model: {e}")))?
-            .ok_or_else(|| {
-                UsageError::ModelNotFound(format!("Model with ID '{}' not found", request.model_id))
-            })?;
+        let model = if let Some(snapshot) = &request.pricing_snapshot {
+            if snapshot.id != request.model_id {
+                return Err(UsageError::InternalError(
+                    "Accepted price snapshot belongs to a different model".into(),
+                ));
+            }
+            snapshot.clone()
+        } else {
+            self.model_repository
+                .get_model_by_id(request.model_id)
+                .await
+                .map_err(|e| UsageError::InternalError(format!("Failed to get model: {e}")))?
+                .ok_or_else(|| {
+                    UsageError::ModelNotFound(format!(
+                        "Model with ID '{}' not found",
+                        request.model_id
+                    ))
+                })?
+        };
 
         // Calculate costs based on inference type
         let (
@@ -443,6 +453,19 @@ impl UsageServiceTrait for UsageServiceImpl {
             }
             None => (input_cost, output_cost, total_cost, billing_details),
         };
+
+        let mut billing_details = billing_details;
+        if let Some(snapshot) = &request.pricing_snapshot {
+            // Persist the actual accepted rates, independently of mutable catalog
+            // history and procurement prices. No provider credentials are present.
+            let details = billing_details.get_or_insert_with(|| serde_json::json!({}));
+            details["accepted_catalog_pricing"] = serde_json::to_value(snapshot)
+                .map_err(|error| UsageError::InternalError(error.to_string()))?;
+            if let Some(cache_write) = request.cache_write {
+                details["accepted_catalog_pricing"]["cache_write_cost_per_token"] =
+                    cache_write.cost_per_token.into();
+            }
+        }
 
         // Create database request with model UUID and name (denormalized).
         // Note: `cache_read_tokens` is persisted for observability across all inference types,
@@ -734,6 +757,7 @@ impl UsageServiceTrait for UsageServiceImpl {
         // Internal metrics (ttft_ms, avg_itl_ms, stop_reason) are not exposed
         // via the public API — they are populated only by the inference pipeline.
         let service_request = RecordUsageServiceRequest {
+            pricing_snapshot: None,
             organization_id,
             workspace_id,
             api_key_id,

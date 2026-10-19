@@ -36,7 +36,7 @@ mod provider_attribution;
 use provider_attribution::{served_provider_attribution, ServedProviderResult};
 pub use provider_attribution::{
     AttributedAnthropicRawResponse, AttributedChatCompletion, AttributedChatCompletionStream,
-    AttributedImageEdit, AttributedImageGeneration, AttributedSystemOne,
+    AttributedImageEdit, AttributedImageGeneration, AttributedInference, AttributedSystemOne,
 };
 
 type InferenceProviderTrait = dyn InferenceProvider + Send + Sync;
@@ -5640,9 +5640,20 @@ impl InferenceProviderPool {
 
     pub async fn audio_transcription(
         &self,
-        mut params: AudioTranscriptionParams,
+        params: AudioTranscriptionParams,
         request_hash: String,
     ) -> Result<AudioTranscriptionResponse, AudioTranscriptionError> {
+        Ok(self
+            .audio_transcription_with_attribution(params, request_hash)
+            .await?
+            .response)
+    }
+
+    pub async fn audio_transcription_with_attribution(
+        &self,
+        mut params: AudioTranscriptionParams,
+        request_hash: String,
+    ) -> Result<AttributedInference<AudioTranscriptionResponse>, AudioTranscriptionError> {
         let model_id = params.model.clone();
         let tee = inference_providers::routing::TeeRequirement::from_value(params.extra.get("tee"))
             .map_err(|_| AudioTranscriptionError::HttpError {
@@ -5754,7 +5765,10 @@ impl InferenceProviderPool {
             "Audio transcription completed successfully"
         );
 
-        Ok(response)
+        Ok(AttributedInference {
+            response,
+            provider_attribution: served.provider_attribution,
+        })
     }
 
     pub async fn image_edit(
@@ -5821,7 +5835,14 @@ impl InferenceProviderPool {
         })
     }
 
-    pub async fn rerank(&self, mut params: RerankParams) -> Result<RerankResponse, RerankError> {
+    pub async fn rerank(&self, params: RerankParams) -> Result<RerankResponse, RerankError> {
+        Ok(self.rerank_with_attribution(params).await?.response)
+    }
+
+    pub async fn rerank_with_attribution(
+        &self,
+        mut params: RerankParams,
+    ) -> Result<AttributedInference<RerankResponse>, RerankError> {
         let model_id = params.model.clone();
         let tee = inference_providers::routing::TeeRequirement::from_value(params.extra.get("tee"))
             .map_err(|_| RerankError::HttpError {
@@ -5896,7 +5917,10 @@ impl InferenceProviderPool {
                 .and_then(|usage| serde_json::to_value(usage).ok()),
         )
         .await;
-        Ok(served.value)
+        Ok(AttributedInference {
+            response: served.value,
+            provider_attribution: served.provider_attribution,
+        })
     }
 
     pub async fn embeddings(
@@ -5905,6 +5929,18 @@ impl InferenceProviderPool {
         body: bytes::Bytes,
         extra: std::collections::HashMap<String, serde_json::Value>,
     ) -> Result<bytes::Bytes, inference_providers::EmbeddingError> {
+        Ok(self
+            .embeddings_with_attribution(model, body, extra)
+            .await?
+            .response)
+    }
+
+    pub async fn embeddings_with_attribution(
+        &self,
+        model: &str,
+        body: bytes::Bytes,
+        extra: std::collections::HashMap<String, serde_json::Value>,
+    ) -> Result<AttributedInference<bytes::Bytes>, inference_providers::EmbeddingError> {
         tracing::debug!(model = %model, "Starting embeddings request");
 
         let mut routing_body: serde_json::Value = serde_json::from_slice(&body).map_err(|_| {
@@ -5985,7 +6021,10 @@ impl InferenceProviderPool {
                 .and_then(|body| body.get("usage").cloned()),
         )
         .await;
-        Ok(served.value)
+        Ok(AttributedInference {
+            response: served.value,
+            provider_attribution: served.provider_attribution,
+        })
     }
 
     /// Native transports share eligibility, quotas and pre-commit retry bounds.
@@ -6194,6 +6233,18 @@ impl InferenceProviderPool {
         body: bytes::Bytes,
         extra: std::collections::HashMap<String, serde_json::Value>,
     ) -> Result<bytes::Bytes, inference_providers::PrivacyClassifyError> {
+        Ok(self
+            .privacy_classify_with_attribution(model, body, extra)
+            .await?
+            .response)
+    }
+
+    pub async fn privacy_classify_with_attribution(
+        &self,
+        model: &str,
+        body: bytes::Bytes,
+        extra: std::collections::HashMap<String, serde_json::Value>,
+    ) -> Result<AttributedInference<bytes::Bytes>, inference_providers::PrivacyClassifyError> {
         tracing::debug!(model = %model, "Starting privacy classify request");
 
         let mut routing_body: serde_json::Value = serde_json::from_slice(&body).map_err(|_| {
@@ -6272,14 +6323,31 @@ impl InferenceProviderPool {
                 .and_then(|body| body.get("usage").cloned()),
         )
         .await;
-        Ok(served.value)
+        Ok(AttributedInference {
+            response: served.value,
+            provider_attribution: served.provider_attribution,
+        })
     }
 
     pub async fn score(
         &self,
-        mut params: inference_providers::ScoreParams,
+        params: inference_providers::ScoreParams,
         request_hash: String,
     ) -> Result<inference_providers::ScoreResponse, inference_providers::ScoreError> {
+        Ok(self
+            .score_with_attribution(params, request_hash)
+            .await?
+            .response)
+    }
+
+    pub async fn score_with_attribution(
+        &self,
+        mut params: inference_providers::ScoreParams,
+        request_hash: String,
+    ) -> Result<
+        AttributedInference<inference_providers::ScoreResponse>,
+        inference_providers::ScoreError,
+    > {
         let model_id = params.model.clone();
         let tee = inference_providers::routing::TeeRequirement::from_value(params.extra.get("tee"))
             .map_err(|_| inference_providers::ScoreError::HttpError {
@@ -6356,7 +6424,10 @@ impl InferenceProviderPool {
                 .and_then(|usage| serde_json::to_value(usage).ok()),
         )
         .await;
-        Ok(served.value)
+        Ok(AttributedInference {
+            response: served.value,
+            provider_attribution: served.provider_attribution,
+        })
     }
 
     fn create_external_provider(

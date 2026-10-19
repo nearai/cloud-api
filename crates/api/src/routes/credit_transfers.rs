@@ -157,7 +157,7 @@ pub struct CreateTransferRequest {
     tag = "Credits",
     params(
         ("org_id" = Uuid, Path, description = "Sender organization"),
-        ("Idempotency-Key" = String, Header, description = "Generate a UUID once in the client before sending and reuse it on retries; required for amount sends, prohibited for cumulative targets; 1–100 characters")
+        ("Idempotency-Key" = Option<String>, Header, description = "Generate a UUID once in the client before sending and reuse it on retries; required for amount sends, prohibited for cumulative targets; 1–100 characters")
     ),
     request_body = CreateTransferRequest,
     responses(

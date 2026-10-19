@@ -1,5 +1,8 @@
 use super::*;
 
+mod signatures;
+use signatures::{PrivacyIdentity, PrivacyResponse};
+
 /// Which privacy endpoint an error response is built for.
 #[derive(Clone, Copy, Debug)]
 enum PrivacyEndpoint {
@@ -124,6 +127,7 @@ async fn settle_privacy_usage(
     model_name: &str,
     endpoint: PrivacyEndpoint,
     token_sum: i64,
+    identity: &PrivacyIdentity,
 ) -> Result<(), axum::response::Response> {
     let label = endpoint.label();
     let organization_id = api_key.organization.id.0;
@@ -215,8 +219,8 @@ async fn settle_privacy_usage(
         inference_type: services::usage::ports::InferenceType::PrivacyClassify,
         ttft_ms: None,
         avg_itl_ms: None,
-        inference_id: Some(uuid::Uuid::new_v4()),
-        provider_request_id: None,
+        inference_id: Some(identity.inference_id),
+        provider_request_id: identity.response_id.clone(),
         stop_reason: Some(services::usage::StopReason::Completed),
         response_id: None,
         image_count: None,
@@ -262,6 +266,9 @@ struct PrivacyClassifyRequestDoc {
 
 #[derive(utoipa::ToSchema, serde::Serialize, serde::Deserialize)]
 struct PrivacyClassifyResponseDoc {
+    /// Upstream response ID; use this ID at /v1/signature/{id}.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    id: Option<String>,
     /// Model identifier that produced the classification.
     #[serde(default)]
     model: String,
@@ -276,7 +283,7 @@ struct PrivacyClassifyResponseDoc {
     tag = "Privacy",
     request_body = PrivacyClassifyRequestDoc,
     responses(
-        (status = 200, description = "Privacy classification completed successfully", body = PrivacyClassifyResponseDoc),
+        (status = 200, description = "Classification supports a Gateway receipt keyed by a valid upstream id. Inference-Id is the billing key.", body = PrivacyClassifyResponseDoc, headers(("Inference-Id" = String, description = "Billing UUID derived from the response id; random fallback if the upstream has no valid id"))),
         (status = 400, description = "Invalid request", body = ErrorResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
         (status = 404, description = "Model not found", body = ErrorResponse),
@@ -291,7 +298,7 @@ struct PrivacyClassifyResponseDoc {
 pub async fn privacy_classify(
     State(app_state): State<AppState>,
     Extension(api_key): Extension<AuthenticatedApiKey>,
-    Extension(_body_hash): Extension<RequestBodyHash>,
+    Extension(body_hash): Extension<RequestBodyHash>,
     Extension(correlation): Extension<RequestCorrelation>,
     headers: header::HeaderMap,
     requested_model: RequestedModel,
@@ -374,24 +381,21 @@ pub async fn privacy_classify(
             let token_sum_i64: i64 = services::auto_redact::parse_usage_entries(&response_bytes)
                 .iter()
                 .fold(0i64, |acc, e| acc.saturating_add(e.input_tokens));
-            if let Err(response) = settle_privacy_usage(
-                &app_state,
-                &api_key,
+            let identity = PrivacyIdentity::from_response(&response_bytes);
+            signatures::finalize(
+                app_state,
+                api_key,
                 model_id,
-                &model_name,
+                model_name,
                 PrivacyEndpoint::Classify,
                 token_sum_i64,
+                PrivacyResponse {
+                    identity,
+                    request_hash: body_hash.hash,
+                    body: response_bytes,
+                },
             )
             .await
-            {
-                return response;
-            }
-
-            Response::builder()
-                .status(StatusCode::OK)
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(response_bytes))
-                .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
         }
         Err(e) => privacy_error_response(PrivacyEndpoint::Classify, e),
     }
@@ -433,6 +437,9 @@ struct PrivacyRedactDataEntryDoc {
 
 #[derive(utoipa::ToSchema, serde::Serialize, serde::Deserialize)]
 struct PrivacyRedactResponseDoc {
+    /// Upstream response ID; use this ID at /v1/signature/{id}.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    id: Option<String>,
     /// Model identifier that produced the redaction.
     #[serde(default)]
     model: String,
@@ -446,7 +453,7 @@ struct PrivacyRedactResponseDoc {
     tag = "Privacy",
     request_body = PrivacyRedactRequestDoc,
     responses(
-        (status = 200, description = "Privacy redaction completed successfully", body = PrivacyRedactResponseDoc),
+        (status = 200, description = "Redacted text supports a Gateway receipt keyed by a valid upstream id. Inference-Id is the billing key.", body = PrivacyRedactResponseDoc, headers(("Inference-Id" = String, description = "Billing UUID derived from the response id; random fallback if the upstream has no valid id"))),
         (status = 400, description = "Invalid request", body = ErrorResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
         (status = 404, description = "Model not found", body = ErrorResponse),
@@ -461,7 +468,7 @@ struct PrivacyRedactResponseDoc {
 pub async fn privacy_redact(
     State(app_state): State<AppState>,
     Extension(api_key): Extension<AuthenticatedApiKey>,
-    Extension(_body_hash): Extension<RequestBodyHash>,
+    Extension(body_hash): Extension<RequestBodyHash>,
     Extension(correlation): Extension<RequestCorrelation>,
     headers: header::HeaderMap,
     requested_model: RequestedModel,
@@ -690,18 +697,7 @@ pub async fn privacy_redact(
     let token_sum_i64: i64 = per_index_tokens
         .values()
         .fold(0i64, |acc, t| acc.saturating_add(*t));
-    if let Err(response) = settle_privacy_usage(
-        &app_state,
-        &api_key,
-        model_id,
-        &model_name,
-        PrivacyEndpoint::Redact,
-        token_sum_i64,
-    )
-    .await
-    {
-        return response;
-    }
+    let identity = PrivacyIdentity::from_response(&response_bytes);
 
     let data: Vec<serde_json::Value> = redacted
         .into_iter()
@@ -719,10 +715,15 @@ pub async fn privacy_redact(
         })
         .collect();
 
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "model": model_name,
         "data": data,
     });
+    // This is the classifier's response ID, also used for receipt lookup and
+    // derived billing. Do not replace it with a separate redaction ID.
+    if let Some(id) = &identity.response_id {
+        body["id"] = serde_json::Value::String(id.clone());
+    }
     let body_bytes = match serde_json::to_vec(&body) {
         Ok(b) => b,
         Err(e) => {
@@ -738,11 +739,20 @@ pub async fn privacy_redact(
         }
     };
 
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(body_bytes))
-        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+    signatures::finalize(
+        app_state,
+        api_key,
+        model_id,
+        model_name,
+        PrivacyEndpoint::Redact,
+        token_sum_i64,
+        PrivacyResponse {
+            identity,
+            request_hash: body_hash.hash,
+            body: Bytes::from(body_bytes),
+        },
+    )
+    .await
 }
 
 #[cfg(test)]

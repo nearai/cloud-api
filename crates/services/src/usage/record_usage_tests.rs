@@ -226,6 +226,7 @@ async fn record(model: ModelPricing, request: RecordUsageServiceRequest) -> Reco
         Arc::new(UnusedLimitsRepository),
         Arc::new(MockWorkspaceServiceTrait::new()),
         metrics.clone(),
+        Vec::new(),
     );
     service.record_usage(request).await.expect("record_usage");
     let db = repo
@@ -281,6 +282,7 @@ async fn image_cost_overflow_is_an_error() {
         Arc::new(UnusedLimitsRepository),
         Arc::new(MockWorkspaceServiceTrait::new()),
         Arc::new(CapturingMetricsService::new()),
+        Vec::new(),
     );
     let result = service
         .record_usage(request(InferenceType::ImageGeneration))
@@ -326,6 +328,7 @@ async fn input_only_overflow_names_the_inference_type() {
         Arc::new(UnusedLimitsRepository),
         Arc::new(MockWorkspaceServiceTrait::new()),
         Arc::new(CapturingMetricsService::new()),
+        Vec::new(),
     );
     let error = service
         .record_usage(request(InferenceType::Rerank))

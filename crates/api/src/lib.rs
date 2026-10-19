@@ -467,6 +467,7 @@ pub async fn init_domain_services_with_pool(
         limits_repository_for_usage as Arc<dyn services::usage::OrganizationLimitsRepository>,
         workspace_service.clone(),
         metrics_service.clone(),
+        config.credit_allocation.near_tier_only_credit_types.clone(),
     )) as Arc<dyn services::usage::UsageServiceTrait + Send + Sync>;
 
     // Create organization limit repository for completion service rate limiting

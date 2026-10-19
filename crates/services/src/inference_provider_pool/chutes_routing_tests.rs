@@ -76,11 +76,11 @@ async fn chutes_pin_requires_the_model_and_survives_pool_discovery_refresh() {
     let hints = ChatRoutingHints::default();
 
     assert!(pool
-        .get_providers_with_fallback("other-model", Some(&key), &hints)
+        .get_providers_with_fallback("other-model", Some(&key), &hints, None)
         .await
         .is_none());
     let selected = pool
-        .get_providers_with_fallback(MODEL, Some(&key), &hints)
+        .get_providers_with_fallback(MODEL, Some(&key), &hints, None)
         .await
         .unwrap();
     assert_eq!(selected.len(), 1);
@@ -90,7 +90,7 @@ async fn chutes_pin_requires_the_model_and_survives_pool_discovery_refresh() {
     // the configured Chutes provider. Its key routing must not need a stale map.
     pool.sync_inference_url_models(Vec::new()).await;
     let selected = pool
-        .get_providers_with_fallback(MODEL, Some(&key), &hints)
+        .get_providers_with_fallback(MODEL, Some(&key), &hints, None)
         .await
         .unwrap();
     assert_eq!(selected.len(), 1);
@@ -105,17 +105,17 @@ async fn near_hex_pin_and_unconstrained_tier_order_are_unchanged() {
     let near: Arc<InferenceProviderTrait> = near;
     let hints = ChatRoutingHints::default();
     let selected = pool
-        .get_providers_with_fallback(MODEL, Some(NEAR_KEY), &hints)
+        .get_providers_with_fallback(MODEL, Some(NEAR_KEY), &hints, None)
         .await
         .unwrap();
     assert_eq!(selected.len(), 1);
     assert!(Arc::ptr_eq(&selected[0], &near));
     assert!(pool
-        .get_providers_with_fallback(MODEL, Some(&"ab".repeat(32)), &hints)
+        .get_providers_with_fallback(MODEL, Some(&"ab".repeat(32)), &hints, None)
         .await
         .is_none());
     let selected = pool
-        .get_providers_with_fallback(MODEL, None, &hints)
+        .get_providers_with_fallback(MODEL, None, &hints, None)
         .await
         .unwrap();
     assert_eq!(selected.len(), 2);

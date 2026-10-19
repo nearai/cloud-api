@@ -3312,6 +3312,16 @@ impl ResponseServiceImpl {
             );
         }
 
+        // Credit-policy admission: organizations drawing on NEAR-tier-only
+        // budget (gifted grant credits) may run NEAR-served models only.
+        let allowed_tier = process_context
+            .completion_service
+            .resolve_serving_restriction(
+                process_context.organization_id,
+                &process_context.request.model,
+            )
+            .await?;
+
         // Call the appropriate image API
         let response = if has_input_image {
             let image_bytes =
@@ -3327,7 +3337,11 @@ impl ResponseServiceImpl {
             process_context
                 .completion_service
                 .get_inference_provider_pool()
-                .image_edit(params, process_context.body_hash.clone())
+                .image_edit_with_attribution(
+                    params,
+                    process_context.body_hash.clone(),
+                    allowed_tier,
+                )
                 .await
                 .map_err(|e| {
                     tracing::error!(error = %e, "Image edit request failed");
@@ -3335,6 +3349,7 @@ impl ResponseServiceImpl {
                         "Image edit processing failed. Please try again later.".to_string(),
                     )
                 })?
+                .response
         } else {
             let params = inference_providers::ImageGenerationParams {
                 model: process_context.request.model.clone(),
@@ -3350,7 +3365,11 @@ impl ResponseServiceImpl {
             process_context
                 .completion_service
                 .get_inference_provider_pool()
-                .image_generation(params, process_context.body_hash.clone())
+                .image_generation_with_attribution(
+                    params,
+                    process_context.body_hash.clone(),
+                    allowed_tier,
+                )
                 .await
                 .map_err(|e| {
                     tracing::error!(error = %e, "Image generation request failed");
@@ -3358,6 +3377,7 @@ impl ResponseServiceImpl {
                         "Image generation processing failed. Please try again later.".to_string(),
                     )
                 })?
+                .response
         };
 
         // Extract base64 images from response

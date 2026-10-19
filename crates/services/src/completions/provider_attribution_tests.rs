@@ -274,3 +274,136 @@ async fn failed_providers_do_not_record_served_attribution() {
         "terminal provider failures must not record successful usage"
     );
 }
+
+#[tokio::test]
+async fn grant_only_admission_serves_from_near_fleet_only() {
+    use inference_providers::ProviderTier;
+
+    let model_name = "z-ai/glm-5.1";
+    let (service, usage_service) =
+        completion_service_with_mock_providers(model_name, false, false).await;
+    // Grant-only budget: NEAR-tier-only capacity remains, unrestricted is 0.
+    usage_service.set_credit_admission(crate::usage::CreditAdmission {
+        unrestricted_available: 0,
+        near_tier_only_available: 500,
+    });
+
+    let served = service
+        .create_chat_completion(completion_request(model_name))
+        .await
+        .expect("grant-only budget must still serve a NEAR-capable model");
+
+    assert_eq!(served.serving.tier, ProviderTier::Near);
+    let requests = wait_for_usage_requests(&usage_service, 1).await;
+    let attribution = requests[0].provider_attribution;
+    assert_eq!(
+        attribution.served_provider_tier,
+        Some(crate::usage::ServedProviderTier::Near)
+    );
+    assert!(
+        !attribution.served_via_fallback,
+        "a NEAR failure must not fall back to third-party providers under grant-only budget"
+    );
+}
+
+#[tokio::test]
+async fn grant_only_admission_rejects_models_without_near_providers() {
+    use inference_providers::mock::{MockProvider, RequestMatcher, ResponseTemplate};
+    use inference_providers::{ProviderSource, ProviderTier};
+
+    let model_name = "third-party-only/model";
+    let pool = Arc::new(InferenceProviderPool::new(
+        None,
+        config::ExternalProvidersConfig::default(),
+    ));
+    let chutes = Arc::new(
+        MockProvider::new_accept_all()
+            .with_tier(ProviderTier::Attested3p)
+            .with_provider_source(ProviderSource::Chutes),
+    );
+    chutes
+        .when(RequestMatcher::Any)
+        .respond_with(ResponseTemplate::new("served-by-chutes"))
+        .await;
+    pool.register_pinned_provider(
+        model_name.to_string(),
+        chutes,
+        None,
+        crate::inference_provider_pool::ProviderPoolRole::Primary,
+    )
+    .await;
+
+    let usage_service = Arc::new(CapturingUsageService::new());
+    usage_service.set_credit_admission(crate::usage::CreditAdmission {
+        unrestricted_available: 0,
+        near_tier_only_available: 500,
+    });
+    let service = CompletionServiceImpl::new(
+        pool,
+        Arc::new(MockAttestationService),
+        usage_service,
+        Arc::new(CapturingMetricsService::new()),
+        Arc::new(StaticModelsRepository {
+            model: test_model(model_name),
+        }),
+        Arc::new(StaticOrganizationLimitRepository),
+    );
+
+    // The model resolves but only has third-party providers: grant-only
+    // budget must deny it before any provider is contacted.
+    let result = service
+        .resolve_serving_restriction(Uuid::new_v4(), model_name)
+        .await;
+    match result {
+        Err(ports::CompletionError::GrantCreditsNearOnly(_)) => {}
+        other => panic!("expected GrantCreditsNearOnly, got: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn unrestricted_admission_allows_fallback_to_third_party() {
+    let model_name = "z-ai/glm-5.1";
+    let (service, usage_service) =
+        completion_service_with_mock_providers(model_name, true, false).await;
+    // Unrestricted budget available: behavior is unchanged from today.
+    usage_service.set_credit_admission(crate::usage::CreditAdmission {
+        unrestricted_available: 1000,
+        near_tier_only_available: 500,
+    });
+
+    let served = service
+        .create_chat_completion(completion_request(model_name))
+        .await
+        .expect("unrestricted budget must keep third-party fallback");
+
+    assert_eq!(
+        served.serving.tier,
+        inference_providers::ProviderTier::Attested3p
+    );
+    let requests = wait_for_usage_requests(&usage_service, 1).await;
+    let attribution = requests[0].provider_attribution;
+    assert_eq!(
+        attribution.served_provider_tier,
+        Some(crate::usage::ServedProviderTier::Attested3p)
+    );
+    assert!(attribution.served_via_fallback);
+}
+
+#[tokio::test]
+async fn exhausted_admission_fails_closed() {
+    let model_name = "z-ai/glm-5.1";
+    let (service, usage_service) =
+        completion_service_with_mock_providers(model_name, false, false).await;
+    usage_service.set_credit_admission(crate::usage::CreditAdmission {
+        unrestricted_available: 0,
+        near_tier_only_available: 0,
+    });
+
+    let result = service
+        .create_chat_completion(completion_request(model_name))
+        .await;
+    match result {
+        Err(ports::CompletionError::InsufficientCredits(_)) => {}
+        other => panic!("expected InsufficientCredits, got: {other:?}"),
+    }
+}

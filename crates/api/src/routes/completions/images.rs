@@ -128,10 +128,27 @@ pub async fn image_generations(
         extra,
     };
 
+    // Credit-policy admission: organizations drawing on NEAR-tier-only budget
+    // (gifted grant credits) may run NEAR-served models only.
+    let allowed_tier = match app_state
+        .completion_service
+        .resolve_serving_restriction(api_key.organization.id.0, &request.model)
+        .await
+    {
+        Ok(tier) => tier,
+        Err(error) => {
+            return (
+                crate::routes::common::map_domain_error_to_status(&error),
+                ResponseJson(crate::models::ErrorResponse::from(error)),
+            )
+                .into_response();
+        }
+    };
+
     // Call the inference provider pool
     match app_state
         .inference_provider_pool
-        .image_generation_with_attribution(params, body_hash.hash.clone())
+        .image_generation_with_attribution(params, body_hash.hash.clone(), allowed_tier)
         .await
     {
         Ok(attributed_response) => {
@@ -519,10 +536,27 @@ pub async fn image_edits(
         response_format,
     };
 
+    // Credit-policy admission: organizations drawing on NEAR-tier-only budget
+    // (gifted grant credits) may run NEAR-served models only.
+    let allowed_tier = match app_state
+        .completion_service
+        .resolve_serving_restriction(api_key.organization.id.0, &request.model)
+        .await
+    {
+        Ok(tier) => tier,
+        Err(error) => {
+            return (
+                crate::routes::common::map_domain_error_to_status(&error),
+                ResponseJson(crate::models::ErrorResponse::from(error)),
+            )
+                .into_response();
+        }
+    };
+
     // Call the inference provider pool
     match app_state
         .inference_provider_pool
-        .image_edit_with_attribution(params, body_hash.hash.clone())
+        .image_edit_with_attribution(params, body_hash.hash.clone(), allowed_tier)
         .await
     {
         Ok(attributed_response) => {

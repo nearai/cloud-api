@@ -255,6 +255,16 @@ impl UsageServiceTrait for MockUsageService {
         Ok(UsageCheckResult::Allowed { remaining: 1000 })
     }
 
+    async fn get_credit_admission(
+        &self,
+        _organization_id: Uuid,
+    ) -> Result<crate::usage::CreditAdmission, UsageError> {
+        Ok(crate::usage::CreditAdmission {
+            unrestricted_available: 1000,
+            near_tier_only_available: 0,
+        })
+    }
+
     async fn get_balance(
         &self,
         _organization_id: Uuid,
@@ -342,17 +352,26 @@ impl UsageServiceTrait for MockUsageService {
 /// A usage service that captures requests for testing
 pub struct CapturingUsageService {
     requests: std::sync::Mutex<Vec<RecordUsageServiceRequest>>,
+    admission: std::sync::Mutex<crate::usage::CreditAdmission>,
 }
 
 impl CapturingUsageService {
     pub fn new() -> Self {
         Self {
             requests: std::sync::Mutex::new(Vec::new()),
+            admission: std::sync::Mutex::new(crate::usage::CreditAdmission {
+                unrestricted_available: 1000,
+                near_tier_only_available: 0,
+            }),
         }
     }
 
     pub fn get_requests(&self) -> Vec<RecordUsageServiceRequest> {
         self.requests.lock().unwrap().clone()
+    }
+
+    pub fn set_credit_admission(&self, admission: crate::usage::CreditAdmission) {
+        *self.admission.lock().unwrap() = admission;
     }
 }
 
@@ -521,6 +540,13 @@ impl UsageServiceTrait for CapturingUsageService {
 
     async fn check_can_use(&self, _organization_id: Uuid) -> Result<UsageCheckResult, UsageError> {
         Ok(UsageCheckResult::Allowed { remaining: 1000 })
+    }
+
+    async fn get_credit_admission(
+        &self,
+        _organization_id: Uuid,
+    ) -> Result<crate::usage::CreditAdmission, UsageError> {
+        Ok(*self.admission.lock().unwrap())
     }
 
     async fn get_balance(

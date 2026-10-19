@@ -553,6 +553,7 @@ impl UserErasureRepository for PostgresUserErasureRepository {
             }
             for sql in [
                 "DELETE FROM feature_request_votes WHERE user_id = $1",
+                "DELETE FROM user_oauth_identities WHERE user_id = $1",
                 "DELETE FROM mcp_connector_usage WHERE user_id = $1",
                 "DELETE FROM refresh_tokens WHERE user_id = $1",
             ] {

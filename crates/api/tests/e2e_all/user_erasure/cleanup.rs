@@ -1,6 +1,35 @@
 use super::*;
 
 #[tokio::test]
+async fn erasure_deletes_linked_oauth_identities() {
+    let (server, database) = setup_test_server_with_database().await;
+    let (_, user_id, email) = new_user(&database).await;
+    let client = database.pool().get().await.unwrap();
+    client.execute("INSERT INTO user_oauth_identities (user_id,provider,provider_user_id,email,email_verified) VALUES ($1,'google',$2,$3,true)",
+        &[&user_id,&uuid::Uuid::new_v4().to_string(),&email]).await.unwrap();
+    assert_eq!(
+        count(
+            &client,
+            "SELECT COUNT(*) FROM user_oauth_identities WHERE user_id=$1",
+            &user_id
+        )
+        .await,
+        2
+    );
+    let response = erase(&server, user_id, &email).await;
+    assert_eq!(response.status_code(), 200, "{}", response.text());
+    assert_eq!(
+        count(
+            &client,
+            "SELECT COUNT(*) FROM user_oauth_identities WHERE user_id=$1",
+            &user_id
+        )
+        .await,
+        0
+    );
+}
+
+#[tokio::test]
 async fn retry_sweeps_content_written_after_erasure() {
     let (server, database) = setup_test_server_with_database().await;
     let (session, user_id, email) = new_user(&database).await;

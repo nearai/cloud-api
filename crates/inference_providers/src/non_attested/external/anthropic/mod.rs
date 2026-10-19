@@ -5,7 +5,7 @@
 
 pub mod converter;
 
-use super::backend::{BackendConfig, ExternalBackend};
+use crate::non_attested::external::backend::{BackendConfig, ExternalBackend};
 #[cfg(test)]
 use crate::MessageRole;
 use crate::{
@@ -24,14 +24,8 @@ use reqwest::{header::HeaderValue, Client};
 
 const DEFAULT_ANTHROPIC_VERSION: &str = "2023-06-01";
 
-/// Caller-supplied `extra` keys we forward to Anthropic's Messages API.
-///
-/// This is an allowlist on purpose: `ChatCompletionParams.extra` is an
-/// unbounded catch-all that also holds internal E2EE keys and OpenAI-only
-/// fields, so we only pass through the reasoning controls Anthropic actually
-/// understands (`thinking`) plus `reasoning_effort` (which Anthropic does not
-/// accept and will reject with its own 400, instead of us silently dropping it).
-const ANTHROPIC_PASSTHROUGH_KEYS: &[&str] = &["thinking", "reasoning_effort"];
+/// Only protocol-supported reasoning controls may cross the adapter boundary.
+const ANTHROPIC_PASSTHROUGH_KEYS: &[&str] = &["thinking", "reasoning_effort", "output_config"];
 
 /// Whether a requested `response_format` asks for JSON output, which Anthropic
 /// has no native mode for and tends to return markdown-fenced (#668). When
@@ -204,11 +198,18 @@ impl AnthropicBackend {
             return Ok(converted.body);
         }
 
-        serde_json::to_value(self.build_request(model, params, stream)).map_err(|error| {
-            CompletionError::CompletionError(format!(
-                "Failed to serialize Anthropic request: {error}"
-            ))
-        })
+        let mut body =
+            serde_json::to_value(self.build_request(model, params, stream)).map_err(|error| {
+                CompletionError::CompletionError(format!(
+                    "Failed to serialize Anthropic request: {error}"
+                ))
+            })?;
+        let fields = body.as_object_mut().ok_or_else(|| {
+            CompletionError::CompletionError("Anthropic request must be an object".into())
+        })?;
+        anthropic_compat::normalize_reasoning_effort(fields)
+            .map_err(|error| CompletionError::CompletionError(error.to_string()))?;
+        Ok(body)
     }
 }
 
@@ -449,7 +450,7 @@ impl ExternalBackend for AnthropicBackend {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::non_attested::external::anthropic::*;
     use crate::{AnthropicRawEndpoint, AnthropicRawHeaders};
 
     async fn collect_raw_body(mut response: AnthropicRawResponse) -> Vec<u8> {
@@ -997,20 +998,16 @@ mod tests {
     fn test_build_request_forwards_reasoning_effort() {
         let backend = AnthropicBackend::new();
         let mut params = make_params(None, None);
-        params.extra.insert(
-            "reasoning_effort".to_string(),
-            serde_json::Value::String("high".to_string()),
-        );
-
-        let request = backend.build_request("claude-opus-4-7", &params, false);
-        let body = serde_json::to_value(&request).unwrap();
-
-        // We forward `reasoning_effort` rather than silently dropping it.
-        // Anthropic validates the field and returns its own error if unsupported.
-        assert_eq!(
-            body.get("reasoning_effort"),
-            Some(&serde_json::Value::String("high".to_string()))
-        );
+        params
+            .extra
+            .insert("reasoning_effort".into(), serde_json::json!("high"));
+        for stream in [false, true] {
+            let body = backend
+                .build_request_body("claude-opus-4-7", &params, stream)
+                .unwrap();
+            assert_eq!(body["output_config"]["effort"], "high");
+            assert!(body.get("reasoning_effort").is_none());
+        }
     }
 
     #[test]

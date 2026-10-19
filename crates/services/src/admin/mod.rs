@@ -1440,19 +1440,20 @@ impl AdminServiceImpl {
             .as_deref()
             .unwrap_or(&existing.provider_type);
         if effective_provider_type == "external" {
-            let config = request
+            // Registry-managed models obtain their configuration from approved mappings.
+            // Continue validating legacy inline configuration when it is supplied.
+            if let Some(config) = request
                 .provider_config
                 .as_ref()
                 .or(existing.provider_config.as_ref())
-                .ok_or_else(|| {
-                    AdminError::InvalidPricing(format!(
-                        "model '{model_name}': external models require providerConfig"
-                    ))
-                })?;
-            inference_providers::non_attested::external::validate_external_provider_config(config)
+            {
+                inference_providers::non_attested::external::validate_external_provider_config(
+                    config,
+                )
                 .map_err(|error| {
                     AdminError::InvalidPricing(format!("model '{model_name}': {error}"))
                 })?;
+            }
         }
 
         let effective_is_active = request.is_active.unwrap_or(is_new_model);

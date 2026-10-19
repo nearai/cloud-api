@@ -92,6 +92,7 @@ mod privacy_classify;
 mod privacy_redact;
 mod privacy_settlement;
 mod provider_errors;
+mod provider_registry;
 mod reasoning;
 mod reporting_usage;
 mod repositories;

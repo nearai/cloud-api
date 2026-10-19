@@ -3802,6 +3802,8 @@ pub struct UpdateServiceRequest {
 /// Model with pricing information for admin listing
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct AdminModelWithPricing {
+    #[serde(default)]
+    pub archived: bool,
     #[serde(rename = "modelId")]
     pub model_id: String,
     #[serde(rename = "inputCostPerToken")]

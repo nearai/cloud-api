@@ -929,6 +929,36 @@ pub async fn init_inference_providers(
         }
     }
 
+    // Registry changes converge independently of potentially slow fleet discovery.
+    let registry_pool = pool.clone();
+    let registry_models = models_repo.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+        loop {
+            interval.tick().await;
+            if registry_pool
+                .refresh_external_providers(registry_models.as_ref())
+                .await
+                .is_err()
+            {
+                tracing::warn!("Provider route refresh failed; retaining previous snapshot");
+            }
+        }
+    });
+    let provider_registry =
+        database::repositories::provider_registry::ProviderRegistryRepository::new(
+            database.pool().clone(),
+        );
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(600));
+        loop {
+            interval.tick().await;
+            if provider_registry.sync_due().await.is_err() {
+                tracing::warn!("Provider inventory refresh failed");
+            }
+        }
+    });
+
     // Start periodic refresh task
     let refresh_interval = config.external_providers.refresh_interval_secs;
     pool.clone()
@@ -2269,6 +2299,14 @@ fn build_admin_routes_with_options(
     ));
 
     let admin_app_state = AdminAppState {
+        provider_registry: Arc::new(
+            database::repositories::provider_registry::ProviderRegistryRepository::new(
+                database.pool().clone(),
+            ),
+        ),
+        provider_models_repository: Arc::new(database::repositories::ModelRepository::new(
+            database.pool().clone(),
+        )),
         admin_service,
         analytics_service: services.analytics_service,
         organization_service: services.organization_service,
@@ -2300,6 +2338,11 @@ fn build_admin_routes_with_options(
 
     // Classify read operations in middleware::admin_policy when adding admin routes.
     let admin_routes = Router::new()
+        .route("/admin/providers", axum::routing::get(crate::routes::providers::list).post(crate::routes::providers::create))
+        .route("/admin/providers/{id}", axum::routing::put(crate::routes::providers::update))
+        .route("/admin/providers/{id}/models", axum::routing::get(crate::routes::providers::models).put(crate::routes::providers::approve))
+        .route("/admin/providers/{id}/sync", axum::routing::post(crate::routes::providers::sync))
+        .route("/admin/models/{model_name}/archive", axum::routing::put(crate::routes::providers::archive_model))
         .route(
             "/admin/models",
             axum::routing::get(admin_list_models).patch(batch_upsert_models),

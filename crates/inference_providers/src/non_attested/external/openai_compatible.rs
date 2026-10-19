@@ -9,7 +9,7 @@
 //! - Anyscale
 //! - Any other OpenAI-compatible provider
 
-use super::backend::{BackendConfig, ExternalBackend};
+use crate::non_attested::external::backend::{BackendConfig, ExternalBackend};
 use crate::{
     models::StreamOptions, sse_parser::new_external_sse_parser, AudioTranscriptionError,
     AudioTranscriptionParams, AudioTranscriptionResponse, ChatCompletionParams,
@@ -68,29 +68,18 @@ impl Default for OpenAiCompatibleBackend {
     }
 }
 
-/// OpenAI's `/v1/chat/completions` rejects the combination of function tools
-/// and `reasoning_effort` for reasoning models (gpt-5.5, o1, o3, …) with:
-///
-/// > "Function tools with reasoning_effort are not supported for gpt-5.5 in
-/// > /v1/chat/completions. Please use /v1/responses instead."
-///
-/// The proper fix is to route tools+reasoning_effort requests through OpenAI's
-/// Responses API; that is a larger effort. As an interim, GPT-5.6 and GPT-6
-/// Sol/Luna must receive an explicit `reasoning_effort: "none"` because their
-/// omitted default still reasons and is rejected with tools. Older models
-/// continue to work when the field is removed. GPT-6 Astra is excluded because
-/// it does not support `none`. We log a warn when a caller's selector is
-/// degraded.
-///
-/// Scoped to OpenAI proper (`api.openai.com`, `api.openai.azure.com` family)
-/// because we cannot assume the same restriction applies to other
-/// openai-compatible providers (Together, Groq, Fireworks, etc.).
+/// Supply the legacy no-reasoning default only when the caller omitted effort.
+/// Explicit effort is forwarded unchanged; unsupported tool/effort combinations
+/// must produce the upstream error instead of silently changing the request.
 fn normalize_reasoning_effort_for_openai_tools(
     params: &mut ChatCompletionParams,
     base_url: &str,
     model: &str,
     catalog_model: Option<&str>,
 ) {
+    if params.extra.contains_key("reasoning_effort") || params.extra.contains_key("reasoning") {
+        return;
+    }
     if params.tools.as_ref().is_none_or(|t| t.is_empty()) {
         return;
     }
@@ -114,14 +103,6 @@ fn normalize_reasoning_effort_for_openai_tools(
                 "Forced `reasoning_effort=none` for OpenAI request with tools"
             );
         }
-        return;
-    }
-    if params.extra.remove("reasoning_effort").is_some() {
-        tracing::warn!(
-            model = %model,
-            base_url = %base_url,
-            "Stripped `reasoning_effort` from OpenAI request: combination with `tools` is rejected by /v1/chat/completions"
-        );
     }
 }
 
@@ -552,7 +533,7 @@ impl ExternalBackend for OpenAiCompatibleBackend {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::non_attested::external::openai_compatible::*;
     use std::collections::HashMap;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -930,193 +911,47 @@ mod tests {
         }]
     }
 
-    /// Reproduces the exact failure mode: OpenAI gpt-5.5 with tools +
-    /// `reasoning_effort` is rejected by `/v1/chat/completions`. The strip
-    /// must drop the field so the request succeeds.
     #[test]
-    fn test_strip_reasoning_effort_openai_with_tools() {
-        let mut params = make_chat_params(Some(bash_tool()), Some("low"));
-        normalize_reasoning_effort_for_openai_tools(
-            &mut params,
-            "https://api.openai.com/v1",
-            "gpt-5.5",
-            None,
-        );
-        assert!(!params.extra.contains_key("reasoning_effort"));
-    }
-
-    #[test]
-    fn test_supported_openai_families_force_none_reasoning_effort_with_tools() {
+    fn explicit_reasoning_effort_is_never_downgraded_with_tools() {
         for model in [
-            "gpt-5.6-sol",
-            "gpt-5.6-terra",
-            "gpt-5.6-luna",
+            "gpt-5.5",
+            "gpt-5.6",
             "gpt-6-sol",
-            "gpt-6-sol-2026-09-22",
             "gpt-6-luna",
-            "gpt-6-luna-2026-09-22",
-        ] {
-            let mut params = make_chat_params(Some(bash_tool()), Some("high"));
-            normalize_reasoning_effort_for_openai_tools(
-                &mut params,
-                "https://api.openai.com/v1",
-                model,
-                None,
-            );
-            assert_eq!(
-                params.extra.get("reasoning_effort"),
-                Some(&serde_json::json!("none")),
-                "reasoning effort should be disabled for {model}"
-            );
-        }
-    }
-
-    #[test]
-    fn test_supported_openai_families_disable_omitted_reasoning_effort() {
-        for model in ["gpt-5.6-sol", "gpt-6-sol", "gpt-6-luna"] {
-            let mut params = make_chat_params(Some(bash_tool()), None);
-            normalize_reasoning_effort_for_openai_tools(
-                &mut params,
-                "https://api.openai.com/v1",
-                model,
-                None,
-            );
-            assert_eq!(
-                params.extra.get("reasoning_effort"),
-                Some(&serde_json::json!("none")),
-                "omitted reasoning effort should be disabled for {model}"
-            );
-        }
-    }
-
-    #[test]
-    fn test_gpt_6_astra_does_not_force_unsupported_none_reasoning_effort() {
-        let mut params = make_chat_params(Some(bash_tool()), Some("high"));
-        normalize_reasoning_effort_for_openai_tools(
-            &mut params,
-            "https://api.openai.com/v1",
             "gpt-6-astra",
-            None,
-        );
-        assert!(!params.extra.contains_key("reasoning_effort"));
-    }
-
-    #[test]
-    fn test_azure_deployment_override_uses_catalog_model_capability() {
-        let mut params = make_chat_params(Some(bash_tool()), Some("high"));
-        normalize_reasoning_effort_for_openai_tools(
-            &mut params,
-            "https://my-resource.openai.azure.com",
-            "sol-prod",
-            Some("openai/gpt-6-sol"),
-        );
-        assert_eq!(
-            params.extra.get("reasoning_effort"),
-            Some(&serde_json::json!("none"))
-        );
-    }
-
-    /// `reasoning_effort` on OpenAI without tools is fine — model still
-    /// honors the effort selector. Don't strip.
-    #[test]
-    fn test_strip_reasoning_effort_openai_no_tools_keeps_field() {
-        let mut params = make_chat_params(None, Some("low"));
-        normalize_reasoning_effort_for_openai_tools(
-            &mut params,
-            "https://api.openai.com/v1",
-            "gpt-5.5",
-            None,
-        );
-        assert_eq!(
-            params.extra.get("reasoning_effort"),
-            Some(&serde_json::Value::String("low".to_string()))
-        );
-    }
-
-    /// Empty tools array is treated as no tools — keep `reasoning_effort`.
-    /// Guards against a client that always sends `tools: []`.
-    #[test]
-    fn test_strip_reasoning_effort_empty_tools_keeps_field() {
-        let mut params = make_chat_params(Some(vec![]), Some("low"));
-        normalize_reasoning_effort_for_openai_tools(
-            &mut params,
-            "https://api.openai.com/v1",
-            "gpt-5.5",
-            None,
-        );
-        assert_eq!(
-            params.extra.get("reasoning_effort"),
-            Some(&serde_json::Value::String("low".to_string()))
-        );
-    }
-
-    /// Non-OpenAI providers (Together, Groq, Fireworks, Anyscale, …) may
-    /// accept the combo. Scope of the workaround is OpenAI proper only.
-    #[test]
-    fn test_strip_reasoning_effort_non_openai_provider_keeps_field() {
-        for base_url in &[
-            "https://api.together.xyz/v1",
-            "https://api.groq.com/openai/v1",
-            "https://api.fireworks.ai/inference/v1",
-            "https://api.anyscale.com/v1",
         ] {
-            let mut params = make_chat_params(Some(bash_tool()), Some("low"));
-            normalize_reasoning_effort_for_openai_tools(&mut params, base_url, "gpt-5.5", None);
-            assert_eq!(
-                params.extra.get("reasoning_effort"),
-                Some(&serde_json::Value::String("low".to_string())),
-                "should not strip for non-OpenAI provider {}",
-                base_url
-            );
+            for base in [
+                "https://api.openai.com/v1",
+                "https://example.openai.azure.com/v1",
+                "https://openrouter.ai/api/v1",
+            ] {
+                for effort in ["none", "low", "medium", "high", "xhigh"] {
+                    let mut params = make_chat_params(Some(bash_tool()), Some(effort));
+                    normalize_reasoning_effort_for_openai_tools(&mut params, base, model, None);
+                    assert_eq!(params.extra["reasoning_effort"], effort);
+                }
+            }
         }
     }
 
-    /// Azure OpenAI hosts the same models with the same restriction.
     #[test]
-    fn test_strip_reasoning_effort_azure_openai_strips() {
-        let mut params = make_chat_params(Some(bash_tool()), Some("medium"));
-        normalize_reasoning_effort_for_openai_tools(
-            &mut params,
-            "https://my-resource.openai.azure.com",
-            "gpt-5.5",
-            None,
-        );
-        assert!(!params.extra.contains_key("reasoning_effort"));
-    }
-
-    /// No `reasoning_effort` in the request → no-op, no log noise.
-    #[test]
-    fn test_strip_reasoning_effort_no_field_present() {
+    fn omitted_effort_keeps_legacy_tools_default_for_supported_models() {
         let mut params = make_chat_params(Some(bash_tool()), None);
         normalize_reasoning_effort_for_openai_tools(
             &mut params,
             "https://api.openai.com/v1",
-            "gpt-5.5",
+            "gpt-6-sol",
             None,
         );
-        assert!(!params.extra.contains_key("reasoning_effort"));
-    }
-
-    /// Other extras (e.g. `verbosity`, `parallel_tool_calls`) must survive
-    /// when `reasoning_effort` is stripped.
-    #[test]
-    fn test_strip_reasoning_effort_preserves_other_extras() {
-        let mut params = make_chat_params(Some(bash_tool()), Some("low"));
-        params.extra.insert(
-            "verbosity".to_string(),
-            serde_json::Value::String("high".to_string()),
-        );
+        assert_eq!(params.extra["reasoning_effort"], "none");
+        let mut params = make_chat_params(None, None);
         normalize_reasoning_effort_for_openai_tools(
             &mut params,
             "https://api.openai.com/v1",
-            "gpt-5.5",
+            "gpt-6-sol",
             None,
         );
         assert!(!params.extra.contains_key("reasoning_effort"));
-        assert_eq!(
-            params.extra.get("verbosity"),
-            Some(&serde_json::Value::String("high".to_string()))
-        );
     }
 
     // ===== unsupported sampling-param stripping (nearai/cloud-api#697) =====

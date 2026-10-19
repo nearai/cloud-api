@@ -38,6 +38,7 @@ pub mod organization_staking_farm_sources;
 pub mod organization_usage;
 mod organization_usage_reporting;
 mod organization_usage_reporting_summary;
+pub mod provider_registry;
 mod reporting_query;
 pub mod reporting_usage_summary;
 pub mod response;

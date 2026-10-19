@@ -935,6 +935,12 @@ struct PoolPlacement {
     affinity_secret: [u8; 32],
 }
 
+struct CachedExternalProvider {
+    config: serde_json::Value,
+    provider: Arc<InferenceProviderTrait>,
+    backend_type: String,
+}
+
 #[derive(Clone)]
 pub struct InferenceProviderPool {
     /// Optional API key for authenticating with inference backends
@@ -943,6 +949,7 @@ pub struct InferenceProviderPool {
     provider_mappings: Arc<RwLock<ProviderMappings>>,
     /// Configuration for external providers (API keys, timeouts, etc.)
     external_configs: ExternalProvidersConfig,
+    external_provider_cache: Arc<RwLock<HashMap<String, Vec<CachedExternalProvider>>>>,
     /// Round-robin index for each model.
     /// Uses std::sync::RwLock because operations are instant HashMap lookups/inserts.
     load_balancer_index: Arc<std::sync::RwLock<HashMap<String, usize>>>,
@@ -1369,6 +1376,7 @@ impl InferenceProviderPool {
             api_key,
             provider_mappings: Arc::new(RwLock::new(ProviderMappings::new())),
             external_configs,
+            external_provider_cache: Arc::new(RwLock::new(HashMap::new())),
             load_balancer_index: Arc::new(std::sync::RwLock::new(HashMap::new())),
             chat_id_mapping: Arc::new(RwLock::new(HashMap::new())),
             refresh_task_handle: Arc::new(Mutex::new(None)),
@@ -1576,6 +1584,36 @@ impl InferenceProviderPool {
         result
     }
 
+    /// Replace only non-attested external registrations from a complete catalog snapshot.
+    pub async fn refresh_external_providers(
+        &self,
+        source: &dyn ExternalModelsSource,
+    ) -> Result<(), String> {
+        let mut generation = self.external_provider_reload_generation.lock().await;
+        *generation = generation.wrapping_add(1);
+        let models = source.fetch_external_models().await?;
+        let names: HashSet<_> = models.iter().map(|(name, _)| name.clone()).collect();
+        let result = self.load_external_providers_inner(models).await;
+        self.provider_mappings
+            .write()
+            .await
+            .model_to_providers
+            .retain(|name, providers| {
+                names.contains(name)
+                    || providers.iter().any(|provider| {
+                        provider.provider_source() != inference_providers::ProviderSource::External
+                    })
+            });
+        self.external_provider_cache
+            .write()
+            .await
+            .retain(|name, _| names.contains(name));
+        if let Err(error) = result {
+            warn!(%error, "External snapshot contains unavailable routes");
+        }
+        Ok(())
+    }
+
     async fn load_external_providers_inner(
         &self,
         models: Vec<(String, serde_json::Value)>,
@@ -1589,6 +1627,9 @@ impl InferenceProviderPool {
             .unwrap_or_else(|e| e.into_inner())
             .clone();
         let mut mappings = self.provider_mappings.write().await;
+        let mut replacements: HashMap<String, Vec<Arc<InferenceProviderTrait>>> = HashMap::new();
+        let mut cache = self.external_provider_cache.write().await;
+        let mut refreshed_cache: HashMap<String, Vec<CachedExternalProvider>> = HashMap::new();
         for (model_name, provider_config) in models {
             // Never overwrite a pinned (out-of-band, attested) provider with a
             // DB-discovered external one (the external refresh routes here).
@@ -1596,11 +1637,23 @@ impl InferenceProviderPool {
                 warn!(model = %model_name, "Skipping external provider for a pinned (attested) model");
                 continue;
             }
-            match self.create_external_provider(&model_name, provider_config) {
+            let candidates = replacements.entry(model_name.clone()).or_default();
+            let cached = cache
+                .get(&model_name)
+                .and_then(|entries| entries.iter().find(|entry| entry.config == provider_config))
+                .map(|entry| (entry.provider.clone(), entry.backend_type.clone()));
+            let result = cached.map(Ok).unwrap_or_else(|| {
+                self.create_external_provider(&model_name, provider_config.clone())
+            });
+            let cache_entries = refreshed_cache.entry(model_name.clone()).or_default();
+            match result {
                 Ok((provider, backend_type)) => {
-                    mappings
-                        .model_to_providers
-                        .insert(model_name.clone(), vec![provider]);
+                    cache_entries.push(CachedExternalProvider {
+                        config: provider_config,
+                        provider: provider.clone(),
+                        backend_type: backend_type.clone(),
+                    });
+                    candidates.push(provider);
                     info!(model = %model_name, backend = %backend_type, "Registered external provider");
                     success_count += 1;
                 }
@@ -1608,10 +1661,25 @@ impl InferenceProviderPool {
                     // A rejected external-config update must not leave an older
                     // route serving. Unknown or misspelled fields may represent
                     // a failed attempt to add a mandatory privacy restriction.
-                    mappings.model_to_providers.remove(&model_name);
                     warn!(model = %model_name, error = %e, "Failed to register external provider");
                     error_count += 1;
                 }
+            }
+        }
+
+        for (name, entries) in refreshed_cache {
+            if entries.is_empty() {
+                cache.remove(&name);
+            } else {
+                cache.insert(name, entries);
+            }
+        }
+        drop(cache);
+        for (name, providers) in replacements {
+            if providers.is_empty() {
+                mappings.model_to_providers.remove(&name);
+            } else {
+                mappings.model_to_providers.insert(name, providers);
             }
         }
 
@@ -5304,6 +5372,13 @@ impl InferenceProviderPool {
             .as_object_mut()
             .and_then(|obj| obj.remove("api_key"))
             .and_then(|v| v.as_str().map(String::from));
+        let reasoning_efforts: Option<Vec<String>> = provider_config
+            .as_object_mut()
+            .and_then(|obj| obj.remove("reasoning_efforts"))
+            .filter(|value| !value.is_null())
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(|_| "Invalid reasoning efforts".to_string())?;
         let config: ProviderConfig = serde_json::from_value(provider_config)
             .map_err(|e| format!("Failed to parse provider config: {e}"))?;
 
@@ -5336,8 +5411,9 @@ impl InferenceProviderPool {
             timeout_seconds: self.external_configs.timeout_seconds,
         };
 
-        let provider =
-            Arc::new(ExternalProvider::new(external_config)) as Arc<InferenceProviderTrait>;
+        let provider = Arc::new(
+            ExternalProvider::new(external_config).with_reasoning_efforts(reasoning_efforts),
+        ) as Arc<InferenceProviderTrait>;
         Ok((provider, backend_type))
     }
 
@@ -8294,6 +8370,35 @@ mod tests {
 
         assert!(result.is_ok());
         assert!(pool.has_provider("gpt-4").await);
+    }
+
+    #[tokio::test]
+    async fn external_registry_groups_routes_and_reuses_unchanged_providers() {
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+        let routes = vec![
+            (
+                "shared-model".into(),
+                serde_json::json!({"backend":"openai_compatible","base_url":"https://one.example/v1","api_key":"fixture"}),
+            ),
+            (
+                "shared-model".into(),
+                serde_json::json!({"backend":"anthropic","base_url":"https://two.example/v1","api_key":"fixture"}),
+            ),
+        ];
+        pool.load_external_providers(routes.clone()).await.unwrap();
+        let before = pool.get_providers_for_model("shared-model").await.unwrap();
+        assert_eq!(before.len(), 2);
+        pool.load_external_providers(routes).await.unwrap();
+        let after = pool.get_providers_for_model("shared-model").await.unwrap();
+        assert_eq!(after.len(), 2);
+        assert!(before
+            .iter()
+            .zip(&after)
+            .all(|(left, right)| Arc::ptr_eq(left, right)));
+        pool.load_external_providers(vec![("shared-model".into(),serde_json::json!({"backend":"openai_compatible","base_url":"https://one.example/v1","api_key":"rotated"}))]).await.unwrap();
+        let changed = pool.get_providers_for_model("shared-model").await.unwrap();
+        assert_eq!(changed.len(), 1);
+        assert!(!Arc::ptr_eq(&before[0], &changed[0]));
     }
 
     #[tokio::test]

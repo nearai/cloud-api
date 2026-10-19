@@ -1440,6 +1440,17 @@ impl ResponseServiceImpl {
 
             // Prepare extra params with tools and encryption headers
             let mut extra = std::collections::HashMap::new();
+            if let Some(effort) = process_context
+                .request
+                .reasoning
+                .as_ref()
+                .and_then(|reasoning| reasoning.effort.as_ref())
+            {
+                extra.insert(
+                    "reasoning_effort".into(),
+                    serde_json::Value::String(effort.clone()),
+                );
+            }
             if !tools.is_empty() {
                 extra.insert("tools".to_string(), serde_json::to_value(tools).unwrap());
             }

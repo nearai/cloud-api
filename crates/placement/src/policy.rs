@@ -9,8 +9,10 @@
 //! counts.
 //!
 //! The heavy lane is the only filter the class adds, and it filters heavy
-//! requests only. [`lane_admits`] is the whole admission predicate (applied
-//! as `Rule::Lane`), and [`classify`] only labels the outcome: every class
+//! requests only. [`lane_admits`] is the admission predicate (applied as
+//! `Rule::Lane`), [`overflow_admits`] the one for a heavy request the lane
+//! refused everywhere (`Tuning::overflow_when_busy`), and [`classify`] only
+//! labels the outcome: every class
 //! selects with the same HRW, pins and score, so a pinned conversation keeps
 //! its replica whenever the lane admits it. A short request is never kept
 //! off a lane member: the pin-hold load test and the affinity score bound
@@ -169,6 +171,24 @@ pub fn lane_admits(
                 && (is_member || lane.size < lane.cap)
         }
         (_, Class::Short) => true,
+    }
+}
+
+/// The admission predicate for overflow: applied, with
+/// `Tuning::overflow_when_busy`, to the stage-1 survivors when [`lane_admits`]
+/// refused every one of them (only a heavy request can be refused).
+/// `member_refused` says some refused survivor is a lane member.
+///
+/// - Long tier: every refused survivor is admitted; the backlog cap only
+///   bounded queueing, and every replica is over it.
+/// - Base tier: only lane members, while any member survived, so the clean
+///   replicas short traffic uses stay clean. With no member (e.g. a prompt
+///   over `HEAVY_BASE_MAX_PROMPT` on an idle Fleet) every survivor is
+///   admitted.
+pub fn overflow_admits(tier: Tier, is_member: bool, member_refused: bool) -> bool {
+    match tier {
+        Tier::Long => true,
+        Tier::Base => is_member || !member_refused,
     }
 }
 
@@ -466,6 +486,22 @@ mod tests {
                     &lane
                 ));
             }
+        }
+    }
+
+    #[test]
+    fn overflow_keeps_base_heavy_work_on_lane_members() {
+        for (is_member, member_refused, base) in [
+            (true, true, true),
+            (false, true, false),
+            (false, false, true),
+        ] {
+            assert_eq!(
+                overflow_admits(Tier::Base, is_member, member_refused),
+                base,
+                "base member={is_member} member_refused={member_refused}"
+            );
+            assert!(overflow_admits(Tier::Long, is_member, member_refused));
         }
     }
 

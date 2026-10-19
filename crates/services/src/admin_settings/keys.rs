@@ -51,10 +51,11 @@ pub struct PlacementTuning {
     /// Default true: a busy verdict (every replica KV-full, or the heavy lane
     /// / long backlog cap admits nothing) is placed on the least-loaded
     /// candidate. False sends those requests through legacy routing instead.
-    /// Write it (to any value) only after every instance runs a build that
-    /// knows this field: an older build cannot parse a stored row naming it
-    /// (`deny_unknown_fields`) and falls back to the defaults for every knob,
-    /// a stored `enabled: false` included.
+    /// This build and later read a stored row leniently (an unknown field is
+    /// ignored, see `PlacementKey::parse`); builds before it do not, and fall
+    /// back to the defaults for every knob, a stored `enabled: false`
+    /// included. So write this field only once no instance, and no rollback
+    /// target, is older than this build.
     pub overflow_when_busy: bool,
 }
 
@@ -217,11 +218,30 @@ impl SettingKey for PlacementKey {
         PlacementTuning::default()
     }
 
-    /// Strict and lenient reads are the same here: stored rows are validated
-    /// exactly like PATCH input.
-    fn parse(value: &Value, _strict: bool) -> Result<PlacementTuning, String> {
-        let typed: PlacementTuning =
-            serde_json::from_value(value.clone()).map_err(|e| e.to_string())?;
+    /// PATCH input is strict: an unknown field is an error. A stored row is
+    /// read leniently: fields this binary does not know (written by a newer
+    /// binary, e.g. before a rollback) are ignored and logged by name, so they
+    /// can never reset the known knobs, the `enabled` kill switch included,
+    /// to their defaults. Known fields are validated either way.
+    fn parse(value: &Value, strict: bool) -> Result<PlacementTuning, String> {
+        let known = match value {
+            Value::Object(fields) if !strict => {
+                let mut known = fields.clone();
+                known.retain(|name, _| {
+                    let is_known = PLACEMENT_FIELDS.contains(&name.as_str());
+                    if !is_known {
+                        tracing::warn!(
+                            field = %name,
+                            "Stored placement setting has a field this build does not know; ignoring it"
+                        );
+                    }
+                    is_known
+                });
+                Value::Object(known)
+            }
+            _ => value.clone(),
+        };
+        let typed: PlacementTuning = serde_json::from_value(known).map_err(|e| e.to_string())?;
         typed.validate().map_err(|e| e.to_string())?;
         Ok(typed)
     }

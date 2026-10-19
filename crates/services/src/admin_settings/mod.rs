@@ -764,6 +764,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stored_placement_row_from_a_newer_build_keeps_known_knobs() {
+        // A newer build stored a field this build does not know beside the
+        // kill switch (e.g. after a rollback). The stored read ignores the
+        // unknown field instead of falling back to the defaults, so a stored
+        // `enabled: false` stays off.
+        let (svc, repo, handle) = service();
+        repo.put(
+            KEY_PLACEMENT,
+            json!({"enabled": false, "pin_ttl_ms": 120_000, "future_knob": 1}),
+        );
+        svc.reload().await;
+        assert_eq!(
+            **handle.load(),
+            Tuning {
+                enabled: false,
+                pin_ttl_ms: 120_000,
+                ..Tuning::default()
+            }
+        );
+        let v = svc.get(KEY_PLACEMENT).await.unwrap();
+        assert_eq!(v.value["enabled"], json!(false));
+        assert!(v.value.get("future_knob").is_none());
+
+        // PATCH input stays strict, and a patch of another field is not
+        // rejected for the unknown stored one.
+        invalid(&svc, json!({"future_knob": 2})).await;
+        svc.update(KEY_PLACEMENT, json!({"kv_max": 0.9}), Uuid::new_v4())
+            .await
+            .unwrap();
+        assert!(!handle.load().enabled, "the kill switch survives the patch");
+        assert_eq!(handle.load().kv_max, 0.9);
+    }
+
+    #[tokio::test]
     async fn reload_applies_rows_keeps_last_good_and_survives_bad_rows() {
         let (svc, repo, handle) = service();
         // Another instance wrote the row.

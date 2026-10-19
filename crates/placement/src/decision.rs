@@ -17,7 +17,8 @@ use rand::Rng;
 use crate::affinity::{pin_id, select, AffinityKey, PinId, Selection};
 use crate::consts::FRESH_MAX_MS;
 use crate::policy::{
-    classify, lane_admits, lane_view, Class, LaneView, PriorityBand, RoutePolicy, Tier,
+    classify, lane_admits, lane_view, overflow_admits, Class, LaneView, PriorityBand, RoutePolicy,
+    Tier,
 };
 use crate::rules::{first_exclusion, saturated, Exclusion, Rule, ALL_RULES};
 use crate::score::{
@@ -532,26 +533,28 @@ impl Placer {
         let mut candidates = admitted;
 
         if candidates.is_empty() {
-            // Only the lane refused the survivors, and `lane_admits` always
-            // admits a short request, so this is a heavy one: the base lane is
+            // Only the lane refused the survivors, and `lane_admits` admits
+            // every short request, so this is a heavy one: the base lane is
             // full or the prompt is too big for it, or every long replica is
             // over its backlog cap. With `overflow_when_busy` it is placed on
-            // the refused survivors anyway, on base only on lane members when
-            // any survived, so the clean replicas short traffic uses stay
-            // clean; the score and pin rules then pick the least-loaded.
-            if !tuning.overflow_when_busy || class == Class::Short {
-                let reason = match (class, self.tier) {
-                    (Class::Heavy, Tier::Long) => LegacyReason::LongFull,
-                    (Class::Heavy, Tier::Base) => LegacyReason::LaneFull,
-                    (Class::Short, _) => LegacyReason::NoneEligible,
+            // the refused survivors `overflow_admits` keeps; the score and pin
+            // rules then pick among them.
+            if !tuning.overflow_when_busy {
+                let reason = match self.tier {
+                    Tier::Long => LegacyReason::LongFull,
+                    Tier::Base => LegacyReason::LaneFull,
                 };
                 return self.legacy_in_lane(input, snap, &lane, reason, tally.record());
             }
-            let has_member = refused.iter().any(|c| lane.members.contains(&c.view.slot));
+            let member_refused = refused.iter().any(|c| lane.members.contains(&c.view.slot));
             candidates = refused
                 .into_iter()
                 .filter(|c| {
-                    self.tier == Tier::Long || !has_member || lane.members.contains(&c.view.slot)
+                    overflow_admits(
+                        self.tier,
+                        lane.members.contains(&c.view.slot),
+                        member_refused,
+                    )
                 })
                 .collect();
             overflow = overflow.or(Some(RoutePolicy::HeavyOverflow));

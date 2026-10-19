@@ -89,9 +89,10 @@ pub const PLACEMENT_ENABLED: bool = true;
 /// ledger and the shared routed counts still see it. False restores the
 /// legacy fallback for those verdicts only; the no-data fallbacks (disabled,
 /// no state, stale, incomplete) are unaffected. Write the field (to any
-/// value) only after every instance runs a build that knows it: the stored
-/// setting is `deny_unknown_fields`, and an older build that cannot parse it
-/// falls back to the defaults for every knob, `enabled` included.
+/// value) only once no instance, and no rollback target, predates it: builds
+/// before it parse the stored setting strictly and fall back to the defaults
+/// for every knob, `enabled` included. Later builds ignore unknown stored
+/// fields.
 pub const OVERFLOW_WHEN_BUSY: bool = true;
 
 /// How long a follow pin stays valid after it's written, in milliseconds.

@@ -228,7 +228,7 @@ use utoipa::{Modify, OpenApi};
             // Core API models
             ChatCompletionRequest, ChatCompletionResponse, Message, CompletionUsage,
             CompletionRequest, CompletionPrompt, StopSequences, CompletionResponse,
-            CompletionChoice, ModelsResponse, ModelInfo, ModelPricing, TopProvider, ErrorResponse,
+            CompletionChoice, ModelsResponse, ModelInfo, ModelPricing, UpcomingModelPricingInfo, TopProvider, ErrorResponse,
             // Image generation models
             ImageGenerationRequest, ImageGenerationResponse, ImageData,
             // Audio transcription models
@@ -306,7 +306,7 @@ use utoipa::{Modify, OpenApi};
             crate::routes::attestation::NvidiaPayload,
             crate::routes::attestation::QuoteResponse,
             // Model pricing models
-            ModelListResponse, ModelWithPricing, AdminModelListResponse, AdminModelWithPricing,
+            ModelListResponse, ModelWithPricing, UpcomingPricing, AdminModelListResponse, AdminModelWithPricing,
             DecimalPrice, DecimalPriceRequest, ModelMetadata,
             ServiceResponse, ServiceListResponse,
             AdminServiceResponse, AdminServiceListResponse, CreateServiceRequest, UpdateServiceRequest,

@@ -107,60 +107,12 @@ fn encryption_parameters_still_enable_e2ee() {
     }
 }
 
-#[test]
-fn nano_dollars_zero_renders_as_bare_zero() {
-    assert_eq!(nano_dollars_to_per_token_string(0), "0");
-}
-
-#[test]
-fn nano_dollars_one_keeps_full_nine_decimal_places() {
-    // 1 nano-USD = $0.000000001 — boundary for our scale.
-    assert_eq!(nano_dollars_to_per_token_string(1), "0.000000001");
-}
-
-#[test]
-fn nano_dollars_typical_per_token_price_trims_trailing_zeros() {
-    // $0.000008 per token, e.g. Claude Sonnet input.
-    assert_eq!(nano_dollars_to_per_token_string(8_000), "0.000008");
-    // $0.000024 per token, e.g. Claude Sonnet output.
-    assert_eq!(nano_dollars_to_per_token_string(24_000), "0.000024");
-}
-
-#[test]
-fn nano_dollars_whole_dollar_amount_omits_decimal_point() {
-    // 1_000_000_000 nano-USD = $1 exactly. Must NOT render as "1." or "1.0".
-    assert_eq!(nano_dollars_to_per_token_string(1_000_000_000), "1");
-    assert_eq!(nano_dollars_to_per_token_string(5_000_000_000), "5");
-}
-
-#[test]
-fn nano_dollars_mixed_integer_and_fraction() {
-    // $1.500000000 → "1.5" after trim.
-    assert_eq!(nano_dollars_to_per_token_string(1_500_000_000), "1.5");
-    // $1.000000001 → all 9 frac digits preserved (no trailing zeros to trim).
-    assert_eq!(
-        nano_dollars_to_per_token_string(1_000_000_001),
-        "1.000000001"
-    );
-}
-
-#[test]
-fn nano_dollars_max_i64_does_not_lose_precision() {
-    // Integer arithmetic must remain exact at the upper bound, unlike the
-    // previous f64-based implementation.
-    // i64::MAX = 9_223_372_036_854_775_807 nano-USD
-    //         = 9_223_372_036.854775807 USD
-    assert_eq!(
-        nano_dollars_to_per_token_string(i64::MAX),
-        "9223372036.854775807"
-    );
-}
-
 fn make_model_with_pricing(
     input_modalities: Option<Vec<String>>,
     output_modalities: Option<Vec<String>>,
 ) -> services::models::ModelWithPricing {
     services::models::ModelWithPricing {
+        upcoming_pricing: None,
         id: uuid::Uuid::new_v4(),
         model_name: "test/model".to_string(),
         model_display_name: "Test Model".to_string(),

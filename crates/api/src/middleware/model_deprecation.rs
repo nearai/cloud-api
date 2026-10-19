@@ -1,11 +1,12 @@
-//! Announces a planned model deprecation on inference responses.
+//! Announces planned model deprecations and pricing changes on inference responses.
 //!
-//! When the model named in a request has a planned deprecation, successful
-//! responses carry:
+//! Successful responses carry the applicable notices for the requested model:
 //!
 //! - `x-model-deprecation-date`: the planned deprecation date, in the same
 //!   form as `deprecation_date` on `GET /v1/models`.
 //! - `x-model-successor`: the recommended replacement model, when one is set.
+//! - `x-model-pricing-change-date`: the earliest pending pricing change,
+//!   independently of whether the model has a planned deprecation.
 //!
 //! These are deliberately not the standard `Deprecation` (RFC 9745) and
 //! `Sunset` (RFC 8594) headers. Those describe the requested URL, so on a
@@ -33,6 +34,7 @@ use services::models::{ModelWithPricing, ModelsServiceTrait};
 
 pub const HEADER_MODEL_DEPRECATION_DATE: &str = "x-model-deprecation-date";
 pub const HEADER_MODEL_SUCCESSOR: &str = "x-model-successor";
+pub const HEADER_MODEL_PRICING_CHANGE_DATE: &str = "x-model-pricing-change-date";
 
 /// Upper bound on the catalog lookup made while a finished response waits.
 const LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
@@ -107,8 +109,8 @@ impl ModelDeprecationNotice {
     }
 }
 
-/// Adds the deprecation headers to successful responses for a model with a
-/// planned deprecation. The handler names the model through
+/// Adds planned deprecation and pricing headers to successful responses.
+/// The handler names the model through
 /// [`RequestedModel`]; requests that never reach that point are left alone.
 pub async fn model_deprecation_middleware(
     State(state): State<ModelDeprecationState>,
@@ -136,6 +138,14 @@ pub async fn model_deprecation_middleware(
     };
     if let Some(notice) = ModelDeprecationNotice::from_model(&model) {
         notice.apply(response.headers_mut());
+    }
+    if let Some(pricing) = &model.upcoming_pricing {
+        let date = crate::routes::admin::format_deprecation_date(&pricing.effective_at);
+        if let Ok(value) = HeaderValue::from_str(&date) {
+            response
+                .headers_mut()
+                .insert(HEADER_MODEL_PRICING_CHANGE_DATE, value);
+        }
     }
     response
 }
@@ -192,6 +202,7 @@ mod tests {
 
     fn model(deprecation_date: Option<DateTime<Utc>>) -> ModelWithPricing {
         ModelWithPricing {
+            upcoming_pricing: None,
             id: uuid::Uuid::nil(),
             model_name: "nearai/old-model".to_string(),
             model_display_name: "Old Model".to_string(),

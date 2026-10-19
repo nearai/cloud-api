@@ -144,6 +144,27 @@ pub(crate) fn estimate_input(params: &ChatCompletionParams) -> InputEstimate {
     }
 }
 
+/// Estimate input tokens for metric labels only; routing keeps its own estimate.
+pub(crate) fn metric_input_tokens(params: &ChatCompletionParams) -> u32 {
+    let estimate = estimate_input(params);
+    let forwarded_tool_tokens = if params.tools.is_none() {
+        params
+            .extra
+            .get("tools")
+            .and_then(|tools| serde_json::to_string(tools).ok())
+            .map_or(0, |tools| {
+                u64::try_from(tools.len() / 4).unwrap_or(u64::MAX)
+            })
+    } else {
+        0
+    };
+    let total = estimate
+        .countable_tokens
+        .saturating_add(estimate.uncounted_tokens)
+        .saturating_add(forwarded_tool_tokens);
+    u32::try_from(total).unwrap_or(u32::MAX)
+}
+
 /// The base tier's capacity: the smallest DECLARED context capacity among a
 /// model's providers, or `None` when fewer than two distinct capacities are
 /// declared (a single-tier model has no tier boundary). The one tier
@@ -322,6 +343,99 @@ mod tests {
 
     fn cfg(json: &str) -> serde_json::Value {
         serde_json::from_str(json).unwrap()
+    }
+
+    #[test]
+    fn metric_input_tokens_counts_tool_schemas_tool_call_args_and_media() {
+        let tools = (0..15)
+            .map(|index| {
+                serde_json::json!({
+                    "type": "function",
+                    "function": {
+                        "name": format!("tool_{index}"),
+                        "description": "x".repeat(600),
+                        "parameters": {"type": "object", "properties": {}}
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        let params: ChatCompletionParams = serde_json::from_value(serde_json::json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "Hi"},
+                {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {
+                            "name": "tool_0",
+                            "arguments": format!("{{\"value\":\"{}\"}}", "x".repeat(200))
+                        }
+                    }]
+                },
+                {
+                    "role": "user",
+                    "content": [{"type": "image_url", "image_url": {"url": "https://example.com/image.png"}}]
+                }
+            ],
+            "tools": tools
+        }))
+        .unwrap();
+
+        let metric_tokens = metric_input_tokens(&params);
+        assert!((3_000..=4_000).contains(&metric_tokens));
+        let estimate = estimate_input(&params);
+        assert_eq!(
+            metric_tokens,
+            u32::try_from(estimate.countable_tokens + estimate.uncounted_tokens).unwrap()
+        );
+
+        let mut without_tools = params.clone();
+        without_tools.tools = None;
+        assert!(metric_tokens > metric_input_tokens(&without_tools));
+
+        let mut without_tool_calls = params.clone();
+        without_tool_calls.messages[1].tool_calls = None;
+        assert!(metric_tokens > metric_input_tokens(&without_tool_calls));
+
+        let mut without_media = params;
+        without_media.messages[2].content = Some(serde_json::json!(""));
+        assert!(metric_tokens > metric_input_tokens(&without_media));
+    }
+
+    #[test]
+    fn metric_input_tokens_counts_forwarded_tools_only_when_typed_tools_are_absent() {
+        let mut params: ChatCompletionParams = serde_json::from_value(serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "Hi"}]
+        }))
+        .unwrap();
+        let forwarded_tools = serde_json::json!([{
+            "type": "web_context_search",
+            "description": "x".repeat(8_000)
+        }]);
+        let forwarded_size = serde_json::to_string(&forwarded_tools).unwrap().len() / 4;
+        params.extra.insert("tools".to_string(), forwarded_tools);
+
+        assert_eq!(
+            metric_input_tokens(&params),
+            u32::try_from(forwarded_size + 4).unwrap()
+        );
+
+        params.tools = Some(
+            serde_json::from_value(serde_json::json!([{
+                "type": "function",
+                "function": {
+                    "name": "typed",
+                    "description": "small",
+                    "parameters": {"type": "object", "properties": {}}
+                }
+            }]))
+            .unwrap(),
+        );
+        assert!(metric_input_tokens(&params) < 100);
     }
 
     #[test]

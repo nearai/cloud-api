@@ -808,6 +808,7 @@ fn check_send_policy(
     if !policy.enabled {
         return reject("sender_not_enabled");
     }
+
     let amount = request.amount.unwrap_or(0);
     if !policy.allows_source(&request.source_credit_type)
         || !policy.constraints.allows(
@@ -819,6 +820,7 @@ fn check_send_policy(
     {
         return reject("organization_transfer_limit_exceeded");
     }
+
     if authorization.credential_id.is_some()
         && !authorization.constraints.allows(
             amount,
@@ -829,6 +831,7 @@ fn check_send_policy(
     {
         return reject("credential_transfer_limit_exceeded");
     }
+
     Ok(())
 }
 
@@ -842,13 +845,14 @@ async fn replay(
     if key.is_empty() {
         return Ok(None);
     }
+
     let Some(row) = tx
         .query_opt(
             r#"
-        SELECT terms = $3::JSONB AS matches, credential_id, result
-        FROM organization_credit_transfers
-        WHERE sender_organization_id = $1 AND idempotency_key = $2
-        "#,
+            SELECT terms = $3::JSONB AS matches, credential_id, result
+            FROM organization_credit_transfers
+            WHERE sender_organization_id = $1 AND idempotency_key = $2
+            "#,
             &[&sender, &key, &terms],
         )
         .await?
@@ -860,12 +864,14 @@ async fn replay(
     if !row.get::<_, bool>("matches") {
         return reject("idempotency_conflict");
     }
+
     let original_credential: Option<Uuid> = row.get("credential_id");
     let same_credential =
         authorization.credential_id.is_some() && authorization.credential_id == original_credential;
     if !same_credential && !authorization.permissions.iter().any(|p| p == READ_CREDITS) {
         return reject("credential_refused");
     }
+
     Ok(Some(row.get("result")))
 }
 

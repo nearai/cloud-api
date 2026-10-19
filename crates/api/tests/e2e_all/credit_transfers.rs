@@ -327,15 +327,20 @@ async fn policy_put_requires_both_sections_without_changing_policy_or_audit() {
     let sender = create_org(&server).await;
     let path = format!("/v1/admin/organizations/{}/policy", sender.id);
     let authorization = format!("Bearer {}", get_session_id());
+
     let initial = server
         .put(&path)
         .add_header("Authorization", authorization.clone())
         .add_header("User-Agent", MOCK_USER_AGENT)
         .json(&json!({
-            "policy": {"credentials": {"enabled": true}, "credits_transfer": {"enabled": true}},
+            "policy": {
+                "credentials": {"enabled": true},
+                "credits_transfer": {"enabled": true}
+            },
             "reason": "Enable both sections"
         }))
         .await;
+
     assert_eq!(initial.status_code(), StatusCode::OK);
     let saved = initial.json::<Value>();
 
@@ -347,8 +352,12 @@ async fn policy_put_requires_both_sections_without_changing_policy_or_audit() {
             .put(&path)
             .add_header("Authorization", authorization.clone())
             .add_header("User-Agent", MOCK_USER_AGENT)
-            .json(&json!({"policy": policy, "reason": "Incomplete replacement"}))
+            .json(&json!({
+                "policy": policy,
+                "reason": "Incomplete replacement"
+            }))
             .await;
+
         assert_eq!(rejected.status_code(), StatusCode::BAD_REQUEST);
 
         let current = server
@@ -356,6 +365,7 @@ async fn policy_put_requires_both_sections_without_changing_policy_or_audit() {
             .add_header("Authorization", authorization.clone())
             .add_header("User-Agent", MOCK_USER_AGENT)
             .await;
+
         assert_eq!(current.json::<Value>(), saved);
     }
 }

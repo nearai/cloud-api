@@ -564,15 +564,16 @@ pub fn validate_encryption_headers(
 
 /// Redact sensitive fields (e.g. `api_key`) from a `provider_config` JSON value.
 ///
-/// Replaces `api_key` with `"***"` so callers can tell whether one is configured
-/// without exposing the actual value.
+/// Replaces a stored `api_key` with `"***"` so callers can tell whether one is
+/// configured without exposing the actual value. A `null` key stays `null`, so
+/// writing a read back never sends `"***"` for a model without a key.
 pub fn redact_provider_config(config: Option<serde_json::Value>) -> Option<serde_json::Value> {
     config.map(|mut v| {
         if let Some(obj) = v.as_object_mut() {
-            if obj.contains_key("api_key") {
+            if obj.get("api_key").is_some_and(serde_json::Value::is_string) {
                 obj.insert(
                     "api_key".to_string(),
-                    serde_json::Value::String("***".to_string()),
+                    serde_json::Value::String(services::admin::REDACTED_API_KEY.to_string()),
                 );
             }
         }

@@ -4063,7 +4063,10 @@ pub struct UpdateModelApiRequest {
     /// Provider type: "vllm" (default, TEE-enabled) or "external" (3rd party)
     #[serde(rename = "providerType", skip_serializing_if = "Option::is_none")]
     pub provider_type: Option<String>,
-    /// JSON config for external providers (backend, base_url, etc.)
+    /// JSON config for external providers (backend, base_url, etc.). On an
+    /// existing model it merges into the stored config: keys sent replace
+    /// stored keys, `null` removes a key, omitted keys are kept. `api_key:
+    /// "***"` keeps the stored key.
     #[serde(rename = "providerConfig", skip_serializing_if = "Option::is_none")]
     pub provider_config: Option<serde_json::Value>,
     /// Whether this model supports TEE attestation

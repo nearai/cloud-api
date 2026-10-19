@@ -517,6 +517,15 @@ fn not_found(message: impl Into<String>, code: &str) -> (StatusCode, ResponseJso
 ///
 /// Upserts (inserts or updates) pricing and metadata for one or more models. Only authenticated admins can perform this operation.
 /// The body should be an array of objects where each key is a model name and the value is the model data.
+///
+/// `providerConfig` on an existing model merges into the stored config at the top level:
+/// keys sent replace stored keys, a key sent as `null` is removed, and omitted keys are kept.
+/// A new model stores `providerConfig` as sent.
+///
+/// `providerConfig.api_key` is returned as `"***"` by admin reads. Sending `"***"` back keeps
+/// the stored key, and is rejected with 400 when no key is stored. Changing `backend` or
+/// `base_url` while keeping a stored key is rejected; send `api_key` again (or `null` to use
+/// the server default key).
 #[utoipa::path(
     patch,
     path = "/v1/admin/models",
@@ -553,31 +562,10 @@ pub async fn batch_upsert_models(
         ));
     }
 
-    // Validate all pricing fields are non-negative to prevent incorrect billing
+    // Validate all pricing fields are non-negative to prevent incorrect billing.
+    // `providerConfig` is validated by the service layer after it is merged
+    // into the stored config, since a partial write is not a full config.
     for (model_name, request) in &batch_request {
-        if let Some(config) = &request.provider_config {
-            // Backend-less configs belong to non-external features such as
-            // long-context routing. The service layer repeats this validation
-            // against the merged stored provider type, which covers partial
-            // updates that omit `providerType`.
-            if request.provider_type.as_deref() == Some("external")
-                || config.get("backend").is_some()
-                || config.get("enforced_request_body").is_some()
-            {
-                inference_providers::non_attested::external::validate_external_provider_config(
-                    config,
-                )
-                .map_err(|error| {
-                    (
-                        StatusCode::BAD_REQUEST,
-                        ResponseJson(ErrorResponse::new(
-                            format!("model '{model_name}': {error}"),
-                            "invalid_request".to_string(),
-                        )),
-                    )
-                })?;
-            }
-        }
         let validate_price = |price: &Option<DecimalPriceRequest>, field: &str| {
             if let Some(p) = price {
                 p.validate().map_err(|e| {
@@ -884,7 +872,8 @@ pub async fn batch_upsert_models(
                     StatusCode::BAD_REQUEST,
                     ResponseJson(ErrorResponse::new(msg, "invalid_pricing".to_string())),
                 ),
-                services::admin::AdminError::InvalidDeprecation(msg) => (
+                services::admin::AdminError::InvalidDeprecation(msg)
+                | services::admin::AdminError::InvalidParams(msg) => (
                     StatusCode::BAD_REQUEST,
                     ResponseJson(ErrorResponse::new(msg, "invalid_request".to_string())),
                 ),

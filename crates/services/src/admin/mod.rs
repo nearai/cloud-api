@@ -33,6 +33,80 @@ const MODEL_PRICING_CHANGE_USAGE_WINDOW_DAYS: i64 = 30;
 const MIN_PRICING_CHANGE_LEAD_SECS: i64 = 3600;
 /// Maximum number of models in one scheduled pricing change batch.
 const MAX_PRICING_CHANGE_BATCH_SIZE: usize = 50;
+/// Value admin reads return in place of a stored `providerConfig.api_key`.
+pub const REDACTED_API_KEY: &str = "***";
+
+/// Applies a `providerConfig` write to the stored config of one model.
+///
+/// `stored` is `None` for a new row, which stores the config as sent. For an
+/// existing row the write merges at the top level: keys sent replace stored
+/// keys, a key sent as `null` is removed, and omitted keys are kept. So a
+/// partial write cannot drop the per-model `api_key` or the
+/// `enforced_request_body` routing policy.
+///
+/// `api_key: "***"`, the redacted value admin reads return, keeps the stored
+/// key and is rejected when no key is stored, so the placeholder is never
+/// stored or sent upstream. A kept key must not follow a changed `backend` or
+/// `base_url` to another upstream; that write has to send `api_key` again.
+fn resolve_provider_config(
+    model_name: &str,
+    stored: Option<Option<&serde_json::Value>>,
+    patch: serde_json::Value,
+) -> Result<serde_json::Value, AdminError> {
+    let invalid =
+        |message: &str| AdminError::InvalidParams(format!("model '{model_name}': {message}"));
+    let stored_config = stored.flatten();
+    let stored_key = stored_config
+        .and_then(|config| config.get("api_key"))
+        .filter(|key| key.as_str().is_some_and(|key| key != REDACTED_API_KEY))
+        .cloned();
+    let sent_key = patch.get("api_key");
+    let sent_redacted_key = sent_key.and_then(serde_json::Value::as_str) == Some(REDACTED_API_KEY);
+    let sent_new_key = sent_key.is_some() && !sent_redacted_key;
+
+    let mut config = match (stored, patch) {
+        (Some(stored_config), serde_json::Value::Object(patch)) => {
+            let mut merged = stored_config
+                .and_then(serde_json::Value::as_object)
+                .cloned()
+                .unwrap_or_default();
+            for (key, value) in patch {
+                if value.is_null() {
+                    merged.remove(&key);
+                } else {
+                    merged.insert(key, value);
+                }
+            }
+            serde_json::Value::Object(merged)
+        }
+        (_, patch) => patch,
+    };
+
+    if sent_redacted_key {
+        let key = stored_key.clone().ok_or_else(|| {
+            invalid(
+                "providerConfig.api_key \"***\" keeps the stored key, but none is stored; \
+                 send the real key",
+            )
+        })?;
+        if let Some(config) = config.as_object_mut() {
+            config.insert("api_key".to_string(), key);
+        }
+    }
+
+    if stored_key.is_some() && !sent_new_key && config.is_object() {
+        for field in ["backend", "base_url"] {
+            if stored_config.and_then(|stored| stored.get(field)) != config.get(field) {
+                return Err(invalid(&format!(
+                    "providerConfig.{field} changed, so the stored api_key is not kept; \
+                     send api_key again, or null to use the server default key"
+                )));
+            }
+        }
+    }
+
+    Ok(config)
+}
 
 pub struct AdminServiceImpl {
     repository: Arc<dyn AdminRepository>,
@@ -335,12 +409,31 @@ impl AdminServiceImpl {
 impl AdminService for AdminServiceImpl {
     async fn batch_upsert_models(
         &self,
-        models: BatchUpdateModelAdminRequest,
+        mut models: BatchUpdateModelAdminRequest,
     ) -> Result<BatchUpdateModelAdminResponse, AdminError> {
         if models.is_empty() {
             return Err(AdminError::InvalidPricing(
                 "At least one model must be provided".to_string(),
             ));
+        }
+
+        // Merge each providerConfig write into the stored config, so that
+        // validation, the write and the runtime reload all use the result.
+        for (model_name, request) in models.iter_mut() {
+            if let Some(patch) = request.provider_config.take() {
+                let existing = self
+                    .repository
+                    .get_model_validation_state(model_name)
+                    .await
+                    .map_err(|e| AdminError::InternalError(e.to_string()))?;
+                request.provider_config = Some(resolve_provider_config(
+                    model_name,
+                    existing
+                        .as_ref()
+                        .map(|state| state.provider_config.as_ref()),
+                    patch,
+                )?);
+            }
         }
 
         // Validate all models first
@@ -1439,19 +1532,31 @@ impl AdminServiceImpl {
             .provider_type
             .as_deref()
             .unwrap_or(&existing.provider_type);
-        if effective_provider_type == "external" {
+        // `request.provider_config` is already merged with the stored config.
+        // Backend-less configs belong to non-external features such as
+        // long-context routing, so only configs that name a backend or carry a
+        // routing policy are checked on non-external rows.
+        let writes_external_config = request.provider_config.as_ref().is_some_and(|config| {
+            config.get("backend").is_some() || config.get("enforced_request_body").is_some()
+        });
+        if effective_provider_type == "external" || writes_external_config {
             let config = request
                 .provider_config
                 .as_ref()
                 .or(existing.provider_config.as_ref())
                 .ok_or_else(|| {
-                    AdminError::InvalidPricing(format!(
+                    AdminError::InvalidParams(format!(
                         "model '{model_name}': external models require providerConfig"
                     ))
                 })?;
             inference_providers::non_attested::external::validate_external_provider_config(config)
                 .map_err(|error| {
-                    AdminError::InvalidPricing(format!("model '{model_name}': {error}"))
+                    let merge_hint = if is_new_model || request.provider_config.is_none() {
+                        ""
+                    } else {
+                        " (providerConfig merges into the stored config; send a key as null to remove it)"
+                    };
+                    AdminError::InvalidParams(format!("model '{model_name}': {error}{merge_hint}"))
                 })?;
         }
 
@@ -1517,5 +1622,149 @@ impl AdminServiceImpl {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod provider_config_tests {
+    use super::{resolve_provider_config, AdminError};
+    use serde_json::{json, Value};
+
+    fn stored_external() -> Value {
+        json!({
+            "backend": "openai_compatible",
+            "base_url": "https://upstream.example/v1",
+            "model_name": "vendor/model",
+            "api_key": "sk-stored",
+            "enforced_request_body": {"provider": {"zdr": true, "only": ["a"]}}
+        })
+    }
+
+    fn update(stored: &Value, patch: Value) -> Result<Value, AdminError> {
+        resolve_provider_config("m", Some(Some(stored)), patch)
+    }
+
+    #[test]
+    fn redacted_key_keeps_the_stored_key() {
+        let mut read_back = stored_external();
+        read_back["api_key"] = json!("***");
+        assert_eq!(
+            update(&stored_external(), read_back).unwrap(),
+            stored_external()
+        );
+
+        let config = update(&stored_external(), json!({"api_key": "***"})).unwrap();
+        assert_eq!(config, stored_external());
+    }
+
+    #[test]
+    fn redacted_key_without_a_stored_key_is_rejected() {
+        let patch = json!({"backend": "openai_compatible", "base_url": "https://x.example",
+            "api_key": "***"});
+        let mut no_key = stored_external();
+        no_key.as_object_mut().unwrap().remove("api_key");
+        let mut null_key = stored_external();
+        null_key["api_key"] = Value::Null;
+        let mut placeholder_key = stored_external();
+        placeholder_key["api_key"] = json!("***");
+
+        let new_row = resolve_provider_config("m", None, patch.clone());
+        let no_config = resolve_provider_config("m", Some(None), patch.clone());
+        for result in [
+            new_row,
+            no_config,
+            update(&no_key, patch.clone()),
+            update(&null_key, patch.clone()),
+            update(&placeholder_key, patch.clone()),
+        ] {
+            let Err(AdminError::InvalidParams(message)) = result else {
+                panic!("expected InvalidParams, got {result:?}");
+            };
+            assert!(message.contains("none is stored"), "{message}");
+        }
+    }
+
+    #[test]
+    fn update_merges_top_level_keys() {
+        let config = update(&stored_external(), json!({"model_name": "vendor/other"})).unwrap();
+        let mut expected = stored_external();
+        expected["model_name"] = json!("vendor/other");
+        assert_eq!(config, expected);
+
+        let policy = json!({"provider": {"zdr": true}});
+        let config = update(
+            &stored_external(),
+            json!({"enforced_request_body": policy.clone()}),
+        )
+        .unwrap();
+        assert_eq!(config["enforced_request_body"], policy);
+        assert_eq!(config["api_key"], "sk-stored");
+
+        let config = update(&stored_external(), json!({"api_key": "sk-new"})).unwrap();
+        assert_eq!(config["api_key"], "sk-new");
+    }
+
+    #[test]
+    fn null_removes_a_stored_key() {
+        let config = update(&stored_external(), json!({"enforced_request_body": null})).unwrap();
+        assert!(config.get("enforced_request_body").is_none());
+        assert_eq!(config["api_key"], "sk-stored");
+
+        let config = update(&stored_external(), json!({"api_key": null})).unwrap();
+        assert!(config.get("api_key").is_none());
+    }
+
+    #[test]
+    fn new_row_stores_the_config_as_sent() {
+        let patch = json!({"backend": "openai_compatible", "base_url": "https://x.example",
+            "api_key": null});
+        assert_eq!(
+            resolve_provider_config("m", None, patch.clone()).unwrap(),
+            patch
+        );
+    }
+
+    #[test]
+    fn long_context_tier_is_kept_unless_removed_explicitly() {
+        let stored = json!({"long_context": {"inference_url": "https://long.example",
+            "base_max_context_tokens": 202752, "max_context_tokens": 1048576}});
+        let config = update(&stored, json!({"other": true})).unwrap();
+        assert_eq!(config["long_context"], stored["long_context"]);
+        assert_eq!(config["other"], true);
+
+        let config = update(&stored, json!({"long_context": null})).unwrap();
+        assert_eq!(config, json!({}));
+
+        let config = resolve_provider_config("m", Some(None), stored.clone()).unwrap();
+        assert_eq!(config, stored);
+    }
+
+    #[test]
+    fn kept_key_cannot_follow_a_new_upstream() {
+        for patch in [
+            json!({"base_url": "https://other.example/v1"}),
+            json!({"base_url": "https://other.example/v1", "api_key": "***"}),
+            json!({"backend": "anthropic", "base_url": null}),
+        ] {
+            let result = update(&stored_external(), patch);
+            let Err(AdminError::InvalidParams(message)) = result else {
+                panic!("expected InvalidParams, got {result:?}");
+            };
+            assert!(message.contains("send api_key again"), "{message}");
+        }
+
+        let config = update(
+            &stored_external(),
+            json!({"base_url": "https://other.example/v1", "api_key": "sk-other"}),
+        )
+        .unwrap();
+        assert_eq!(config["api_key"], "sk-other");
+
+        let config = update(
+            &stored_external(),
+            json!({"base_url": "https://other.example/v1", "api_key": null}),
+        )
+        .unwrap();
+        assert!(config.get("api_key").is_none());
     }
 }

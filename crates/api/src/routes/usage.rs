@@ -223,6 +223,10 @@ pub async fn compute_organization_balance_response(
 /// and is not used in billing calculations.
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct UsageHistoryEntryResponse {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub served_route_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub served_deployment_id: Option<String>,
     pub id: String,
     pub workspace_id: String,
     pub api_key_id: String,
@@ -480,6 +484,14 @@ pub async fn get_organization_usage_history(
     let data = history
         .into_iter()
         .map(|entry| UsageHistoryEntryResponse {
+            served_route_id: entry
+                .provider_attribution
+                .served_route_id
+                .map(|id| id.to_string()),
+            served_deployment_id: entry
+                .provider_attribution
+                .served_deployment_id
+                .map(|id| id.to_string()),
             id: entry.id.to_string(),
             workspace_id: entry.workspace_id.to_string(),
             api_key_id: entry.api_key_id.to_string(),
@@ -662,6 +674,8 @@ fn usage_report_row_response(
     row: InferenceUsageReportRow,
 ) -> Result<UsageHistoryEntryResponse, UsageError> {
     Ok(UsageHistoryEntryResponse {
+        served_route_id: row.served_route_id.map(|id| id.to_string()),
+        served_deployment_id: row.served_deployment_id.map(|id| id.to_string()),
         id: row.id.to_string(),
         workspace_id: row.workspace_id.to_string(),
         api_key_id: row.api_key_id.to_string(),
@@ -946,6 +960,14 @@ pub async fn get_api_key_usage_history(
     let data = history
         .into_iter()
         .map(|entry| UsageHistoryEntryResponse {
+            served_route_id: entry
+                .provider_attribution
+                .served_route_id
+                .map(|id| id.to_string()),
+            served_deployment_id: entry
+                .provider_attribution
+                .served_deployment_id
+                .map(|id| id.to_string()),
             id: entry.id.to_string(),
             workspace_id: entry.workspace_id.to_string(),
             api_key_id: entry.api_key_id.to_string(),

@@ -134,6 +134,8 @@ async fn credits(f: &Fixture, kind: &str, amount: i64) {
 fn request(f: &Fixture, cost: i64) -> RecordUsageRequest {
     let inference = Uuid::new_v4();
     RecordUsageRequest {
+        served_route_id: None,
+        served_deployment_id: None,
         organization_id: f.org,
         workspace_id: f.workspace,
         api_key_id: f.key,

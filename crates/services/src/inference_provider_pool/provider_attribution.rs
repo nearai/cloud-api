@@ -50,6 +50,8 @@ pub(super) fn served_provider_attribution(
     served_via_fallback: bool,
 ) -> crate::usage::ProviderAttribution {
     crate::usage::ProviderAttribution {
+        served_route_id: None,
+        served_deployment_id: None,
         served_provider_tier: Some(provider.tier().into()),
         served_provider_type: Some(provider.provider_source().into()),
         served_via_fallback,

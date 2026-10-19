@@ -59,6 +59,7 @@ impl Stream for AttemptStream {
         if let Some((timer, seconds)) = &mut self.deadline {
             if timer.as_mut().poll(cx).is_ready() {
                 let timeout_seconds = *seconds;
+                self.inner = Box::pin(futures::stream::empty());
                 self.terminated = true;
                 self.finish("timeout");
                 return Poll::Ready(Some(Err(CompletionError::Timeout {
@@ -77,6 +78,7 @@ impl Stream for AttemptStream {
                 }
             }
             Poll::Ready(Some(Err(_))) => {
+                self.inner = Box::pin(futures::stream::empty());
                 self.terminated = true;
                 self.finish("stream_failed");
             }
@@ -112,6 +114,7 @@ pub(crate) fn track(
 struct RawAttemptStream {
     inner: inference_providers::responses_raw::ResponsesRawBody,
     lifecycle: AttemptStream,
+    usage: Option<super::native_usage::NativeUsage>,
 }
 
 impl Stream for RawAttemptStream {
@@ -134,9 +137,24 @@ impl Stream for RawAttemptStream {
             }
         }
         let result = self.inner.poll_next_unpin(cx);
+        if let Some(usage) = &mut self.usage {
+            match &result {
+                Poll::Ready(Some(Ok(bytes))) => usage.push(bytes),
+                Poll::Ready(None) => usage.eof(),
+                _ => {}
+            }
+            let tokens = usage.usage.clone();
+            if let Some(attempt) = &mut self.lifecycle.attempt {
+                attempt.usage = tokens;
+            }
+        }
         let outcome = match &result {
             Poll::Ready(Some(Err(_))) => Some("stream_failed"),
-            Poll::Ready(None) => Some("success"),
+            Poll::Ready(None) => Some(
+                self.usage
+                    .as_ref()
+                    .map_or("success", |usage| usage.outcome.unwrap_or("incomplete")),
+            ),
             _ => None,
         };
         if let Some(outcome) = outcome {
@@ -148,14 +166,28 @@ impl Stream for RawAttemptStream {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn track_raw(
     inner: inference_providers::responses_raw::ResponsesRawBody,
     attempt: InferenceAttempt,
     repository: Arc<dyn AttemptRepository>,
     deadline: Option<(tokio::time::Instant, u64)>,
 ) -> inference_providers::responses_raw::ResponsesRawBody {
+    track_native(inner, attempt, repository, deadline, None)
+}
+
+pub(crate) fn track_native(
+    inner: inference_providers::responses_raw::ResponsesRawBody,
+    attempt: InferenceAttempt,
+    repository: Arc<dyn AttemptRepository>,
+    deadline: Option<(tokio::time::Instant, u64)>,
+    protocol: Option<(bool, bool)>,
+) -> inference_providers::responses_raw::ResponsesRawBody {
     Box::pin(RawAttemptStream {
         inner,
+        usage: protocol.map(|(anthropic, streaming)| {
+            super::native_usage::NativeUsage::new(anthropic, streaming)
+        }),
         lifecycle: AttemptStream {
             inner: Box::pin(futures::stream::empty()),
             attempt: Some(attempt),
@@ -223,6 +255,34 @@ mod tests {
             estimated_cost_microusd: Some(7),
             latency_ms: Some(2),
         }
+    }
+
+    #[tokio::test]
+    async fn native_usage_reaches_the_attempt_without_rewriting_body() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let body = bytes::Bytes::from_static(br#"{"status":"completed","usage":{"input_tokens":10,"output_tokens":2,"input_tokens_details":{"cached_tokens":4}}}"#);
+        let mut stream = track_native(
+            Box::pin(futures::stream::iter([Ok(body.clone())])),
+            attempt(),
+            Arc::new(Ledger(tx)),
+            None,
+            Some((false, false)),
+        );
+        assert_eq!(stream.next().await.unwrap().unwrap(), body);
+        assert!(stream.next().await.is_none());
+        drop(stream);
+        let recorded = rx.recv().await.unwrap();
+        assert_eq!(recorded.outcome, "success");
+        let usage = recorded.usage.unwrap();
+        assert_eq!(
+            (
+                usage.prompt_tokens,
+                usage.completion_tokens,
+                usage.cached_tokens()
+            ),
+            (10, 2, 4)
+        );
+        assert!(rx.try_recv().is_err());
     }
 
     #[tokio::test]

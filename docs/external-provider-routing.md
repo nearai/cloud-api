@@ -264,8 +264,9 @@ These are planning limits, not guarantees about vendor invoices or tokenizer
 estimation. Native Responses and Anthropic transports use the same pre-commit
 retry bounds and shared health. Final HTTP status, headers, and body bytes are
 preserved. Successful native bodies record EOF, failure, timeout, or cancellation
-without replaying committed output; native token-cost reconciliation and
-non-token billing units remain incomplete.
+without replaying committed output. Bounded native usage observers retain
+reported input, output, and cache usage for procurement estimates; malformed or
+oversized usage remains unknown. Non-token billing units remain incomplete.
 
 Rate limits and transient failures update shared PostgreSQL cooldowns; bounded
 `Retry-After` is honored. Credential failures quarantine the quota group. Expired
@@ -292,8 +293,8 @@ is `estimated`, and an unobserved/failed/cancelled charge remains `unknown`.
 
 Do not treat the management or transport-fixture tests as proof of full #1273.
 Remaining work includes registry-authoritative import and rollback for all legacy
-NEAR/long-context/Chutes/Tinfoil sources; native token-cost reconciliation and non-token billing units; stable actual
-deployment attribution in customer usage and responses; and process-level real-vendor and
+NEAR/long-context/Chutes/Tinfoil sources; non-token billing units; stable actual
+deployment attribution for every non-chat path and public inference response; and process-level real-vendor and
 verifier-backed TEE acceptance evidence. Live acceptance requires provisioned
 upstreams and credential references. The current mocks prove management and
 transport behavior only.
@@ -340,3 +341,9 @@ unsupported. Profiles disappear when routes are withdrawn or the registry
 snapshot becomes stale; public HTTP caches can delay listing updates. These
 capabilities describe configured transports, not verification of a particular
 response. Actual verification still depends on the serving transport's verifier.
+
+Usage rows and usage history/report APIs carry nullable `served_route_id` and
+`served_deployment_id` for attributed registry dispatches. The billing function
+records the pair atomically with the debit, validates that it belongs to the
+billed model, and preserves it on duplicate submissions. Historical/legacy
+rows remain null; no security or deployment identity is guessed retroactively.

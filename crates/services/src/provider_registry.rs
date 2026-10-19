@@ -3,6 +3,7 @@ pub(crate) mod accepted_request;
 pub(crate) mod attempt_stream;
 pub mod capabilities;
 pub mod entities;
+mod native_usage;
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
 pub use inference_providers::routing::TeeRequirement;

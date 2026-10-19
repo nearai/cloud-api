@@ -184,6 +184,8 @@ fn admin_provider_attribution_preserves_existing_response_fields() {
         offset: 0,
     };
     let customer_usage_entry = api::routes::usage::UsageHistoryEntryResponse {
+        served_route_id: None,
+        served_deployment_id: None,
         id: "usage-1".to_string(),
         workspace_id: "workspace-1".to_string(),
         api_key_id: "api-key-1".to_string(),

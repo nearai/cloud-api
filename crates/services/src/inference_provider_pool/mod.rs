@@ -4545,10 +4545,11 @@ impl InferenceProviderPool {
                             attempt: ledger_attempt,
                             value: result,
                             provider: provider.clone(),
-                            provider_attribution: served_provider_attribution(
-                                provider.as_ref(),
-                                is_fallback,
-                            ),
+                            provider_attribution: crate::usage::ProviderAttribution {
+                                served_route_id: route.map(|route| route.route_id),
+                                served_deployment_id: route.map(|route| route.deployment_id),
+                                ..served_provider_attribution(provider.as_ref(), is_fallback)
+                            },
                         });
                     }
                     Err(e) => {
@@ -6101,11 +6102,20 @@ impl InferenceProviderPool {
                 if let (Some(attempt), Some(repository)) =
                     (served.attempt, self.attempt_repository.get())
                 {
-                    served.value.body = crate::provider_registry::attempt_stream::track_raw(
+                    served.value.body = crate::provider_registry::attempt_stream::track_native(
                         served.value.body,
                         attempt,
                         repository.clone(),
                         served.routing_deadline,
+                        Some((
+                            anthropic.is_some(),
+                            served
+                                .value
+                                .headers
+                                .get("content-type")
+                                .and_then(|value| value.to_str().ok())
+                                .is_some_and(|value| value.starts_with("text/event-stream")),
+                        )),
                     );
                 }
                 Ok((served.value, served.provider_attribution))

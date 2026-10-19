@@ -301,6 +301,8 @@ mod tests {
         ty: Option<ServedProviderType>,
     ) -> ProviderAttribution {
         ProviderAttribution {
+            served_route_id: None,
+            served_deployment_id: None,
             served_provider_tier: tier,
             served_provider_type: ty,
             served_via_fallback: false,

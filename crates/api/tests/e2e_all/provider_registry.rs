@@ -571,17 +571,23 @@ async fn provider_registry_cost_bounded_failover_records_attempts() {
     assert_eq!(response.status_code(), 204, "{}", response.text());
     let params=serde_json::from_value(json!({"model":name,"messages":[{"role":"user","content":"fixture"}],"max_tokens":10,"reasoning_effort":"high"})).unwrap();
     let request_id = Uuid::new_v4();
-    pool.chat_completion_with_attribution_and_hints(
-        params,
-        "fixture".into(),
-        services::inference_provider_pool::ChatRoutingHints {
-            request_id: Some(request_id),
-            estimated_tokens: Some(4),
-            ..Default::default()
-        },
-    )
-    .await
-    .unwrap();
+    let served = pool
+        .chat_completion_with_attribution_and_hints(
+            params,
+            "fixture".into(),
+            services::inference_provider_pool::ChatRoutingHints {
+                request_id: Some(request_id),
+                estimated_tokens: Some(4),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        served.provider_attribution.served_deployment_id,
+        Some(provider_ids[1])
+    );
+    assert!(served.provider_attribution.served_route_id.is_some());
     let rows=db.pool().get().await.unwrap().query("SELECT outcome,cost_status,usage_cost_microusd,actual_cost_microusd FROM inference_attempts WHERE accepted_request_id=$1 ORDER BY attempt_index", &[&request_id]).await.unwrap();
     assert_eq!(rows.len(), 2);
     assert_eq!(rows[0].get::<_, String>("outcome"), "http_429");
@@ -916,7 +922,7 @@ async fn provider_registry_organization_requirement_cannot_be_weakened() {
         "choices":[{"index":0,"message":{"role":"assistant","content":"fixture"},"finish_reason":"stop"}],
         "usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}
     }))).expect(1).mount(&upstream).await;
-    let (server, _, _, _) = crate::common::setup_test_server_with_pool_and_config(|config| {
+    let (server, _, _, db) = crate::common::setup_test_server_with_pool_and_config(|config| {
         config.external_providers.timeout_seconds = 10
     })
     .await;
@@ -934,6 +940,47 @@ async fn provider_registry_organization_requirement_cannot_be_weakened() {
         .json(&request)
         .await;
     assert_eq!(response.status_code(), 200, "{}", response.text());
+    let usage = db.pool().get().await.unwrap().query_one("SELECT served_route_id,served_deployment_id FROM organization_usage_log WHERE model_name=$1 ORDER BY created_at DESC LIMIT 1", &[&name]).await.unwrap();
+    assert_eq!(
+        usage.get::<_, Option<Uuid>>("served_deployment_id"),
+        Some(provider)
+    );
+    assert!(usage.get::<_, Option<Uuid>>("served_route_id").is_some());
+    let duplicate = db.pool().get().await.unwrap().query_one("SELECT r.was_inserted,(r.recorded_usage).served_route_id,(r.recorded_usage).served_deployment_id FROM (SELECT * FROM organization_usage_log WHERE model_name=$1 ORDER BY created_at DESC LIMIT 1) u CROSS JOIN LATERAL record_organization_usage(u.id,u.organization_id,u.workspace_id,u.api_key_id,u.model_id,u.model_name,u.input_tokens,u.output_tokens,u.cache_read_tokens,u.cache_write_tokens,u.input_cost,u.output_cost,u.total_cost,u.inference_type,u.ttft_ms,u.avg_itl_ms,u.inference_id,u.provider_request_id,u.stop_reason,u.response_id,u.image_count,u.served_provider_tier,u.served_provider_type,u.served_via_fallback,u.billing_details,u.service_tier,u.context_band,ARRAY[]::TEXT[],COALESCE(u.allocation_policy_version,'fixture')::VARCHAR,NULL::UUID,NULL::UUID) r", &[&name]).await.unwrap();
+    assert!(!duplicate.get::<_, bool>("was_inserted"));
+    assert_eq!(
+        duplicate.get::<_, Option<Uuid>>("served_deployment_id"),
+        Some(provider)
+    );
+    assert_eq!(
+        duplicate.get::<_, Option<Uuid>>("served_route_id"),
+        usage.get::<_, Option<Uuid>>("served_route_id")
+    );
+
+    let history = call(
+        &server,
+        Method::GET,
+        &format!(
+            "/v1/organizations/{}/usage/history?limit=20&offset=0",
+            org.id
+        ),
+        json!({}),
+    )
+    .await;
+    assert_eq!(history.status_code(), 200, "{}", history.text());
+    let history = history.json::<Value>();
+    let entry = history["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["model"] == name)
+        .unwrap();
+    assert_eq!(entry["served_deployment_id"], json!(provider));
+    assert_eq!(
+        entry["served_route_id"],
+        json!(usage.get::<_, Option<Uuid>>("served_route_id").unwrap())
+    );
+
     let response = call(
         &server,
         Method::PUT,

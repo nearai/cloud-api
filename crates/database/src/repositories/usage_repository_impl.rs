@@ -38,6 +38,8 @@ impl services::usage::ports::UsageRepository for OrganizationUsageRepository {
             stop_reason: request.stop_reason,
             response_id: request.response_id,
             image_count: request.image_count,
+            served_route_id: request.provider_attribution.served_route_id,
+            served_deployment_id: request.provider_attribution.served_deployment_id,
             served_provider_tier: request.provider_attribution.served_provider_tier,
             served_provider_type: request.provider_attribution.served_provider_type,
             served_via_fallback: request.provider_attribution.served_via_fallback,
@@ -81,6 +83,8 @@ impl services::usage::ports::UsageRepository for OrganizationUsageRepository {
             unfunded_amount: log.unfunded_amount,
             allocation_policy_version: log.allocation_policy_version,
             provider_attribution: services::usage::ProviderAttribution {
+                served_route_id: log.served_route_id,
+                served_deployment_id: log.served_deployment_id,
                 served_provider_tier: log.served_provider_tier,
                 served_provider_type: log.served_provider_type,
                 served_via_fallback: log.served_via_fallback,
@@ -153,6 +157,8 @@ impl services::usage::ports::UsageRepository for OrganizationUsageRepository {
                 unfunded_amount: log.unfunded_amount,
                 allocation_policy_version: log.allocation_policy_version,
                 provider_attribution: services::usage::ProviderAttribution {
+                    served_route_id: log.served_route_id,
+                    served_deployment_id: log.served_deployment_id,
                     served_provider_tier: log.served_provider_tier,
                     served_provider_type: log.served_provider_type,
                     served_via_fallback: log.served_via_fallback,
@@ -216,6 +222,8 @@ impl services::usage::ports::UsageRepository for OrganizationUsageRepository {
                 unfunded_amount: log.unfunded_amount,
                 allocation_policy_version: log.allocation_policy_version,
                 provider_attribution: services::usage::ProviderAttribution {
+                    served_route_id: log.served_route_id,
+                    served_deployment_id: log.served_deployment_id,
                     served_provider_tier: log.served_provider_tier,
                     served_provider_type: log.served_provider_type,
                     served_via_fallback: log.served_via_fallback,

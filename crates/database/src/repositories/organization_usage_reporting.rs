@@ -55,7 +55,7 @@ impl OrganizationUsageRepository {
                                AND a.credit_type = $8)
                         END AS total_cost,
                         response_id, provider_request_id, inference_id,
-                        stop_reason, image_count, service_tier, context_band, billing_details,
+                        stop_reason, image_count, service_tier, context_band, billing_details, served_route_id, served_deployment_id,
                         funded_amount, unfunded_amount, allocation_policy_version,
                         CASE WHEN funded_amount IS NULL THEN NULL ELSE
                             COALESCE((SELECT jsonb_agg(jsonb_build_object(
@@ -157,7 +157,7 @@ impl OrganizationUsageRepository {
                                AND a.credit_type = $6)
                         END AS total_cost,
                         response_id, provider_request_id, inference_id,
-                        stop_reason, image_count, service_tier, context_band, billing_details,
+                        stop_reason, image_count, service_tier, context_band, billing_details, served_route_id, served_deployment_id,
                         funded_amount, unfunded_amount, allocation_policy_version,
                         CASE WHEN funded_amount IS NULL THEN NULL ELSE
                             COALESCE((SELECT jsonb_agg(jsonb_build_object(
@@ -297,6 +297,8 @@ fn row_to_report(row: &Row) -> InferenceUsageReportRow {
         (None, None)
     };
     InferenceUsageReportRow {
+        served_route_id: row.try_get("served_route_id").ok().flatten(),
+        served_deployment_id: row.try_get("served_deployment_id").ok().flatten(),
         id: row.get("id"),
         organization_id: row.get("organization_id"),
         workspace_id: row.get("workspace_id"),

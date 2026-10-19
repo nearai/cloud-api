@@ -56,6 +56,10 @@ impl InferenceUsageReportQuery {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InferenceUsageReportRow {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub served_route_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub served_deployment_id: Option<Uuid>,
     pub id: Uuid,
     pub organization_id: Uuid,
     pub workspace_id: Uuid,

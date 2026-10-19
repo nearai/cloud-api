@@ -52,6 +52,8 @@ fn usage(
         served_provider_tier: None,
         served_provider_type: None,
         served_via_fallback: false,
+        served_route_id: None,
+        served_deployment_id: None,
     }
 }
 

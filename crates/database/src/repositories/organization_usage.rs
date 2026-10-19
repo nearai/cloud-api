@@ -104,7 +104,7 @@ impl OrganizationUsageRepository {
                     FROM record_organization_usage(
                         $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
                         $11, $12, $13, $14, $15, $16, $17, $18, $19, $20,
-                        $21, $22, $23, $24, $25, $26, $27, $28, $29
+                        $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31
                     ) AS result
                     "#,
                     &[
@@ -137,6 +137,8 @@ impl OrganizationUsageRepository {
                         (&request.context_band, Type::TEXT),
                         (&self.allocation_policy.priority, Type::TEXT_ARRAY),
                         (&self.allocation_policy.version, Type::VARCHAR),
+                        (&request.served_route_id, Type::UUID),
+                        (&request.served_deployment_id, Type::UUID),
                     ],
                 )
                 .await
@@ -498,6 +500,8 @@ impl OrganizationUsageRepository {
         };
 
         Ok(OrganizationUsageLog {
+            served_route_id: row.try_get("served_route_id").ok().flatten(),
+            served_deployment_id: row.try_get("served_deployment_id").ok().flatten(),
             id: row.get("id"),
             organization_id: row.get("organization_id"),
             workspace_id: row.get("workspace_id"),

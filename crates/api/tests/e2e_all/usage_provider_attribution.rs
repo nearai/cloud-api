@@ -76,6 +76,8 @@ fn attributed_usage_request(
     inference_id: Uuid,
 ) -> RecordUsageRequest {
     RecordUsageRequest {
+        served_route_id: None,
+        served_deployment_id: None,
         organization_id: fixture.organization_id,
         workspace_id: fixture.workspace_id,
         api_key_id: fixture.api_key_id,

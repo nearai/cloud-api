@@ -124,6 +124,10 @@ impl From<ServedProviderType> for ProviderSource {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderAttribution {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub served_route_id: Option<uuid::Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub served_deployment_id: Option<uuid::Uuid>,
     #[serde(default)]
     pub served_provider_tier: Option<ServedProviderTier>,
     #[serde(default)]

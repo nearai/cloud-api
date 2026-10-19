@@ -20,6 +20,7 @@ const PLACEMENT_FIELDS: &[&str] = &[
     "pin_hold_factor",
     "pin_ttl_ms",
     "enabled",
+    "overflow_when_busy",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -47,6 +48,14 @@ pub struct PlacementTuning {
     /// `routed:_placement_off`. Set it to false only after every instance runs
     /// a build that knows this field (`deny_unknown_fields`).
     pub enabled: bool,
+    /// Default true: a busy verdict (every replica KV-full, or the heavy lane
+    /// / long backlog cap admits nothing) is placed on the least-loaded
+    /// candidate. False sends those requests through legacy routing instead.
+    /// Write it (to any value) only after every instance runs a build that
+    /// knows this field: an older build cannot parse a stored row naming it
+    /// (`deny_unknown_fields`) and falls back to the defaults for every knob,
+    /// a stored `enabled: false` included.
+    pub overflow_when_busy: bool,
 }
 
 impl Default for PlacementTuning {
@@ -65,6 +74,7 @@ impl From<Tuning> for PlacementTuning {
             pin_hold_factor: t.pin_hold_factor,
             pin_ttl_ms: t.pin_ttl_ms as i64,
             enabled: t.enabled,
+            overflow_when_busy: t.overflow_when_busy,
         }
     }
 }
@@ -109,6 +119,7 @@ impl PlacementTuning {
             pin_hold_factor: self.pin_hold_factor,
             pin_ttl_ms: self.pin_ttl_ms as u64,
             enabled: self.enabled,
+            overflow_when_busy: self.overflow_when_busy,
         }
     }
 }

@@ -52,6 +52,7 @@ fn assert_defaults(setting: &Value) {
     assert_eq!(v["pin_hold_factor"], json!(1.0));
     assert_eq!(v["pin_ttl_ms"], json!(600_000));
     assert_eq!(v["enabled"], json!(true));
+    assert_eq!(v["overflow_when_busy"], json!(true));
 }
 
 async fn reset(server: &axum_test::TestServer) {
@@ -60,7 +61,7 @@ async fn reset(server: &axum_test::TestServer) {
         json!({
             "affinity_abs_slack": null, "affinity_eps": null, "kv_max": null,
             "lane_load_tokens": null, "pin_hold_factor": null, "pin_ttl_ms": null,
-            "enabled": null
+            "enabled": null, "overflow_when_busy": null
         }),
     )
     .await;

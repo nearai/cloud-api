@@ -16,7 +16,9 @@ use rand::Rng;
 
 use crate::affinity::{pin_id, select, AffinityKey, PinId, Selection};
 use crate::consts::FRESH_MAX_MS;
-use crate::policy::{classify, lane_admits, lane_view, Class, LaneView, PriorityBand, Tier};
+use crate::policy::{
+    classify, lane_admits, lane_view, Class, LaneView, PriorityBand, RoutePolicy, Tier,
+};
 use crate::rules::{first_exclusion, saturated, Exclusion, Rule, ALL_RULES};
 use crate::score::{
     effective_backlog, fleet_median_tps, known_idle, pending_for, replica_score, Pending,
@@ -105,18 +107,19 @@ pub enum LegacyReason {
     NoState,
     Stale,
     NoneEligible,
-    /// Placement had state but every eligible replica was busy or capped; the
-    /// request is routed by legacy (load-blind) routing. No stage-1 survivor
-    /// and every live replica saturated (`rules::saturated`), for short and
-    /// heavy requests alike.
+    /// No stage-1 survivor and every live replica saturated
+    /// (`rules::saturated`), for short and heavy requests alike. Only with
+    /// `Tuning::overflow_when_busy` off (or no KV-full replica that passes
+    /// the other rules); otherwise the request is placed
+    /// (`capacity_overflow`).
     CapacityFull,
-    /// Placement had state but every eligible replica was busy or capped; the
-    /// request is routed by legacy (load-blind) routing. A heavy request on
-    /// base where the lane filter left no candidate.
+    /// A heavy request on base where the lane filter left no candidate. Only
+    /// with `Tuning::overflow_when_busy` off; otherwise placed
+    /// (`heavy_overflow`).
     LaneFull,
-    /// Placement had state but every eligible replica was busy or capped; the
-    /// request is routed by legacy (load-blind) routing. A heavy request on
-    /// long where the backlog cap left no candidate.
+    /// A heavy request on long where the backlog cap left no candidate. Only
+    /// with `Tuning::overflow_when_busy` off; otherwise placed
+    /// (`heavy_overflow`).
     LongFull,
     /// Reserved for the caller: the chosen host isn't in its host map.
     HostUnmapped,
@@ -223,7 +226,9 @@ pub struct DecisionRecord {
     pub pinned: Option<String>,
     /// Number of eligible replica slots the decision scored over.
     pub eligible: u16,
-    /// Exclusions per rule, in `ALL_RULES` order.
+    /// Exclusions per rule, in `ALL_RULES` order. An overflow placement
+    /// (`capacity_overflow`, `heavy_overflow`) still counts the refusals that
+    /// made it overflow, so its candidates appear here and in `eligible`.
     pub excluded: [(Rule, u16); 5],
     pub chosen_score: Option<f64>,
     pub home_score: Option<f64>,
@@ -386,8 +391,9 @@ impl Placer {
     /// yet (`mine`, per slot: [`crate::score::unseen_by_read`] of the slot's
     /// ledger against `snap.routed_read_ms`; see
     /// [`crate::score::pending_for`]). `Legacy` when the snapshot is
-    /// disabled, empty or stale, or when nothing survives the rules (see
-    /// [`LegacyReason`]); otherwise `Place`. The record's `place_us` times
+    /// disabled, empty or stale, or when nothing usable survives the rules
+    /// (see [`LegacyReason`]); otherwise `Place`, including busy verdicts
+    /// placed as overflow (`Tuning::overflow_when_busy`). The record's `place_us` times
     /// the whole call.
     pub fn place(
         &self,
@@ -426,10 +432,17 @@ impl Placer {
 
         // Stage 1: per-replica rules, tallying exclusions for the record.
         // Every live replica (past Lifecycle and Freshness) also feeds the
-        // lane view with its load, survivor or not.
+        // lane view with its load, survivor or not. A replica dropped only
+        // for KV saturation is kept aside in `kv_full`, for the capacity
+        // overflow below.
         let mut tally = Tally::default();
         let mut live: Vec<(&ReplicaView, u64)> = Vec::with_capacity(snap.replicas.len());
         let mut candidates: Vec<Candidate<'_>> = Vec::with_capacity(snap.replicas.len());
+        let mut kv_full: Vec<Candidate<'_>> = Vec::new();
+        let kv_blind = Tuning {
+            kv_max: f64::INFINITY,
+            ..*tuning
+        };
         for view in &snap.replicas {
             let exclusion = first_exclusion(view, input, input.now_ms, tuning);
             if let Some(Exclusion(rule @ (Rule::Lifecycle | Rule::Freshness))) = exclusion {
@@ -442,70 +455,106 @@ impl Placer {
             );
             let load = effective_backlog(&view.state.load).saturating_add(pending.tok);
             live.push((view, load));
+            let idle = known_idle(&view.state.load) && pending == Pending::default();
+            let candidate = Candidate {
+                view,
+                pending,
+                load,
+                idle,
+            };
             match exclusion {
-                None => {
-                    let idle = known_idle(&view.state.load) && pending == Pending::default();
-                    candidates.push(Candidate {
-                        view,
-                        pending,
-                        load,
-                        idle,
-                    });
+                None => candidates.push(candidate),
+                Some(Exclusion(rule)) => {
+                    tally.add(rule);
+                    if rule == Rule::Capacity
+                        && saturated(view, tuning.kv_max)
+                        && first_exclusion(view, input, input.now_ms, &kv_blind).is_none()
+                    {
+                        kv_full.push(candidate);
+                    }
                 }
-                Some(Exclusion(rule)) => tally.add(rule),
             }
         }
 
         // Stage 2: the heavy lane, admitting stage-1 survivors against a view
         // of every live replica.
         let class = Class::of(input.prefill_heavy);
-        let lane = {
-            let survivors: Vec<&SlotId> = candidates.iter().map(|c| &c.view.slot).collect();
-            lane_view(&live, &survivors, tuning.lane_load_tokens)
-        };
+        let lane = lane_view(&live, tuning.lane_load_tokens);
+        // Set when a busy verdict is placed anyway; it names the strategy.
+        let mut overflow: Option<RoutePolicy> = None;
 
         // No stage-1 survivor is a state problem (stale, not ready, over
         // context, no load counts), so `NoneEligible`, except when every live
         // replica reported itself full: that is a capacity answer, for short
-        // and heavy requests alike. Either way the caller falls back.
+        // and heavy requests alike. With `overflow_when_busy` the request is
+        // placed on the KV-full replicas anyway (the engine queues it, as it
+        // would under legacy routing); otherwise the caller falls back.
         if candidates.is_empty() {
             let all_full =
                 !live.is_empty() && live.iter().all(|(v, _)| saturated(v, tuning.kv_max));
-            let reason = if all_full {
-                LegacyReason::CapacityFull
-            } else {
-                LegacyReason::NoneEligible
-            };
-            return self.legacy_in_lane(input, snap, &lane, reason, tally.record());
+            if !all_full {
+                return self.legacy_in_lane(
+                    input,
+                    snap,
+                    &lane,
+                    LegacyReason::NoneEligible,
+                    tally.record(),
+                );
+            }
+            if !tuning.overflow_when_busy || kv_full.is_empty() {
+                return self.legacy_in_lane(
+                    input,
+                    snap,
+                    &lane,
+                    LegacyReason::CapacityFull,
+                    tally.record(),
+                );
+            }
+            candidates = kv_full;
+            overflow = Some(RoutePolicy::CapacityOverflow);
         }
 
-        candidates.retain(|c| {
-            let is_member = lane.members.contains(&c.view.slot);
-            let admitted = lane_admits(
-                self.tier,
-                class,
-                c.load,
-                c.idle,
-                input.prompt_tokens,
-                is_member,
-                &lane,
-            );
-            if !admitted {
-                tally.add(Rule::Lane);
-            }
-            admitted
-        });
+        let (admitted, refused): (Vec<Candidate<'_>>, Vec<Candidate<'_>>) =
+            candidates.into_iter().partition(|c| {
+                lane_admits(
+                    self.tier,
+                    class,
+                    c.load,
+                    c.idle,
+                    input.prompt_tokens,
+                    lane.members.contains(&c.view.slot),
+                    &lane,
+                )
+            });
+        for _ in &refused {
+            tally.add(Rule::Lane);
+        }
+        let mut candidates = admitted;
 
         if candidates.is_empty() {
-            // Only the lane excluded the survivors. `lane_admits` always
-            // admits a short request when anything survived stage 1, so this
-            // is heavy in practice; a short request would still fall back.
-            let reason = match (class, self.tier) {
-                (Class::Heavy, Tier::Long) => LegacyReason::LongFull,
-                (Class::Heavy, Tier::Base) => LegacyReason::LaneFull,
-                (Class::Short, _) => LegacyReason::NoneEligible,
-            };
-            return self.legacy_in_lane(input, snap, &lane, reason, tally.record());
+            // Only the lane refused the survivors, and `lane_admits` always
+            // admits a short request, so this is a heavy one: the base lane is
+            // full or the prompt is too big for it, or every long replica is
+            // over its backlog cap. With `overflow_when_busy` it is placed on
+            // the refused survivors anyway, on base only on lane members when
+            // any survived, so the clean replicas short traffic uses stay
+            // clean; the score and pin rules then pick the least-loaded.
+            if !tuning.overflow_when_busy || class == Class::Short {
+                let reason = match (class, self.tier) {
+                    (Class::Heavy, Tier::Long) => LegacyReason::LongFull,
+                    (Class::Heavy, Tier::Base) => LegacyReason::LaneFull,
+                    (Class::Short, _) => LegacyReason::NoneEligible,
+                };
+                return self.legacy_in_lane(input, snap, &lane, reason, tally.record());
+            }
+            let has_member = refused.iter().any(|c| lane.members.contains(&c.view.slot));
+            candidates = refused
+                .into_iter()
+                .filter(|c| {
+                    self.tier == Tier::Long || !has_member || lane.members.contains(&c.view.slot)
+                })
+                .collect();
+            overflow = overflow.or(Some(RoutePolicy::HeavyOverflow));
         }
 
         // The snapshot's replica order is the reader's; `select`'s keyless
@@ -623,7 +672,11 @@ impl Placer {
             reason: None,
             tier: self.tier,
             class,
-            strategy: Some(classify(self.tier, class, &lane, &selected.slot).as_str()),
+            strategy: Some(
+                overflow
+                    .unwrap_or_else(|| classify(self.tier, class, &lane, &selected.slot))
+                    .as_str(),
+            ),
             priority_band: PriorityBand::of(input.priority).as_str(),
             lane_size: u16::try_from(lane.size).unwrap_or(u16::MAX),
             lane_cap: u16::try_from(lane.cap).unwrap_or(u16::MAX),
@@ -725,6 +778,23 @@ mod tests {
 
     fn placer() -> Placer {
         Placer::new([1u8; 32], Tier::Base)
+    }
+
+    /// A placer with `overflow_when_busy` off: busy verdicts fall back to
+    /// legacy routing, as before overflow placement.
+    fn busy_legacy_with(secret: [u8; 32], tier: Tier) -> Placer {
+        Placer::with_tuning(
+            secret,
+            tier,
+            Arc::new(ArcSwap::from_pointee(Tuning {
+                overflow_when_busy: false,
+                ..Tuning::default()
+            })),
+        )
+    }
+
+    fn busy_legacy(tier: Tier) -> Placer {
+        busy_legacy_with([1u8; 32], tier)
     }
 
     fn keyed(key: AffinityKey) -> PlaceInput {
@@ -1261,15 +1331,17 @@ mod tests {
         record
     }
 
-    #[test]
-    fn eight_heavy_on_eight_base_replicas() {
+    /// Eight 120K heavy prompts in a burst on eight idle base replicas, each
+    /// recorded in this node's ledger before the next, by `p`. Returns each
+    /// decision's strategy (or legacy reason) and the final ledger.
+    fn eight_heavy_burst(p: &Placer) -> (Vec<&'static str>, HashMap<SlotId, Pending>) {
         let snap = snap_with(eight_slots());
         let prompt = 120_000;
         let mut mine: HashMap<SlotId, Pending> = HashMap::new();
         let mut strategies = Vec::new();
         for seed in 0..8 {
             let mut rng = StdRng::seed_from_u64(seed);
-            match placer().place(&heavy(prompt), &snap, &mine, &mut rng) {
+            match p.place(&heavy(prompt), &snap, &mine, &mut rng) {
                 Decision::Place { slot, record, .. } => {
                     let p = mine.entry(slot).or_default();
                     p.req += 1;
@@ -1284,8 +1356,22 @@ mod tests {
                 }
             }
         }
+        (strategies, mine)
+    }
+
+    fn lane_members(mine: &HashMap<SlotId, Pending>) -> Vec<SlotId> {
+        mine.iter()
+            .filter(|(_, p)| p.tok >= crate::consts::LANE_LOAD_TOKENS)
+            .map(|(s, _)| s.clone())
+            .collect()
+    }
+
+    #[test]
+    fn eight_heavy_on_eight_base_replicas() {
         // Two new members, each joined once more until the next prompt would
-        // take it over HEAVY_BACKLOG_CAP (3 x 120K > 300K), then legacy.
+        // take it over HEAVY_BACKLOG_CAP (3 x 120K > 300K). The rest overflow
+        // onto those two members, never onto a clean replica.
+        let (strategies, mine) = eight_heavy_burst(&placer());
         assert_eq!(
             strategies,
             [
@@ -1293,33 +1379,68 @@ mod tests {
                 "heavy_lane_admit",
                 "heavy_lane_join",
                 "heavy_lane_join",
-                "lane_full",
-                "lane_full",
-                "lane_full",
-                "lane_full"
+                "heavy_overflow",
+                "heavy_overflow",
+                "heavy_overflow",
+                "heavy_overflow"
             ]
         );
-        let members: Vec<&SlotId> = mine
-            .iter()
-            .filter(|(_, p)| p.tok >= crate::consts::LANE_LOAD_TOKENS)
-            .map(|(s, _)| s)
-            .collect();
+        let members = lane_members(&mine);
         assert_eq!(members.len(), 2, "ceil(8 * 0.25) lane members");
+        assert_eq!(mine.len(), 2, "overflow never dirties a clean replica");
 
-        // Short requests land only on the 6 clean replicas.
+        // With overflow off, the same burst falls back to legacy instead.
+        let (strategies, _) = eight_heavy_burst(&busy_legacy(Tier::Base));
+        assert_eq!(strategies[4..], ["lane_full"; 4]);
+
+        // Short requests are not kept off the members (no lane exclusion),
+        // but the members' 360K+ backlog loses them every score comparison,
+        // so a keyless short lands on a member only when both best-of-two
+        // samples are members.
+        let snap = snap_with(eight_slots());
         let mut short = base_input();
         short.prompt_tokens = 500;
         for seed in 0..64 {
             let mut rng = StdRng::seed_from_u64(seed);
             let (chosen, record, _) = placed(placer().place(&short, &snap, &mine, &mut rng));
-            assert!(
-                !members.contains(&&chosen),
-                "seed {seed}: short landed on {chosen:?}"
-            );
-            assert_eq!(record.strategy, Some("short_clean"));
-            assert_eq!(record.eligible, 6);
-            assert_eq!(record.excluded[4], (Rule::Lane, 2));
+            assert_eq!(record.eligible, 8);
+            assert_eq!(record.excluded[4], (Rule::Lane, 0));
+            let want = if members.contains(&chosen) {
+                "short_on_member"
+            } else {
+                "short_clean"
+            };
+            assert_eq!(record.strategy, Some(want), "seed {seed}");
         }
+    }
+
+    #[test]
+    fn short_pin_on_a_lane_member_holds_while_its_backlog_is_cheaper() {
+        // gpu02#1 is a lane member (64K backlog) holding this conversation's
+        // warm cache; every other replica is idle. A 70K short prompt costs
+        // more as a cold prefill elsewhere than waiting behind 64K, so the pin
+        // holds. Before, the lane kept short requests off any member.
+        let secret = [8u8; 32];
+        let (snap, key, pinned) = pinned_member_with_room(secret, LANE_LOAD_TOKENS);
+        let mut input = keyed(key.clone());
+        input.prompt_tokens = 70_000;
+        let mut rng = StdRng::seed_from_u64(1);
+        let (chosen, record, _) =
+            placed(Placer::new(secret, Tier::Base).place(&input, &snap, &HashMap::new(), &mut rng));
+        assert_eq!(chosen, pinned);
+        assert_eq!(record.pin_outcome, "held");
+        assert_eq!(record.selection, Some("pinned"));
+        assert_eq!(record.strategy, Some("short_on_member"));
+        assert_eq!(record.excluded[4], (Rule::Lane, 0));
+
+        // A small prompt is cheaper to prefill cold than to queue behind 64K:
+        // the pin is released on load, not on lane membership.
+        input.prompt_tokens = 2_000;
+        let (chosen, record, _) =
+            placed(Placer::new(secret, Tier::Base).place(&input, &snap, &HashMap::new(), &mut rng));
+        assert_ne!(chosen, pinned);
+        assert_eq!(record.pin_outcome, "released_load");
+        assert_eq!(record.strategy, Some("short_clean"));
     }
 
     #[test]
@@ -1348,7 +1469,7 @@ mod tests {
     }
 
     #[test]
-    fn no_clean_replica_gives_short_overflow() {
+    fn short_on_a_member_is_labelled() {
         let snap = snap_with(vec![
             with_backlog("gpu01", 0, 70_000),
             with_backlog("gpu01", 1, 400_000),
@@ -1361,20 +1482,30 @@ mod tests {
             slot("gpu01", 0),
             "the lighter member still wins on score"
         );
-        assert_eq!(record.strategy, Some("short_overflow"));
+        assert_eq!(record.strategy, Some("short_on_member"));
         assert_eq!(record.excluded[4], (Rule::Lane, 0));
     }
 
     #[test]
-    fn long_tier_falls_back_for_heavy_when_all_over_cap() {
+    fn long_tier_overflows_heavy_when_all_over_cap() {
         let long = Placer::new([1u8; 32], Tier::Long);
         let snap = snap_with(vec![
             with_backlog("long01", 0, 550_000),
-            with_backlog("long01", 1, 550_000),
+            with_backlog("long01", 1, 510_000),
         ]);
         let mut rng = StdRng::seed_from_u64(1);
+        // Both are over LONG_BACKLOG_CAP with this prompt: placed anyway, on
+        // the lighter one, with the lane refusals still tallied.
+        let (chosen, record, _) =
+            placed(long.place(&heavy(100_000), &snap, &HashMap::new(), &mut rng));
+        assert_eq!(chosen, slot("long01", 1));
+        assert_eq!(record.outcome, "place");
+        assert_eq!(record.strategy, Some("heavy_overflow"));
+        assert_eq!(record.excluded[4], (Rule::Lane, 2));
+
+        // With overflow off, it falls back to legacy.
         let record = legacy_record(
-            long.place(&heavy(100_000), &snap, &HashMap::new(), &mut rng),
+            busy_legacy(Tier::Long).place(&heavy(100_000), &snap, &HashMap::new(), &mut rng),
             LegacyReason::LongFull,
         );
         assert_eq!(record.excluded[4], (Rule::Lane, 2));
@@ -1392,12 +1523,13 @@ mod tests {
     }
 
     #[test]
-    fn long_tier_third_oversized_prompt_in_burst_falls_back() {
+    fn long_tier_third_oversized_prompt_in_burst_overflows() {
         // Two idle long replicas and three 310K prompts in a burst, each
         // placement recorded in this node's ledger before the next. The long
         // tier has no lane cap, only LONG_BACKLOG_CAP (600K): the first lands
         // on an idle replica, the second can't join it (620K > 600K) and takes
-        // the other, and the third fits neither, so it falls back to legacy.
+        // the other, and the third fits neither, so it overflows (or, with
+        // overflow off, falls back to legacy).
         let long = Placer::new([1u8; 32], Tier::Long);
         let snap = snap_with(vec![ready_view("long01", 0), ready_view("long01", 1)]);
         let prompt = 310_000;
@@ -1416,8 +1548,11 @@ mod tests {
         assert_ne!(chosen[0], chosen[1], "one prompt per replica");
 
         let mut rng = StdRng::seed_from_u64(2);
+        let (_, record, _) = placed(long.place(&heavy(prompt), &snap, &mine, &mut rng));
+        assert_eq!(record.strategy, Some("heavy_overflow"));
+        assert_eq!(record.excluded[4], (Rule::Lane, 2));
         let record = legacy_record(
-            long.place(&heavy(prompt), &snap, &mine, &mut rng),
+            busy_legacy(Tier::Long).place(&heavy(prompt), &snap, &mine, &mut rng),
             LegacyReason::LongFull,
         );
         assert_eq!(record.excluded[4], (Rule::Lane, 2));
@@ -1453,9 +1588,18 @@ mod tests {
         placed(p.place(&base_input(), &snap, &HashMap::new(), &mut rng));
 
         // Tightening kv_max through the shared handle takes effect on the
-        // next decision, with no new Placer.
+        // next decision, with no new Placer: the replica is now KV-full.
         handle.store(Arc::new(Tuning {
             kv_max: 0.7,
+            ..Tuning::default()
+        }));
+        let (_, record, _) = placed(p.place(&base_input(), &snap, &HashMap::new(), &mut rng));
+        assert_eq!(record.strategy, Some("capacity_overflow"));
+
+        // So does switching overflow off.
+        handle.store(Arc::new(Tuning {
+            kv_max: 0.7,
+            overflow_when_busy: false,
             ..Tuning::default()
         }));
         let (reason, _) = legacy_reason(p.place(&base_input(), &snap, &HashMap::new(), &mut rng));
@@ -1463,11 +1607,12 @@ mod tests {
     }
 
     #[test]
-    fn all_replicas_kv_full_is_capacity_full_for_any_class() {
+    fn all_replicas_kv_full_overflows_for_any_class() {
         // Every live replica is out of capacity (KV at the bound), so there is
-        // no survivor and the answer is `capacity_full` for a short request
-        // as much as a heavy one: legacy routing, with the reason named.
-        let mut kv_full = ready_view("gpu01", 0);
+        // no survivor: a capacity answer for a short request as much as a
+        // heavy one. It is placed on the KV-full replicas anyway, the
+        // lighter first; with overflow off it is `capacity_full` legacy.
+        let mut kv_full = with_backlog("gpu01", 0, 50_000);
         kv_full.state.load.kv_usage = Some(crate::consts::KV_MAX);
         let mut kv_over = ready_view("gpu01", 1);
         kv_over.state.load.kv_usage = Some(0.99);
@@ -1477,6 +1622,15 @@ mod tests {
         for tier in [Tier::Base, Tier::Long] {
             let mut rng = StdRng::seed_from_u64(1);
             let p = Placer::new([1u8; 32], tier);
+            for input in [heavy(100_000), base_input()] {
+                let (chosen, record, _) = placed(p.place(&input, &snap, &HashMap::new(), &mut rng));
+                assert_eq!(chosen, slot("gpu01", 1), "{tier:?}");
+                assert_eq!(record.strategy, Some("capacity_overflow"));
+                assert_eq!(record.excluded[0], (Rule::Lifecycle, 1));
+                assert_eq!(record.excluded[2], (Rule::Capacity, 2));
+                assert_eq!(record.eligible, 2);
+            }
+            let p = busy_legacy(tier);
             for input in [heavy(100_000), base_input()] {
                 let record = legacy_record(
                     p.place(&input, &snap, &HashMap::new(), &mut rng),
@@ -1526,6 +1680,45 @@ mod tests {
     }
 
     #[test]
+    fn capacity_overflow_only_takes_replicas_that_pass_every_other_rule() {
+        // Every live replica is KV-full, but none would be a candidate with
+        // KV ignored: one is too small for the prompt, one has no backlog
+        // count. Capacity overflow must not pick either, so the verdict stays
+        // a `capacity_full` legacy fallback.
+        let kv = crate::consts::KV_MAX;
+        let mut small = ready_view("gpu01", 0);
+        small.state.load.kv_usage = Some(kv);
+        small.state.limits.max_context_tokens = Some(64_000);
+        let mut countless = ready_view("gpu01", 1);
+        countless.state.load.kv_usage = Some(kv);
+        countless.state.load.prefill_backlog_tokens = None;
+        let mut rng = StdRng::seed_from_u64(1);
+        for views in [vec![small.clone()], vec![countless.clone()]] {
+            let (reason, _) = legacy_reason(placer().place(
+                &heavy(100_000),
+                &snap_with(views),
+                &HashMap::new(),
+                &mut rng,
+            ));
+            assert_eq!(reason, LegacyReason::CapacityFull);
+        }
+
+        // Beside one KV-full replica that passes every other rule, only that
+        // one is an overflow candidate.
+        let mut fits = ready_view("gpu02", 0);
+        fits.state.load.kv_usage = Some(kv);
+        let snap = snap_with(vec![small, countless, fits]);
+        for seed in 0..16 {
+            let mut rng = StdRng::seed_from_u64(seed);
+            let (chosen, record, _) =
+                placed(placer().place(&heavy(100_000), &snap, &HashMap::new(), &mut rng));
+            assert_eq!(chosen, slot("gpu02", 0), "seed {seed}");
+            assert_eq!(record.strategy, Some("capacity_overflow"));
+            assert_eq!(record.eligible, 1);
+        }
+    }
+
+    #[test]
     fn prompt_heavy_request_uses_lane() {
         let input = heavy(120_000);
         let mut rng = StdRng::seed_from_u64(1);
@@ -1533,8 +1726,11 @@ mod tests {
             placed(placer().place(&input, &snap_with(eight_slots()), &HashMap::new(), &mut rng));
         assert_eq!(record.strategy, Some("heavy_lane_admit"));
         assert_eq!(record.class, Class::Heavy);
+        let (_, record, _) =
+            placed(placer().place(&input, &saturated_base(), &HashMap::new(), &mut rng));
+        assert_eq!(record.strategy, Some("heavy_overflow"));
         legacy_record(
-            placer().place(&input, &saturated_base(), &HashMap::new(), &mut rng),
+            busy_legacy(Tier::Base).place(&input, &saturated_base(), &HashMap::new(), &mut rng),
             LegacyReason::LaneFull,
         );
     }
@@ -1563,7 +1759,7 @@ mod tests {
         ]);
         let mut rng = StdRng::seed_from_u64(1);
         let (_, record, _) = placed(long.place(&base_input(), &snap, &HashMap::new(), &mut rng));
-        assert_eq!(record.strategy, Some("short_overflow"));
+        assert_eq!(record.strategy, Some("short_on_member"));
     }
 
     /// 8 slots (lane cap 2) where `gpu02#1` is the only lane member, with a
@@ -1655,7 +1851,7 @@ mod tests {
             &mut rng,
         ));
         assert_ne!(chosen, pinned);
-        assert_eq!(record.strategy, Some("short_overflow"));
+        assert_eq!(record.strategy, Some("short_on_member"));
     }
 
     #[test]
@@ -1735,12 +1931,18 @@ mod tests {
         ]);
         let mut rng = StdRng::seed_from_u64(1);
         let record = legacy_record(
-            placer().place(&heavy(100_000), &snap, &HashMap::new(), &mut rng),
+            busy_legacy(Tier::Base).place(&heavy(100_000), &snap, &HashMap::new(), &mut rng),
             LegacyReason::LaneFull,
         );
         assert_eq!((record.lane_size, record.lane_cap), (1, 1));
         assert_eq!(record.excluded[2], (Rule::Capacity, 1));
         assert_eq!(record.excluded[4], (Rule::Lane, 3));
+        // With overflow it is placed on an idle survivor: the only member is
+        // KV-full and out of stage 1, so no surviving member can take it.
+        let (chosen, record, _) =
+            placed(placer().place(&heavy(100_000), &snap, &HashMap::new(), &mut rng));
+        assert_ne!(chosen, slot("gpu01", 0));
+        assert_eq!(record.strategy, Some("heavy_overflow"));
 
         // Short requests still see the idle survivors as clean.
         let (_, record, _) =
@@ -1829,7 +2031,7 @@ mod tests {
         let snap = snap_with(vec![busy, no_backlog, no_running]);
         let mut rng = StdRng::seed_from_u64(1);
         let record = legacy_record(
-            long.place(&heavy(prompt), &snap, &HashMap::new(), &mut rng),
+            busy_legacy(Tier::Long).place(&heavy(prompt), &snap, &HashMap::new(), &mut rng),
             LegacyReason::LongFull,
         );
         assert_eq!(record.excluded[2], (Rule::Capacity, 2));
@@ -2093,11 +2295,20 @@ mod tests {
     fn oversized_heavy_never_admitted_on_base() {
         // Base engines accept 1M context, but a prompt over
         // HEAVY_BASE_MAX_PROMPT is long-tier work: on an idle base Fleet with
-        // lane room it finds no candidate and falls back to legacy.
+        // lane room the lane admits no candidate. It overflows (no member
+        // survives, so any replica), or with overflow off falls back.
         let snap = snap_with(eight_slots());
         let mut rng = StdRng::seed_from_u64(1);
+        let (_, record, _) = placed(placer().place(
+            &heavy(HEAVY_BASE_MAX_PROMPT + 1),
+            &snap,
+            &HashMap::new(),
+            &mut rng,
+        ));
+        assert_eq!(record.strategy, Some("heavy_overflow"));
+        assert_eq!(record.excluded[4], (Rule::Lane, 8));
         let record = legacy_record(
-            placer().place(
+            busy_legacy(Tier::Base).place(
                 &heavy(HEAVY_BASE_MAX_PROMPT + 1),
                 &snap,
                 &HashMap::new(),
@@ -2197,7 +2408,7 @@ mod tests {
         input.priority = -1;
         let mut rng = StdRng::seed_from_u64(1);
         let record = legacy_record(
-            placer().place(&input, &saturated_base(), &HashMap::new(), &mut rng),
+            busy_legacy(Tier::Base).place(&input, &saturated_base(), &HashMap::new(), &mut rng),
             LegacyReason::LaneFull,
         );
         assert_eq!(record.tier, Tier::Base);
@@ -2208,10 +2419,9 @@ mod tests {
         assert_eq!(record.eligible, 0);
         assert_eq!(record.slot, None);
 
-        let long = Placer::new([1u8; 32], Tier::Long);
         let snap = snap_with(vec![with_backlog("long01", 0, LONG_BACKLOG_CAP)]);
         let record = legacy_record(
-            long.place(&input, &snap, &HashMap::new(), &mut rng),
+            busy_legacy(Tier::Long).place(&input, &snap, &HashMap::new(), &mut rng),
             LegacyReason::LongFull,
         );
         assert_eq!(record.tier, Tier::Long);
@@ -2273,10 +2483,9 @@ mod tests {
     fn disabled_wins_over_a_capacity_fallback() {
         let mut snap = saturated_base();
         let mut rng = StdRng::seed_from_u64(1);
-        legacy_record(
-            placer().place(&heavy(100_000), &snap, &HashMap::new(), &mut rng),
-            LegacyReason::LaneFull,
-        );
+        let (_, record, _) =
+            placed(placer().place(&heavy(100_000), &snap, &HashMap::new(), &mut rng));
+        assert_eq!(record.strategy, Some("heavy_overflow"));
 
         snap.disabled = true;
         let (reason, record) =
@@ -2372,9 +2581,12 @@ mod tests {
         input.prompt_tokens = 100_000;
         let mut rng = StdRng::seed_from_u64(1);
         let record = legacy_record(
-            Placer::new(secret, Tier::Base).place(&input, &snap, &HashMap::new(), &mut rng),
+            busy_legacy_with(secret, Tier::Base).place(&input, &snap, &HashMap::new(), &mut rng),
             LegacyReason::LaneFull,
         );
+        assert_no_key_material(&format!("{record:?}"), key_bytes, &pid);
+        let (_, record, _) =
+            placed(Placer::new(secret, Tier::Base).place(&input, &snap, &HashMap::new(), &mut rng));
         assert_no_key_material(&format!("{record:?}"), key_bytes, &pid);
     }
 

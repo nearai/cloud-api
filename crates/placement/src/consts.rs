@@ -1,5 +1,5 @@
 //! Crate-wide constants. Fixed identifiers and tunables are code constants;
-//! the five live-tunable knobs (see [`crate::tuning::Tuning`]) keep their
+//! the live-tunable knobs (see [`crate::tuning::Tuning`]) keep their
 //! constants here as the defaults. There is exactly one runtime env var
 //! (`PLACEMENT_REDIS_PASSWORD`, read outside this crate).
 
@@ -80,6 +80,19 @@ pub const PIN_HOLD_FACTOR: f64 = 1.0;
 /// instance runs a build that knows the field (`PlacementTuning` uses
 /// `deny_unknown_fields`).
 pub const PLACEMENT_ENABLED: bool = true;
+
+/// Whether a busy verdict still places. When every live replica is KV-full
+/// (`capacity_full`) or the heavy lane / long backlog cap admits no survivor
+/// (`lane_full`, `long_full`), the request is placed anyway on the
+/// least-loaded candidate (strategy `capacity_overflow` / `heavy_overflow`)
+/// instead of falling back to load-blind legacy routing, so this node's
+/// ledger and the shared routed counts still see it. False restores the
+/// legacy fallback for those verdicts only; the no-data fallbacks (disabled,
+/// no state, stale, incomplete) are unaffected. Write the field (to any
+/// value) only after every instance runs a build that knows it: the stored
+/// setting is `deny_unknown_fields`, and an older build that cannot parse it
+/// falls back to the defaults for every knob, `enabled` included.
+pub const OVERFLOW_WHEN_BUSY: bool = true;
 
 /// How long a follow pin stays valid after it's written, in milliseconds.
 /// 10 minutes, matching OpenRouter's sticky-session TTL.

@@ -3,8 +3,8 @@
 //! that never loads a setting behaves exactly as the constants say.
 
 use crate::consts::{
-    AFFINITY_ABS_SLACK, AFFINITY_EPS, KV_MAX, LANE_LOAD_TOKENS, PIN_HOLD_FACTOR, PIN_TTL_MS,
-    PLACEMENT_ENABLED,
+    AFFINITY_ABS_SLACK, AFFINITY_EPS, KV_MAX, LANE_LOAD_TOKENS, OVERFLOW_WHEN_BUSY,
+    PIN_HOLD_FACTOR, PIN_TTL_MS, PLACEMENT_ENABLED,
 };
 
 /// Live-tunable placement knobs. `Copy`, so a decision reads it once.
@@ -27,6 +27,9 @@ pub struct Tuning {
     /// False routes every request through legacy routing
     /// (`LegacyReason::Disabled`) (`PLACEMENT_ENABLED`).
     pub enabled: bool,
+    /// Place busy verdicts on the least-loaded candidate instead of falling
+    /// back to legacy routing (`OVERFLOW_WHEN_BUSY`).
+    pub overflow_when_busy: bool,
 }
 
 impl Default for Tuning {
@@ -39,6 +42,7 @@ impl Default for Tuning {
             pin_hold_factor: PIN_HOLD_FACTOR,
             pin_ttl_ms: PIN_TTL_MS,
             enabled: PLACEMENT_ENABLED,
+            overflow_when_busy: OVERFLOW_WHEN_BUSY,
         }
     }
 }
@@ -57,6 +61,7 @@ mod tests {
         assert_eq!(t.pin_hold_factor, 1.0);
         assert_eq!(t.pin_ttl_ms, PIN_TTL_MS);
         assert!(t.enabled);
+        assert!(t.overflow_when_busy);
         assert_eq!(AFFINITY_ABS_SLACK, 0.25);
     }
 }

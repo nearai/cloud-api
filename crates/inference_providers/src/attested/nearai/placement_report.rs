@@ -207,8 +207,9 @@ pub(super) fn size_tag(prompt_tokens: Option<u64>) -> &'static str {
 /// logged at debug;
 /// they would otherwise repeat on every such request while the shared state
 /// is down, unconfigured or the switch is on. The decision metric still
-/// counts each. So are `capacity_full`, `lane_full` and `long_full`: with the
-/// fleet busy they repeat on every request, and the metric is the signal.
+/// counts each. So are `capacity_full`, `lane_full` and `long_full` (only
+/// reached with `overflow_when_busy` off): with the fleet busy they repeat on
+/// every request, and the metric is the signal.
 fn logs_at_debug(record: &DecisionRecord) -> bool {
     record.outcome == "legacy"
         && matches!(
@@ -271,10 +272,12 @@ fn strategy_tag(strategy: Option<&str>) -> &'static str {
     match strategy {
         None => "strategy:none",
         Some("short_clean") => "strategy:short_clean",
-        Some("short_overflow") => "strategy:short_overflow",
+        Some("short_on_member") => "strategy:short_on_member",
         Some("heavy_long") => "strategy:heavy_long",
         Some("heavy_lane_join") => "strategy:heavy_lane_join",
         Some("heavy_lane_admit") => "strategy:heavy_lane_admit",
+        Some("heavy_overflow") => "strategy:heavy_overflow",
+        Some("capacity_overflow") => "strategy:capacity_overflow",
         Some(_) => "strategy:unknown",
     }
 }
@@ -557,10 +560,12 @@ mod observability_tests {
 
         for strategy in [
             RoutePolicy::ShortClean,
-            RoutePolicy::ShortOverflow,
+            RoutePolicy::ShortOnMember,
             RoutePolicy::HeavyLong,
             RoutePolicy::HeavyLaneJoin,
             RoutePolicy::HeavyLaneAdmit,
+            RoutePolicy::HeavyOverflow,
+            RoutePolicy::CapacityOverflow,
         ] {
             assert_eq!(
                 strategy_tag(Some(strategy.as_str())),

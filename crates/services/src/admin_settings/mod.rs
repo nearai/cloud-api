@@ -542,6 +542,7 @@ mod tests {
         invalid(&svc, json!({"lane_load_tokens": 5000.5})).await;
         invalid(&svc, json!({"enabled": "no"})).await;
         invalid(&svc, json!({"enabled": 0})).await;
+        invalid(&svc, json!({"overflow_when_busy": "yes"})).await;
         invalid(&svc, json!({"not_a_knob": 1})).await;
         // A null-valued unknown field is rejected too (not silently dropped).
         invalid(&svc, json!({"not_a_knob": null})).await;
@@ -610,6 +611,7 @@ mod tests {
             pin_hold_factor: 0.5,
             pin_ttl_ms: 60_000,
             enabled: false,
+            overflow_when_busy: false,
         };
         let hi = PlacementTuning {
             affinity_abs_slack: 4.0,
@@ -619,6 +621,7 @@ mod tests {
             pin_hold_factor: 2.0,
             pin_ttl_ms: 3_600_000,
             enabled: true,
+            overflow_when_busy: true,
         };
         assert!(lo.validate().is_ok());
         assert!(hi.validate().is_ok());
@@ -635,7 +638,7 @@ mod tests {
             json!({
                 "affinity_abs_slack": 0.25, "affinity_eps": 0.25, "kv_max": 0.95,
                 "lane_load_tokens": 64_000, "pin_hold_factor": 1.0,
-                "pin_ttl_ms": 600_000, "enabled": true
+                "pin_ttl_ms": 600_000, "enabled": true, "overflow_when_busy": true
             })
         );
         assert_eq!(v.updated_at, None);
@@ -723,6 +726,25 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(v.value["enabled"], json!(true));
+        assert_eq!(**handle.load(), Tuning::default());
+    }
+
+    #[tokio::test]
+    async fn overflow_when_busy_round_trips_and_null_resets() {
+        let (svc, _, handle) = service();
+        let admin = Uuid::new_v4();
+        let v = svc
+            .update(KEY_PLACEMENT, json!({"overflow_when_busy": false}), admin)
+            .await
+            .unwrap();
+        assert_eq!(v.value["overflow_when_busy"], json!(false));
+        assert!(!handle.load().overflow_when_busy);
+
+        let v = svc
+            .update(KEY_PLACEMENT, json!({"overflow_when_busy": null}), admin)
+            .await
+            .unwrap();
+        assert_eq!(v.value["overflow_when_busy"], json!(true));
         assert_eq!(**handle.load(), Tuning::default());
     }
 

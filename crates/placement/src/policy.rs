@@ -8,11 +8,14 @@
 //! capacity is above that. Placement never re-derives either from token
 //! counts.
 //!
-//! The heavy lane is the only filter the class adds. [`lane_admits`] is the
-//! whole admission predicate (applied as `Rule::Lane`), and [`classify`] only
-//! labels the outcome: every class selects with the same HRW, pins and
-//! score, so a pinned heavy conversation keeps its replica whenever the lane
-//! admits it.
+//! The heavy lane is the only filter the class adds, and it filters heavy
+//! requests only. [`lane_admits`] is the whole admission predicate (applied
+//! as `Rule::Lane`), and [`classify`] only labels the outcome: every class
+//! selects with the same HRW, pins and score, so a pinned conversation keeps
+//! its replica whenever the lane admits it. A short request is never kept
+//! off a lane member: the pin-hold load test and the affinity score bound
+//! already move it when the member's backlog would cost more than its warm
+//! cache saves, and otherwise it keeps that cache.
 
 use std::collections::HashSet;
 
@@ -112,19 +115,11 @@ pub struct LaneView {
     pub size: usize,
     /// `ceil(live replicas * HEAVY_SHARE)`.
     pub cap: usize,
-    /// Whether some stage-1 survivor is not a member: the only replicas a
-    /// short request can be sent to.
-    pub any_clean: bool,
 }
 
-/// Build the lane from every live replica and its load (`live`), and judge
-/// `any_clean` over the stage-1 survivors (`survivors`, a subset of `live`).
-/// A replica is a member at `lane_load_tokens` of load or more.
-pub fn lane_view(
-    live: &[(&ReplicaView, u64)],
-    survivors: &[&SlotId],
-    lane_load_tokens: u64,
-) -> LaneView {
+/// Build the lane from every live replica and its load (`live`). A replica is
+/// a member at `lane_load_tokens` of load or more.
+pub fn lane_view(live: &[(&ReplicaView, u64)], lane_load_tokens: u64) -> LaneView {
     let members: HashSet<SlotId> = live
         .iter()
         .filter(|(_, load)| *load >= lane_load_tokens)
@@ -132,7 +127,6 @@ pub fn lane_view(
         .collect();
     LaneView {
         cap: (live.len() as f64 * HEAVY_SHARE).ceil() as usize,
-        any_clean: survivors.iter().any(|s| !members.contains(*s)),
         size: members.len(),
         members,
     }
@@ -156,8 +150,8 @@ pub fn lane_view(
 /// has none. It needs known load, so a replica that omits a load field never
 /// gets it. The engine's own context limit is `Rule::Context`'s job, not the
 /// lane's.
-/// - Short: a member is avoided while any clean replica survives; with none
-///   clean, every survivor passes, so the lane never empties a short request.
+/// - Short: always admitted. Lane membership is not a reason to leave a warm
+///   replica for a short request (see the module docs).
 pub fn lane_admits(
     tier: Tier,
     class: Class,
@@ -174,7 +168,7 @@ pub fn lane_admits(
                 && load.saturating_add(prompt) <= HEAVY_BACKLOG_CAP
                 && (is_member || lane.size < lane.cap)
         }
-        (_, Class::Short) => !is_member || !lane.any_clean,
+        (_, Class::Short) => true,
     }
 }
 
@@ -182,16 +176,23 @@ pub fn lane_admits(
 /// for the record and metrics only: it never changes the selection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RoutePolicy {
-    /// Short, and a clean (non-member) replica was eligible.
+    /// Short, placed on a replica outside the heavy lane.
     ShortClean,
-    /// Short, and every eligible replica was a lane member.
-    ShortOverflow,
+    /// Short, placed on a heavy-lane member (its warm cache or score won).
+    ShortOnMember,
     /// Heavy, placed on the long tier.
     HeavyLong,
     /// Heavy, placed on a replica already in the base lane.
     HeavyLaneJoin,
     /// Heavy, placed on a base replica that joins the lane.
     HeavyLaneAdmit,
+    /// Heavy, and the lane (base) or the backlog cap (long) admitted no
+    /// survivor: placed on the least-loaded survivor anyway, preferring base
+    /// lane members so clean replicas stay clean (`Tuning::overflow_when_busy`).
+    HeavyOverflow,
+    /// Every live replica reported itself KV-full: placed on one of them
+    /// anyway, any class (`Tuning::overflow_when_busy`).
+    CapacityOverflow,
 }
 
 impl RoutePolicy {
@@ -199,10 +200,12 @@ impl RoutePolicy {
     pub const fn as_str(self) -> &'static str {
         match self {
             RoutePolicy::ShortClean => "short_clean",
-            RoutePolicy::ShortOverflow => "short_overflow",
+            RoutePolicy::ShortOnMember => "short_on_member",
             RoutePolicy::HeavyLong => "heavy_long",
             RoutePolicy::HeavyLaneJoin => "heavy_lane_join",
             RoutePolicy::HeavyLaneAdmit => "heavy_lane_admit",
+            RoutePolicy::HeavyOverflow => "heavy_overflow",
+            RoutePolicy::CapacityOverflow => "capacity_overflow",
         }
     }
 }
@@ -213,8 +216,8 @@ pub fn classify(tier: Tier, class: Class, lane: &LaneView, chosen: &SlotId) -> R
         (Class::Heavy, Tier::Long) => RoutePolicy::HeavyLong,
         (Class::Heavy, Tier::Base) if lane.members.contains(chosen) => RoutePolicy::HeavyLaneJoin,
         (Class::Heavy, Tier::Base) => RoutePolicy::HeavyLaneAdmit,
-        (Class::Short, _) if lane.any_clean => RoutePolicy::ShortClean,
-        (Class::Short, _) => RoutePolicy::ShortOverflow,
+        (Class::Short, _) if lane.members.contains(chosen) => RoutePolicy::ShortOnMember,
+        (Class::Short, _) => RoutePolicy::ShortClean,
     }
 }
 
@@ -243,8 +246,7 @@ mod tests {
     fn lane_of(loads: &[u64]) -> LaneView {
         let views: Vec<ReplicaView> = (0..loads.len() as u32).map(|i| view("gpu01", i)).collect();
         let pairs: Vec<(&ReplicaView, u64)> = views.iter().zip(loads.iter().copied()).collect();
-        let slots: Vec<&SlotId> = views.iter().map(|v| &v.slot).collect();
-        lane_view(&pairs, &slots, LANE_LOAD_TOKENS)
+        lane_view(&pairs, LANE_LOAD_TOKENS)
     }
 
     #[test]
@@ -254,7 +256,6 @@ mod tests {
         assert_eq!(lane.cap, 2, "ceil(8 * 0.25)");
         assert!(lane.members.contains(&slot("gpu01", 0)));
         assert!(!lane.members.contains(&slot("gpu01", 1)));
-        assert!(lane.any_clean);
 
         // ceil rounds a single replica's share up to one lane slot.
         assert_eq!(lane_of(&[0]).cap, 1);
@@ -262,29 +263,16 @@ mod tests {
         assert_eq!(lane_of(&[]).cap, 0);
 
         let all_members = lane_of(&[LANE_LOAD_TOKENS; 3]);
-        assert!(!all_members.any_clean);
         assert_eq!(all_members.size, 3);
-
-        // A live member outside the survivors still counts; a clean live
-        // replica outside them does not make the lane clean.
-        let views = [view("gpu01", 0), view("gpu01", 1), view("gpu01", 2)];
-        let live = [
-            (&views[0], LANE_LOAD_TOKENS),
-            (&views[1], 0),
-            (&views[2], LANE_LOAD_TOKENS),
-        ];
-        let lane = lane_view(&live, &[&views[2].slot], LANE_LOAD_TOKENS);
-        assert_eq!((lane.size, lane.cap), (2, 1));
-        assert!(!lane.any_clean);
     }
 
     #[test]
     fn lane_membership_follows_the_tuned_threshold() {
         let v = view("gpu01", 0);
         let live = [(&v, 10_000)];
-        assert_eq!(lane_view(&live, &[&v.slot], 10_000).size, 1);
-        assert_eq!(lane_view(&live, &[&v.slot], 10_001).size, 0);
-        assert_eq!(lane_view(&live, &[&v.slot], LANE_LOAD_TOKENS).size, 0);
+        assert_eq!(lane_view(&live, 10_000).size, 1);
+        assert_eq!(lane_view(&live, 10_001).size, 0);
+        assert_eq!(lane_view(&live, LANE_LOAD_TOKENS).size, 0);
     }
 
     #[test]
@@ -292,9 +280,9 @@ mod tests {
         // The load passed in is what the caller computed (backlog + pending);
         // a view's own backlog alone doesn't make it a member here.
         let v = with_backlog(0, 70_000);
-        let lane = lane_view(&[(&v, 0)], &[&v.slot], LANE_LOAD_TOKENS);
+        let lane = lane_view(&[(&v, 0)], LANE_LOAD_TOKENS);
         assert_eq!(lane.size, 0);
-        let lane = lane_view(&[(&v, 70_000)], &[&v.slot], LANE_LOAD_TOKENS);
+        let lane = lane_view(&[(&v, 70_000)], LANE_LOAD_TOKENS);
         assert_eq!(lane.size, 1);
     }
 
@@ -462,30 +450,23 @@ mod tests {
     }
 
     #[test]
-    fn short_avoids_members_only_while_a_clean_replica_exists() {
+    fn short_is_admitted_on_members_and_clean_replicas_alike() {
+        // Lane membership never keeps a short request off a replica: the
+        // pin-hold test and the score bound judge its backlog instead.
         let lane = lane_of(&[LANE_LOAD_TOKENS, 0]);
         for tier in [Tier::Base, Tier::Long] {
-            assert!(!lane_admits(
-                tier,
-                Class::Short,
-                LANE_LOAD_TOKENS,
-                false,
-                10,
-                true,
-                &lane
-            ));
-            assert!(lane_admits(tier, Class::Short, 0, true, 10, false, &lane));
+            for (load, idle, is_member) in [(LANE_LOAD_TOKENS, false, true), (0, true, false)] {
+                assert!(lane_admits(
+                    tier,
+                    Class::Short,
+                    load,
+                    idle,
+                    10,
+                    is_member,
+                    &lane
+                ));
+            }
         }
-        let no_clean = lane_of(&[LANE_LOAD_TOKENS, LANE_LOAD_TOKENS]);
-        assert!(lane_admits(
-            Tier::Base,
-            Class::Short,
-            u64::MAX,
-            false,
-            10,
-            true,
-            &no_clean
-        ));
     }
 
     #[test]
@@ -493,7 +474,6 @@ mod tests {
         let member = slot("gpu01", 0);
         let clean = slot("gpu01", 1);
         let lane = lane_of(&[LANE_LOAD_TOKENS, 0]);
-        let no_clean = lane_of(&[LANE_LOAD_TOKENS, LANE_LOAD_TOKENS]);
         use RoutePolicy::*;
         let table = [
             (Tier::Long, Class::Heavy, &lane, &member, HeavyLong),
@@ -502,8 +482,8 @@ mod tests {
             (Tier::Base, Class::Heavy, &lane, &clean, HeavyLaneAdmit),
             (Tier::Base, Class::Short, &lane, &clean, ShortClean),
             (Tier::Long, Class::Short, &lane, &clean, ShortClean),
-            (Tier::Base, Class::Short, &no_clean, &member, ShortOverflow),
-            (Tier::Long, Class::Short, &no_clean, &member, ShortOverflow),
+            (Tier::Base, Class::Short, &lane, &member, ShortOnMember),
+            (Tier::Long, Class::Short, &lane, &member, ShortOnMember),
         ];
         for (tier, class, lane, chosen, want) in table {
             assert_eq!(
@@ -515,10 +495,12 @@ mod tests {
 
         let tags: Vec<&str> = [
             ShortClean,
-            ShortOverflow,
+            ShortOnMember,
             HeavyLong,
             HeavyLaneJoin,
             HeavyLaneAdmit,
+            HeavyOverflow,
+            CapacityOverflow,
         ]
         .iter()
         .map(|p| p.as_str())
@@ -527,10 +509,12 @@ mod tests {
             tags,
             [
                 "short_clean",
-                "short_overflow",
+                "short_on_member",
                 "heavy_long",
                 "heavy_lane_join",
-                "heavy_lane_admit"
+                "heavy_lane_admit",
+                "heavy_overflow",
+                "capacity_overflow"
             ]
         );
     }

@@ -524,8 +524,11 @@ fn not_found(message: impl Into<String>, code: &str) -> (StatusCode, ResponseJso
 ///
 /// `providerConfig.api_key` is returned as `"***"` by admin reads. Sending `"***"` back keeps
 /// the stored key, and is rejected with 400 when no key is stored. Changing `backend` or
-/// `base_url` while keeping a stored key is rejected; send `api_key` again (or `null` to use
-/// the server default key).
+/// `base_url` while keeping a stored key is rejected; send `api_key` again, or `null` to use
+/// the server key, which is only sent to the provider's official HTTPS host.
+///
+/// A `providerConfig` write applies only if the stored config has not changed since it was
+/// read for the merge; otherwise it fails with 409 and can be retried.
 #[utoipa::path(
     patch,
     path = "/v1/admin/models",
@@ -535,6 +538,7 @@ fn not_found(message: impl Into<String>, code: &str) -> (StatusCode, ResponseJso
         (status = 200, description = "Models upserted successfully", body = Vec<ModelWithPricing>),
         (status = 400, description = "Invalid request", body = ErrorResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 409, description = "providerConfig changed concurrently; retry", body = ErrorResponse),
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
     security(
@@ -814,6 +818,8 @@ pub async fn batch_upsert_models(
                         owned_by: request.owned_by.clone(),
                         provider_type: request.provider_type.clone(),
                         provider_config: request.provider_config.clone(),
+                        // Set by the service from the stored row it merges into.
+                        expected_provider_config: None,
                         attestation_supported: request.attestation_supported,
                         input_modalities: request.input_modalities.clone(),
                         output_modalities: request.output_modalities.clone(),
@@ -876,6 +882,10 @@ pub async fn batch_upsert_models(
                 | services::admin::AdminError::InvalidParams(msg) => (
                     StatusCode::BAD_REQUEST,
                     ResponseJson(ErrorResponse::new(msg, "invalid_request".to_string())),
+                ),
+                services::admin::AdminError::ModelUpdateConflict(msg) => (
+                    StatusCode::CONFLICT,
+                    ResponseJson(ErrorResponse::new(msg, "conflict".to_string())),
                 ),
                 services::admin::AdminError::Unauthorized(msg) => (
                     StatusCode::UNAUTHORIZED,
@@ -2426,7 +2436,8 @@ fn admin_error_to_response(
             StatusCode::NOT_FOUND,
             ResponseJson(ErrorResponse::new(msg, "not_found".to_string())),
         ),
-        services::admin::AdminError::PricingChangeConflict(msg) => (
+        services::admin::AdminError::PricingChangeConflict(msg)
+        | services::admin::AdminError::ModelUpdateConflict(msg) => (
             StatusCode::CONFLICT,
             ResponseJson(ErrorResponse::new(msg, "conflict".to_string())),
         ),

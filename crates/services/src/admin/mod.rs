@@ -46,8 +46,10 @@ pub const REDACTED_API_KEY: &str = "***";
 ///
 /// `api_key: "***"`, the redacted value admin reads return, keeps the stored
 /// key and is rejected when no key is stored, so the placeholder is never
-/// stored or sent upstream. A kept key must not follow a changed `backend` or
-/// `base_url` to another upstream; that write has to send `api_key` again.
+/// stored or sent upstream. A write that would keep a "***" stored by an
+/// earlier client is rejected too. A kept key must not follow a changed
+/// `backend` or `base_url` to another upstream; that write has to send
+/// `api_key` again.
 fn resolve_provider_config(
     model_name: &str,
     stored: Option<Option<&serde_json::Value>>,
@@ -94,12 +96,19 @@ fn resolve_provider_config(
         }
     }
 
+    if config.get("api_key").and_then(serde_json::Value::as_str) == Some(REDACTED_API_KEY) {
+        return Err(invalid(
+            "the stored providerConfig.api_key is the placeholder \"***\", not a key; \
+             send the real key, or null to remove it",
+        ));
+    }
+
     if stored_key.is_some() && !sent_new_key && config.is_object() {
         for field in ["backend", "base_url"] {
             if stored_config.and_then(|stored| stored.get(field)) != config.get(field) {
                 return Err(invalid(&format!(
                     "providerConfig.{field} changed, so the stored api_key is not kept; \
-                     send api_key again, or null to use the server default key"
+                     send api_key again, or null to use the server key (official provider host only)"
                 )));
             }
         }
@@ -419,20 +428,22 @@ impl AdminService for AdminServiceImpl {
 
         // Merge each providerConfig write into the stored config, so that
         // validation, the write and the runtime reload all use the result.
+        // The write is compare-and-set against the snapshot merged into, so a
+        // concurrent update is rejected instead of silently overwritten.
         for (model_name, request) in models.iter_mut() {
             if let Some(patch) = request.provider_config.take() {
-                let existing = self
+                let stored = self
                     .repository
                     .get_model_validation_state(model_name)
                     .await
-                    .map_err(|e| AdminError::InternalError(e.to_string()))?;
+                    .map_err(|e| AdminError::InternalError(e.to_string()))?
+                    .map(|state| state.provider_config);
                 request.provider_config = Some(resolve_provider_config(
                     model_name,
-                    existing
-                        .as_ref()
-                        .map(|state| state.provider_config.as_ref()),
+                    stored.as_ref().map(Option::as_ref),
                     patch,
                 )?);
+                request.expected_provider_config = Some(stored.flatten());
             }
         }
 
@@ -514,11 +525,27 @@ impl AdminService for AdminServiceImpl {
         // is essentially free.
         let mut results = std::collections::HashMap::new();
         for (model_name, request) in models {
+            let compare_and_set = request.expected_provider_config.is_some();
             let pricing = self
                 .repository
                 .upsert_model_pricing(&model_name, request)
                 .await
-                .map_err(|e| AdminError::InternalError(e.to_string()))?;
+                .map_err(|e| {
+                    let conflict = e
+                        .chain()
+                        .filter_map(|cause| cause.downcast_ref::<crate::common::RepositoryError>())
+                        .any(|cause| {
+                            matches!(cause, crate::common::RepositoryError::TransactionConflict)
+                        });
+                    if compare_and_set && conflict {
+                        AdminError::ModelUpdateConflict(format!(
+                            "model '{model_name}': providerConfig changed while this update \
+                             was applied; read the model again and retry"
+                        ))
+                    } else {
+                        AdminError::InternalError(e.to_string())
+                    }
+                })?;
             results.insert(model_name, pricing);
             self.models_service.invalidate_models_cache().await;
         }
@@ -783,6 +810,7 @@ impl AdminService for AdminServiceImpl {
             owned_by: None,
             provider_type: None,
             provider_config: None,
+            expected_provider_config: None,
             attestation_supported: None,
             input_modalities: None,
             output_modalities: None,
@@ -1682,6 +1710,23 @@ mod provider_config_tests {
             };
             assert!(message.contains("none is stored"), "{message}");
         }
+    }
+
+    #[test]
+    fn stored_placeholder_key_is_not_kept() {
+        let mut stored = stored_external();
+        stored["api_key"] = json!("***");
+
+        let result = update(&stored, json!({"model_name": "vendor/other"}));
+        let Err(AdminError::InvalidParams(message)) = result else {
+            panic!("expected InvalidParams, got {result:?}");
+        };
+        assert!(message.contains("placeholder"), "{message}");
+
+        let config = update(&stored, json!({"api_key": "sk-real"})).unwrap();
+        assert_eq!(config["api_key"], "sk-real");
+        let config = update(&stored, json!({"api_key": null})).unwrap();
+        assert!(config.get("api_key").is_none());
     }
 
     #[test]

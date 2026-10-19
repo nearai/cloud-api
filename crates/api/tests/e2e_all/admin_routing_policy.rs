@@ -360,3 +360,79 @@ async fn provider_config_writes_keep_the_stored_key_and_routing_policy() {
         None
     );
 }
+
+#[tokio::test]
+async fn provider_config_write_is_compare_and_set() {
+    let (server, database) = setup_test_server_with_database().await;
+    let model_name = format!("test/provider-config-cas-{}", uuid::Uuid::new_v4());
+    patch_models(
+        &server,
+        serde_json::json!({&model_name: {
+            "isActive": false,
+            "modelDisplayName": "Synthetic compare-and-set test",
+            "modelDescription": "Synthetic compare-and-set test",
+            "contextLength": 4096,
+            "inputCostPerToken": {"amount": 220, "currency": "USD"},
+            "outputCostPerToken": {"amount": 660, "currency": "USD"},
+            "providerConfig": {"first": 1}
+        }}),
+    )
+    .await
+    .assert_status_ok();
+
+    // A write merged into a snapshot that is no longer stored is refused.
+    let repo = database::repositories::ModelRepository::new(database.pool().clone());
+    let write = |expected: serde_json::Value| database::models::UpdateModelPricingRequest {
+        provider_config: Some(serde_json::json!({"first": 1, "second": 2})),
+        expected_provider_config: Some(Some(expected)),
+        ..Default::default()
+    };
+    let stale = repo
+        .upsert_model_pricing(&model_name, &write(serde_json::json!({"first": 0})))
+        .await
+        .unwrap_err();
+    assert!(stale.chain().any(|cause| matches!(
+        cause.downcast_ref::<services::common::RepositoryError>(),
+        Some(services::common::RepositoryError::TransactionConflict)
+    )));
+    assert_eq!(
+        stored_provider_config(&database, &model_name).await,
+        Some(serde_json::json!({"first": 1}))
+    );
+    repo.upsert_model_pricing(&model_name, &write(serde_json::json!({"first": 1})))
+        .await
+        .unwrap();
+    assert_eq!(
+        stored_provider_config(&database, &model_name).await,
+        Some(serde_json::json!({"first": 1, "second": 2}))
+    );
+    // Writing the value already stored loses nothing, so a stale snapshot is fine.
+    repo.upsert_model_pricing(&model_name, &write(serde_json::json!({"first": 0})))
+        .await
+        .unwrap();
+
+    // Concurrent PATCHes each succeed or get 409; none is silently lost.
+    let responses = futures::future::join_all((0..8).map(|i| {
+        patch_models(
+            &server,
+            serde_json::json!({&model_name: {"providerConfig": {format!("key{i}"): i}}}),
+        )
+    }))
+    .await;
+    let stored = stored_provider_config(&database, &model_name)
+        .await
+        .unwrap();
+    let mut applied = 0;
+    for (i, response) in responses.iter().enumerate() {
+        match response.status_code().as_u16() {
+            200 => {
+                applied += 1;
+                assert_eq!(stored[format!("key{i}")], i, "lost update for key{i}");
+            }
+            409 => assert!(response.text().contains("retry"), "{}", response.text()),
+            status => panic!("unexpected status {status}: {}", response.text()),
+        }
+    }
+    assert!(applied > 0);
+    assert_eq!(stored["second"], 2);
+}

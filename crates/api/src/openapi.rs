@@ -201,6 +201,10 @@ use utoipa::{Modify, OpenApi};
         crate::routes::credit_transfers::put_policy,
         crate::routes::credit_transfers::create_credential,
         crate::routes::credit_transfers::revoke_credential,
+        crate::routes::credit_transfers::list_credentials,
+        crate::routes::credit_transfers::update_credential,
+        crate::routes::credit_transfers::rotate_credential,
+        crate::routes::credit_transfers::reconciliation,
         crate::routes::admin_usage_discount::put_usage_discount,
         crate::routes::admin::get_org_revenue,
         crate::routes::admin::get_infra_summary,
@@ -575,12 +579,12 @@ impl Modify for SecurityAddon {
                 ),
             );
             components.add_security_scheme(
-                "transfer_credential",
+                "organization_credential",
                 SecurityScheme::Http(
                     HttpBuilder::new()
                         .scheme(HttpAuthScheme::Bearer)
-                        .bearer_format("ct_")
-                        .description(Some("Organization-bound credits:transfer credential; never valid for inference"))
+                        .bearer_format("oc_")
+                        .description(Some("Organization-owned credential with explicit credits:read and/or credits:transfer permissions; never valid for inference"))
                         .build(),
                 ),
             );

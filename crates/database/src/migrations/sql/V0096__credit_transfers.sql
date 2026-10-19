@@ -1,32 +1,50 @@
+SET LOCAL lock_timeout = '5s';
+
 -- Forward-only: every accounting writer must understand outgoing deductions
 -- before any reseller is enabled. No organization is enabled by this migration.
-CREATE TABLE organization_credit_transfer_policies (
+CREATE TABLE organization_policies (
     organization_id UUID PRIMARY KEY REFERENCES organizations(id),
-    enabled BOOLEAN NOT NULL DEFAULT FALSE,
+    policy JSONB NOT NULL,
     policy_version BIGINT NOT NULL CHECK (policy_version > 0),
     changed_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
     changed_by UUID NOT NULL,
     change_reason TEXT NOT NULL
 );
-CREATE TABLE organization_credit_transfer_policy_audit (
+CREATE TABLE organization_policy_audit (
     id UUID PRIMARY KEY,
     organization_id UUID NOT NULL REFERENCES organizations(id),
-    enabled BOOLEAN NOT NULL,
+    policy JSONB NOT NULL,
     policy_version BIGINT NOT NULL,
     changed_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
     changed_by UUID NOT NULL,
     change_reason TEXT NOT NULL,
     UNIQUE (organization_id, policy_version)
 );
-CREATE TABLE organization_credit_transfer_credentials (
+CREATE TABLE organization_credentials (
     id UUID PRIMARY KEY,
     organization_id UUID NOT NULL REFERENCES organizations(id),
+    name TEXT NOT NULL,
+    permissions TEXT[] NOT NULL,
+    constraints JSONB NOT NULL,
     token_hash TEXT NOT NULL UNIQUE,
+    token_prefix TEXT NOT NULL,
     created_by UUID NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
     expires_at TIMESTAMPTZ NOT NULL,
-    revoked_at TIMESTAMPTZ
+    revoked_at TIMESTAMPTZ,
+    revoked_by UUID
 );
+CREATE TABLE organization_credential_audit (
+    id UUID PRIMARY KEY,
+    organization_id UUID NOT NULL REFERENCES organizations(id),
+    credential_id UUID NOT NULL REFERENCES organization_credentials(id),
+    action TEXT NOT NULL,
+    actor_id UUID NOT NULL,
+    configuration JSONB NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
+);
+CREATE INDEX organization_credentials_by_org ON organization_credentials (organization_id, created_at, id);
+CREATE INDEX organization_credential_audit_by_org ON organization_credential_audit (organization_id, created_at, id);
 CREATE TABLE organization_credit_transfer_totals (
     organization_id UUID NOT NULL REFERENCES organizations(id),
     credit_type TEXT NOT NULL CHECK (credit_type IN ('payment', 'staking_farm', 'transfer')),
@@ -46,7 +64,7 @@ CREATE TABLE organization_credit_transfers (
     terms JSONB NOT NULL,
     actor_id UUID NOT NULL,
     actor_kind TEXT NOT NULL CHECK (actor_kind IN ('owner_session', 'credits:transfer')),
-    credential_id UUID REFERENCES organization_credit_transfer_credentials(id),
+    credential_id UUID REFERENCES organization_credentials(id),
     policy_version BIGINT NOT NULL,
     source_limit_id UUID NOT NULL REFERENCES organization_limits_history(id),
     recipient_limit_id UUID NOT NULL REFERENCES organization_limits_history(id),
@@ -70,8 +88,13 @@ END;
 $$;
 CREATE TRIGGER credit_transfers_immutable BEFORE UPDATE OR DELETE ON organization_credit_transfers
     FOR EACH ROW EXECUTE FUNCTION reject_credit_transfer_mutation();
-CREATE TRIGGER credit_transfer_policy_audit_immutable BEFORE UPDATE OR DELETE ON organization_credit_transfer_policy_audit
+CREATE TRIGGER credit_transfer_policy_audit_immutable BEFORE UPDATE OR DELETE ON organization_policy_audit
     FOR EACH ROW EXECUTE FUNCTION reject_credit_transfer_mutation();
+
+CREATE TRIGGER organization_credential_audit_immutable
+    BEFORE UPDATE OR DELETE ON organization_credential_audit
+    FOR EACH ROW EXECUTE FUNCTION reject_credit_transfer_mutation();
+CREATE INDEX credit_transfers_credential ON organization_credit_transfers (credential_id);
 
 CREATE VIEW organization_credit_capacities AS
 SELECT limits.*, COALESCE(totals.outgoing, 0)::BIGINT AS transferred_out,
@@ -81,9 +104,9 @@ LEFT JOIN organization_credit_transfer_totals totals
   ON totals.organization_id = limits.organization_id AND totals.credit_type = limits.credit_type;
 
 ALTER TABLE usage_credit_allocations DROP CONSTRAINT usage_credit_allocations_credit_type_check;
-ALTER TABLE usage_credit_allocations ADD CHECK (credit_type IN ('grant', 'postpay', 'staking_farm', 'payment', 'transfer'));
+ALTER TABLE usage_credit_allocations ADD CHECK (credit_type IN ('grant', 'postpay', 'staking_farm', 'payment', 'transfer')) NOT VALID;
 ALTER TABLE organization_credit_consumption DROP CONSTRAINT organization_credit_consumption_credit_type_check;
-ALTER TABLE organization_credit_consumption ADD CHECK (credit_type IN ('grant', 'postpay', 'staking_farm', 'payment', 'transfer'));
+ALTER TABLE organization_credit_consumption ADD CHECK (credit_type IN ('grant', 'postpay', 'staking_farm', 'payment', 'transfer')) NOT VALID;
 
 -- All general limit writers are also rejected in Rust. This constraint ensures
 -- a direct writer cannot mint capacity beyond the transaction's incoming total.

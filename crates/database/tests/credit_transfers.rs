@@ -329,13 +329,12 @@ async fn concurrent_retries_distinct_keys_and_credentials_serialize() -> anyhow:
         "insufficient_posted_capacity"
     );
 
-    let credential = repository
-        .credential(
-            sender.org_id,
-            owner,
-            None,
-            Some(chrono::Utc::now() + chrono::Duration::hours(1)),
-        )
+    let credentials =
+        database::repositories::organization_credentials::OrganizationCredentialRepository::new(
+            pool.clone(),
+        );
+    let credential = credentials
+        .save(sender.org_id, owner, None, &credential_request(100, 100))
         .await?;
     let credential_actor =
         TransferActor::Credential(database::repositories::credit_transfers::hash_credential(
@@ -349,12 +348,11 @@ async fn concurrent_retries_distinct_keys_and_credentials_serialize() -> anyhow:
         retry.0,
         first_result(&repository, sender.org_id, &actor, "same").await?
     );
-    repository
-        .credential(
+    credentials
+        .revoke(
             sender.org_id,
             owner,
-            Some(serde_json::from_value(credential["id"].clone())?),
-            None,
+            serde_json::from_value(credential["id"].clone())?,
         )
         .await?;
     assert_eq!(
@@ -770,5 +768,560 @@ async fn opposite_transfers_and_concurrent_usage_keep_conservation() -> anyhow::
         )
         .await?;
     assert!(row.get::<_, i64>("outgoing") + row.get::<_, i64>("consumed") <= 100);
+    Ok(())
+}
+
+fn credential_request(
+    per_transfer: i64,
+    total: i64,
+) -> database::repositories::organization_credentials::CredentialRequest {
+    serde_json::from_value(json!({
+        "name": "Payout worker",
+        "permissions": ["credits:read", "credits:transfer"],
+        "constraints": {"credits:transfer": {
+            "max_amount_per_transfer": per_transfer,
+            "max_total_amount": total,
+            "allowed_source_types": ["payment"],
+        }},
+        "expires_at": chrono::Utc::now() + chrono::Duration::hours(1),
+    }))
+    .unwrap()
+}
+
+#[tokio::test]
+async fn organization_credentials_enforce_budgets_and_preserve_identity_on_rotation(
+) -> anyhow::Result<()> {
+    use database::repositories::organization_credentials::OrganizationCredentialRepository;
+
+    let pool = test_pool().await?;
+    let (sender, owner) = organization(&pool).await?;
+    let (recipient, other_owner) = organization(&pool).await?;
+    fund(&pool, sender.org_id, "payment", 1000).await?;
+    fund(&pool, sender.org_id, "staking_farm", 1000).await?;
+    let repository = CreditTransferRepository::new(pool.clone(), &Default::default());
+    let credentials = OrganizationCredentialRepository::new(pool.clone());
+    repository
+        .policy(sender.org_id, Some((true, owner, "reviewed")))
+        .await?;
+    let mut config = credential_request(30, 50);
+    let created = credentials
+        .save(sender.org_id, owner, None, &config)
+        .await?;
+    let id: Uuid = serde_json::from_value(created["id"].clone())?;
+    let actor =
+        TransferActor::Credential(database::repositories::credit_transfers::hash_credential(
+            created["token"].as_str().unwrap(),
+        ));
+
+    assert_eq!(
+        code(credentials.list(sender.org_id, other_owner).await),
+        "credential_refused"
+    );
+    assert_eq!(
+        code(
+            repository
+                .transfer(
+                    sender.org_id,
+                    &actor,
+                    "too-big",
+                    &request(recipient.org_id, "payment", 31)
+                )
+                .await
+        ),
+        "credential_transfer_limit_exceeded"
+    );
+    assert_eq!(
+        code(
+            repository
+                .transfer(
+                    sender.org_id,
+                    &actor,
+                    "wrong-source",
+                    &request(recipient.org_id, "staking_farm", 1)
+                )
+                .await
+        ),
+        "credential_transfer_limit_exceeded"
+    );
+
+    let terms = request(recipient.org_id, "payment", 30);
+    repository
+        .transfer(sender.org_id, &actor, "first", &terms)
+        .await?;
+    let capacity = repository.capacity(sender.org_id, &actor).await?;
+    assert_eq!(capacity["credential_remaining_budget"], 20);
+    assert_eq!(capacity["sources"][0]["max_amount_per_transfer"], 20);
+    assert!(
+        repository
+            .transfer(sender.org_id, &actor, "first", &terms)
+            .await?
+            .1
+    );
+    assert_eq!(
+        code(
+            repository
+                .transfer(sender.org_id, &actor, "second", &terms)
+                .await
+        ),
+        "credential_transfer_limit_exceeded"
+    );
+
+    let rotated = credentials.rotate(sender.org_id, owner, id).await?;
+    assert_eq!(rotated["id"], created["id"]);
+    assert_eq!(
+        code(repository.capacity(sender.org_id, &actor).await),
+        "credential_refused"
+    );
+    let actor =
+        TransferActor::Credential(database::repositories::credit_transfers::hash_credential(
+            rotated["token"].as_str().unwrap(),
+        ));
+    assert_eq!(
+        repository.capacity(sender.org_id, &actor).await?["credential_remaining_budget"],
+        20
+    );
+
+    // Raising the ceiling preserves the 30 already sent; lowering it below
+    // usage blocks new sends without invalidating an authorized replay.
+    config.constraints.transfer.max_total_amount = Some(60);
+    credentials
+        .save(sender.org_id, owner, Some(id), &config)
+        .await?;
+    assert_eq!(
+        repository.capacity(sender.org_id, &actor).await?["credential_remaining_budget"],
+        30
+    );
+    config.constraints.transfer.max_total_amount = Some(10);
+    credentials
+        .save(sender.org_id, owner, Some(id), &config)
+        .await?;
+    assert!(
+        repository
+            .transfer(sender.org_id, &actor, "first", &terms)
+            .await?
+            .1
+    );
+    assert_eq!(
+        code(
+            repository
+                .transfer(
+                    sender.org_id,
+                    &actor,
+                    "new",
+                    &request(recipient.org_id, "payment", 1)
+                )
+                .await
+        ),
+        "credential_transfer_limit_exceeded"
+    );
+
+    let listed = credentials.list(sender.org_id, owner).await?;
+    assert_eq!(listed["credentials"][0]["transferred_amount"], "30");
+    assert!(listed["credentials"][0].get("token").is_none());
+    assert!(listed["credentials"][0].get("token_hash").is_none());
+    assert!(!listed
+        .to_string()
+        .contains(created["token"].as_str().unwrap()));
+    assert!(!listed
+        .to_string()
+        .contains(rotated["token"].as_str().unwrap()));
+
+    credentials.revoke(sender.org_id, owner, id).await?;
+    let first_revoke = credentials.list(sender.org_id, owner).await?;
+    credentials.revoke(sender.org_id, owner, id).await?;
+    assert_eq!(credentials.list(sender.org_id, owner).await?, first_revoke);
+    assert_eq!(
+        code(
+            credentials
+                .revoke(sender.org_id, owner, Uuid::new_v4())
+                .await
+        ),
+        "credential_not_found"
+    );
+    assert_eq!(
+        code(
+            repository
+                .transfer(sender.org_id, &actor, "first", &terms)
+                .await
+        ),
+        "credential_refused"
+    );
+    assert_eq!(
+        repository.reconciliation(sender.org_id).await?["consistent"],
+        true
+    );
+    assert_eq!(
+        repository.reconciliation(recipient.org_id).await?["consistent"],
+        true
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn credential_permissions_recipient_restrictions_and_organization_ownership(
+) -> anyhow::Result<()> {
+    use database::repositories::organization_credentials::OrganizationCredentialRepository;
+
+    let pool = test_pool().await?;
+    let (sender, owner) = organization(&pool).await?;
+    let (recipient, second_owner) = organization(&pool).await?;
+    let (other_recipient, _) = organization(&pool).await?;
+    fund(&pool, sender.org_id, "payment", 1000).await?;
+    let repository = CreditTransferRepository::new(pool.clone(), &Default::default());
+    let credentials = OrganizationCredentialRepository::new(pool.clone());
+    repository
+        .policy(sender.org_id, Some((true, owner, "reviewed")))
+        .await?;
+    let mut config = credential_request(30, 50);
+    config.permissions = vec!["credits:read".into()];
+    let created = credentials
+        .save(sender.org_id, owner, None, &config)
+        .await?;
+    let id: Uuid = serde_json::from_value(created["id"].clone())?;
+    let actor =
+        TransferActor::Credential(database::repositories::credit_transfers::hash_credential(
+            created["token"].as_str().unwrap(),
+        ));
+
+    let capacity = repository.capacity(sender.org_id, &actor).await?;
+    assert_eq!(capacity["credential_can_transfer"], false);
+    assert_eq!(capacity["sources"][0]["max_amount_per_transfer"], 0);
+    assert_eq!(
+        code(
+            repository
+                .transfer(
+                    sender.org_id,
+                    &actor,
+                    "read-only",
+                    &request(recipient.org_id, "payment", 1)
+                )
+                .await
+        ),
+        "credential_refused"
+    );
+
+    config.permissions = vec!["credits:transfer".into()];
+    config.constraints.transfer.allowed_recipient_ids = Some(vec![recipient.org_id]);
+    credentials
+        .save(sender.org_id, owner, Some(id), &config)
+        .await?;
+    assert_eq!(
+        code(repository.capacity(sender.org_id, &actor).await),
+        "credential_refused"
+    );
+    assert_eq!(
+        code(
+            repository
+                .transfer(
+                    sender.org_id,
+                    &actor,
+                    "wrong-recipient",
+                    &request(other_recipient.org_id, "payment", 1)
+                )
+                .await
+        ),
+        "credential_transfer_limit_exceeded"
+    );
+
+    // Service credentials survive their creator's removal. Remaining owners can
+    // discover and revoke them, while the removed owner's session is refused.
+    let client = pool.get().await?;
+    client.execute("INSERT INTO organization_members (organization_id, user_id, role) VALUES ($1, $2, 'owner')", &[&sender.org_id, &second_owner]).await?;
+    client
+        .execute(
+            "DELETE FROM organization_members WHERE organization_id = $1 AND user_id = $2",
+            &[&sender.org_id, &owner],
+        )
+        .await?;
+    assert_eq!(
+        code(credentials.list(sender.org_id, owner).await),
+        "credential_refused"
+    );
+    assert_eq!(
+        credentials.list(sender.org_id, second_owner).await?["credentials"][0]["id"],
+        created["id"]
+    );
+    repository
+        .transfer(
+            sender.org_id,
+            &actor,
+            "service",
+            &request(recipient.org_id, "payment", 10),
+        )
+        .await?;
+    credentials.revoke(sender.org_id, second_owner, id).await?;
+    assert_eq!(
+        code(
+            repository
+                .transfer(
+                    sender.org_id,
+                    &actor,
+                    "service",
+                    &request(recipient.org_id, "payment", 10)
+                )
+                .await
+        ),
+        "credential_refused"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn concurrent_credential_sends_cannot_overspend_and_org_policy_caps_all_credentials(
+) -> anyhow::Result<()> {
+    use database::repositories::credit_transfers::{OrganizationPolicy, TransferPolicy};
+    use database::repositories::organization_credentials::OrganizationCredentialRepository;
+
+    let pool = test_pool().await?;
+    let (sender, owner) = organization(&pool).await?;
+    let (recipient, _) = organization(&pool).await?;
+    fund(&pool, sender.org_id, "payment", 1000).await?;
+    let repository = CreditTransferRepository::new(pool.clone(), &Default::default());
+    let credentials = OrganizationCredentialRepository::new(pool.clone());
+    let policy = OrganizationPolicy {
+        credentials: database::repositories::credit_transfers::CredentialPolicy { enabled: true },
+        credits_transfer: TransferPolicy {
+            enabled: true,
+            constraints: database::repositories::organization_credentials::TransferConstraints {
+                max_total_amount: Some(50),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    };
+    repository
+        .configure_policy(sender.org_id, Some((policy, owner, "50 total")))
+        .await?;
+    let created = credentials
+        .save(sender.org_id, owner, None, &credential_request(30, 30))
+        .await?;
+    let actor =
+        TransferActor::Credential(database::repositories::credit_transfers::hash_credential(
+            created["token"].as_str().unwrap(),
+        ));
+    let terms = request(recipient.org_id, "payment", 30);
+
+    // Keep both send futures pending on the accounting lock before releasing
+    // them, rather than relying only on scheduler overlap from join!.
+    let mut blocker = pool.get().await?;
+    let held = blocker.transaction().await?;
+    held.query_one(
+        "SELECT id FROM organizations WHERE id = $1 FOR UPDATE",
+        &[&sender.org_id.min(recipient.org_id)],
+    )
+    .await?;
+    let first = repository.transfer(sender.org_id, &actor, "a", &terms);
+    let second = repository.transfer(sender.org_id, &actor, "b", &terms);
+    tokio::pin!(first, second);
+    tokio::select! {
+        result = &mut first => panic!("send unexpectedly completed: {result:?}"),
+        result = &mut second => panic!("send unexpectedly completed: {result:?}"),
+        _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
+    }
+    held.commit().await?;
+    let (first, second) = tokio::join!(first, second);
+    assert_ne!(first.is_ok(), second.is_ok());
+    // The organization limit is checked first; both ceilings prevent the second send.
+    assert_eq!(
+        code(if first.is_err() { first } else { second }),
+        "organization_transfer_limit_exceeded"
+    );
+
+    let other = credentials
+        .save(sender.org_id, owner, None, &credential_request(100, 100))
+        .await?;
+    let other_actor = TransferActor::Credential(
+        database::repositories::credit_transfers::hash_credential(other["token"].as_str().unwrap()),
+    );
+    assert_eq!(
+        code(
+            repository
+                .transfer(
+                    sender.org_id,
+                    &other_actor,
+                    "too-much",
+                    &request(recipient.org_id, "payment", 21)
+                )
+                .await
+        ),
+        "organization_transfer_limit_exceeded"
+    );
+    repository
+        .transfer(
+            sender.org_id,
+            &other_actor,
+            "remaining",
+            &request(recipient.org_id, "payment", 20),
+        )
+        .await?;
+    assert_eq!(
+        repository.capacity(sender.org_id, &other_actor).await?["organization_remaining_budget"],
+        0
+    );
+    assert_eq!(
+        repository.reconciliation(sender.org_id).await?["consistent"],
+        true
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn reconciliation_reports_drift_without_repairing_it() -> anyhow::Result<()> {
+    let pool = test_pool().await?;
+    let (sender, owner) = organization(&pool).await?;
+    let (recipient, _) = organization(&pool).await?;
+    fund(&pool, sender.org_id, "payment", 100).await?;
+    let repository = CreditTransferRepository::new(pool.clone(), &Default::default());
+    repository
+        .policy(sender.org_id, Some((true, owner, "reviewed")))
+        .await?;
+    repository
+        .transfer(
+            sender.org_id,
+            &TransferActor::Owner(owner),
+            "send",
+            &request(recipient.org_id, "payment", 50),
+        )
+        .await?;
+
+    let client = pool.get().await?;
+    client.execute("UPDATE organization_credit_transfer_totals SET outgoing = 49 WHERE organization_id = $1 AND credit_type = 'payment'", &[&sender.org_id]).await?;
+    client.execute("UPDATE organization_limits_history SET spend_limit = 0 WHERE organization_id = $1 AND credit_type = 'payment' AND effective_until IS NULL", &[&sender.org_id]).await?;
+    let result = repository.reconciliation(sender.org_id).await?;
+    let findings = result["findings"].as_array().unwrap();
+    assert_eq!(result["consistent"], false);
+    assert!(findings.iter().any(|f| f["kind"] == "projection_mismatch"));
+    assert!(findings
+        .iter()
+        .any(|f| f["kind"] == "outgoing_exceeds_source"));
+    let unchanged: i64 = client.query_one("SELECT outgoing FROM organization_credit_transfer_totals WHERE organization_id = $1 AND credit_type = 'payment'", &[&sender.org_id]).await?.get(0);
+    assert_eq!(unchanged, 49);
+
+    client.execute("UPDATE organization_credit_transfer_totals SET incoming = 49 WHERE organization_id = $1 AND credit_type = 'transfer'", &[&recipient.org_id]).await?;
+    client.execute("UPDATE organization_limits_history SET spend_limit = 49 WHERE organization_id = $1 AND credit_type = 'transfer' AND effective_until IS NULL", &[&recipient.org_id]).await?;
+    client.execute("INSERT INTO organization_credit_consumption (organization_id, credit_type, amount) VALUES ($1, 'transfer', 51)", &[&recipient.org_id]).await?;
+    let result = repository.reconciliation(recipient.org_id).await?;
+    let findings = result["findings"].as_array().unwrap();
+    assert!(findings
+        .iter()
+        .any(|f| f["kind"] == "incoming_limit_mismatch"));
+    assert!(findings
+        .iter()
+        .any(|f| f["kind"] == "consumption_exceeds_incoming"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn policy_quota_counts_new_transfers_but_not_retries() -> anyhow::Result<()> {
+    use database::repositories::credit_transfers::{OrganizationPolicy, TransferPolicy};
+    let pool = test_pool().await?;
+    let (sender, owner) = organization(&pool).await?;
+    let (recipient, _) = organization(&pool).await?;
+    fund(&pool, sender.org_id, "payment", 100).await?;
+    let repository = CreditTransferRepository::new(pool.clone(), &Default::default());
+    let policy = OrganizationPolicy {
+        credentials: database::repositories::credit_transfers::CredentialPolicy { enabled: true },
+        credits_transfer: TransferPolicy {
+            enabled: true,
+            max_sends_per_minute: 1,
+            ..Default::default()
+        },
+    };
+    repository
+        .configure_policy(sender.org_id, Some((policy, owner, "quota")))
+        .await?;
+    let actor = TransferActor::Owner(owner);
+    let terms = request(recipient.org_id, "payment", 1);
+
+    repository
+        .transfer(sender.org_id, &actor, "first", &terms)
+        .await?;
+    assert!(
+        repository
+            .transfer(sender.org_id, &actor, "first", &terms)
+            .await?
+            .1
+    );
+    assert_eq!(
+        code(
+            repository
+                .transfer(sender.org_id, &actor, "second", &terms)
+                .await
+        ),
+        "transfer_rate_limited"
+    );
+    assert_eq!(
+        repository.capacity(sender.org_id, &actor).await?["sends_remaining_in_window"],
+        0
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn unauthorized_calls_and_snapshot_reads_do_not_wait_for_accounting_locks(
+) -> anyhow::Result<()> {
+    let pool = test_pool().await?;
+    let (sender, owner) = organization(&pool).await?;
+    let (recipient, recipient_owner) = organization(&pool).await?;
+    fund(&pool, sender.org_id, "staking_farm", 100).await?;
+    let repository = CreditTransferRepository::new(pool.clone(), &Default::default());
+    repository
+        .policy(sender.org_id, Some((true, owner, "reviewed")))
+        .await?;
+    let terms = request(recipient.org_id, "staking_farm", 10);
+    repository
+        .transfer(
+            sender.org_id,
+            &TransferActor::Owner(owner),
+            "privacy",
+            &terms,
+        )
+        .await?;
+    let incoming = repository
+        .history(
+            recipient.org_id,
+            &TransferActor::Owner(recipient_owner),
+            None,
+            None,
+            None,
+            10,
+        )
+        .await?;
+    assert!(incoming["transfers"][0].get("sender_snapshot").is_none());
+    assert!(incoming["transfers"][0].get("staking_evidence").is_none());
+    assert!(incoming["transfers"][0].get("recipient_snapshot").is_some());
+
+    let mut blocker = pool.get().await?;
+    let held = blocker.transaction().await?;
+    held.query_one(
+        "SELECT id FROM organizations WHERE id = $1 FOR UPDATE",
+        &[&sender.org_id],
+    )
+    .await?;
+    let refused = TransferActor::Credential("not-a-real-hash".into());
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        repository.transfer(sender.org_id, &refused, "denied", &terms),
+    )
+    .await?;
+    assert_eq!(code(result), "credential_refused");
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        repository.capacity(sender.org_id, &TransferActor::Owner(owner)),
+    )
+    .await??;
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        repository.history(
+            sender.org_id,
+            &TransferActor::Owner(owner),
+            None,
+            None,
+            None,
+            10,
+        ),
+    )
+    .await??;
+    held.rollback().await?;
     Ok(())
 }

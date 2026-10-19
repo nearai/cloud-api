@@ -182,22 +182,107 @@ consistent with limit-change reasons and billing correction records.
 ## Reseller credit transfers
 
 An administrator explicitly enables each reseller with
-`PUT /v1/admin/organizations/{org_id}/credit/transfer-policy`, sending
-`{"enabled": true, "reason": "Reviewed opening accounting"}`. GET returns the
-current policy and append-only audit. Read-only admin credentials cannot change
-policies. No organization is enabled by migration. Disabling a policy stops new
-sends but retains authorized history and exact replay access.
+`PUT /v1/admin/organizations/{org_id}/policy`:
 
-An owner session can create an organization-bound `credits:transfer` credential
-with `POST /v1/organizations/{org_id}/credit/transfer-credentials`, passing an
-`expires_at` timestamp in the next 366 days. The secret is returned once; only its
-SHA-256 hash is stored. Rotate by issuing a replacement and deleting the old
-`/credit/transfer-credentials/{id}`. These credentials cannot manage policies,
-issue credentials, run inference, or read another organization's finances.
-Ordinary inference API keys and reporting tokens cannot transfer credits.
+```json
+{
+  "policy": {
+    "credentials": {"enabled": true},
+    "credits_transfer": {
+      "enabled": true,
+      "max_sends_per_minute": 60,
+      "constraints": {
+        "max_amount_per_transfer": 10000000000,
+        "max_total_amount": 500000000000,
+        "allowed_source_types": ["payment", "staking_farm"]
+      }
+    }
+  },
+  "reason": "Reviewed opening accounting"
+}
+```
+
+The policy uses named sections for future extension. PUT replaces the complete
+supported policy; unknown fields and permissions are rejected, never silently
+accepted. GET returns current policy and append-only audit. Read-only admin
+credentials may inspect policies and reconciliation but cannot change policies.
+No organization is enabled by migration. Disabling sends retains authorized
+history and exact replay access. Organization-wide budgets include owner-session
+sends and all credentials, including revoked credentials.
+
+### Organization credentials
+
+Owners manage organization-owned automation credentials. Administrators must
+first enable `policy.credentials.enabled` (default false). The server gates
+creation, configuration updates, and rotation; listing and revocation remain
+available when disabled so owners can still remove existing access. This flag
+does not revoke existing secrets or disable their use; use revocation or the
+separate transfer policy to stop sending.
+
+Cloud Admin UI exposes this organization policy alongside transfer settings.
+Credential management controls require both this policy flag and owner membership;
+being a platform admin alone does not grant permission to mint an organization's
+credentials.
+
+Endpoints:
+
+| Method | Path (under `/v1/organizations/{org_id}`) | Purpose |
+| --- | --- | --- |
+| POST | `/credentials` | Create; secret returned once |
+| GET | `/credentials` | List configuration, decimal-string lifetime transfer usage, and audit |
+| PUT | `/credentials/{id}` | Replace configuration; preserve identity and usage |
+| POST | `/credentials/{id}/rotate` | Replace secret immediately; preserve identity and usage |
+| DELETE | `/credentials/{id}` | Revoke; repeated revocation preserves timestamp and audit |
+
+Create or update with:
+
+```json
+{
+  "name": "Contributor payouts",
+  "permissions": ["credits:read", "credits:transfer"],
+  "constraints": {
+    "credits:transfer": {
+      "max_amount_per_transfer": 10000000000,
+      "max_total_amount": 500000000000,
+      "allowed_source_types": ["payment"]
+    }
+  },
+  "expires_at": "2027-01-01T00:00:00Z"
+}
+```
+
+Amounts are integer nano-USD: the example permits $10 per transfer and $500 over
+the credential's lifetime. `expires_at` must be in the next 366 days. Optional
+constraints are `max_amount_per_transfer`, `max_total_amount`,
+`allowed_source_types`, and `allowed_recipient_ids` (at most 1,000 UUIDs).
+Omitting a constraint adds no restriction; an empty allowlist permits nothing,
+and a zero monetary limit blocks new sends. Organization policy and credential
+constraints both apply. Neither can permit grant, postpay, or transfer as a source.
+A per-credential limit bounds an integration, not the owners who can create more
+credentials; the organization policy is the aggregate budget boundary.
+
+`credits:read` allows transfer history/detail and capacity reads. `credits:transfer`
+allows sends and their original response replays; it does not implicitly grant
+history reads. Neither permission authorizes credential management, policy
+changes, or inference. Owners manage credentials using their sessions. Existing
+reporting tokens and workspace inference API keys remain unchanged.
+
+Secrets have the `oc_` prefix; only their SHA-256 hashes and safe display prefixes
+are stored. Listing and audit never expose hashes or secrets. Unknown credential
+IDs return 404. Creation, configuration changes, rotation, and revocation are
+audited. Credentials belong to the organization: removing the creator does not
+revoke them. Other owners must review and revoke credentials during offboarding.
+Rotation immediately invalidates the old secret without resetting usage or expiry;
+update expiry separately if needed. A revoked credential cannot be reactivated.
+
+Lifetime usage is derived from the immutable transfer ledger under the same
+organization lock as sends. Failed operations and exact retries consume no budget.
+Raising or lowering a budget never resets usage; lowering below spent blocks new
+sends but permits authorized exact retries. Authorization is still required for a
+retry: expired, revoked, or permission-removed credentials cannot replay.
 
 Send `POST /v1/organizations/{sender_org_id}/credit/transfer` with an owner session
-or `Authorization: Bearer ct_...`, plus a required `Idempotency-Key` header:
+or `Authorization: Bearer oc_...`, plus a required `Idempotency-Key` header:
 
 ```json
 {
@@ -222,7 +307,11 @@ if balances or sender policy have since changed. Keys are trimmed, nonempty,
 and at most 100 characters, scoped to the sender and retained with the ledger.
 Failures before commit, including unavailable recipients, do not reserve keys or
 debit either organization. Use one stable key per intended transfer and reuse the
-original terms after a timeout. Changes to any business field return 409.
+original terms after a timeout. Clients/SDKs may automatically generate a UUID
+once before the first attempt and persist/reuse it across retries. A new server-
+generated UUID per request cannot deduplicate a committed transfer whose response
+was lost. The server separately generates the transfer record ID.
+Changes to any business field return 409.
 
 Memo defaults to the empty string, preserves whitespace, and permits at most
 2,000 UTF-8 bytes. Metadata defaults to an object and permits at most 16 KiB of
@@ -241,9 +330,16 @@ outgoing transfers, newest first, with a maximum page size of 100. Select
 `?idempotency_key=...` for an outgoing lookup, or `/credit/transfers/{id}` for a
 single record. Sender responses contain its original snapshot and delivery
 confirmation; only recipient views contain its snapshot and debt settlement.
-`GET /credit/transfer-capacity` returns the organization's own credit positions,
-`own_staking_earned_total` from posted issuance history, and reconciliation status.
-Source availability is transferable only while the sender is enabled and reconciled.
+`GET /v1/organizations/{org_id}/credit/transfer/capacity` requires `credits:read`
+or an owner session. It returns own credit positions, posted own staking earnings,
+reconciliation status, policy enablement, credential transfer permission,
+organization/credential remaining lifetime budgets, remaining send quota, and a
+per-source maximum for one new transfer. The maximum accounts for both budgets,
+per-transfer ceilings, permissions, policy, and source eligibility. Recipient
+allowlists are returned in the constraints and must also be satisfied; recipient
+availability is checked at send time. This snapshot is informational, never a
+reservation. A subsequent concurrent send, usage posting, or configuration change
+can change capacity before the requested transfer executes.
 
 Balance breakdowns retain gross `amount` semantics and add `transferred_out` and
 `effective_capacity`. Availability is `max(gross - outgoing - consumed, 0)` for
@@ -262,31 +358,39 @@ admitted before distribution can finish afterwards with overage. Further sends
 are blocked once overage is posted. Prefer a dedicated distribution organization.
 
 409 codes distinguish `insufficient_posted_capacity`, `sender_not_reconciled`,
-`idempotency_conflict`, and `capacity_overflow`. 403 distinguishes
+`idempotency_conflict`, `capacity_overflow`, `organization_transfer_limit_exceeded`,
+and `credential_transfer_limit_exceeded`. 403 distinguishes
 `credential_refused` and `sender_not_enabled`. 404 `organization_unavailable`
 debits nothing; recipient availability is checked only after sender authorization
-and policy. At most 60 new successful sends per sender per rolling minute are
-allowed; exact replays do not consume that quota. 429 uses `transfer_rate_limited`.
+and policy. By default, at most 60 new successful sends per sender per rolling minute are
+allowed, configurable through organization policy (1–100,000); exact replays do not consume that quota. 429 uses `transfer_rate_limited`.
 Transient database/lock errors return 503; retry with the original key.
 `credit_transfer_operations` records bounded outcome labels, never user metadata.
 
 ### Deployment and reconciliation
 
-1. Deploy migration V0095 and every transfer-aware accounting binary before
-   enabling a reseller. Migration introduces new operator-owned ledger, policy,
-   credential, and projection data that cannot be represented by existing columns.
-2. Explicitly migrate configured `CREDIT_USAGE_ORDER` from four to five types.
-   Existing four-type overrides fail validation instead of being silently reordered.
-   Choose the transfer position deliberately and bump the policy version (default
-   `v2`). Historical allocation versions remain unchanged.
-3. Drain incompatible workers and update clients that assume four types. Frontend
-   balance rendering should show gross, distributed, consumed, effective, and
-   available amounts separately; this server PR does not deploy those clients.
-4. Run `scripts/reconcile-credit-transfers.sql`. It verifies ledger/projection
-   agreement, incoming system limits, and global conservation. Investigate any row
-   or nonzero difference before enablement. Projections can be rebuilt from the
-   grouped ledger sums under accounting locks in a reviewed maintenance operation;
-   never rewrite completed transfers or historical usage allocations.
+1. Ship the transfer-aware image and its five-type `CREDIT_USAGE_ORDER` together
+   in the same deployment revision, with allocation policy version `v2` (or a new
+   explicitly chosen version). New binaries reject four-type overrides and old
+   binaries reject five-type overrides. Do not update a shared ConfigMap that old
+   pods may reload/restart from. Deploy migration V0096 and every transfer-aware
+   accounting writer before enabling any reseller. V0096 is an unreleased draft
+   migration; environments that ran an earlier draft require a fresh test database.
+2. Drain incompatible workers and update clients that assume four types. Choose
+   the transfer priority deliberately; historical allocation versions remain
+   unchanged. Pin both order and policy version together for custom policies.
+3. Balance rendering can show gross, distributed, consumed, and available amounts.
+   `effective_capacity` is a convenience field derived from gross minus outgoing;
+   clients do not have to display it separately. This server PR does not deploy UI.
+4. Call `GET /v1/admin/organizations/{org_id}/credit/transfer/reconciliation`
+   using an admin session or read-only admin token. It returns `consistent`,
+   `checked_at`, and structured `findings` for ledger/projection mismatches,
+   incoming-limit mismatches, outgoing above gross source capacity, and transfer
+   consumption above incoming credits. Operators need no SQL access. This is a
+   single consistent database snapshot, not an automatic repair or a guarantee
+   against later manual changes. Investigate findings before enablement.
+   Corrections remain separate reviewed maintenance operations; never rewrite
+   completed transfers or historical usage allocations.
 5. Enable one reviewed, fully reconciled, debt-free reseller and check end-to-end
    delivery, consumption attribution, and staking sync before broadening access.
 6. Emergency rollback disables policies but retains transfer-aware accounting.

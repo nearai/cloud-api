@@ -1264,6 +1264,9 @@ pub fn build_app_with_config_and_options(
             database.pool().clone(),
             &config.credit_allocation,
         ),
+        database::repositories::organization_credentials::OrganizationCredentialRepository::new(
+            database.pool().clone(),
+        ),
         auth_components.auth_state_middleware.clone(),
     );
     let management_routes = build_management_router(
@@ -2503,10 +2506,11 @@ fn build_admin_routes_with_options(
         .merge(
             Router::new()
                 .route(
-                    "/admin/organizations/{org_id}/credit/transfer-policy",
+                    "/admin/organizations/{org_id}/policy",
                     get(crate::routes::credit_transfers::get_policy)
                         .put(crate::routes::credit_transfers::put_policy),
                 )
+                .route("/admin/organizations/{org_id}/credit/transfer/reconciliation", get(crate::routes::credit_transfers::reconciliation))
                 .layer(axum::Extension(
                     database::repositories::credit_transfers::CreditTransferRepository::new(
                         database.pool().clone(),

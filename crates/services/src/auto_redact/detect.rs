@@ -23,9 +23,9 @@ pub async fn detect_pii(
     texts: &[String],
     model: &str,
     pool: &InferenceProviderPool,
-) -> Result<(Vec<Vec<Span>>, i64), AutoRedactError> {
+) -> Result<(Vec<Vec<Span>>, i64, crate::usage::ProviderAttribution), AutoRedactError> {
     if texts.is_empty() {
-        return Ok((Vec::new(), 0));
+        return Ok((Vec::new(), 0, Default::default()));
     }
 
     let req_body = serde_json::json!({
@@ -37,11 +37,12 @@ pub async fn detect_pii(
         .map_err(|e| AutoRedactError::Internal(format!("encode detect req: {e}")))?;
 
     let resp_bytes = pool
-        .privacy_classify(model, bytes::Bytes::from(body_bytes), HashMap::new())
+        .privacy_classify_with_attribution(model, bytes::Bytes::from(body_bytes), HashMap::new())
         .await
         .map_err(|e| AutoRedactError::DetectorUnavailable(detector_error_message(&e)))?;
 
-    parse_response(&resp_bytes, texts.len())
+    let (spans, tokens) = parse_response(&resp_bytes.response, texts.len())?;
+    Ok((spans, tokens, resp_bytes.provider_attribution))
 }
 
 /// Convert the inference-pool error into a sanitized public message.

@@ -1843,6 +1843,26 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         &self,
         request: ports::CompletionRequest,
     ) -> Result<StreamingResult, ports::CompletionError> {
+        self.create_chat_completion_stream_with_attribution(request)
+            .await
+            .map(|served| served.response)
+    }
+    async fn create_chat_completion(
+        &self,
+        request: ports::CompletionRequest,
+    ) -> Result<inference_providers::ChatCompletionResponseWithBytes, ports::CompletionError> {
+        self.create_chat_completion_with_attribution(request)
+            .await
+            .map(|served| served.response)
+    }
+
+    async fn create_chat_completion_stream_with_attribution(
+        &self,
+        request: ports::CompletionRequest,
+    ) -> Result<
+        crate::inference_provider_pool::AttributedInference<StreamingResult>,
+        ports::CompletionError,
+    > {
         let service_start_time = Instant::now();
 
         // Extract context for usage tracking
@@ -2053,13 +2073,21 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             )
             .await;
 
-        Ok(event_stream)
+        Ok(crate::inference_provider_pool::AttributedInference {
+            response: event_stream,
+            provider_attribution,
+        })
     }
 
-    async fn create_chat_completion(
+    async fn create_chat_completion_with_attribution(
         &self,
         request: ports::CompletionRequest,
-    ) -> Result<inference_providers::ChatCompletionResponseWithBytes, ports::CompletionError> {
+    ) -> Result<
+        crate::inference_provider_pool::AttributedInference<
+            inference_providers::ChatCompletionResponseWithBytes,
+        >,
+        ports::CompletionError,
+    > {
         let service_start_time = Instant::now();
         let organization_id = request.organization_id;
         let workspace_id = request.workspace_id;
@@ -2365,7 +2393,10 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             api_key_id
         );
 
-        Ok(response_with_bytes)
+        Ok(crate::inference_provider_pool::AttributedInference {
+            response: response_with_bytes,
+            provider_attribution,
+        })
     }
 
     async fn audio_transcription(

@@ -562,7 +562,7 @@ async fn handle_request(
         cache_write_cost_per_token: seed.cache_write_cost_per_token,
     });
 
-    build_upstream_response(
+    let response = build_upstream_response(
         served.response,
         endpoint,
         prepared.stream,
@@ -570,7 +570,8 @@ async fn handle_request(
         concurrent_slot,
         alias_from,
     )
-    .await
+    .await;
+    super::common::with_serving_identity(response, served.provider_attribution)
 }
 
 fn prepare_billing_seed(

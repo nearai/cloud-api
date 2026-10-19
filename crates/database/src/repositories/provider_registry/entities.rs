@@ -293,13 +293,24 @@ impl AttemptRepository for ProviderRegistryRepository {
     }
 
     async fn finish(&self, attempt: &InferenceAttempt) -> Result<()> {
-        let usage_cost = attempt.usage.as_ref().and_then(|usage| {
-            attempt
-                .route
-                .cost_rates
-                .as_ref()
-                .and_then(|rates| rates.usage_cost_usd(usage))
+        let usage_cost = attempt.route.cost_rates.as_ref().and_then(|rates| {
+            if rates.billing_unit == "million_tokens" {
+                attempt
+                    .usage
+                    .as_ref()
+                    .and_then(|usage| rates.usage_cost_usd(usage))
+            } else {
+                attempt
+                    .billable_quantity
+                    .as_ref()
+                    .and_then(|quantity| rates.quantity_cost_usd(quantity))
+            }
         });
+        let quantity = attempt
+            .billable_quantity
+            .as_ref()
+            .map(serde_json::to_value)
+            .transpose()?;
         let input_tokens = attempt
             .usage
             .as_ref()
@@ -308,9 +319,9 @@ impl AttemptRepository for ProviderRegistryRepository {
             .usage
             .as_ref()
             .map(|usage| i64::from(usage.completion_tokens));
-        self.pool.get().await?.execute("UPDATE inference_attempts SET outcome=$3,latency_ms=$4,finished_at=clock_timestamp(),usage_cost_microusd=$5,input_tokens=$6,output_tokens=$7,
+        self.pool.get().await?.execute("UPDATE inference_attempts SET outcome=$3,latency_ms=$4,finished_at=clock_timestamp(),usage_cost_microusd=$5,input_tokens=$6,output_tokens=$7,billable_quantity=$8,
             cost_status=CASE WHEN actual_cost_microusd IS NOT NULL THEN 'settled' WHEN $3='success' AND $5::bigint IS NOT NULL THEN 'estimated' ELSE 'unknown' END WHERE request_id=$1 AND attempt_index=$2",
-            &[&attempt.request_id,&attempt.attempt_index,&attempt.outcome,&attempt.latency_ms,&usage_cost,&input_tokens,&output_tokens]).await?;
+            &[&attempt.request_id,&attempt.attempt_index,&attempt.outcome,&attempt.latency_ms,&usage_cost,&input_tokens,&output_tokens,&quantity]).await?;
         Ok(())
     }
 }

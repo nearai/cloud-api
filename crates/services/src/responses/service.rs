@@ -45,6 +45,7 @@ struct ProcessStreamContext {
     response_repository: Arc<dyn ports::ResponseRepositoryTrait>,
     response_items_repository: Arc<dyn ports::ResponseItemRepositoryTrait>,
     completion_service: Arc<dyn CompletionServiceTrait>,
+    usage_service: Arc<dyn crate::usage::UsageServiceTrait + Send + Sync>,
     conversation_service: Arc<dyn ConversationServiceTrait>,
     file_service: Arc<dyn FileServiceTrait>,
     organization_service: Arc<dyn crate::organization::OrganizationServiceTrait>,
@@ -61,6 +62,7 @@ pub struct ResponseServiceImpl {
     pub inference_provider_pool: Arc<InferenceProviderPool>,
     pub conversation_service: Arc<dyn ConversationServiceTrait>,
     pub completion_service: Arc<dyn CompletionServiceTrait>,
+    pub usage_service: Arc<dyn crate::usage::UsageServiceTrait + Send + Sync>,
     pub web_search_provider: Option<Arc<dyn tools::WebSearchProviderTrait>>,
     pub web_context_search_provider: Option<Arc<dyn tools::WebContextSearchProviderTrait>>,
     pub file_search_provider: Option<Arc<dyn tools::FileSearchProviderTrait>>,
@@ -86,6 +88,7 @@ impl ResponseServiceImpl {
         inference_provider_pool: Arc<InferenceProviderPool>,
         conversation_service: Arc<dyn ConversationServiceTrait>,
         completion_service: Arc<dyn CompletionServiceTrait>,
+        usage_service: Arc<dyn crate::usage::UsageServiceTrait + Send + Sync>,
         web_search_provider: Option<Arc<dyn tools::WebSearchProviderTrait>>,
         web_context_search_provider: Option<Arc<dyn tools::WebContextSearchProviderTrait>>,
         file_search_provider: Option<Arc<dyn tools::FileSearchProviderTrait>>,
@@ -98,6 +101,7 @@ impl ResponseServiceImpl {
             inference_provider_pool,
             conversation_service,
             completion_service,
+            usage_service,
             web_search_provider,
             web_context_search_provider,
             file_search_provider,
@@ -115,6 +119,7 @@ impl ResponseServiceImpl {
         inference_provider_pool: Arc<InferenceProviderPool>,
         conversation_service: Arc<dyn ConversationServiceTrait>,
         completion_service: Arc<dyn CompletionServiceTrait>,
+        usage_service: Arc<dyn crate::usage::UsageServiceTrait + Send + Sync>,
         web_search_provider: Option<Arc<dyn tools::WebSearchProviderTrait>>,
         web_context_search_provider: Option<Arc<dyn tools::WebContextSearchProviderTrait>>,
         file_search_provider: Option<Arc<dyn tools::FileSearchProviderTrait>>,
@@ -128,6 +133,7 @@ impl ResponseServiceImpl {
             inference_provider_pool,
             conversation_service,
             completion_service,
+            usage_service,
             web_search_provider,
             web_context_search_provider,
             file_search_provider,
@@ -232,6 +238,7 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
         let web_context_search_provider = self.web_context_search_provider.clone();
         let file_search_provider = self.file_search_provider.clone();
         let file_service = self.file_service.clone();
+        let usage_service = self.usage_service.clone();
         let organization_service = self.organization_service.clone();
         let mcp_client_factory = self.mcp_client_factory.clone();
         let signing_algo_clone = signing_algo.clone();
@@ -277,6 +284,7 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
                     response_repository,
                     response_items_repository,
                     completion_service,
+                    usage_service,
                     conversation_service,
                     file_service,
                     organization_service,
@@ -861,7 +869,7 @@ impl ResponseServiceImpl {
             role: "assistant".to_string(),
             content: vec![],
             model: ctx.model.clone(),
-            metadata: None,
+            metadata: ctx.serving_metadata(),
         };
         emitter
             .emit_item_added(ctx, item, message_item_id.to_string())
@@ -926,7 +934,7 @@ impl ResponseServiceImpl {
                 logprobs: vec![],
             }],
             model: ctx.model.clone(),
-            metadata: None,
+            metadata: ctx.serving_metadata(),
         };
 
         // CRITICAL: Store to database FIRST before emitting events
@@ -1560,11 +1568,12 @@ impl ResponseServiceImpl {
             // Get completion stream
             let completion_result = process_context
                 .completion_service
-                .create_chat_completion_stream(completion_request)
+                .create_chat_completion_stream_with_attribution(completion_request)
                 .await
                 .map_err(errors::ResponseError::from)?;
 
-            let mut completion_stream = completion_result;
+            ctx.serving_attribution = completion_result.provider_attribution;
+            let mut completion_stream = completion_result.response;
 
             // Process the completion stream and extract text + tool calls
             let stream_result = Self::process_completion_stream(
@@ -3370,8 +3379,14 @@ impl ResponseServiceImpl {
             );
         }
 
+        let model = process_context.model.as_ref().ok_or_else(|| {
+            errors::ResponseError::InvalidParams("Image model pricing unavailable".into())
+        })?;
+        let api_key_id = Uuid::parse_str(&process_context.api_key_id)
+            .map_err(|_| errors::ResponseError::InternalError("Invalid API key identity".into()))?;
+
         // Call the appropriate image API
-        let response = if has_input_image {
+        let (response, attribution) = if has_input_image {
             if process_context.model_pub_key.is_some() {
                 return Err(errors::ResponseError::InvalidParams(
                     "Image editing does not support signing-key pinning".into(),
@@ -3388,17 +3403,18 @@ impl ResponseServiceImpl {
                 response_format: Some("b64_json".to_string()),
             };
 
-            process_context
+            let served = process_context
                 .completion_service
                 .get_inference_provider_pool()
-                .image_edit(params, process_context.body_hash.clone())
+                .image_edit_with_attribution(params, process_context.body_hash.clone())
                 .await
                 .map_err(|e| {
                     tracing::error!(error = %e, "Image edit request failed");
                     errors::ResponseError::InternalError(
                         "Image edit processing failed. Please try again later.".to_string(),
                     )
-                })?
+                })?;
+            (served.response, served.provider_attribution)
         } else {
             let params = inference_providers::ImageGenerationParams {
                 model: process_context.request.model.clone(),
@@ -3411,18 +3427,62 @@ impl ResponseServiceImpl {
                 extra: extra_params,
             };
 
-            process_context
+            let served = process_context
                 .completion_service
                 .get_inference_provider_pool()
-                .image_generation(params, process_context.body_hash.clone())
+                .image_generation_with_attribution(params, process_context.body_hash.clone())
                 .await
                 .map_err(|e| {
                     tracing::error!(error = %e, "Image generation request failed");
                     errors::ResponseError::InternalError(
                         "Image generation processing failed. Please try again later.".to_string(),
                     )
-                })?
+                })?;
+            (served.response, served.provider_attribution)
         };
+
+        ctx.serving_attribution = attribution;
+        let image_count = i32::try_from(response.response.data.len())
+            .map_err(|_| errors::ResponseError::InternalError("Invalid image count".into()))?;
+        if image_count > 0 {
+            // The response ID is owned by this accepted request and makes retries
+            // of usage persistence idempotent without trusting upstream IDs.
+            let usage = crate::usage::RecordUsageServiceRequest {
+                pricing_snapshot: Some(model.into()),
+                organization_id: process_context.organization_id,
+                workspace_id: process_context.workspace_id,
+                api_key_id,
+                model_id: model.id,
+                input_tokens: 0,
+                output_tokens: 0,
+                cache_read_tokens: 0,
+                cache_write: None,
+                profiled_cache_write_tokens: 0,
+                requested_service_tier: None,
+                provider_service_tier: None,
+                inference_type: if has_input_image {
+                    crate::usage::InferenceType::ImageEdit
+                } else {
+                    crate::usage::InferenceType::ImageGeneration
+                },
+                ttft_ms: None,
+                avg_itl_ms: None,
+                inference_id: Some(*ctx.response_id.as_uuid()),
+                provider_request_id: Some(response.response.id.clone()),
+                stop_reason: Some(crate::usage::StopReason::Completed),
+                response_id: Some(ctx.response_id.clone()),
+                image_count: Some(image_count),
+                discount: None,
+                provider_attribution: attribution,
+            };
+            process_context
+                .usage_service
+                .record_usage(usage)
+                .await
+                .map_err(|_| {
+                    errors::ResponseError::InternalError("Image usage persistence failed".into())
+                })?;
+        }
 
         // Extract base64 images from response
         let image_data: Vec<models::ImageOutputData> = response
@@ -3458,7 +3518,7 @@ impl ResponseServiceImpl {
                 url: None,
             }],
             model: process_context.request.model.clone(),
-            metadata: None,
+            metadata: ctx.serving_metadata(),
         };
 
         // Store the image message item in database

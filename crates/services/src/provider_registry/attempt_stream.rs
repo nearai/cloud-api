@@ -9,6 +9,46 @@ use std::{
     task::{Context, Poll},
 };
 
+/// Covers cancellation while waiting for upstream response headers. The stream
+/// observer takes over after dispatch; neither observer initiates another call.
+pub(crate) struct PendingAttempt {
+    attempt: Option<InferenceAttempt>,
+    repository: Arc<dyn AttemptRepository>,
+    started: std::time::Instant,
+}
+
+impl PendingAttempt {
+    pub(crate) fn new(attempt: InferenceAttempt, repository: Arc<dyn AttemptRepository>) -> Self {
+        Self {
+            attempt: Some(attempt),
+            repository,
+            started: std::time::Instant::now(),
+        }
+    }
+
+    pub(crate) fn disarm(&mut self) {
+        self.attempt = None;
+    }
+}
+
+impl Drop for PendingAttempt {
+    fn drop(&mut self) {
+        let Some(mut attempt) = self.attempt.take() else {
+            return;
+        };
+        attempt.outcome = "cancelled".into();
+        attempt.latency_ms = Some(self.started.elapsed().as_millis().min(i64::MAX as u128) as i64);
+        let repository = self.repository.clone();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                if repository.finish(&attempt).await.is_err() {
+                    tracing::error!(request_id=%attempt.request_id,"Cancelled provider attempt persistence failed");
+                }
+            });
+        }
+    }
+}
+
 struct AttemptStream {
     inner: StreamingResult,
     attempt: Option<InferenceAttempt>,
@@ -22,6 +62,15 @@ impl AttemptStream {
     fn finish(&mut self, outcome: &str) {
         if let Some(mut attempt) = self.attempt.take() {
             attempt.outcome = outcome.into();
+            if outcome == "success"
+                && attempt
+                    .route
+                    .cost_rates
+                    .as_ref()
+                    .is_some_and(|rates| rates.billing_unit == "request")
+            {
+                attempt.billable_quantity = super::entities::BillableQuantity::whole("request", 1);
+            }
             attempt.latency_ms = Some(
                 attempt.latency_ms.unwrap_or(0).saturating_add(
                     self.stream_started
@@ -207,6 +256,21 @@ mod tests {
     use uuid::Uuid;
 
     struct Ledger(tokio::sync::mpsc::UnboundedSender<InferenceAttempt>);
+
+    #[tokio::test]
+    async fn pending_dispatch_cancellation_records_unknown_cost_once() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let ledger = Arc::new(Ledger(tx));
+        drop(PendingAttempt::new(attempt(), ledger.clone()));
+        let cancelled = rx.recv().await.unwrap();
+        assert_eq!(cancelled.outcome, "cancelled");
+        assert!(cancelled.usage.is_none());
+        assert!(cancelled.billable_quantity.is_none());
+        let mut completed = PendingAttempt::new(attempt(), ledger);
+        completed.disarm();
+        drop(completed);
+        assert!(rx.try_recv().is_err());
+    }
     #[async_trait::async_trait]
     impl AttemptRepository for Ledger {
         async fn claim_quota(&self, _: &str) -> anyhow::Result<bool> {
@@ -230,6 +294,7 @@ mod tests {
     }
     fn attempt() -> InferenceAttempt {
         InferenceAttempt {
+            billable_quantity: None,
             request_id: Uuid::new_v4(),
             accepted_request_id: None,
             started_at: chrono::Utc::now(),

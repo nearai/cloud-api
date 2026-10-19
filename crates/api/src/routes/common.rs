@@ -684,6 +684,41 @@ pub fn analytics_error_response(
     }
 }
 
+/// Append stable IDs from the accepted dispatch without changing signed bytes.
+pub(crate) fn with_serving_identity(
+    mut response: axum::response::Response,
+    attribution: services::usage::ProviderAttribution,
+) -> axum::response::Response {
+    if !response.status().is_success() {
+        return response;
+    }
+    let mut exposed: Vec<String> = response
+        .headers()
+        .get_all(axum::http::header::ACCESS_CONTROL_EXPOSE_HEADERS)
+        .iter()
+        .filter_map(|value| value.to_str().ok().map(str::to_owned))
+        .collect();
+    for (name, id) in [
+        ("x-serving-route-id", attribution.served_route_id),
+        ("x-serving-deployment-id", attribution.served_deployment_id),
+    ] {
+        if let Some(id) = id {
+            response.headers_mut().insert(
+                name,
+                axum::http::HeaderValue::from_str(&id.to_string()).expect("UUID is header-safe"),
+            );
+            exposed.push(name.to_owned());
+        }
+    }
+    if !exposed.is_empty() {
+        response.headers_mut().insert(
+            axum::http::header::ACCESS_CONTROL_EXPOSE_HEADERS,
+            axum::http::HeaderValue::from_str(&exposed.join(", ")).expect("static header names"),
+        );
+    }
+    response
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

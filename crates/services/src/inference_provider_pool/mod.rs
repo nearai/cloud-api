@@ -308,6 +308,7 @@ pub struct ChatRoutingHints {
     pub policy_resolved: bool,
     pub request_id: Option<uuid::Uuid>,
     pub output_tokens: Option<u64>,
+    pub billable_quantity: Option<crate::provider_registry::entities::BillableQuantity>,
     /// Accepted customer pricing estimate, never recomputed from live prices.
     pub customer_cost_microusd: Option<i64>,
     pub tee: Option<inference_providers::routing::TeeRequirement>,
@@ -1618,6 +1619,28 @@ impl InferenceProviderPool {
         repository: Arc<dyn crate::provider_registry::entities::AttemptRepository>,
     ) {
         let _ = self.attempt_repository.set(repository);
+    }
+
+    async fn record_billable_quantity(
+        &self,
+        attempt: Option<crate::provider_registry::entities::InferenceAttempt>,
+        quantity: Option<crate::provider_registry::entities::BillableQuantity>,
+    ) {
+        if let (Some(mut attempt), Some(quantity), Some(repository)) =
+            (attempt, quantity, self.attempt_repository.get())
+        {
+            if attempt
+                .route
+                .cost_rates
+                .as_ref()
+                .is_some_and(|rates| rates.billing_unit == quantity.unit)
+            {
+                attempt.billable_quantity = Some(quantity);
+                if repository.finish(&attempt).await.is_err() {
+                    tracing::error!(request_id=%attempt.request_id,"Provider quantity persistence failed");
+                }
+            }
+        }
     }
 
     async fn record_non_chat_usage(
@@ -4053,9 +4076,10 @@ impl InferenceProviderPool {
                 .get(&(Arc::as_ptr(provider) as *const () as usize))
                 .and_then(|route| route.cost_rates.as_ref())
                 .and_then(|rates| {
-                    rates.estimate_usd(
-                        u64::from(hints.estimated_tokens.unwrap_or(0)),
-                        hints.output_tokens.unwrap_or(4096),
+                    rates.estimate_request(
+                        hints.estimated_tokens,
+                        hints.output_tokens,
+                        hints.billable_quantity.as_ref(),
                     )
                 })
                 .unwrap_or(i64::MAX)
@@ -4281,8 +4305,10 @@ impl InferenceProviderPool {
                     route
                         .and_then(|route| route.cost_rates.as_ref())
                         .and_then(|rates| {
-                            hints.output_tokens.zip(hints.estimated_tokens).and_then(
-                                |(output, input)| rates.estimate_usd(u64::from(input), output),
+                            rates.estimate_request(
+                                hints.estimated_tokens,
+                                hints.output_tokens,
+                                hints.billable_quantity.as_ref(),
                             )
                         });
                 if let Some(policy) = &policy {
@@ -4340,6 +4366,7 @@ impl InferenceProviderPool {
                 let mut ledger_attempt =
                     route.map(
                         |route| crate::provider_registry::entities::InferenceAttempt {
+                            billable_quantity: None,
                             request_id,
                             accepted_request_id: hints.request_id.or_else(|| {
                                 crate::provider_registry::ACCEPTED_REQUEST_ID
@@ -4382,6 +4409,12 @@ impl InferenceProviderPool {
                     })?;
                 }
                 let attempt_started = std::time::Instant::now();
+                let mut pending_attempt = ledger_attempt.as_ref().map(|attempt| {
+                    crate::provider_registry::attempt_stream::PendingAttempt::new(
+                        attempt.clone(),
+                        ledger.unwrap().clone(),
+                    )
+                });
                 let result = if let Some(deadline) = request_deadline {
                     tokio::time::timeout_at(deadline, provider_fn(provider.clone()))
                         .await
@@ -4398,6 +4431,9 @@ impl InferenceProviderPool {
                 } else {
                     provider_fn(provider.clone()).await
                 };
+                if let Some(pending) = &mut pending_attempt {
+                    pending.disarm();
+                }
                 if let Some(attempt) = &ledger_attempt {
                     let cooldown_ms = match &result {
                         Ok(_) => None,
@@ -4454,6 +4490,18 @@ impl InferenceProviderPool {
                         Err(error) => Self::classify_error_kind(error),
                     }
                     .into();
+                    if attempt.outcome == "success"
+                        && attempt
+                            .route
+                            .cost_rates
+                            .as_ref()
+                            .is_some_and(|rates| rates.billing_unit == "request")
+                    {
+                        attempt.billable_quantity =
+                            crate::provider_registry::entities::BillableQuantity::whole(
+                                "request", 1,
+                            );
+                    }
                     attempt.latency_ms =
                         Some(attempt_started.elapsed().as_millis().min(i64::MAX as u128) as i64);
                     if ledger.unwrap().finish(attempt).await.is_err() {
@@ -5576,6 +5624,12 @@ impl InferenceProviderPool {
             .extra
             .contains_key(encryption_headers::CLIENT_PUB_KEY);
         let hints = ChatRoutingHints {
+            billable_quantity: u64::try_from(params.n.unwrap_or(1))
+                .ok()
+                .filter(|n| *n > 0)
+                .and_then(|n| {
+                    crate::provider_registry::entities::BillableQuantity::whole("image", n)
+                }),
             tee,
             ..Default::default()
         };
@@ -5619,6 +5673,14 @@ impl InferenceProviderPool {
             )
             .await
             .map_err(|e| ImageGenerationError::GenerationError(e.to_string()))?;
+        self.record_billable_quantity(
+            served.attempt,
+            crate::provider_registry::entities::BillableQuantity::whole(
+                "image",
+                served.value.response.data.len() as u64,
+            ),
+        )
+        .await;
         let response = served.value;
         let provider = served.provider;
         let provider_attribution = served.provider_attribution;
@@ -5757,6 +5819,14 @@ impl InferenceProviderPool {
                     &other.to_string(),
                 )),
             })?;
+        self.record_billable_quantity(
+            served.attempt,
+            served
+                .value
+                .duration
+                .and_then(crate::provider_registry::entities::BillableQuantity::audio_seconds),
+        )
+        .await;
         let response = served.value;
 
         tracing::info!(
@@ -5789,6 +5859,9 @@ impl InferenceProviderPool {
     ) -> Result<AttributedImageEdit, ImageEditError> {
         let model_id = params.model.clone();
         let hints = ChatRoutingHints {
+            billable_quantity: crate::provider_registry::entities::BillableQuantity::whole(
+                "image", 1,
+            ),
             tee: params.tee,
             ..Default::default()
         };
@@ -5816,6 +5889,14 @@ impl InferenceProviderPool {
             })
             .await
             .map_err(|e| ImageEditError::EditError(e.to_string()))?;
+        self.record_billable_quantity(
+            served.attempt,
+            crate::provider_registry::entities::BillableQuantity::whole(
+                "image",
+                served.value.response.data.len() as u64,
+            ),
+        )
+        .await;
         let response = served.value;
         let provider = served.provider;
         let provider_attribution = served.provider_attribution;

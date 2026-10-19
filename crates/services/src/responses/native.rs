@@ -54,6 +54,7 @@ pub enum NativeResponsesError {
 }
 
 pub struct NativeResponse {
+    pub provider_attribution: ProviderAttribution,
     pub upstream: ResponsesRawResponse,
     pub provider_response_id: Option<String>,
 }
@@ -341,8 +342,10 @@ async fn account(
     billing: Billing,
     guard: ConcurrentRequestGuard,
 ) -> Result<NativeResponse, NativeResponsesError> {
+    let provider_attribution = billing.attribution;
     if !upstream.status.is_success() {
         return Ok(NativeResponse {
+            provider_attribution,
             upstream,
             provider_response_id: None,
         });
@@ -358,6 +361,7 @@ async fn account(
             done: false,
         });
         return Ok(NativeResponse {
+            provider_attribution,
             upstream,
             provider_response_id: None,
         });
@@ -390,6 +394,7 @@ async fn account(
         async move { Ok(Bytes::from(bytes)) },
     ));
     Ok(NativeResponse {
+        provider_attribution,
         upstream,
         provider_response_id,
     })

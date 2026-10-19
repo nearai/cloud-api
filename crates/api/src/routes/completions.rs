@@ -111,6 +111,24 @@ pub(crate) const HEADER_INFERENCE_ID: &str = "Inference-Id";
 // "tinfoil").
 const HEADER_SERVING_PROVIDER: &str = "x-serving-provider";
 
+/// IDs come from the accepted dispatch snapshot, never a refreshed provider map.
+fn serving_identity_headers(
+    mut builder: axum::http::response::Builder,
+    exposed: &mut Vec<&'static str>,
+    attribution: services::usage::ProviderAttribution,
+) -> axum::http::response::Builder {
+    for (name, id) in [
+        ("x-serving-route-id", attribution.served_route_id),
+        ("x-serving-deployment-id", attribution.served_deployment_id),
+    ] {
+        if let Some(id) = id {
+            builder = builder.header(name, id.to_string());
+            exposed.push(name);
+        }
+    }
+    builder
+}
+
 /// True when a client encryption header was supplied. `X-Model-Pub-Key` alone
 /// only pins routing and does not make the request or response encrypted.
 /// E2EE bodies are opaque to the gateway, so alias warnings use the response
@@ -734,20 +752,26 @@ fn convert_chat_request_to_service(
     }
 }
 
+struct AutoRedactBilling {
+    model: services::models::ports::ModelWithPricing,
+    tokens: i64,
+    attribution: services::usage::ProviderAttribution,
+}
+
 /// Decide whether to enable auto-redact based on the request, mutate the
 /// service request to scrub the body field, and (if enabled) run the PII
 /// detector + rewrite messages in place. Returns the placeholder map for
 /// downstream un-redact; an empty map is also returned when auto-redact is
 /// off.
-/// The tuple is `(requested, map, classify_input_tokens)`. `classify_input_tokens`
+/// The tuple is `(requested, map, billing)`. The billing token count
 /// is the number of tokens the privacy-filter billed for the classify pass,
 /// for the caller to charge (nearai/cloud-api#602); it is 0 when auto-redact
-/// is off or there was nothing to classify.
+/// is off or there was nothing to classify. Pricing is captured before dispatch.
 async fn maybe_redact(
     headers: &header::HeaderMap,
     service_request: &mut ServiceCompletionRequest,
-    pool: &services::inference_provider_pool::InferenceProviderPool,
-) -> Result<(bool, RedactionMap, i64), AutoRedactError> {
+    app_state: &AppState,
+) -> Result<(bool, RedactionMap, Option<AutoRedactBilling>), AutoRedactError> {
     let header_values: Vec<&str> = headers
         .get_all(auto_redact::AUTO_REDACT_HEADER)
         .iter()
@@ -763,16 +787,31 @@ async fn maybe_redact(
     auto_redact::strip_body_field(&mut service_request.extra);
 
     if !enabled {
-        return Ok((false, RedactionMap::new(), 0));
+        return Ok((false, RedactionMap::new(), None));
     }
 
-    let (map, classify_tokens) = auto_redact::redact_messages(
+    let model = app_state
+        .models_service
+        .get_model_by_name(auto_redact::DEFAULT_PII_MODEL)
+        .await
+        .map_err(|_| {
+            AutoRedactError::DetectorUnavailable("PII model pricing unavailable".into())
+        })?;
+    let (map, classify_tokens, attribution) = auto_redact::redact_messages(
         &mut service_request.messages,
         auto_redact::DEFAULT_PII_MODEL,
-        pool,
+        &app_state.inference_provider_pool,
     )
     .await?;
-    Ok((true, map, classify_tokens))
+    Ok((
+        true,
+        map,
+        Some(AutoRedactBilling {
+            model,
+            tokens: classify_tokens,
+            attribution,
+        }),
+    ))
 }
 
 /// Convert an [`AutoRedactError`] into the user-facing error response.
@@ -823,8 +862,13 @@ const AUTO_REDACT_BILL_TIMEOUT: std::time::Duration = std::time::Duration::from_
 async fn bill_auto_redact_classify(
     app_state: &AppState,
     api_key: &crate::middleware::auth::AuthenticatedApiKey,
-    classify_tokens: i64,
+    billing: AutoRedactBilling,
 ) {
+    let AutoRedactBilling {
+        model,
+        tokens: classify_tokens,
+        attribution,
+    } = billing;
     if classify_tokens <= 0 {
         return; // nothing to bill
     }
@@ -854,22 +898,6 @@ async fn bill_auto_redact_classify(
         MAX_REASONABLE_TOKENS
     } else {
         classify_tokens as i32 // safe: 0 < classify_tokens <= 1_000_000
-    };
-
-    let model = match app_state
-        .models_service
-        .get_model_by_name(auto_redact::DEFAULT_PII_MODEL)
-        .await
-    {
-        Ok(model) => model,
-        Err(e) => {
-            tracing::error!(
-                error = %e,
-                model = auto_redact::DEFAULT_PII_MODEL,
-                "auto_redact: could not resolve PII model; classify usage not recorded"
-            );
-            return;
-        }
     };
 
     let api_key_id = match Uuid::parse_str(&api_key.api_key.id.0) {
@@ -902,7 +930,7 @@ async fn bill_auto_redact_classify(
         response_id: None,
         image_count: None,
         discount: None,
-        provider_attribution: services::usage::ProviderAttribution::default(),
+        provider_attribution: attribution,
     };
 
     if let Err(e) = app_state.usage_service.record_usage(usage_request).await {
@@ -1601,29 +1629,24 @@ async fn chat_completions_inner(
     // Auto-redact (opt-in via x-auto-redact header or auto_redact body field).
     // On success this may rewrite service_request.messages to substitute
     // placeholders for PII; the returned map drives the response un-redact.
-    let (auto_redact_requested, redaction_map, auto_redact_classify_tokens) = match maybe_redact(
-        &headers,
-        &mut service_request,
-        &app_state.inference_provider_pool,
-    )
-    .await
-    {
-        Ok(out) => out,
-        Err(e) => return auto_redact_error_response(e),
-    };
+    let (auto_redact_requested, redaction_map, auto_redact_billing) =
+        match maybe_redact(&headers, &mut service_request, &app_state).await {
+            Ok(out) => out,
+            Err(e) => return auto_redact_error_response(e),
+        };
     // Bill the privacy-filter classify pass that auto-redact ran (it is a
     // real inference call to the PII model). Charged like an explicit
     // `/v1/privacy/classify`. Spawned (not awaited) and time-bounded so a
     // slow/exhausted billing DB or model lookup can never stall the user's
     // completion before dispatch — the classify already succeeded, and the
     // chat bills separately via InterceptStream. See nearai/cloud-api#602.
-    if auto_redact_requested {
+    if let Some(billing) = auto_redact_billing {
         let app_state = app_state.clone();
         let api_key = api_key.clone();
         tokio::spawn(async move {
             if tokio::time::timeout(
                 AUTO_REDACT_BILL_TIMEOUT,
-                bill_auto_redact_classify(&app_state, &api_key, auto_redact_classify_tokens),
+                bill_auto_redact_classify(&app_state, &api_key, billing),
             )
             .await
             .is_err()
@@ -1689,10 +1712,12 @@ async fn chat_completions_inner(
         // Call the streaming completion service
         match app_state
             .completion_service
-            .create_chat_completion_stream(service_request)
+            .create_chat_completion_stream_with_attribution(service_request)
             .await
         {
-            Ok(stream) => {
+            Ok(served) => {
+                let provider_attribution = served.provider_attribution;
+                let stream = served.response;
                 // Make stream peekable to extract chat_id for Inference-Id header
                 let mut peekable_stream = Box::pin(stream.peekable());
 
@@ -2421,6 +2446,11 @@ async fn chat_completions_inner(
                 // comma-joined list (repeated header lines are not
                 // consistently merged by browsers).
                 let mut exposed_headers: Vec<&str> = Vec::new();
+                response_builder = serving_identity_headers(
+                    response_builder,
+                    &mut exposed_headers,
+                    provider_attribution,
+                );
 
                 // Add Inference-Id header if available
                 if let Some(uuid) = inference_id {
@@ -2472,10 +2502,12 @@ async fn chat_completions_inner(
         // Call the non-streaming completion service
         match app_state
             .completion_service
-            .create_chat_completion(service_request)
+            .create_chat_completion_with_attribution(service_request)
             .await
         {
-            Ok(mut response_with_bytes) => {
+            Ok(served) => {
+                let provider_attribution = served.provider_attribution;
+                let mut response_with_bytes = served.response;
                 // Extract inference ID from response ID (reuse same hashing as usage tracking)
                 let inference_id =
                     Some(hash_inference_id_to_uuid(&response_with_bytes.response.id));
@@ -2583,6 +2615,11 @@ async fn chat_completions_inner(
                 // comma-joined list (repeated header lines are not
                 // consistently merged by browsers).
                 let mut exposed_headers: Vec<&str> = Vec::new();
+                response_builder = serving_identity_headers(
+                    response_builder,
+                    &mut exposed_headers,
+                    provider_attribution,
+                );
 
                 // Add Inference-Id header if available
                 if let Some(uuid) = inference_id {
@@ -2843,10 +2880,12 @@ async fn completions_inner(
     if request.stream == Some(true) {
         match app_state
             .completion_service
-            .create_chat_completion_stream(service_request)
+            .create_chat_completion_stream_with_attribution(service_request)
             .await
         {
-            Ok(stream) => {
+            Ok(served) => {
+                let provider_attribution = served.provider_attribution;
+                let stream = served.response;
                 // Peek the first data chunk to surface the Inference-Id
                 // header, consuming any leading control events. This route
                 // reshapes chat chunks into text-completion format, so
@@ -3056,6 +3095,11 @@ async fn completions_inner(
                     .header(header::CONNECTION, "keep-alive");
 
                 let mut exposed_headers: Vec<&str> = Vec::new();
+                response_builder = serving_identity_headers(
+                    response_builder,
+                    &mut exposed_headers,
+                    provider_attribution,
+                );
                 if let Some(uuid) = inference_id {
                     response_builder =
                         response_builder.header(HEADER_INFERENCE_ID, uuid.to_string());
@@ -3098,10 +3142,12 @@ async fn completions_inner(
     } else {
         match app_state
             .completion_service
-            .create_chat_completion(service_request)
+            .create_chat_completion_with_attribution(service_request)
             .await
         {
-            Ok(response_with_bytes) => {
+            Ok(served) => {
+                let provider_attribution = served.provider_attribution;
+                let response_with_bytes = served.response;
                 let chat_id = response_with_bytes.response.id.clone();
                 let inference_id = hash_inference_id_to_uuid(&chat_id);
                 let completion = chat_response_to_text_response(response_with_bytes.response);
@@ -3163,6 +3209,11 @@ async fn completions_inner(
                     .header(HEADER_INFERENCE_ID, inference_id.to_string());
 
                 let mut exposed_headers: Vec<&str> = vec![HEADER_INFERENCE_ID];
+                response_builder = serving_identity_headers(
+                    response_builder,
+                    &mut exposed_headers,
+                    provider_attribution,
+                );
                 response_builder = response_builder
                     .header(HEADER_SERVING_PROVIDER, response_with_bytes.serving.label());
                 exposed_headers.push(HEADER_SERVING_PROVIDER);
@@ -5348,11 +5399,14 @@ pub async fn image_generations(
 
             // Return the exact bytes from the provider for hash verification
             // This ensures clients can hash the response and compare with attestation endpoints
-            Response::builder()
-                .status(StatusCode::OK)
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(response_with_bytes.raw_bytes))
-                .unwrap()
+            super::common::with_serving_identity(
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(response_with_bytes.raw_bytes))
+                    .unwrap(),
+                provider_attribution,
+            )
         }
         Err(e) => {
             // Log provider errors at debug level to avoid exposing infrastructure details in production
@@ -5739,7 +5793,7 @@ pub async fn audio_transcriptions(
                 "Audio transcription completed and usage recorded successfully"
             );
 
-            if requested_response_format.as_deref() == Some("text") {
+            let http_response = if requested_response_format.as_deref() == Some("text") {
                 (
                     StatusCode::OK,
                     [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
@@ -5749,7 +5803,8 @@ pub async fn audio_transcriptions(
             } else {
                 let response_body = crate::models::AudioTranscriptionResponse::from(response);
                 (StatusCode::OK, ResponseJson(response_body)).into_response()
-            }
+            };
+            super::common::with_serving_identity(http_response, provider_attribution)
         }
         Err(e) => {
             let (status_code, error_type, message) = match e {
@@ -6197,11 +6252,14 @@ pub async fn image_edits(
 
             // Return the exact bytes from the provider for hash verification
             // This ensures clients can hash the response and compare with attestation endpoints
-            Response::builder()
-                .status(StatusCode::OK)
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(response_with_bytes.raw_bytes))
-                .unwrap()
+            super::common::with_serving_identity(
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(response_with_bytes.raw_bytes))
+                    .unwrap(),
+                provider_attribution,
+            )
         }
         Err(e) => {
             // Log provider errors at debug level to avoid exposing infrastructure details in production
@@ -6616,7 +6674,10 @@ pub async fn rerank(
                     .into_response();
             }
 
-            (StatusCode::OK, ResponseJson(response)).into_response()
+            super::common::with_serving_identity(
+                (StatusCode::OK, ResponseJson(response)).into_response(),
+                provider_attribution,
+            )
         }
         Err(e) => {
             let (status_code, error_type, message) = match e {
@@ -6969,11 +7030,14 @@ pub async fn embeddings(
             }
 
             // Return raw response bytes
-            Response::builder()
-                .status(StatusCode::OK)
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(response_bytes))
-                .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+            super::common::with_serving_identity(
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(response_bytes))
+                    .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
+                provider_attribution,
+            )
         }
         Err(e) => {
             let (status_code, error_type, message) = match e {
@@ -7309,11 +7373,14 @@ pub async fn privacy_classify(
                     .into_response();
             }
 
-            Response::builder()
-                .status(StatusCode::OK)
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(response_bytes))
-                .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+            super::common::with_serving_identity(
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(response_bytes))
+                    .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
+                provider_attribution,
+            )
         }
         Err(e) => {
             let (status_code, error_type, message) = match e {
@@ -7877,11 +7944,14 @@ pub async fn privacy_redact(
         }
     };
 
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(body_bytes))
-        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+    super::common::with_serving_identity(
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body_bytes))
+            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
+        provider_attribution,
+    )
 }
 
 /// Text similarity scoring endpoint
@@ -8058,7 +8128,10 @@ pub async fn score(
             )
             .await
             {
-                Ok(Ok(_)) => ResponseJson(response).into_response(),
+                Ok(Ok(_)) => super::common::with_serving_identity(
+                    ResponseJson(response).into_response(),
+                    provider_attribution,
+                ),
                 Ok(Err(e)) => {
                     tracing::warn!(
                         error = %e,
@@ -8100,7 +8173,10 @@ pub async fn score(
                             );
                         }
                     });
-                    ResponseJson(response).into_response()
+                    super::common::with_serving_identity(
+                        ResponseJson(response).into_response(),
+                        provider_attribution,
+                    )
                 }
                 Err(_timeout) => {
                     // Recording timed out, fall back to async retry to avoid blocking client
@@ -8143,7 +8219,10 @@ pub async fn score(
                             );
                         }
                     });
-                    ResponseJson(response).into_response()
+                    super::common::with_serving_identity(
+                        ResponseJson(response).into_response(),
+                        provider_attribution,
+                    )
                 }
             }
         }

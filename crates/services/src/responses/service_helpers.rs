@@ -60,6 +60,7 @@ impl UsageTracker {
 /// This struct holds all the state needed during response processing,
 /// reducing the number of parameters passed between functions.
 pub struct ResponseStreamContext {
+    pub serving_attribution: crate::usage::ProviderAttribution,
     pub response_id: models::ResponseId,
     pub api_key_id: Uuid,
     pub conversation_id: Option<ConversationId>,
@@ -94,6 +95,7 @@ impl ResponseStreamContext {
         usage_tracker: Arc<UsageTracker>,
     ) -> Self {
         Self {
+            serving_attribution: Default::default(),
             response_id,
             api_key_id,
             conversation_id,
@@ -109,6 +111,13 @@ impl ResponseStreamContext {
             created_at,
             usage_tracker,
         }
+    }
+
+    /// Server-owned metadata for this iteration's actual selected route.
+    pub fn serving_metadata(&self) -> Option<serde_json::Value> {
+        self.serving_attribution
+            .served_route_id
+            .map(|_| serde_json::json!({"serving": self.serving_attribution}))
     }
 
     /// Increment and return the current sequence number

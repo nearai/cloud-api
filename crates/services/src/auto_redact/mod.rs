@@ -113,7 +113,7 @@ pub async fn redact_messages(
     messages: &mut [CompletionMessage],
     pii_model: &str,
     pool: &InferenceProviderPool,
-) -> Result<(RedactionMap, i64), AutoRedactError> {
+) -> Result<(RedactionMap, i64, crate::usage::ProviderAttribution), AutoRedactError> {
     match tokio::time::timeout(
         REDACT_TIMEOUT,
         redact_messages_inner(messages, pii_model, pool),
@@ -132,10 +132,10 @@ async fn redact_messages_inner(
     messages: &mut [CompletionMessage],
     pii_model: &str,
     pool: &InferenceProviderPool,
-) -> Result<(RedactionMap, i64), AutoRedactError> {
+) -> Result<(RedactionMap, i64, crate::usage::ProviderAttribution), AutoRedactError> {
     let (refs, texts) = apply::collect_text_fragments(messages);
     if texts.is_empty() {
-        return Ok((RedactionMap::new(), 0));
+        return Ok((RedactionMap::new(), 0, Default::default()));
     }
 
     let mut map = RedactionMap::new();
@@ -145,7 +145,8 @@ async fn redact_messages_inner(
     // a string we'd otherwise mint.
     let haystack: String = texts.join("\u{0001}");
 
-    let (spans_per_text, classify_tokens) = detect::detect_pii(&texts, pii_model, pool).await?;
+    let (spans_per_text, classify_tokens, attribution) =
+        detect::detect_pii(&texts, pii_model, pool).await?;
     debug_assert_eq!(spans_per_text.len(), texts.len());
 
     let mut redacted = Vec::with_capacity(texts.len());
@@ -156,7 +157,7 @@ async fn redact_messages_inner(
         redacted.push(apply::redact_one(text, spans, &mut map, &haystack)?);
     }
     apply::write_back(messages, &refs, redacted);
-    Ok((map, classify_tokens))
+    Ok((map, classify_tokens, attribution))
 }
 
 /// Apply privacy-filter spans (parsed from a raw classify response) to a

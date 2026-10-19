@@ -558,6 +558,7 @@ pub async fn init_domain_services_with_pool(
         inference_provider_pool.clone(),
         conversation_service.clone(),
         completion_service.clone(),
+        usage_service.clone(),
         Some(web_search_provider.clone()), // web_search_provider
         Some(web_context_search_provider), // web_context_search_provider
         None,                              // file_search_provider
@@ -716,6 +717,7 @@ pub async fn init_domain_services_with_mcp_factory(
         inference_provider_pool,
         domain_services.conversation_service.clone(),
         domain_services.completion_service.clone(),
+        domain_services.usage_service.clone(),
         Some(web_search_provider),
         Some(web_context_search_provider),
         None,
@@ -786,6 +788,7 @@ pub async fn init_domain_services_with_pool_and_search_providers(
         inference_provider_pool,
         domain_services.conversation_service.clone(),
         domain_services.completion_service.clone(),
+        domain_services.usage_service.clone(),
         Some(web_search_provider.clone()),
         web_context_search_provider,
         None,

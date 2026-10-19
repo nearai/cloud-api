@@ -251,9 +251,20 @@ async fn systemone_uses_actual_provider_trust_and_signature_capability() {
         (ProviderTier::Attested3p, false, "gateway"),
         (ProviderTier::NonAttested, true, "gateway"),
     ] {
-        // Deliberately declares TEE metadata in every case. Runtime attribution
-        // must still follow the actual provider and its signature capability.
+        // TEE policy controls eligibility; receipt kind still follows the actual
+        // provider's signing capability, never the catalog flag alone.
         let (model, _) = catalog(&server, None, true).await;
+        if tier == ProviderTier::NonAttested {
+            let mut batch = BatchUpdateModelApiRequest::new();
+            batch.insert(
+                model.clone(),
+                serde_json::from_value(json!({
+                    "providerType":"external", "verifiable":false, "attestationSupported":false
+                }))
+                .unwrap(),
+            );
+            admin_batch_upsert_models(&server, batch, get_session_id()).await;
+        }
         let upstream_id = format!("decision-{}", uuid::Uuid::new_v4());
         let raw = serde_json::to_vec_pretty(&result(Some(&upstream_id))).unwrap();
         let response_bytes = raw.clone();
@@ -507,14 +518,16 @@ async fn systemone_retains_upstream_validation_status_without_retry_or_state_ech
     pool.register_provider(
         model.clone(),
         Arc::new(
-            MockProvider::new_accept_all().with_systemone_handler(move |_| {
-                counter.fetch_add(1, Ordering::SeqCst);
-                Err(CompletionError::HttpError {
-                    status_code: 422,
-                    message: "private-state".into(),
-                    is_external: true,
-                })
-            }),
+            MockProvider::new_accept_all()
+                .with_tier(ProviderTier::Near)
+                .with_systemone_handler(move |_| {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    Err(CompletionError::HttpError {
+                        status_code: 422,
+                        message: "private-state".into(),
+                        is_external: true,
+                    })
+                }),
         ),
     )
     .await;

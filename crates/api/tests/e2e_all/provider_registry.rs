@@ -946,6 +946,17 @@ async fn provider_registry_organization_requirement_cannot_be_weakened() {
         Some(provider)
     );
     assert!(usage.get::<_, Option<Uuid>>("served_route_id").is_some());
+    assert_eq!(
+        response.header("x-serving-deployment-id"),
+        provider.to_string()
+    );
+    assert_eq!(
+        response.header("x-serving-route-id"),
+        usage
+            .get::<_, Option<Uuid>>("served_route_id")
+            .unwrap()
+            .to_string()
+    );
     let duplicate = db.pool().get().await.unwrap().query_one("SELECT r.was_inserted,(r.recorded_usage).served_route_id,(r.recorded_usage).served_deployment_id FROM (SELECT * FROM organization_usage_log WHERE model_name=$1 ORDER BY created_at DESC LIMIT 1) u CROSS JOIN LATERAL record_organization_usage(u.id,u.organization_id,u.workspace_id,u.api_key_id,u.model_id,u.model_name,u.input_tokens,u.output_tokens,u.cache_read_tokens,u.cache_write_tokens,u.input_cost,u.output_cost,u.total_cost,u.inference_type,u.ttft_ms,u.avg_itl_ms,u.inference_id,u.provider_request_id,u.stop_reason,u.response_id,u.image_count,u.served_provider_tier,u.served_provider_type,u.served_via_fallback,u.billing_details,u.service_tier,u.context_band,ARRAY[]::TEXT[],COALESCE(u.allocation_policy_version,'fixture')::VARCHAR,NULL::UUID,NULL::UUID) r", &[&name]).await.unwrap();
     assert!(!duplicate.get::<_, bool>("was_inserted"));
     assert_eq!(
@@ -1007,7 +1018,7 @@ async fn provider_registry_audio_usage_keeps_serving_identity_and_accepted_price
         .respond_with(
             ResponseTemplate::new(200)
                 .set_delay(std::time::Duration::from_secs(3))
-                .set_body_json(json!({"text":"transport fixture", "duration":1.0})),
+                .set_body_json(json!({"text":"transport fixture", "duration":0.5})),
         )
         .expect(1)
         .mount(&upstream)
@@ -1021,6 +1032,14 @@ async fn provider_registry_audio_usage_keeps_serving_identity_and_accepted_price
     definition["config"]["base_url"] = json!(upstream.uri());
     let provider = create(&server, definition).await;
     approve(&server, provider, &name, true, false).await;
+    let repo = database::repositories::provider_registry::ProviderRegistryRepository::new(
+        db.pool().clone(),
+    );
+    let route = repo.model_routes(&name).await.unwrap().remove(0);
+    let response = call(&server, Method::POST,
+        &format!("/v1/admin/provider-routes/{}/cost-profiles", route.id),
+        json!({"rates":{"currency":"USD","billing_unit":"audio_second","input_microunits":7,"output_microunits":0,"provenance":"transport fixture"},"change_reason":"Audio procurement fixture"})).await;
+    assert_eq!(response.status_code(), 201, "{}", response.text());
     let org = crate::common::setup_org_with_credits(&server, 10_000_000_000).await;
     let key = crate::common::get_api_key_for_org(&server, org.id.clone()).await;
     let price_edited = std::sync::atomic::AtomicBool::new(false);
@@ -1064,6 +1083,11 @@ async fn provider_registry_audio_usage_keeps_serving_identity_and_accepted_price
     };
     let (response, ()) = tokio::join!(request, edit_prices);
     assert_eq!(response.status_code(), 200, "{}", response.text());
+    assert_eq!(
+        response.header("x-serving-deployment-id"),
+        provider.to_string()
+    );
+    assert_eq!(response.header("x-serving-route-id"), route.id.to_string());
     let usage = db.pool().get().await.unwrap().query_one("SELECT served_route_id,served_deployment_id,total_cost,billing_details FROM organization_usage_log WHERE model_name=$1", &[&name]).await.unwrap();
     assert_eq!(
         usage.get::<_, Option<Uuid>>("served_deployment_id"),
@@ -1076,4 +1100,145 @@ async fn provider_registry_audio_usage_keeps_serving_identity_and_accepted_price
             ["input_cost_per_token"],
         1_000_000
     );
+    let attempt = db.pool().get().await.unwrap().query_one(
+        "SELECT billable_quantity,usage_cost_microusd,actual_cost_microusd,cost_status FROM inference_attempts WHERE route_id=$1", &[&route.id]).await.unwrap();
+    assert_eq!(
+        attempt.get::<_, Value>("billable_quantity"),
+        json!({"unit":"audio_second","microunits":500_000})
+    );
+    assert_eq!(
+        attempt.get::<_, Option<i64>>("usage_cost_microusd"),
+        Some(4)
+    );
+    assert_eq!(attempt.get::<_, Option<i64>>("actual_cost_microusd"), None);
+    assert_eq!(attempt.get::<_, String>("cost_status"), "estimated");
+}
+
+#[tokio::test]
+async fn provider_registry_responses_images_record_customer_and_procurement_usage() {
+    use wiremock::{matchers::path, Mock, MockServer, ResponseTemplate};
+    let upstream = MockServer::start().await;
+    Mock::given(path("/images/generations"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id":"image-fixture", "created":1, "data":[{"b64_json":"aW1hZ2U="}]
+        })))
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    let (server, _, _, db) = crate::common::setup_test_server_with_pool_and_config(|config| {
+        config.external_providers.timeout_seconds = 10
+    })
+    .await;
+    let name = catalog(&server, true).await;
+    let mut batch = api::models::BatchUpdateModelApiRequest::new();
+    batch.insert(
+        name.clone(),
+        serde_json::from_value(json!({
+            "outputModalities":["image"],"inputModalities":["text"],
+            "costPerImage":{"amount":123_000_000,"currency":"USD"}
+        }))
+        .unwrap(),
+    );
+    admin_batch_upsert_models(&server, batch, get_session_id()).await;
+    let mut definition = definition();
+    definition["config"]["base_url"] = json!(upstream.uri());
+    let provider = create(&server, definition).await;
+    approve(&server, provider, &name, true, false).await;
+    let repo = database::repositories::provider_registry::ProviderRegistryRepository::new(
+        db.pool().clone(),
+    );
+    let route = repo.model_routes(&name).await.unwrap().remove(0);
+    let response = call(&server, Method::POST,
+        &format!("/v1/admin/provider-routes/{}/cost-profiles", route.id),
+        json!({"rates":{"currency":"USD","billing_unit":"image","input_microunits":9,"output_microunits":0,"provenance":"transport fixture"},"change_reason":"Image procurement fixture"})).await;
+    assert_eq!(response.status_code(), 201, "{}", response.text());
+    let org = crate::common::setup_org_with_credits(&server, 10_000_000_000).await;
+    let key = crate::common::get_api_key_for_org(&server, org.id.clone()).await;
+    let response = server
+        .post("/v1/responses")
+        .add_header("Authorization", format!("Bearer {key}"))
+        .json(&json!({"model":name,"input":"Draw a tree","stream":false}))
+        .await;
+    assert_eq!(response.status_code(), 200, "{}", response.text());
+    assert_eq!(response.json::<Value>()["status"], "completed");
+    assert_eq!(
+        response.json::<Value>()["output"][0]["metadata"]["serving"]["served_route_id"],
+        route.id.to_string()
+    );
+    let usage = db.pool().get().await.unwrap().query_one(
+        "SELECT served_route_id,total_cost,image_count,response_id FROM organization_usage_log WHERE model_name=$1", &[&name]).await.unwrap();
+    assert_eq!(
+        usage.get::<_, Option<Uuid>>("served_route_id"),
+        Some(route.id)
+    );
+    assert_eq!(usage.get::<_, i64>("total_cost"), 123_000_000);
+    assert_eq!(usage.get::<_, Option<i32>>("image_count"), Some(1));
+    assert!(usage.get::<_, Option<Uuid>>("response_id").is_some());
+    let attempt = db.pool().get().await.unwrap().query_one(
+        "SELECT usage_cost_microusd,billable_quantity FROM inference_attempts WHERE route_id=$1", &[&route.id]).await.unwrap();
+    assert_eq!(
+        attempt.get::<_, Option<i64>>("usage_cost_microusd"),
+        Some(9)
+    );
+    assert_eq!(
+        attempt.get::<_, Value>("billable_quantity"),
+        json!({"unit":"image","microunits":1_000_000})
+    );
+}
+
+#[tokio::test]
+async fn provider_registry_cancel_before_headers_records_unknown_cost_without_retry() {
+    use wiremock::{matchers::path, Mock, MockServer, ResponseTemplate};
+    let upstream = MockServer::start().await;
+    Mock::given(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(503).set_delay(std::time::Duration::from_secs(30)))
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    let (server, pool, _, db) = crate::common::setup_test_server_with_pool_and_config(|config| {
+        config.external_providers.timeout_seconds = 60;
+    })
+    .await;
+    let name = catalog(&server, true).await;
+    let mut definition = definition();
+    definition["config"]["base_url"] = json!(upstream.uri());
+    let provider = create(&server, definition).await;
+    approve(&server, provider, &name, true, false).await;
+    let params = serde_json::from_value(
+        json!({"model":name,"messages":[{"role":"user","content":"fixture"}],"max_tokens":4}),
+    )
+    .unwrap();
+    let request_id = Uuid::new_v4();
+    let mut request = Box::pin(pool.chat_completion_with_attribution_and_hints(
+        params,
+        "fixture".into(),
+        services::inference_provider_pool::ChatRoutingHints {
+            request_id: Some(request_id),
+            ..Default::default()
+        },
+    ));
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            tokio::select! {
+                _ = &mut request => panic!("dispatch must still be waiting for upstream headers"),
+                _ = tokio::time::sleep(std::time::Duration::from_millis(5)) => {
+                    if !upstream.received_requests().await.unwrap().is_empty() { break; }
+                }
+            }
+        }
+    })
+    .await
+    .unwrap();
+    drop(request);
+    let row = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let row = db.pool().get().await.unwrap().query_one(
+                "SELECT outcome,cost_status,actual_cost_microusd FROM inference_attempts WHERE accepted_request_id=$1", &[&request_id]).await.unwrap();
+            if row.get::<_, String>("outcome") == "cancelled" { break row; }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }).await.unwrap();
+    assert_eq!(row.get::<_, String>("cost_status"), "unknown");
+    assert_eq!(row.get::<_, Option<i64>>("actual_cost_microusd"), None);
+    assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
 }

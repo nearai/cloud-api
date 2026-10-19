@@ -220,9 +220,12 @@ pub async fn systemone(
         if let Some(alias) = alias {
             response = response.header(common::HEADER_MODEL_ALIAS_RESOLVED, alias);
         }
-        response
-            .body(Body::from(served.response.raw_bytes))
-            .expect("validated System One response headers")
+        common::with_serving_identity(
+            response
+                .body(Body::from(served.response.raw_bytes))
+                .expect("validated System One response headers"),
+            served.provider_attribution,
+        )
     });
     finalize.await.unwrap_or_else(|_| {
         error(

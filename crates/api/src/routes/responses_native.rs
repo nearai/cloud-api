@@ -63,12 +63,15 @@ pub(super) async fn handle(
             .map(str::to_owned),
     };
     match service.execute(model, body, context).await {
-        Ok(result) => response(
-            result.upstream.status,
-            result.upstream.headers,
-            Body::from_stream(result.upstream.body),
-            alias,
-            result.provider_response_id.as_deref(),
+        Ok(result) => common::with_serving_identity(
+            response(
+                result.upstream.status,
+                result.upstream.headers,
+                Body::from_stream(result.upstream.body),
+                alias,
+                result.provider_response_id.as_deref(),
+            ),
+            result.provider_attribution,
         ),
         Err(e) => match e {
             NativeResponsesError::InvalidRequest(message) => {

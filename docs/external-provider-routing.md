@@ -248,9 +248,11 @@ PUT wraps `policy` and a required `change_reason`. Policy includes:
 
 `GET/POST /v1/admin/provider-routes/{id}/cost-profiles` manages versioned costs.
 POST wraps `rates` and `change_reason`. Rates include `currency`, `billing_unit`
-(`million_tokens`), `input_microunits`, `output_microunits`, nullable
+(`million_tokens`, `request`, `image`, or `audio_second`), `input_microunits`, `output_microunits`, nullable
 `cache_read_microunits`/`cache_write_microunits`, and `provenance`. Integers represent
-millionths of currency per million tokens. Updating creates a new version and
+millionths of currency per million tokens for token profiles. Other profiles use
+`input_microunits` per whole unit, require zero output rate and no cache rates,
+and record observed quantities in millionths of a unit. Updating creates a new version and
 closes the prior interval; it does not change catalog customer prices.
 
 Only eligible routes are cost-ranked. The shared retry path reserves each
@@ -266,7 +268,11 @@ retry bounds and shared health. Final HTTP status, headers, and body bytes are
 preserved. Successful native bodies record EOF, failure, timeout, or cancellation
 without replaying committed output. Bounded native usage observers retain
 reported input, output, and cache usage for procurement estimates; malformed or
-oversized usage remains unknown. Non-token billing units remain incomplete.
+oversized usage remains unknown. Request costs reserve one request per attempt;
+image generation reserves the requested image count. Observed image counts and
+audio durations produce usage estimates, never settled charges. Audio duration
+is unknown before dispatch, so audio-duration profiles fail closed under a cost
+ceiling unless a trustworthy quantity bound is available.
 
 Rate limits and transient failures update shared PostgreSQL cooldowns; bounded
 `Retry-After` is honored. Credential failures quarantine the quota group. Expired
@@ -293,8 +299,8 @@ is `estimated`, and an unobserved/failed/cancelled charge remains `unknown`.
 
 Do not treat the management or transport-fixture tests as proof of full #1273.
 Remaining work includes registry-authoritative import and rollback for all legacy
-NEAR/long-context/Chutes/Tinfoil sources; non-token billing units; complete auxiliary
-inference billing and attribution; public inference-response deployment IDs; and
+NEAR/long-context/Chutes/Tinfoil sources; complete auxiliary
+inference path acceptance coverage; and
 process-level real-vendor and verifier-backed TEE acceptance evidence. Live acceptance requires provisioned
 upstreams and credential references. The current mocks prove management and
 transport behavior only.
@@ -354,3 +360,18 @@ in `billingDetails.accepted_catalog_pricing`; provider cost profiles cannot alte
 those customer rates. Trusted external usage reporters retain the documented
 current-catalog pricing behavior. Auxiliary auto-redaction and Responses image
 billing still need full acceptance coverage.
+
+Automatic PII redaction captures detector pricing before classification and carries
+its actual serving identity into its separate usage record. Responses image
+operations record image counts, accepted customer rates, serving identities, and
+the response ID before returning completion. Transport fixtures verify these
+accounting paths; they are not live provider acceptance evidence.
+
+Successful Chat Completions, text completions, native Responses, and Anthropic
+responses expose `x-serving-route-id` and `x-serving-deployment-id` when dispatched
+through a registry route. These optional headers use the accepted serving snapshot
+and are CORS-exposed; legacy-only dispatches omit them. Signed payload bytes are
+unchanged. Non-chat inference endpoints expose the same headers. Translated Responses
+assistant messages and image outputs include `metadata.serving` for the actual
+iteration, including the stable IDs; this preserves attribution across tool-loop
+route changes. Customer usage records carry the same serving IDs.

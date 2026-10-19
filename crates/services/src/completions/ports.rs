@@ -198,6 +198,32 @@ pub trait CompletionServiceTrait: Send + Sync {
         request: CompletionRequest,
     ) -> Result<inference_providers::ChatCompletionResponseWithBytes, CompletionError>;
 
+    async fn create_chat_completion_stream_with_attribution(
+        &self,
+        request: CompletionRequest,
+    ) -> Result<crate::inference_provider_pool::AttributedInference<StreamingResult>, CompletionError>
+    {
+        Ok(crate::inference_provider_pool::AttributedInference {
+            response: self.create_chat_completion_stream(request).await?,
+            provider_attribution: Default::default(),
+        })
+    }
+
+    async fn create_chat_completion_with_attribution(
+        &self,
+        request: CompletionRequest,
+    ) -> Result<
+        crate::inference_provider_pool::AttributedInference<
+            inference_providers::ChatCompletionResponseWithBytes,
+        >,
+        CompletionError,
+    > {
+        Ok(crate::inference_provider_pool::AttributedInference {
+            response: self.create_chat_completion(request).await?,
+            provider_attribution: Default::default(),
+        })
+    }
+
     /// Execute an audio transcription request with concurrent request limiting
     async fn audio_transcription(
         &self,

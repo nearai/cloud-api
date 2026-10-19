@@ -132,17 +132,7 @@ against an OAuth app whose callback URL is
 `http://localhost:3000/v1/auth/callback`. Visit `/v1/auth/login` to start
 the flow.
 
-### OAuth account-linking deployment
-
-This release enables automatic linking without an environment or runtime switch.
-For the initial deployment, stop routing OAuth requests to every old API instance
-before any new instance serves them: pause sign-in briefly, upgrade all instances
-and apply `V0095__oauth_account_linking.sql`, then restore traffic. Do not use a
-mixed-version rolling deployment for this release. An old instance cannot resolve
-secondary identities created by a new instance and can return a login error.
-Deploy the conflict-message UI after all API instances have been upgraded. Once
-secondary identities exist, rolling back to an API without identity lookup support is unsafe;
-keep that support in any rollback build.
+### Same-email OAuth sign-in
 
 Accounts are identified by their OAuth provider and provider user ID. A new Google
 or GitHub identity automatically links to an existing active account on the other

@@ -3024,6 +3024,59 @@ mod tests {
     }
 
     #[test]
+    fn server_api_keys_are_only_sent_to_the_official_host() {
+        let cfg = ExternalProvidersConfig {
+            openai_api_key: Some("sk-openai".into()),
+            anthropic_api_key: Some("sk-ant".into()),
+            gemini_api_key: Some("gem".into()),
+            typesafe_api_key: Some("ts".into()),
+            ..Default::default()
+        };
+        for (backend, base_url, key) in [
+            (
+                "openai_compatible",
+                "https://api.openai.com/v1",
+                "sk-openai",
+            ),
+            ("anthropic", "https://api.anthropic.com/v1", "sk-ant"),
+            (
+                "gemini",
+                "https://generativelanguage.googleapis.com/v1beta",
+                "gem",
+            ),
+            ("typesafe", "https://api.typesafe.ai/v1", "ts"),
+            (
+                "openai_compatible",
+                "https://API.OpenAI.com:443/v1",
+                "sk-openai",
+            ),
+        ] {
+            assert_eq!(cfg.get_api_key(backend, base_url), Some(key), "{base_url}");
+        }
+        for (backend, base_url) in [
+            ("openai_compatible", "https://openrouter.ai/api/v1"),
+            ("typesafe", "https://openrouter.ai/api/v1"),
+            ("openai_compatible", "http://api.openai.com/v1"),
+            ("openai_compatible", "https://api.openai.com.example.net/v1"),
+            ("openai_compatible", "https://api.anthropic.com/v1"),
+            ("anthropic", "https://api.openai.com/v1"),
+            ("openai_compatible", "not a url"),
+            ("unknown", "https://api.openai.com/v1"),
+        ] {
+            assert_eq!(
+                cfg.get_api_key(backend, base_url),
+                None,
+                "{backend} {base_url}"
+            );
+        }
+        assert_eq!(
+            ExternalProvidersConfig::default()
+                .get_api_key("openai_compatible", "https://api.openai.com/v1"),
+            None
+        );
+    }
+
+    #[test]
     #[serial]
     fn native_anthropic_beta_denylist_is_trimmed_and_deduplicated() {
         let previous = std::env::var_os("ANTHROPIC_DENIED_BETAS");
@@ -3389,15 +3442,23 @@ impl ExternalProvidersConfig {
         }
     }
 
-    /// Get API key for a specific backend type
-    pub fn get_api_key(&self, backend_type: &str) -> Option<&str> {
-        match backend_type {
-            "openai_compatible" => self.openai_api_key.as_deref(),
-            "anthropic" => self.anthropic_api_key.as_deref(),
-            "gemini" => self.gemini_api_key.as_deref(),
-            "typesafe" => self.typesafe_api_key.as_deref(),
-            _ => None,
+    /// Server-wide API key for `backend_type`, returned only when `base_url`
+    /// is HTTPS on that provider's official API host. Any other upstream (an
+    /// aggregator, a proxy, a gateway) needs a per-model `api_key`, so a
+    /// server key is never sent to a host it was not issued for.
+    pub fn get_api_key(&self, backend_type: &str, base_url: &str) -> Option<&str> {
+        let (key, official_host) = match backend_type {
+            "openai_compatible" => (&self.openai_api_key, "api.openai.com"),
+            "anthropic" => (&self.anthropic_api_key, "api.anthropic.com"),
+            "gemini" => (&self.gemini_api_key, "generativelanguage.googleapis.com"),
+            "typesafe" => (&self.typesafe_api_key, "api.typesafe.ai"),
+            _ => return None,
+        };
+        let url = url::Url::parse(base_url).ok()?;
+        if url.scheme() != "https" || url.host_str() != Some(official_host) {
+            return None;
         }
+        key.as_deref()
     }
 }
 

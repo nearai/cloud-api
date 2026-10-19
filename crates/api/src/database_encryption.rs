@@ -172,6 +172,7 @@ const APPROVED: &[ApprovedGroup] = &[
     ApprovedGroup { table: "services", columns: &["service_name", "display_name", "description", "unit"], reason: "Public service catalog" },
     ApprovedGroup { table: "user_contact_email_verifications", columns: &["email", "email_limit_key", "token_hash"], reason: "Contact email verification workflow data required for indexed send limits and confirmation; the token is stored as a one-way hash, and rows older than 24 hours are deleted when the next verification request comes in" },
     ApprovedGroup { table: "user_erasure_log", columns: &["erased_organization_ids", "retained_organization_ids"], reason: "Restricted erasure audit: organization UUIDs only, no customer content; the email is stored as a one-way digest" },
+    ApprovedGroup { table: "user_oauth_identities", columns: &["provider", "provider_user_id", "email"], reason: "Account identity fields required for indexed provider login, consistent with users identity fields" },
     ApprovedGroup { table: "usage_credit_allocations", columns: &["credit_type", "source", "policy_version", "allocation_phase"], reason: "Immutable restricted billing attribution records" },
     ApprovedGroup { table: "organization_usage_discounts", columns: &["status", "last_error"], reason: "Restricted administrator billing correction state" },
     ApprovedGroup { table: "usage_discount_adjustments", columns: &["original_billing_details"], reason: "Restricted immutable billing correction audit" },

@@ -10,7 +10,7 @@ use config::ApiConfig;
 use database::repositories::OAuthStateRepository;
 use serde::{Deserialize, Serialize};
 use services::auth::near::NearAuthError;
-use services::auth::{AuthServiceTrait, OAuthManager};
+use services::auth::{AuthError, AuthServiceTrait, OAuthManager};
 use std::sync::Arc;
 use tracing::{debug, error, info};
 use url::Url;
@@ -87,10 +87,84 @@ fn validate_frontend_callback(
     Ok(url)
 }
 
+/// Only the known account conflict is redirected here; general OAuth callback
+/// failures retain their existing handling. Never put internal errors in a URL.
+fn oauth_user_error_response(
+    error: AuthError,
+    frontend_callback: Option<&str>,
+    cors: &config::CorsConfig,
+) -> Response {
+    let AuthError::OAuthProviderConflict { existing_provider } = error else {
+        error!(error = %error, "Failed to get or create OAuth user");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": "internal_server_error",
+                "error_description": "Unable to sign in. Please try again."
+            })),
+        )
+            .into_response();
+    };
+
+    info!(
+        existing_provider = %existing_provider,
+        "OAuth sign-in rejected: email already registered to another identity"
+    );
+
+    let provider_name = match existing_provider.as_str() {
+        "github" => "GitHub",
+        "google" => "Google",
+        "near" => "NEAR",
+        _ => "the original provider",
+    };
+    let description = format!(
+        "This email is registered with {provider_name}. Sign in with {provider_name} using the original account."
+    );
+    let error_code = "oauth_provider_conflict";
+
+    if let Some(frontend_callback) = frontend_callback {
+        let mut callback_url = match validate_frontend_callback(frontend_callback, cors) {
+            Ok(url) => url,
+            Err(reason) => {
+                error!(
+                    reason,
+                    "Invalid frontend callback for OAuth account conflict"
+                );
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": "invalid_request",
+                        "error_description": "Invalid frontend callback URL"
+                    })),
+                )
+                    .into_response();
+            }
+        };
+        let fragment = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("error", error_code)
+            .append_pair("error_description", &description)
+            .append_pair("existing_provider", &existing_provider)
+            .finish();
+        callback_url.set_fragment(Some(&fragment));
+        return Redirect::temporary(callback_url.as_str()).into_response();
+    }
+
+    (
+        StatusCode::CONFLICT,
+        Json(serde_json::json!({
+            "error": error_code,
+            "error_description": description,
+            "existing_provider": existing_provider
+        })),
+    )
+        .into_response()
+}
+
 #[derive(Deserialize)]
 pub struct OAuthCallback {
-    code: String,
+    code: Option<String>,
     state: String,
+    error: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -394,12 +468,19 @@ pub async fn oauth_callback(
     info!("Processing {} OAuth callback", oauth_state_row.provider);
 
     // Handle provider-specific callback to get OAuth user info
+    if params.error.is_some() || params.code.is_none() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "access_denied",
+                "error_description": "Sign-in was not completed."
+            })),
+        )
+            .into_response();
+    }
+    let code = params.code.unwrap();
     let oauth_result = match oauth_state_row.provider.as_str() {
-        "github" => {
-            oauth
-                .handle_github_callback(params.code, params.state)
-                .await
-        }
+        "github" => oauth.handle_github_callback(code, params.state).await,
         "google" => {
             let verifier = match oauth_state_row.pkce_verifier {
                 Some(v) => v,
@@ -416,7 +497,7 @@ pub async fn oauth_callback(
                 }
             };
             oauth
-                .handle_google_callback(params.code, params.state, verifier)
+                .handle_google_callback(code, params.state, verifier)
                 .await
         }
         _ => {
@@ -451,15 +532,11 @@ pub async fn oauth_callback(
     let user = match auth_service.get_or_create_oauth_user(oauth_user_info).await {
         Ok(user) => user,
         Err(e) => {
-            error!("Failed to get or create user");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({
-                    "error": "internal_server_error",
-                    "error_description": format!("User creation failed: {}", e)
-                })),
-            )
-                .into_response();
+            return oauth_user_error_response(
+                e,
+                oauth_state_row.frontend_callback.as_deref(),
+                &config.cors,
+            );
         }
     };
 
@@ -804,4 +881,141 @@ pub async fn login_page() -> Html<&'static str> {
 </body>
 </html>"##,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn cors() -> config::CorsConfig {
+        config::CorsConfig {
+            exact_matches: vec!["https://app.example.com".into()],
+            wildcard_suffixes: vec![],
+        }
+    }
+
+    fn conflict(provider: &str) -> AuthError {
+        AuthError::OAuthProviderConflict {
+            existing_provider: provider.into(),
+        }
+    }
+
+    async fn json_body(response: Response) -> serde_json::Value {
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn oauth_provider_conflict_without_frontend_returns_409_and_sign_in_method() {
+        for (provider, name) in [("github", "GitHub"), ("google", "Google")] {
+            let response = oauth_user_error_response(conflict(provider), None, &cors());
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            assert!(!response.headers().contains_key("location"));
+            let body = json_body(response).await;
+            assert_eq!(body["error"], "oauth_provider_conflict");
+            assert_eq!(body["existing_provider"], provider);
+            assert!(body["error_description"]
+                .as_str()
+                .unwrap()
+                .contains(&format!("Sign in with {name}")));
+            assert!(body.get("access_token").is_none());
+            assert!(body.get("refresh_token").is_none());
+        }
+    }
+
+    #[test]
+    fn oauth_provider_conflict_redirects_to_validated_frontend_with_error_and_no_tokens() {
+        for (provider, name) in [("github", "GitHub"), ("google", "Google")] {
+            let response = oauth_user_error_response(
+                conflict(provider),
+                Some("https://app.example.com/auth/callback"),
+                &cors(),
+            );
+            assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+            let location = Url::parse(response.headers()["location"].to_str().unwrap()).unwrap();
+            assert_eq!(
+                location.origin().ascii_serialization(),
+                "https://app.example.com"
+            );
+            assert_eq!(location.path(), "/auth/callback");
+            assert!(location.query().is_none());
+            let params: HashMap<_, _> =
+                url::form_urlencoded::parse(location.fragment().unwrap().as_bytes())
+                    .into_owned()
+                    .collect();
+            assert_eq!(params.len(), 3);
+            assert_eq!(params["error"], "oauth_provider_conflict");
+            assert_eq!(params["existing_provider"], provider);
+            assert!(params["error_description"].contains(&format!("Sign in with {name}")));
+        }
+    }
+
+    #[tokio::test]
+    async fn oauth_provider_conflict_rejects_invalid_frontend_callbacks() {
+        for callback in [
+            "https://untrusted.example.com/auth/callback",
+            "http://app.example.com/auth/callback",
+            "https://user@app.example.com/auth/callback",
+            "https://app.example.com/auth/callback?redirect=https://untrusted.example.com",
+            "https://app.example.com/auth/callback#token=unexpected",
+            "not-a-url",
+        ] {
+            let response = oauth_user_error_response(conflict("github"), Some(callback), &cors());
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{callback}");
+            assert!(!response.headers().contains_key("location"));
+            assert_eq!(json_body(response).await["error"], "invalid_request");
+        }
+    }
+
+    #[tokio::test]
+    async fn oauth_provider_conflict_redirect_respects_wildcard_domain_boundaries() {
+        for suffix in [".example.com", "example.com"] {
+            let cors = config::CorsConfig {
+                exact_matches: vec![],
+                wildcard_suffixes: vec![suffix.into()],
+            };
+            let response = oauth_user_error_response(
+                conflict("github"),
+                Some("https://sub.example.com/auth/callback"),
+                &cors,
+            );
+            assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+            let location = Url::parse(response.headers()["location"].to_str().unwrap()).unwrap();
+            assert_eq!(location.host_str(), Some("sub.example.com"));
+
+            for callback in [
+                "https://evilexample.com/auth/callback",
+                "https://example.com.evil.test/auth/callback",
+                "http://sub.example.com/auth/callback",
+            ] {
+                let response = oauth_user_error_response(conflict("github"), Some(callback), &cors);
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{callback}");
+                assert!(!response.headers().contains_key("location"));
+                assert_eq!(json_body(response).await["error"], "invalid_request");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn oauth_internal_user_error_stays_500_without_exposing_details_or_redirecting() {
+        for callback in [None, Some("https://app.example.com/auth/callback")] {
+            let response = oauth_user_error_response(
+                AuthError::InternalError("database password and connection details".into()),
+                callback,
+                &cors(),
+            );
+            assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+            assert!(!response.headers().contains_key("location"));
+            let body = json_body(response).await;
+            assert_eq!(body["error"], "internal_server_error");
+            assert_eq!(
+                body["error_description"],
+                "Unable to sign in. Please try again."
+            );
+            assert!(body.get("existing_provider").is_none());
+        }
+    }
 }

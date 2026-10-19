@@ -91,51 +91,15 @@ pub async fn models_internal(
     ))
 }
 
-/// Convert a nano-USD amount (DB scale 9 — used for per-token, per-image, and
-/// per-request prices) to a USD string suitable for OpenRouter
-/// (e.g. 8_000 → "0.000008"). Strings are required by the OpenRouter provider
-/// spec to avoid float precision issues, so this uses pure integer arithmetic.
-/// Pricing is non-negative throughout the system; a defensive `abs()` keeps
-/// the formatter total in the unexpected case.
-pub(super) fn nano_dollars_to_per_token_string(nano_dollars: i64) -> String {
-    if nano_dollars == 0 {
-        return "0".to_string();
-    }
-    let n = nano_dollars.unsigned_abs();
-    let dollars = n / 1_000_000_000;
-    let nanos = n % 1_000_000_000;
-    let mut s = if nanos == 0 {
-        format!("{dollars}")
-    } else {
-        let frac = format!("{nanos:09}");
-        let frac = frac.trim_end_matches('0');
-        format!("{dollars}.{frac}")
-    };
-    if nano_dollars < 0 {
-        s.insert(0, '-');
-    }
-    s
-}
-
 pub(super) fn model_with_pricing_to_info(model: services::models::ModelWithPricing) -> ModelInfo {
-    // Legacy HuggingFace-style fields: USD per million tokens.
-    // nano_dollars_per_token * 0.001 = USD per million.
-    let input_per_million = (model.input_cost_per_token as f64) * 0.001;
-    let output_per_million = (model.output_cost_per_token as f64) * 0.001;
-
-    let pricing = ModelPricing {
-        input: input_per_million,
-        output: output_per_million,
-        prompt: nano_dollars_to_per_token_string(model.input_cost_per_token),
-        completion: nano_dollars_to_per_token_string(model.output_cost_per_token),
-        image: nano_dollars_to_per_token_string(model.cost_per_image),
-        request: "0".to_string(),
-        // None = cache pricing disabled -> omit the field entirely.
-        // Some(0) is a real (genuinely free) price and renders as "0".
-        input_cache_read: model
-            .cache_read_cost_per_token
-            .map(nano_dollars_to_per_token_string),
-    };
+    let pricing = CatalogPricingAmounts {
+        input_cost_per_token: model.input_cost_per_token,
+        output_cost_per_token: model.output_cost_per_token,
+        cost_per_image: model.cost_per_image,
+        cache_read_cost_per_token: model.cache_read_cost_per_token,
+    }
+    .into();
+    let upcoming_pricing = model.upcoming_pricing.map(Into::into);
 
     // OpenRouter's provider spec marks `input_modalities` / `output_modalities`
     // as REQUIRED fields. They are derived from the nullable `architecture`
@@ -173,6 +137,7 @@ pub(super) fn model_with_pricing_to_info(model: services::models::ModelWithPrici
         hugging_face_id: model.hugging_face_id,
         quantization: model.quantization,
         pricing: Some(pricing),
+        upcoming_pricing,
         text_pricing: model
             .text_pricing
             .map(|profile| serde_json::to_value(profile).unwrap_or(serde_json::Value::Null)),

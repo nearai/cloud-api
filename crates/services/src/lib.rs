@@ -18,6 +18,7 @@ pub mod mcp;
 pub mod metrics;
 pub mod models;
 pub mod organization;
+pub mod provider_registry;
 pub mod reporting_tokens;
 pub mod reporting_usage;
 pub mod responses;

@@ -36,6 +36,8 @@ pub(crate) fn admin_operation(method: &Method, matched_path: &str) -> AdminOpera
         && matches!(
             path,
             "/admin/models"
+                | "/admin/providers"
+                | "/admin/providers/{id}/models"
                 | "/admin/models/pricing-changes"
                 | "/admin/models/{model_name}/history"
                 | "/admin/organizations/{org_id}/limits/history"
@@ -93,7 +95,39 @@ pub(crate) fn admin_operation(method: &Method, matched_path: &str) -> AdminOpera
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::middleware::admin_policy::{admin_operation, AdminOperation};
+    use axum::http::Method;
+
+    #[test]
+    fn provider_registry_reads_and_mutations_are_distinct() {
+        for prefix in ["", "/v1"] {
+            for path in ["/admin/providers", "/admin/providers/{id}/models"] {
+                assert_eq!(
+                    admin_operation(&Method::GET, &format!("{prefix}{path}")),
+                    AdminOperation::Read
+                );
+                for method in [Method::POST, Method::PUT, Method::DELETE] {
+                    assert_eq!(
+                        admin_operation(&method, &format!("{prefix}{path}")),
+                        AdminOperation::Write
+                    );
+                }
+            }
+            for path in [
+                "/admin/providers/{id}/sync",
+                "/admin/models/{model_name}/archive",
+            ] {
+                assert_eq!(
+                    admin_operation(&Method::POST, &format!("{prefix}{path}")),
+                    AdminOperation::Write
+                );
+                assert_eq!(
+                    admin_operation(&Method::PUT, &format!("{prefix}{path}")),
+                    AdminOperation::Write
+                );
+            }
+        }
+    }
 
     #[test]
     fn user_erasure_preview_is_read_and_execute_is_session_only() {

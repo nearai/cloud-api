@@ -156,6 +156,13 @@ use utoipa::{Modify, OpenApi};
         crate::routes::admin::list_models,
         crate::routes::admin::batch_upsert_models,
         crate::routes::admin::delete_model,
+        crate::routes::providers::list,
+        crate::routes::providers::create,
+        crate::routes::providers::update,
+        crate::routes::providers::models,
+        crate::routes::providers::sync,
+        crate::routes::providers::approve,
+        crate::routes::providers::archive_model,
         crate::routes::admin::deprecate_model,
         crate::routes::admin::preview_model_deprecation,
         crate::routes::admin::confirm_model_deprecation,
@@ -222,6 +229,11 @@ use utoipa::{Modify, OpenApi};
     ),
     components(
         schemas(
+            services::provider_registry::ProviderDefinition,
+            services::provider_registry::RegisteredProvider,
+            services::provider_registry::ProviderModel,
+            services::provider_registry::ProviderModelApproval,
+            crate::routes::providers::ModelArchiveRequest,
             // Health check models
             crate::routes::health::HealthResponse,
             // Core API models

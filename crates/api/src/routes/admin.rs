@@ -185,6 +185,9 @@ pub(crate) fn is_valid_openrouter_slug(slug: &str) -> bool {
 
 #[derive(Clone)]
 pub struct AdminAppState {
+    pub provider_registry:
+        Arc<database::repositories::provider_registry::ProviderRegistryRepository>,
+    pub provider_models_repository: Arc<database::repositories::ModelRepository>,
     pub admin_service: Arc<dyn AdminService + Send + Sync>,
     pub analytics_service: Arc<AnalyticsService>,
     pub organization_service:
@@ -1020,38 +1023,8 @@ pub async fn batch_upsert_models(
             .await;
     }
 
-    // Register external providers (OpenAI, Anthropic, Gemini, etc.)
-    let external_models: Vec<(String, serde_json::Value)> = batch_request
-        .iter()
-        .filter_map(|(model_name, request)| {
-            let merged = updated_models.get(model_name)?;
-            let touches_registration = request.provider_type.is_some()
-                || request.provider_config.is_some()
-                || request.is_active.is_some();
-            if merged.provider_type == "external" && merged.is_active && touches_registration {
-                merged
-                    .provider_config
-                    .clone()
-                    .map(|config| (model_name.clone(), config))
-            } else {
-                None
-            }
-        })
-        .collect();
-
-    if !external_models.is_empty() {
-        tracing::info!(
-            count = external_models.len(),
-            "Registering external providers at runtime"
-        );
-        if let Err(e) = app_state
-            .inference_provider_pool
-            .load_external_providers(external_models)
-            .await
-        {
-            tracing::warn!(error = %e, "Failed to register some external providers at runtime");
-        }
-    }
+    // Reload the complete approved route set, including registry-managed models.
+    crate::routes::providers::reload(&app_state).await?;
 
     // Fire GitHub repository_dispatch for each model this PATCH (re)loaded.
     // Downstream automation (validate / promote workflows in
@@ -1204,9 +1177,23 @@ pub async fn list_models(
             )
         })?;
 
+    let archived = app_state
+        .provider_models_repository
+        .archived_models()
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ResponseJson(ErrorResponse::new(
+                    "Failed to load archive state".into(),
+                    "internal_server_error".into(),
+                )),
+            )
+        })?;
     let api_models: Vec<AdminModelWithPricing> = models
         .into_iter()
         .map(|model| AdminModelWithPricing {
+            archived: archived.contains(&model.model_name),
             model_id: model.model_name,
             input_cost_per_token: DecimalPrice {
                 amount: model.input_cost_per_token,
@@ -1719,11 +1706,11 @@ pub async fn get_admin_organization_balance(
     path = "/v1/admin/models/{model_name}",
     tag = "Admin",
     params(
-        ("model_name" = String, Path, description = "Model name to delete (URL-encode if it contains slashes)")
+        ("model_name" = String, Path, description = "Model name to archive (URL-encode if it contains slashes)")
     ),
     request_body = DeleteModelRequest,
     responses(
-        (status = 204, description = "Model deleted successfully"),
+        (status = 204, description = "Model archived successfully"),
         (status = 404, description = "Model not found", body = ErrorResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
         (status = 500, description = "Internal server error", body = ErrorResponse)
@@ -1792,7 +1779,7 @@ pub async fn delete_model(
         tracing::warn!(
             model = %model_name,
             "delete_model: skipping unregister of a pinned (config-managed) provider; \
-             the catalog row is removed (model 404s), pinned provider left intact"
+             the catalog row is archived (model 404s), pinned provider left intact"
         );
     } else {
         app_state

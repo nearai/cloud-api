@@ -801,6 +801,39 @@ fn copy_sampling_parameters(
     Ok(())
 }
 
+/// Translate the OpenAI effort selector without dropping native output options.
+/// Conflicting forms are rejected instead of choosing one silently.
+pub fn normalize_reasoning_effort(output: &mut Map<String, Value>) -> Result<(), CompatError> {
+    if let Some(effort) = output
+        .remove("reasoning_effort")
+        .filter(|value| !value.is_null())
+    {
+        let value = effort
+            .as_str()
+            .ok_or_else(|| CompatError::at("reasoning_effort", "effort must be a string"))?;
+        if !matches!(value, "low" | "medium" | "high" | "xhigh" | "max") {
+            return Err(CompatError::at(
+                "reasoning_effort",
+                "effort has no supported Anthropic equivalent; use native thinking controls",
+            ));
+        }
+        let config = output
+            .entry("output_config")
+            .or_insert_with(|| Value::Object(Map::new()));
+        let config = config
+            .as_object_mut()
+            .ok_or_else(|| CompatError::at("output_config", "output_config must be an object"))?;
+        if config.get("effort").is_some_and(|native| native != &effort) {
+            return Err(CompatError::at(
+                "reasoning_effort",
+                "conflicting output_config.effort",
+            ));
+        }
+        config.insert("effort".into(), effort);
+    }
+    Ok(())
+}
+
 fn copy_anthropic_extensions(
     request: &Map<String, Value>,
     output: &mut Map<String, Value>,
@@ -821,7 +854,7 @@ fn copy_anthropic_extensions(
             Value::String("standard_only".to_string()),
         );
     }
-    Ok(())
+    normalize_reasoning_effort(output)
 }
 
 fn collect_parameter_warnings(request: &Map<String, Value>, warnings: &mut Vec<ConversionWarning>) {
@@ -967,6 +1000,26 @@ mod tests {
 
     fn convert(input: Value) -> ConvertedRequest {
         convert_openai_request(&input, &options()).expect("conversion should succeed")
+    }
+
+    #[test]
+    fn reasoning_effort_maps_to_native_config_without_losing_other_options() {
+        let mut fields = serde_json::json!({"reasoning_effort":"high","output_config":{"format":{"type":"json_schema"}},"thinking":{"type":"adaptive"}}).as_object().unwrap().clone();
+        crate::normalize_reasoning_effort(&mut fields).unwrap();
+        assert_eq!(fields["output_config"]["effort"], "high");
+        assert!(fields["output_config"].get("format").is_some());
+        assert_eq!(fields["thinking"]["type"], "adaptive");
+        assert!(!fields.contains_key("reasoning_effort"));
+        fields.insert("reasoning_effort".into(), serde_json::json!("low"));
+        assert!(crate::normalize_reasoning_effort(&mut fields).is_err());
+        for invalid in [
+            serde_json::json!(false),
+            serde_json::json!("none"),
+            serde_json::json!("unknown"),
+        ] {
+            let mut fields = serde_json::Map::from_iter([("reasoning_effort".into(), invalid)]);
+            assert!(crate::normalize_reasoning_effort(&mut fields).is_err());
+        }
     }
 
     #[test]

@@ -11,7 +11,7 @@ use tokio_postgres::types::Type;
 use tokio_postgres::Row;
 
 // Default reason for soft delete operations
-const DEFAULT_SOFT_DELETE_REASON: &str = "Model soft deleted";
+const DEFAULT_SOFT_DELETE_REASON: &str = "Model archived";
 
 fn parse_text_pricing(
     value: Option<serde_json::Value>,
@@ -534,7 +534,7 @@ impl ModelRepository {
                 // Record history: close previous history record and insert new one
                 let model_id: uuid::Uuid = updated_row.get("id");
                 self.record_model_history(
-                    &client,
+                    &**client,
                     model_id,
                     &updated_row,
                     &update_request.change_reason,
@@ -669,7 +669,7 @@ impl ModelRepository {
                 // Record history for new model
                 let model_id: uuid::Uuid = inserted_row.get("id");
                 self.record_model_history(
-                    &client,
+                    &**client,
                     model_id,
                     &inserted_row,
                     &update_request.change_reason,
@@ -815,7 +815,7 @@ impl ModelRepository {
             if let Some(inserted_row) = &inserted {
                 let model_id: uuid::Uuid = inserted_row.get("id");
                 self.record_model_history(
-                    &client,
+                    &**client,
                     model_id,
                     inserted_row,
                     &req.change_reason,
@@ -1079,62 +1079,73 @@ impl ModelRepository {
         changed_by_user_id: Option<uuid::Uuid>,
         changed_by_user_email: Option<String>,
     ) -> Result<bool> {
-        let result = retry_db!("soft_delete_model", {
-            let client = self
-                .pool
-                .get()
-                .await
-                .context("Failed to get database connection")
-                .map_err(RepositoryError::PoolError)?;
+        self.set_archived(
+            model_name,
+            true,
+            change_reason,
+            changed_by_user_id,
+            changed_by_user_email,
+        )
+        .await
+    }
 
-            let result = client
-                .query_opt(
-                    r#"
-                    UPDATE models
-                    SET is_active = false, updated_at = NOW()
-                    WHERE model_name = $1 AND is_active = true
-                    RETURNING id, model_name, model_display_name, model_description, model_icon,
-                              input_cost_per_token, output_cost_per_token, cost_per_image, cache_read_cost_per_token, text_pricing,
-                              context_length, verifiable, is_active, owned_by, created_at, updated_at,
-                              provider_type, provider_config, attestation_supported,
-                              input_modalities, output_modalities, inference_url, hugging_face_id, quantization, max_output_length, supported_sampling_parameters, supported_features, datacenters, is_ready, deprecation_date, successor_model_name, openrouter_slug, allow_free, is_listed
-                    "#,
-                    &[&model_name],
+    pub async fn set_archived(
+        &self,
+        model_name: &str,
+        archived: bool,
+        change_reason: Option<String>,
+        actor: Option<uuid::Uuid>,
+        email: Option<String>,
+    ) -> Result<bool> {
+        let mut client = self.pool.get().await?;
+        let tx = (**client).transaction().await?;
+        let row = tx.query_opt(
+            "UPDATE models SET
+                archive_was_active=CASE WHEN $2 AND archived_at IS NULL THEN is_active ELSE archive_was_active END,
+                archived_at=CASE WHEN $2 THEN COALESCE(archived_at,now()) ELSE NULL END,
+                is_active=CASE WHEN $2 THEN false WHEN archived_at IS NOT NULL THEN COALESCE(archive_was_active,false) ELSE is_active END,
+                updated_at=now()
+             WHERE model_name=$1 RETURNING *", &[&model_name,&archived]).await?;
+        if let Some(row) = row {
+            let reason = change_reason.or_else(|| {
+                Some(
+                    if archived {
+                        DEFAULT_SOFT_DELETE_REASON
+                    } else {
+                        "Model unarchived"
+                    }
+                    .into(),
                 )
-                .await
-                .map_err(map_db_error)?;
+            });
+            self.record_model_history(&tx, row.get("id"), &row, &reason, actor, email)
+                .await?;
+            tx.commit().await?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
 
-            if let Some(row) = result {
-                // Record history: capture the soft delete in history
-                let model_id: uuid::Uuid = row.get("id");
-                let reason = change_reason
-                    .clone()
-                    .or_else(|| Some(DEFAULT_SOFT_DELETE_REASON.to_string()));
-                self.record_model_history(
-                    &client,
-                    model_id,
-                    &row,
-                    &reason,
-                    changed_by_user_id,
-                    changed_by_user_email.clone(),
-                )
-                .await
-                .map_err(RepositoryError::DatabaseError)?;
-
-                Ok(Some(()))
-            } else {
-                Ok(None)
-            }
-        })?;
-
-        Ok(result.is_some())
+    pub async fn archived_models(&self) -> Result<std::collections::HashSet<String>> {
+        Ok(self
+            .pool
+            .get()
+            .await?
+            .query(
+                "SELECT model_name FROM models WHERE archived_at IS NOT NULL",
+                &[],
+            )
+            .await?
+            .into_iter()
+            .map(|row| row.get(0))
+            .collect())
     }
 
     /// Helper method to record a model history entry
     /// Closes the previous history record and creates a new one
-    async fn record_model_history(
+    async fn record_model_history<C: tokio_postgres::GenericClient + Sync>(
         &self,
-        client: &tokio_postgres::Client,
+        client: &C,
         model_id: uuid::Uuid,
         model_row: &Row,
         change_reason: &Option<String>,
@@ -1287,6 +1298,7 @@ impl ModelRepository {
             )
             .await
             .context("Failed to insert model history record")?;
+        client.execute("UPDATE model_history h SET archived_at=m.archived_at FROM models m WHERE h.model_id=m.id AND h.model_id=$1 AND h.effective_until IS NULL", &[&model_id]).await?;
 
         Ok(())
     }
@@ -1621,19 +1633,10 @@ impl ModelRepository {
 #[async_trait]
 impl services::inference_provider_pool::ExternalModelsSource for ModelRepository {
     async fn fetch_external_models(&self) -> Result<Vec<(String, serde_json::Value)>, String> {
-        let models = self
-            .get_external_models()
+        crate::repositories::provider_registry::ProviderRegistryRepository::new(self.pool.clone())
+            .routes()
             .await
-            .map_err(|e| format!("Failed to fetch external models: {e}"))?;
-
-        Ok(models
-            .into_iter()
-            .filter_map(|model| {
-                model
-                    .provider_config
-                    .map(|config| (model.model_name, config))
-            })
-            .collect())
+            .map_err(|error| error.to_string())
     }
 
     async fn fetch_inference_url_models(

@@ -33,6 +33,8 @@ pub mod typesafe;
 #[cfg(test)]
 mod routing_policy_tests;
 
+mod reasoning;
+
 use crate::{
     AnthropicRawError, AnthropicRawRequest, AnthropicRawResponse, AttestationError,
     AudioTranscriptionError, AudioTranscriptionParams, AudioTranscriptionResponse,
@@ -137,9 +139,26 @@ pub fn validate_external_provider_config(config: &serde_json::Value) -> Result<(
     };
     if config
         .keys()
-        .any(|key| !allowed_fields.contains(&key.as_str()))
+        .any(|key| key != "reasoning_efforts" && !allowed_fields.contains(&key.as_str()))
     {
         return Err("external provider config contains an unsupported field");
+    }
+    if let Some(efforts) = config
+        .get("reasoning_efforts")
+        .filter(|value| !value.is_null())
+    {
+        if !efforts.as_array().is_some_and(|values| {
+            values.iter().all(|v| {
+                v.as_str().is_some_and(|s| {
+                    matches!(
+                        s,
+                        "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
+                    )
+                })
+            })
+        }) {
+            return Err("reasoning_efforts must be an array of supported effort names");
+        }
     }
     if config
         .get("api_key")
@@ -169,10 +188,9 @@ pub fn validate_external_provider_config(config: &serde_json::Value) -> Result<(
     // `api_key` is pool-level metadata rather than part of `ProviderConfig`, so
     // remove it exactly as the runtime loader does before deserializing.
     let mut backend_config = serde_json::Value::Object(config.clone());
-    backend_config
-        .as_object_mut()
-        .expect("backend config was constructed from an object")
-        .remove("api_key");
+    if let Some(fields) = backend_config.as_object_mut() {
+        fields.remove("api_key");
+    }
     serde_json::from_value::<ProviderConfig>(backend_config)
         .map_err(|_| "external provider config does not match the backend schema")?;
 
@@ -286,6 +304,7 @@ pub struct ExternalProvider {
     backend: Arc<dyn ExternalBackend>,
     config: BackendConfig,
     model_name: String,
+    reasoning_efforts: Option<Vec<String>>,
     enforced_request_body: std::collections::HashMap<String, serde_json::Value>,
 }
 
@@ -395,6 +414,7 @@ impl ExternalProvider {
             backend,
             config,
             model_name: effective_model_name,
+            reasoning_efforts: None,
             enforced_request_body,
         }
     }
@@ -405,6 +425,34 @@ impl ExternalProvider {
     }
 
     /// Get the model name
+    pub fn with_reasoning_efforts(mut self, efforts: Option<Vec<String>>) -> Self {
+        self.reasoning_efforts = efforts;
+        self
+    }
+
+    fn prepare_chat_reasoning(
+        &self,
+        params: &mut ChatCompletionParams,
+    ) -> Result<(), CompletionError> {
+        reasoning::validate(&params.extra, self.reasoning_efforts.as_deref())?;
+        reasoning::normalize_chat(&mut params.extra, &self.config.base_url)?;
+        // Anthropic's raw-sidecar adapter must see the same effective controls
+        // as typed callers (including configured defaults).
+        if let Some(original) = params
+            .original_request
+            .as_mut()
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            for key in ["reasoning_effort", "reasoning", "output_config", "thinking"] {
+                original.remove(key);
+                if let Some(value) = params.extra.get(key) {
+                    original.insert(key.into(), value.clone());
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn model_name(&self) -> &str {
         &self.model_name
     }
@@ -473,6 +521,7 @@ impl InferenceProvider for ExternalProvider {
         params.strip_client_priority();
         strip_internal_keys(&mut params.extra);
         self.inject_extra_request_body(&mut params.extra);
+        self.prepare_chat_reasoning(&mut params)?;
         self.backend
             .chat_completion_stream(&self.config, &self.model_name, params)
             .await
@@ -487,6 +536,7 @@ impl InferenceProvider for ExternalProvider {
         params.strip_client_priority();
         strip_internal_keys(&mut params.extra);
         self.inject_extra_request_body(&mut params.extra);
+        self.prepare_chat_reasoning(&mut params)?;
         self.backend
             .chat_completion(&self.config, &self.model_name, params)
             .await
@@ -636,6 +686,7 @@ impl InferenceProvider for ExternalProvider {
             CompletionError::CompletionError(format!("Invalid Responses body: {e}"))
         })?;
         self.inject_extra_request_body(&mut fields);
+        reasoning::validate(&fields, self.reasoning_efforts.as_deref())?;
         let body = serde_json::to_value(fields)
             .map_err(|e| CompletionError::CompletionError(e.to_string()))?;
         self.backend
@@ -654,6 +705,10 @@ impl InferenceProvider for ExternalProvider {
         &self,
         request: AnthropicRawRequest,
     ) -> Result<AnthropicRawResponse, AnthropicRawError> {
+        let fields = serde_json::from_value(request.body.clone())
+            .map_err(|_| AnthropicRawError::InvalidRequest("Request must be an object".into()))?;
+        reasoning::validate(&fields, self.reasoning_efforts.as_deref())
+            .map_err(|error| AnthropicRawError::InvalidRequest(error.to_string()))?;
         self.backend
             .anthropic_raw(&self.config, &self.model_name, request)
             .await
@@ -666,7 +721,7 @@ impl InferenceProvider for ExternalProvider {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::non_attested::external::*;
     use std::collections::HashMap;
 
     #[test]

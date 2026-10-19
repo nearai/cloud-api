@@ -90,6 +90,7 @@ mod patroni_failover;
 mod privacy_classify;
 mod privacy_redact;
 mod provider_errors;
+mod provider_registry;
 mod reasoning;
 mod reporting_usage;
 mod repositories;

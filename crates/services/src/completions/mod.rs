@@ -4060,6 +4060,7 @@ mod tests {
             .unwrap()["textPricing"]
             .clone();
         crate::models::ModelWithPricing {
+            upcoming_pricing: None,
             id: Uuid::new_v4(),
             model_name: "openai/gpt-5.6-sol".to_string(),
             model_display_name: "GPT-5.6 Sol".to_string(),

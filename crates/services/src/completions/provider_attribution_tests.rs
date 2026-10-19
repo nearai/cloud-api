@@ -47,6 +47,7 @@ impl ports::OrganizationConcurrentLimitRepository for StaticOrganizationLimitRep
 
 pub(super) fn test_model(model_name: &str) -> ModelWithPricing {
     ModelWithPricing {
+        upcoming_pricing: None,
         id: Uuid::new_v4(),
         model_name: model_name.to_string(),
         model_display_name: model_name.to_string(),

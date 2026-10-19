@@ -183,3 +183,93 @@ async fn malformed_proxy_document_fails_the_run() {
     cfg.proxy_fetcher = Some(Arc::new(|_t| Box::pin(async { Ok("{".to_string()) })));
     failing_run_keeps_pins_and_writes_evidence(&cfg, "malformed").await;
 }
+
+fn read_admin_pins(dir: &std::path::Path) -> serde_json::Value {
+    serde_json::from_str(&std::fs::read_to_string(dir.join("out/tinfoil-admin-pins.json")).unwrap())
+        .unwrap()
+}
+
+#[tokio::test]
+async fn admin_pins_artifact_has_only_live_verified_uncompiled_rows() {
+    let (_s, cfg) = server().await;
+    let dir = std::env::temp_dir().join(format!("tinfoil-sync-admin-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let pins_path = dir.join("pins.json");
+    std::fs::write(&pins_path, TinfoilPins::default().to_canonical_json()).unwrap();
+    let args = Args {
+        pins: pins_path.clone(),
+        out_dir: dir.join("out"),
+        evidence_dir: None,
+    };
+    let client = reqwest::Client::new();
+
+    run_sync(&args, &client, &cfg).await.unwrap();
+    let doc = read_admin_pins(&dir);
+    let rows = doc["model_pins"].as_array().unwrap();
+    // Only the release whose Sigstore bundle verified is offered; the other
+    // proxy entries had no attestation.
+    assert_eq!(rows.len(), 1, "{doc}");
+    assert_eq!(rows[0]["slug"], "deepseek-v4-1-flash");
+    assert_eq!(rows[0]["repo"], REPO);
+    assert_eq!(rows[0]["tag"], "v0.0.3");
+    let raw: serde_json::Value = serde_json::from_str(MODEL_BUNDLE).unwrap();
+    assert_eq!(rows[0]["sigstore_bundle"], raw);
+
+    // Now compiled: the next run offers nothing.
+    run_sync(&args, &client, &cfg).await.unwrap();
+    assert_eq!(read_admin_pins(&dir), serde_json::json!({"model_pins": []}));
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[tokio::test]
+async fn admin_pins_artifact_empty_on_unchanged_and_failing_runs() {
+    let (_s, cfg) = server().await;
+    let dir = std::env::temp_dir().join(format!("tinfoil-sync-admin-dry-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    // A run that adds nothing to the pins file still writes the artifact.
+    let pins_path = dir.join("pins.json");
+    std::fs::write(&pins_path, TinfoilPins::default().to_canonical_json()).unwrap();
+    let args = Args {
+        pins: pins_path.clone(),
+        out_dir: dir.join("out"),
+        evidence_dir: None,
+    };
+    let client = reqwest::Client::new();
+    run_sync(&args, &client, &cfg).await.unwrap();
+    std::fs::remove_dir_all(dir.join("out")).unwrap();
+    let before = std::fs::read_to_string(&pins_path).unwrap();
+    run_sync(&args, &client, &cfg).await.unwrap();
+    assert_eq!(std::fs::read_to_string(&pins_path).unwrap(), before);
+    assert_eq!(read_admin_pins(&dir), serde_json::json!({"model_pins": []}));
+    // A failing run writes it too.
+    std::fs::remove_dir_all(dir.join("out")).unwrap();
+    let mut bad = cfg;
+    bad.proxy_fetcher = Some(Arc::new(|_t| Box::pin(async { Err("down".to_string()) })));
+    run_sync(&args, &client, &bad).await.unwrap_err();
+    assert_eq!(read_admin_pins(&dir), serde_json::json!({"model_pins": []}));
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[tokio::test]
+async fn admin_pins_artifact_is_written_even_when_the_probe_fails_fatally() {
+    let (_s, mut cfg) = server().await;
+    // The ATC fetch itself fails, so the probe errors before producing output.
+    cfg.atc_url = format!("{}/missing-atc", cfg.atc_url.trim_end_matches("/atc"));
+    let dir = std::env::temp_dir().join(format!("tinfoil-sync-fatal-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let pins_path = dir.join("pins.json");
+    std::fs::write(&pins_path, TinfoilPins::default().to_canonical_json()).unwrap();
+    let args = Args {
+        pins: pins_path,
+        out_dir: dir.join("out"),
+        evidence_dir: None,
+    };
+    run_sync(&args, &reqwest::Client::new(), &cfg)
+        .await
+        .unwrap_err();
+    assert_eq!(read_admin_pins(&dir), serde_json::json!({"model_pins": []}));
+    std::fs::remove_dir_all(&dir).unwrap();
+}

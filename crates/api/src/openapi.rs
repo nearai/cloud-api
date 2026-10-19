@@ -219,6 +219,7 @@ use utoipa::{Modify, OpenApi};
         crate::routes::attestation::signature::get_signature,
         crate::routes::attestation::report::get_attestation_report,
         crate::routes::attestation::ita_token::get_ita_token,
+        crate::routes::attestation::pins::get_attested_pins,
     ),
     components(
         schemas(
@@ -227,7 +228,7 @@ use utoipa::{Modify, OpenApi};
             // Core API models
             ChatCompletionRequest, ChatCompletionResponse, Message, CompletionUsage,
             CompletionRequest, CompletionPrompt, StopSequences, CompletionResponse,
-            CompletionChoice, ModelsResponse, ModelInfo, ModelPricing, TopProvider, ErrorResponse,
+            CompletionChoice, ModelsResponse, ModelInfo, ModelPricing, UpcomingModelPricingInfo, TopProvider, ErrorResponse,
             // Image generation models
             ImageGenerationRequest, ImageGenerationResponse, ImageData,
             // Audio transcription models
@@ -305,7 +306,7 @@ use utoipa::{Modify, OpenApi};
             crate::routes::attestation::NvidiaPayload,
             crate::routes::attestation::QuoteResponse,
             // Model pricing models
-            ModelListResponse, ModelWithPricing, AdminModelListResponse, AdminModelWithPricing,
+            ModelListResponse, ModelWithPricing, UpcomingPricing, AdminModelListResponse, AdminModelWithPricing,
             DecimalPrice, DecimalPriceRequest, ModelMetadata,
             ServiceResponse, ServiceListResponse,
             AdminServiceResponse, AdminServiceListResponse, CreateServiceRequest, UpdateServiceRequest,

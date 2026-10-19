@@ -10,7 +10,7 @@ use crate::{
     BufferedSSEParser, ChatCompletionParams, ChatCompletionResponse, ChatCompletionResponseChoice,
     ChatCompletionResponseWithBytes, ChatResponseMessage, CompletionError, ImageData,
     ImageGenerationError, ImageGenerationParams, ImageGenerationResponse,
-    ImageGenerationResponseWithBytes, MessageRole, StreamingResult, TokenUsage,
+    ImageGenerationResponseWithBytes, MessageRole, StreamingResult,
 };
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -95,13 +95,10 @@ fn convert_to_openai_response(
         }],
         service_tier: None,
         system_fingerprint: None,
-        usage: TokenUsage {
-            prompt_tokens: gemini_response.usage_metadata.prompt_token_count,
-            completion_tokens: gemini_response.usage_metadata.candidates_token_count,
-            total_tokens: gemini_response.usage_metadata.total_token_count,
-            prompt_tokens_details: None,
-            ..Default::default()
-        },
+        usage: gemini_response
+            .usage_metadata
+            .unwrap_or_default()
+            .to_token_usage(),
         prompt_logprobs: None,
         prompt_token_ids: None,
         kv_transfer_params: None,
@@ -682,6 +679,216 @@ mod tests {
             .is_none());
     }
 
+    fn type_array_schema() -> serde_json::Value {
+        serde_json::json!({
+            "type": ["object"],
+            "additionalProperties": false,
+            "properties": {
+                "name": {
+                    "type": ["string", "null"],
+                    "description": "Optional display name"
+                },
+                "values": {
+                    "type": "array",
+                    "items": {
+                        "type": ["object"],
+                        "properties": {
+                            "value": {"type": ["null", "string", "number"]}
+                        },
+                        "required": ["value"]
+                    }
+                },
+                "status": {"type": ["string"], "enum": ["ready", "pending"]},
+                "details": {
+                    "type": ["object", "null"],
+                    "properties": {"label": {"type": "string"}},
+                    "required": ["label"],
+                    "propertyOrdering": ["label"]
+                },
+                "tags": {
+                    "type": ["null", "array"],
+                    "items": {"type": "string"},
+                    "minItems": 1
+                },
+                "enum_status": {
+                    "type": ["string", "null"],
+                    "nullable": true,
+                    "enum": ["ready", "pending"]
+                },
+                "choice": {
+                    "anyOf": [
+                        {"type": ["boolean", "null"]},
+                        {"type": ["integer"]}
+                    ]
+                }
+            },
+            "required": ["name", "values"]
+        })
+    }
+
+    fn normalized_type_array_schema() -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "nullable": true,
+                    "description": "Optional display name"
+                },
+                "values": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "value": {
+                                "anyOf": [
+                                    {"type": "null"}, {"type": "string"}, {"type": "number"}
+                                ]
+                            }
+                        },
+                        "required": ["value"]
+                    }
+                },
+                "status": {"type": "string", "enum": ["ready", "pending"]},
+                "details": {
+                    "type": "object",
+                    "nullable": true,
+                    "properties": {"label": {"type": "string"}},
+                    "required": ["label"],
+                    "propertyOrdering": ["label"]
+                },
+                "tags": {
+                    "type": "array",
+                    "nullable": true,
+                    "items": {"type": "string"},
+                    "minItems": 1
+                },
+                "enum_status": {"type": "string", "enum": ["ready", "pending"]},
+                "choice": {
+                    "anyOf": [
+                        {"type": "boolean", "nullable": true},
+                        {"type": "integer"}
+                    ]
+                }
+            },
+            "required": ["name", "values"]
+        })
+    }
+
+    /// #1189: the serialized tool declaration must use scalar types, including
+    /// nullable properties and unions nested beneath items and anyOf.
+    /// FunctionDefinition does not retain tool strict; this covers schema conversion.
+    #[test]
+    fn test_build_request_normalizes_tool_parameter_type_arrays() {
+        let backend = GeminiBackend::new();
+        let tool = serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "save_record",
+                "description": "Save a record",
+                "parameters": type_array_schema()
+            }
+        });
+        let mut params = base_params();
+        params.tools = Some(vec![serde_json::from_value(tool).unwrap()]);
+
+        let body = serde_json::to_value(backend.build_request(&params)).unwrap();
+        let declaration = &body["tools"][0]["functionDeclarations"][0];
+        assert_eq!(declaration["name"], "save_record");
+        assert_eq!(declaration["description"], "Save a record");
+        assert_eq!(declaration["parameters"], normalized_type_array_schema());
+    }
+
+    #[test]
+    fn test_build_request_normalizes_non_strict_response_schema_type_arrays() {
+        let backend = GeminiBackend::new();
+        for strict in [None, Some(false)] {
+            let mut response_format = serde_json::json!({
+                "type": "json_schema",
+                "json_schema": {"name": "record", "schema": type_array_schema()}
+            });
+            if let Some(strict) = strict {
+                response_format["json_schema"]["strict"] = serde_json::json!(strict);
+            }
+            let mut params = base_params();
+            params
+                .extra
+                .insert("response_format".to_string(), response_format);
+
+            let body = serde_json::to_value(backend.build_request(&params)).unwrap();
+            let config = &body["generationConfig"];
+            assert_eq!(config["responseMimeType"], "application/json");
+            assert_eq!(config["responseSchema"], normalized_type_array_schema());
+            assert!(config.get("responseJsonSchema").is_none());
+        }
+    }
+
+    #[test]
+    fn test_build_request_preserves_strict_response_schema_type_arrays() {
+        let backend = GeminiBackend::new();
+        let original_schema = type_array_schema();
+        let mut params = base_params();
+        params.extra.insert(
+            "response_format".to_string(),
+            serde_json::json!({
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "record",
+                    "strict": true,
+                    "schema": original_schema.clone()
+                }
+            }),
+        );
+
+        let body = serde_json::to_value(backend.build_request(&params)).unwrap();
+        let config = &body["generationConfig"];
+        assert_eq!(config["responseMimeType"], "application/json");
+        assert_eq!(config["responseJsonSchema"], original_schema);
+        assert!(config.get("responseSchema").is_none());
+    }
+
+    #[test]
+    fn test_build_request_type_intersection_does_not_restore_null() {
+        let backend = GeminiBackend::new();
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "value": {
+                    "type": ["string", "boolean"],
+                    "anyOf": [{"type": ["string", "null"]}]
+                }
+            },
+            "required": ["value"]
+        });
+        let expected = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "value": {"anyOf": [{"anyOf": [{"type": "string"}]}]}
+            },
+            "required": ["value"]
+        });
+        let mut params = base_params();
+        params.tools = Some(vec![serde_json::from_value(serde_json::json!({
+            "type": "function",
+            "function": {"name": "save_value", "parameters": schema.clone()}
+        }))
+        .unwrap()]);
+        params.extra.insert(
+            "response_format".to_string(),
+            serde_json::json!({
+                "type": "json_schema",
+                "json_schema": {"name": "value", "schema": schema}
+            }),
+        );
+
+        let body = serde_json::to_value(backend.build_request(&params)).unwrap();
+        assert_eq!(
+            body["tools"][0]["functionDeclarations"][0]["parameters"],
+            expected
+        );
+        assert_eq!(body["generationConfig"]["responseSchema"], expected);
+    }
+
     #[test]
     fn test_strip_vendor_prefix_google() {
         assert_eq!(
@@ -796,5 +1003,167 @@ mod tests {
         let choice = &openai.choices[0];
         assert_eq!(choice.message.content.as_deref(), Some("Hi!"));
         assert_eq!(choice.finish_reason.as_deref(), Some("stop"));
+    }
+
+    // Billing: thinking is reported outside `candidatesTokenCount` and billed
+    // by Google at the output rate. Counts are from a `gemini-2.5-pro` reply to
+    // a short arithmetic prompt (26 visible tokens, 2,706 thinking tokens).
+    #[test]
+    fn test_convert_to_openai_response_counts_thinking_and_cache() {
+        let json = r#"{
+            "candidates": [{
+                "content": {"role": "model", "parts": [{"text": "42"}]},
+                "finishReason": "STOP",
+                "index": 0
+            }],
+            "usageMetadata": {
+                "promptTokenCount": 71,
+                "cachedContentTokenCount": 64,
+                "candidatesTokenCount": 26,
+                "thoughtsTokenCount": 2706,
+                "totalTokenCount": 2803
+            }
+        }"#;
+        let response: GeminiResponse = serde_json::from_str(json).unwrap();
+        let openai = convert_to_openai_response(response, "google/gemini-2.5-pro").unwrap();
+
+        assert_eq!(openai.usage.prompt_tokens, 71);
+        assert_eq!(openai.usage.completion_tokens, 2732);
+        assert_eq!(openai.usage.total_tokens, 2803);
+        assert_eq!(openai.usage.cached_tokens(), 64);
+        assert_eq!(openai.usage.reasoning_tokens(), Some(2706));
+
+        // What the client sees.
+        let wire = serde_json::to_value(&openai).unwrap();
+        assert_eq!(
+            wire["usage"],
+            serde_json::json!({
+                "prompt_tokens": 71,
+                "completion_tokens": 2732,
+                "total_tokens": 2803,
+                "prompt_tokens_details": {"cached_tokens": 64},
+                "completion_tokens_details": {"reasoning_tokens": 2706}
+            })
+        );
+    }
+
+    #[test]
+    fn test_convert_to_openai_response_usage_without_thinking_or_cache() {
+        let json = r#"{
+            "candidates": [{
+                "content": {"role": "model", "parts": [{"text": "Hi!"}]},
+                "finishReason": "STOP",
+                "index": 0
+            }],
+            "usageMetadata": {
+                "promptTokenCount": 3,
+                "candidatesTokenCount": 2,
+                "totalTokenCount": 5
+            }
+        }"#;
+        let response: GeminiResponse = serde_json::from_str(json).unwrap();
+        let openai = convert_to_openai_response(response, "google/gemini-2.0-flash").unwrap();
+
+        let wire = serde_json::to_value(&openai).unwrap();
+        assert_eq!(
+            wire["usage"],
+            serde_json::json!({
+                "prompt_tokens": 3,
+                "completion_tokens": 2,
+                "total_tokens": 5
+            })
+        );
+    }
+
+    /// Full HTTP path, non-streaming and streaming, against a stand-in for
+    /// Google's API: both must report the same usage for the same request.
+    #[tokio::test]
+    async fn test_backend_reports_thinking_and_cache_on_both_paths() {
+        use futures_util::StreamExt;
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let usage_metadata = serde_json::json!({
+            "promptTokenCount": 71,
+            "cachedContentTokenCount": 64,
+            "candidatesTokenCount": 26,
+            "thoughtsTokenCount": 2706,
+            "totalTokenCount": 2803
+        });
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/models/gemini-2.5-pro:generateContent"))
+            .and(header("x-goog-api-key", "upstream-secret"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "candidates": [{
+                    "content": {"role": "model", "parts": [{"text": "42"}]},
+                    "finishReason": "STOP"
+                }],
+                "usageMetadata": usage_metadata
+            })))
+            .mount(&server)
+            .await;
+        let sse = format!(
+            "data: {}\n\ndata: {}\n\n",
+            serde_json::json!({
+                "candidates": [{"content": {"role": "model", "parts": [{"text": "4"}]}}],
+                "usageMetadata": {
+                    "promptTokenCount": 71,
+                    "cachedContentTokenCount": 64,
+                    "candidatesTokenCount": 1,
+                    "thoughtsTokenCount": 2706,
+                    "totalTokenCount": 2778
+                }
+            }),
+            serde_json::json!({
+                "candidates": [{
+                    "content": {"role": "model", "parts": [{"text": "2"}]},
+                    "finishReason": "STOP"
+                }],
+                "usageMetadata": usage_metadata
+            }),
+        );
+        Mock::given(method("POST"))
+            .and(path("/models/gemini-2.5-pro:streamGenerateContent"))
+            .and(header("x-goog-api-key", "upstream-secret"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(sse, "text/event-stream"))
+            .mount(&server)
+            .await;
+
+        let config = BackendConfig {
+            base_url: server.uri(),
+            api_key: "upstream-secret".to_string(),
+            ..Default::default()
+        };
+        let backend = GeminiBackend::new();
+
+        let response = backend
+            .chat_completion(&config, "google/gemini-2.5-pro", base_params())
+            .await
+            .expect("completion should succeed");
+        let non_streaming = response.response.usage;
+
+        let mut stream = backend
+            .chat_completion_stream(&config, "google/gemini-2.5-pro", base_params())
+            .await
+            .expect("stream should start");
+        let mut streaming = None;
+        while let Some(event) = stream.next().await {
+            let event = event.expect("stream event should parse");
+            if let Some(crate::StreamChunk::Chat(chunk)) = event.chunk {
+                if chunk.usage.is_some() {
+                    streaming = chunk.usage;
+                }
+            }
+        }
+        let streaming = streaming.expect("stream should carry usage");
+
+        for usage in [&non_streaming, &streaming] {
+            assert_eq!(usage.prompt_tokens, 71);
+            assert_eq!(usage.completion_tokens, 2732);
+            assert_eq!(usage.total_tokens, 2803);
+            assert_eq!(usage.cached_tokens(), 64);
+            assert_eq!(usage.reasoning_tokens(), Some(2706));
+        }
     }
 }

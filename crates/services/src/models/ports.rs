@@ -36,6 +36,9 @@ pub struct ModelWithPricing {
     /// (`Some(0)` = genuinely free, rendered as `"0"`).
     pub cache_read_cost_per_token: Option<i64>,
     pub text_pricing: Option<crate::usage::TextPricingProfile>,
+    /// Earliest pending change, projected onto the current prices. Loaded with
+    /// the model and shared by the catalog and inference resolve caches.
+    pub upcoming_pricing: Option<super::UpcomingModelPricing>,
 
     // Model metadata
     pub context_length: i32,

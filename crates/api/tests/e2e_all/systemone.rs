@@ -349,11 +349,24 @@ async fn systemone_rejects_invalid_requests_before_inference() {
     .await;
     let mut invalid = vec![
         json!({"model":model,"state":"x","questions":{}}),
-        json!({"model":model,"state":null,"questions":{"q":{"type":"noul"}}}),
-        json!({"model":model,"state":"x","questions":{"q":{"type":"choice","criteria":{}}}}),
-        json!({"model":model,"state":"x","questions":{"q":{"type":"score","criteria":[]}}}),
+        json!({"model":model,"state":null,"questions":{"q":{"type":"noul","instructions":"Is this urgent?"}}}),
+        json!({"model":model,"state":"x","questions":{"q":{"type":"choice","instructions":"Choose a team.","criteria":{}}}}),
+        json!({"model":model,"state":"x","questions":{"q":{"type":"score","instructions":"Rate urgency.","criteria":[]}}}),
         request("unknown-model"),
     ];
+    for question in [
+        json!({"type":"noul"}),
+        json!({"type":"choice","criteria":{"billing":null,"other":null}}),
+        json!({"type":"score","criteria":["low","high"]}),
+    ] {
+        for instructions in [None, Some(Value::Null)] {
+            let mut question = question.clone();
+            if let Some(value) = instructions {
+                question["instructions"] = value;
+            }
+            invalid.push(json!({"model":model,"state":"x","questions":{"q":question}}));
+        }
+    }
     let mut streaming = request(&model);
     streaming["stream"] = json!(true);
     invalid.push(streaming);
@@ -367,9 +380,10 @@ async fn systemone_rejects_invalid_requests_before_inference() {
             .add_header("Authorization", format!("Bearer {key}"))
             .json(&body)
             .await;
-        assert!(
-            matches!(response.status_code().as_u16(), 400 | 422),
-            "{}",
+        assert_eq!(
+            response.status_code(),
+            400,
+            "request: {body}; response: {}",
             response.text()
         );
     }

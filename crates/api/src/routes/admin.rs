@@ -1096,6 +1096,7 @@ pub async fn batch_upsert_models(
     let api_models: Vec<ModelWithPricing> = updated_models
         .into_iter()
         .map(|(model_name, updated_model)| ModelWithPricing {
+            upcoming_pricing: None,
             model_id: model_name,
             input_cost_per_token: DecimalPrice {
                 amount: updated_model.input_cost_per_token,
@@ -1899,6 +1900,7 @@ pub async fn deprecate_model(
     }
 
     let to_api = |model_name: String, m: services::admin::ModelPricing| ModelWithPricing {
+        upcoming_pricing: None,
         model_id: model_name,
         input_cost_per_token: DecimalPrice {
             amount: m.input_cost_per_token,
@@ -4509,6 +4511,10 @@ pub async fn get_admin_setting(
 /// other instances, redeploy; per-org `fallback_disabled` only excludes
 /// registered fallback providers for that organization and is not a
 /// source-wide stop.
+///
+/// A PATCH setting `tinfoil_trust.model_pins` verifies each pinned Sigstore
+/// bundle offline (up to 32, a few ms each) synchronously in the request,
+/// which is acceptable for an admin-only write path.
 #[utoipa::path(
     patch,
     path = "/v1/admin/settings/{key}",

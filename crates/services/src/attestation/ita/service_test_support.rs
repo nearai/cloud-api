@@ -262,6 +262,7 @@ impl ModelsRepository for FakeModelsRepository {
 
 fn canonical_model() -> ModelWithPricing {
     ModelWithPricing {
+        upcoming_pricing: None,
         id: Uuid::new_v4(),
         model_name: "canonical-model".to_string(),
         model_display_name: "Canonical".to_string(),

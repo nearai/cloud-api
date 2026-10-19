@@ -942,6 +942,10 @@ impl AdminService for AdminServiceImpl {
             existing
         };
 
+        // The schedule is now durable. Invalidate before any fallible email
+        // work, so a delivery failure cannot hide an announced pricing change.
+        self.models_service.invalidate_models_cache().await;
+
         // Whether freshly inserted or resumed, the request body must
         // describe the batch that is actually persisted — emails below are
         // built from the persisted rows, never from the request.
@@ -1126,7 +1130,8 @@ impl AdminService for AdminServiceImpl {
         cancelled_by_user_id: Option<uuid::Uuid>,
         cancelled_by_user_email: Option<String>,
     ) -> Result<ScheduledPricingChange, AdminError> {
-        self.repository
+        let change = self
+            .repository
             .cancel_scheduled_pricing_change(id, cancelled_by_user_id, cancelled_by_user_email)
             .await
             .map_err(|e| AdminError::InternalError(e.to_string()))?
@@ -1134,7 +1139,9 @@ impl AdminService for AdminServiceImpl {
                 AdminError::PricingChangeNotFound(format!(
                     "Scheduled pricing change '{id}' not found or no longer pending"
                 ))
-            })
+            })?;
+        self.models_service.invalidate_models_cache().await;
+        Ok(change)
     }
 
     async fn update_organization_concurrent_limit(

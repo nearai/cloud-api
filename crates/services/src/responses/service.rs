@@ -1475,7 +1475,7 @@ impl ResponseServiceImpl {
 
             // Create completion request (names not included - tracked via database analytics)
             // `session_hint` is intentionally always None: /responses does not read or
-            // forward `x-session-id` (unlike /chat/completions, see routes/completions.rs).
+            // forward `x-session-id` (unlike /chat/completions, see routes/completions/chat.rs).
             // Covered-model traffic entering through /responses therefore only ever gets
             // `client` affinity by falling through to prefix-based derivation (or none
             // under E2EE). This is an intentional scope cut, not an oversight: the

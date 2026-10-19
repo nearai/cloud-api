@@ -5,9 +5,9 @@ fn request() -> SystemOneRequest {
     serde_json::from_value(json!({
         "model":"jev-latest", "state":{"message":"Refund please"},
         "questions":{
-            "billing":{"type":"noul"},
-            "route":{"type":"choice","criteria":{"billing":null,"other":"Other requests"}},
-            "urgency":{"type":"score","criteria":["low",{"label":"high"}]}
+            "billing":{"type":"noul","instructions":"Is this about billing?"},
+            "route":{"type":"choice","instructions":"Which team should handle this?","criteria":{"billing":null,"other":"Other requests"}},
+            "urgency":{"type":"score","instructions":"How urgent is this?","criteria":["low",{"label":"high"}]}
         }
     }))
     .unwrap()
@@ -41,13 +41,39 @@ fn mixed_questions_preserve_exact_response_bytes_and_extensions() {
 }
 
 #[test]
+fn question_instructions_are_required_and_preserve_structured_content() {
+    for question in request().questions.values() {
+        let mut value = serde_json::to_value(question).unwrap();
+        value.as_object_mut().unwrap().remove("instructions");
+        let error = serde_json::from_value::<Question>(value.clone()).unwrap_err();
+        assert!(error.to_string().contains("missing field `instructions`"));
+
+        value["instructions"] = json!(null);
+        assert!(serde_json::from_value::<Question>(value.clone()).is_err());
+
+        for instructions in [
+            json!("Evaluate the request."),
+            json!({"task":"Evaluate the request."}),
+            json!(["Evaluate the request.", {"context":"Support ticket"}]),
+        ] {
+            value["instructions"] = instructions.clone();
+            let parsed: Question = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(
+                serde_json::to_value(parsed).unwrap()["instructions"],
+                instructions
+            );
+        }
+    }
+}
+
+#[test]
 fn rejects_invalid_question_shapes_and_bounds() {
     for patch in [
         json!({"type":"unknown"}),
-        json!({"type":"choice","criteria":{}}),
-        json!({"type":"score","criteria":[]}),
-        json!({"type":"score","criteria":vec!["level";11]}),
-        json!({"type":"noul","extra":"ignored?"}),
+        json!({"type":"choice","instructions":"Choose a team.","criteria":{}}),
+        json!({"type":"score","instructions":"Rate urgency.","criteria":[]}),
+        json!({"type":"score","instructions":"Rate urgency.","criteria":vec!["level";11]}),
+        json!({"type":"noul","instructions":"Is this urgent?","extra":"ignored?"}),
     ] {
         let value = json!({"model":"jev","state":"content","questions":{"q":patch}});
         assert!(serde_json::from_value::<SystemOneRequest>(value)
@@ -56,7 +82,7 @@ fn rejects_invalid_question_shapes_and_bounds() {
     }
     for state in [json!(null), json!(12), json!(true)] {
         assert!(serde_json::from_value::<SystemOneRequest>(json!({
-            "model":"jev","state":state,"questions":{"q":{"type":"noul"}}
+            "model":"jev","state":state,"questions":{"q":{"type":"noul","instructions":"Is this urgent?"}}
         }))
         .is_err());
     }

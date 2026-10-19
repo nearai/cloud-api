@@ -94,33 +94,24 @@ pub(super) async fn bill_auto_redact_classify(
     if classify_tokens <= 0 {
         return; // nothing to bill
     }
-    // Cap an anomalous count at the same `MAX_REASONABLE_TOKENS` the explicit
-    // `/v1/privacy/{classify,redact}` paths use, emitting the same anomaly
-    // metric — so x-auto-redact (which shares the privacy-filter classify
-    // call) can't massively overcharge on a buggy/malicious provider response
-    // instead of just clamping to i32::MAX. See nearai/cloud-api#602 review.
-    const MAX_REASONABLE_TOKENS: i32 = 1_000_000;
-    let input_tokens = if classify_tokens > MAX_REASONABLE_TOKENS as i64 {
-        tracing::error!(
-            token_count = classify_tokens,
-            max_expected = MAX_REASONABLE_TOKENS,
-            model = auto_redact::DEFAULT_PII_MODEL,
-            "auto_redact: provider returned unreasonable classify token count - capping"
-        );
-        let model_tag = format!("model:{}", auto_redact::DEFAULT_PII_MODEL);
-        let reason_tag = format!(
-            "reason:{}",
-            services::metrics::consts::REASON_TOKEN_OVERFLOW
-        );
-        app_state.metrics_service.record_count(
-            services::metrics::consts::METRIC_PROVIDER_TOKEN_ANOMALIES,
-            1,
-            &[model_tag.as_str(), reason_tag.as_str()],
-        );
-        MAX_REASONABLE_TOKENS
-    } else {
-        classify_tokens as i32 // safe: 0 < classify_tokens <= 1_000_000
-    };
+    // Cap an anomalous count through the same guard the explicit
+    // `/v1/privacy/{classify,redact}`, rerank and embeddings paths use, so
+    // x-auto-redact (which shares the privacy-filter classify call) can't
+    // massively overcharge on a buggy/malicious provider response. Counts past
+    // i32 saturate first and are then capped like any other overflow. The
+    // zero branch is unreachable: non-positive counts returned above. See
+    // nearai/cloud-api#602 review.
+    let input_tokens = super::billing::cap_reported_tokens(
+        app_state.metrics_service.as_ref(),
+        auto_redact::DEFAULT_PII_MODEL,
+        api_key.organization.id.0,
+        i32::try_from(classify_tokens).unwrap_or(i32::MAX),
+        &super::billing::TokenAnomalyMessages {
+            overflow: "auto_redact: provider returned unreasonable classify token count - capping",
+            zero: "auto_redact: provider returned zero classify tokens",
+            anomaly: "auto_redact: token count anomaly; check provider logs and configuration",
+        },
+    );
 
     let model = match app_state
         .models_service
@@ -147,27 +138,18 @@ pub(super) async fn bill_auto_redact_classify(
     };
 
     let usage_request = services::usage::RecordUsageServiceRequest {
-        organization_id: api_key.organization.id.0,
-        workspace_id: api_key.workspace.id.0,
-        api_key_id,
-        model_id: model.id,
         input_tokens,
-        output_tokens: 0,
-        cache_read_tokens: 0,
-        cache_write: None,
-        profiled_cache_write_tokens: 0,
-        requested_service_tier: None,
-        provider_service_tier: None,
-        inference_type: services::usage::ports::InferenceType::PrivacyClassify,
-        ttft_ms: None,
-        avg_itl_ms: None,
         inference_id: Some(Uuid::new_v4()),
-        provider_request_id: None,
         stop_reason: Some(services::usage::StopReason::Completed),
-        response_id: None,
-        image_count: None,
-        discount: None,
-        provider_attribution: services::usage::ProviderAttribution::default(),
+        ..services::usage::RecordUsageServiceRequest::base(
+            services::usage::BillingIdentity {
+                organization_id: api_key.organization.id.0,
+                workspace_id: api_key.workspace.id.0,
+                api_key_id,
+                model_id: model.id,
+            },
+            services::usage::ports::InferenceType::PrivacyClassify,
+        )
     };
 
     if let Err(e) = app_state.usage_service.record_usage(usage_request).await {

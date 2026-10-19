@@ -2526,6 +2526,20 @@ fn build_admin_routes_with_options(
         )
         .merge(
             Router::new()
+                .route(
+                    "/admin/organizations/{org_id}/trace-commons/credit",
+                    get(crate::routes::admin_trace_commons_credit::get_trace_commons_credit)
+                        .put(crate::routes::admin_trace_commons_credit::set_trace_commons_credit),
+                )
+                .layer(axum::Extension(
+                    database::repositories::trace_commons_credit::TraceCommonsCreditRepository::with_accounting_config(
+                        database.pool().clone(),
+                        &config.credit_allocation,
+                    ),
+                ))
+        )
+        .merge(
+            Router::new()
                 .route("/admin/organizations/{org_id}/usage-discount",
                     axum::routing::get(crate::routes::admin_usage_discount::get_usage_discount)
                         .put(crate::routes::admin_usage_discount::put_usage_discount))

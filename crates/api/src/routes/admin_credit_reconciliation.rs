@@ -45,7 +45,8 @@ pub struct CreditPositionResponse {
 
 #[derive(Debug, Serialize, ToSchema)]
 pub struct AccountingPositionResponse {
-    /// Positions keyed by credit type (grant, payment, staking_farm, or postpay).
+    /// Positions keyed by credit type (grant, payment, staking_farm, trace_commons,
+    /// transfer, or postpay).
     /// Includes active limits and recorded consumption for inactive types.
     pub credits: BTreeMap<String, CreditPositionResponse>,
     /// Historical consumption still lacking a credit type, in nano-USD.

@@ -153,6 +153,7 @@ async fn admin_metrics_credit_type_uses_saved_allocations() {
         ("&credit_type=grant", 3.0, 1, 1),
         ("&credit_type=payment", 8.0, 2, 2),
         ("&credit_type=staking_farm", 0.0, 0, 0),
+        ("&credit_type=trace_commons", 0.0, 0, 0),
     ] {
         let response = fixture
             .server

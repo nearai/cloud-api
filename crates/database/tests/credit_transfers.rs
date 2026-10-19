@@ -772,3 +772,167 @@ async fn opposite_transfers_and_concurrent_usage_keep_conservation() -> anyhow::
     assert!(row.get::<_, i64>("outgoing") + row.get::<_, i64>("consumed") <= 100);
     Ok(())
 }
+
+#[tokio::test]
+async fn trace_commons_credit_cannot_fund_a_transfer() -> anyhow::Result<()> {
+    use database::repositories::trace_commons_credit::TraceCommonsCreditRepository;
+
+    let pool = test_pool().await?;
+    let repository = CreditTransferRepository::new(pool.clone(), &Default::default());
+    let (sender, owner) = organization(&pool).await?;
+    let (recipient, _) = organization(&pool).await?;
+    let actor = TransferActor::Owner(owner);
+    // A whitelisted, reconciled reseller whose only credit is Trace Commons.
+    TraceCommonsCreditRepository::new(pool.clone())
+        .set_cumulative(sender.org_id, 100, "sha256:earned", None)
+        .await?;
+    repository
+        .policy(sender.org_id, Some((true, owner, "Reviewed reseller")))
+        .await?;
+
+    assert_eq!(
+        code(
+            repository
+                .transfer(
+                    sender.org_id,
+                    &actor,
+                    "trace-commons",
+                    &request(recipient.org_id, "trace_commons", 10)
+                )
+                .await
+        ),
+        "invalid_transfer_terms"
+    );
+    // Neither transferable source has capacity, so trace_commons cannot leak
+    // through them either.
+    for source in ["payment", "staking_farm"] {
+        assert_eq!(
+            code(
+                repository
+                    .transfer(
+                        sender.org_id,
+                        &actor,
+                        source,
+                        &request(recipient.org_id, source, 10)
+                    )
+                    .await
+            ),
+            "insufficient_posted_capacity"
+        );
+    }
+
+    let client = pool.get().await?;
+    let projections: i64 = client
+        .query_one(
+            "SELECT COUNT(*) FROM organization_credit_transfer_totals WHERE organization_id = ANY($1)",
+            &[&vec![sender.org_id, recipient.org_id]],
+        )
+        .await?
+        .get(0);
+    assert_eq!(projections, 0);
+    // The database refuses a trace_commons projection or ledger row as well.
+    assert!(client
+        .execute(
+            "INSERT INTO organization_credit_transfer_totals (organization_id, credit_type, outgoing) VALUES ($1, 'trace_commons', 1)",
+            &[&sender.org_id],
+        )
+        .await
+        .is_err());
+    let capacity = repository.capacity(sender.org_id, &actor).await?;
+    assert_eq!(capacity["credits"][0]["credit_type"], "trace_commons");
+    assert_eq!(capacity["credits"][0]["transferred_out"], 0);
+    assert_eq!(capacity["credits"][0]["available"], 100);
+    Ok(())
+}
+
+#[tokio::test]
+async fn trace_commons_writes_serialize_with_transfers_and_leave_projections_alone(
+) -> anyhow::Result<()> {
+    use database::repositories::trace_commons_credit::TraceCommonsCreditRepository;
+
+    let pool = test_pool().await?;
+    let repository = CreditTransferRepository::new(pool.clone(), &Default::default());
+    let trace_commons = TraceCommonsCreditRepository::new(pool.clone());
+    let (sender, owner) = organization(&pool).await?;
+    let (recipient, _) = organization(&pool).await?;
+    let actor = TransferActor::Owner(owner);
+    fund(&pool, sender.org_id, "payment", 100).await?;
+    repository
+        .policy(sender.org_id, Some((true, owner, "Reviewed reseller")))
+        .await?;
+
+    // Hold the shared organization accounting lock: a trace_commons write must
+    // wait for it (and time out), exactly as a transfer does.
+    let mut holder = pool.get().await?;
+    let held = holder.transaction().await?;
+    held.query_one(
+        "SELECT id FROM organizations WHERE id = $1 FOR UPDATE",
+        &[&sender.org_id],
+    )
+    .await?;
+    let blocked = trace_commons
+        .set_cumulative(sender.org_id, 50, "sha256:held", None)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        blocked
+            .downcast_ref::<database::repositories::trace_commons_credit::TraceCommonsCreditError>(
+            ),
+        Some(&database::repositories::trace_commons_credit::TraceCommonsCreditError::Conflict)
+    );
+    held.rollback().await?;
+    drop(holder);
+
+    let mut tasks = Vec::new();
+    for step in 0..5_i64 {
+        let repository = repository.clone();
+        let trace_commons = trace_commons.clone();
+        let actor = actor.clone();
+        let (sender, recipient) = (sender.org_id, recipient.org_id);
+        tasks.push(tokio::spawn(async move {
+            trace_commons
+                .set_cumulative(sender, 10 * (step + 1), "sha256:concurrent", None)
+                .await?;
+            repository
+                .transfer(
+                    sender,
+                    &actor,
+                    &format!("concurrent-{step}"),
+                    &request(recipient, "payment", 10),
+                )
+                .await?;
+            anyhow::Ok(())
+        }));
+    }
+    for task in tasks {
+        task.await??;
+    }
+
+    let capacity = repository.capacity(sender.org_id, &actor).await?;
+    let credits = capacity["credits"].as_array().unwrap();
+    let position = |kind: &str| {
+        credits
+            .iter()
+            .find(|credit| credit["credit_type"] == kind)
+            .cloned()
+            .unwrap()
+    };
+    assert_eq!(position("payment")["transferred_out"], 50);
+    assert_eq!(position("payment")["available"], 50);
+    assert_eq!(position("trace_commons")["gross_limit"], 50);
+    assert_eq!(position("trace_commons")["transferred_out"], 0);
+    assert_eq!(position("trace_commons")["effective_capacity"], 50);
+    let types: Vec<String> = pool
+        .get()
+        .await?
+        .query(
+            "SELECT credit_type FROM organization_credit_transfer_totals WHERE organization_id = ANY($1) ORDER BY credit_type",
+            &[&vec![sender.org_id, recipient.org_id]],
+        )
+        .await?
+        .iter()
+        .map(|row| row.get(0))
+        .collect();
+    assert_eq!(types, ["payment", "transfer"]);
+    Ok(())
+}

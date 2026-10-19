@@ -193,6 +193,8 @@ use utoipa::{Modify, OpenApi};
         crate::routes::admin_usage_hourly::recompute_usage_hourly,
         crate::routes::admin_usage_discount::get_usage_discount,
         crate::routes::admin_credit_reconciliation::reconcile_organization_credits,
+        crate::routes::admin_trace_commons_credit::set_trace_commons_credit,
+        crate::routes::admin_trace_commons_credit::get_trace_commons_credit,
         crate::routes::credit_transfers::create,
         crate::routes::credit_transfers::history,
         crate::routes::credit_transfers::detail,
@@ -254,6 +256,8 @@ use utoipa::{Modify, OpenApi};
             // usage_hourly repair models
             crate::routes::admin_usage_discount::UsageDiscountRequest,
             crate::routes::admin_credit_reconciliation::CreditReconciliationRequest,
+            crate::routes::admin_trace_commons_credit::SetTraceCommonsCreditRequest,
+            crate::routes::admin_trace_commons_credit::TraceCommonsCreditResponse,
             crate::routes::admin_credit_reconciliation::CreditReconciliationResponse,
             crate::routes::admin_credit_reconciliation::AccountingPositionResponse,
             crate::routes::admin_credit_reconciliation::CreditPositionResponse,

@@ -2,6 +2,9 @@
 mod support;
 
 use database::models::{RecordUsageRequest, UpdateOrganizationLimitsDbRequest};
+use database::repositories::trace_commons_credit::{
+    TraceCommonsCreditRepository, CREDIT_SOURCE_TRACE_COMMONS,
+};
 use database::repositories::{
     OrganizationLimitsRepository, OrganizationServiceUsageRepository,
     OrganizationStakingFarmSourcesRepository, OrganizationUsageRepository,
@@ -153,7 +156,7 @@ async fn priority_splits_exactly_and_records_overage() -> anyhow::Result<()> {
         );
         assert_eq!(row.funded_amount, Some(cost - unfunded));
         assert_eq!(row.unfunded_amount, Some(unfunded));
-        assert_eq!(row.allocation_policy_version.as_deref(), Some("v2"));
+        assert_eq!(row.allocation_policy_version.as_deref(), Some("v3"));
         cleanup_usage_fixtures(&pool, &[org.org_id], &[]).await?;
     }
 
@@ -664,7 +667,13 @@ async fn every_credit_source_automatically_settles_overage() -> anyhow::Result<(
     let usage_repository = OrganizationUsageRepository::new(pool.clone());
     let model = insert_model(&pool, "allocation-auto-settlement-sources").await?;
 
-    for credit_type in ["grant", "staking_farm", "payment", "postpay"] {
+    for credit_type in [
+        "grant",
+        "staking_farm",
+        "trace_commons",
+        "payment",
+        "postpay",
+    ] {
         let org = insert_org_fixture(&pool).await?;
         let request = usage(&org, &model, Uuid::new_v4(), 5);
         let original = usage_repository.record_usage(request.clone()).await?;
@@ -688,6 +697,13 @@ async fn every_credit_source_automatically_settles_overage() -> anyhow::Result<(
                 .await?;
             assert!(applied);
             CREDIT_SOURCE_HOUSE_OF_STAKE.to_string()
+        } else if credit_type == "trace_commons" {
+            // The monotonic writer settles overage in its own transaction.
+            let write = TraceCommonsCreditRepository::new(pool.clone())
+                .set_cumulative(org.org_id, 7, "settlement", None)
+                .await?;
+            assert!(write.applied);
+            CREDIT_SOURCE_TRACE_COMMONS.to_string()
         } else {
             set_limit(&limits, org.org_id, credit_type, 7).await?;
             format!("test-{credit_type}")
@@ -714,7 +730,7 @@ async fn every_credit_source_automatically_settles_overage() -> anyhow::Result<(
             allocations[0].source.as_deref(),
             Some(expected_source.as_str())
         );
-        assert_eq!(allocations[0].policy_version, "v2");
+        assert_eq!(allocations[0].policy_version, "v3");
 
         let phase: String = pool
             .get()
@@ -868,7 +884,7 @@ async fn same_credit_type_settlement_is_append_only_and_reports_effective_fundin
     assert_eq!(
         phases_and_versions,
         vec![
-            ("posting".to_string(), "v2".to_string()),
+            ("posting".to_string(), "v3".to_string()),
             (
                 "overage_settlement".to_string(),
                 "settlement-v2".to_string()
@@ -1228,12 +1244,27 @@ async fn inference_function_matches_service_allocation_for_credit_boundaries() -
         (9, vec![("grant", 3), ("payment", 10)], 0),
         (9, vec![("grant", 5), ("payment", 6)], 4),
         (0, vec![("grant", 10)], 0),
+        (
+            9,
+            vec![("grant", 2), ("trace_commons", 3), ("payment", 10)],
+            0,
+        ),
+        (9, vec![("staking_farm", 2), ("trace_commons", 4)], 1),
+        (5, vec![("trace_commons", 5), ("postpay", 10)], 0),
     ] {
         let inference_org = insert_org_fixture(&pool).await?;
         let service_org = insert_org_fixture(&pool).await?;
         for (credit_type, amount) in &credit_limits {
-            set_limit(&limits, inference_org.org_id, credit_type, *amount).await?;
-            set_limit(&limits, service_org.org_id, credit_type, *amount).await?;
+            for org_id in [inference_org.org_id, service_org.org_id] {
+                if *credit_type == "trace_commons" {
+                    // trace_commons has a single monotonic writer.
+                    TraceCommonsCreditRepository::new(pool.clone())
+                        .set_cumulative(org_id, *amount, "parity", None)
+                        .await?;
+                } else {
+                    set_limit(&limits, org_id, credit_type, *amount).await?;
+                }
+            }
         }
         if legacy > 0 {
             let client = pool.get().await?;

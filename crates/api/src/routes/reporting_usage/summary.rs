@@ -46,7 +46,7 @@ impl ReportingUsageSummaryState {
         ("model" = Option<String>, Query, description = "Filter inference usage by model name."),
         ("inference_type" = Option<String>, Query, description = "Filter inference usage by inference type."),
         ("service_name" = Option<String>, Query, description = "Filter service usage by platform service name."),
-        ("credit_type" = Option<String>, Query, description = "Filter costs by their saved grant, postpay, staking_farm, or payment allocation.")
+        ("credit_type" = Option<String>, Query, description = "Filter costs by their saved grant, postpay, staking_farm, trace_commons, transfer, or payment allocation.")
     ),
     responses(
         (status = 200, description = "Usage summary", body = ReportingUsageSummaryResponse),

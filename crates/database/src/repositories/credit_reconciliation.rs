@@ -229,13 +229,18 @@ fn validate_request(amounts: &BTreeMap<String, i64>, key: &str, reason: &str) ->
         )
         .into());
     }
-    if amounts.is_empty() || amounts.len() > 4 {
-        return Err(invalid("Specify one to four credit types").into());
+    if amounts.is_empty() || amounts.len() > 5 {
+        return Err(invalid("Specify one to five credit types").into());
     }
 
     amounts.iter().try_fold(0_i64, |sum, (kind, amount)| {
-        if !matches!(kind.as_str(), "grant" | "payment" | "staking_farm" | "postpay") || *amount <= 0 {
-            return Err(invalid("Amounts must be positive integer nano-USD for grant, payment, staking_farm or postpay").into());
+        // transfer is system-owned and never reconciled; trace_commons is.
+        if !matches!(
+            kind.as_str(),
+            "grant" | "payment" | "staking_farm" | "trace_commons" | "postpay"
+        ) || *amount <= 0
+        {
+            return Err(invalid("Amounts must be positive integer nano-USD for grant, payment, staking_farm, trace_commons or postpay").into());
         }
         sum.checked_add(*amount).ok_or_else(|| invalid("Reconciliation amount overflow").into())
     })
@@ -373,15 +378,30 @@ mod tests {
 
     #[test]
     fn too_many_types_reports_the_actual_constraint() {
-        let amounts = ["grant", "payment", "staking_farm", "postpay", "extra"]
-            .into_iter()
-            .map(|key| (key.to_string(), 1))
-            .collect();
+        let amounts = [
+            "grant",
+            "payment",
+            "staking_farm",
+            "trace_commons",
+            "postpay",
+            "extra",
+        ]
+        .into_iter()
+        .map(|key| (key.to_string(), 1))
+        .collect();
         assert_eq!(
             validate_request(&amounts, "key", "reason")
                 .unwrap_err()
                 .to_string(),
-            "Specify one to four credit types"
+            "Specify one to five credit types"
         );
+    }
+
+    #[test]
+    fn trace_commons_is_reconcilable_but_transfer_is_not() {
+        let one =
+            |kind: &str| -> BTreeMap<String, i64> { [(kind.to_string(), 1)].into_iter().collect() };
+        assert!(validate_request(&one("trace_commons"), "key", "reason").is_ok());
+        assert!(validate_request(&one("transfer"), "key", "reason").is_err());
     }
 }

@@ -50,6 +50,11 @@ impl OrganizationLimitsRepository {
             request.credit_type != "transfer",
             "transfer credits are system-owned"
         );
+        anyhow::ensure!(
+            request.credit_type
+                != crate::repositories::trace_commons_credit::CREDIT_TYPE_TRACE_COMMONS,
+            "trace_commons credit is set only through its dedicated monotonic writer"
+        );
         let row = retry_db!("update_organization_limits", {
             let mut client = self
                 .pool

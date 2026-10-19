@@ -690,7 +690,7 @@ mod tests {
             assert!(serde_json::from_value::<TransferRequest>(invalid_payload).is_err());
         }
 
-        for source in ["grant", "postpay", "transfer"] {
+        for source in ["grant", "postpay", "transfer", "trace_commons"] {
             let mut invalid = request.clone();
             invalid.source_credit_type = source.into();
 

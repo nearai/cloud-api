@@ -4550,6 +4550,9 @@ pub struct ModelHistoryResponse {
 /// - grant: Free credits provided by the platform
 /// - payment: Credits purchased by the organization
 /// - staking_farm: House of Stake farm reward units converted into credits
+/// - trace_commons: Trace Commons contributor credit; cumulative and monotonic,
+///   written only by `PUT /v1/admin/organizations/{org_id}/trace-commons/credit`
+///   and never a transfer source
 /// - postpay: Contract billing safety ceiling; usage is invoiced separately
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
 #[serde(rename_all = "lowercase")]
@@ -4560,6 +4563,8 @@ pub enum CreditType {
     Payment,
     #[serde(rename = "staking_farm", alias = "STAKING_FARM")]
     StakingFarm,
+    #[serde(rename = "trace_commons", alias = "TRACE_COMMONS")]
+    TraceCommons,
     #[serde(alias = "TRANSFER")]
     Transfer,
     #[serde(alias = "POSTPAY")]
@@ -4572,6 +4577,7 @@ impl std::fmt::Display for CreditType {
             CreditType::Grant => write!(f, "grant"),
             CreditType::Payment => write!(f, "payment"),
             CreditType::StakingFarm => write!(f, "staking_farm"),
+            CreditType::TraceCommons => write!(f, "trace_commons"),
             CreditType::Transfer => write!(f, "transfer"),
             CreditType::Postpay => write!(f, "postpay"),
         }
@@ -4585,6 +4591,7 @@ impl CreditType {
             CreditType::Grant => "grant",
             CreditType::Payment => "payment",
             CreditType::StakingFarm => "staking_farm",
+            CreditType::TraceCommons => "trace_commons",
             CreditType::Transfer => "transfer",
             CreditType::Postpay => "postpay",
         }
@@ -4603,6 +4610,7 @@ impl std::str::FromStr for CreditType {
             "grant" => Ok(Self::Grant),
             "payment" => Ok(Self::Payment),
             "staking_farm" => Ok(Self::StakingFarm),
+            "trace_commons" => Ok(Self::TraceCommons),
             "transfer" => Ok(Self::Transfer),
             "postpay" => Ok(Self::Postpay),
             _ => Err(ParseCreditTypeError),
@@ -5942,6 +5950,19 @@ mod credit_type_tests {
     fn credit_type_from_str_rejects_unknown_values() {
         assert_eq!("POSTPAY".parse(), Ok(CreditType::Postpay));
         assert!("unexpected".parse::<CreditType>().is_err());
+    }
+
+    #[test]
+    fn trace_commons_round_trips_in_every_spelling() {
+        let lower: CreditType = serde_json::from_str("\"trace_commons\"").unwrap();
+        let upper: CreditType = serde_json::from_str("\"TRACE_COMMONS\"").unwrap();
+
+        assert_eq!(lower, CreditType::TraceCommons);
+        assert_eq!(upper, CreditType::TraceCommons);
+        assert_eq!(lower.as_str(), "trace_commons");
+        assert_eq!(lower.to_string(), "trace_commons");
+        assert_eq!(serde_json::to_string(&lower).unwrap(), "\"trace_commons\"");
+        assert_eq!("TRACE_COMMONS".parse(), Ok(CreditType::TraceCommons));
     }
 }
 

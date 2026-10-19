@@ -114,8 +114,14 @@ pub struct CreditAllocationConfig {
     pub policy_version: String,
 }
 
-pub const SUPPORTED_CREDIT_TYPES: [&str; 5] =
-    ["grant", "staking_farm", "transfer", "payment", "postpay"];
+pub const SUPPORTED_CREDIT_TYPES: [&str; 6] = [
+    "grant",
+    "staking_farm",
+    "trace_commons",
+    "transfer",
+    "payment",
+    "postpay",
+];
 
 impl Default for CreditAllocationConfig {
     fn default() -> Self {
@@ -124,7 +130,7 @@ impl Default for CreditAllocationConfig {
                 .into_iter()
                 .map(str::to_string)
                 .collect(),
-            policy_version: "v2".to_string(),
+            policy_version: "v3".to_string(),
         }
     }
 }
@@ -1854,9 +1860,16 @@ mod tests {
         let defaults = CreditAllocationConfig::from_env().unwrap();
         assert_eq!(
             defaults.priority,
-            ["grant", "staking_farm", "transfer", "payment", "postpay"]
+            [
+                "grant",
+                "staking_farm",
+                "trace_commons",
+                "transfer",
+                "payment",
+                "postpay"
+            ]
         );
-        assert_eq!(defaults.policy_version, "v2");
+        assert_eq!(defaults.policy_version, "v3");
 
         std::env::set_var("CREDIT_ALLOCATION_POLICY_VERSION", "");
         assert!(CreditAllocationConfig::from_env().is_err());
@@ -1878,7 +1891,7 @@ mod tests {
         let _env = CreditAllocationEnvGuard::new();
         std::env::set_var(
             "CREDIT_USAGE_ORDER",
-            "payment, staking_farm, transfer, postpay, grant",
+            "payment, staking_farm, transfer, postpay, trace_commons, grant",
         );
         std::env::set_var("CREDIT_ALLOCATION_POLICY_VERSION", "emergency-v2");
 
@@ -1886,7 +1899,14 @@ mod tests {
 
         assert_eq!(
             config.priority,
-            ["payment", "staking_farm", "transfer", "postpay", "grant"]
+            [
+                "payment",
+                "staking_farm",
+                "transfer",
+                "postpay",
+                "trace_commons",
+                "grant"
+            ]
         );
         assert_eq!(config.policy_version, "emergency-v2");
     }
@@ -1899,6 +1919,9 @@ mod tests {
             "grant,postpay,staking_farm",
             "grant,postpay,staking_farm,grant",
             "grant,postpay,staking_farm,cash",
+            // A five-type order from before trace_commons existed must be
+            // updated, not silently extended: the order is a billing policy.
+            "grant,staking_farm,transfer,payment,postpay",
         ] {
             std::env::set_var("CREDIT_USAGE_ORDER", invalid);
             assert!(CreditAllocationConfig::from_env().is_err(), "{invalid}");

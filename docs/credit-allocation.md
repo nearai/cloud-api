@@ -4,9 +4,9 @@ Every newly posted inference or platform-service charge is split, in exact
 integer nano-USD, across the organization's active credit limits. The default
 order is:
 
-`grant -> staking_farm -> transfer -> payment -> postpay`
+`grant -> staking_farm -> trace_commons -> transfer -> payment -> postpay`
 
-Set `CREDIT_USAGE_ORDER` to a comma-separated permutation of those five
+Set `CREDIT_USAGE_ORDER` to a comma-separated permutation of those six
 API/database names to change the order. Set
 `CREDIT_ALLOCATION_POLICY_VERSION` to a new non-empty identifier whenever the
 policy meaning changes. The configured version and the active limit/source are
@@ -47,7 +47,7 @@ outstanding unfunded usage is settled; these are not frozen invoice totals.
 Filtered admin metrics share a 10-second database-query budget across their
 statements, using transaction-local timeouts. Unfiltered requests keep their
 existing timeout behavior.
-The optional filter accepts `grant`, `staking_farm`, `payment`, and `postpay`
+The optional filter accepts `grant`, `staking_farm`, `trace_commons`, `transfer`, `payment`, and `postpay`
 (case-insensitively, like reporting); unsupported values return HTTP 400.
 For example, September postpay consumption can be queried with
 `/v1/admin/organizations/{org_id}/metrics?start=2026-09-01T00:00:00Z&end=2026-10-01T00:00:00Z&credit_type=postpay`.
@@ -96,7 +96,8 @@ reclassify a reviewed portion of `legacy_unattributed_amount` using:
 ```
 
 All amounts are positive integer nano-USD. Supported names are `grant`,
-`payment`, `staking_farm`, and `postpay`. A nonempty reason (up to 2000 characters)
+`payment`, `staking_farm`, `trace_commons`, and `postpay` (at most five per
+request; system-owned `transfer` credit is never reconciled). A nonempty reason (up to 2000 characters)
 and a per-organization idempotency key (up to 100 characters) are required.
 The endpoint requires an admin session or read-write admin access token;
 read-only tokens cannot preview or commit this operation.
@@ -211,7 +212,8 @@ or `Authorization: Bearer ct_...`, plus a required `Idempotency-Key` header:
 
 Amounts are positive integer nano-USD. Only the explicitly chosen `payment` or
 already-posted `staking_farm` source can fund a send. Grants, postpay, future
-staking rewards, and received `transfer` capacity cannot fund it. Staking source
+staking rewards, `trace_commons` credit, and received `transfer` capacity cannot
+fund it. Staking source
 limits must come from `house-of-stake`. Sync externally accrued rewards separately
 and retry if posted capacity is insufficient. Network operations never run inside
 the transfer transaction. Evidence reports the sync observation time separately
@@ -294,3 +296,43 @@ Transient database/lock errors return 503; retry with the original key.
 
 Reversals, chargebacks, fees, expiry, claims by email, bulk sends, automatic
 recipient selection, and per-reseller attribution of recipient usage are excluded.
+
+## Trace Commons credit
+
+`trace_commons` holds inference credit earned through Trace Commons, an
+external contribution-rewards source. Like `staking_farm`, it has a single
+writer and only ever grows:
+
+```
+PUT /v1/admin/organizations/{org_id}/trace-commons/credit
+{"cumulativeNanoUsd": 25000000000, "statementRef": "sha256:..."}
+```
+
+The body states the organization's cumulative Trace Commons credit. Under the
+organization accounting lock (the same lock transfers and every other limit
+writer take), and only for an active organization, the active `trace_commons`
+limit is raised to that total and outstanding unfunded usage is settled in the
+same transaction; a total at or below the active limit writes nothing and
+returns `applied: false`. Retries and late, smaller totals are therefore
+harmless, and the limit never decreases. `statementRef` (1-128 characters of
+`[A-Za-z0-9_.:-]`) is recorded in the history row's change reason. `GET` on the
+same path returns the current total and is available to read-only admin tokens;
+`PUT` needs a read-write token or an admin session. The generic limits `PATCH`
+refuses `trace_commons`.
+
+`trace_commons` is not a transfer source: transfer requests naming it are
+rejected, and the transfer projection and ledger CHECKs admit only `payment`
+and `staking_farm`. Its effective capacity therefore always equals its limit.
+
+### Deployment
+
+1. Deploy migration V0096, which widens the `credit_type` CHECKs on
+   `usage_credit_allocations` and `organization_credit_consumption`. It does
+   not redefine `record_organization_usage`: that function walks the priority
+   array the application passes and names no credit type.
+2. Explicitly migrate a configured `CREDIT_USAGE_ORDER` from five to six types.
+   A five-type override fails validation at startup instead of being silently
+   extended. The default policy version is `v3`; historical allocation versions
+   remain unchanged. If `CREDIT_USAGE_ORDER` is unset, nothing is needed.
+3. Do not write `trace_commons` credit until no binary from before this change
+   is serving: older binaries cannot parse the type when listing limits.

@@ -44,14 +44,17 @@ pub struct ProxyDoc {
 
 impl<'de> serde::Deserialize<'de> for ProxyDoc {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // Each entry is kept as its original text (not a `Value`, which would
+        // let the last of two duplicate keys win), so the typed parse below
+        // still rejects duplicate fields: ambiguous evidence closes the slug.
         #[derive(serde::Deserialize)]
         struct Raw {
-            models: BTreeMap<String, serde_json::Value>,
+            models: BTreeMap<String, Box<serde_json::value::RawValue>>,
         }
         let raw = Raw::deserialize(deserializer)?;
         let mut doc = ProxyDoc::default();
-        for (slug, value) in raw.models {
-            match serde_json::from_value::<ProxyModelEntry>(value) {
+        for (slug, text) in raw.models {
+            match serde_json::from_str::<ProxyModelEntry>(text.get()) {
                 Ok(entry) => {
                     doc.models.insert(slug, entry);
                 }
@@ -275,6 +278,30 @@ mod proxy_doc_tests {
             doc.malformed.iter().map(String::as_str).collect::<Vec<_>>(),
             ["glm-5-3-flash", "not-an-object"]
         );
+    }
+
+    #[test]
+    fn an_entry_with_a_duplicate_field_is_malformed() {
+        // Ambiguous evidence (two `tag`s, two `measurement`s) must close the
+        // slug, never let the last value win and match a pin.
+        let doc: ProxyDoc = serde_json::from_str(
+            r#"{"models": {
+                "dup": {
+                    "repo": "tinfoilsh/r", "tag": "v0", "tag": "v1",
+                    "measurement": {"type": "t", "registers": ["00"]},
+                    "measurement": {"type": "t", "registers": ["aa"]},
+                    "enclaves": {}
+                },
+                "good": {
+                    "repo": "tinfoilsh/r", "tag": "v1",
+                    "measurement": {"type": "t", "registers": ["aa"]},
+                    "enclaves": {}
+                }
+            }}"#,
+        )
+        .unwrap();
+        assert_eq!(doc.models.keys().collect::<Vec<_>>(), ["good"]);
+        assert!(doc.malformed.contains("dup"));
     }
 
     #[test]

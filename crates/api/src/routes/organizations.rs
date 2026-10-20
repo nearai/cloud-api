@@ -178,7 +178,7 @@ impl From<OrganizationOrderDirection> for services::organization::OrganizationOr
         (status = 200, description = "Organization created successfully", body = OrganizationResponse),
         (status = 400, description = "Bad request", body = ErrorResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
-        (status = 409, description = "Organization already exists", body = ErrorResponse),
+        (status = 409, description = "Organization name is already taken", body = ErrorResponse),
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
     security(
@@ -251,12 +251,8 @@ pub async fn create_organization(
         }
         Err(OrganizationError::AlreadyExists) => {
             debug!("Organization already exists");
-            Err((
-                StatusCode::CONFLICT,
-                Json(ErrorResponse::new(
-                    "Organization already exists".to_string(),
-                    "conflict".to_string(),
-                )),
+            Err(crate::routes::common::map_organization_error(
+                OrganizationError::AlreadyExists,
             ))
         }
         Err(_) => {
@@ -511,6 +507,7 @@ pub async fn patch_organization_settings(
         (status = 401, description = "Unauthorized", body = ErrorResponse),
         (status = 403, description = "Forbidden", body = ErrorResponse),
         (status = 404, description = "Organization not found", body = ErrorResponse),
+        (status = 409, description = "Organization name is already taken", body = ErrorResponse),
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
     security(
@@ -597,6 +594,9 @@ pub async fn update_organization(
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse::new(msg, "bad_request".to_string())),
         )),
+        Err(OrganizationError::AlreadyExists) => Err(
+            crate::routes::common::map_organization_error(OrganizationError::AlreadyExists),
+        ),
         Err(_) => {
             error!("Failed to update organization");
             Err((

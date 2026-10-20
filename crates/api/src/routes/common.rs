@@ -611,7 +611,8 @@ pub fn map_organization_error(
         OrganizationError::AlreadyExists => (
             StatusCode::CONFLICT,
             ResponseJson(ErrorResponse::new(
-                "Organization already exists".to_string(),
+                "This organization name is already taken. Please choose a different name."
+                    .to_string(),
                 "conflict".to_string(),
             )),
         ),

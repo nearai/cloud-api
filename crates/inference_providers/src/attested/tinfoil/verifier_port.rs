@@ -1,7 +1,7 @@
 //! Dependency-inversion seam for verifying Tinfoil evidence. The concrete
 //! policy verifier lives in `services`; the provider depends on this port.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// The ATC (`atc.tinfoil.sh/attestation`) bundle for the router.
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -29,9 +29,39 @@ pub struct AttestationDoc {
     pub body: String,
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+/// The router's model directory (`/.well-known/tinfoil-proxy`). Entries are
+/// parsed one by one: an entry that does not parse (Tinfoil publishes inactive
+/// models with an empty tag, a null measurement and no enclaves) lands in
+/// `malformed` and closes only that model; the rest of the directory is still
+/// checked against the pins. A document that is not an object of entries at
+/// all is still an error.
+#[derive(Debug, Clone, Default)]
 pub struct ProxyDoc {
     pub models: BTreeMap<String, ProxyModelEntry>,
+    /// Slugs whose entry did not parse.
+    pub malformed: BTreeSet<String>,
+}
+
+impl<'de> serde::Deserialize<'de> for ProxyDoc {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(serde::Deserialize)]
+        struct Raw {
+            models: BTreeMap<String, serde_json::Value>,
+        }
+        let raw = Raw::deserialize(deserializer)?;
+        let mut doc = ProxyDoc::default();
+        for (slug, value) in raw.models {
+            match serde_json::from_value::<ProxyModelEntry>(value) {
+                Ok(entry) => {
+                    doc.models.insert(slug, entry);
+                }
+                Err(_) => {
+                    doc.malformed.insert(slug);
+                }
+            }
+        }
+        Ok(doc)
+    }
 }
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
@@ -218,4 +248,38 @@ pub trait TinfoilVerifier: Send + Sync {
         slug: &str,
         entry: &ProxyModelEntry,
     ) -> Result<PinnedModel, TinfoilVerifyError>;
+}
+
+#[cfg(test)]
+mod proxy_doc_tests {
+    use super::*;
+
+    #[test]
+    fn a_malformed_entry_is_isolated() {
+        let doc: ProxyDoc = serde_json::from_value(serde_json::json!({"models": {
+            "good": {
+                "repo": "tinfoilsh/r", "tag": "v1",
+                "measurement": {"type": "t", "registers": ["aa"]},
+                "enclaves": {}
+            },
+            "glm-5-3-flash": {
+                "repo": "tinfoilsh/confidential-glm5-3-flash", "tag": "",
+                "measurement": null, "enclaves": {},
+                "verification": {"configured": 0, "verified": 0, "healthy": 0, "hosts": {}}
+            },
+            "not-an-object": 7
+        }}))
+        .unwrap();
+        assert_eq!(doc.models.keys().collect::<Vec<_>>(), ["good"]);
+        assert_eq!(
+            doc.malformed.iter().map(String::as_str).collect::<Vec<_>>(),
+            ["glm-5-3-flash", "not-an-object"]
+        );
+    }
+
+    #[test]
+    fn a_document_without_models_is_still_an_error() {
+        assert!(serde_json::from_value::<ProxyDoc>(serde_json::json!({"x": 1})).is_err());
+        assert!(serde_json::from_value::<ProxyDoc>(serde_json::json!({"models": []})).is_err());
+    }
 }

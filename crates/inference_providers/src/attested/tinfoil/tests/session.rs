@@ -226,6 +226,31 @@ async fn verify_failure_fails_closed() {
 }
 
 #[tokio::test]
+async fn malformed_directory_entry_closes_only_that_model() {
+    let e = env().await;
+    e.session.verify_now().await.unwrap();
+    assert!(
+        e.session.model_status(SLUG).is_ok(),
+        "valid entries still serve"
+    );
+    assert_eq!(
+        e.session.model_status(PLACEHOLDER_SLUG).unwrap_err(),
+        TinfoilVerifyError::Malformed {
+            stage: "proxy_entry"
+        }
+    );
+    e.session.reread_proxy().await;
+    assert!(e.session.model_status(SLUG).is_ok(), "and after a reread");
+    assert_eq!(
+        e.session
+            .model_status(PLACEHOLDER_SLUG)
+            .unwrap_err()
+            .reason(),
+        "malformed_evidence"
+    );
+}
+
+#[tokio::test]
 async fn proxy_reread_picks_up_pins_miss() {
     let e = env().await;
     e.session.verify_now().await.unwrap();

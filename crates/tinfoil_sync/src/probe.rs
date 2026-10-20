@@ -368,9 +368,7 @@ pub async fn run(client: &reqwest::Client, cfg: &ProbeConfig) -> Result<ProbeOut
         }
     };
     let complete = proxy.is_some();
-    let proxy = proxy.unwrap_or(ProxyDoc {
-        models: BTreeMap::new(),
-    });
+    let proxy = proxy.unwrap_or_default();
 
     let mut releases: BTreeMap<(String, String), ()> = BTreeMap::new();
     for (slug, m) in &proxy.models {

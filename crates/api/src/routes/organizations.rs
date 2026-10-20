@@ -251,12 +251,8 @@ pub async fn create_organization(
         }
         Err(OrganizationError::AlreadyExists) => {
             debug!("Organization already exists");
-            Err((
-                StatusCode::CONFLICT,
-                Json(ErrorResponse::new(
-                    "Organization already exists".to_string(),
-                    "conflict".to_string(),
-                )),
+            Err(crate::routes::common::map_organization_error(
+                OrganizationError::AlreadyExists,
             ))
         }
         Err(_) => {
@@ -597,6 +593,9 @@ pub async fn update_organization(
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse::new(msg, "bad_request".to_string())),
         )),
+        Err(OrganizationError::AlreadyExists) => Err(
+            crate::routes::common::map_organization_error(OrganizationError::AlreadyExists),
+        ),
         Err(_) => {
             error!("Failed to update organization");
             Err((

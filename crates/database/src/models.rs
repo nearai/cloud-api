@@ -576,6 +576,11 @@ pub struct UpdateModelPricingRequest {
     // Provider configuration
     pub provider_type: Option<String>,
     pub provider_config: Option<serde_json::Value>,
+    /// Compare-and-set guard for `provider_config` on update: `Some(expected)`
+    /// applies the update only while the stored config equals `expected`
+    /// (`Some(None)` = NULL); otherwise it fails with `TransactionConflict`.
+    #[serde(skip)]
+    pub expected_provider_config: Option<Option<serde_json::Value>>,
     pub attestation_supported: Option<bool>,
     // Architecture/modalities
     pub input_modalities: Option<Vec<String>>,

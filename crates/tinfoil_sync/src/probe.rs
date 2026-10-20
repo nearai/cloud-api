@@ -119,6 +119,9 @@ impl Default for ProbeConfig {
 pub struct ProbeOutput {
     pub observations: Observations,
     pub sigstore: SigstoreResults,
+    /// The raw Sigstore bundle of each verified model release, by `repo@tag`,
+    /// as GitHub returned it (for the admin-pin artifact).
+    pub model_bundles: BTreeMap<String, serde_json::Value>,
     /// Why something was not observed or verified. Categories only.
     pub notes: Vec<String>,
     /// The router verified and its proxy document was fetched and decoded. A
@@ -202,7 +205,7 @@ async fn fetch_release_attestation(
     cfg: &ProbeConfig,
     repo: &str,
     tag: &str,
-) -> Result<tinfoil_provenance::Provenance, String> {
+) -> Result<(tinfoil_provenance::Provenance, serde_json::Value), String> {
     if !is_tinfoil_repo(repo) {
         return Err("repo outside tinfoilsh".into());
     }
@@ -237,7 +240,7 @@ async fn fetch_release_attestation(
     for a in bundles {
         if let Ok(r) = verify_release(&a["bundle"], repo) {
             if r.subject_sha256 == digest && r.tag == tag {
-                return Ok(r);
+                return Ok((r, a["bundle"].clone()));
             }
         }
     }
@@ -293,6 +296,7 @@ pub async fn run(client: &reqwest::Client, cfg: &ProbeConfig) -> Result<ProbeOut
         ..Observations::default()
     };
     let mut sigstore = SigstoreResults::default();
+    let mut model_bundles = BTreeMap::new();
 
     // Verify the router first: nothing the proxy document says is trusted
     // unless it came from this attested router.
@@ -335,7 +339,21 @@ pub async fn run(client: &reqwest::Client, cfg: &ProbeConfig) -> Result<ProbeOut
             };
             match fetched {
                 Ok(text) => match serde_json::from_str::<ProxyDoc>(&text) {
+                    Ok(p) if p.models.is_empty() && !p.malformed.is_empty() => {
+                        // Every entry failed to parse: a format change, not an
+                        // empty directory. Fail the run so it stays visible.
+                        notes.push(format!(
+                            "proxy document: no entry parsed ({} malformed)",
+                            p.malformed.len()
+                        ));
+                        None
+                    }
                     Ok(p) => {
+                        for slug in &p.malformed {
+                            notes.push(format!(
+                                "proxy document: entry {slug} did not parse; skipped"
+                            ));
+                        }
                         let distinct = p
                             .models
                             .values()
@@ -364,9 +382,7 @@ pub async fn run(client: &reqwest::Client, cfg: &ProbeConfig) -> Result<ProbeOut
         }
     };
     let complete = proxy.is_some();
-    let proxy = proxy.unwrap_or(ProxyDoc {
-        models: BTreeMap::new(),
-    });
+    let proxy = proxy.unwrap_or_default();
 
     let mut releases: BTreeMap<(String, String), ()> = BTreeMap::new();
     for (slug, m) in &proxy.models {
@@ -381,8 +397,9 @@ pub async fn run(client: &reqwest::Client, cfg: &ProbeConfig) -> Result<ProbeOut
     }
     for (repo, tag) in releases.into_keys() {
         match fetch_release_attestation(client, cfg, &repo, &tag).await {
-            Ok(r) => {
+            Ok((r, raw)) => {
                 sigstore.models.insert(format!("{repo}@{tag}"), r);
+                model_bundles.insert(format!("{repo}@{tag}"), raw);
             }
             Err(e) => notes.push(format!("{repo}@{tag}: {e}")),
         }
@@ -390,6 +407,7 @@ pub async fn run(client: &reqwest::Client, cfg: &ProbeConfig) -> Result<ProbeOut
     Ok(ProbeOutput {
         observations,
         sigstore,
+        model_bundles,
         notes,
         complete,
     })
@@ -958,6 +976,58 @@ mod tests {
             out.observations.router.unwrap().spki_sha256_hex
         );
         assert!(out.notes.iter().any(|n| n == "proxy document: stop"));
+    }
+
+    /// `PROXY` with every entry replaced by Tinfoil's inactive-model shape
+    /// (empty tag, null measurement), or with one such entry added.
+    fn proxy_with_placeholders(all: bool) -> String {
+        let mut doc: serde_json::Value = serde_json::from_str(PROXY).unwrap();
+        let models = doc["models"].as_object_mut().unwrap();
+        let placeholder = serde_json::json!({
+            "repo": "tinfoilsh/confidential-glm5-3-flash", "tag": "",
+            "measurement": null, "enclaves": {}
+        });
+        if all {
+            for v in models.values_mut() {
+                *v = placeholder.clone();
+            }
+        } else {
+            models.insert("glm-5-3-flash".into(), placeholder);
+        }
+        doc.to_string()
+    }
+
+    fn fixed_proxy(text: String) -> ProxyFetcher {
+        Arc::new(move |_t| {
+            let text = text.clone();
+            Box::pin(async move { Ok(text) })
+        })
+    }
+
+    #[tokio::test]
+    async fn one_malformed_entry_is_noted_and_the_rest_are_observed() {
+        let (_s, mut cfg) = server().await;
+        cfg.proxy_fetcher = Some(fixed_proxy(proxy_with_placeholders(false)));
+        let out = run(&reqwest::Client::new(), &cfg).await.unwrap();
+        assert!(out.complete);
+        assert!(!out.observations.models.is_empty());
+        assert!(out
+            .notes
+            .iter()
+            .any(|n| n == "proxy document: entry glm-5-3-flash did not parse; skipped"));
+    }
+
+    #[tokio::test]
+    async fn a_directory_where_no_entry_parses_is_incomplete() {
+        let (_s, mut cfg) = server().await;
+        cfg.proxy_fetcher = Some(fixed_proxy(proxy_with_placeholders(true)));
+        let out = run(&reqwest::Client::new(), &cfg).await.unwrap();
+        assert!(!out.complete, "a format change must not look like success");
+        assert!(out.observations.models.is_empty());
+        assert!(out
+            .notes
+            .iter()
+            .any(|n| n.starts_with("proxy document: no entry parsed")));
     }
 
     /// A valid proxy document padded to `n` distinct releases (cloned

@@ -11,6 +11,7 @@ mod config;
 mod session;
 #[cfg(test)]
 mod tests;
+mod trust_timer;
 pub mod verifier_port;
 mod wire;
 
@@ -25,6 +26,7 @@ pub use self::availability::{
 };
 pub use self::config::{Config, ATC_URL, BASE_URL, PROXY_REREAD, ROUTER_REVERIFY};
 pub use self::session::{TinfoilRouterSession, VerifiedState};
+pub use self::trust_timer::TrustKind;
 pub use self::verifier_port::validate_router_domain;
 use crate::attested::openai_wire::request_body;
 use crate::{
@@ -424,16 +426,18 @@ impl InferenceProvider for Provider {
             router["rekor_log_index"] = json!(index);
         }
         m.insert("router".into(), router);
-        m.insert(
-            "model_entry".into(),
-            json!({
+        let mut model_entry = json!({
                 "slug": pinned.slug,
                 "repo": pinned.entry.repo,
                 "tag": pinned.entry.tag,
                 "registers": pinned.entry.measurement.registers,
+                "pin_source": pinned.source.as_str(),
                 "replicas": replicas,
-            }),
-        );
+        });
+        if let Some(index) = pinned.rekor_log_index {
+            model_entry["rekor_log_index"] = json!(index);
+        }
+        m.insert("model_entry".into(), model_entry);
         Ok(m)
     }
 

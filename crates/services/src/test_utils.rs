@@ -7,7 +7,7 @@ use crate::{
         AttestationError,
     },
     usage::{
-        CostBreakdown, InferenceType, InferenceUsageHistoryQuery, InferenceUsageReportQuery,
+        InferenceType, InferenceUsageHistoryQuery, InferenceUsageReportQuery,
         InferenceUsageReportRow, OrganizationBalanceInfo, OrganizationCreditLimit,
         OrganizationLimit, ProviderAttribution, RecordUsageApiRequest, RecordUsageServiceRequest,
         UsageCheckResult, UsageDiscount, UsageError, UsageLogEntry, UsageServiceTrait,
@@ -92,20 +92,6 @@ pub struct MockUsageService;
 
 #[async_trait]
 impl UsageServiceTrait for MockUsageService {
-    async fn calculate_cost(
-        &self,
-        _model_id: &str,
-        _input_tokens: i32,
-        _output_tokens: i32,
-        _cache_read_tokens: i32,
-    ) -> Result<CostBreakdown, UsageError> {
-        Ok(CostBreakdown {
-            input_cost: 0,
-            output_cost: 0,
-            total_cost: 0,
-        })
-    }
-
     async fn record_usage(
         &self,
         _request: RecordUsageServiceRequest,
@@ -372,20 +358,6 @@ impl CapturingUsageService {
 
 #[async_trait]
 impl UsageServiceTrait for CapturingUsageService {
-    async fn calculate_cost(
-        &self,
-        _model_id: &str,
-        _input_tokens: i32,
-        _output_tokens: i32,
-        _cache_read_tokens: i32,
-    ) -> Result<CostBreakdown, UsageError> {
-        Ok(CostBreakdown {
-            input_cost: 0,
-            output_cost: 0,
-            total_cost: 0,
-        })
-    }
-
     async fn record_usage(
         &self,
         request: RecordUsageServiceRequest,

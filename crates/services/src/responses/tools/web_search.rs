@@ -194,7 +194,7 @@ pub fn format_results(
         .collect::<Vec<_>>()
         .join("\n");
 
-    let instruction = if current_source_count == 0 {
+    let instruction = if current_source_count == 0 && !sources.is_empty() {
         Some(CITATION_INSTRUCTION.to_string())
     } else {
         None
@@ -649,5 +649,12 @@ mod tests {
         // First search should include citation instruction
         assert!(result.instruction.is_some());
         assert!(result.instruction.unwrap().contains("CITATION REQUIREMENT"));
+    }
+
+    #[test]
+    fn test_format_results_without_sources_has_no_citation_instruction() {
+        let result = format_results(&[], 0);
+        assert!(result.formatted.is_empty());
+        assert!(result.instruction.is_none());
     }
 }

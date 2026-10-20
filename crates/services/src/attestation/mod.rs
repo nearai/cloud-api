@@ -4,6 +4,7 @@ mod chat_signatures;
 pub mod chutes;
 pub mod chutes_observer;
 pub mod chutes_pins;
+pub mod chutes_pins_view;
 mod environment;
 mod gateway_quote;
 mod gateway_signatures;
@@ -12,6 +13,7 @@ mod keys;
 mod lifecycle;
 pub mod measurement;
 pub mod models;
+pub mod pins_view;
 pub mod ports;
 #[cfg(test)]
 mod provider_signature_tests;
@@ -26,6 +28,7 @@ pub mod tinfoil;
 mod tinfoil_live_tests;
 pub mod tinfoil_observer;
 pub mod tinfoil_pins;
+pub mod tinfoil_pins_view;
 pub mod tinfoil_trust;
 pub mod verification;
 

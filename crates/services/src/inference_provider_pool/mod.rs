@@ -5212,23 +5212,25 @@ impl InferenceProviderPool {
         }
 
         // Final user-facing error: only the status code escapes; no
-        // upstream response body. (`sanitize_error_message` would still
-        // include the body via Display, so we route around it.)
-        let error_msg = last_error
-            .as_ref()
-            .map(|e| match e {
-                inference_providers::PrivacyClassifyError::HttpError { status_code, .. } => {
-                    format!("PII detector returned HTTP {status_code}")
+        // upstream response body (a filter that echoes its input would leak
+        // customer PII). The status is kept as `HttpError` so callers can
+        // tell a client 4xx from an upstream outage.
+        Err(match last_error {
+            Some(inference_providers::PrivacyClassifyError::HttpError { status_code, .. }) => {
+                inference_providers::PrivacyClassifyError::HttpError {
+                    status_code,
+                    message: format!("PII detector returned HTTP {status_code}"),
                 }
-                inference_providers::PrivacyClassifyError::RequestFailed(_) => {
-                    "PII detector unreachable".to_string()
-                }
-            })
-            .unwrap_or_else(|| "No providers available for privacy classify".to_string());
-
-        Err(inference_providers::PrivacyClassifyError::RequestFailed(
-            error_msg,
-        ))
+            }
+            Some(inference_providers::PrivacyClassifyError::RequestFailed(_)) => {
+                inference_providers::PrivacyClassifyError::RequestFailed(
+                    "PII detector unreachable".to_string(),
+                )
+            }
+            None => inference_providers::PrivacyClassifyError::RequestFailed(
+                "No providers available for privacy classify".to_string(),
+            ),
+        })
     }
 
     pub async fn score(
@@ -5302,27 +5304,43 @@ impl InferenceProviderPool {
             .as_object_mut()
             .and_then(|obj| obj.remove("api_key"))
             .and_then(|v| v.as_str().map(String::from));
+        // Admin reads return the key as "***". A row that stored that
+        // placeholder has no real key, so fail closed rather than send it
+        // upstream or fall back to a server key.
+        if per_model_api_key.as_deref() == Some(crate::admin::REDACTED_API_KEY) {
+            tracing::error!(
+                model = %model_name,
+                "providerConfig.api_key is the redaction placeholder; provider not registered"
+            );
+            return Err(
+                "providerConfig.api_key is the redaction placeholder \"***\", not a key; \
+                 set the real key with PATCH /v1/admin/models"
+                    .to_string(),
+            );
+        }
         let config: ProviderConfig = serde_json::from_value(provider_config)
             .map_err(|e| format!("Failed to parse provider config: {e}"))?;
 
-        let backend_type = match &config {
-            ProviderConfig::OpenAiCompatible { .. } => "openai_compatible".to_string(),
-            ProviderConfig::Anthropic { .. } => "anthropic".to_string(),
-            ProviderConfig::Gemini { .. } => "gemini".to_string(),
-            ProviderConfig::TypeSafe { .. } => "typesafe".to_string(),
+        let (backend_type, base_url) = match &config {
+            ProviderConfig::OpenAiCompatible { base_url, .. } => ("openai_compatible", base_url),
+            ProviderConfig::Anthropic { base_url, .. } => ("anthropic", base_url),
+            ProviderConfig::Gemini { base_url, .. } => ("gemini", base_url),
+            ProviderConfig::TypeSafe { base_url, .. } => ("typesafe", base_url),
         };
+        let backend_type = backend_type.to_string();
 
         let api_key = per_model_api_key
             .or_else(|| {
                 self.external_configs
-                    .get_api_key(&backend_type)
+                    .get_api_key(&backend_type, base_url)
                     .map(|s| s.to_string())
             })
             .ok_or_else(|| {
                 format!(
                     "No API key configured for backend type '{}'. \
-                     Set the appropriate environment variable (e.g., OPENAI_API_KEY, ANTHROPIC_API_KEY, GEMINI_API_KEY, TYPESAFE_API_KEY) \
-                     or include 'api_key' in the model's providerConfig",
+                     Server keys (OPENAI_API_KEY, ANTHROPIC_API_KEY, GEMINI_API_KEY, TYPESAFE_API_KEY) \
+                     are only used for their provider's official HTTPS host; \
+                     for any other base_url include 'api_key' in the model's providerConfig",
                     backend_type
                 )
             })?;
@@ -8326,6 +8344,72 @@ mod tests {
 
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("failed to load"));
+    }
+
+    #[tokio::test]
+    async fn test_server_api_key_is_not_sent_to_another_host() {
+        let pool = InferenceProviderPool::new(
+            None,
+            ExternalProvidersConfig {
+                openai_api_key: Some("sk-test-key".to_string()),
+                typesafe_api_key: Some("ts-test-key".to_string()),
+                ..Default::default()
+            },
+        );
+
+        for (model, config) in [
+            (
+                "aggregator-model",
+                serde_json::json!({"backend": "openai_compatible",
+                "base_url": "https://openrouter.ai/api/v1"}),
+            ),
+            (
+                "aggregator-decisions",
+                serde_json::json!({"backend": "typesafe",
+                "base_url": "https://openrouter.ai/api/v1"}),
+            ),
+        ] {
+            let result = pool
+                .load_external_providers(vec![(model.to_string(), config)])
+                .await;
+            assert!(result.is_err(), "{model}");
+            assert!(!pool.has_provider(model).await, "{model}");
+        }
+
+        pool.load_external_providers(vec![(
+            "aggregator-model".to_string(),
+            serde_json::json!({"backend": "openai_compatible",
+                "base_url": "https://openrouter.ai/api/v1", "api_key": "sk-per-model"}),
+        )])
+        .await
+        .unwrap();
+        assert!(pool.has_provider("aggregator-model").await);
+    }
+
+    #[tokio::test]
+    async fn test_placeholder_api_key_fails_closed() {
+        let pool = InferenceProviderPool::new(
+            None,
+            ExternalProvidersConfig {
+                openai_api_key: Some("sk-test-key".to_string()),
+                ..Default::default()
+            },
+        );
+        let config = |api_key: &str| {
+            serde_json::json!({"backend": "openai_compatible",
+                "base_url": "https://api.openai.com/v1", "api_key": api_key})
+        };
+        pool.load_external_providers(vec![("placeholder-key".to_string(), config("sk-real"))])
+            .await
+            .unwrap();
+        assert!(pool.has_provider("placeholder-key").await);
+
+        // Neither sent upstream nor replaced by the server key.
+        let result = pool
+            .load_external_providers(vec![("placeholder-key".to_string(), config("***"))])
+            .await;
+        assert!(result.is_err());
+        assert!(!pool.has_provider("placeholder-key").await);
     }
 
     #[tokio::test]

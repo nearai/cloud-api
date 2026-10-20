@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 use arc_swap::ArcSwap;
 
 use super::config::{Config, Redirect, PROXY_REREAD, ROUTER_REVERIFY};
+use super::trust_timer::TrustKind;
 use super::verifier_port::{
     validate_router_domain, AtcBundle, PinnedModel, ProxyDoc, TinfoilVerifier, TinfoilVerifyError,
     VerifiedRouter,
@@ -115,6 +116,10 @@ pub struct TinfoilRouterSession {
     /// The verifier's `trust_generation` as of the last tick that looked. A
     /// change means its trust inputs moved, so the router is re-verified.
     seen_trust_generation: AtomicU64,
+    /// First-rejection to first-admission times, drained by the API layer.
+    trust_timer: super::trust_timer::TrustTimer,
+    /// Slugs whose time to trust is measured (`None`: every published slug).
+    served_slugs: Option<Arc<HashSet<String>>>,
 }
 
 impl TinfoilRouterSession {
@@ -151,6 +156,8 @@ impl TinfoilRouterSession {
             auth_failures: AtomicU64::new(0),
             last_error: std::sync::Mutex::new(None),
             seen_trust_generation,
+            trust_timer: Default::default(),
+            served_slugs: cfg.served_slugs.clone(),
         }))
     }
 
@@ -229,6 +236,13 @@ impl TinfoilRouterSession {
             .clone()
     }
 
+    /// Drains `(kind, seconds)` samples (`kind` is `Router` or `Model`) for
+    /// measurements that were rejected as unknown and have since been admitted.
+    /// Polled by the API layer for `cloud_api.attested_3p.time_to_trust_seconds` (`provider:tinfoil`).
+    pub fn take_time_to_trust(&self) -> Vec<(TrustKind, f64)> {
+        self.trust_timer.take()
+    }
+
     pub(super) fn record_auth_failure(&self) {
         self.auth_failures.fetch_add(1, Ordering::Relaxed);
     }
@@ -283,14 +297,62 @@ impl TinfoilRouterSession {
         serde_json::from_slice(&bytes).map_err(|_| TinfoilVerifyError::Fetch)
     }
 
-    fn check_models(
+    /// `check_model` per published slug; a slug whose directory entry did not
+    /// parse is closed on its own. A check may verify admin-pin Sigstore
+    /// bundles (CPU-bound, up to 32 on the first call after a trust change),
+    /// so the checks run off the async worker like `verify_router`. A
+    /// JoinError (the verifier panicked or was cancelled) closes every slug.
+    async fn check_models(
         &self,
         doc: &ProxyDoc,
     ) -> BTreeMap<String, Result<PinnedModel, TinfoilVerifyError>> {
-        doc.models
-            .iter()
-            .map(|(slug, entry)| (slug.clone(), self.verifier.check_model(slug, entry)))
-            .collect()
+        let entries = doc.models.clone();
+        let verifier = Arc::clone(&self.verifier);
+        let checked = tokio::task::spawn_blocking(move || {
+            entries
+                .iter()
+                .map(|(slug, entry)| (slug.clone(), verifier.check_model(slug, entry)))
+                .collect::<BTreeMap<_, _>>()
+        })
+        .await;
+        let checked = checked.unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "check_models task failed; closing all models");
+            doc.models
+                .keys()
+                .map(|slug| {
+                    (
+                        slug.clone(),
+                        Err(TinfoilVerifyError::Malformed {
+                            stage: "check_models_join",
+                        }),
+                    )
+                })
+                .collect()
+        });
+        let mut checked = checked;
+        for slug in &doc.malformed {
+            tracing::warn!(slug = %slug, "Tinfoil directory entry did not parse; closing that model");
+            checked.insert(
+                slug.clone(),
+                Err(TinfoilVerifyError::Malformed {
+                    stage: "proxy_entry",
+                }),
+            );
+        }
+        for (slug, entry) in &doc.models {
+            if self.served_slugs.as_ref().is_none_or(|s| s.contains(slug)) {
+                match checked.get(slug) {
+                    Some(Ok(_)) => self
+                        .trust_timer
+                        .admitted(TrustKind::Model, &format!("{slug}@{}", entry.tag)),
+                    Some(Err(TinfoilVerifyError::UnknownModelMeasurement)) => self
+                        .trust_timer
+                        .rejected(TrustKind::Model, &format!("{slug}@{}", entry.tag)),
+                    _ => {}
+                }
+            }
+        }
+        checked
     }
 
     /// ATC -> `verify_router` -> pin SPKI -> proxy document (over the pinned
@@ -326,14 +388,27 @@ impl TinfoilRouterSession {
         // It is reported as a malformed-evidence stage (not a fetch failure),
         // and the session fails closed like any other verification error.
         let verifier = Arc::clone(&self.verifier);
-        let router = tokio::task::spawn_blocking({
+        let verified = tokio::task::spawn_blocking({
             let bundle = bundle.clone();
             move || verifier.verify_router(&bundle)
         })
         .await
-        .map_err(|_| TinfoilVerifyError::Malformed {
-            stage: "verify_join",
-        })??;
+        .map_err(|e| {
+            tracing::warn!(error = %e, "verify_router task failed");
+            TinfoilVerifyError::Malformed {
+                stage: "verify_join",
+            }
+        })?;
+        // The release digest identifies the router release being judged.
+        let router = match verified {
+            Ok(r) => r,
+            Err(e) => {
+                if e == TinfoilVerifyError::UnknownRouterMeasurement {
+                    self.trust_timer.rejected(TrustKind::Router, &bundle.digest);
+                }
+                return Err(e);
+            }
+        };
         validate_router_domain(&bundle.domain)?;
         let fp = hex::encode(router.spki_sha256);
 
@@ -347,12 +422,13 @@ impl TinfoilRouterSession {
                     .map_err(|_| TinfoilVerifyError::Fetch)?,
             ),
         };
+        let router_digest = bundle.digest.clone();
         let doc: ProxyDoc = Self::fetch_json(
             &transport.client,
             &format!("{}{PROXY_PATH}", transport.base),
         )
         .await?;
-        let models = self.check_models(&doc);
+        let models = self.check_models(&doc).await;
         // Published windows are best effort and never fail the verify. A failed
         // fetch keeps the last known windows so an oversized declared context
         // cannot start passing just because `/v1/models` is briefly down; only a
@@ -389,6 +465,8 @@ impl TinfoilRouterSession {
             bundle,
             transport,
         })));
+        // Admit only once the session actually published the router as trusted.
+        self.trust_timer.admitted(TrustKind::Router, &router_digest);
         Ok(())
     }
 
@@ -409,7 +487,7 @@ impl TinfoilRouterSession {
         .await;
         match doc {
             Ok(doc) => {
-                let models = self.check_models(&doc);
+                let models = self.check_models(&doc).await;
                 for (slug, m) in &models {
                     let was_ok = cur.models.get(slug).is_some_and(|p| p.is_ok());
                     if let (true, Err(e)) = (was_ok, m) {

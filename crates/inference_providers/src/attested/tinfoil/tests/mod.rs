@@ -268,9 +268,22 @@ fn proxy_doc() -> serde_json::Value {
             "repo": "r", "tag": "t",
             "measurement": {"type": "x", "registers": ["cc"]},
             "enclaves": {}
+        },
+        // Shape Tinfoil published live for an inactive model (glm-5-3-flash,
+        // 2026-10-20): empty tag, null measurement, no enclaves. It must close
+        // only itself, never the whole directory.
+        PLACEHOLDER_SLUG: {
+            "repo": "tinfoilsh/confidential-glm5-3-flash",
+            "tag": "",
+            "measurement": null,
+            "enclaves": {},
+            "verification": {"configured": 0, "verified": 0, "healthy": 0, "hosts": {}}
         }
     }})
 }
+
+/// A directory entry that does not parse (see `proxy_doc`).
+pub(super) const PLACEHOLDER_SLUG: &str = "placeholder-model";
 
 fn proxy_json() -> Vec<u8> {
     serde_json::to_vec(&proxy_doc()).unwrap()
@@ -334,6 +347,8 @@ impl TinfoilVerifier for StubVerifier {
         Ok(PinnedModel {
             slug: slug.into(),
             entry: entry.clone(),
+            source: PinSource::Compiled,
+            rekor_log_index: None,
         })
     }
 }

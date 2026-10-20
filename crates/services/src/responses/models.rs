@@ -7,7 +7,7 @@ use std::collections::HashSet;
 use utoipa::ToSchema;
 use uuid::Uuid;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResponseId(pub Uuid);
 
 impl From<Uuid> for ResponseId {

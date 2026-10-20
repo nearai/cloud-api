@@ -1181,6 +1181,57 @@ pub struct ModelPricing {
     pub input_cache_read: Option<String>,
 }
 
+/// Named nano-dollar amounts keep distinct price fields explicit at call sites.
+pub(crate) struct CatalogPricingAmounts {
+    pub input_cost_per_token: i64,
+    pub output_cost_per_token: i64,
+    pub cost_per_image: i64,
+    pub cache_read_cost_per_token: Option<i64>,
+}
+
+impl From<CatalogPricingAmounts> for ModelPricing {
+    fn from(pricing: CatalogPricingAmounts) -> Self {
+        Self {
+            // nano-dollars per token * 0.001 = USD per million tokens.
+            input: (pricing.input_cost_per_token as f64) * 0.001,
+            output: (pricing.output_cost_per_token as f64) * 0.001,
+            prompt: nano_dollars_to_per_token_string(pricing.input_cost_per_token),
+            completion: nano_dollars_to_per_token_string(pricing.output_cost_per_token),
+            image: nano_dollars_to_per_token_string(pricing.cost_per_image),
+            request: "0".to_string(),
+            input_cache_read: pricing
+                .cache_read_cost_per_token
+                .map(nano_dollars_to_per_token_string),
+        }
+    }
+}
+
+/// Convert a nano-USD amount (DB scale 9 — used for per-token, per-image, and
+/// per-request prices) to a USD string suitable for OpenRouter
+/// (e.g. 8_000 → "0.000008"). Strings are required by the OpenRouter provider
+/// spec to avoid float precision issues, so this uses pure integer arithmetic.
+/// Pricing is non-negative throughout the system; a defensive `abs()` keeps
+/// the formatter total in the unexpected case.
+fn nano_dollars_to_per_token_string(nano_dollars: i64) -> String {
+    if nano_dollars == 0 {
+        return "0".to_string();
+    }
+    let n = nano_dollars.unsigned_abs();
+    let dollars = n / 1_000_000_000;
+    let nanos = n % 1_000_000_000;
+    let mut s = if nanos == 0 {
+        format!("{dollars}")
+    } else {
+        let frac = format!("{nanos:09}");
+        let frac = frac.trim_end_matches('0');
+        format!("{dollars}.{frac}")
+    };
+    if nano_dollars < 0 {
+        s.insert(0, '-');
+    }
+    s
+}
+
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct ModelInfo {
     pub id: String,
@@ -1200,6 +1251,9 @@ pub struct ModelInfo {
     /// Pricing information (HuggingFace + OpenRouter compatible).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pricing: Option<ModelPricing>,
+    /// Earliest pending change and complete prices after it is applied.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upcoming_pricing: Option<UpcomingModelPricingInfo>,
     /// Exact, versioned USD-per-million text pricing. The legacy `pricing`
     /// projection remains Standard-short for compatibility.
     #[serde(rename = "textPricing", skip_serializing_if = "Option::is_none")]
@@ -3844,6 +3898,68 @@ pub struct AdminModelWithPricing {
     pub updated_at: DateTime<Utc>,
 }
 
+/// A scheduled change on the OpenAI-compatible model catalog. Prices use the
+/// same representation as the model's current `pricing` and `textPricing`.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct UpcomingModelPricingInfo {
+    pub effective_at: String,
+    pub pricing: ModelPricing,
+    #[serde(rename = "textPricing", skip_serializing_if = "Option::is_none")]
+    pub text_pricing: Option<serde_json::Value>,
+}
+
+/// A scheduled change on the native model catalog, in nano-dollars like the
+/// current prices. Absent when no change is pending.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct UpcomingPricing {
+    #[serde(rename = "effectiveAt")]
+    pub effective_at: String,
+    pub pricing: PricingFields,
+}
+
+impl From<services::models::UpcomingModelPricing> for UpcomingPricing {
+    fn from(pricing: services::models::UpcomingModelPricing) -> Self {
+        let decimal = |amount| DecimalPrice {
+            amount,
+            scale: 9,
+            currency: "USD".to_string(),
+        };
+        Self {
+            effective_at: crate::routes::admin::format_deprecation_date(&pricing.effective_at),
+            pricing: PricingFields {
+                input_cost_per_token: decimal(pricing.input_cost_per_token),
+                output_cost_per_token: decimal(pricing.output_cost_per_token),
+                cache_read_cost_per_token: pricing.cache_read_cost_per_token.map(decimal),
+                cost_per_image: decimal(pricing.cost_per_image),
+                text_pricing: pricing.text_pricing.map(|profile| {
+                    serde_json::to_value(profile).unwrap_or(serde_json::Value::Null)
+                }),
+            },
+        }
+    }
+}
+
+impl From<services::models::UpcomingModelPricing> for UpcomingModelPricingInfo {
+    fn from(pricing: services::models::UpcomingModelPricing) -> Self {
+        // Share the date and optional profile conversion with the native catalog.
+        let future = UpcomingPricing::from(pricing);
+        Self {
+            effective_at: future.effective_at,
+            pricing: CatalogPricingAmounts {
+                input_cost_per_token: future.pricing.input_cost_per_token.amount,
+                output_cost_per_token: future.pricing.output_cost_per_token.amount,
+                cost_per_image: future.pricing.cost_per_image.amount,
+                cache_read_cost_per_token: future
+                    .pricing
+                    .cache_read_cost_per_token
+                    .map(|price| price.amount),
+            }
+            .into(),
+            text_pricing: future.pricing.text_pricing,
+        }
+    }
+}
+
 /// Model with pricing information
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct ModelWithPricing {
@@ -3864,6 +3980,9 @@ pub struct ModelWithPricing {
     pub cache_read_cost_per_token: Option<DecimalPrice>,
     #[serde(rename = "textPricing", skip_serializing_if = "Option::is_none")]
     pub text_pricing: Option<serde_json::Value>,
+    /// Complete future prices and date for the earliest pending change.
+    #[serde(rename = "upcomingPricing", skip_serializing_if = "Option::is_none")]
+    pub upcoming_pricing: Option<UpcomingPricing>,
     pub metadata: ModelMetadata,
 }
 
@@ -4079,7 +4198,10 @@ pub struct UpdateModelApiRequest {
     /// Provider type: "vllm" (default, TEE-enabled) or "external" (3rd party)
     #[serde(rename = "providerType", skip_serializing_if = "Option::is_none")]
     pub provider_type: Option<String>,
-    /// JSON config for external providers (backend, base_url, etc.)
+    /// JSON config for external providers (backend, base_url, etc.). On an
+    /// existing model it merges into the stored config: keys sent replace
+    /// stored keys, `null` removes a key, omitted keys are kept. `api_key:
+    /// "***"` keeps the stored key.
     #[serde(rename = "providerConfig", skip_serializing_if = "Option::is_none")]
     pub provider_config: Option<serde_json::Value>,
     /// Whether this model supports TEE attestation
@@ -4835,6 +4957,87 @@ mod tests {
                     "model": "test", "tools": [{"type": "web_search", "count": count}]
                 }))
                 .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn nano_dollars_zero_renders_as_bare_zero() {
+        assert_eq!(nano_dollars_to_per_token_string(0), "0");
+    }
+
+    #[test]
+    fn nano_dollars_one_keeps_full_nine_decimal_places() {
+        // 1 nano-USD = $0.000000001 — boundary for our scale.
+        assert_eq!(nano_dollars_to_per_token_string(1), "0.000000001");
+    }
+
+    #[test]
+    fn nano_dollars_typical_per_token_price_trims_trailing_zeros() {
+        // $0.000008 per token, e.g. Claude Sonnet input.
+        assert_eq!(nano_dollars_to_per_token_string(8_000), "0.000008");
+        // $0.000024 per token, e.g. Claude Sonnet output.
+        assert_eq!(nano_dollars_to_per_token_string(24_000), "0.000024");
+    }
+
+    #[test]
+    fn nano_dollars_whole_dollar_amount_omits_decimal_point() {
+        // 1_000_000_000 nano-USD = $1 exactly. Must NOT render as "1." or "1.0".
+        assert_eq!(nano_dollars_to_per_token_string(1_000_000_000), "1");
+        assert_eq!(nano_dollars_to_per_token_string(5_000_000_000), "5");
+    }
+
+    #[test]
+    fn nano_dollars_mixed_integer_and_fraction() {
+        // $1.500000000 → "1.5" after trim.
+        assert_eq!(nano_dollars_to_per_token_string(1_500_000_000), "1.5");
+        // $1.000000001 → all 9 frac digits preserved (no trailing zeros to trim).
+        assert_eq!(
+            nano_dollars_to_per_token_string(1_000_000_001),
+            "1.000000001"
+        );
+    }
+
+    #[test]
+    fn nano_dollars_max_i64_does_not_lose_precision() {
+        // Integer arithmetic must remain exact at the upper bound, unlike the
+        // previous f64-based implementation.
+        // i64::MAX = 9_223_372_036_854_775_807 nano-USD
+        //         = 9_223_372_036.854775807 USD
+        assert_eq!(
+            nano_dollars_to_per_token_string(i64::MAX),
+            "9223372036.854775807"
+        );
+    }
+
+    #[test]
+    fn upcoming_catalogs_preserve_distinct_price_fields_and_units() {
+        let pricing = services::models::UpcomingModelPricing {
+            effective_at: "2030-01-01T00:00:00Z".parse().unwrap(),
+            input_cost_per_token: 1234,
+            output_cost_per_token: 5678,
+            cost_per_image: 9_876_543_210,
+            cache_read_cost_per_token: Some(234),
+            text_pricing: None,
+        };
+        let openai = serde_json::to_value(UpcomingModelPricingInfo::from(pricing.clone())).unwrap();
+        let native = serde_json::to_value(UpcomingPricing::from(pricing)).unwrap();
+        assert_eq!(openai["effective_at"], native["effectiveAt"]);
+        assert_eq!(openai["pricing"]["prompt"], "0.000001234");
+        assert_eq!(openai["pricing"]["completion"], "0.000005678");
+        assert_eq!(openai["pricing"]["image"], "9.87654321");
+        assert_eq!(openai["pricing"]["input_cache_read"], "0.000000234");
+        assert_eq!(openai["pricing"]["input"], 1.234);
+        assert_eq!(openai["pricing"]["output"], 5.678);
+        for (field, amount) in [
+            ("inputCostPerToken", 1234_i64),
+            ("outputCostPerToken", 5678),
+            ("costPerImage", 9_876_543_210),
+            ("cacheReadCostPerToken", 234),
+        ] {
+            assert_eq!(
+                native["pricing"][field],
+                json!({"amount": amount, "scale": 9, "currency": "USD"})
             );
         }
     }

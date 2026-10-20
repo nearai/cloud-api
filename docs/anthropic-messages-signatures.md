@@ -33,7 +33,9 @@ malformed or repeated start event, or an SSE event exceeding 256 KiB also preven
 receipt creation. Existing response and usage handling remain available; no
 replacement response ID is invented. The bounded initial ID peek can omit the
 `Inference-Id` header if the ID arrives late; billing and signature lookup still
-use the eventual message ID when available.
+use the eventual message ID when available. Once the first `message_start` is
+observed, a missing or invalid ID ends the peek immediately: the response keeps
+streaming without a receipt or `Inference-Id`.
 
 As with Chat Completions, signature storage failure does not replay inference or
 replace an otherwise successful response. Verification must fail if a receipt

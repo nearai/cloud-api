@@ -6,7 +6,7 @@ use crate::{
         common::{
             alias_warning_message, inject_chat_warning_field, inject_warning_field,
             map_domain_error_to_status, no_aliasing_requested, HEADER_MODEL_ALIAS_RESOLVED,
-            HEADER_NO_ALIASING,
+            HEADER_NO_ALIASING, SIGNATURE_STORE_TIMEOUT,
         },
         extractors::OpenAiJson,
         files::MAX_FILE_SIZE,
@@ -63,10 +63,6 @@ pub use score::*;
 
 // Timeout for synchronous usage recording before response is returned
 const USAGE_RECORDING_TIMEOUT_SECS: u64 = 5;
-
-// Bound the final Gateway-signature write before exposing a synthesized SSE
-// terminator. The provider routing pin has already been released on this path.
-const STREAM_SIGNATURE_STORE_TIMEOUT_SECS: u64 = 5;
 
 // Upper bound on leading SSE control events (keepalive comments, blank
 // lines) consumed while peeking for the first parsed chunk. Real upstreams

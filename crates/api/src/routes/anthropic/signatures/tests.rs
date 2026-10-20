@@ -14,6 +14,7 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Mutex,
 };
+use std::time::Duration;
 use tokio::sync::{Notify, Semaphore};
 
 const REQUEST: &[u8] = b"{ \"model\": \"anthropic/alias\", \"stream\": true }";
@@ -107,7 +108,149 @@ async fn collect(mut stream: AnthropicRawBody) -> Vec<u8> {
 }
 
 fn receipt_context(store: &Arc<ReceiptStore>) -> MessageSigningContext {
-    MessageSigningContext::new(store.clone(), REQUEST)
+    MessageSigningContext::new(store.clone(), body_hash(REQUEST))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unusable_start_ids_stream_immediately_and_bill_without_receipts() {
+    use futures_util::FutureExt;
+    use serde_json::json;
+
+    for id in [
+        Some(json!("x".repeat(256))),
+        Some(json!("msg_\ninvalid")),
+        Some(json!("")),
+        Some(json!(42)),
+        None,
+    ] {
+        let store = Arc::new(ReceiptStore::default());
+        let usage = Arc::new(RecordingUsageService::default());
+        let mut message = json!({"usage":{"input_tokens":3}});
+        if let Some(id) = id {
+            message["id"] = id;
+        }
+        let start = Bytes::from(format!(
+            "event: message_start\ndata: {}\n\n",
+            json!({"type":"message_start","message":message})
+        ));
+        let tail = Bytes::from(
+            [
+                b"data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":9}}\n\n"
+                    .as_slice(),
+                STOP,
+            ]
+            .concat(),
+        );
+        let release = Arc::new(Notify::new());
+        let upstream_release = release.clone();
+        let upstream_tail = tail.clone();
+        let inner =
+            raw_stream(vec![Ok(start.clone())]).chain(futures_util::stream::once(async move {
+                upstream_release.notified().await;
+                Ok(upstream_tail)
+            }));
+        // The tail is deliberately unavailable. The response must be ready
+        // immediately, without waiting for the 30-second peek timeout.
+        let response = build_upstream_response(
+            AnthropicRawResponse {
+                status: StatusCode::OK,
+                headers: Default::default(),
+                body: Box::pin(inner),
+            },
+            AnthropicRawEndpoint::Messages,
+            true,
+            Some(billing_context(usage.clone())),
+            None,
+            None,
+            Some(receipt_context(&store)),
+        )
+        .now_or_never()
+        .expect("an observed invalid/missing ID must end the peek");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(!response.headers().contains_key("inference-id"));
+        let mut body = response.into_body().into_data_stream();
+        assert_eq!(body.next().now_or_never().unwrap().unwrap().unwrap(), start);
+        release.notify_one();
+        let mut returned_tail = Vec::new();
+        while let Some(bytes) = body.next().await {
+            returned_tail.extend_from_slice(&bytes.unwrap());
+        }
+        assert_eq!(returned_tail, tail);
+        drop(body);
+        let recorded = wait_for_recorded_usage(&usage).await;
+        assert_eq!(recorded.provider_request_id, None);
+        assert_eq!(recorded.input_tokens, 3);
+        assert_eq!(recorded.output_tokens, 9);
+        assert_eq!(
+            recorded.stop_reason,
+            Some(services::usage::StopReason::Completed)
+        );
+        assert!(usage.records.lock().unwrap().is_empty());
+        assert_eq!(store.attempts.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[tokio::test]
+async fn json_billing_errors_and_task_panics_keep_distinct_diagnostics() {
+    #[derive(Clone)]
+    struct LogWriter(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for LogWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    for panic_on_record in [false, true] {
+        let store = Arc::new(ReceiptStore::default());
+        let usage = Arc::new(RecordingUsageService {
+            panic_on_record,
+            ..Default::default()
+        });
+        let logs = Arc::new(Mutex::new(Vec::new()));
+        let writer = LogWriter(logs.clone());
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        // This test uses the current-thread runtime, including across await.
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let response = build_upstream_response(
+            AnthropicRawResponse {
+                status: StatusCode::OK,
+                headers: Default::default(),
+                body: raw_stream(vec![Ok(Bytes::from_static(
+                    br#"{"id":"msg_billing_error","usage":{"input_tokens":3,"output_tokens":9}}"#,
+                ))]),
+            },
+            AnthropicRawEndpoint::Messages,
+            false,
+            Some(billing_context(usage)),
+            None,
+            None,
+            Some(receipt_context(&store)),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = to_bytes(response.into_body(), 4096).await.unwrap();
+        let error: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error["error"]["message"], "Failed to record usage");
+        assert_eq!(store.attempts.load(Ordering::SeqCst), 0);
+        let logs = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+        if panic_on_record {
+            assert!(logs.contains("Native Anthropic usage finalization task failed"));
+            assert!(logs.contains("task_panicked=true"));
+            assert!(logs.contains("task_cancelled=false"));
+            assert!(!logs.contains("fixture usage panic"));
+        } else {
+            assert!(logs.contains("Failed to record native Anthropic usage"));
+            assert!(logs.contains("Internal error: recorded"));
+        }
+    }
 }
 
 #[tokio::test]
@@ -295,9 +438,12 @@ async fn failed_or_timed_out_storage_preserves_response_without_retry() {
             receipt_context(&store),
         );
         assert_eq!(
-            tokio::time::timeout(SIGNATURE_TIMEOUT + Duration::from_secs(1), collect(stream))
-                .await
-                .unwrap(),
+            tokio::time::timeout(
+                SIGNATURE_STORE_TIMEOUT + Duration::from_secs(1),
+                collect(stream)
+            )
+            .await
+            .unwrap(),
             raw
         );
         assert_eq!(store.attempts.load(Ordering::SeqCst), 1);

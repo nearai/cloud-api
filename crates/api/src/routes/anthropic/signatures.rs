@@ -1,12 +1,12 @@
 //! Gateway receipts for native Messages, without re-encoding JSON or SSE.
 
 use super::{AnthropicRawBody, AnthropicRawError, Bytes};
+use crate::routes::common::SIGNATURE_STORE_TIMEOUT;
 use futures_util::StreamExt;
 use services::attestation::ports::AttestationServiceTrait;
 use sha2::{Digest, Sha256};
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
 
-const SIGNATURE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_EVENT_BYTES: usize = 256 * 1024;
 
 pub(super) fn body_hash(bytes: &[u8]) -> String {
@@ -25,10 +25,10 @@ pub(super) struct MessageSigningContext {
 }
 
 impl MessageSigningContext {
-    pub(super) fn new(service: Arc<dyn AttestationServiceTrait>, request: &[u8]) -> Self {
+    pub(super) fn new(service: Arc<dyn AttestationServiceTrait>, request_hash: String) -> Self {
         Self {
             service,
-            request_hash: body_hash(request),
+            request_hash,
         }
     }
 
@@ -36,7 +36,7 @@ impl MessageSigningContext {
         // Native Messages never pins a provider connection: the gateway signs
         // these bytes. Bound the database write as well as signature creation.
         let result = tokio::time::timeout(
-            SIGNATURE_TIMEOUT,
+            SIGNATURE_STORE_TIMEOUT,
             self.service
                 .store_chat_signature(&id, self.request_hash, response_hash),
         )

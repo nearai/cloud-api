@@ -205,15 +205,14 @@ impl Default for GeminiBackend {
     }
 }
 
-/// Strip vendor prefix from model name (e.g., "google/gemini-2.0-flash" -> "gemini-2.0-flash")
+/// Accept catalog aliases and Gemini discovery resource names. Normalize at
+/// dispatch so already-persisted `models/...` inventory remains usable.
 fn strip_vendor_prefix(model: &str) -> &str {
-    if let Some(stripped) = model.strip_prefix("google/") {
-        return stripped;
-    }
-    if let Some(stripped) = model.strip_prefix("vertex/") {
-        return stripped;
-    }
-    model
+    let model = model
+        .strip_prefix("google/")
+        .or_else(|| model.strip_prefix("vertex/"))
+        .unwrap_or(model);
+    model.strip_prefix("models/").unwrap_or(model)
 }
 
 /// SSE parser type alias for Gemini

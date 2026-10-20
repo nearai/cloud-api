@@ -246,9 +246,10 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
         let model_pub_key_clone = model_pub_key.clone();
         let encryption_version_clone = encryption_version.clone();
 
-        tokio::spawn(crate::provider_registry::accepted_request::ACCEPTED.scope(
-            accepted,
-            async move {
+        let organization_requires_tee = crate::provider_registry::organization_requires_tee();
+        tokio::spawn(crate::provider_registry::ORGANIZATION_TEE_REQUIRED.scope(
+            organization_requires_tee,
+            crate::provider_registry::accepted_request::ACCEPTED.scope(accepted, async move {
                 let mut tool_registry = tools::ToolRegistry::new();
                 if let Some(provider) = web_search_provider {
                     tool_registry.register(Arc::new(tools::WebSearchToolExecutor::new(provider)));
@@ -347,7 +348,7 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
                         tracing::error!("Error sending error event: {e:?}");
                     }
                 }
-            },
+            }),
         ));
 
         Ok(Box::pin(rx))
@@ -3132,24 +3133,31 @@ impl ResponseServiceImpl {
             return None;
         }
 
-        // Spawn background task to check and generate title
-        let handle = tokio::spawn(async move {
-            Self::generate_and_update_title(
-                conv_id,
-                user_id,
-                user_message,
-                api_key_id,
-                request_id,
-                organization_id,
-                workspace_id,
-                fallback_enabled,
-                request_priority,
-                conversation_service,
-                completion_service,
-                tx,
-            )
-            .await
-        });
+        // Tokio task locals are not inherited by spawned title work. Carry both
+        // the organization constraint and the already resolved request policy.
+        let tee = request.tee;
+        let organization_requires_tee = crate::provider_registry::organization_requires_tee();
+        let handle = tokio::spawn(crate::provider_registry::ORGANIZATION_TEE_REQUIRED.scope(
+            organization_requires_tee,
+            async move {
+                Self::generate_and_update_title(
+                    conv_id,
+                    user_id,
+                    user_message,
+                    tee,
+                    api_key_id,
+                    request_id,
+                    organization_id,
+                    workspace_id,
+                    fallback_enabled,
+                    request_priority,
+                    conversation_service,
+                    completion_service,
+                    tx,
+                )
+                .await
+            },
+        ));
 
         Some(handle)
     }
@@ -3160,6 +3168,7 @@ impl ResponseServiceImpl {
         conversation_id: ConversationId,
         user_id: crate::UserId,
         user_message: String,
+        tee: Option<inference_providers::routing::TeeRequirement>,
         api_key_id: String,
         request_id: uuid::Uuid,
         organization_id: uuid::Uuid,
@@ -3247,10 +3256,18 @@ impl ResponseServiceImpl {
             original_request: None,
             n: None,
             service_tier: Some(inference_providers::ChatServiceTier::Default),
-            extra: std::collections::HashMap::from([(
-                "chat_template_kwargs".to_string(),
-                serde_json::json!({ "enable_thinking": false }),
-            )]),
+            extra: std::collections::HashMap::from([
+                (
+                    "tee".to_string(),
+                    serde_json::json!(
+                        tee.unwrap_or(inference_providers::routing::TeeRequirement::Required)
+                    ),
+                ),
+                (
+                    "chat_template_kwargs".to_string(),
+                    serde_json::json!({ "enable_thinking": false }),
+                ),
+            ]),
         };
 
         // Call completion service to generate title

@@ -1242,3 +1242,242 @@ async fn provider_registry_cancel_before_headers_records_unknown_cost_without_re
     assert_eq!(row.get::<_, Option<i64>>("actual_cost_microusd"), None);
     assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
 }
+
+#[tokio::test]
+async fn provider_registry_review_gemini_discovery_routes_both_transports() {
+    use wiremock::{
+        matchers::{method, path},
+        Mock, MockServer, ResponseTemplate,
+    };
+    let upstream = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/models"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"models":[{"name":"models/gemini-fixture"}]})),
+        )
+        .mount(&upstream)
+        .await;
+    let payload = json!({"candidates":[{"content":{"role":"model","parts":[{"text":"fixture reply"}]},"finishReason":"STOP","index":0}],"usageMetadata":{"promptTokenCount":2,"candidatesTokenCount":3,"totalTokenCount":5}});
+    Mock::given(method("POST"))
+        .and(path("/models/gemini-fixture:generateContent"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(payload.clone()))
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/models/gemini-fixture:streamGenerateContent"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(format!("data: {payload}\n\n")),
+        )
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    let (server, _, _, db) = crate::common::setup_test_server_with_pool_and_config(|cfg| {
+        cfg.external_providers.timeout_seconds = 10
+    })
+    .await;
+    let name = catalog(&server, true).await;
+    let mut body = definition();
+    body["config"] = json!({"backend":"gemini","base_url":upstream.uri()});
+    body["models_path"] = json!("models");
+    let id = create(&server, body).await;
+    let inventory = call(
+        &server,
+        Method::GET,
+        &format!("/v1/admin/providers/{id}/models"),
+        json!({}),
+    )
+    .await
+    .json::<Vec<Value>>();
+    assert_eq!(inventory[0]["upstream_model"], "models/gemini-fixture");
+    let approved = call(&server,Method::PUT,&format!("/v1/admin/providers/{id}/models"),json!({"upstream_model":"models/gemini-fixture","model_name":name,"approved":true,"archived":false})).await;
+    assert_eq!(approved.status_code(), 204, "{}", approved.text());
+    let org = crate::common::setup_org_with_credits(&server, 10_000_000_000).await;
+    let key = crate::common::get_api_key_for_org(&server, org.id.clone()).await;
+    for stream in [false, true] {
+        let response = server.post("/v1/chat/completions").add_header("Authorization",format!("Bearer {key}"))
+            .json(&json!({"model":name,"messages":[{"role":"user","content":"fixture"}],"stream":stream,"max_tokens":16})).await;
+        assert_eq!(response.status_code(), 200, "{}", response.text());
+        assert!(response.text().contains("fixture reply"));
+        assert_eq!(response.header("x-serving-deployment-id"), id.to_string());
+    }
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let count: i64 = db.pool().get().await.unwrap().query_one("SELECT count(*) FROM organization_usage_log WHERE model_name=$1 AND served_deployment_id=$2", &[&name,&id]).await.unwrap().get(0);
+            if count == 2 { break; }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }).await.unwrap();
+}
+
+#[tokio::test]
+async fn provider_registry_review_discovery_preserves_manual_availability() {
+    use wiremock::{matchers::path, Mock, MockServer, ResponseTemplate};
+    let upstream = MockServer::start().await;
+    Mock::given(path("/models"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"data":[{"id":"remote-model"}]})),
+        )
+        .mount(&upstream)
+        .await;
+    let (server, pool, _, db) = crate::common::setup_test_server_with_pool_and_config(|cfg| {
+        cfg.external_providers.timeout_seconds = 10
+    })
+    .await;
+    let name = catalog(&server, true).await;
+    let mut body = definition();
+    body["config"]["base_url"] = json!(upstream.uri());
+    body["models_path"] = json!("models");
+    let id = create(&server, body).await;
+    approve(&server, id, &name, true, false).await;
+    let repo = database::repositories::provider_registry::ProviderRegistryRepository::new(
+        db.pool().clone(),
+    );
+    let inventory_id = repo.models(id).await.unwrap()[0].id;
+    assert!(pool.has_provider(&name).await);
+    let org = crate::common::setup_org_with_credits(&server, 10_000_000_000).await;
+    let key = crate::common::get_api_key_for_org(&server, org.id).await;
+    for available in [false, true] {
+        let response = call(&server,Method::PUT,&format!("/v1/admin/providers/{id}/inventory"),json!({"upstream_model":"remote-model","available":available,"archived":false,"reasoning_efforts":["high"],"provenance":"operator decision","change_reason":"Availability regression"})).await;
+        assert_eq!(response.status_code(), 204, "{}", response.text());
+        for present in [true, false, true] {
+            upstream.reset().await;
+            let rows = if present {
+                json!([{"id":"remote-model","version":"refreshed"}])
+            } else {
+                json!([])
+            };
+            Mock::given(path("/models"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data":rows})))
+                .mount(&upstream)
+                .await;
+            let response = call(
+                &server,
+                Method::POST,
+                &format!("/v1/admin/providers/{id}/sync"),
+                json!({}),
+            )
+            .await;
+            assert_eq!(response.status_code(), 204, "{}", response.text());
+            let models = repo.models(id).await.unwrap();
+            assert_eq!(models[0].id, inventory_id);
+            assert_eq!(models[0].available, available);
+            assert!(models[0].approved);
+            assert_eq!(models[0].reasoning_efforts, Some(vec!["high".into()]));
+            assert_eq!(pool.has_provider(&name).await, available);
+            Mock::given(path("/chat/completions"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "id":format!("availability-{}",Uuid::new_v4()),"object":"chat.completion","created":1,"model":"remote-model",
+                    "choices":[{"index":0,"message":{"role":"assistant","content":"available"},"finish_reason":"stop"}],
+                    "usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}
+                }))).expect(u64::from(available)).mount(&upstream).await;
+            let response = server.post("/v1/chat/completions").add_header("Authorization",format!("Bearer {key}"))
+                .json(&json!({"model":name,"messages":[{"role":"user","content":"availability fixture"}],"max_tokens":4})).await;
+            assert_eq!(
+                response.status_code().is_success(),
+                available,
+                "{}",
+                response.text()
+            );
+            upstream.verify().await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn provider_registry_review_title_generation_preserves_tee_across_spawns() {
+    use std::sync::Arc;
+    use wiremock::{matchers::path, Mock, MockServer, ResponseTemplate};
+    // Nextest runs each case in its own process. Restore the setting on unwind
+    // as well so this test does not leave process-global configuration behind.
+    struct TitleModelEnv(Option<String>);
+    impl Drop for TitleModelEnv {
+        fn drop(&mut self) {
+            if let Some(value) = &self.0 {
+                std::env::set_var("TITLE_GENERATION_MODEL", value);
+            } else {
+                std::env::remove_var("TITLE_GENERATION_MODEL");
+            }
+        }
+    }
+    let upstream = MockServer::start().await;
+    Mock::given(path("/chat/completions"))
+        .respond_with(|_: &wiremock::Request| ResponseTemplate::new(200).set_body_json(json!({
+            "id":format!("title-{}",Uuid::new_v4()), "object":"chat.completion", "created":1,"model":"remote-model",
+            "choices":[{"index":0,"message":{"role":"assistant","content":"Fixture title"},"finish_reason":"stop"}],
+            "usage":{"prompt_tokens":2,"completion_tokens":2,"total_tokens":4}
+        }))).expect(2).mount(&upstream).await;
+    let (server, pool, _, db) = crate::common::setup_test_server_with_pool_and_config(|cfg| {
+        cfg.external_providers.timeout_seconds = 10
+    })
+    .await;
+    let main_model = catalog(&server, true).await;
+    let title_model = catalog(&server, true).await;
+    let _env = TitleModelEnv(std::env::var("TITLE_GENERATION_MODEL").ok());
+    std::env::set_var("TITLE_GENERATION_MODEL", &title_model);
+    let mut body = definition();
+    body["config"]["base_url"] = json!(upstream.uri());
+    let deployment = create(&server, body).await;
+    approve(&server, deployment, &title_model, true, false).await;
+    // This fixture tests policy propagation, not real TEE verification.
+    pool.register_provider(
+        main_model.clone(),
+        Arc::new(
+            inference_providers::mock::MockProvider::new_accept_all()
+                .with_tier(inference_providers::ProviderTier::Near)
+                .with_provider_source(inference_providers::ProviderSource::Vllm),
+        ),
+    )
+    .await;
+    for stream in [false, true] {
+        for (org_required, tee, allowed) in [
+            (false, "any", true),
+            (true, "any", false),
+            (false, "required", false),
+        ] {
+            let org = crate::common::setup_org_with_credits(&server, 10_000_000_000).await;
+            let key = crate::common::get_api_key_for_org(&server, org.id.clone()).await;
+            if org_required {
+                let response = call(
+                    &server,
+                    Method::PUT,
+                    &format!("/v1/admin/organizations/{}/inference-policy", org.id),
+                    json!({"tee_required":true,"change_reason":"Title isolation regression"}),
+                )
+                .await;
+                assert_eq!(response.status_code(), 204, "{}", response.text());
+            }
+            let conversation = server
+                .post("/v1/conversations")
+                .add_header("Authorization", format!("Bearer {key}"))
+                .json(&json!({"name":"Untitled fixture"}))
+                .await;
+            assert_eq!(conversation.status_code(), 201, "{}", conversation.text());
+            let conversation = conversation.json::<Value>();
+            let before = upstream.received_requests().await.unwrap().len();
+            let response = server.post("/v1/responses").add_header("Authorization",format!("Bearer {key}"))
+                .json(&json!({"model":main_model,"conversation":{"id":conversation["id"]},"input":"Customer text for title","tee":tee,"stream":stream,"max_output_tokens":16})).await;
+            assert_eq!(response.status_code(), 200, "{}", response.text());
+            if stream {
+                assert!(
+                    response.text().contains("response.completed"),
+                    "{}",
+                    response.text()
+                );
+            } else {
+                assert_eq!(response.json::<Value>()["status"], "completed");
+            }
+            assert_eq!(
+                upstream.received_requests().await.unwrap().len() - before,
+                usize::from(allowed),
+                "org_required={org_required}, tee={tee}, stream={stream}"
+            );
+            let org_id = Uuid::parse_str(&org.id).unwrap();
+            let rows: i64 = db.pool().get().await.unwrap().query_one("SELECT count(*) FROM organization_usage_log WHERE organization_id=$1 AND model_name=$2", &[&org_id,&title_model]).await.unwrap().get(0);
+            assert_eq!(rows, i64::from(allowed));
+        }
+    }
+}

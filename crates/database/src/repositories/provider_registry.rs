@@ -287,7 +287,7 @@ impl ProviderRegistryRepository {
         for model in models {
             tx.execute("INSERT INTO provider_models(provider_id,upstream_model,metadata,discovered_reasoning_efforts,last_seen_at,provenance)
                 VALUES($1,$2,$3,$4,now(),'discovered') ON CONFLICT(provider_id,upstream_model) DO UPDATE SET
-                metadata=$3,discovered_reasoning_efforts=$4,available=true,last_seen_at=now(),updated_at=now()",
+                metadata=$3,discovered_reasoning_efforts=$4,available=CASE WHEN provider_models.provenance='manual' THEN provider_models.available ELSE true END,last_seen_at=now(),updated_at=now()",
                 &[&id,&model.upstream_model,&model.metadata,&model.reasoning_efforts]).await?;
         }
         tx.execute(

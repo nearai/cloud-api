@@ -97,6 +97,13 @@ impl OrganizationUsageRepository {
             let served_provider_type = request
                 .served_provider_type
                 .map(|provider| provider.as_str());
+            // NEAR-tier-only credit types (e.g. grant) are excluded from the
+            // funding candidates unless this charge was served by the NEAR
+            // fleet; unattributed charges fail closed. See
+            // `CreditAllocationPolicy::priority_for_tier`.
+            let allocation_priority = self
+                .allocation_policy
+                .priority_for_tier(request.served_provider_tier);
             client
                 .query_typed_one(
                     r#"
@@ -135,7 +142,7 @@ impl OrganizationUsageRepository {
                         (&request.billing_details, Type::JSONB),
                         (&request.service_tier, Type::TEXT),
                         (&request.context_band, Type::TEXT),
-                        (&self.allocation_policy.priority, Type::TEXT_ARRAY),
+                        (&allocation_priority, Type::TEXT_ARRAY),
                         (&self.allocation_policy.version, Type::VARCHAR),
                     ],
                 )

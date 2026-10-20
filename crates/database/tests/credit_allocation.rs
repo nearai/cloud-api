@@ -136,7 +136,13 @@ async fn priority_splits_exactly_and_records_overage() -> anyhow::Result<()> {
         let org = insert_org_fixture(&pool).await?;
         set_example_limits(&limits, org.org_id).await?;
         let row = repository
-            .record_usage(usage(&org, &model, Uuid::new_v4(), cost))
+            .record_usage(usage_with_tier(
+                &org,
+                &model,
+                Uuid::new_v4(),
+                cost,
+                Some(services::usage::ServedProviderTier::Near),
+            ))
             .await?;
         let actual = row
             .credit_allocations
@@ -179,7 +185,13 @@ async fn in_flight_usage_is_billed_after_organization_deactivation() -> anyhow::
         .await?;
 
     let recorded = repository
-        .record_usage(usage(&org, &model, Uuid::new_v4(), 4))
+        .record_usage(usage_with_tier(
+            &org,
+            &model,
+            Uuid::new_v4(),
+            4,
+            Some(services::usage::ServedProviderTier::Near),
+        ))
         .await?;
     assert_eq!(recorded.funded_amount, Some(4));
     assert_eq!(recorded.unfunded_amount, Some(0));
@@ -565,7 +577,9 @@ async fn ambiguous_legacy_spend_stays_unknown_and_cannot_restore_capacity() -> a
     let repository = OrganizationUsageRepository::new(pool.clone());
     let org = insert_org_fixture(&pool).await?;
     let model = insert_model(&pool, "allocation-legacy-baseline").await?;
-    set_limit(&limits, org.org_id, "grant", 100).await?;
+    // Unattributed (legacy) spend cannot draw on NEAR-tier-only credit, so the
+    // legacy-capacity semantics are characterized on an unrestricted type.
+    set_limit(&limits, org.org_id, "payment", 100).await?;
 
     let client = pool.get().await?;
     client
@@ -607,11 +621,23 @@ async fn limit_replacement_preserves_consumption_and_custom_order_is_honored() -
     set_limit(&limits, org.org_id, "postpay", 10).await?;
     let repository = OrganizationUsageRepository::new(pool.clone());
     repository
-        .record_usage(usage(&org, &model, Uuid::new_v4(), 2))
+        .record_usage(usage_with_tier(
+            &org,
+            &model,
+            Uuid::new_v4(),
+            2,
+            Some(services::usage::ServedProviderTier::Near),
+        ))
         .await?;
     set_limit(&limits, org.org_id, "grant", 5).await?;
     let next = repository
-        .record_usage(usage(&org, &model, Uuid::new_v4(), 4))
+        .record_usage(usage_with_tier(
+            &org,
+            &model,
+            Uuid::new_v4(),
+            4,
+            Some(services::usage::ServedProviderTier::Near),
+        ))
         .await?;
     assert_eq!(
         next.credit_allocations
@@ -630,6 +656,7 @@ async fn limit_replacement_preserves_consumption_and_custom_order_is_honored() -
             .map(str::to_string)
             .collect(),
         policy_version: "custom-v2".to_string(),
+        near_tier_only_credit_types: vec!["grant".to_string()],
     };
     let custom_repository = OrganizationUsageRepository::with_accounting_config(
         pool.clone(),
@@ -637,7 +664,13 @@ async fn limit_replacement_preserves_consumption_and_custom_order_is_honored() -
         &custom,
     );
     let custom_row = custom_repository
-        .record_usage(usage(&custom_org, &model, Uuid::new_v4(), 5))
+        .record_usage(usage_with_tier(
+            &custom_org,
+            &model,
+            Uuid::new_v4(),
+            5,
+            Some(services::usage::ServedProviderTier::Near),
+        ))
         .await?;
     assert_eq!(
         custom_row
@@ -666,7 +699,13 @@ async fn every_credit_source_automatically_settles_overage() -> anyhow::Result<(
 
     for credit_type in ["grant", "staking_farm", "payment", "postpay"] {
         let org = insert_org_fixture(&pool).await?;
-        let request = usage(&org, &model, Uuid::new_v4(), 5);
+        let request = usage_with_tier(
+            &org,
+            &model,
+            Uuid::new_v4(),
+            5,
+            Some(services::usage::ServedProviderTier::Near),
+        );
         let original = usage_repository.record_usage(request.clone()).await?;
         assert_eq!(original.funded_amount, Some(0));
         assert_eq!(original.unfunded_amount, Some(5));
@@ -804,7 +843,13 @@ async fn partial_exact_and_excess_topups_settle_only_available_capacity() -> any
     for (topup, expected_unfunded, expected_available) in [(3, 2, 0), (5, 0, 0), (7, 0, 2)] {
         let org = insert_org_fixture(&pool).await?;
         usage_repository
-            .record_usage(usage(&org, &model, Uuid::new_v4(), 5))
+            .record_usage(usage_with_tier(
+                &org,
+                &model,
+                Uuid::new_v4(),
+                5,
+                Some(services::usage::ServedProviderTier::Near),
+            ))
             .await?;
 
         set_limit(&limits, org.org_id, "payment", topup).await?;
@@ -829,7 +874,13 @@ async fn same_credit_type_settlement_is_append_only_and_reports_effective_fundin
     let org = insert_org_fixture(&pool).await?;
     let model = insert_model(&pool, "allocation-auto-settlement-same-type").await?;
     set_limit(&posting_limits, org.org_id, "grant", 2).await?;
-    let request = usage(&org, &model, Uuid::new_v4(), 5);
+    let request = usage_with_tier(
+        &org,
+        &model,
+        Uuid::new_v4(),
+        5,
+        Some(services::usage::ServedProviderTier::Near),
+    );
     let original = usage_repository.record_usage(request.clone()).await?;
     assert_eq!(original.unfunded_amount, Some(3));
 
@@ -897,9 +948,21 @@ async fn settlement_funds_oldest_overages_first() -> anyhow::Result<()> {
     let org = insert_org_fixture(&pool).await?;
     let model = insert_model(&pool, "allocation-auto-settlement-fifo").await?;
     let first = usage_repository
-        .record_usage(usage(&org, &model, Uuid::new_v4(), 2))
+        .record_usage(usage_with_tier(
+            &org,
+            &model,
+            Uuid::new_v4(),
+            2,
+            Some(services::usage::ServedProviderTier::Near),
+        ))
         .await?;
-    let second_request = usage(&org, &model, Uuid::new_v4(), 3);
+    let second_request = usage_with_tier(
+        &org,
+        &model,
+        Uuid::new_v4(),
+        3,
+        Some(services::usage::ServedProviderTier::Near),
+    );
     let second = usage_repository
         .record_usage(second_request.clone())
         .await?;
@@ -940,7 +1003,13 @@ async fn concurrent_credit_additions_cannot_double_settle_overage() -> anyhow::R
     let org = insert_org_fixture(&pool).await?;
     let model = insert_model(&pool, "allocation-auto-settlement-concurrent").await?;
     usage_repository
-        .record_usage(usage(&org, &model, Uuid::new_v4(), 10))
+        .record_usage(usage_with_tier(
+            &org,
+            &model,
+            Uuid::new_v4(),
+            10,
+            Some(services::usage::ServedProviderTier::Near),
+        ))
         .await?;
 
     let grant_limits = OrganizationLimitsRepository::new(pool.clone());
@@ -997,7 +1066,13 @@ async fn concurrent_inference_and_service_cannot_double_spend_capacity() -> anyh
 
     let inference_id = Uuid::new_v4();
     let service_inference_id = Uuid::new_v4();
-    let inference = inference_repository.record_usage(usage(&org, &model, inference_id, 8));
+    let inference = inference_repository.record_usage(usage_with_tier(
+        &org,
+        &model,
+        inference_id,
+        8,
+        Some(services::usage::ServedProviderTier::Near),
+    ));
     let service_request = RecordServiceUsageRequest {
         organization_id: org.org_id,
         workspace_id: org.workspace_a_id,
@@ -1107,7 +1182,13 @@ async fn credit_status_reports_consumption_and_funding_columns() -> anyhow::Resu
         )
         .await?;
     repository
-        .record_usage(usage(&org, &model, Uuid::new_v4(), 90))
+        .record_usage(usage_with_tier(
+            &org,
+            &model,
+            Uuid::new_v4(),
+            90,
+            Some(services::usage::ServedProviderTier::Near),
+        ))
         .await?;
 
     let (status, unfunded, unattributed) = limits.get_current_credit_status(org.org_id).await?;
@@ -1255,7 +1336,13 @@ async fn inference_function_matches_service_allocation_for_credit_boundaries() -
             )
             .await?;
         let inference = inference_repo
-            .record_usage(usage(&inference_org, &model, Uuid::new_v4(), cost))
+            .record_usage(usage_with_tier(
+                &inference_org,
+                &model,
+                Uuid::new_v4(),
+                cost,
+                Some(services::usage::ServedProviderTier::Near),
+            ))
             .await?;
         let service = service_repo
             .record_usage(&RecordServiceUsageRequest {
@@ -1757,7 +1844,13 @@ async fn reconciliation_snapshot_retains_expired_credit_consumption() -> anyhow:
     seed_legacy_consumption(&pool, &org, &model, 80).await?;
     set_limit(&limits, org.org_id, "grant", 5).await?;
     OrganizationUsageRepository::new(pool.clone())
-        .record_usage(usage(&org, &model, Uuid::new_v4(), 5))
+        .record_usage(usage_with_tier(
+            &org,
+            &model,
+            Uuid::new_v4(),
+            5,
+            Some(services::usage::ServedProviderTier::Near),
+        ))
         .await?;
     let client = pool.get().await?;
     client
@@ -1872,4 +1965,173 @@ async fn reconciliation_lock_timeout_is_a_retryable_conflict() -> anyhow::Result
 
     cleanup_usage_fixtures(&pool, &[org.org_id], &[]).await?;
     Ok(())
+}
+
+fn usage_with_tier(
+    org: &OrgFixture,
+    model: &ModelFixture,
+    inference_id: Uuid,
+    cost: i64,
+    served_provider_tier: Option<services::usage::ServedProviderTier>,
+) -> RecordUsageRequest {
+    RecordUsageRequest {
+        served_provider_tier,
+        ..usage(org, model, inference_id, cost)
+    }
+}
+
+fn allocations_of(row: &OrganizationUsageLog) -> Vec<(String, i64)> {
+    row.credit_allocations
+        .as_ref()
+        .unwrap_or_else(|| panic!("new usage must have attributed allocations"))
+        .iter()
+        .map(|allocation| (allocation.credit_type.clone(), allocation.amount))
+        .collect()
+}
+
+use database::models::OrganizationUsageLog;
+
+/// NEAR-tier-only credit types (default: grant) must be excluded from the
+/// funding candidates when a charge was not served by the NEAR fleet —
+/// including unattributed charges (fail-closed).
+#[tokio::test]
+async fn near_tier_only_credits_skip_non_near_posting() -> anyhow::Result<()> {
+    let pool = test_pool().await?;
+    let limits = OrganizationLimitsRepository::new(pool.clone());
+    let repository = OrganizationUsageRepository::new(pool.clone());
+    let model = insert_model(&pool, "allocation-near-scope-posting").await?;
+    let org = insert_org_fixture(&pool).await?;
+    set_limit(&limits, org.org_id, "grant", 10).await?;
+    set_limit(&limits, org.org_id, "payment", 4).await?;
+
+    // Unattributed tier fails closed: grant (first in priority) is skipped,
+    // payment funds what it can, the rest posts as unfunded overage.
+    let row = repository
+        .record_usage(usage_with_tier(&org, &model, Uuid::new_v4(), 6, None))
+        .await?;
+    assert_eq!(allocations_of(&row), vec![("payment".to_string(), 4)]);
+    assert_eq!(row.funded_amount, Some(4));
+    assert_eq!(row.unfunded_amount, Some(2));
+
+    // NEAR-served usage draws on the grant per the normal priority.
+    let row = repository
+        .record_usage(usage_with_tier(
+            &org,
+            &model,
+            Uuid::new_v4(),
+            6,
+            Some(services::usage::ServedProviderTier::Near),
+        ))
+        .await?;
+    assert_eq!(allocations_of(&row), vec![("grant".to_string(), 6)]);
+    assert_eq!(row.funded_amount, Some(6));
+    assert_eq!(row.unfunded_amount, Some(0));
+
+    // Attested third-party tier: grant stays locked, payment is exhausted,
+    // the whole charge posts unfunded.
+    let row = repository
+        .record_usage(usage_with_tier(
+            &org,
+            &model,
+            Uuid::new_v4(),
+            3,
+            Some(services::usage::ServedProviderTier::Attested3p),
+        ))
+        .await?;
+    assert_eq!(allocations_of(&row), vec![]);
+    assert_eq!(row.funded_amount, Some(0));
+    assert_eq!(row.unfunded_amount, Some(3));
+
+    cleanup_usage_fixtures(&pool, &[org.org_id], &[model.id]).await?;
+    Ok(())
+}
+
+/// Overage settlement obeys the same tier scoping: debts that were not
+/// NEAR-served never draw on NEAR-tier-only credit, even after a top-up;
+/// NEAR-served debts do.
+#[tokio::test]
+async fn near_tier_only_credits_skip_non_near_settlement() -> anyhow::Result<()> {
+    let pool = test_pool().await?;
+    let limits = OrganizationLimitsRepository::new(pool.clone());
+    let repository = OrganizationUsageRepository::new(pool.clone());
+    let model = insert_model(&pool, "allocation-near-scope-settle").await?;
+    let org = insert_org_fixture(&pool).await?;
+    set_limit(&limits, org.org_id, "grant", 5).await?;
+
+    // NEAR-served charge partially funded by grant; 3 left unfunded.
+    let near_row = repository
+        .record_usage(usage_with_tier(
+            &org,
+            &model,
+            Uuid::new_v4(),
+            8,
+            Some(services::usage::ServedProviderTier::Near),
+        ))
+        .await?;
+    assert_eq!(near_row.funded_amount, Some(5));
+    assert_eq!(near_row.unfunded_amount, Some(3));
+
+    // Unattributed charge: grant excluded entirely.
+    let legacy_row = repository
+        .record_usage(usage_with_tier(&org, &model, Uuid::new_v4(), 2, None))
+        .await?;
+    assert_eq!(legacy_row.funded_amount, Some(0));
+    assert_eq!(legacy_row.unfunded_amount, Some(2));
+
+    // Top-up grant: settlement must fund the NEAR-served debt only.
+    set_limit(&limits, org.org_id, "grant", 10).await?;
+
+    let settled_allocations = load_allocations_for(&pool, near_row.id).await?;
+    let settled: i64 = settled_allocations
+        .iter()
+        .filter(|allocation| allocation.allocation_phase == "overage_settlement")
+        .map(|allocation| allocation.amount)
+        .sum();
+    assert_eq!(
+        settled, 3,
+        "NEAR-served debt settles from the topped-up grant"
+    );
+
+    let legacy_allocations = load_allocations_for(&pool, legacy_row.id).await?;
+    assert!(
+        legacy_allocations.is_empty(),
+        "unattributed debt must never draw on NEAR-tier-only credit"
+    );
+
+    cleanup_usage_fixtures(&pool, &[org.org_id], &[model.id]).await?;
+    Ok(())
+}
+
+async fn load_allocations_for(
+    pool: &database::pool::DbPool,
+    usage_id: Uuid,
+) -> anyhow::Result<Vec<AllocationRow>> {
+    let client = pool.get().await?;
+    let rows = client
+        .query(
+            r#"
+            SELECT credit_type, amount, source, organization_limit_id, policy_version,
+                   allocation_phase
+            FROM effective_usage_credit_allocations
+            WHERE inference_usage_id = $1
+            ORDER BY created_at, priority_position, id
+            "#,
+            &[&usage_id],
+        )
+        .await?;
+    Ok(rows
+        .iter()
+        .map(|row| AllocationRow {
+            credit_type: row.get("credit_type"),
+            amount: row.get("amount"),
+            allocation_phase: row.get("allocation_phase"),
+        })
+        .collect())
+}
+
+struct AllocationRow {
+    #[allow(dead_code)]
+    credit_type: String,
+    amount: i64,
+    allocation_phase: String,
 }

@@ -58,6 +58,16 @@ impl RecordingUsageService {
 
 #[async_trait::async_trait]
 impl UsageServiceTrait for RecordingUsageService {
+    async fn get_credit_admission(
+        &self,
+        _organization_id: uuid::Uuid,
+    ) -> Result<services::usage::CreditAdmission, UsageError> {
+        Ok(services::usage::CreditAdmission {
+            unrestricted_available: 1000,
+            near_tier_only_available: 0,
+        })
+    }
+
     async fn record_usage(
         &self,
         request: RecordUsageServiceRequest,

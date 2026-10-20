@@ -332,6 +332,16 @@ mod tests {
             unimplemented!()
         }
 
+        async fn get_credit_admission(
+            &self,
+            _organization_id: Uuid,
+        ) -> Result<services::usage::CreditAdmission, UsageError> {
+            Ok(services::usage::CreditAdmission {
+                unrestricted_available: 1000,
+                near_tier_only_available: 0,
+            })
+        }
+
         async fn record_usage_from_api(
             &self,
             _organization_id: Uuid,

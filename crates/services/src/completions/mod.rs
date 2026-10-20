@@ -1546,6 +1546,8 @@ impl CompletionServiceImpl {
             ports::CompletionError::RateLimitExceeded(_) => ERROR_TYPE_RATE_LIMIT,
             ports::CompletionError::ProviderError { .. } => ERROR_TYPE_INFERENCE_ERROR,
             ports::CompletionError::ServiceOverloaded(_) => ERROR_TYPE_SERVICE_OVERLOADED,
+            ports::CompletionError::GrantCreditsNearOnly(_)
+            | ports::CompletionError::InsufficientCredits(_) => ERROR_TYPE_INFERENCE_ERROR,
             ports::CompletionError::InternalError(_) => ERROR_TYPE_INTERNAL_ERROR,
         };
 
@@ -1885,6 +1887,10 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         }
         Self::apply_deepseek_v4_flash_thinking_compat(canonical_name, &mut chat_params);
 
+        let allowed_tier = self
+            .resolve_serving_restriction(organization_id, canonical_name)
+            .await;
+
         let counter = self
             .try_acquire_concurrent_slot(organization_id, model.id, canonical_name)
             .await?;
@@ -1925,6 +1931,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
                 chat_params,
                 request.body_hash.clone(),
                 routing_hints,
+                allowed_tier?,
             )
             .await
         {
@@ -2092,6 +2099,9 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         Self::apply_deepseek_v4_flash_thinking_compat(canonical_name, &mut chat_params);
 
         let organization_id = request.organization_id;
+        let allowed_tier = self
+            .resolve_serving_restriction(organization_id, canonical_name)
+            .await;
         let counter = self
             .try_acquire_concurrent_slot(organization_id, model.id, canonical_name)
             .await?;
@@ -2127,6 +2137,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
                     request_priority,
                     ..Default::default()
                 },
+                allowed_tier?,
             )
             .await;
 
@@ -2296,6 +2307,10 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         params: inference_providers::AudioTranscriptionParams,
         request_hash: String,
     ) -> Result<inference_providers::AudioTranscriptionResponse, ports::CompletionError> {
+        let allowed_tier = self
+            .resolve_serving_restriction(organization_id, model_name)
+            .await?;
+
         // Acquire concurrent request slot to enforce organization limits
         let counter = self
             .try_acquire_concurrent_slot(organization_id, model_id, model_name)
@@ -2309,7 +2324,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         let result = tokio::time::timeout(
             timeout_duration,
             self.inference_provider_pool
-                .audio_transcription(params, request_hash),
+                .audio_transcription(params, request_hash, allowed_tier),
         )
         .await;
 
@@ -2360,6 +2375,10 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         model_name: &str,
         params: inference_providers::RerankParams,
     ) -> Result<inference_providers::RerankResponse, ports::CompletionError> {
+        let allowed_tier = self
+            .resolve_serving_restriction(organization_id, model_name)
+            .await?;
+
         // Acquire concurrent request slot to enforce organization limits
         let counter = self
             .try_acquire_concurrent_slot(organization_id, model_id, model_name)
@@ -2370,7 +2389,10 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
 
         // Call inference provider pool
         // The guard will automatically release the slot when this function returns or panics
-        let result = self.inference_provider_pool.rerank(params).await;
+        let result = self
+            .inference_provider_pool
+            .rerank(params, allowed_tier)
+            .await;
 
         // Map provider errors to service errors with proper status codes
         result.map_err(|e| match e {
@@ -2413,13 +2435,16 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         body: bytes::Bytes,
         extra: std::collections::HashMap<String, serde_json::Value>,
     ) -> Result<bytes::Bytes, ports::CompletionError> {
+        let allowed_tier = self
+            .resolve_serving_restriction(organization_id, model_name)
+            .await?;
         let counter = self
             .try_acquire_concurrent_slot(organization_id, model_id, model_name)
             .await?;
         let _guard = ConcurrentSlotGuard::new(counter);
 
         self.inference_provider_pool
-            .embeddings(model_name, body, extra)
+            .embeddings(model_name, body, extra, allowed_tier)
             .await
             .map_err(|e| match e {
                 inference_providers::EmbeddingError::RequestFailed(msg) => {
@@ -2461,13 +2486,16 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         body: bytes::Bytes,
         extra: std::collections::HashMap<String, serde_json::Value>,
     ) -> Result<bytes::Bytes, ports::CompletionError> {
+        let allowed_tier = self
+            .resolve_serving_restriction(organization_id, model_name)
+            .await?;
         let counter = self
             .try_acquire_concurrent_slot(organization_id, model_id, model_name)
             .await?;
         let _guard = ConcurrentSlotGuard::new(counter);
 
         self.inference_provider_pool
-            .privacy_classify(model_name, body, extra)
+            .privacy_classify(model_name, body, extra, allowed_tier)
             .await
             .map_err(|e| match e {
                 inference_providers::PrivacyClassifyError::RequestFailed(msg) => {
@@ -2509,6 +2537,10 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         request_hash: String,
         params: inference_providers::ScoreParams,
     ) -> Result<inference_providers::ScoreResponse, ports::CompletionError> {
+        let allowed_tier = self
+            .resolve_serving_restriction(organization_id, model_name)
+            .await?;
+
         // Acquire concurrent request slot to enforce organization limits
         let counter = self
             .try_acquire_concurrent_slot(organization_id, model_id, model_name)
@@ -2521,7 +2553,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         // The guard will automatically release the slot when this function returns or panics
         let result = self
             .inference_provider_pool
-            .score(params, request_hash)
+            .score(params, request_hash, allowed_tier)
             .await;
 
         // Map provider errors to service errors with proper status codes
@@ -2562,6 +2594,51 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         model_name: &str,
     ) -> Result<Option<crate::models::ModelWithPricing>, anyhow::Error> {
         self.resolve_model_cached(model_name).await
+    }
+
+    async fn resolve_serving_restriction(
+        &self,
+        organization_id: Uuid,
+        canonical_model: &str,
+    ) -> Result<Option<inference_providers::ProviderTier>, ports::CompletionError> {
+        let admission = self
+            .usage_service
+            .get_credit_admission(organization_id)
+            .await
+            .map_err(|e| {
+                ports::CompletionError::InternalError(format!(
+                    "Failed to read credit admission: {e}"
+                ))
+            })?;
+
+        match admission.near_tier_only() {
+            // Unrestricted (paid/postpay/staking) budget available.
+            Some(false) => Ok(None),
+            // Only NEAR-tier-only budget (e.g. gifted grant credits) remains:
+            // the request may run solely on the NEAR fleet, or not at all.
+            Some(true) => {
+                if self
+                    .inference_provider_pool
+                    .model_has_provider_of_tier(
+                        canonical_model,
+                        inference_providers::ProviderTier::Near,
+                    )
+                    .await
+                {
+                    Ok(Some(inference_providers::ProviderTier::Near))
+                } else {
+                    Err(ports::CompletionError::GrantCreditsNearOnly(format!(
+                        "Model '{canonical_model}' is not served by NEAR AI infrastructure"
+                    )))
+                }
+            }
+            // Nothing available per-type: the aggregate middleware check has
+            // passed moments earlier, so this is an exhaustion race. Fail
+            // closed rather than letting the charge post unfunded.
+            None => Err(ports::CompletionError::InsufficientCredits(
+                "No credit capacity available".to_string(),
+            )),
+        }
     }
 
     fn get_inference_provider_pool(

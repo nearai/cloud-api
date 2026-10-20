@@ -243,6 +243,20 @@ pub trait UsageServiceTrait: Send + Sync {
     /// Check if organization can make an API call (pre-flight check)
     async fn check_can_use(&self, organization_id: Uuid) -> Result<UsageCheckResult, UsageError>;
 
+    /// Per-tier credit admission for a pre-execution routing decision.
+    ///
+    /// Splits currently available credit capacity into the part that may fund
+    /// inference on any provider tier and the part restricted to NEAR-tier
+    /// (`near`) served inference (gifted grant credits, see
+    /// `config::CreditAllocationConfig::near_tier_only_credit_types`).
+    /// Callers use this to restrict routing to NEAR-tier providers — or to
+    /// deny third-party-only models — while an organization is drawing on its
+    /// restricted budget only.
+    async fn get_credit_admission(
+        &self,
+        organization_id: Uuid,
+    ) -> Result<CreditAdmission, UsageError>;
+
     /// Get current balance for an organization
     async fn get_balance(
         &self,
@@ -952,6 +966,32 @@ pub enum UsageCheckResult {
     LimitExceeded { spent: i64, limit: i64 },
     NoCredits,  // No credits available - must purchase credits
     NoLimitSet, // No spending limit configured - must set limit
+}
+
+/// Available credit capacity split by provider-tier eligibility.
+///
+/// `unrestricted_available` may fund inference served by any provider tier;
+/// `near_tier_only_available` may only fund inference served by NEAR AI's own
+/// fleet. All amounts use fixed scale of 9 (nano-dollars).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CreditAdmission {
+    pub unrestricted_available: i64,
+    pub near_tier_only_available: i64,
+}
+
+impl CreditAdmission {
+    /// The routing restriction implied by the available buckets.
+    /// `Some(true)` = NEAR-tier-only budget remains (restrict routing);
+    /// `Some(false)` = unrestricted budget remains; `None` = nothing remains.
+    pub fn near_tier_only(&self) -> Option<bool> {
+        if self.unrestricted_available > 0 {
+            Some(false)
+        } else if self.near_tier_only_available > 0 {
+            Some(true)
+        } else {
+            None
+        }
+    }
 }
 
 /// Organization balance information

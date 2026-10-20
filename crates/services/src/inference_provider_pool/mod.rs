@@ -2760,11 +2760,31 @@ impl InferenceProviderPool {
             .map(|p| inference_providers::ServingProvider::of(p.as_ref()))
     }
 
+    /// Whether at least one registered provider for the model has the given
+    /// trust tier. Used by the credit-admission layer to decide whether a
+    /// tier-restricted organization (e.g. grant-only budget that may fund
+    /// NEAR-served inference only) can run a model at all, before any
+    /// provider is selected.
+    pub async fn model_has_provider_of_tier(
+        &self,
+        model_id: &str,
+        tier: inference_providers::ProviderTier,
+    ) -> bool {
+        let mappings = self.provider_mappings.read().await;
+        mappings
+            .model_to_providers
+            .get(model_id)
+            .is_some_and(|providers| providers.iter().any(|provider| provider.tier() == tier))
+    }
+
     /// Get providers with load balancing support
     ///
     /// This function handles provider selection based on model_id and optional model_pub_key:
     /// - Gets providers by model_id first
     /// - If model_pub_key is provided: Filters providers by public key
+    /// - If `allowed_tier` is provided: only providers of that trust tier are
+    ///   eligible (credit-policy restriction, e.g. grant credits are
+    ///   NEAR-served only)
     /// - Applies round-robin load balancing
     ///
     /// Returns providers with the round-robin selected one first, followed by others for fallback.
@@ -2773,6 +2793,7 @@ impl InferenceProviderPool {
         model_id: &str,
         model_pub_key: Option<&str>,
         hints: &ChatRoutingHints,
+        allowed_tier: Option<inference_providers::ProviderTier>,
     ) -> Option<Vec<Arc<InferenceProviderTrait>>> {
         let mappings = self.provider_mappings.read().await;
 
@@ -2837,6 +2858,18 @@ impl InferenceProviderPool {
         };
 
         let providers = self.drop_disabled_sources(providers);
+
+        // Credit-policy tier restriction: when admission restricted this
+        // request to a single trust tier (e.g. an org drawing on grant-only
+        // budget may use NEAR-served inference only), drop every other tier
+        // before ordering so neither selection nor fallback can cross it.
+        let providers = match allowed_tier {
+            Some(tier) => providers
+                .into_iter()
+                .filter(|provider| provider.tier() == tier)
+                .collect(),
+            None => providers,
+        };
 
         if providers.is_empty() {
             // The model exists, but its only eligible providers were excluded by
@@ -3479,11 +3512,13 @@ impl InferenceProviderPool {
     /// Returns both the result and the provider that succeeded (for chat_id mapping).
     /// If model_pub_key is provided, routes to the specific provider by signing public key.
     /// Thin wrapper that requests no extra capability (see [`Self::retry_with_fallback_caps`]).
+    #[allow(clippy::too_many_arguments)]
     async fn retry_with_fallback<T, F, Fut>(
         &self,
         model_id: &str,
         operation_name: &str,
         model_pub_key: Option<&str>,
+        allowed_tier: Option<inference_providers::ProviderTier>,
         provider_fn: F,
     ) -> Result<ServedProviderResult<T>, CompletionError>
     where
@@ -3496,6 +3531,7 @@ impl InferenceProviderPool {
             model_pub_key,
             false,
             &ChatRoutingHints::default(),
+            allowed_tier,
             provider_fn,
         )
         .await
@@ -3509,6 +3545,7 @@ impl InferenceProviderPool {
     /// only provider lacks the capability still surfaces that provider's clear error.
     /// System One requires an explicit capability: unlike chat variants, there
     /// is no compatible default transport, so an empty capable set fails here.
+    #[allow(clippy::too_many_arguments)]
     async fn retry_with_fallback_caps<T, F, Fut>(
         &self,
         model_id: &str,
@@ -3516,6 +3553,7 @@ impl InferenceProviderPool {
         model_pub_key: Option<&str>,
         needs_client_e2ee: bool,
         hints: &ChatRoutingHints,
+        allowed_tier: Option<inference_providers::ProviderTier>,
         provider_fn: F,
     ) -> Result<ServedProviderResult<T>, CompletionError>
     where
@@ -3523,7 +3561,7 @@ impl InferenceProviderPool {
         Fut: std::future::Future<Output = Result<T, CompletionError>>,
     {
         let providers = match self
-            .get_providers_with_fallback(model_id, model_pub_key, hints)
+            .get_providers_with_fallback(model_id, model_pub_key, hints, allowed_tier)
             .await
         {
             Some(p) => p,
@@ -4418,7 +4456,7 @@ impl InferenceProviderPool {
         hints: ChatRoutingHints,
     ) -> Result<StreamingResult, CompletionError> {
         Ok(self
-            .chat_completion_stream_with_attribution(params, request_hash, hints)
+            .chat_completion_stream_with_attribution(params, request_hash, hints, None)
             .await?
             .stream)
     }
@@ -4428,6 +4466,7 @@ impl InferenceProviderPool {
         mut params: ChatCompletionParams,
         request_hash: String,
         mut hints: ChatRoutingHints,
+        allowed_tier: Option<inference_providers::ProviderTier>,
     ) -> Result<AttributedChatCompletionStream, CompletionError> {
         let model_id = params.model.clone();
 
@@ -4465,6 +4504,7 @@ impl InferenceProviderPool {
                 model_pub_key,
                 needs_client_e2ee,
                 &hints,
+                allowed_tier,
                 |provider| {
                     let params = params_for_provider.clone();
                     let request_hash = request_hash.clone();
@@ -4613,6 +4653,7 @@ impl InferenceProviderPool {
             params,
             request_hash,
             ChatRoutingHints::default(),
+            None,
         )
         .await
     }
@@ -4622,6 +4663,7 @@ impl InferenceProviderPool {
         mut params: ChatCompletionParams,
         request_hash: String,
         mut hints: ChatRoutingHints,
+        allowed_tier: Option<inference_providers::ProviderTier>,
     ) -> Result<AttributedChatCompletion, CompletionError> {
         let model_id = params.model.clone();
         // Non-streaming requests may carry policy hints such as
@@ -4666,6 +4708,7 @@ impl InferenceProviderPool {
                 model_pub_key,
                 needs_client_e2ee,
                 &hints,
+                allowed_tier,
                 |provider| {
                     let params = params_for_provider.clone();
                     let request_hash = request_hash.clone();
@@ -4703,7 +4746,7 @@ impl InferenceProviderPool {
         request_hash: String,
     ) -> Result<ImageGenerationResponseWithBytes, ImageGenerationError> {
         Ok(self
-            .image_generation_with_attribution(params, request_hash)
+            .image_generation_with_attribution(params, request_hash, None)
             .await?
             .response)
     }
@@ -4725,6 +4768,7 @@ impl InferenceProviderPool {
                 None,
                 false,
                 &hints,
+                None,
                 |provider| {
                     let request = request.clone();
                     let request_hash = request_hash.clone();
@@ -4779,6 +4823,7 @@ impl InferenceProviderPool {
         &self,
         mut params: ImageGenerationParams,
         request_hash: String,
+        allowed_tier: Option<inference_providers::ProviderTier>,
     ) -> Result<AttributedImageGeneration, ImageGenerationError> {
         let model_id = params.model.clone();
 
@@ -4802,16 +4847,22 @@ impl InferenceProviderPool {
         let cloned_params = params.clone();
 
         let served = self
-            .retry_with_fallback(&model_id, "image_generation", model_pub_key, |provider| {
-                let params = cloned_params.clone();
-                let request_hash = request_hash.clone();
-                async move {
-                    provider
-                        .image_generation(params, request_hash)
-                        .await
-                        .map_err(|e| CompletionError::CompletionError(e.to_string()))
-                }
-            })
+            .retry_with_fallback(
+                &model_id,
+                "image_generation",
+                model_pub_key,
+                allowed_tier,
+                |provider| {
+                    let params = cloned_params.clone();
+                    let request_hash = request_hash.clone();
+                    async move {
+                        provider
+                            .image_generation(params, request_hash)
+                            .await
+                            .map_err(|e| CompletionError::CompletionError(e.to_string()))
+                    }
+                },
+            )
             .await
             .map_err(|e| ImageGenerationError::GenerationError(e.to_string()))?;
         let response = served.value;
@@ -4837,6 +4888,7 @@ impl InferenceProviderPool {
         &self,
         params: AudioTranscriptionParams,
         request_hash: String,
+        allowed_tier: Option<inference_providers::ProviderTier>,
     ) -> Result<AudioTranscriptionResponse, AudioTranscriptionError> {
         let model_id = params.model.clone();
         let file_size_kb = params.file_bytes.len() / 1024;
@@ -4849,52 +4901,58 @@ impl InferenceProviderPool {
         );
 
         let served = self
-            .retry_with_fallback(&model_id, "audio_transcription", None, |provider| {
-                let params = params.clone();
-                let request_hash = request_hash.clone();
-                async move {
-                    provider
-                        .audio_transcription(params, request_hash)
-                        .await
-                        // Classify the provider's failure so the structured HTTP
-                        // status survives retry/fallback only where that is
-                        // correct. Genuine client-input 4xx (400/413/415/422)
-                        // stay structured: the route returns invalid_request_error
-                        // and the pool fast-returns without wasting fallback on a
-                        // payload that fails everywhere. 5xx/429 stay structured
-                        // too, so retry, failover, and the service status mapping
-                        // work. Provider-infra 4xx — 401/403 (our creds), 404
-                        // (missing/stale route), 408 (timeout) — are NOT client
-                        // input: drop them to a generic provider failure so the
-                        // request can fall through to other providers and surfaces
-                        // as a 5xx server error, not misleading bad-audio guidance.
-                        // is_external=false: this is our own vLLM whisper backend.
-                        .map_err(|e| match e {
-                            AudioTranscriptionError::HttpError {
-                                status_code,
-                                message,
-                            } if is_client_audio_input_status(status_code)
-                                || status_code >= 500
-                                || status_code == 429 =>
-                            {
-                                CompletionError::HttpError {
+            .retry_with_fallback(
+                &model_id,
+                "audio_transcription",
+                None,
+                allowed_tier,
+                |provider| {
+                    let params = params.clone();
+                    let request_hash = request_hash.clone();
+                    async move {
+                        provider
+                            .audio_transcription(params, request_hash)
+                            .await
+                            // Classify the provider's failure so the structured HTTP
+                            // status survives retry/fallback only where that is
+                            // correct. Genuine client-input 4xx (400/413/415/422)
+                            // stay structured: the route returns invalid_request_error
+                            // and the pool fast-returns without wasting fallback on a
+                            // payload that fails everywhere. 5xx/429 stay structured
+                            // too, so retry, failover, and the service status mapping
+                            // work. Provider-infra 4xx — 401/403 (our creds), 404
+                            // (missing/stale route), 408 (timeout) — are NOT client
+                            // input: drop them to a generic provider failure so the
+                            // request can fall through to other providers and surfaces
+                            // as a 5xx server error, not misleading bad-audio guidance.
+                            // is_external=false: this is our own vLLM whisper backend.
+                            .map_err(|e| match e {
+                                AudioTranscriptionError::HttpError {
                                     status_code,
                                     message,
-                                    is_external: false,
+                                } if is_client_audio_input_status(status_code)
+                                    || status_code >= 500
+                                    || status_code == 429 =>
+                                {
+                                    CompletionError::HttpError {
+                                        status_code,
+                                        message,
+                                        is_external: false,
+                                    }
                                 }
-                            }
-                            AudioTranscriptionError::HttpError {
-                                status_code,
-                                message,
-                            } => CompletionError::CompletionError(format!(
-                                "HTTP error {status_code}: {message}"
-                            )),
-                            AudioTranscriptionError::TranscriptionError(msg) => {
-                                CompletionError::CompletionError(msg)
-                            }
-                        })
-                }
-            })
+                                AudioTranscriptionError::HttpError {
+                                    status_code,
+                                    message,
+                                } => CompletionError::CompletionError(format!(
+                                    "HTTP error {status_code}: {message}"
+                                )),
+                                AudioTranscriptionError::TranscriptionError(msg) => {
+                                    CompletionError::CompletionError(msg)
+                                }
+                            })
+                    }
+                },
+            )
             .await
             .map_err(|e| match e {
                 // Carry the structured status back out for the codes kept
@@ -4932,7 +4990,7 @@ impl InferenceProviderPool {
         request_hash: String,
     ) -> Result<ImageEditResponseWithBytes, ImageEditError> {
         Ok(self
-            .image_edit_with_attribution(params, request_hash)
+            .image_edit_with_attribution(params, request_hash, None)
             .await?
             .response)
     }
@@ -4941,6 +4999,7 @@ impl InferenceProviderPool {
         &self,
         params: ImageEditParams,
         request_hash: String,
+        allowed_tier: Option<inference_providers::ProviderTier>,
     ) -> Result<AttributedImageEdit, ImageEditError> {
         let model_id = params.model.clone();
 
@@ -4955,7 +5014,7 @@ impl InferenceProviderPool {
         let params = Arc::new(params);
 
         let served = self
-            .retry_with_fallback(&model_id, "image_edit", None, |provider| {
+            .retry_with_fallback(&model_id, "image_edit", None, allowed_tier, |provider| {
                 let params = params.clone();
                 let request_hash = request_hash.clone();
                 async move {
@@ -4986,7 +5045,11 @@ impl InferenceProviderPool {
         })
     }
 
-    pub async fn rerank(&self, params: RerankParams) -> Result<RerankResponse, RerankError> {
+    pub async fn rerank(
+        &self,
+        params: RerankParams,
+        allowed_tier: Option<inference_providers::ProviderTier>,
+    ) -> Result<RerankResponse, RerankError> {
         let model_id = params.model.clone();
 
         tracing::debug!(
@@ -4996,7 +5059,12 @@ impl InferenceProviderPool {
         );
 
         let providers = match self
-            .get_providers_with_fallback(&model_id, None, &ChatRoutingHints::default())
+            .get_providers_with_fallback(
+                &model_id,
+                None,
+                &ChatRoutingHints::default(),
+                allowed_tier,
+            )
             .await
         {
             Some(p) => p,
@@ -5044,11 +5112,12 @@ impl InferenceProviderPool {
         model: &str,
         body: bytes::Bytes,
         extra: std::collections::HashMap<String, serde_json::Value>,
+        allowed_tier: Option<inference_providers::ProviderTier>,
     ) -> Result<bytes::Bytes, inference_providers::EmbeddingError> {
         tracing::debug!(model = %model, "Starting embeddings request");
 
         let providers = match self
-            .get_providers_with_fallback(model, None, &ChatRoutingHints::default())
+            .get_providers_with_fallback(model, None, &ChatRoutingHints::default(), allowed_tier)
             .await
         {
             Some(p) => p,
@@ -5119,6 +5188,7 @@ impl InferenceProviderPool {
                     fallback_disabled: !fallback_enabled,
                     ..Default::default()
                 },
+                None,
             )
             .await
             .ok_or_else(|| {
@@ -5144,11 +5214,12 @@ impl InferenceProviderPool {
         &self,
         model: &str,
         request: AnthropicRawRequest,
+        allowed_tier: Option<inference_providers::ProviderTier>,
     ) -> Result<AttributedAnthropicRawResponse, AnthropicRawError> {
         tracing::debug!(model = %model, endpoint = ?request.endpoint, "Starting native Anthropic request");
 
         let providers = self
-            .get_providers_with_fallback(model, None, &ChatRoutingHints::default())
+            .get_providers_with_fallback(model, None, &ChatRoutingHints::default(), allowed_tier)
             .await
             .ok_or(AnthropicRawError::UnsupportedProvider)?;
         let provider = providers
@@ -5170,11 +5241,12 @@ impl InferenceProviderPool {
         model: &str,
         body: bytes::Bytes,
         extra: std::collections::HashMap<String, serde_json::Value>,
+        allowed_tier: Option<inference_providers::ProviderTier>,
     ) -> Result<bytes::Bytes, inference_providers::PrivacyClassifyError> {
         tracing::debug!(model = %model, "Starting privacy classify request");
 
         let providers = match self
-            .get_providers_with_fallback(model, None, &ChatRoutingHints::default())
+            .get_providers_with_fallback(model, None, &ChatRoutingHints::default(), allowed_tier)
             .await
         {
             Some(p) => p,
@@ -5237,13 +5309,19 @@ impl InferenceProviderPool {
         &self,
         params: inference_providers::ScoreParams,
         request_hash: String,
+        allowed_tier: Option<inference_providers::ProviderTier>,
     ) -> Result<inference_providers::ScoreResponse, inference_providers::ScoreError> {
         let model_id = params.model.clone();
 
         tracing::debug!(model = %model_id, "Starting score request");
 
         let providers = match self
-            .get_providers_with_fallback(&model_id, None, &ChatRoutingHints::default())
+            .get_providers_with_fallback(
+                &model_id,
+                None,
+                &ChatRoutingHints::default(),
+                allowed_tier,
+            )
             .await
         {
             Some(p) => p,
@@ -8726,7 +8804,7 @@ mod tests {
         .await;
 
         let providers = pool
-            .get_providers_with_fallback(&model, None, &ChatRoutingHints::default())
+            .get_providers_with_fallback(&model, None, &ChatRoutingHints::default(), None)
             .await
             .expect("model has providers");
         let tiers: Vec<ProviderTier> = providers.iter().map(|p| p.tier()).collect();
@@ -8757,7 +8835,7 @@ mod tests {
             .await;
 
         let before = pool
-            .get_providers_with_fallback(&model, None, &ChatRoutingHints::default())
+            .get_providers_with_fallback(&model, None, &ChatRoutingHints::default(), None)
             .await
             .unwrap();
         assert!(before.iter().any(|p| Arc::ptr_eq(p, &chutes)));
@@ -8778,7 +8856,7 @@ mod tests {
         pool.attested_3p_disabled().store(Arc::new(d));
 
         let order = pool
-            .get_providers_with_fallback(&model, None, &ChatRoutingHints::default())
+            .get_providers_with_fallback(&model, None, &ChatRoutingHints::default(), None)
             .await
             .unwrap();
         assert!(!order.is_empty());
@@ -8816,7 +8894,7 @@ mod tests {
         pool.attested_3p_disabled().store(Arc::new(d));
 
         let r = pool
-            .get_providers_with_fallback(&model, None, &ChatRoutingHints::default())
+            .get_providers_with_fallback(&model, None, &ChatRoutingHints::default(), None)
             .await;
         assert_eq!(
             r.map(|v| v.len()),
@@ -8866,7 +8944,7 @@ mod tests {
         .await;
         for _ in 0..8 {
             let order = pool
-                .get_providers_with_fallback("m-src-a", None, &ChatRoutingHints::default())
+                .get_providers_with_fallback("m-src-a", None, &ChatRoutingHints::default(), None)
                 .await
                 .unwrap();
             assert!(Arc::ptr_eq(&order[0], &p[1]), "Chutes must lead");
@@ -8884,7 +8962,7 @@ mod tests {
         .await;
         for _ in 0..4 {
             let order = pool
-                .get_providers_with_fallback("m-src-b", None, &ChatRoutingHints::default())
+                .get_providers_with_fallback("m-src-b", None, &ChatRoutingHints::default(), None)
                 .await
                 .unwrap();
             assert!(Arc::ptr_eq(&order[0], &p[1]), "best-fit Tinfoil leads");
@@ -8906,7 +8984,7 @@ mod tests {
         let mut leaders = std::collections::HashSet::new();
         for _ in 0..6 {
             let order = pool
-                .get_providers_with_fallback("m-src-c", None, &ChatRoutingHints::default())
+                .get_providers_with_fallback("m-src-c", None, &ChatRoutingHints::default(), None)
                 .await
                 .unwrap();
             assert!(Arc::ptr_eq(&order[2], &p[2]), "Tinfoil stays last");
@@ -8940,7 +9018,7 @@ mod tests {
         pool.attested_3p_disabled().store(Arc::new(d));
 
         let order = pool
-            .get_providers_with_fallback(&model, None, &ChatRoutingHints::default())
+            .get_providers_with_fallback(&model, None, &ChatRoutingHints::default(), None)
             .await
             .unwrap();
         assert!(order.iter().any(|p| Arc::ptr_eq(p, &chutes)));
@@ -8964,7 +9042,7 @@ mod tests {
         .await;
 
         let providers = pool
-            .get_providers_with_fallback(&model, None, &ChatRoutingHints::default())
+            .get_providers_with_fallback(&model, None, &ChatRoutingHints::default(), None)
             .await
             .expect("model has providers");
         assert_eq!(providers.len(), 1);
@@ -8987,7 +9065,7 @@ mod tests {
         .await;
 
         let providers = pool
-            .get_providers_with_fallback(&model, None, &ChatRoutingHints::default())
+            .get_providers_with_fallback(&model, None, &ChatRoutingHints::default(), None)
             .await
             .expect("model has providers");
         assert_eq!(providers.len(), 1);
@@ -9021,7 +9099,7 @@ mod tests {
 
         assert!(pool.is_pinned(&model));
         let providers = pool
-            .get_providers_with_fallback(&model, None, &ChatRoutingHints::default())
+            .get_providers_with_fallback(&model, None, &ChatRoutingHints::default(), None)
             .await
             .expect("model has providers");
         let tiers: Vec<ProviderTier> = providers.iter().map(|p| p.tier()).collect();
@@ -9541,7 +9619,7 @@ mod tests {
         complete.insert(model.clone());
         pool.prune_stale_pinned(&complete).await;
         let tiers: Vec<ProviderTier> = pool
-            .get_providers_with_fallback(&model, None, &ChatRoutingHints::default())
+            .get_providers_with_fallback(&model, None, &ChatRoutingHints::default(), None)
             .await
             .expect("providers")
             .iter()
@@ -9552,7 +9630,7 @@ mod tests {
         // NEAR dropped it (absent from the complete set) → rebuilt pinned-only.
         pool.prune_stale_pinned(&HashSet::new()).await;
         let tiers: Vec<ProviderTier> = pool
-            .get_providers_with_fallback(&model, None, &ChatRoutingHints::default())
+            .get_providers_with_fallback(&model, None, &ChatRoutingHints::default(), None)
             .await
             .expect("providers")
             .iter()
@@ -9838,9 +9916,13 @@ mod tests {
 
         // Verify E2EE routing works
         let result: Result<ServedProviderResult<()>, _> = pool
-            .retry_with_fallback(&model_id, "test_op", Some(ecdsa_key), |_provider| async {
-                Ok(())
-            })
+            .retry_with_fallback(
+                &model_id,
+                "test_op",
+                Some(ecdsa_key),
+                None,
+                |_provider| async { Ok(()) },
+            )
             .await;
         assert!(
             result.is_ok(),
@@ -9868,15 +9950,21 @@ mod tests {
 
         // Test 1: routing WITHOUT pubkey should work
         let result: Result<ServedProviderResult<()>, _> = pool
-            .retry_with_fallback(&model_id, "test_op", None, |_provider| async { Ok(()) })
+            .retry_with_fallback(&model_id, "test_op", None, None, |_provider| async {
+                Ok(())
+            })
             .await;
         assert!(result.is_ok(), "Routing without pubkey should succeed");
 
         // Test 2: routing WITH correct pubkey should work
         let result: Result<ServedProviderResult<()>, _> = pool
-            .retry_with_fallback(&model_id, "test_op", Some(ecdsa_key), |_provider| async {
-                Ok(())
-            })
+            .retry_with_fallback(
+                &model_id,
+                "test_op",
+                Some(ecdsa_key),
+                None,
+                |_provider| async { Ok(()) },
+            )
             .await;
         assert!(
             result.is_ok(),
@@ -9890,6 +9978,7 @@ mod tests {
                 &model_id,
                 "test_op",
                 Some("deadbeef00000000deadbeef00000000deadbeef00000000deadbeef00000000deadbeef00000000deadbeef00000000deadbeef00000000deadbeef00000000"),
+                None,
                 |_provider| async { Ok(()) },
             )
             .await;
@@ -10077,7 +10166,7 @@ mod tests {
         let (pool, model_id) = pool_with_mock_provider().await;
 
         let result: Result<ServedProviderResult<()>, _> = pool
-            .retry_with_fallback(&model_id, "test_op", None, |_provider| async {
+            .retry_with_fallback(&model_id, "test_op", None, None, |_provider| async {
                 Err(CompletionError::HttpError {
                     status_code: 400,
                     message: "Bad request".to_string(),
@@ -10128,7 +10217,7 @@ mod tests {
         let count_clone = attempt_count.clone();
 
         let result: Result<ServedProviderResult<()>, _> = pool
-            .retry_with_fallback(&model_id, "test_op", None, move |_provider| {
+            .retry_with_fallback(&model_id, "test_op", None, None, move |_provider| {
                 let count = count_clone.clone();
                 async move {
                     let n = count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -10179,7 +10268,7 @@ mod tests {
 
         // 429 should retry with exponential backoff across all rounds
         let result: Result<ServedProviderResult<()>, _> = pool
-            .retry_with_fallback(&model_id, "test_op", None, move |_provider| {
+            .retry_with_fallback(&model_id, "test_op", None, None, move |_provider| {
                 let count = count_clone.clone();
                 async move {
                     count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -10214,7 +10303,7 @@ mod tests {
 
         // 408 should NOT short-circuit - it should fall through to the normal retry path
         let result: Result<ServedProviderResult<()>, _> = pool
-            .retry_with_fallback(&model_id, "test_op", None, |_provider| async {
+            .retry_with_fallback(&model_id, "test_op", None, None, |_provider| async {
                 Err(CompletionError::HttpError {
                     status_code: 408,
                     message: "Request timeout".to_string(),
@@ -10241,7 +10330,7 @@ mod tests {
         let count_clone = attempt_count.clone();
 
         let result: Result<ServedProviderResult<()>, _> = pool
-            .retry_with_fallback(&model_id, "test_op", None, move |_provider| {
+            .retry_with_fallback(&model_id, "test_op", None, None, move |_provider| {
                 let count = count_clone.clone();
                 async move {
                     count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -10269,7 +10358,7 @@ mod tests {
         let count_clone = attempt_count.clone();
 
         let result: Result<ServedProviderResult<()>, _> = pool
-            .retry_with_fallback(&model_id, "test_op", None, move |_provider| {
+            .retry_with_fallback(&model_id, "test_op", None, None, move |_provider| {
                 let count = count_clone.clone();
                 async move {
                     count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -10300,7 +10389,7 @@ mod tests {
         let count_clone = attempt_count.clone();
 
         let result: Result<ServedProviderResult<()>, _> = pool
-            .retry_with_fallback(&model_id, "test_op", None, move |_provider| {
+            .retry_with_fallback(&model_id, "test_op", None, None, move |_provider| {
                 let count = count_clone.clone();
                 async move {
                     count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -10343,7 +10432,7 @@ mod tests {
         let count_clone = attempt_count.clone();
 
         let result: Result<ServedProviderResult<()>, _> = pool
-            .retry_with_fallback(&model_id, "test_op", None, move |_provider| {
+            .retry_with_fallback(&model_id, "test_op", None, None, move |_provider| {
                 let count = count_clone.clone();
                 async move {
                     count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -10374,7 +10463,7 @@ mod tests {
         let count_clone = attempt_count.clone();
 
         let result: Result<ServedProviderResult<()>, _> = pool
-            .retry_with_fallback(&model_id, "test_op", None, move |_provider| {
+            .retry_with_fallback(&model_id, "test_op", None, None, move |_provider| {
                 let count = count_clone.clone();
                 async move {
                     count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -10401,7 +10490,7 @@ mod tests {
         let count_clone = attempt_count.clone();
 
         let result: Result<ServedProviderResult<()>, _> = pool
-            .retry_with_fallback(&model_id, "test_op", None, move |_provider| {
+            .retry_with_fallback(&model_id, "test_op", None, None, move |_provider| {
                 let count = count_clone.clone();
                 async move {
                     count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -10431,7 +10520,7 @@ mod tests {
         let count_clone = attempt_count.clone();
 
         let result: Result<ServedProviderResult<()>, _> = pool
-            .retry_with_fallback(&model_id, "test_op", None, move |_provider| {
+            .retry_with_fallback(&model_id, "test_op", None, None, move |_provider| {
                 let count = count_clone.clone();
                 async move {
                     let n = count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -10455,7 +10544,7 @@ mod tests {
         let (pool, model_id) = pool_with_mock_provider().await;
 
         let result: Result<ServedProviderResult<()>, _> = pool
-            .retry_with_fallback(&model_id, "test_op", None, |_provider| async {
+            .retry_with_fallback(&model_id, "test_op", None, None, |_provider| async {
                 Err(CompletionError::HttpError {
                     status_code: 400,
                     message: "Error at http://192.168.0.1:8000/v1/chat/completions".to_string(),
@@ -10866,7 +10955,7 @@ mod tests {
             r#"{"model":"Qwen/Qwen3-Embedding-0.6B","input":"hi","dimensions":256}"#,
         );
         let result = pool
-            .embeddings(&model_id, body, std::collections::HashMap::new())
+            .embeddings(&model_id, body, std::collections::HashMap::new(), None)
             .await;
 
         match result {
@@ -10906,6 +10995,7 @@ mod tests {
                 &model_id,
                 bytes::Bytes::from(r#"{"model":"x","input":"hi"}"#),
                 std::collections::HashMap::new(),
+                None,
             )
             .await;
 
@@ -11556,6 +11646,7 @@ mod tests {
                     estimated_tokens: Some(10_000),
                     ..Default::default()
                 },
+                None,
             )
             .await
             .expect("providers");
@@ -11575,6 +11666,7 @@ mod tests {
                     estimated_tokens: Some(300_000),
                     ..Default::default()
                 },
+                None,
             )
             .await
             .expect("providers");
@@ -11586,7 +11678,7 @@ mod tests {
 
         // No estimate: pure tier/capacity order, no overflow flags.
         let no_hint = pool
-            .get_providers_with_fallback(&model, None, &ChatRoutingHints::default())
+            .get_providers_with_fallback(&model, None, &ChatRoutingHints::default(), None)
             .await
             .expect("providers");
         assert_eq!(
@@ -11608,6 +11700,7 @@ mod tests {
                     estimated_tokens: Some(2_000_000),
                     ..Default::default()
                 },
+                None,
             )
             .await
             .expect("providers");
@@ -11687,6 +11780,7 @@ mod tests {
                             estimated_tokens: Some(estimated_tokens),
                             ..Default::default()
                         },
+                        None,
                     )
                     .await
                     .expect("providers");
@@ -11773,6 +11867,7 @@ mod tests {
                     request_priority: -2,
                     ..Default::default()
                 },
+                None,
             )
             .await;
         let err = match result {
@@ -11867,6 +11962,7 @@ mod tests {
                     request_priority: -2,
                     ..Default::default()
                 },
+                None,
             )
             .await;
 
@@ -11937,6 +12033,7 @@ mod tests {
                     request_priority: -2,
                     ..Default::default()
                 },
+                None,
             )
             .await;
         if let Err(error) = result {
@@ -12012,6 +12109,7 @@ mod tests {
                     request_priority: -2,
                     ..Default::default()
                 },
+                None,
             )
             .await;
         if let Err(error) = result {
@@ -12212,7 +12310,7 @@ mod tests {
         pool.seed_ttft(&chutes, 100.0);
         for _ in 0..4 {
             let order = pool
-                .get_providers_with_fallback("m-lat-1", None, &ChatRoutingHints::default())
+                .get_providers_with_fallback("m-lat-1", None, &ChatRoutingHints::default(), None)
                 .await
                 .unwrap();
             assert_eq!(order.len(), 3);
@@ -12235,7 +12333,7 @@ mod tests {
         pool.seed_ttft(&near_slow, 3000.0);
         for _ in 0..4 {
             let order = pool
-                .get_providers_with_fallback("m-lat-2", None, &ChatRoutingHints::default())
+                .get_providers_with_fallback("m-lat-2", None, &ChatRoutingHints::default(), None)
                 .await
                 .unwrap();
             assert_eq!(order.len(), 2);
@@ -12256,7 +12354,7 @@ mod tests {
         let mut leaders = Vec::new();
         for _ in 0..4 {
             let order = pool
-                .get_providers_with_fallback("m-cold-a", None, &ChatRoutingHints::default())
+                .get_providers_with_fallback("m-cold-a", None, &ChatRoutingHints::default(), None)
                 .await
                 .unwrap();
             leaders.push(Arc::ptr_eq(&order[0], &warm));
@@ -12272,7 +12370,7 @@ mod tests {
         pool.seed_ttft(&warm_near, 3000.0);
         for _ in 0..4 {
             let order = pool
-                .get_providers_with_fallback("m-cold-b", None, &ChatRoutingHints::default())
+                .get_providers_with_fallback("m-cold-b", None, &ChatRoutingHints::default(), None)
                 .await
                 .unwrap();
             assert!(Arc::ptr_eq(&order[0], &warm_near));
@@ -12295,7 +12393,7 @@ mod tests {
         pool.seed_ttft(&chutes, 100.0);
         for _ in 0..4 {
             let order = pool
-                .get_providers_with_fallback("m-lat-3", None, &ChatRoutingHints::default())
+                .get_providers_with_fallback("m-lat-3", None, &ChatRoutingHints::default(), None)
                 .await
                 .unwrap();
             assert_eq!(order.len(), 3);
@@ -12331,6 +12429,7 @@ mod tests {
                 fallback_params(&model_id),
                 "slow-near".to_string(),
                 ChatRoutingHints::default(),
+                None,
             )
             .await
             .expect("slow NEAR must still serve");
@@ -12347,7 +12446,7 @@ mod tests {
         let (pool, near, chutes) = pool_with_near_and_chutes("m-lat-4").await;
         pool.seed_failures(&near, 10); // MAX_CONSECUTIVE_FAILURES
         let order = pool
-            .get_providers_with_fallback("m-lat-4", None, &ChatRoutingHints::default())
+            .get_providers_with_fallback("m-lat-4", None, &ChatRoutingHints::default(), None)
             .await
             .unwrap();
         assert_eq!(order.len(), 2);
@@ -12361,7 +12460,7 @@ mod tests {
             pool_with_near_and_two_backups("m-tie", Some(262_144), Some(262_144)).await;
         for _ in 0..4 {
             let order = pool
-                .get_providers_with_fallback("m-tie", None, &ChatRoutingHints::default())
+                .get_providers_with_fallback("m-tie", None, &ChatRoutingHints::default(), None)
                 .await
                 .unwrap();
             assert!(Arc::ptr_eq(&order[0], &near));
@@ -12380,7 +12479,7 @@ mod tests {
             ..Default::default()
         };
         let order = pool
-            .get_providers_with_fallback("m-ref", None, &hints)
+            .get_providers_with_fallback("m-ref", None, &hints, None)
             .await
             .unwrap();
         assert_eq!(order.len(), 3);
@@ -13457,7 +13556,7 @@ mod tests {
             ..Default::default()
         };
         let standalone = pool
-            .get_providers_with_fallback(&model_id, None, &disabled)
+            .get_providers_with_fallback(&model_id, None, &disabled, None)
             .await
             .expect("registered model");
         assert_eq!(standalone.len(), 1);
@@ -13465,7 +13564,7 @@ mod tests {
 
         pool.refresh_pinned_provider_roles_from_catalog(&model_id, "chutes", true);
         let paired = pool
-            .get_providers_with_fallback(&model_id, None, &disabled)
+            .get_providers_with_fallback(&model_id, None, &disabled, None)
             .await
             .expect("registered model");
         assert!(
@@ -13475,7 +13574,7 @@ mod tests {
 
         pool.refresh_pinned_provider_roles_from_catalog(&model_id, "vllm", false);
         let provider_owned_elsewhere = pool
-            .get_providers_with_fallback(&model_id, None, &disabled)
+            .get_providers_with_fallback(&model_id, None, &disabled, None)
             .await
             .expect("registered model");
         assert!(
@@ -13485,7 +13584,7 @@ mod tests {
 
         pool.refresh_pinned_provider_roles_from_catalog(&model_id, "chutes", false);
         let standalone_again = pool
-            .get_providers_with_fallback(&model_id, None, &disabled)
+            .get_providers_with_fallback(&model_id, None, &disabled, None)
             .await
             .expect("registered model");
         assert_eq!(standalone_again.len(), 1);
@@ -13579,6 +13678,7 @@ mod tests {
                     fallback_disabled: true,
                     ..Default::default()
                 },
+                None,
             )
             .await;
         assert!(disabled.is_err(), "the primary error must surface");
@@ -13623,13 +13723,14 @@ mod tests {
                     fallback_disabled: true,
                     ..Default::default()
                 },
+                None,
             )
             .await
             .expect("configured model remains known");
         assert!(disabled.is_empty());
 
         let enabled = pool
-            .get_providers_with_fallback(&model_id, None, &ChatRoutingHints::default())
+            .get_providers_with_fallback(&model_id, None, &ChatRoutingHints::default(), None)
             .await
             .expect("configured fallback remains available when permitted");
         assert_eq!(enabled.len(), 1);
@@ -13676,6 +13777,7 @@ mod tests {
                     fallback_disabled: true,
                     ..Default::default()
                 },
+                None,
             )
             .await;
         assert!(disabled.is_err(), "the primary stream error must surface");
@@ -13689,6 +13791,7 @@ mod tests {
                 fallback_params(&model_id),
                 "enabled".to_string(),
                 ChatRoutingHints::default(),
+                None,
             )
             .await
             .expect("default policy should allow the registered fallback stream");
@@ -13726,7 +13829,7 @@ mod tests {
             ..Default::default()
         };
         let demoted = pool
-            .get_providers_with_fallback(&model_id, None, &disabled_hints)
+            .get_providers_with_fallback(&model_id, None, &disabled_hints, None)
             .await
             .expect("known model");
         assert_eq!(demoted.len(), 1);
@@ -13734,7 +13837,7 @@ mod tests {
 
         pool.prune_stale_pinned(&HashSet::new()).await;
         let disappeared = pool
-            .get_providers_with_fallback(&model_id, None, &disabled_hints)
+            .get_providers_with_fallback(&model_id, None, &disabled_hints, None)
             .await
             .expect("known model with all candidates excluded by policy");
         assert!(disappeared.is_empty());
@@ -13743,6 +13846,7 @@ mod tests {
                 fallback_params(&model_id),
                 "no-primary".to_string(),
                 disabled_hints,
+                None,
             )
             .await;
         assert!(result.is_err());
@@ -13795,6 +13899,7 @@ mod tests {
                     fallback_disabled: true,
                     ..Default::default()
                 },
+                None,
             )
             .await
             .expect("a primary peer should serve after another primary fails");
@@ -13831,6 +13936,7 @@ mod tests {
                     fallback_disabled: true,
                     ..Default::default()
                 },
+                None,
             )
             .await
             .expect("a model that has never had a primary peer remains directly usable");
@@ -14052,5 +14158,131 @@ mod tests {
                 "new URL fingerprint state must be created after a URL change"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn allowed_tier_restriction_forces_near_serving_and_blocks_otherwise() {
+        use inference_providers::mock::{MockProvider, RequestMatcher, ResponseTemplate};
+        use inference_providers::{ProviderSource, ProviderTier};
+
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+        let model_id = "grant-scope/dual-tier".to_string();
+
+        let near = Arc::new(
+            MockProvider::new_accept_all()
+                .with_tier(ProviderTier::Near)
+                .with_provider_source(ProviderSource::Vllm),
+        );
+        near.when(RequestMatcher::Any)
+            .respond_with(ResponseTemplate::new("served-by-near"))
+            .await;
+        let chutes = Arc::new(
+            MockProvider::new_accept_all()
+                .with_tier(ProviderTier::Attested3p)
+                .with_provider_source(ProviderSource::Chutes),
+        );
+        chutes
+            .when(RequestMatcher::Any)
+            .respond_with(ResponseTemplate::new("served-by-chutes"))
+            .await;
+
+        pool.register_provider(model_id.clone(), near).await;
+        pool.register_pinned_secondary_provider(model_id.clone(), chutes, None)
+            .await;
+
+        assert!(
+            pool.model_has_provider_of_tier(&model_id, ProviderTier::Near)
+                .await
+        );
+        assert!(
+            pool.model_has_provider_of_tier(&model_id, ProviderTier::Attested3p)
+                .await
+        );
+
+        // Restricted admission: only the NEAR fleet may serve, even though a
+        // healthy attested fallback is registered.
+        let served = pool
+            .chat_completion_with_attribution_and_hints(
+                fallback_params(&model_id),
+                "grant-only".to_string(),
+                ChatRoutingHints::default(),
+                Some(ProviderTier::Near),
+            )
+            .await
+            .expect("NEAR-restricted request must serve from the NEAR fleet");
+        let body = String::from_utf8_lossy(&served.response.raw_bytes);
+        assert!(
+            body.contains("served-by-near"),
+            "restricted request must be served by NEAR, got: {body}"
+        );
+        assert_eq!(
+            served.provider_attribution.served_provider_tier,
+            Some(crate::usage::ServedProviderTier::Near)
+        );
+        assert!(!served.provider_attribution.served_via_fallback);
+
+        // Unrestricted admission keeps today's NEAR-first behavior with the
+        // attested fallback available.
+        let served = pool
+            .chat_completion_with_attribution_and_hints(
+                fallback_params(&model_id),
+                "unrestricted".to_string(),
+                ChatRoutingHints::default(),
+                None,
+            )
+            .await
+            .expect("unrestricted request must serve");
+        assert_eq!(
+            served.provider_attribution.served_provider_tier,
+            Some(crate::usage::ServedProviderTier::Near)
+        );
+    }
+
+    #[tokio::test]
+    async fn allowed_tier_restriction_fails_closed_without_matching_tier() {
+        use inference_providers::mock::{MockProvider, RequestMatcher, ResponseTemplate};
+        use inference_providers::{ProviderSource, ProviderTier};
+
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+        let model_id = "grant-scope/chutes-only".to_string();
+
+        let chutes = Arc::new(
+            MockProvider::new_accept_all()
+                .with_tier(ProviderTier::Attested3p)
+                .with_provider_source(ProviderSource::Chutes),
+        );
+        chutes
+            .when(RequestMatcher::Any)
+            .respond_with(ResponseTemplate::new("served-by-chutes"))
+            .await;
+        let chutes_provider: Arc<InferenceProviderTrait> = chutes.clone();
+        pool.register_pinned_provider(
+            model_id.clone(),
+            chutes_provider,
+            None,
+            ProviderPoolRole::Primary,
+        )
+        .await;
+
+        assert!(
+            !pool
+                .model_has_provider_of_tier(&model_id, ProviderTier::Near)
+                .await
+        );
+
+        let result = pool
+            .chat_completion_with_attribution_and_hints(
+                fallback_params(&model_id),
+                "restricted".to_string(),
+                ChatRoutingHints::default(),
+                Some(ProviderTier::Near),
+            )
+            .await;
+        assert!(
+            result.is_err(),
+            "NEAR-restricted request must not be served by a third-party provider"
+        );
+        // The chutes provider must never have been contacted.
+        assert!(chutes.last_chat_params().await.is_none());
     }
 }

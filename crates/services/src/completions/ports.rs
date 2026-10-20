@@ -67,6 +67,17 @@ pub enum CompletionError {
     #[error("Service overloaded: {0}")]
     ServiceOverloaded(String),
 
+    /// Credit-policy denial: the organization is drawing on budget that may
+    /// only fund NEAR-served inference (e.g. gifted grant credits) and the
+    /// requested model has no NEAR-tier provider.
+    #[error("Grant credits can only be used with NEAR AI served models: {0}")]
+    GrantCreditsNearOnly(String),
+
+    /// Credit-policy denial: no usable credit capacity remains (exhaustion
+    /// race with the pre-flight middleware check).
+    #[error("Insufficient credits: {0}")]
+    InsufficientCredits(String),
+
     #[error("Internal error: {0}")]
     InternalError(String),
 }
@@ -262,6 +273,25 @@ pub trait CompletionServiceTrait: Send + Sync {
         &self,
         model_name: &str,
     ) -> Result<Option<crate::models::ModelWithPricing>, anyhow::Error>;
+
+    /// Resolve the credit-policy serving restriction for one request.
+    ///
+    /// Returns:
+    /// - `Ok(None)` when unrestricted budget is available (any provider tier),
+    /// - `Ok(Some(ProviderTier::Near))` when only NEAR-tier-only budget (e.g.
+    ///   gifted grant credits) remains and the canonical model has a NEAR-tier
+    ///   provider — the caller must restrict routing to that tier,
+    /// - `Err(GrantCreditsNearOnly)` when only NEAR-tier-only budget remains
+    ///   but the model cannot be served by the NEAR fleet,
+    /// - `Err(InternalError)` when admission state cannot be read.
+    ///
+    /// The aggregate credit admission (middleware) is assumed to have already
+    /// passed; exhaustion races surface as provider/accounting failures.
+    async fn resolve_serving_restriction(
+        &self,
+        organization_id: uuid::Uuid,
+        canonical_model: &str,
+    ) -> Result<Option<inference_providers::ProviderTier>, CompletionError>;
 
     /// Get the inference provider pool for direct access
     fn get_inference_provider_pool(

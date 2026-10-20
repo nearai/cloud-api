@@ -1,6 +1,7 @@
 use crate::repositories::utils::map_db_error;
 use services::common::RepositoryError;
 use services::usage::CreditAllocation;
+use services::usage::ServedProviderTier;
 use tokio_postgres::{GenericClient, Transaction};
 use uuid::Uuid;
 
@@ -8,6 +9,9 @@ use uuid::Uuid;
 pub struct CreditAllocationPolicy {
     pub priority: Vec<String>,
     pub version: String,
+    /// Credit types restricted to NEAR-tier (`near`) served inference. See
+    /// `config::CreditAllocationConfig::near_tier_only_credit_types`.
+    pub near_tier_only: Vec<String>,
 }
 
 impl Default for CreditAllocationPolicy {
@@ -22,7 +26,32 @@ impl From<&config::CreditAllocationConfig> for CreditAllocationPolicy {
         Self {
             priority: value.priority.clone(),
             version: value.policy_version.clone(),
+            near_tier_only: value.near_tier_only_credit_types.clone(),
         }
+    }
+}
+
+impl CreditAllocationPolicy {
+    /// Funding priority for a charge served at the given provider tier.
+    ///
+    /// Credit types marked NEAR-tier-only are eligible only when the charge
+    /// was served by NEAR AI's own fleet. Charges with any other tier — or
+    /// with no tier attribution at all (legacy rows, unattributed reporters)
+    /// — fail closed: restricted types are dropped from the candidate set so
+    /// gifted credits can never fund third-party provider usage.
+    pub fn priority_for_tier(
+        &self,
+        served_provider_tier: Option<ServedProviderTier>,
+    ) -> Vec<String> {
+        if served_provider_tier == Some(ServedProviderTier::Near) || self.near_tier_only.is_empty()
+        {
+            return self.priority.clone();
+        }
+        self.priority
+            .iter()
+            .filter(|credit_type| !self.near_tier_only.contains(credit_type))
+            .cloned()
+            .collect()
     }
 }
 
@@ -323,10 +352,11 @@ pub async fn settle_unfunded_usage(
     let debts = transaction
         .query(
             r#"
-            SELECT usage_kind, usage_id, outstanding
+            SELECT usage_kind, usage_id, outstanding, served_provider_tier
             FROM (
                 SELECT 'inference'::TEXT AS usage_kind, usage.id AS usage_id,
                        usage.created_at,
+                       usage.served_provider_tier,
                        GREATEST(usage.unfunded_amount
                            - COALESCE((SELECT SUM(allocation.amount)::BIGINT
                                FROM effective_usage_credit_allocations allocation
@@ -338,6 +368,7 @@ pub async fn settle_unfunded_usage(
                 UNION ALL
                 SELECT 'service'::TEXT AS usage_kind, usage.id AS usage_id,
                        usage.created_at,
+                       NULL::TEXT AS served_provider_tier,
                        GREATEST(usage.unfunded_amount
                            - COALESCE((SELECT SUM(allocation.amount)::BIGINT
                                FROM effective_usage_credit_allocations allocation
@@ -363,10 +394,24 @@ pub async fn settle_unfunded_usage(
         }
         let usage_kind: String = debt.get("usage_kind");
         let usage_id: Uuid = debt.get("usage_id");
+        let debt_tier: Option<String> = debt.get("served_provider_tier");
+        let debt_tier = debt_tier.and_then(|tier| tier.parse::<ServedProviderTier>().ok());
+        // Settlement must obey the same tier scoping as posting: a charge that
+        // was not served by the NEAR fleet can never draw on NEAR-tier-only
+        // credit. Unattributed inference debts (legacy rows) fail closed.
+        let allowed_types = match usage_kind.as_str() {
+            "inference" => policy.priority_for_tier(debt_tier),
+            // Platform services carry no provider tier and keep the full
+            // funding priority.
+            _ => policy.priority.clone(),
+        };
         let mut outstanding = debt.get::<_, i64>("outstanding").min(remaining_debt);
         for credit in &mut credits {
             if outstanding == 0 || aggregate_available == 0 {
                 break;
+            }
+            if !allowed_types.contains(&credit.credit_type) {
+                continue;
             }
             let amount = outstanding.min(credit.amount).min(aggregate_available);
             if amount == 0 {
@@ -478,4 +523,53 @@ pub async fn load_allocations<C: GenericClient + Sync>(
             policy_version: row.get("policy_version"),
         })
         .collect())
+}
+
+#[cfg(test)]
+mod tier_scoping_tests {
+    use super::*;
+
+    fn policy() -> CreditAllocationPolicy {
+        CreditAllocationPolicy {
+            priority: ["grant", "staking_farm", "payment", "postpay"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            version: "test".to_string(),
+            near_tier_only: vec!["grant".to_string()],
+        }
+    }
+
+    #[test]
+    fn near_tier_keeps_full_priority() {
+        assert_eq!(
+            policy().priority_for_tier(Some(ServedProviderTier::Near)),
+            vec!["grant", "staking_farm", "payment", "postpay"]
+        );
+    }
+
+    #[test]
+    fn non_near_tiers_and_unattributed_fail_closed() {
+        for tier in [
+            None,
+            Some(ServedProviderTier::Attested3p),
+            Some(ServedProviderTier::NonAttested),
+        ] {
+            assert_eq!(
+                policy().priority_for_tier(tier),
+                vec!["staking_farm", "payment", "postpay"],
+                "tier {tier:?} must not draw on NEAR-tier-only credit"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_scope_keeps_full_priority() {
+        let mut unrestricted = policy();
+        unrestricted.near_tier_only.clear();
+        assert_eq!(
+            unrestricted.priority_for_tier(None),
+            vec!["grant", "staking_farm", "payment", "postpay"]
+        );
+    }
 }

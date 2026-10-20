@@ -218,6 +218,8 @@ fn completion_http_status_code(error: &crate::completions::CompletionError) -> u
         crate::completions::CompletionError::RateLimitExceeded(_) => 429,
         crate::completions::CompletionError::ProviderError { status_code, .. } => *status_code,
         crate::completions::CompletionError::ServiceOverloaded(_) => 429,
+        crate::completions::CompletionError::GrantCreditsNearOnly(_)
+        | crate::completions::CompletionError::InsufficientCredits(_) => 402,
         crate::completions::CompletionError::InternalError(_) => 500,
     }
 }
@@ -256,6 +258,12 @@ fn completion_response_error(
         }
         crate::completions::CompletionError::ServiceOverloaded(msg) => {
             response_error(msg, "service_overloaded", None)
+        }
+        crate::completions::CompletionError::GrantCreditsNearOnly(msg) => {
+            response_error(msg, "grant_credits_near_only", None)
+        }
+        crate::completions::CompletionError::InsufficientCredits(msg) => {
+            response_error(msg, "insufficient_credits", None)
         }
         crate::completions::CompletionError::InternalError(msg) => response_error(
             &format!("Internal server error: {msg}"),

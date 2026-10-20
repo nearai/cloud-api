@@ -109,6 +109,7 @@ async fn admin_patch_with_provider_type_keeps_pinned_provider() {
                 fallback_disabled: true,
                 ..Default::default()
             },
+            None,
         )
         .await
         .expect("the live catalog update must reclassify the standalone pin as primary");

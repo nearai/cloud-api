@@ -37,7 +37,9 @@ pub async fn detect_pii(
         .map_err(|e| AutoRedactError::Internal(format!("encode detect req: {e}")))?;
 
     let resp_bytes = pool
-        .privacy_classify(model, bytes::Bytes::from(body_bytes), HashMap::new())
+        // Platform-side PII detection: not tenant-visible model usage, so it
+        // is exempt from credit-tier admission restrictions.
+        .privacy_classify(model, bytes::Bytes::from(body_bytes), HashMap::new(), None)
         .await
         .map_err(|e| AutoRedactError::DetectorUnavailable(detector_error_message(&e)))?;
 

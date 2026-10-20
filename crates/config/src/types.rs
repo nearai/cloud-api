@@ -112,6 +112,12 @@ impl ApiConfig {
 pub struct CreditAllocationConfig {
     pub priority: Vec<String>,
     pub policy_version: String,
+    /// Credit types that may only fund inference served by NEAR AI's own
+    /// fleet (`served_provider_tier = 'near'`). When a charge carries any
+    /// other tier — or no tier attribution at all (fail-closed) — these
+    /// types are excluded from the funding candidates, so gifted credits
+    /// can never pay for third-party provider usage.
+    pub near_tier_only_credit_types: Vec<String>,
 }
 
 pub const SUPPORTED_CREDIT_TYPES: [&str; 4] = ["grant", "staking_farm", "payment", "postpay"];
@@ -124,6 +130,7 @@ impl Default for CreditAllocationConfig {
                 .map(str::to_string)
                 .collect(),
             policy_version: "v1".to_string(),
+            near_tier_only_credit_types: vec!["grant".to_string()],
         }
     }
 }
@@ -162,9 +169,26 @@ impl CreditAllocationConfig {
             );
         }
 
+        let near_tier_only_credit_types = env::var("CREDIT_NEAR_TIER_ONLY_TYPES")
+            .unwrap_or_else(|_| defaults.near_tier_only_credit_types.join(","))
+            .split(',')
+            .map(|value| value.trim().to_ascii_lowercase())
+            .filter(|value| !value.is_empty())
+            .collect::<Vec<_>>();
+        if near_tier_only_credit_types
+            .iter()
+            .any(|value| !SUPPORTED_CREDIT_TYPES.contains(&value.as_str()))
+        {
+            return Err(format!(
+                "CREDIT_NEAR_TIER_ONLY_TYPES may only contain supported credit types: {}",
+                SUPPORTED_CREDIT_TYPES.join(",")
+            ));
+        }
+
         Ok(Self {
             priority,
             policy_version,
+            near_tier_only_credit_types,
         })
     }
 }

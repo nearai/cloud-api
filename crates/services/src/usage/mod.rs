@@ -184,6 +184,10 @@ pub struct UsageServiceImpl {
     limits_repository: Arc<dyn OrganizationLimitsRepository>,
     workspace_service: Arc<dyn crate::workspace::WorkspaceServiceTrait>,
     metrics_service: Arc<dyn MetricsServiceTrait>,
+    /// Credit types that may only fund NEAR-tier served inference. Mirrors
+    /// `config::CreditAllocationConfig::near_tier_only_credit_types` so the
+    /// admission decision matches the posting-time allocation policy.
+    near_tier_only_credit_types: Vec<String>,
 }
 
 impl UsageServiceImpl {
@@ -193,6 +197,7 @@ impl UsageServiceImpl {
         limits_repository: Arc<dyn OrganizationLimitsRepository>,
         workspace_service: Arc<dyn crate::workspace::WorkspaceServiceTrait>,
         metrics_service: Arc<dyn MetricsServiceTrait>,
+        near_tier_only_credit_types: Vec<String>,
     ) -> Self {
         Self {
             usage_repository,
@@ -200,6 +205,7 @@ impl UsageServiceImpl {
             limits_repository,
             workspace_service,
             metrics_service,
+            near_tier_only_credit_types,
         }
     }
 }
@@ -657,8 +663,46 @@ impl UsageServiceTrait for UsageServiceImpl {
             .get_current_limits(organization_id)
             .await
             .map_err(|e| UsageError::InternalError(format!("Failed to get limits: {e}")))?;
-
         Ok(limit)
+    }
+
+    /// Split currently available credit capacity by provider-tier eligibility.
+    ///
+    /// Composes the aggregate admission view (which already discounts legacy
+    /// unattributed spend and unresolved overage) with the per-credit-type
+    /// breakdown, so callers can tell "drawing on gifted grant credits only"
+    /// apart from "paid capacity available".
+    async fn get_credit_admission(
+        &self,
+        organization_id: Uuid,
+    ) -> Result<CreditAdmission, UsageError> {
+        let limit = self.get_limit(organization_id).await?;
+        let Some(limit) = limit else {
+            // No limits configured: nothing is authorized (check_can_use
+            // reports NoLimitSet); report empty admission.
+            return Ok(CreditAdmission::default());
+        };
+        if limit.available <= 0 {
+            return Ok(CreditAdmission::default());
+        }
+
+        let breakdown = self.get_credit_limits(organization_id).await?;
+        let mut admission = CreditAdmission::default();
+        for credit in breakdown {
+            if self
+                .near_tier_only_credit_types
+                .contains(&credit.credit_type)
+            {
+                admission.near_tier_only_available = admission
+                    .near_tier_only_available
+                    .saturating_add(credit.available);
+            } else {
+                admission.unrestricted_available = admission
+                    .unrestricted_available
+                    .saturating_add(credit.available);
+            }
+        }
+        Ok(admission)
     }
 
     async fn get_credit_limits(

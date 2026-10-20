@@ -513,6 +513,40 @@ async fn handle_request(
         None
     };
 
+    // Credit-policy admission: NEAR-tier-only budget (gifted grant credits)
+    // can only fund NEAR-served inference. Native Anthropic transport is
+    // third-party-only today, so `resolve_serving_restriction` denies here
+    // whenever the restriction applies (no NEAR-tier provider for the model).
+    let allowed_tier = match app_state
+        .completion_service
+        .resolve_serving_restriction(api_key.organization.id.0, &model.model_name)
+        .await
+    {
+        Ok(tier) => tier,
+        Err(CompletionError::GrantCreditsNearOnly(message)) => {
+            return anthropic_error(
+                StatusCode::PAYMENT_REQUIRED,
+                "invalid_request_error",
+                message,
+            );
+        }
+        Err(CompletionError::InsufficientCredits(message)) => {
+            return anthropic_error(
+                StatusCode::PAYMENT_REQUIRED,
+                "invalid_request_error",
+                message,
+            );
+        }
+        Err(error) => {
+            tracing::error!(error = %error, "Failed to read credit admission");
+            return anthropic_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "api_error",
+                "Failed to check credit admission",
+            );
+        }
+    };
+
     let request = AnthropicRawRequest {
         endpoint,
         beta: prepared.beta_query,
@@ -521,7 +555,7 @@ async fn handle_request(
     };
     let served = match app_state
         .inference_provider_pool
-        .anthropic_raw(&model.model_name, request)
+        .anthropic_raw(&model.model_name, request, allowed_tier)
         .await
     {
         Ok(response) => response,
@@ -1772,6 +1806,16 @@ redact-thinking-2026-02-12";
             Err(services::usage::UsageError::InternalError(
                 "recorded".to_string(),
             ))
+        }
+
+        async fn get_credit_admission(
+            &self,
+            _organization_id: Uuid,
+        ) -> Result<services::usage::CreditAdmission, services::usage::UsageError> {
+            Ok(services::usage::CreditAdmission {
+                unrestricted_available: 1000,
+                near_tier_only_available: 0,
+            })
         }
 
         async fn record_usage_from_api(

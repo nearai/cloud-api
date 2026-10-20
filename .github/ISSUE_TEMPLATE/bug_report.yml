@@ -38,21 +38,6 @@ body:
       required: true
 
   - type: textarea
-    id: environment
-    attributes:
-      label: Environment and request details
-      description: Include the details you know; omit anything that does not apply.
-      placeholder: |
-        Environment: local / staging / production / self-hosted
-        Cloud API commit or image tag, if known:
-        Endpoint and model/provider:
-        Client or SDK and version:
-        Streaming or encryption mode, if relevant:
-        OS and deployment setup, if self-hosted:
-    validations:
-      required: true
-
-  - type: textarea
     id: context
     attributes:
       label: Logs or additional context

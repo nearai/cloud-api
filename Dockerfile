@@ -49,6 +49,9 @@ RUN cargo build --release --locked --bin api
 FROM debian:bookworm-slim@sha256:78d2f66e0fec9e5a39fb2c72ea5e052b548df75602b5215ed01a17171529f706 AS runtime
 
 # Install pinned apt dependencies
+# eMudhra intermediate CA key compromise (2026-10-20): bookworm has no fixed
+# ca-certificates yet, so distrust the two roots the compromised intermediates
+# chain to. Remove once the pinned ca-certificates no longer ships them.
 RUN --mount=type=bind,source=pinned-packages-runtime.txt,target=/tmp/pinned-packages-runtime.txt,ro \
     --mount=type=bind,from=builder-base,source=/etc/ssl/certs/ca-certificates.crt,target=/run/bootstrap-ca.crt,ro \
     set -e; \
@@ -71,7 +74,12 @@ RUN --mount=type=bind,source=pinned-packages-runtime.txt,target=/tmp/pinned-pack
         ca-certificates \
         libssl3 \
         curl \
-        && rm -rf /var/lib/apt/lists/* /var/log/* /var/cache/ldconfig/aux-cache
+        && sed -i -e 's|^mozilla/emSign_ECC_Root_CA_-_G3.crt$|!&|' \
+            -e 's|^mozilla/Comodo_AAA_Services_root.crt$|!&|' /etc/ca-certificates.conf && \
+    update-ca-certificates && \
+    test ! -e /etc/ssl/certs/emSign_ECC_Root_CA_-_G3.pem && \
+    test ! -e /etc/ssl/certs/Comodo_AAA_Services_root.pem && \
+    rm -rf /var/lib/apt/lists/* /var/log/* /var/cache/ldconfig/aux-cache
 
 # Create app user
 # Normalize /etc/shadow file last password change date to 0 for app user

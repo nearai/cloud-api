@@ -463,11 +463,6 @@ where
                         last_finish_reason.as_ref(),
                     ));
                     let usage_request = RecordUsageServiceRequest {
-                        discount: None,
-                        organization_id,
-                        workspace_id,
-                        api_key_id,
-                        model_id,
                         input_tokens,
                         output_tokens,
                         cache_read_tokens,
@@ -475,15 +470,22 @@ where
                         profiled_cache_write_tokens,
                         requested_service_tier,
                         provider_service_tier,
-                        inference_type,
                         ttft_ms,
                         avg_itl_ms,
                         inference_id: Some(inference_id),
                         provider_request_id: Some(chat_id),
                         stop_reason,
                         response_id,
-                        image_count: None,
                         provider_attribution,
+                        ..RecordUsageServiceRequest::base(
+                            crate::usage::BillingIdentity {
+                                organization_id,
+                                workspace_id,
+                                api_key_id,
+                                model_id,
+                            },
+                            inference_type,
+                        )
                     };
                     let usage_write = spawn_usage_write(
                         &write_handle,
@@ -2239,11 +2241,6 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
 
         usage_service
             .record_usage(RecordUsageServiceRequest {
-                discount: None,
-                organization_id,
-                workspace_id,
-                api_key_id,
-                model_id,
                 input_tokens,
                 output_tokens,
                 cache_read_tokens,
@@ -2256,15 +2253,21 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
                 profiled_cache_write_tokens,
                 requested_service_tier,
                 provider_service_tier,
-                inference_type: crate::usage::ports::InferenceType::ChatCompletion,
-                ttft_ms: None,    // N/A for non-streaming
-                avg_itl_ms: None, // N/A for non-streaming
+                // ttft_ms / avg_itl_ms stay None: N/A for non-streaming
                 inference_id: Some(inference_id),
                 provider_request_id: Some(provider_request_id),
                 stop_reason: Some(stop_reason),
                 response_id,
-                image_count: None,
                 provider_attribution,
+                ..RecordUsageServiceRequest::base(
+                    crate::usage::BillingIdentity {
+                        organization_id,
+                        workspace_id,
+                        api_key_id,
+                        model_id,
+                    },
+                    crate::usage::ports::InferenceType::ChatCompletion,
+                )
             })
             .await
             .map_err(|e| {
@@ -4057,6 +4060,7 @@ mod tests {
             .unwrap()["textPricing"]
             .clone();
         crate::models::ModelWithPricing {
+            upcoming_pricing: None,
             id: Uuid::new_v4(),
             model_name: "openai/gpt-5.6-sol".to_string(),
             model_display_name: "GPT-5.6 Sol".to_string(),

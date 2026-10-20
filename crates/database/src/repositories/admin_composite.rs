@@ -207,6 +207,7 @@ impl AdminRepository for AdminCompositeRepository {
             owned_by: request.owned_by,
             provider_type: request.provider_type,
             provider_config: request.provider_config,
+            expected_provider_config: request.expected_provider_config,
             attestation_supported: request.attestation_supported,
             input_modalities: request.input_modalities,
             output_modalities: request.output_modalities,

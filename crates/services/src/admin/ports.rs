@@ -31,6 +31,11 @@ pub struct UpdateModelAdminRequest {
     // Provider configuration
     pub provider_type: Option<String>,
     pub provider_config: Option<serde_json::Value>,
+    /// Compare-and-set guard for `provider_config`, set from the stored value
+    /// a merge started from. `None` skips the check; `Some(expected)` applies
+    /// the update only while the stored config still equals `expected`
+    /// (`Some(None)` = NULL), and otherwise fails with a transaction conflict.
+    pub expected_provider_config: Option<Option<serde_json::Value>>,
     pub attestation_supported: Option<bool>,
     // Architecture/modalities
     pub input_modalities: Option<Vec<String>>,
@@ -395,7 +400,8 @@ pub struct ModelDeprecationConfirmResult {
 }
 
 /// Lifecycle status of a scheduled model pricing change.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ScheduledPricingChangeStatus {
     Pending,
     Applying,
@@ -670,6 +676,8 @@ pub enum AdminError {
     PricingChangeConflict(String),
     #[error("Pricing change not found: {0}")]
     PricingChangeNotFound(String),
+    #[error("Model update conflict: {0}")]
+    ModelUpdateConflict(String),
     #[error("Invalid parameters: {0}")]
     InvalidParams(String),
     #[error("Unauthorized: {0}")]

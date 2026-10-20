@@ -746,6 +746,8 @@ async fn signup_new_user(database: &std::sync::Arc<database::Database>) -> (Stri
     let user = auth_components
         .auth_service
         .get_or_create_oauth_user(OAuthUserInfo {
+            email_verified: true,
+            email_authoritative: true,
             provider: "github".to_string(),
             provider_user_id: format!("gh-{unique}"),
             email: format!("newuser-{unique}@test.com"),

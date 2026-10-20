@@ -132,6 +132,34 @@ against an OAuth app whose callback URL is
 `http://localhost:3000/v1/auth/callback`. Visit `/v1/auth/login` to start
 the flow.
 
+### Same-email OAuth sign-in
+
+Accounts are identified by their OAuth provider and provider user ID. A new Google
+or GitHub identity automatically links to an existing active account on the other
+provider only when both the incoming identity and the account's original identity
+verify the same email and are authoritative for it. For Google this requires a
+Gmail address or a nonempty `hd` returned by Google's userinfo endpoint for a
+verified Google Workspace account. For a verified third-party Google email without
+`hd`, sign-in returns a conflict with guidance to use the original provider.
+See [Google's email-authority rules](https://developers.google.com/identity/sign-in/web/backend-auth).
+Sign-in then uses the existing account and its resources.
+Existing identities remain authoritative; separately registered accounts are not
+merged. If automatic linking is not allowed, a conflicting email returns `409`
+with `error: "oauth_provider_conflict"`, `existing_provider`, and an
+`error_description` naming the original sign-in method.
+
+Migrated identities with unknown verification or authority require an authoritative,
+verified sign-in through the original provider before automatic linking is available.
+When that evidence is unavailable, continue signing in through the original
+provider. Different-email identities are not linked.
+
+When the login request includes an allowed `frontend_callback`, this conflict
+instead redirects to that callback with the same three fields in the URL
+fragment. Frontend callbacks should check `error` before reading tokens, display
+the description, and offer sign-in with `existing_provider`. Conflict responses
+contain no tokens and do not create a session. Other callback errors retain their
+existing response handling.
+
 ## 4. End-to-end walkthrough
 
 This sequence creates an organization, workspace, and API key with

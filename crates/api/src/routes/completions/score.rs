@@ -119,52 +119,33 @@ pub async fn score(
             let workspace_id = api_key.workspace.id.0;
 
             // Parse API key ID to UUID
-            let api_key_id = match Uuid::parse_str(&api_key.api_key.id.0) {
+            let api_key_id = match billing::billing_api_key_id(&api_key) {
                 Ok(id) => id,
-                Err(e) => {
-                    tracing::error!(error = %e, "Invalid API key ID for usage tracking");
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        ResponseJson(ErrorResponse::new(
-                            "Failed to record usage".to_string(),
-                            "server_error".to_string(),
-                        )),
-                    )
-                        .into_response();
-                }
+                Err(response) => return *response,
             };
 
             let inference_id = hash_inference_id_to_uuid(&response.id);
 
             // Score requests don't have traditional token counts - use input token count as 1
             let usage_request = services::usage::ports::RecordUsageServiceRequest {
-                organization_id,
-                workspace_id,
-                api_key_id,
-                model_id,
                 input_tokens: 1,
-                output_tokens: 0,
-                cache_read_tokens: 0,
-                cache_write: None,
-                profiled_cache_write_tokens: 0,
-                requested_service_tier: None,
-                provider_service_tier: None,
-                inference_type: services::usage::ports::InferenceType::Score,
-                ttft_ms: None,
-                avg_itl_ms: None,
                 inference_id: Some(inference_id),
-                provider_request_id: None,
                 stop_reason: Some(services::usage::StopReason::Completed),
-                response_id: None,
-                image_count: None,
-                discount: None,
-                provider_attribution: services::usage::ProviderAttribution::default(),
+                ..services::usage::ports::RecordUsageServiceRequest::base(
+                    services::usage::ports::BillingIdentity {
+                        organization_id,
+                        workspace_id,
+                        api_key_id,
+                        model_id,
+                    },
+                    services::usage::ports::InferenceType::Score,
+                )
             };
 
             // Record usage with timeout to prevent blocking responses
             match tokio::time::timeout(
                 Duration::from_secs(USAGE_RECORDING_TIMEOUT_SECS),
-                app_state.usage_service.record_usage(usage_request),
+                app_state.usage_service.record_usage(usage_request.clone()),
             )
             .await
             {
@@ -176,32 +157,8 @@ pub async fn score(
                         "Failed to record usage synchronously, retrying async"
                     );
                     let usage_service_clone = app_state.usage_service.clone();
-                    let usage_request_retry = services::usage::ports::RecordUsageServiceRequest {
-                        organization_id,
-                        workspace_id,
-                        api_key_id,
-                        model_id,
-                        input_tokens: 1,
-                        output_tokens: 0,
-                        cache_read_tokens: 0,
-                        cache_write: None,
-                        profiled_cache_write_tokens: 0,
-                        requested_service_tier: None,
-                        provider_service_tier: None,
-                        inference_type: services::usage::ports::InferenceType::Score,
-                        ttft_ms: None,
-                        avg_itl_ms: None,
-                        inference_id: Some(inference_id),
-                        provider_request_id: None,
-                        stop_reason: Some(services::usage::StopReason::Completed),
-                        response_id: None,
-                        image_count: None,
-                        discount: None,
-                        provider_attribution: services::usage::ProviderAttribution::default(),
-                    };
                     tokio::spawn(async move {
-                        if let Err(e) = usage_service_clone.record_usage(usage_request_retry).await
-                        {
+                        if let Err(e) = usage_service_clone.record_usage(usage_request).await {
                             tracing::error!(
                                 error = %e,
                                 model_id = %model_id,
@@ -218,32 +175,8 @@ pub async fn score(
                         "Score usage recording timed out, retrying async"
                     );
                     let usage_service_clone = app_state.usage_service.clone();
-                    let usage_request_retry = services::usage::ports::RecordUsageServiceRequest {
-                        organization_id,
-                        workspace_id,
-                        api_key_id,
-                        model_id,
-                        input_tokens: 1,
-                        output_tokens: 0,
-                        cache_read_tokens: 0,
-                        cache_write: None,
-                        profiled_cache_write_tokens: 0,
-                        requested_service_tier: None,
-                        provider_service_tier: None,
-                        inference_type: services::usage::ports::InferenceType::Score,
-                        ttft_ms: None,
-                        avg_itl_ms: None,
-                        inference_id: Some(inference_id),
-                        provider_request_id: None,
-                        stop_reason: Some(services::usage::StopReason::Completed),
-                        response_id: None,
-                        image_count: None,
-                        discount: None,
-                        provider_attribution: services::usage::ProviderAttribution::default(),
-                    };
                     tokio::spawn(async move {
-                        if let Err(e) = usage_service_clone.record_usage(usage_request_retry).await
-                        {
+                        if let Err(e) = usage_service_clone.record_usage(usage_request).await {
                             tracing::error!(
                                 error = %e,
                                 model_id = %model_id,

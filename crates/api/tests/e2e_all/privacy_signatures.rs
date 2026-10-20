@@ -113,7 +113,7 @@ impl Fixture {
 
     async fn check_billing(&self, inference_id: uuid::Uuid, id: Option<&str>, tokens: i32) {
         let client = self.database.pool().get().await.unwrap();
-        let rows=client.query("SELECT inference_id, provider_request_id, input_tokens, output_tokens FROM organization_usage_log WHERE organization_id=$1", &[&self.org_id]).await.unwrap();
+        let rows=client.query("SELECT inference_id, provider_request_id, input_tokens, output_tokens, total_cost FROM organization_usage_log WHERE organization_id=$1", &[&self.org_id]).await.unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].get::<_, uuid::Uuid>("inference_id"), inference_id);
         assert_eq!(
@@ -124,6 +124,19 @@ impl Fixture {
         );
         assert_eq!(rows[0].get::<_, i32>("input_tokens"), tokens);
         assert_eq!(rows[0].get::<_, i32>("output_tokens"), 0);
+        let balance = client
+            .query_one(
+                "SELECT total_requests, total_tokens, total_spent FROM organization_balance WHERE organization_id=$1",
+                &[&self.org_id],
+            )
+            .await
+            .unwrap();
+        assert_eq!(balance.get::<_, i64>("total_requests"), 1);
+        assert_eq!(balance.get::<_, i64>("total_tokens"), i64::from(tokens));
+        assert_eq!(
+            balance.get::<_, i64>("total_spent"),
+            rows[0].get::<_, i64>("total_cost"),
+        );
         assert_eq!(self.requests.lock().unwrap().len(), 1);
     }
 }
@@ -289,6 +302,120 @@ async fn signature_timeout_keeps_response_and_single_billing() {
             .await;
         assert!(fixture.pool.get_provider_by_chat_id(&id).await.is_none());
         tx.rollback().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn usage_timeout_returns_success_and_retries_with_the_same_billing_id() {
+    for path in ["/v1/privacy/classify", "/v1/privacy/redact"] {
+        // The fallback UUID must also survive retries; only deriving a stable
+        // ID for newer providers would leave the legacy path double-billed.
+        for has_id in [true, false] {
+            let id = has_id.then(|| format!("privacy-{}", uuid::Uuid::new_v4()));
+            let raw = upstream(id.as_deref(), false);
+            let fixture = Fixture::new(raw, ProviderTier::Near, false).await;
+            let mut blocker = fixture.database.pool().get().await.unwrap();
+            let tx = blocker.transaction().await.unwrap();
+            tx.query_one(
+                "SELECT id FROM organizations WHERE id=$1 FOR UPDATE",
+                &[&fixture.org_id],
+            )
+            .await
+            .unwrap();
+            let blocker_pid: i32 = tx
+                .query_one("SELECT pg_backend_pid()", &[])
+                .await
+                .unwrap()
+                .get(0);
+            let client = fixture.database.pool().get().await.unwrap();
+            let request = fixture.request(false);
+            let started = std::time::Instant::now();
+            let (response, ()) = tokio::join!(
+                async {
+                    tokio::time::timeout(Duration::from_secs(12), fixture.post(path, &request))
+                        .await
+                        .expect("billing must not indefinitely delay a completed inference")
+                },
+                async {
+                    let writer = tokio::time::timeout(Duration::from_secs(4), async {
+                        loop {
+                            let rows = client
+                                .query(
+                                    "SELECT pid FROM pg_stat_activity WHERE datname=current_database() AND $1 = ANY(pg_blocking_pids(pid))",
+                                    &[&blocker_pid],
+                                )
+                                .await
+                                .unwrap();
+                            if let Some(row) = rows.first() {
+                                break row.get::<_, i32>(0);
+                            }
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                    })
+                    .await
+                    .unwrap();
+                    // Cross the actual five-second deadline, then cancel only
+                    // this test's original statement. A later usage row must
+                    // come from the retry, not a write surviving future drop.
+                    tokio::time::sleep(Duration::from_secs(6)).await;
+                    let cancelled: bool = client
+                        .query_one(
+                            "SELECT pg_cancel_backend(pid) FROM pg_stat_activity WHERE pid=$1 AND $2 = ANY(pg_blocking_pids(pid))",
+                            &[&writer, &blocker_pid],
+                        )
+                        .await
+                        .unwrap()
+                        .get(0);
+                    assert!(cancelled);
+                }
+            );
+            // Keep the lock until after the response, so the actual five-second
+            // settlement deadline expires. The old implementation returned 500.
+            assert_eq!(response.status_code(), 200, "{}", response.text());
+            assert!(started.elapsed() >= Duration::from_secs(5));
+            let inference_id =
+                uuid::Uuid::parse_str(response.header("inference-id").to_str().unwrap()).unwrap();
+            if let Some(id) = &id {
+                assert_eq!(
+                    inference_id,
+                    services::completions::hash_inference_id_to_uuid(id),
+                );
+                fixture.verify(id, &request, &response.text()).await;
+            } else {
+                assert_eq!(inference_id.get_version_num(), 4);
+            }
+            let before: i64 = client
+                .query_one(
+                    "SELECT count(*) FROM organization_usage_log WHERE organization_id=$1",
+                    &[&fixture.org_id],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            assert_eq!(before, 0);
+            tx.rollback().await.unwrap();
+            // The original statement was cancelled; the retry must persist the
+            // header's exact ID before we check both the usage row and balance.
+            tokio::time::timeout(Duration::from_secs(4), async {
+                loop {
+                    let recorded: i64 = client
+                        .query_one(
+                            "SELECT count(*) FROM organization_usage_log WHERE organization_id=$1",
+                            &[&fixture.org_id],
+                        )
+                        .await
+                        .unwrap()
+                        .get(0);
+                    if recorded > 0 {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            fixture.check_billing(inference_id, id.as_deref(), 7).await;
+        }
     }
 }
 

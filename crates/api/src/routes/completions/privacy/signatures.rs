@@ -49,29 +49,18 @@ pub(super) async fn finalize(
     served: PrivacyResponse,
 ) -> Response {
     tokio::spawn(async move {
-        let settlement = tokio::time::timeout(
-            Duration::from_secs(USAGE_RECORDING_TIMEOUT_SECS),
-            settle_privacy_usage(
-                &state,
-                &api_key,
-                model_id,
-                &model_name,
-                endpoint,
-                tokens,
-                &served.identity,
-            ),
+        if let Err(response) = settle_privacy_usage(
+            &state,
+            &api_key,
+            model_id,
+            &model_name,
+            endpoint,
+            tokens,
+            &served.identity,
         )
-        .await;
-        match settlement {
-            Ok(Ok(())) => {}
-            Ok(Err(response)) => return response,
-            Err(_) => {
-                tracing::error!(
-                    endpoint = endpoint.label(),
-                    "Privacy usage settlement timed out"
-                );
-                return finalization_error();
-            }
+        .await
+        {
+            return response;
         }
         if let Some(id) = served.identity.response_id.as_deref() {
             let stored = tokio::time::timeout(

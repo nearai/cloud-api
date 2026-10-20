@@ -118,8 +118,9 @@ const MAX_REASONABLE_PRIVACY_TOKENS: i32 = 1_000_000;
 /// `[0, MAX_REASONABLE_PRIVACY_TOKENS]`, flag zero or oversized counts as
 /// provider anomalies, and record the usage. Classify and redact share this
 /// so their thresholds, anomaly metrics and billing cannot drift apart.
-/// Returns the error response to send when recording fails (the call must
-/// not succeed unbilled).
+/// Returns an error for an invalid billing identity. Once inference completes,
+/// a slow or failed usage write uses the shared idempotent retry path rather
+/// than inviting the client to repeat a completed, potentially billed call.
 async fn settle_privacy_usage(
     app_state: &AppState,
     api_key: &AuthenticatedApiKey,
@@ -228,17 +229,12 @@ async fn settle_privacy_usage(
         provider_attribution: services::usage::ProviderAttribution::default(),
     };
 
-    if let Err(e) = app_state.usage_service.record_usage(usage_request).await {
-        tracing::error!(endpoint = label, error = %e, "Failed to record privacy usage");
-        return Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            ResponseJson(ErrorResponse::new(
-                "Failed to record usage - please retry".to_string(),
-                "server_error".to_string(),
-            )),
-        )
-            .into_response());
-    }
+    record_usage_with_sync_fallback(
+        app_state.usage_service.clone(),
+        usage_request,
+        endpoint.label(),
+    )
+    .await;
 
     Ok(())
 }

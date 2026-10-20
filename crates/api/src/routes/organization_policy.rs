@@ -5,11 +5,11 @@ use axum::{
     extract::{Extension, Path},
     Json,
 };
-use database::repositories::credit_transfers::{
-    CreditTransferRepository, OrganizationPolicy, TransferError,
-};
 use serde::Deserialize;
 use serde_json::Value;
+use services::organization_credits::models::{OrganizationPolicy, TransferError};
+use services::organization_credits::OrganizationCreditServiceTrait;
+use std::sync::Arc;
 use uuid::Uuid;
 
 #[derive(Deserialize)]
@@ -30,11 +30,15 @@ pub struct PolicyRequest {
     security(("session_token" = []))
 )]
 pub async fn get_policy(
-    Extension(repository): Extension<CreditTransferRepository>,
+    Extension(service): Extension<Arc<dyn OrganizationCreditServiceTrait>>,
     Extension(_admin): Extension<AdminUser>,
     Path(org): Path<Uuid>,
 ) -> Result<Json<Value>, ApiError> {
-    repository.policy(org, None).await.map(Json).map_err(error)
+    service
+        .configure_policy(org, None)
+        .await
+        .map(Json)
+        .map_err(error)
 }
 
 #[utoipa::path(
@@ -49,7 +53,7 @@ pub async fn get_policy(
     security(("session_token" = []))
 )]
 pub async fn put_policy(
-    Extension(repository): Extension<CreditTransferRepository>,
+    Extension(service): Extension<Arc<dyn OrganizationCreditServiceTrait>>,
     Extension(admin): Extension<AdminUser>,
     Path(org): Path<Uuid>,
     request: Result<Json<PolicyRequest>, axum::extract::rejection::JsonRejection>,
@@ -57,8 +61,8 @@ pub async fn put_policy(
     let Json(request) =
         request.map_err(|_| error(TransferError("invalid_policy_configuration").into()))?;
 
-    repository
-        .configure_policy(org, Some((request.policy, admin.0.id, &request.reason)))
+    service
+        .configure_policy(org, Some((request.policy, admin.0.id, request.reason)))
         .await
         .map(Json)
         .map_err(error)

@@ -3,120 +3,14 @@
 use crate::pool::DbPool;
 use crate::repositories::credit_allocation::lock_organization_accounting;
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 use tokio_postgres::Transaction;
 use uuid::Uuid;
 
-#[derive(Debug, thiserror::Error)]
-#[error("{0}")]
-pub struct OrganizationOperationError(pub &'static str);
-
-pub const READ_CREDITS: &str = "credits:read";
-pub const TRANSFER_CREDITS: &str = "credits:transfer";
-
-#[derive(Clone)]
-pub enum OrganizationActor {
-    Owner(Uuid),
-    Credential(String),
-}
-
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct TransferConstraints {
-    pub max_amount_per_transfer: Option<i64>,
-    pub max_total_amount: Option<i64>,
-    pub allowed_source_types: Option<Vec<String>>,
-    pub allowed_recipient_ids: Option<Vec<Uuid>>,
-}
-
-impl TransferConstraints {
-    pub fn validate(&self) -> anyhow::Result<()> {
-        if self.max_amount_per_transfer.is_some_and(|n| n < 0)
-            || self.max_total_amount.is_some_and(|n| n < 0)
-            || self.allowed_source_types.as_ref().is_some_and(|types| {
-                types.len() > 3
-                    || types
-                        .iter()
-                        .any(|t| !matches!(t.as_str(), "payment" | "staking_farm" | "grant"))
-            })
-            || self
-                .allowed_recipient_ids
-                .as_ref()
-                .is_some_and(|ids| ids.len() > 1000)
-        {
-            return Err(OrganizationOperationError("invalid_credential_constraints").into());
-        }
-        Ok(())
-    }
-
-    pub fn remaining(&self, spent: i64) -> i64 {
-        self.max_total_amount
-            .unwrap_or(i64::MAX)
-            .saturating_sub(spent)
-            .max(0)
-    }
-
-    pub fn allows_source(&self, source: &str) -> bool {
-        self.allowed_source_types
-            .as_ref()
-            .is_none_or(|types| types.iter().any(|t| t == source))
-    }
-
-    pub fn allows(&self, amount: i64, source: &str, recipient: Uuid, spent: i64) -> bool {
-        amount <= self.max_amount_per_transfer.unwrap_or(i64::MAX)
-            && amount <= self.remaining(spent)
-            && self.allows_source(source)
-            && self
-                .allowed_recipient_ids
-                .as_ref()
-                .is_none_or(|ids| ids.contains(&recipient))
-    }
-}
-
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct CredentialConstraints {
-    #[serde(rename = "credits:transfer", default)]
-    pub transfer: TransferConstraints,
-}
-
-#[derive(Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct CredentialRequest {
-    pub name: String,
-    pub permissions: Vec<String>,
-    #[serde(default)]
-    pub constraints: CredentialConstraints,
-    pub expires_at: DateTime<Utc>,
-}
-
-impl CredentialRequest {
-    fn validate(&self) -> anyhow::Result<()> {
-        if self.name.trim().is_empty()
-            || self.name.len() > 200
-            || self.permissions.is_empty()
-            || self.permissions.len() > 2
-            || self
-                .permissions
-                .iter()
-                .any(|p| !matches!(p.as_str(), READ_CREDITS | TRANSFER_CREDITS))
-            || self.expires_at <= Utc::now()
-            || self.expires_at > Utc::now() + chrono::Duration::days(366)
-        {
-            return Err(OrganizationOperationError("invalid_credential_configuration").into());
-        }
-        self.constraints.transfer.validate()
-    }
-}
-
-pub struct Authorization {
-    pub actor_id: Uuid,
-    pub credential_id: Option<Uuid>,
-    pub permissions: Vec<String>,
-    pub constraints: TransferConstraints,
-}
+pub use services::organization_credits::models::{
+    hash_credential, Authorization, CredentialConstraints, CredentialRequest, OrganizationActor,
+    OrganizationOperationError, TransferConstraints, READ_CREDITS, TRANSFER_CREDITS,
+};
 
 pub async fn authorize(
     tx: &Transaction<'_>,
@@ -203,10 +97,6 @@ async fn authorize_inner(
             })
         }
     }
-}
-
-pub fn hash_credential(token: &str) -> String {
-    hex::encode(Sha256::digest(token.as_bytes()))
 }
 
 fn secret() -> (String, String, String) {
@@ -445,6 +335,33 @@ async fn management_enabled(tx: &Transaction<'_>, org: Uuid) -> anyhow::Result<b
         )
         .await?
         .get(0))
+}
+
+#[async_trait::async_trait]
+impl services::organization_credits::ports::OrganizationCredentialRepositoryPort
+    for OrganizationCredentialRepository
+{
+    async fn list_credentials(&self, org: Uuid, owner: Uuid) -> anyhow::Result<Value> {
+        OrganizationCredentialRepository::list(self, org, owner).await
+    }
+
+    async fn save_credential(
+        &self,
+        org: Uuid,
+        owner: Uuid,
+        id: Option<Uuid>,
+        request: &CredentialRequest,
+    ) -> anyhow::Result<Value> {
+        OrganizationCredentialRepository::save(self, org, owner, id, request).await
+    }
+
+    async fn revoke_credential(&self, org: Uuid, owner: Uuid, id: Uuid) -> anyhow::Result<Value> {
+        OrganizationCredentialRepository::revoke(self, org, owner, id).await
+    }
+
+    async fn rotate_credential(&self, org: Uuid, owner: Uuid, id: Uuid) -> anyhow::Result<Value> {
+        OrganizationCredentialRepository::rotate(self, org, owner, id).await
+    }
 }
 
 #[cfg(test)]

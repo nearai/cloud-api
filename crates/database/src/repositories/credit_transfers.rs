@@ -5,12 +5,10 @@ use crate::repositories::credit_allocation::{
     lock_organization_accounting, settle_unfunded_usage, CreditAllocationPolicy,
 };
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
-use serde_json::{json, Map, Value};
+use serde_json::{json, Value};
 
 use super::organization_credentials::{
-    authorize, preauthorize, transferred_amount, TransferConstraints, READ_CREDITS,
-    TRANSFER_CREDITS,
+    authorize, preauthorize, transferred_amount, READ_CREDITS, TRANSFER_CREDITS,
 };
 pub use super::organization_credentials::{hash_credential, OrganizationActor as TransferActor};
 use tokio_postgres::Transaction;
@@ -22,147 +20,10 @@ fn reject<T>(code: &'static str) -> anyhow::Result<T> {
     Err(TransferError(code).into())
 }
 
-#[derive(Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct TransferRequest {
-    pub recipient_organization_id: Uuid,
-    pub source_credit_type: String,
-    pub amount: Option<i64>,
-    pub recipient_cumulative: Option<i64>,
-    pub payout_program: Option<String>,
-    #[serde(default)]
-    pub memo: String,
-    #[serde(default)]
-    pub metadata: Map<String, Value>,
-}
-
-impl TransferRequest {
-    pub fn validate(&self, sender: Uuid, key: &str) -> anyhow::Result<Value> {
-        if sender == self.recipient_organization_id
-            || !matches!(
-                self.source_credit_type.as_str(),
-                "payment" | "staking_farm" | "grant"
-            )
-            || !matches!(
-                (self.amount, self.recipient_cumulative),
-                (Some(1..), None) | (None, Some(0..))
-            )
-            || (self.amount.is_some() && key.trim().is_empty())
-            || (self.recipient_cumulative.is_some()
-                && (self.payout_program.is_none() || !key.is_empty()))
-            || self.payout_program.as_ref().is_some_and(|program| {
-                program.is_empty() || program.len() > 100 || program.trim() != program
-            })
-            || key.trim().chars().count() > 100
-            || self.memo.len() > 2000
-        {
-            return reject("invalid_transfer_terms");
-        }
-
-        // Recursively sort object keys. Arrays retain their order. Persist this
-        // exact normalized representation and compare JSON values on replay.
-        fn canonical(value: Value, depth: usize) -> anyhow::Result<Value> {
-            if depth > 16 {
-                return reject("invalid_metadata_depth");
-            }
-            Ok(match value {
-                Value::Object(object) => {
-                    let sorted = object
-                        .into_iter()
-                        .collect::<std::collections::BTreeMap<_, _>>();
-                    Value::Object(
-                        sorted
-                            .into_iter()
-                            .map(|(key, value)| Ok((key, canonical(value, depth + 1)?)))
-                            .collect::<anyhow::Result<_>>()?,
-                    )
-                }
-                Value::Array(array) => Value::Array(
-                    array
-                        .into_iter()
-                        .map(|value| canonical(value, depth + 1))
-                        .collect::<anyhow::Result<_>>()?,
-                ),
-                scalar => scalar,
-            })
-        }
-
-        let metadata = canonical(Value::Object(self.metadata.clone()), 0)?;
-        if serde_json::to_vec(&metadata)?.len() > 16 * 1024 {
-            return reject("invalid_metadata_size");
-        }
-
-        Ok(json!({
-            "recipient_organization_id": self.recipient_organization_id,
-            "source_credit_type": self.source_credit_type,
-            "amount": self.amount,
-            "recipient_cumulative": self.recipient_cumulative,
-            "payout_program": self.payout_program,
-            "memo": self.memo,
-            "metadata": metadata,
-        }))
-    }
-}
-
-#[derive(Clone, Default, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct OrganizationPolicy {
-    pub credentials: CredentialPolicy,
-    pub credits_transfer: TransferPolicy,
-}
-
-#[derive(Clone, Default, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct CredentialPolicy {
-    pub enabled: bool,
-}
-
-#[derive(Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct TransferPolicy {
-    pub enabled: bool,
-    #[serde(default)]
-    pub constraints: TransferConstraints,
-    #[serde(default = "default_send_quota")]
-    pub max_sends_per_minute: i64,
-}
-
-fn default_send_quota() -> i64 {
-    60
-}
-
-impl TransferPolicy {
-    fn allows_source(&self, source: &str) -> bool {
-        match &self.constraints.allowed_source_types {
-            Some(types) => types.iter().any(|kind| kind == source),
-            None => matches!(source, "payment" | "staking_farm"),
-        }
-    }
-}
-
-impl Default for TransferPolicy {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            constraints: TransferConstraints::default(),
-            max_sends_per_minute: 60,
-        }
-    }
-}
-
-pub struct TransferHistoryOptions {
-    pub limit: i64,
-    pub direction: Option<String>,
-}
-
-impl From<i64> for TransferHistoryOptions {
-    fn from(limit: i64) -> Self {
-        Self {
-            limit,
-            direction: None,
-        }
-    }
-}
+use services::organization_credits::models::check_send_policy;
+pub use services::organization_credits::models::{
+    CredentialPolicy, OrganizationPolicy, TransferHistoryOptions, TransferPolicy, TransferRequest,
+};
 
 #[derive(Clone)]
 pub struct CreditTransferRepository {
@@ -601,6 +462,7 @@ impl CreditTransferRepository {
                 .iter()
                 .find(|credit| {
                     credit["credit_type"] == source
+                        && credit["currency"] == "USD"
                         && (source != "staking_farm" || credit["source"] == "house-of-stake")
                 })
                 .and_then(|credit| credit["available"].as_i64())
@@ -747,13 +609,7 @@ impl CreditTransferRepository {
         let tx = client.transaction().await?;
         lock_organization_accounting(&tx, org).await?;
         if let Some((policy, admin, reason)) = update {
-            if reason.trim().is_empty()
-                || reason.len() > 2000
-                || !(1..=100_000).contains(&policy.credits_transfer.max_sends_per_minute)
-            {
-                return reject("invalid_policy_configuration");
-            }
-            policy.credits_transfer.constraints.validate()?;
+            policy.validate(reason)?;
             let policy = serde_json::to_value(policy)?;
             tx.execute(
                 r#"WITH saved AS (
@@ -796,43 +652,6 @@ impl CreditTransferRepository {
             .await?
             .get(0))
     }
-}
-
-// This early rejection is advisory; repeat it after accounting locks. Budget
-// usage and cumulative deltas are checked only against the locked position.
-fn check_send_policy(
-    policy: &TransferPolicy,
-    authorization: &super::organization_credentials::Authorization,
-    request: &TransferRequest,
-) -> anyhow::Result<()> {
-    if !policy.enabled {
-        return reject("sender_not_enabled");
-    }
-
-    let amount = request.amount.unwrap_or(0);
-    if !policy.allows_source(&request.source_credit_type)
-        || !policy.constraints.allows(
-            amount,
-            &request.source_credit_type,
-            request.recipient_organization_id,
-            0,
-        )
-    {
-        return reject("organization_transfer_limit_exceeded");
-    }
-
-    if authorization.credential_id.is_some()
-        && !authorization.constraints.allows(
-            amount,
-            &request.source_credit_type,
-            request.recipient_organization_id,
-            0,
-        )
-    {
-        return reject("credential_transfer_limit_exceeded");
-    }
-
-    Ok(())
 }
 
 async fn replay(
@@ -892,7 +711,8 @@ async fn snapshot(tx: &Transaction<'_>, org: Uuid) -> anyhow::Result<Value> {
     Ok(tx
         .query_one(
             r#"SELECT COALESCE(jsonb_agg(jsonb_build_object(
-            'credit_type', c.credit_type, 'source', c.source, 'gross_limit', c.spend_limit,
+            'credit_type', c.credit_type, 'source', c.source, 'currency', c.currency,
+            'gross_limit', c.spend_limit,
             'transferred_out', c.transferred_out, 'effective_capacity', c.effective_capacity,
             'consumed', COALESCE(u.amount, 0),
             'available', GREATEST(c.effective_capacity - COALESCE(u.amount, 0), 0)
@@ -905,6 +725,62 @@ async fn snapshot(tx: &Transaction<'_>, org: Uuid) -> anyhow::Result<Value> {
         )
         .await?
         .get(0))
+}
+
+#[async_trait::async_trait]
+impl services::organization_credits::ports::CreditTransferRepositoryPort
+    for CreditTransferRepository
+{
+    async fn transfer(
+        &self,
+        org: Uuid,
+        actor: &TransferActor,
+        key: &str,
+        request: &TransferRequest,
+    ) -> anyhow::Result<(Value, bool)> {
+        CreditTransferRepository::transfer(self, org, actor, key, request).await
+    }
+
+    async fn capacity(&self, org: Uuid, actor: &TransferActor) -> anyhow::Result<Value> {
+        CreditTransferRepository::capacity(self, org, actor).await
+    }
+
+    async fn history(
+        &self,
+        org: Uuid,
+        actor: &TransferActor,
+        query: services::organization_credits::models::HistoryRequest,
+    ) -> anyhow::Result<Value> {
+        CreditTransferRepository::history(
+            self,
+            org,
+            actor,
+            query.id,
+            query.key.as_deref(),
+            query.before,
+            query.options,
+        )
+        .await
+    }
+
+    async fn configure_policy(
+        &self,
+        org: Uuid,
+        update: Option<(OrganizationPolicy, Uuid, String)>,
+    ) -> anyhow::Result<Value> {
+        CreditTransferRepository::configure_policy(
+            self,
+            org,
+            update
+                .as_ref()
+                .map(|(policy, actor, reason)| (policy.clone(), *actor, reason.as_str())),
+        )
+        .await
+    }
+
+    async fn reconciliation(&self, org: Uuid) -> anyhow::Result<Value> {
+        CreditTransferRepository::reconciliation(self, org).await
+    }
 }
 
 #[cfg(test)]

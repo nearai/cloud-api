@@ -178,6 +178,67 @@ async fn transfer_credentials_policy_replays_and_validation() {
         .await;
     assert_eq!(denied_management.status_code(), StatusCode::FORBIDDEN);
 
+    let detail = server
+        .get(&format!(
+            "/v1/organizations/{}/credit/transfers/{}",
+            sender.id,
+            created["id"].as_str().unwrap()
+        ))
+        .add_header("Authorization", bearer.clone())
+        .await;
+
+    assert_eq!(detail.status_code(), StatusCode::OK);
+    assert_eq!(detail.json::<Value>()["id"], created["id"]);
+
+    let credential_id_path = format!("{credential_path}/{}", credential["id"].as_str().unwrap());
+    let updated = server
+        .put(&credential_id_path)
+        .add_header("Authorization", authorization.clone())
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .json(&json!({
+            "name": "Updated payout worker",
+            "permissions": ["credits:read", "credits:transfer"],
+            "constraints": {
+                "credits:transfer": {
+                    "max_amount_per_transfer": 30,
+                    "max_total_amount": 50
+                }
+            },
+            "expires_at": chrono::Utc::now() + chrono::Duration::hours(1)
+        }))
+        .await;
+
+    assert_eq!(updated.status_code(), StatusCode::OK);
+    assert_eq!(updated.json::<Value>()["id"], credential["id"]);
+
+    let rotated = server
+        .post(&format!("{credential_id_path}/rotate"))
+        .add_header("Authorization", authorization.clone())
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .await;
+
+    assert_eq!(rotated.status_code(), StatusCode::OK);
+    let rotated = rotated.json::<Value>();
+    let capacity_path = format!("/v1/organizations/{}/credit/transfer/capacity", sender.id);
+    let old_secret = server
+        .get(&capacity_path)
+        .add_header("Authorization", bearer)
+        .await;
+
+    assert_eq!(old_secret.status_code(), StatusCode::FORBIDDEN);
+
+    let bearer = format!("Bearer {}", rotated["token"].as_str().unwrap());
+    let rotated_capacity = server
+        .get(&capacity_path)
+        .add_header("Authorization", bearer.clone())
+        .await;
+
+    assert_eq!(rotated_capacity.status_code(), StatusCode::OK);
+    assert_eq!(
+        rotated_capacity.json::<Value>()["credential_remaining_budget"],
+        20
+    );
+
     let reconciliation = server
         .get(&format!(
             "/v1/admin/organizations/{}/credit/transfer/reconciliation",

@@ -20,13 +20,19 @@ WITH ledger AS (
     WHERE COALESCE(e.outgoing, 0) <> COALESCE(p.outgoing, 0)
        OR COALESCE(e.incoming, 0) <> COALESCE(p.incoming, 0)
 ), active_limits AS (
-    SELECT credit_type, SUM(spend_limit::NUMERIC) AS gross
+    SELECT credit_type, SUM(spend_limit::NUMERIC) AS gross,
+           COALESCE(SUM(spend_limit::NUMERIC) FILTER (WHERE currency = 'USD'), 0) AS usd_gross
     FROM organization_limits_history
     WHERE organization_id = $1 AND effective_until IS NULL GROUP BY credit_type
 ), backing_deficits AS (
     SELECT e.credit_type, e.outgoing, COALESCE(l.gross, 0) AS gross
     FROM expected e LEFT JOIN active_limits l USING (credit_type)
     WHERE e.outgoing > COALESCE(l.gross, 0)
+), currency_mismatches AS (
+    SELECT e.credit_type, e.outgoing, COALESCE(l.usd_gross, 0) AS usd_gross
+    FROM expected e LEFT JOIN active_limits l USING (credit_type)
+    WHERE e.outgoing > COALESCE(l.usd_gross, 0)
+      AND e.outgoing <= COALESCE(l.gross, 0)
 ), transfer_position AS (
     SELECT COALESCE((SELECT incoming FROM expected WHERE credit_type = 'transfer'), 0) AS incoming,
            COALESCE((SELECT gross FROM active_limits WHERE credit_type = 'transfer'), 0) AS gross,
@@ -36,6 +42,8 @@ WITH ledger AS (
     SELECT 'projection_mismatch' AS kind, to_jsonb(m) AS details FROM mismatches m
     UNION ALL
     SELECT 'outgoing_exceeds_source', to_jsonb(d) FROM backing_deficits d
+    UNION ALL
+    SELECT 'source_currency_mismatch', to_jsonb(c) FROM currency_mismatches c
     UNION ALL
     SELECT 'incoming_limit_mismatch', to_jsonb(p) FROM transfer_position p WHERE incoming <> gross
     UNION ALL

@@ -1962,3 +1962,168 @@ async fn replays_require_original_credential_or_read_permission() -> anyhow::Res
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn large_incoming_transfers_keep_aggregate_readers_available() -> anyhow::Result<()> {
+    use database::repositories::admin_composite::AdminCompositeRepository;
+    use database::repositories::UserRepository;
+    use services::admin::{AdminRepository, OrganizationLifecycleFilter};
+
+    let pool = test_pool().await?;
+    let repository = CreditTransferRepository::new(pool.clone(), &Default::default());
+    let (recipient, owner) = organization(&pool).await?;
+    fund(
+        &pool,
+        recipient.org_id,
+        "payment",
+        1_000_000_000_000_000_000,
+    )
+    .await?;
+
+    for _ in 0..10 {
+        let (sender, sender_owner) = organization(&pool).await?;
+        fund(&pool, sender.org_id, "payment", 900_000_000_000_000_000).await?;
+        repository
+            .policy(
+                sender.org_id,
+                Some((true, sender_owner, "Enable large payout")),
+            )
+            .await?;
+        repository
+            .transfer(
+                sender.org_id,
+                &TransferActor::Owner(sender_owner),
+                "large",
+                &request(recipient.org_id, "payment", 900_000_000_000_000_000),
+            )
+            .await?;
+    }
+
+    let admin = AdminCompositeRepository::new(pool.clone());
+    let detail = admin.get_organization(recipient.org_id).await?.unwrap();
+    let organizations = admin
+        .list_all_organizations(100_000, 0, OrganizationLifecycleFilter::Active)
+        .await?;
+    let (users, _) = UserRepository::new(pool.clone())
+        .list_with_organizations(10, 0, Some(owner.to_string()), None, None)
+        .await?;
+
+    assert_eq!(detail.spend_limit, Some(i64::MAX));
+    assert_eq!(
+        organizations
+            .iter()
+            .find(|org| org.id == recipient.org_id)
+            .unwrap()
+            .spend_limit,
+        Some(i64::MAX)
+    );
+    assert_eq!(users[0].1.as_ref().unwrap().spend_limit, Some(i64::MAX));
+    let client = pool.get().await?;
+    let gross: String = client
+        .query_one(
+            r#"
+            SELECT SUM(spend_limit)::TEXT
+            FROM organization_limits_history
+            WHERE organization_id = $1 AND effective_until IS NULL
+            "#,
+            &[&recipient.org_id],
+        )
+        .await?
+        .get(0);
+    assert_eq!(gross, "10000000000000000000");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn non_usd_capacity_is_not_transferable_and_backing_cannot_change_currency(
+) -> anyhow::Result<()> {
+    let pool = test_pool().await?;
+    let repository = CreditTransferRepository::new(pool.clone(), &Default::default());
+    let (sender, owner) = organization(&pool).await?;
+    let (recipient, _) = organization(&pool).await?;
+    let actor = TransferActor::Owner(owner);
+    fund(&pool, sender.org_id, "payment", 100).await?;
+    repository
+        .policy(sender.org_id, Some((true, owner, "Enable payout")))
+        .await?;
+    let client = pool.get().await?;
+    client
+        .execute(
+            r#"
+            UPDATE organization_limits_history
+            SET currency = 'USDT'
+            WHERE organization_id = $1 AND effective_until IS NULL
+            "#,
+            &[&sender.org_id],
+        )
+        .await?;
+
+    let capacity = repository.capacity(sender.org_id, &actor).await?;
+    assert_eq!(capacity["credits"][0]["currency"], "USDT");
+    assert_eq!(capacity["sources"][0]["max_amount_per_transfer"], 0);
+    assert_eq!(
+        code(
+            repository
+                .transfer(
+                    sender.org_id,
+                    &actor,
+                    "currency",
+                    &request(recipient.org_id, "payment", 50)
+                )
+                .await
+        ),
+        "insufficient_posted_capacity"
+    );
+
+    fund(&pool, sender.org_id, "payment", 100).await?;
+    repository
+        .transfer(
+            sender.org_id,
+            &actor,
+            "currency",
+            &request(recipient.org_id, "payment", 50),
+        )
+        .await?;
+    let replacement = UpdateOrganizationLimitsDbRequest {
+        spend_limit: 100,
+        credit_type: "payment".into(),
+        source: Some("test-payment".into()),
+        currency: "USDT".into(),
+        changed_by: Some("test".into()),
+        change_reason: Some("Attempt currency replacement".into()),
+        changed_by_user_id: None,
+        changed_by_user_email: None,
+    };
+
+    let result = OrganizationLimitsRepository::new(pool.clone())
+        .update_limits(sender.org_id, &replacement)
+        .await;
+    assert!(result.unwrap_err().to_string().contains("backed by USD"));
+    assert_eq!(
+        repository.reconciliation(sender.org_id).await?["consistent"],
+        true
+    );
+
+    // Simulate an out-of-band edit: reconciliation must detect the missing USD backing.
+    client
+        .execute(
+            r#"
+            UPDATE organization_limits_history
+            SET currency = 'USDT'
+            WHERE organization_id = $1 AND effective_until IS NULL
+            "#,
+            &[&sender.org_id],
+        )
+        .await?;
+    let reconciliation = repository.reconciliation(sender.org_id).await?;
+
+    assert_eq!(reconciliation["consistent"], false);
+    assert!(reconciliation["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|finding| finding["kind"] == "source_currency_mismatch"));
+
+    Ok(())
+}

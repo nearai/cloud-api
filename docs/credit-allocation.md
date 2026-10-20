@@ -455,3 +455,14 @@ Rotation preserves credential identity. A transfer-only credential cannot retrie
 another actor's stored response. Organization-wide idempotency keys still reveal
 key existence through `idempotency_conflict` when terms differ. Valid replays do
 not require transfers to remain enabled or the original budgets to remain available.
+
+Transfer source backing is denominated in USD. A source with distributed credits
+cannot be replaced by a non-USD limit, even if its numeric amount is unchanged.
+Reconciliation reports `source_currency_mismatch` when non-USD capacity would
+otherwise conceal missing USD backing. Non-USD limits remain visible in balance
+snapshots but contribute zero to transfer capacity.
+
+Legacy organization/user aggregate `spend_limit` responses are bounded at
+`i64::MAX` when the sum of individual sources exceeds that range. Individual
+source limits and the transfer ledger retain their exact amounts; the bounded
+aggregate is a display value, not an authorization or accounting input.

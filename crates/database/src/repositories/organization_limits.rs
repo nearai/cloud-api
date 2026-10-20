@@ -96,6 +96,12 @@ impl OrganizationLimitsRepository {
                 ));
             }
 
+            if outgoing > 0 && request.currency != "USD" {
+                return Err(RepositoryError::ValidationFailed(
+                    "Credits already transferred out must remain backed by USD".into(),
+                ));
+            }
+
             let now = Utc::now();
 
             // Close any existing active limits of the same credit_type (set effective_until to now)

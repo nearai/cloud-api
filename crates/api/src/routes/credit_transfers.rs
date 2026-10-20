@@ -11,11 +11,13 @@ use axum::{
     Json, Router,
 };
 use chrono::{DateTime, Utc};
-use database::repositories::credit_transfers::{
-    CreditTransferRepository, TransferActor, TransferError, TransferHistoryOptions, TransferRequest,
-};
 use serde::Deserialize;
 use serde_json::Value;
+use services::organization_credits::models::{
+    HistoryRequest, TransferActor, TransferError, TransferHistoryOptions, TransferRequest,
+};
+use services::organization_credits::OrganizationCreditServiceTrait;
+use std::sync::Arc;
 use uuid::Uuid;
 
 fn record_outcome(outcome: &'static str) {
@@ -36,7 +38,7 @@ fn error(error: anyhow::Error) -> ApiError {
     operation_error(error)
 }
 
-pub fn routes(repository: CreditTransferRepository, auth: AuthState) -> Router {
+pub fn routes(service: Arc<dyn OrganizationCreditServiceTrait>, auth: AuthState) -> Router {
     Router::new()
         .route("/organizations/{org_id}/credit/transfer", post(create))
         .route("/organizations/{org_id}/credit/transfers", get(history))
@@ -45,7 +47,7 @@ pub fn routes(repository: CreditTransferRepository, auth: AuthState) -> Router {
             "/organizations/{org_id}/credit/transfer/capacity",
             get(capacity),
         )
-        .layer(Extension(repository))
+        .layer(Extension(service))
         .layer(from_fn_with_state(auth, authenticate))
 }
 
@@ -85,7 +87,7 @@ pub struct CreateTransferRequest {
     security(("session_token" = []), ("organization_credential" = []))
 )]
 pub async fn create(
-    Extension(repository): Extension<CreditTransferRepository>,
+    Extension(service): Extension<Arc<dyn OrganizationCreditServiceTrait>>,
     user: Option<Extension<AuthenticatedUser>>,
     token: Option<Extension<TransferActor>>,
     Path(org): Path<Uuid>,
@@ -108,7 +110,7 @@ pub async fn create(
         .get("Idempotency-Key")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    let (result, replay) = repository
+    let (result, replay) = service
         .transfer(org, &actor, key, &request)
         .await
         .map_err(error)?;
@@ -155,7 +157,7 @@ pub struct HistoryQuery {
     security(("session_token" = []), ("organization_credential" = []))
 )]
 pub async fn history(
-    Extension(repository): Extension<CreditTransferRepository>,
+    Extension(service): Extension<Arc<dyn OrganizationCreditServiceTrait>>,
     user: Option<Extension<AuthenticatedUser>>,
     token: Option<Extension<TransferActor>>,
     Path(org): Path<Uuid>,
@@ -164,16 +166,18 @@ pub async fn history(
     if query.before_time.is_some() != query.before_id.is_some() {
         return Err(error(TransferError("invalid_cursor").into()));
     }
-    repository
+    service
         .history(
             org,
             &actor(user, token)?,
-            None,
-            query.idempotency_key.as_deref(),
-            query.before_time.zip(query.before_id),
-            TransferHistoryOptions {
-                limit: query.limit.unwrap_or(50),
-                direction: query.direction,
+            HistoryRequest {
+                id: None,
+                key: query.idempotency_key,
+                before: query.before_time.zip(query.before_id),
+                options: TransferHistoryOptions {
+                    limit: query.limit.unwrap_or(50),
+                    direction: query.direction,
+                },
             },
         )
         .await
@@ -193,13 +197,22 @@ pub async fn history(
     security(("session_token" = []), ("organization_credential" = []))
 )]
 pub async fn detail(
-    Extension(repository): Extension<CreditTransferRepository>,
+    Extension(service): Extension<Arc<dyn OrganizationCreditServiceTrait>>,
     user: Option<Extension<AuthenticatedUser>>,
     token: Option<Extension<TransferActor>>,
     Path((org, id)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<Value>, ApiError> {
-    let result = repository
-        .history(org, &actor(user, token)?, Some(id), None, None, 1)
+    let result = service
+        .history(
+            org,
+            &actor(user, token)?,
+            HistoryRequest {
+                id: Some(id),
+                key: None,
+                before: None,
+                options: 1.into(),
+            },
+        )
         .await
         .map_err(error)?;
     let item = result["transfers"]
@@ -220,12 +233,12 @@ pub async fn detail(
     security(("session_token" = []), ("organization_credential" = []))
 )]
 pub async fn capacity(
-    Extension(repository): Extension<CreditTransferRepository>,
+    Extension(service): Extension<Arc<dyn OrganizationCreditServiceTrait>>,
     user: Option<Extension<AuthenticatedUser>>,
     token: Option<Extension<TransferActor>>,
     Path(org): Path<Uuid>,
 ) -> Result<Json<Value>, ApiError> {
-    repository
+    service
         .capacity(org, &actor(user, token)?)
         .await
         .map(Json)
@@ -241,11 +254,11 @@ pub async fn capacity(
     security(("session_token" = []))
 )]
 pub async fn reconciliation(
-    Extension(repository): Extension<CreditTransferRepository>,
+    Extension(service): Extension<Arc<dyn OrganizationCreditServiceTrait>>,
     Extension(_admin): Extension<AdminUser>,
     Path(org): Path<Uuid>,
 ) -> Result<Json<Value>, ApiError> {
-    let result = repository.reconciliation(org).await.map_err(error)?;
+    let result = service.reconciliation(org).await.map_err(error)?;
     if result["organization_exists"] != true {
         return Err(error(TransferError("organization_unavailable").into()));
     }

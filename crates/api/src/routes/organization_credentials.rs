@@ -10,13 +10,13 @@ use axum::{
     Router,
 };
 use chrono::{DateTime, Utc};
-use database::repositories::organization_credentials::{
-    CredentialRequest, OrganizationCredentialRepository, OrganizationOperationError,
-};
 use serde_json::Value;
+use services::organization_credits::models::{CredentialRequest, OrganizationOperationError};
+use services::organization_credits::OrganizationCreditServiceTrait;
+use std::sync::Arc;
 use uuid::Uuid;
 
-pub fn routes(repository: OrganizationCredentialRepository, auth: AuthState) -> Router {
+pub fn routes(service: Arc<dyn OrganizationCreditServiceTrait>, auth: AuthState) -> Router {
     Router::new()
         .route(
             "/organizations/{org_id}/credentials",
@@ -30,7 +30,7 @@ pub fn routes(repository: OrganizationCredentialRepository, auth: AuthState) -> 
             "/organizations/{org_id}/credentials/{id}/rotate",
             post(rotate_credential),
         )
-        .layer(Extension(repository))
+        .layer(Extension(service))
         .layer(from_fn_with_state(auth, authenticate))
 }
 
@@ -46,7 +46,7 @@ pub fn routes(repository: OrganizationCredentialRepository, auth: AuthState) -> 
     security(("session_token" = []))
 )]
 pub async fn create_credential(
-    Extension(repository): Extension<OrganizationCredentialRepository>,
+    Extension(service): Extension<Arc<dyn OrganizationCreditServiceTrait>>,
     user: Option<Extension<AuthenticatedUser>>,
     Path(org): Path<Uuid>,
     Json(request): Json<CredentialRequest>,
@@ -54,8 +54,8 @@ pub async fn create_credential(
     let user =
         user.ok_or_else(|| error(OrganizationOperationError("credential_refused").into()))?;
 
-    repository
-        .save(org, user.0 .0.id, None, &request)
+    service
+        .save_credential(org, user.0 .0.id, None, &request)
         .await
         .map(Json)
         .map_err(error)
@@ -73,15 +73,15 @@ pub async fn create_credential(
     security(("session_token" = []))
 )]
 pub async fn revoke_credential(
-    Extension(repository): Extension<OrganizationCredentialRepository>,
+    Extension(service): Extension<Arc<dyn OrganizationCreditServiceTrait>>,
     user: Option<Extension<AuthenticatedUser>>,
     Path((org, id)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<Value>, ApiError> {
     let user =
         user.ok_or_else(|| error(OrganizationOperationError("credential_refused").into()))?;
 
-    repository
-        .revoke(org, user.0 .0.id, id)
+    service
+        .revoke_credential(org, user.0 .0.id, id)
         .await
         .map(Json)
         .map_err(error)
@@ -96,15 +96,15 @@ pub async fn revoke_credential(
     security(("session_token" = []))
 )]
 pub async fn list_credentials(
-    Extension(repository): Extension<OrganizationCredentialRepository>,
+    Extension(service): Extension<Arc<dyn OrganizationCreditServiceTrait>>,
     user: Option<Extension<AuthenticatedUser>>,
     Path(org): Path<Uuid>,
 ) -> Result<Json<Value>, ApiError> {
     let user =
         user.ok_or_else(|| error(OrganizationOperationError("credential_refused").into()))?;
 
-    repository
-        .list(org, user.0 .0.id)
+    service
+        .list_credentials(org, user.0 .0.id)
         .await
         .map(Json)
         .map_err(error)
@@ -120,7 +120,7 @@ pub async fn list_credentials(
     security(("session_token" = []))
 )]
 pub async fn update_credential(
-    Extension(repository): Extension<OrganizationCredentialRepository>,
+    Extension(service): Extension<Arc<dyn OrganizationCreditServiceTrait>>,
     user: Option<Extension<AuthenticatedUser>>,
     Path((org, id)): Path<(Uuid, Uuid)>,
     Json(request): Json<CredentialRequest>,
@@ -128,8 +128,8 @@ pub async fn update_credential(
     let user =
         user.ok_or_else(|| error(OrganizationOperationError("credential_refused").into()))?;
 
-    repository
-        .save(org, user.0 .0.id, Some(id), &request)
+    service
+        .save_credential(org, user.0 .0.id, Some(id), &request)
         .await
         .map(Json)
         .map_err(error)
@@ -144,21 +144,21 @@ pub async fn update_credential(
     security(("session_token" = []))
 )]
 pub async fn rotate_credential(
-    Extension(repository): Extension<OrganizationCredentialRepository>,
+    Extension(service): Extension<Arc<dyn OrganizationCreditServiceTrait>>,
     user: Option<Extension<AuthenticatedUser>>,
     Path((org, id)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<Value>, ApiError> {
     let user =
         user.ok_or_else(|| error(OrganizationOperationError("credential_refused").into()))?;
 
-    repository
-        .rotate(org, user.0 .0.id, id)
+    service
+        .rotate_credential(org, user.0 .0.id, id)
         .await
         .map(Json)
         .map_err(error)
 }
 
-// Keep wire schemas explicit even though repository DTOs own validation.
+// Keep wire schemas explicit even though service DTOs own validation.
 #[allow(dead_code)]
 #[derive(utoipa::ToSchema)]
 pub struct TransferConstraintsSchema {

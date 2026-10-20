@@ -182,6 +182,7 @@ jobs:
   # PostgreSQL headroom for runner-side services.
   e2e-test:
     name: E2E tests
+    timeout-minutes: 60
     needs: changes
     if: ${{ needs.changes.outputs.rust == 'true' }}
     runs-on: [self-hosted, infra]
@@ -212,8 +213,11 @@ jobs:
       with:
         cache-key: e2e
 
-    - name: Run typed-query, credit-allocation, session, and binding regressions
-      run: cargo test --locked -p database --test hot_path_typed_queries --test billing_typed_queries --test credit_allocation --test credit_transfers --test session_rotation --test staking_wallet_binding -- --test-threads=4
+    - name: Run typed-query, credit-allocation, credit-transfer, session, and binding regressions
+      run: |
+        cargo test --locked -p database --test hot_path_typed_queries --test billing_typed_queries --test credit_allocation --test session_rotation --test staking_wallet_binding -- --test-threads=4
+        # Fault injection changes shared table constraints; isolate this binary.
+        cargo test --locked -p database --test credit_transfers -- --test-threads=1
       env:
         PGHOST: localhost
         PGPORT: 5432

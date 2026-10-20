@@ -7,7 +7,7 @@ use axum::{
     response::Response,
     Json,
 };
-use database::repositories::organization_credentials::{
+use services::organization_credits::models::{
     hash_credential, OrganizationActor, OrganizationOperationError,
 };
 

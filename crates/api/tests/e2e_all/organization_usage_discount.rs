@@ -675,6 +675,158 @@ async fn historical_batches_rollback_resume_and_never_compound() {
     );
 }
 
+/// Three legacy rows with inference ids, costing 6 each, under a saved historical rule.
+async fn three_row_history(f: &Fixture) -> Vec<Uuid> {
+    let hour = crate::usage_hourly::random_past_hour();
+    let inference_ids =
+        f.db.pool()
+            .get()
+            .await
+            .unwrap()
+            .query(
+                "INSERT INTO organization_usage_log
+        (organization_id,workspace_id,api_key_id,model_id,model_name,input_tokens,output_tokens,
+         total_tokens,input_cost,output_cost,total_cost,inference_type,created_at,inference_id)
+        SELECT $1,$2,$3,$4,$5,1,1,2,2,4,6,'chat_completion',$6,uuid_generate_v4()
+        FROM generate_series(1,3) RETURNING inference_id",
+                &[&f.org, &f.workspace, &f.key, &f.model, &f.model_name, &hour],
+            )
+            .await
+            .unwrap()
+            .iter()
+            .map(|row| row.get(0))
+            .collect();
+    seed_balance(f, 18).await;
+    crate::usage_hourly::recompute_usage_hours(hour, hour + Duration::hours(1)).await;
+    save(f, Some(hour)).await;
+    inference_ids
+}
+
+/// Hold the organization lock the way a live charge does; returns the holder's backend pid.
+async fn hold_organization_lock(f: &Fixture, live: &tokio_postgres::Transaction<'_>) -> i32 {
+    live.query_one(
+        "SELECT id FROM organizations WHERE id=$1 FOR UPDATE",
+        &[&f.org],
+    )
+    .await
+    .unwrap();
+    live.query_one("SELECT pg_backend_pid()", &[])
+        .await
+        .unwrap()
+        .get(0)
+}
+
+/// Wait until a batch that has already written its rows is queued behind `holder`.
+async fn wait_for_batch_queued_behind(f: &Fixture, holder: i32) {
+    let observer = f.db.pool().get().await.unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let queued: bool = observer
+            .query_one(
+                "SELECT EXISTS (SELECT 1 FROM pg_stat_activity s
+                    JOIN pg_locks l ON l.pid = s.pid AND l.granted AND l.mode = 'RowExclusiveLock'
+                    JOIN pg_class c ON c.oid = l.relation AND c.relname = 'usage_discount_adjustments'
+                    WHERE $1 = ANY(pg_blocking_pids(s.pid)))",
+                &[&holder],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        if queued {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the batch never queued for the organization lock after writing its rows"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+async fn total_spent(f: &Fixture) -> Value {
+    get(
+        f,
+        &format!("/v1/admin/organizations/{}/usage/balance", f.org),
+    )
+    .await["total_spent"]
+        .clone()
+}
+
+#[tokio::test]
+async fn historical_batch_takes_the_organization_lock_after_its_row_work() {
+    let f = fixture().await;
+    three_row_history(&f).await;
+    let repo = OrganizationUsageDiscountRepository::new(f.db.pool().clone());
+    let mut live_client = f.db.pool().get().await.unwrap();
+    let live = live_client.transaction().await.unwrap();
+    let holder = hold_organization_lock(&f, &live).await;
+    let batch = tokio::spawn({
+        let repo = repo.clone();
+        let org = f.org;
+        async move { repo.apply_batch(org).await }
+    });
+    wait_for_batch_queued_behind(&f, holder).await;
+    live.rollback().await.unwrap();
+    drop(live_client);
+    assert!(batch.await.unwrap().unwrap());
+    let progress = repo.get(f.org).await.unwrap().unwrap();
+    assert_eq!(
+        (progress.status.as_str(), progress.processed_count),
+        ("applying", 3)
+    );
+    finish(&f).await;
+    // Half-up rounding on each component: 2 * .75 -> 2; 4 * .75 -> 3.
+    assert_eq!(total_spent(&f).await, 15);
+}
+
+#[tokio::test]
+async fn duplicate_charge_waiting_on_a_batch_rolls_the_batch_back() {
+    let f = fixture().await;
+    let inference_ids = three_row_history(&f).await;
+    let repo = OrganizationUsageDiscountRepository::new(f.db.pool().clone());
+    let mut live_client = f.db.pool().get().await.unwrap();
+    let live = live_client.transaction().await.unwrap();
+    let holder = hold_organization_lock(&f, &live).await;
+    let batch = tokio::spawn({
+        let repo = repo.clone();
+        let org = f.org;
+        async move { repo.apply_batch(org).await }
+    });
+    wait_for_batch_queued_behind(&f, holder).await;
+    // A retried report for a row the batch rewrote waits on the batch while it holds
+    // the lock the batch needs. The batch waited first, so PostgreSQL aborts it.
+    let inserted = live
+        .execute(
+            "INSERT INTO organization_usage_log
+        (organization_id,workspace_id,api_key_id,model_id,model_name,input_tokens,output_tokens,
+         total_tokens,input_cost,output_cost,total_cost,inference_type,inference_id)
+        VALUES ($1,$2,$3,$4,$5,1,1,2,2,4,6,'chat_completion',$6)
+        ON CONFLICT (organization_id, inference_id) WHERE inference_id IS NOT NULL DO NOTHING",
+            &[
+                &f.org,
+                &f.workspace,
+                &f.key,
+                &f.model,
+                &f.model_name,
+                &inference_ids[0],
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(inserted, 0);
+    assert!(
+        !batch.await.unwrap().unwrap(),
+        "the aborted batch is retried, not reported as a failure"
+    );
+    live.commit().await.unwrap();
+    drop(live_client);
+    let progress = repo.get(f.org).await.unwrap().unwrap();
+    assert_eq!((progress.processed_count, progress.last_error), (0, None));
+    assert_eq!(total_spent(&f).await, 18);
+    finish(&f).await;
+    assert_eq!(total_spent(&f).await, 15);
+}
+
 #[tokio::test]
 async fn unsupported_history_rejects_before_persisting_terms() {
     for settled in [false, true] {

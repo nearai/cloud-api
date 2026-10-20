@@ -11,6 +11,11 @@ when constructing the lookup path. Both `signing_algo=ecdsa` and
   lookup key. The usage record stores the original ID as `provider_request_id`.
 - No `X-Generation-Id`, separate signature ID, or second redaction ID is added.
 
+Privacy uses the same ID and lookup contract as other inference endpoints:
+providers must issue a unique response ID for each inference, and signature
+lookup requires a valid API key but does not enforce receipt ownership by
+organization or API key. IDs share the existing receipt and billing namespaces.
+
 The receipt has `signature_kind: gateway` and signs:
 
 ```text
@@ -24,12 +29,16 @@ and the response hash covers the final redacted JSON, including its ID, rather
 than the classifier's spans.
 
 After inference succeeds, usage settlement and receipt storage continue if the
-client disconnects during finalization. Settlement and signature storage each
-have a five-second deadline. A settlement failure returns a server error as
-before. A signature failure or timeout preserves the successful response and
-never replays inference or bills again. A successful write is visible when the
-HTTP response completes; clients must fail verification if the receipt cannot
-be retrieved or validated. A timed-out database write may still finish later.
+client disconnects during finalization. The initial usage write and signature
+storage each have a five-second deadline. A usage write failure or timeout
+preserves the successful response and retries billing asynchronously with the
+same `Inference-Id`, including the random fallback ID. The database's per-org
+idempotency key prevents that retry from charging twice if the original write
+later commits. A signature failure or timeout also preserves the response;
+neither path replays inference. A successful signature write is visible when
+the HTTP response completes; clients must fail verification if the receipt
+cannot be retrieved or validated. A timed-out database write may finish later,
+and an unsuccessful billing retry is logged for investigation.
 
 Legacy responses with a missing, malformed, empty, control-character-containing,
 or longer-than-255-byte ID keep their classification/redaction behavior. They
@@ -43,5 +52,6 @@ and chat-signature support do not establish such a contract. A future classify
 provider-TEE path must verify a receipt from the actual serving provider over
 the appropriate request and response; redact still needs a gateway receipt for
 its locally rewritten output. This change does not affect automatic redaction
-on Chat Completions. Receipt storage contains hashes, IDs and signatures, not
-privacy inputs, detected spans or redacted text.
+on Chat Completions. Receipt storage contains hashes, IDs and signatures rather
+than raw inputs, detected spans or redacted text. Hashing is not anonymization;
+request/response hashes can still reveal whether a candidate payload matches.

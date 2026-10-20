@@ -1,0 +1,59 @@
+name: Bug report
+description: Report unexpected behavior in NEAR AI Cloud API.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please search existing issues before submitting a report.
+        Report security vulnerabilities [privately](https://github.com/nearai/cloud-api/security/advisories/new).
+        Remove API keys, authorization headers, tokens, personal data, and private prompt or response content from all examples and attachments.
+
+  - type: textarea
+    id: actual-behavior
+    attributes:
+      label: What happened?
+      description: Describe the problem and its impact. Include the HTTP status or error message if relevant.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected-behavior
+    attributes:
+      label: Expected behavior
+      description: What should have happened instead?
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      description: Include a minimal, sanitized request or code example. For intermittent failures, describe the conditions and frequency.
+      placeholder: |
+        1. Set up ...
+        2. Send this request or run ...
+        3. Observe ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment and request details
+      description: Include the details you know; omit anything that does not apply.
+      placeholder: |
+        Environment: local / staging / production / self-hosted
+        Cloud API commit or image tag, if known:
+        Endpoint and model/provider:
+        Client or SDK and version:
+        Streaming or encryption mode, if relevant:
+        OS and deployment setup, if self-hosted:
+    validations:
+      required: true
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Logs or additional context
+      description: Optional. Add short, sanitized log excerpts, request IDs and timestamps, screenshots, workarounds, or related issues.

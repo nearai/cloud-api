@@ -1184,6 +1184,7 @@ mod tests {
                 ResponseTool::CodeInterpreter {},
                 ResponseTool::Computer {},
                 ResponseTool::WebSearch {
+                    count: None,
                     filters: None,
                     user_location: None,
                     search_context_size: None,

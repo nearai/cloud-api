@@ -89,7 +89,31 @@ async fn test_organizations_duplicate_name_conflict_message() {
     assert_eq!(resp2.status_code(), 409);
     let err = resp2.json::<api::models::ErrorResponse>();
     assert_eq!(err.error.r#type, "conflict");
-    assert_eq!(err.error.message, "Organization already exists");
+    assert_eq!(
+        err.error.message,
+        "This organization name is already taken. Please choose a different name."
+    );
+
+    let other = server
+        .post("/v1/organizations")
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .json(&api::models::CreateOrganizationRequest {
+            name: format!("{org_name}-other"),
+            description: None,
+        })
+        .await;
+    assert_eq!(other.status_code(), 200);
+    let other = other.json::<api::models::OrganizationResponse>();
+
+    let rename = server
+        .put(&format!("/v1/organizations/{}", other.id))
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .json(&serde_json::json!({ "name": org_name }))
+        .await;
+    assert_eq!(rename.status_code(), 409);
+    let rename_error = rename.json::<api::models::ErrorResponse>();
+    assert_eq!(rename_error.error.r#type, "conflict");
+    assert_eq!(rename_error.error.message, err.error.message);
 }
 
 #[tokio::test]

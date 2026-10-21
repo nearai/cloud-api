@@ -169,6 +169,7 @@ fn api_error(error: AdminError) -> ApiError {
     responses(
         (status = 200, description = "The model and its grants", body = ModelAccessResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 403, description = "Forbidden: not an admin", body = ErrorResponse),
         (status = 404, description = "Model not found", body = ErrorResponse),
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
@@ -219,6 +220,7 @@ pub async fn get_model_access(
         (status = 200, description = "The grant", body = ModelAccessGrantResponse),
         (status = 400, description = "Invalid organization ID", body = ErrorResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 403, description = "Forbidden: not an admin, or a read-only admin access token", body = ErrorResponse),
         (status = 404, description = "Model or organization not found", body = ErrorResponse),
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
@@ -266,6 +268,7 @@ pub async fn grant_model_access(
         (status = 204, description = "The organization holds no grant for the model"),
         (status = 400, description = "Invalid organization ID", body = ErrorResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 403, description = "Forbidden: not an admin, or a read-only admin access token", body = ErrorResponse),
         (status = 404, description = "Model or organization not found", body = ErrorResponse),
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
@@ -309,6 +312,7 @@ pub async fn revoke_model_access(
         (status = 200, description = "The organization's grants", body = OrganizationModelAccessResponse),
         (status = 400, description = "Invalid organization ID", body = ErrorResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 403, description = "Forbidden: not an admin", body = ErrorResponse),
         (status = 404, description = "Organization not found", body = ErrorResponse),
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),

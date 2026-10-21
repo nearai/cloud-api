@@ -1116,6 +1116,78 @@ async fn deprecation_headers_are_only_added_for_a_caller_that_may_use_the_model(
     assert!(revoked.maybe_header(HEADER_SUCCESSOR).is_none());
 }
 
+/// A listed model may name an unlisted successor. Its name reaches only a
+/// caller that may use it: the deprecation header carries it for an
+/// organization that holds a grant for the successor, and the public
+/// catalogs leave it out until the successor is listed.
+#[tokio::test]
+async fn an_unlisted_successor_is_named_only_to_a_caller_that_may_use_it() {
+    let fixture = setup().await;
+    let server = &fixture.server;
+    let suffix = Uuid::new_v4();
+    let successor = format!("access-restricted-successor/model-{suffix}");
+    let public = format!("access-public/model-{suffix}");
+    upsert_models(server, vec![(&successor, model_fields(json!({})))]).await;
+    let mut fields = model_fields(json!({ "isListed": true }));
+    fields["deprecationDate"] = json!(DEPRECATION_DATE);
+    fields["successorModelId"] = json!(successor);
+    upsert_models(server, vec![(&public, fields)]).await;
+    fixture
+        .pool
+        .register_provider(public.clone(), fixture.provider.clone())
+        .await;
+    let outsider = organization(server).await;
+    let member = organization(server).await;
+    grant(server, &successor, &member.id).await;
+
+    let headers = |org: &Organization| {
+        let api_key = org.api_key.clone();
+        let public = public.clone();
+        async move {
+            let response = send(server, Route::ChatCompletions, &api_key, &public).await;
+            assert_eq!(response.status_code(), 200, "{}", response.text());
+            let observed = observe(&response, &public);
+            (
+                deprecation_headers(&observed).0.map(str::to_string),
+                deprecation_headers(&observed).1.map(str::to_string),
+                observed.body,
+            )
+        }
+    };
+    let catalogs = || async {
+        let mut bodies = Vec::new();
+        for path in [
+            "/v1/models".to_string(),
+            "/v1/model/list?limit=100000".to_string(),
+            format!("/v1/model/{}", urlencoding::encode(&public)),
+        ] {
+            let response = server.get(&path).await;
+            assert_eq!(response.status_code(), 200, "{path}");
+            assert!(response.text().contains(&public), "{path}");
+            bodies.push((path, response.text()));
+        }
+        bodies
+    };
+
+    let (date, named, body) = headers(&outsider).await;
+    assert_eq!(date.as_deref(), Some(DEPRECATION_DATE_HEADER));
+    assert_eq!(named, None);
+    assert!(!body.contains(&successor), "{body}");
+    let (_, named, _) = headers(&member).await;
+    assert_eq!(named.as_deref(), Some(successor.as_str()));
+    for (path, body) in catalogs().await {
+        assert!(!body.contains(&successor), "{path}: {body}");
+    }
+
+    // Once the successor is listed, everyone may use it and see it.
+    set_listed(server, &successor, true).await;
+    let (_, named, _) = headers(&outsider).await;
+    assert_eq!(named.as_deref(), Some(successor.as_str()));
+    for (path, body) in catalogs().await {
+        assert!(body.contains(&successor), "{path}: {body}");
+    }
+}
+
 /// The pre-dispatch checks of the chat routes answer for the requested model
 /// before the completion service resolves it. None of them may answer for an
 /// unlisted model the organization holds no grant for.

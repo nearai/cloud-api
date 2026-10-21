@@ -255,9 +255,25 @@ pub trait ModelsServiceTrait: Send + Sync {
     /// The models of [`Self::get_models_with_pricing`] that are listed in the
     /// public catalogs (`is_listed`). Every unauthenticated catalog endpoint
     /// must read this one, so an unlisted model never reaches them.
+    ///
+    /// A successor is kept only if it is one of these models: a listed model
+    /// may name an unlisted successor, and the public catalogs must not.
     async fn get_public_models_with_pricing(&self) -> Result<Vec<ModelWithPricing>, ModelsError> {
         let mut models = self.get_models_with_pricing().await?;
         models.retain(|model| model.is_listed);
+        let public: std::collections::HashSet<String> = models
+            .iter()
+            .map(|model| model.model_name.clone())
+            .collect();
+        for model in &mut models {
+            if model
+                .successor_model_name
+                .as_ref()
+                .is_some_and(|successor| !public.contains(successor))
+            {
+                model.successor_model_name = None;
+            }
+        }
         Ok(models)
     }
 
@@ -298,7 +314,8 @@ pub trait ModelsServiceTrait: Send + Sync {
     }
 
     /// Resolve a model identifier for public model-detail reads. An unlisted
-    /// model is answered like a model that does not exist.
+    /// model is answered like a model that does not exist, and an unlisted
+    /// successor is left out like in [`Self::get_public_models_with_pricing`].
     ///
     /// Production implementations should use the cached active public model
     /// list, preferring exact canonical model-name matches before alias matches.
@@ -308,10 +325,19 @@ pub trait ModelsServiceTrait: Send + Sync {
         &self,
         identifier: &str,
     ) -> Result<ModelWithPricing, ModelsError> {
-        let model = self
+        let mut model = self
             .resolve_and_get_model(identifier, ModelCaller::Anonymous)
             .await?;
         if model.is_listed {
+            if let Some(successor) = &model.successor_model_name {
+                if self
+                    .resolve_and_get_model(successor, ModelCaller::Anonymous)
+                    .await
+                    .is_err()
+                {
+                    model.successor_model_name = None;
+                }
+            }
             Ok(model)
         } else {
             Err(ModelsError::NotFound(format!(

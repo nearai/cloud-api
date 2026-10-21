@@ -103,6 +103,11 @@ pub async fn models_internal(
 /// requests it serves. It is read from the database on every call, so a
 /// grant or a revocation shows up on the next poll of any instance.
 ///
+/// Each entry names a model by its canonical name only. A gateway that
+/// accepts an alias must check the model the alias stands for (the aliases
+/// are in `GET /v1/internal/models`); checking the alias itself would find
+/// no entry and read the model as unrestricted.
+///
 /// Auth: `Authorization: Bearer <CLOUD_API_USAGE_TOKEN>`, the service secret
 /// of `POST /v1/internal/usage`. The endpoint answers 503 until that token is
 /// configured. Not part of the public OpenAPI document. The answer is marked

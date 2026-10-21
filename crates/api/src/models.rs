@@ -1306,7 +1306,8 @@ pub struct ModelInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub deprecation_date: Option<String>,
     /// Recommended replacement for a model with a planned deprecation
-    /// (canonical model id). Omitted when none is set.
+    /// (canonical model id). Omitted when none is set. The public catalogs
+    /// name only a listed successor.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub successor_model_id: Option<String>,
     /// Human-readable description (OpenRouter `description`).
@@ -4141,7 +4142,8 @@ pub struct ModelMetadata {
     #[serde(rename = "deprecationDate", skip_serializing_if = "Option::is_none")]
     pub deprecation_date: Option<String>,
     /// Recommended replacement for a model with a planned deprecation
-    /// (canonical model id). Omitted when none is set.
+    /// (canonical model id). Omitted when none is set. The public catalogs
+    /// name only a listed successor.
     #[serde(rename = "successorModelId", skip_serializing_if = "Option::is_none")]
     pub successor_model_id: Option<String>,
     /// OpenRouter `openrouter.slug` override (lowercase `author/slug`). Omitted

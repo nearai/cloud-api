@@ -1518,11 +1518,18 @@ impl AdminService for AdminServiceImpl {
         let model = self.model_for_access(model_name).await?;
         self.require_active_organization(organization_id).await?;
 
+        // The repository checks the organization again, under a lock: it can
+        // be deleted after the check above.
         let (grant, created) = self
             .repository
             .grant_model_access(model.id, organization_id, granted_by_user_id)
             .await
-            .map_err(|e| AdminError::InternalError(e.to_string()))?;
+            .map_err(|e| AdminError::InternalError(e.to_string()))?
+            .ok_or_else(|| {
+                AdminError::OrganizationNotFound(format!(
+                    "Organization '{organization_id}' not found"
+                ))
+            })?;
 
         // A grant that already existed changed nothing: nothing to drop.
         if created {

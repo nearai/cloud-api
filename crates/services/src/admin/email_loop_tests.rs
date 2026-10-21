@@ -64,6 +64,9 @@ struct CountingRepo {
     access_model: Option<ModelAccessModel>,
     /// Whether a grant creates a row (false: the grant already existed).
     grant_creates: bool,
+    /// Whether the grant finds the organization deleted, after the service
+    /// checked that it was active.
+    grant_finds_organization_deleted: bool,
     /// Whether a revocation finds a grant to delete.
     revoke_finds: bool,
 }
@@ -441,8 +444,11 @@ impl AdminRepository for CountingRepo {
         model_id: uuid::Uuid,
         organization_id: uuid::Uuid,
         granted_by_user_id: Option<uuid::Uuid>,
-    ) -> Result<(ModelAccessGrant, bool), anyhow::Error> {
-        Ok((
+    ) -> Result<Option<(ModelAccessGrant, bool)>, anyhow::Error> {
+        if self.grant_finds_organization_deleted {
+            return Ok(None);
+        }
+        Ok(Some((
             ModelAccessGrant {
                 organization_id,
                 organization_name: "org".to_string(),
@@ -451,7 +457,7 @@ impl AdminRepository for CountingRepo {
                 granted_by_user_email: None,
             },
             self.grant_creates,
-        ))
+        )))
     }
 
     async fn revoke_model_access(
@@ -778,6 +784,24 @@ async fn a_grant_that_already_exists_invalidates_nothing() {
         .grant_model_access("restricted/model", organization_id, Some(Uuid::new_v4()))
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn a_grant_for_an_organization_deleted_meanwhile_is_not_found() {
+    let organization_id = Uuid::new_v4();
+    let repo = CountingRepo {
+        grant_creates: true,
+        grant_finds_organization_deleted: true,
+        ..Default::default()
+    };
+    let service = access_service(repo, organization_id, 0);
+
+    assert!(matches!(
+        service
+            .grant_model_access("restricted/model", organization_id, Some(Uuid::new_v4()))
+            .await,
+        Err(AdminError::OrganizationNotFound(_))
+    ));
 }
 
 #[tokio::test]

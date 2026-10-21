@@ -1083,13 +1083,15 @@ pub trait AdminRepository: Send + Sync {
     /// Grant the organization access to the model. Returns the stored grant
     /// and whether this call created it: a grant that already exists is
     /// returned unchanged. A grant that is created gets its audit row in the
-    /// same statement.
+    /// same statement. `None` if the organization is not active: the check
+    /// holds the organization row until the grant is written, so a
+    /// concurrent deletion cannot leave a grant behind.
     async fn grant_model_access(
         &self,
         model_id: uuid::Uuid,
         organization_id: uuid::Uuid,
         granted_by_user_id: Option<uuid::Uuid>,
-    ) -> Result<(ModelAccessGrant, bool), anyhow::Error>;
+    ) -> Result<Option<(ModelAccessGrant, bool)>, anyhow::Error>;
 
     /// Revoke the organization's grant for the model. Returns whether a
     /// grant existed. A grant that is revoked gets its audit row in the same
@@ -1392,8 +1394,10 @@ pub trait AdminService: Send + Sync {
 
     /// Revoke an organization's access to a model (admin only). Idempotent:
     /// revoking a grant that does not exist succeeds. Returns `ModelNotFound`
-    /// or `OrganizationNotFound` if either is missing. A grant that is
-    /// revoked is written to the audit log with `revoked_by_user_id`.
+    /// or `OrganizationNotFound` if either is missing; the organization must
+    /// be active, like for a grant. A deleted organization has no grants
+    /// left to revoke: its deletion removed them. A grant that is revoked is
+    /// written to the audit log with `revoked_by_user_id`.
     async fn revoke_model_access(
         &self,
         model_name: &str,

@@ -1976,12 +1976,29 @@ impl AdminRepository for AdminCompositeRepository {
         model_id: Uuid,
         organization_id: Uuid,
         granted_by_user_id: Option<Uuid>,
-    ) -> Result<(ModelAccessGrant, bool)> {
-        let client = self.pool.get().await?;
+    ) -> Result<Option<(ModelAccessGrant, bool)>> {
+        let mut client = self.pool.get().await?;
+        let transaction = client.transaction().await?;
+        // Hold the organization row until the grant is written. Deleting an
+        // organization locks the same row to deactivate it and then removes
+        // its grants in that transaction, so the two cannot interleave: either
+        // the deletion waits and then removes this grant too, or this waits
+        // for the deletion and finds the organization inactive. Without the
+        // lock a grant could land after the deletion had removed the others.
+        let active = transaction
+            .query_opt(
+                "SELECT 1 FROM organizations WHERE id = $1 AND is_active = true FOR SHARE",
+                &[&organization_id],
+            )
+            .await?
+            .is_some();
+        if !active {
+            return Ok(None);
+        }
         // One statement, so the grant and its audit row are written together
         // or not at all. An existing grant keeps its date and its author, and
         // then nothing is written to the audit log either.
-        let created = client
+        let created = transaction
             .execute(
                 r#"
                 WITH granted AS (
@@ -1997,7 +2014,7 @@ impl AdminRepository for AdminCompositeRepository {
             )
             .await?
             > 0;
-        let row = client
+        let row = transaction
             .query_opt(
                 &format!(
                     "{MODEL_ACCESS_GRANT_SELECT} WHERE a.model_id = $1 AND a.organization_id = $2"
@@ -2005,9 +2022,10 @@ impl AdminRepository for AdminCompositeRepository {
                 &[&model_id, &organization_id],
             )
             .await?
-            .context("the grant is gone: revoked or the organization was deleted meanwhile")?;
+            .context("the grant is gone: revoked meanwhile")?;
+        transaction.commit().await?;
 
-        Ok((row_to_model_access_grant(&row), created))
+        Ok(Some((row_to_model_access_grant(&row), created)))
     }
 
     async fn revoke_model_access(

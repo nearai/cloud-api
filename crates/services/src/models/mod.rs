@@ -365,14 +365,24 @@ impl ModelsServiceTrait for ModelsServiceImpl {
     ) -> Result<ModelWithPricing, ModelsError> {
         let models = self.cached_models().await?;
         // An unlisted model is answered like a model that does not exist.
-        let mut listed = models.iter().filter(|model| model.is_listed);
-        if let Some(model) = listed.clone().find(|model| model.model_name == identifier) {
-            return Ok(model.clone());
-        }
-        listed
-            .find(|model| model.aliases.iter().any(|alias| alias == identifier))
+        let listed = models.iter().filter(|model| model.is_listed);
+        let mut model = listed
+            .clone()
+            .find(|model| model.model_name == identifier)
+            .or_else(|| {
+                listed
+                    .clone()
+                    .find(|model| model.aliases.iter().any(|alias| alias == identifier))
+            })
             .cloned()
-            .ok_or_else(|| ModelsError::NotFound(format!("Model '{identifier}' not found")))
+            .ok_or_else(|| ModelsError::NotFound(format!("Model '{identifier}' not found")))?;
+        // So is an unlisted successor: a listed model may name one.
+        if let Some(successor) = &model.successor_model_name {
+            if !listed.clone().any(|listed| &listed.model_name == successor) {
+                model.successor_model_name = None;
+            }
+        }
+        Ok(model)
     }
 
     async fn resolve_alias_cached(&self, identifier: &str, caller: ModelCaller) -> Option<String> {
@@ -381,11 +391,20 @@ impl ModelsServiceTrait for ModelsServiceImpl {
             .iter()
             .find(|m| m.aliases.iter().any(|a| a == identifier))?;
         // The canonical name of a model the caller may not use stays hidden.
-        // A failed check hides it too.
-        self.caller_can_use_model(caller, model)
-            .await
-            .unwrap_or(false)
-            .then(|| model.model_name.clone())
+        // A failed check hides it too, and is logged: otherwise a database
+        // outage on this advisory path would look like an unknown alias.
+        match self.caller_can_use_model(caller, model).await {
+            Ok(true) => Some(model.model_name.clone()),
+            Ok(false) => None,
+            Err(error) => {
+                warn!(
+                    model_id = %model.id,
+                    error = %error,
+                    "Model access check failed during alias resolution; the alias stays unresolved"
+                );
+                None
+            }
+        }
     }
 
     async fn get_configured_model_names(&self) -> Result<Vec<String>, ModelsError> {
@@ -1014,6 +1033,66 @@ mod tests {
             service
                 .resolve_alias_cached("unlisted-alias", ModelCaller::Trusted)
                 .await,
+            Some(unlisted_name.to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn the_public_views_name_only_a_listed_successor() {
+        let to_unlisted = "test/to-unlisted";
+        let to_listed = "test/to-listed";
+        let unlisted_name = "test/unlisted-successor";
+        let listed_name = "test/listed-successor";
+        let mut unlisted = test_catalog_model(unlisted_name);
+        unlisted.is_listed = false;
+        let mut names_unlisted = test_catalog_model(to_unlisted);
+        names_unlisted.aliases = vec!["to-unlisted-alias".to_string()];
+        names_unlisted.successor_model_name = Some(unlisted_name.to_string());
+        let mut names_listed = test_catalog_model(to_listed);
+        names_listed.successor_model_name = Some(listed_name.to_string());
+        let service = service_with_backend_models(
+            StaticModelsRepository::with_active_models(vec![
+                names_unlisted,
+                names_listed,
+                unlisted,
+                test_catalog_model(listed_name),
+            ]),
+            to_listed,
+            vec![provider_model(to_listed, Some(32_768), Some(4_096))],
+        )
+        .await;
+
+        let successor_in = |models: &[ModelWithPricing], name: &str| {
+            models
+                .iter()
+                .find(|model| model.model_name == name)
+                .unwrap()
+                .successor_model_name
+                .clone()
+        };
+        let public = service.get_public_models_with_pricing().await.unwrap();
+        assert_eq!(successor_in(&public, to_unlisted), None);
+        assert_eq!(
+            successor_in(&public, to_listed),
+            Some(listed_name.to_string())
+        );
+        for identifier in [to_unlisted, "to-unlisted-alias"] {
+            let model = service.resolve_public_model(identifier).await.unwrap();
+            assert_eq!(model.successor_model_name, None, "{identifier}");
+        }
+        assert_eq!(
+            service
+                .resolve_public_model(to_listed)
+                .await
+                .unwrap()
+                .successor_model_name,
+            Some(listed_name.to_string())
+        );
+
+        // The trusted view keeps the successor.
+        let all = service.get_models_with_pricing().await.unwrap();
+        assert_eq!(
+            successor_in(&all, to_unlisted),
             Some(unlisted_name.to_string())
         );
     }

@@ -1642,7 +1642,10 @@ impl AdminRepository for AdminCompositeRepository {
                     {all_erased} AS all_members_erased
                 FROM organizations o
                 LEFT JOIN LATERAL (
-                    SELECT SUM(spend_limit)::BIGINT AS spend_limit
+                    SELECT CASE
+                        WHEN COUNT(spend_limit) = 0 THEN NULL
+                        ELSE LEAST(SUM(spend_limit), 9223372036854775807)::BIGINT
+                    END AS spend_limit
                     FROM organization_limits_history
                     WHERE organization_id = o.id
                       AND effective_until IS NULL
@@ -1683,7 +1686,10 @@ impl AdminRepository for AdminCompositeRepository {
                     {all_erased} AS all_members_erased
                 FROM organizations o
                 LEFT JOIN LATERAL (
-                    SELECT SUM(spend_limit)::BIGINT AS spend_limit
+                    SELECT CASE
+                        WHEN COUNT(spend_limit) = 0 THEN NULL
+                        ELSE LEAST(SUM(spend_limit), 9223372036854775807)::BIGINT
+                    END AS spend_limit
                     FROM organization_limits_history
                     WHERE organization_id = o.id
                       AND effective_until IS NULL

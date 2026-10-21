@@ -1259,6 +1259,15 @@ pub fn build_app_with_config_and_options(
         &auth_components.auth_state_middleware,
     );
 
+    let organization_credit_service = build_organization_credit_service(&database, &config);
+    let transfer_routes = crate::routes::credit_transfers::routes(
+        organization_credit_service.clone(),
+        auth_components.auth_state_middleware.clone(),
+    );
+    let organization_credential_routes = crate::routes::organization_credentials::routes(
+        organization_credit_service,
+        auth_components.auth_state_middleware.clone(),
+    );
     let management_routes = build_management_router(
         app_state.clone(),
         auth_components.auth_state_middleware.clone(),
@@ -1378,6 +1387,8 @@ pub fn build_app_with_config_and_options(
                 .merge(unsupported_openai_routes)
                 .merge(conversation_routes)
                 .merge(management_routes)
+                .merge(transfer_routes)
+                .merge(organization_credential_routes)
                 .merge(workspace_routes)
                 .merge(attestation_routes.clone())
                 .merge(model_routes)
@@ -2495,6 +2506,18 @@ fn build_admin_routes_with_options(
         .merge(
             Router::new()
                 .route(
+                    "/admin/organizations/{org_id}/policy",
+                    get(crate::routes::organization_policy::get_policy)
+                        .put(crate::routes::organization_policy::put_policy),
+                )
+                .route("/admin/organizations/{org_id}/credit/transfer/reconciliation", get(crate::routes::credit_transfers::reconciliation))
+                .layer(axum::Extension(
+                    build_organization_credit_service(&database, &config),
+                ))
+        )
+        .merge(
+            Router::new()
+                .route(
                     "/admin/organizations/{org_id}/credit/reconciliations",
                     axum::routing::post(
                         crate::routes::admin_credit_reconciliation::reconcile_organization_credits,
@@ -2629,6 +2652,25 @@ async fn swagger_ui_handler() -> Html<String> {
 </html>"#
             .to_string(),
     )
+}
+
+fn build_organization_credit_service(
+    database: &database::Database,
+    config: &ApiConfig,
+) -> Arc<dyn services::organization_credits::OrganizationCreditServiceTrait> {
+    use database::repositories::credit_transfers::CreditTransferRepository;
+    use database::repositories::organization_credentials::OrganizationCredentialRepository;
+    use services::organization_credits::OrganizationCreditService;
+
+    let transfers = Arc::new(CreditTransferRepository::new(
+        database.pool().clone(),
+        &config.credit_allocation,
+    ));
+    let credentials = Arc::new(OrganizationCredentialRepository::new(
+        database.pool().clone(),
+    ));
+
+    Arc::new(OrganizationCreditService::new(transfers, credentials))
 }
 
 #[cfg(test)]

@@ -41,6 +41,8 @@ pub(crate) fn admin_operation(method: &Method, matched_path: &str) -> AdminOpera
                 | "/admin/organizations/{org_id}/limits/history"
                 | "/admin/organizations/{org_id}/usage/balance"
                 | "/admin/organizations/{org_id}/usage-discount"
+                | "/admin/organizations/{org_id}/policy"
+                | "/admin/organizations/{org_id}/credit/transfer/reconciliation"
                 | "/admin/organizations/{org_id}/staking/farm"
                 | "/admin/aml/reports"
                 | "/admin/aml/allowlist"

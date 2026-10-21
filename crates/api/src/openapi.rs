@@ -193,6 +193,18 @@ use utoipa::{Modify, OpenApi};
         crate::routes::admin_usage_hourly::recompute_usage_hourly,
         crate::routes::admin_usage_discount::get_usage_discount,
         crate::routes::admin_credit_reconciliation::reconcile_organization_credits,
+        crate::routes::credit_transfers::create,
+        crate::routes::credit_transfers::history,
+        crate::routes::credit_transfers::detail,
+        crate::routes::credit_transfers::capacity,
+        crate::routes::organization_policy::get_policy,
+        crate::routes::organization_policy::put_policy,
+        crate::routes::organization_credentials::create_credential,
+        crate::routes::organization_credentials::revoke_credential,
+        crate::routes::organization_credentials::list_credentials,
+        crate::routes::organization_credentials::update_credential,
+        crate::routes::organization_credentials::rotate_credential,
+        crate::routes::credit_transfers::reconciliation,
         crate::routes::admin_usage_discount::put_usage_discount,
         crate::routes::admin::get_org_revenue,
         crate::routes::admin::get_infra_summary,
@@ -563,6 +575,16 @@ impl Modify for SecurityAddon {
                         .description(Some(
                             "API key for programmatic access (Authorization: Bearer sk-<api_key>)",
                         ))
+                        .build(),
+                ),
+            );
+            components.add_security_scheme(
+                "organization_credential",
+                SecurityScheme::Http(
+                    HttpBuilder::new()
+                        .scheme(HttpAuthScheme::Bearer)
+                        .bearer_format("oc_")
+                        .description(Some("Organization-owned credential with explicit credits:read and/or credits:transfer permissions; never valid for inference"))
                         .build(),
                 ),
             );

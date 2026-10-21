@@ -57,7 +57,7 @@ use crate::{
     attestation::{ita::ItaClient, models::VpcInfo, ports::AttestationRepository},
     inference_provider_pool::InferenceProviderPool,
     metrics::MetricsServiceTrait,
-    models::ModelsRepository,
+    models::{ModelResolveCache, ModelsRepository},
     usage::UsageRepository,
 };
 
@@ -65,6 +65,10 @@ pub struct AttestationService {
     pub repository: Arc<dyn AttestationRepository + Send + Sync>,
     pub inference_provider_pool: Arc<InferenceProviderPool>,
     pub models_repository: Arc<dyn ModelsRepository>,
+    /// The cache owned by `ModelsServiceImpl`, so a model is resolved here
+    /// with the access decisions (and the admin invalidation) the rest of
+    /// the request path uses.
+    pub model_resolve_cache: ModelResolveCache,
     pub metrics_service: Arc<dyn MetricsServiceTrait>,
     pub usage_repository: Arc<dyn UsageRepository>,
     pub vpc_info: Option<VpcInfo>,

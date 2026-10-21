@@ -113,9 +113,11 @@ pub(super) async fn bill_auto_redact_classify(
         },
     );
 
+    // A trusted lookup: the platform chose this model and has already run the
+    // classify pass, so the usage is billed whoever the organization is.
     let model = match app_state
         .models_service
-        .get_model_by_name(auto_redact::DEFAULT_PII_MODEL)
+        .get_model_by_name(auto_redact::DEFAULT_PII_MODEL, ModelCaller::Trusted)
         .await
     {
         Ok(model) => model,

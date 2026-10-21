@@ -171,6 +171,7 @@ const APPROVED: &[ApprovedGroup] = &[
     ApprovedGroup { table: "organization_invitations", columns: &["email", "role", "status", "token", "email_status", "email_last_error", "email_message_id"], reason: "Invitation workflow data required for indexed acceptance and delivery operations; tokens are short-lived" },
     ApprovedGroup { table: "organization_limits_history", columns: &["changed_by", "change_reason", "changed_by_user_email", "credit_type", "source", "currency"], reason: "Restricted billing and limits audit history" },
     ApprovedGroup { table: "organization_member_role_audit_log", columns: &["previous_role", "new_role"], reason: "Restricted administrator member-role audit history" },
+    ApprovedGroup { table: "organization_model_access_log", columns: &["action"], reason: "Restricted administrator model-access audit history: a grant-or-revoke enum next to UUIDs, no customer content" },
     ApprovedGroup { table: "organization_members", columns: &["role"], reason: "Queryable authorization role" },
     ApprovedGroup { table: "organization_credit_consumption", columns: &["credit_type"], reason: "Restricted current billing consumption counter" },
     ApprovedGroup { table: "organization_reporting_tokens", columns: &["name", "token_hash", "token_prefix"], reason: "Reporting credentials are one-way hashed; name and prefix are display metadata" },

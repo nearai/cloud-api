@@ -3,14 +3,18 @@ use super::{
     errors::{attestation_report_error_response, error_response},
     AttestationRouteState,
 };
-use crate::{models::ErrorResponse, ohttp_gateway::OhttpAttestation};
+use crate::{
+    middleware::auth::AuthenticatedApiKey, models::ErrorResponse, ohttp_gateway::OhttpAttestation,
+};
 use axum::{
     extract::{Query, State},
     http::{HeaderMap, StatusCode},
     response::Json as ResponseJson,
+    Extension,
 };
 use inference_providers::{ProviderFilter, ProviderSource};
 use serde::{Deserialize, Serialize};
+use services::models::ModelCaller;
 use utoipa::{IntoParams, ToSchema};
 
 /// Query parameters for attestation report
@@ -155,7 +159,7 @@ impl From<services::attestation::models::AttestationReport> for AttestationRespo
     ),
     responses(
         (status = 200, description = "Attestation report retrieved", body = AttestationResponse),
-        (status = 400, description = "Invalid nonce, signing_algo or provider, or unknown model", body = ErrorResponse),
+        (status = 400, description = "Invalid nonce, signing_algo or provider, or unknown model (a model the key's organization may not use is reported as unknown)", body = ErrorResponse),
         (status = 401, description = "Missing or invalid API key", body = ErrorResponse),
         (status = 503, description = "Service unavailable", body = ErrorResponse)
     ),
@@ -167,10 +171,18 @@ impl From<services::attestation::models::AttestationReport> for AttestationRespo
 pub async fn get_attestation_report(
     Query(params): Query<AttestationQuery>,
     State(state): State<AttestationRouteState>,
+    Extension(api_key): Extension<AuthenticatedApiKey>,
     headers: HeaderMap,
 ) -> Result<axum::response::Response, (StatusCode, ResponseJson<ErrorResponse>)> {
-    let alias_resolved =
-        resolve_attestation_alias(params.model.as_deref(), &state.models_service, &headers).await?;
+    // An unlisted model has a report only for an organization that may use it.
+    let caller = ModelCaller::Organization(api_key.organization.id.0);
+    let alias_resolved = resolve_attestation_alias(
+        params.model.as_deref(),
+        &state.models_service,
+        caller,
+        &headers,
+    )
+    .await?;
     let provider_filter = match params
         .provider
         .as_deref()
@@ -202,6 +214,7 @@ pub async fn get_attestation_report(
             params.signing_address,
             params.include_tls_fingerprint.unwrap_or(false),
             provider_filter,
+            caller,
         )
         .await
         .map_err(attestation_report_error_response)?;

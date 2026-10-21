@@ -126,6 +126,47 @@ async fn model_flow_uses_canonical_model_and_returns_alias_metadata() -> TestRes
 }
 
 #[tokio::test]
+async fn an_unlisted_model_is_unknown_to_the_public_token_flow() -> TestResult {
+    // Given: the catalog holds an unlisted model, and the token is served to
+    // the public, so no organization is known.
+    let nonce_step = || {
+        FakeStep::json(
+            200,
+            r#"{"val":"dmVyaWZpZXItdmFsdWU=","iat":"aWF0LWJ5dGVz","signature":"dmVyaWZpZXItc2lnbmF0dXJl"}"#,
+        )
+    };
+    let mut errors = Vec::new();
+    for model in ["unlisted-model", "no-such-model"] {
+        let server = FakeIta::start(vec![nonce_step()]).await?;
+        let model_collector = RecordingModelCollector::compatible();
+        let service = service_for_fake_ita(
+            &server,
+            0,
+            RecordingGatewayQuoteCollector::default(),
+            Some(model_collector.clone()),
+        )?;
+
+        // When: the request names it.
+        let error = service
+            .get_ita_attestation_token(query(Some(model)))
+            .await
+            .expect_err("the model must not resolve");
+
+        // Then: no provider evidence is collected for it.
+        assert!(
+            matches!(&error, AttestationError::UnknownModel(name) if name == model),
+            "unexpected error for {model}: {error:?}"
+        );
+        assert!(model_collector.calls().is_empty());
+        errors.push(error.to_string().replace(model, "<model>"));
+    }
+
+    // And: it is reported exactly like a model that does not exist.
+    assert_eq!(errors[0], errors[1]);
+    Ok(())
+}
+
+#[tokio::test]
 async fn model_flow_fails_closed_on_incompatible_provider_evidence() -> TestResult {
     // Given: a model provider returns evidence without ITA-compatible GPU nonce binding.
     let server = FakeIta::start(vec![FakeStep::json(

@@ -725,7 +725,8 @@ fn registered_routes(source: &str) -> Vec<(String, String)> {
 
 /// The access tests cover the routes in `ROUTES`. This one fails when a route
 /// is registered in any router builder of `src/lib.rs` (or in the public
-/// attestation router it merges) without a decision on record here: either
+/// attestation, credit transfer and organization credential routers it
+/// merges) without a decision on record here: either
 /// the route is in `ROUTES`, and so in the table test, or it is listed below
 /// with the reason it is not. A new route cannot ship without that decision.
 ///
@@ -742,6 +743,9 @@ fn every_registered_route_has_a_model_access_decision() {
         ("GET", "/model/{model_name}"),
         // Public: resolves as an anonymous caller.
         ("GET", "/attestation/ita-token"),
+        // Public: the attested providers' trust pins, published for
+        // verifiers. It takes no model name and reads no catalog row.
+        ("GET", "/attestation/pins"),
         // Service token: usage is recorded for any model, and the two
         // documents are for a gateway that enforces access itself.
         ("POST", "/internal/usage"),
@@ -822,12 +826,27 @@ fn every_registered_route_has_a_model_access_decision() {
         ("POST", "/check_api_key"),
         ("GET", "/services"),
         ("GET", "/services/{service_name}"),
+        // Credit transfers and the scoped credentials that authorize them.
+        ("POST", "/organizations/{org_id}/credit/transfer"),
+        ("GET", "/organizations/{org_id}/credit/transfers"),
+        ("GET", "/organizations/{org_id}/credit/transfers/{id}"),
+        ("GET", "/organizations/{org_id}/credit/transfer/capacity"),
+        ("POST", "/organizations/{org_id}/credentials"),
+        ("GET", "/organizations/{org_id}/credentials"),
+        ("DELETE", "/organizations/{org_id}/credentials/{id}"),
+        ("PUT", "/organizations/{org_id}/credentials/{id}"),
+        ("POST", "/organizations/{org_id}/credentials/{id}/rotate"),
     ];
 
     let mut registered = registered_routes(include_str!("../../src/lib.rs"));
-    registered.extend(registered_routes(include_str!(
-        "../../src/routes/attestation.rs"
-    )));
+    // Router builders that `src/lib.rs` calls from other modules.
+    for source in [
+        include_str!("../../src/routes/attestation.rs"),
+        include_str!("../../src/routes/credit_transfers.rs"),
+        include_str!("../../src/routes/organization_credentials.rs"),
+    ] {
+        registered.extend(registered_routes(source));
+    }
     assert!(
         registered.len() >= 100,
         "found too few routes, the scan is broken: {registered:?}"

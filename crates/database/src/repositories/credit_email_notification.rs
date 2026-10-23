@@ -118,29 +118,32 @@ impl CreditEmailNotificationRepositoryPort for CreditEmailNotificationRepository
         let mut claimed_recipients = Vec::new();
         for row in rows {
             let recipient_user_id = row.get("id");
+            let claim_token = Uuid::new_v4();
             let claimed = transaction
                 .query_opt(
                     r#"
                 INSERT INTO email_notification_deliveries
-                    (event_type, resource_id, event_key, recipient_user_id)
-                VALUES ($1, $2, $3, $4)
+                    (event_type, resource_id, event_key, recipient_user_id, claim_token)
+                VALUES ($1, $2, $3, $4, $5)
                 ON CONFLICT (event_type, resource_id, event_key, recipient_user_id)
-                DO UPDATE SET claimed_at = NOW()
+                DO UPDATE SET claimed_at = NOW(), claim_token = EXCLUDED.claim_token
                 WHERE email_notification_deliveries.sent_at IS NULL
                   AND email_notification_deliveries.claimed_at < NOW() - INTERVAL '30 minutes'
-                RETURNING recipient_user_id
+                RETURNING recipient_user_id, claim_token
                 "#,
                     &[
                         &EVENT_TYPE,
                         &resource_id,
                         &threshold.to_string(),
                         &recipient_user_id,
+                        &claim_token,
                     ],
                 )
                 .await?;
             if claimed.is_some() {
                 claimed_recipients.push(CreditEmailRecipient {
                     user_id: recipient_user_id,
+                    claim_token,
                     email: row.get("email"),
                     contact_email: row.get("contact_email"),
                     contact_email_verified_at: row
@@ -157,16 +160,18 @@ impl CreditEmailNotificationRepositoryPort for CreditEmailNotificationRepository
         organization_id: Uuid,
         threshold: i16,
         recipient_user_id: Uuid,
+        claim_token: Uuid,
     ) -> Result<()> {
         let client = self.pool.get().await?;
         client
             .execute(
-                "DELETE FROM email_notification_deliveries WHERE event_type = $1 AND resource_id = $2 AND event_key = $3 AND recipient_user_id = $4",
+                "DELETE FROM email_notification_deliveries WHERE event_type = $1 AND resource_id = $2 AND event_key = $3 AND recipient_user_id = $4 AND claim_token = $5",
                 &[
                     &EVENT_TYPE,
                     &Self::resource_id(organization_id),
                     &threshold.to_string(),
                     &recipient_user_id,
+                    &claim_token,
                 ],
             )
             .await?;
@@ -178,16 +183,18 @@ impl CreditEmailNotificationRepositoryPort for CreditEmailNotificationRepository
         organization_id: Uuid,
         threshold: i16,
         recipient_user_id: Uuid,
+        claim_token: Uuid,
     ) -> Result<()> {
         let client = self.pool.get().await?;
         client
             .execute(
-                "UPDATE email_notification_deliveries SET sent_at = NOW() WHERE event_type = $1 AND resource_id = $2 AND event_key = $3 AND recipient_user_id = $4",
+                "UPDATE email_notification_deliveries SET sent_at = NOW() WHERE event_type = $1 AND resource_id = $2 AND event_key = $3 AND recipient_user_id = $4 AND claim_token = $5",
                 &[
                     &EVENT_TYPE,
                     &Self::resource_id(organization_id),
                     &threshold.to_string(),
                     &recipient_user_id,
+                    &claim_token,
                 ],
             )
             .await?;

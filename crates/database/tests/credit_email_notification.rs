@@ -84,15 +84,12 @@ async fn claims_deduplicate_recover_and_release() -> anyhow::Result<()> {
     let (organization_id, user_id) = insert_credit_fixture(&pool, 90).await?;
     let version = snapshot_version(&pool, organization_id).await?;
 
-    assert_eq!(
-        claimed(
-            repository
-                .reconcile_claims(organization_id, &version, Some(10), &[])
-                .await?
-        )
-        .len(),
-        1
+    let initial_claim = claimed(
+        repository
+            .reconcile_claims(organization_id, &version, Some(10), &[])
+            .await?,
     );
+    assert_eq!(initial_claim.len(), 1);
     assert!(claimed(
         repository
             .reconcile_claims(organization_id, &version, Some(10), &[])
@@ -107,17 +104,18 @@ async fn claims_deduplicate_recover_and_release() -> anyhow::Result<()> {
             &[&format!("{organization_id}:combined")],
         )
         .await?;
-    assert_eq!(
-        claimed(
-            repository
-                .reconcile_claims(organization_id, &version, Some(10), &[])
-                .await?
-        )
-        .len(),
-        1
+    let reclaimed = claimed(
+        repository
+            .reconcile_claims(organization_id, &version, Some(10), &[])
+            .await?,
     );
+    assert_eq!(reclaimed.len(), 1);
+    assert_ne!(reclaimed[0].claim_token, initial_claim[0].claim_token);
+    let claim_token = reclaimed[0].claim_token;
 
-    repository.mark_sent(organization_id, 10, user_id).await?;
+    repository
+        .mark_sent(organization_id, 10, user_id, claim_token)
+        .await?;
     pool.get()
         .await?
         .execute(
@@ -133,7 +131,7 @@ async fn claims_deduplicate_recover_and_release() -> anyhow::Result<()> {
     .is_empty());
 
     repository
-        .release_claim(organization_id, 10, user_id)
+        .release_claim(organization_id, 10, user_id, claim_token)
         .await?;
     assert_eq!(
         claimed(
@@ -147,6 +145,67 @@ async fn claims_deduplicate_recover_and_release() -> anyhow::Result<()> {
     repository
         .reconcile_claims(organization_id, &version, None, &[])
         .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn stale_worker_cannot_release_or_complete_a_reclaimed_delivery() -> anyhow::Result<()> {
+    let pool = test_pool().await?;
+    let repository = CreditEmailNotificationRepository::new(pool.clone());
+    let (organization_id, user_id) = insert_credit_fixture(&pool, 90).await?;
+    let version = snapshot_version(&pool, organization_id).await?;
+
+    let first_claim = claimed(
+        repository
+            .reconcile_claims(organization_id, &version, Some(10), &[])
+            .await?,
+    );
+    let first_token = first_claim[0].claim_token;
+    pool.get()
+        .await?
+        .execute(
+            "UPDATE email_notification_deliveries SET claimed_at = NOW() - INTERVAL '31 minutes' WHERE resource_id = $1",
+            &[&format!("{organization_id}:combined")],
+        )
+        .await?;
+    let second_claim = claimed(
+        repository
+            .reconcile_claims(organization_id, &version, Some(10), &[])
+            .await?,
+    );
+    let second_token = second_claim[0].claim_token;
+    assert_ne!(first_token, second_token);
+
+    repository
+        .release_claim(organization_id, 10, user_id, first_token)
+        .await?;
+    repository
+        .mark_sent(organization_id, 10, user_id, first_token)
+        .await?;
+    let row = pool
+        .get()
+        .await?
+        .query_one(
+            "SELECT claim_token, sent_at IS NOT NULL AS sent FROM email_notification_deliveries WHERE resource_id = $1 AND event_key = '10' AND recipient_user_id = $2",
+            &[&format!("{organization_id}:combined"), &user_id],
+        )
+        .await?;
+    assert_eq!(row.get::<_, Uuid>("claim_token"), second_token);
+    assert!(!row.get::<_, bool>("sent"));
+
+    repository
+        .mark_sent(organization_id, 10, user_id, second_token)
+        .await?;
+    let sent: bool = pool
+        .get()
+        .await?
+        .query_one(
+            "SELECT sent_at IS NOT NULL FROM email_notification_deliveries WHERE resource_id = $1 AND event_key = '10' AND recipient_user_id = $2",
+            &[&format!("{organization_id}:combined"), &user_id],
+        )
+        .await?
+        .get(0);
+    assert!(sent);
     Ok(())
 }
 
@@ -166,16 +225,16 @@ async fn stale_snapshot_cannot_remove_a_newer_threshold_claim() -> anyhow::Resul
         .await?;
     let current_version = snapshot_version(&pool, organization_id).await?;
     assert_ne!(stale_version, current_version);
-    assert_eq!(
-        claimed(
-            repository
-                .reconcile_claims(organization_id, &current_version, Some(10), &[])
-                .await?
-        )
-        .len(),
-        1
+    let current_claim = claimed(
+        repository
+            .reconcile_claims(organization_id, &current_version, Some(10), &[])
+            .await?,
     );
-    repository.mark_sent(organization_id, 10, user_id).await?;
+    assert_eq!(current_claim.len(), 1);
+    let claim_token = current_claim[0].claim_token;
+    repository
+        .mark_sent(organization_id, 10, user_id, claim_token)
+        .await?;
 
     assert_eq!(
         repository

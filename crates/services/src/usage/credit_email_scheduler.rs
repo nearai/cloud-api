@@ -11,6 +11,7 @@ use super::ports::{
 use crate::email::{deliverable_email, CreditBalanceAlertEmail, EmailDeliveryOutcome, EmailSender};
 
 const SCAN_INTERVAL_SECS: u64 = 300;
+const MAX_SNAPSHOT_RETRIES: usize = 5;
 
 pub struct CreditEmailScheduler {
     repository: Arc<dyn CreditEmailNotificationRepository>,
@@ -90,14 +91,34 @@ impl CreditEmailScheduler {
         &self,
         organization: CreditEmailOrganization,
     ) -> anyhow::Result<()> {
+        for attempt in 1..=MAX_SNAPSHOT_RETRIES {
+            if self.process_organization_snapshot(&organization).await? {
+                return Ok(());
+            }
+            info!(
+                organization_id = %organization.id,
+                attempt,
+                "Credit balance changed during alert scan; retrying immediately"
+            );
+        }
+        anyhow::bail!(
+            "credit balance kept changing while claiming alerts after {MAX_SNAPSHOT_RETRIES} attempts"
+        )
+    }
+
+    async fn process_organization_snapshot(
+        &self,
+        organization: &CreditEmailOrganization,
+    ) -> anyhow::Result<bool> {
         let snapshot = self
             .limits_repository
             .get_current_credit_snapshot(organization.id)
             .await?;
         let Some(limit) = snapshot.limit else {
-            self.reconcile_claims(&organization, &snapshot.version, None, &[])
-                .await?;
-            return Ok(());
+            return Ok(self
+                .reconcile_claims(organization, &snapshot.version, None, &[])
+                .await?
+                .is_some());
         };
         let breakdown = snapshot.breakdown;
         let effective_capacity = breakdown
@@ -105,9 +126,10 @@ impl CreditEmailScheduler {
             .map(|credit| credit.effective_capacity)
             .fold(0_i64, i64::saturating_add);
         if effective_capacity <= 0 {
-            self.reconcile_claims(&organization, &snapshot.version, None, &[])
-                .await?;
-            return Ok(());
+            return Ok(self
+                .reconcile_claims(organization, &snapshot.version, None, &[])
+                .await?
+                .is_some());
         }
 
         // Usage admission blocks while unresolved overage exists. Treat that state as exhausted
@@ -120,9 +142,10 @@ impl CreditEmailScheduler {
         let Some(threshold) =
             threshold_for_balance(remaining, effective_capacity, &self.thresholds)
         else {
-            self.reconcile_claims(&organization, &snapshot.version, None, &[])
-                .await?;
-            return Ok(());
+            return Ok(self
+                .reconcile_claims(organization, &snapshot.version, None, &[])
+                .await?
+                .is_some());
         };
 
         let lower_thresholds = self
@@ -144,14 +167,14 @@ impl CreditEmailScheduler {
         };
         let Some(recipients) = self
             .reconcile_claims(
-                &organization,
+                organization,
                 &snapshot.version,
                 Some(threshold),
                 &lower_thresholds,
             )
             .await?
         else {
-            return Ok(());
+            return Ok(false);
         };
         for recipient in recipients {
             let Some(recipient_email) = deliverable_email(
@@ -161,7 +184,12 @@ impl CreditEmailScheduler {
             ) else {
                 let _ = self
                     .repository
-                    .release_claim(organization.id, threshold, recipient.user_id)
+                    .release_claim(
+                        organization.id,
+                        threshold,
+                        recipient.user_id,
+                        recipient.claim_token,
+                    )
                     .await;
                 continue;
             };
@@ -185,7 +213,12 @@ impl CreditEmailScheduler {
                 Ok(EmailDeliveryOutcome::Sent { .. }) => {
                     if let Err(error) = self
                         .repository
-                        .mark_sent(organization.id, threshold, recipient.user_id)
+                        .mark_sent(
+                            organization.id,
+                            threshold,
+                            recipient.user_id,
+                            recipient.claim_token,
+                        )
                         .await
                     {
                         warn!(organization_id = %organization.id, error = %error, "Failed to mark credit balance alert as sent");
@@ -194,19 +227,29 @@ impl CreditEmailScheduler {
                 Ok(EmailDeliveryOutcome::Skipped) => {
                     let _ = self
                         .repository
-                        .release_claim(organization.id, threshold, recipient.user_id)
+                        .release_claim(
+                            organization.id,
+                            threshold,
+                            recipient.user_id,
+                            recipient.claim_token,
+                        )
                         .await;
                 }
                 Err(error) => {
                     warn!(organization_id = %organization.id, error = %error.sanitized_message(), "Failed to send credit balance alert");
                     let _ = self
                         .repository
-                        .release_claim(organization.id, threshold, recipient.user_id)
+                        .release_claim(
+                            organization.id,
+                            threshold,
+                            recipient.user_id,
+                            recipient.claim_token,
+                        )
                         .await;
                 }
             }
         }
-        Ok(())
+        Ok(true)
     }
 
     async fn reconcile_claims(
@@ -226,10 +269,7 @@ impl CreditEmailScheduler {
             )
             .await?
         {
-            CreditEmailClaimResult::SnapshotChanged => {
-                info!(organization_id = %organization.id, "Credit balance changed during alert scan; deferring to the next scan");
-                Ok(None)
-            }
+            CreditEmailClaimResult::SnapshotChanged => Ok(None),
             CreditEmailClaimResult::Claimed(recipients) => Ok(Some(recipients)),
         }
     }
@@ -271,6 +311,7 @@ mod tests {
         recipients: Vec<CreditEmailRecipient>,
         reconciliations: Mutex<Vec<ReconcileCall>>,
         released_users: Mutex<Vec<Uuid>>,
+        snapshot_changes_remaining: Mutex<usize>,
     }
 
     #[async_trait::async_trait]
@@ -292,17 +333,28 @@ mod tests {
                 threshold,
                 lower_thresholds: lower_thresholds.to_vec(),
             });
+            let mut snapshot_changes_remaining = self.snapshot_changes_remaining.lock().await;
+            if *snapshot_changes_remaining > 0 {
+                *snapshot_changes_remaining -= 1;
+                return Ok(CreditEmailClaimResult::SnapshotChanged);
+            }
             Ok(CreditEmailClaimResult::Claimed(
                 threshold.map_or_else(Vec::new, |_| self.recipients.clone()),
             ))
         }
 
-        async fn release_claim(&self, _: Uuid, _: i16, user_id: Uuid) -> anyhow::Result<()> {
+        async fn release_claim(
+            &self,
+            _: Uuid,
+            _: i16,
+            user_id: Uuid,
+            _: Uuid,
+        ) -> anyhow::Result<()> {
             self.released_users.lock().await.push(user_id);
             Ok(())
         }
 
-        async fn mark_sent(&self, _: Uuid, _: i16, _: Uuid) -> anyhow::Result<()> {
+        async fn mark_sent(&self, _: Uuid, _: i16, _: Uuid, _: Uuid) -> anyhow::Result<()> {
             Ok(())
         }
     }
@@ -386,6 +438,7 @@ mod tests {
             recipients,
             reconciliations: Mutex::new(Vec::new()),
             released_users: Mutex::new(Vec::new()),
+            snapshot_changes_remaining: Mutex::new(0),
         })
     }
 
@@ -428,6 +481,26 @@ mod tests {
         assert!(calls[0].lower_thresholds.is_empty());
     }
 
+    #[tokio::test]
+    async fn balance_change_retries_without_waiting_for_the_next_scan() {
+        let repository = repository(Vec::new());
+        *repository.snapshot_changes_remaining.lock().await = 1;
+        let scheduler = CreditEmailScheduler::new(
+            repository.clone(),
+            limits(10),
+            Arc::new(NoopEmailSender),
+            vec![0, 10, 20],
+            None,
+        );
+
+        scheduler.run_once().await.unwrap();
+
+        let calls = repository.reconciliations.lock().await;
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].threshold, Some(10));
+        assert_eq!(calls[1].threshold, Some(10));
+    }
+
     #[test]
     fn threshold_crossing_does_not_round_down() {
         assert_eq!(threshold_for_balance(201, 1_000, &[0, 10, 20]), None);
@@ -466,12 +539,14 @@ mod tests {
             ],
             recipients: vec![CreditEmailRecipient {
                 user_id: Uuid::new_v4(),
+                claim_token: Uuid::new_v4(),
                 email: "owner@example.com".to_string(),
                 contact_email: None,
                 contact_email_verified_at: None,
             }],
             reconciliations: Mutex::new(Vec::new()),
             released_users: Mutex::new(Vec::new()),
+            snapshot_changes_remaining: Mutex::new(0),
         });
         let limits = Arc::new(PartiallyFailingLimitsRepository {
             failed_organization_id,
@@ -538,6 +613,7 @@ mod tests {
         let placeholder_user_id = Uuid::new_v4();
         let repository = repository(vec![CreditEmailRecipient {
             user_id: placeholder_user_id,
+            claim_token: Uuid::new_v4(),
             email: "alice.near@NEAR".to_string(),
             contact_email: None,
             contact_email_verified_at: None,
@@ -565,6 +641,7 @@ mod tests {
     async fn unresolved_overage_uses_exhausted_threshold() {
         let repository = repository(vec![CreditEmailRecipient {
             user_id: Uuid::new_v4(),
+            claim_token: Uuid::new_v4(),
             email: "owner@example.com".to_string(),
             contact_email: None,
             contact_email_verified_at: None,
@@ -606,6 +683,7 @@ mod tests {
     fn verified_contact_email_allows_placeholder_login() {
         let recipient = CreditEmailRecipient {
             user_id: Uuid::new_v4(),
+            claim_token: Uuid::new_v4(),
             email: "alice.near@NEAR".to_string(),
             contact_email: Some("alice@example.com".to_string()),
             contact_email_verified_at: Some(Utc::now()),

@@ -509,6 +509,7 @@ pub struct CreditEmailOrganization {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreditEmailRecipient {
     pub user_id: Uuid,
+    pub claim_token: Uuid,
     pub email: String,
     pub contact_email: Option<String>,
     pub contact_email_verified_at: Option<DateTime<Utc>>,
@@ -540,12 +541,14 @@ pub trait CreditEmailNotificationRepository: Send + Sync {
         organization_id: Uuid,
         threshold: i16,
         recipient_user_id: Uuid,
+        claim_token: Uuid,
     ) -> anyhow::Result<()>;
     async fn mark_sent(
         &self,
         organization_id: Uuid,
         threshold: i16,
         recipient_user_id: Uuid,
+        claim_token: Uuid,
     ) -> anyhow::Result<()>;
 }
 

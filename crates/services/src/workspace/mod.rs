@@ -65,26 +65,13 @@ impl WorkspaceServiceImpl {
         let Some(base_url) = self.frontend_base_url.as_deref() else {
             return;
         };
-        let members = match async {
-            let member_count = self
-                .organization_service
-                .get_member_count(organization.id.clone(), requester_id.clone())
-                .await
-                .map_err(|error| ("member_count", error))?;
-            self.organization_service
-                .get_members_with_users_paginated(
-                    organization.id.clone(),
-                    requester_id.clone(),
-                    member_count.max(1),
-                    0,
-                )
-                .await
-                .map_err(|error| ("member_list", error))
-        }
-        .await
+        let members = match self
+            .organization_service
+            .get_members_for_api_key_notification(organization.id.clone())
+            .await
         {
             Ok(members) => members,
-            Err((lookup, error)) => {
+            Err(error) => {
                 // Organization errors can include customer data; log only their kind.
                 let error_kind = match error {
                     OrganizationError::NotFound => "not_found",
@@ -97,7 +84,7 @@ impl WorkspaceServiceImpl {
                     OrganizationError::InternalError(_) => "internal_error",
                     OrganizationError::AlreadyMember => "already_member",
                 };
-                tracing::warn!(organization_id = %organization.id.0, workspace_id = %workspace.id.0, api_key_id = %key.id.0, lookup, error_kind, "Failed to load API key change email recipients");
+                tracing::warn!(organization_id = %organization.id.0, workspace_id = %workspace.id.0, api_key_id = %key.id.0, lookup = "member_list", error_kind, "Failed to load API key change email recipients");
                 return;
             }
         };

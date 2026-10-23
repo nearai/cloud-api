@@ -651,6 +651,14 @@ pub trait OrganizationServiceTrait: Send + Sync {
         offset: i64,
     ) -> Result<Vec<OrganizationMemberWithUser>, OrganizationError>;
 
+    /// Internal follow-up to an authorized API key mutation, not a client read API.
+    /// Scope comes from the key's verified workspace organization. Recipient reads
+    /// must not depend on the actor retaining membership after the mutation.
+    async fn get_members_for_api_key_notification(
+        &self,
+        organization_id: OrganizationId,
+    ) -> Result<Vec<OrganizationMemberWithUser>, OrganizationError>;
+
     /// Invite members by email (batch operation)
     async fn invite_members_by_email(
         &self,

@@ -5,7 +5,13 @@ use crate::email::{
     ModelDeprecationEmail, PricingChangeEmail,
 };
 use crate::organization::{MockOrganizationServiceTrait, Organization, OrganizationMemberWithUser};
-use std::{sync::Mutex, time::Duration};
+use std::{
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Mutex,
+    },
+    time::Duration,
+};
 use tokio::sync::{mpsc, Semaphore};
 use tracing::instrument::WithSubscriber;
 use uuid::Uuid;
@@ -157,6 +163,7 @@ fn service(
         settings: None,
     };
     let mut workspaces = MockWorkspaceRepository::new();
+    let notification_organization = organization.id.clone();
     workspaces
         .expect_get_workspace_with_organization()
         .returning(move |_| Ok(Some((workspace.clone(), organization.clone()))));
@@ -188,15 +195,11 @@ fn service(
         .expect_get_user_role()
         .returning(|_, _| Ok(Some(MemberRole::Admin)));
     let notification_count = usize::from(should_notify);
-    let member_count = members.len() as i64;
     organizations
-        .expect_get_member_count()
+        .expect_get_members_for_api_key_notification()
         .times(notification_count)
-        .returning(move |_, _| Ok(member_count));
-    organizations
-        .expect_get_members_with_users_paginated()
-        .times(notification_count)
-        .returning(move |_, _, _, _| Ok(members.clone()));
+        .withf(move |org_id| org_id == &notification_organization)
+        .returning(move |_| Ok(members.clone()));
     WorkspaceServiceImpl::new_with_email_sender(
         Arc::new(workspaces),
         Arc::new(keys),
@@ -471,8 +474,123 @@ async fn updates_map_concurrent_revocation_to_not_found_without_notifying() {
 }
 
 #[tokio::test]
-async fn recipient_lookup_failures_are_logged_without_sensitive_details_or_a_silent_cap() {
-    for count_fails in [false, true] {
+async fn actor_removal_after_authorization_does_not_suppress_notifications() {
+    for operation in 0..3 {
+        let owner = member(MemberRole::Owner, true, "owner@example.com");
+        let admin = member(MemberRole::Admin, true, "admin@example.com");
+        let actor = UserId(Uuid::new_v4());
+        let before = key(actor.clone());
+        let mut after = before.clone();
+        after.is_active = false;
+        after.spend_limit = Some(4_000_000);
+        let (sender, mut receiver) = sender();
+        let mut service = service(
+            &before,
+            &after,
+            true,
+            vec![owner.clone(), admin.clone()],
+            sender,
+            false,
+        );
+        let removed = Arc::new(AtomicBool::new(false));
+        let mut keys = MockApiKeyRepository::new();
+        let existing = before.clone();
+        keys.expect_get_by_id()
+            .times(1)
+            .returning(move |_| Ok(Some(existing.clone())));
+        let removal = removed.clone();
+        let update = ApiKeyUpdate {
+            previous: before.clone(),
+            updated: after.clone(),
+        };
+        keys.expect_update().returning(move |_, _, _, _, _| {
+            removal.store(true, Ordering::SeqCst);
+            Ok(update.clone())
+        });
+        let removal = removed.clone();
+        let update = ApiKeyUpdate {
+            previous: before.clone(),
+            updated: after.clone(),
+        };
+        keys.expect_update_spend_limit().returning(move |_, _| {
+            removal.store(true, Ordering::SeqCst);
+            Ok(update.clone())
+        });
+        let removal = removed.clone();
+        keys.expect_revoke().returning(move |_| {
+            removal.store(true, Ordering::SeqCst);
+            Ok(true)
+        });
+        service.api_key_repository = Arc::new(keys);
+        let mut organizations = MockOrganizationServiceTrait::new();
+        let removal = removed.clone();
+        let expected_actor = actor.clone();
+        organizations
+            .expect_get_user_role()
+            .times(1)
+            .returning(move |_, requester| {
+                assert_eq!(requester, expected_actor);
+                assert!(!removal.load(Ordering::SeqCst));
+                Ok(Some(MemberRole::Member))
+            });
+        let removal = removed.clone();
+        organizations.expect_get_member_count().never();
+        organizations
+            .expect_get_members_with_users_paginated()
+            .never();
+        organizations
+            .expect_get_members_for_api_key_notification()
+            .times(1)
+            .returning(move |_| {
+                assert!(removal.load(Ordering::SeqCst));
+                Ok(vec![owner.clone(), admin.clone()])
+            });
+        service.organization_service = Arc::new(organizations);
+        match operation {
+            0 => {
+                assert!(service
+                    .revoke_api_key(before.workspace_id, before.id, actor)
+                    .await
+                    .unwrap());
+            }
+            1 => {
+                service
+                    .update_api_key_spend_limit(
+                        before.workspace_id,
+                        before.id,
+                        actor,
+                        after.spend_limit,
+                    )
+                    .await
+                    .unwrap();
+            }
+            _ => {
+                service
+                    .update_api_key(
+                        before.workspace_id,
+                        before.id,
+                        actor,
+                        None,
+                        None,
+                        Some(after.spend_limit),
+                        Some(false),
+                    )
+                    .await
+                    .unwrap();
+            }
+        }
+        for expected in ["owner@example.com", "admin@example.com"] {
+            let email = receive(&mut receiver).await;
+            assert_eq!(email.recipient_email, expected);
+            assert_eq!(email.actor_name, None);
+        }
+        assert!(receiver.try_recv().is_err());
+    }
+}
+
+#[tokio::test]
+async fn recipient_lookup_failures_are_logged_without_sensitive_details() {
+    for unauthorized in [false, true] {
         let owner = member(MemberRole::Owner, true, "owner@example.com");
         let requester = owner.user_id.clone();
         let before = key(requester.clone());
@@ -483,26 +601,21 @@ async fn recipient_lookup_failures_are_logged_without_sensitive_details_or_a_sil
             .expect_get_user_role()
             .times(1)
             .returning(|_, _| Ok(Some(MemberRole::Owner)));
-        let sensitive_error = || {
-            OrganizationError::InternalError(
-                "private@example.com sk-live-secret private-org-name".into(),
-            )
-        };
-        organizations
-            .expect_get_member_count()
-            .times(1)
-            .returning(move |_, _| {
-                if count_fails {
-                    Err(sensitive_error())
-                } else {
-                    Ok(1501)
-                }
-            });
+        organizations.expect_get_member_count().never();
         organizations
             .expect_get_members_with_users_paginated()
-            .times(usize::from(!count_fails))
-            .withf(|_, _, limit, offset| *limit == 1501 && *offset == 0)
-            .returning(move |_, _, _, _| Err(sensitive_error()));
+            .never();
+        organizations
+            .expect_get_members_for_api_key_notification()
+            .times(1)
+            .returning(move |_| {
+                let sensitive = "private@example.com sk-live-secret private-org-name".into();
+                Err(if unauthorized {
+                    OrganizationError::Unauthorized(sensitive)
+                } else {
+                    OrganizationError::InternalError(sensitive)
+                })
+            });
         service.organization_service = Arc::new(organizations);
         let logs = Arc::new(Mutex::new(Vec::new()));
         let output = logs.clone();
@@ -524,12 +637,12 @@ async fn recipient_lookup_failures_are_logged_without_sensitive_details_or_a_sil
         let logged = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
         assert!(logged.contains("WARN"));
         assert!(logged.contains("Failed to load API key change email recipients"));
-        assert!(logged.contains(if count_fails {
-            "member_count"
+        assert!(logged.contains("member_list"));
+        assert!(logged.contains(if unauthorized {
+            "unauthorized"
         } else {
-            "member_list"
+            "internal_error"
         }));
-        assert!(logged.contains("internal_error"));
         assert!(logged.contains(&before.workspace_id.0.to_string()));
         assert!(logged.contains(&before.id.0));
         assert!(!logged.contains("private@example.com"));

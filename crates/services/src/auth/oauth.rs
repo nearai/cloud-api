@@ -22,11 +22,32 @@ type ConfiguredClient = oauth2::Client<
     oauth2::EndpointSet,
 >;
 
+fn token_exchange_error<E: std::error::Error + 'static>(
+    error: oauth2::RequestTokenError<E, oauth2::basic::BasicErrorResponse>,
+) -> AuthError {
+    let message = format!("Token exchange failed: {error}");
+    match error {
+        oauth2::RequestTokenError::ServerResponse(response) => match response.error() {
+            oauth2::basic::BasicErrorResponseType::InvalidGrant => AuthError::OAuthError(message),
+            oauth2::basic::BasicErrorResponseType::InvalidClient
+            | oauth2::basic::BasicErrorResponseType::UnauthorizedClient => {
+                AuthError::ConfigError(message)
+            }
+            _ => AuthError::InternalError(message),
+        },
+        oauth2::RequestTokenError::Request(_) => AuthError::NetworkError(message),
+        _ => AuthError::InternalError(message),
+    }
+}
+
 /// OAuth2 authentication manager
 pub struct OAuthManager {
     github_client: Option<ConfiguredClient>,
     google_client: Option<ConfiguredClient>,
     http_client: Client,
+    github_user_url: String,
+    github_emails_url: String,
+    google_user_url: String,
 }
 
 impl OAuthManager {
@@ -42,7 +63,33 @@ impl OAuthManager {
             github_client,
             google_client,
             http_client: Client::new(),
+            github_user_url: "https://api.github.com/user".into(),
+            github_emails_url: "https://api.github.com/user/emails".into(),
+            google_user_url: "https://www.googleapis.com/oauth2/v2/userinfo".into(),
         })
+    }
+
+    #[cfg(feature = "test-mocks")]
+    pub fn with_test_provider_endpoints(mut self, provider: &str, base_url: &str) -> Self {
+        let token_url = TokenUrl::new(format!("{base_url}/token")).unwrap();
+        let auth_url = AuthUrl::new(format!("{base_url}/authorize")).unwrap();
+        match provider {
+            "github" => {
+                self.github_client = self
+                    .github_client
+                    .map(|client| client.set_token_uri(token_url).set_auth_uri(auth_url));
+                self.github_user_url = format!("{base_url}/user");
+                self.github_emails_url = format!("{base_url}/emails");
+            }
+            "google" => {
+                self.google_client = self
+                    .google_client
+                    .map(|client| client.set_token_uri(token_url).set_auth_uri(auth_url));
+                self.google_user_url = format!("{base_url}/user");
+            }
+            _ => panic!("Unsupported test provider"),
+        }
+        self
     }
 
     fn create_github_client(config: OAuthProviderConfig) -> Result<ConfiguredClient, AuthError> {
@@ -140,7 +187,7 @@ impl OAuthManager {
             .exchange_code(AuthorizationCode::new(code))
             .request_async(&self.http_client)
             .await
-            .map_err(|e| AuthError::OAuthError(format!("Token exchange failed: {e}")))?;
+            .map_err(token_exchange_error)?;
 
         let access_token = token.access_token().secret();
 
@@ -148,6 +195,8 @@ impl OAuthManager {
         let user_info = self.fetch_github_user(access_token).await?;
 
         let oauth_info = OAuthUserInfo {
+            email_verified: user_info.email_verified,
+            email_authoritative: user_info.email_verified,
             provider: "github".to_string(),
             provider_user_id: user_info.id.to_string(),
             email: user_info.email.ok_or_else(|| {
@@ -189,7 +238,7 @@ impl OAuthManager {
             .set_pkce_verifier(pkce_verifier)
             .request_async(&self.http_client)
             .await
-            .map_err(|e| AuthError::OAuthError(format!("Token exchange failed: {e}")))?;
+            .map_err(token_exchange_error)?;
 
         let access_token = token.access_token().secret();
 
@@ -197,6 +246,8 @@ impl OAuthManager {
         let user_info = self.fetch_google_user(access_token).await?;
 
         let oauth_info = OAuthUserInfo {
+            email_verified: user_info.email_verified,
+            email_authoritative: user_info.email_is_authoritative(),
             provider: "google".to_string(),
             provider_user_id: user_info.sub.clone(),
             email: user_info.email.clone(),
@@ -222,7 +273,7 @@ impl OAuthManager {
     async fn fetch_github_user(&self, access_token: &str) -> Result<GitHubUser, AuthError> {
         let response = self
             .http_client
-            .get("https://api.github.com/user")
+            .get(&self.github_user_url)
             .header("Authorization", format!("Bearer {access_token}"))
             .header("User-Agent", "cloud-api")
             .send()
@@ -241,11 +292,12 @@ impl OAuthManager {
             .await
             .map_err(|e| AuthError::AuthFailed(format!("Failed to parse GitHub user: {e}")))?;
 
-        // If no public email, fetch from emails endpoint
-        if user.email.is_none() {
+        // The public profile has no email verification flag. Read /user/emails
+        // even for a public email before accepting it for account linking.
+        {
             let emails_response = self
                 .http_client
-                .get("https://api.github.com/user/emails")
+                .get(&self.github_emails_url)
                 .header("Authorization", format!("Bearer {access_token}"))
                 .header("User-Agent", "cloud-api")
                 .send()
@@ -259,11 +311,19 @@ impl OAuthManager {
                     AuthError::AuthFailed(format!("Failed to parse GitHub emails: {e}"))
                 })?;
 
-                // Get primary email
-                if let Some(primary) = emails.iter().find(|e| e.primary) {
-                    user.email = Some(primary.email.clone());
-                } else if let Some(first) = emails.first() {
-                    user.email = Some(first.email.clone());
+                let selected = if let Some(public_email) = user.email.as_ref() {
+                    emails.iter().find(|entry| &entry.email == public_email)
+                } else {
+                    emails
+                        .iter()
+                        .find(|e| e.primary && e.verified)
+                        .or_else(|| emails.iter().find(|e| e.verified))
+                        .or_else(|| emails.iter().find(|e| e.primary))
+                        .or_else(|| emails.first())
+                };
+                if let Some(selected) = selected {
+                    user.email = Some(selected.email.clone());
+                    user.email_verified = selected.verified;
                 }
             }
         }
@@ -277,7 +337,7 @@ impl OAuthManager {
 
         let response = self
             .http_client
-            .get("https://www.googleapis.com/oauth2/v2/userinfo")
+            .get(&self.google_user_url)
             .header("Authorization", format!("Bearer {access_token}"))
             .send()
             .await
@@ -307,6 +367,8 @@ impl OAuthManager {
 struct GitHubUser {
     id: i64,
     email: Option<String>,
+    #[serde(skip)]
+    email_verified: bool,
     #[serde(default)]
     login: String,
     #[serde(default)]
@@ -319,6 +381,8 @@ struct GitHubUser {
 struct GitHubEmail {
     email: String,
     primary: bool,
+    #[serde(default)]
+    verified: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -326,8 +390,128 @@ struct GoogleUser {
     #[serde(alias = "sub", alias = "id")]
     sub: String,
     email: String,
+    #[serde(default, alias = "verified_email")]
+    email_verified: bool,
     #[serde(default)]
     name: Option<String>,
     #[serde(default)]
+    hd: Option<String>,
+    #[serde(default)]
     picture: Option<String>,
+}
+
+impl GoogleUser {
+    // hd comes from the server-fetched userinfo response, never the authorization URL hint.
+    // https://developers.google.com/identity/sign-in/web/backend-auth
+    fn email_is_authoritative(&self) -> bool {
+        self.email_verified
+            && (self
+                .email
+                .rsplit_once('@')
+                .is_some_and(|(_, domain)| domain.eq_ignore_ascii_case("gmail.com"))
+                || self
+                    .hd
+                    .as_deref()
+                    .is_some_and(|domain| !domain.trim().is_empty()))
+    }
+}
+
+#[cfg(test)]
+mod token_exchange_tests {
+    use super::*;
+    use oauth2::{basic::BasicErrorResponse, basic::BasicErrorResponseType, RequestTokenError};
+
+    #[test]
+    fn google_email_authority_requires_verified_gmail_or_hosted_domain() {
+        for (email, hd, verified, expected) in [
+            ("alice@gmail.com", None, true, true),
+            ("alice@GMAIL.COM", None, true, true),
+            ("alice@example.test", Some("example.test"), true, true),
+            ("alice@example.test", None, true, false),
+            ("alice@example.test", Some(""), true, false),
+            ("alice@example.test", Some("  "), true, false),
+            ("alice@gmail.com.evil.test", None, true, false),
+            ("alice@notgmail.com", None, true, false),
+            ("alice@gmail.com", None, false, false),
+            ("alice@example.test", Some("example.test"), false, false),
+        ] {
+            for (subject_key, verified_key) in [("sub", "email_verified"), ("id", "verified_email")]
+            {
+                let user: GoogleUser = serde_json::from_value(serde_json::json!({
+                    subject_key: "subject", "email": email, verified_key: verified, "hd": hd,
+                }))
+                .unwrap();
+                assert_eq!(user.sub, "subject");
+                assert_eq!(user.email_verified, verified);
+                assert_eq!(
+                    user.email_is_authoritative(),
+                    expected,
+                    "{email} {hd:?} {verified_key}"
+                );
+            }
+        }
+        let missing: GoogleUser = serde_json::from_value(serde_json::json!({
+            "id":"subject", "email":"alice@gmail.com", "hd":"example.test"
+        }))
+        .unwrap();
+        assert!(!missing.email_is_authoritative());
+    }
+
+    #[test]
+    fn invalid_grant_is_an_authorization_failure() {
+        let error =
+            RequestTokenError::<std::io::Error, _>::ServerResponse(BasicErrorResponse::new(
+                BasicErrorResponseType::InvalidGrant,
+                Some("expired authorization code".into()),
+                None,
+            ));
+        assert!(matches!(
+            token_exchange_error(error),
+            AuthError::OAuthError(_)
+        ));
+    }
+
+    #[test]
+    fn configuration_and_provider_faults_are_not_authorization_failures() {
+        for kind in [
+            BasicErrorResponseType::InvalidClient,
+            BasicErrorResponseType::UnauthorizedClient,
+        ] {
+            let error = RequestTokenError::<std::io::Error, _>::ServerResponse(
+                BasicErrorResponse::new(kind, None, None),
+            );
+            assert!(matches!(
+                token_exchange_error(error),
+                AuthError::ConfigError(_)
+            ));
+        }
+        let error =
+            RequestTokenError::<std::io::Error, _>::ServerResponse(BasicErrorResponse::new(
+                BasicErrorResponseType::Extension("server_error".into()),
+                None,
+                None,
+            ));
+        assert!(matches!(
+            token_exchange_error(error),
+            AuthError::InternalError(_)
+        ));
+        let error = RequestTokenError::<std::io::Error, BasicErrorResponse>::Other(
+            "unexpected provider response".into(),
+        );
+        assert!(matches!(
+            token_exchange_error(error),
+            AuthError::InternalError(_)
+        ));
+    }
+
+    #[test]
+    fn transport_failure_stays_a_network_error() {
+        let error = RequestTokenError::<_, BasicErrorResponse>::Request(std::io::Error::other(
+            "connection failed",
+        ));
+        assert!(matches!(
+            token_exchange_error(error),
+            AuthError::NetworkError(_)
+        ));
+    }
 }

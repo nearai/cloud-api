@@ -7,8 +7,8 @@
 //! - Tool call support
 
 use crate::{
-    chunk_builder::ChunkContext, ChatMessage, CompletionError, FunctionCall, MessageRole,
-    SSEEventParser, StreamChunk, TokenUsage, ToolCall, ToolDefinition,
+    chunk_builder::ChunkContext, models::CompletionTokensDetails, ChatMessage, CompletionError,
+    FunctionCall, MessageRole, SSEEventParser, StreamChunk, TokenUsage, ToolCall, ToolDefinition,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -248,15 +248,69 @@ pub struct GeminiCandidate {
 }
 
 /// Gemini usage metadata
+///
+/// Google's `totalTokenCount` is the sum of four separately reported counts:
+/// `promptTokenCount`, `toolUsePromptTokenCount`, `candidatesTokenCount` and
+/// `thoughtsTokenCount`. We read the parts and rebuild the total from them
+/// (see `to_token_usage`), so `totalTokenCount` itself is not parsed.
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct GeminiUsageMetadata {
+    /// Prompt size, including the cached part (`cached_content_token_count`).
     #[serde(default)]
     pub prompt_token_count: i32,
+    /// Visible output only. Thinking is reported in `thoughts_token_count`.
     #[serde(default)]
     pub candidates_token_count: i32,
+    /// Thinking tokens. Google bills them at the output rate, on top of
+    /// `candidates_token_count`. Absent on models that do not think.
     #[serde(default)]
-    pub total_token_count: i32,
+    pub thoughts_token_count: i32,
+    /// Prompt tokens served from Google's cache (explicit or implicit). A
+    /// subset of `prompt_token_count`, not an addition to it.
+    #[serde(default)]
+    pub cached_content_token_count: i32,
+    /// Input tokens Google's built-in tools (search, code execution, URL
+    /// context) feed back to the model. Reported outside `prompt_token_count`
+    /// and billed as input. This backend only sends function declarations, so
+    /// the field is absent today.
+    #[serde(default)]
+    pub tool_use_prompt_token_count: i32,
+}
+
+impl GeminiUsageMetadata {
+    /// Convert to the OpenAI-shaped usage that billing reads.
+    ///
+    /// - `prompt_tokens` = prompt + tool-use prompt
+    /// - `completion_tokens` = candidates + thoughts
+    /// - `total_tokens` = `prompt_tokens` + `completion_tokens`, which equals
+    ///   Google's `totalTokenCount`
+    ///
+    /// Thinking is also exposed as `completion_tokens_details.reasoning_tokens`
+    /// and cache hits as `prompt_tokens_details.cached_tokens`; both are
+    /// omitted when zero. A negative count is treated as zero.
+    pub fn to_token_usage(&self) -> TokenUsage {
+        let thoughts = self.thoughts_token_count.max(0);
+        let cached = self.cached_content_token_count.max(0);
+        let prompt_tokens = self
+            .prompt_token_count
+            .max(0)
+            .saturating_add(self.tool_use_prompt_token_count.max(0));
+        let completion_tokens = self.candidates_token_count.max(0).saturating_add(thoughts);
+
+        TokenUsage {
+            prompt_tokens,
+            completion_tokens,
+            total_tokens: prompt_tokens.saturating_add(completion_tokens),
+            prompt_tokens_details: (cached > 0)
+                .then(|| serde_json::json!({ "cached_tokens": cached })),
+            completion_tokens_details: (thoughts > 0).then(|| CompletionTokensDetails {
+                reasoning_tokens: Some(thoughts),
+                ..Default::default()
+            }),
+            reasoning_tokens: None,
+        }
+    }
 }
 
 /// Gemini response format
@@ -264,8 +318,10 @@ pub struct GeminiUsageMetadata {
 #[serde(rename_all = "camelCase")]
 pub struct GeminiResponse {
     pub candidates: Vec<GeminiCandidate>,
+    /// `None` when the event carried no `usageMetadata`, which is not the
+    /// same as zero usage.
     #[serde(default)]
-    pub usage_metadata: GeminiUsageMetadata,
+    pub usage_metadata: Option<GeminiUsageMetadata>,
 }
 
 // =============================================================================
@@ -932,8 +988,9 @@ pub struct GeminiParserState {
     pub request_id: String,
     pub created: i64,
     pub chunk_index: i64,
-    pub prompt_tokens: i32,
-    pub completion_tokens: i32,
+    /// Usage from the latest event that reported it. Gemini restates
+    /// cumulative counts, so the last report is the total for the request.
+    pub usage: TokenUsage,
 }
 
 impl GeminiParserState {
@@ -943,8 +1000,7 @@ impl GeminiParserState {
             request_id: format!("gemini-{}", Uuid::new_v4()),
             created: chrono::Utc::now().timestamp(),
             chunk_index: 0,
-            prompt_tokens: 0,
-            completion_tokens: 0,
+            usage: TokenUsage::default(),
         }
     }
 
@@ -973,9 +1029,11 @@ impl SSEEventParser for GeminiEventParser {
         let candidate = &response.candidates[0];
         let ctx = state.chunk_context();
 
-        // Update token counts
-        state.prompt_tokens = response.usage_metadata.prompt_token_count;
-        state.completion_tokens = response.usage_metadata.candidates_token_count;
+        // Update token counts. An event without `usageMetadata` keeps the last
+        // reported counts; resetting them would bill the request as 0 tokens.
+        if let Some(usage_metadata) = &response.usage_metadata {
+            state.usage = usage_metadata.to_token_usage();
+        }
 
         let is_first = state.chunk_index == 0;
         state.chunk_index += 1;
@@ -1003,13 +1061,7 @@ impl SSEEventParser for GeminiEventParser {
             ctx.tool_calls_chunk(
                 tool_calls.unwrap(),
                 finish_reason,
-                Some(TokenUsage {
-                    prompt_tokens: state.prompt_tokens,
-                    completion_tokens: state.completion_tokens,
-                    total_tokens: state.prompt_tokens + state.completion_tokens,
-                    prompt_tokens_details: None,
-                    ..Default::default()
-                }),
+                Some(state.usage.clone()),
             )
         } else if is_first {
             // First chunk with role and possibly text
@@ -1020,38 +1072,17 @@ impl SSEEventParser for GeminiEventParser {
                 }
             }
             chunk.choices[0].finish_reason = finish_reason;
-            chunk.usage = Some(TokenUsage {
-                prompt_tokens: state.prompt_tokens,
-                completion_tokens: state.completion_tokens,
-                total_tokens: state.prompt_tokens + state.completion_tokens,
-                prompt_tokens_details: None,
-                ..Default::default()
-            });
+            chunk.usage = Some(state.usage.clone());
             chunk
         } else if let Some(t) = text {
             // Subsequent text chunk
             let mut chunk = ctx.text_chunk(t);
             chunk.choices[0].finish_reason = finish_reason;
-            chunk.usage = Some(TokenUsage {
-                prompt_tokens: state.prompt_tokens,
-                completion_tokens: state.completion_tokens,
-                total_tokens: state.prompt_tokens + state.completion_tokens,
-                prompt_tokens_details: None,
-                ..Default::default()
-            });
+            chunk.usage = Some(state.usage.clone());
             chunk
         } else {
             // Empty chunk with just finish reason
-            ctx.finish_chunk(
-                finish_reason,
-                TokenUsage {
-                    prompt_tokens: state.prompt_tokens,
-                    completion_tokens: state.completion_tokens,
-                    total_tokens: state.prompt_tokens + state.completion_tokens,
-                    prompt_tokens_details: None,
-                    ..Default::default()
-                },
-            )
+            ctx.finish_chunk(finish_reason, state.usage.clone())
         };
 
         Ok(Some(StreamChunk::Chat(chunk)))
@@ -2081,5 +2112,288 @@ mod tests {
 
         let response: GeminiResponse = serde_json::from_str(json).unwrap();
         assert!(response.candidates[0].content.is_none());
+    }
+
+    // Usage accounting. Google reports thinking outside `candidatesTokenCount`
+    // and bills it at the output rate, so `completion_tokens` has to carry
+    // both or we pay Google for tokens we never charge for.
+
+    fn token_usage(json: serde_json::Value) -> TokenUsage {
+        serde_json::from_value::<GeminiUsageMetadata>(json)
+            .unwrap()
+            .to_token_usage()
+    }
+
+    /// Counts from a `gemini-2.5-pro` response to a short arithmetic prompt:
+    /// 26 visible tokens, 2,706 thinking tokens.
+    #[test]
+    fn test_usage_counts_thinking_as_completion_tokens() {
+        let usage = token_usage(serde_json::json!({
+            "promptTokenCount": 71,
+            "candidatesTokenCount": 26,
+            "thoughtsTokenCount": 2706,
+            "totalTokenCount": 2803
+        }));
+
+        assert_eq!(usage.prompt_tokens, 71);
+        assert_eq!(usage.completion_tokens, 26 + 2706);
+        assert_eq!(usage.total_tokens, 2803);
+        assert_eq!(usage.reasoning_tokens(), Some(2706));
+        assert_eq!(usage.cached_tokens(), 0);
+        assert!(usage.prompt_tokens_details.is_none());
+    }
+
+    /// `promptTokenCount` already includes the cached part, so the cached
+    /// count is reported as a subset and never added on top.
+    #[test]
+    fn test_usage_reports_cached_tokens_without_double_counting() {
+        let usage = token_usage(serde_json::json!({
+            "promptTokenCount": 5000,
+            "cachedContentTokenCount": 4096,
+            "candidatesTokenCount": 10,
+            "totalTokenCount": 5010
+        }));
+
+        assert_eq!(usage.prompt_tokens, 5000);
+        assert_eq!(usage.cached_tokens(), 4096);
+        assert_eq!(usage.completion_tokens, 10);
+        assert_eq!(usage.total_tokens, 5010);
+        assert!(usage.completion_tokens_details.is_none());
+    }
+
+    #[test]
+    fn test_usage_with_thinking_and_cache_together() {
+        let usage = token_usage(serde_json::json!({
+            "promptTokenCount": 5000,
+            "cachedContentTokenCount": 4096,
+            "candidatesTokenCount": 10,
+            "thoughtsTokenCount": 300,
+            "totalTokenCount": 5310
+        }));
+
+        assert_eq!(usage.prompt_tokens, 5000);
+        assert_eq!(usage.cached_tokens(), 4096);
+        assert_eq!(usage.completion_tokens, 310);
+        assert_eq!(usage.total_tokens, 5310);
+        assert_eq!(usage.reasoning_tokens(), Some(300));
+    }
+
+    /// A model that neither thinks nor hits the cache: same numbers as
+    /// before, and no detail objects on the wire.
+    #[test]
+    fn test_usage_without_thinking_or_cache_is_unchanged() {
+        let usage = token_usage(serde_json::json!({
+            "promptTokenCount": 10,
+            "candidatesTokenCount": 5,
+            "totalTokenCount": 15
+        }));
+
+        assert_eq!(
+            serde_json::to_value(&usage).unwrap(),
+            serde_json::json!({
+                "prompt_tokens": 10,
+                "completion_tokens": 5,
+                "total_tokens": 15
+            })
+        );
+
+        // Explicit zeros behave like absent fields.
+        let zeros = token_usage(serde_json::json!({
+            "promptTokenCount": 10,
+            "candidatesTokenCount": 5,
+            "thoughtsTokenCount": 0,
+            "cachedContentTokenCount": 0,
+            "totalTokenCount": 15
+        }));
+        assert!(zeros.prompt_tokens_details.is_none());
+        assert!(zeros.completion_tokens_details.is_none());
+    }
+
+    /// Thinking cut off by `MAX_TOKENS` before any visible output: Google
+    /// omits `candidatesTokenCount` but still bills the thoughts.
+    #[test]
+    fn test_usage_bills_thinking_when_no_visible_output() {
+        let usage = token_usage(serde_json::json!({
+            "promptTokenCount": 8,
+            "thoughtsTokenCount": 120,
+            "totalTokenCount": 128
+        }));
+
+        assert_eq!(usage.completion_tokens, 120);
+        assert_eq!(usage.total_tokens, 128);
+        assert_eq!(usage.reasoning_tokens(), Some(120));
+    }
+
+    #[test]
+    fn test_usage_treats_negative_counts_as_zero() {
+        let usage = token_usage(serde_json::json!({
+            "promptTokenCount": -1,
+            "cachedContentTokenCount": -2,
+            "candidatesTokenCount": -3,
+            "thoughtsTokenCount": -4,
+            "toolUsePromptTokenCount": -5
+        }));
+
+        assert_eq!(usage.prompt_tokens, 0);
+        assert_eq!(usage.completion_tokens, 0);
+        assert_eq!(usage.total_tokens, 0);
+        assert!(usage.prompt_tokens_details.is_none());
+        assert!(usage.completion_tokens_details.is_none());
+    }
+
+    /// Tool-use prompt tokens sit outside `promptTokenCount` and are billed
+    /// as input. Counts from Google's URL-context example.
+    #[test]
+    fn test_usage_adds_tool_use_prompt_tokens_to_prompt() {
+        let usage = token_usage(serde_json::json!({
+            "promptTokenCount": 27,
+            "toolUsePromptTokenCount": 10309,
+            "candidatesTokenCount": 45,
+            "thoughtsTokenCount": 31,
+            "totalTokenCount": 10412
+        }));
+
+        assert_eq!(usage.prompt_tokens, 27 + 10309);
+        assert_eq!(usage.completion_tokens, 45 + 31);
+        assert_eq!(usage.total_tokens, 10412);
+    }
+
+    fn parse_usage(state: &mut GeminiParserState, event: serde_json::Value) -> TokenUsage {
+        let chunk = GeminiEventParser::parse_event(state, &event.to_string())
+            .unwrap()
+            .expect("event should produce a chunk");
+        let StreamChunk::Chat(chat) = chunk else {
+            panic!("expected a chat chunk");
+        };
+        chat.usage.expect("chunk should carry usage")
+    }
+
+    /// Streaming restates cumulative usage on every event. The final chunk,
+    /// which is what billing records, carries candidates + thoughts.
+    #[test]
+    fn test_streaming_usage_counts_thinking_and_cache() {
+        let mut state = GeminiParserState::new("gemini-2.5-pro".to_string());
+
+        let first = parse_usage(
+            &mut state,
+            serde_json::json!({
+                "candidates": [{"content": {"role": "model", "parts": [{"text": "The"}]}}],
+                "usageMetadata": {
+                    "promptTokenCount": 5000,
+                    "cachedContentTokenCount": 4096,
+                    "candidatesTokenCount": 1,
+                    "thoughtsTokenCount": 2706,
+                    "totalTokenCount": 7707
+                }
+            }),
+        );
+        // An interrupted stream is billed from the last usage seen, so the
+        // thinking has to be counted from the first chunk on.
+        assert_eq!(first.completion_tokens, 1 + 2706);
+
+        let last = parse_usage(
+            &mut state,
+            serde_json::json!({
+                "candidates": [{
+                    "content": {"role": "model", "parts": [{"text": " answer is 42."}]},
+                    "finishReason": "STOP"
+                }],
+                "usageMetadata": {
+                    "promptTokenCount": 5000,
+                    "cachedContentTokenCount": 4096,
+                    "candidatesTokenCount": 26,
+                    "thoughtsTokenCount": 2706,
+                    "totalTokenCount": 7732
+                }
+            }),
+        );
+        assert_eq!(last.prompt_tokens, 5000);
+        assert_eq!(last.cached_tokens(), 4096);
+        assert_eq!(last.completion_tokens, 26 + 2706);
+        assert_eq!(last.total_tokens, 7732);
+        assert_eq!(last.reasoning_tokens(), Some(2706));
+    }
+
+    #[test]
+    fn test_streaming_usage_without_thinking_or_cache_is_unchanged() {
+        let mut state = GeminiParserState::new("gemini-2.0-flash".to_string());
+        let usage = parse_usage(
+            &mut state,
+            serde_json::json!({
+                "candidates": [{
+                    "content": {"role": "model", "parts": [{"text": "Hello"}]},
+                    "finishReason": "STOP"
+                }],
+                "usageMetadata": {
+                    "promptTokenCount": 10,
+                    "candidatesTokenCount": 1,
+                    "totalTokenCount": 11
+                }
+            }),
+        );
+
+        assert_eq!(usage.prompt_tokens, 10);
+        assert_eq!(usage.completion_tokens, 1);
+        assert_eq!(usage.total_tokens, 11);
+        assert!(usage.prompt_tokens_details.is_none());
+        assert!(usage.completion_tokens_details.is_none());
+    }
+
+    /// Billing records the usage on the last chunk, so an event that omits
+    /// `usageMetadata` must not reset the counts reported before it.
+    #[test]
+    fn test_streaming_event_without_usage_keeps_last_counts() {
+        let mut state = GeminiParserState::new("gemini-2.5-pro".to_string());
+        parse_usage(
+            &mut state,
+            serde_json::json!({
+                "candidates": [{"content": {"role": "model", "parts": [{"text": "4"}]}}],
+                "usageMetadata": {
+                    "promptTokenCount": 71,
+                    "candidatesTokenCount": 26,
+                    "thoughtsTokenCount": 2706,
+                    "totalTokenCount": 2803
+                }
+            }),
+        );
+
+        let last = parse_usage(
+            &mut state,
+            serde_json::json!({
+                "candidates": [{
+                    "content": {"role": "model", "parts": [{"text": "2"}]},
+                    "finishReason": "STOP"
+                }]
+            }),
+        );
+        assert_eq!(last.prompt_tokens, 71);
+        assert_eq!(last.completion_tokens, 2732);
+        assert_eq!(last.total_tokens, 2803);
+    }
+
+    /// Tool calls go out on their own chunk type; it must carry the same usage.
+    #[test]
+    fn test_streaming_tool_call_chunk_counts_thinking() {
+        let mut state = GeminiParserState::new("gemini-2.5-pro".to_string());
+        let usage = parse_usage(
+            &mut state,
+            serde_json::json!({
+                "candidates": [{
+                    "content": {"role": "model", "parts": [{
+                        "functionCall": {"name": "web_search", "args": {"query": "weather"}}
+                    }]},
+                    "finishReason": "STOP"
+                }],
+                "usageMetadata": {
+                    "promptTokenCount": 40,
+                    "candidatesTokenCount": 12,
+                    "thoughtsTokenCount": 500,
+                    "totalTokenCount": 552
+                }
+            }),
+        );
+
+        assert_eq!(usage.completion_tokens, 512);
+        assert_eq!(usage.total_tokens, 552);
     }
 }

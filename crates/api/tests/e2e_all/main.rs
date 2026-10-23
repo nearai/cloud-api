@@ -42,6 +42,7 @@ mod auto_redact;
 mod auto_redact_adversarial;
 mod backend_output_limits;
 mod billing_and_models;
+mod billing_record_characterization;
 mod body_hash_limit;
 mod chat_encryption;
 mod check_api_key;
@@ -74,8 +75,10 @@ mod message_metadata;
 mod model_alias_transparency;
 mod model_deprecation_headers;
 mod model_history_test;
+mod model_pricing_notices;
 mod multiturn_tools;
 mod near_auth;
+mod oauth_account_linking;
 mod oauth_frontend_callback;
 mod openai_tiered_pricing;
 mod openrouter_compat;
@@ -83,12 +86,14 @@ mod openrouter_params;
 mod org_system_prompt;
 mod organization_deletion;
 mod organization_membership_order;
+mod organization_model_access;
 mod organization_priority;
 mod organization_usage_discount;
 mod pagination_validation;
 mod patroni_failover;
 mod privacy_classify;
 mod privacy_redact;
+mod privacy_settlement;
 mod provider_errors;
 mod reasoning;
 mod reporting_usage;
@@ -191,3 +196,5 @@ fn no_proxy_with_loopback() -> String {
 
     entries.join(",")
 }
+
+mod credit_transfers;

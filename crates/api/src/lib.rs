@@ -227,7 +227,7 @@ pub fn init_auth_services(database: Arc<Database>, config: &ApiConfig) -> AuthCo
             organization_repo as Arc<dyn services::organization::ports::OrganizationRepository>,
             workspace_repository_for_auth,
             organization_service.clone(),
-            config.auth.require_session_bound_access_tokens,
+            &config.auth,
         ))
     };
 
@@ -324,7 +324,7 @@ pub async fn init_domain_services(
     organization_service: Arc<dyn services::organization::OrganizationServiceTrait + Send + Sync>,
     metrics_service: Arc<dyn services::metrics::MetricsServiceTrait>,
 ) -> DomainServices {
-    let inference_provider_pool =
+    let (inference_provider_pool, admin_settings) =
         init_inference_providers(database.clone(), config, metrics_service.clone()).await;
     init_domain_services_with_pool(
         database,
@@ -332,18 +332,25 @@ pub async fn init_domain_services(
         organization_service,
         inference_provider_pool,
         metrics_service,
+        Some(admin_settings),
     )
     .await
 }
 
 /// Initialize domain services with a provided inference provider pool
-/// This allows tests to inject mock providers without changing core implementations
+/// This allows tests to inject mock providers without changing core implementations.
+///
+/// `admin_settings` is the already-started service from
+/// [`init_inference_providers`], whose consumers were registered after it
+/// loaded. `None` (the test harnesses, which have no such consumers) builds
+/// and starts an equivalent service here against the pool's handles.
 pub async fn init_domain_services_with_pool(
     database: Arc<Database>,
     config: &ApiConfig,
     organization_service: Arc<dyn services::organization::OrganizationServiceTrait + Send + Sync>,
     inference_provider_pool: Arc<services::inference_provider_pool::InferenceProviderPool>,
     metrics_service: Arc<dyn services::metrics::MetricsServiceTrait>,
+    admin_settings: Option<Arc<services::admin_settings::AdminSettingsService>>,
 ) -> DomainServices {
     let database_encryption_key = database::field_encryption::parse_key(
         &config.database_encryption_key,
@@ -399,12 +406,21 @@ pub async fn init_domain_services_with_pool(
         database::repositories::OrganizationUsageRepository::new(database.pool().clone()),
     ) as Arc<dyn services::usage::UsageRepository>;
 
+    // Create models service. It owns the model-resolve cache (models and
+    // access decisions on unlisted models) that the attestation and completion
+    // services below share, so its invalidation reaches all three.
+    let models_service = Arc::new(services::models::ModelsServiceImpl::new(
+        inference_provider_pool.clone(),
+        models_repo.clone(),
+    ));
+
     // Create attestation service
     let attestation_service = Arc::new(
         services::attestation::AttestationService::init(
             attestation_repo,
             inference_provider_pool.clone(),
             models_repo.clone(),
+            models_service.model_resolve_cache(),
             metrics_service.clone(),
             usage_repository_for_attestation,
             config.ita.clone(),
@@ -412,12 +428,6 @@ pub async fn init_domain_services_with_pool(
         .await
         .unwrap(),
     );
-
-    // Create models service
-    let models_service = Arc::new(services::models::ModelsServiceImpl::new(
-        inference_provider_pool.clone(),
-        models_repo.clone(),
-    ));
 
     // Prepare repositories for usage service (will be created after workspace service)
     let usage_repository = Arc::new(
@@ -630,16 +640,23 @@ pub async fn init_domain_services_with_pool(
         .with_binding(staking_binding),
     );
 
-    // Admin settings (placement tuning today): load into the pool's tuning
-    // handle now, then every 10 minutes. Placement off leaves it unused.
-    let admin_settings_service = Arc::new(services::admin_settings::AdminSettingsService::new(
-        Arc::new(
-            database::repositories::PostgresAdminSettingsRepository::new(database.pool().clone()),
-        ),
-        inference_provider_pool.placement_tuning(),
-        inference_provider_pool.attested_3p_disabled(),
-    ));
-    admin_settings_service.clone().start().await;
+    // Admin settings: the production path builds and starts them in
+    // `init_inference_providers`, before their consumers register.
+    let admin_settings_service = match admin_settings {
+        Some(service) => service,
+        None => {
+            build_admin_settings(
+                Arc::new(
+                    database::repositories::PostgresAdminSettingsRepository::new(
+                        database.pool().clone(),
+                    ),
+                ),
+                &inference_provider_pool,
+                new_tinfoil_trust_handle(),
+            )
+            .await
+        }
+    };
 
     DomainServices {
         conversation_service,
@@ -682,6 +699,7 @@ pub async fn init_domain_services_with_mcp_factory(
         organization_service.clone(),
         inference_provider_pool.clone(),
         metrics_service.clone(),
+        None,
     )
     .await;
 
@@ -760,6 +778,7 @@ pub async fn init_domain_services_with_pool_and_search_providers(
         organization_service.clone(),
         inference_provider_pool.clone(),
         metrics_service,
+        None,
     )
     .await;
 
@@ -851,7 +870,10 @@ pub async fn init_inference_providers(
     database: Arc<Database>,
     config: &ApiConfig,
     metrics_service: Arc<dyn services::metrics::MetricsServiceTrait>,
-) -> Arc<services::inference_provider_pool::InferenceProviderPool> {
+) -> (
+    Arc<services::inference_provider_pool::InferenceProviderPool>,
+    Arc<services::admin_settings::AdminSettingsService>,
+) {
     let api_key = config.inference_api_key.clone();
 
     let pool = Arc::new(
@@ -862,6 +884,20 @@ pub async fn init_inference_providers(
     );
     pool.set_metrics_service(metrics_service.clone());
     install_placement(&pool, &config.placement);
+
+    // Runtime settings load BEFORE their consumers register, so a stored
+    // setting (e.g. `tinfoil_trust.router_sigstore = false`) governs the very
+    // first verification. A store that is down leaves the fail-closed initial
+    // value until the retried load succeeds.
+    let tinfoil_trust = new_tinfoil_trust_handle();
+    let admin_settings = build_admin_settings(
+        Arc::new(
+            database::repositories::PostgresAdminSettingsRepository::new(database.pool().clone()),
+        ),
+        &pool,
+        tinfoil_trust.clone(),
+    )
+    .await;
 
     let models_repo = Arc::new(database::repositories::ModelRepository::new(
         database.pool().clone(),
@@ -912,11 +948,46 @@ pub async fn init_inference_providers(
         &pool,
         &models_repo,
         &config.external_providers,
+        tinfoil_trust,
         metrics_service,
     )
     .await;
 
-    pool
+    (pool, admin_settings)
+}
+
+/// The Tinfoil trust handle before any stored row is applied: version 0 with
+/// `router_sigstore` and admin model pins off, so both fail closed until the stored
+/// value has loaded.
+fn new_tinfoil_trust_handle() -> services::attestation::tinfoil_trust::TinfoilTrustHandle {
+    Arc::new(arc_swap::ArcSwap::from_pointee(
+        services::admin_settings::Versioned {
+            version: 0,
+            value: services::attestation::tinfoil_trust::TinfoilTrust::fail_closed_initial(),
+        },
+    ))
+}
+
+/// Builds the admin settings service with every key registered in listing
+/// order (`placement`, `attested_3p`, `tinfoil_trust`), each publishing into
+/// its owner's handle, then loads once and starts the periodic reload. A
+/// failing store keeps the defaults and never panics.
+pub(crate) async fn build_admin_settings(
+    repository: Arc<dyn services::admin_settings::AdminSettingsRepository>,
+    pool: &services::inference_provider_pool::InferenceProviderPool,
+    tinfoil_trust: services::attestation::tinfoil_trust::TinfoilTrustHandle,
+) -> Arc<services::admin_settings::AdminSettingsService> {
+    use services::admin_settings::{AdminSettingsService, Attested3pKey, PlacementKey};
+    use services::attestation::tinfoil_trust::TinfoilTrustKey;
+    let service = Arc::new(
+        AdminSettingsService::builder(repository)
+            .register::<PlacementKey>(pool.placement_tuning())
+            .register::<Attested3pKey>(pool.attested_3p_disabled())
+            .register::<TinfoilTrustKey>(tinfoil_trust)
+            .build(),
+    );
+    service.clone().start().await;
+    service
 }
 
 /// Initialize inference provider pool with mock providers for testing
@@ -1020,10 +1091,14 @@ pub fn is_origin_allowed(origin_str: &str, cors_config: &config::CorsConfig) -> 
     }
 
     if origin_str.starts_with("https://")
-        && cors_config
-            .wildcard_suffixes
-            .iter()
-            .any(|suffix| origin_str.ends_with(suffix))
+        && cors_config.wildcard_suffixes.iter().any(|suffix| {
+            // Config parsing adds a dot to bare domain suffixes. Enforce
+            // that boundary here too for callers constructing CorsConfig.
+            !suffix.is_empty()
+                && origin_str.strip_suffix(suffix).is_some_and(|prefix| {
+                    suffix.starts_with('.') || suffix.starts_with('-') || prefix.ends_with('.')
+                })
+        })
     {
         return true;
     }
@@ -1192,6 +1267,15 @@ pub fn build_app_with_config_and_options(
         &auth_components.auth_state_middleware,
     );
 
+    let organization_credit_service = build_organization_credit_service(&database, &config);
+    let transfer_routes = crate::routes::credit_transfers::routes(
+        organization_credit_service.clone(),
+        auth_components.auth_state_middleware.clone(),
+    );
+    let organization_credential_routes = crate::routes::organization_credentials::routes(
+        organization_credit_service,
+        auth_components.auth_state_middleware.clone(),
+    );
     let management_routes = build_management_router(
         app_state.clone(),
         auth_components.auth_state_middleware.clone(),
@@ -1200,8 +1284,11 @@ pub fn build_app_with_config_and_options(
     let workspace_routes =
         build_workspace_routes(app_state.clone(), &auth_components.auth_state_middleware);
 
-    let attestation_routes =
-        build_attestation_routes(app_state.clone(), &auth_components.auth_state_middleware);
+    let attestation_routes = build_attestation_routes(
+        app_state.clone(),
+        &auth_components.auth_state_middleware,
+        domain_services.admin_settings_service.clone(),
+    );
 
     let model_routes = build_model_routes(domain_services.models_service.clone());
 
@@ -1308,6 +1395,8 @@ pub fn build_app_with_config_and_options(
                 .merge(unsupported_openai_routes)
                 .merge(conversation_routes)
                 .merge(management_routes)
+                .merge(transfer_routes)
+                .merge(organization_credential_routes)
                 .merge(workspace_routes)
                 .merge(attestation_routes.clone())
                 .merge(model_routes)
@@ -1780,14 +1869,22 @@ pub fn build_conversation_routes(
 /// Route classification (nearai/infra#193) — see `routes/attestation.rs` for
 /// the full table:
 /// - `GET /v1/attestation/report` and `GET /v1/signature/{chat_id}` require an
-///   API key (`auth_middleware_with_api_key`). The middleware validates the key
-///   and confirms its workspace and organization remain active (rejecting
-///   missing/invalid/expired/deactivated credentials with 401); like
-///   the signature route, report retrieval is non-billable — no usage or
-///   billing records are created.
-/// - `GET /v1/attestation/ita-token` is deliberately public; the rationale is
-///   documented on `build_public_attestation_routes`.
-pub fn build_attestation_routes(app_state: AppState, auth_state_middleware: &AuthState) -> Router {
+///   API key (`auth_middleware_with_workspace_context`). The middleware
+///   validates the key and confirms its workspace and organization remain
+///   active (rejecting missing/invalid/expired/deactivated credentials with
+///   401); like the signature route, report retrieval is non-billable — no
+///   usage or billing records are created. It is the same check as
+///   `auth_middleware_with_api_key`, and it also hands the handler the key's
+///   organization: the report route needs it to decide whether the caller
+///   may ask about an unlisted model.
+/// - `GET /v1/attestation/ita-token` and `GET /v1/attestation/pins` are
+///   deliberately public; the rationale is documented on
+///   `build_public_attestation_routes`.
+pub fn build_attestation_routes(
+    app_state: AppState,
+    auth_state_middleware: &AuthState,
+    admin_settings: Arc<services::admin_settings::AdminSettingsService>,
+) -> Router {
     let attestation_route_state = attestation::AttestationRouteState::from(app_state);
     let authenticated_routes = Router::new()
         .route("/attestation/report", get(get_attestation_report))
@@ -1795,10 +1892,16 @@ pub fn build_attestation_routes(app_state: AppState, auth_state_middleware: &Aut
         .with_state(attestation_route_state.clone())
         .layer(from_fn_with_state(
             auth_state_middleware.clone(),
-            auth_middleware_with_api_key,
+            middleware::auth::auth_middleware_with_workspace_context,
         ));
 
-    let public_routes = attestation::build_public_attestation_routes(attestation_route_state);
+    // One section per attested backup provider; add new providers here.
+    let pins_sources: Vec<Arc<dyn services::attestation::pins_view::ProviderPinsSource>> = vec![
+        Arc::new(services::attestation::tinfoil_pins_view::TinfoilPinsSource::new(admin_settings)),
+        Arc::new(services::attestation::chutes_pins_view::ChutesPinsSource),
+    ];
+    let public_routes =
+        attestation::build_public_attestation_routes(attestation_route_state, pins_sources);
 
     Router::new()
         .merge(authenticated_routes)
@@ -1993,8 +2096,10 @@ pub fn build_gateway_routes(
 /// `CLOUD_API_USAGE_TOKEN` service secret rather than the standard `sk-…`
 /// API-key middleware. Mounted under `/v1/internal/*` after the global
 /// `/v1` nest. Routes: `POST /internal/usage` (inference-proxy's
-/// service-token usage reporter) and `GET /internal/models` (the model
-/// catalog including unlisted models, for a gateway lane). Further internal
+/// service-token usage reporter), `GET /internal/models` (the model
+/// catalog including unlisted models, for a gateway lane) and
+/// `GET /internal/model-access` (which organizations may use each unlisted
+/// model, for a gateway lane that enforces access itself). Further internal
 /// endpoints can be added here without touching the sk-auth stack.
 pub fn build_internal_routes(app_state: AppState) -> Router {
     Router::new()
@@ -2005,6 +2110,10 @@ pub fn build_internal_routes(app_state: AppState) -> Router {
         .route(
             "/internal/models",
             get(crate::routes::completions::models_internal),
+        )
+        .route(
+            "/internal/model-access",
+            get(crate::routes::completions::model_access_internal),
         )
         .with_state(app_state)
 }
@@ -2263,6 +2372,19 @@ fn build_admin_routes_with_options(
             "/admin/models/{model_name}/deprecation/confirm",
             axum::routing::post(confirm_model_deprecation),
         )
+        .route(
+            "/admin/models/{model_name}/access",
+            axum::routing::get(crate::routes::admin_model_access::get_model_access),
+        )
+        .route(
+            "/admin/models/{model_name}/access/{org_id}",
+            axum::routing::put(crate::routes::admin_model_access::grant_model_access)
+                .delete(crate::routes::admin_model_access::revoke_model_access),
+        )
+        .route(
+            "/admin/organizations/{org_id}/model-access",
+            axum::routing::get(crate::routes::admin_model_access::list_organization_model_access),
+        )
         .route("/admin/services", axum::routing::post(create_service))
         .route("/admin/services/{id}", axum::routing::patch(update_service))
         .route(
@@ -2414,6 +2536,18 @@ fn build_admin_routes_with_options(
         .merge(
             Router::new()
                 .route(
+                    "/admin/organizations/{org_id}/policy",
+                    get(crate::routes::organization_policy::get_policy)
+                        .put(crate::routes::organization_policy::put_policy),
+                )
+                .route("/admin/organizations/{org_id}/credit/transfer/reconciliation", get(crate::routes::credit_transfers::reconciliation))
+                .layer(axum::Extension(
+                    build_organization_credit_service(&database, &config),
+                ))
+        )
+        .merge(
+            Router::new()
+                .route(
                     "/admin/organizations/{org_id}/credit/reconciliations",
                     axum::routing::post(
                         crate::routes::admin_credit_reconciliation::reconcile_organization_credits,
@@ -2548,6 +2682,25 @@ async fn swagger_ui_handler() -> Html<String> {
 </html>"#
             .to_string(),
     )
+}
+
+fn build_organization_credit_service(
+    database: &database::Database,
+    config: &ApiConfig,
+) -> Arc<dyn services::organization_credits::OrganizationCreditServiceTrait> {
+    use database::repositories::credit_transfers::CreditTransferRepository;
+    use database::repositories::organization_credentials::OrganizationCredentialRepository;
+    use services::organization_credits::OrganizationCreditService;
+
+    let transfers = Arc::new(CreditTransferRepository::new(
+        database.pool().clone(),
+        &config.credit_allocation,
+    ));
+    let credentials = Arc::new(OrganizationCredentialRepository::new(
+        database.pool().clone(),
+    ));
+
+    Arc::new(OrganizationCreditService::new(transfers, credentials))
 }
 
 #[cfg(test)]
@@ -2741,8 +2894,9 @@ mod tests {
 
     #[test]
     fn test_openapi_ita_token_endpoint_is_public() {
-        // /v1/attestation/ita-token is the ONLY public attestation route — an
-        // explicit, documented decision (nearai/infra#193); see
+        // /v1/attestation/ita-token and /v1/attestation/pins are the
+        // ONLY public attestation routes — explicit, documented decisions
+        // (nearai/infra#193); see
         // `build_public_attestation_routes` in routes/attestation.rs.
         let spec = match serde_json::to_value(ApiDoc::openapi()) {
             Ok(spec) => spec,
@@ -2760,6 +2914,16 @@ mod tests {
         assert!(spec["components"]["schemas"]
             .as_object()
             .is_some_and(|schemas| schemas.contains_key("ItaTokenResponse")));
+    }
+
+    #[test]
+    fn test_openapi_attested_pins_endpoint_is_public() {
+        let spec = serde_json::to_value(ApiDoc::openapi()).unwrap();
+        assert_eq!(
+            spec["paths"]["/v1/attestation/pins"]["get"]["security"],
+            serde_json::json!([{}]),
+            "/v1/attestation/pins must explicitly override global OpenAPI security"
+        );
     }
 
     #[test]
@@ -3250,6 +3414,19 @@ mod tests {
         let config = test_cors_config();
         assert!(is_origin_allowed("https://preview-example.com", &config));
         assert!(is_origin_allowed("https://staging-example.com", &config));
+    }
+
+    #[test]
+    fn test_cors_bare_wildcard_requires_a_domain_boundary() {
+        let config = config::CorsConfig {
+            exact_matches: vec![],
+            wildcard_suffixes: vec!["example.com".into()],
+        };
+        assert!(is_origin_allowed("https://sub.example.com", &config));
+        assert!(!is_origin_allowed("https://evilexample.com", &config));
+        assert!(!is_origin_allowed("https://example.com.evil.test", &config));
+        assert!(!is_origin_allowed("https://example.com", &config));
+        assert!(!is_origin_allowed("http://sub.example.com", &config));
     }
 
     #[tokio::test]

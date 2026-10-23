@@ -25,6 +25,7 @@ mod placeholders;
 mod stream_unredact;
 
 pub use apply::TextRef;
+pub use detect::{parse_usage_entries, UsageEntry};
 pub use placeholders::{RedactionMap, MAX_PLACEHOLDER_LEN};
 pub use stream_unredact::StreamUnredact;
 

@@ -22,6 +22,21 @@ fn parse_text_pricing(
         .map_err(|error| anyhow::anyhow!(error.to_string()))
 }
 
+fn parse_pending_pricing_changes(
+    value: Option<serde_json::Value>,
+) -> Result<Vec<services::models::ModelPricingChange>> {
+    let changes: Vec<services::models::ModelPricingChange> = value
+        .map(serde_json::from_value)
+        .transpose()?
+        .unwrap_or_default();
+    for change in &changes {
+        if let Some(profile) = &change.new_text_pricing {
+            profile.validate()?;
+        }
+    }
+    Ok(changes)
+}
+
 /// Serialize optional modalities to JSON value for database storage.
 /// Returns Ok(None) if input is None, Ok(Some(value)) if serialization succeeds,
 /// or an error if serialization fails.
@@ -73,7 +88,7 @@ impl ModelRepository {
     /// Returns every active model — the list is small (~tens of entries) and
     /// the result is cached in the service layer, so pagination is unused on
     /// the public `/v1/model/list` endpoint.
-    pub async fn get_all_active_models(&self) -> Result<Vec<Model>> {
+    async fn get_all_active_model_rows(&self) -> Result<Vec<Row>> {
         let rows = retry_db!("get_all_active_models", {
             let client = self
                 .pool
@@ -94,6 +109,19 @@ impl ModelRepository {
                         m.hugging_face_id, m.quantization, m.max_output_length,
                         m.supported_sampling_parameters, m.supported_features, m.datacenters,
                         m.is_ready, m.deprecation_date, m.successor_model_name, m.openrouter_slug, m.allow_free, m.is_listed,
+                        (
+                            SELECT jsonb_agg(jsonb_build_object(
+                                'effective_at', change.effective_at,
+                                'status', change.status,
+                                'new_input_cost_per_token', change.new_input_cost_per_token,
+                                'new_output_cost_per_token', change.new_output_cost_per_token,
+                                'new_cache_read_cost_per_token', change.new_cache_read_cost_per_token,
+                                'new_cost_per_image', change.new_cost_per_image,
+                                'new_text_pricing', change.new_text_pricing
+                            ))
+                            FROM scheduled_model_pricing_changes change
+                            WHERE change.model_id = m.id AND change.status = 'pending'
+                        ) AS pricing_changes,
                         COALESCE(array_agg(a.alias_name) FILTER (WHERE a.alias_name IS NOT NULL), '{}') AS aliases
                     FROM models m
                     LEFT JOIN model_aliases a ON a.canonical_model_id = m.id AND a.is_active = true
@@ -107,11 +135,7 @@ impl ModelRepository {
                 .map_err(map_db_error)
         })?;
 
-        let models = rows
-            .into_iter()
-            .map(|row| self.row_to_model(&row))
-            .collect();
-        Ok(models)
+        Ok(rows)
     }
 
     /// Get count of all models (optionally including inactive)
@@ -297,77 +321,11 @@ impl ModelRepository {
     /// Get model by model name (public API - only active models)
     /// Searches model_name (canonical name) field only
     pub async fn get_active_model_by_name(&self, model_name: &str) -> Result<Option<Model>> {
-        let rows = retry_db!("get_active_model_by_name", {
-            let client = self
-                .pool
-                .get()
-                .await
-                .context("Failed to get database connection")
-                .map_err(RepositoryError::PoolError)?;
-
-            client
-                .query(
-                    r#"
-                    SELECT
-                        m.id,
-                        m.model_name,
-                        m.model_display_name,
-                        m.model_description,
-                        m.model_icon,
-                        m.input_cost_per_token,
-                        m.output_cost_per_token,
-                        m.cost_per_image,
-                        m.cache_read_cost_per_token,
-                        m.text_pricing,
-                        m.context_length,
-                        m.verifiable,
-                        m.is_active,
-                        m.owned_by,
-                        m.created_at,
-                        m.updated_at,
-                        m.provider_type,
-                        m.provider_config,
-                        m.attestation_supported,
-                        m.input_modalities,
-                        m.output_modalities,
-                        m.inference_url,
-                        m.hugging_face_id,
-                        m.quantization,
-                        m.max_output_length,
-                        m.supported_sampling_parameters,
-                        m.supported_features,
-                        m.datacenters,
-                        m.is_ready,
-                        m.deprecation_date,
-                        m.successor_model_name,
-                        m.openrouter_slug,
-                        m.allow_free,
-                        m.is_listed,
-                        COALESCE(
-                            array_agg(ma.alias_name)
-                            FILTER (WHERE ma.alias_name IS NOT NULL),
-                            '{}'
-                        ) AS aliases
-                    FROM models m
-                    LEFT JOIN model_aliases ma
-                        ON ma.canonical_model_id = m.id
-                        AND ma.is_active = true
-                    WHERE m.is_active = true
-                    AND m.model_name = $1
-                    GROUP BY m.id
-                    LIMIT 1;
-                    "#,
-                    &[&model_name],
-                )
-                .await
-                .map_err(map_db_error)
-        })?;
-
-        if let Some(row) = rows.first() {
-            Ok(Some(self.row_to_model(row)))
-        } else {
-            Ok(None)
-        }
+        Ok(self
+            .get_active_model_row(model_name, false, "get_active_model_by_name")
+            .await?
+            .as_ref()
+            .map(|row| self.row_to_model(row)))
     }
 
     /// Update model pricing and metadata (or insert if not exists - upsert)
@@ -435,6 +393,13 @@ impl ModelRepository {
         let text_pricing_value: Option<serde_json::Value> =
             update_request.text_pricing.clone().flatten();
         let text_pricing_clear: bool = matches!(update_request.text_pricing, Some(None));
+        // Compare-and-set for provider_config: when the caller merged its write
+        // into a stored snapshot, update only while the row still holds it, or
+        // already holds the value being written (an idempotent write loses
+        // nothing, e.g. two identical creates racing).
+        let provider_config_check: bool = update_request.expected_provider_config.is_some();
+        let expected_provider_config: Option<serde_json::Value> =
+            update_request.expected_provider_config.clone().flatten();
 
         let row = retry_db!("upsert_model_pricing", {
             let client = self
@@ -447,7 +412,7 @@ impl ModelRepository {
             let row = if existing.is_some() {
                 // Model exists - do UPDATE (partial updates work)
                 let updated_row = client
-                    .query_one(
+                    .query_opt(
                         r#"
                         UPDATE models SET
                             input_cost_per_token = COALESCE($2, input_cost_per_token),
@@ -482,6 +447,9 @@ impl ModelRepository {
                             is_listed = COALESCE($37, is_listed),
                             updated_at = NOW()
                         WHERE model_name = $1
+                          AND (NOT $38
+                               OR provider_config IS NOT DISTINCT FROM $39
+                               OR provider_config IS NOT DISTINCT FROM $14)
                         RETURNING id, model_name, model_display_name, model_description, model_icon,
                                   input_cost_per_token, output_cost_per_token, cost_per_image, cache_read_cost_per_token, text_pricing,
                                   context_length, verifiable, is_active, owned_by, created_at, updated_at,
@@ -526,10 +494,17 @@ impl ModelRepository {
                             &successor_value,
                             &successor_clear,
                             &update_request.is_listed,
+                            &provider_config_check,
+                            &expected_provider_config,
                         ],
                     )
                     .await
                     .map_err(map_db_error)?;
+                // No row: provider_config changed since the caller read it.
+                // Returned as None so the retry loop does not re-run the write.
+                let Some(updated_row) = updated_row else {
+                    return Ok(None);
+                };
 
                 // Record history: close previous history record and insert new one
                 let model_id: uuid::Uuid = updated_row.get("id");
@@ -544,7 +519,7 @@ impl ModelRepository {
                 .await
                 .map_err(RepositoryError::DatabaseError)?;
 
-                updated_row
+                Some(updated_row)
             } else {
                 // Model doesn't exist - do INSERT with ON CONFLICT to handle race conditions
                 // Use INSERT ... ON CONFLICT to handle race conditions where another
@@ -679,11 +654,12 @@ impl ModelRepository {
                 .await
                 .map_err(RepositoryError::DatabaseError)?;
 
-                inserted_row
+                Some(inserted_row)
             };
 
             Ok(row)
         })?;
+        let row = row.ok_or(RepositoryError::TransactionConflict)?;
 
         Ok(self.row_to_model(&row))
     }
@@ -1327,7 +1303,20 @@ impl ModelRepository {
     /// Resolve a model identifier (alias or canonical name) and return the full model details
     /// Returns None if the model is not found or not active
     pub async fn resolve_and_get_model(&self, identifier: &str) -> Result<Option<Model>> {
-        let row = retry_db!("resolve_and_get_model", {
+        Ok(self
+            .get_active_model_row(identifier, true, "resolve_and_get_model")
+            .await?
+            .as_ref()
+            .map(|row| self.row_to_model(row)))
+    }
+
+    async fn get_active_model_row(
+        &self,
+        identifier: &str,
+        resolve_alias: bool,
+        operation: &'static str,
+    ) -> Result<Option<Row>> {
+        let row = retry_db!(operation, {
             let client = self
                 .pool
                 .get()
@@ -1374,6 +1363,19 @@ impl ModelRepository {
                         m.openrouter_slug,
                         m.allow_free,
                         m.is_listed,
+                        (
+                            SELECT jsonb_agg(jsonb_build_object(
+                                'effective_at', change.effective_at,
+                                'status', change.status,
+                                'new_input_cost_per_token', change.new_input_cost_per_token,
+                                'new_output_cost_per_token', change.new_output_cost_per_token,
+                                'new_cache_read_cost_per_token', change.new_cache_read_cost_per_token,
+                                'new_cost_per_image', change.new_cost_per_image,
+                                'new_text_pricing', change.new_text_pricing
+                            ))
+                            FROM scheduled_model_pricing_changes change
+                            WHERE change.model_id = m.id AND change.status = 'pending'
+                        ) AS pricing_changes,
                         COALESCE(
                             array_agg(ma_all.alias_name)
                             FILTER (WHERE ma_all.alias_name IS NOT NULL),
@@ -1386,24 +1388,113 @@ impl ModelRepository {
                     WHERE m.is_active = true
                     AND (
                         m.model_name = $1
-                        OR EXISTS (
+                        OR ($2 AND EXISTS (
                             SELECT 1
                             FROM model_aliases ma_match
                             WHERE ma_match.canonical_model_id = m.id
                             AND ma_match.alias_name = $1
                             AND ma_match.is_active = true
-                        )
+                        ))
                     )
                     GROUP BY m.id
                     LIMIT 1;
                     "#,
-                    &[(&identifier, Type::VARCHAR)],
+                    &[(&identifier, Type::VARCHAR), (&resolve_alias, Type::BOOL)],
                 )
                 .await
                 .map_err(map_db_error)
         })?;
 
-        Ok(row.map(|r| self.row_to_model(&r)))
+        Ok(row)
+    }
+
+    /// Whether the organization holds a grant for the model that is in
+    /// effect. A grant held by an inactive organization, or on an inactive
+    /// model, has no effect.
+    pub async fn organization_has_model_access(
+        &self,
+        organization_id: uuid::Uuid,
+        model_id: uuid::Uuid,
+    ) -> Result<bool> {
+        let row = retry_db!("organization_has_model_access", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
+
+            // One-shot typed query: one round trip, see repositories/mod.rs.
+            client
+                .query_typed_opt(
+                    r#"
+                    SELECT 1
+                    FROM organization_model_access a
+                    JOIN organizations o ON o.id = a.organization_id
+                    JOIN models m ON m.id = a.model_id
+                    WHERE a.organization_id = $1
+                      AND a.model_id = $2
+                      AND o.is_active = true
+                      AND m.is_active = true
+                    "#,
+                    &[(&organization_id, Type::UUID), (&model_id, Type::UUID)],
+                )
+                .await
+                .map_err(map_db_error)
+        })?;
+
+        Ok(row.is_some())
+    }
+
+    /// Every unlisted model, active or not, with the active organizations
+    /// that hold a grant for it, ordered by model name. A model nobody may
+    /// use is listed with no organizations.
+    ///
+    /// Inactive models are included on purpose. The reader takes a model that
+    /// is absent from the list to be unrestricted, and it may still be
+    /// serving a model that was deactivated here.
+    pub async fn list_restricted_model_access(
+        &self,
+    ) -> Result<Vec<services::models::RestrictedModelAccess>> {
+        let rows = retry_db!("list_restricted_model_access", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
+
+            client
+                .query(
+                    r#"
+                    SELECT
+                        m.model_name,
+                        COALESCE(
+                            array_agg(o.id ORDER BY o.id) FILTER (WHERE o.id IS NOT NULL),
+                            '{}'
+                        ) AS organization_ids
+                    FROM models m
+                    LEFT JOIN organization_model_access a ON a.model_id = m.id
+                    LEFT JOIN organizations o
+                        ON o.id = a.organization_id
+                        AND o.is_active = true
+                    WHERE m.is_listed = false
+                    GROUP BY m.id
+                    ORDER BY m.model_name
+                    "#,
+                    &[],
+                )
+                .await
+                .map_err(map_db_error)
+        })?;
+
+        Ok(rows
+            .iter()
+            .map(|row| services::models::RestrictedModelAccess {
+                model_name: row.get("model_name"),
+                organization_ids: row.get("organization_ids"),
+            })
+            .collect())
     }
 
     /// Helper method to convert database row to Model
@@ -1645,49 +1736,72 @@ impl services::inference_provider_pool::ExternalModelsSource for ModelRepository
     }
 }
 
-// Implement ModelsRepository trait from services
+impl ModelRepository {
+    fn model_with_pricing_from_row(&self, row: Row) -> Result<services::models::ModelWithPricing> {
+        let m = self.row_to_model(&row);
+        let mut model = services::models::ModelWithPricing {
+            id: m.id,
+            model_name: m.model_name,
+            model_display_name: m.model_display_name,
+            model_description: m.model_description,
+            model_icon: m.model_icon,
+            input_cost_per_token: m.input_cost_per_token,
+            output_cost_per_token: m.output_cost_per_token,
+            cost_per_image: m.cost_per_image,
+            cache_read_cost_per_token: m.cache_read_cost_per_token,
+            text_pricing: parse_text_pricing(m.text_pricing)?,
+            upcoming_pricing: None,
+            context_length: m.context_length,
+            verifiable: m.verifiable,
+            aliases: m.aliases,
+            owned_by: m.owned_by,
+            provider_type: m.provider_type,
+            provider_config: m.provider_config,
+            attestation_supported: m.attestation_supported,
+            input_modalities: m.input_modalities,
+            output_modalities: m.output_modalities,
+            inference_url: m.inference_url,
+            hugging_face_id: m.hugging_face_id,
+            quantization: m.quantization,
+            max_output_length: m.max_output_length,
+            supported_sampling_parameters: m.supported_sampling_parameters,
+            supported_features: m.supported_features,
+            datacenters: m.datacenters,
+            is_ready: m.is_ready,
+            deprecation_date: m.deprecation_date,
+            successor_model_name: m.successor_model_name,
+            openrouter_slug: m.openrouter_slug,
+            is_listed: m.is_listed,
+            created_at: m.created_at,
+        };
+        model.upcoming_pricing = match parse_pending_pricing_changes(row.get("pricing_changes")) {
+            Ok(changes) => {
+                services::models::UpcomingModelPricing::earliest_pending(&model, &changes)
+            }
+            Err(error) => {
+                // Notices are advisory. Drop the entire set rather than promoting
+                // a later valid row to the earliest notice. Live prices above
+                // still require strict validation because they drive billing.
+                tracing::warn!(
+                    model_id = %model.id,
+                    error = %error,
+                    "Ignoring invalid pending pricing notice metadata"
+                );
+                None
+            }
+        };
+        Ok(model)
+    }
+}
+
+// All notice metadata is read in the model query's snapshot and cached with it.
 #[async_trait]
 impl services::models::ModelsRepository for ModelRepository {
     async fn get_all_active_models(&self) -> Result<Vec<services::models::ModelWithPricing>> {
-        let models = self.get_all_active_models().await?;
-        models
+        self.get_all_active_model_rows()
+            .await?
             .into_iter()
-            .map(|m| {
-                Ok(services::models::ModelWithPricing {
-                    id: m.id,
-                    model_name: m.model_name,
-                    model_display_name: m.model_display_name,
-                    model_description: m.model_description,
-                    model_icon: m.model_icon,
-                    input_cost_per_token: m.input_cost_per_token,
-                    output_cost_per_token: m.output_cost_per_token,
-                    cost_per_image: m.cost_per_image,
-                    cache_read_cost_per_token: m.cache_read_cost_per_token,
-                    text_pricing: parse_text_pricing(m.text_pricing)?,
-                    context_length: m.context_length,
-                    verifiable: m.verifiable,
-                    aliases: m.aliases,
-                    owned_by: m.owned_by,
-                    provider_type: m.provider_type,
-                    provider_config: m.provider_config,
-                    attestation_supported: m.attestation_supported,
-                    input_modalities: m.input_modalities,
-                    output_modalities: m.output_modalities,
-                    inference_url: m.inference_url,
-                    hugging_face_id: m.hugging_face_id,
-                    quantization: m.quantization,
-                    max_output_length: m.max_output_length,
-                    supported_sampling_parameters: m.supported_sampling_parameters,
-                    supported_features: m.supported_features,
-                    datacenters: m.datacenters,
-                    is_ready: m.is_ready,
-                    deprecation_date: m.deprecation_date,
-                    successor_model_name: m.successor_model_name,
-                    openrouter_slug: m.openrouter_slug,
-                    is_listed: m.is_listed,
-                    created_at: m.created_at,
-                })
-            })
+            .map(|row| self.model_with_pricing_from_row(row))
             .collect()
     }
 
@@ -1695,44 +1809,9 @@ impl services::models::ModelsRepository for ModelRepository {
         &self,
         model_name: &str,
     ) -> Result<Option<services::models::ModelWithPricing>> {
-        let model_opt = self.get_active_model_by_name(model_name).await?;
-        model_opt
-            .map(|m| {
-                Ok(services::models::ModelWithPricing {
-                    id: m.id,
-                    model_name: m.model_name,
-                    model_display_name: m.model_display_name,
-                    model_description: m.model_description,
-                    model_icon: m.model_icon,
-                    input_cost_per_token: m.input_cost_per_token,
-                    output_cost_per_token: m.output_cost_per_token,
-                    cost_per_image: m.cost_per_image,
-                    cache_read_cost_per_token: m.cache_read_cost_per_token,
-                    text_pricing: parse_text_pricing(m.text_pricing)?,
-                    context_length: m.context_length,
-                    verifiable: m.verifiable,
-                    aliases: m.aliases,
-                    owned_by: m.owned_by,
-                    provider_type: m.provider_type,
-                    provider_config: m.provider_config,
-                    attestation_supported: m.attestation_supported,
-                    input_modalities: m.input_modalities,
-                    output_modalities: m.output_modalities,
-                    inference_url: m.inference_url,
-                    hugging_face_id: m.hugging_face_id,
-                    quantization: m.quantization,
-                    max_output_length: m.max_output_length,
-                    supported_sampling_parameters: m.supported_sampling_parameters,
-                    supported_features: m.supported_features,
-                    datacenters: m.datacenters,
-                    is_ready: m.is_ready,
-                    deprecation_date: m.deprecation_date,
-                    successor_model_name: m.successor_model_name,
-                    openrouter_slug: m.openrouter_slug,
-                    is_listed: m.is_listed,
-                    created_at: m.created_at,
-                })
-            })
+        self.get_active_model_row(model_name, false, "get_model_by_name")
+            .await?
+            .map(|row| self.model_with_pricing_from_row(row))
             .transpose()
     }
 
@@ -1740,48 +1819,28 @@ impl services::models::ModelsRepository for ModelRepository {
         &self,
         identifier: &str,
     ) -> Result<Option<services::models::ModelWithPricing>> {
-        let model_opt = self.resolve_and_get_model(identifier).await?;
-        model_opt
-            .map(|m| {
-                Ok(services::models::ModelWithPricing {
-                    id: m.id,
-                    model_name: m.model_name,
-                    model_display_name: m.model_display_name,
-                    model_description: m.model_description,
-                    model_icon: m.model_icon,
-                    input_cost_per_token: m.input_cost_per_token,
-                    output_cost_per_token: m.output_cost_per_token,
-                    cost_per_image: m.cost_per_image,
-                    cache_read_cost_per_token: m.cache_read_cost_per_token,
-                    text_pricing: parse_text_pricing(m.text_pricing)?,
-                    context_length: m.context_length,
-                    verifiable: m.verifiable,
-                    aliases: m.aliases,
-                    owned_by: m.owned_by,
-                    provider_type: m.provider_type,
-                    provider_config: m.provider_config,
-                    attestation_supported: m.attestation_supported,
-                    input_modalities: m.input_modalities,
-                    output_modalities: m.output_modalities,
-                    inference_url: m.inference_url,
-                    hugging_face_id: m.hugging_face_id,
-                    quantization: m.quantization,
-                    max_output_length: m.max_output_length,
-                    supported_sampling_parameters: m.supported_sampling_parameters,
-                    supported_features: m.supported_features,
-                    datacenters: m.datacenters,
-                    is_ready: m.is_ready,
-                    deprecation_date: m.deprecation_date,
-                    successor_model_name: m.successor_model_name,
-                    openrouter_slug: m.openrouter_slug,
-                    is_listed: m.is_listed,
-                    created_at: m.created_at,
-                })
-            })
+        self.get_active_model_row(identifier, true, "resolve_and_get_model")
+            .await?
+            .map(|row| self.model_with_pricing_from_row(row))
             .transpose()
     }
 
     async fn get_configured_model_names(&self) -> Result<Vec<String>> {
         self.get_configured_model_names().await
+    }
+
+    async fn organization_has_model_access(
+        &self,
+        organization_id: uuid::Uuid,
+        model_id: uuid::Uuid,
+    ) -> Result<bool> {
+        self.organization_has_model_access(organization_id, model_id)
+            .await
+    }
+
+    async fn list_restricted_model_access(
+        &self,
+    ) -> Result<Vec<services::models::RestrictedModelAccess>> {
+        self.list_restricted_model_access().await
     }
 }

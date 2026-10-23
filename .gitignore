@@ -10,7 +10,10 @@ config/examples/production.yaml
 .GIT_REV
 oci.tar
 .idea
-.claude
+# Everything under .claude/ is ignored (worktrees, local settings, scratch) except the
+# shared agent rules. Add a `!.claude/<path>` line to share more, e.g. settings.json.
+.claude/*
+!.claude/rules/
 .slim/
 *.resolved.txt
 .DS_Store

@@ -463,11 +463,6 @@ where
                         last_finish_reason.as_ref(),
                     ));
                     let usage_request = RecordUsageServiceRequest {
-                        discount: None,
-                        organization_id,
-                        workspace_id,
-                        api_key_id,
-                        model_id,
                         input_tokens,
                         output_tokens,
                         cache_read_tokens,
@@ -475,15 +470,22 @@ where
                         profiled_cache_write_tokens,
                         requested_service_tier,
                         provider_service_tier,
-                        inference_type,
                         ttft_ms,
                         avg_itl_ms,
                         inference_id: Some(inference_id),
                         provider_request_id: Some(chat_id),
                         stop_reason,
                         response_id,
-                        image_count: None,
                         provider_attribution,
+                        ..RecordUsageServiceRequest::base(
+                            crate::usage::BillingIdentity {
+                                organization_id,
+                                workspace_id,
+                                api_key_id,
+                                model_id,
+                            },
+                            inference_type,
+                        )
                     };
                     let usage_write = spawn_usage_write(
                         &write_handle,
@@ -788,8 +790,9 @@ pub struct CompletionServiceImpl {
     concurrent_limit: u32,
     /// Cache for per-organization concurrent limits (5-minute TTL)
     org_concurrent_limits: Cache<Uuid, u32>,
-    /// Positive-only cache of model resolution (30 s TTL), shared with
-    /// `ModelsServiceImpl` so admin invalidation clears it.
+    /// Cache of model resolution and of access decisions on unlisted models
+    /// (30 s TTL), shared with `ModelsServiceImpl` so admin invalidation
+    /// clears it.
     model_resolve_cache: crate::models::ModelResolveCache,
     /// Repository for fetching organization concurrent limits
     organization_limit_repository: Arc<dyn ports::OrganizationConcurrentLimitRepository>,
@@ -932,14 +935,18 @@ impl CompletionServiceImpl {
         self
     }
 
+    /// Resolve a model for `caller`. `None` covers both an unknown name and an
+    /// unlisted model the caller may not use, so both get the same error.
     async fn resolve_model_cached(
         &self,
         identifier: &str,
+        caller: crate::models::ModelCaller,
     ) -> Result<Option<crate::models::ModelWithPricing>, anyhow::Error> {
         crate::models::resolve_model_cached(
             &self.model_resolve_cache,
             self.models_repository.as_ref(),
             identifier,
+            caller,
         )
         .await
     }
@@ -1193,8 +1200,8 @@ impl CompletionServiceImpl {
 
     /// Whether `extra` carries any client-facing E2EE marker: the model
     /// pub-key routing pin, or any of the four encryption headers. Mirrors
-    /// the route's `e2ee_requested` (`crates/api/src/routes/completions.rs`,
-    /// near line 126), which checks the same four encryption headers off
+    /// the route's `e2ee_requested` (`crates/api/src/routes/completions/mod.rs`),
+    /// which checks the same four encryption headers off
     /// the validated `EncryptionHeaders` struct before they're written into
     /// `extra`; this checks `extra` directly (plus `MODEL_PUB_KEY`, which
     /// `e2ee_requested` doesn't cover but `reject_e2ee_if_unsupported`
@@ -1843,8 +1850,15 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         chat_params.placement = Default::default();
 
         // Resolve model name (could be an alias) and get model details in a single DB call
-        // This also validates that the model exists and is active
-        let model = match self.resolve_model_cached(&request.model).await {
+        // This also validates that the model exists, is active, and may be
+        // used by the request's organization
+        let model = match self
+            .resolve_model_cached(
+                &request.model,
+                crate::models::ModelCaller::Organization(request.organization_id),
+            )
+            .await
+        {
             Ok(Some(m)) => m,
             Ok(None) => {
                 let err = ports::CompletionError::InvalidModel(format!(
@@ -1980,10 +1994,23 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         Ok(event_stream)
     }
 
-    async fn create_chat_completion(
+    async fn run_chat_completion(
         &self,
-        request: ports::CompletionRequest,
+        mut request: ports::CompletionRequest,
+        platform_model: Option<crate::models::PlatformModel>,
     ) -> Result<inference_providers::ChatCompletionResponseWithBytes, ports::CompletionError> {
+        // Who the model is resolved for. A platform model replaces the
+        // request's model and is resolved as a trusted caller: the platform
+        // chose it, so it must not depend on the grants of the organization
+        // the work is done for. Its name comes from `PlatformModel`, never
+        // from the request.
+        let model_caller = match platform_model {
+            Some(platform_model) => {
+                request.model = platform_model.name().to_string();
+                crate::models::ModelCaller::Trusted
+            }
+            None => crate::models::ModelCaller::Organization(request.organization_id),
+        };
         let service_start_time = Instant::now();
         let organization_id = request.organization_id;
         let workspace_id = request.workspace_id;
@@ -2040,8 +2067,12 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         chat_params.placement = Default::default();
 
         // Resolve model name (could be an alias) and get model details in a single DB call
-        // This also validates that the model exists and is active
-        let model = match self.resolve_model_cached(&request.model).await {
+        // This also validates that the model exists, is active, and may be
+        // used by whoever chose it (see `model_caller` above)
+        let model = match self
+            .resolve_model_cached(&request.model, model_caller)
+            .await
+        {
             Ok(Some(m)) => m,
             Ok(None) => {
                 let err = ports::CompletionError::InvalidModel(format!(
@@ -2239,11 +2270,6 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
 
         usage_service
             .record_usage(RecordUsageServiceRequest {
-                discount: None,
-                organization_id,
-                workspace_id,
-                api_key_id,
-                model_id,
                 input_tokens,
                 output_tokens,
                 cache_read_tokens,
@@ -2256,15 +2282,21 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
                 profiled_cache_write_tokens,
                 requested_service_tier,
                 provider_service_tier,
-                inference_type: crate::usage::ports::InferenceType::ChatCompletion,
-                ttft_ms: None,    // N/A for non-streaming
-                avg_itl_ms: None, // N/A for non-streaming
+                // ttft_ms / avg_itl_ms stay None: N/A for non-streaming
                 inference_id: Some(inference_id),
                 provider_request_id: Some(provider_request_id),
                 stop_reason: Some(stop_reason),
                 response_id,
-                image_count: None,
                 provider_attribution,
+                ..RecordUsageServiceRequest::base(
+                    crate::usage::BillingIdentity {
+                        organization_id,
+                        workspace_id,
+                        api_key_id,
+                        model_id,
+                    },
+                    crate::usage::ports::InferenceType::ChatCompletion,
+                )
             })
             .await
             .map_err(|e| {
@@ -2557,8 +2589,9 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
     async fn get_model(
         &self,
         model_name: &str,
+        caller: crate::models::ModelCaller,
     ) -> Result<Option<crate::models::ModelWithPricing>, anyhow::Error> {
-        self.resolve_model_cached(model_name).await
+        self.resolve_model_cached(model_name, caller).await
     }
 
     fn get_inference_provider_pool(
@@ -4057,6 +4090,7 @@ mod tests {
             .unwrap()["textPricing"]
             .clone();
         crate::models::ModelWithPricing {
+            upcoming_pricing: None,
             id: Uuid::new_v4(),
             model_name: "openai/gpt-5.6-sol".to_string(),
             model_display_name: "GPT-5.6 Sol".to_string(),
@@ -4646,7 +4680,7 @@ mod tests {
     #[test]
     fn apply_placement_affinity_client_pub_key_alone_gives_no_prefix_affinity() {
         // client_pub_key is one of the four encryption headers e2ee_requested
-        // (routes/completions.rs) checks, distinct from model_pub_key. It must
+        // (routes/completions/mod.rs) checks, distinct from model_pub_key. It must
         // independently suppress the prefix source here too.
         let mut params = minimal_chat_params();
         params.extra.insert(

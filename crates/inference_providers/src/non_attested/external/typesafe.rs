@@ -77,7 +77,7 @@ mod tests {
 
     fn request() -> SystemOneRequest {
         serde_json::from_value(json!({"model":"catalog/jev","state":["text",{"x":1}],
-            "questions":{"q":{"type":"noul"}}}))
+            "questions":{"q":{"type":"noul","instructions":"Is this about billing?"}}}))
         .unwrap()
     }
 
@@ -129,7 +129,8 @@ mod tests {
                 .and(path("/v1/systemone"))
                 .and(header("authorization", "Bearer fixture-key"))
                 .and(body_partial_json(
-                    json!({"model":"jev-latest","state":["text",{"x":1}]}),
+                    json!({"model":"jev-latest","state":["text",{"x":1}],
+                        "questions":{"q":{"type":"noul","instructions":"Is this about billing?"}}}),
                 ))
                 .respond_with(template)
                 .expect(1)

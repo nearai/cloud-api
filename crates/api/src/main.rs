@@ -119,8 +119,8 @@ async fn main() {
 
     // Scan outside the inference path. Durable per-recipient claims prevent
     // duplicate delivery when multiple API replicas run the scheduler. Do not
-    // take locks or write claims when transactional email is disabled.
-    let credit_email_scheduler = if config.invitation_email.enabled {
+    // take locks or write claims when credit email is disabled.
+    let credit_email_scheduler = if config.invitation_email.credit_email_enabled {
         let scheduler = Arc::new(services::usage::CreditEmailScheduler::new(
             Arc::new(
                 database::repositories::credit_email_notification::CreditEmailNotificationRepository::new(
@@ -133,7 +133,7 @@ async fn main() {
                     &config.credit_allocation,
                 ),
             ),
-            services::email::sender_from_config(&config.invitation_email)
+            services::email::credit_email_sender_from_config(&config.invitation_email)
                 .expect("Failed to initialize credit alert email sender"),
             config.invitation_email.credit_email_thresholds.clone(),
             config.invitation_email.frontend_base_url.clone(),

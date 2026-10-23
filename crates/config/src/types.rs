@@ -1431,6 +1431,9 @@ pub const DEFAULT_CREDIT_EMAIL_THRESHOLDS: &[i16] = &[0, 10, 20];
 #[derive(Debug, Clone)]
 pub struct InvitationEmailConfig {
     pub enabled: bool,
+    /// Sends organization credit-balance threshold alerts independently of
+    /// invitation delivery.
+    pub credit_email_enabled: bool,
     /// Lets NEAR wallet users add and verify a contact email. Switched on its
     /// own, but uses the same sender address, Resend key and frontend URL.
     pub contact_email_verification_enabled: bool,
@@ -1449,6 +1452,7 @@ impl Default for InvitationEmailConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            credit_email_enabled: false,
             contact_email_verification_enabled: false,
             contact_email_verification_daily_cap: DEFAULT_CONTACT_EMAIL_VERIFICATION_DAILY_CAP,
             from_email: None,
@@ -1466,6 +1470,10 @@ impl InvitationEmailConfig {
             .ok()
             .and_then(|v| v.parse::<bool>().ok())
             .unwrap_or(false);
+        let credit_email_enabled = env::var("CREDIT_EMAIL_ENABLED")
+            .ok()
+            .and_then(|v| v.parse::<bool>().ok())
+            .unwrap_or(false);
         let contact_email_verification_enabled = env::var("CONTACT_EMAIL_VERIFICATION_ENABLED")
             .ok()
             .and_then(|v| v.parse::<bool>().ok())
@@ -1477,11 +1485,12 @@ impl InvitationEmailConfig {
 
         let from_email = non_empty_env("INVITATION_EMAIL_FROM");
         let reply_to = non_empty_env("INVITATION_EMAIL_REPLY_TO");
-        let resend_api_key = if enabled || contact_email_verification_enabled {
-            read_optional_secret_env("RESEND_API_KEY_FILE", "RESEND_API_KEY")?
-        } else {
-            None
-        };
+        let resend_api_key =
+            if enabled || credit_email_enabled || contact_email_verification_enabled {
+                read_optional_secret_env("RESEND_API_KEY_FILE", "RESEND_API_KEY")?
+            } else {
+                None
+            };
         let frontend_base_url = non_empty_env("CLOUD_UI_BASE_URL");
         let credit_email_thresholds = match env::var("CREDIT_EMAIL_THRESHOLDS") {
             Ok(value) => {
@@ -1519,6 +1528,7 @@ impl InvitationEmailConfig {
 
         for (switched_on, switch) in [
             (enabled, "INVITATION_EMAIL_ENABLED"),
+            (credit_email_enabled, "CREDIT_EMAIL_ENABLED"),
             (
                 contact_email_verification_enabled,
                 "CONTACT_EMAIL_VERIFICATION_ENABLED",
@@ -1553,6 +1563,7 @@ impl InvitationEmailConfig {
 
         Ok(Self {
             enabled,
+            credit_email_enabled,
             contact_email_verification_enabled,
             contact_email_verification_daily_cap,
             from_email,
@@ -2644,6 +2655,7 @@ mod tests {
         let config = InvitationEmailConfig::from_env().unwrap();
 
         assert!(!config.enabled);
+        assert!(!config.credit_email_enabled);
         assert!(config.from_email.is_none());
         assert!(config.resend_api_key.is_none());
         assert!(config.invitations_url().is_none());
@@ -2667,6 +2679,24 @@ mod tests {
             let error = InvitationEmailConfig::from_env().unwrap_err();
             assert!(error.contains("CREDIT_EMAIL_THRESHOLDS"), "{error}");
         }
+        clear_invitation_email_env();
+    }
+
+    #[test]
+    #[serial]
+    fn test_credit_email_is_independent_of_invitation_emails() {
+        clear_invitation_email_env();
+        std::env::set_var("CREDIT_EMAIL_ENABLED", "true");
+        std::env::set_var("INVITATION_EMAIL_FROM", "no-reply@example.com");
+        std::env::set_var("RESEND_API_KEY", "re_test");
+        std::env::set_var("CLOUD_UI_BASE_URL", "https://cloud.example.com");
+
+        let config = InvitationEmailConfig::from_env().unwrap();
+
+        assert!(config.credit_email_enabled);
+        assert!(!config.enabled);
+        assert!(!config.contact_email_verification_enabled);
+        assert_eq!(config.resend_api_key.as_deref(), Some("re_test"));
         clear_invitation_email_env();
     }
 
@@ -2901,6 +2931,7 @@ mod tests {
         std::env::remove_var("CONTACT_EMAIL_VERIFICATION_ENABLED");
         std::env::remove_var("CONTACT_EMAIL_VERIFICATION_DAILY_CAP");
         std::env::remove_var("INVITATION_EMAIL_ENABLED");
+        std::env::remove_var("CREDIT_EMAIL_ENABLED");
         std::env::remove_var("INVITATION_EMAIL_FROM");
         std::env::remove_var("INVITATION_EMAIL_REPLY_TO");
         std::env::remove_var("RESEND_API_KEY");

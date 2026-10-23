@@ -437,6 +437,18 @@ pub fn sender_from_config(
     }
 }
 
+/// Sender for credit-balance alerts. Credit alerts have their own rollout
+/// switch while sharing the transactional sender settings.
+pub fn credit_email_sender_from_config(
+    config: &InvitationEmailConfig,
+) -> Result<Arc<dyn EmailSender>, EmailError> {
+    if config.credit_email_enabled {
+        Ok(Arc::new(ResendEmailSender::new(config)?))
+    } else {
+        Ok(Arc::new(NoopEmailSender))
+    }
+}
+
 /// Sender for contact email verification. It has its own switch, so it can be on
 /// while invitation emails are off (and the other way round); the sender address
 /// and Resend key are shared.
@@ -1323,10 +1335,44 @@ mod tests {
         assert_eq!(outcome, EmailDeliveryOutcome::Skipped);
     }
 
+    #[tokio::test]
+    async fn credit_email_sender_follows_its_own_switch() {
+        let sender = credit_email_sender_from_config(&InvitationEmailConfig {
+            enabled: true,
+            from_email: Some("NEAR AI Cloud <no-reply@near.ai>".to_string()),
+            resend_api_key: Some("re_test".to_string()),
+            ..InvitationEmailConfig::default()
+        })
+        .unwrap();
+        let outcome = sender
+            .send_credit_balance_alert(&CreditBalanceAlertEmail {
+                recipient_email: "owner@example.com".to_string(),
+                organization_name: "Example".to_string(),
+                credit_type: "payment".to_string(),
+                remaining: 10,
+                limit: 100,
+                threshold_percent: 10,
+                credits_url: "https://cloud.example.com/credits".to_string(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(outcome, EmailDeliveryOutcome::Skipped);
+
+        let error = match credit_email_sender_from_config(&InvitationEmailConfig {
+            credit_email_enabled: true,
+            ..InvitationEmailConfig::default()
+        }) {
+            Ok(_) => panic!("expected missing sender settings to fail"),
+            Err(error) => error,
+        };
+        assert!(error.sanitized_message().contains("INVITATION_EMAIL_FROM"));
+    }
+
     #[test]
     fn resend_sender_requires_api_key() {
         let config = InvitationEmailConfig {
             enabled: true,
+            credit_email_enabled: false,
             contact_email_verification_enabled: false,
             contact_email_verification_daily_cap: 500,
             from_email: Some("NEAR AI Cloud <no-reply@near.ai>".to_string()),

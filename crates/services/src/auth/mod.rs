@@ -1170,7 +1170,7 @@ mod tests {
             &self,
             _: ApiKeyId,
             _: Option<i64>,
-        ) -> Result<ApiKey, RepositoryError> {
+        ) -> Result<crate::workspace::ApiKeyUpdate, RepositoryError> {
             unimplemented!()
         }
         async fn update(
@@ -1180,7 +1180,7 @@ mod tests {
             _: Option<Option<chrono::DateTime<Utc>>>,
             _: Option<Option<i64>>,
             _: Option<bool>,
-        ) -> Result<ApiKey, RepositoryError> {
+        ) -> Result<crate::workspace::ApiKeyUpdate, RepositoryError> {
             unimplemented!()
         }
         async fn count_by_workspace(&self, _: WorkspaceId) -> Result<i64, RepositoryError> {

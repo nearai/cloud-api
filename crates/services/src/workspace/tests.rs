@@ -147,15 +147,27 @@ fn service(
         .expect_get_workspace_with_organization()
         .returning(move |_| Ok(Some((workspace.clone(), organization.clone()))));
     let mut keys = MockApiKeyRepository::new();
-    let existing = before.clone();
+    // The authorization pre-read can be stale. Notification decisions must use
+    // the previous value returned atomically by the write, not this snapshot.
+    let mut existing = after.clone();
+    if !should_notify {
+        existing.is_active = !after.is_active;
+        existing.spend_limit = Some(4_000_000);
+    }
     keys.expect_get_by_id()
         .returning(move |_| Ok(Some(existing.clone())));
-    let updated = after.clone();
+    let update = ApiKeyUpdate {
+        previous: before.clone(),
+        updated: after.clone(),
+    };
     keys.expect_update_spend_limit()
-        .returning(move |_, _| Ok(updated.clone()));
-    let updated = after.clone();
+        .returning(move |_, _| Ok(update.clone()));
+    let update = ApiKeyUpdate {
+        previous: before.clone(),
+        updated: after.clone(),
+    };
     keys.expect_update()
-        .returning(move |_, _, _, _, _| Ok(updated.clone()));
+        .returning(move |_, _, _, _, _| Ok(update.clone()));
     keys.expect_revoke().returning(move |_| Ok(revoked));
     let mut organizations = MockOrganizationServiceTrait::new();
     organizations

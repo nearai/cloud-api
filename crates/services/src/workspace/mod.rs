@@ -474,14 +474,14 @@ impl WorkspaceServiceTrait for WorkspaceServiceImpl {
         }
 
         // Update the spend limit
-        let updated = self
+        let ApiKeyUpdate { previous, updated } = self
             .api_key_repository
             .update_spend_limit(api_key_id, spend_limit)
             .await
             .map_err(|e| {
                 WorkspaceError::InternalError(format!("Failed to update API key spend limit: {e}"))
             })?;
-        if api_key.spend_limit != updated.spend_limit {
+        if previous.spend_limit != updated.spend_limit {
             self.notify_api_key_change(
                 &workspace,
                 &organization,
@@ -489,7 +489,7 @@ impl WorkspaceServiceTrait for WorkspaceServiceImpl {
                 requester_id,
                 format!(
                     "Spend limit changed from {} to {}",
-                    format_spend_limit(api_key.spend_limit),
+                    format_spend_limit(previous.spend_limit),
                     format_spend_limit(updated.spend_limit)
                 ),
             )
@@ -542,23 +542,23 @@ impl WorkspaceServiceTrait for WorkspaceServiceImpl {
         }
 
         // Update the API key
-        let updated = self
+        let ApiKeyUpdate { previous, updated } = self
             .api_key_repository
             .update(api_key_id, name, expires_at, spend_limit, is_active)
             .await
             .map_err(Self::map_repository_error)?;
         let mut changes = Vec::new();
-        if api_key.is_active != updated.is_active {
+        if previous.is_active != updated.is_active {
             changes.push(if updated.is_active {
                 "API key enabled".to_string()
             } else {
                 "API key disabled".to_string()
             });
         }
-        if api_key.spend_limit != updated.spend_limit {
+        if previous.spend_limit != updated.spend_limit {
             changes.push(format!(
                 "Spend limit changed from {} to {}",
-                format_spend_limit(api_key.spend_limit),
+                format_spend_limit(previous.spend_limit),
                 format_spend_limit(updated.spend_limit)
             ));
         }

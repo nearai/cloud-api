@@ -478,8 +478,11 @@ impl WorkspaceServiceTrait for WorkspaceServiceImpl {
             .api_key_repository
             .update_spend_limit(api_key_id, spend_limit)
             .await
-            .map_err(|e| {
-                WorkspaceError::InternalError(format!("Failed to update API key spend limit: {e}"))
+            .map_err(|error| match error {
+                RepositoryError::NotFound(_) => WorkspaceError::ApiKeyNotFound,
+                error => WorkspaceError::InternalError(format!(
+                    "Failed to update API key spend limit: {error}"
+                )),
             })?;
         if previous.spend_limit != updated.spend_limit {
             self.notify_api_key_change(
@@ -546,7 +549,10 @@ impl WorkspaceServiceTrait for WorkspaceServiceImpl {
             .api_key_repository
             .update(api_key_id, name, expires_at, spend_limit, is_active)
             .await
-            .map_err(Self::map_repository_error)?;
+            .map_err(|error| match error {
+                RepositoryError::NotFound(_) => WorkspaceError::ApiKeyNotFound,
+                error => Self::map_repository_error(error),
+            })?;
         let mut changes = Vec::new();
         if previous.is_active != updated.is_active {
             changes.push(if updated.is_active {

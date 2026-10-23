@@ -399,6 +399,64 @@ async fn sender_failure_does_not_fail_mutation_or_stop_other_recipients() {
 }
 
 #[tokio::test]
+async fn updates_map_concurrent_revocation_to_not_found_without_notifying() {
+    for spend_limit_only in [false, true] {
+        for revoked in [false, true] {
+            let owner = member(MemberRole::Owner, true, "owner@example.com");
+            let requester = owner.user_id.clone();
+            let before = key(requester.clone());
+            let (sender, mut receiver) = sender();
+            let mut service = service(&before, &before, true, vec![owner], sender, false);
+            let mut keys = MockApiKeyRepository::new();
+            let existing = before.clone();
+            keys.expect_get_by_id()
+                .times(1)
+                .returning(move |_| Ok(Some(existing.clone())));
+            let failure = move || {
+                if revoked {
+                    RepositoryError::NotFound("API key".into())
+                } else {
+                    RepositoryError::ConnectionFailed("simulated database failure".into())
+                }
+            };
+            if spend_limit_only {
+                keys.expect_update_spend_limit()
+                    .times(1)
+                    .returning(move |_, _| Err(failure()));
+            } else {
+                keys.expect_update()
+                    .times(1)
+                    .returning(move |_, _, _, _, _| Err(failure()));
+            }
+            service.api_key_repository = Arc::new(keys);
+            let result = if spend_limit_only {
+                service
+                    .update_api_key_spend_limit(before.workspace_id, before.id, requester, None)
+                    .await
+            } else {
+                service
+                    .update_api_key(
+                        before.workspace_id,
+                        before.id,
+                        requester,
+                        None,
+                        None,
+                        None,
+                        Some(false),
+                    )
+                    .await
+            };
+            if revoked {
+                assert!(matches!(result, Err(WorkspaceError::ApiKeyNotFound)));
+            } else {
+                assert!(matches!(result, Err(WorkspaceError::InternalError(_))));
+            }
+            assert!(receiver.try_recv().is_err());
+        }
+    }
+}
+
+#[tokio::test]
 async fn slow_sender_does_not_block_mutation_response() {
     let owner = member(MemberRole::Owner, true, "owner@example.com");
     let requester = owner.user_id.clone();

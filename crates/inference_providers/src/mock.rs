@@ -736,7 +736,10 @@ impl MockExpectationBuilder {
 type ResponsesHandler =
     Arc<dyn Fn(serde_json::Value) -> crate::responses_raw::ResponsesRawResponse + Send + Sync>;
 type SystemOneHandler = Arc<
-    dyn Fn(crate::SystemOneRequest) -> Result<crate::SystemOneResponseWithBytes, CompletionError>
+    dyn Fn(
+            crate::SystemOneRequest,
+            Option<&str>,
+        ) -> Result<crate::SystemOneResponseWithBytes, CompletionError>
         + Send
         + Sync,
 >;
@@ -801,6 +804,7 @@ impl MockProvider {
         mut self,
         handler: impl Fn(
                 crate::SystemOneRequest,
+                Option<&str>,
             ) -> Result<crate::SystemOneResponseWithBytes, CompletionError>
             + Send
             + Sync
@@ -1193,12 +1197,13 @@ impl crate::InferenceProvider for MockProvider {
         &self,
         request: crate::SystemOneRequest,
         request_hash: String,
+        model_pub_key: Option<&str>,
     ) -> Result<crate::SystemOneResponseWithBytes, CompletionError> {
         let handler = self
             .systemone_handler
             .as_ref()
             .ok_or_else(|| CompletionError::CompletionError("No System One fixture".into()))?;
-        let response = handler(request)?;
+        let response = handler(request, model_pub_key)?;
         if let Some(id) = &response.response.id {
             self.register_signature_hashes(
                 id.clone(),

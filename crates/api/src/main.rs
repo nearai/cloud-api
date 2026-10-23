@@ -118,25 +118,31 @@ async fn main() {
         .await;
 
     // Scan outside the inference path. Durable per-recipient claims prevent
-    // duplicate delivery when multiple API replicas run the scheduler.
-    let credit_email_scheduler = Arc::new(services::usage::CreditEmailScheduler::new(
-        Arc::new(
-            database::repositories::credit_email_notification::CreditEmailNotificationRepository::new(
-                database.pool().clone(),
+    // duplicate delivery when multiple API replicas run the scheduler. Do not
+    // take locks or write claims when transactional email is disabled.
+    let credit_email_scheduler = if config.invitation_email.enabled {
+        let scheduler = Arc::new(services::usage::CreditEmailScheduler::new(
+            Arc::new(
+                database::repositories::credit_email_notification::CreditEmailNotificationRepository::new(
+                    database.pool().clone(),
+                ),
             ),
-        ),
-        Arc::new(
-            database::repositories::OrganizationLimitsRepository::with_accounting_config(
-                database.pool().clone(),
-                &config.credit_allocation,
+            Arc::new(
+                database::repositories::OrganizationLimitsRepository::with_accounting_config(
+                    database.pool().clone(),
+                    &config.credit_allocation,
+                ),
             ),
-        ),
-        services::email::sender_from_config(&config.invitation_email)
-            .expect("Failed to initialize credit alert email sender"),
-        config.invitation_email.credit_email_thresholds.clone(),
-        config.invitation_email.frontend_base_url.clone(),
-    ));
-    credit_email_scheduler.clone().start().await;
+            services::email::sender_from_config(&config.invitation_email)
+                .expect("Failed to initialize credit alert email sender"),
+            config.invitation_email.credit_email_thresholds.clone(),
+            config.invitation_email.frontend_base_url.clone(),
+        ));
+        scheduler.clone().start().await;
+        Some(scheduler)
+    } else {
+        None
+    };
 
     // A durable per-org claim prevents replica duplication. Keep two jobs in
     // flight so a slow final verification does not stall every other organization.
@@ -205,7 +211,7 @@ fn load_configuration() -> ApiConfig {
 
 struct BackgroundWorkers {
     discount: tokio::task::JoinHandle<()>,
-    credit_email: Arc<services::usage::CreditEmailScheduler>,
+    credit_email: Option<Arc<services::usage::CreditEmailScheduler>>,
 }
 
 /// Start the HTTP server with graceful shutdown on SIGTERM/SIGINT
@@ -242,7 +248,9 @@ async fn start_server(
     } = workers;
     discount.abort();
     let _ = discount.await;
-    credit_email.shutdown().await;
+    if let Some(credit_email) = credit_email {
+        credit_email.shutdown().await;
+    }
     match result {
         Ok(_) => {
             tracing::info!("Server shutdown successfully, initiating coordinated cleanup");

@@ -292,7 +292,10 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
-    use crate::email::NoopEmailSender;
+    use crate::email::{
+        ContactEmailVerificationEmail, EmailError, InvitationEmail, ModelDeprecationEmail,
+        NoopEmailSender, PricingChangeEmail,
+    };
     use crate::usage::ports::{
         CreditEmailRecipient, OrganizationCreditLimit, OrganizationCreditSnapshot,
         OrganizationLimit,
@@ -306,11 +309,19 @@ mod tests {
         lower_thresholds: Vec<i16>,
     }
 
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct ClaimMutation {
+        threshold: i16,
+        user_id: Uuid,
+        claim_token: Uuid,
+    }
+
     struct TestNotificationRepository {
         organizations: Vec<CreditEmailOrganization>,
         recipients: Vec<CreditEmailRecipient>,
         reconciliations: Mutex<Vec<ReconcileCall>>,
-        released_users: Mutex<Vec<Uuid>>,
+        released_claims: Mutex<Vec<ClaimMutation>>,
+        sent_claims: Mutex<Vec<ClaimMutation>>,
         snapshot_changes_remaining: Mutex<usize>,
     }
 
@@ -346,16 +357,84 @@ mod tests {
         async fn release_claim(
             &self,
             _: Uuid,
-            _: i16,
+            threshold: i16,
             user_id: Uuid,
-            _: Uuid,
+            claim_token: Uuid,
         ) -> anyhow::Result<()> {
-            self.released_users.lock().await.push(user_id);
+            self.released_claims.lock().await.push(ClaimMutation {
+                threshold,
+                user_id,
+                claim_token,
+            });
             Ok(())
         }
 
-        async fn mark_sent(&self, _: Uuid, _: i16, _: Uuid, _: Uuid) -> anyhow::Result<()> {
+        async fn mark_sent(
+            &self,
+            _: Uuid,
+            threshold: i16,
+            user_id: Uuid,
+            claim_token: Uuid,
+        ) -> anyhow::Result<()> {
+            self.sent_claims.lock().await.push(ClaimMutation {
+                threshold,
+                user_id,
+                claim_token,
+            });
             Ok(())
+        }
+    }
+
+    struct RecordingEmailSender {
+        result: Result<EmailDeliveryOutcome, EmailError>,
+        emails: Mutex<Vec<CreditBalanceAlertEmail>>,
+    }
+
+    impl RecordingEmailSender {
+        fn new(result: Result<EmailDeliveryOutcome, EmailError>) -> Self {
+            Self {
+                result,
+                emails: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl EmailSender for RecordingEmailSender {
+        async fn send_invitation(
+            &self,
+            _: &InvitationEmail,
+        ) -> Result<EmailDeliveryOutcome, EmailError> {
+            Ok(EmailDeliveryOutcome::Skipped)
+        }
+
+        async fn send_model_deprecation(
+            &self,
+            _: &ModelDeprecationEmail,
+        ) -> Result<EmailDeliveryOutcome, EmailError> {
+            Ok(EmailDeliveryOutcome::Skipped)
+        }
+
+        async fn send_pricing_change(
+            &self,
+            _: &PricingChangeEmail,
+        ) -> Result<EmailDeliveryOutcome, EmailError> {
+            Ok(EmailDeliveryOutcome::Skipped)
+        }
+
+        async fn send_contact_email_verification(
+            &self,
+            _: &ContactEmailVerificationEmail,
+        ) -> Result<EmailDeliveryOutcome, EmailError> {
+            Ok(EmailDeliveryOutcome::Skipped)
+        }
+
+        async fn send_credit_balance_alert(
+            &self,
+            email: &CreditBalanceAlertEmail,
+        ) -> Result<EmailDeliveryOutcome, EmailError> {
+            self.emails.lock().await.push(email.clone());
+            self.result.clone()
         }
     }
 
@@ -437,7 +516,8 @@ mod tests {
             }],
             recipients,
             reconciliations: Mutex::new(Vec::new()),
-            released_users: Mutex::new(Vec::new()),
+            released_claims: Mutex::new(Vec::new()),
+            sent_claims: Mutex::new(Vec::new()),
             snapshot_changes_remaining: Mutex::new(0),
         })
     }
@@ -501,6 +581,78 @@ mod tests {
         assert_eq!(calls[1].threshold, Some(10));
     }
 
+    #[tokio::test]
+    async fn successful_send_marks_the_exact_claim_as_sent() {
+        let user_id = Uuid::new_v4();
+        let claim_token = Uuid::new_v4();
+        let repository = repository(vec![CreditEmailRecipient {
+            user_id,
+            claim_token,
+            email: "owner@example.com".to_string(),
+            contact_email: None,
+            contact_email_verified_at: None,
+        }]);
+        let sender = Arc::new(RecordingEmailSender::new(Ok(EmailDeliveryOutcome::Sent {
+            message_id: Some("message-1".to_string()),
+        })));
+        let scheduler = CreditEmailScheduler::new(
+            repository.clone(),
+            limits(10),
+            sender.clone(),
+            vec![0, 10, 20],
+            None,
+        );
+
+        scheduler.run_once().await.unwrap();
+
+        assert_eq!(sender.emails.lock().await.len(), 1);
+        assert_eq!(
+            *repository.sent_claims.lock().await,
+            vec![ClaimMutation {
+                threshold: 10,
+                user_id,
+                claim_token,
+            }]
+        );
+        assert!(repository.released_claims.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_send_releases_the_exact_claim() {
+        let user_id = Uuid::new_v4();
+        let claim_token = Uuid::new_v4();
+        let repository = repository(vec![CreditEmailRecipient {
+            user_id,
+            claim_token,
+            email: "owner@example.com".to_string(),
+            contact_email: None,
+            contact_email_verified_at: None,
+        }]);
+        let sender = Arc::new(RecordingEmailSender::new(Err(EmailError::new(
+            "simulated send failure",
+        ))));
+        let scheduler = CreditEmailScheduler::new(
+            repository.clone(),
+            limits(10),
+            sender.clone(),
+            vec![0, 10, 20],
+            None,
+        );
+
+        scheduler.run_once().await.unwrap();
+
+        assert_eq!(sender.emails.lock().await.len(), 1);
+        assert_eq!(
+            *repository.released_claims.lock().await,
+            vec![ClaimMutation {
+                threshold: 10,
+                user_id,
+                claim_token,
+            }]
+        );
+        assert!(repository.sent_claims.lock().await.is_empty());
+    }
+
     #[test]
     fn threshold_crossing_does_not_round_down() {
         assert_eq!(threshold_for_balance(201, 1_000, &[0, 10, 20]), None);
@@ -545,7 +697,8 @@ mod tests {
                 contact_email_verified_at: None,
             }],
             reconciliations: Mutex::new(Vec::new()),
-            released_users: Mutex::new(Vec::new()),
+            released_claims: Mutex::new(Vec::new()),
+            sent_claims: Mutex::new(Vec::new()),
             snapshot_changes_remaining: Mutex::new(0),
         });
         let limits = Arc::new(PartiallyFailingLimitsRepository {
@@ -629,8 +782,8 @@ mod tests {
         scheduler.run_once().await.unwrap();
 
         assert_eq!(
-            *repository.released_users.lock().await,
-            vec![placeholder_user_id]
+            repository.released_claims.lock().await[0].user_id,
+            placeholder_user_id
         );
         let calls = repository.reconciliations.lock().await;
         assert_eq!(calls[0].threshold, Some(10));

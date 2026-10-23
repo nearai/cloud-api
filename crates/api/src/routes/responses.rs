@@ -268,7 +268,13 @@ pub async fn create_response(
         requested_model.set(model);
     }
     let native = if let Some(body) = body.as_ref() {
-        state.native_service.selected_model(body).await
+        state
+            .native_service
+            .selected_model(
+                body,
+                services::models::ModelCaller::Organization(api_key.organization.id.0),
+            )
+            .await
     } else {
         None
     };

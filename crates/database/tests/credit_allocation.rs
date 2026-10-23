@@ -153,7 +153,7 @@ async fn priority_splits_exactly_and_records_overage() -> anyhow::Result<()> {
         );
         assert_eq!(row.funded_amount, Some(cost - unfunded));
         assert_eq!(row.unfunded_amount, Some(unfunded));
-        assert_eq!(row.allocation_policy_version.as_deref(), Some("v1"));
+        assert_eq!(row.allocation_policy_version.as_deref(), Some("v2"));
         cleanup_usage_fixtures(&pool, &[org.org_id], &[]).await?;
     }
 
@@ -714,7 +714,7 @@ async fn every_credit_source_automatically_settles_overage() -> anyhow::Result<(
             allocations[0].source.as_deref(),
             Some(expected_source.as_str())
         );
-        assert_eq!(allocations[0].policy_version, "v1");
+        assert_eq!(allocations[0].policy_version, "v2");
 
         let phase: String = pool
             .get()
@@ -868,7 +868,7 @@ async fn same_credit_type_settlement_is_append_only_and_reports_effective_fundin
     assert_eq!(
         phases_and_versions,
         vec![
-            ("posting".to_string(), "v1".to_string()),
+            ("posting".to_string(), "v2".to_string()),
             (
                 "overage_settlement".to_string(),
                 "settlement-v2".to_string()

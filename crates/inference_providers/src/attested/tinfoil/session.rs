@@ -297,7 +297,8 @@ impl TinfoilRouterSession {
         serde_json::from_slice(&bytes).map_err(|_| TinfoilVerifyError::Fetch)
     }
 
-    /// `check_model` per published slug. A check may verify admin-pin Sigstore
+    /// `check_model` per published slug; a slug whose directory entry did not
+    /// parse is closed on its own. A check may verify admin-pin Sigstore
     /// bundles (CPU-bound, up to 32 on the first call after a trust change),
     /// so the checks run off the async worker like `verify_router`. A
     /// JoinError (the verifier panicked or was cancelled) closes every slug.
@@ -328,6 +329,16 @@ impl TinfoilRouterSession {
                 })
                 .collect()
         });
+        let mut checked = checked;
+        for slug in &doc.malformed {
+            tracing::warn!(slug = %slug, "Tinfoil directory entry did not parse; closing that model");
+            checked.insert(
+                slug.clone(),
+                Err(TinfoilVerifyError::Malformed {
+                    stage: "proxy_entry",
+                }),
+            );
+        }
         for (slug, entry) in &doc.models {
             if self.served_slugs.as_ref().is_none_or(|s| s.contains(slug)) {
                 match checked.get(slug) {

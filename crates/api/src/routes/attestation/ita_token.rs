@@ -13,6 +13,7 @@ use axum::{
 use services::attestation::ita::{
     ItaGatewaySigningAlg as ServiceItaGatewaySigningAlg, ItaTokenQuery as ServiceItaTokenQuery,
 };
+use services::models::ModelCaller;
 
 /// Get Intel Trust Authority attestation token
 ///
@@ -45,10 +46,15 @@ pub async fn get_ita_token(
     State(state): State<AttestationRouteState>,
     headers: HeaderMap,
 ) -> Result<Response, Response> {
-    let alias_resolved =
-        resolve_attestation_alias(params.model.as_deref(), &state.models_service, &headers)
-            .await
-            .map_err(error_tuple_into_response)?;
+    // Public route: no organization is known, so only listed models resolve.
+    let alias_resolved = resolve_attestation_alias(
+        params.model.as_deref(),
+        &state.models_service,
+        ModelCaller::Anonymous,
+        &headers,
+    )
+    .await
+    .map_err(error_tuple_into_response)?;
     let query = params
         .into_service_query()
         .map_err(error_tuple_into_response)?;

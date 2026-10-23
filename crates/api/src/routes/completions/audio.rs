@@ -154,7 +154,10 @@ pub async fn audio_transcriptions(
     // Resolve model to get UUID for usage tracking (handles aliases like chat_completions)
     let model = match app_state
         .models_service
-        .resolve_and_get_model(&request.model)
+        .resolve_and_get_model(
+            &request.model,
+            ModelCaller::Organization(api_key.organization.id.0),
+        )
         .await
     {
         Ok(model) => model,

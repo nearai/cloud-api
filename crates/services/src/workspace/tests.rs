@@ -5,14 +5,28 @@ use crate::email::{
     ModelDeprecationEmail, PricingChangeEmail,
 };
 use crate::organization::{MockOrganizationServiceTrait, Organization, OrganizationMemberWithUser};
-use std::time::Duration;
+use std::{sync::Mutex, time::Duration};
 use tokio::sync::{mpsc, Semaphore};
+use tracing::instrument::WithSubscriber;
 use uuid::Uuid;
 
 struct RecordingEmailSender {
     attempts: mpsc::UnboundedSender<ApiKeyChangedEmail>,
     fail: bool,
     gate: Option<Arc<Semaphore>>,
+}
+
+struct LogWriter(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for LogWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -453,6 +467,74 @@ async fn updates_map_concurrent_revocation_to_not_found_without_notifying() {
             }
             assert!(receiver.try_recv().is_err());
         }
+    }
+}
+
+#[tokio::test]
+async fn recipient_lookup_failures_are_logged_without_sensitive_details_or_a_silent_cap() {
+    for count_fails in [false, true] {
+        let owner = member(MemberRole::Owner, true, "owner@example.com");
+        let requester = owner.user_id.clone();
+        let before = key(requester.clone());
+        let (sender, mut receiver) = sender();
+        let mut service = service(&before, &before, true, vec![owner], sender, false);
+        let mut organizations = MockOrganizationServiceTrait::new();
+        organizations
+            .expect_get_user_role()
+            .times(1)
+            .returning(|_, _| Ok(Some(MemberRole::Owner)));
+        let sensitive_error = || {
+            OrganizationError::InternalError(
+                "private@example.com sk-live-secret private-org-name".into(),
+            )
+        };
+        organizations
+            .expect_get_member_count()
+            .times(1)
+            .returning(move |_, _| {
+                if count_fails {
+                    Err(sensitive_error())
+                } else {
+                    Ok(1501)
+                }
+            });
+        organizations
+            .expect_get_members_with_users_paginated()
+            .times(usize::from(!count_fails))
+            .withf(|_, _, limit, offset| *limit == 1501 && *offset == 0)
+            .returning(move |_, _, _, _| Err(sensitive_error()));
+        service.organization_service = Arc::new(organizations);
+        let logs = Arc::new(Mutex::new(Vec::new()));
+        let output = logs.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(move || LogWriter(output.clone()))
+            .finish();
+        let result = service
+            .revoke_api_key(before.workspace_id.clone(), before.id.clone(), requester)
+            .with_subscriber(subscriber)
+            .await;
+        assert!(
+            result.unwrap(),
+            "recipient lookup failure must not fail the key mutation"
+        );
+        assert!(receiver.try_recv().is_err());
+        let logged = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+        assert!(logged.contains("WARN"));
+        assert!(logged.contains("Failed to load API key change email recipients"));
+        assert!(logged.contains(if count_fails {
+            "member_count"
+        } else {
+            "member_list"
+        }));
+        assert!(logged.contains("internal_error"));
+        assert!(logged.contains(&before.workspace_id.0.to_string()));
+        assert!(logged.contains(&before.id.0));
+        assert!(!logged.contains("private@example.com"));
+        assert!(!logged.contains("sk-live-secret"));
+        assert!(!logged.contains("private-org-name"));
     }
 }
 

@@ -80,7 +80,15 @@ impl CreditEmailNotificationRepositoryPort for CreditEmailNotificationRepository
         let Some(threshold) = threshold else {
             transaction
                 .execute(
-                    "DELETE FROM email_notification_deliveries WHERE event_type = $1 AND resource_id = $2",
+                    r#"
+                    DELETE FROM email_notification_deliveries
+                    WHERE event_type = $1 AND resource_id = $2
+                      AND NOT (
+                          sent_at IS NULL
+                          AND dispatch_started_at IS NOT NULL
+                          AND claimed_at >= NOW() - INTERVAL '30 minutes'
+                      )
+                    "#,
                     &[&EVENT_TYPE, &resource_id],
                 )
                 .await?;
@@ -95,12 +103,26 @@ impl CreditEmailNotificationRepositoryPort for CreditEmailNotificationRepository
                 .map(ToString::to_string)
                 .collect::<Vec<_>>();
             recovered_from_lower_threshold = transaction
-                .execute(
-                    "DELETE FROM email_notification_deliveries WHERE event_type = $1 AND resource_id = $2 AND event_key = ANY($3)",
+                .query_one(
+                    "SELECT EXISTS (SELECT 1 FROM email_notification_deliveries WHERE event_type = $1 AND resource_id = $2 AND event_key = ANY($3))",
                     &[&EVENT_TYPE, &resource_id, &event_keys],
                 )
                 .await?
-                > 0;
+                .get(0);
+            transaction
+                .execute(
+                    r#"
+                    DELETE FROM email_notification_deliveries
+                    WHERE event_type = $1 AND resource_id = $2 AND event_key = ANY($3)
+                      AND NOT (
+                          sent_at IS NULL
+                          AND dispatch_started_at IS NOT NULL
+                          AND claimed_at >= NOW() - INTERVAL '30 minutes'
+                      )
+                    "#,
+                    &[&EVENT_TYPE, &resource_id, &event_keys],
+                )
+                .await?;
         }
 
         let rows = transaction
@@ -134,6 +156,11 @@ impl CreditEmailNotificationRepositoryPort for CreditEmailNotificationRepository
                 ON CONFLICT (event_type, resource_id, event_key, recipient_user_id)
                 DO UPDATE SET claimed_at = NOW(), claim_token = EXCLUDED.claim_token,
                               sent_at = COALESCE(email_notification_deliveries.sent_at, NOW())
+                WHERE NOT (
+                    email_notification_deliveries.sent_at IS NULL
+                    AND email_notification_deliveries.dispatch_started_at IS NOT NULL
+                    AND email_notification_deliveries.claimed_at >= NOW() - INTERVAL '30 minutes'
+                )
                 "#,
                         &[
                             &EVENT_TYPE,
@@ -153,7 +180,8 @@ impl CreditEmailNotificationRepositoryPort for CreditEmailNotificationRepository
                     (event_type, resource_id, event_key, recipient_user_id, claim_token)
                 VALUES ($1, $2, $3, $4, $5)
                 ON CONFLICT (event_type, resource_id, event_key, recipient_user_id)
-                DO UPDATE SET claimed_at = NOW(), claim_token = EXCLUDED.claim_token
+                DO UPDATE SET claimed_at = NOW(), claim_token = EXCLUDED.claim_token,
+                              dispatch_started_at = NULL
                 WHERE email_notification_deliveries.sent_at IS NULL
                   AND email_notification_deliveries.claimed_at < NOW() - INTERVAL '30 minutes'
                 RETURNING recipient_user_id, claim_token
@@ -180,6 +208,35 @@ impl CreditEmailNotificationRepositoryPort for CreditEmailNotificationRepository
         }
         transaction.commit().await?;
         Ok(CreditEmailClaimResult::Claimed(claimed_recipients))
+    }
+
+    async fn begin_dispatch(
+        &self,
+        organization_id: Uuid,
+        threshold: i16,
+        recipient_user_id: Uuid,
+        claim_token: Uuid,
+    ) -> Result<bool> {
+        let client = self.pool.get().await?;
+        let updated = client
+            .execute(
+                r#"
+                UPDATE email_notification_deliveries
+                SET dispatch_started_at = NOW(), claimed_at = NOW()
+                WHERE event_type = $1 AND resource_id = $2 AND event_key = $3
+                  AND recipient_user_id = $4 AND claim_token = $5
+                  AND sent_at IS NULL AND dispatch_started_at IS NULL
+                "#,
+                &[
+                    &EVENT_TYPE,
+                    &Self::resource_id(organization_id),
+                    &threshold.to_string(),
+                    &recipient_user_id,
+                    &claim_token,
+                ],
+            )
+            .await?;
+        Ok(updated == 1)
     }
 
     async fn release_claim(
@@ -215,7 +272,7 @@ impl CreditEmailNotificationRepositoryPort for CreditEmailNotificationRepository
         let client = self.pool.get().await?;
         client
             .execute(
-                "UPDATE email_notification_deliveries SET sent_at = NOW() WHERE event_type = $1 AND resource_id = $2 AND event_key = $3 AND recipient_user_id = $4 AND claim_token = $5",
+                "UPDATE email_notification_deliveries SET sent_at = NOW() WHERE event_type = $1 AND resource_id = $2 AND event_key = $3 AND recipient_user_id = $4 AND claim_token = $5 AND dispatch_started_at IS NOT NULL",
                 &[
                     &EVENT_TYPE,
                     &Self::resource_id(organization_id),

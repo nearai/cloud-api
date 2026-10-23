@@ -536,6 +536,15 @@ pub trait CreditEmailNotificationRepository: Send + Sync {
         threshold: Option<i16>,
         lower_thresholds: &[i16],
     ) -> anyhow::Result<CreditEmailClaimResult>;
+    /// Fence the outbound provider call with the current claim token and renew
+    /// its lease. Returns false if the claim was replaced or revoked.
+    async fn begin_dispatch(
+        &self,
+        organization_id: Uuid,
+        threshold: i16,
+        recipient_user_id: Uuid,
+        claim_token: Uuid,
+    ) -> anyhow::Result<bool>;
     async fn release_claim(
         &self,
         organization_id: Uuid,

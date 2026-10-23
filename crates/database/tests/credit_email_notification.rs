@@ -113,6 +113,11 @@ async fn claims_deduplicate_recover_and_release() -> anyhow::Result<()> {
     assert_ne!(reclaimed[0].claim_token, initial_claim[0].claim_token);
     let claim_token = reclaimed[0].claim_token;
 
+    assert!(
+        repository
+            .begin_dispatch(organization_id, 10, user_id, claim_token)
+            .await?
+    );
     repository
         .mark_sent(organization_id, 10, user_id, claim_token)
         .await?;
@@ -176,6 +181,11 @@ async fn stale_worker_cannot_release_or_complete_a_reclaimed_delivery() -> anyho
     let second_token = second_claim[0].claim_token;
     assert_ne!(first_token, second_token);
 
+    assert!(
+        !repository
+            .begin_dispatch(organization_id, 10, user_id, first_token)
+            .await?
+    );
     repository
         .release_claim(organization_id, 10, user_id, first_token)
         .await?;
@@ -193,6 +203,11 @@ async fn stale_worker_cannot_release_or_complete_a_reclaimed_delivery() -> anyho
     assert_eq!(row.get::<_, Uuid>("claim_token"), second_token);
     assert!(!row.get::<_, bool>("sent"));
 
+    assert!(
+        repository
+            .begin_dispatch(organization_id, 10, user_id, second_token)
+            .await?
+    );
     repository
         .mark_sent(organization_id, 10, user_id, second_token)
         .await?;
@@ -232,6 +247,11 @@ async fn stale_snapshot_cannot_remove_a_newer_threshold_claim() -> anyhow::Resul
     );
     assert_eq!(current_claim.len(), 1);
     let claim_token = current_claim[0].claim_token;
+    assert!(
+        repository
+            .begin_dispatch(organization_id, 10, user_id, claim_token)
+            .await?
+    );
     repository
         .mark_sent(organization_id, 10, user_id, claim_token)
         .await?;
@@ -269,6 +289,11 @@ async fn partial_replenishment_rearms_lower_alert_without_sending_higher_alert(
             .await?,
     );
     assert_eq!(low_claim.len(), 1);
+    assert!(
+        repository
+            .begin_dispatch(organization_id, 10, user_id, low_claim[0].claim_token,)
+            .await?
+    );
     repository
         .mark_sent(organization_id, 10, user_id, low_claim[0].claim_token)
         .await?;
@@ -312,6 +337,118 @@ async fn partial_replenishment_rearms_lower_alert_without_sending_higher_alert(
         .len(),
         1
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn partial_replenishment_does_not_revoke_an_active_dispatch() -> anyhow::Result<()> {
+    let pool = test_pool().await?;
+    let repository = CreditEmailNotificationRepository::new(pool.clone());
+    let (organization_id, user_id) = insert_credit_fixture(&pool, 90).await?;
+    let low_version = snapshot_version(&pool, organization_id).await?;
+    let low_claim = claimed(
+        repository
+            .reconcile_claims(organization_id, &low_version, Some(10), &[0])
+            .await?,
+    );
+    let claim_token = low_claim[0].claim_token;
+    assert!(
+        repository
+            .begin_dispatch(organization_id, 10, user_id, claim_token)
+            .await?
+    );
+
+    pool.get()
+        .await?
+        .execute(
+            "UPDATE organization_credit_consumption SET amount = 85, updated_at = clock_timestamp() WHERE organization_id = $1 AND credit_type = 'payment'",
+            &[&organization_id],
+        )
+        .await?;
+    let recovered_version = snapshot_version(&pool, organization_id).await?;
+    assert!(claimed(
+        repository
+            .reconcile_claims(organization_id, &recovered_version, Some(20), &[0, 10],)
+            .await?
+    )
+    .is_empty());
+
+    let active: bool = pool
+        .get()
+        .await?
+        .query_one(
+            "SELECT dispatch_started_at IS NOT NULL AND sent_at IS NULL FROM email_notification_deliveries WHERE resource_id = $1 AND event_key = '10' AND recipient_user_id = $2 AND claim_token = $3",
+            &[&format!("{organization_id}:combined"), &user_id, &claim_token],
+        )
+        .await?
+        .get(0);
+    assert!(active);
+    repository
+        .mark_sent(organization_id, 10, user_id, claim_token)
+        .await?;
+
+    assert!(claimed(
+        repository
+            .reconcile_claims(organization_id, &recovered_version, Some(20), &[0, 10],)
+            .await?
+    )
+    .is_empty());
+    let lower_claims: i64 = pool
+        .get()
+        .await?
+        .query_one(
+            "SELECT COUNT(*) FROM email_notification_deliveries WHERE resource_id = $1 AND event_key = '10'",
+            &[&format!("{organization_id}:combined")],
+        )
+        .await?
+        .get(0);
+    assert_eq!(lower_claims, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn full_replenishment_does_not_revoke_an_active_dispatch() -> anyhow::Result<()> {
+    let pool = test_pool().await?;
+    let repository = CreditEmailNotificationRepository::new(pool.clone());
+    let (organization_id, user_id) = insert_credit_fixture(&pool, 90).await?;
+    let low_version = snapshot_version(&pool, organization_id).await?;
+    let claim = claimed(
+        repository
+            .reconcile_claims(organization_id, &low_version, Some(10), &[0])
+            .await?,
+    );
+    let claim_token = claim[0].claim_token;
+    assert!(
+        repository
+            .begin_dispatch(organization_id, 10, user_id, claim_token)
+            .await?
+    );
+
+    pool.get()
+        .await?
+        .execute(
+            "UPDATE organization_credit_consumption SET amount = 0, updated_at = clock_timestamp() WHERE organization_id = $1 AND credit_type = 'payment'",
+            &[&organization_id],
+        )
+        .await?;
+    let recovered_version = snapshot_version(&pool, organization_id).await?;
+    repository
+        .reconcile_claims(organization_id, &recovered_version, None, &[])
+        .await?;
+
+    let active: bool = pool
+        .get()
+        .await?
+        .query_one(
+            "SELECT dispatch_started_at IS NOT NULL AND sent_at IS NULL FROM email_notification_deliveries WHERE resource_id = $1 AND event_key = '10' AND recipient_user_id = $2 AND claim_token = $3",
+            &[&format!("{organization_id}:combined"), &user_id, &claim_token],
+        )
+        .await?
+        .get(0);
+    assert!(active);
+    repository
+        .mark_sent(organization_id, 10, user_id, claim_token)
+        .await?;
     Ok(())
 }
 

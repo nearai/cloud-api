@@ -209,6 +209,18 @@ impl CreditEmailScheduler {
                     organization.id
                 ),
             };
+            if !self
+                .repository
+                .begin_dispatch(
+                    organization.id,
+                    threshold,
+                    recipient.user_id,
+                    recipient.claim_token,
+                )
+                .await?
+            {
+                continue;
+            }
             match self.email_sender.send_credit_balance_alert(&email).await {
                 Ok(EmailDeliveryOutcome::Sent { .. }) => {
                     if let Err(error) = self
@@ -319,7 +331,9 @@ mod tests {
     struct TestNotificationRepository {
         organizations: Vec<CreditEmailOrganization>,
         recipients: Vec<CreditEmailRecipient>,
+        dispatch_allowed: bool,
         reconciliations: Mutex<Vec<ReconcileCall>>,
+        begun_claims: Mutex<Vec<ClaimMutation>>,
         released_claims: Mutex<Vec<ClaimMutation>>,
         sent_claims: Mutex<Vec<ClaimMutation>>,
         snapshot_changes_remaining: Mutex<usize>,
@@ -352,6 +366,21 @@ mod tests {
             Ok(CreditEmailClaimResult::Claimed(
                 threshold.map_or_else(Vec::new, |_| self.recipients.clone()),
             ))
+        }
+
+        async fn begin_dispatch(
+            &self,
+            _: Uuid,
+            threshold: i16,
+            user_id: Uuid,
+            claim_token: Uuid,
+        ) -> anyhow::Result<bool> {
+            self.begun_claims.lock().await.push(ClaimMutation {
+                threshold,
+                user_id,
+                claim_token,
+            });
+            Ok(self.dispatch_allowed)
         }
 
         async fn release_claim(
@@ -509,13 +538,22 @@ mod tests {
     }
 
     fn repository(recipients: Vec<CreditEmailRecipient>) -> Arc<TestNotificationRepository> {
+        repository_with_dispatch_fence(recipients, true)
+    }
+
+    fn repository_with_dispatch_fence(
+        recipients: Vec<CreditEmailRecipient>,
+        dispatch_allowed: bool,
+    ) -> Arc<TestNotificationRepository> {
         Arc::new(TestNotificationRepository {
             organizations: vec![CreditEmailOrganization {
                 id: Uuid::new_v4(),
                 name: "Example".to_string(),
             }],
             recipients,
+            dispatch_allowed,
             reconciliations: Mutex::new(Vec::new()),
+            begun_claims: Mutex::new(Vec::new()),
             released_claims: Mutex::new(Vec::new()),
             sent_claims: Mutex::new(Vec::new()),
             snapshot_changes_remaining: Mutex::new(0),
@@ -607,6 +645,14 @@ mod tests {
 
         assert_eq!(sender.emails.lock().await.len(), 1);
         assert_eq!(
+            *repository.begun_claims.lock().await,
+            vec![ClaimMutation {
+                threshold: 10,
+                user_id,
+                claim_token,
+            }]
+        );
+        assert_eq!(
             *repository.sent_claims.lock().await,
             vec![ClaimMutation {
                 threshold: 10,
@@ -653,6 +699,39 @@ mod tests {
         assert!(repository.sent_claims.lock().await.is_empty());
     }
 
+    #[tokio::test]
+    async fn replaced_claim_is_not_dispatched_or_mutated() {
+        let user_id = Uuid::new_v4();
+        let claim_token = Uuid::new_v4();
+        let repository = repository_with_dispatch_fence(
+            vec![CreditEmailRecipient {
+                user_id,
+                claim_token,
+                email: "owner@example.com".to_string(),
+                contact_email: None,
+                contact_email_verified_at: None,
+            }],
+            false,
+        );
+        let sender = Arc::new(RecordingEmailSender::new(Ok(EmailDeliveryOutcome::Sent {
+            message_id: Some("message-1".to_string()),
+        })));
+        let scheduler = CreditEmailScheduler::new(
+            repository.clone(),
+            limits(10),
+            sender.clone(),
+            vec![0, 10, 20],
+            None,
+        );
+
+        scheduler.run_once().await.unwrap();
+
+        assert_eq!(repository.begun_claims.lock().await.len(), 1);
+        assert!(sender.emails.lock().await.is_empty());
+        assert!(repository.sent_claims.lock().await.is_empty());
+        assert!(repository.released_claims.lock().await.is_empty());
+    }
+
     #[test]
     fn threshold_crossing_does_not_round_down() {
         assert_eq!(threshold_for_balance(201, 1_000, &[0, 10, 20]), None);
@@ -696,7 +775,9 @@ mod tests {
                 contact_email: None,
                 contact_email_verified_at: None,
             }],
+            dispatch_allowed: true,
             reconciliations: Mutex::new(Vec::new()),
+            begun_claims: Mutex::new(Vec::new()),
             released_claims: Mutex::new(Vec::new()),
             sent_claims: Mutex::new(Vec::new()),
             snapshot_changes_remaining: Mutex::new(0),

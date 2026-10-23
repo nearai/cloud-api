@@ -19,7 +19,7 @@ use inference_providers::{
 use services::{
     attestation::SignatureKind,
     completions::hash_inference_id_to_uuid,
-    models::ModelsError,
+    models::{ModelCaller, ModelsError},
     usage::{InferenceType, ProviderAttribution, RecordUsageServiceRequest, StopReason},
 };
 use sha2::{Digest, Sha256};
@@ -72,7 +72,10 @@ pub async fn systemone(
     }
     let model = match state
         .models_service
-        .resolve_and_get_model(&request.model)
+        .resolve_and_get_model(
+            &request.model,
+            ModelCaller::Organization(api_key.organization.id.0),
+        )
         .await
     {
         Ok(model) => model,
@@ -143,27 +146,21 @@ pub async fn systemone(
         let inference_id = hash_inference_id_to_uuid(decision_id);
         let usage = &served.response.response.usage;
         let usage_request = RecordUsageServiceRequest {
-            organization_id: api_key.organization.id.0,
-            workspace_id: api_key.workspace.id.0,
-            api_key_id,
-            model_id: model.id,
             input_tokens: usage.input_tokens,
             output_tokens: usage.output_tokens,
-            cache_read_tokens: 0,
-            cache_write: None,
-            profiled_cache_write_tokens: 0,
-            requested_service_tier: None,
-            provider_service_tier: None,
-            inference_type: InferenceType::Decisions,
-            ttft_ms: None,
-            avg_itl_ms: None,
             inference_id: Some(inference_id),
             provider_request_id: Some(decision_id.clone()),
             stop_reason: Some(StopReason::Completed),
-            response_id: None,
-            image_count: None,
             provider_attribution: served.provider_attribution,
-            discount: None,
+            ..RecordUsageServiceRequest::base(
+                services::usage::BillingIdentity {
+                    organization_id: api_key.organization.id.0,
+                    workspace_id: api_key.workspace.id.0,
+                    api_key_id,
+                    model_id: model.id,
+                },
+                InferenceType::Decisions,
+            )
         };
         let signature = async {
             let result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -358,7 +355,7 @@ mod tests {
     }
 
     #[test]
-    fn systemone_openapi_keeps_usage_schemas_distinct() {
+    fn systemone_openapi_matches_request_and_usage_contracts() {
         let spec = serde_json::to_value(crate::openapi::ApiDoc::openapi()).unwrap();
         assert_eq!(
             spec["paths"]["/v1/systemone"]["post"]["requestBody"]["content"]["application/json"]
@@ -366,6 +363,12 @@ mod tests {
             "#/components/schemas/SystemOneRequest",
         );
         let schemas = &spec["components"]["schemas"];
+        for question in schemas["SystemOneQuestion"]["oneOf"].as_array().unwrap() {
+            assert!(question["required"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("instructions")));
+        }
         assert!(schemas["Usage"]["properties"].get("total_tokens").is_some());
         assert!(schemas["SystemOneUsage"]["properties"]
             .get("total_tokens")
@@ -374,5 +377,61 @@ mod tests {
             schemas["SystemOneResponse"]["properties"]["usage"]["$ref"],
             "#/components/schemas/SystemOneUsage",
         );
+    }
+
+    #[tokio::test]
+    async fn systemone_requires_instructions_at_the_json_boundary() {
+        use axum::extract::FromRequest;
+        use serde_json::{json, Value};
+
+        for question in [
+            json!({"type":"noul"}),
+            json!({"type":"choice","criteria":{"billing":null,"other":null}}),
+            json!({"type":"score","criteria":["low","high"]}),
+        ] {
+            for (case, instructions) in [("missing", None), ("null", Some(Value::Null))] {
+                let mut question = question.clone();
+                let missing = instructions.is_none();
+                if let Some(value) = instructions {
+                    question["instructions"] = value;
+                }
+                let request = axum::http::Request::builder()
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({"model":"jev","state":"Refund please","questions":{"q":question}})
+                            .to_string(),
+                    ))
+                    .unwrap();
+                let rejection = match OpenAiJson::<SystemOneRequest>::from_request(request, &())
+                    .await
+                {
+                    Ok(_) => panic!("{case} instructions must be rejected; question: {question}"),
+                    Err(rejection) => rejection,
+                };
+                let response = rejection.into_response();
+                let status = response.status();
+                let bytes = axum::body::to_bytes(response.into_body(), 4096)
+                    .await
+                    .unwrap();
+                let error: Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(
+                    status,
+                    StatusCode::BAD_REQUEST,
+                    "{case} instructions; question: {question}; error: {error}"
+                );
+                assert_eq!(
+                    error["error"]["type"], "invalid_request_error",
+                    "{case} instructions; question: {question}; error: {error}"
+                );
+                if missing {
+                    assert!(
+                        error["error"]["message"]
+                            .as_str()
+                            .is_some_and(|message| message.contains("missing field `instructions`")),
+                        "{case} instructions; question: {question}; error: {error}"
+                    );
+                }
+            }
+        }
     }
 }

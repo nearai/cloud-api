@@ -10,7 +10,7 @@ use crate::{
     BufferedSSEParser, ChatCompletionParams, ChatCompletionResponse, ChatCompletionResponseChoice,
     ChatCompletionResponseWithBytes, ChatResponseMessage, CompletionError, ImageData,
     ImageGenerationError, ImageGenerationParams, ImageGenerationResponse,
-    ImageGenerationResponseWithBytes, MessageRole, StreamingResult, TokenUsage,
+    ImageGenerationResponseWithBytes, MessageRole, StreamingResult,
 };
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -95,13 +95,10 @@ fn convert_to_openai_response(
         }],
         service_tier: None,
         system_fingerprint: None,
-        usage: TokenUsage {
-            prompt_tokens: gemini_response.usage_metadata.prompt_token_count,
-            completion_tokens: gemini_response.usage_metadata.candidates_token_count,
-            total_tokens: gemini_response.usage_metadata.total_token_count,
-            prompt_tokens_details: None,
-            ..Default::default()
-        },
+        usage: gemini_response
+            .usage_metadata
+            .unwrap_or_default()
+            .to_token_usage(),
         prompt_logprobs: None,
         prompt_token_ids: None,
         kv_transfer_params: None,
@@ -1006,5 +1003,167 @@ mod tests {
         let choice = &openai.choices[0];
         assert_eq!(choice.message.content.as_deref(), Some("Hi!"));
         assert_eq!(choice.finish_reason.as_deref(), Some("stop"));
+    }
+
+    // Billing: thinking is reported outside `candidatesTokenCount` and billed
+    // by Google at the output rate. Counts are from a `gemini-2.5-pro` reply to
+    // a short arithmetic prompt (26 visible tokens, 2,706 thinking tokens).
+    #[test]
+    fn test_convert_to_openai_response_counts_thinking_and_cache() {
+        let json = r#"{
+            "candidates": [{
+                "content": {"role": "model", "parts": [{"text": "42"}]},
+                "finishReason": "STOP",
+                "index": 0
+            }],
+            "usageMetadata": {
+                "promptTokenCount": 71,
+                "cachedContentTokenCount": 64,
+                "candidatesTokenCount": 26,
+                "thoughtsTokenCount": 2706,
+                "totalTokenCount": 2803
+            }
+        }"#;
+        let response: GeminiResponse = serde_json::from_str(json).unwrap();
+        let openai = convert_to_openai_response(response, "google/gemini-2.5-pro").unwrap();
+
+        assert_eq!(openai.usage.prompt_tokens, 71);
+        assert_eq!(openai.usage.completion_tokens, 2732);
+        assert_eq!(openai.usage.total_tokens, 2803);
+        assert_eq!(openai.usage.cached_tokens(), 64);
+        assert_eq!(openai.usage.reasoning_tokens(), Some(2706));
+
+        // What the client sees.
+        let wire = serde_json::to_value(&openai).unwrap();
+        assert_eq!(
+            wire["usage"],
+            serde_json::json!({
+                "prompt_tokens": 71,
+                "completion_tokens": 2732,
+                "total_tokens": 2803,
+                "prompt_tokens_details": {"cached_tokens": 64},
+                "completion_tokens_details": {"reasoning_tokens": 2706}
+            })
+        );
+    }
+
+    #[test]
+    fn test_convert_to_openai_response_usage_without_thinking_or_cache() {
+        let json = r#"{
+            "candidates": [{
+                "content": {"role": "model", "parts": [{"text": "Hi!"}]},
+                "finishReason": "STOP",
+                "index": 0
+            }],
+            "usageMetadata": {
+                "promptTokenCount": 3,
+                "candidatesTokenCount": 2,
+                "totalTokenCount": 5
+            }
+        }"#;
+        let response: GeminiResponse = serde_json::from_str(json).unwrap();
+        let openai = convert_to_openai_response(response, "google/gemini-2.0-flash").unwrap();
+
+        let wire = serde_json::to_value(&openai).unwrap();
+        assert_eq!(
+            wire["usage"],
+            serde_json::json!({
+                "prompt_tokens": 3,
+                "completion_tokens": 2,
+                "total_tokens": 5
+            })
+        );
+    }
+
+    /// Full HTTP path, non-streaming and streaming, against a stand-in for
+    /// Google's API: both must report the same usage for the same request.
+    #[tokio::test]
+    async fn test_backend_reports_thinking_and_cache_on_both_paths() {
+        use futures_util::StreamExt;
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let usage_metadata = serde_json::json!({
+            "promptTokenCount": 71,
+            "cachedContentTokenCount": 64,
+            "candidatesTokenCount": 26,
+            "thoughtsTokenCount": 2706,
+            "totalTokenCount": 2803
+        });
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/models/gemini-2.5-pro:generateContent"))
+            .and(header("x-goog-api-key", "upstream-secret"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "candidates": [{
+                    "content": {"role": "model", "parts": [{"text": "42"}]},
+                    "finishReason": "STOP"
+                }],
+                "usageMetadata": usage_metadata
+            })))
+            .mount(&server)
+            .await;
+        let sse = format!(
+            "data: {}\n\ndata: {}\n\n",
+            serde_json::json!({
+                "candidates": [{"content": {"role": "model", "parts": [{"text": "4"}]}}],
+                "usageMetadata": {
+                    "promptTokenCount": 71,
+                    "cachedContentTokenCount": 64,
+                    "candidatesTokenCount": 1,
+                    "thoughtsTokenCount": 2706,
+                    "totalTokenCount": 2778
+                }
+            }),
+            serde_json::json!({
+                "candidates": [{
+                    "content": {"role": "model", "parts": [{"text": "2"}]},
+                    "finishReason": "STOP"
+                }],
+                "usageMetadata": usage_metadata
+            }),
+        );
+        Mock::given(method("POST"))
+            .and(path("/models/gemini-2.5-pro:streamGenerateContent"))
+            .and(header("x-goog-api-key", "upstream-secret"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(sse, "text/event-stream"))
+            .mount(&server)
+            .await;
+
+        let config = BackendConfig {
+            base_url: server.uri(),
+            api_key: "upstream-secret".to_string(),
+            ..Default::default()
+        };
+        let backend = GeminiBackend::new();
+
+        let response = backend
+            .chat_completion(&config, "google/gemini-2.5-pro", base_params())
+            .await
+            .expect("completion should succeed");
+        let non_streaming = response.response.usage;
+
+        let mut stream = backend
+            .chat_completion_stream(&config, "google/gemini-2.5-pro", base_params())
+            .await
+            .expect("stream should start");
+        let mut streaming = None;
+        while let Some(event) = stream.next().await {
+            let event = event.expect("stream event should parse");
+            if let Some(crate::StreamChunk::Chat(chunk)) = event.chunk {
+                if chunk.usage.is_some() {
+                    streaming = chunk.usage;
+                }
+            }
+        }
+        let streaming = streaming.expect("stream should carry usage");
+
+        for usage in [&non_streaming, &streaming] {
+            assert_eq!(usage.prompt_tokens, 71);
+            assert_eq!(usage.completion_tokens, 2732);
+            assert_eq!(usage.total_tokens, 2803);
+            assert_eq!(usage.cached_tokens(), 64);
+            assert_eq!(usage.reasoning_tokens(), Some(2706));
+        }
     }
 }

@@ -57,6 +57,10 @@ pub const METRIC_BACKEND_KEY_DIVERGENCE: &str = "cloud_api.backend.key_divergenc
 // Tagged `model`, `path` (inline_verify|discovery) and `result`
 // (match|mismatch|unattested|missing).
 pub const METRIC_BACKEND_CHANNEL_BINDING: &str = "cloud_api.backend.channel_binding";
+/// Seconds from an attested third-party measurement or release first being
+/// rejected as unknown to its first admission, emitted once each. Tagged
+/// `provider` (a `ProviderSource::as_str()` value) and `kind` (`router|model`).
+pub const METRIC_ATTESTED_3P_TIME_TO_TRUST: &str = "cloud_api.attested_3p.time_to_trust_seconds";
 
 // Tinfoil attested backup (polled by the API layer from the router session,
 // since `inference_providers` cannot depend on this crate).
@@ -68,6 +72,8 @@ pub const METRIC_BACKEND_CHANNEL_BINDING: &str = "cloud_api.backend.channel_bind
 // upstream 401/402/403 (key or billing problem); pages immediately.
 pub const METRIC_TINFOIL_VERIFICATION: &str = "cloud_api.tinfoil.verification";
 pub const METRIC_TINFOIL_AVAILABLE: &str = "cloud_api.tinfoil.available";
+/// Trust path that admitted the current Tinfoil router (`source:compiled|sigstore_atc`).
+pub const METRIC_TINFOIL_ROUTER_SOURCE: &str = "cloud_api.tinfoil.router_source";
 pub const METRIC_TINFOIL_UPSTREAM_AUTH_FAILURE: &str = "cloud_api.tinfoil.upstream_auth_failure";
 
 // Error metrics
@@ -142,6 +148,7 @@ pub const REASON_REPOSITORY_ERROR: &str = "repository_error";
 // Provider token anomaly reasons
 pub const REASON_TOKEN_OVERFLOW: &str = "overflow";
 pub const REASON_MISSING_USAGE: &str = "missing_usage";
+pub const REASON_NEGATIVE_USAGE: &str = "negative_usage";
 
 /// Get the current environment from the ENVIRONMENT env var, defaulting to "local"
 pub fn get_environment() -> String {

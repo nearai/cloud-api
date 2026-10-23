@@ -82,6 +82,7 @@ fn service_with_collectors(
             ExternalProvidersConfig::default(),
         )),
         models_repository: Arc::new(FakeModelsRepository),
+        model_resolve_cache: crate::models::new_model_resolve_cache(),
         metrics_service: Arc::new(NoopMetricsService),
         usage_repository: Arc::new(NoopUsageRepository),
         vpc_info: None,
@@ -252,6 +253,13 @@ impl ModelsRepository for FakeModelsRepository {
         &self,
         identifier: &str,
     ) -> anyhow::Result<Option<ModelWithPricing>> {
+        if identifier == "unlisted-model" {
+            let mut model = canonical_model();
+            model.model_name = identifier.to_string();
+            model.aliases = Vec::new();
+            model.is_listed = false;
+            return Ok(Some(model));
+        }
         Ok((identifier == "alias-model" || identifier == "canonical-model").then(canonical_model))
     }
 
@@ -262,6 +270,7 @@ impl ModelsRepository for FakeModelsRepository {
 
 fn canonical_model() -> ModelWithPricing {
     ModelWithPricing {
+        upcoming_pricing: None,
         id: Uuid::new_v4(),
         model_name: "canonical-model".to_string(),
         model_display_name: "Canonical".to_string(),

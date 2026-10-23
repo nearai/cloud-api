@@ -126,6 +126,7 @@ async fn main() {
             value
                 .split(',')
                 .filter_map(|part| part.trim().parse::<i16>().ok())
+                .filter(|threshold| (0..=100).contains(threshold))
                 .collect::<Vec<_>>()
         })
         .filter(|values| !values.is_empty())
@@ -138,39 +139,68 @@ async fn main() {
     let credit_email_sender = services::email::sender_from_config(&config.invitation_email)
         .expect("Failed to initialize credit alert email sender");
     let credit_frontend_url = config.invitation_email.frontend_base_url.clone();
+    let credit_email_worker = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            match credit_email_repository.claim_crossings().await {
+                Ok(candidates) => {
+                    for candidate in candidates {
+                        for recipient_email in &candidate.recipient_emails {
+                            let email = services::email::CreditBalanceAlertEmail {
+                                recipient_email: recipient_email.clone(),
+                                organization_name: candidate.organization_name.clone(),
+                                credit_type: candidate.credit_type.clone(),
+                                remaining: candidate.remaining,
+                                limit: candidate.limit,
+                                threshold_percent: candidate.threshold_percent,
+                                credits_url: format!(
+                                    "{}/dashboard/organizations/{}/credits",
+                                    credit_frontend_url
+                                        .as_deref()
+                                        .unwrap_or("")
+                                        .trim_end_matches('/'),
+                                    candidate.organization_id
+                                ),
+                            };
+                            match credit_email_sender.send_credit_balance_alert(&email).await {
+                                Ok(services::email::EmailDeliveryOutcome::Sent { .. }) => {}
+                                Ok(services::email::EmailDeliveryOutcome::Skipped) => {
+                                    let _ = credit_email_repository
+                                        .release_claim(
+                                            candidate.organization_id,
+                                            &candidate.credit_type,
+                                            candidate.threshold_percent,
+                                            recipient_email,
+                                        )
+                                        .await;
+                                }
+                                Err(error) => {
+                                    tracing::warn!(organization_id = %candidate.organization_id, credit_type = %candidate.credit_type, error = %error.sanitized_message(), "Failed to send credit balance alert");
+                                    let _ = credit_email_repository
+                                        .release_claim(
+                                            candidate.organization_id,
+                                            &candidate.credit_type,
+                                            candidate.threshold_percent,
+                                            recipient_email,
+                                        )
+                                        .await;
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(error) => tracing::error!(%error, "Failed to scan credit alert thresholds"),
+            }
+        }
+    });
     let discount_worker = tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
-        let mut credit_email_interval = tokio::time::interval(std::time::Duration::from_secs(300));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        credit_email_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut jobs = tokio::task::JoinSet::new();
         loop {
             tokio::select! {
-                _ = credit_email_interval.tick() => {
-                    match credit_email_repository.claim_crossings().await {
-                        Ok(candidates) => for candidate in candidates {
-                            for recipient_email in &candidate.recipient_emails {
-                                let email = services::email::CreditBalanceAlertEmail {
-                                    recipient_email: recipient_email.clone(), organization_name: candidate.organization_name.clone(),
-                                    credit_type: candidate.credit_type.clone(), remaining: candidate.remaining, limit: candidate.limit,
-                                    threshold_percent: candidate.threshold_percent,
-                                    credits_url: format!("{}/dashboard/organizations/{}/credits", credit_frontend_url.as_deref().unwrap_or("").trim_end_matches('/'), candidate.organization_id),
-                                };
-                                match credit_email_sender.send_credit_balance_alert(&email).await {
-                                    Ok(services::email::EmailDeliveryOutcome::Sent { .. }) => {}
-                                    Ok(services::email::EmailDeliveryOutcome::Skipped) => {
-                                        let _ = credit_email_repository.release_claim(candidate.organization_id, &candidate.credit_type, candidate.threshold_percent, recipient_email).await;
-                                    }
-                                    Err(error) => {
-                                        tracing::warn!(organization_id = %candidate.organization_id, credit_type = %candidate.credit_type, error = %error.sanitized_message(), "Failed to send credit balance alert");
-                                        let _ = credit_email_repository.release_claim(candidate.organization_id, &candidate.credit_type, candidate.threshold_percent, recipient_email).await;
-                                    }
-                                }
-                            }
-                        },
-                        Err(error) => tracing::error!(%error, "Failed to scan credit alert thresholds"),
-                    }
-                }
                 _ = interval.tick() => {
                     while jobs.len() < 2 {
                         match discount_repository.claim_next().await {
@@ -209,6 +239,7 @@ async fn main() {
         pricing_scheduler,
         usage_hourly_scheduler,
         discount_worker,
+        credit_email_worker,
     )
     .await;
 }
@@ -233,6 +264,7 @@ async fn start_server(
     pricing_scheduler: Arc<ModelPricingScheduler>,
     usage_hourly_scheduler: Arc<services::usage::UsageHourlyScheduler>,
     discount_worker: tokio::task::JoinHandle<()>,
+    credit_email_worker: tokio::task::JoinHandle<()>,
 ) {
     let bind_address = format!("{}:{}", config.server.host, config.server.port);
     let listener = tokio::net::TcpListener::bind(&bind_address)
@@ -253,7 +285,9 @@ async fn start_server(
 
     let result = server.await;
     discount_worker.abort();
+    credit_email_worker.abort();
     let _ = discount_worker.await;
+    let _ = credit_email_worker.await;
     match result {
         Ok(_) => {
             tracing::info!("Server shutdown successfully, initiating coordinated cleanup");

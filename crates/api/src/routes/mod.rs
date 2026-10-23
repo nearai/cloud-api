@@ -1,5 +1,6 @@
 pub mod admin;
 pub mod admin_credit_reconciliation;
+pub mod admin_model_access;
 pub mod admin_usage_hourly;
 pub mod anthropic;
 pub mod api;
@@ -34,3 +35,8 @@ pub mod workspaces;
 mod responses_native;
 
 pub mod admin_usage_discount;
+
+pub mod credit_transfers;
+
+pub(crate) mod organization_credentials;
+pub(crate) mod organization_policy;

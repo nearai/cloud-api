@@ -66,7 +66,13 @@ impl CreditEmailNotificationRepository {
             }
             let threshold = threshold.unwrap();
             let resource_id = format!("{organization_id}:{credit_type}");
-            transaction.execute("DELETE FROM email_notification_deliveries WHERE event_type = 'credit_balance' AND resource_id = $1 AND event_key::SMALLINT < $2", &[&resource_id, &threshold]).await?;
+            let reset_event_keys = self
+                .thresholds
+                .iter()
+                .filter(|candidate| **candidate < threshold)
+                .map(ToString::to_string)
+                .collect::<Vec<_>>();
+            transaction.execute("DELETE FROM email_notification_deliveries WHERE event_type = 'credit_balance' AND resource_id = $1 AND event_key = ANY($2)", &[&resource_id, &reset_event_keys]).await?;
             let event_key = threshold.to_string();
             let recipients = transaction.query(r#"
                 SELECT CASE WHEN u.contact_email_verified_at IS NOT NULL THEN u.contact_email ELSE u.email END AS email

@@ -226,6 +226,31 @@ async fn verify_failure_fails_closed() {
 }
 
 #[tokio::test]
+async fn malformed_directory_entry_closes_only_that_model() {
+    let e = env().await;
+    e.session.verify_now().await.unwrap();
+    assert!(
+        e.session.model_status(SLUG).is_ok(),
+        "valid entries still serve"
+    );
+    assert_eq!(
+        e.session.model_status(PLACEHOLDER_SLUG).unwrap_err(),
+        TinfoilVerifyError::Malformed {
+            stage: "proxy_entry"
+        }
+    );
+    e.session.reread_proxy().await;
+    assert!(e.session.model_status(SLUG).is_ok(), "and after a reread");
+    assert_eq!(
+        e.session
+            .model_status(PLACEHOLDER_SLUG)
+            .unwrap_err()
+            .reason(),
+        "malformed_evidence"
+    );
+}
+
+#[tokio::test]
 async fn proxy_reread_picks_up_pins_miss() {
     let e = env().await;
     e.session.verify_now().await.unwrap();
@@ -265,8 +290,19 @@ async fn published_context_window_reads_models() {
     assert_eq!(e.session.published_context_window("missing"), None);
 }
 
-#[tokio::test]
-async fn attestation_report_payload_shape() {
+async fn report_for(
+    source: PinSource,
+    rekor: Option<u64>,
+) -> serde_json::Map<String, serde_json::Value> {
+    report_for_model(source, rekor, PinSource::Compiled, None).await
+}
+
+async fn report_for_model(
+    source: PinSource,
+    rekor: Option<u64>,
+    model_source: PinSource,
+    model_rekor: Option<u64>,
+) -> serde_json::Map<String, serde_json::Value> {
     let e = env().await;
     // No network: install a verified state directly.
     let bundle: AtcBundle = serde_json::from_slice(&atc_json("inference.tinfoil.sh")).unwrap();
@@ -278,6 +314,8 @@ async fn attestation_report_payload_shape() {
         Ok(PinnedModel {
             slug: SLUG.into(),
             entry: entry.clone(),
+            source: model_source,
+            rekor_log_index: model_rekor,
         }),
     );
     e.session.install_state(VerifiedState {
@@ -285,6 +323,8 @@ async fn attestation_report_payload_shape() {
             spki_sha256: [1; 32],
             measurement_hex: "ab".repeat(48),
             tag: "r@v1".into(),
+            source,
+            rekor_log_index: rekor,
             tcb: RouterTcb {
                 bootloader: 10,
                 tee: 0,
@@ -307,6 +347,12 @@ async fn attestation_report_payload_shape() {
         .get_attestation_report(CANON.into(), None, Some("ff".into()), None, false)
         .await
         .unwrap();
+    m
+}
+
+#[tokio::test]
+async fn attestation_report_payload_shape() {
+    let m = report_for(PinSource::Compiled, None).await;
     assert_eq!(m["provider"], "tinfoil");
     assert_eq!(m["trust"], "router_attested");
     assert_eq!(m["verified"], true);
@@ -314,12 +360,16 @@ async fn attestation_report_payload_shape() {
     assert_eq!(m["router"]["format"], "sev-snp-guest/v2");
     assert_eq!(m["router"]["measurement"], "ab".repeat(48));
     assert_eq!(m["router"]["tag"], "r@v1");
+    assert_eq!(m["router"]["pin_source"], "compiled");
+    assert!(m["router"].get("rekor_log_index").is_none());
     assert_eq!(
         m["router"]["tcb"],
         serde_json::json!({"bootloader": 10, "tee": 0, "snp": 23, "microcode": 84})
     );
     assert_eq!(m["router"]["report_b64"], "cmVwb3J0");
     assert_eq!(m["model_entry"]["slug"], SLUG);
+    assert_eq!(m["model_entry"]["pin_source"], "compiled");
+    assert!(m["model_entry"].get("rekor_log_index").is_none());
     assert_eq!(
         m["model_entry"]["registers"],
         serde_json::json!(["aa", "bb"])
@@ -329,6 +379,23 @@ async fn attestation_report_payload_shape() {
         m.get("nonce").is_none(),
         "client nonce is not bound into the Tinfoil report"
     );
+}
+
+#[tokio::test]
+async fn attestation_report_shows_sigstore_pin_source() {
+    let m = report_for(PinSource::SigstoreAtc, Some(42)).await;
+    assert_eq!(m["router"]["pin_source"], "sigstore_atc");
+    assert_eq!(m["router"]["rekor_log_index"], 42);
+    assert_eq!(m["router"]["tag"], "r@v1", "existing field is unchanged");
+}
+
+#[tokio::test]
+async fn attestation_report_shows_admin_model_pin_source() {
+    let m = report_for_model(PinSource::Compiled, None, PinSource::Admin, Some(77)).await;
+    assert_eq!(m["model_entry"]["pin_source"], "admin");
+    assert_eq!(m["model_entry"]["rekor_log_index"], 77);
+    assert_eq!(m["model_entry"]["slug"], SLUG, "existing fields unchanged");
+    assert_eq!(m["router"]["pin_source"], "compiled");
 }
 
 #[tokio::test]
@@ -459,4 +526,101 @@ async fn failed_proxy_fetch_does_not_publish_the_new_pin() {
         FingerprintState::Blocked
     ));
     assert!(matches!(before, FingerprintState::Pinned(_)));
+}
+
+/// Advances the clock by `secs` without a fully paused runtime: auto-advance
+/// under `start_paused` would expire the real-socket timeouts of the
+/// verification itself, so the clock is frozen only for the jump.
+async fn jump_clock(secs: u64) {
+    tokio::time::pause();
+    tokio::time::advance(std::time::Duration::from_secs(secs)).await;
+    tokio::time::resume();
+}
+
+fn assert_elapsed(sample: (crate::attested::tinfoil::TrustKind, f64), kind: &str, secs: f64) {
+    assert_eq!(sample.0.as_str(), kind);
+    // The jump plus the real time of one local verification.
+    assert!(
+        sample.1 >= secs && sample.1 < secs + 5.0,
+        "{kind}: {} s, expected about {secs}",
+        sample.1
+    );
+}
+
+#[tokio::test]
+async fn time_to_trust_is_sampled_once_when_a_rejected_measurement_is_admitted() {
+    let e = env().await;
+    assert!(e.session.take_time_to_trust().is_empty());
+    // Router: rejected as unknown, then admitted.
+    e.verifier
+        .reject_router
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(
+        e.session.verify_now().await.unwrap_err(),
+        TinfoilVerifyError::UnknownRouterMeasurement
+    );
+    assert!(e.session.take_time_to_trust().is_empty());
+    e.verifier
+        .reject_router
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    // Model: rejected as unknown on the first verify, then admitted.
+    e.verifier
+        .deny_models
+        .lock()
+        .unwrap()
+        .push(SLUG.to_string());
+    jump_clock(40).await;
+    e.session.verify_now().await.unwrap();
+    // The router was rejected 40 s before it was admitted.
+    let samples = e.session.take_time_to_trust();
+    assert_eq!(samples.len(), 1);
+    assert_elapsed(samples[0], "router", 40.0);
+    e.verifier.deny_models.lock().unwrap().clear();
+    jump_clock(15).await;
+    e.session.reread_proxy().await;
+    // The model was first rejected at the verify above, 15 s ago.
+    let samples = e.session.take_time_to_trust();
+    assert_eq!(samples.len(), 1);
+    assert_elapsed(samples[0], "model", 15.0);
+    // Already admitted: no further samples.
+    e.session.reread_proxy().await;
+    assert!(e.session.take_time_to_trust().is_empty());
+}
+
+#[tokio::test]
+async fn router_time_to_trust_waits_for_session_publication() {
+    use std::sync::atomic::Ordering;
+    let e = env().await;
+    let good_spki = *e.verifier.spki.lock().unwrap();
+    // Reject the router as unknown: this starts its clock.
+    e.verifier.reject_router.store(true, Ordering::SeqCst);
+    assert_eq!(
+        e.session.verify_now().await.unwrap_err(),
+        TinfoilVerifyError::UnknownRouterMeasurement
+    );
+    // The verifier now accepts the router, but the pinned proxy-document fetch
+    // fails, so the session never publishes it as trusted.
+    e.verifier.reject_router.store(false, Ordering::SeqCst);
+    *e.verifier.spki.lock().unwrap() = [7u8; 32];
+    jump_clock(40).await;
+    assert_eq!(e.session.verify_now().await, Err(TinfoilVerifyError::Fetch));
+    assert!(e.session.take_time_to_trust().is_empty());
+    assert!(e.session.model_status(SLUG).is_err());
+    assert!(matches!(
+        e.session.fingerprint_state(),
+        FingerprintState::Blocked
+    ));
+    // Restore the transport: the session publishes, and the one sample spans
+    // from the original rejection.
+    *e.verifier.spki.lock().unwrap() = good_spki;
+    jump_clock(20).await;
+    e.session.verify_now().await.unwrap();
+    let samples: Vec<_> = e
+        .session
+        .take_time_to_trust()
+        .into_iter()
+        .filter(|s| s.0.as_str() == "router")
+        .collect();
+    assert_eq!(samples.len(), 1);
+    assert_elapsed(samples[0], "router", 60.0);
 }

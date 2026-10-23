@@ -164,16 +164,21 @@ pub trait EmailSender: Send + Sync {
 
     async fn send_member_permission_changed(
         &self,
-        _email: &MemberPermissionChangedEmail,
-    ) -> Result<EmailDeliveryOutcome, EmailError> {
-        Ok(EmailDeliveryOutcome::Skipped)
-    }
+        email: &MemberPermissionChangedEmail,
+    ) -> Result<EmailDeliveryOutcome, EmailError>;
 }
 
 pub struct NoopEmailSender;
 
 #[async_trait]
 impl EmailSender for NoopEmailSender {
+    async fn send_member_permission_changed(
+        &self,
+        _email: &MemberPermissionChangedEmail,
+    ) -> Result<EmailDeliveryOutcome, EmailError> {
+        Ok(EmailDeliveryOutcome::Skipped)
+    }
+
     async fn send_invitation(
         &self,
         _email: &InvitationEmail,

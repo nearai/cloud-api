@@ -728,12 +728,6 @@ impl OrganizationServiceTrait for OrganizationServiceImpl {
             ));
         }
 
-        let previous = self
-            .repository
-            .get_member(organization_id.0, member_id.0)
-            .await
-            .map_err(Self::map_repository_error)?
-            .ok_or(OrganizationError::NotFound)?;
         let request = UpdateOrganizationMemberRequest { role: new_role };
 
         let updated = self
@@ -744,12 +738,12 @@ impl OrganizationServiceTrait for OrganizationServiceImpl {
         self.send_member_permission_changed_email(
             &org,
             member_id,
-            previous.role,
-            updated.role.clone(),
+            updated.previous_role,
+            updated.member.role.clone(),
             requester_id,
         )
         .await;
-        Ok(updated)
+        Ok(updated.member)
     }
 
     /// Check if a user is a member of an organization (private helper)
@@ -1834,6 +1828,8 @@ impl OrganizationServiceTrait for OrganizationServiceImpl {
 
 #[cfg(test)]
 mod tests {
+    mod permission_email_tests;
+
     use super::*;
     use crate::auth::ports::{User, UserRole};
     use crate::email::{EmailDeliveryOutcome, EmailError};
@@ -1986,7 +1982,7 @@ mod tests {
             _: Uuid,
             _: UpdateOrganizationMemberRequest,
             _: Uuid,
-        ) -> Result<OrganizationMember, RepositoryError> {
+        ) -> Result<OrganizationMemberRoleUpdate, RepositoryError> {
             unimplemented!()
         }
 
@@ -2052,6 +2048,7 @@ mod tests {
     struct StubUserRepo {
         inviter: User,
         get_by_id_calls: Mutex<usize>,
+        notification_users: std::collections::HashMap<UserId, User>,
     }
 
     #[async_trait]
@@ -2078,9 +2075,14 @@ mod tests {
             unimplemented!()
         }
 
-        async fn get_by_id(&self, _: UserId) -> anyhow::Result<Option<User>> {
+        async fn get_by_id(&self, user_id: UserId) -> anyhow::Result<Option<User>> {
             *self.get_by_id_calls.lock().unwrap() += 1;
-            Ok(Some(self.inviter.clone()))
+            Ok(Some(
+                self.notification_users
+                    .get(&user_id)
+                    .unwrap_or(&self.inviter)
+                    .clone(),
+            ))
         }
 
         async fn get_by_email(&self, _: &str) -> anyhow::Result<Option<User>> {
@@ -2285,10 +2287,19 @@ mod tests {
     struct StubEmailSender {
         outcome: Result<EmailDeliveryOutcome, EmailError>,
         sent_to: Mutex<Vec<String>>,
+        permission_changes: Mutex<Vec<MemberPermissionChangedEmail>>,
     }
 
     #[async_trait]
     impl EmailSender for StubEmailSender {
+        async fn send_member_permission_changed(
+            &self,
+            email: &MemberPermissionChangedEmail,
+        ) -> Result<EmailDeliveryOutcome, EmailError> {
+            self.permission_changes.lock().unwrap().push(email.clone());
+            self.outcome.clone()
+        }
+
         async fn send_invitation(
             &self,
             email: &InvitationEmail,
@@ -2396,10 +2407,12 @@ mod tests {
         let email_sender = Arc::new(StubEmailSender {
             outcome,
             sent_to: Mutex::new(Vec::new()),
+            permission_changes: Mutex::new(Vec::new()),
         });
         let user_repo = Arc::new(StubUserRepo {
             inviter,
             get_by_id_calls: Mutex::new(0),
+            notification_users: Default::default(),
         });
         let service = OrganizationServiceImpl::new_with_email_sender(
             Arc::new(StubOrgRepo {
@@ -2476,6 +2489,7 @@ mod tests {
                 email_opt_in_at: None,
             },
             get_by_id_calls: Mutex::new(0),
+            notification_users: Default::default(),
         });
         let invitation_repo = Arc::new(StubInvitationRepo {
             records: Mutex::new(Vec::new()),
@@ -2691,6 +2705,7 @@ mod tests {
                 email_opt_in_at: None,
             },
             get_by_id_calls: Mutex::new(0),
+            notification_users: Default::default(),
         });
         let invitation_repo = Arc::new(StubInvitationRepo {
             records: Mutex::new(Vec::new()),

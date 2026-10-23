@@ -434,8 +434,8 @@ impl PgOrganizationRepository {
         user_id: Uuid,
         request: DbUpdateOrganizationMemberRequest,
         requester_user_id: Uuid,
-    ) -> Result<DbOrganizationMember, RepositoryError> {
-        let row = retry_db!("update_member_role", {
+    ) -> Result<OrganizationMemberRoleUpdate, RepositoryError> {
+        let (row, previous_role) = retry_db!("update_member_role", {
             let mut client = self
                 .pool
                 .get()
@@ -480,7 +480,8 @@ impl PgOrganizationRepository {
                 .await
                 .map_err(map_db_error)?
                 .ok_or_else(|| RepositoryError::NotFound("organization member".to_string()))?;
-            if current.get::<_, String>("role") == "owner" {
+            let previous_role: String = current.get("role");
+            if previous_role == "owner" {
                 return Err(RepositoryError::ValidationFailed(
                     "Cannot change the owner's role. Use transfer ownership instead.".to_string(),
                 ));
@@ -503,16 +504,29 @@ impl PgOrganizationRepository {
                 )
                 .await
                 .map_err(map_db_error)?;
-            transaction.commit().await.map_err(map_db_error)?;
-            Ok(row)
-        })?;
+            // Once COMMIT is issued its result may be ambiguous. Keep that error
+            // outside retry_db so a retry cannot erase the original role change.
+            Ok(transaction
+                .commit()
+                .await
+                .map_err(map_db_error)
+                .map(|()| (row, previous_role)))
+        })??;
 
         debug!(
             "Updated member {} in organization {} to role {:?}",
             user_id, org_id, request.role
         );
-        self.row_to_db_org_member(row)
-            .map_err(RepositoryError::DataConversionError)
+        Ok(OrganizationMemberRoleUpdate {
+            member: self
+                .row_to_db_org_member(row)
+                .and_then(|member| self.db_to_domain_member(member))
+                .map_err(RepositoryError::DataConversionError)?,
+            previous_role: self
+                .role_str_to_domain_role(&previous_role)
+                .map_err(RepositoryError::DataConversionError)?,
+            additional_changes: Vec::new(),
+        })
     }
 
     /// Remove a member from an organization
@@ -1089,16 +1103,13 @@ impl OrganizationRepository for PgOrganizationRepository {
         user_id: Uuid,
         request: UpdateOrganizationMemberRequest,
         requester_user_id: Uuid,
-    ) -> Result<OrganizationMember, RepositoryError> {
+    ) -> Result<OrganizationMemberRoleUpdate, RepositoryError> {
         let db_request = DbUpdateOrganizationMemberRequest {
             role: self.domain_to_db_role(request.role),
         };
 
-        let db_member = self
-            .update_member_internal(org_id, user_id, db_request, requester_user_id)
-            .await?;
-        self.db_to_domain_member(db_member)
-            .map_err(RepositoryError::DataConversionError)
+        self.update_member_internal(org_id, user_id, db_request, requester_user_id)
+            .await
     }
 
     async fn update_member_role_with_audit(
@@ -1258,9 +1269,13 @@ impl OrganizationRepository for PgOrganizationRepository {
                 row
             };
 
-            transaction.commit().await.map_err(map_db_error)?;
-            Ok((row, previous_role, demoted_owner_ids))
-        })?;
+            // Do not replay a role change after an ambiguous COMMIT result.
+            Ok(transaction
+                .commit()
+                .await
+                .map_err(map_db_error)
+                .map(|()| (row, previous_role, demoted_owner_ids)))
+        })??;
         let (row, previous_role, demoted_owner_ids) = update;
 
         let previous_role = self

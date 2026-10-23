@@ -3448,6 +3448,46 @@ mod tests {
     }
 
     #[test]
+    fn test_prepare_encryption_headers_v3_without_optional_flag() {
+        let provider = create_test_provider();
+        for flag in [None, Some("false"), Some("true")] {
+            let mut headers = reqwest::header::HeaderMap::new();
+            let mut extra = std::collections::HashMap::from([
+                (
+                    encryption_headers::SIGNING_ALGO.to_string(),
+                    serde_json::json!("ed25519"),
+                ),
+                (
+                    encryption_headers::CLIENT_PUB_KEY.to_string(),
+                    serde_json::json!("ab".repeat(32)),
+                ),
+                (
+                    encryption_headers::ENCRYPTION_VERSION.to_string(),
+                    serde_json::json!("3"),
+                ),
+            ]);
+            if let Some(flag) = flag {
+                extra.insert(
+                    encryption_headers::ENCRYPT_ALL_FIELDS.to_string(),
+                    serde_json::json!(flag),
+                );
+            }
+            provider
+                .fleet
+                .prepare_encryption_headers(&mut headers, &mut extra);
+            assert_eq!(headers["X-Encryption-Version"], "3");
+            assert_eq!(headers["X-Client-Pub-Key"], "ab".repeat(32));
+            assert_eq!(
+                headers
+                    .get("X-Encrypt-All-Fields")
+                    .map(|v| v.to_str().unwrap()),
+                flag
+            );
+            assert!(extra.is_empty());
+        }
+    }
+
+    #[test]
     fn test_prepare_encryption_headers_preserves_other_extra_fields() {
         let provider = create_test_provider();
 

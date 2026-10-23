@@ -380,6 +380,26 @@ impl ChatCompletionParams {
             original.remove("request_priority");
         }
     }
+
+    /// Third-party providers get neither our internal user id nor a request to
+    /// keep the exchange: `store` retains it in our provider account, and
+    /// `metadata` is only accepted alongside `store`. A client's own `user`
+    /// stays in `extra`; client copies of `store` and `metadata` are removed.
+    pub fn strip_third_party_retention(&mut self) {
+        self.user = None;
+        self.store = None;
+        self.metadata = None;
+        self.extra.remove("store");
+        self.extra.remove("metadata");
+        if let Some(original) = self
+            .original_request
+            .as_mut()
+            .and_then(|value| value.as_object_mut())
+        {
+            original.remove("store");
+            original.remove("metadata");
+        }
+    }
 }
 
 /// Parameters for text completion requests (legacy OpenAI API)

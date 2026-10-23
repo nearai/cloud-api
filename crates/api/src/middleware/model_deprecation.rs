@@ -1,11 +1,13 @@
-//! Announces a planned model deprecation on inference responses.
+//! Announces planned model deprecations and pricing changes on inference responses.
 //!
-//! When the model named in a request has a planned deprecation, successful
-//! responses carry:
+//! Successful responses carry the applicable notices for the requested model:
 //!
 //! - `x-model-deprecation-date`: the planned deprecation date, in the same
 //!   form as `deprecation_date` on `GET /v1/models`.
-//! - `x-model-successor`: the recommended replacement model, when one is set.
+//! - `x-model-successor`: the recommended replacement model, when one is set
+//!   and the caller may use it.
+//! - `x-model-pricing-change-date`: the earliest pending pricing change,
+//!   independently of whether the model has a planned deprecation.
 //!
 //! These are deliberately not the standard `Deprecation` (RFC 9745) and
 //! `Sunset` (RFC 8594) headers. Those describe the requested URL, so on a
@@ -29,10 +31,13 @@ use axum::{
     response::Response,
 };
 use chrono::{DateTime, Utc};
-use services::models::{ModelWithPricing, ModelsServiceTrait};
+use services::models::{ModelCaller, ModelWithPricing, ModelsServiceTrait};
+
+use super::auth::AuthenticatedApiKey;
 
 pub const HEADER_MODEL_DEPRECATION_DATE: &str = "x-model-deprecation-date";
 pub const HEADER_MODEL_SUCCESSOR: &str = "x-model-successor";
+pub const HEADER_MODEL_PRICING_CHANGE_DATE: &str = "x-model-pricing-change-date";
 
 /// Upper bound on the catalog lookup made while a finished response waits.
 const LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
@@ -107,8 +112,8 @@ impl ModelDeprecationNotice {
     }
 }
 
-/// Adds the deprecation headers to successful responses for a model with a
-/// planned deprecation. The handler names the model through
+/// Adds planned deprecation and pricing headers to successful responses.
+/// The handler names the model through
 /// [`RequestedModel`]; requests that never reach that point are left alone.
 pub async fn model_deprecation_middleware(
     State(state): State<ModelDeprecationState>,
@@ -117,6 +122,14 @@ pub async fn model_deprecation_middleware(
 ) -> Response {
     let requested = RequestedModel::default();
     request.extensions_mut().insert(requested.clone());
+    // Who is asking, read before the request moves on. The auth layer runs
+    // outside this one and has stored the API key's organization.
+    let caller = request
+        .extensions()
+        .get::<AuthenticatedApiKey>()
+        .map_or(ModelCaller::Anonymous, |api_key| {
+            ModelCaller::Organization(api_key.organization.id.0)
+        });
 
     let mut response = next.run(request).await;
 
@@ -130,12 +143,48 @@ pub async fn model_deprecation_middleware(
     // ago. An alias resolves to its canonical model. Advisory only: a failed
     // or slow lookup (cache miss while the database is struggling) leaves the
     // response as it is instead of holding it back.
-    let lookup = state.models_service.resolve_and_get_model(model_name);
+    //
+    // Resolved for the request's own caller, never as a trusted one. A
+    // successful status does not mean the handler resolved the model: a
+    // streaming Responses request answers 200 first and fails inside the
+    // stream. The headers of a model the caller may not use would tell it
+    // that the model exists.
+    //
+    // The successor is another model, possibly an unlisted one, so it is
+    // named only if it resolves for the same caller. Both lookups share the
+    // time limit.
+    let lookup = async {
+        let mut model = state
+            .models_service
+            .resolve_and_get_model(model_name, caller)
+            .await?;
+        if model.deprecation_date.is_some() {
+            if let Some(successor) = model.successor_model_name.take() {
+                if state
+                    .models_service
+                    .resolve_and_get_model(&successor, caller)
+                    .await
+                    .is_ok()
+                {
+                    model.successor_model_name = Some(successor);
+                }
+            }
+        }
+        Ok::<_, services::models::ModelsError>(model)
+    };
     let Ok(Ok(model)) = tokio::time::timeout(LOOKUP_TIMEOUT, lookup).await else {
         return response;
     };
     if let Some(notice) = ModelDeprecationNotice::from_model(&model) {
         notice.apply(response.headers_mut());
+    }
+    if let Some(pricing) = &model.upcoming_pricing {
+        let date = crate::routes::admin::format_deprecation_date(&pricing.effective_at);
+        if let Ok(value) = HeaderValue::from_str(&date) {
+            response
+                .headers_mut()
+                .insert(HEADER_MODEL_PRICING_CHANGE_DATE, value);
+        }
     }
     response
 }
@@ -192,6 +241,7 @@ mod tests {
 
     fn model(deprecation_date: Option<DateTime<Utc>>) -> ModelWithPricing {
         ModelWithPricing {
+            upcoming_pricing: None,
             id: uuid::Uuid::nil(),
             model_name: "nearai/old-model".to_string(),
             model_display_name: "Old Model".to_string(),

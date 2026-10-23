@@ -47,6 +47,8 @@ impl services::usage::ports::OrganizationLimitsRepository for OrganizationLimits
                 credit_type: status.limit.credit_type,
                 source: status.limit.source,
                 amount: status.limit.spend_limit,
+                transferred_out: status.transferred_out,
+                effective_capacity: status.effective_capacity,
                 consumed: status.consumed,
                 available: status.available,
                 currency: status.limit.currency,

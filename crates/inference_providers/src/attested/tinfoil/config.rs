@@ -1,6 +1,8 @@
 //! Tinfoil provider configuration. Endpoints are code constants: there is no
 //! environment override in production builds.
 
+use std::collections::HashSet;
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Tinfoil's inference router. Requests actually go to `https://{domain}` of
@@ -38,6 +40,9 @@ pub struct Config {
     /// Always default outside the crate-private test constructors.
     pub(super) redirect: Redirect,
     pub timeout: Duration,
+    /// Upstream slugs this deployment serves. Only these have their
+    /// time-to-trust timed; `None` times every slug the router publishes.
+    pub(super) served_slugs: Option<Arc<HashSet<String>>>,
 }
 
 impl Config {
@@ -51,7 +56,14 @@ impl Config {
             atc_url: ATC_URL.to_string(),
             redirect: Redirect::default(),
             timeout: Duration::from_secs(secs),
+            served_slugs: None,
         }
+    }
+
+    /// Time to trust is measured for these upstream slugs only.
+    pub fn with_served_slugs(mut self, slugs: impl IntoIterator<Item = String>) -> Self {
+        self.served_slugs = Some(Arc::new(slugs.into_iter().collect()));
+        self
     }
 
     /// Point at a local test server. Test builds only.

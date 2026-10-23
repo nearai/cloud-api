@@ -1,7 +1,7 @@
 //! Dependency-inversion seam for verifying Tinfoil evidence. The concrete
 //! policy verifier lives in `services`; the provider depends on this port.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// The ATC (`atc.tinfoil.sh/attestation`) bundle for the router.
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -14,12 +14,12 @@ pub struct AtcBundle {
     pub enclave_cert: String,
     pub digest: String,
     /// Sigstore (DSSE/Rekor) bundle over the ATC document. Intentionally an
-    /// opaque pass-through here: the runtime verifier does not read it (it
-    /// anchors on the SNP report chain plus the compiled pins). It is verified
-    /// only by the offline `tinfoil_sync` tooling, whose Sigstore dependencies
-    /// must stay out of this crate's (and `api`'s) dependency tree, so no typed
-    /// bundle lives in this port.
-    #[serde(rename = "sigstoreBundle")]
+    /// opaque pass-through in this port, so no typed bundle lives here. The
+    /// runtime verifies it through `tinfoil_provenance`, the only crate allowed
+    /// to depend on `sigstore-verify` (enforced by
+    /// `scripts/check_dep_guards.sh`). `tinfoil_sync` stays CI tooling and is
+    /// never a dependency of `api` or `services`.
+    #[serde(rename = "sigstoreBundle", default)]
     pub sigstore_bundle: serde_json::Value,
 }
 
@@ -29,9 +29,42 @@ pub struct AttestationDoc {
     pub body: String,
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+/// The router's model directory (`/.well-known/tinfoil-proxy`). Entries are
+/// parsed one by one: an entry that does not parse (Tinfoil publishes inactive
+/// models with an empty tag, a null measurement and no enclaves) lands in
+/// `malformed` and closes only that model; the rest of the directory is still
+/// checked against the pins. A document that is not an object of entries at
+/// all is still an error.
+#[derive(Debug, Clone, Default)]
 pub struct ProxyDoc {
     pub models: BTreeMap<String, ProxyModelEntry>,
+    /// Slugs whose entry did not parse.
+    pub malformed: BTreeSet<String>,
+}
+
+impl<'de> serde::Deserialize<'de> for ProxyDoc {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // Each entry is kept as its original text (not a `Value`, which would
+        // let the last of two duplicate keys win), so the typed parse below
+        // still rejects duplicate fields: ambiguous evidence closes the slug.
+        #[derive(serde::Deserialize)]
+        struct Raw {
+            models: BTreeMap<String, Box<serde_json::value::RawValue>>,
+        }
+        let raw = Raw::deserialize(deserializer)?;
+        let mut doc = ProxyDoc::default();
+        for (slug, text) in raw.models {
+            match serde_json::from_str::<ProxyModelEntry>(text.get()) {
+                Ok(entry) => {
+                    doc.models.insert(slug, entry);
+                }
+                Err(_) => {
+                    doc.malformed.insert(slug);
+                }
+            }
+        }
+        Ok(doc)
+    }
 }
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
@@ -56,12 +89,40 @@ pub struct ProxyEnclave {
     pub predicate: String,
 }
 
-/// A router whose attestation verified against pins and is bound to its TLS key.
+/// Where a verified router's trust came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PinSource {
+    /// The measurement is in the compiled pins.
+    Compiled,
+    /// The measurement is not compiled, but the ATC bundle's Sigstore release
+    /// attestation verified and binds to the live measurement.
+    SigstoreAtc,
+    /// A model pin an admin added through `tinfoil_trust`, backed by a
+    /// Sigstore release bundle the verifier checked itself.
+    Admin,
+}
+
+impl PinSource {
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Compiled => "compiled",
+            Self::SigstoreAtc => "sigstore_atc",
+            Self::Admin => "admin",
+        }
+    }
+}
+
+/// A router whose attestation verified against pins (or its Sigstore release
+/// attestation) and is bound to its TLS key.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifiedRouter {
     pub spki_sha256: [u8; 32],
     pub measurement_hex: String,
+    /// The compiled pin's tag, or the Sigstore-verified release tag.
     pub tag: String,
+    pub source: PinSource,
+    /// Rekor log index of the release signature (`SigstoreAtc` only).
+    pub rekor_log_index: Option<u64>,
     /// Reported TCB from the verified SNP report.
     pub tcb: RouterTcb,
 }
@@ -74,13 +135,17 @@ pub struct RouterTcb {
     pub microcode: u8,
 }
 
-/// A proxy model entry whose registers, repo and tag all matched one compiled
-/// pin for `slug`. `entry.repo` and `entry.tag` are therefore the pinned
-/// provenance.
+/// A proxy model entry whose registers, repo and tag all matched one pin
+/// (compiled, or admin-added and Sigstore-verified) for `slug`. `entry.repo`
+/// and `entry.tag` are therefore the pinned provenance.
 #[derive(Debug, Clone)]
 pub struct PinnedModel {
     pub slug: String,
     pub entry: ProxyModelEntry,
+    /// Which kind of pin admitted the model.
+    pub source: PinSource,
+    /// Rekor log index of the release signature (`Admin` only).
+    pub rekor_log_index: Option<u64>,
 }
 
 #[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
@@ -95,6 +160,14 @@ pub enum TinfoilVerifyError {
     BadSignature,
     #[error("debug policy")]
     DebugPolicy,
+    /// The ATC's Sigstore bundle did not verify; `stage` is a fixed tag
+    /// (`verify` or `digest`) and is not part of [`Self::reason`].
+    #[error("router sigstore rejected ({stage})")]
+    RouterSigstoreRejected { stage: &'static str },
+    /// The Sigstore bundle verified but attests a different router release
+    /// than the live measurement.
+    #[error("router sigstore measurement mismatch")]
+    RouterSigstoreMeasurementMismatch,
     #[error("tcb too low")]
     TcbTooLow,
     #[error("report data mismatch")]
@@ -114,6 +187,8 @@ impl TinfoilVerifyError {
             Self::UnsupportedRouterPlatform => "unsupported_router_platform",
             Self::UnknownRouterMeasurement => "unknown_router_measurement",
             Self::UnknownModelMeasurement => "unknown_model_measurement",
+            Self::RouterSigstoreRejected { .. } => "router_sigstore_rejected",
+            Self::RouterSigstoreMeasurementMismatch => "router_sigstore_measurement_mismatch",
             Self::BadSignature => "bad_signature",
             Self::DebugPolicy => "debug_policy",
             Self::TcbTooLow => "tcb_too_low",
@@ -159,8 +234,13 @@ pub fn validate_router_domain(domain: &str) -> Result<(), TinfoilVerifyError> {
 /// implementations MUST still enforce it, and MUST also check that the attested
 /// certificate's SAN names that domain, inside `verify_router`.
 pub trait TinfoilVerifier: Send + Sync {
+    /// Version of the verifier's runtime trust inputs (the `tinfoil_trust`
+    /// setting); the session re-verifies when it changes. Fixed-input verifiers keep 0.
+    fn trust_generation(&self) -> u64 {
+        0
+    }
     fn verify_router(&self, bundle: &AtcBundle) -> Result<VerifiedRouter, TinfoilVerifyError>;
-    /// Verifies that `entry` matches a compiled pin for `slug`: the measurement
+    /// Verifies that `entry` matches a pin (compiled or admin-added) for `slug`: the measurement
     /// registers, `repo` and `tag` must all equal one pinned row. Enclave
     /// metadata (`enclaves`) is passed through unverified. `entry` is
     /// caller-supplied, so callers must obtain it from a source whose
@@ -171,4 +251,62 @@ pub trait TinfoilVerifier: Send + Sync {
         slug: &str,
         entry: &ProxyModelEntry,
     ) -> Result<PinnedModel, TinfoilVerifyError>;
+}
+
+#[cfg(test)]
+mod proxy_doc_tests {
+    use super::*;
+
+    #[test]
+    fn a_malformed_entry_is_isolated() {
+        let doc: ProxyDoc = serde_json::from_value(serde_json::json!({"models": {
+            "good": {
+                "repo": "tinfoilsh/r", "tag": "v1",
+                "measurement": {"type": "t", "registers": ["aa"]},
+                "enclaves": {}
+            },
+            "glm-5-3-flash": {
+                "repo": "tinfoilsh/confidential-glm5-3-flash", "tag": "",
+                "measurement": null, "enclaves": {},
+                "verification": {"configured": 0, "verified": 0, "healthy": 0, "hosts": {}}
+            },
+            "not-an-object": 7
+        }}))
+        .unwrap();
+        assert_eq!(doc.models.keys().collect::<Vec<_>>(), ["good"]);
+        assert_eq!(
+            doc.malformed.iter().map(String::as_str).collect::<Vec<_>>(),
+            ["glm-5-3-flash", "not-an-object"]
+        );
+    }
+
+    #[test]
+    fn an_entry_with_a_duplicate_field_is_malformed() {
+        // Ambiguous evidence (two `tag`s, two `measurement`s) must close the
+        // slug, never let the last value win and match a pin.
+        let doc: ProxyDoc = serde_json::from_str(
+            r#"{"models": {
+                "dup": {
+                    "repo": "tinfoilsh/r", "tag": "v0", "tag": "v1",
+                    "measurement": {"type": "t", "registers": ["00"]},
+                    "measurement": {"type": "t", "registers": ["aa"]},
+                    "enclaves": {}
+                },
+                "good": {
+                    "repo": "tinfoilsh/r", "tag": "v1",
+                    "measurement": {"type": "t", "registers": ["aa"]},
+                    "enclaves": {}
+                }
+            }}"#,
+        )
+        .unwrap();
+        assert_eq!(doc.models.keys().collect::<Vec<_>>(), ["good"]);
+        assert!(doc.malformed.contains("dup"));
+    }
+
+    #[test]
+    fn a_document_without_models_is_still_an_error() {
+        assert!(serde_json::from_value::<ProxyDoc>(serde_json::json!({"x": 1})).is_err());
+        assert!(serde_json::from_value::<ProxyDoc>(serde_json::json!({"models": []})).is_err());
+    }
 }

@@ -231,6 +231,7 @@ jobs:
           path: |
             ${{ runner.temp }}/out/report.md
             ${{ runner.temp }}/out/observations.json
+            ${{ runner.temp }}/out/tinfoil-admin-pins.json
           if-no-files-found: ignore
           retention-days: 90
 

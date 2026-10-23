@@ -535,10 +535,11 @@ pub struct Model {
     /// If true, this model may be activated even when both cost fields are 0.
     /// Intended for intentionally-free models (e.g. community previews).
     pub allow_free: bool,
-    /// Whether the model appears in the public model catalogs
-    /// (`GET /v1/models`, `GET /v1/model/list`, `GET /v1/model/{name}`).
-    /// `false` keeps an active, billable row out of them. It is a catalog
-    /// switch only: it does not change routing or who may call the model.
+    /// Whether the model is listed. A listed model appears in the public
+    /// model catalogs (`GET /v1/models`, `GET /v1/model/list`,
+    /// `GET /v1/model/{name}`) and every caller may use it. An unlisted model
+    /// stays active and billable but is left out of them, and only an
+    /// organization with a row in `organization_model_access` may use it.
     pub is_listed: bool,
     pub owned_by: String,
     pub created_at: DateTime<Utc>,
@@ -567,15 +568,21 @@ pub struct UpdateModelPricingRequest {
     pub is_active: Option<bool>,
     /// If true, allows activation even with zero pricing.
     pub allow_free: Option<bool>,
-    /// `Some(false)` keeps the model out of the public model catalogs,
-    /// `Some(true)` lists it again, `None` leaves the column unchanged
-    /// (new rows default to listed).
+    /// `Some(false)` unlists the model: it leaves the public model catalogs
+    /// and only organizations that hold a grant may use it. `Some(true)`
+    /// lists it again, `None` leaves the column unchanged (new rows default
+    /// to listed).
     pub is_listed: Option<bool>,
     pub aliases: Option<Vec<String>>,
     pub owned_by: Option<String>,
     // Provider configuration
     pub provider_type: Option<String>,
     pub provider_config: Option<serde_json::Value>,
+    /// Compare-and-set guard for `provider_config` on update: `Some(expected)`
+    /// applies the update only while the stored config equals `expected`
+    /// (`Some(None)` = NULL); otherwise it fails with `TransactionConflict`.
+    #[serde(skip)]
+    pub expected_provider_config: Option<Option<serde_json::Value>>,
     pub attestation_supported: Option<bool>,
     // Architecture/modalities
     pub input_modalities: Option<Vec<String>>,
@@ -674,7 +681,8 @@ pub struct ModelHistory {
 
     /// If true, this model was allowed to serve without pricing at this point in time.
     pub allow_free: bool,
-    /// Whether the model was in the public model catalogs at this point in time.
+    /// Whether the model was listed (in the public model catalogs and open to
+    /// every caller) at this point in time.
     pub is_listed: bool,
 }
 

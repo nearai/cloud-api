@@ -167,6 +167,10 @@ use utoipa::{Modify, OpenApi};
         crate::routes::admin::list_model_pricing_changes,
         crate::routes::admin::cancel_model_pricing_change,
         crate::routes::admin::get_model_history,
+        crate::routes::admin_model_access::get_model_access,
+        crate::routes::admin_model_access::grant_model_access,
+        crate::routes::admin_model_access::revoke_model_access,
+        crate::routes::admin_model_access::list_organization_model_access,
         crate::routes::admin::get_admin_organization_balance,
         crate::routes::admin::update_organization_limits,
         crate::routes::admin::get_organization_limits_history,
@@ -193,6 +197,18 @@ use utoipa::{Modify, OpenApi};
         crate::routes::admin_usage_hourly::recompute_usage_hourly,
         crate::routes::admin_usage_discount::get_usage_discount,
         crate::routes::admin_credit_reconciliation::reconcile_organization_credits,
+        crate::routes::credit_transfers::create,
+        crate::routes::credit_transfers::history,
+        crate::routes::credit_transfers::detail,
+        crate::routes::credit_transfers::capacity,
+        crate::routes::organization_policy::get_policy,
+        crate::routes::organization_policy::put_policy,
+        crate::routes::organization_credentials::create_credential,
+        crate::routes::organization_credentials::revoke_credential,
+        crate::routes::organization_credentials::list_credentials,
+        crate::routes::organization_credentials::update_credential,
+        crate::routes::organization_credentials::rotate_credential,
+        crate::routes::credit_transfers::reconciliation,
         crate::routes::admin_usage_discount::put_usage_discount,
         crate::routes::admin::get_org_revenue,
         crate::routes::admin::get_infra_summary,
@@ -219,6 +235,7 @@ use utoipa::{Modify, OpenApi};
         crate::routes::attestation::signature::get_signature,
         crate::routes::attestation::report::get_attestation_report,
         crate::routes::attestation::ita_token::get_ita_token,
+        crate::routes::attestation::pins::get_attested_pins,
     ),
     components(
         schemas(
@@ -227,7 +244,7 @@ use utoipa::{Modify, OpenApi};
             // Core API models
             ChatCompletionRequest, ChatCompletionResponse, Message, CompletionUsage,
             CompletionRequest, CompletionPrompt, StopSequences, CompletionResponse,
-            CompletionChoice, ModelsResponse, ModelInfo, ModelPricing, TopProvider, ErrorResponse,
+            CompletionChoice, ModelsResponse, ModelInfo, ModelPricing, UpcomingModelPricingInfo, TopProvider, ErrorResponse,
             // Image generation models
             ImageGenerationRequest, ImageGenerationResponse, ImageData,
             // Audio transcription models
@@ -243,6 +260,10 @@ use utoipa::{Modify, OpenApi};
             UpdateOrganizationRequest, CreateApiKeyRequest, ApiKeyResponse,
             UpdateApiKeySpendLimitRequest, UpdateApiKeyRequest,
             // usage_hourly repair models
+            crate::routes::admin_model_access::ModelAccessResponse,
+            crate::routes::admin_model_access::ModelAccessGrantResponse,
+            crate::routes::admin_model_access::OrganizationModelAccessResponse,
+            crate::routes::admin_model_access::OrganizationModelAccessEntry,
             crate::routes::admin_usage_discount::UsageDiscountRequest,
             crate::routes::admin_credit_reconciliation::CreditReconciliationRequest,
             crate::routes::admin_credit_reconciliation::CreditReconciliationResponse,
@@ -305,7 +326,7 @@ use utoipa::{Modify, OpenApi};
             crate::routes::attestation::NvidiaPayload,
             crate::routes::attestation::QuoteResponse,
             // Model pricing models
-            ModelListResponse, ModelWithPricing, AdminModelListResponse, AdminModelWithPricing,
+            ModelListResponse, ModelWithPricing, UpcomingPricing, AdminModelListResponse, AdminModelWithPricing,
             DecimalPrice, DecimalPriceRequest, ModelMetadata,
             ServiceResponse, ServiceListResponse,
             AdminServiceResponse, AdminServiceListResponse, CreateServiceRequest, UpdateServiceRequest,
@@ -562,6 +583,16 @@ impl Modify for SecurityAddon {
                         .description(Some(
                             "API key for programmatic access (Authorization: Bearer sk-<api_key>)",
                         ))
+                        .build(),
+                ),
+            );
+            components.add_security_scheme(
+                "organization_credential",
+                SecurityScheme::Http(
+                    HttpBuilder::new()
+                        .scheme(HttpAuthScheme::Bearer)
+                        .bearer_format("oc_")
+                        .description(Some("Organization-owned credential with explicit credits:read and/or credits:transfer permissions; never valid for inference"))
                         .build(),
                 ),
             );

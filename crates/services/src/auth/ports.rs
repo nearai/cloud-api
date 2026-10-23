@@ -115,9 +115,23 @@ pub struct OAuthUserInfo {
     pub provider: String,
     pub provider_user_id: String,
     pub email: String,
+    #[serde(default)]
+    pub email_verified: bool,
+    /// Trusted provider evidence that it is authoritative for this mailbox.
+    /// Historical verification alone is insufficient for Google third-party emails.
+    #[serde(default)]
+    pub email_authoritative: bool,
     pub username: String,
     pub display_name: Option<String>,
     pub avatar_url: Option<String>,
+}
+
+impl OAuthUserInfo {
+    pub fn can_auto_link_by_email(&self) -> bool {
+        self.email_verified
+            && self.email_authoritative
+            && matches!(self.provider.as_str(), "google" | "github")
+    }
 }
 
 // Error types
@@ -144,6 +158,9 @@ pub enum AuthError {
     #[error("User not found")]
     UserNotFound,
 
+    #[error("This email is already registered with {existing_provider}")]
+    OAuthProviderConflict { existing_provider: String },
+
     #[error("Internal error: {0}")]
     InternalError(String),
 
@@ -160,6 +177,19 @@ pub enum AuthError {
 // Repository traits
 #[async_trait]
 pub trait UserRepository: Send + Sync {
+    async fn try_link_oauth_identity_by_email(
+        &self,
+        _info: &OAuthUserInfo,
+    ) -> anyhow::Result<Option<User>> {
+        Ok(None)
+    }
+    async fn observe_oauth_identity(
+        &self,
+        _user_id: UserId,
+        _info: &OAuthUserInfo,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
     async fn create(
         &self,
         email: String,

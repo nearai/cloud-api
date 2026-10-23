@@ -110,6 +110,7 @@ pub async fn list_models(
         .skip(offset_usize)
         .take(limit_usize)
         .map(|model| ModelWithPricing {
+            upcoming_pricing: model.upcoming_pricing.map(Into::into),
             model_id: model.model_name,
             input_cost_per_token: DecimalPrice {
                 amount: model.input_cost_per_token,
@@ -233,6 +234,7 @@ pub async fn get_model_by_name(
 
     // Convert to API model
     let api_model = ModelWithPricing {
+        upcoming_pricing: model.upcoming_pricing.map(Into::into),
         model_id: model.model_name,
         input_cost_per_token: DecimalPrice {
             amount: model.input_cost_per_token,
@@ -312,6 +314,7 @@ mod tests {
         max_output_length: Option<i32>,
     ) -> services::models::ModelWithPricing {
         services::models::ModelWithPricing {
+            upcoming_pricing: None,
             id: Uuid::new_v4(),
             model_name: model_name.to_string(),
             model_display_name: "Public Detail Model".to_string(),
@@ -362,6 +365,7 @@ mod tests {
         async fn get_model_by_name(
             &self,
             model_name: &str,
+            _caller: services::models::ModelCaller,
         ) -> Result<services::models::ModelWithPricing, ModelsError> {
             Err(ModelsError::NotFound(format!(
                 "Model '{model_name}' not found"
@@ -371,6 +375,7 @@ mod tests {
         async fn resolve_and_get_model(
             &self,
             _identifier: &str,
+            _caller: services::models::ModelCaller,
         ) -> Result<services::models::ModelWithPricing, ModelsError> {
             self.db_calls.fetch_add(1, Ordering::SeqCst);
             Ok(service_model("db-backed/detail", Some(512)))
@@ -385,7 +390,11 @@ mod tests {
             Ok(service_model("public/enriched-detail", Some(4_096)))
         }
 
-        async fn resolve_alias_cached(&self, _identifier: &str) -> Option<String> {
+        async fn resolve_alias_cached(
+            &self,
+            _identifier: &str,
+            _caller: services::models::ModelCaller,
+        ) -> Option<String> {
             None
         }
 

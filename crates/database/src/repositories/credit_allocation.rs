@@ -84,10 +84,11 @@ pub async fn allocate_usage(
     let rows = transaction
         .query(
             r#"
-            SELECT active.id, active.credit_type, active.source, active.spend_limit,
+            SELECT active.id, active.credit_type, active.source,
+                   active.effective_capacity AS spend_limit,
                    COALESCE(consumed.amount, 0)::BIGINT AS consumed
             FROM unnest($2::TEXT[]) WITH ORDINALITY AS wanted(credit_type, position)
-            JOIN organization_limits_history active
+            JOIN organization_credit_capacities active
               ON active.organization_id = $1
              AND active.credit_type = wanted.credit_type
              AND active.effective_until IS NULL
@@ -255,10 +256,11 @@ pub async fn settle_unfunded_usage(
     let credit_rows = transaction
         .query(
             r#"
-            SELECT active.id, active.credit_type, active.source, active.spend_limit,
+            SELECT active.id, active.credit_type, active.source,
+                   active.effective_capacity AS spend_limit,
                    COALESCE(consumed.amount, 0)::BIGINT AS consumed
             FROM unnest($2::TEXT[]) WITH ORDINALITY AS wanted(credit_type, position)
-            JOIN organization_limits_history active
+            JOIN organization_credit_capacities active
               ON active.organization_id = $1
              AND active.credit_type = wanted.credit_type
              AND active.effective_until IS NULL

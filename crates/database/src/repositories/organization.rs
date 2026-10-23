@@ -717,6 +717,27 @@ where
         .await
         .map_err(map_db_error)?;
 
+    // A grant on an unlisted model counts only for an active organization,
+    // but remove the rows as well, for the reason given for reporting
+    // tokens above: a deleted org cannot regain access through a future path.
+    // Each removed grant gets its audit row; no acting user, as above: this
+    // is a system revocation.
+    client
+        .execute(
+            r#"
+            WITH revoked AS (
+                DELETE FROM organization_model_access
+                WHERE organization_id = $1
+                RETURNING organization_id, model_id
+            )
+            INSERT INTO organization_model_access_log (organization_id, model_id, action, acting_user_id)
+            SELECT organization_id, model_id, 'revoke', NULL::UUID FROM revoked
+            "#,
+            &[&organization_id],
+        )
+        .await
+        .map_err(map_db_error)?;
+
     Ok(())
 }
 

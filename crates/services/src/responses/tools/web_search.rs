@@ -6,11 +6,13 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::{sync::Arc, time::Instant};
 
-use super::executor::{ToolEventContext, ToolExecutionContext, ToolExecutor, ToolOutput};
-use super::ports::{WebSearchParams, WebSearchProviderTrait, WebSearchResult};
 use crate::responses::errors::ResponseError;
 use crate::responses::models::{ResponseItemStatus, ResponseOutputItem, WebSearchAction};
 use crate::responses::service_helpers::ToolCallInfo;
+use crate::responses::tools::executor::{
+    ToolEventContext, ToolExecutionContext, ToolExecutor, ToolOutput,
+};
+use crate::responses::tools::ports::{WebSearchParams, WebSearchProviderTrait, WebSearchResult};
 use crate::web_search::{WEB_SEARCH_MAX_COUNT, WEB_SEARCH_MAX_OFFSET};
 
 /// Create a web search output item for streaming events
@@ -192,7 +194,7 @@ pub fn format_results(
         .collect::<Vec<_>>()
         .join("\n");
 
-    let instruction = if current_source_count == 0 {
+    let instruction = if current_source_count == 0 && !sources.is_empty() {
         Some(CITATION_INSTRUCTION.to_string())
     } else {
         None
@@ -219,7 +221,10 @@ impl WebSearchToolExecutor {
     }
 
     /// Parse additional parameters from the tool call
-    fn parse_params(tool_call: &ToolCallInfo) -> WebSearchParams {
+    fn parse_params(
+        tool_call: &ToolCallInfo,
+        request: &crate::responses::models::CreateResponseRequest,
+    ) -> WebSearchParams {
         let mut search_params = WebSearchParams::new(tool_call.query.clone());
 
         if let Some(params) = &tool_call.params {
@@ -280,6 +285,13 @@ impl WebSearchToolExecutor {
             }
         }
 
+        if let Some(count) = request.tools.iter().flatten().find_map(|tool| match tool {
+            crate::responses::models::ResponseTool::WebSearch { count, .. } => *count,
+            _ => None,
+        }) {
+            search_params.count = Some(count);
+        }
+
         search_params
     }
 }
@@ -297,26 +309,31 @@ impl ToolExecutor for WebSearchToolExecutor {
     async fn execute(
         &self,
         tool_call: &ToolCallInfo,
-        _context: &ToolExecutionContext<'_>,
+        context: &ToolExecutionContext<'_>,
     ) -> Result<ToolOutput, ResponseError> {
-        let search_params = Self::parse_params(tool_call);
+        let search_params = Self::parse_params(tool_call, context.request);
+        if search_params.count == Some(0) {
+            return Ok(ToolOutput::WebSearch {
+                sources: Vec::new(),
+            });
+        }
         let started_at = Instant::now();
         let tool_call_id = tool_call.id.as_deref().unwrap_or("unknown");
 
         tracing::info!(
             tool_name = WEB_SEARCH_TOOL_NAME,
             tool_call_id,
-            model = %_context.request.model,
+            model = %context.request.model,
             requested_count = search_params.count.unwrap_or(WEB_SEARCH_MAX_COUNT),
             "Web search tool started"
         );
 
         let sources = self.provider.search(search_params).await.map_err(|error| {
-            let error_category = super::web_search_error_category(&error);
+            let error_category = crate::responses::tools::web_search_error_category(&error);
             tracing::warn!(
                 tool_name = WEB_SEARCH_TOOL_NAME,
                 tool_call_id,
-                model = %_context.request.model,
+                model = %context.request.model,
                 error_category,
                 elapsed_ms = started_at.elapsed().as_millis() as u64,
                 "Web search tool failed"
@@ -324,11 +341,12 @@ impl ToolExecutor for WebSearchToolExecutor {
             ResponseError::InternalError(format!("Web search failed: {error_category}"))
         })?;
 
-        let (snippet_count, total_snippet_chars) = super::web_search_result_stats(&sources);
+        let (snippet_count, total_snippet_chars) =
+            crate::responses::tools::web_search_result_stats(&sources);
         tracing::info!(
             tool_name = WEB_SEARCH_TOOL_NAME,
             tool_call_id,
-            model = %_context.request.model,
+            model = %context.request.model,
             result_count = sources.len(),
             snippet_count,
             total_snippet_chars,
@@ -379,9 +397,9 @@ impl ToolExecutor for WebSearchToolExecutor {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::responses::models::CreateResponseRequest;
     use crate::responses::tools::ports::WebSearchError;
+    use crate::responses::tools::web_search::*;
     use std::sync::{Arc as StdArc, Mutex};
 
     struct MockWebSearchProvider {
@@ -427,6 +445,73 @@ mod tests {
             prompt_cache_key: None,
             service_tier: None,
         }
+    }
+
+    #[tokio::test]
+    async fn test_web_search_count_zero_returns_without_provider_request() {
+        let provider = Arc::new(crate::responses::tools::brave::BraveWebSearchProvider {
+            api_key: String::new(),
+            llm_context_api_key: String::new(),
+            client: reqwest::Client::builder()
+                .proxy(reqwest::Proxy::all("http://127.0.0.1:0").unwrap())
+                .build()
+                .unwrap(),
+        });
+        let executor = WebSearchToolExecutor::new(provider);
+        let request = serde_json::from_value(serde_json::json!({
+            "model": "test", "tools": [{"type": "web_search", "count": 0}]
+        }))
+        .unwrap();
+        let call = ToolCallInfo {
+            id: None,
+            tool_type: WEB_SEARCH_TOOL_NAME.to_string(),
+            query: "test".to_string(),
+            params: Some(serde_json::json!({"count": 20})),
+            thought_signature: None,
+        };
+        let output = executor
+            .execute(&call, &ToolExecutionContext { request: &request })
+            .await
+            .unwrap();
+        match output {
+            ToolOutput::WebSearch { sources } => assert!(sources.is_empty()),
+            _ => panic!("Expected empty web search results"),
+        }
+    }
+
+    #[test]
+    fn test_web_search_count_configuration_overrides_model_arguments() {
+        for configured in [None, Some(0), Some(1), Some(5), Some(20)] {
+            for model_count in [None, Some(2), Some(10), Some(20)] {
+                let request = serde_json::from_value(serde_json::json!({
+                    "model": "test",
+                    "tools": [{"type": "web_search", "count": configured}]
+                }))
+                .unwrap();
+                let call = ToolCallInfo {
+                    id: None,
+                    tool_type: WEB_SEARCH_TOOL_NAME.to_string(),
+                    query: "test query".to_string(),
+                    params: Some(serde_json::json!({"count": model_count, "country": "US"})),
+                    thought_signature: None,
+                };
+                let params = WebSearchToolExecutor::parse_params(&call, &request);
+                assert_eq!(params.count, configured.or(model_count));
+                assert_eq!(params.query, "test query");
+                assert_eq!(params.country.as_deref(), Some("US"));
+            }
+        }
+        let call = ToolCallInfo {
+            id: None,
+            tool_type: WEB_SEARCH_TOOL_NAME.to_string(),
+            query: "test".to_string(),
+            params: None,
+            thought_signature: None,
+        };
+        assert_eq!(
+            WebSearchToolExecutor::parse_params(&call, &create_test_request()).count,
+            None
+        );
     }
 
     #[tokio::test]
@@ -564,5 +649,12 @@ mod tests {
         // First search should include citation instruction
         assert!(result.instruction.is_some());
         assert!(result.instruction.unwrap().contains("CITATION REQUIREMENT"));
+    }
+
+    #[test]
+    fn test_format_results_without_sources_has_no_citation_instruction() {
+        let result = format_results(&[], 0);
+        assert!(result.formatted.is_empty());
+        assert!(result.instruction.is_none());
     }
 }

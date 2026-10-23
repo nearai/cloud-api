@@ -13,7 +13,7 @@ use services::{
         },
         AttestationError, SignatureLookupResult,
     },
-    models::{ModelInfo, ModelWithPricing, ModelsError, ModelsServiceTrait},
+    models::{ModelCaller, ModelInfo, ModelWithPricing, ModelsError, ModelsServiceTrait},
 };
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
@@ -99,6 +99,7 @@ impl services::attestation::ports::AttestationServiceTrait for RecordingItaAttes
         _signing_address: Option<String>,
         _include_tls_fingerprint: bool,
         _provider_filter: Option<inference_providers::ProviderFilter>,
+        _caller: ModelCaller,
     ) -> Result<services::attestation::models::AttestationReport, AttestationError> {
         Err(AttestationError::InternalError("unused".to_string()))
     }
@@ -127,13 +128,32 @@ impl services::attestation::ports::AttestationServiceTrait for RecordingItaAttes
 #[derive(Clone, Default)]
 pub(super) struct TestModelsService {
     alias: Option<(String, String)>,
+    /// When set, the alias target is an unlisted model.
+    unlisted: bool,
+    callers: Arc<Mutex<Vec<ModelCaller>>>,
 }
 
 impl TestModelsService {
     pub(super) fn with_alias(alias: &str, canonical: &str) -> Self {
         Self {
             alias: Some((alias.to_string(), canonical.to_string())),
+            ..Self::default()
         }
+    }
+
+    pub(super) fn with_unlisted_alias(alias: &str, canonical: &str) -> Self {
+        Self {
+            unlisted: true,
+            ..Self::with_alias(alias, canonical)
+        }
+    }
+
+    /// The callers the route resolved models for, in order.
+    pub(super) fn callers(&self) -> Vec<ModelCaller> {
+        self.callers
+            .lock()
+            .unwrap_or_else(|error| panic!("caller lock poisoned: {error}"))
+            .clone()
     }
 }
 
@@ -147,24 +167,41 @@ impl ModelsServiceTrait for TestModelsService {
         Ok(Vec::new())
     }
 
-    async fn get_model_by_name(&self, model_name: &str) -> Result<ModelWithPricing, ModelsError> {
+    async fn get_model_by_name(
+        &self,
+        model_name: &str,
+        _caller: ModelCaller,
+    ) -> Result<ModelWithPricing, ModelsError> {
         Ok(model_with_name(model_name))
     }
 
     async fn resolve_and_get_model(
         &self,
         identifier: &str,
+        caller: ModelCaller,
     ) -> Result<ModelWithPricing, ModelsError> {
-        let canonical = self
+        self.callers
+            .lock()
+            .unwrap_or_else(|error| panic!("caller lock poisoned: {error}"))
+            .push(caller);
+        let alias_target = self
             .alias
             .as_ref()
             .filter(|(alias, _)| alias == identifier)
-            .map(|(_, canonical)| canonical.as_str())
-            .unwrap_or(identifier);
-        Ok(model_with_name(canonical))
+            .map(|(_, canonical)| canonical.as_str());
+        if self.unlisted && alias_target.is_some() && caller != ModelCaller::Trusted {
+            return Err(ModelsError::NotFound(format!(
+                "Model '{identifier}' not found"
+            )));
+        }
+        Ok(model_with_name(alias_target.unwrap_or(identifier)))
     }
 
-    async fn resolve_alias_cached(&self, _identifier: &str) -> Option<String> {
+    async fn resolve_alias_cached(
+        &self,
+        _identifier: &str,
+        _caller: ModelCaller,
+    ) -> Option<String> {
         None
     }
 
@@ -227,6 +264,7 @@ pub(super) fn sample_ita_response(
 
 fn model_with_name(model_name: &str) -> ModelWithPricing {
     ModelWithPricing {
+        upcoming_pricing: None,
         id: Uuid::new_v4(),
         model_name: model_name.to_string(),
         model_display_name: model_name.to_string(),

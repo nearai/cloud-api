@@ -1155,6 +1155,26 @@ pub struct ModelsResponse {
     pub data: Vec<ModelInfo>,
 }
 
+/// `GET /v1/internal/model-access`: which organizations may use each
+/// restricted model. A model that is absent from `models` is unrestricted.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ModelAccessDocument {
+    /// Always `"model_access"`.
+    pub object: String,
+    /// One entry per unlisted model, active or not, ordered by model name.
+    pub models: Vec<ModelAccessDocumentEntry>,
+}
+
+/// One restricted model of [`ModelAccessDocument`].
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ModelAccessDocumentEntry {
+    /// Canonical model name, the `id` of `GET /v1/internal/models`.
+    pub id: String,
+    /// The active organizations that hold a grant. Empty when nobody may use
+    /// the model.
+    pub organization_ids: Vec<uuid::Uuid>,
+}
+
 /// Model pricing information.
 ///
 /// `input` / `output` are the legacy HuggingFace-style fields (USD per million
@@ -1181,6 +1201,57 @@ pub struct ModelPricing {
     pub input_cache_read: Option<String>,
 }
 
+/// Named nano-dollar amounts keep distinct price fields explicit at call sites.
+pub(crate) struct CatalogPricingAmounts {
+    pub input_cost_per_token: i64,
+    pub output_cost_per_token: i64,
+    pub cost_per_image: i64,
+    pub cache_read_cost_per_token: Option<i64>,
+}
+
+impl From<CatalogPricingAmounts> for ModelPricing {
+    fn from(pricing: CatalogPricingAmounts) -> Self {
+        Self {
+            // nano-dollars per token * 0.001 = USD per million tokens.
+            input: (pricing.input_cost_per_token as f64) * 0.001,
+            output: (pricing.output_cost_per_token as f64) * 0.001,
+            prompt: nano_dollars_to_per_token_string(pricing.input_cost_per_token),
+            completion: nano_dollars_to_per_token_string(pricing.output_cost_per_token),
+            image: nano_dollars_to_per_token_string(pricing.cost_per_image),
+            request: "0".to_string(),
+            input_cache_read: pricing
+                .cache_read_cost_per_token
+                .map(nano_dollars_to_per_token_string),
+        }
+    }
+}
+
+/// Convert a nano-USD amount (DB scale 9 — used for per-token, per-image, and
+/// per-request prices) to a USD string suitable for OpenRouter
+/// (e.g. 8_000 → "0.000008"). Strings are required by the OpenRouter provider
+/// spec to avoid float precision issues, so this uses pure integer arithmetic.
+/// Pricing is non-negative throughout the system; a defensive `abs()` keeps
+/// the formatter total in the unexpected case.
+fn nano_dollars_to_per_token_string(nano_dollars: i64) -> String {
+    if nano_dollars == 0 {
+        return "0".to_string();
+    }
+    let n = nano_dollars.unsigned_abs();
+    let dollars = n / 1_000_000_000;
+    let nanos = n % 1_000_000_000;
+    let mut s = if nanos == 0 {
+        format!("{dollars}")
+    } else {
+        let frac = format!("{nanos:09}");
+        let frac = frac.trim_end_matches('0');
+        format!("{dollars}.{frac}")
+    };
+    if nano_dollars < 0 {
+        s.insert(0, '-');
+    }
+    s
+}
+
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct ModelInfo {
     pub id: String,
@@ -1200,6 +1271,9 @@ pub struct ModelInfo {
     /// Pricing information (HuggingFace + OpenRouter compatible).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pricing: Option<ModelPricing>,
+    /// Earliest pending change and complete prices after it is applied.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upcoming_pricing: Option<UpcomingModelPricingInfo>,
     /// Exact, versioned USD-per-million text pricing. The legacy `pricing`
     /// projection remains Standard-short for compatibility.
     #[serde(rename = "textPricing", skip_serializing_if = "Option::is_none")]
@@ -1232,7 +1306,8 @@ pub struct ModelInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub deprecation_date: Option<String>,
     /// Recommended replacement for a model with a planned deprecation
-    /// (canonical model id). Omitted when none is set.
+    /// (canonical model id). Omitted when none is set. The public catalogs
+    /// name only a listed successor.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub successor_model_id: Option<String>,
     /// Human-readable description (OpenRouter `description`).
@@ -1868,7 +1943,12 @@ pub enum ResponseTool {
         parameters: Option<serde_json::Value>,
     },
     #[serde(rename = "web_search")]
-    WebSearch {},
+    WebSearch {
+        /// Maximum results per search (0–20); zero disables searches. Overrides the model's count when set.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[schema(minimum = 0, maximum = 20)]
+        count: Option<u32>,
+    },
     #[serde(rename = "web_context_search")]
     WebContextSearch {},
     #[serde(rename = "file_search")]
@@ -2553,6 +2633,17 @@ impl CreateResponseRequest {
     pub fn validate(&self) -> Result<(), String> {
         if self.model.trim().is_empty() {
             return Err("Model cannot be empty".to_string());
+        }
+
+        for tool in self.tools.iter().flatten() {
+            if let ResponseTool::WebSearch {
+                count: Some(count), ..
+            } = tool
+            {
+                if *count > services::web_search::WEB_SEARCH_MAX_COUNT {
+                    return Err("web_search count must be between 0 and 20".to_string());
+                }
+            }
         }
 
         if let Some(max_tokens) = self.max_output_tokens {
@@ -3828,6 +3919,68 @@ pub struct AdminModelWithPricing {
     pub updated_at: DateTime<Utc>,
 }
 
+/// A scheduled change on the OpenAI-compatible model catalog. Prices use the
+/// same representation as the model's current `pricing` and `textPricing`.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct UpcomingModelPricingInfo {
+    pub effective_at: String,
+    pub pricing: ModelPricing,
+    #[serde(rename = "textPricing", skip_serializing_if = "Option::is_none")]
+    pub text_pricing: Option<serde_json::Value>,
+}
+
+/// A scheduled change on the native model catalog, in nano-dollars like the
+/// current prices. Absent when no change is pending.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct UpcomingPricing {
+    #[serde(rename = "effectiveAt")]
+    pub effective_at: String,
+    pub pricing: PricingFields,
+}
+
+impl From<services::models::UpcomingModelPricing> for UpcomingPricing {
+    fn from(pricing: services::models::UpcomingModelPricing) -> Self {
+        let decimal = |amount| DecimalPrice {
+            amount,
+            scale: 9,
+            currency: "USD".to_string(),
+        };
+        Self {
+            effective_at: crate::routes::admin::format_deprecation_date(&pricing.effective_at),
+            pricing: PricingFields {
+                input_cost_per_token: decimal(pricing.input_cost_per_token),
+                output_cost_per_token: decimal(pricing.output_cost_per_token),
+                cache_read_cost_per_token: pricing.cache_read_cost_per_token.map(decimal),
+                cost_per_image: decimal(pricing.cost_per_image),
+                text_pricing: pricing.text_pricing.map(|profile| {
+                    serde_json::to_value(profile).unwrap_or(serde_json::Value::Null)
+                }),
+            },
+        }
+    }
+}
+
+impl From<services::models::UpcomingModelPricing> for UpcomingModelPricingInfo {
+    fn from(pricing: services::models::UpcomingModelPricing) -> Self {
+        // Share the date and optional profile conversion with the native catalog.
+        let future = UpcomingPricing::from(pricing);
+        Self {
+            effective_at: future.effective_at,
+            pricing: CatalogPricingAmounts {
+                input_cost_per_token: future.pricing.input_cost_per_token.amount,
+                output_cost_per_token: future.pricing.output_cost_per_token.amount,
+                cost_per_image: future.pricing.cost_per_image.amount,
+                cache_read_cost_per_token: future
+                    .pricing
+                    .cache_read_cost_per_token
+                    .map(|price| price.amount),
+            }
+            .into(),
+            text_pricing: future.pricing.text_pricing,
+        }
+    }
+}
+
 /// Model with pricing information
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct ModelWithPricing {
@@ -3848,6 +4001,9 @@ pub struct ModelWithPricing {
     pub cache_read_cost_per_token: Option<DecimalPrice>,
     #[serde(rename = "textPricing", skip_serializing_if = "Option::is_none")]
     pub text_pricing: Option<serde_json::Value>,
+    /// Complete future prices and date for the earliest pending change.
+    #[serde(rename = "upcomingPricing", skip_serializing_if = "Option::is_none")]
+    pub upcoming_pricing: Option<UpcomingPricing>,
     pub metadata: ModelMetadata,
 }
 
@@ -3986,7 +4142,8 @@ pub struct ModelMetadata {
     #[serde(rename = "deprecationDate", skip_serializing_if = "Option::is_none")]
     pub deprecation_date: Option<String>,
     /// Recommended replacement for a model with a planned deprecation
-    /// (canonical model id). Omitted when none is set.
+    /// (canonical model id). Omitted when none is set. The public catalogs
+    /// name only a listed successor.
     #[serde(rename = "successorModelId", skip_serializing_if = "Option::is_none")]
     pub successor_model_id: Option<String>,
     /// OpenRouter `openrouter.slug` override (lowercase `author/slug`). Omitted
@@ -3994,8 +4151,9 @@ pub struct ModelMetadata {
     /// `openrouter: { slug }` object; the admin view exposes the raw value.
     #[serde(rename = "openrouterSlug", skip_serializing_if = "Option::is_none")]
     pub openrouter_slug: Option<String>,
-    /// Whether the model appears in the public model catalogs. Set on admin
-    /// views only; the public catalog endpoints omit it.
+    /// Whether the model is listed. An unlisted model is left out of the
+    /// public model catalogs and only organizations that hold a grant may
+    /// use it. Set on admin views only; the public catalog endpoints omit it.
     #[serde(rename = "isListed", skip_serializing_if = "Option::is_none")]
     pub is_listed: Option<bool>,
 }
@@ -4050,11 +4208,14 @@ pub struct UpdateModelApiRequest {
     /// Required to be set explicitly when activating a zero-price model.
     #[serde(rename = "allowFree", skip_serializing_if = "Option::is_none")]
     pub allow_free: Option<bool>,
-    /// `false` keeps the model out of the public model catalogs
-    /// (`GET /v1/models`, `GET /v1/model/list`, `GET /v1/model/{name}`) while
-    /// it stays active and billable; `true` lists it again. Omitted = leave
-    /// unchanged (new models are listed). It is a catalog switch only: a
-    /// model that has an inference URL can still be called by name.
+    /// `false` unlists the model. It stays active and billable, but it
+    /// leaves the public model catalogs (`GET /v1/models`,
+    /// `GET /v1/model/list`, `GET /v1/model/{name}`) and becomes restricted:
+    /// only organizations that hold a grant
+    /// (`PUT /v1/admin/models/{model_name}/access/{org_id}`) may use it, and
+    /// everyone else is answered as if the model did not exist. `true` lists
+    /// it again and opens it to every caller. Omitted = leave unchanged (new
+    /// models are listed).
     #[serde(rename = "isListed", skip_serializing_if = "Option::is_none")]
     pub is_listed: Option<bool>,
     pub aliases: Option<Vec<String>>,
@@ -4063,7 +4224,10 @@ pub struct UpdateModelApiRequest {
     /// Provider type: "vllm" (default, TEE-enabled) or "external" (3rd party)
     #[serde(rename = "providerType", skip_serializing_if = "Option::is_none")]
     pub provider_type: Option<String>,
-    /// JSON config for external providers (backend, base_url, etc.)
+    /// JSON config for external providers (backend, base_url, etc.). On an
+    /// existing model it merges into the stored config: keys sent replace
+    /// stored keys, `null` removes a key, omitted keys are kept. `api_key:
+    /// "***"` keeps the stored key.
     #[serde(rename = "providerConfig", skip_serializing_if = "Option::is_none")]
     pub provider_config: Option<serde_json::Value>,
     /// Whether this model supports TEE attestation
@@ -4526,7 +4690,8 @@ pub struct ModelHistoryEntry {
     /// If true, this model was allowed to serve without pricing at this point in time.
     #[serde(rename = "allowFree")]
     pub allow_free: bool,
-    /// Whether the model was in the public model catalogs at this point in time.
+    /// Whether the model was listed (in the public model catalogs and open to
+    /// every caller) at this point in time.
     #[serde(rename = "isListed")]
     pub is_listed: bool,
 }
@@ -4560,6 +4725,8 @@ pub enum CreditType {
     Payment,
     #[serde(rename = "staking_farm", alias = "STAKING_FARM")]
     StakingFarm,
+    #[serde(alias = "TRANSFER")]
+    Transfer,
     #[serde(alias = "POSTPAY")]
     Postpay,
 }
@@ -4570,6 +4737,7 @@ impl std::fmt::Display for CreditType {
             CreditType::Grant => write!(f, "grant"),
             CreditType::Payment => write!(f, "payment"),
             CreditType::StakingFarm => write!(f, "staking_farm"),
+            CreditType::Transfer => write!(f, "transfer"),
             CreditType::Postpay => write!(f, "postpay"),
         }
     }
@@ -4582,6 +4750,7 @@ impl CreditType {
             CreditType::Grant => "grant",
             CreditType::Payment => "payment",
             CreditType::StakingFarm => "staking_farm",
+            CreditType::Transfer => "transfer",
             CreditType::Postpay => "postpay",
         }
     }
@@ -4599,6 +4768,7 @@ impl std::str::FromStr for CreditType {
             "grant" => Ok(Self::Grant),
             "payment" => Ok(Self::Payment),
             "staking_farm" => Ok(Self::StakingFarm),
+            "transfer" => Ok(Self::Transfer),
             "postpay" => Ok(Self::Postpay),
             _ => Err(ParseCreditTypeError),
         }
@@ -4787,8 +4957,122 @@ pub struct FileDeleteResponse {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::models::*;
     use serde_json::json;
+
+    #[test]
+    fn test_web_search_count_validation_and_round_trip() {
+        for count in [None, Some(1), Some(5), Some(20), Some(0), Some(21)] {
+            let mut tool = serde_json::json!({"type": "web_search"});
+            if let Some(count) = count {
+                tool["count"] = serde_json::json!(count);
+            }
+            let request: CreateResponseRequest = serde_json::from_value(serde_json::json!({
+                "model": "test", "input": "Search the web", "tools": [tool.clone()]
+            }))
+            .unwrap();
+            assert_eq!(
+                request.validate().is_ok(),
+                count.is_none_or(|n| (0..=20).contains(&n))
+            );
+            let serialized = serde_json::to_value(&request.tools).unwrap();
+            assert_eq!(serialized[0], tool);
+        }
+        for count in [
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+            serde_json::json!("5"),
+            serde_json::json!(4294967296u64),
+        ] {
+            assert!(
+                serde_json::from_value::<CreateResponseRequest>(serde_json::json!({
+                    "model": "test", "tools": [{"type": "web_search", "count": count}]
+                }))
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn nano_dollars_zero_renders_as_bare_zero() {
+        assert_eq!(nano_dollars_to_per_token_string(0), "0");
+    }
+
+    #[test]
+    fn nano_dollars_one_keeps_full_nine_decimal_places() {
+        // 1 nano-USD = $0.000000001 — boundary for our scale.
+        assert_eq!(nano_dollars_to_per_token_string(1), "0.000000001");
+    }
+
+    #[test]
+    fn nano_dollars_typical_per_token_price_trims_trailing_zeros() {
+        // $0.000008 per token, e.g. Claude Sonnet input.
+        assert_eq!(nano_dollars_to_per_token_string(8_000), "0.000008");
+        // $0.000024 per token, e.g. Claude Sonnet output.
+        assert_eq!(nano_dollars_to_per_token_string(24_000), "0.000024");
+    }
+
+    #[test]
+    fn nano_dollars_whole_dollar_amount_omits_decimal_point() {
+        // 1_000_000_000 nano-USD = $1 exactly. Must NOT render as "1." or "1.0".
+        assert_eq!(nano_dollars_to_per_token_string(1_000_000_000), "1");
+        assert_eq!(nano_dollars_to_per_token_string(5_000_000_000), "5");
+    }
+
+    #[test]
+    fn nano_dollars_mixed_integer_and_fraction() {
+        // $1.500000000 → "1.5" after trim.
+        assert_eq!(nano_dollars_to_per_token_string(1_500_000_000), "1.5");
+        // $1.000000001 → all 9 frac digits preserved (no trailing zeros to trim).
+        assert_eq!(
+            nano_dollars_to_per_token_string(1_000_000_001),
+            "1.000000001"
+        );
+    }
+
+    #[test]
+    fn nano_dollars_max_i64_does_not_lose_precision() {
+        // Integer arithmetic must remain exact at the upper bound, unlike the
+        // previous f64-based implementation.
+        // i64::MAX = 9_223_372_036_854_775_807 nano-USD
+        //         = 9_223_372_036.854775807 USD
+        assert_eq!(
+            nano_dollars_to_per_token_string(i64::MAX),
+            "9223372036.854775807"
+        );
+    }
+
+    #[test]
+    fn upcoming_catalogs_preserve_distinct_price_fields_and_units() {
+        let pricing = services::models::UpcomingModelPricing {
+            effective_at: "2030-01-01T00:00:00Z".parse().unwrap(),
+            input_cost_per_token: 1234,
+            output_cost_per_token: 5678,
+            cost_per_image: 9_876_543_210,
+            cache_read_cost_per_token: Some(234),
+            text_pricing: None,
+        };
+        let openai = serde_json::to_value(UpcomingModelPricingInfo::from(pricing.clone())).unwrap();
+        let native = serde_json::to_value(UpcomingPricing::from(pricing)).unwrap();
+        assert_eq!(openai["effective_at"], native["effectiveAt"]);
+        assert_eq!(openai["pricing"]["prompt"], "0.000001234");
+        assert_eq!(openai["pricing"]["completion"], "0.000005678");
+        assert_eq!(openai["pricing"]["image"], "9.87654321");
+        assert_eq!(openai["pricing"]["input_cache_read"], "0.000000234");
+        assert_eq!(openai["pricing"]["input"], 1.234);
+        assert_eq!(openai["pricing"]["output"], 5.678);
+        for (field, amount) in [
+            ("inputCostPerToken", 1234_i64),
+            ("outputCostPerToken", 5678),
+            ("costPerImage", 9_876_543_210),
+            ("cacheReadCostPerToken", 234),
+        ] {
+            assert_eq!(
+                native["pricing"][field],
+                json!({"amount": amount, "scale": 9, "currency": "USD"})
+            );
+        }
+    }
 
     #[test]
     fn test_response_status_serializes_in_progress_with_underscore() {
@@ -5920,7 +6204,7 @@ pub struct ScoreUsage {
 
 #[cfg(test)]
 mod credit_type_tests {
-    use super::CreditType;
+    use crate::models::CreditType;
 
     #[test]
     fn postpay_serializes_and_accepts_supported_casing() {
@@ -5942,7 +6226,7 @@ mod credit_type_tests {
 
 #[cfg(test)]
 mod input_modality_tests {
-    use super::*;
+    use crate::models::*;
 
     fn msg(content: Option<MessageContent>) -> Message {
         Message {

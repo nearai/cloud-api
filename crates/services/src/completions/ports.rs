@@ -193,9 +193,38 @@ pub trait CompletionServiceTrait: Send + Sync {
         request: CompletionRequest,
     ) -> Result<StreamingResult, CompletionError>;
 
+    /// Create a completion on the model the request names. The model is
+    /// resolved for the request's organization.
     async fn create_chat_completion(
         &self,
         request: CompletionRequest,
+    ) -> Result<inference_providers::ChatCompletionResponseWithBytes, CompletionError> {
+        self.run_chat_completion(request, None).await
+    }
+
+    /// Create a completion on a model the platform chose for its own work,
+    /// such as a conversation title. `model` replaces `request.model` and is
+    /// resolved as a trusted caller, so the work does not depend on the
+    /// grants of the organization it is done (and billed) for.
+    ///
+    /// A model name from a request cannot take this path: a
+    /// [`PlatformModel`](crate::models::PlatformModel) cannot be built from a
+    /// string.
+    async fn create_platform_chat_completion(
+        &self,
+        model: crate::models::PlatformModel,
+        request: CompletionRequest,
+    ) -> Result<inference_providers::ChatCompletionResponseWithBytes, CompletionError> {
+        self.run_chat_completion(request, Some(model)).await
+    }
+
+    /// The completion behind [`Self::create_chat_completion`] and
+    /// [`Self::create_platform_chat_completion`]. Implement this one; call
+    /// one of those two. With a platform model, `request.model` is ignored.
+    async fn run_chat_completion(
+        &self,
+        request: CompletionRequest,
+        platform_model: Option<crate::models::PlatformModel>,
     ) -> Result<inference_providers::ChatCompletionResponseWithBytes, CompletionError>;
 
     /// Execute an audio transcription request with concurrent request limiting
@@ -257,10 +286,13 @@ pub trait CompletionServiceTrait: Send + Sync {
         params: inference_providers::ScoreParams,
     ) -> Result<inference_providers::ScoreResponse, CompletionError>;
 
-    /// Resolve an active model by canonical name or alias (for capability checks, etc.).
+    /// Resolve an active model by canonical name or alias, for `caller` (for
+    /// capability checks, etc.). `None` if the name is unknown or names an
+    /// unlisted model the caller may not use.
     async fn get_model(
         &self,
         model_name: &str,
+        caller: crate::models::ModelCaller,
     ) -> Result<Option<crate::models::ModelWithPricing>, anyhow::Error>;
 
     /// Get the inference provider pool for direct access

@@ -268,9 +268,22 @@ fn proxy_doc() -> serde_json::Value {
             "repo": "r", "tag": "t",
             "measurement": {"type": "x", "registers": ["cc"]},
             "enclaves": {}
+        },
+        // Shape Tinfoil published live for an inactive model (glm-5-3-flash,
+        // 2026-10-20): empty tag, null measurement, no enclaves. It must close
+        // only itself, never the whole directory.
+        PLACEHOLDER_SLUG: {
+            "repo": "tinfoilsh/confidential-glm5-3-flash",
+            "tag": "",
+            "measurement": null,
+            "enclaves": {},
+            "verification": {"configured": 0, "verified": 0, "healthy": 0, "hosts": {}}
         }
     }})
 }
+
+/// A directory entry that does not parse (see `proxy_doc`).
+pub(super) const PLACEHOLDER_SLUG: &str = "placeholder-model";
 
 fn proxy_json() -> Vec<u8> {
     serde_json::to_vec(&proxy_doc()).unwrap()
@@ -280,6 +293,10 @@ struct StubVerifier {
     spki: Mutex<[u8; 32]>,
     router_calls: AtomicUsize,
     deny_models: Mutex<Vec<String>>,
+    /// Reported through `trust_generation`.
+    generation: std::sync::atomic::AtomicU64,
+    /// When set, `verify_router` rejects the router (a trust switch turned off).
+    reject_router: std::sync::atomic::AtomicBool,
 }
 
 impl StubVerifier {
@@ -290,17 +307,27 @@ impl StubVerifier {
             spki: Mutex::new(a),
             router_calls: AtomicUsize::new(0),
             deny_models: Mutex::new(vec![]),
+            generation: std::sync::atomic::AtomicU64::new(0),
+            reject_router: std::sync::atomic::AtomicBool::new(false),
         })
     }
 }
 
 impl TinfoilVerifier for StubVerifier {
+    fn trust_generation(&self) -> u64 {
+        self.generation.load(Ordering::SeqCst)
+    }
     fn verify_router(&self, _b: &AtcBundle) -> Result<VerifiedRouter, TinfoilVerifyError> {
         self.router_calls.fetch_add(1, Ordering::SeqCst);
+        if self.reject_router.load(Ordering::SeqCst) {
+            return Err(TinfoilVerifyError::UnknownRouterMeasurement);
+        }
         Ok(VerifiedRouter {
             spki_sha256: *self.spki.lock().unwrap(),
             measurement_hex: "ab".repeat(48),
             tag: "tinfoilsh/confidential-model-router@v0.0.155".into(),
+            source: PinSource::Compiled,
+            rekor_log_index: None,
             tcb: RouterTcb {
                 bootloader: 10,
                 tee: 0,
@@ -320,6 +347,8 @@ impl TinfoilVerifier for StubVerifier {
         Ok(PinnedModel {
             slug: slug.into(),
             entry: entry.clone(),
+            source: PinSource::Compiled,
+            rekor_log_index: None,
         })
     }
 }

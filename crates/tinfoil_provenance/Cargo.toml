@@ -1,0 +1,18 @@
+[package]
+name = "tinfoil_provenance"
+edition.workspace = true
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Offline Sigstore verification of Tinfoil release attestations"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+base64 = "0.22"
+chrono = { version = "0.4", features = ["serde"] }
+# Sigstore bundle verification, offline against the crate's embedded
+# public-good trusted root.
+# The only crate that may depend on sigstore-verify directly (CI guard).
+sigstore-verify = { version = "0.14", default-features = false }

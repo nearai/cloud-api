@@ -176,6 +176,7 @@ impl Provider {
         let (transport, generation) = self.ensure_available()?;
         crate::strip_cache_control(&mut params.messages);
         crate::strip_reasoning_content(&mut params.messages);
+        params.strip_third_party_retention();
         let body =
             request_body(&self.slug, &params, stream).map_err(CompletionError::CompletionError)?;
 

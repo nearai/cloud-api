@@ -307,6 +307,53 @@ async fn continuous_usage_stats_alone_counts_as_asking_for_usage() {
 }
 
 #[tokio::test]
+async fn chat_body_sends_no_user_store_or_metadata() {
+    let e = env().await;
+    e.session.verify_now().await.unwrap();
+    for stream in [false, true] {
+        let (content_type, body) = if stream {
+            ("text/event-stream", "chat_stream.sse")
+        } else {
+            ("application/json", "chat_nonstream.json")
+        };
+        *e.server.chat.lock().unwrap() = ChatReply {
+            status: 200,
+            content_type,
+            body: fixture(body),
+        };
+        // What the Responses path builds (our user id, `store: true`,
+        // `metadata`) plus client copies of `store` and `metadata`.
+        let mut p = params(stream, None);
+        p.user = Some("00000000-0000-4000-8000-000000000001".into());
+        p.store = Some(true);
+        p.metadata = Some(serde_json::json!({"ticket": "synthetic"}));
+        p.extra.insert("store".into(), serde_json::json!(true));
+        p.extra.insert(
+            "metadata".into(),
+            serde_json::json!({"client": "synthetic"}),
+        );
+        if stream {
+            let s = e
+                .provider
+                .chat_completion_stream(p, "h".into())
+                .await
+                .unwrap();
+            let _: Vec<_> = s.map(|x| x.unwrap()).collect().await;
+        } else {
+            e.provider.chat_completion(p, "h".into()).await.unwrap();
+        }
+
+        let (_, body) = e.server.last_chat.lock().unwrap().take().unwrap();
+        let b: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        for field in ["user", "store", "metadata"] {
+            assert!(b.get(field).is_none(), "{field} reached Tinfoil");
+        }
+        assert_eq!(b["model"], SLUG);
+        assert_eq!(b["stream"], stream);
+    }
+}
+
+#[tokio::test]
 async fn proxy_reread_fetch_failure_escalates_to_full_verify_and_fails_closed() {
     let e = env().await;
     e.session.verify_now().await.unwrap();

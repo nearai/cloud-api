@@ -213,7 +213,11 @@ mod tests {
         let near =
             crate::nearai::Provider::new(crate::nearai::Config::new(server.uri(), None, Some(2)));
         let response = near
-            .systemone(request(), "original-client-hash".into(), None)
+            .systemone(
+                request(),
+                "original-client-hash".into(),
+                Some("selected-key"),
+            )
             .await
             .unwrap();
         assert_eq!(response.raw_bytes, raw.as_bytes());

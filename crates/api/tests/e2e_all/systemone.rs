@@ -267,7 +267,7 @@ async fn systemone_uses_actual_provider_trust_and_signature_capability() {
                 .with_tier(tier)
                 .with_provider_source(source)
                 .with_chat_signature_support(signatures)
-                .with_systemone_handler(move |req| {
+                .with_systemone_handler(move |req, _| {
                     SystemOneResponseWithBytes::parse(response_bytes.clone(), &req)
                 }),
         );
@@ -345,6 +345,8 @@ async fn systemone_public_key_restricts_provider_fallback() {
     let key = auth(&server).await;
     let (model, alias) = catalog(&server, None, true).await;
     let model_key = "ab".repeat(32);
+    let primary_key = model_key.clone();
+    let fallback_key = model_key.clone();
     let calls = Arc::new(AtomicUsize::new(0));
     let counter = calls.clone();
     pool.register_provider(
@@ -353,7 +355,8 @@ async fn systemone_public_key_restricts_provider_fallback() {
             MockProvider::new_accept_all()
                 .with_tier(ProviderTier::Near)
                 .with_per_request_pubkey_routing(model_key.clone())
-                .with_systemone_handler(move |_| {
+                .with_systemone_handler(move |_, model_pub_key| {
+                    assert_eq!(model_pub_key, Some(primary_key.as_str()));
                     counter.fetch_add(1, Ordering::SeqCst);
                     Err(CompletionError::HttpError {
                         status_code: 503,
@@ -370,7 +373,8 @@ async fn systemone_public_key_restricts_provider_fallback() {
         MockProvider::new_accept_all()
             .with_tier(ProviderTier::Attested3p)
             .with_per_request_pubkey_routing(model_key.clone())
-            .with_systemone_handler(move |req| {
+            .with_systemone_handler(move |req, model_pub_key| {
+                assert_eq!(model_pub_key, Some(fallback_key.as_str()));
                 SystemOneResponseWithBytes::parse(response_bytes.clone(), &req)
             }),
     );
@@ -380,7 +384,7 @@ async fn systemone_public_key_restricts_provider_fallback() {
         Arc::new(
             MockProvider::new_accept_all()
                 .with_tier(ProviderTier::Attested3p)
-                .with_systemone_handler(|_| panic!("must keep the selected signing identity")),
+                .with_systemone_handler(|_, _| panic!("must keep the selected signing identity")),
         ),
         None,
     )
@@ -423,7 +427,7 @@ async fn systemone_rejects_invalid_requests_before_inference() {
     pool.register_provider(
         model.clone(),
         Arc::new(
-            MockProvider::new_accept_all().with_systemone_handler(move |_| {
+            MockProvider::new_accept_all().with_systemone_handler(move |_, _| {
                 counter.fetch_add(1, Ordering::SeqCst);
                 panic!("invalid requests must not reach inference");
             }),
@@ -604,7 +608,7 @@ async fn systemone_retains_upstream_validation_status_without_retry_or_state_ech
     pool.register_provider(
         model.clone(),
         Arc::new(
-            MockProvider::new_accept_all().with_systemone_handler(move |_| {
+            MockProvider::new_accept_all().with_systemone_handler(move |_, _| {
                 counter.fetch_add(1, Ordering::SeqCst);
                 Err(CompletionError::HttpError {
                     status_code: 422,
@@ -641,7 +645,7 @@ async fn systemone_rejects_missing_tee_id_and_invalid_usage_without_billing() {
             Arc::new(
                 MockProvider::new_accept_all()
                     .with_tier(ProviderTier::Near)
-                    .with_systemone_handler(move |req| {
+                    .with_systemone_handler(move |req, _| {
                         SystemOneResponseWithBytes::parse(raw.clone(), &req)
                     }),
             ),
@@ -673,7 +677,7 @@ async fn systemone_fallback_respects_trust_and_organization_policy() {
     let primary = Arc::new(
         MockProvider::new_accept_all()
             .with_tier(ProviderTier::Near)
-            .with_systemone_handler(|_| {
+            .with_systemone_handler(|_, _| {
                 Err(CompletionError::HttpError {
                     status_code: 503,
                     message: "unavailable".into(),
@@ -687,7 +691,7 @@ async fn systemone_fallback_respects_trust_and_organization_policy() {
         MockProvider::new_accept_all()
             .with_tier(ProviderTier::Attested3p)
             .with_chat_signature_support(false)
-            .with_systemone_handler(move |req| {
+            .with_systemone_handler(move |req, _| {
                 counter.fetch_add(1, Ordering::SeqCst);
                 SystemOneResponseWithBytes::parse(serde_json::to_vec(&result(None)).unwrap(), &req)
             }),
@@ -699,7 +703,7 @@ async fn systemone_fallback_respects_trust_and_organization_policy() {
     pool.register_pinned_secondary_provider(
         model.clone(),
         Arc::new(
-            MockProvider::new_accept_all().with_systemone_handler(|_| panic!("trust downgrade")),
+            MockProvider::new_accept_all().with_systemone_handler(|_, _| panic!("trust downgrade")),
         ),
         None,
     )
@@ -735,7 +739,7 @@ async fn systemone_invalid_success_and_timeout_never_invoke_a_second_provider() 
             Arc::new(
                 MockProvider::new_accept_all()
                     .with_tier(ProviderTier::Near)
-                    .with_systemone_handler(move |req| {
+                    .with_systemone_handler(move |req, _| {
                         calls.fetch_add(1, Ordering::SeqCst);
                         if scenario == "timeout" {
                             Err(CompletionError::Timeout {
@@ -762,7 +766,9 @@ async fn systemone_invalid_success_and_timeout_never_invoke_a_second_provider() 
             Arc::new(
                 MockProvider::new_accept_all()
                     .with_tier(ProviderTier::Attested3p)
-                    .with_systemone_handler(|_| panic!("must not issue a second paid inference")),
+                    .with_systemone_handler(|_, _| {
+                        panic!("must not issue a second paid inference")
+                    }),
             ),
             None,
         )
@@ -843,7 +849,7 @@ async fn systemone_finalization_survives_client_disconnect() {
     let provider = Arc::new(
         MockProvider::new_accept_all()
             .with_tier(ProviderTier::Near)
-            .with_systemone_handler(move |req| {
+            .with_systemone_handler(move |req, _| {
                 let attempt = counter.fetch_add(1, Ordering::SeqCst);
                 let id = if attempt == 0 {
                     response_id.clone()

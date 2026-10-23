@@ -1491,30 +1491,11 @@ impl InferenceProvider for Fleet {
             HeaderValue::from_str(&request_hash)
                 .map_err(|_| CompletionError::CompletionError("Invalid request hash".into()))?,
         );
-        // Keep initial selection and retries on the same discovered key group.
-        let count = self.rotation_count();
-        let pinned_indices = match model_pub_key {
-            Some(key) => match self.key_group(key, count) {
-                fleet::KeyGroup::Indices(indices) => Some(indices),
-                _ => {
-                    return Err(CompletionError::NoPubKeyProvider(
-                        "No System One backend matches the selected signing key".into(),
-                    ))
-                }
-            },
-            None => None,
-        };
-        let mut lease =
-            self.acquire_systemone_index(&request_hash, count, pinned_indices.as_deref());
+        let mut lease = self.acquire_systemone_index(&request_hash, model_pub_key);
         let route_key = lease.as_ref().map(|lease| lease.route_key());
         let indices = match &lease {
             Some(lease) => std::iter::once(lease.index())
-                .chain(self.fallback_indices_for(lease.index(), None))
-                .filter(|index| {
-                    pinned_indices
-                        .as_ref()
-                        .is_none_or(|group| group.contains(index))
-                })
+                .chain(self.fallback_indices_for(lease.index(), model_pub_key))
                 .map(Some)
                 .collect::<Vec<_>>(),
             None => vec![None],

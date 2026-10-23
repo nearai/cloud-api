@@ -1,6 +1,7 @@
 use super::{Config, Provider};
 use crate::{InferenceProvider, SystemOneRequest};
 use serde_json::json;
+use std::collections::HashMap;
 use wiremock::{
     matchers::{header, method, path},
     Mock, MockServer, ResponseTemplate,
@@ -20,7 +21,7 @@ fn systemone_distributes_requests_and_spills_concurrent_duplicates() {
         for request in 0..256 {
             let lease = provider
                 .fleet
-                .acquire_systemone_index(&request.to_string(), count, None)
+                .acquire_systemone_index(&request.to_string(), None)
                 .unwrap();
             reached.insert(lease.index());
         }
@@ -29,7 +30,7 @@ fn systemone_distributes_requests_and_spills_concurrent_duplicates() {
             .map(|_| {
                 provider
                     .fleet
-                    .acquire_systemone_index("same-request", count, None)
+                    .acquire_systemone_index("same-request", None)
                     .unwrap()
             })
             .collect();
@@ -59,38 +60,35 @@ async fn systemone_fleet_does_not_replay_invalid_responses_or_read_timeouts() {
 }
 
 #[tokio::test]
-async fn systemone_fleet_limits_requests_and_retries_to_selected_key() {
-    for allowed in [vec![0, 2], vec![1], vec![]] {
+async fn systemone_fleet_uses_chat_key_policy_for_requests_and_retries() {
+    for keys in [
+        HashMap::from([("selected-key".into(), vec![0, 2])]),
+        HashMap::from([("selected-key".into(), vec![1])]),
+        HashMap::new(),
+        HashMap::from([("other-key".into(), vec![2])]),
+        HashMap::from([("selected-key".into(), vec![3])]),
+    ] {
         let server = MockServer::start().await;
         let port = server.address().port();
         let provider = fleet_provider(&server);
-        provider
+        provider.fleet.set_backend_keys(keys);
+        let first = provider
             .fleet
-            .set_backend_keys(std::collections::HashMap::from([(
-                "selected-key".into(),
-                allowed.clone(),
-            )]));
-        let first = (!allowed.is_empty()).then(|| {
-            provider
-                .fleet
-                .acquire_systemone_index("hash", 3, Some(&allowed))
-                .unwrap()
-                .index()
-        });
+            .acquire_index(&[], Some("selected-key"))
+            .unwrap()
+            .index();
+        let allowed: Vec<_> = std::iter::once(first)
+            .chain(
+                provider
+                    .fleet
+                    .fallback_indices_for(first, Some("selected-key")),
+            )
+            .collect();
         for index in 0..3 {
-            let response = if Some(index) == first {
-                ResponseTemplate::new(503)
-            } else {
-                ResponseTemplate::new(200).set_body_json(json!({
-                    "id":format!("decision-{index}"), "model":"jev",
-                    "answers":{"q":{"type":"noul","noul":0.8}},
-                    "usage":{"input_tokens":7,"output_tokens":1}
-                }))
-            };
             Mock::given(method("POST"))
                 .and(path("/v1/systemone"))
                 .and(header("host", format!("jev-i{index}.fleet.test:{port}")))
-                .respond_with(response)
+                .respond_with(ResponseTemplate::new(503))
                 .expect(u64::from(allowed.contains(&index)))
                 .mount(&server)
                 .await;
@@ -100,39 +98,16 @@ async fn systemone_fleet_limits_requests_and_retries_to_selected_key() {
             "questions":{"q":{"type":"noul","instructions":"Is this about billing?"}}
         }))
         .unwrap();
-        assert!(matches!(
-            provider
-                .systemone(request.clone(), "hash".into(), Some("unknown-key"))
-                .await,
-            Err(crate::CompletionError::NoPubKeyProvider(_))
-        ));
         let response = provider
             .systemone(request, "hash".into(), Some("selected-key"))
             .await;
-        match allowed.len() {
-            2 => {
-                let next = allowed.iter().find(|&&index| Some(index) != first).unwrap();
-                let id = format!("decision-{next}");
-                assert_eq!(response.unwrap().provider_decision_id().unwrap(), id);
-                assert_eq!(
-                    provider.fleet.signature_rotation.lock().unwrap().get(&id),
-                    Some(&(*next as u64))
-                );
-                provider.unpin_chat_connection(&id);
-            }
-            1 => assert!(matches!(
-                response,
-                Err(crate::CompletionError::HttpError {
-                    status_code: 503,
-                    ..
-                })
-            )),
-            0 => assert!(matches!(
-                response,
-                Err(crate::CompletionError::NoPubKeyProvider(_))
-            )),
-            _ => unreachable!(),
-        }
+        assert!(matches!(
+            response,
+            Err(crate::CompletionError::HttpError {
+                status_code: 503,
+                ..
+            })
+        ));
         assert_eq!(provider.fleet.active_prefix_loads(), 0);
     }
 }
@@ -163,7 +138,7 @@ async fn fleet_case(status: u16, malformed: bool, timeout: bool) {
     let provider = fleet_provider(&server);
     let first = provider
         .fleet
-        .acquire_systemone_index("original-hash", 3, None)
+        .acquire_systemone_index("original-hash", None)
         .unwrap()
         .index();
     let next = provider.fleet.fallback_indices_for(first, None)[0];
@@ -194,7 +169,7 @@ async fn fleet_case(status: u16, malformed: bool, timeout: bool) {
         "questions":{"q":{"type":"noul","instructions":"Is this about billing?"}}}))
     .unwrap();
     let response = provider
-        .systemone(request, "original-hash".into(), None)
+        .systemone(request, "original-hash".into(), Some("selected-key"))
         .await;
     if retry {
         let id = format!("decision:tee.{next}/receipt?version=1");

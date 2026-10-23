@@ -32,12 +32,12 @@ back to plaintext. Signature selection uses the **actual serving provider's**
 trust tier and signature capability, including fallback, rather than catalog flags.
 An attested provider without per-response signatures receives a gateway receipt.
 
-Self-hosted decision requests use request-key routing with bounded spillover
-across verified fleet backends. With `X-Model-Pub-Key`, provider selection and
-instance retries stay within the selected signing identity. Retryable HTTP
-errors and connection failures can try another matching instance; its response
-ID pins subsequent signature retrieval to that instance. Invalid successful
-responses, invalid TEE receipt IDs and ambiguous transport/read timeouts stop
+Self-hosted decision requests use request-key routing with bounded spillover.
+`X-Model-Pub-Key` uses the same provider selection and backend key-affinity policy
+as Chat Completions. Retryable HTTP errors and connection failures can try
+another eligible instance; its response ID pins subsequent signature retrieval
+to that instance. Invalid successful responses, invalid TEE receipt IDs and
+ambiguous transport/read timeouts stop
 both instance and provider fallback to avoid issuing another paid inference.
 
 Endpoint compatibility is checked against an already resolved model, including
@@ -173,8 +173,8 @@ The underlying TEE server/model proxy must implement:
    signing the original request hash and the exact response bytes.
 
 To select a signing identity, send `X-Model-Pub-Key` from the model's attestation
-report. The request remains plaintext. If no matching provider or backend is
-available, the endpoint returns 421; refresh the attestation before retrying.
+report. The request remains plaintext. If no matching provider is available,
+the endpoint returns 421; refresh the attestation before retrying.
 
 The NEAR adapter uses the verified backend client and retains the backend
 rotation index for signature retrieval, then releases the pin after finalization.

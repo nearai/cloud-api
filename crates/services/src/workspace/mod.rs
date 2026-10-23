@@ -1,5 +1,8 @@
 pub mod ports;
 
+#[cfg(test)]
+mod tests;
+
 pub use ports::*;
 use std::sync::Arc;
 
@@ -87,19 +90,6 @@ impl WorkspaceServiceImpl {
                     .clone()
                     .unwrap_or_else(|| member.user.username.clone())
             });
-        let creator_is_member = members
-            .iter()
-            .any(|member| member.user_id == key.created_by_user_id);
-        let creator = if creator_is_member {
-            None
-        } else {
-            self.organization_service
-                .get_user_for_notification(key.created_by_user_id.clone())
-                .await
-                .ok()
-                .flatten()
-                .filter(|user| user.is_active)
-        };
         let recipients = members
             .iter()
             .filter(|member| {
@@ -107,8 +97,8 @@ impl WorkspaceServiceImpl {
                     && (member.user_id == key.created_by_user_id
                         || matches!(member.role, MemberRole::Owner | MemberRole::Admin))
             })
-            .map(|member| &member.user)
-            .chain(creator.iter());
+            .map(|member| &member.user);
+        let mut emails = Vec::new();
         for user in recipients {
             let Some(recipient_email) = deliverable_email(
                 &user.email,
@@ -117,7 +107,7 @@ impl WorkspaceServiceImpl {
             ) else {
                 continue;
             };
-            let email = ApiKeyChangedEmail {
+            emails.push(ApiKeyChangedEmail {
                 recipient_email: recipient_email.to_string(),
                 organization_name: organization.name.clone(),
                 workspace_name: workspace.name.clone(),
@@ -131,11 +121,18 @@ impl WorkspaceServiceImpl {
                     base_url.trim_end_matches('/'),
                     organization.id.0
                 ),
-            };
-            if let Err(error) = self.email_sender.send_api_key_changed(&email).await {
-                tracing::warn!(workspace_id = %workspace.id.0, api_key_id = %key.id.0, error = %error.sanitized_message(), "Failed to send API key change email");
-            }
+            });
         }
+        let email_sender = self.email_sender.clone();
+        let workspace_id = workspace.id.clone();
+        let api_key_id = key.id.clone();
+        tokio::spawn(async move {
+            for email in emails {
+                if let Err(error) = email_sender.send_api_key_changed(&email).await {
+                    tracing::warn!(workspace_id = %workspace_id.0, api_key_id = %api_key_id.0, error = %error.sanitized_message(), "Failed to send API key change email");
+                }
+            }
+        });
     }
 
     /// Convert RepositoryError to WorkspaceError
@@ -771,6 +768,14 @@ impl WorkspaceServiceTrait for WorkspaceServiceImpl {
 
 fn format_spend_limit(value: Option<i64>) -> String {
     value
-        .map(|nano| format!("${:.2}", nano as f64 / 1_000_000_000.0))
+        .map(|nano| {
+            let magnitude = nano.unsigned_abs();
+            let mut fraction = format!("{:09}", magnitude % 1_000_000_000);
+            while fraction.len() > 2 && fraction.ends_with('0') {
+                fraction.pop();
+            }
+            let sign = if nano < 0 { "-" } else { "" };
+            format!("{sign}${}.{fraction}", magnitude / 1_000_000_000)
+        })
         .unwrap_or_else(|| "unlimited".to_string())
 }

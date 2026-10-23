@@ -651,15 +651,6 @@ pub trait OrganizationServiceTrait: Send + Sync {
         offset: i64,
     ) -> Result<Vec<OrganizationMemberWithUser>, OrganizationError>;
 
-    /// Load an active user for a trusted transactional-notification recipient.
-    async fn get_user_for_notification(
-        &self,
-        user_id: UserId,
-    ) -> Result<Option<User>, OrganizationError> {
-        let _ = user_id;
-        Ok(None)
-    }
-
     /// Invite members by email (batch operation)
     async fn invite_members_by_email(
         &self,

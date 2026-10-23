@@ -121,6 +121,7 @@ pub enum ApiKeyOrderDirection {
 }
 
 // Repository trait for workspace data access
+#[cfg_attr(test, mockall::automock)]
 #[async_trait]
 pub trait WorkspaceRepository: Send + Sync {
     async fn get_by_id(
@@ -190,6 +191,7 @@ pub trait WorkspaceRepository: Send + Sync {
 }
 
 // Repository trait for API key data access
+#[cfg_attr(test, mockall::automock)]
 #[async_trait]
 pub trait ApiKeyRepository: Send + Sync {
     async fn validate(&self, api_key: String) -> Result<Option<ApiKey>, RepositoryError>;

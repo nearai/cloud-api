@@ -250,8 +250,10 @@ async fn main() {
         domain_services.inference_provider_pool,
         pricing_scheduler,
         usage_hourly_scheduler,
-        discount_worker,
-        credit_email_worker,
+        BackgroundWorkers {
+            discount: discount_worker,
+            credit_email: credit_email_worker,
+        },
     )
     .await;
 }
@@ -267,6 +269,11 @@ fn load_configuration() -> ApiConfig {
     })
 }
 
+struct BackgroundWorkers {
+    discount: tokio::task::JoinHandle<()>,
+    credit_email: tokio::task::JoinHandle<()>,
+}
+
 /// Start the HTTP server with graceful shutdown on SIGTERM/SIGINT
 async fn start_server(
     app: axum::Router,
@@ -275,8 +282,7 @@ async fn start_server(
     inference_provider_pool: Arc<InferenceProviderPool>,
     pricing_scheduler: Arc<ModelPricingScheduler>,
     usage_hourly_scheduler: Arc<services::usage::UsageHourlyScheduler>,
-    discount_worker: tokio::task::JoinHandle<()>,
-    credit_email_worker: tokio::task::JoinHandle<()>,
+    workers: BackgroundWorkers,
 ) {
     let bind_address = format!("{}:{}", config.server.host, config.server.port);
     let listener = tokio::net::TcpListener::bind(&bind_address)
@@ -296,10 +302,14 @@ async fn start_server(
     let server = axum::serve(listener, app).with_graceful_shutdown(shutdown_signal());
 
     let result = server.await;
-    discount_worker.abort();
-    credit_email_worker.abort();
-    let _ = discount_worker.await;
-    let _ = credit_email_worker.await;
+    let BackgroundWorkers {
+        discount,
+        credit_email,
+    } = workers;
+    discount.abort();
+    credit_email.abort();
+    let _ = discount.await;
+    let _ = credit_email.await;
     match result {
         Ok(_) => {
             tracing::info!("Server shutdown successfully, initiating coordinated cleanup");

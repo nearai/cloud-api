@@ -203,47 +203,63 @@ async fn pinned_chat_verifies_encrypts_and_invokes_only_the_matching_key() {
     }
 }
 
+/// Sends what the Responses path builds (our user id, `store: true`,
+/// `metadata`) plus client copies of `store` and `metadata` (and of `user`
+/// when given), and returns the plaintext the instance decrypted, i.e. the
+/// body before E2EE.
+async fn decrypted_chat_body(streaming: bool, client_user: Option<&str>) -> Value {
+    let (dk, pk) = instance_keypair();
+    let key = b64(&pk);
+    let verifier = Arc::new(RecordingVerifier::default());
+    let (provider, server) = fixture(&[("pinned", &key)], verifier).await;
+    let bodies = Arc::new(Mutex::new(Vec::new()));
+    let seen = bodies.clone();
+    Mock::given(method("POST"))
+        .and(path("/e2e/invoke"))
+        .respond_with(move |request: &Request| {
+            let (body, response_key) = instance_open_request(&dk, &request.body);
+            seen.lock().unwrap().push(body);
+            invoke_reply(&response_key, streaming)
+        })
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut params: ChatCompletionParams = serde_json::from_value(json!({
+        "model": "model", "messages": [], "stream": streaming,
+        "user": "00000000-0000-4000-8000-000000000001",
+        "store": true, "metadata": {"ticket": "synthetic"}
+    }))
+    .unwrap();
+    params.extra.insert("store".into(), json!(true));
+    params
+        .extra
+        .insert("metadata".into(), json!({"client": "synthetic"}));
+    if let Some(user) = client_user {
+        params.extra.insert("user".into(), json!(user));
+    }
+    send_chat(&provider, params, Some(&key), streaming)
+        .await
+        .unwrap();
+    let body = bodies.lock().unwrap().pop().unwrap();
+    assert_eq!(body["model"], "upstream");
+    body
+}
+
 #[tokio::test]
 async fn chat_body_sends_no_user_store_or_metadata() {
     for streaming in [false, true] {
-        let (dk, pk) = instance_keypair();
-        let key = b64(&pk);
-        let verifier = Arc::new(RecordingVerifier::default());
-        let (provider, server) = fixture(&[("pinned", &key)], verifier).await;
-        let bodies = Arc::new(Mutex::new(Vec::new()));
-        let seen = bodies.clone();
-        Mock::given(method("POST"))
-            .and(path("/e2e/invoke"))
-            .respond_with(move |request: &Request| {
-                let (body, response_key) = instance_open_request(&dk, &request.body);
-                seen.lock().unwrap().push(body);
-                invoke_reply(&response_key, streaming)
-            })
-            .expect(1)
-            .mount(&server)
-            .await;
-        // What the Responses path builds (our user id, `store: true`,
-        // `metadata`) plus client copies of `store` and `metadata`.
-        let mut params: ChatCompletionParams = serde_json::from_value(json!({
-            "model": "model", "messages": [], "stream": streaming,
-            "user": "00000000-0000-4000-8000-000000000001",
-            "store": true, "metadata": {"ticket": "synthetic"}
-        }))
-        .unwrap();
-        params.extra.insert("store".into(), json!(true));
-        params
-            .extra
-            .insert("metadata".into(), json!({"client": "synthetic"}));
-        send_chat(&provider, params, Some(&key), streaming)
-            .await
-            .unwrap();
-
-        // The plaintext the instance decrypted, i.e. the body before E2EE.
-        let body = bodies.lock().unwrap().pop().unwrap();
+        let body = decrypted_chat_body(streaming, None).await;
         for field in ["user", "store", "metadata"] {
             assert!(body.get(field).is_none(), "{field} reached Chutes");
         }
-        assert_eq!(body["model"], "upstream");
+    }
+}
+
+#[tokio::test]
+async fn chat_body_keeps_the_clients_own_user() {
+    for streaming in [false, true] {
+        let body = decrypted_chat_body(streaming, Some("client-end-user")).await;
+        assert_eq!(body["user"], "client-end-user");
     }
 }
 

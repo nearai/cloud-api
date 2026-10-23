@@ -256,6 +256,66 @@ async fn stale_snapshot_cannot_remove_a_newer_threshold_claim() -> anyhow::Resul
 }
 
 #[tokio::test]
+async fn partial_replenishment_rearms_lower_alert_without_sending_higher_alert(
+) -> anyhow::Result<()> {
+    let pool = test_pool().await?;
+    let repository = CreditEmailNotificationRepository::new(pool.clone());
+    let (organization_id, user_id) = insert_credit_fixture(&pool, 90).await?;
+
+    let low_version = snapshot_version(&pool, organization_id).await?;
+    let low_claim = claimed(
+        repository
+            .reconcile_claims(organization_id, &low_version, Some(10), &[0])
+            .await?,
+    );
+    assert_eq!(low_claim.len(), 1);
+    repository
+        .mark_sent(organization_id, 10, user_id, low_claim[0].claim_token)
+        .await?;
+
+    pool.get()
+        .await?
+        .execute(
+            "UPDATE organization_credit_consumption SET amount = 85, updated_at = clock_timestamp() WHERE organization_id = $1 AND credit_type = 'payment'",
+            &[&organization_id],
+        )
+        .await?;
+    let recovered_version = snapshot_version(&pool, organization_id).await?;
+
+    assert!(claimed(
+        repository
+            .reconcile_claims(organization_id, &recovered_version, Some(20), &[0, 10],)
+            .await?
+    )
+    .is_empty());
+    assert!(claimed(
+        repository
+            .reconcile_claims(organization_id, &recovered_version, Some(20), &[0, 10],)
+            .await?
+    )
+    .is_empty());
+
+    pool.get()
+        .await?
+        .execute(
+            "UPDATE organization_credit_consumption SET amount = 90, updated_at = clock_timestamp() WHERE organization_id = $1 AND credit_type = 'payment'",
+            &[&organization_id],
+        )
+        .await?;
+    let low_again_version = snapshot_version(&pool, organization_id).await?;
+    assert_eq!(
+        claimed(
+            repository
+                .reconcile_claims(organization_id, &low_again_version, Some(10), &[0])
+                .await?
+        )
+        .len(),
+        1
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn claims_store_user_identity_and_are_removed_with_the_user() -> anyhow::Result<()> {
     let pool = test_pool().await?;
     let repository = CreditEmailNotificationRepository::new(pool.clone());

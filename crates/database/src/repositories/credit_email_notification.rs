@@ -88,17 +88,19 @@ impl CreditEmailNotificationRepositoryPort for CreditEmailNotificationRepository
             return Ok(CreditEmailClaimResult::Claimed(Vec::new()));
         };
 
+        let mut recovered_from_lower_threshold = false;
         if !lower_thresholds.is_empty() {
             let event_keys = lower_thresholds
                 .iter()
                 .map(ToString::to_string)
                 .collect::<Vec<_>>();
-            transaction
+            recovered_from_lower_threshold = transaction
                 .execute(
                     "DELETE FROM email_notification_deliveries WHERE event_type = $1 AND resource_id = $2 AND event_key = ANY($3)",
                     &[&EVENT_TYPE, &resource_id, &event_keys],
                 )
-                .await?;
+                .await?
+                > 0;
         }
 
         let rows = transaction
@@ -119,6 +121,31 @@ impl CreditEmailNotificationRepositoryPort for CreditEmailNotificationRepository
         for row in rows {
             let recipient_user_id = row.get("id");
             let claim_token = Uuid::new_v4();
+            if recovered_from_lower_threshold {
+                // Crossing a threshold upward re-arms the lower alerts, but must not
+                // emit the current higher alert. Persist the suppression so the next
+                // scan at the same balance does not mistake it for a downward crossing.
+                transaction
+                    .execute(
+                        r#"
+                INSERT INTO email_notification_deliveries
+                    (event_type, resource_id, event_key, recipient_user_id, claim_token, sent_at)
+                VALUES ($1, $2, $3, $4, $5, NOW())
+                ON CONFLICT (event_type, resource_id, event_key, recipient_user_id)
+                DO UPDATE SET claimed_at = NOW(), claim_token = EXCLUDED.claim_token,
+                              sent_at = COALESCE(email_notification_deliveries.sent_at, NOW())
+                "#,
+                        &[
+                            &EVENT_TYPE,
+                            &resource_id,
+                            &threshold.to_string(),
+                            &recipient_user_id,
+                            &claim_token,
+                        ],
+                    )
+                    .await?;
+                continue;
+            }
             let claimed = transaction
                 .query_opt(
                     r#"

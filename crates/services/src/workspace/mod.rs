@@ -103,8 +103,9 @@ impl WorkspaceServiceImpl {
         let recipients = members
             .iter()
             .filter(|member| {
-                member.user_id == key.created_by_user_id
-                    || matches!(member.role, MemberRole::Owner | MemberRole::Admin)
+                member.user.is_active
+                    && (member.user_id == key.created_by_user_id
+                        || matches!(member.role, MemberRole::Owner | MemberRole::Admin))
             })
             .map(|member| &member.user)
             .chain(creator.iter());

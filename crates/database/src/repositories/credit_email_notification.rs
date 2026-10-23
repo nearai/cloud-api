@@ -2,10 +2,13 @@ use crate::pool::DbPool;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use services::usage::ports::{
+    CreditEmailClaimResult,
     CreditEmailNotificationRepository as CreditEmailNotificationRepositoryPort,
     CreditEmailOrganization, CreditEmailRecipient,
 };
 use uuid::Uuid;
+
+use super::OrganizationLimitsRepository;
 
 const EVENT_TYPE: &str = "credit_balance";
 const RESOURCE_SCOPE: &str = "combined";
@@ -44,15 +47,64 @@ impl CreditEmailNotificationRepositoryPort for CreditEmailNotificationRepository
             .collect())
     }
 
-    async fn owner_admin_recipients(
+    async fn reconcile_claims(
         &self,
         organization_id: Uuid,
-    ) -> Result<Vec<CreditEmailRecipient>> {
-        let client = self.pool.get().await?;
-        let rows = client
+        snapshot_version: &str,
+        threshold: Option<i16>,
+        lower_thresholds: &[i16],
+    ) -> Result<CreditEmailClaimResult> {
+        let mut client = self.pool.get().await?;
+        let transaction = client.transaction().await?;
+        let active = transaction
+            .query_opt(
+                "SELECT id FROM organizations WHERE id = $1 AND is_active = true FOR UPDATE",
+                &[&organization_id],
+            )
+            .await?;
+        if active.is_none() {
+            transaction.rollback().await?;
+            return Ok(CreditEmailClaimResult::SnapshotChanged);
+        }
+        let (_, _, _, current_version) = OrganizationLimitsRepository::load_current_credit_status(
+            &*transaction,
+            organization_id,
+        )
+        .await?;
+        if current_version != snapshot_version {
+            transaction.rollback().await?;
+            return Ok(CreditEmailClaimResult::SnapshotChanged);
+        }
+
+        let resource_id = Self::resource_id(organization_id);
+        let Some(threshold) = threshold else {
+            transaction
+                .execute(
+                    "DELETE FROM email_notification_deliveries WHERE event_type = $1 AND resource_id = $2",
+                    &[&EVENT_TYPE, &resource_id],
+                )
+                .await?;
+            transaction.commit().await?;
+            return Ok(CreditEmailClaimResult::Claimed(Vec::new()));
+        };
+
+        if !lower_thresholds.is_empty() {
+            let event_keys = lower_thresholds
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>();
+            transaction
+                .execute(
+                    "DELETE FROM email_notification_deliveries WHERE event_type = $1 AND resource_id = $2 AND event_key = ANY($3)",
+                    &[&EVENT_TYPE, &resource_id, &event_keys],
+                )
+                .await?;
+        }
+
+        let rows = transaction
             .query(
                 r#"
-                SELECT u.email, u.contact_email, u.contact_email_verified_at
+                SELECT u.id, u.email, u.contact_email, u.contact_email_verified_at
                 FROM organization_members om
                 JOIN users u ON u.id = om.user_id
                 WHERE om.organization_id = $1
@@ -63,95 +115,58 @@ impl CreditEmailNotificationRepositoryPort for CreditEmailNotificationRepository
                 &[&organization_id],
             )
             .await?;
-        Ok(rows
-            .into_iter()
-            .map(|row| CreditEmailRecipient {
-                email: row.get("email"),
-                contact_email: row.get("contact_email"),
-                contact_email_verified_at: row
-                    .get::<_, Option<DateTime<Utc>>>("contact_email_verified_at"),
-            })
-            .collect())
-    }
-
-    async fn clear_claims(&self, organization_id: Uuid) -> Result<()> {
-        let client = self.pool.get().await?;
-        client
-            .execute(
-                "DELETE FROM email_notification_deliveries WHERE event_type = $1 AND resource_id = $2",
-                &[&EVENT_TYPE, &Self::resource_id(organization_id)],
-            )
-            .await?;
-        Ok(())
-    }
-
-    async fn clear_threshold_claims(
-        &self,
-        organization_id: Uuid,
-        thresholds: &[i16],
-    ) -> Result<()> {
-        if thresholds.is_empty() {
-            return Ok(());
-        }
-        let event_keys = thresholds
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>();
-        let client = self.pool.get().await?;
-        client
-            .execute(
-                "DELETE FROM email_notification_deliveries WHERE event_type = $1 AND resource_id = $2 AND event_key = ANY($3)",
-                &[&EVENT_TYPE, &Self::resource_id(organization_id), &event_keys],
-            )
-            .await?;
-        Ok(())
-    }
-
-    async fn try_claim(
-        &self,
-        organization_id: Uuid,
-        threshold: i16,
-        recipient_email: &str,
-    ) -> Result<bool> {
-        let client = self.pool.get().await?;
-        let claimed = client
-            .query_opt(
-                r#"
+        let mut claimed_recipients = Vec::new();
+        for row in rows {
+            let recipient_user_id = row.get("id");
+            let claimed = transaction
+                .query_opt(
+                    r#"
                 INSERT INTO email_notification_deliveries
-                    (event_type, resource_id, event_key, recipient_email)
+                    (event_type, resource_id, event_key, recipient_user_id)
                 VALUES ($1, $2, $3, $4)
-                ON CONFLICT (event_type, resource_id, event_key, recipient_email)
+                ON CONFLICT (event_type, resource_id, event_key, recipient_user_id)
                 DO UPDATE SET claimed_at = NOW()
                 WHERE email_notification_deliveries.sent_at IS NULL
                   AND email_notification_deliveries.claimed_at < NOW() - INTERVAL '30 minutes'
-                RETURNING resource_id
+                RETURNING recipient_user_id
                 "#,
-                &[
-                    &EVENT_TYPE,
-                    &Self::resource_id(organization_id),
-                    &threshold.to_string(),
-                    &recipient_email,
-                ],
-            )
-            .await?;
-        Ok(claimed.is_some())
+                    &[
+                        &EVENT_TYPE,
+                        &resource_id,
+                        &threshold.to_string(),
+                        &recipient_user_id,
+                    ],
+                )
+                .await?;
+            if claimed.is_some() {
+                claimed_recipients.push(CreditEmailRecipient {
+                    user_id: recipient_user_id,
+                    email: row.get("email"),
+                    contact_email: row.get("contact_email"),
+                    contact_email_verified_at: row
+                        .get::<_, Option<DateTime<Utc>>>("contact_email_verified_at"),
+                });
+            }
+        }
+        transaction.commit().await?;
+        Ok(CreditEmailClaimResult::Claimed(claimed_recipients))
     }
 
     async fn release_claim(
         &self,
         organization_id: Uuid,
         threshold: i16,
-        recipient_email: &str,
+        recipient_user_id: Uuid,
     ) -> Result<()> {
         let client = self.pool.get().await?;
         client
             .execute(
-                "DELETE FROM email_notification_deliveries WHERE event_type = $1 AND resource_id = $2 AND event_key = $3 AND recipient_email = $4",
+                "DELETE FROM email_notification_deliveries WHERE event_type = $1 AND resource_id = $2 AND event_key = $3 AND recipient_user_id = $4",
                 &[
                     &EVENT_TYPE,
                     &Self::resource_id(organization_id),
                     &threshold.to_string(),
-                    &recipient_email,
+                    &recipient_user_id,
                 ],
             )
             .await?;
@@ -162,17 +177,17 @@ impl CreditEmailNotificationRepositoryPort for CreditEmailNotificationRepository
         &self,
         organization_id: Uuid,
         threshold: i16,
-        recipient_email: &str,
+        recipient_user_id: Uuid,
     ) -> Result<()> {
         let client = self.pool.get().await?;
         client
             .execute(
-                "UPDATE email_notification_deliveries SET sent_at = NOW() WHERE event_type = $1 AND resource_id = $2 AND event_key = $3 AND recipient_email = $4",
+                "UPDATE email_notification_deliveries SET sent_at = NOW() WHERE event_type = $1 AND resource_id = $2 AND event_key = $3 AND recipient_user_id = $4",
                 &[
                     &EVENT_TYPE,
                     &Self::resource_id(organization_id),
                     &threshold.to_string(),
-                    &recipient_email,
+                    &recipient_user_id,
                 ],
             )
             .await?;

@@ -552,6 +552,7 @@ impl UserErasureRepository for PostgresUserErasureRepository {
                     .map_err(map_db_error)?;
             }
             for sql in [
+                "DELETE FROM email_notification_deliveries WHERE recipient_user_id = $1",
                 "DELETE FROM feature_request_votes WHERE user_id = $1",
                 "DELETE FROM user_oauth_identities WHERE user_id = $1",
                 "DELETE FROM mcp_connector_usage WHERE user_id = $1",

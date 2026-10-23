@@ -1,5 +1,7 @@
 use crate::repositories::OrganizationLimitsRepository;
-use services::usage::ports::{OrganizationCreditLimit, OrganizationLimit};
+use services::usage::ports::{
+    OrganizationCreditLimit, OrganizationCreditSnapshot, OrganizationLimit,
+};
 use uuid::Uuid;
 
 /// Trait implementation adapter for OrganizationLimitsRepository
@@ -54,5 +56,45 @@ impl services::usage::ports::OrganizationLimitsRepository for OrganizationLimits
                 currency: status.limit.currency,
             })
             .collect())
+    }
+
+    async fn get_current_credit_snapshot(
+        &self,
+        organization_id: Uuid,
+    ) -> anyhow::Result<OrganizationCreditSnapshot> {
+        let (limits, unfunded, unattributed, version) = self
+            .get_current_credit_status_with_version(organization_id)
+            .await?;
+        let limit = (!limits.is_empty()).then(|| OrganizationLimit {
+            spend_limit: limits
+                .iter()
+                .map(|status| status.limit.spend_limit)
+                .fold(0_i64, i64::saturating_add),
+            available: limits
+                .iter()
+                .map(|status| status.available)
+                .fold(0_i64, i64::saturating_add)
+                .saturating_sub(unattributed)
+                .max(0),
+            unfunded,
+        });
+        let breakdown = limits
+            .into_iter()
+            .map(|status| OrganizationCreditLimit {
+                credit_type: status.limit.credit_type,
+                source: status.limit.source,
+                amount: status.limit.spend_limit,
+                transferred_out: status.transferred_out,
+                effective_capacity: status.effective_capacity,
+                consumed: status.consumed,
+                available: status.available,
+                currency: status.limit.currency,
+            })
+            .collect();
+        Ok(OrganizationCreditSnapshot {
+            limit,
+            breakdown,
+            version,
+        })
     }
 }

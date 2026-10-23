@@ -483,6 +483,21 @@ pub trait OrganizationLimitsRepository: Send + Sync {
         &self,
         organization_id: Uuid,
     ) -> anyhow::Result<Vec<OrganizationCreditLimit>>;
+
+    /// Read the balance, capacity breakdown, and an opaque version from one
+    /// database snapshot. The version is used to reject stale notification
+    /// claim/re-arm decisions made by another scheduler instance.
+    async fn get_current_credit_snapshot(
+        &self,
+        organization_id: Uuid,
+    ) -> anyhow::Result<OrganizationCreditSnapshot>;
+}
+
+#[derive(Debug, Clone)]
+pub struct OrganizationCreditSnapshot {
+    pub limit: Option<OrganizationLimit>,
+    pub breakdown: Vec<OrganizationCreditLimit>,
+    pub version: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -493,42 +508,44 @@ pub struct CreditEmailOrganization {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreditEmailRecipient {
+    pub user_id: Uuid,
     pub email: String,
     pub contact_email: Option<String>,
     pub contact_email_verified_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CreditEmailClaimResult {
+    SnapshotChanged,
+    Claimed(Vec<CreditEmailRecipient>),
 }
 
 #[cfg_attr(test, mockall::automock)]
 #[async_trait::async_trait]
 pub trait CreditEmailNotificationRepository: Send + Sync {
     async fn active_organizations(&self) -> anyhow::Result<Vec<CreditEmailOrganization>>;
-    async fn owner_admin_recipients(
+    /// Under the organization row lock, verify `snapshot_version`, apply the
+    /// requested re-arm transition, and claim current owner/admin recipients.
+    /// `threshold = None` clears all claims after a replenishment and returns
+    /// no recipients.
+    async fn reconcile_claims(
         &self,
         organization_id: Uuid,
-    ) -> anyhow::Result<Vec<CreditEmailRecipient>>;
-    async fn clear_claims(&self, organization_id: Uuid) -> anyhow::Result<()>;
-    async fn clear_threshold_claims(
-        &self,
-        organization_id: Uuid,
-        thresholds: &[i16],
-    ) -> anyhow::Result<()>;
-    async fn try_claim(
-        &self,
-        organization_id: Uuid,
-        threshold: i16,
-        recipient_email: &str,
-    ) -> anyhow::Result<bool>;
+        snapshot_version: &str,
+        threshold: Option<i16>,
+        lower_thresholds: &[i16],
+    ) -> anyhow::Result<CreditEmailClaimResult>;
     async fn release_claim(
         &self,
         organization_id: Uuid,
         threshold: i16,
-        recipient_email: &str,
+        recipient_user_id: Uuid,
     ) -> anyhow::Result<()>;
     async fn mark_sent(
         &self,
         organization_id: Uuid,
         threshold: i16,
-        recipient_email: &str,
+        recipient_user_id: Uuid,
     ) -> anyhow::Result<()>;
 }
 

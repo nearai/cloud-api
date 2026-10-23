@@ -5,7 +5,8 @@ use std::sync::Arc;
 use tracing::{error, info, warn};
 
 use super::ports::{
-    CreditEmailNotificationRepository, CreditEmailOrganization, OrganizationLimitsRepository,
+    CreditEmailClaimResult, CreditEmailNotificationRepository, CreditEmailOrganization,
+    OrganizationLimitsRepository,
 };
 use crate::email::{deliverable_email, CreditBalanceAlertEmail, EmailDeliveryOutcome, EmailSender};
 
@@ -89,24 +90,23 @@ impl CreditEmailScheduler {
         &self,
         organization: CreditEmailOrganization,
     ) -> anyhow::Result<()> {
-        let Some(limit) = self
+        let snapshot = self
             .limits_repository
-            .get_current_limits(organization.id)
-            .await?
-        else {
-            self.repository.clear_claims(organization.id).await?;
+            .get_current_credit_snapshot(organization.id)
+            .await?;
+        let Some(limit) = snapshot.limit else {
+            self.reconcile_claims(&organization, &snapshot.version, None, &[])
+                .await?;
             return Ok(());
         };
-        let breakdown = self
-            .limits_repository
-            .get_current_limit_breakdown(organization.id)
-            .await?;
+        let breakdown = snapshot.breakdown;
         let effective_capacity = breakdown
             .iter()
             .map(|credit| credit.effective_capacity)
             .fold(0_i64, i64::saturating_add);
         if effective_capacity <= 0 {
-            self.repository.clear_claims(organization.id).await?;
+            self.reconcile_claims(&organization, &snapshot.version, None, &[])
+                .await?;
             return Ok(());
         }
 
@@ -120,7 +120,8 @@ impl CreditEmailScheduler {
         let Some(threshold) =
             threshold_for_balance(remaining, effective_capacity, &self.thresholds)
         else {
-            self.repository.clear_claims(organization.id).await?;
+            self.reconcile_claims(&organization, &snapshot.version, None, &[])
+                .await?;
             return Ok(());
         };
 
@@ -130,12 +131,6 @@ impl CreditEmailScheduler {
             .copied()
             .filter(|candidate| *candidate < threshold)
             .collect::<Vec<_>>();
-        if !lower_thresholds.is_empty() {
-            self.repository
-                .clear_threshold_claims(organization.id, &lower_thresholds)
-                .await?;
-        }
-
         let mut credit_types = breakdown
             .into_iter()
             .map(|credit| credit.credit_type)
@@ -147,25 +142,29 @@ impl CreditEmailScheduler {
         } else {
             format!("combined ({})", credit_types.join(", "))
         };
-        let recipients = self
-            .repository
-            .owner_admin_recipients(organization.id)
-            .await?;
+        let Some(recipients) = self
+            .reconcile_claims(
+                &organization,
+                &snapshot.version,
+                Some(threshold),
+                &lower_thresholds,
+            )
+            .await?
+        else {
+            return Ok(());
+        };
         for recipient in recipients {
             let Some(recipient_email) = deliverable_email(
                 &recipient.email,
                 recipient.contact_email.as_deref(),
                 recipient.contact_email_verified_at,
             ) else {
+                let _ = self
+                    .repository
+                    .release_claim(organization.id, threshold, recipient.user_id)
+                    .await;
                 continue;
             };
-            if !self
-                .repository
-                .try_claim(organization.id, threshold, recipient_email)
-                .await?
-            {
-                continue;
-            }
             let email = CreditBalanceAlertEmail {
                 recipient_email: recipient_email.to_string(),
                 organization_name: organization.name.clone(),
@@ -186,7 +185,7 @@ impl CreditEmailScheduler {
                 Ok(EmailDeliveryOutcome::Sent { .. }) => {
                     if let Err(error) = self
                         .repository
-                        .mark_sent(organization.id, threshold, recipient_email)
+                        .mark_sent(organization.id, threshold, recipient.user_id)
                         .await
                     {
                         warn!(organization_id = %organization.id, error = %error, "Failed to mark credit balance alert as sent");
@@ -195,19 +194,44 @@ impl CreditEmailScheduler {
                 Ok(EmailDeliveryOutcome::Skipped) => {
                     let _ = self
                         .repository
-                        .release_claim(organization.id, threshold, recipient_email)
+                        .release_claim(organization.id, threshold, recipient.user_id)
                         .await;
                 }
                 Err(error) => {
                     warn!(organization_id = %organization.id, error = %error.sanitized_message(), "Failed to send credit balance alert");
                     let _ = self
                         .repository
-                        .release_claim(organization.id, threshold, recipient_email)
+                        .release_claim(organization.id, threshold, recipient.user_id)
                         .await;
                 }
             }
         }
         Ok(())
+    }
+
+    async fn reconcile_claims(
+        &self,
+        organization: &CreditEmailOrganization,
+        snapshot_version: &str,
+        threshold: Option<i16>,
+        lower_thresholds: &[i16],
+    ) -> anyhow::Result<Option<Vec<super::ports::CreditEmailRecipient>>> {
+        match self
+            .repository
+            .reconcile_claims(
+                organization.id,
+                snapshot_version,
+                threshold,
+                lower_thresholds,
+            )
+            .await?
+        {
+            CreditEmailClaimResult::SnapshotChanged => {
+                info!(organization_id = %organization.id, "Credit balance changed during alert scan; deferring to the next scan");
+                Ok(None)
+            }
+            CreditEmailClaimResult::Claimed(recipients) => Ok(Some(recipients)),
+        }
     }
 }
 
@@ -223,23 +247,30 @@ fn threshold_for_balance(remaining: i64, capacity: i64, thresholds: &[i16]) -> O
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
     use chrono::Utc;
     use tokio::sync::Mutex;
     use uuid::Uuid;
 
     use super::*;
     use crate::email::NoopEmailSender;
-    use crate::usage::ports::{CreditEmailRecipient, OrganizationCreditLimit, OrganizationLimit};
+    use crate::usage::ports::{
+        CreditEmailRecipient, OrganizationCreditLimit, OrganizationCreditSnapshot,
+        OrganizationLimit,
+    };
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct ReconcileCall {
+        organization_id: Uuid,
+        snapshot_version: String,
+        threshold: Option<i16>,
+        lower_thresholds: Vec<i16>,
+    }
 
     struct TestNotificationRepository {
         organizations: Vec<CreditEmailOrganization>,
         recipients: Vec<CreditEmailRecipient>,
-        clear_all_calls: AtomicUsize,
-        cleared_thresholds: Mutex<Vec<Vec<i16>>>,
-        claimed_thresholds: Mutex<Vec<i16>>,
-        claimed_organizations: Mutex<Vec<Uuid>>,
+        reconciliations: Mutex<Vec<ReconcileCall>>,
+        released_users: Mutex<Vec<Uuid>>,
     }
 
     #[async_trait::async_trait]
@@ -248,45 +279,30 @@ mod tests {
             Ok(self.organizations.clone())
         }
 
-        async fn owner_admin_recipients(
-            &self,
-            _: Uuid,
-        ) -> anyhow::Result<Vec<CreditEmailRecipient>> {
-            Ok(self.recipients.clone())
-        }
-
-        async fn clear_claims(&self, _: Uuid) -> anyhow::Result<()> {
-            self.clear_all_calls.fetch_add(1, Ordering::Relaxed);
-            Ok(())
-        }
-
-        async fn clear_threshold_claims(&self, _: Uuid, thresholds: &[i16]) -> anyhow::Result<()> {
-            self.cleared_thresholds
-                .lock()
-                .await
-                .push(thresholds.to_vec());
-            Ok(())
-        }
-
-        async fn try_claim(
+        async fn reconcile_claims(
             &self,
             organization_id: Uuid,
-            threshold: i16,
-            _: &str,
-        ) -> anyhow::Result<bool> {
-            self.claimed_organizations
-                .lock()
-                .await
-                .push(organization_id);
-            self.claimed_thresholds.lock().await.push(threshold);
-            Ok(false)
+            snapshot_version: &str,
+            threshold: Option<i16>,
+            lower_thresholds: &[i16],
+        ) -> anyhow::Result<CreditEmailClaimResult> {
+            self.reconciliations.lock().await.push(ReconcileCall {
+                organization_id,
+                snapshot_version: snapshot_version.to_string(),
+                threshold,
+                lower_thresholds: lower_thresholds.to_vec(),
+            });
+            Ok(CreditEmailClaimResult::Claimed(
+                threshold.map_or_else(Vec::new, |_| self.recipients.clone()),
+            ))
         }
 
-        async fn release_claim(&self, _: Uuid, _: i16, _: &str) -> anyhow::Result<()> {
+        async fn release_claim(&self, _: Uuid, _: i16, user_id: Uuid) -> anyhow::Result<()> {
+            self.released_users.lock().await.push(user_id);
             Ok(())
         }
 
-        async fn mark_sent(&self, _: Uuid, _: i16, _: &str) -> anyhow::Result<()> {
+        async fn mark_sent(&self, _: Uuid, _: i16, _: Uuid) -> anyhow::Result<()> {
             Ok(())
         }
     }
@@ -307,6 +323,17 @@ mod tests {
             _: Uuid,
         ) -> anyhow::Result<Vec<OrganizationCreditLimit>> {
             Ok(self.breakdown.clone())
+        }
+
+        async fn get_current_credit_snapshot(
+            &self,
+            _: Uuid,
+        ) -> anyhow::Result<OrganizationCreditSnapshot> {
+            Ok(OrganizationCreditSnapshot {
+                limit: Some(self.limit.clone()),
+                breakdown: self.breakdown.clone(),
+                version: "snapshot-v1".to_string(),
+            })
         }
     }
 
@@ -334,6 +361,20 @@ mod tests {
         ) -> anyhow::Result<Vec<OrganizationCreditLimit>> {
             Ok(self.breakdown.clone())
         }
+
+        async fn get_current_credit_snapshot(
+            &self,
+            organization_id: Uuid,
+        ) -> anyhow::Result<OrganizationCreditSnapshot> {
+            if organization_id == self.failed_organization_id {
+                anyhow::bail!("simulated organization read failure");
+            }
+            Ok(OrganizationCreditSnapshot {
+                limit: Some(self.limit.clone()),
+                breakdown: self.breakdown.clone(),
+                version: "snapshot-v1".to_string(),
+            })
+        }
     }
 
     fn repository(recipients: Vec<CreditEmailRecipient>) -> Arc<TestNotificationRepository> {
@@ -343,10 +384,8 @@ mod tests {
                 name: "Example".to_string(),
             }],
             recipients,
-            clear_all_calls: AtomicUsize::new(0),
-            cleared_thresholds: Mutex::new(Vec::new()),
-            claimed_thresholds: Mutex::new(Vec::new()),
-            claimed_organizations: Mutex::new(Vec::new()),
+            reconciliations: Mutex::new(Vec::new()),
+            released_users: Mutex::new(Vec::new()),
         })
     }
 
@@ -383,8 +422,10 @@ mod tests {
 
         scheduler.run_once().await.unwrap();
 
-        assert_eq!(repository.clear_all_calls.load(Ordering::Relaxed), 1);
-        assert!(repository.claimed_thresholds.lock().await.is_empty());
+        let calls = repository.reconciliations.lock().await;
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].threshold, None);
+        assert!(calls[0].lower_thresholds.is_empty());
     }
 
     #[test]
@@ -393,6 +434,19 @@ mod tests {
         assert_eq!(threshold_for_balance(200, 1_000, &[0, 10, 20]), Some(20));
         assert_eq!(threshold_for_balance(101, 1_000, &[0, 10, 20]), Some(20));
         assert_eq!(threshold_for_balance(100, 1_000, &[0, 10, 20]), Some(10));
+    }
+
+    #[test]
+    fn threshold_crossing_handles_supported_large_limits_without_overflow() {
+        let billion_dollars = 1_000_000_000_i64 * 1_000_000_000;
+        assert_eq!(
+            threshold_for_balance(billion_dollars, billion_dollars, &[0, 10, 20]),
+            None
+        );
+        assert_eq!(
+            threshold_for_balance(billion_dollars / 10, billion_dollars, &[0, 10, 20]),
+            Some(10)
+        );
     }
 
     #[tokio::test]
@@ -411,14 +465,13 @@ mod tests {
                 },
             ],
             recipients: vec![CreditEmailRecipient {
+                user_id: Uuid::new_v4(),
                 email: "owner@example.com".to_string(),
                 contact_email: None,
                 contact_email_verified_at: None,
             }],
-            clear_all_calls: AtomicUsize::new(0),
-            cleared_thresholds: Mutex::new(Vec::new()),
-            claimed_thresholds: Mutex::new(Vec::new()),
-            claimed_organizations: Mutex::new(Vec::new()),
+            reconciliations: Mutex::new(Vec::new()),
+            released_users: Mutex::new(Vec::new()),
         });
         let limits = Arc::new(PartiallyFailingLimitsRepository {
             failed_organization_id,
@@ -450,7 +503,13 @@ mod tests {
 
         assert!(error.to_string().contains("1 organization"));
         assert_eq!(
-            *repository.claimed_organizations.lock().await,
+            repository
+                .reconciliations
+                .lock()
+                .await
+                .iter()
+                .map(|call| call.organization_id)
+                .collect::<Vec<_>>(),
             vec![healthy_organization_id]
         );
     }
@@ -468,16 +527,17 @@ mod tests {
 
         scheduler.run_once().await.unwrap();
 
-        assert_eq!(repository.clear_all_calls.load(Ordering::Relaxed), 0);
-        assert_eq!(
-            *repository.cleared_thresholds.lock().await,
-            vec![vec![0, 10]]
-        );
+        let calls = repository.reconciliations.lock().await;
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].threshold, Some(20));
+        assert_eq!(calls[0].lower_thresholds, vec![0, 10]);
     }
 
     #[tokio::test]
     async fn placeholder_email_filter_is_shared_and_case_insensitive() {
+        let placeholder_user_id = Uuid::new_v4();
         let repository = repository(vec![CreditEmailRecipient {
+            user_id: placeholder_user_id,
             email: "alice.near@NEAR".to_string(),
             contact_email: None,
             contact_email_verified_at: None,
@@ -492,13 +552,19 @@ mod tests {
 
         scheduler.run_once().await.unwrap();
 
-        assert!(repository.claimed_thresholds.lock().await.is_empty());
-        assert_eq!(*repository.cleared_thresholds.lock().await, vec![vec![0]]);
+        assert_eq!(
+            *repository.released_users.lock().await,
+            vec![placeholder_user_id]
+        );
+        let calls = repository.reconciliations.lock().await;
+        assert_eq!(calls[0].threshold, Some(10));
+        assert_eq!(calls[0].lower_thresholds, vec![0]);
     }
 
     #[tokio::test]
     async fn unresolved_overage_uses_exhausted_threshold() {
         let repository = repository(vec![CreditEmailRecipient {
+            user_id: Uuid::new_v4(),
             email: "owner@example.com".to_string(),
             contact_email: None,
             contact_email_verified_at: None,
@@ -530,12 +596,16 @@ mod tests {
 
         scheduler.run_once().await.unwrap();
 
-        assert_eq!(*repository.claimed_thresholds.lock().await, vec![0]);
+        assert_eq!(
+            repository.reconciliations.lock().await[0].threshold,
+            Some(0)
+        );
     }
 
     #[test]
     fn verified_contact_email_allows_placeholder_login() {
         let recipient = CreditEmailRecipient {
+            user_id: Uuid::new_v4(),
             email: "alice.near@NEAR".to_string(),
             contact_email: Some("alice@example.com".to_string()),
             contact_email_verified_at: Some(Utc::now()),

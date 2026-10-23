@@ -392,7 +392,7 @@ pub struct EncryptionHeaders {
 ///   - ECDSA: 128 hex characters (64 bytes) or 130 hex characters (65 bytes with 0x04 prefix)
 /// - `x-model-pub-key`: NEAR hex key (64-130 characters) or Chutes standard
 ///   base64 ML-KEM-768 key (1184 decoded bytes); routing alone needs no client key
-/// - `x-encryption-version`: Must be "1" or "2" (selects encryption protocol version)
+/// - `x-encryption-version`: Must be "1", "2" or "3" (v3 binds the reply key and requires all-field encryption)
 ///
 /// Returns:
 /// - `Ok(EncryptionHeaders)` if all provided headers are valid
@@ -434,12 +434,12 @@ pub fn validate_encryption_headers(
 
     // Validate encryption version if provided
     if let Some(ref version) = encryption_version {
-        if version != "1" && version != "2" {
+        if !matches!(version.as_str(), "1" | "2" | "3") {
             return Err((
                 StatusCode::BAD_REQUEST,
                 ResponseJson(ErrorResponse::new(
                     format!(
-                        "Invalid X-Encryption-Version: '{}'. Must be '1' or '2'",
+                        "Invalid X-Encryption-Version: '{}'. Must be '1', '2' or '3'",
                         version
                     ),
                     "invalid_parameter".to_string(),
@@ -946,9 +946,24 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_encryption_version_v3() {
+        for flag in [None, Some("false"), Some("true")] {
+            let mut headers = HeaderMap::new();
+            headers.insert("x-encryption-version", "3".parse().unwrap());
+            if let Some(flag) = flag {
+                headers.insert("x-encrypt-all-fields", flag.parse().unwrap());
+            }
+            let result = validate_encryption_headers(&headers).unwrap();
+            assert_eq!(result.encryption_version.as_deref(), Some("3"));
+            // The proxy derives mandatory all-field encryption from v3 itself.
+            assert_eq!(result.encrypt_all_fields.as_deref(), flag);
+        }
+    }
+
+    #[test]
     fn test_validate_encryption_version_invalid() {
         let mut headers = HeaderMap::new();
-        headers.insert("x-encryption-version", "3".parse().unwrap());
+        headers.insert("x-encryption-version", "4".parse().unwrap());
         let err = validate_encryption_headers(&headers).unwrap_err();
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
         assert!(err.1 .0.error.message.contains("X-Encryption-Version"));

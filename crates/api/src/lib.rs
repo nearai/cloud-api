@@ -2916,7 +2916,6 @@ mod tests {
         }
     }
 
-
     #[test]
     fn test_openapi_chat_completion_details_are_optional() {
         // Chat-completion usage details are independently optional (a provider

@@ -249,7 +249,14 @@ impl CreditEmailNotificationRepositoryPort for CreditEmailNotificationRepository
         let client = self.pool.get().await?;
         client
             .execute(
-                "DELETE FROM email_notification_deliveries WHERE event_type = $1 AND resource_id = $2 AND event_key = $3 AND recipient_user_id = $4 AND claim_token = $5",
+                r#"
+                UPDATE email_notification_deliveries
+                SET claimed_at = NOW() - INTERVAL '31 minutes',
+                    dispatch_started_at = NULL
+                WHERE event_type = $1 AND resource_id = $2 AND event_key = $3
+                  AND recipient_user_id = $4 AND claim_token = $5
+                  AND sent_at IS NULL
+                "#,
                 &[
                     &EVENT_TYPE,
                     &Self::resource_id(organization_id),

@@ -136,17 +136,25 @@ async fn claims_deduplicate_recover_and_release() -> anyhow::Result<()> {
     .is_empty());
 
     repository
-        .release_claim(organization_id, 10, user_id, claim_token)
+        .reconcile_claims(organization_id, &version, None, &[])
         .await?;
-    assert_eq!(
-        claimed(
-            repository
-                .reconcile_claims(organization_id, &version, Some(10), &[])
-                .await?
-        )
-        .len(),
-        1
+    let retryable = claimed(
+        repository
+            .reconcile_claims(organization_id, &version, Some(10), &[])
+            .await?,
     );
+    assert_eq!(retryable.len(), 1);
+    let released_token = retryable[0].claim_token;
+    repository
+        .release_claim(organization_id, 10, user_id, released_token)
+        .await?;
+    let retried = claimed(
+        repository
+            .reconcile_claims(organization_id, &version, Some(10), &[])
+            .await?,
+    );
+    assert_eq!(retried.len(), 1);
+    assert_ne!(retried[0].claim_token, released_token);
     repository
         .reconcile_claims(organization_id, &version, None, &[])
         .await?;
@@ -337,6 +345,61 @@ async fn partial_replenishment_rearms_lower_alert_without_sending_higher_alert(
         .len(),
         1
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn failed_lower_alert_still_suppresses_a_higher_alert_during_replenishment(
+) -> anyhow::Result<()> {
+    let pool = test_pool().await?;
+    let repository = CreditEmailNotificationRepository::new(pool.clone());
+    let (organization_id, user_id) = insert_credit_fixture(&pool, 90).await?;
+    let low_version = snapshot_version(&pool, organization_id).await?;
+    let low_claim = claimed(
+        repository
+            .reconcile_claims(organization_id, &low_version, Some(10), &[0])
+            .await?,
+    );
+    let failed_token = low_claim[0].claim_token;
+    assert!(
+        repository
+            .begin_dispatch(organization_id, 10, user_id, failed_token)
+            .await?
+    );
+    repository
+        .release_claim(organization_id, 10, user_id, failed_token)
+        .await?;
+
+    pool.get()
+        .await?
+        .execute(
+            "UPDATE organization_credit_consumption SET amount = 85, updated_at = clock_timestamp() WHERE organization_id = $1 AND credit_type = 'payment'",
+            &[&organization_id],
+        )
+        .await?;
+    let recovered_version = snapshot_version(&pool, organization_id).await?;
+    assert!(claimed(
+        repository
+            .reconcile_claims(organization_id, &recovered_version, Some(20), &[0, 10],)
+            .await?
+    )
+    .is_empty());
+
+    pool.get()
+        .await?
+        .execute(
+            "UPDATE organization_credit_consumption SET amount = 90, updated_at = clock_timestamp() WHERE organization_id = $1 AND credit_type = 'payment'",
+            &[&organization_id],
+        )
+        .await?;
+    let low_again_version = snapshot_version(&pool, organization_id).await?;
+    let low_again = claimed(
+        repository
+            .reconcile_claims(organization_id, &low_again_version, Some(10), &[0])
+            .await?,
+    );
+    assert_eq!(low_again.len(), 1);
+    assert_eq!(low_again[0].user_id, user_id);
     Ok(())
 }
 

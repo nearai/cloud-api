@@ -545,6 +545,7 @@ pub trait CreditEmailNotificationRepository: Send + Sync {
         recipient_user_id: Uuid,
         claim_token: Uuid,
     ) -> anyhow::Result<bool>;
+    /// Make a failed delivery retryable without erasing the threshold crossing.
     async fn release_claim(
         &self,
         organization_id: Uuid,

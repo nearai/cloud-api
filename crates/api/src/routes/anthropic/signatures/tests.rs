@@ -81,6 +81,7 @@ impl AttestationServiceTrait for ReceiptStore {
         _: Option<String>,
         _: bool,
         _: Option<ProviderFilter>,
+        _: services::models::ModelCaller,
     ) -> Result<AttestationReport, AttestationError> {
         unimplemented!()
     }

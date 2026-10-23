@@ -13,7 +13,9 @@ use crate::workspace::{ApiKey, ApiKeyRepository, WorkspaceId, WorkspaceRepositor
 use async_trait::async_trait;
 use bloomfilter::Bloom;
 use chrono::Utc;
+use hmac::{Hmac, KeyInit, Mac};
 use moka::future::Cache;
+use sha2::Sha256;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -27,6 +29,14 @@ const BLOOM_FILTER_ITEMS: usize = 10_000_000;
 const BLOOM_FILTER_FP_RATE: f64 = 0.001;
 const BLOOM_FILTER_SYNC_INTERVAL_SECS: u64 = 10;
 const BLOOM_FILTER_FULL_REBUILD_INTERVAL_SECS: u64 = 60 * 60;
+
+fn refresh_token_successor(old_token: &str, encoding_key: &str) -> Result<String, AuthError> {
+    let mut mac = Hmac::<Sha256>::new_from_slice(encoding_key.as_bytes())
+        .map_err(|e| AuthError::InternalError(format!("Invalid refresh rotation key: {e}")))?;
+    mac.update(b"nearai-refresh-token-rotation-v1\0");
+    mac.update(old_token.as_bytes());
+    Ok(format!("rt_{}", hex::encode(mac.finalize().into_bytes())))
+}
 
 #[async_trait]
 impl AuthServiceTrait for AuthService {
@@ -246,17 +256,23 @@ impl AuthServiceTrait for AuthService {
         &self,
         user_id: UserId,
         session_id: SessionId,
-        old_token_hash: &str,
+        old_token: &str,
         encoding_key: String,
         access_token_expires_in_hours: i64,
         refresh_token_expires_in_hours: i64,
     ) -> Result<(String, Session, String), AuthError> {
+        let successor_token = refresh_token_successor(old_token, &encoding_key)?;
         // Rotate the refresh token first; only mint an access token for a
         // session that is confirmed live. Rotation keeps the session id, so
         // the new access token stays bound to the same session.
         let (rotated_session, new_refresh_token) = self
             .session_repository
-            .rotate(session_id, old_token_hash, refresh_token_expires_in_hours)
+            .rotate(
+                session_id,
+                old_token,
+                &successor_token,
+                refresh_token_expires_in_hours,
+            )
             .await
             .map_err(|e| {
                 let error_msg = e.to_string();
@@ -289,40 +305,15 @@ impl AuthServiceTrait for AuthService {
             .map_err(|e| AuthError::InternalError(format!("Failed to check existing user: {e}")))?;
 
         if let Some(user) = existing_user {
-            self.user_repository
-                .update_last_login(user.id.clone())
-                .await
-                .map_err(|e| {
-                    AuthError::InternalError(format!("Failed to update last login: {e}"))
-                })?;
+            return self.sync_existing_oauth_user(user, &oauth_info).await;
+        }
 
-            if user.email != oauth_info.email {
-                self.user_repository
-                    .update_email(user.id.clone(), oauth_info.email)
-                    .await
-                    .map_err(|e| {
-                        AuthError::InternalError(format!("Failed to update user email: {e}"))
-                    })?;
-            }
-
-            if user.display_name != oauth_info.display_name
-                || user.avatar_url != oauth_info.avatar_url
-            {
-                self.user_repository
-                    .update(
-                        user.id.clone(),
-                        oauth_info.display_name,
-                        oauth_info.avatar_url,
-                    )
-                    .await
-                    .map_err(|e| AuthError::InternalError(format!("Failed to update user: {e}")))?;
-            }
-
+        if let Some(user) = self.find_or_link_oauth_user_by_email(&oauth_info).await? {
             return Ok(user);
         }
 
         // Create new user
-        let new_user = self
+        let creation = self
             .user_repository
             .create_from_oauth(
                 oauth_info.email.clone(),
@@ -332,8 +323,49 @@ impl AuthServiceTrait for AuthService {
                 oauth_info.provider.clone(),
                 oauth_info.provider_user_id.clone(),
             )
+            .await;
+        let new_user = match creation {
+            Ok(user) => user,
+            Err(error) => {
+                // Explicit binding may provision the provider identity concurrently
+                // with first login. Reuse it without creating another destination.
+                if let Some(user) = self
+                    .user_repository
+                    .get_by_provider(&oauth_info.provider, &oauth_info.provider_user_id)
+                    .await
+                    .map_err(|e| {
+                        AuthError::InternalError(format!("Failed to resolve user identity: {e}"))
+                    })?
+                {
+                    return self.sync_existing_oauth_user(user, &oauth_info).await;
+                }
+                // The email may have been claimed after the preflight lookup.
+                // Only classify a uniqueness failure as a possible email conflict;
+                // infrastructure failures must remain internal errors.
+                if matches!(
+                    error.downcast_ref::<crate::common::RepositoryError>(),
+                    Some(crate::common::RepositoryError::AlreadyExists)
+                ) {
+                    if let Some(user) = self.find_or_link_oauth_user_by_email(&oauth_info).await? {
+                        return Ok(user);
+                    }
+                }
+                return Err(AuthError::InternalError(format!(
+                    "Failed to create user: {error}"
+                )));
+            }
+        };
+
+        // NEAR identities are provisioned with their personal organization and
+        // workspace atomically by the repository, shared with wallet binding.
+        if oauth_info.provider == "near" {
+            return Ok(new_user);
+        }
+
+        self.user_repository
+            .observe_oauth_identity(new_user.id.clone(), &oauth_info)
             .await
-            .map_err(|e| AuthError::InternalError(format!("Failed to create user: {e}")))?;
+            .map_err(|e| AuthError::InternalError(format!("Failed to update identity: {e}")))?;
 
         // Create default organization and workspace for new user
         debug!(
@@ -469,6 +501,119 @@ impl AuthServiceTrait for AuthService {
 }
 
 impl AuthService {
+    async fn find_or_link_oauth_user_by_email(
+        &self,
+        oauth_info: &OAuthUserInfo,
+    ) -> Result<Option<User>, AuthError> {
+        if oauth_info.can_auto_link_by_email() {
+            if let Some(user) = self
+                .user_repository
+                .try_link_oauth_identity_by_email(oauth_info)
+                .await
+                .map_err(|e| {
+                    AuthError::InternalError(format!("Failed to link OAuth identity: {e}"))
+                })?
+            {
+                return self
+                    .sync_existing_oauth_user(user, oauth_info)
+                    .await
+                    .map(Some);
+            }
+        }
+        self.check_oauth_email_conflict(oauth_info).await?;
+        Ok(None)
+    }
+
+    async fn check_oauth_email_conflict(
+        &self,
+        oauth_info: &OAuthUserInfo,
+    ) -> Result<(), AuthError> {
+        let existing = self
+            .user_repository
+            .get_by_email(&oauth_info.email)
+            .await
+            .map_err(|e| AuthError::InternalError(format!("Failed to check user email: {e}")))?;
+        if let Some(user) = existing {
+            // A matching identity may have been created concurrently. Let the
+            // insert/re-read path reuse it. Other matches remain conflicts.
+            if user.auth_provider != oauth_info.provider
+                || user.provider_user_id != oauth_info.provider_user_id
+            {
+                return Err(AuthError::OAuthProviderConflict {
+                    existing_provider: user.auth_provider,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    async fn sync_existing_oauth_user(
+        &self,
+        user: User,
+        oauth_info: &OAuthUserInfo,
+    ) -> Result<User, AuthError> {
+        // Linked identities authenticate the same account, but must not
+        // overwrite the original provider's account email or profile.
+        if user.auth_provider != oauth_info.provider
+            || user.provider_user_id != oauth_info.provider_user_id
+        {
+            self.user_repository
+                .observe_oauth_identity(user.id.clone(), oauth_info)
+                .await
+                .map_err(|e| AuthError::InternalError(format!("Failed to update identity: {e}")))?;
+            self.user_repository
+                .update_last_login(user.id.clone())
+                .await
+                .map_err(|e| {
+                    AuthError::InternalError(format!("Failed to update last login: {e}"))
+                })?;
+            return Ok(user);
+        }
+        if user.email != oauth_info.email {
+            self.check_oauth_email_conflict(oauth_info).await?;
+            if let Err(error) = self
+                .user_repository
+                .update_email(user.id.clone(), oauth_info.email.clone())
+                .await
+            {
+                // Another identity may have claimed the email after the lookup.
+                // Infrastructure failures must not be classified as conflicts.
+                if matches!(
+                    error.downcast_ref::<crate::common::RepositoryError>(),
+                    Some(crate::common::RepositoryError::AlreadyExists)
+                ) {
+                    self.check_oauth_email_conflict(oauth_info).await?;
+                }
+                return Err(AuthError::InternalError(format!(
+                    "Failed to update user email: {error}"
+                )));
+            }
+        }
+
+        if user.display_name != oauth_info.display_name || user.avatar_url != oauth_info.avatar_url
+        {
+            self.user_repository
+                .update(
+                    user.id.clone(),
+                    oauth_info.display_name.clone(),
+                    oauth_info.avatar_url.clone(),
+                )
+                .await
+                .map_err(|e| AuthError::InternalError(format!("Failed to update user: {e}")))?;
+        }
+
+        self.user_repository
+            .update_last_login(user.id.clone())
+            .await
+            .map_err(|e| AuthError::InternalError(format!("Failed to update last login: {e}")))?;
+
+        self.user_repository
+            .observe_oauth_identity(user.id.clone(), oauth_info)
+            .await
+            .map_err(|e| AuthError::InternalError(format!("Failed to update identity: {e}")))?;
+        Ok(user)
+    }
+
     pub fn new(
         user_repository: Arc<dyn UserRepository>,
         session_repository: Arc<dyn SessionRepository>,
@@ -476,7 +621,7 @@ impl AuthService {
         organization_repository: Arc<dyn OrganizationRepository>,
         workspace_repository: Arc<dyn WorkspaceRepository>,
         organization_service: Arc<dyn crate::organization::OrganizationServiceTrait>,
-        require_session_bound_access_tokens: bool,
+        auth_config: &config::AuthConfig,
     ) -> Self {
         let api_key_cache: ApiKeyCache = Cache::builder()
             .max_capacity(API_KEY_CACHE_MAX_CAPACITY)
@@ -504,7 +649,7 @@ impl AuthService {
             api_key_cache,
             api_key_bloom_filter,
             bloom_filter_ready,
-            require_session_bound_access_tokens,
+            require_session_bound_access_tokens: auth_config.require_session_bound_access_tokens,
         }
     }
 
@@ -607,16 +752,7 @@ impl AuthService {
 mod tests {
     use super::*;
     use crate::common::RepositoryError;
-    use crate::organization::{
-        AddOrganizationMemberRequest, BatchInvitationResponse, CreateOrganizationRequest,
-        DeleteOrganizationResult, InvitationEmailDeliveryFilters, InvitationEmailResendResult,
-        InvitationStatus, MemberRole, Organization, OrganizationError, OrganizationId,
-        OrganizationInvitation, OrganizationInvitationEmailDelivery,
-        OrganizationInvitationWithDetails, OrganizationMember, OrganizationMemberWithUser,
-        OrganizationOrderBy, OrganizationOrderDirection, OrganizationRepository,
-        OrganizationServiceTrait, OrganizationWithRole, UpdateOrganizationMemberRequest,
-        UpdateOrganizationRequest,
-    };
+    use crate::organization::{Organization, OrganizationId};
     use crate::workspace::{
         ApiKey, ApiKeyId, ApiKeyOrderBy, ApiKeyOrderDirection, ApiKeyRepository,
         CreateApiKeyRequest, Workspace, WorkspaceId, WorkspaceOrderBy, WorkspaceOrderDirection,
@@ -628,6 +764,24 @@ mod tests {
     use std::sync::Mutex;
     use tokio::sync::RwLock;
     use uuid::Uuid;
+
+    #[test]
+    fn refresh_successor_is_stable_and_keyed() {
+        let first = refresh_token_successor("rt_original", "signing-key").unwrap();
+        assert_eq!(
+            first,
+            refresh_token_successor("rt_original", "signing-key").unwrap()
+        );
+        assert!(first.starts_with("rt_"));
+        assert_ne!(
+            first,
+            refresh_token_successor("rt_other", "signing-key").unwrap()
+        );
+        assert_ne!(
+            first,
+            refresh_token_successor("rt_original", "other-key").unwrap()
+        );
+    }
 
     fn make_user(email: &str, provider: &str) -> User {
         User {
@@ -644,29 +798,84 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
             tokens_revoked_at: None,
+            contact_email: None,
+            contact_email_verified_at: None,
+            email_opt_in_at: None,
         }
     }
 
     struct MockUserRepo {
+        linked_identities: Mutex<Vec<OAuthUserInfo>>,
         user: Mutex<Option<User>>,
         email_updated: Mutex<Option<String>>,
         last_login_updated: Mutex<bool>,
         profile_updated: Mutex<bool>,
+        provider_lookups: Mutex<usize>,
+        creation_calls: Mutex<usize>,
+        creation_race: bool,
+        fallback_lookup_fails: bool,
+        email_lookup_fails: bool,
+        fallback_email_lookup_fails: bool,
+        creation_unavailable: bool,
+        email_owner: Mutex<Option<User>>,
+        email_update_calls: Mutex<usize>,
+        email_update_race: bool,
+        email_update_unavailable: bool,
     }
 
     impl MockUserRepo {
         fn with_user(user: User) -> Self {
             Self {
+                linked_identities: Mutex::new(Vec::new()),
                 user: Mutex::new(Some(user)),
                 email_updated: Mutex::new(None),
                 last_login_updated: Mutex::new(false),
                 profile_updated: Mutex::new(false),
+                provider_lookups: Mutex::new(0),
+                creation_calls: Mutex::new(0),
+                creation_race: false,
+                fallback_lookup_fails: false,
+                email_lookup_fails: false,
+                fallback_email_lookup_fails: false,
+                creation_unavailable: false,
+                email_owner: Mutex::new(None),
+                email_update_calls: Mutex::new(0),
+                email_update_race: false,
+                email_update_unavailable: false,
             }
+        }
+    }
+
+    impl MockUserRepo {
+        fn creation_failure(user: Option<User>) -> Self {
+            let mut repo = Self::with_user(
+                user.clone()
+                    .unwrap_or_else(|| make_user("unused@example.test", "near")),
+            );
+            repo.user = Mutex::new(user);
+            repo.creation_race = true;
+            repo
         }
     }
 
     #[async_trait]
     impl UserRepository for MockUserRepo {
+        async fn try_link_oauth_identity_by_email(
+            &self,
+            info: &OAuthUserInfo,
+        ) -> anyhow::Result<Option<User>> {
+            let Some(user) = self.get_by_email(&info.email).await? else {
+                return Ok(None);
+            };
+            if info.can_auto_link_by_email()
+                && matches!(user.auth_provider.as_str(), "github" | "google")
+                && user.auth_provider != info.provider
+            {
+                self.linked_identities.lock().unwrap().push(info.clone());
+                return Ok(Some(user));
+            }
+            Ok(None)
+        }
         async fn create(
             &self,
             _: String,
@@ -685,24 +894,70 @@ mod tests {
             _: String,
             _: String,
         ) -> anyhow::Result<User> {
-            unimplemented!()
+            *self.creation_calls.lock().unwrap() += 1;
+            if self.creation_unavailable {
+                return Err(
+                    RepositoryError::ConnectionFailed("test database unavailable".into()).into(),
+                );
+            }
+            Err(anyhow::Error::new(RepositoryError::AlreadyExists)
+                .context("test creation conflict"))
         }
         async fn get_by_id(&self, id: UserId) -> anyhow::Result<Option<User>> {
             let user = self.user.lock().unwrap();
             Ok(user.as_ref().filter(|u| u.id == id).cloned())
         }
-        async fn get_by_email(&self, _: &str) -> anyhow::Result<Option<User>> {
-            unimplemented!()
+        async fn get_by_email(&self, email: &str) -> anyhow::Result<Option<User>> {
+            let created = *self.creation_calls.lock().unwrap() > 0;
+            let updated = *self.email_update_calls.lock().unwrap() > 0;
+            if self.email_lookup_fails || ((created || updated) && self.fallback_email_lookup_fails)
+            {
+                return Err(anyhow::anyhow!("test email lookup unavailable"));
+            }
+            if self.creation_race && !created {
+                return Ok(None);
+            }
+            if self.email_update_race && *self.email_update_calls.lock().unwrap() == 0 {
+                return Ok(None);
+            }
+            if let Some(owner) = self.email_owner.lock().unwrap().as_ref() {
+                if owner.email == email && owner.is_active {
+                    return Ok(Some(owner.clone()));
+                }
+            }
+            Ok(self
+                .user
+                .lock()
+                .unwrap()
+                .as_ref()
+                .filter(|u| u.email == email && u.is_active)
+                .cloned())
         }
         async fn get_by_provider(
             &self,
             auth_provider: &str,
-            _provider_user_id: &str,
+            provider_user_id: &str,
         ) -> anyhow::Result<Option<User>> {
+            let mut calls = self.provider_lookups.lock().unwrap();
+            *calls += 1;
+            if self.creation_race && *calls == 1 {
+                return Ok(None);
+            }
+            if self.fallback_lookup_fails {
+                return Err(anyhow::anyhow!("test lookup unavailable"));
+            }
             let user = self.user.lock().unwrap();
             Ok(user
                 .as_ref()
-                .filter(|u| u.auth_provider == auth_provider)
+                .filter(|u| {
+                    u.is_active
+                        && ((u.auth_provider == auth_provider
+                            && u.provider_user_id == provider_user_id)
+                            || self.linked_identities.lock().unwrap().iter().any(|info| {
+                                info.provider == auth_provider
+                                    && info.provider_user_id == provider_user_id
+                            }))
+                })
                 .cloned())
         }
         async fn update(
@@ -715,6 +970,24 @@ mod tests {
             Ok(self.user.lock().unwrap().clone())
         }
         async fn update_email(&self, _: UserId, email: String) -> anyhow::Result<()> {
+            *self.email_update_calls.lock().unwrap() += 1;
+            if self.email_update_unavailable {
+                return Err(RepositoryError::ConnectionFailed(
+                    "test email update unavailable".into(),
+                )
+                .into());
+            }
+            if self.email_update_race
+                || self
+                    .email_owner
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .is_some_and(|owner| owner.email == email)
+            {
+                return Err(anyhow::Error::new(RepositoryError::AlreadyExists)
+                    .context("test email update conflict"));
+            }
             *self.email_updated.lock().unwrap() = Some(email);
             Ok(())
         }
@@ -758,7 +1031,13 @@ mod tests {
         async fn extend(&self, _: SessionId, _: i64) -> anyhow::Result<bool> {
             unimplemented!()
         }
-        async fn rotate(&self, _: SessionId, _: &str, _: i64) -> anyhow::Result<(Session, String)> {
+        async fn rotate(
+            &self,
+            _: SessionId,
+            _: &str,
+            _: &str,
+            _: i64,
+        ) -> anyhow::Result<(Session, String)> {
             unimplemented!()
         }
         async fn revoke(&self, _: SessionId) -> anyhow::Result<bool> {
@@ -834,7 +1113,13 @@ mod tests {
         async fn extend(&self, _: SessionId, _: i64) -> anyhow::Result<bool> {
             unimplemented!()
         }
-        async fn rotate(&self, _: SessionId, _: &str, _: i64) -> anyhow::Result<(Session, String)> {
+        async fn rotate(
+            &self,
+            _: SessionId,
+            _: &str,
+            _: &str,
+            _: i64,
+        ) -> anyhow::Result<(Session, String)> {
             unimplemented!()
         }
         async fn revoke(&self, session_id: SessionId) -> anyhow::Result<bool> {
@@ -922,131 +1207,6 @@ mod tests {
         }
     }
 
-    struct StubOrgRepo;
-    #[async_trait]
-    impl OrganizationRepository for StubOrgRepo {
-        async fn create(
-            &self,
-            _: CreateOrganizationRequest,
-            _: Uuid,
-        ) -> Result<Organization, RepositoryError> {
-            unimplemented!()
-        }
-        async fn get_by_id(&self, _: Uuid) -> Result<Option<Organization>, RepositoryError> {
-            unimplemented!()
-        }
-        async fn set_request_priority(
-            &self,
-            _: Uuid,
-            _: i32,
-        ) -> Result<Option<i32>, RepositoryError> {
-            unimplemented!()
-        }
-        async fn get_by_name(&self, _: &str) -> Result<Option<Organization>, RepositoryError> {
-            unimplemented!()
-        }
-        async fn get_member(
-            &self,
-            _: Uuid,
-            _: Uuid,
-        ) -> Result<Option<OrganizationMember>, RepositoryError> {
-            unimplemented!()
-        }
-        async fn update(
-            &self,
-            _: Uuid,
-            _: UpdateOrganizationRequest,
-            _: Option<Option<serde_json::Value>>,
-            _: Uuid,
-        ) -> Result<Organization, RepositoryError> {
-            unimplemented!()
-        }
-        async fn patch_settings(
-            &self,
-            _: Uuid,
-            _: crate::organization::PatchOrganizationSettings,
-            _: Option<Uuid>,
-        ) -> Result<Organization, RepositoryError> {
-            unimplemented!()
-        }
-        async fn delete_if_no_staking_farm_source(
-            &self,
-            _: Uuid,
-            _: Uuid,
-        ) -> Result<DeleteOrganizationResult, RepositoryError> {
-            unimplemented!()
-        }
-        async fn add_member(
-            &self,
-            _: Uuid,
-            _: AddOrganizationMemberRequest,
-            _: Uuid,
-        ) -> Result<OrganizationMember, RepositoryError> {
-            unimplemented!()
-        }
-        async fn update_member(
-            &self,
-            _: Uuid,
-            _: Uuid,
-            _: UpdateOrganizationMemberRequest,
-            _: Uuid,
-        ) -> Result<OrganizationMember, RepositoryError> {
-            unimplemented!()
-        }
-        async fn update_member_role_with_audit(
-            &self,
-            _: Uuid,
-            _: Uuid,
-            _: UpdateOrganizationMemberRequest,
-            _: Uuid,
-        ) -> Result<crate::organization::OrganizationMemberRoleUpdate, RepositoryError> {
-            unimplemented!()
-        }
-        async fn remove_member(
-            &self,
-            _: Uuid,
-            _: Uuid,
-            _: Uuid,
-        ) -> Result<crate::organization::RemoveOrganizationMemberResult, RepositoryError> {
-            unimplemented!()
-        }
-        async fn list_members_paginated(
-            &self,
-            _: Uuid,
-            _: i64,
-            _: i64,
-        ) -> Result<Vec<OrganizationMember>, RepositoryError> {
-            unimplemented!()
-        }
-        async fn get_member_count(&self, _: Uuid) -> Result<i64, RepositoryError> {
-            unimplemented!()
-        }
-        async fn count_organizations_by_user(&self, _: Uuid) -> Result<i64, RepositoryError> {
-            unimplemented!()
-        }
-        async fn list_organizations_by_user(
-            &self,
-            _: Uuid,
-            _: i64,
-            _: i64,
-            _: Option<OrganizationOrderBy>,
-            _: Option<OrganizationOrderDirection>,
-        ) -> Result<Vec<Organization>, RepositoryError> {
-            unimplemented!()
-        }
-
-        async fn list_organizations_with_roles_by_user(
-            &self,
-            _: Uuid,
-            _: i64,
-            _: i64,
-            _: Option<OrganizationOrderBy>,
-            _: Option<OrganizationOrderDirection>,
-        ) -> Result<Vec<OrganizationWithRole>, RepositoryError> {
-            unimplemented!()
-        }
-    }
-
     struct StubWorkspaceRepo;
     #[async_trait]
     impl WorkspaceRepository for StubWorkspaceRepo {
@@ -1111,294 +1271,6 @@ mod tests {
         }
     }
 
-    struct StubOrgService;
-    #[async_trait]
-    impl OrganizationServiceTrait for StubOrgService {
-        async fn create_organization(
-            &self,
-            _: String,
-            _: Option<String>,
-            _: UserId,
-        ) -> Result<Organization, OrganizationError> {
-            unimplemented!()
-        }
-        async fn get_organization(
-            &self,
-            _: OrganizationId,
-        ) -> Result<Organization, OrganizationError> {
-            unimplemented!()
-        }
-        async fn update_organization(
-            &self,
-            _: OrganizationId,
-            _: UserId,
-            _: Option<String>,
-            _: Option<String>,
-            _: Option<i32>,
-            _: Option<serde_json::Value>,
-        ) -> Result<Organization, OrganizationError> {
-            unimplemented!()
-        }
-        async fn delete_organization(
-            &self,
-            _: OrganizationId,
-            _: UserId,
-        ) -> Result<bool, OrganizationError> {
-            unimplemented!()
-        }
-        async fn list_organizations_for_user(
-            &self,
-            _: UserId,
-            _: i64,
-            _: i64,
-            _: Option<OrganizationOrderBy>,
-            _: Option<OrganizationOrderDirection>,
-        ) -> Result<Vec<Organization>, OrganizationError> {
-            unimplemented!()
-        }
-        async fn list_organizations_with_roles_for_user(
-            &self,
-            _: UserId,
-            _: i64,
-            _: i64,
-            _: Option<OrganizationOrderBy>,
-            _: Option<OrganizationOrderDirection>,
-        ) -> Result<Vec<OrganizationWithRole>, OrganizationError> {
-            unimplemented!()
-        }
-        async fn count_organizations_for_user(&self, _: UserId) -> Result<i64, OrganizationError> {
-            unimplemented!()
-        }
-        async fn add_member(
-            &self,
-            _: OrganizationId,
-            _: UserId,
-            _: UserId,
-            _: MemberRole,
-        ) -> Result<OrganizationMember, OrganizationError> {
-            unimplemented!()
-        }
-        async fn remove_member(
-            &self,
-            _: OrganizationId,
-            _: UserId,
-            _: UserId,
-        ) -> Result<bool, OrganizationError> {
-            unimplemented!()
-        }
-        async fn update_member_role(
-            &self,
-            _: OrganizationId,
-            _: UserId,
-            _: UserId,
-            _: MemberRole,
-        ) -> Result<OrganizationMember, OrganizationError> {
-            unimplemented!()
-        }
-        async fn is_member(&self, _: OrganizationId, _: UserId) -> Result<bool, OrganizationError> {
-            unimplemented!()
-        }
-        async fn get_user_role(
-            &self,
-            _: OrganizationId,
-            _: UserId,
-        ) -> Result<Option<MemberRole>, OrganizationError> {
-            unimplemented!()
-        }
-        async fn get_member_count(
-            &self,
-            _: OrganizationId,
-            _: UserId,
-        ) -> Result<i64, OrganizationError> {
-            unimplemented!()
-        }
-        async fn get_organization_by_name(
-            &self,
-            _: &str,
-        ) -> Result<Option<Organization>, OrganizationError> {
-            unimplemented!()
-        }
-        async fn get_members_with_users_paginated(
-            &self,
-            _: OrganizationId,
-            _: UserId,
-            _: i64,
-            _: i64,
-        ) -> Result<Vec<OrganizationMemberWithUser>, OrganizationError> {
-            unimplemented!()
-        }
-        async fn invite_members_by_email(
-            &self,
-            _: OrganizationId,
-            _: UserId,
-            _: Vec<(String, MemberRole)>,
-        ) -> Result<BatchInvitationResponse, OrganizationError> {
-            unimplemented!()
-        }
-        async fn add_member_validated(
-            &self,
-            _: OrganizationId,
-            _: UserId,
-            _: UserId,
-            _: MemberRole,
-        ) -> Result<OrganizationMember, OrganizationError> {
-            unimplemented!()
-        }
-        async fn update_member_role_validated(
-            &self,
-            _: OrganizationId,
-            _: UserId,
-            _: UserId,
-            _: MemberRole,
-        ) -> Result<OrganizationMember, OrganizationError> {
-            unimplemented!()
-        }
-        async fn update_member_role_for_admin(
-            &self,
-            _: OrganizationId,
-            _: UserId,
-            _: MemberRole,
-            _: UserId,
-        ) -> Result<crate::organization::OrganizationMemberRoleUpdate, OrganizationError> {
-            unimplemented!()
-        }
-        async fn remove_member_validated(
-            &self,
-            _: OrganizationId,
-            _: UserId,
-            _: UserId,
-        ) -> Result<bool, OrganizationError> {
-            unimplemented!()
-        }
-        async fn create_invitations(
-            &self,
-            _: OrganizationId,
-            _: UserId,
-            _: Vec<(String, MemberRole)>,
-            _: i64,
-        ) -> Result<BatchInvitationResponse, OrganizationError> {
-            unimplemented!()
-        }
-        async fn list_user_invitations(
-            &self,
-            _: &str,
-        ) -> Result<Vec<OrganizationInvitationWithDetails>, OrganizationError> {
-            unimplemented!()
-        }
-        async fn get_invitation_by_token(
-            &self,
-            _: &str,
-        ) -> Result<OrganizationInvitation, OrganizationError> {
-            unimplemented!()
-        }
-        async fn accept_invitation_by_token(
-            &self,
-            _: &str,
-            _: UserId,
-            _: &str,
-        ) -> Result<OrganizationMember, OrganizationError> {
-            unimplemented!()
-        }
-        async fn accept_invitation(
-            &self,
-            _: Uuid,
-            _: UserId,
-            _: &str,
-        ) -> Result<OrganizationMember, OrganizationError> {
-            unimplemented!()
-        }
-        async fn decline_invitation(&self, _: Uuid, _: &str) -> Result<(), OrganizationError> {
-            unimplemented!()
-        }
-        async fn cancel_organization_invitation(
-            &self,
-            _: OrganizationId,
-            _: UserId,
-            _: Uuid,
-        ) -> Result<(), OrganizationError> {
-            unimplemented!()
-        }
-        async fn list_organization_invitations(
-            &self,
-            _: OrganizationId,
-            _: UserId,
-            _: Option<InvitationStatus>,
-        ) -> Result<Vec<OrganizationInvitation>, OrganizationError> {
-            unimplemented!()
-        }
-        async fn list_invitation_email_deliveries(
-            &self,
-            _: InvitationEmailDeliveryFilters,
-            _: i64,
-            _: i64,
-        ) -> Result<(Vec<OrganizationInvitationEmailDelivery>, i64), OrganizationError> {
-            unimplemented!()
-        }
-        async fn resend_invitation_email(
-            &self,
-            _: Uuid,
-        ) -> Result<InvitationEmailResendResult, OrganizationError> {
-            unimplemented!()
-        }
-        async fn get_organization_settings(
-            &self,
-            _: OrganizationId,
-            _: UserId,
-        ) -> Result<crate::organization::OrganizationSettings, OrganizationError> {
-            unimplemented!()
-        }
-        async fn patch_organization_settings(
-            &self,
-            _: OrganizationId,
-            _: UserId,
-            _: crate::organization::PatchOrganizationSettings,
-        ) -> Result<crate::organization::OrganizationSettings, OrganizationError> {
-            unimplemented!()
-        }
-        async fn get_request_priority_for_admin(
-            &self,
-            _: OrganizationId,
-        ) -> Result<i32, OrganizationError> {
-            unimplemented!()
-        }
-        async fn update_request_priority_for_admin(
-            &self,
-            _: OrganizationId,
-            _: i32,
-        ) -> Result<i32, OrganizationError> {
-            unimplemented!()
-        }
-
-        async fn get_fallback_enabled_for_admin(
-            &self,
-            _: OrganizationId,
-        ) -> Result<bool, OrganizationError> {
-            unimplemented!()
-        }
-        async fn update_fallback_enabled_for_admin(
-            &self,
-            _: OrganizationId,
-            _: bool,
-        ) -> Result<bool, OrganizationError> {
-            unimplemented!()
-        }
-        async fn get_system_prompt(
-            &self,
-            _: OrganizationId,
-            _: UserId,
-        ) -> Result<Option<String>, OrganizationError> {
-            unimplemented!()
-        }
-        async fn update_system_prompt(
-            &self,
-            _: OrganizationId,
-            _: UserId,
-            _: Option<String>,
-        ) -> Result<Option<String>, OrganizationError> {
-            unimplemented!()
-        }
-    }
-
     fn build_auth_service(user_repo: Arc<MockUserRepo>) -> AuthService {
         build_auth_service_with_sessions(user_repo, Arc::new(StubSessionRepo), false)
     }
@@ -1413,9 +1285,11 @@ mod tests {
             user_repository: user_repo,
             session_repository: session_repo,
             api_key_repository: Arc::new(StubApiKeyRepo),
-            organization_repository: Arc::new(StubOrgRepo),
+            organization_repository: Arc::new(
+                crate::organization::MockOrganizationRepository::new(),
+            ),
             workspace_repository: Arc::new(StubWorkspaceRepo),
-            organization_service: Arc::new(StubOrgService),
+            organization_service: Arc::new(crate::organization::MockOrganizationServiceTrait::new()),
             api_key_cache: moka::future::Cache::builder().build(),
             api_key_bloom_filter: Arc::new(RwLock::new(bloom)),
             bloom_filter_ready: Arc::new(AtomicBool::new(false)),
@@ -1425,12 +1299,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_returning_user_matched_by_provider_identity() {
-        let existing = make_user("alice@example.com", "google");
+        let mut existing = make_user("alice@example.com", "google");
+        existing.provider_user_id = "google-sub-123".into();
         let repo = Arc::new(MockUserRepo::with_user(existing.clone()));
         let service = build_auth_service(repo.clone());
 
         let result = service
             .get_or_create_oauth_user(OAuthUserInfo {
+                email_verified: true,
+                email_authoritative: true,
                 provider: "google".to_string(),
                 provider_user_id: "google-sub-123".to_string(),
                 email: "alice@example.com".to_string(),
@@ -1448,12 +1325,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_returning_user_email_changed_updates_email() {
-        let existing = make_user("old@example.com", "google");
+        let mut existing = make_user("old@example.com", "google");
+        existing.provider_user_id = "google-sub-456".into();
         let repo = Arc::new(MockUserRepo::with_user(existing.clone()));
         let service = build_auth_service(repo.clone());
 
         let result = service
             .get_or_create_oauth_user(OAuthUserInfo {
+                email_verified: true,
+                email_authoritative: true,
                 provider: "google".to_string(),
                 provider_user_id: "google-sub-456".to_string(),
                 email: "new@example.com".to_string(),
@@ -1472,7 +1352,379 @@ mod tests {
         );
     }
 
+    fn race_oauth_info() -> OAuthUserInfo {
+        OAuthUserInfo {
+            email_verified: true,
+            email_authoritative: true,
+            provider: "near".into(),
+            provider_user_id: "alice.near".into(),
+            email: "alice.near@near".into(),
+            username: "alice.near".into(),
+            display_name: Some("Updated wallet profile".into()),
+            avatar_url: Some("https://example.test/avatar".into()),
+        }
+    }
+
+    #[tokio::test]
+    async fn creation_race_reuses_identity_and_syncs_last_login_and_profile() {
+        let mut existing = make_user("old@near", "near");
+        existing.provider_user_id = "alice.near".into();
+        let repo = Arc::new(MockUserRepo::creation_failure(Some(existing.clone())));
+        let service = build_auth_service(repo.clone());
+        let result = service
+            .get_or_create_oauth_user(race_oauth_info())
+            .await
+            .unwrap();
+        assert_eq!(result.id, existing.id);
+        assert!(*repo.last_login_updated.lock().unwrap());
+        assert!(*repo.profile_updated.lock().unwrap());
+        assert_eq!(
+            *repo.email_updated.lock().unwrap(),
+            Some("alice.near@near".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn creation_failure_without_matching_identity_preserves_original_error() {
+        let repo = Arc::new(MockUserRepo::creation_failure(None));
+        let error = build_auth_service(repo.clone())
+            .get_or_create_oauth_user(race_oauth_info())
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("test creation conflict"));
+        assert!(!*repo.last_login_updated.lock().unwrap());
+    }
+
+    #[tokio::test]
+    async fn creation_race_lookup_failure_preserves_lookup_cause() {
+        let mut repo = MockUserRepo::creation_failure(None);
+        repo.fallback_lookup_fails = true;
+        let error = build_auth_service(Arc::new(repo))
+            .get_or_create_oauth_user(race_oauth_info())
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("test lookup unavailable"));
+    }
+
+    fn oauth_info(provider: &str) -> OAuthUserInfo {
+        OAuthUserInfo {
+            email_verified: true,
+            email_authoritative: true,
+            provider: provider.into(),
+            provider_user_id: format!("{provider}-alice"),
+            email: "alice@example.com".into(),
+            username: "alice".into(),
+            display_name: Some("New profile".into()),
+            avatar_url: Some("https://example.test/new-avatar".into()),
+        }
+    }
+
+    #[tokio::test]
+    async fn oauth_non_authoritative_email_rejects_linking_including_creation_races() {
+        for (original, incoming) in [("github", "google"), ("google", "github")] {
+            for creation_race in [false, true] {
+                let existing = make_user("alice@example.com", original);
+                let repo = Arc::new(if creation_race {
+                    MockUserRepo::creation_failure(Some(existing))
+                } else {
+                    MockUserRepo::with_user(existing)
+                });
+                let service = build_auth_service(repo.clone());
+                let mut info = oauth_info(incoming);
+                info.email_authoritative = false;
+                let error = service.get_or_create_oauth_user(info).await.unwrap_err();
+                assert!(matches!(
+                    error,
+                    AuthError::OAuthProviderConflict { existing_provider } if existing_provider == original
+                ));
+                assert!(repo.linked_identities.lock().unwrap().is_empty());
+                assert_eq!(
+                    *repo.creation_calls.lock().unwrap(),
+                    usize::from(creation_race)
+                );
+                assert!(!*repo.last_login_updated.lock().unwrap());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn oauth_non_authoritative_email_preserves_linked_provider_login() {
+        for (original, incoming) in [("github", "google"), ("google", "github")] {
+            let existing = make_user("alice@example.com", original);
+            let repo = Arc::new(MockUserRepo::with_user(existing.clone()));
+            let mut info = oauth_info(incoming);
+            info.email_authoritative = false;
+            repo.linked_identities.lock().unwrap().push(info.clone());
+            let service = build_auth_service(repo.clone());
+            let user = service.get_or_create_oauth_user(info).await.unwrap();
+            assert_eq!(user.id, existing.id);
+            assert_eq!(repo.linked_identities.lock().unwrap().len(), 1);
+            assert_eq!(*repo.creation_calls.lock().unwrap(), 0);
+            assert!(*repo.last_login_updated.lock().unwrap());
+        }
+    }
+
+    #[tokio::test]
+    async fn oauth_verified_email_links_both_providers_without_reprovisioning_account() {
+        for (original, incoming) in [("github", "google"), ("google", "github")] {
+            let existing = make_user("alice@example.com", original);
+            let repo = Arc::new(MockUserRepo::with_user(existing.clone()));
+            let user = build_auth_service(repo.clone())
+                .get_or_create_oauth_user(oauth_info(incoming))
+                .await
+                .unwrap();
+
+            assert_eq!(user.id, existing.id);
+            assert_eq!(repo.linked_identities.lock().unwrap().len(), 1);
+            assert_eq!(*repo.creation_calls.lock().unwrap(), 0);
+            assert!(*repo.last_login_updated.lock().unwrap());
+            assert!(!*repo.profile_updated.lock().unwrap());
+            assert!(repo.email_updated.lock().unwrap().is_none());
+            let stored = repo.user.lock().unwrap().clone().unwrap();
+            assert_eq!(stored.id, existing.id);
+            assert_eq!(stored.auth_provider, original);
+            assert_eq!(stored.provider_user_id, existing.provider_user_id);
+            // Organization/workspace/session stubs panic if provisioning is attempted.
+        }
+    }
+
+    #[tokio::test]
+    async fn oauth_unverified_email_never_links_an_existing_account() {
+        for (original, incoming) in [("github", "google"), ("google", "github")] {
+            let existing = make_user("alice@example.com", original);
+            let repo = Arc::new(MockUserRepo::with_user(existing));
+            let mut info = oauth_info(incoming);
+            info.email_verified = false;
+            let error = build_auth_service(repo.clone())
+                .get_or_create_oauth_user(info)
+                .await
+                .unwrap_err();
+            assert!(matches!(error, AuthError::OAuthProviderConflict { .. }));
+            assert!(repo.linked_identities.lock().unwrap().is_empty());
+            assert_eq!(*repo.creation_calls.lock().unwrap(), 0);
+            assert!(!*repo.last_login_updated.lock().unwrap());
+        }
+    }
+
+    #[tokio::test]
+    async fn oauth_verified_email_claimed_concurrently_links_in_both_directions() {
+        for (original, incoming) in [("github", "google"), ("google", "github")] {
+            let repo = Arc::new(MockUserRepo::creation_failure(Some(make_user(
+                "alice@example.com",
+                original,
+            ))));
+            let user = build_auth_service(repo.clone())
+                .get_or_create_oauth_user(oauth_info(incoming))
+                .await
+                .unwrap();
+
+            assert_eq!(user.auth_provider, original);
+            assert_eq!(repo.linked_identities.lock().unwrap().len(), 1);
+            assert_eq!(*repo.creation_calls.lock().unwrap(), 1);
+            assert_eq!(*repo.provider_lookups.lock().unwrap(), 2);
+            assert!(*repo.last_login_updated.lock().unwrap());
+            assert!(!*repo.profile_updated.lock().unwrap());
+        }
+    }
+
+    #[tokio::test]
+    async fn oauth_same_identity_created_concurrently_is_reused_for_both_providers() {
+        for provider in ["github", "google"] {
+            let info = oauth_info(provider);
+            let mut existing = make_user(&info.email, provider);
+            existing.provider_user_id = info.provider_user_id.clone();
+            let repo = Arc::new(MockUserRepo::creation_failure(Some(existing.clone())));
+            let user = build_auth_service(repo.clone())
+                .get_or_create_oauth_user(info)
+                .await
+                .unwrap();
+
+            assert_eq!(user.id, existing.id);
+            assert_eq!(*repo.creation_calls.lock().unwrap(), 1);
+            assert!(*repo.last_login_updated.lock().unwrap());
+        }
+    }
+
+    #[tokio::test]
+    async fn oauth_email_does_not_authenticate_another_identity_on_the_same_provider() {
+        let repo = Arc::new(MockUserRepo::with_user(make_user(
+            "alice@example.com",
+            "github",
+        )));
+        let error = build_auth_service(repo.clone())
+            .get_or_create_oauth_user(oauth_info("github"))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, AuthError::OAuthProviderConflict { .. }));
+        assert_eq!(*repo.creation_calls.lock().unwrap(), 0);
+        assert!(!*repo.last_login_updated.lock().unwrap());
+    }
+
+    #[tokio::test]
+    async fn oauth_existing_identity_is_resolved_before_email_lookup() {
+        let info = oauth_info("github");
+        let mut existing = make_user(&info.email, "github");
+        existing.provider_user_id = info.provider_user_id.clone();
+        let mut repo = MockUserRepo::with_user(existing.clone());
+        repo.email_lookup_fails = true;
+        let user = build_auth_service(Arc::new(repo))
+            .get_or_create_oauth_user(info)
+            .await
+            .unwrap();
+        assert_eq!(user.id, existing.id);
+    }
+
+    #[tokio::test]
+    async fn oauth_database_failure_is_not_misclassified_as_email_conflict() {
+        let mut repo =
+            MockUserRepo::creation_failure(Some(make_user("alice@example.com", "google")));
+        repo.creation_unavailable = true;
+        let error = build_auth_service(Arc::new(repo))
+            .get_or_create_oauth_user(oauth_info("github"))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, AuthError::InternalError(ref message)
+            if message.contains("test database unavailable")));
+    }
+
+    #[tokio::test]
+    async fn oauth_email_lookup_failure_remains_internal_before_and_after_creation() {
+        for after_creation in [false, true] {
+            let mut repo = MockUserRepo::creation_failure(None);
+            repo.email_lookup_fails = !after_creation;
+            repo.fallback_email_lookup_fails = after_creation;
+            let repo = Arc::new(repo);
+            let error = build_auth_service(repo.clone())
+                .get_or_create_oauth_user(oauth_info("github"))
+                .await
+                .unwrap_err();
+            assert!(matches!(error, AuthError::InternalError(ref message)
+                if message.contains("test email lookup unavailable")));
+            assert_eq!(
+                *repo.creation_calls.lock().unwrap(),
+                usize::from(after_creation)
+            );
+        }
+    }
+
     const TEST_ENCODING_KEY: &str = "test_encoding_key";
+
+    #[tokio::test]
+    async fn returning_oauth_user_email_conflict_leaves_login_and_profile_unchanged() {
+        for (provider, owner_provider) in [
+            ("google", "github"),
+            ("github", "google"),
+            ("google", "google"),
+            ("github", "github"),
+        ] {
+            let info = oauth_info(provider);
+            let mut existing = make_user("original@example.com", provider);
+            existing.provider_user_id = info.provider_user_id.clone();
+            let repo = MockUserRepo::with_user(existing.clone());
+            *repo.email_owner.lock().unwrap() = Some(make_user(&info.email, owner_provider));
+            let repo = Arc::new(repo);
+            let error = build_auth_service(repo.clone())
+                .get_or_create_oauth_user(info)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, AuthError::OAuthProviderConflict { existing_provider }
+                if existing_provider == owner_provider)
+            );
+            assert_eq!(*repo.email_update_calls.lock().unwrap(), 0);
+            assert!(!*repo.last_login_updated.lock().unwrap());
+            assert!(!*repo.profile_updated.lock().unwrap());
+            assert!(repo.email_updated.lock().unwrap().is_none());
+            assert_eq!(
+                repo.user.lock().unwrap().as_ref().unwrap().email,
+                existing.email
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn returning_oauth_user_email_claimed_during_update_returns_conflict() {
+        for (provider, owner_provider) in [("google", "github"), ("github", "google")] {
+            let info = oauth_info(provider);
+            let mut existing = make_user("original@example.com", provider);
+            existing.provider_user_id = info.provider_user_id.clone();
+            let mut repo = MockUserRepo::with_user(existing);
+            *repo.email_owner.lock().unwrap() = Some(make_user(&info.email, owner_provider));
+            repo.email_update_race = true;
+            let repo = Arc::new(repo);
+            let error = build_auth_service(repo.clone())
+                .get_or_create_oauth_user(info)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, AuthError::OAuthProviderConflict { existing_provider }
+                if existing_provider == owner_provider)
+            );
+            assert_eq!(*repo.email_update_calls.lock().unwrap(), 1);
+            assert!(!*repo.last_login_updated.lock().unwrap());
+            assert!(!*repo.profile_updated.lock().unwrap());
+            assert!(repo.email_updated.lock().unwrap().is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn returning_oauth_user_email_update_failure_stays_internal_without_login_mutation() {
+        let info = oauth_info("google");
+        let mut existing = make_user("original@example.com", "google");
+        existing.provider_user_id = info.provider_user_id.clone();
+        let mut repo = MockUserRepo::with_user(existing);
+        repo.email_update_unavailable = true;
+        repo.email_update_race = true;
+        *repo.email_owner.lock().unwrap() = Some(make_user(&info.email, "github"));
+        let repo = Arc::new(repo);
+        let error = build_auth_service(repo.clone())
+            .get_or_create_oauth_user(info)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, AuthError::InternalError(ref message)
+            if message.contains("test email update unavailable")));
+        assert!(!*repo.last_login_updated.lock().unwrap());
+        assert!(!*repo.profile_updated.lock().unwrap());
+    }
+
+    #[tokio::test]
+    async fn returning_oauth_user_email_lookup_failure_leaves_login_and_profile_unchanged() {
+        for race in [false, true] {
+            let info = oauth_info("google");
+            let mut existing = make_user("original@example.com", "google");
+            existing.provider_user_id = info.provider_user_id.clone();
+            let mut repo = MockUserRepo::with_user(existing);
+            repo.email_update_race = race;
+            repo.email_lookup_fails = !race;
+            repo.fallback_email_lookup_fails = race;
+            let repo = Arc::new(repo);
+            let error = build_auth_service(repo.clone())
+                .get_or_create_oauth_user(info)
+                .await
+                .unwrap_err();
+            assert!(matches!(error, AuthError::InternalError(ref message)
+                if message.contains("test email lookup unavailable")));
+            assert_eq!(*repo.email_update_calls.lock().unwrap(), usize::from(race));
+            assert!(!*repo.last_login_updated.lock().unwrap());
+            assert!(!*repo.profile_updated.lock().unwrap());
+            assert!(repo.email_updated.lock().unwrap().is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn inactive_oauth_email_owner_is_never_authenticated_or_reactivated() {
+        let mut inactive = make_user("alice@example.com", "github");
+        inactive.is_active = false;
+        let repo = Arc::new(MockUserRepo::with_user(inactive.clone()));
+        let error = build_auth_service(repo.clone())
+            .get_or_create_oauth_user(oauth_info("google"))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, AuthError::InternalError(_)));
+        assert_eq!(*repo.creation_calls.lock().unwrap(), 1);
+        assert!(!*repo.last_login_updated.lock().unwrap());
+        assert!(!repo.user.lock().unwrap().as_ref().unwrap().is_active);
+    }
 
     #[tokio::test]
     async fn test_create_session_binds_access_token_to_session() {

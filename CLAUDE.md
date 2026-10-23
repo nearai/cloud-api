@@ -1,101 +1,39 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+Guidance for Claude Code and other agents working in this repository. Topic rules live in `.claude/rules/` and load automatically when you work on matching files (see the index below); review criteria live in `REVIEW.md`.
 
-## 🔒 PRIVACY & DATA SECURITY - CRITICAL
+## Privacy comes first
 
-**Privacy and data security are THE most important aspects of this service for customer/client trust.**
+This service runs in a Trusted Execution Environment, and customer trust depends on never exposing customer data. **IMPORTANT: before adding or changing any log, metric label, or `Debug` output, follow `.claude/rules/privacy-logging.md`.** It defines what may be logged (IDs, counts, latencies, error codes) and what never may (credentials and customer content).
 
-### Logging Rules (ABSOLUTE REQUIREMENTS)
+Also: API keys and session tokens are SHA-256 hashed before storage, customer data is encrypted at rest and in transit, authentication flows use HTTPS/TLS, and secrets never go into the repository.
 
-Production runs at **info level and above**. We ABSOLUTELY CANNOT and SHOULD NOT log customer-related data.
+## Project overview
 
-#### ✗ NEVER LOG (Forbidden)
-- **Security credentials** - API keys, session tokens, passwords, secrets, OAuth tokens, encryption keys (these could compromise security if leaked)
-- **Conversation content** - Any message text, completion text, or AI-generated content
-- **Conversation titles** - User-provided or AI-generated conversation names
-- **Conversation descriptions** - Any descriptive text about conversations
-- **User input** - Messages, prompts, or any user-submitted text
-- **AI responses** - Model outputs, completions, or generated text
-- **Metadata that reveals customer information** - Custom fields, tags, labels that could expose user activity
-- **File contents** - Uploaded file data or processed file content
-- **Any PII** - Names, emails (except for auth flow), addresses, phone numbers in user content
+NEAR AI Cloud API is a Rust multi-tenant AI inference platform running in a TEE:
+- **Management plane** (session/OAuth auth): organizations, workspaces, users, API key administration.
+- **Data plane** (API key auth): OpenAI-compatible inference with streaming.
 
-#### ✓ OK TO LOG (Permitted for Debugging)
-- **IDs only** - `conversation_id`, `org_id`, `user_id`, `workspace_id`, `response_id`
-- **System metrics** - Request counts, latency, token counts (numbers only)
-- **Error types** - Error codes, HTTP status codes, error categories
-- **Performance data** - Time-to-first-token (TTFT), inter-token latency (ITL)
-- **System events** - Server startup, shutdown, connection pool status
-- **Authentication events** - Login attempts, session creation (not passwords/tokens)
+## Commands
 
-#### Guidelines for Adding Logging
-1. **Before adding any log statement**: Ask yourself "Could this reveal anything about a customer's conversation or activity?"
-2. **If in doubt, don't log it** - Err on the side of caution
-3. **Log IDs, not content** - Use `conversation_id` not conversation title
-4. **Review all logging changes carefully** - Every log statement is a potential privacy leak
-5. **Use debug/trace levels for detailed data** - These are not enabled in production
-6. **Never log request/response bodies** - Even at debug level, unless you're 100% certain they don't contain customer data
-
-#### Examples
-
-**❌ BAD - NEVER DO THIS:**
-```rust
-tracing::info!("API key: {}", api_key);  // Security risk - exposes credentials!
-tracing::info!("Creating conversation: {}", conversation.title);  // Exposes title!
-tracing::info!("User message: {}", message.content);  // Exposes content!
-tracing::warn!("Invalid input: {}", user_input);  // Exposes user data!
-tracing::debug!("Session token: {}", session_token);  // Security risk!
-```
-
-**✅ GOOD - Do this instead:**
-```rust
-tracing::info!("API key validated: api_key_id={}", api_key_id);  // Only log ID
-tracing::info!("Creating conversation: conversation_id={}", conversation.id);
-tracing::info!("Processing message: conversation_id={}, message_id={}", conv_id, msg_id);
-tracing::warn!("Invalid input format: conversation_id={}", conversation_id);
-tracing::debug!("Session validated: session_id={}, user_id={}", session_id, user_id);
-```
-
-### Security Reminders
-- This service runs in a **Trusted Execution Environment (TEE)** - customer trust is paramount
-- All customer data must be encrypted at rest and in transit
-- API keys and session tokens are SHA-256 hashed before storage
-- Never commit secrets or credentials to the repository
-- All authentication flows use HTTPS/TLS
-
----
-
-## Project Overview
-
-NEAR AI Cloud API is a Rust-based multi-tenant AI inference platform running in a Trusted Execution Environment (TEE). It provides:
-- **Management Plane** (OAuth): Organization, workspace, and API key administration
-- **Data Plane** (API Keys): OpenAI-compatible AI inference with streaming support
-
-## Common Commands
-
-### Development & Building
 ```bash
-# Build the project
 cargo build
-
-# Run the API server locally
-cargo run --bin api
-
-# Start with Docker Compose (includes PostgreSQL)
-docker-compose up -d
-
-# Check code formatting
-cargo fmt --all -- --check
-
-# Run linter
-cargo clippy
-
-# Format code
-cargo fmt
+cargo run --bin api                     # run the API server locally
+docker-compose up -d                    # local stack including PostgreSQL
+cargo fmt                               # format
+cargo fmt --all -- --check              # CI format check
+cargo clippy --all-targets --all-features -- -D warnings   # CI lint
+bash scripts/check_dep_guards.sh        # CI dependency guards
+cargo nextest run --lib --bins          # unit tests
+cargo nextest run test_create_conversation                  # tests matching a name
+cargo nextest run --test e2e_all        # database-backed e2e (needs PostgreSQL)
+cargo nextest run --test e2e_all -E 'test(/^module_name::test_name$/)'   # one e2e test
+TEST_DATABASE_NAME=platform_api_e2e_local cargo nextest run --test e2e_all   # per-checkout e2e DB
+cargo nextest run --test integration_tests   # vLLM integration (needs a vLLM server)
 ```
 
-### Testing
+Local PostgreSQL for tests:
+
 ```bash
 # Run unit tests (library and binary tests only)
 cargo nextest run --lib --bins
@@ -131,48 +69,35 @@ TEST_DATABASE_NAME=platform_api_e2e_local cargo nextest run --test e2e_all
 
 ## Architecture
 
-### Workspace Structure (Cargo Workspace)
+Cargo workspace:
+
 ```
 crates/
-├── api/                    # HTTP routes & server (Axum)
-├── database/               # Database abstraction & repositories
-├── config/                 # Environment-based configuration
-├── services/               # Domain logic (business logic)
-└── inference_providers/    # AI provider abstractions (vLLM)
+├── api/                  # HTTP routes and server (Axum)
+├── services/             # domain logic; each domain declares its traits in ports.rs
+├── database/             # repositories implementing those traits; SQL migrations
+├── config/               # environment-based configuration
+└── inference_providers/  # inference backend abstraction (vLLM and attested providers)
 ```
 
-### Hexagonal Architecture Pattern
-The codebase follows ports & adapters (hexagonal architecture):
-```
-Routes (api/src/routes/)
-    ↓ HTTP Adapters
-Services (services/src/*/)
-    ↓ Domain Logic (define traits in ports.rs)
-Repositories (database/src/repositories/)
-    ↓ Data Adapters (implement service traits)
-PostgreSQL Database
-```
+The layering rules and the existing seams to extend are in `.claude/rules/architecture.md`. Diagrams and flows: `docs/architecture/c4-diagrams.md`.
 
-**Key Principle**: Services depend on abstract traits (ports), not concrete implementations. This makes services framework-agnostic and easy to test.
+### Multi-tenancy
 
-### Multi-Tenancy Hierarchy
 ```
-Organization (Tenant Root)
-├── Members (Roles: owner, admin, member)
+Organization (tenant root)
+├── Members (owner, admin, member)
 ├── Workspaces
-│   ├── API Keys (workspace-scoped)
+│   ├── API keys (workspace-scoped)
 │   └── Settings
-├── Usage Limits (org-level enforcement)
-└── Rate Limits
+├── Usage limits (org-level enforcement)
+└── Rate limits
 ```
 
-### Authentication Strategy (Mutually Exclusive)
+### Authentication (two mutually exclusive methods)
 
-**1. Session-Based OAuth (Management Operations)**
-- Used for: Organizations, workspaces, users, API key management
-- Endpoints: `/v1/organizations/*`, `/v1/workspaces/*`, `/v1/users/*`
-- Providers: GitHub OAuth, Google OAuth
-- Storage: Hashed session token in database, returned as HTTP-only cookie
+- **Session-based OAuth** (GitHub, Google) for management: `/v1/organizations/*`, `/v1/workspaces/*`, `/v1/users/*`. The hashed session token is stored in the database and returned as an HTTP-only cookie.
+- **API keys** for inference: `/v1/chat/completions`, `/v1/responses/*`, `/v1/conversations/*`, attestation. `Authorization: Bearer sk-live-...` or `sk-test-...`; SHA-256 hashed, workspace-scoped, with last-used tracking and optional expiry.
 
 **2. API Key-Based (AI Inference Operations)**
 - Used for: Chat completions, Responses, and attestation
@@ -181,11 +106,13 @@ Organization (Tenant Root)
 - Storage: SHA-256 hashed, workspace-scoped
 - Tracking: Last used timestamp, optional expiration
 
-**Critical**: These auth methods are mutually exclusive by design.
+### Inference
 
-### AI Inference: Two APIs, Same Streaming Engine
+- **Chat Completions** (`POST /v1/chat/completions`, `/v1/completions`): drop-in OpenAI-compatible API, SSE streaming with a `[DONE]` terminator, plus non-streaming.
+- **Responses** (`POST /v1/responses`): linked to conversation history, with events `response.created`, `response.output_text.delta`, `response.completed`, `response.failed`. Supports client-executed tools (function calls, code_interpreter, computer) and server-executed web_search, file_search, and MCP. On a function call the response pauses as `incomplete`; the client resumes with `previous_response_id` plus `FunctionCallOutput`. Resumption verifies workspace ownership of `previous_response_id` and that each `call_id` maps to exactly one stored function call.
 
-**A. Chat Completions API (OpenAI-compatible)**
+Streaming flow:
+
 ```
 POST /v1/chat/completions
 POST /v1/completions
@@ -222,12 +149,7 @@ Client → CompletionService → Provider Pool (round-robin)
 - Provider Pool updated dynamically (no hardcoded models)
 - Load balancing: round-robin for new requests
 
-### Database Layer (Patroni High-Availability)
-- PostgreSQL 16 with deadpool connection pooling
-- **Patroni integration**: Automatic leader discovery, read replica load balancing
-- **20+ Repositories**: User, Organization, Workspace, APIKey, Session, Conversation, Response, Model, Usage, Attestation
-- **Migrations**: SQL-based using Refinery, run on startup
-- Located at: `crates/database/src/migrations/sql/`
+### Model discovery
 
 Historical Conversation, Response, ResponseItem, and File schemas/repositories remain for now,
 but the retired public APIs must not be wired back to them. Data deletion and schema removal are
@@ -235,8 +157,7 @@ separate work.
 
 ### External Billing / Credits Service
 
-Cloud API itself has no direct Stripe integration. The billing/credits service is the
-Next.js server in `../nearai-cloud-ui`, deployed on Vercel:
+### Database
 
 - `../nearai-cloud-ui/app/api/stripe/webhook/route.ts` handles Stripe checkout webhooks.
 - `../nearai-cloud-ui/app/api/credit/sync/route.ts` recalculates payment credits from Stripe + Hot Labs.
@@ -294,83 +215,32 @@ Located in `crates/api/src/routes/`:
 - `api.rs` - API versioning
 
 ### Configuration
-- Environment variables loaded from `.env` or environment
-- Example config: `env.example`
-- Config structs: `crates/config/src/types.rs`
-- YAML templates: `config/` directory
 
-### Architecture Documentation
-Comprehensive C4 diagrams and flows: `docs/architecture/c4-diagrams.md`
+Static config: environment variables or a `.env` file (see `env.example`), structs in `crates/config/src/types.rs`, YAML templates in `config/`. Runtime-changeable config uses the `admin_settings` KV store: `.claude/rules/architecture.md`.
 
-## Development Patterns
+### Observability
 
-### Adding a New Service
-1. Create directory: `crates/services/src/{service_name}/`
-2. Create `ports.rs` with trait definitions
-3. Create `mod.rs` or `service.rs` with implementation
-4. Define repository trait if data access needed
-5. Implement repository in `crates/database/src/repositories/`
-6. Update `crates/services/src/lib.rs` to export new service
+Structured logging with `tracing`; production runs at `info` with per-module levels (`LOG_MODULE_API=info`, `LOG_MODULE_SERVICES=debug`). Metrics go out through OpenTelemetry (OTLP exporter), with Datadog integration available.
 
-### Testing E2E Flows
-- E2E tests are modules in `crates/api/tests/e2e_all/`, compiled into one `e2e_all` binary
-- Common test utilities in `crates/api/tests/common/mod.rs`
-- Test helpers: `setup_test_server()`, `create_org()`, `get_api_key_for_org()`
-- Run database-backed E2E tests through `cargo nextest run --test e2e_all` so the
-  suite bootstrap, concurrency limits, and serialized overrides in
-  `.config/nextest.toml` apply.
-- Nextest processes share one real PostgreSQL database. Treat database state as
-  mutable between requests, independent of test order, and potentially retained
-  from an earlier run. Concurrent nextest invocations must use different,
-  disposable `TEST_DATABASE_NAME` values.
-- Keep bootstrapped shared fixtures immutable and use them only when the test
-  does not depend on exclusive history or state. Tests that create or mutate
-  users, organizations, workspaces, keys, models, aliases, jobs, schedules, or
-  usage must use UUID-scoped resources and assert through test-owned IDs, names,
-  or filters. Register test-owned model names with the mock provider pool when
-  exercising inference.
-- Scope queries and assertions to a stable, test-owned cohort. Across separate
-  requests, global totals, ordering, and offset boundaries may change. Prefer
-  direct lookup or keyset/cursor pagination; when an API only supports offset
-  pagination over mutable rows, restart and reconcile bounded scans until two
-  consecutive snapshots converge. Deduplication alone does not prevent skipped
-  rows after concurrent deletion.
-- Add tests that change database-wide state (including DDL, global queues or
-  schedulers, and broad scans or updates) to a serialized override in
-  `.config/nextest.toml`. Keep E2E concurrency and per-test pool limits within
-  PostgreSQL capacity, including secondary pools and background workers.
-- Stabilize asynchronous behavior with deadline-bounded polling of the exact
-  observable outcome. Use isolation and deterministic synchronization for test
-  reliability. Reserve bounded retries for idempotent database readiness or
-  bootstrap work before test processes start; keep test requests, assertions,
-  and nextest execution single-attempt so races remain visible.
+### External billing service
 
-### Database Migrations
-- SQL files in `crates/database/src/migrations/sql/`
-- Migrations run automatically on server startup
-- Use `refinery` for migration management
-- Name format: `V{number}__{description}.sql`
+Cloud API has no direct Stripe integration. Billing lives in the Next.js app in `../nearai-cloud-ui` (Vercel): `app/api/stripe/webhook/route.ts` handles Stripe checkout, `app/api/credit/sync/route.ts` recalculates credits, and `lib/webhook-utils.ts` calls `PATCH /v1/admin/organizations/{org_id}/limits` (`update_organization_limits` in `crates/api/src/routes/admin.rs`) using `NEAR_AI_CLOUD_ADMIN_ACCESS_TOKEN` and optional `BILLING_SERVICE_USER_AGENT`.
 
-### Error Handling
-- API errors use `api::models::ErrorResponse`
-- Standard error types: `unauthorized`, `forbidden`, `not_found`, `conflict`, `validation_error`
-- Service errors propagate up to routes, converted to HTTP responses
+## Rules index
 
-### Logging & Observability
-- Structured logging with `tracing` crate
-- Production log level: **info and above**
-- Module-specific levels: `LOG_MODULE_API=info`, `LOG_MODULE_SERVICES=debug`
-- OpenTelemetry metrics support (OTLP exporter)
-- Datadog integration available
-- **CRITICAL**: See "Privacy & Data Security" section above for what you can and cannot log
+Each rule has one home; other files point to it rather than restating it.
 
-## Key Architectural Decisions
+| File | Applies to | Covers |
+|---|---|---|
+| `.claude/rules/privacy-logging.md` | `crates/**/*.rs` | what may and may not be logged |
+| `.claude/rules/architecture.md` | `crates/**/*.rs` | layers, extending existing seams, errors, runtime config, file size |
+| `.claude/rules/rust-correctness.md` | `crates/**/*.rs` | panics, untrusted input, fail-closed, async, races, rolling deploys |
+| `.claude/rules/database.md` | `crates/database/**`, `ports.rs` | typed parsing vs migrations, migration mechanics, queries |
+| `.claude/rules/testing.md` | tests, `.config/nextest.toml` | tests that can fail, e2e isolation on a shared database |
+| `.claude/rules/ci-workflows.md` | `.github/**`, `scripts/**` | workflow trust boundaries, concurrency, required checks |
+| `REVIEW.md` | pull requests | severity, what to report and skip |
 
-### Why Two Auth Methods?
-- **Session Auth (OAuth)**: Interactive users managing resources
-- **API Key Auth**: Programmatic access to AI inference
-- Separation of concerns: management plane vs. data plane
-- Clear security boundaries
+## API documentation
 
 ### Why Hexagonal Architecture?
 - Services are framework-independent (can swap Axum for another framework)
@@ -399,23 +269,7 @@ Generated from Rust code using `utoipa` annotations.
 
 ## Troubleshooting
 
-### Tests Failing with Database Connection Errors
-1. Ensure PostgreSQL is running on port 5432
-2. Check database credentials match `env.example` defaults
-3. Try: `docker run --name test-postgres -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=platform_api -p 5432:5432 -d postgres:latest`
-
-### vLLM Integration Tests Failing
-1. Ensure vLLM server is running at configured URL
-2. Set environment variables: `VLLM_BASE_URL`, `VLLM_API_KEY` (optional)
-3. Check model availability at vLLM endpoint
-
-### Server Won't Start
-1. Check all required environment variables in `env.example`
-2. Verify database connectivity
-3. Check OAuth credentials (if using real OAuth, not mock)
-4. Review logs for specific errors (remember: no customer data in logs!)
-
-### Model Discovery Not Working
-1. Verify `MODEL_DISCOVERY_SERVER_URL` is accessible
-2. Check `MODEL_DISCOVERY_API_KEY` is correct
-3. Review discovery server response format matches expected schema
+- **Tests fail to connect to the database**: make sure PostgreSQL is on port 5432 with the `env.example` credentials (see the docker command above).
+- **vLLM integration tests fail**: set `VLLM_BASE_URL` (and `VLLM_API_KEY` if needed) and check the model is served.
+- **Server won't start**: check required variables in `env.example`, database connectivity, OAuth credentials (unless using mock OAuth), then the startup logs for the specific error.
+- **Model discovery not working**: check `MODEL_DISCOVERY_SERVER_URL` is reachable, `MODEL_DISCOVERY_API_KEY` is correct, and the response matches the expected schema.

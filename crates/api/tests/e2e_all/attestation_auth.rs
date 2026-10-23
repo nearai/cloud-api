@@ -4,6 +4,7 @@
 //   - GET /v1/attestation/report    -> API key required (non-billable)
 //   - GET /v1/signature/{chat_id}   -> API key required (unchanged)
 //   - GET /v1/attestation/ita-token -> public (explicit, documented decision)
+//   - GET /v1/attestation/pins -> public (explicit, documented decision)
 //
 // Covers: missing/malformed/invalid/expired/revoked credentials -> 401,
 // valid key -> 200 across query variants, and that report retrieval creates

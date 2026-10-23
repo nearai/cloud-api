@@ -244,6 +244,7 @@ async fn read_only_reads_and_mixed_method_mutations_have_no_side_effects() {
         "/v1/admin/models",
         "/v1/admin/feature-requests",
         "/v1/admin/aml/allowlist",
+        "/v1/admin/api-keys",
     ] {
         assert_eq!(
             call(&server, Method::GET, route, &read_only, json!({}))

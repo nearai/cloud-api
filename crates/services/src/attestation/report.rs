@@ -6,7 +6,8 @@ use super::{models::AttestationReport, AttestationError, AttestationService, Gat
 use crate::metrics::consts::{
     get_environment, METRIC_ATTESTATION_REPORT_CACHE, TAG_ENVIRONMENT, TAG_RESULT,
 };
-use inference_providers::ProviderTier;
+use crate::models::{resolve_model_cached, ModelCaller};
+use inference_providers::ProviderFilter;
 
 pub(in crate::attestation) fn generate_nonce_hex() -> String {
     let mut nonce_bytes = [0u8; 32];
@@ -42,29 +43,40 @@ pub(in crate::attestation) fn decode_nonce_hex(nonce: &str) -> Result<Vec<u8>, A
 /// before using the returned key). Every other parameter that changes the report
 /// contents IS part of the key, so a request can never receive a report built
 /// for a different model / algo / tls-fingerprint / provider tier / signing
-/// address. `signing_algo` is lowercased and defaulted to match the service's
-/// own algo normalization.
+/// address. `signing_algo` is the output of [`normalize_signing_algo`]. An
+/// omitted algorithm keys separately from an explicit `ed25519`: the gateway
+/// quote defaults to ed25519, but the model backend applies its own default
+/// (ecdsa on inference-proxy), so the two requests get different reports.
 fn report_cache_key(
     model: Option<&str>,
     signing_algo: Option<&str>,
     include_tls_fingerprint: bool,
-    provider_filter: Option<ProviderTier>,
+    provider_filter: Option<ProviderFilter>,
     signing_address: Option<&str>,
 ) -> String {
     format!(
         "m={}|a={}|tls={}|pf={}|sa={}",
         model.unwrap_or("*"),
-        signing_algo.unwrap_or("ed25519").to_ascii_lowercase(),
+        signing_algo.unwrap_or("-"),
         include_tls_fingerprint,
-        provider_filter.map(|t| t.as_str()).unwrap_or("-"),
+        provider_filter.map(ProviderFilter::as_str).unwrap_or("-"),
         signing_address.unwrap_or("-"),
     )
 }
 
-fn normalize_signing_algo(signing_algo: Option<&str>) -> Result<String, AttestationError> {
-    let algo = signing_algo
-        .map(str::to_lowercase)
-        .unwrap_or_else(|| "ed25519".to_string());
+/// Gateway quote algorithm when the caller does not choose one.
+const DEFAULT_GATEWAY_SIGNING_ALGO: &str = "ed25519";
+
+/// Validate and lowercase the caller's `signing_algo`. This is the only place
+/// the value is normalized: the cache key, the gateway quote and the request
+/// forwarded to the model backend all use the result, because model backends
+/// accept only the lowercase names. `None` stays `None`, so the model backend
+/// keeps applying its own default.
+fn normalize_signing_algo(signing_algo: Option<&str>) -> Result<Option<String>, AttestationError> {
+    let Some(algo) = signing_algo else {
+        return Ok(None);
+    };
+    let algo = algo.to_lowercase();
 
     if algo != "ecdsa" && algo != "ed25519" {
         return Err(AttestationError::InvalidParameter(format!(
@@ -72,10 +84,11 @@ fn normalize_signing_algo(signing_algo: Option<&str>) -> Result<String, Attestat
         )));
     }
 
-    Ok(algo)
+    Ok(Some(algo))
 }
 
 impl AttestationService {
+    #[allow(clippy::too_many_arguments)]
     pub(in crate::attestation) async fn get_attestation_report_impl(
         &self,
         model: Option<String>,
@@ -83,18 +96,62 @@ impl AttestationService {
         nonce: Option<String>,
         signing_address: Option<String>,
         include_tls_fingerprint: bool,
-        provider_filter: Option<ProviderTier>,
+        provider_filter: Option<ProviderFilter>,
+        caller: ModelCaller,
     ) -> Result<AttestationReport, AttestationError> {
         let env_tag = format!("{TAG_ENVIRONMENT}:{}", get_environment());
+        let signing_algo = normalize_signing_algo(signing_algo.as_deref())?;
+
+        // Resolve the model for the caller before the cache lookup below. A
+        // cache hit skips the build, so a check made inside the build would
+        // not run when another caller had already cached the report. A model
+        // the caller may not use fails here exactly like an unknown one.
+        let resolved_canonical = if let Some(ref m) = model {
+            let resolved_model = resolve_model_cached(
+                &self.model_resolve_cache,
+                self.models_repository.as_ref(),
+                m,
+                caller,
+            )
+            .await
+            .map_err(|e| AttestationError::ProviderError(format!("Failed to resolve model: {e}")))?
+            .ok_or_else(|| AttestationError::UnknownModel(m.clone()))?;
+            let canonical = resolved_model.model_name;
+            if &canonical != m {
+                tracing::debug!(
+                    requested_model = %m,
+                    canonical_model = %canonical,
+                    "Resolved alias to canonical model name for attestation report"
+                );
+            }
+            Some(canonical)
+        } else {
+            None
+        };
 
         // Precompute the no-nonce cache key BEFORE the params are moved into the
         // build closure below.
-        let cache_key = report_cache_key(
-            model.as_deref(),
-            signing_algo.as_deref(),
-            include_tls_fingerprint,
-            provider_filter,
-            signing_address.as_deref(),
+        let cache_key = format!(
+            "{}|off={}",
+            report_cache_key(
+                model.as_deref(),
+                signing_algo.as_deref(),
+                include_tls_fingerprint,
+                provider_filter,
+                signing_address.as_deref(),
+            ),
+            // The live `attested_3p` kill-switch policy is part of the key: a
+            // cache hit skips the build (and the pool's disabled-source
+            // filter), so a report cached before a source was disabled must
+            // not be reachable once the policy changes. Applies on this
+            // instance immediately, for filtered and unfiltered requests.
+            self.inference_provider_pool
+                .attested_3p_disabled()
+                .load()
+                .iter()
+                .map(inference_providers::ProviderSource::as_str)
+                .collect::<Vec<_>>()
+                .join(","),
         );
 
         // The full (expensive) report build. `nonce` is the closure parameter so
@@ -113,35 +170,10 @@ impl AttestationService {
                 generate_nonce_hex()
             });
             let nonce_bytes = decode_nonce_hex(&nonce)?;
-            let algo = normalize_signing_algo(signing_algo.as_deref())?;
-
-            // Resolve model alias synchronously (fast DB lookup ~10 ms) before
-            // spawning the parallel futures below.
-            let resolved_canonical = if let Some(ref m) = model {
-                let resolved_model = self
-                    .models_repository
-                    .resolve_and_get_model(m)
-                    .await
-                    .map_err(|e| {
-                        AttestationError::ProviderError(format!("Failed to resolve model: {e}"))
-                    })?
-                    .ok_or_else(|| {
-                        AttestationError::ProviderError(format!(
-                            "Model '{m}' not found. It's not a valid model name or alias."
-                        ))
-                    })?;
-                let canonical = resolved_model.model_name.clone();
-                if &canonical != m {
-                    tracing::debug!(
-                        requested_model = %m,
-                        canonical_model = %canonical,
-                        "Resolved alias to canonical model name for attestation report"
-                    );
-                }
-                Some(canonical)
-            } else {
-                None
-            };
+            let algo = signing_algo
+                .as_deref()
+                .unwrap_or(DEFAULT_GATEWAY_SIGNING_ALGO)
+                .to_string();
 
             let signing_address_to_use = self.get_signing_address_hex(&algo)?;
             let signing_address_clean = signing_address_to_use
@@ -201,6 +233,7 @@ impl AttestationService {
                     if let Some(canonical) = resolved_canonical {
                         pool.get_attestation_report(
                             canonical,
+                            // Normalized above; `None` keeps the backend's default.
                             signing_algo,
                             // Key fix: only forward the nonce when the caller supplied one.
                             // When None, inference-proxy serves its 5-min cached report
@@ -288,8 +321,30 @@ impl AttestationService {
 
 #[cfg(test)]
 mod cache_key_tests {
-    use super::report_cache_key;
-    use inference_providers::ProviderTier;
+    use super::{normalize_signing_algo, report_cache_key};
+    use crate::attestation::AttestationError;
+    use inference_providers::{ProviderFilter, ProviderSource};
+
+    #[test]
+    fn report_cache_key_distinguishes_3p_sources() {
+        let c = report_cache_key(
+            Some("m"),
+            None,
+            false,
+            Some(ProviderFilter::Source(ProviderSource::Chutes)),
+            None,
+        );
+        let t = report_cache_key(
+            Some("m"),
+            None,
+            false,
+            Some(ProviderFilter::Source(ProviderSource::Tinfoil)),
+            None,
+        );
+        let n = report_cache_key(Some("m"), None, false, Some(ProviderFilter::Near), None);
+        assert!(c.contains("pf=chutes") && t.contains("pf=tinfoil") && n.contains("pf=near"));
+        assert_ne!(c, t);
+    }
 
     #[test]
     fn key_is_independent_of_nonce_by_construction() {
@@ -304,16 +359,37 @@ mod cache_key_tests {
     }
 
     #[test]
-    fn algo_defaults_and_lowercases() {
-        // None defaults to ed25519; case is normalized so ECDSA and ecdsa collide.
-        assert_eq!(
-            report_cache_key(Some("m"), None, false, None, None),
-            report_cache_key(Some("m"), Some("ed25519"), false, None, None),
-        );
-        assert_eq!(
-            report_cache_key(Some("m"), Some("ECDSA"), false, None, None),
-            report_cache_key(Some("m"), Some("ecdsa"), false, None, None),
-        );
+    fn normalize_lowercases_and_keeps_omitted_algo_unset() {
+        for (input, expected) in [
+            ("ECDSA", "ecdsa"),
+            ("ecdsa", "ecdsa"),
+            ("Ed25519", "ed25519"),
+            ("ED25519", "ed25519"),
+        ] {
+            assert_eq!(
+                normalize_signing_algo(Some(input)).unwrap().as_deref(),
+                Some(expected)
+            );
+        }
+        assert_eq!(normalize_signing_algo(None).unwrap(), None);
+        assert!(matches!(
+            normalize_signing_algo(Some("rsa")),
+            Err(AttestationError::InvalidParameter(_))
+        ));
+    }
+
+    #[test]
+    fn algo_casings_share_a_key_but_omitted_algo_does_not() {
+        let key = |algo: Option<&str>| {
+            let algo = normalize_signing_algo(algo).unwrap();
+            report_cache_key(Some("m"), algo.as_deref(), false, None, None)
+        };
+        assert_eq!(key(Some("ECDSA")), key(Some("ecdsa")));
+        assert_eq!(key(Some("Ed25519")), key(Some("ed25519")));
+        // The gateway defaults to ed25519 but the model backend defaults to
+        // ecdsa, so an omitted algo must not be served an explicit-ed25519
+        // report (or vice versa).
+        assert_ne!(key(None), key(Some("ed25519")));
     }
 
     #[test]
@@ -338,7 +414,7 @@ mod cache_key_tests {
                 Some("m"),
                 Some("ecdsa"),
                 false,
-                Some(ProviderTier::Near),
+                Some(ProviderFilter::Near),
                 None
             )
         );
@@ -352,14 +428,14 @@ mod cache_key_tests {
                 Some("m"),
                 Some("ecdsa"),
                 false,
-                Some(ProviderTier::Near),
+                Some(ProviderFilter::Near),
                 None
             ),
             report_cache_key(
                 Some("m"),
                 Some("ecdsa"),
                 false,
-                Some(ProviderTier::Attested3p),
+                Some(ProviderFilter::Source(ProviderSource::Chutes)),
                 None
             ),
         );

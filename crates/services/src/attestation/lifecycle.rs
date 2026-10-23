@@ -6,7 +6,8 @@ use super::{
     environment::{load_tls_cert_fingerprint, load_vpc_info, load_vpc_shared_secret},
     ita::{ita_client_error_class, ItaClient, ProviderPoolModelAttestationCollector},
     AttestationError, AttestationRepository, AttestationService, DstackGatewayQuoteCollector,
-    InferenceProviderPool, MetricsServiceTrait, ModelsRepository, UsageRepository,
+    InferenceProviderPool, MetricsServiceTrait, ModelResolveCache, ModelsRepository,
+    UsageRepository,
 };
 
 /// Default TTL (seconds) for the no-nonce attestation-report cache. Reports for
@@ -20,6 +21,7 @@ impl AttestationService {
         repository: Arc<dyn AttestationRepository + Send + Sync>,
         inference_provider_pool: Arc<InferenceProviderPool>,
         models_repository: Arc<dyn ModelsRepository>,
+        model_resolve_cache: ModelResolveCache,
         metrics_service: Arc<dyn MetricsServiceTrait>,
         usage_repository: Arc<dyn UsageRepository>,
         ita_config: ItaAttestationConfig,
@@ -128,6 +130,7 @@ impl AttestationService {
             repository,
             inference_provider_pool,
             models_repository,
+            model_resolve_cache,
             metrics_service,
             usage_repository,
             vpc_info,

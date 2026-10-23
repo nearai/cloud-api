@@ -468,8 +468,19 @@ async fn test_chat_completions_stream_include_usage_false_attested_strips_usage_
 async fn test_chat_completions_stream_include_usage_true_emits_final_usage_only() {
     // include_usage:true on the (attested) qwen model: intermediate chunks carry
     // usage:null and exactly one final usage chunk is emitted (rewrite path).
+    // The mock engine reasons and reports the count SGLang-style (top-level
+    // `usage.reasoning_tokens`); the final chunk must also carry it in
+    // `completion_tokens_details`, where OpenAI-compatible clients read it.
     ensure_usage_chat_completions_env();
-    let server = setup_test_server().await;
+    let (server, _pool, mock_provider, _db) = setup_test_server_with_pool().await;
+    let reasoning = "First add the numbers, then check the sum.";
+    let reasoning_tokens = reasoning.split_whitespace().count() as i64;
+    mock_provider
+        .set_default_response(
+            inference_providers::mock::ResponseTemplate::new("hello back")
+                .with_reasoning(reasoning),
+        )
+        .await;
 
     setup_qwen_model(&server).await;
     let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
@@ -496,6 +507,7 @@ async fn test_chat_completions_stream_include_usage_true_emits_final_usage_only(
     let text = stream_resp.text();
     let mut final_usage_chunks = 0;
     let mut content_chunks = 0;
+    let mut final_usage = None;
     for line in text.lines() {
         let Some(data) = line.strip_prefix("data: ") else {
             continue;
@@ -518,6 +530,7 @@ async fn test_chat_completions_stream_include_usage_true_emits_final_usage_only(
             });
         if is_terminal_chunk && value.get("usage").is_some_and(serde_json::Value::is_object) {
             final_usage_chunks += 1;
+            final_usage = value.get("usage").cloned();
         } else {
             content_chunks += 1;
             assert!(
@@ -531,6 +544,15 @@ async fn test_chat_completions_stream_include_usage_true_emits_final_usage_only(
     assert_eq!(
         final_usage_chunks, 1,
         "include_usage=true should expose exactly one final usage chunk"
+    );
+    let final_usage = final_usage.expect("final usage chunk");
+    assert_eq!(
+        final_usage["completion_tokens_details"]["reasoning_tokens"], reasoning_tokens,
+        "final usage chunk must report reasoning in completion_tokens_details: {final_usage}"
+    );
+    assert_eq!(
+        final_usage["reasoning_tokens"], reasoning_tokens,
+        "final usage chunk keeps the engine's top-level reasoning count: {final_usage}"
     );
 }
 

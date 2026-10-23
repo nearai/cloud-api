@@ -13,6 +13,14 @@ on:
     tags:
       - 'v*'
 
+# Serialize builds per ref so :latest is pushed and the staging/dev dispatches fire in commit
+# order. queue: max keeps every pending run (FIFO) instead of GitHub's default of replacing
+# queued runs, so no commit is skipped and every one still gets its staging-stamped tag.
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: false
+  queue: max
+
 env:
   REGISTRY: docker.io
   IMAGE_REPOSITORY: ${{ vars.DOCKER_REGISTRY_USER }}/cloud-api
@@ -121,6 +129,16 @@ jobs:
           token: ${{ secrets.REPOSITORY_DISPATCH_TOKEN }}
           repository: nearai/cvm-ansible-playbooks
           event-type: deploy-cloud-api-stg
+
+      # Dev tracks the tip of main with no freeze window. Main builds push :latest,
+      # non-main builds push :dev, so dispatch only when :latest was pushed.
+      - name: Trigger dev deployment
+        if: github.ref == 'refs/heads/main'
+        uses: peter-evans/repository-dispatch@28959ce8df70de7be546dd1250a005dd32156697 # v4.0.1
+        with:
+          token: ${{ secrets.REPOSITORY_DISPATCH_TOKEN }}
+          repository: nearai/cvm-ansible-playbooks
+          event-type: deploy-cloud-api-dev
 
       - name: Generate build summary
         run: |

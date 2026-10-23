@@ -19,6 +19,7 @@ DATABASE_PASSWORD_FILE=/run/secrets/rds-app-password
 DATABASE_TLS_ENABLED=true
 DATABASE_TLS_CA_CERT_PATH=/run/certs/us-east-1-bundle.pem
 DATABASE_MAX_CONNECTIONS=16
+DATABASE_RECYCLING_METHOD=fast
 ```
 
 Create an appropriately privileged RDS application account; the example username
@@ -41,8 +42,12 @@ This mode uses one pool for application reads and writes against the configured
 writer endpoint. Hostname padding is trimmed; empty database/user names are rejected.
 Pool wait, creation and recycling have explicit timeouts of 5, 10 and 5 seconds,
 respectively, in addition to the 10-second socket connection timeout. Recycled
-connections run a verification query before checkout. These are per-operation
-bounds, not an overall request/query deadline, and are not currently configurable.
+connections use `fast` recycling by default, which skips the verification
+query on checkout. Set `DATABASE_RECYCLING_METHOD=verified` to run that query;
+only lowercase `fast` and `verified` are accepted. A pool wait timeout is not
+retried because it indicates exhausted checkout capacity. The timeouts are
+per-operation bounds, not an overall request/query deadline, and are not
+currently configurable.
 It does not discover RDS read replicas. On failover, existing
 connections can break; new connections resolve the endpoint again. Validate
 application retry behavior; this does not guarantee interruption-free failover.

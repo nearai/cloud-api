@@ -2,6 +2,9 @@
 mod chat_signature_lifecycle_tests;
 mod chat_signatures;
 pub mod chutes;
+pub mod chutes_observer;
+pub mod chutes_pins;
+pub mod chutes_pins_view;
 mod environment;
 mod gateway_quote;
 mod gateway_signatures;
@@ -10,12 +13,23 @@ mod keys;
 mod lifecycle;
 pub mod measurement;
 pub mod models;
+pub mod pins_view;
 pub mod ports;
 #[cfg(test)]
 mod provider_signature_tests;
 mod report;
 pub mod report_data;
+#[cfg(test)]
+mod report_tests;
 mod service_trait;
+pub mod snp;
+pub mod tinfoil;
+#[cfg(test)]
+mod tinfoil_live_tests;
+pub mod tinfoil_observer;
+pub mod tinfoil_pins;
+pub mod tinfoil_pins_view;
+pub mod tinfoil_trust;
 pub mod verification;
 
 use std::sync::Arc;
@@ -34,13 +48,16 @@ pub use measurement::MeasurementPolicy;
 pub use models::{AttestationError, ChatSignature, SignatureKind, SignatureLookupResult};
 pub(in crate::attestation) use report::{decode_nonce_hex, generate_nonce_hex};
 pub use report_data::{ReportDataVerifier, StrictBoundReportDataVerifier};
-pub use verification::{AttestationVerificationError, AttestationVerifier, VerifiedAttestation};
+pub use verification::{
+    AttestationVerificationError, AttestationVerifier, BackendAttestationVerifier,
+    ReplicaReportKey, VerifiedAttestation,
+};
 
 use crate::{
     attestation::{ita::ItaClient, models::VpcInfo, ports::AttestationRepository},
     inference_provider_pool::InferenceProviderPool,
     metrics::MetricsServiceTrait,
-    models::ModelsRepository,
+    models::{ModelResolveCache, ModelsRepository},
     usage::UsageRepository,
 };
 
@@ -48,6 +65,10 @@ pub struct AttestationService {
     pub repository: Arc<dyn AttestationRepository + Send + Sync>,
     pub inference_provider_pool: Arc<InferenceProviderPool>,
     pub models_repository: Arc<dyn ModelsRepository>,
+    /// The cache owned by `ModelsServiceImpl`, so a model is resolved here
+    /// with the access decisions (and the admin invalidation) the rest of
+    /// the request path uses.
+    pub model_resolve_cache: ModelResolveCache,
     pub metrics_service: Arc<dyn MetricsServiceTrait>,
     pub usage_repository: Arc<dyn UsageRepository>,
     pub vpc_info: Option<VpcInfo>,

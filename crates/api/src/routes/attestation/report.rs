@@ -3,14 +3,18 @@ use super::{
     errors::{attestation_report_error_response, error_response},
     AttestationRouteState,
 };
-use crate::{models::ErrorResponse, ohttp_gateway::OhttpAttestation};
+use crate::{
+    middleware::auth::AuthenticatedApiKey, models::ErrorResponse, ohttp_gateway::OhttpAttestation,
+};
 use axum::{
     extract::{Query, State},
     http::{HeaderMap, StatusCode},
     response::Json as ResponseJson,
+    Extension,
 };
-use inference_providers::ProviderTier;
+use inference_providers::{ProviderFilter, ProviderSource};
 use serde::{Deserialize, Serialize};
+use services::models::ModelCaller;
 use utoipa::{IntoParams, ToSchema};
 
 /// Query parameters for attestation report
@@ -23,8 +27,8 @@ pub struct AttestationQuery {
     /// Include the TLS certificate SPKI fingerprint in the report-data binding.
     /// Defaults to false; when true, report_data[..32] = SHA256(signing_address || tls_cert_fingerprint).
     pub include_tls_fingerprint: Option<bool>,
-    /// Restrict the report to a specific serving tier.
-    /// Accepted values: `near` (NEAR AI's own TEE fleet) or `chutes` (attested Chutes fallback).
+    /// Restrict the report to a specific provider.
+    /// Accepted values: `near` (NEAR AI's own TEE fleet), `chutes`, or `tinfoil` (attested third-party sources).
     /// When omitted, the first successfully responding provider is used.
     pub provider: Option<String>,
 }
@@ -155,7 +159,7 @@ impl From<services::attestation::models::AttestationReport> for AttestationRespo
     ),
     responses(
         (status = 200, description = "Attestation report retrieved", body = AttestationResponse),
-        (status = 400, description = "Invalid nonce format", body = ErrorResponse),
+        (status = 400, description = "Invalid nonce, signing_algo or provider, or unknown model (a model the key's organization may not use is reported as unknown)", body = ErrorResponse),
         (status = 401, description = "Missing or invalid API key", body = ErrorResponse),
         (status = 503, description = "Service unavailable", body = ErrorResponse)
     ),
@@ -167,10 +171,18 @@ impl From<services::attestation::models::AttestationReport> for AttestationRespo
 pub async fn get_attestation_report(
     Query(params): Query<AttestationQuery>,
     State(state): State<AttestationRouteState>,
+    Extension(api_key): Extension<AuthenticatedApiKey>,
     headers: HeaderMap,
 ) -> Result<axum::response::Response, (StatusCode, ResponseJson<ErrorResponse>)> {
-    let alias_resolved =
-        resolve_attestation_alias(params.model.as_deref(), &state.models_service, &headers).await?;
+    // An unlisted model has a report only for an organization that may use it.
+    let caller = ModelCaller::Organization(api_key.organization.id.0);
+    let alias_resolved = resolve_attestation_alias(
+        params.model.as_deref(),
+        &state.models_service,
+        caller,
+        &headers,
+    )
+    .await?;
     let provider_filter = match params
         .provider
         .as_deref()
@@ -178,12 +190,15 @@ pub async fn get_attestation_report(
         .as_deref()
     {
         None => None,
-        Some("near") => Some(ProviderTier::Near),
-        Some("chutes") => Some(ProviderTier::Attested3p),
+        Some("near") => Some(ProviderFilter::Near),
+        Some("chutes") => Some(ProviderFilter::Source(ProviderSource::Chutes)),
+        Some("tinfoil") => Some(ProviderFilter::Source(ProviderSource::Tinfoil)),
         Some(unknown) => {
             return Err(error_response(
                 StatusCode::BAD_REQUEST,
-                format!("Unknown provider '{unknown}'. Accepted values: 'near', 'chutes'."),
+                format!(
+                    "Unknown provider '{unknown}'. Accepted values: 'near', 'chutes', 'tinfoil'."
+                ),
                 "invalid_request_error",
                 Some("provider"),
             ));
@@ -199,6 +214,7 @@ pub async fn get_attestation_report(
             params.signing_address,
             params.include_tls_fingerprint.unwrap_or(false),
             provider_filter,
+            caller,
         )
         .await
         .map_err(attestation_report_error_response)?;

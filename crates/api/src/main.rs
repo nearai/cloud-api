@@ -15,6 +15,23 @@ mod telemetry;
 
 #[tokio::main]
 async fn main() {
+    // Install the process-wide rustls crypto provider unconditionally, as
+    // early as possible. Both `aws-lc-rs` and `ring` are enabled on rustls
+    // (needed for TLS support across the dependency graph), which removes
+    // rustls's implicit default provider for the whole binary: any rustls
+    // config built through that implicit default (today, `redis`'s
+    // `rediss://` TLS setup) would otherwise panic unless something already
+    // installed a provider first. `inference_providers::placement_io` also
+    // calls this lazily inside `PlacementIo::start` (kept below, since it's
+    // the one path that's guaranteed to run before that crate's own
+    // `rediss://` client is built) — installing it here too makes the
+    // default provider exist regardless of whether placement is configured.
+    // `install_crypto_provider` is idempotent: a second call is a no-op.
+    // The `database` crate separately installs `ring` as well; both calls
+    // race for "install_default" and only the first one wins, which is fine
+    // since they install the same provider.
+    inference_providers::placement_io::install_crypto_provider();
+
     // Load configuration and initialize logging
     let config = load_configuration();
     init_tracing(&config.logging);
@@ -100,6 +117,44 @@ async fn main() {
         .start(config.server.usage_hourly_interval_secs)
         .await;
 
+    // A durable per-org claim prevents replica duplication. Keep two jobs in
+    // flight so a slow final verification does not stall every other organization.
+    let discount_repository = database::repositories::organization_usage_discount::OrganizationUsageDiscountRepository::new(database.pool().clone());
+    let discount_worker = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut jobs = tokio::task::JoinSet::new();
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    while jobs.len() < 2 {
+                        match discount_repository.claim_next().await {
+                            Ok(Some(claim)) => {
+                                let repository = discount_repository.clone();
+                                jobs.spawn(async move {
+                                    let organization_id = claim.organization_id;
+                                    if let Err(error) = repository.run_claimed(claim).await {
+                                        tracing::error!(%organization_id, %error, "Usage discount correction deferred for retry");
+                                    }
+                                });
+                            }
+                            Ok(None) => break,
+                            Err(error) => {
+                                tracing::error!(%error, "Failed to claim usage discount work");
+                                break;
+                            }
+                        }
+                    }
+                }
+                result = jobs.join_next(), if !jobs.is_empty() => {
+                    if let Some(Err(error)) = result {
+                        tracing::error!(%error, "Usage discount worker stopped; claim will expire");
+                    }
+                }
+            }
+        }
+    });
+
     // Start server with graceful shutdown handling
     start_server(
         app,
@@ -108,6 +163,7 @@ async fn main() {
         domain_services.inference_provider_pool,
         pricing_scheduler,
         usage_hourly_scheduler,
+        discount_worker,
     )
     .await;
 }
@@ -131,6 +187,7 @@ async fn start_server(
     inference_provider_pool: Arc<InferenceProviderPool>,
     pricing_scheduler: Arc<ModelPricingScheduler>,
     usage_hourly_scheduler: Arc<services::usage::UsageHourlyScheduler>,
+    discount_worker: tokio::task::JoinHandle<()>,
 ) {
     let bind_address = format!("{}:{}", config.server.host, config.server.port);
     let listener = tokio::net::TcpListener::bind(&bind_address)
@@ -149,7 +206,10 @@ async fn start_server(
 
     let server = axum::serve(listener, app).with_graceful_shutdown(shutdown_signal());
 
-    match server.await {
+    let result = server.await;
+    discount_worker.abort();
+    let _ = discount_worker.await;
+    match result {
         Ok(_) => {
             tracing::info!("Server shutdown successfully, initiating coordinated cleanup");
             perform_coordinated_shutdown(

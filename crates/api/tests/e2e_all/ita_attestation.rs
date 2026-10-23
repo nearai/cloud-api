@@ -127,6 +127,36 @@ async fn ita_token_rejects_alias_when_no_aliasing_is_requested() {
 }
 
 #[tokio::test]
+async fn ita_token_unknown_model_returns_model_parameter_error() {
+    let fake_ita = FakeIta::start(FakeItaMode::Success).await;
+    let server = setup_ita_server(&fake_ita, ItaServerMode::Enabled { max_retries: 0 }).await;
+    let unknown = format!("test-unknown/model-{}", uuid::Uuid::new_v4());
+    let encoded = url::form_urlencoded::byte_serialize(unknown.as_bytes()).collect::<String>();
+
+    for no_aliasing in [false, true] {
+        let mut request = server.get(&format!("{ITA_TOKEN_PATH}?model={encoded}&nonce={NONCE}"));
+        if no_aliasing {
+            request = request.add_header(HEADER_NO_ALIASING, "true");
+        }
+        let response = request.await;
+
+        assert_eq!(response.status_code(), 400, "{}", response.text());
+        let body: Value = response.json();
+        assert_eq!(
+            body["error"],
+            json!({
+                "message": format!("Model '{unknown}' not found. It's not a valid model name or alias."),
+                "type": "invalid_request_error",
+                "param": "model",
+                "code": null,
+            })
+        );
+    }
+    // Resolving an unknown model must fail before either ITA appraisal.
+    assert_eq!(fake_ita.paths(), vec!["/appraisal/v2/nonce"; 2]);
+}
+
+#[tokio::test]
 async fn ita_token_announces_alias_when_alias_is_served() {
     // Given: a model alias exists and ITA is configured.
     let fake_ita = FakeIta::start(FakeItaMode::Success).await;

@@ -39,6 +39,11 @@ pub struct User {
     pub provider_user_id: String,
     /// Timestamp when all tokens were revoked (for invalidating access tokens)
     pub tokens_revoked_at: Option<DateTime<Utc>>,
+    /// Verified contact address (set at confirmation, never by login)
+    pub contact_email: Option<String>,
+    pub contact_email_verified_at: Option<DateTime<Utc>>,
+    /// When the user agreed to be emailed at `contact_email`
+    pub email_opt_in_at: Option<DateTime<Utc>>,
 }
 
 /// Organization membership - many-to-many relationship between users and organizations
@@ -517,6 +522,9 @@ pub struct Model {
     pub is_ready: Option<bool>,
     /// Planned deprecation date (ISO 8601). NULL = no planned deprecation.
     pub deprecation_date: Option<DateTime<Utc>>,
+    /// Canonical name of the recommended replacement model. Cleared together
+    /// with `deprecation_date`.
+    pub successor_model_name: Option<String>,
     /// OpenRouter `openrouter.slug` override (lowercase `author/slug`). Set when
     /// our canonical `model_name` does not match OpenRouter's slug. NULL = unset;
     /// the public API then omits the nested `openrouter` object.
@@ -527,6 +535,12 @@ pub struct Model {
     /// If true, this model may be activated even when both cost fields are 0.
     /// Intended for intentionally-free models (e.g. community previews).
     pub allow_free: bool,
+    /// Whether the model is listed. A listed model appears in the public
+    /// model catalogs (`GET /v1/models`, `GET /v1/model/list`,
+    /// `GET /v1/model/{name}`) and every caller may use it. An unlisted model
+    /// stays active and billable but is left out of them, and only an
+    /// organization with a row in `organization_model_access` may use it.
+    pub is_listed: bool,
     pub owned_by: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -554,11 +568,21 @@ pub struct UpdateModelPricingRequest {
     pub is_active: Option<bool>,
     /// If true, allows activation even with zero pricing.
     pub allow_free: Option<bool>,
+    /// `Some(false)` unlists the model: it leaves the public model catalogs
+    /// and only organizations that hold a grant may use it. `Some(true)`
+    /// lists it again, `None` leaves the column unchanged (new rows default
+    /// to listed).
+    pub is_listed: Option<bool>,
     pub aliases: Option<Vec<String>>,
     pub owned_by: Option<String>,
     // Provider configuration
     pub provider_type: Option<String>,
     pub provider_config: Option<serde_json::Value>,
+    /// Compare-and-set guard for `provider_config` on update: `Some(expected)`
+    /// applies the update only while the stored config equals `expected`
+    /// (`Some(None)` = NULL); otherwise it fails with `TransactionConflict`.
+    #[serde(skip)]
+    pub expected_provider_config: Option<Option<serde_json::Value>>,
     pub attestation_supported: Option<bool>,
     // Architecture/modalities
     pub input_modalities: Option<Vec<String>>,
@@ -579,6 +603,10 @@ pub struct UpdateModelPricingRequest {
     /// Tri-state: `None` = leave unchanged, `Some(None)` = clear to NULL,
     /// `Some(Some(dt))` = set to `dt`.
     pub deprecation_date: Option<Option<DateTime<Utc>>>,
+    /// Recommended replacement model for a planned deprecation.
+    /// Tri-state: `None` = leave unchanged, `Some(None)` = clear to NULL,
+    /// `Some(Some(v))` = set to `v`. Also cleared when `deprecation_date` is.
+    pub successor_model_name: Option<Option<String>>,
     /// OpenRouter `openrouter.slug` override.
     /// Tri-state: `None` = leave unchanged, `Some(None)` = clear to NULL,
     /// `Some(Some(v))` = set to `v`.
@@ -637,6 +665,7 @@ pub struct ModelHistory {
     pub datacenters: Option<Vec<String>>,
     pub is_ready: Option<bool>,
     pub deprecation_date: Option<DateTime<Utc>>,
+    pub successor_model_name: Option<String>,
     /// OpenRouter `openrouter.slug` override the model carried at this point.
     pub openrouter_slug: Option<String>,
 
@@ -652,6 +681,9 @@ pub struct ModelHistory {
 
     /// If true, this model was allowed to serve without pricing at this point in time.
     pub allow_free: bool,
+    /// Whether the model was listed (in the public model catalogs and open to
+    /// every caller) at this point in time.
+    pub is_listed: bool,
 }
 
 /// Model alias - maps client-facing alias names to canonical vLLM model names
@@ -773,6 +805,8 @@ pub struct OrganizationUsageLog {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrganizationBalance {
     pub organization_id: Uuid,
+    /// Historical consumption not yet assigned to a credit type, in nano-USD.
+    pub legacy_unattributed_amount: i64,
     pub total_spent: i64,
     pub last_usage_at: Option<DateTime<Utc>>,
     pub total_requests: i64,

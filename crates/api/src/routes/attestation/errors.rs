@@ -19,6 +19,7 @@ pub(super) fn signature_error_response(
             "invalid_request_error",
             invalid_parameter_name(detail),
         ),
+        AttestationError::UnknownModel(_) => unknown_model_response(message),
         AttestationError::ClientError(_) => error_response(
             StatusCode::BAD_REQUEST,
             message,
@@ -52,6 +53,7 @@ pub(super) fn attestation_report_error_response(
             "invalid_request_error",
             invalid_parameter_name(detail),
         ),
+        AttestationError::UnknownModel(_) => unknown_model_response(message),
         AttestationError::ClientError(_) => error_response(
             StatusCode::BAD_REQUEST,
             message,
@@ -91,6 +93,9 @@ pub(super) fn ita_token_error_response(error: AttestationError) -> Response {
             "invalid_request_error",
             invalid_parameter_name(detail),
         )),
+        AttestationError::UnknownModel(_) => {
+            error_tuple_into_response(unknown_model_response(message))
+        }
         AttestationError::ClientError(_) => error_tuple_into_response(error_response(
             StatusCode::BAD_REQUEST,
             message,
@@ -170,6 +175,17 @@ pub(super) fn internal_error_response(
         message,
         "internal_server_error",
         None,
+    )
+}
+
+/// Same status and envelope as `/v1/chat/completions` for a model that is
+/// neither a catalog name nor an alias.
+fn unknown_model_response(message: String) -> (StatusCode, ResponseJson<ErrorResponse>) {
+    error_response(
+        StatusCode::BAD_REQUEST,
+        message,
+        "invalid_request_error",
+        Some("model"),
     )
 }
 

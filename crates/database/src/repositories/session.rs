@@ -7,12 +7,15 @@ use regex::Regex;
 use services::common::RepositoryError;
 use sha2::{Digest, Sha256};
 use std::sync::OnceLock;
-use tracing::debug;
+use tracing::{debug, warn};
 use uuid::Uuid;
 
 pub struct SessionRepository {
     pool: DbPool,
 }
+
+// Covers the UI's 30-second upstream timeout plus network jitter.
+const REFRESH_REUSE_WINDOW_SECONDS: i64 = 60;
 
 impl SessionRepository {
     pub fn new(pool: DbPool) -> Self {
@@ -31,25 +34,34 @@ impl SessionRepository {
         hex::encode(hasher.finalize())
     }
 
-    /// Normalize User-Agent string by removing version numbers.
+    /// Normalize User-Agent string by removing browser and platform versions.
     ///
-    /// This removes version numbers (e.g., "/129.0.6668.92") to prevent
-    /// session invalidation when browsers update. Examples:
+    /// This removes product versions (e.g., "/129.0.6668.92") and OS versions
+    /// (e.g., "iPhone OS 17_5" or "Android 14") so routine updates do not
+    /// invalidate the session. Keep the platform and device names for binding.
+    /// Examples:
     /// - "Chrome/129.0.6668.92" -> "Chrome"
     /// - "Safari/605.1.15" -> "Safari"
     /// - "Firefox/131.0" -> "Firefox"
     /// - "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36"
-    ///   -> "Mozilla (Windows NT 10.0; Win64; x64) AppleWebKit (KHTML, like Gecko) Chrome Safari"
+    ///   -> "Mozilla (Windows NT; Win64; x64) AppleWebKit (KHTML, like Gecko) Chrome Safari"
     fn normalize_user_agent(user_agent: &str) -> String {
-        // Remove version patterns: "/" followed by digits and dots
-        // This matches patterns like "/129.0.6668.92", "/605.1.15", "/131.0", "/537.36"
         static VERSION_PATTERN: OnceLock<Regex> = OnceLock::new();
+        static PLATFORM_VERSION_PATTERN: OnceLock<Regex> = OnceLock::new();
 
-        let pattern = VERSION_PATTERN.get_or_init(|| {
+        let product_version = VERSION_PATTERN.get_or_init(|| {
             Regex::new(r"/[A-Za-z0-9._-]+").expect("Failed to compile version pattern regex")
         });
+        let platform_version = PLATFORM_VERSION_PATTERN.get_or_init(|| {
+            Regex::new(r"(?i)\b(OS|Android|Mac OS X|Windows NT)\s+\d+(?:[._]\d+)*")
+                .expect("Failed to compile platform version pattern regex")
+        });
 
-        pattern.replace_all(user_agent, "").trim().to_string()
+        let without_product_versions = product_version.replace_all(user_agent, "");
+        platform_version
+            .replace_all(&without_product_versions, "$1")
+            .trim()
+            .to_string()
     }
 
     /// Create a new refresh token session
@@ -84,13 +96,14 @@ impl SessionRepository {
                 .map_err(RepositoryError::PoolError)?;
 
             client
-                .query_one(
+                .query_opt(
                     r#"
             INSERT INTO refresh_tokens (
                 id, user_id, token_hash, created_at, expires_at,
                 ip_address, user_agent
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            SELECT $1, $2, $3, $4, $5, $6, $7
+            WHERE EXISTS (SELECT 1 FROM users WHERE id = $2 AND is_active = true FOR SHARE)
             RETURNING *
             "#,
                     &[
@@ -104,7 +117,8 @@ impl SessionRepository {
                     ],
                 )
                 .await
-                .map_err(map_db_error)
+                .map_err(map_db_error)?
+                .ok_or_else(|| RepositoryError::NotFound("active user".to_string()))
         })?;
 
         debug!(
@@ -136,10 +150,16 @@ impl SessionRepository {
             client
                 .query_opt(
                     r#"
-            SELECT * FROM refresh_tokens 
-            WHERE token_hash = $1 AND expires_at > $2
+            SELECT * FROM refresh_tokens
+            WHERE expires_at > $2
+              AND (token_hash = $1 OR
+                   (previous_token_hash = $1 AND rotated_at > $3))
             "#,
-                    &[&token_hash, &now],
+                    &[
+                        &token_hash,
+                        &now,
+                        &(now - chrono::Duration::seconds(REFRESH_REUSE_WINDOW_SECONDS)),
+                    ],
                 )
                 .await
                 .map_err(map_db_error)
@@ -152,6 +172,7 @@ impl SessionRepository {
                 if stored_normalized == normalized_user_agent {
                     Ok(Some(session))
                 } else {
+                    warn!(session_id = %session.id, reason = "user_agent_mismatch", "Refresh token rejected");
                     Ok(None)
                 }
             }
@@ -240,22 +261,24 @@ impl SessionRepository {
 
     /// Rotates a refresh token session.
     ///
-    /// This operation atomically updates the token hash and expiration time in the database,
-    /// invalidating the old token. This ensures that the previous token can no longer be used.
+    /// Serializes rotation per session. A duplicate use of the immediate
+    /// predecessor within the reuse window returns the same successor; a request
+    /// with the current token during that window does not rotate again. This
+    /// prevents out-of-order HTTP responses from overwriting the browser's
+    /// cookie with a superseded token.
     ///
-    /// The old_token_hash is included in the WHERE clause to prevent race conditions where
-    /// two requests try to rotate the same token simultaneously. If the token was already
-    /// rotated, no row will be updated and an error will be returned.
-    ///
-    /// Returns the updated session and the new plaintext token.
+    /// Callers must derive `successor_token` deterministically from `old_token`
+    /// so concurrent retries present the same successor. Otherwise they fail
+    /// instead of reusing the existing rotation.
     pub async fn rotate(
         &self,
         session_id: Uuid,
-        old_token_hash: &str,
+        old_token: &str,
+        successor_token: &str,
         expires_in_hours: i64,
     ) -> Result<(Session, String)> {
-        let new_session_token = Self::generate_session_token();
-        let new_token_hash = Self::hash_session_token(&new_session_token);
+        let old_token_hash = Self::hash_session_token(old_token);
+        let successor_hash = Self::hash_session_token(successor_token);
         let new_expires_at = Utc::now()
             + chrono::Duration::seconds(
                 expires_in_hours
@@ -263,42 +286,71 @@ impl SessionRepository {
                     .context("Invalid expiration hours: value too large")?,
             );
 
-        let row = retry_db!("rotate_refresh_token_session", {
-            let client = self
+        let (row, token, predecessor_reused) = retry_db!("rotate_refresh_token_session", {
+            let mut client = self
                 .pool
                 .get()
                 .await
                 .context("Failed to get database connection")
                 .map_err(RepositoryError::PoolError)?;
 
-            client
+            let tx = client.transaction().await.map_err(map_db_error)?;
+            let row = tx
                 .query_opt(
-                    r#"
-                UPDATE refresh_tokens
-                SET token_hash = $1, expires_at = $2
-                WHERE id = $3 AND token_hash = $4
-                RETURNING *
-                "#,
-                    &[
-                        &new_token_hash,
-                        &new_expires_at,
-                        &session_id,
-                        &old_token_hash,
-                    ],
+                    "SELECT * FROM refresh_tokens WHERE id = $1 AND expires_at > $2 FOR UPDATE",
+                    &[&session_id, &Utc::now()],
                 )
                 .await
-                .map_err(map_db_error)
+                .map_err(map_db_error)?
+                .ok_or_else(|| {
+                    RepositoryError::DatabaseError(anyhow::anyhow!(
+                        "Token rotation failed: session not found"
+                    ))
+                })?;
+            let current_hash: String = row.get("token_hash");
+            let previous_hash: Option<String> = row.get("previous_token_hash");
+            let rotated_at: Option<chrono::DateTime<Utc>> = row.get("rotated_at");
+            let in_reuse_window = rotated_at.is_some_and(|at| {
+                at > Utc::now() - chrono::Duration::seconds(REFRESH_REUSE_WINDOW_SECONDS)
+            });
+
+            let result = if current_hash == old_token_hash {
+                if in_reuse_window {
+                    // The current credential already refreshed recently.
+                    (row, old_token.to_string(), false)
+                } else {
+                    let updated = tx
+                        .query_one(
+                            "UPDATE refresh_tokens SET token_hash = $1, previous_token_hash = $2, rotated_at = $3, expires_at = $4 WHERE id = $5 RETURNING *",
+                            &[&successor_hash, &old_token_hash, &Utc::now(), &new_expires_at, &session_id],
+                        )
+                        .await
+                        .map_err(map_db_error)?;
+                    (updated, successor_token.to_string(), false)
+                }
+            } else if in_reuse_window
+                && previous_hash.as_deref() == Some(old_token_hash.as_str())
+                && current_hash == successor_hash
+            {
+                (row, successor_token.to_string(), true)
+            } else {
+                return Err(RepositoryError::DatabaseError(anyhow::anyhow!(
+                    "Token rotation failed: token not found or already rotated"
+                )));
+            };
+            tx.commit().await.map_err(map_db_error)?;
+            Ok(result)
         })?;
 
-        let row = row.ok_or_else(|| {
-            anyhow::anyhow!("Token rotation failed: token not found or already rotated")
-        })?;
-
-        debug!("Rotated refresh token session: {session_id}",);
+        if predecessor_reused {
+            warn!(session_id = %session_id, "Refresh token predecessor reused within grace window");
+        } else {
+            debug!(session_id = %session_id, "Refresh token session accepted");
+        }
 
         let session = self.row_to_session(row)?;
 
-        Ok((session, new_session_token))
+        Ok((session, token))
     }
 
     /// Revoke a refresh token session
@@ -473,11 +525,18 @@ impl services::auth::SessionRepository for SessionRepository {
     async fn rotate(
         &self,
         session_id: services::auth::SessionId,
-        old_token_hash: &str,
+        old_token: &str,
+        successor_token: &str,
         expires_in_hours: i64,
     ) -> anyhow::Result<(services::auth::Session, String)> {
-        let (db_session, token) =
-            SessionRepository::rotate(self, session_id.0, old_token_hash, expires_in_hours).await?;
+        let (db_session, token) = SessionRepository::rotate(
+            self,
+            session_id.0,
+            old_token,
+            successor_token,
+            expires_in_hours,
+        )
+        .await?;
 
         let service_session = services::auth::Session {
             id: services::auth::SessionId(db_session.id),
@@ -498,5 +557,38 @@ impl services::auth::SessionRepository for SessionRepository {
 
     async fn cleanup_expired(&self) -> anyhow::Result<usize> {
         self.cleanup_expired().await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SessionRepository;
+
+    #[test]
+    fn mobile_os_updates_keep_the_same_user_agent_binding() {
+        let old_iphone = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 Version/17.5 Mobile/15E148 Safari/604.1";
+        let new_iphone = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 Version/18.0 Mobile/15E148 Safari/604.1";
+        assert_eq!(
+            SessionRepository::normalize_user_agent(old_iphone),
+            SessionRepository::normalize_user_agent(new_iphone)
+        );
+
+        let old_android = "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 Chrome/126.0.0.0 Mobile Safari/537.36";
+        let new_android = "Mozilla/5.0 (Linux; Android 15; Pixel 8) AppleWebKit/537.36 Chrome/127.0.0.0 Mobile Safari/537.36";
+        assert_eq!(
+            SessionRepository::normalize_user_agent(old_android),
+            SessionRepository::normalize_user_agent(new_android)
+        );
+        assert!(SessionRepository::normalize_user_agent(new_android).contains("Android; Pixel 8"));
+    }
+
+    #[test]
+    fn different_device_still_fails_the_user_agent_binding() {
+        let pixel_8 = "Mozilla/5.0 (Linux; Android 14; Pixel 8) Chrome/126.0.0.0";
+        let pixel_9 = "Mozilla/5.0 (Linux; Android 15; Pixel 9) Chrome/127.0.0.0";
+        assert_ne!(
+            SessionRepository::normalize_user_agent(pixel_8),
+            SessionRepository::normalize_user_agent(pixel_9)
+        );
     }
 }

@@ -5,7 +5,7 @@ use services::common::RepositoryError;
 use services::usage::{
     InferenceUsageHistoryQuery, InferenceUsageReportQuery, InferenceUsageReportRow,
 };
-use tokio_postgres::Row;
+use tokio_postgres::{IsolationLevel, Row};
 
 impl OrganizationUsageRepository {
     pub async fn list_inference_usage_report(
@@ -50,7 +50,7 @@ impl OrganizationUsageRepository {
                         model_name, inference_type, input_tokens, output_tokens,
                         cache_read_tokens, cache_write_tokens, total_tokens, input_cost, output_cost,
                         CASE WHEN $8::TEXT IS NULL THEN total_cost ELSE
-                            (SELECT COALESCE(SUM(a.amount), 0)::BIGINT FROM usage_credit_allocations a
+                            (SELECT COALESCE(SUM(a.amount), 0)::BIGINT FROM effective_usage_credit_allocations a
                              WHERE a.inference_usage_id = organization_usage_log.id
                                AND a.credit_type = $8)
                         END AS total_cost,
@@ -63,7 +63,7 @@ impl OrganizationUsageRepository {
                                 'organization_limit_id', a.organization_limit_id,
                                 'policy_version', a.policy_version
                             ) ORDER BY a.created_at, a.priority_position, a.id)
-                            FROM usage_credit_allocations a
+                            FROM effective_usage_credit_allocations a
                             WHERE a.inference_usage_id = organization_usage_log.id
                               AND ($8::TEXT IS NULL OR a.credit_type = $8)), '[]'::jsonb)
                         END AS credit_allocations
@@ -76,7 +76,7 @@ impl OrganizationUsageRepository {
                       AND ($6::TEXT IS NULL OR model_name = $6)
                       AND ($7::TEXT IS NULL OR inference_type = $7)
                       AND ($8::TEXT IS NULL OR EXISTS (
-                          SELECT 1 FROM usage_credit_allocations allocation_filter
+                          SELECT 1 FROM effective_usage_credit_allocations allocation_filter
                           WHERE allocation_filter.inference_usage_id = organization_usage_log.id
                             AND allocation_filter.credit_type = $8
                       ))
@@ -111,21 +111,40 @@ impl OrganizationUsageRepository {
         Ok(rows.iter().map(row_to_report).collect())
     }
 
+    /// Filtered usage history page plus the exact filtered count, from one snapshot.
+    /// Both queries share the reporting deadline: the count reads every matching
+    /// row, and an abandoned request must not keep scanning.
     pub async fn list_inference_usage_history(
         &self,
         query: InferenceUsageHistoryQuery,
     ) -> Result<(Vec<InferenceUsageReportRow>, i64)> {
         validate_history_query(&query)?;
+        let deadline = crate::repositories::reporting_query::reporting_deadline(
+            self.reporting_statement_timeout,
+            None,
+        )?;
 
         let (rows, total) = retry_db!("list_inference_usage_history", {
-            let client = self
+            let mut client = self
                 .pool
                 .get()
                 .await
                 .context("Failed to get database connection")
                 .map_err(RepositoryError::PoolError)?;
 
-            let rows = client
+            let transaction = client
+                .build_transaction()
+                .read_only(true)
+                .isolation_level(IsolationLevel::RepeatableRead)
+                .start()
+                .await
+                .map_err(map_db_error)?;
+            crate::repositories::reporting_query::configure_reporting_transaction(
+                &transaction,
+                crate::repositories::reporting_query::remaining_statement_timeout(deadline)?,
+            )
+            .await?;
+            let rows = transaction
                 .query(
                     r#"
                     SELECT
@@ -133,7 +152,7 @@ impl OrganizationUsageRepository {
                         model_name, inference_type, input_tokens, output_tokens,
                         cache_read_tokens, cache_write_tokens, total_tokens, input_cost, output_cost,
                         CASE WHEN $6::TEXT IS NULL THEN total_cost ELSE
-                            (SELECT COALESCE(SUM(a.amount), 0)::BIGINT FROM usage_credit_allocations a
+                            (SELECT COALESCE(SUM(a.amount), 0)::BIGINT FROM effective_usage_credit_allocations a
                              WHERE a.inference_usage_id = organization_usage_log.id
                                AND a.credit_type = $6)
                         END AS total_cost,
@@ -146,7 +165,7 @@ impl OrganizationUsageRepository {
                                 'organization_limit_id', a.organization_limit_id,
                                 'policy_version', a.policy_version
                             ) ORDER BY a.created_at, a.priority_position, a.id)
-                            FROM usage_credit_allocations a
+                            FROM effective_usage_credit_allocations a
                             WHERE a.inference_usage_id = organization_usage_log.id
                               AND ($6::TEXT IS NULL OR a.credit_type = $6)), '[]'::jsonb)
                         END AS credit_allocations
@@ -157,7 +176,7 @@ impl OrganizationUsageRepository {
                       AND ($4::UUID IS NULL OR workspace_id = $4)
                       AND ($5::UUID IS NULL OR api_key_id = $5)
                       AND ($6::TEXT IS NULL OR EXISTS (
-                          SELECT 1 FROM usage_credit_allocations allocation_filter
+                          SELECT 1 FROM effective_usage_credit_allocations allocation_filter
                           WHERE allocation_filter.inference_usage_id = organization_usage_log.id
                             AND allocation_filter.credit_type = $6
                       ))
@@ -178,7 +197,14 @@ impl OrganizationUsageRepository {
                 .await
                 .map_err(map_db_error)?;
 
-            let count = client
+            // statement_timeout applies per statement: give the count only what is
+            // left of the deadline, not a fresh budget.
+            crate::repositories::reporting_query::configure_reporting_transaction(
+                &transaction,
+                crate::repositories::reporting_query::remaining_statement_timeout(deadline)?,
+            )
+            .await?;
+            let count = transaction
                 .query_one(
                     r#"
                     SELECT COUNT(*)::BIGINT AS count
@@ -189,7 +215,7 @@ impl OrganizationUsageRepository {
                       AND ($4::UUID IS NULL OR workspace_id = $4)
                       AND ($5::UUID IS NULL OR api_key_id = $5)
                       AND ($6::TEXT IS NULL OR EXISTS (
-                          SELECT 1 FROM usage_credit_allocations allocation_filter
+                          SELECT 1 FROM effective_usage_credit_allocations allocation_filter
                           WHERE allocation_filter.inference_usage_id = organization_usage_log.id
                             AND allocation_filter.credit_type = $6
                       ))
@@ -205,6 +231,7 @@ impl OrganizationUsageRepository {
                 )
                 .await
                 .map_err(map_db_error)?;
+            transaction.commit().await.map_err(map_db_error)?;
 
             Ok::<(Vec<Row>, i64), RepositoryError>((rows, count.get("count")))
         })?;

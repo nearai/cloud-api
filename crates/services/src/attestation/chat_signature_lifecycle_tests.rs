@@ -82,9 +82,15 @@ impl AttestationRepository for RecordingRepository {
         chat_id: &str,
         signing_algo: &str,
     ) -> Result<ChatSignature, AttestationError> {
-        Err(AttestationError::SignatureNotFound(format!(
-            "{chat_id}:{signing_algo}"
-        )))
+        self.stored
+            .lock()
+            .map_err(|_| AttestationError::InternalError("stored lock poisoned".to_string()))?
+            .iter()
+            .find(|(stored_chat_id, signature)| {
+                stored_chat_id == chat_id && signature.signing_algo == signing_algo
+            })
+            .map(|(_, signature)| signature.clone())
+            .ok_or_else(|| AttestationError::SignatureNotFound(format!("{chat_id}:{signing_algo}")))
     }
 }
 
@@ -237,6 +243,7 @@ impl UsageRepository for NoopUsageRepository {
         &self,
         _organization_id: Uuid,
         _start_date: chrono::DateTime<chrono::Utc>,
+        _end_date: Option<chrono::DateTime<chrono::Utc>>,
     ) -> anyhow::Result<Vec<UsageByModelEntry>> {
         Ok(Vec::new())
     }
@@ -279,6 +286,7 @@ pub(super) fn lifecycle_service(
         repository,
         inference_provider_pool: pool.clone(),
         models_repository: Arc::new(EmptyModelsRepository),
+        model_resolve_cache: crate::models::new_model_resolve_cache(),
         metrics_service: Arc::new(NoopMetricsService),
         usage_repository: Arc::new(NoopUsageRepository),
         vpc_info: None,

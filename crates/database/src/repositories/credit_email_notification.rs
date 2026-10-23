@@ -81,6 +81,19 @@ impl CreditEmailNotificationRepositoryPort for CreditEmailNotificationRepository
             transaction
                 .execute(
                     r#"
+                    UPDATE email_notification_deliveries
+                    SET rearm_after_dispatch = TRUE
+                    WHERE event_type = $1 AND resource_id = $2
+                      AND sent_at IS NULL
+                      AND dispatch_started_at IS NOT NULL
+                      AND claimed_at >= NOW() - INTERVAL '30 minutes'
+                    "#,
+                    &[&EVENT_TYPE, &resource_id],
+                )
+                .await?;
+            transaction
+                .execute(
+                    r#"
                     DELETE FROM email_notification_deliveries
                     WHERE event_type = $1 AND resource_id = $2
                       AND NOT (
@@ -109,6 +122,19 @@ impl CreditEmailNotificationRepositoryPort for CreditEmailNotificationRepository
                 )
                 .await?
                 .get(0);
+            transaction
+                .execute(
+                    r#"
+                    UPDATE email_notification_deliveries
+                    SET rearm_after_dispatch = TRUE
+                    WHERE event_type = $1 AND resource_id = $2 AND event_key = ANY($3)
+                      AND sent_at IS NULL
+                      AND dispatch_started_at IS NOT NULL
+                      AND claimed_at >= NOW() - INTERVAL '30 minutes'
+                    "#,
+                    &[&EVENT_TYPE, &resource_id, &event_keys],
+                )
+                .await?;
             transaction
                 .execute(
                     r#"
@@ -155,7 +181,8 @@ impl CreditEmailNotificationRepositoryPort for CreditEmailNotificationRepository
                 VALUES ($1, $2, $3, $4, $5, NOW())
                 ON CONFLICT (event_type, resource_id, event_key, recipient_user_id)
                 DO UPDATE SET claimed_at = NOW(), claim_token = EXCLUDED.claim_token,
-                              sent_at = COALESCE(email_notification_deliveries.sent_at, NOW())
+                              sent_at = COALESCE(email_notification_deliveries.sent_at, NOW()),
+                              dispatch_started_at = NULL, rearm_after_dispatch = FALSE
                 WHERE NOT (
                     email_notification_deliveries.sent_at IS NULL
                     AND email_notification_deliveries.dispatch_started_at IS NOT NULL
@@ -181,7 +208,7 @@ impl CreditEmailNotificationRepositoryPort for CreditEmailNotificationRepository
                 VALUES ($1, $2, $3, $4, $5)
                 ON CONFLICT (event_type, resource_id, event_key, recipient_user_id)
                 DO UPDATE SET claimed_at = NOW(), claim_token = EXCLUDED.claim_token,
-                              dispatch_started_at = NULL
+                              dispatch_started_at = NULL, rearm_after_dispatch = FALSE
                 WHERE email_notification_deliveries.sent_at IS NULL
                   AND email_notification_deliveries.claimed_at < NOW() - INTERVAL '30 minutes'
                 RETURNING recipient_user_id, claim_token
@@ -279,7 +306,19 @@ impl CreditEmailNotificationRepositoryPort for CreditEmailNotificationRepository
         let client = self.pool.get().await?;
         client
             .execute(
-                "UPDATE email_notification_deliveries SET sent_at = NOW() WHERE event_type = $1 AND resource_id = $2 AND event_key = $3 AND recipient_user_id = $4 AND claim_token = $5 AND dispatch_started_at IS NOT NULL",
+                r#"
+                UPDATE email_notification_deliveries
+                SET sent_at = CASE WHEN rearm_after_dispatch THEN NULL ELSE NOW() END,
+                    claimed_at = CASE
+                        WHEN rearm_after_dispatch THEN NOW() - INTERVAL '31 minutes'
+                        ELSE claimed_at
+                    END,
+                    dispatch_started_at = NULL,
+                    rearm_after_dispatch = FALSE
+                WHERE event_type = $1 AND resource_id = $2 AND event_key = $3
+                  AND recipient_user_id = $4 AND claim_token = $5
+                  AND sent_at IS NULL AND dispatch_started_at IS NOT NULL
+                "#,
                 &[
                     &EVENT_TYPE,
                     &Self::resource_id(organization_id),

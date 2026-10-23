@@ -499,19 +499,35 @@ async fn full_replenishment_does_not_revoke_an_active_dispatch() -> anyhow::Resu
         .reconcile_claims(organization_id, &recovered_version, None, &[])
         .await?;
 
-    let active: bool = pool
+    let active_and_rearmed: bool = pool
         .get()
         .await?
         .query_one(
-            "SELECT dispatch_started_at IS NOT NULL AND sent_at IS NULL FROM email_notification_deliveries WHERE resource_id = $1 AND event_key = '10' AND recipient_user_id = $2 AND claim_token = $3",
+            "SELECT dispatch_started_at IS NOT NULL AND sent_at IS NULL AND rearm_after_dispatch FROM email_notification_deliveries WHERE resource_id = $1 AND event_key = '10' AND recipient_user_id = $2 AND claim_token = $3",
             &[&format!("{organization_id}:combined"), &user_id, &claim_token],
         )
         .await?
         .get(0);
-    assert!(active);
+    assert!(active_and_rearmed);
     repository
         .mark_sent(organization_id, 10, user_id, claim_token)
         .await?;
+
+    pool.get()
+        .await?
+        .execute(
+            "UPDATE organization_credit_consumption SET amount = 90, updated_at = clock_timestamp() WHERE organization_id = $1 AND credit_type = 'payment'",
+            &[&organization_id],
+        )
+        .await?;
+    let low_again_version = snapshot_version(&pool, organization_id).await?;
+    let low_again = claimed(
+        repository
+            .reconcile_claims(organization_id, &low_again_version, Some(10), &[0])
+            .await?,
+    );
+    assert_eq!(low_again.len(), 1);
+    assert_eq!(low_again[0].user_id, user_id);
     Ok(())
 }
 

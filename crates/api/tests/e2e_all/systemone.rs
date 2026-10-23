@@ -194,6 +194,79 @@ async fn systemone_external_catalog_alias_billing_and_gateway_signatures() {
 }
 
 #[tokio::test]
+async fn systemone_openrouter_box_preserves_images_billing_and_receipts() {
+    let upstream = MockServer::start().await;
+    let (server, _, _, database) = setup_test_server_with_pool().await;
+    let (model, _) = catalog(
+        &server,
+        Some(json!({
+            "backend":"typesafe","base_url":format!("{}/api/v1",upstream.uri()),
+            "model_name":"typesafe/jev-1.14","api_key":"fixture-openrouter-key"
+        })),
+        true,
+    )
+    .await;
+    let key = auth(&server).await;
+    // Opaque transport fixture: image decoding belongs to the upstream provider.
+    let image =
+        json!({"type":"image_url","image_url":{"url":"data:image/png;base64,Zml4dHVyZQ=="}});
+    let mut body = request(&model);
+    body["state"] = json!(["Refund request", image, {"attachment":image}]);
+    body["questions"]["billing"]["criteria"] = json!({"true":image});
+    body["questions"]["receipt"] =
+        json!({"type":"box","instructions":["Locate the receipt in",image]});
+    let request_text = serde_json::to_string_pretty(&body).unwrap();
+    let mut forwarded = body;
+    forwarded["model"] = json!("typesafe/jev-1.14");
+
+    for confidence in [None, Some(0.9)] {
+        let id = format!("gen-dec-{}", uuid::Uuid::new_v4());
+        let mut response_body = result(Some(&id));
+        response_body["model"] = json!("typesafe/jev-1.14-20261014");
+        response_body["answers"]["receipt"] =
+            json!({"type":"box","box":{"top":0.1,"bottom":0.9,"left":0.2,"right":0.8}});
+        if let Some(confidence) = confidence {
+            response_body["answers"]["receipt"]["confidence"] = json!(confidence);
+        }
+        let raw = serde_json::to_string_pretty(&response_body).unwrap();
+        let _mock = Mock::given(method("POST"))
+            .and(path("/api/v1/systemone"))
+            .and(header("authorization", "Bearer fixture-openrouter-key"))
+            .and(header("content-type", "application/json"))
+            .and(body_partial_json(forwarded.clone()))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(raw.clone(), "application/json"))
+            .expect(1)
+            .mount_as_scoped(&upstream)
+            .await;
+        let response = server
+            .post("/v1/systemone")
+            .add_header("Authorization", format!("Bearer {key}"))
+            .add_header("Content-Type", "application/json")
+            .bytes(Bytes::from(request_text.clone()))
+            .await;
+        assert_eq!(response.status_code(), 200, "{}", response.text());
+        assert_eq!(response.text(), raw);
+        assert_eq!(response.header("x-generation-id"), id.as_str());
+        assert_signatures(&server, &key, &id, "gateway", &request_text, &raw).await;
+        let inference_id =
+            uuid::Uuid::parse_str(response.header("inference-id").to_str().unwrap()).unwrap();
+        let client = database.pool().get().await.unwrap();
+        let row = client
+            .query_one(
+                "SELECT input_tokens, output_tokens, total_cost, inference_type
+                 FROM organization_usage_log WHERE inference_id = $1",
+                &[&inference_id],
+            )
+            .await
+            .unwrap();
+        assert_eq!(row.get::<_, i32>("input_tokens"), 10);
+        assert_eq!(row.get::<_, i32>("output_tokens"), 3);
+        assert_eq!(row.get::<_, i64>("total_cost"), 36);
+        assert_eq!(row.get::<_, String>("inference_type"), "decisions");
+    }
+}
+
+#[tokio::test]
 async fn systemone_external_generation_header_indexes_gateway_signatures() {
     let upstream = MockServer::start().await;
     let upstream_id = format!("gen:decision.{}/result", uuid::Uuid::new_v4());
@@ -358,6 +431,7 @@ async fn systemone_rejects_invalid_requests_before_inference() {
         json!({"type":"noul"}),
         json!({"type":"choice","criteria":{"billing":null,"other":null}}),
         json!({"type":"score","criteria":["low","high"]}),
+        json!({"type":"box"}),
     ] {
         for instructions in [None, Some(Value::Null)] {
             let mut question = question.clone();

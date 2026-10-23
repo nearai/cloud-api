@@ -1425,8 +1425,9 @@ impl PlacementEndpoint {
 
 /// Default for `CONTACT_EMAIL_VERIFICATION_DAILY_CAP`.
 pub const DEFAULT_CONTACT_EMAIL_VERIFICATION_DAILY_CAP: u32 = 500;
+pub const DEFAULT_CREDIT_EMAIL_THRESHOLDS: &[i16] = &[0, 10, 20];
 
-/// Email notification configuration for organization invitations.
+/// Shared configuration for transactional email notifications.
 #[derive(Debug, Clone)]
 pub struct InvitationEmailConfig {
     pub enabled: bool,
@@ -1440,6 +1441,8 @@ pub struct InvitationEmailConfig {
     pub reply_to: Option<String>,
     pub resend_api_key: Option<String>,
     pub frontend_base_url: Option<String>,
+    /// Remaining-credit percentages that trigger organization email alerts.
+    pub credit_email_thresholds: Vec<i16>,
 }
 
 impl Default for InvitationEmailConfig {
@@ -1452,6 +1455,7 @@ impl Default for InvitationEmailConfig {
             reply_to: None,
             resend_api_key: None,
             frontend_base_url: None,
+            credit_email_thresholds: DEFAULT_CREDIT_EMAIL_THRESHOLDS.to_vec(),
         }
     }
 }
@@ -1479,6 +1483,39 @@ impl InvitationEmailConfig {
             None
         };
         let frontend_base_url = non_empty_env("CLOUD_UI_BASE_URL");
+        let credit_email_thresholds = match env::var("CREDIT_EMAIL_THRESHOLDS") {
+            Ok(value) => {
+                let mut thresholds = value
+                    .split(',')
+                    .map(|part| {
+                        let part = part.trim();
+                        let threshold = part.parse::<i16>().map_err(|_| {
+                            format!(
+                                "CREDIT_EMAIL_THRESHOLDS contains invalid percentage '{part}'"
+                            )
+                        })?;
+                        if !(0..=100).contains(&threshold) {
+                            return Err(format!(
+                                "CREDIT_EMAIL_THRESHOLDS percentage must be between 0 and 100: {threshold}"
+                            ));
+                        }
+                        Ok(threshold)
+                    })
+                    .collect::<Result<Vec<_>, String>>()?;
+                if thresholds.is_empty() {
+                    return Err(
+                        "CREDIT_EMAIL_THRESHOLDS must contain at least one percentage".to_string(),
+                    );
+                }
+                thresholds.sort_unstable();
+                thresholds.dedup();
+                thresholds
+            }
+            Err(env::VarError::NotPresent) => DEFAULT_CREDIT_EMAIL_THRESHOLDS.to_vec(),
+            Err(env::VarError::NotUnicode(_)) => {
+                return Err("CREDIT_EMAIL_THRESHOLDS must be valid UTF-8".to_string())
+            }
+        };
 
         for (switched_on, switch) in [
             (enabled, "INVITATION_EMAIL_ENABLED"),
@@ -1522,6 +1559,7 @@ impl InvitationEmailConfig {
             reply_to,
             resend_api_key,
             frontend_base_url,
+            credit_email_thresholds,
         })
     }
 
@@ -2609,6 +2647,27 @@ mod tests {
         assert!(config.from_email.is_none());
         assert!(config.resend_api_key.is_none());
         assert!(config.invitations_url().is_none());
+        assert_eq!(config.credit_email_thresholds, vec![0, 10, 20]);
+    }
+
+    #[test]
+    #[serial]
+    fn test_credit_email_thresholds_are_strictly_validated() {
+        clear_invitation_email_env();
+        std::env::set_var("CREDIT_EMAIL_THRESHOLDS", " 20, 10,0,10 ");
+        assert_eq!(
+            InvitationEmailConfig::from_env()
+                .unwrap()
+                .credit_email_thresholds,
+            vec![0, 10, 20]
+        );
+
+        for invalid in ["", "20,1O", "20;10", "-1", "101", "20,"] {
+            std::env::set_var("CREDIT_EMAIL_THRESHOLDS", invalid);
+            let error = InvitationEmailConfig::from_env().unwrap_err();
+            assert!(error.contains("CREDIT_EMAIL_THRESHOLDS"), "{error}");
+        }
+        clear_invitation_email_env();
     }
 
     #[test]
@@ -2847,6 +2906,7 @@ mod tests {
         std::env::remove_var("RESEND_API_KEY");
         std::env::remove_var("RESEND_API_KEY_FILE");
         std::env::remove_var("CLOUD_UI_BASE_URL");
+        std::env::remove_var("CREDIT_EMAIL_THRESHOLDS");
     }
 
     #[test]

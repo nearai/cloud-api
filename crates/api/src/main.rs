@@ -117,96 +117,30 @@ async fn main() {
         .start(config.server.usage_hourly_interval_secs)
         .await;
 
+    // Scan outside the inference path. Durable per-recipient claims prevent
+    // duplicate delivery when multiple API replicas run the scheduler.
+    let credit_email_scheduler = Arc::new(services::usage::CreditEmailScheduler::new(
+        Arc::new(
+            database::repositories::credit_email_notification::CreditEmailNotificationRepository::new(
+                database.pool().clone(),
+            ),
+        ),
+        Arc::new(
+            database::repositories::OrganizationLimitsRepository::with_accounting_config(
+                database.pool().clone(),
+                &config.credit_allocation,
+            ),
+        ),
+        services::email::sender_from_config(&config.invitation_email)
+            .expect("Failed to initialize credit alert email sender"),
+        config.invitation_email.credit_email_thresholds.clone(),
+        config.invitation_email.frontend_base_url.clone(),
+    ));
+    credit_email_scheduler.clone().start().await;
+
     // A durable per-org claim prevents replica duplication. Keep two jobs in
     // flight so a slow final verification does not stall every other organization.
     let discount_repository = database::repositories::organization_usage_discount::OrganizationUsageDiscountRepository::new(database.pool().clone());
-    let credit_email_thresholds = std::env::var("CREDIT_EMAIL_THRESHOLDS")
-        .ok()
-        .map(|value| {
-            value
-                .split(',')
-                .filter_map(|part| part.trim().parse::<i16>().ok())
-                .filter(|threshold| (0..=100).contains(threshold))
-                .collect::<Vec<_>>()
-        })
-        .filter(|values| !values.is_empty())
-        .unwrap_or_else(|| vec![20, 10, 0]);
-    let credit_email_repository =
-        database::repositories::credit_email_notification::CreditEmailNotificationRepository::new(
-            database.pool().clone(),
-            credit_email_thresholds,
-        );
-    let credit_email_sender = services::email::sender_from_config(&config.invitation_email)
-        .expect("Failed to initialize credit alert email sender");
-    let credit_frontend_url = config.invitation_email.frontend_base_url.clone();
-    let credit_email_worker = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            interval.tick().await;
-            match credit_email_repository.claim_crossings().await {
-                Ok(candidates) => {
-                    for candidate in candidates {
-                        for recipient_email in &candidate.recipient_emails {
-                            let email = services::email::CreditBalanceAlertEmail {
-                                recipient_email: recipient_email.clone(),
-                                organization_name: candidate.organization_name.clone(),
-                                credit_type: candidate.credit_type.clone(),
-                                remaining: candidate.remaining,
-                                limit: candidate.limit,
-                                threshold_percent: candidate.threshold_percent,
-                                credits_url: format!(
-                                    "{}/dashboard/organizations/{}/credits",
-                                    credit_frontend_url
-                                        .as_deref()
-                                        .unwrap_or("")
-                                        .trim_end_matches('/'),
-                                    candidate.organization_id
-                                ),
-                            };
-                            match credit_email_sender.send_credit_balance_alert(&email).await {
-                                Ok(services::email::EmailDeliveryOutcome::Sent { .. }) => {
-                                    if let Err(error) = credit_email_repository
-                                        .mark_sent(
-                                            candidate.organization_id,
-                                            &candidate.credit_type,
-                                            candidate.threshold_percent,
-                                            recipient_email,
-                                        )
-                                        .await
-                                    {
-                                        tracing::warn!(organization_id = %candidate.organization_id, credit_type = %candidate.credit_type, error = %error, "Failed to mark credit balance alert as sent");
-                                    }
-                                }
-                                Ok(services::email::EmailDeliveryOutcome::Skipped) => {
-                                    let _ = credit_email_repository
-                                        .release_claim(
-                                            candidate.organization_id,
-                                            &candidate.credit_type,
-                                            candidate.threshold_percent,
-                                            recipient_email,
-                                        )
-                                        .await;
-                                }
-                                Err(error) => {
-                                    tracing::warn!(organization_id = %candidate.organization_id, credit_type = %candidate.credit_type, error = %error.sanitized_message(), "Failed to send credit balance alert");
-                                    let _ = credit_email_repository
-                                        .release_claim(
-                                            candidate.organization_id,
-                                            &candidate.credit_type,
-                                            candidate.threshold_percent,
-                                            recipient_email,
-                                        )
-                                        .await;
-                                }
-                            }
-                        }
-                    }
-                }
-                Err(error) => tracing::error!(%error, "Failed to scan credit alert thresholds"),
-            }
-        }
-    });
     let discount_worker = tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -252,7 +186,7 @@ async fn main() {
         usage_hourly_scheduler,
         BackgroundWorkers {
             discount: discount_worker,
-            credit_email: credit_email_worker,
+            credit_email: credit_email_scheduler,
         },
     )
     .await;
@@ -271,7 +205,7 @@ fn load_configuration() -> ApiConfig {
 
 struct BackgroundWorkers {
     discount: tokio::task::JoinHandle<()>,
-    credit_email: tokio::task::JoinHandle<()>,
+    credit_email: Arc<services::usage::CreditEmailScheduler>,
 }
 
 /// Start the HTTP server with graceful shutdown on SIGTERM/SIGINT
@@ -307,9 +241,8 @@ async fn start_server(
         credit_email,
     } = workers;
     discount.abort();
-    credit_email.abort();
     let _ = discount.await;
-    let _ = credit_email.await;
+    credit_email.shutdown().await;
     match result {
         Ok(_) => {
             tracing::info!("Server shutdown successfully, initiating coordinated cleanup");

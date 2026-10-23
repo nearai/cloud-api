@@ -1333,6 +1333,7 @@ mod tests {
             reply_to: None,
             resend_api_key: None,
             frontend_base_url: Some("https://cloud.example.com".to_string()),
+            credit_email_thresholds: vec![0, 10, 20],
         };
 
         let error = match ResendEmailSender::new(&config) {

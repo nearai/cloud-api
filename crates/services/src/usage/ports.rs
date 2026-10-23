@@ -485,6 +485,53 @@ pub trait OrganizationLimitsRepository: Send + Sync {
     ) -> anyhow::Result<Vec<OrganizationCreditLimit>>;
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreditEmailOrganization {
+    pub id: Uuid,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreditEmailRecipient {
+    pub email: String,
+    pub contact_email: Option<String>,
+    pub contact_email_verified_at: Option<DateTime<Utc>>,
+}
+
+#[cfg_attr(test, mockall::automock)]
+#[async_trait::async_trait]
+pub trait CreditEmailNotificationRepository: Send + Sync {
+    async fn active_organizations(&self) -> anyhow::Result<Vec<CreditEmailOrganization>>;
+    async fn owner_admin_recipients(
+        &self,
+        organization_id: Uuid,
+    ) -> anyhow::Result<Vec<CreditEmailRecipient>>;
+    async fn clear_claims(&self, organization_id: Uuid) -> anyhow::Result<()>;
+    async fn clear_threshold_claims(
+        &self,
+        organization_id: Uuid,
+        thresholds: &[i16],
+    ) -> anyhow::Result<()>;
+    async fn try_claim(
+        &self,
+        organization_id: Uuid,
+        threshold: i16,
+        recipient_email: &str,
+    ) -> anyhow::Result<bool>;
+    async fn release_claim(
+        &self,
+        organization_id: Uuid,
+        threshold: i16,
+        recipient_email: &str,
+    ) -> anyhow::Result<()>;
+    async fn mark_sent(
+        &self,
+        organization_id: Uuid,
+        threshold: i16,
+        recipient_email: &str,
+    ) -> anyhow::Result<()>;
+}
+
 // ============================================
 // Service Data Structures
 // ============================================

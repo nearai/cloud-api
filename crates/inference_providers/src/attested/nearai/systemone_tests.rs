@@ -20,7 +20,7 @@ fn systemone_distributes_requests_and_spills_concurrent_duplicates() {
         for request in 0..256 {
             let lease = provider
                 .fleet
-                .acquire_systemone_index(&request.to_string())
+                .acquire_systemone_index(&request.to_string(), count, None)
                 .unwrap();
             reached.insert(lease.index());
         }
@@ -29,7 +29,7 @@ fn systemone_distributes_requests_and_spills_concurrent_duplicates() {
             .map(|_| {
                 provider
                     .fleet
-                    .acquire_systemone_index("same-request")
+                    .acquire_systemone_index("same-request", count, None)
                     .unwrap()
             })
             .collect();
@@ -58,8 +58,86 @@ async fn systemone_fleet_does_not_replay_invalid_responses_or_read_timeouts() {
     fleet_case(422, false, false).await;
 }
 
-async fn fleet_case(status: u16, malformed: bool, timeout: bool) {
-    let server = MockServer::start().await;
+#[tokio::test]
+async fn systemone_fleet_limits_requests_and_retries_to_selected_key() {
+    for allowed in [vec![0, 2], vec![1], vec![]] {
+        let server = MockServer::start().await;
+        let port = server.address().port();
+        let provider = fleet_provider(&server);
+        provider
+            .fleet
+            .set_backend_keys(std::collections::HashMap::from([(
+                "selected-key".into(),
+                allowed.clone(),
+            )]));
+        let first = (!allowed.is_empty()).then(|| {
+            provider
+                .fleet
+                .acquire_systemone_index("hash", 3, Some(&allowed))
+                .unwrap()
+                .index()
+        });
+        for index in 0..3 {
+            let response = if Some(index) == first {
+                ResponseTemplate::new(503)
+            } else {
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "id":format!("decision-{index}"), "model":"jev",
+                    "answers":{"q":{"type":"noul","noul":0.8}},
+                    "usage":{"input_tokens":7,"output_tokens":1}
+                }))
+            };
+            Mock::given(method("POST"))
+                .and(path("/v1/systemone"))
+                .and(header("host", format!("jev-i{index}.fleet.test:{port}")))
+                .respond_with(response)
+                .expect(u64::from(allowed.contains(&index)))
+                .mount(&server)
+                .await;
+        }
+        let request: SystemOneRequest = serde_json::from_value(json!({
+            "model":"jev", "state":"x",
+            "questions":{"q":{"type":"noul","instructions":"Is this about billing?"}}
+        }))
+        .unwrap();
+        assert!(matches!(
+            provider
+                .systemone(request.clone(), "hash".into(), Some("unknown-key"))
+                .await,
+            Err(crate::CompletionError::NoPubKeyProvider(_))
+        ));
+        let response = provider
+            .systemone(request, "hash".into(), Some("selected-key"))
+            .await;
+        match allowed.len() {
+            2 => {
+                let next = allowed.iter().find(|&&index| Some(index) != first).unwrap();
+                let id = format!("decision-{next}");
+                assert_eq!(response.unwrap().provider_decision_id().unwrap(), id);
+                assert_eq!(
+                    provider.fleet.signature_rotation.lock().unwrap().get(&id),
+                    Some(&(*next as u64))
+                );
+                provider.unpin_chat_connection(&id);
+            }
+            1 => assert!(matches!(
+                response,
+                Err(crate::CompletionError::HttpError {
+                    status_code: 503,
+                    ..
+                })
+            )),
+            0 => assert!(matches!(
+                response,
+                Err(crate::CompletionError::NoPubKeyProvider(_))
+            )),
+            _ => unreachable!(),
+        }
+        assert_eq!(provider.fleet.active_prefix_loads(), 0);
+    }
+}
+
+fn fleet_provider(server: &MockServer) -> Provider {
     let port = server.address().port();
     let provider = Provider::new(Config {
         base_url: format!("http://jev.fleet.test:{port}"),
@@ -76,9 +154,16 @@ async fn fleet_case(status: u16, malformed: bool, timeout: bool) {
     for index in 0..3 {
         *provider.fleet.index_clients[index].lock().unwrap() = Some(client.clone());
     }
+    provider
+}
+
+async fn fleet_case(status: u16, malformed: bool, timeout: bool) {
+    let server = MockServer::start().await;
+    let port = server.address().port();
+    let provider = fleet_provider(&server);
     let first = provider
         .fleet
-        .acquire_systemone_index("original-hash")
+        .acquire_systemone_index("original-hash", 3, None)
         .unwrap()
         .index();
     let next = provider.fleet.fallback_indices_for(first, None)[0];
@@ -108,7 +193,9 @@ async fn fleet_case(status: u16, malformed: bool, timeout: bool) {
     let request: SystemOneRequest = serde_json::from_value(json!({"model":"jev","state":"x",
         "questions":{"q":{"type":"noul","instructions":"Is this about billing?"}}}))
     .unwrap();
-    let response = provider.systemone(request, "original-hash".into()).await;
+    let response = provider
+        .systemone(request, "original-hash".into(), None)
+        .await;
     if retry {
         let id = format!("decision:tee.{next}/receipt?version=1");
         assert_eq!(response.unwrap().provider_decision_id().unwrap(), id);

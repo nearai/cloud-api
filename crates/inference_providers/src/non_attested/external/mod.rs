@@ -444,6 +444,7 @@ impl InferenceProvider for ExternalProvider {
         &self,
         request: crate::SystemOneRequest,
         _request_hash: String,
+        _model_pub_key: Option<&str>,
     ) -> Result<crate::SystemOneResponseWithBytes, CompletionError> {
         self.backend
             .systemone(&self.config, &self.model_name, request)

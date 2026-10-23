@@ -435,15 +435,19 @@ impl Fleet {
 
     /// Independent decision requests have no chat prefix. Hash the original
     /// request key and use the same bounded spillover as first-turn chat.
-    pub(super) fn acquire_systemone_index(&self, request_hash: &str) -> Option<RouteLease> {
-        let count = self.rotation_count();
+    pub(super) fn acquire_systemone_index(
+        &self,
+        request_hash: &str,
+        count: usize,
+        allowed: Option<&[usize]>,
+    ) -> Option<RouteLease> {
         if count == 0 {
             return None;
         }
         let digest = Sha256::digest(request_hash.as_bytes());
         let route_key =
             u64::from_be_bytes(digest[..8].try_into().expect("SHA-256 has eight bytes"));
-        let candidates = self.candidate_indices(route_key, count, None);
+        let candidates = self.candidate_indices(route_key, count, allowed);
         Some(self.acquire_candidates(route_key, count, &candidates))
     }
 

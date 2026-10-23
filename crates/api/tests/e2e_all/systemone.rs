@@ -274,12 +274,21 @@ async fn systemone_uses_actual_provider_trust_and_signature_capability() {
         pool.register_provider(model.clone(), provider.clone())
             .await;
         let request_text = serde_json::to_string(&request(&model)).unwrap();
-        let response = server
+        let mut call = server
             .post("/v1/systemone")
             .add_header("Authorization", format!("Bearer {key}"))
-            .add_header("Content-Type", "application/json")
-            .bytes(Bytes::from(request_text.clone()))
-            .await;
+            .add_header("Content-Type", "application/json");
+        if kind == "provider_tee" {
+            let report = provider
+                .get_attestation_report(model.clone(), Some("ecdsa".into()), None, None, false)
+                .await
+                .unwrap();
+            call = call.add_header(
+                "x-model-pub-key",
+                report["signing_public_key"].as_str().unwrap(),
+            );
+        }
+        let response = call.bytes(Bytes::from(request_text.clone())).await;
         assert_eq!(response.status_code(), 200, "{}", response.text());
         assert_eq!(response.as_bytes(), raw.as_slice());
         assert_eq!(
@@ -328,6 +337,80 @@ async fn systemone_uses_actual_provider_trust_and_signature_capability() {
             assert_signatures(&server, &key, &id, kind, &request_text, &response.text()).await;
         }
     }
+}
+
+#[tokio::test]
+async fn systemone_public_key_restricts_provider_fallback() {
+    let (server, pool, _, _) = setup_test_server_with_pool().await;
+    let key = auth(&server).await;
+    let (model, alias) = catalog(&server, None, true).await;
+    let model_key = "ab".repeat(32);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counter = calls.clone();
+    pool.register_provider(
+        model.clone(),
+        Arc::new(
+            MockProvider::new_accept_all()
+                .with_tier(ProviderTier::Near)
+                .with_per_request_pubkey_routing(model_key.clone())
+                .with_systemone_handler(move |_| {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    Err(CompletionError::HttpError {
+                        status_code: 503,
+                        message: "unavailable".into(),
+                        is_external: false,
+                    })
+                }),
+        ),
+    )
+    .await;
+    let decision_id = format!("decision-{}", uuid::Uuid::new_v4());
+    let response_bytes = serde_json::to_vec(&result(Some(&decision_id))).unwrap();
+    let fallback = Arc::new(
+        MockProvider::new_accept_all()
+            .with_tier(ProviderTier::Attested3p)
+            .with_per_request_pubkey_routing(model_key.clone())
+            .with_systemone_handler(move |req| {
+                SystemOneResponseWithBytes::parse(response_bytes.clone(), &req)
+            }),
+    );
+    // A fallback with another key must not be used when the selected provider fails.
+    pool.register_pinned_secondary_provider(
+        model.clone(),
+        Arc::new(
+            MockProvider::new_accept_all()
+                .with_tier(ProviderTier::Attested3p)
+                .with_systemone_handler(|_| panic!("must keep the selected signing identity")),
+        ),
+        None,
+    )
+    .await;
+    for (pin, status) in [("cd".repeat(32), 421), (model_key.clone(), 503)] {
+        let response = server
+            .post("/v1/systemone")
+            .add_header("Authorization", format!("Bearer {key}"))
+            .add_header("x-model-pub-key", pin)
+            .json(&request(&alias))
+            .await;
+        assert_eq!(response.status_code(), status, "{}", response.text());
+        if status == 421 {
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+        }
+    }
+    assert!(
+        calls.load(Ordering::SeqCst) > 1,
+        "the selected provider was retried"
+    );
+    pool.register_pinned_secondary_provider(model.clone(), fallback, None)
+        .await;
+    let response = server
+        .post("/v1/systemone")
+        .add_header("Authorization", format!("Bearer {key}"))
+        .add_header("x-model-pub-key", model_key)
+        .json(&request(&alias))
+        .await;
+    assert_eq!(response.status_code(), 200, "{}", response.text());
+    assert_eq!(response.header("x-generation-id"), decision_id.as_str());
 }
 
 #[tokio::test]
@@ -623,7 +706,7 @@ async fn systemone_fallback_respects_trust_and_organization_policy() {
     .await;
     let req = serde_json::from_value(request(&model)).unwrap();
     let served = pool
-        .systemone_with_attribution(req, "hash".into(), false)
+        .systemone_with_attribution(req, "hash".into(), None, false)
         .await
         .unwrap();
     assert_eq!(
@@ -634,7 +717,7 @@ async fn systemone_fallback_respects_trust_and_organization_policy() {
     assert_eq!(hits.load(Ordering::SeqCst), 1);
     let req = serde_json::from_value(request(&model)).unwrap();
     assert!(pool
-        .systemone_with_attribution(req, "hash".into(), true)
+        .systemone_with_attribution(req, "hash".into(), None, true)
         .await
         .is_err());
     assert_eq!(hits.load(Ordering::SeqCst), 1);
@@ -688,6 +771,7 @@ async fn systemone_invalid_success_and_timeout_never_invoke_a_second_provider() 
             .systemone_with_attribution(
                 serde_json::from_value(request(&model)).unwrap(),
                 "hash".into(),
+                None,
                 false,
             )
             .await

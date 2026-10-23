@@ -138,7 +138,7 @@ mod tests {
                 .await;
             let provider = provider(format!("{}/v1/", server.uri()));
             let response = provider
-                .systemone(request(), "client-hash".into())
+                .systemone(request(), "client-hash".into(), None)
                 .await
                 .unwrap();
             assert_eq!(response.raw_bytes, raw.as_bytes());
@@ -166,7 +166,7 @@ mod tests {
             .mount(&server)
             .await;
         let error = provider(format!("{}/v1", server.uri()))
-            .systemone(request(), "hash".into())
+            .systemone(request(), "hash".into(), None)
             .await
             .unwrap_err();
         assert!(matches!(error, CompletionError::InvalidResponse(_)));
@@ -185,7 +185,7 @@ mod tests {
                 .mount(&server)
                 .await;
             let error = provider(format!("{}/v1", server.uri()))
-                .systemone(request(), "hash".into())
+                .systemone(request(), "hash".into(), None)
                 .await
                 .unwrap_err();
             assert!(
@@ -213,7 +213,7 @@ mod tests {
         let near =
             crate::nearai::Provider::new(crate::nearai::Config::new(server.uri(), None, Some(2)));
         let response = near
-            .systemone(request(), "original-client-hash".into())
+            .systemone(request(), "original-client-hash".into(), None)
             .await
             .unwrap();
         assert_eq!(response.raw_bytes, raw.as_bytes());

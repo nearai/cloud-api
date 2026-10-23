@@ -1193,6 +1193,7 @@ impl crate::InferenceProvider for MockProvider {
         &self,
         request: crate::SystemOneRequest,
         request_hash: String,
+        _model_pub_key: Option<&str>,
     ) -> Result<crate::SystemOneResponseWithBytes, CompletionError> {
         let handler = self
             .systemone_handler

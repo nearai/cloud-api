@@ -33,11 +33,12 @@ trust tier and signature capability, including fallback, rather than catalog fla
 An attested provider without per-response signatures receives a gateway receipt.
 
 Self-hosted decision requests use request-key routing with bounded spillover
-across verified fleet backends. Retryable HTTP errors and connection failures
-can try another instance; its response ID pins subsequent signature retrieval
-to that instance. Invalid successful responses, invalid TEE receipt IDs and
-ambiguous transport/read timeouts stop both instance and provider fallback to
-avoid issuing another paid inference.
+across verified fleet backends. With `X-Model-Pub-Key`, provider selection and
+instance retries stay within the selected signing identity. Retryable HTTP
+errors and connection failures can try another matching instance; its response
+ID pins subsequent signature retrieval to that instance. Invalid successful
+responses, invalid TEE receipt IDs and ambiguous transport/read timeouts stop
+both instance and provider fallback to avoid issuing another paid inference.
 
 Endpoint compatibility is checked against an already resolved model, including
 aliases. Chat Completions and legacy Completions share the same service check.
@@ -171,6 +172,10 @@ The underlying TEE server/model proxy must implement:
 4. Expose the existing `/v1/signature/{id}` contract for both algorithms,
    signing the original request hash and the exact response bytes.
 
+To select a signing identity, send `X-Model-Pub-Key` from the model's attestation
+report. The request remains plaintext. If no matching provider or backend is
+available, the endpoint returns 421; refresh the attestation before retrying.
+
 The NEAR adapter uses the verified backend client and retains the backend
 rotation index for signature retrieval, then releases the pin after finalization.
 Missing/invalid TEE IDs fail closed rather than fabricating a provider receipt.
@@ -179,8 +184,7 @@ Cloud API does not add System One support to the model server itself.
 ## Scope and validation
 
 `/v1/responses`, `/v1/chat/completions`, and `/v1/completions` reject decision models with a pointer to
-`/v1/systemone`. There is no streaming, E2EE, or key-pinned routing contract for
-this endpoint yet; encryption/routing-key headers are explicitly rejected.
+`/v1/systemone`. Streaming and E2EE are unavailable; encryption headers are rejected.
 Unknown request fields are rejected until their behavior is explicitly supported;
 unknown fields on otherwise valid upstream responses are preserved verbatim.
 The existing image receipt issue is tracked separately in

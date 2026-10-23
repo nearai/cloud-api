@@ -3,8 +3,76 @@ mod support;
 
 use database::repositories::ApiKeyRepository;
 use services::workspace::{ApiKeyId, ApiKeyRepository as ApiKeyRepositoryPort};
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 use support::{insert_org_fixture, test_pool};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+async fn pool_losing_first_commit_ack() -> anyhow::Result<(
+    database::DbPool,
+    Arc<AtomicUsize>,
+    tokio::task::JoinHandle<()>,
+)> {
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?;
+    let address = listener.local_addr()?;
+    let commits = Arc::new(AtomicUsize::new(0));
+    let observed_commits = commits.clone();
+    let host = std::env::var("PGHOST").unwrap_or_else(|_| "localhost".into());
+    let port = std::env::var("PGPORT")
+        .unwrap_or_else(|_| "5432".into())
+        .parse::<u16>()?;
+    let proxy = tokio::spawn(async move {
+        while let Ok((client, _)) = listener.accept().await {
+            let host = host.clone();
+            let commits = observed_commits.clone();
+            tokio::spawn(async move {
+                let upstream = tokio::net::TcpStream::connect((host.as_str(), port)).await?;
+                let (mut client_read, mut client_write) = client.into_split();
+                let (mut upstream_read, mut upstream_write) = upstream.into_split();
+                tokio::select! {
+                    result = tokio::io::copy(&mut client_read, &mut upstream_write) => { result?; }
+                    result = async {
+                        loop {
+                            // PostgreSQL backend messages: tag, 4-byte length (including
+                            // the length itself), then payload. Forward all other frames.
+                            let tag = upstream_read.read_u8().await?;
+                            let length = upstream_read.read_u32().await?;
+                            anyhow::ensure!((4..=16_777_216).contains(&length), "invalid backend frame");
+                            let mut payload = vec![0; (length - 4) as usize];
+                            upstream_read.read_exact(&mut payload).await?;
+                            if tag == b'C' && payload == b"COMMIT\0"
+                                && commits.fetch_add(1, Ordering::SeqCst) == 0
+                            {
+                                // CommandComplete means PostgreSQL committed. Close the
+                                // socket before forwarding acknowledgement to the client.
+                                return Ok::<_, anyhow::Error>(());
+                            }
+                            client_write.write_u8(tag).await?;
+                            client_write.write_u32(length).await?;
+                            client_write.write_all(&payload).await?;
+                        }
+                    } => { result?; }
+                }
+                Ok::<_, anyhow::Error>(())
+            });
+        }
+    });
+    let mut config = deadpool_postgres::Config::new();
+    config.host = Some(address.ip().to_string());
+    config.port = Some(address.port());
+    config.dbname = Some(std::env::var("PGDATABASE").unwrap_or_else(|_| "platform_api".into()));
+    config.user = Some(std::env::var("PGUSER").unwrap_or_else(|_| "postgres".into()));
+    config.password = Some(std::env::var("PGPASSWORD").unwrap_or_else(|_| "postgres".into()));
+    let pool = database::DbPool::new(
+        config.create_pool(Some(deadpool::Runtime::Tokio1), tokio_postgres::NoTls)?,
+    );
+    Ok((pool, commits, proxy))
+}
 
 async fn wait_for_lock_wait(pool: &database::DbPool, blocker_pid: i32) -> anyhow::Result<()> {
     let observer = pool.get().await?;
@@ -159,6 +227,51 @@ async fn updates_reject_a_key_revoked_while_waiting_for_its_row_lock() -> anyhow
             .await?;
         assert!(row.get::<_, bool>("is_active"));
         assert_eq!(row.get::<_, Option<i64>>("spend_limit"), None);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn lost_commit_acknowledgement_does_not_replay_the_update() -> anyhow::Result<()> {
+    let pool = test_pool().await?;
+    for spend_limit_only in [false, true] {
+        let fixture = insert_org_fixture(&pool).await?;
+        let id = fixture.api_key_a_id;
+        let (proxy_pool, commits, proxy) = pool_losing_first_commit_ack().await?;
+        let repository = ApiKeyRepository::new(proxy_pool);
+        let key_id = ApiKeyId(id.to_string());
+        let result = tokio::time::timeout(Duration::from_secs(5), async {
+            if spend_limit_only {
+                ApiKeyRepositoryPort::update_spend_limit(&repository, key_id, Some(1_000_000)).await
+            } else {
+                ApiKeyRepositoryPort::update(&repository, key_id, None, None, None, Some(false))
+                    .await
+            }
+        })
+        .await?;
+        proxy.abort();
+        assert!(
+            result.is_err(),
+            "an ambiguous COMMIT must not return a replayed no-op"
+        );
+        assert_eq!(
+            commits.load(Ordering::SeqCst),
+            1,
+            "COMMIT must not be retried"
+        );
+        let persisted = ApiKeyRepository::new(pool.clone())
+            .get_by_id(id)
+            .await?
+            .unwrap();
+        assert_eq!(persisted.is_active, spend_limit_only);
+        assert_eq!(
+            persisted.spend_limit,
+            if spend_limit_only {
+                Some(1_000_000)
+            } else {
+                None
+            }
+        );
     }
     Ok(())
 }

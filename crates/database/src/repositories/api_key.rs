@@ -509,9 +509,14 @@ impl ApiKeyRepository {
                     .await
                     .map_err(map_db_error)?
             };
-            transaction.commit().await.map_err(map_db_error)?;
-            Ok((previous, updated))
-        })?;
+            // COMMIT may have succeeded even if its acknowledgement is lost.
+            // Keep its error outside retry_db so replay cannot erase the transition.
+            Ok(transaction
+                .commit()
+                .await
+                .map_err(map_db_error)
+                .map(|()| (previous, updated)))
+        })??;
 
         debug!("Updated API key: {}", id);
         Ok((

@@ -223,7 +223,7 @@ pub async fn cleanup_usage_fixtures(
     Ok(())
 }
 
-fn pool_config() -> Config {
+pub fn pool_config() -> Config {
     let mut config = Config::new();
     config.host = Some(std::env::var("PGHOST").unwrap_or_else(|_| "localhost".to_string()));
     config.port = Some(

@@ -71,8 +71,16 @@ impl CreditEmailScheduler {
     }
 
     pub async fn run_once(&self) -> anyhow::Result<()> {
+        let mut failed_organizations = 0_u64;
         for organization in self.repository.active_organizations().await? {
-            self.process_organization(organization).await?;
+            let organization_id = organization.id;
+            if let Err(error) = self.process_organization(organization).await {
+                failed_organizations += 1;
+                warn!(%organization_id, %error, "Failed to process credit email alerts for organization");
+            }
+        }
+        if failed_organizations > 0 {
+            anyhow::bail!("credit email scan failed for {failed_organizations} organization(s)");
         }
         Ok(())
     }
@@ -109,16 +117,8 @@ impl CreditEmailScheduler {
         } else {
             limit.available
         };
-        let percent = if remaining == 0 {
-            0
-        } else {
-            remaining.saturating_mul(100) / effective_capacity
-        };
-        let Some(threshold) = self
-            .thresholds
-            .iter()
-            .copied()
-            .find(|threshold| percent <= i64::from(*threshold))
+        let Some(threshold) =
+            threshold_for_balance(remaining, effective_capacity, &self.thresholds)
         else {
             self.repository.clear_claims(organization.id).await?;
             return Ok(());
@@ -211,6 +211,16 @@ impl CreditEmailScheduler {
     }
 }
 
+fn threshold_for_balance(remaining: i64, capacity: i64, thresholds: &[i16]) -> Option<i16> {
+    if capacity <= 0 {
+        return None;
+    }
+    let remaining_percent_numerator = i128::from(remaining.max(0)) * 100;
+    thresholds.iter().copied().find(|threshold| {
+        remaining_percent_numerator <= i128::from(capacity) * i128::from(*threshold)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -224,17 +234,18 @@ mod tests {
     use crate::usage::ports::{CreditEmailRecipient, OrganizationCreditLimit, OrganizationLimit};
 
     struct TestNotificationRepository {
-        organization: CreditEmailOrganization,
+        organizations: Vec<CreditEmailOrganization>,
         recipients: Vec<CreditEmailRecipient>,
         clear_all_calls: AtomicUsize,
         cleared_thresholds: Mutex<Vec<Vec<i16>>>,
         claimed_thresholds: Mutex<Vec<i16>>,
+        claimed_organizations: Mutex<Vec<Uuid>>,
     }
 
     #[async_trait::async_trait]
     impl CreditEmailNotificationRepository for TestNotificationRepository {
         async fn active_organizations(&self) -> anyhow::Result<Vec<CreditEmailOrganization>> {
-            Ok(vec![self.organization.clone()])
+            Ok(self.organizations.clone())
         }
 
         async fn owner_admin_recipients(
@@ -257,7 +268,16 @@ mod tests {
             Ok(())
         }
 
-        async fn try_claim(&self, _: Uuid, threshold: i16, _: &str) -> anyhow::Result<bool> {
+        async fn try_claim(
+            &self,
+            organization_id: Uuid,
+            threshold: i16,
+            _: &str,
+        ) -> anyhow::Result<bool> {
+            self.claimed_organizations
+                .lock()
+                .await
+                .push(organization_id);
             self.claimed_thresholds.lock().await.push(threshold);
             Ok(false)
         }
@@ -290,16 +310,43 @@ mod tests {
         }
     }
 
+    struct PartiallyFailingLimitsRepository {
+        failed_organization_id: Uuid,
+        limit: OrganizationLimit,
+        breakdown: Vec<OrganizationCreditLimit>,
+    }
+
+    #[async_trait::async_trait]
+    impl OrganizationLimitsRepository for PartiallyFailingLimitsRepository {
+        async fn get_current_limits(
+            &self,
+            organization_id: Uuid,
+        ) -> anyhow::Result<Option<OrganizationLimit>> {
+            if organization_id == self.failed_organization_id {
+                anyhow::bail!("simulated organization read failure");
+            }
+            Ok(Some(self.limit.clone()))
+        }
+
+        async fn get_current_limit_breakdown(
+            &self,
+            _: Uuid,
+        ) -> anyhow::Result<Vec<OrganizationCreditLimit>> {
+            Ok(self.breakdown.clone())
+        }
+    }
+
     fn repository(recipients: Vec<CreditEmailRecipient>) -> Arc<TestNotificationRepository> {
         Arc::new(TestNotificationRepository {
-            organization: CreditEmailOrganization {
+            organizations: vec![CreditEmailOrganization {
                 id: Uuid::new_v4(),
                 name: "Example".to_string(),
-            },
+            }],
             recipients,
             clear_all_calls: AtomicUsize::new(0),
             cleared_thresholds: Mutex::new(Vec::new()),
             claimed_thresholds: Mutex::new(Vec::new()),
+            claimed_organizations: Mutex::new(Vec::new()),
         })
     }
 
@@ -338,6 +385,74 @@ mod tests {
 
         assert_eq!(repository.clear_all_calls.load(Ordering::Relaxed), 1);
         assert!(repository.claimed_thresholds.lock().await.is_empty());
+    }
+
+    #[test]
+    fn threshold_crossing_does_not_round_down() {
+        assert_eq!(threshold_for_balance(201, 1_000, &[0, 10, 20]), None);
+        assert_eq!(threshold_for_balance(200, 1_000, &[0, 10, 20]), Some(20));
+        assert_eq!(threshold_for_balance(101, 1_000, &[0, 10, 20]), Some(20));
+        assert_eq!(threshold_for_balance(100, 1_000, &[0, 10, 20]), Some(10));
+    }
+
+    #[tokio::test]
+    async fn one_organization_failure_does_not_block_later_organizations() {
+        let failed_organization_id = Uuid::new_v4();
+        let healthy_organization_id = Uuid::new_v4();
+        let repository = Arc::new(TestNotificationRepository {
+            organizations: vec![
+                CreditEmailOrganization {
+                    id: failed_organization_id,
+                    name: "Failed".to_string(),
+                },
+                CreditEmailOrganization {
+                    id: healthy_organization_id,
+                    name: "Healthy".to_string(),
+                },
+            ],
+            recipients: vec![CreditEmailRecipient {
+                email: "owner@example.com".to_string(),
+                contact_email: None,
+                contact_email_verified_at: None,
+            }],
+            clear_all_calls: AtomicUsize::new(0),
+            cleared_thresholds: Mutex::new(Vec::new()),
+            claimed_thresholds: Mutex::new(Vec::new()),
+            claimed_organizations: Mutex::new(Vec::new()),
+        });
+        let limits = Arc::new(PartiallyFailingLimitsRepository {
+            failed_organization_id,
+            limit: OrganizationLimit {
+                spend_limit: 100,
+                available: 10,
+                unfunded: 0,
+            },
+            breakdown: vec![OrganizationCreditLimit {
+                credit_type: "payment".to_string(),
+                source: None,
+                amount: 100,
+                transferred_out: 0,
+                effective_capacity: 100,
+                consumed: 90,
+                available: 10,
+                currency: "USD".to_string(),
+            }],
+        });
+        let scheduler = CreditEmailScheduler::new(
+            repository.clone(),
+            limits,
+            Arc::new(NoopEmailSender),
+            vec![0, 10, 20],
+            None,
+        );
+
+        let error = scheduler.run_once().await.unwrap_err();
+
+        assert!(error.to_string().contains("1 organization"));
+        assert_eq!(
+            *repository.claimed_organizations.lock().await,
+            vec![healthy_organization_id]
+        );
     }
 
     #[tokio::test]

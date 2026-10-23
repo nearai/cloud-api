@@ -85,6 +85,8 @@ async fn check_org_membership(
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct OrganizationBalanceResponse {
     pub organization_id: String,
+    /// Historical consumption not yet assigned to a credit type, in nano-USD.
+    pub legacy_unattributed_amount: i64,
     pub total_spent: i64,            // In nano-dollars (scale 9)
     pub total_spent_display: String, // Human readable, e.g., "$12.50"
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -110,8 +112,14 @@ pub struct CreditLimitBreakdownResponse {
     pub credit_type: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
+    /// Gross allocated amount before transfers.
     pub amount: i64,
+    /// Nonnegative capacity transferred out to other organizations.
+    pub transferred_out: i64,
+    /// Net capacity for this source: `max(amount - transferred_out, 0)`.
+    pub effective_capacity: i64,
     pub consumed: i64,
+    /// Remaining spendable capacity: `max(effective_capacity - consumed, 0)`.
     pub available: i64,
     pub currency: String,
 }
@@ -145,6 +153,8 @@ pub async fn compute_organization_balance_response(
             credit_type: limit.credit_type,
             source: limit.source,
             amount: limit.amount,
+            transferred_out: limit.transferred_out,
+            effective_capacity: limit.effective_capacity,
             consumed: limit.consumed,
             available: limit.available,
             currency: limit.currency,
@@ -169,6 +179,7 @@ pub async fn compute_organization_balance_response(
             Ok(OrganizationBalanceResponse {
                 organization_id: balance.organization_id.to_string(),
                 total_spent: balance.total_spent,
+                legacy_unattributed_amount: balance.legacy_unattributed_amount,
                 total_spent_display: format_amount(balance.total_spent),
                 spend_limit,
                 spend_limit_display,
@@ -187,6 +198,7 @@ pub async fn compute_organization_balance_response(
                 Ok(OrganizationBalanceResponse {
                     organization_id: organization_id.to_string(),
                     total_spent: 0,
+                    legacy_unattributed_amount: 0,
                     total_spent_display: format_amount(0),
                     spend_limit: Some(limit_info.spend_limit),
                     spend_limit_display: Some(format_amount(limit_info.spend_limit)),
@@ -270,6 +282,9 @@ pub struct UsageHistoryEntryResponse {
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct UsageHistoryResponse {
     pub data: Vec<UsageHistoryEntryResponse>,
+    /// Number of matching records. Without filters this is the organization's
+    /// recorded request count (`total_requests` in the balance), which can exceed
+    /// the rows still stored, so a final page may come back short or empty.
     pub total: usize,
     pub limit: i64,
     pub offset: i64,
@@ -419,7 +434,8 @@ pub async fn get_organization_balance(
         (status = 200, description = "Usage history", body = UsageHistoryResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
         (status = 403, description = "Forbidden", body = ErrorResponse),
-        (status = 500, description = "Internal server error", body = ErrorResponse)
+        (status = 500, description = "Internal server error", body = ErrorResponse),
+        (status = 504, description = "Usage query timed out", body = ErrorResponse)
     ),
     security(
         ("session_token" = [])
@@ -453,15 +469,20 @@ pub async fn get_organization_usage_history(
         .usage_service
         .get_usage_history(organization_id, Some(query.limit), Some(query.offset))
         .await
-        .map_err(|_| {
-            tracing::error!("Failed to get usage history");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                ResponseJson(ErrorResponse::new(
-                    "Failed to retrieve usage history".to_string(),
-                    "internal_server_error".to_string(),
-                )),
-            )
+        .map_err(|error| match error {
+            services::usage::UsageError::ReportingTimeout => {
+                usage_query_timeout_error(organization_id)
+            }
+            _ => {
+                tracing::error!("Failed to get usage history");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    ResponseJson(ErrorResponse::new(
+                        "Failed to retrieve usage history".to_string(),
+                        "internal_server_error".to_string(),
+                    )),
+                )
+            }
         })?;
 
     let data = history
@@ -513,7 +534,12 @@ async fn get_filtered_organization_usage_history(
         .usage_service
         .list_inference_usage_history(report_query)
         .await
-        .map_err(|_| internal_usage_history_error("Failed to retrieve usage history"))?;
+        .map_err(|error| match error {
+            services::usage::UsageError::ReportingTimeout => {
+                usage_query_timeout_error(organization_id)
+            }
+            _ => internal_usage_history_error("Failed to retrieve usage history"),
+        })?;
 
     let data = history
         .into_iter()
@@ -709,6 +735,18 @@ fn internal_usage_history_error(message: &str) -> UsageError {
         ResponseJson(ErrorResponse::new(
             message.to_string(),
             "internal_server_error".to_string(),
+        )),
+    )
+}
+
+/// The database cancelled a usage query at the reporting statement timeout.
+fn usage_query_timeout_error(organization_id: Uuid) -> UsageError {
+    tracing::warn!(%organization_id, "Usage query timed out");
+    (
+        StatusCode::GATEWAY_TIMEOUT,
+        ResponseJson(ErrorResponse::new(
+            "Usage query timed out".to_string(),
+            "usage_query_timeout".to_string(),
         )),
     )
 }
@@ -1169,11 +1207,12 @@ fn resolve_internal_usage_discount(
 }
 
 /// Validate the `Authorization: Bearer …` header against the configured
-/// `internal_usage_token` in constant time. Returns:
+/// `internal_usage_token` in constant time. Shared by every `/v1/internal/*`
+/// route. Returns:
 /// - `Ok(())` on match.
 /// - `Err(503)` if the endpoint is disabled (token not configured).
 /// - `Err(401)` if the header is missing or doesn't match.
-fn verify_internal_usage_token(
+pub(crate) fn verify_internal_usage_token(
     headers: &HeaderMap,
     expected: Option<&str>,
 ) -> Result<(), UsageError> {
@@ -1181,7 +1220,7 @@ fn verify_internal_usage_token(
         (
             StatusCode::SERVICE_UNAVAILABLE,
             ResponseJson(ErrorResponse::new(
-                "Internal usage endpoint is not configured on this deployment".to_string(),
+                "Internal endpoint is not configured on this deployment".to_string(),
                 "endpoint_disabled".to_string(),
             )),
         )
@@ -1418,6 +1457,17 @@ fn parse_datetime_or_default(
     }
 }
 
+/// `end` defaults to now and `start` to 30 days before `end`.
+fn parse_date_range(
+    start: &Option<String>,
+    end: &Option<String>,
+) -> Result<(chrono::DateTime<Utc>, chrono::DateTime<Utc>), UsageError> {
+    let end = parse_datetime_or_default(end, Utc::now())?;
+    let start = parse_datetime_or_default(start, end - Duration::days(30))?;
+    validate_date_range(start, end)?;
+    Ok((start, end))
+}
+
 /// Organization usage metrics.
 #[utoipa::path(
     get,
@@ -1447,11 +1497,7 @@ pub async fn get_user_organization_metrics(
 ) -> Result<ResponseJson<UserOrganizationMetrics>, (StatusCode, ResponseJson<ErrorResponse>)> {
     let organization_id = check_org_membership(&app_state, user, &org_id).await?;
 
-    let now = Utc::now();
-    let end = parse_datetime_or_default(&query.end, now)?;
-    let start = parse_datetime_or_default(&query.start, end - Duration::days(30))?;
-
-    validate_date_range(start, end)?;
+    let (start, end) = parse_date_range(&query.start, &query.end)?;
 
     let metrics = app_state
         .analytics_service
@@ -1541,11 +1587,7 @@ pub async fn get_user_organization_timeseries(
         ));
     }
 
-    let now = Utc::now();
-    let end = parse_datetime_or_default(&query.end, now)?;
-    let start = parse_datetime_or_default(&query.start, end - Duration::days(30))?;
-
-    validate_date_range(start, end)?;
+    let (start, end) = parse_date_range(&query.start, &query.end)?;
 
     let timeseries = app_state
         .analytics_service
@@ -1582,15 +1624,19 @@ pub enum UsageByModelPeriod {
     Day,
     Week,
     Month,
+    /// The `start`/`end` range instead of a rolling window.
+    Custom,
 }
 
 impl UsageByModelPeriod {
-    fn since(self) -> chrono::DateTime<Utc> {
+    /// Start of the rolling window; `None` for `Custom`.
+    fn since(self) -> Option<chrono::DateTime<Utc>> {
         let now = Utc::now();
         match self {
-            UsageByModelPeriod::Day => now - Duration::days(1),
-            UsageByModelPeriod::Week => now - Duration::days(7),
-            UsageByModelPeriod::Month => now - Duration::days(30),
+            UsageByModelPeriod::Day => Some(now - Duration::days(1)),
+            UsageByModelPeriod::Week => Some(now - Duration::days(7)),
+            UsageByModelPeriod::Month => Some(now - Duration::days(30)),
+            UsageByModelPeriod::Custom => None,
         }
     }
 
@@ -1599,15 +1645,22 @@ impl UsageByModelPeriod {
             UsageByModelPeriod::Day => "day",
             UsageByModelPeriod::Week => "week",
             UsageByModelPeriod::Month => "month",
+            UsageByModelPeriod::Custom => "custom",
         }
     }
 }
 
 #[derive(Debug, Deserialize)]
 pub struct UsageByModelQuery {
-    /// `day` (last 24h), `week` (last 7d), or `month` (last 30d). Defaults to `month`.
+    /// `day` (last 24h), `week` (last 7d), `month` (last 30d), or `custom` for the
+    /// `start`/`end` range. Defaults to `month`.
     #[serde(default = "default_period")]
     pub period: UsageByModelPeriod,
+    /// Custom range start (ISO 8601). Setting `start` or `end` selects the custom range
+    /// whatever `period` says.
+    pub start: Option<String>,
+    /// Custom range end, exclusive (ISO 8601). Defaults to now.
+    pub end: Option<String>,
 }
 
 fn default_period() -> UsageByModelPeriod {
@@ -1629,8 +1682,12 @@ pub struct UsageByModelEntryResponse {
 /// Per-model usage breakdown response
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct UsageByModelResponse {
+    /// `day`, `week` or `month` for a rolling window; `custom` for a `start`/`end` range.
     pub period: String,
     pub start_date: String,
+    /// Exclusive end of a custom range. Absent for rolling windows, which end now.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end_date: Option<String>,
     pub data: Vec<UsageByModelEntryResponse>,
 }
 
@@ -1638,21 +1695,26 @@ pub struct UsageByModelResponse {
 ///
 /// Returns one row per model, summed over a rolling window ending now:
 /// `day` = last 24h, `week` = last 7 days, `month` = last 30 days (NOT calendar
-/// day/week/month-to-date). Used by the dashboard pie chart to show which models
-/// drive spend.
+/// day/week/month-to-date). Setting `start` or `end` (or `period=custom`) sums a custom
+/// range instead; a range longer than 366 days is rejected with 400. Used by the
+/// dashboard pie chart to show which models drive spend.
 #[utoipa::path(
     get,
     path = "/v1/organizations/{org_id}/usage/by-model",
     tag = "Usage",
     params(
         ("org_id" = String, Path, description = "Organization ID"),
-        ("period" = Option<String>, Query, description = "Rolling window: `day` (last 24h), `week` (last 7d), or `month` (last 30d). Default: `month`")
+        ("period" = Option<String>, Query, description = "Rolling window: `day` (last 24h), `week` (last 7d), or `month` (last 30d); or `custom` for the `start`/`end` range. Default: `month`. Setting `start` or `end` selects the custom range whatever `period` says"),
+        ("start" = Option<String>, Query, description = "Custom range start (ISO 8601). Defaults to `end` minus 30 days"),
+        ("end" = Option<String>, Query, description = "Custom range end, exclusive (ISO 8601). Defaults to now")
     ),
     responses(
         (status = 200, description = "Per-model usage breakdown", body = UsageByModelResponse),
+        (status = 400, description = "Invalid date or date range", body = ErrorResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
         (status = 403, description = "Forbidden", body = ErrorResponse),
-        (status = 500, description = "Internal server error", body = ErrorResponse)
+        (status = 500, description = "Internal server error", body = ErrorResponse),
+        (status = 504, description = "Usage query timed out", body = ErrorResponse)
     ),
     security(
         ("session_token" = [])
@@ -1665,21 +1727,37 @@ pub async fn get_organization_usage_by_model(
     Query(query): Query<UsageByModelQuery>,
 ) -> Result<ResponseJson<UsageByModelResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
     let organization_id = check_org_membership(&app_state, user, &org_id).await?;
-    let start_date = query.period.since();
+    let period = if query.start.is_some() || query.end.is_some() {
+        UsageByModelPeriod::Custom
+    } else {
+        query.period
+    };
+    let (start_date, end_date) = match period.since() {
+        Some(since) => (since, None),
+        None => {
+            let (start, end) = parse_date_range(&query.start, &query.end)?;
+            (start, Some(end))
+        }
+    };
 
     let entries = app_state
         .usage_service
-        .get_usage_by_model(organization_id, start_date)
+        .get_usage_by_model(organization_id, start_date, end_date)
         .await
-        .map_err(|e| {
-            tracing::error!(error = ?e, "Failed to get usage by model");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                ResponseJson(ErrorResponse::new(
-                    "Failed to retrieve usage breakdown".to_string(),
-                    "internal_server_error".to_string(),
-                )),
-            )
+        .map_err(|e| match e {
+            services::usage::UsageError::ReportingTimeout => {
+                usage_query_timeout_error(organization_id)
+            }
+            _ => {
+                tracing::error!(error = ?e, "Failed to get usage by model");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    ResponseJson(ErrorResponse::new(
+                        "Failed to retrieve usage breakdown".to_string(),
+                        "internal_server_error".to_string(),
+                    )),
+                )
+            }
         })?;
 
     let data = entries
@@ -1696,8 +1774,9 @@ pub async fn get_organization_usage_by_model(
         .collect();
 
     Ok(ResponseJson(UsageByModelResponse {
-        period: query.period.as_str().to_string(),
+        period: period.as_str().to_string(),
         start_date: start_date.to_rfc3339(),
+        end_date: end_date.map(|d| d.to_rfc3339()),
         data,
     }))
 }

@@ -12,6 +12,14 @@ on:
   # Include stacked PRs targeting another feature branch.
   pull_request:
 
+# A new push to a PR supersedes the previous run, so cancel it instead of letting
+# it hold self-hosted runners. Non-PR runs get a unique group (run_id): a shared
+# group would serialize main/develop pushes and GitHub would cancel the pending
+# run whenever a third arrives, leaving that commit untested.
+concurrency:
+  group: tests-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
@@ -45,7 +53,9 @@ jobs:
   # classify (new branch, detection error) is treated as "run the tests".
   changes:
     name: Detect changes
-    runs-on: [self-hosted, infra]
+    # Lightweight jobs run on GitHub-hosted runners (free for this public repo)
+    # so they never queue behind Rust builds for a self-hosted slot.
+    runs-on: ubuntu-latest
     permissions:
       contents: read
     outputs:
@@ -73,7 +83,7 @@ jobs:
           # and none of it is Rust-relevant.
           RUST=true
           if [ -n "$CHANGED" ] && ! echo "$CHANGED" | grep -qE \
-            '(\.rs$|(^|/)Cargo\.(toml|lock)$|^crates/database/src/migrations/|^\.github/workflows/test\.yml$|^\.github/actions/setup-rust-ci/|^\.config/nextest\.toml$|^rust-toolchain\.toml$|^\.cargo/config\.toml$)'; then
+            '(\.rs$|(^|/)Cargo\.(toml|lock)$|^crates/[^/]+/src/.*\.json$|^crates/database/src/migrations/|^\.github/workflows/test\.yml$|^\.github/actions/setup-rust-ci/|^\.config/nextest\.toml$|^rust-toolchain\.toml$|^\.cargo/config\.toml$|^scripts/check_dep_guards\.sh$)'; then
             RUST=false
           fi
           echo "rust=$RUST" >> "$GITHUB_OUTPUT"
@@ -101,6 +111,9 @@ jobs:
     # sccache + rust-cache for the parallel test jobs.
     - name: Run cargo clippy
       run: cargo clippy --all-targets --all-features -- -D warnings
+
+    - name: Dependency guards
+      run: bash scripts/check_dep_guards.sh
 
   # Unit tests (library + binary tests) run without PostgreSQL: the in-crate
   # #[test] functions use mocks and do not establish real DB connections.
@@ -169,6 +182,7 @@ jobs:
   # PostgreSQL headroom for runner-side services.
   e2e-test:
     name: E2E tests
+    timeout-minutes: 60
     needs: changes
     if: ${{ needs.changes.outputs.rust == 'true' }}
     runs-on: [self-hosted, infra]
@@ -188,7 +202,8 @@ jobs:
           --health-retries 5
           --shm-size=256mb
         ports:
-          - 5432:5432
+          # E2E clients run on the host; keep the temporary test database local.
+          - 127.0.0.1:5432:5432
 
     steps:
     - uses: actions/checkout@v7
@@ -197,6 +212,18 @@ jobs:
       uses: ./.github/actions/setup-rust-ci
       with:
         cache-key: e2e
+
+    - name: Run typed-query, credit-allocation, credit-transfer, session, and binding regressions
+      run: |
+        cargo test --locked -p database --test hot_path_typed_queries --test billing_typed_queries --test credit_allocation --test session_rotation --test staking_wallet_binding -- --test-threads=4
+        # Fault injection changes shared table constraints; isolate this binary.
+        cargo test --locked -p database --test credit_transfers -- --test-threads=1
+      env:
+        PGHOST: localhost
+        PGPORT: 5432
+        PGDATABASE: platform_api
+        PGUSER: postgres
+        PGPASSWORD: postgres
 
     - name: Run e2e tests
       run: cargo nextest run --test e2e_all
@@ -220,11 +247,13 @@ jobs:
 
   script-test:
     name: Script tests
-    runs-on: [self-hosted, infra]
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
       - name: Test synthetic rollout verification
         run: python3 -B -m unittest discover -s scripts/tests -v
+      - name: Test PR review comment formatter
+        run: python3 -B -m unittest discover -s .github/scripts -p 'test_*.py' -v
 
   # Aggregates all test jobs into a single required status check. The branch
   # ruleset requires "Test Suite", so this job MUST always run and always report
@@ -234,7 +263,7 @@ jobs:
   # gate passes; otherwise every test job must have succeeded.
   test-suite:
     name: Test Suite
-    runs-on: [self-hosted, infra]
+    runs-on: ubuntu-latest
     needs: [changes, lint, unit-test, integration-test, e2e-test, script-test]
     if: always()
     steps:
@@ -275,23 +304,3 @@ jobs:
             exit 1
           fi
           echo "All test jobs passed"
-
-  # Release build, only on main pushes. Split into its own job so it does
-  # not block the test jobs and does not pull in PostgreSQL or test env vars
-  # (there is no build.rs; cargo build --release needs none of them).
-  build-release:
-    name: Build release
-    needs: changes
-    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.changes.outputs.rust == 'true' }}
-    runs-on: [self-hosted, infra]
-
-    steps:
-    - uses: actions/checkout@v7
-
-    - name: Setup Rust CI
-      uses: ./.github/actions/setup-rust-ci
-      with:
-        cache-key: release
-
-    - name: Build release
-      run: cargo build --release

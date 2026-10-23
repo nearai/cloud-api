@@ -82,16 +82,20 @@ impl AttestationService {
 
         let environment = get_environment();
         let env_tag = format!("{TAG_ENVIRONMENT}:{environment}");
-        let mut signatures = Vec::with_capacity(2);
-        let fetched: Result<(), AttestationError> = async {
-            for algo in ["ecdsa", "ed25519"] {
+        // Fetch both algorithms independently. A slow or unavailable legacy
+        // ECDSA signature must not consume the shared streaming deadline before
+        // the SDK-default Ed25519 lookup gets a chance to run. Keep the result
+        // order deterministic so the repository batch remains stable.
+        let fetch_signature = |algo: &'static str| {
+            let provider = provider.clone();
+            async move {
                 let fetch = async {
                     provider
                         .get_signature(chat_id, Some(algo.to_string()))
                         .await
                         .map_err(|e| AttestationError::ProviderError(e.to_string()))
                 };
-                let provider_signature = match fetch_deadline {
+                let result = match fetch_deadline {
                     Some(deadline) => match tokio::time::timeout_at(deadline, fetch).await {
                         Ok(result) => result,
                         Err(_) => Err(AttestationError::ProviderError(format!(
@@ -99,47 +103,59 @@ impl AttestationService {
                         ))),
                     },
                     None => fetch.await,
-                }
-                .inspect_err(|e| {
-                    // The error string embeds the backend URL on connection
-                    // failures — without it (and chat_id) these events are
-                    // impossible to attribute to a model/backend.
-                    tracing::error!(
-                        %chat_id,
-                        error = %e,
-                        "Failed to get chat signature from provider for algorithm: {}",
-                        algo
-                    );
-                    let duration = start_time.elapsed();
-                    self.metrics_service.record_count(
-                        METRIC_VERIFICATION_FAILURE,
-                        1,
-                        &[&format!("{TAG_REASON}:{REASON_INFERENCE_ERROR}"), &env_tag],
-                    );
-                    self.metrics_service.record_latency(
-                        METRIC_VERIFICATION_DURATION,
-                        duration,
-                        &[&env_tag],
-                    );
-                })?;
-                signatures.push(ChatSignature {
+                };
+                (algo, result)
+            }
+        };
+        let (ecdsa, ed25519) = tokio::join!(fetch_signature("ecdsa"), fetch_signature("ed25519"));
+
+        let mut signatures = Vec::with_capacity(2);
+        let mut fetch_error = None;
+        for (algo, result) in [ecdsa, ed25519] {
+            match result {
+                Ok(provider_signature) => signatures.push(ChatSignature {
                     text: provider_signature.text,
                     signature: provider_signature.signature,
                     signing_address: provider_signature.signing_address,
                     signing_algo: provider_signature.signing_algo,
                     signature_kind: Some(SignatureKind::ProviderTee),
-                });
+                }),
+                Err(error) => {
+                    // The error string embeds the backend URL on connection
+                    // failures — without it (and chat_id) these events are
+                    // impossible to attribute to a model/backend.
+                    tracing::error!(
+                        %chat_id,
+                        error = %error,
+                        "Failed to get chat signature from provider for algorithm: {}",
+                        algo
+                    );
+                    if fetch_error.is_none() {
+                        fetch_error = Some(error);
+                    }
+                }
             }
-
-            Ok(())
         }
-        .await;
+        let fetched = if let Some(error) = fetch_error {
+            let duration = start_time.elapsed();
+            self.metrics_service.record_count(
+                METRIC_VERIFICATION_FAILURE,
+                1,
+                &[&format!("{TAG_REASON}:{REASON_INFERENCE_ERROR}"), &env_tag],
+            );
+            self.metrics_service.record_latency(
+                METRIC_VERIFICATION_DURATION,
+                duration,
+                &[&env_tag],
+            );
+            Err(error)
+        } else {
+            Ok(())
+        };
 
-        // Store whatever was fetched even if a later algorithm failed or hit
-        // the fetch deadline, leaving time before the outer stream timeout. The
-        // one-at-a-time implementation persisted each signature as it came,
-        // so a backend that serves ecdsa but fails ed25519 still leaves the
-        // chat verifiable by ecdsa. Both algorithms land in one statement:
+        // Store whatever was fetched even if either algorithm failed or hit the
+        // fetch deadline, leaving time before the outer stream timeout. Both
+        // algorithms land in one statement:
         // this runs before the client sees `[DONE]`, so every saved round
         // trip is user-visible.
         let stored: Result<(), AttestationError> = if signatures.is_empty() {

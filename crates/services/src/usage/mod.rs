@@ -1,6 +1,9 @@
 pub mod hourly_scheduler;
 pub mod ports;
+mod pricing;
 pub mod provider_attribution;
+#[cfg(test)]
+mod record_usage_tests;
 pub mod reporting;
 pub mod text_pricing;
 
@@ -8,8 +11,8 @@ use crate::metrics::{
     consts::{
         get_environment, METRIC_BILLED_CACHE_READ_TOKENS, METRIC_BILLED_CACHE_WRITE_TOKENS,
         METRIC_BILLED_INPUT_COST_USD, METRIC_BILLED_INPUT_TOKENS, METRIC_BILLED_OUTPUT_COST_USD,
-        METRIC_BILLED_OUTPUT_TOKENS, METRIC_BILLED_REQUESTS, METRIC_BILLING_PRICING_FALLBACK,
-        METRIC_COST_USD, TAG_ENVIRONMENT, TAG_INFERENCE_TYPE, TAG_MODEL,
+        METRIC_BILLED_OUTPUT_TOKENS, METRIC_BILLED_REQUESTS, METRIC_COST_USD, TAG_ENVIRONMENT,
+        TAG_INFERENCE_TYPE, TAG_MODEL,
     },
     MetricsServiceTrait,
 };
@@ -37,7 +40,7 @@ const EXTERNAL_USAGE_ID_NAMESPACE: Uuid = Uuid::from_u128(0x1966acaf_9f95_5dab_b
 ///
 /// Important: This helper is intended for chat/LLM-style models where cache-read pricing
 /// applies. Non-token billing types (image, audio duration, rerank, etc.) use dedicated
-/// branches in `record_usage` and deliberately ignore `cache_read_tokens` and
+/// branches in `pricing::price_usage` and deliberately ignore `cache_read_tokens` and
 /// `cache_read_cost_per_token` even if configured on the model.
 ///
 /// Formula (with cache enabled):
@@ -95,7 +98,7 @@ pub fn compute_token_cost_with_cache_write(
     pricing: &ModelPricing,
 ) -> Result<CostBreakdown, UsageError> {
     // Basic validation: token counts must be non-negative. This protects both direct callers
-    // (e.g., calculate_cost) and internal usage from accidentally computing negative costs.
+    // (e.g., e2e cost oracles) and internal usage from accidentally computing negative costs.
     if input_tokens < 0
         || output_tokens < 0
         || cache_read_tokens < 0
@@ -203,73 +206,11 @@ impl UsageServiceImpl {
 
 #[async_trait::async_trait]
 impl UsageServiceTrait for UsageServiceImpl {
-    /// Calculate cost for a given model and token usage.
-    ///
-    /// Uses the same semantics as `record_usage` / `compute_token_cost`:
-    /// - For token-based chat-style models, applies cache-aware pricing:
-    ///   `(input - cache_read) * input_rate + cache_read * cache_read_rate + output * output_rate`.
-    /// - When `cache_read_cost_per_token` is `None`, cache pricing is **disabled** and
-    ///   all input tokens (including cached ones) are billed at `input_cost_per_token`.
-    ///   `Some(0)` means cached tokens are genuinely free; `Some(x)` bills them at `x`.
-    /// - Non-token billing types (image, audio duration, rerank, etc.) have dedicated paths in
-    ///   `record_usage` and do not use this helper.
-    ///
-    /// All costs use fixed scale of 9 (nano-dollars) and USD currency.
-    async fn calculate_cost(
-        &self,
-        model_id: &str,
-        input_tokens: i32,
-        output_tokens: i32,
-        cache_read_tokens: i32,
-    ) -> Result<CostBreakdown, UsageError> {
-        let model = self
-            .model_repository
-            .get_model_by_name(model_id)
-            .await
-            .map_err(|e| UsageError::InternalError(format!("Failed to get model: {e}")))?
-            .ok_or_else(|| UsageError::ModelNotFound(format!("Model '{model_id}' not found")))?;
-
-        if let Some(profile) = &model.text_pricing {
-            Ok(compute_profiled_text_cost(
-                input_tokens,
-                output_tokens,
-                cache_read_tokens,
-                0,
-                TextServiceTier::Default,
-                // This API has no requested/actual tier parameter. Estimate
-                // conservatively instead of assuming Standard, so a preflight
-                // calculation cannot understate Flex/Priority catalog rates.
-                Some("unknown_preflight_tier"),
-                profile,
-            )?
-            .cost)
-        } else {
-            compute_token_cost(input_tokens, output_tokens, cache_read_tokens, &model)
-        }
-    }
-
     /// Record usage after an API call completes
     async fn record_usage(
         &self,
         request: RecordUsageServiceRequest,
     ) -> Result<UsageLogEntry, UsageError> {
-        // Normalize cache_read_tokens to satisfy invariant: 0 <= cache_read_tokens <= input_tokens.
-        // Ensures cost computation and persisted usage stay consistent across all callers
-        // (API, provider parsing, etc.).
-        let cache_read_tokens = request.cache_read_tokens.min(request.input_tokens).max(0);
-        let cache_write = request.cache_write.map(|write| CacheWriteBilling {
-            tokens: write
-                .tokens
-                .min(request.input_tokens.saturating_sub(cache_read_tokens))
-                .max(0),
-            cost_per_token: write.cost_per_token,
-        });
-        let legacy_cache_write_tokens = cache_write.map(|write| write.tokens).unwrap_or(0);
-        let profiled_cache_write_tokens = request
-            .profiled_cache_write_tokens
-            .min(request.input_tokens.saturating_sub(cache_read_tokens))
-            .max(0);
-
         // Look up the model to get pricing (model_id is already a UUID)
         let model = self
             .model_repository
@@ -280,169 +221,16 @@ impl UsageServiceTrait for UsageServiceImpl {
                 UsageError::ModelNotFound(format!("Model with ID '{}' not found", request.model_id))
             })?;
 
-        // Calculate costs based on inference type
-        let (
+        let pricing::PricedUsage {
+            cache_read_tokens,
+            cache_write_tokens,
             input_cost,
             output_cost,
             total_cost,
-            cache_write_tokens,
             billing_details,
             service_tier,
             context_band,
-        ) = match request.inference_type {
-            ports::InferenceType::ImageGeneration | ports::InferenceType::ImageEdit => {
-                // For image-based operations: use image_count and cost_per_image
-                let image_count = request.image_count.unwrap_or(0);
-                // Use checked arithmetic to prevent integer overflow in billing-critical path
-                let image_cost = (image_count as i64)
-                    .checked_mul(model.cost_per_image)
-                    .ok_or_else(|| {
-                        UsageError::CostCalculationOverflow(format!(
-                            "Image cost calculation overflow: {} images * {} cost_per_image",
-                            image_count, model.cost_per_image
-                        ))
-                    })?;
-                (
-                    0,
-                    image_cost,
-                    image_cost,
-                    legacy_cache_write_tokens,
-                    None,
-                    None,
-                    None,
-                )
-            }
-            ports::InferenceType::AudioTranscription => {
-                // For audio transcription: bill by duration in seconds (stored in input_tokens).
-                // Cache pricing is intentionally NOT applied for audio transcription, even if
-                // cache_read_cost_per_token is configured on the model.
-                // input_tokens contains the audio duration rounded up to nearest second
-                let duration_cost = (request.input_tokens as i64)
-                    .checked_mul(model.input_cost_per_token)
-                    .ok_or_else(|| {
-                        UsageError::CostCalculationOverflow(format!(
-                            "Audio transcription cost calculation overflow: {} seconds * {} cost_per_token",
-                            request.input_tokens, model.input_cost_per_token
-                        ))
-                    })?;
-                (
-                    duration_cost,
-                    0,
-                    duration_cost,
-                    legacy_cache_write_tokens,
-                    None,
-                    None,
-                    None,
-                )
-            }
-            ports::InferenceType::Rerank
-            | ports::InferenceType::Embedding
-            | ports::InferenceType::Score
-            | ports::InferenceType::PrivacyClassify => {
-                // For rerank/embedding/score/privacy_classify: use input tokens as the billing unit.
-                // Cache pricing is intentionally NOT applied, even if
-                // cache_read_cost_per_token is configured on the model.
-                // Use checked arithmetic to prevent integer overflow in billing-critical path
-                let cost = (request.input_tokens as i64)
-                    .checked_mul(model.input_cost_per_token)
-                    .ok_or_else(|| {
-                        UsageError::CostCalculationOverflow(format!(
-                            "{} cost calculation overflow: {} tokens * {} cost_per_token",
-                            request.inference_type,
-                            request.input_tokens,
-                            model.input_cost_per_token
-                        ))
-                    })?;
-                (cost, 0, cost, legacy_cache_write_tokens, None, None, None)
-            }
-            _ => {
-                // For token-based models (chat completions, etc.)
-                if let Some(profile) = &model.text_pricing {
-                    let requested_tier = request
-                        .requested_service_tier
-                        .unwrap_or(TextServiceTier::Default);
-                    let priced = compute_profiled_text_cost(
-                        request.input_tokens,
-                        request.output_tokens,
-                        cache_read_tokens,
-                        profiled_cache_write_tokens,
-                        requested_tier,
-                        request.provider_service_tier.as_deref(),
-                        profile,
-                    )?;
-                    if let Some(reason) = priced.snapshot.critical_fallback_reason.as_deref() {
-                        let environment = get_environment();
-                        let tags = [
-                            format!("{}:{}", TAG_MODEL, model.model_name),
-                            format!("reason:{reason}"),
-                            format!("{TAG_ENVIRONMENT}:{environment}"),
-                        ];
-                        let tag_refs: Vec<&str> = tags.iter().map(String::as_str).collect();
-                        self.metrics_service.record_count(
-                            METRIC_BILLING_PRICING_FALLBACK,
-                            1,
-                            &tag_refs,
-                        );
-                        tracing::error!(
-                            model = %model.model_name,
-                            reason,
-                            "Critical billing pricing fallback applied"
-                        );
-                    }
-                    let service_tier = Some(priced.snapshot.actual_tier.clone());
-                    let context_band = Some(priced.snapshot.context_band.as_str().to_string());
-                    let billing_details =
-                        Some(serde_json::to_value(&priced.snapshot).map_err(|error| {
-                            UsageError::InternalError(format!(
-                                "Failed to serialize billing snapshot: {error}"
-                            ))
-                        })?);
-                    (
-                        priced.cost.input_cost,
-                        priced.cost.output_cost,
-                        priced.cost.total_cost,
-                        profiled_cache_write_tokens,
-                        billing_details,
-                        service_tier,
-                        context_band,
-                    )
-                } else {
-                    let cost = compute_token_cost_with_cache_write(
-                        request.input_tokens,
-                        request.output_tokens,
-                        cache_read_tokens,
-                        cache_write,
-                        &model,
-                    )?;
-                    (
-                        cost.input_cost,
-                        cost.output_cost,
-                        cost.total_cost,
-                        legacy_cache_write_tokens,
-                        None,
-                        None,
-                        None,
-                    )
-                }
-            }
-        };
-
-        // A reporter-supplied discount is applied after pricing so every SKU
-        // (input, cache read/write, output, image) gets the same multiplier,
-        // and the list amounts stay in `billing_details` for auditing.
-        let (input_cost, output_cost, total_cost, billing_details) = match request.discount {
-            Some(discount) => {
-                let discounted =
-                    discount.apply_to_costs(input_cost, output_cost, billing_details)?;
-                (
-                    discounted.input_cost,
-                    discounted.output_cost,
-                    discounted.total_cost,
-                    Some(discounted.billing_details),
-                )
-            }
-            None => (input_cost, output_cost, total_cost, billing_details),
-        };
+        } = pricing::price_usage(&request, &model, self.metrics_service.as_ref())?;
 
         // Create database request with model UUID and name (denormalized).
         // Note: `cache_read_tokens` is persisted for observability across all inference types,
@@ -524,13 +312,13 @@ impl UsageServiceTrait for UsageServiceImpl {
                 cache_write_tokens as i64,
                 &tags_str,
             );
-            metrics.record_count(METRIC_BILLED_INPUT_COST_USD, input_cost, &tags_str);
-            metrics.record_count(METRIC_BILLED_OUTPUT_COST_USD, output_cost, &tags_str);
+            metrics.record_count(METRIC_BILLED_INPUT_COST_USD, log.input_cost, &tags_str);
+            metrics.record_count(METRIC_BILLED_OUTPUT_COST_USD, log.output_cost, &tags_str);
 
             // Existing total-cost metric, kept for backward compatibility with
             // dashboards; now also dimensioned by inference_type.
-            if total_cost > 0 {
-                metrics.record_count(METRIC_COST_USD, total_cost, &tags_str);
+            if log.total_cost > 0 {
+                metrics.record_count(METRIC_COST_USD, log.total_cost, &tags_str);
             }
         } else {
             // Log when we skip metrics for a duplicate (aids debugging)
@@ -734,27 +522,23 @@ impl UsageServiceTrait for UsageServiceImpl {
         // Internal metrics (ttft_ms, avg_itl_ms, stop_reason) are not exposed
         // via the public API — they are populated only by the inference pipeline.
         let service_request = RecordUsageServiceRequest {
-            organization_id,
-            workspace_id,
-            api_key_id,
-            model_id: model.id,
             input_tokens,
             output_tokens,
             cache_read_tokens,
-            cache_write: None,
-            profiled_cache_write_tokens: 0,
-            requested_service_tier: None,
-            provider_service_tier: None,
-            inference_type,
-            ttft_ms: None,
-            avg_itl_ms: None,
             inference_id,
             provider_request_id,
-            stop_reason: None,
-            response_id: None,
             image_count,
             provider_attribution,
             discount,
+            ..RecordUsageServiceRequest::base(
+                crate::usage::BillingIdentity {
+                    organization_id,
+                    workspace_id,
+                    api_key_id,
+                    model_id: model.id,
+                },
+                inference_type,
+            )
         };
 
         self.record_usage(service_request).await
@@ -833,6 +617,7 @@ impl UsageServiceTrait for UsageServiceImpl {
         Ok(balance.map(|b| OrganizationBalanceInfo {
             organization_id: b.organization_id,
             total_spent: b.total_spent,
+            legacy_unattributed_amount: b.legacy_unattributed_amount,
             last_usage_at: b.last_usage_at,
             total_requests: b.total_requests,
             total_tokens: b.total_tokens,
@@ -851,7 +636,13 @@ impl UsageServiceTrait for UsageServiceImpl {
             .usage_repository
             .get_usage_history(organization_id, limit, offset)
             .await
-            .map_err(|e| UsageError::InternalError(format!("Failed to get usage history: {e}")))?;
+            .map_err(|e| {
+                if crate::common::is_query_timeout(&e) {
+                    UsageError::ReportingTimeout
+                } else {
+                    UsageError::InternalError(format!("Failed to get usage history: {e}"))
+                }
+            })?;
 
         Ok((logs, total))
     }
@@ -989,11 +780,18 @@ impl UsageServiceTrait for UsageServiceImpl {
         &self,
         organization_id: Uuid,
         start_date: chrono::DateTime<chrono::Utc>,
+        end_date: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<Vec<UsageByModelEntry>, UsageError> {
         self.usage_repository
-            .get_usage_by_model(organization_id, start_date)
+            .get_usage_by_model(organization_id, start_date, end_date)
             .await
-            .map_err(|e| UsageError::InternalError(format!("Failed to get usage by model: {e}")))
+            .map_err(|e| {
+                if crate::common::is_query_timeout(&e) {
+                    UsageError::ReportingTimeout
+                } else {
+                    UsageError::InternalError(format!("Failed to get usage by model: {e}"))
+                }
+            })
     }
 
     async fn list_inference_usage_report(
@@ -1022,7 +820,13 @@ impl UsageServiceTrait for UsageServiceImpl {
             .list_inference_usage_history(query)
             .await
             .map_err(|e| {
-                UsageError::InternalError(format!("Failed to list inference usage history: {e}"))
+                if crate::common::is_query_timeout(&e) {
+                    UsageError::ReportingTimeout
+                } else {
+                    UsageError::InternalError(format!(
+                        "Failed to list inference usage history: {e}"
+                    ))
+                }
             })
     }
 }

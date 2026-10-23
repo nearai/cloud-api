@@ -2,8 +2,9 @@ use crate::attestation::ita::{ItaTokenQuery, ItaTokenResponse};
 use crate::attestation::models::{
     AttestationError, AttestationReport, ChatSignature, SignatureLookupResult,
 };
+use crate::models::ModelCaller;
 use async_trait::async_trait;
-use inference_providers::ProviderTier;
+use inference_providers::ProviderFilter;
 
 #[async_trait]
 pub trait AttestationServiceTrait: Send + Sync {
@@ -79,8 +80,12 @@ pub trait AttestationServiceTrait: Send + Sync {
 
     /// Fetch a hardware attestation report.
     ///
-    /// `provider_filter`: when `Some`, only the matching trust tier is queried.
+    /// `provider_filter`: when `Some`, only the matching provider (NEAR fleet or 3P source) is queried.
     /// `None` keeps the existing behaviour (first successful provider wins).
+    ///
+    /// `caller`: who asks. A `model` the caller may not use is reported as
+    /// `UnknownModel`, like a name that does not exist.
+    #[allow(clippy::too_many_arguments)]
     async fn get_attestation_report(
         &self,
         model: Option<String>,
@@ -88,9 +93,13 @@ pub trait AttestationServiceTrait: Send + Sync {
         nonce: Option<String>,
         signing_address: Option<String>,
         include_tls_fingerprint: bool,
-        provider_filter: Option<ProviderTier>,
+        provider_filter: Option<ProviderFilter>,
+        caller: ModelCaller,
     ) -> Result<AttestationReport, AttestationError>;
 
+    /// Intel Trust Authority tokens for the gateway and, when the query names
+    /// one, a model. Served to the public: the model is resolved for an
+    /// anonymous caller, so an unlisted model is reported as `UnknownModel`.
     async fn get_ita_attestation_token(
         &self,
         query: ItaTokenQuery,

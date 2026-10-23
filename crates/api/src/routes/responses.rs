@@ -1,5 +1,5 @@
 use crate::{
-    middleware::{auth::AuthenticatedApiKey, RequestBodyHash, RequestCorrelation},
+    middleware::{auth::AuthenticatedApiKey, RequestBodyHash, RequestCorrelation, RequestedModel},
     models::ErrorResponse,
     routes::extractors::OpenAiJson,
 };
@@ -474,12 +474,26 @@ pub async fn create_response(
     Extension(body_hash): Extension<RequestBodyHash>,
     Extension(correlation): Extension<RequestCorrelation>,
     headers: HeaderMap,
+    requested_model: RequestedModel,
     OpenAiJson(raw): OpenAiJson<Box<serde_json::value::RawValue>>,
 ) -> axum::response::Response {
     // Keep the original JSON for legacy typed extraction (including its errors).
     let body = serde_json::from_str::<serde_json::Value>(raw.get()).ok();
+    if let Some(model) = body
+        .as_ref()
+        .and_then(|body| body.get("model"))
+        .and_then(|model| model.as_str())
+    {
+        requested_model.set(model);
+    }
     let native = if let Some(body) = body.as_ref() {
-        state.native_service.selected_model(body).await
+        state
+            .native_service
+            .selected_model(
+                body,
+                services::models::ModelCaller::Organization(api_key.organization.id.0),
+            )
+            .await
     } else {
         None
     };
@@ -957,7 +971,8 @@ mod tests {
             _nonce: Option<String>,
             _signing_address: Option<String>,
             _include_tls_fingerprint: bool,
-            _provider_filter: Option<inference_providers::ProviderTier>,
+            _provider_filter: Option<inference_providers::ProviderFilter>,
+            _caller: services::models::ModelCaller,
         ) -> Result<services::attestation::models::AttestationReport, AttestationError> {
             Err(AttestationError::InternalError("unused".to_string()))
         }

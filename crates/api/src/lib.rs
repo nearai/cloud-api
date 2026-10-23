@@ -1,3 +1,5 @@
+#[doc(hidden)]
+pub mod attested_3p_startup;
 pub mod consts;
 pub mod conversions;
 pub mod database_encryption;
@@ -63,7 +65,7 @@ use services::{
 use std::sync::Arc;
 use tower_http::{
     compression::CompressionLayer,
-    cors::{AllowOrigin, Any, CorsLayer},
+    cors::{AllowHeaders, AllowOrigin, Any, CorsLayer},
 };
 use utoipa::OpenApi;
 
@@ -78,6 +80,10 @@ const PRIVACY_CLASSIFY_MAX_BODY_SIZE: usize = 256 * 1024; // 256 KB
 // cover audio-transcription payloads (≤25 MB) plus HPKE overhead, while
 // bounding unauthenticated memory use before the inner request is decrypted.
 const OHTTP_MAX_BODY_SIZE: usize = 32 * 1024 * 1024; // 32 MB
+
+// POST /v1/responses sets no DefaultBodyLimit, so axum's 2 MB extractor default
+// is its effective limit. body_hash_middleware needs it as an explicit cap.
+const RESPONSES_MAX_BODY_SIZE: usize = 2 * 1024 * 1024; // 2 MB
 
 /// Service initialization components
 #[derive(Clone)]
@@ -105,6 +111,7 @@ pub struct DomainServices {
     pub workspace_service: Arc<dyn services::workspace::WorkspaceServiceTrait + Send + Sync>,
     pub usage_service: Arc<dyn services::usage::UsageServiceTrait + Send + Sync>,
     pub user_service: Arc<dyn services::user::UserServiceTrait + Send + Sync>,
+    pub contact_email_service: Arc<services::contact_email::ContactEmailService>,
     pub files_service: Arc<dyn services::files::FileServiceTrait + Send + Sync>,
     pub metrics_service: Arc<dyn services::metrics::MetricsServiceTrait>,
     pub staking_farm_service: Arc<services::staking_farm::StakingFarmService>,
@@ -112,6 +119,7 @@ pub struct DomainServices {
     pub web_search_provider: Arc<dyn services::responses::tools::WebSearchProviderTrait>,
     pub service_usage_service:
         Arc<dyn services::service_usage::ServiceUsageServiceTrait + Send + Sync>,
+    pub admin_settings_service: Arc<services::admin_settings::AdminSettingsService>,
 }
 
 /// Controls process-level background work started while the application router
@@ -219,7 +227,7 @@ pub fn init_auth_services(database: Arc<Database>, config: &ApiConfig) -> AuthCo
             organization_repo as Arc<dyn services::organization::ports::OrganizationRepository>,
             workspace_repository_for_auth,
             organization_service.clone(),
-            config.auth.require_session_bound_access_tokens,
+            &config.auth,
         ))
     };
 
@@ -316,25 +324,33 @@ pub async fn init_domain_services(
     organization_service: Arc<dyn services::organization::OrganizationServiceTrait + Send + Sync>,
     metrics_service: Arc<dyn services::metrics::MetricsServiceTrait>,
 ) -> DomainServices {
-    let inference_provider_pool = init_inference_providers(database.clone(), config).await;
+    let (inference_provider_pool, admin_settings) =
+        init_inference_providers(database.clone(), config, metrics_service.clone()).await;
     init_domain_services_with_pool(
         database,
         config,
         organization_service,
         inference_provider_pool,
         metrics_service,
+        Some(admin_settings),
     )
     .await
 }
 
 /// Initialize domain services with a provided inference provider pool
-/// This allows tests to inject mock providers without changing core implementations
+/// This allows tests to inject mock providers without changing core implementations.
+///
+/// `admin_settings` is the already-started service from
+/// [`init_inference_providers`], whose consumers were registered after it
+/// loaded. `None` (the test harnesses, which have no such consumers) builds
+/// and starts an equivalent service here against the pool's handles.
 pub async fn init_domain_services_with_pool(
     database: Arc<Database>,
     config: &ApiConfig,
     organization_service: Arc<dyn services::organization::OrganizationServiceTrait + Send + Sync>,
     inference_provider_pool: Arc<services::inference_provider_pool::InferenceProviderPool>,
     metrics_service: Arc<dyn services::metrics::MetricsServiceTrait>,
+    admin_settings: Option<Arc<services::admin_settings::AdminSettingsService>>,
 ) -> DomainServices {
     let database_encryption_key = database::field_encryption::parse_key(
         &config.database_encryption_key,
@@ -390,12 +406,21 @@ pub async fn init_domain_services_with_pool(
         database::repositories::OrganizationUsageRepository::new(database.pool().clone()),
     ) as Arc<dyn services::usage::UsageRepository>;
 
+    // Create models service. It owns the model-resolve cache (models and
+    // access decisions on unlisted models) that the attestation and completion
+    // services below share, so its invalidation reaches all three.
+    let models_service = Arc::new(services::models::ModelsServiceImpl::new(
+        inference_provider_pool.clone(),
+        models_repo.clone(),
+    ));
+
     // Create attestation service
     let attestation_service = Arc::new(
         services::attestation::AttestationService::init(
             attestation_repo,
             inference_provider_pool.clone(),
             models_repo.clone(),
+            models_service.model_resolve_cache(),
             metrics_service.clone(),
             usage_repository_for_attestation,
             config.ita.clone(),
@@ -403,12 +428,6 @@ pub async fn init_domain_services_with_pool(
         .await
         .unwrap(),
     );
-
-    // Create models service
-    let models_service = Arc::new(services::models::ModelsServiceImpl::new(
-        inference_provider_pool.clone(),
-        models_repo.clone(),
-    ));
 
     // Prepare repositories for usage service (will be created after workspace service)
     let usage_repository = Arc::new(
@@ -460,14 +479,20 @@ pub async fn init_domain_services_with_pool(
         as Arc<dyn services::completions::ports::OrganizationConcurrentLimitRepository>;
 
     // Create completion service with usage tracking (needs usage_service)
-    let completion_service = Arc::new(services::CompletionServiceImpl::new(
+    let mut completion_service = services::CompletionServiceImpl::new(
         inference_provider_pool.clone(),
         attestation_service.clone(),
         usage_service.clone(),
         metrics_service.clone(),
         models_repo.clone() as Arc<dyn services::models::ModelsRepository>,
         org_limit_repository,
-    ));
+    )
+    .with_model_resolve_cache(models_service.model_resolve_cache());
+    // Affinity keys only matter to a pool that places requests.
+    if let Some(affinity_secret) = inference_provider_pool.affinity_secret() {
+        completion_service = completion_service.with_affinity_secret(affinity_secret);
+    }
+    let completion_service = Arc::new(completion_service);
 
     let brave_search_provider =
         Arc::new(services::responses::tools::brave::BraveWebSearchProvider::new());
@@ -477,6 +502,24 @@ pub async fn init_domain_services_with_pool(
     // Create session repository for user service
     let session_repo = Arc::new(database::SessionRepository::new(database.pool().clone()))
         as Arc<dyn services::auth::SessionRepository>;
+
+    // Contact email verification for wallet users. Off unless
+    // CONTACT_EMAIL_VERIFICATION_ENABLED is set; it then shares the invitation
+    // email sender settings.
+    let contact_email_service = Arc::new(services::contact_email::ContactEmailService::new(
+        Arc::new(database::repositories::PgContactEmailRepository::new(
+            database.pool().clone(),
+        )),
+        user_repo.clone(),
+        services::email::contact_email_sender_from_config(&config.invitation_email)
+            .expect("Failed to initialize contact email sender"),
+        config
+            .invitation_email
+            .contact_email_verification_enabled
+            .then(|| config.invitation_email.contact_email_verification_url())
+            .flatten(),
+        i64::from(config.invitation_email.contact_email_verification_daily_cap),
+    ));
 
     // Create user service
     let user_service = Arc::new(services::user::UserService::new(user_repo, session_repo))
@@ -564,12 +607,45 @@ pub async fn init_domain_services_with_pool(
         .expect("Failed to initialize staking farm NEAR RPC client"),
     )
         as Arc<dyn services::staking_farm::StakingFarmContractClient>;
-    let staking_farm_service = Arc::new(services::staking_farm::StakingFarmService::new(
-        staking_farm_repository,
-        staking_farm_contract_client,
-        Some(aml_service.clone()),
+    let staking_binding = Arc::new(services::staking_farm::binding::StakingBindingService::new(
+        Arc::new(
+            database::repositories::PostgresStakingBindingRepository::new(database.pool().clone()),
+        ),
+        Arc::new(
+            services::staking_farm::binding::NearBindingVerifier::new(&config.auth.near)
+                .expect("Invalid binding RPC config"),
+        ),
+        aml_service.clone(),
         config.staking_farm.clone(),
+        config.auth.near.expected_recipient.clone(),
     ));
+    let staking_farm_service = Arc::new(
+        services::staking_farm::StakingFarmService::new(
+            staking_farm_repository,
+            staking_farm_contract_client,
+            Some(aml_service.clone()),
+            config.staking_farm.clone(),
+        )
+        .with_binding(staking_binding),
+    );
+
+    // Admin settings: the production path builds and starts them in
+    // `init_inference_providers`, before their consumers register.
+    let admin_settings_service = match admin_settings {
+        Some(service) => service,
+        None => {
+            build_admin_settings(
+                Arc::new(
+                    database::repositories::PostgresAdminSettingsRepository::new(
+                        database.pool().clone(),
+                    ),
+                ),
+                &inference_provider_pool,
+                new_tinfoil_trust_handle(),
+            )
+            .await
+        }
+    };
 
     DomainServices {
         conversation_service,
@@ -583,12 +659,14 @@ pub async fn init_domain_services_with_pool(
         workspace_service,
         usage_service,
         user_service,
+        contact_email_service,
         files_service,
         metrics_service,
         staking_farm_service,
         aml_service,
         web_search_provider,
         service_usage_service,
+        admin_settings_service,
     }
 }
 
@@ -613,6 +691,7 @@ pub async fn init_domain_services_with_mcp_factory(
         organization_service.clone(),
         inference_provider_pool.clone(),
         metrics_service.clone(),
+        None,
     )
     .await;
 
@@ -680,6 +759,7 @@ pub async fn init_domain_services_with_pool_and_search_providers(
         organization_service.clone(),
         inference_provider_pool.clone(),
         metrics_service,
+        None,
     )
     .await;
 
@@ -704,222 +784,74 @@ pub async fn init_domain_services_with_pool_and_search_providers(
     domain_services
 }
 
-/// Standard OpenAI sampling knobs Chutes (sglang) honors, expressed in
-/// OpenRouter's fixed `supported_sampling_parameters` vocabulary. Seeded onto
-/// every auto-created Chutes catalog row so `GET /v1/models` advertises real
-/// capabilities instead of an empty list (which silently disables routing for
-/// OpenRouter-style consumers). `n` is intentionally omitted: it is not part of
-/// OpenRouter's vocabulary. Must remain a subset of `routes::admin::VALID_SAMPLING_PARAMS`.
-pub(crate) const CHUTES_SUPPORTED_SAMPLING_PARAMS: &[&str] = &[
-    "temperature",
-    "top_p",
-    "frequency_penalty",
-    "presence_penalty",
-    "stop",
-    "seed",
-    "max_tokens",
-];
-
-/// Feature capabilities Chutes (sglang) exposes, in OpenRouter's fixed
-/// `supported_features` vocabulary: `tools` => tool/function-calling, `json_mode`
-/// => JSON `response_format`. Streaming is always supported but is not a member
-/// of OpenRouter's feature vocabulary, so it is not advertised here. Must remain
-/// a subset of `routes::admin::VALID_FEATURES`.
-///
-/// `tools` is a *default* assumption, not a universal guarantee: tool-calling in
-/// sglang is model-family specific (needs a compatible chat template + tool-call
-/// parser), so a family without it would be over-advertised here — the inverse of
-/// the empty-array bug. That risk is bounded because the seed lands INACTIVE: an
-/// operator must PATCH the row (and is warned to verify tool support, clearing
-/// `supported_features` if absent) before any traffic is served.
-pub(crate) const CHUTES_SUPPORTED_FEATURES: &[&str] = &["tools", "json_mode"];
-
-/// Ensure a Chutes (attested) model has a catalog row in the `models` table.
-///
-/// The data plane rejects any model without an active `models` row *before*
-/// reaching the provider pool (`resolve_and_get_model` in completions), so a
-/// pinned Chutes provider registered purely in-memory would 404 every request
-/// even with `ENABLE_CHUTES=true` and a valid key. Worse, usage rows carry a
-/// `FOREIGN KEY (model_id) REFERENCES models(id)` — a synthesized id can't be
-/// billed — so the row must genuinely exist. Seed it here at startup.
-///
-/// Idempotent and non-clobbering: if an active row already exists (operator
-/// pre-seeded it with real pricing/metadata via the admin API) we leave it
-/// untouched. We only INSERT when missing, with attestation flags set and
-/// **zero pricing** — the operator must set real per-token rates via
-/// `PATCH /v1/admin/models` before serving paid traffic, which we warn about.
-async fn ensure_chutes_catalog_row(
-    models_repo: &database::repositories::ModelRepository,
-    model_name: &str,
-) -> services::inference_provider_pool::ProviderPoolRole {
-    use services::inference_provider_pool::ProviderPoolRole;
-
-    let role_for_existing = |model: &database::models::Model| {
-        // A catalog row owned by another provider configuration means this
-        // out-of-band provider is a fallback even if the configured primary is
-        // temporarily undiscoverable. Rows created for this provider itself are
-        // genuine standalone primaries.
-        ProviderPoolRole::from_catalog(
-            inference_providers::ProviderSource::Chutes,
-            &model.provider_type,
-            model.inference_url.is_some(),
-        )
+/// Enables smart placement on `pool` when `PLACEMENT_REDIS_PASSWORD` and a
+/// valid placement Valkey endpoint are configured. Without either there is
+/// no placement state and every request routes as before (this is not a
+/// mode flag); a missing or invalid endpoint is logged once, at startup,
+/// and never fails it. The pool derives both HMAC secrets from the password
+/// and is the single source of the affinity secret
+/// (`pool.affinity_secret()`); none of them is ever logged.
+pub fn install_placement(
+    pool: &services::inference_provider_pool::InferenceProviderPool,
+    placement: &config::PlacementConfig,
+) {
+    let Some(password) = placement.redis_password.as_deref() else {
+        tracing::info!("Placement secret not configured; smart placement off, legacy routing");
+        return;
     };
-
-    // Use the *unfiltered* lookup (not get_active_model_by_name): a deliberately
-    // disabled row (is_active=false) must be respected, not silently re-activated
-    // and clobbered by the seed path below.
-    match models_repo.get_by_internal_name(model_name).await {
-        Ok(Some(existing)) => {
-            let role = role_for_existing(&existing);
-            // Already in the catalog — respect operator configuration verbatim.
-            // Surface a warning if the metadata contradicts attested serving so
-            // a misconfigured row (e.g. attestation_supported=false) is visible.
-            if !existing.is_active {
-                tracing::warn!(
-                    model = %model_name,
-                    "Chutes model has a DISABLED catalog row (is_active=false); requests will \
-                     404 by design — re-enable via PATCH /v1/admin/models if that's unintended"
-                );
-            } else if !existing.attestation_supported {
-                tracing::warn!(
-                    model = %model_name,
-                    "Chutes model has an existing catalog row with attestation_supported=false; \
-                     E2EE/signature handling may misbehave — fix via PATCH /v1/admin/models"
-                );
-            } else if existing.supported_sampling_parameters.is_empty()
-                && existing.supported_features.is_empty()
-            {
-                // This is the exact #781 (M1) bug state on a pre-existing row: both
-                // capability arrays are still the empty V0051 default, so
-                // `GET /v1/models` advertises the model as supporting *nothing* and
-                // OpenRouter-style routers won't route tool calls to it. New rows are
-                // seeded non-empty above; existing rows are backfilled by migration
-                // V0060. Warn in case a row predates the migration or was cleared.
-                tracing::warn!(
-                    model = %model_name,
-                    "Chutes model has an existing catalog row with EMPTY supported_features \
-                     and supported_sampling_parameters — OpenRouter-style routers will refuse \
-                     to route tool calls to it; backfilled by migration V0060, or set via \
-                     PATCH /v1/admin/models"
-                );
-            } else {
-                tracing::info!(model = %model_name, "Chutes model already in catalog");
-            }
-            role
-        }
-        Ok(None) => {
-            // Friendly display name = last path segment; owner = leading segment.
-            let display_name = model_name.rsplit('/').next().unwrap_or(model_name);
-            let owned_by = model_name.split('/').next().unwrap_or("chutes");
-            let req = database::models::UpdateModelPricingRequest {
-                model_display_name: Some(display_name.to_string()),
-                model_description: Some(
-                    "Attested model served via Chutes TEE (verified end-to-end by NEAR AI)."
-                        .to_string(),
-                ),
-                // Generous default; operator should set the model's real context
-                // window via the admin API. Not enforced as a hard reject here.
-                context_length: Some(128_000),
-                verifiable: Some(true),
-                attestation_supported: Some(true),
-                // Seed INACTIVE. `is_active=false` is the only field that actually
-                // gates serving (`resolve_and_get_model` filters `WHERE is_active`;
-                // `is_ready` is pure display metadata and does NOT gate). Seeding
-                // inactive makes it *impossible* to serve — and therefore bill at
-                // the zero default pricing — until an operator explicitly sets real
-                // per-token rates AND flips is_active=true (one admin PATCH). This
-                // closes the unpriced-serving window rather than merely warning.
-                is_active: Some(false),
-                is_ready: Some(Some(false)),
-                provider_type: Some("chutes".to_string()),
-                owned_by: Some(owned_by.to_string()),
-                input_modalities: Some(vec!["text".to_string()]),
-                output_modalities: Some(vec!["text".to_string()]),
-                // OpenRouter-style routers gate tool/function-calling on these two
-                // arrays; leaving them empty (the SQL default) silently advertises a
-                // Chutes model as supporting *nothing*, so routers refuse to route
-                // tool calls to it. Chutes serves via sglang on an OpenAI-compatible
-                // surface, so seed the standard OpenAI knobs it honors. Operators can
-                // still override via PATCH /v1/admin/models. Both lists are restricted
-                // to OpenRouter's fixed vocabulary (asserted by a unit test below) so
-                // the seeded row would pass the same admin write-path validation.
-                supported_sampling_parameters: Some(
-                    CHUTES_SUPPORTED_SAMPLING_PARAMS
-                        .iter()
-                        .copied()
-                        .map(String::from)
-                        .collect(),
-                ),
-                supported_features: Some(
-                    CHUTES_SUPPORTED_FEATURES
-                        .iter()
-                        .copied()
-                        .map(String::from)
-                        .collect(),
-                ),
-                // Pricing left None -> defaults to 0 on INSERT. The inactive seed
-                // above prevents this zero price from ever being charged.
-                ..Default::default()
-            };
-            // INSERT ... ON CONFLICT DO NOTHING: if an operator created/activated
-            // the row concurrently with startup, their row wins and is left
-            // untouched (no clobbering is_active/pricing back to the seed defaults).
-            match models_repo.seed_model_if_absent(model_name, &req).await {
-                Ok(Some(_)) => {
-                    tracing::warn!(
-                        model = %model_name,
-                        "Seeded Chutes catalog row as INACTIVE with zero pricing — set real \
-                         per-token rates AND is_active=true via PATCH /v1/admin/models to serve \
-                         (kept inactive so paid traffic can't be billed at $0). The seed \
-                         advertises `tools`/`json_mode`: verify this model family actually \
-                         supports tool-calling in sglang (per-family parser + compatible chat \
-                         template) before activating, and clear `supported_features` via the \
-                         same PATCH if it doesn't"
-                    );
-                    ProviderPoolRole::Primary
-                }
-                Ok(None) => {
-                    tracing::info!(
-                        model = %model_name,
-                        "Chutes catalog row already present (created concurrently); left untouched"
-                    );
-                    match models_repo.get_by_internal_name(model_name).await {
-                        Ok(Some(existing)) => role_for_existing(&existing),
-                        _ => ProviderPoolRole::Fallback,
-                    }
-                }
-                Err(e) => {
-                    tracing::error!(
-                        model = %model_name, error = %e,
-                        "Failed to seed Chutes catalog row; requests for this model will 404 \
-                         until a row exists (create it via PATCH /v1/admin/models)"
-                    );
-                    ProviderPoolRole::Fallback
-                }
-            }
-        }
-        Err(e) => {
+    let endpoint = match &placement.redis_endpoint {
+        config::PlacementEndpoint::Valid(endpoint) => endpoint,
+        config::PlacementEndpoint::Missing => {
             tracing::warn!(
-                model = %model_name, error = %e,
-                "Could not check catalog for Chutes model; skipping auto-seed"
+                "Placement Valkey endpoint not configured (PLACEMENT_REDIS_HOST); smart placement off, legacy routing"
             );
-            // Unknown catalog state is fail-closed for organizations that
-            // disable fallback. A later restart/registration can establish a
-            // standalone primary role once the catalog is readable again.
-            ProviderPoolRole::Fallback
+            return;
         }
+        config::PlacementEndpoint::Invalid(reason) => {
+            // `reason` names the variable, never its value.
+            tracing::error!(
+                reason = %reason,
+                "Placement Valkey endpoint invalid; smart placement off, legacy routing"
+            );
+            return;
+        }
+    };
+    if !endpoint.tls {
+        tracing::warn!(
+            "PLACEMENT_REDIS_TLS_ENABLED=false: the placement Valkey password travels in plaintext"
+        );
     }
+    pool.set_placement(
+        password.to_string(),
+        inference_providers::placement_io::ValkeyEndpoint {
+            host: endpoint.host.clone(),
+            port: endpoint.port,
+            tls: endpoint.tls,
+            ca_pem: endpoint.ca_pem.clone(),
+        },
+    );
+    // Configured is not active: until the proxies publish frames (or while
+    // Valkey is unreachable) the snapshot stays empty and every request
+    // still routes legacy.
+    tracing::info!("Smart placement configured");
 }
 
 /// Initialize inference provider pool
 ///
 /// Loads inference_url models and external providers from the database,
-/// then starts a periodic refresh task to keep them in sync.
+/// then starts a periodic refresh task to keep them in sync. The metrics
+/// sink and smart placement are attached before the first load, so
+/// providers created at startup get them exactly like those created by
+/// later discovery refreshes, and counters emitted by the initial
+/// attestation discovery are recorded.
 pub async fn init_inference_providers(
     database: Arc<Database>,
     config: &ApiConfig,
-) -> Arc<services::inference_provider_pool::InferenceProviderPool> {
+    metrics_service: Arc<dyn services::metrics::MetricsServiceTrait>,
+) -> (
+    Arc<services::inference_provider_pool::InferenceProviderPool>,
+    Arc<services::admin_settings::AdminSettingsService>,
+) {
     let api_key = config.inference_api_key.clone();
 
     let pool = Arc::new(
@@ -928,6 +860,22 @@ pub async fn init_inference_providers(
             config.external_providers.clone(),
         ),
     );
+    pool.set_metrics_service(metrics_service.clone());
+    install_placement(&pool, &config.placement);
+
+    // Runtime settings load BEFORE their consumers register, so a stored
+    // setting (e.g. `tinfoil_trust.router_sigstore = false`) governs the very
+    // first verification. A store that is down leaves the fail-closed initial
+    // value until the retried load succeeds.
+    let tinfoil_trust = new_tinfoil_trust_handle();
+    let admin_settings = build_admin_settings(
+        Arc::new(
+            database::repositories::PostgresAdminSettingsRepository::new(database.pool().clone()),
+        ),
+        &pool,
+        tinfoil_trust.clone(),
+    )
+    .await;
 
     let models_repo = Arc::new(database::repositories::ModelRepository::new(
         database.pool().clone(),
@@ -935,29 +883,9 @@ pub async fn init_inference_providers(
     let models_source =
         models_repo.clone() as Arc<dyn services::inference_provider_pool::ExternalModelsSource>;
 
-    // Fail-closed reservation (MUST run before external/discovery loads below):
-    // when Chutes is enabled, reserve EVERY configured canonical id as a pinned
-    // (verifiable) model up front — even before we try to build the providers. This
-    // guarantees a plaintext external/OpenRouter row sharing a canonical id can
-    // never register for it, even if the Chutes provider fails to build (missing
-    // key / construction error). A reserved id then serves only its attested
-    // provider(s) or fails closed (404); it can never silently serve plaintext for
-    // a model an operator configured as verifiable.
-    if config.external_providers.enable_chutes {
-        let canonical_ids: Vec<String> = config
-            .external_providers
-            .chutes_models
-            .iter()
-            .map(|e| e.canonical_id.clone())
-            .collect();
-        if !canonical_ids.is_empty() {
-            pool.reserve_pinned_models(&canonical_ids);
-            tracing::info!(
-                count = canonical_ids.len(),
-                "Reserved Chutes canonical ids as verifiable (fail-closed) before external load"
-            );
-        }
-    }
+    // Fail-closed reservation (MUST run before external/discovery loads below);
+    // see `attested_3p_startup::reserve_attested_3p`.
+    attested_3p_startup::reserve_attested_3p(&pool, &config.external_providers);
 
     // Load inference_url models (our own vLLM/SGLang backends)
     match models_source.fetch_inference_url_models().await {
@@ -993,95 +921,51 @@ pub async fn init_inference_providers(
         .start_refresh_task(models_source, refresh_interval)
         .await;
 
-    // Chutes attested provider — hard-off by default (`ENABLE_CHUTES`). Each model
-    // is served over a verified ML-KEM E2EE channel: every request attests the
-    // chosen instance (TDX quote + report_data bindings + register-pinned
-    // measurement + GPU) before encapsulating, so an unverified backend can never
-    // serve a Chutes response. Registration is gated on the flag + an API key +
-    // at least one model id.
-    if config.external_providers.enable_chutes {
-        match &config.external_providers.chutes_api_key {
-            Some(api_key) if !config.external_providers.chutes_models.is_empty() => {
-                let pccs_url = config.external_providers.pccs_url.clone();
-                let allow_streaming = config.external_providers.chutes_enable_streaming;
-                let verifier: Arc<
-                    dyn inference_providers::attested::chutes::verifier_port::ChutesInstanceVerifier,
-                > = Arc::new(services::attestation::chutes::ChutesBackendVerifier::new(
-                    services::attestation::chutes::vetted_golden_measurements(),
-                    pccs_url,
-                ));
-                for entry in &config.external_providers.chutes_models {
-                    // The provider talks to Chutes with the chute SLUG (request_body
-                    // pins it + cached_chute_id resolves it); we expose/route under
-                    // the CANONICAL id (the NEAR-served id when NEAR also serves the
-                    // model, else the OpenRouter id) — never the raw `-TEE` slug.
-                    let cfg = inference_providers::attested::chutes::Config::new(
-                        api_key.clone(),
-                        entry.chute_slug.clone(),
-                        config.external_providers.timeout_seconds,
-                    )
-                    .with_canonical_id(entry.canonical_id.clone())
-                    .with_streaming(allow_streaming);
-                    match inference_providers::attested::chutes::Provider::new(
-                        cfg,
-                        verifier.clone(),
-                    ) {
-                        Ok(provider) => {
-                            // Ensure a catalog row exists under the canonical id so the
-                            // data plane resolves the model (and usage bills against a
-                            // real id). If NEAR already serves this id, its row is left
-                            // untouched and we just add Chutes as a fallback provider.
-                            let role =
-                                ensure_chutes_catalog_row(&models_repo, &entry.canonical_id).await;
-                            // Register the stable role from catalog configuration,
-                            // independently of whether discovery happened to find a live
-                            // primary during this startup.
-                            pool.register_pinned_provider(
-                                entry.canonical_id.clone(),
-                                Arc::new(provider),
-                                entry.max_context_tokens,
-                                role,
-                            )
-                            .await;
-                            tracing::info!(
-                                canonical = %entry.canonical_id,
-                                chute_slug = %entry.chute_slug,
-                                role = ?role,
-                                "Registered Chutes attested provider"
-                            );
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                canonical = %entry.canonical_id,
-                                chute_slug = %entry.chute_slug,
-                                error = %e,
-                                "Failed to build Chutes provider"
-                            );
-                        }
-                    }
-                }
-            }
-            _ => {
-                tracing::warn!(
-                    "ENABLE_CHUTES is set but CHUTES_API_KEY or CHUTES_MODELS is missing; \
-                     not registering any Chutes provider"
-                );
-            }
-        }
-    } else if !config.external_providers.chutes_models.is_empty() {
-        // Flag off but models still listed: any *active* catalog row left over
-        // from a previous run would resolve to a model with no registered provider
-        // (per-request provider errors, not a clean 404). Warn so an operator
-        // notices and deactivates those rows (PATCH is_active=false).
-        tracing::warn!(
-            models = ?config.external_providers.chutes_models,
-            "ENABLE_CHUTES is off but CHUTES_MODELS is set; if any of these have an active \
-             catalog row, requests will surface provider errors — deactivate them via \
-             PATCH /v1/admin/models or re-enable ENABLE_CHUTES"
-        );
-    }
+    // Attested third-party providers (Chutes, then Tinfoil).
+    attested_3p_startup::register_attested_3p(
+        &pool,
+        &models_repo,
+        &config.external_providers,
+        tinfoil_trust,
+        metrics_service,
+    )
+    .await;
 
-    pool
+    (pool, admin_settings)
+}
+
+/// The Tinfoil trust handle before any stored row is applied: version 0 with
+/// `router_sigstore` and admin model pins off, so both fail closed until the stored
+/// value has loaded.
+fn new_tinfoil_trust_handle() -> services::attestation::tinfoil_trust::TinfoilTrustHandle {
+    Arc::new(arc_swap::ArcSwap::from_pointee(
+        services::admin_settings::Versioned {
+            version: 0,
+            value: services::attestation::tinfoil_trust::TinfoilTrust::fail_closed_initial(),
+        },
+    ))
+}
+
+/// Builds the admin settings service with every key registered in listing
+/// order (`placement`, `attested_3p`, `tinfoil_trust`), each publishing into
+/// its owner's handle, then loads once and starts the periodic reload. A
+/// failing store keeps the defaults and never panics.
+pub(crate) async fn build_admin_settings(
+    repository: Arc<dyn services::admin_settings::AdminSettingsRepository>,
+    pool: &services::inference_provider_pool::InferenceProviderPool,
+    tinfoil_trust: services::attestation::tinfoil_trust::TinfoilTrustHandle,
+) -> Arc<services::admin_settings::AdminSettingsService> {
+    use services::admin_settings::{AdminSettingsService, Attested3pKey, PlacementKey};
+    use services::attestation::tinfoil_trust::TinfoilTrustKey;
+    let service = Arc::new(
+        AdminSettingsService::builder(repository)
+            .register::<PlacementKey>(pool.placement_tuning())
+            .register::<Attested3pKey>(pool.attested_3p_disabled())
+            .register::<TinfoilTrustKey>(tinfoil_trust)
+            .build(),
+    );
+    service.clone().start().await;
+    service
 }
 
 /// Initialize inference provider pool with mock providers for testing
@@ -1143,6 +1027,30 @@ pub async fn init_inference_providers_with_mocks(
     (pool, mock_provider)
 }
 
+// Browser API clients supply their own tokens. Keep public API CORS open for
+// third-party clients, while admin browser access remains limited to configured
+// origins. OAuth callback origins use the same configured origin policy.
+fn build_cors_layer(cors_config: config::CorsConfig) -> CorsLayer {
+    CorsLayer::new()
+        .allow_origin(AllowOrigin::predicate(
+            move |origin: &HeaderValue, request_parts: &axum::http::request::Parts| {
+                let path = request_parts.uri.path();
+                let is_admin_route = path == "/v1/admin" || path.starts_with("/v1/admin/");
+                if !is_admin_route {
+                    return true;
+                }
+
+                origin
+                    .to_str()
+                    .map(|origin| is_origin_allowed(origin, &cors_config))
+                    .unwrap_or(false)
+            },
+        ))
+        .allow_methods(Any)
+        .allow_headers(AllowHeaders::mirror_request())
+        .expose_headers(Any)
+}
+
 pub fn is_origin_allowed(origin_str: &str, cors_config: &config::CorsConfig) -> bool {
     if cors_config.exact_matches.iter().any(|o| o == origin_str) {
         return true;
@@ -1161,10 +1069,14 @@ pub fn is_origin_allowed(origin_str: &str, cors_config: &config::CorsConfig) -> 
     }
 
     if origin_str.starts_with("https://")
-        && cors_config
-            .wildcard_suffixes
-            .iter()
-            .any(|suffix| origin_str.ends_with(suffix))
+        && cors_config.wildcard_suffixes.iter().any(|suffix| {
+            // Config parsing adds a dot to bare domain suffixes. Enforce
+            // that boundary here too for callers constructing CorsConfig.
+            !suffix.is_empty()
+                && origin_str.strip_suffix(suffix).is_some_and(|prefix| {
+                    suffix.starts_with('.') || suffix.starts_with('-') || prefix.ends_with('.')
+                })
+        })
     {
         return true;
     }
@@ -1255,6 +1167,7 @@ pub fn build_app_with_config_and_options(
         )
             as Arc<dyn services::reporting_tokens::OrganizationReportingTokenService>,
         user_service: domain_services.user_service.clone(),
+        contact_email_service: domain_services.contact_email_service.clone(),
         files_service: domain_services.files_service.clone(),
         inference_provider_pool: domain_services.inference_provider_pool.clone(),
         metrics_service: domain_services.metrics_service.clone(),
@@ -1332,6 +1245,15 @@ pub fn build_app_with_config_and_options(
         &auth_components.auth_state_middleware,
     );
 
+    let organization_credit_service = build_organization_credit_service(&database, &config);
+    let transfer_routes = crate::routes::credit_transfers::routes(
+        organization_credit_service.clone(),
+        auth_components.auth_state_middleware.clone(),
+    );
+    let organization_credential_routes = crate::routes::organization_credentials::routes(
+        organization_credit_service,
+        auth_components.auth_state_middleware.clone(),
+    );
     let management_routes = build_management_router(
         app_state.clone(),
         auth_components.auth_state_middleware.clone(),
@@ -1340,8 +1262,11 @@ pub fn build_app_with_config_and_options(
     let workspace_routes =
         build_workspace_routes(app_state.clone(), &auth_components.auth_state_middleware);
 
-    let attestation_routes =
-        build_attestation_routes(app_state.clone(), &auth_components.auth_state_middleware);
+    let attestation_routes = build_attestation_routes(
+        app_state.clone(),
+        &auth_components.auth_state_middleware,
+        domain_services.admin_settings_service.clone(),
+    );
 
     let model_routes = build_model_routes(domain_services.models_service.clone());
 
@@ -1361,6 +1286,12 @@ pub fn build_app_with_config_and_options(
             completion_service: domain_services.completion_service.clone(),
             organization_service: domain_services.organization_service.clone(),
             usage_service: domain_services.usage_service.clone(),
+            admin_settings_service: domain_services.admin_settings_service.clone(),
+            user_erasure_service: Arc::new(services::user_erasure::UserErasureService::new(
+                Arc::new(database::repositories::PostgresUserErasureRepository::new(
+                    database.pool().clone(),
+                )),
+            )),
         },
     );
 
@@ -1419,21 +1350,7 @@ pub fn build_app_with_config_and_options(
         metrics_service: domain_services.metrics_service.clone(),
     };
 
-    // Create CORS layer
-    let cors_config = config.cors.clone();
-    let cors = CorsLayer::new()
-        .allow_origin(AllowOrigin::predicate(
-            move |origin: &HeaderValue, _request_parts: &axum::http::request::Parts| {
-                let origin_str = match origin.to_str() {
-                    Ok(s) => s,
-                    Err(_) => return false,
-                };
-                is_origin_allowed(origin_str, &cors_config)
-            },
-        ))
-        .allow_methods(Any)
-        .allow_headers(Any)
-        .expose_headers(Any);
+    let cors = build_cors_layer(config.cors.clone());
 
     // OHTTP routes: `POST /ohttp` and `GET /.well-known/ohttp-gateway` are at the
     // root (not under /v1) so clients can reach them without version-prefixing.
@@ -1456,6 +1373,8 @@ pub fn build_app_with_config_and_options(
                 .merge(unsupported_openai_routes)
                 .merge(conversation_routes)
                 .merge(management_routes)
+                .merge(transfer_routes)
+                .merge(organization_credential_routes)
                 .merge(workspace_routes)
                 .merge(attestation_routes.clone())
                 .merge(model_routes)
@@ -1597,6 +1516,12 @@ pub fn build_completion_routes(
 ) -> Router {
     use crate::routes::files::MAX_FILE_SIZE;
 
+    // Announces a planned model deprecation in response headers. Innermost
+    // layer: it only sees requests that passed auth, rate and usage checks.
+    let model_deprecation_state = middleware::ModelDeprecationState {
+        models_service: app_state.models_service.clone(),
+    };
+
     // Native Anthropic Messages support is staging-gated and hard-off by
     // default. Keep it on its own router so enabling it cannot alter the
     // existing OpenAI-compatible routes or middleware behavior.
@@ -1609,6 +1534,10 @@ pub fn build_completion_routes(
             .route("/messages", post(routes::anthropic::messages))
             .layer(DefaultBodyLimit::max(AUDIO_TRANSCRIPTION_MAX_BODY_SIZE))
             .with_state(app_state.clone())
+            .layer(from_fn_with_state(
+                model_deprecation_state.clone(),
+                middleware::model_deprecation_middleware,
+            ))
             .layer(from_fn_with_state(
                 usage_state.clone(),
                 middleware::usage::anthropic_usage_check_middleware,
@@ -1672,6 +1601,10 @@ pub fn build_completion_routes(
         .layer(DefaultBodyLimit::max(AUDIO_TRANSCRIPTION_MAX_BODY_SIZE))
         .with_state(app_state.clone())
         .layer(from_fn_with_state(
+            model_deprecation_state.clone(),
+            middleware::model_deprecation_middleware,
+        ))
+        .layer(from_fn_with_state(
             usage_state.clone(),
             middleware::usage_check_middleware,
         ))
@@ -1683,15 +1616,24 @@ pub fn build_completion_routes(
             auth_state_middleware.clone(),
             middleware::auth::auth_middleware_with_workspace_context,
         ))
-        .layer(from_fn(middleware::body_hash_middleware));
+        // body_hash buffers before auth runs, so cap it at the largest route
+        // limit in this group. Smaller per-route limits (privacy) still apply
+        // through their extractors.
+        .layer(from_fn_with_state(
+            middleware::BodyHashLimit(AUDIO_TRANSCRIPTION_MAX_BODY_SIZE),
+            middleware::body_hash_middleware,
+        ));
 
     // File-based inference routes (image edits)
-    // Apply 512 MB limit only to endpoints that accept file uploads
-    // IMPORTANT: body_hash_middleware is placed AFTER auth to prevent buffering
-    // unauthenticated requests. Auth failures prevent memory exhaustion DoS attacks.
+    // Apply 512 MB limit only to endpoints that accept file uploads.
+    // body_hash_middleware buffers before auth, so it is capped at the same limit.
     let file_inference_routes = Router::new()
         .route("/images/edits", post(image_edits))
         .with_state(app_state.clone())
+        .layer(from_fn_with_state(
+            model_deprecation_state.clone(),
+            middleware::model_deprecation_middleware,
+        ))
         .layer(from_fn_with_state(
             usage_state,
             middleware::usage_check_middleware,
@@ -1704,7 +1646,10 @@ pub fn build_completion_routes(
             auth_state_middleware.clone(),
             middleware::auth::auth_middleware_with_workspace_context,
         ))
-        .layer(from_fn(middleware::body_hash_middleware))
+        .layer(from_fn_with_state(
+            middleware::BodyHashLimit(MAX_FILE_SIZE),
+            middleware::body_hash_middleware,
+        ))
         .layer(DefaultBodyLimit::max(MAX_FILE_SIZE));
 
     let metadata_routes = Router::new()
@@ -1732,6 +1677,9 @@ pub fn build_response_routes(
     usage_state: middleware::UsageState,
     rate_limit_state: middleware::RateLimitState,
 ) -> Router {
+    let model_deprecation_state = middleware::ModelDeprecationState {
+        models_service: native_app_state.models_service.clone(),
+    };
     let route_state = responses::ResponseRouteState {
         native_service: services::responses::native::NativeResponsesService {
             models: native_app_state.config.native_responses_models.clone(),
@@ -1749,6 +1697,10 @@ pub fn build_response_routes(
         .route("/responses", post(responses::create_response))
         .with_state(route_state.clone())
         .layer(from_fn_with_state(
+            model_deprecation_state,
+            middleware::model_deprecation_middleware,
+        ))
+        .layer(from_fn_with_state(
             usage_state,
             middleware::usage_check_middleware,
         ))
@@ -1760,7 +1712,10 @@ pub fn build_response_routes(
             auth_state_middleware.clone(),
             middleware::auth::auth_middleware_with_workspace_context,
         ))
-        .layer(from_fn(middleware::body_hash_middleware));
+        .layer(from_fn_with_state(
+            middleware::BodyHashLimit(RESPONSES_MAX_BODY_SIZE),
+            middleware::body_hash_middleware,
+        ));
 
     let retired_history_routes = Router::new()
         // Keep retired response-history paths explicit so authenticated clients
@@ -1914,14 +1869,22 @@ where
 /// Route classification (nearai/infra#193) — see `routes/attestation.rs` for
 /// the full table:
 /// - `GET /v1/attestation/report` and `GET /v1/signature/{chat_id}` require an
-///   API key (`auth_middleware_with_api_key`). The middleware validates the key
-///   and confirms its workspace and organization remain active (rejecting
-///   missing/invalid/expired/deactivated credentials with 401); like
-///   the signature route, report retrieval is non-billable — no usage or
-///   billing records are created.
-/// - `GET /v1/attestation/ita-token` is deliberately public; the rationale is
-///   documented on `build_public_attestation_routes`.
-pub fn build_attestation_routes(app_state: AppState, auth_state_middleware: &AuthState) -> Router {
+///   API key (`auth_middleware_with_workspace_context`). The middleware
+///   validates the key and confirms its workspace and organization remain
+///   active (rejecting missing/invalid/expired/deactivated credentials with
+///   401); like the signature route, report retrieval is non-billable — no
+///   usage or billing records are created. It is the same check as
+///   `auth_middleware_with_api_key`, and it also hands the handler the key's
+///   organization: the report route needs it to decide whether the caller
+///   may ask about an unlisted model.
+/// - `GET /v1/attestation/ita-token` and `GET /v1/attestation/pins` are
+///   deliberately public; the rationale is documented on
+///   `build_public_attestation_routes`.
+pub fn build_attestation_routes(
+    app_state: AppState,
+    auth_state_middleware: &AuthState,
+    admin_settings: Arc<services::admin_settings::AdminSettingsService>,
+) -> Router {
     let attestation_route_state = attestation::AttestationRouteState::from(app_state);
     let authenticated_routes = Router::new()
         .route("/attestation/report", get(get_attestation_report))
@@ -1929,10 +1892,16 @@ pub fn build_attestation_routes(app_state: AppState, auth_state_middleware: &Aut
         .with_state(attestation_route_state.clone())
         .layer(from_fn_with_state(
             auth_state_middleware.clone(),
-            auth_middleware_with_api_key,
+            middleware::auth::auth_middleware_with_workspace_context,
         ));
 
-    let public_routes = attestation::build_public_attestation_routes(attestation_route_state);
+    // One section per attested backup provider; add new providers here.
+    let pins_sources: Vec<Arc<dyn services::attestation::pins_view::ProviderPinsSource>> = vec![
+        Arc::new(services::attestation::tinfoil_pins_view::TinfoilPinsSource::new(admin_settings)),
+        Arc::new(services::attestation::chutes_pins_view::ChutesPinsSource),
+    ];
+    let public_routes =
+        attestation::build_public_attestation_routes(attestation_route_state, pins_sources);
 
     Router::new()
         .merge(authenticated_routes)
@@ -2170,14 +2139,25 @@ pub fn build_gateway_routes(
 /// Build internal-only routes authenticated by the shared
 /// `CLOUD_API_USAGE_TOKEN` service secret rather than the standard `sk-…`
 /// API-key middleware. Mounted under `/v1/internal/*` after the global
-/// `/v1` nest. Today's only route is `POST /internal/usage` (for
-/// inference-proxy's service-token reporter); future internal endpoints
-/// can be added here without touching the sk-auth stack.
+/// `/v1` nest. Routes: `POST /internal/usage` (inference-proxy's
+/// service-token usage reporter), `GET /internal/models` (the model
+/// catalog including unlisted models, for a gateway lane) and
+/// `GET /internal/model-access` (which organizations may use each unlisted
+/// model, for a gateway lane that enforces access itself). Further internal
+/// endpoints can be added here without touching the sk-auth stack.
 pub fn build_internal_routes(app_state: AppState) -> Router {
     Router::new()
         .route(
             "/internal/usage",
             post(crate::routes::usage::record_usage_internal),
+        )
+        .route(
+            "/internal/models",
+            get(crate::routes::completions::models_internal),
+        )
+        .route(
+            "/internal/model-access",
+            get(crate::routes::completions::model_access_internal),
         )
         .with_state(app_state)
 }
@@ -2283,6 +2263,8 @@ pub struct AdminRouteServices {
     pub organization_service:
         Arc<dyn services::organization::OrganizationServiceTrait + Send + Sync>,
     pub usage_service: Arc<dyn services::usage::UsageServiceTrait + Send + Sync>,
+    pub admin_settings_service: Arc<services::admin_settings::AdminSettingsService>,
+    pub user_erasure_service: Arc<services::user_erasure::UserErasureService>,
 }
 
 pub fn build_admin_routes(
@@ -2312,17 +2294,19 @@ fn build_admin_routes_with_options(
         batch_upsert_models, cancel_model_pricing_change, confirm_model_deprecation,
         confirm_model_pricing_changes, create_admin_access_token, create_service,
         delete_admin_access_token, delete_aml_allowlist_entry, delete_model, deprecate_model,
-        get_admin_organization_balance, get_billing_summary, get_infra_summary,
-        get_model_consumption_timeseries, get_model_history, get_model_revenue, get_org_revenue,
-        get_organization as get_admin_organization, get_organization_concurrent_limit,
-        get_organization_fallback, get_organization_limits_history, get_organization_metrics,
-        get_organization_priority, get_organization_timeseries, get_performance_timeseries,
-        get_platform_metrics, get_platform_timeseries, get_revenue_density,
-        list_admin_access_tokens, list_aml_allowlist, list_aml_reports,
+        erase_user, get_admin_organization_balance, get_admin_setting, get_billing_summary,
+        get_infra_summary, get_model_consumption_timeseries, get_model_history, get_model_revenue,
+        get_org_revenue, get_organization as get_admin_organization,
+        get_organization_concurrent_limit, get_organization_fallback,
+        get_organization_limits_history, get_organization_metrics, get_organization_priority,
+        get_organization_timeseries, get_performance_timeseries, get_platform_metrics,
+        get_platform_timeseries, get_revenue_density, list_admin_access_tokens,
+        list_admin_settings, list_aml_allowlist, list_aml_reports, list_api_keys,
         list_invitation_email_deliveries, list_model_pricing_changes,
         list_models as admin_list_models, list_organization_members, list_organizations,
-        list_users, preview_model_deprecation, preview_model_pricing_changes,
-        resend_invitation_email, update_aml_report_status, update_organization_concurrent_limit,
+        list_users, lookup_user_erasures, preview_model_deprecation, preview_model_pricing_changes,
+        preview_user_erasure, resend_invitation_email, update_admin_setting,
+        update_aml_report_status, update_organization_concurrent_limit,
         update_organization_fallback, update_organization_limits, update_organization_member_role,
         update_organization_priority, update_service, upsert_aml_allowlist_entry, AdminAppState,
     };
@@ -2383,6 +2367,8 @@ fn build_admin_routes_with_options(
         inference_provider_pool: services.inference_provider_pool,
         github_dispatcher,
         infra_service,
+        admin_settings_service: services.admin_settings_service,
+        user_erasure_service: services.user_erasure_service,
     };
 
     let database_encryption_state = crate::database_encryption::DatabaseEncryptionState::new(
@@ -2439,6 +2425,19 @@ fn build_admin_routes_with_options(
         .route(
             "/admin/models/{model_name}/deprecation/confirm",
             axum::routing::post(confirm_model_deprecation),
+        )
+        .route(
+            "/admin/models/{model_name}/access",
+            axum::routing::get(crate::routes::admin_model_access::get_model_access),
+        )
+        .route(
+            "/admin/models/{model_name}/access/{org_id}",
+            axum::routing::put(crate::routes::admin_model_access::grant_model_access)
+                .delete(crate::routes::admin_model_access::revoke_model_access),
+        )
+        .route(
+            "/admin/organizations/{org_id}/model-access",
+            axum::routing::get(crate::routes::admin_model_access::list_organization_model_access),
         )
         .route("/admin/services", axum::routing::post(create_service))
         .route("/admin/services/{id}", axum::routing::patch(update_service))
@@ -2520,6 +2519,11 @@ fn build_admin_routes_with_options(
             "/admin/platform/infra-summary",
             axum::routing::get(get_infra_summary),
         )
+        .route("/admin/settings", axum::routing::get(list_admin_settings))
+        .route(
+            "/admin/settings/{key}",
+            axum::routing::get(get_admin_setting).patch(update_admin_setting),
+        )
         .route(
             "/admin/platform/model-consumption-timeseries",
             axum::routing::get(get_model_consumption_timeseries),
@@ -2542,9 +2546,22 @@ fn build_admin_routes_with_options(
         )
         .route("/admin/users", axum::routing::get(list_users))
         .route(
+            "/admin/users/{user_id}/erasure/preview",
+            axum::routing::post(preview_user_erasure),
+        )
+        .route(
+            "/admin/users/{user_id}/erasure",
+            axum::routing::post(erase_user),
+        )
+        .route(
+            "/admin/user-erasures/lookup",
+            axum::routing::post(lookup_user_erasures),
+        )
+        .route(
             "/admin/organizations",
             axum::routing::get(list_organizations),
         )
+        .route("/admin/api-keys", axum::routing::get(list_api_keys))
         .route(
             "/admin/organizations/{org_id}",
             axum::routing::get(get_admin_organization),
@@ -2570,6 +2587,39 @@ fn build_admin_routes_with_options(
             axum::routing::delete(delete_admin_access_token),
         )
         .with_state(admin_app_state)
+        .merge(
+            Router::new()
+                .route(
+                    "/admin/organizations/{org_id}/policy",
+                    get(crate::routes::organization_policy::get_policy)
+                        .put(crate::routes::organization_policy::put_policy),
+                )
+                .route("/admin/organizations/{org_id}/credit/transfer/reconciliation", get(crate::routes::credit_transfers::reconciliation))
+                .layer(axum::Extension(
+                    build_organization_credit_service(&database, &config),
+                ))
+        )
+        .merge(
+            Router::new()
+                .route(
+                    "/admin/organizations/{org_id}/credit/reconciliations",
+                    axum::routing::post(
+                        crate::routes::admin_credit_reconciliation::reconcile_organization_credits,
+                    ),
+                )
+                .layer(axum::Extension(
+                    database::repositories::credit_reconciliation::CreditReconciliationRepository::new(
+                        database.pool().clone(),
+                    ),
+                ))
+        )
+        .merge(
+            Router::new()
+                .route("/admin/organizations/{org_id}/usage-discount",
+                    axum::routing::get(crate::routes::admin_usage_discount::get_usage_discount)
+                        .put(crate::routes::admin_usage_discount::put_usage_discount))
+                .layer(axum::Extension(database::repositories::organization_usage_discount::OrganizationUsageDiscountRepository::new(database.pool().clone())))
+        )
         .merge(
             Router::new()
                 .route(
@@ -2688,9 +2738,29 @@ async fn swagger_ui_handler() -> Html<String> {
     )
 }
 
+fn build_organization_credit_service(
+    database: &database::Database,
+    config: &ApiConfig,
+) -> Arc<dyn services::organization_credits::OrganizationCreditServiceTrait> {
+    use database::repositories::credit_transfers::CreditTransferRepository;
+    use database::repositories::organization_credentials::OrganizationCredentialRepository;
+    use services::organization_credits::OrganizationCreditService;
+
+    let transfers = Arc::new(CreditTransferRepository::new(
+        database.pool().clone(),
+        &config.credit_allocation,
+    ));
+    let credentials = Arc::new(OrganizationCredentialRepository::new(
+        database.pool().clone(),
+    ));
+
+    Arc::new(OrganizationCreditService::new(transfers, credentials))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::attested_3p_startup::{CHUTES_SUPPORTED_FEATURES, CHUTES_SUPPORTED_SAMPLING_PARAMS};
     use crate::openapi::ApiDoc;
 
     /// Regression for issue #781 (M1): the Chutes catalog seed must advertise a
@@ -2888,6 +2958,46 @@ mod tests {
         }
     }
 
+
+    #[test]
+    fn test_openapi_chat_completion_details_are_optional() {
+        // Chat-completion usage details are independently optional (a provider
+        // may report only `audio_tokens`), while the Responses API usage keeps
+        // OpenAI's required `output_tokens_details.reasoning_tokens`.
+        let spec = serde_json::to_value(ApiDoc::openapi()).unwrap();
+        let schemas = &spec["components"]["schemas"];
+        let details = &schemas["CompletionUsage"]["properties"]["completion_tokens_details"];
+        assert!(
+            details
+                .to_string()
+                .contains("#/components/schemas/CompletionTokensDetails"),
+            "completion_tokens_details should use CompletionTokensDetails: {details}"
+        );
+        let completion_details = &schemas["CompletionTokensDetails"];
+        for field in [
+            "reasoning_tokens",
+            "audio_tokens",
+            "accepted_prediction_tokens",
+            "rejected_prediction_tokens",
+        ] {
+            assert!(
+                completion_details["properties"].get(field).is_some(),
+                "CompletionTokensDetails should document {field}"
+            );
+        }
+        assert!(
+            completion_details
+                .get("required")
+                .and_then(serde_json::Value::as_array)
+                .is_none_or(Vec::is_empty),
+            "no CompletionTokensDetails field is required: {completion_details}"
+        );
+        assert_eq!(
+            schemas["OutputTokensDetails"]["required"],
+            serde_json::json!(["reasoning_tokens"])
+        );
+    }
+
     fn assert_reporting_path_security(
         spec: &serde_json::Value,
         path: &str,
@@ -2920,8 +3030,9 @@ mod tests {
 
     #[test]
     fn test_openapi_ita_token_endpoint_is_public() {
-        // /v1/attestation/ita-token is the ONLY public attestation route — an
-        // explicit, documented decision (nearai/infra#193); see
+        // /v1/attestation/ita-token and /v1/attestation/pins are the
+        // ONLY public attestation routes — explicit, documented decisions
+        // (nearai/infra#193); see
         // `build_public_attestation_routes` in routes/attestation.rs.
         let spec = match serde_json::to_value(ApiDoc::openapi()) {
             Ok(spec) => spec,
@@ -2939,6 +3050,16 @@ mod tests {
         assert!(spec["components"]["schemas"]
             .as_object()
             .is_some_and(|schemas| schemas.contains_key("ItaTokenResponse")));
+    }
+
+    #[test]
+    fn test_openapi_attested_pins_endpoint_is_public() {
+        let spec = serde_json::to_value(ApiDoc::openapi()).unwrap();
+        assert_eq!(
+            spec["paths"]["/v1/attestation/pins"]["get"]["security"],
+            serde_json::json!([{}]),
+            "/v1/attestation/pins must explicitly override global OpenAPI security"
+        );
     }
 
     #[test]
@@ -3252,6 +3373,89 @@ mod tests {
         assert_eq!(unrelated.status(), StatusCode::NOT_FOUND);
         assert!(unrelated.headers().get(CACHE_CONTROL).is_none());
     }
+
+    #[test]
+    fn missing_password_means_no_placement() {
+        let pool = services::inference_provider_pool::InferenceProviderPool::new(
+            None,
+            config::ExternalProvidersConfig::default(),
+        );
+        install_placement(&pool, &config::PlacementConfig::default());
+        assert!(
+            pool.affinity_secret().is_none(),
+            "no affinity secret without the password"
+        );
+        assert!(!pool.has_placement(), "no placement without the password");
+    }
+
+    fn configured_endpoint() -> config::PlacementEndpoint {
+        config::PlacementEndpoint::Valid(config::PlacementRedisEndpoint {
+            host: "203.0.113.7".to_string(),
+            port: 6379,
+            tls: true,
+            // Not a parsable certificate: the handle sets stay inert.
+            ca_pem: Some("-----BEGIN CERTIFICATE-----".to_string()),
+        })
+    }
+
+    #[test]
+    fn placement_password_installs_placement_and_affinity() {
+        let pool = services::inference_provider_pool::InferenceProviderPool::new(
+            None,
+            config::ExternalProvidersConfig::default(),
+        );
+        let placement = config::PlacementConfig {
+            redis_password: Some("router-password".to_string()),
+            redis_endpoint: configured_endpoint(),
+        };
+        install_placement(&pool, &placement);
+        assert!(pool.has_placement());
+        let (expected, _) = services::completions::affinity::secrets_from("router-password");
+        assert_eq!(pool.affinity_secret(), Some(expected));
+    }
+
+    /// TLS off is allowed (with a startup warning): placement still installs.
+    #[test]
+    fn plaintext_endpoint_still_installs_placement() {
+        let pool = services::inference_provider_pool::InferenceProviderPool::new(
+            None,
+            config::ExternalProvidersConfig::default(),
+        );
+        let placement = config::PlacementConfig {
+            redis_password: Some("router-password".to_string()),
+            redis_endpoint: config::PlacementEndpoint::Valid(config::PlacementRedisEndpoint {
+                host: "127.0.0.1".to_string(),
+                port: 6379,
+                tls: false,
+                ca_pem: None,
+            }),
+        };
+        install_placement(&pool, &placement);
+        assert!(pool.has_placement());
+    }
+
+    /// Without a usable endpoint placement stays off (fail open), password
+    /// or not: no handles and no affinity secret.
+    #[test]
+    fn placement_without_a_usable_endpoint_stays_off() {
+        for endpoint in [
+            config::PlacementEndpoint::Missing,
+            config::PlacementEndpoint::Invalid("PLACEMENT_REDIS_PORT".to_string()),
+        ] {
+            let pool = services::inference_provider_pool::InferenceProviderPool::new(
+                None,
+                config::ExternalProvidersConfig::default(),
+            );
+            let placement = config::PlacementConfig {
+                redis_password: Some("router-password".to_string()),
+                redis_endpoint: endpoint,
+            };
+            install_placement(&pool, &placement);
+            assert!(!pool.has_placement());
+            assert!(pool.affinity_secret().is_none());
+        }
+    }
+
     /// Example of how to set up the application for E2E testing
     #[tokio::test]
     #[ignore] // Remove ignore to run with a real database and Patroni cluster
@@ -3297,6 +3501,7 @@ mod tests {
                 username: "test_user".to_string(),
                 password: "test_pass".to_string(),
                 max_connections: 5,
+                recycling_method: config::DatabaseRecyclingMethod::Fast,
                 tls_enabled: false,
                 tls_ca_cert_path: None,
                 refresh_interval: 30,
@@ -3328,6 +3533,7 @@ mod tests {
             usage_reporting: config::UsageReportingConfig::default(),
             credit_allocation: config::CreditAllocationConfig::default(),
             ita: config::ItaAttestationConfig::default(),
+            placement: config::PlacementConfig::default(),
         };
 
         // Initialize services
@@ -3368,6 +3574,7 @@ mod tests {
             username: "test_user".to_string(),
             password: "test_pass".to_string(),
             max_connections: 5,
+            recycling_method: config::DatabaseRecyclingMethod::Fast,
             tls_enabled: false,
             tls_ca_cert_path: None,
             refresh_interval: 30,
@@ -3418,6 +3625,7 @@ mod tests {
                 username: "test_user".to_string(),
                 password: "test_pass".to_string(),
                 max_connections: 5,
+                recycling_method: config::DatabaseRecyclingMethod::Fast,
                 tls_enabled: false,
                 tls_ca_cert_path: None,
                 refresh_interval: 30,
@@ -3449,6 +3657,7 @@ mod tests {
             usage_reporting: config::UsageReportingConfig::default(),
             credit_allocation: config::CreditAllocationConfig::default(),
             ita: config::ItaAttestationConfig::default(),
+            placement: config::PlacementConfig::default(),
         };
 
         let auth_components = init_auth_services(database.clone(), &config);
@@ -3555,6 +3764,125 @@ mod tests {
         let config = test_cors_config();
         assert!(is_origin_allowed("https://preview-example.com", &config));
         assert!(is_origin_allowed("https://staging-example.com", &config));
+    }
+
+    #[test]
+    fn test_cors_bare_wildcard_requires_a_domain_boundary() {
+        let config = config::CorsConfig {
+            exact_matches: vec![],
+            wildcard_suffixes: vec!["example.com".into()],
+        };
+        assert!(is_origin_allowed("https://sub.example.com", &config));
+        assert!(!is_origin_allowed("https://evilexample.com", &config));
+        assert!(!is_origin_allowed("https://example.com.evil.test", &config));
+        assert!(!is_origin_allowed("https://example.com", &config));
+        assert!(!is_origin_allowed("http://sub.example.com", &config));
+    }
+
+    #[tokio::test]
+    async fn cors_preflight_allows_browser_authorization() {
+        use axum::http::header::{
+            ACCESS_CONTROL_ALLOW_CREDENTIALS, ACCESS_CONTROL_ALLOW_HEADERS,
+            ACCESS_CONTROL_ALLOW_METHODS, ACCESS_CONTROL_ALLOW_ORIGIN,
+            ACCESS_CONTROL_REQUEST_HEADERS, ACCESS_CONTROL_REQUEST_METHOD, ORIGIN, VARY,
+        };
+
+        for origin in [
+            "https://example.com",
+            "https://www.typingmind.com",
+            "https://client.example",
+        ] {
+            let app = Router::new()
+                .route(
+                    "/chat/completions",
+                    post(|| async { StatusCode::UNAUTHORIZED }),
+                )
+                .layer(build_cors_layer(config::CorsConfig::default()));
+            let response = app
+                .oneshot(
+                    HttpRequest::builder()
+                        .method("OPTIONS")
+                        .uri("/chat/completions")
+                        .header(ORIGIN, origin)
+                        .header(ACCESS_CONTROL_REQUEST_METHOD, "POST")
+                        .header(
+                            ACCESS_CONTROL_REQUEST_HEADERS,
+                            "authorization,content-type,x-request-id",
+                        )
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.headers()[ACCESS_CONTROL_ALLOW_ORIGIN], origin);
+            assert_eq!(response.headers()[ACCESS_CONTROL_ALLOW_METHODS], "*");
+            assert_eq!(
+                response.headers()[ACCESS_CONTROL_ALLOW_HEADERS],
+                "authorization,content-type,x-request-id",
+            );
+            let vary = response.headers()[VARY].to_str().unwrap();
+            for name in ["origin", "access-control-request-headers"] {
+                assert!(vary
+                    .split(',')
+                    .any(|part| part.trim().eq_ignore_ascii_case(name)));
+            }
+            assert!(!response
+                .headers()
+                .contains_key(ACCESS_CONTROL_ALLOW_CREDENTIALS));
+        }
+    }
+
+    #[tokio::test]
+    async fn cors_actual_responses_reflect_browser_origin() {
+        use axum::http::header::{
+            ACCESS_CONTROL_ALLOW_CREDENTIALS, ACCESS_CONTROL_ALLOW_ORIGIN,
+            ACCESS_CONTROL_EXPOSE_HEADERS, ORIGIN,
+        };
+
+        for origin in ["https://www.typingmind.com", "https://client.example"] {
+            for status in [StatusCode::OK, StatusCode::UNAUTHORIZED] {
+                let app = Router::new()
+                    .route("/response", get(move || async move { status }))
+                    .layer(build_cors_layer(config::CorsConfig::default()));
+                let response = app
+                    .oneshot(
+                        HttpRequest::builder()
+                            .uri("/response")
+                            .header(ORIGIN, origin)
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), status);
+                assert_eq!(response.headers()[ACCESS_CONTROL_ALLOW_ORIGIN], origin);
+                assert_eq!(response.headers()[ACCESS_CONTROL_EXPOSE_HEADERS], "*");
+                assert!(!response
+                    .headers()
+                    .contains_key(ACCESS_CONTROL_ALLOW_CREDENTIALS));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn cors_request_without_origin_remains_usable() {
+        use axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN;
+
+        let app = Router::new()
+            .route("/ok", get(|| async { "ok" }))
+            .layer(build_cors_layer(config::CorsConfig::default()));
+        let response = app
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/ok")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(!response.headers().contains_key(ACCESS_CONTROL_ALLOW_ORIGIN));
     }
 
     // --- cache_control_layer tests -------------------------------------------

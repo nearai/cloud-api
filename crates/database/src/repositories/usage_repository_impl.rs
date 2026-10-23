@@ -97,6 +97,7 @@ impl services::usage::ports::UsageRepository for OrganizationUsageRepository {
         Ok(balance.map(|b| OrganizationBalanceInfo {
             organization_id: b.organization_id,
             total_spent: b.total_spent,
+            legacy_unattributed_amount: b.legacy_unattributed_amount,
             last_usage_at: b.last_usage_at,
             total_requests: b.total_requests,
             total_tokens: b.total_tokens,
@@ -110,11 +111,9 @@ impl services::usage::ports::UsageRepository for OrganizationUsageRepository {
         limit: Option<i64>,
         offset: Option<i64>,
     ) -> anyhow::Result<(Vec<UsageLogEntry>, i64)> {
-        let logs = self
+        let (logs, total) = self
             .get_usage_history(organization_id, limit, offset)
             .await?;
-
-        let total = self.count_usage_history(organization_id).await?;
 
         let entries = logs
             .into_iter()
@@ -259,9 +258,10 @@ impl services::usage::ports::UsageRepository for OrganizationUsageRepository {
         &self,
         organization_id: Uuid,
         start_date: DateTime<Utc>,
+        end_date: Option<DateTime<Utc>>,
     ) -> anyhow::Result<Vec<UsageByModelEntry>> {
         let rows = self
-            .get_usage_by_model_since(organization_id, start_date)
+            .get_usage_by_model_since(organization_id, start_date, end_date)
             .await?;
 
         Ok(rows

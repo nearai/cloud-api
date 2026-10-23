@@ -42,7 +42,7 @@ async fn setup_non_attested_signature_model(
     (model_name, mock)
 }
 
-async fn assert_gateway_signatures(
+pub(crate) async fn assert_gateway_signatures(
     server: &axum_test::TestServer,
     api_key: &str,
     chat_id: &str,
@@ -429,7 +429,7 @@ async fn test_near_non_streaming_chat_retains_provider_signature_with_chutes_fal
     assert_chutes_chat_signature_routing(Some(true)).await;
 }
 
-async fn setup_chutes_signature_model(
+pub(crate) async fn setup_chutes_signature_model(
     server: &axum_test::TestServer,
     pool: &services::inference_provider_pool::InferenceProviderPool,
     near_succeeds: Option<bool>,

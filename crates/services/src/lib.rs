@@ -1,16 +1,19 @@
 pub mod admin;
+pub mod admin_settings;
 pub mod aml;
 pub mod attestation;
 pub mod auth;
 pub mod auto_redact;
 pub mod common;
 pub mod completions;
+pub mod contact_email;
 pub mod conversations;
 pub mod email;
 pub mod files;
 pub mod github_dispatch;
 pub mod id_prefixes;
 pub mod inference_provider_pool;
+pub mod lifecycle;
 pub mod mcp;
 pub mod metrics;
 pub mod models;
@@ -22,6 +25,7 @@ pub mod service_usage;
 pub mod staking_farm;
 pub mod usage;
 pub mod user;
+pub mod user_erasure;
 pub mod web_search;
 pub mod workspace;
 
@@ -32,3 +36,5 @@ pub use responses::service::ResponseServiceImpl as ResponseService;
 
 #[cfg(test)]
 mod test_utils;
+
+pub mod organization_credits;

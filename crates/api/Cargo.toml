@@ -21,6 +21,7 @@ anyhow = "1.0"
 config = { path = "../config" }
 database = { path = "../database" }
 services = { path = "../services" }
+arc-swap = "1.9.1"
 inference_providers = { path = "../inference_providers", features = ["openapi"] }
 # Authentication dependencies
 tower = { version = "0.5", features = ["util"] }

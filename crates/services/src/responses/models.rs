@@ -7,7 +7,7 @@ use std::collections::HashSet;
 use utoipa::ToSchema;
 use uuid::Uuid;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResponseId(pub Uuid);
 
 impl From<Uuid> for ResponseId {
@@ -301,6 +301,10 @@ pub enum ResponseTool {
     },
     #[serde(rename = "web_search")]
     WebSearch {
+        /// Maximum results per search (0–20); zero disables searches. Overrides the model's count when set.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[schema(minimum = 0, maximum = 20)]
+        count: Option<u32>,
         #[serde(skip_serializing_if = "Option::is_none")]
         filters: Option<serde_json::Value>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -1240,6 +1244,17 @@ impl CreateResponseRequest {
             return Err("Model cannot be empty".to_string());
         }
 
+        for tool in self.tools.iter().flatten() {
+            if let ResponseTool::WebSearch {
+                count: Some(count), ..
+            } = tool
+            {
+                if *count > crate::web_search::WEB_SEARCH_MAX_COUNT {
+                    return Err("web_search count must be between 0 and 20".to_string());
+                }
+            }
+        }
+
         if let Some(max_tokens) = self.max_output_tokens {
             if max_tokens < 1 {
                 return Err("max_output_tokens must be greater than 0".to_string());
@@ -1507,7 +1522,7 @@ impl Usage {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::responses::models::*;
     use serde_json::json;
 
     fn stateless_request() -> CreateResponseRequest {
@@ -1558,6 +1573,39 @@ mod tests {
         let mut request = stateless_request();
         request.input = Some(ResponseInput::Items(items));
         request
+    }
+
+    #[test]
+    fn test_web_search_count_validation_and_round_trip() {
+        for count in [None, Some(1), Some(5), Some(20), Some(0), Some(21)] {
+            let mut tool = serde_json::json!({"type": "web_search"});
+            if let Some(count) = count {
+                tool["count"] = serde_json::json!(count);
+            }
+            let request: CreateResponseRequest = serde_json::from_value(serde_json::json!({
+                "model": "test", "input": "Search the web", "tools": [tool.clone()]
+            }))
+            .unwrap();
+            assert_eq!(
+                request.validate().is_ok(),
+                count.is_none_or(|n| (0..=20).contains(&n))
+            );
+            let serialized = serde_json::to_value(&request.tools).unwrap();
+            assert_eq!(serialized[0], tool);
+        }
+        for count in [
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+            serde_json::json!("5"),
+            serde_json::json!(4294967296u64),
+        ] {
+            assert!(
+                serde_json::from_value::<CreateResponseRequest>(serde_json::json!({
+                    "model": "test", "tools": [{"type": "web_search", "count": count}]
+                }))
+                .is_err()
+            );
+        }
     }
 
     #[test]
@@ -2421,6 +2469,7 @@ mod tests {
             filters: None,
             search_context_size: None,
             user_location: None,
+            count: None,
         }]);
         assert!(web_search
             .validate_stateless()
@@ -2483,6 +2532,7 @@ mod tests {
                 filters: None,
                 search_context_size: None,
                 user_location: None,
+                count: None,
             },
         ]);
 

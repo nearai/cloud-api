@@ -40,6 +40,10 @@ pub struct Delta {
 pub struct ChatCompletionRequest {
     pub model: String,
     pub messages: Vec<Message>,
+    /// Completion token limit, including reasoning tokens. Takes precedence over `max_tokens`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_completion_tokens: Option<i64>,
+    /// Legacy completion token limit. Prefer `max_completion_tokens` for new clients.
     pub max_tokens: Option<i64>,
     #[serde(default)]
     pub temperature: Option<f32>,
@@ -1151,6 +1155,26 @@ pub struct ModelsResponse {
     pub data: Vec<ModelInfo>,
 }
 
+/// `GET /v1/internal/model-access`: which organizations may use each
+/// restricted model. A model that is absent from `models` is unrestricted.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ModelAccessDocument {
+    /// Always `"model_access"`.
+    pub object: String,
+    /// One entry per unlisted model, active or not, ordered by model name.
+    pub models: Vec<ModelAccessDocumentEntry>,
+}
+
+/// One restricted model of [`ModelAccessDocument`].
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ModelAccessDocumentEntry {
+    /// Canonical model name, the `id` of `GET /v1/internal/models`.
+    pub id: String,
+    /// The active organizations that hold a grant. Empty when nobody may use
+    /// the model.
+    pub organization_ids: Vec<uuid::Uuid>,
+}
+
 /// Model pricing information.
 ///
 /// `input` / `output` are the legacy HuggingFace-style fields (USD per million
@@ -1177,6 +1201,57 @@ pub struct ModelPricing {
     pub input_cache_read: Option<String>,
 }
 
+/// Named nano-dollar amounts keep distinct price fields explicit at call sites.
+pub(crate) struct CatalogPricingAmounts {
+    pub input_cost_per_token: i64,
+    pub output_cost_per_token: i64,
+    pub cost_per_image: i64,
+    pub cache_read_cost_per_token: Option<i64>,
+}
+
+impl From<CatalogPricingAmounts> for ModelPricing {
+    fn from(pricing: CatalogPricingAmounts) -> Self {
+        Self {
+            // nano-dollars per token * 0.001 = USD per million tokens.
+            input: (pricing.input_cost_per_token as f64) * 0.001,
+            output: (pricing.output_cost_per_token as f64) * 0.001,
+            prompt: nano_dollars_to_per_token_string(pricing.input_cost_per_token),
+            completion: nano_dollars_to_per_token_string(pricing.output_cost_per_token),
+            image: nano_dollars_to_per_token_string(pricing.cost_per_image),
+            request: "0".to_string(),
+            input_cache_read: pricing
+                .cache_read_cost_per_token
+                .map(nano_dollars_to_per_token_string),
+        }
+    }
+}
+
+/// Convert a nano-USD amount (DB scale 9 — used for per-token, per-image, and
+/// per-request prices) to a USD string suitable for OpenRouter
+/// (e.g. 8_000 → "0.000008"). Strings are required by the OpenRouter provider
+/// spec to avoid float precision issues, so this uses pure integer arithmetic.
+/// Pricing is non-negative throughout the system; a defensive `abs()` keeps
+/// the formatter total in the unexpected case.
+fn nano_dollars_to_per_token_string(nano_dollars: i64) -> String {
+    if nano_dollars == 0 {
+        return "0".to_string();
+    }
+    let n = nano_dollars.unsigned_abs();
+    let dollars = n / 1_000_000_000;
+    let nanos = n % 1_000_000_000;
+    let mut s = if nanos == 0 {
+        format!("{dollars}")
+    } else {
+        let frac = format!("{nanos:09}");
+        let frac = frac.trim_end_matches('0');
+        format!("{dollars}.{frac}")
+    };
+    if nano_dollars < 0 {
+        s.insert(0, '-');
+    }
+    s
+}
+
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct ModelInfo {
     pub id: String,
@@ -1196,6 +1271,9 @@ pub struct ModelInfo {
     /// Pricing information (HuggingFace + OpenRouter compatible).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pricing: Option<ModelPricing>,
+    /// Earliest pending change and complete prices after it is applied.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upcoming_pricing: Option<UpcomingModelPricingInfo>,
     /// Exact, versioned USD-per-million text pricing. The legacy `pricing`
     /// projection remains Standard-short for compatibility.
     #[serde(rename = "textPricing", skip_serializing_if = "Option::is_none")]
@@ -1227,6 +1305,11 @@ pub struct ModelInfo {
     /// string. Omitted when there is no planned deprecation.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub deprecation_date: Option<String>,
+    /// Recommended replacement for a model with a planned deprecation
+    /// (canonical model id). Omitted when none is set. The public catalogs
+    /// name only a listed successor.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub successor_model_id: Option<String>,
     /// Human-readable description (OpenRouter `description`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
@@ -1314,16 +1397,25 @@ pub struct CompletionChoice {
 }
 
 /// Usage for chat/completions endpoints.
-/// Serializes as prompt_tokens, completion_tokens, prompt_tokens_details, completion_tokens_details, total_tokens.
+/// Serializes as prompt_tokens, prompt_tokens_details, completion_tokens, completion_tokens_details, total_tokens, reasoning_tokens.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct CompletionUsage {
     pub prompt_tokens: i32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_tokens_details: Option<InputTokensDetails>,
     pub completion_tokens: i32,
+    /// Breakdown of `completion_tokens`. `reasoning_tokens` here is the
+    /// standard location of the reasoning count, present when the model
+    /// reported one.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub completion_tokens_details: Option<OutputTokensDetails>,
+    pub completion_tokens_details: Option<CompletionTokensDetails>,
     pub total_tokens: i32,
+    /// Deprecated: use `completion_tokens_details.reasoning_tokens`. Top-level
+    /// reasoning count as reported by some self-hosted engines; kept for
+    /// existing readers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(deprecated)]
+    pub reasoning_tokens: Option<i64>,
 }
 
 /// Usage for Response API and other non-OpenAI endpoints.
@@ -1347,6 +1439,21 @@ pub struct InputTokensDetails {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct OutputTokensDetails {
     pub reasoning_tokens: i64,
+}
+
+/// Breakdown of chat-completion `completion_tokens`. Every field is optional:
+/// a provider may report any subset of them.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+pub struct CompletionTokensDetails {
+    /// Tokens spent on reasoning.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_tokens: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_tokens: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accepted_prediction_tokens: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rejected_prediction_tokens: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -1473,18 +1580,14 @@ use crate::consts::{
 };
 use crate::routes::common::{validate_max_length, validate_non_empty_field};
 
-/// Reject `max_tokens` values the OpenAI API requires to be `>= 1`.
-///
-/// `None` (unset) is valid. Negative or zero values are rejected with a 400
-/// `invalid_request_error` carrying `param: "max_tokens"` instead of falling
-/// through to upstream and surfacing as a masked 502 (nearai/cloud-api #786).
-fn validate_max_tokens(max_tokens: Option<i64>) -> Result<(), ErrorResponse> {
-    if let Some(value) = max_tokens {
+/// Reject non-positive token limits with an error naming the supplied parameter.
+fn validate_token_limit(value: Option<i64>, param: &str) -> Result<(), ErrorResponse> {
+    if let Some(value) = value {
         if value < 1 {
             return Err(ErrorResponse::with_param(
-                "max_tokens must be at least 1".to_string(),
+                format!("{param} must be at least 1"),
                 "invalid_request_error".to_string(),
-                "max_tokens".to_string(),
+                param.to_string(),
             ));
         }
     }
@@ -1510,7 +1613,7 @@ impl ChatCompletionRequest {
     /// envelope (`{error:{message,type,param,code}}`) on failure.
     ///
     /// This wraps the message-only [`Self::validate`] (temperature/top_p/stop/
-    /// logprobs) and adds the param-bearing sampling checks (`max_tokens`, `n`)
+    /// logprobs) and adds the param-bearing sampling checks (token limits, `n`)
     /// that would otherwise fall through to upstream and surface as a masked
     /// 502 instead of a 4xx (nearai/cloud-api #786). All checks reject only
     /// genuinely-invalid values; valid requests are untouched.
@@ -1523,7 +1626,8 @@ impl ChatCompletionRequest {
     pub fn validate_request(&self) -> Result<(), ErrorResponse> {
         self.validate()
             .map_err(|message| ErrorResponse::new(message, "invalid_request_error".to_string()))?;
-        validate_max_tokens(self.max_tokens)?;
+        validate_token_limit(self.max_completion_tokens, "max_completion_tokens")?;
+        validate_token_limit(self.max_tokens, "max_tokens")?;
         validate_n(self.n)?;
         Ok(())
     }
@@ -1639,7 +1743,7 @@ impl CompletionRequest {
     pub fn validate_request(&self) -> Result<(), ErrorResponse> {
         self.validate()
             .map_err(|message| ErrorResponse::new(message, "invalid_request_error".to_string()))?;
-        validate_max_tokens(self.max_tokens)?;
+        validate_token_limit(self.max_tokens, "max_tokens")?;
         validate_n(self.n)?;
         Ok(())
     }
@@ -1839,7 +1943,12 @@ pub enum ResponseTool {
         parameters: Option<serde_json::Value>,
     },
     #[serde(rename = "web_search")]
-    WebSearch {},
+    WebSearch {
+        /// Maximum results per search (0–20); zero disables searches. Overrides the model's count when set.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[schema(minimum = 0, maximum = 20)]
+        count: Option<u32>,
+    },
     #[serde(rename = "web_context_search")]
     WebContextSearch {},
     #[serde(rename = "file_search")]
@@ -2530,6 +2639,17 @@ impl CreateResponseRequest {
             return Err("Model cannot be empty".to_string());
         }
 
+        for tool in self.tools.iter().flatten() {
+            if let ResponseTool::WebSearch {
+                count: Some(count), ..
+            } = tool
+            {
+                if *count > services::web_search::WEB_SEARCH_MAX_COUNT {
+                    return Err("web_search count must be between 0 and 20".to_string());
+                }
+            }
+        }
+
         if let Some(max_tokens) = self.max_output_tokens {
             if max_tokens < 1 {
                 return Err("max_output_tokens must be greater than 0".to_string());
@@ -3004,6 +3124,93 @@ pub struct AdminUserOrganizationDetails {
     pub current_usage: Option<OrganizationUsage>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ErasedOrganizationResponse {
+    pub id: String,
+    pub lifecycle: services::lifecycle::OrganizationLifecycle,
+    pub workspaces: i64,
+    pub api_keys: i64,
+    pub conversations: i64,
+    pub files: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct RetainedOrganizationResponse {
+    pub id: String,
+    pub role: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ErasureLogResponse {
+    pub requested_at: DateTime<Utc>,
+    pub erased_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ErasurePreviewResponse {
+    pub user_id: String,
+    pub lifecycle: services::lifecycle::UserLifecycle,
+    pub blockers: Vec<services::user_erasure::ErasureBlocker>,
+    pub erased_organizations: Vec<ErasedOrganizationResponse>,
+    pub retained_organizations: Vec<RetainedOrganizationResponse>,
+    pub log: Option<ErasureLogResponse>,
+}
+
+/// Body of the 409 returned when erasure is blocked: the usual error envelope plus the blockers.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ErasureBlockedResponse {
+    pub error: ErrorDetail,
+    pub blockers: Vec<services::user_erasure::ErasureBlocker>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct EraseUserRequest {
+    /// Must match the user's current email, ignoring case and surrounding whitespace.
+    /// Typed by the operator as a guard against erasing the wrong id.
+    pub confirm_email: String,
+    /// When the person asked (starts the GDPR response clock). Defaults to now.
+    pub requested_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct EraseUserResponse {
+    pub user_id: String,
+    pub lifecycle: services::lifecycle::UserLifecycle,
+    pub already_erased: bool,
+    pub erased_organization_ids: Vec<String>,
+}
+
+/// Body of the erasure lookup: exactly one of `email` or `user_id`. The email is
+/// compared as a digest and must never appear in a URL or query string.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct LookupUserErasuresRequest {
+    pub email: Option<String>,
+    pub user_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ErasureLookupOrganizationResponse {
+    pub organization_id: String,
+    pub lifecycle: services::lifecycle::OrganizationLifecycle,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct UserErasureRecordResponse {
+    pub user_id: String,
+    pub user_lifecycle: services::lifecycle::UserLifecycle,
+    pub admin_user_id: String,
+    pub requested_at: DateTime<Utc>,
+    pub erased_at: DateTime<Utc>,
+    pub erased_organizations: Vec<ErasureLookupOrganizationResponse>,
+    pub retained_organizations: Vec<ErasureLookupOrganizationResponse>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct LookupUserErasuresResponse {
+    /// Newest `erased_at` first; empty when nothing matches.
+    pub erasures: Vec<UserErasureRecordResponse>,
+}
+
 /// Admin user response model (for owners/admins)
 /// Contains sensitive information only visible to organization owners/admins
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -3018,6 +3225,15 @@ pub struct AdminUserResponse {
     pub is_active: bool,
     pub auth_provider: String,
     pub provider_user_id: String,
+    /// Verified contact address. `email` is the login identity, which is a
+    /// placeholder for NEAR wallet users.
+    pub contact_email: Option<String>,
+    pub contact_email_verified_at: Option<DateTime<Utc>>,
+    /// When the user agreed to be emailed at `contact_email`.
+    pub email_opt_in_at: Option<DateTime<Utc>>,
+    /// Omitted when the row's `is_active`/`auth_provider` columns are inconsistent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lifecycle: Option<services::lifecycle::UserLifecycle>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub organizations: Option<Vec<AdminUserOrganizationDetails>>,
 }
@@ -3025,6 +3241,8 @@ pub struct AdminUserResponse {
 /// User response model (full user profile)
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct UserResponse {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub staking_organization_id: Option<String>,
     pub id: String,
     pub email: String,
     pub username: String,
@@ -3035,6 +3253,14 @@ pub struct UserResponse {
     pub last_login_at: Option<DateTime<Utc>>,
     pub is_active: bool,
     pub auth_provider: String,
+    /// Verified contact address. `email` is the login identity, which is a
+    /// placeholder (`{account_id}@near`) for NEAR wallet users.
+    pub contact_email: Option<String>,
+    pub contact_email_verified: bool,
+    /// True when the user signs in with a NEAR wallet and has no verified contact
+    /// email, so the frontend should ask for one. Always false while contact email
+    /// verification is switched off.
+    pub needs_contact_email: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub organizations: Option<Vec<UserOrganizationResponse>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -3172,12 +3398,43 @@ pub struct AdminOrganizationResponse {
     #[serde(rename = "currentUsage", skip_serializing_if = "Option::is_none")]
     pub current_usage: Option<OrganizationUsage>,
     pub created_at: DateTime<Utc>,
+    /// Always `active` on org detail, which only returns active organizations.
+    pub lifecycle: services::lifecycle::OrganizationLifecycle,
 }
 
 /// List organizations response model (admin only)
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ListOrganizationsAdminResponse {
     pub organizations: Vec<AdminOrganizationResponse>,
+    pub total: i64,
+    pub limit: i64,
+    pub offset: i64,
+}
+
+/// API key metadata for admin listing. Never includes key material (raw key,
+/// hash, or prefix) or the user-supplied key name.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct AdminApiKeyResponse {
+    pub id: String,
+    pub organization_id: String,
+    pub organization_name: String,
+    pub workspace_id: String,
+    /// User who created the key
+    pub created_by_user_id: String,
+    pub created_at: DateTime<Utc>,
+    pub is_active: bool,
+    /// Set when the key was revoked
+    pub deleted_at: Option<DateTime<Utc>>,
+    /// True when the key's name matches the Cloud UI's managed Playground key
+    /// naming (`Playground-<uuid>-g<generation>`). Best-effort: derived from the
+    /// user-editable key name, not stored provenance.
+    pub is_managed_playground: bool,
+}
+
+/// List API keys response model (admin only)
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ListAdminApiKeysResponse {
+    pub api_keys: Vec<AdminApiKeyResponse>,
     pub total: i64,
     pub limit: i64,
     pub offset: i64,
@@ -3666,6 +3923,68 @@ pub struct AdminModelWithPricing {
     pub updated_at: DateTime<Utc>,
 }
 
+/// A scheduled change on the OpenAI-compatible model catalog. Prices use the
+/// same representation as the model's current `pricing` and `textPricing`.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct UpcomingModelPricingInfo {
+    pub effective_at: String,
+    pub pricing: ModelPricing,
+    #[serde(rename = "textPricing", skip_serializing_if = "Option::is_none")]
+    pub text_pricing: Option<serde_json::Value>,
+}
+
+/// A scheduled change on the native model catalog, in nano-dollars like the
+/// current prices. Absent when no change is pending.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct UpcomingPricing {
+    #[serde(rename = "effectiveAt")]
+    pub effective_at: String,
+    pub pricing: PricingFields,
+}
+
+impl From<services::models::UpcomingModelPricing> for UpcomingPricing {
+    fn from(pricing: services::models::UpcomingModelPricing) -> Self {
+        let decimal = |amount| DecimalPrice {
+            amount,
+            scale: 9,
+            currency: "USD".to_string(),
+        };
+        Self {
+            effective_at: crate::routes::admin::format_deprecation_date(&pricing.effective_at),
+            pricing: PricingFields {
+                input_cost_per_token: decimal(pricing.input_cost_per_token),
+                output_cost_per_token: decimal(pricing.output_cost_per_token),
+                cache_read_cost_per_token: pricing.cache_read_cost_per_token.map(decimal),
+                cost_per_image: decimal(pricing.cost_per_image),
+                text_pricing: pricing.text_pricing.map(|profile| {
+                    serde_json::to_value(profile).unwrap_or(serde_json::Value::Null)
+                }),
+            },
+        }
+    }
+}
+
+impl From<services::models::UpcomingModelPricing> for UpcomingModelPricingInfo {
+    fn from(pricing: services::models::UpcomingModelPricing) -> Self {
+        // Share the date and optional profile conversion with the native catalog.
+        let future = UpcomingPricing::from(pricing);
+        Self {
+            effective_at: future.effective_at,
+            pricing: CatalogPricingAmounts {
+                input_cost_per_token: future.pricing.input_cost_per_token.amount,
+                output_cost_per_token: future.pricing.output_cost_per_token.amount,
+                cost_per_image: future.pricing.cost_per_image.amount,
+                cache_read_cost_per_token: future
+                    .pricing
+                    .cache_read_cost_per_token
+                    .map(|price| price.amount),
+            }
+            .into(),
+            text_pricing: future.pricing.text_pricing,
+        }
+    }
+}
+
 /// Model with pricing information
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct ModelWithPricing {
@@ -3686,6 +4005,9 @@ pub struct ModelWithPricing {
     pub cache_read_cost_per_token: Option<DecimalPrice>,
     #[serde(rename = "textPricing", skip_serializing_if = "Option::is_none")]
     pub text_pricing: Option<serde_json::Value>,
+    /// Complete future prices and date for the earliest pending change.
+    #[serde(rename = "upcomingPricing", skip_serializing_if = "Option::is_none")]
+    pub upcoming_pricing: Option<UpcomingPricing>,
     pub metadata: ModelMetadata,
 }
 
@@ -3823,11 +4145,21 @@ pub struct ModelMetadata {
     /// string. Omitted when there is no planned deprecation.
     #[serde(rename = "deprecationDate", skip_serializing_if = "Option::is_none")]
     pub deprecation_date: Option<String>,
+    /// Recommended replacement for a model with a planned deprecation
+    /// (canonical model id). Omitted when none is set. The public catalogs
+    /// name only a listed successor.
+    #[serde(rename = "successorModelId", skip_serializing_if = "Option::is_none")]
+    pub successor_model_id: Option<String>,
     /// OpenRouter `openrouter.slug` override (lowercase `author/slug`). Omitted
     /// when unset. On public `GET /v1/models` this surfaces as the nested
     /// `openrouter: { slug }` object; the admin view exposes the raw value.
     #[serde(rename = "openrouterSlug", skip_serializing_if = "Option::is_none")]
     pub openrouter_slug: Option<String>,
+    /// Whether the model is listed. An unlisted model is left out of the
+    /// public model catalogs and only organizations that hold a grant may
+    /// use it. Set on admin views only; the public catalog endpoints omit it.
+    #[serde(rename = "isListed", skip_serializing_if = "Option::is_none")]
+    pub is_listed: Option<bool>,
 }
 
 /// Request to update model pricing (admin endpoint)
@@ -3880,13 +4212,26 @@ pub struct UpdateModelApiRequest {
     /// Required to be set explicitly when activating a zero-price model.
     #[serde(rename = "allowFree", skip_serializing_if = "Option::is_none")]
     pub allow_free: Option<bool>,
+    /// `false` unlists the model. It stays active and billable, but it
+    /// leaves the public model catalogs (`GET /v1/models`,
+    /// `GET /v1/model/list`, `GET /v1/model/{name}`) and becomes restricted:
+    /// only organizations that hold a grant
+    /// (`PUT /v1/admin/models/{model_name}/access/{org_id}`) may use it, and
+    /// everyone else is answered as if the model did not exist. `true` lists
+    /// it again and opens it to every caller. Omitted = leave unchanged (new
+    /// models are listed).
+    #[serde(rename = "isListed", skip_serializing_if = "Option::is_none")]
+    pub is_listed: Option<bool>,
     pub aliases: Option<Vec<String>>,
     #[serde(rename = "ownedBy")]
     pub owned_by: Option<String>,
     /// Provider type: "vllm" (default, TEE-enabled) or "external" (3rd party)
     #[serde(rename = "providerType", skip_serializing_if = "Option::is_none")]
     pub provider_type: Option<String>,
-    /// JSON config for external providers (backend, base_url, etc.)
+    /// JSON config for external providers (backend, base_url, etc.). On an
+    /// existing model it merges into the stored config: keys sent replace
+    /// stored keys, `null` removes a key, omitted keys are kept. `api_key:
+    /// "***"` keeps the stored key.
     #[serde(rename = "providerConfig", skip_serializing_if = "Option::is_none")]
     pub provider_config: Option<serde_json::Value>,
     /// Whether this model supports TEE attestation
@@ -3957,6 +4302,25 @@ pub struct UpdateModelApiRequest {
     )]
     #[schema(value_type = Option<String>)]
     pub deprecation_date: Nullable<String>,
+    /// Recommended replacement for a model with a planned deprecation: the
+    /// canonical id of an active model (or of a model created in the same
+    /// request). Announced to API users in the `x-model-successor` response
+    /// header and on `GET /v1/models`.
+    ///
+    /// Tri-state PATCH semantics:
+    /// - omitted → leave unchanged
+    /// - `null` → clear
+    /// - a string → set
+    ///
+    /// Clearing `deprecationDate` also clears the successor.
+    #[serde(
+        rename = "successorModelId",
+        default,
+        deserialize_with = "deserialize_nullable",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[schema(value_type = Option<String>)]
+    pub successor_model_id: Nullable<String>,
     /// OpenRouter `openrouter.slug` override (lowercase `author/slug`, e.g.
     /// `z-ai/glm-5.1`). Set when our canonical `model_name` does not match
     /// OpenRouter's slug; surfaced as the nested `openrouter: { slug }` object
@@ -4322,12 +4686,18 @@ pub struct ModelHistoryEntry {
     pub is_ready: Option<bool>,
     #[serde(rename = "deprecationDate", skip_serializing_if = "Option::is_none")]
     pub deprecation_date: Option<String>,
+    #[serde(rename = "successorModelId", skip_serializing_if = "Option::is_none")]
+    pub successor_model_id: Option<String>,
     /// OpenRouter `openrouter.slug` override the model carried at this point.
     #[serde(rename = "openrouterSlug", skip_serializing_if = "Option::is_none")]
     pub openrouter_slug: Option<String>,
     /// If true, this model was allowed to serve without pricing at this point in time.
     #[serde(rename = "allowFree")]
     pub allow_free: bool,
+    /// Whether the model was listed (in the public model catalogs and open to
+    /// every caller) at this point in time.
+    #[serde(rename = "isListed")]
+    pub is_listed: bool,
 }
 
 /// Model history response - complete history of model changes
@@ -4359,6 +4729,8 @@ pub enum CreditType {
     Payment,
     #[serde(rename = "staking_farm", alias = "STAKING_FARM")]
     StakingFarm,
+    #[serde(alias = "TRANSFER")]
+    Transfer,
     #[serde(alias = "POSTPAY")]
     Postpay,
 }
@@ -4369,6 +4741,7 @@ impl std::fmt::Display for CreditType {
             CreditType::Grant => write!(f, "grant"),
             CreditType::Payment => write!(f, "payment"),
             CreditType::StakingFarm => write!(f, "staking_farm"),
+            CreditType::Transfer => write!(f, "transfer"),
             CreditType::Postpay => write!(f, "postpay"),
         }
     }
@@ -4381,6 +4754,7 @@ impl CreditType {
             CreditType::Grant => "grant",
             CreditType::Payment => "payment",
             CreditType::StakingFarm => "staking_farm",
+            CreditType::Transfer => "transfer",
             CreditType::Postpay => "postpay",
         }
     }
@@ -4398,6 +4772,7 @@ impl std::str::FromStr for CreditType {
             "grant" => Ok(Self::Grant),
             "payment" => Ok(Self::Payment),
             "staking_farm" => Ok(Self::StakingFarm),
+            "transfer" => Ok(Self::Transfer),
             "postpay" => Ok(Self::Postpay),
             _ => Err(ParseCreditTypeError),
         }
@@ -4586,8 +4961,122 @@ pub struct FileDeleteResponse {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::models::*;
     use serde_json::json;
+
+    #[test]
+    fn test_web_search_count_validation_and_round_trip() {
+        for count in [None, Some(1), Some(5), Some(20), Some(0), Some(21)] {
+            let mut tool = serde_json::json!({"type": "web_search"});
+            if let Some(count) = count {
+                tool["count"] = serde_json::json!(count);
+            }
+            let request: CreateResponseRequest = serde_json::from_value(serde_json::json!({
+                "model": "test", "input": "Search the web", "tools": [tool.clone()]
+            }))
+            .unwrap();
+            assert_eq!(
+                request.validate().is_ok(),
+                count.is_none_or(|n| (0..=20).contains(&n))
+            );
+            let serialized = serde_json::to_value(&request.tools).unwrap();
+            assert_eq!(serialized[0], tool);
+        }
+        for count in [
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+            serde_json::json!("5"),
+            serde_json::json!(4294967296u64),
+        ] {
+            assert!(
+                serde_json::from_value::<CreateResponseRequest>(serde_json::json!({
+                    "model": "test", "tools": [{"type": "web_search", "count": count}]
+                }))
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn nano_dollars_zero_renders_as_bare_zero() {
+        assert_eq!(nano_dollars_to_per_token_string(0), "0");
+    }
+
+    #[test]
+    fn nano_dollars_one_keeps_full_nine_decimal_places() {
+        // 1 nano-USD = $0.000000001 — boundary for our scale.
+        assert_eq!(nano_dollars_to_per_token_string(1), "0.000000001");
+    }
+
+    #[test]
+    fn nano_dollars_typical_per_token_price_trims_trailing_zeros() {
+        // $0.000008 per token, e.g. Claude Sonnet input.
+        assert_eq!(nano_dollars_to_per_token_string(8_000), "0.000008");
+        // $0.000024 per token, e.g. Claude Sonnet output.
+        assert_eq!(nano_dollars_to_per_token_string(24_000), "0.000024");
+    }
+
+    #[test]
+    fn nano_dollars_whole_dollar_amount_omits_decimal_point() {
+        // 1_000_000_000 nano-USD = $1 exactly. Must NOT render as "1." or "1.0".
+        assert_eq!(nano_dollars_to_per_token_string(1_000_000_000), "1");
+        assert_eq!(nano_dollars_to_per_token_string(5_000_000_000), "5");
+    }
+
+    #[test]
+    fn nano_dollars_mixed_integer_and_fraction() {
+        // $1.500000000 → "1.5" after trim.
+        assert_eq!(nano_dollars_to_per_token_string(1_500_000_000), "1.5");
+        // $1.000000001 → all 9 frac digits preserved (no trailing zeros to trim).
+        assert_eq!(
+            nano_dollars_to_per_token_string(1_000_000_001),
+            "1.000000001"
+        );
+    }
+
+    #[test]
+    fn nano_dollars_max_i64_does_not_lose_precision() {
+        // Integer arithmetic must remain exact at the upper bound, unlike the
+        // previous f64-based implementation.
+        // i64::MAX = 9_223_372_036_854_775_807 nano-USD
+        //         = 9_223_372_036.854775807 USD
+        assert_eq!(
+            nano_dollars_to_per_token_string(i64::MAX),
+            "9223372036.854775807"
+        );
+    }
+
+    #[test]
+    fn upcoming_catalogs_preserve_distinct_price_fields_and_units() {
+        let pricing = services::models::UpcomingModelPricing {
+            effective_at: "2030-01-01T00:00:00Z".parse().unwrap(),
+            input_cost_per_token: 1234,
+            output_cost_per_token: 5678,
+            cost_per_image: 9_876_543_210,
+            cache_read_cost_per_token: Some(234),
+            text_pricing: None,
+        };
+        let openai = serde_json::to_value(UpcomingModelPricingInfo::from(pricing.clone())).unwrap();
+        let native = serde_json::to_value(UpcomingPricing::from(pricing)).unwrap();
+        assert_eq!(openai["effective_at"], native["effectiveAt"]);
+        assert_eq!(openai["pricing"]["prompt"], "0.000001234");
+        assert_eq!(openai["pricing"]["completion"], "0.000005678");
+        assert_eq!(openai["pricing"]["image"], "9.87654321");
+        assert_eq!(openai["pricing"]["input_cache_read"], "0.000000234");
+        assert_eq!(openai["pricing"]["input"], 1.234);
+        assert_eq!(openai["pricing"]["output"], 5.678);
+        for (field, amount) in [
+            ("inputCostPerToken", 1234_i64),
+            ("outputCostPerToken", 5678),
+            ("costPerImage", 9_876_543_210),
+            ("cacheReadCostPerToken", 234),
+        ] {
+            assert_eq!(
+                native["pricing"][field],
+                json!({"amount": amount, "scale": 9, "currency": "USD"})
+            );
+        }
+    }
 
     #[test]
     fn test_response_status_serializes_in_progress_with_underscore() {
@@ -4844,6 +5333,7 @@ mod tests {
                 tool_call_id: None,
                 tool_calls: None,
             }],
+            max_completion_tokens: None,
             max_tokens: Some(100),
             temperature: None,
             top_p: None,
@@ -5032,6 +5522,7 @@ mod tests {
                 tool_call_id: None,
                 tool_calls: None,
             }],
+            max_completion_tokens: None,
             max_tokens: Some(100),
             temperature: None,
             top_p: None,
@@ -5072,6 +5563,7 @@ mod tests {
                 tool_call_id: None,
                 tool_calls: None,
             }],
+            max_completion_tokens: None,
             max_tokens: Some(100),
             temperature: None,
             top_p: None,
@@ -5107,6 +5599,7 @@ mod tests {
                 tool_call_id: None,
                 tool_calls: None,
             }],
+            max_completion_tokens: None,
             max_tokens: Some(100),
             temperature: None,
             top_p: None,
@@ -5140,6 +5633,7 @@ mod tests {
                 tool_call_id: None,
                 tool_calls: None,
             }],
+            max_completion_tokens: None,
             max_tokens: Some(100),
             temperature: None,
             top_p: None,
@@ -5171,6 +5665,7 @@ mod tests {
                 tool_call_id: None,
                 tool_calls: None,
             }],
+            max_completion_tokens: None,
             max_tokens,
             temperature: None,
             top_p: None,
@@ -5202,6 +5697,39 @@ mod tests {
             assert_eq!(err.r#type, "invalid_request_error");
             assert_eq!(err.param.as_deref(), Some("max_tokens"));
             assert_eq!(err.message, "max_tokens must be at least 1");
+        }
+    }
+
+    #[test]
+    fn chat_validate_request_rejects_non_positive_max_completion_tokens() {
+        for value in [-1, 0] {
+            let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_completion_tokens": value,
+                "max_tokens": 128,
+            }))
+            .unwrap();
+            let error = request.validate_request().unwrap_err().error;
+            assert_eq!(error.r#type, "invalid_request_error");
+            assert_eq!(error.param.as_deref(), Some("max_completion_tokens"));
+            assert_eq!(error.message, "max_completion_tokens must be at least 1");
+        }
+    }
+
+    #[test]
+    fn chat_max_completion_tokens_requires_an_integer() {
+        for value in [
+            serde_json::json!("128"),
+            serde_json::json!(1.5),
+            serde_json::json!(true),
+        ] {
+            let result = serde_json::from_value::<ChatCompletionRequest>(serde_json::json!({
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_completion_tokens": value,
+            }));
+            assert!(result.is_err(), "invalid token limit was accepted: {value}");
         }
     }
 
@@ -5680,7 +6208,7 @@ pub struct ScoreUsage {
 
 #[cfg(test)]
 mod credit_type_tests {
-    use super::CreditType;
+    use crate::models::CreditType;
 
     #[test]
     fn postpay_serializes_and_accepts_supported_casing() {
@@ -5702,7 +6230,7 @@ mod credit_type_tests {
 
 #[cfg(test)]
 mod input_modality_tests {
-    use super::*;
+    use crate::models::*;
 
     fn msg(content: Option<MessageContent>) -> Message {
         Message {

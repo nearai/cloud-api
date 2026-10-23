@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 fn chat_params(model: &str) -> inference_providers::ChatCompletionParams {
     inference_providers::ChatCompletionParams {
+        placement: Default::default(),
         request_priority: 0,
         model: model.to_string(),
         messages: vec![inference_providers::ChatMessage {
@@ -180,5 +181,27 @@ async fn seed_model_if_absent_does_not_clobber_existing() {
     assert_eq!(
         row.output_cost_per_token, 5_678,
         "output pricing must be preserved"
+    );
+}
+
+/// `ensure_attested_3p_catalog_row` with no seed and no existing row must not
+/// create anything and must return `None` (3P-only models are out of scope).
+#[tokio::test]
+async fn ensure_catalog_row_without_seed_and_without_row_returns_none() {
+    let (_server, database) = setup_test_server_with_database().await;
+    let repo = database::repositories::ModelRepository::new(database.pool().clone());
+    let model = format!("zai-org/no-seed-{}", uuid::Uuid::new_v4());
+
+    let role = api::attested_3p_startup::ensure_attested_3p_catalog_row(
+        &repo,
+        inference_providers::ProviderSource::Tinfoil,
+        &model,
+        None,
+    )
+    .await;
+    assert!(role.is_none());
+    assert!(
+        repo.get_by_internal_name(&model).await.unwrap().is_none(),
+        "no row may be seeded when no seed is given"
     );
 }

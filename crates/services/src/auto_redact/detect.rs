@@ -83,7 +83,7 @@ struct DetectItem {
     /// struct) so a malformed `usage` field — wrong type, out-of-range
     /// number — can never turn a valid span response into a parse error
     /// and fail the completion. `input_tokens` is extracted leniently in
-    /// `parse_response` (invalid/absent => 0).
+    /// `usage_input_tokens` (invalid/absent => 0).
     #[serde(default)]
     usage: Option<serde_json::Value>,
 }
@@ -93,6 +93,60 @@ struct RawSpan {
     category: String,
     start: usize,
     end: usize,
+}
+
+/// One privacy-filter data entry's billable usage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UsageEntry {
+    /// The entry's `index`; `None` when present but not a valid index.
+    pub index: Option<usize>,
+    /// The entry's `usage.input_tokens`, non-negative.
+    pub input_tokens: i64,
+}
+
+/// A data entry's billable `input_tokens`, read leniently: absent, negative
+/// or non-integer values yield `None` (billing metadata must never break
+/// span parsing or void other entries), and values above `i64::MAX`
+/// saturate so they still reach the caller's overflow cap.
+fn usage_input_tokens(usage: &serde_json::Value) -> Option<i64> {
+    usage
+        .get("input_tokens")?
+        .as_u64()
+        .map(|t| i64::try_from(t).unwrap_or(i64::MAX))
+}
+
+/// Billable usage per data entry of a privacy-filter response, with the
+/// same per-entry leniency as [`parse_response`]: an entry without a usable
+/// `input_tokens` is skipped without voiding the others. A missing `index`
+/// defaults to 0. A body without a `data` array yields no entries.
+///
+/// Used by the /v1/privacy/classify and /v1/privacy/redact handlers, which
+/// bill the raw upstream response themselves.
+pub fn parse_usage_entries(bytes: &[u8]) -> Vec<UsageEntry> {
+    #[derive(Deserialize)]
+    struct UsageResponse {
+        #[serde(default)]
+        data: Vec<serde_json::Value>,
+    }
+
+    let Ok(parsed) = serde_json::from_slice::<UsageResponse>(bytes) else {
+        return Vec::new();
+    };
+    parsed
+        .data
+        .iter()
+        .filter_map(|entry| {
+            let input_tokens = usage_input_tokens(entry.get("usage")?)?;
+            let index = match entry.get("index") {
+                None => Some(0),
+                Some(v) => v.as_u64().and_then(|i| usize::try_from(i).ok()),
+            };
+            Some(UsageEntry {
+                index,
+                input_tokens,
+            })
+        })
+        .collect()
 }
 
 /// Parse a privacy-filter response into per-text spans plus the total
@@ -116,9 +170,8 @@ pub(super) fn parse_response(
         .data
         .iter()
         .filter_map(|item| item.usage.as_ref())
-        .filter_map(|u| u.get("input_tokens"))
-        .filter_map(|v| v.as_i64())
-        .fold(0i64, |acc, t| acc.saturating_add(t.max(0)));
+        .filter_map(usage_input_tokens)
+        .fold(0i64, |acc, t| acc.saturating_add(t));
 
     let mut out: Vec<Vec<Span>> = (0..expected_len).map(|_| Vec::new()).collect();
     for item in parsed.data {
@@ -140,6 +193,68 @@ pub(super) fn parse_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn entry(index: Option<usize>, input_tokens: i64) -> UsageEntry {
+        UsageEntry {
+            index,
+            input_tokens,
+        }
+    }
+
+    #[test]
+    fn usage_entries_skip_only_the_malformed_entry() {
+        let body = br#"{"data": [
+            {"index": 0, "usage": {"input_tokens": 5}},
+            {"index": 1, "usage": {"input_tokens": "n/a"}},
+            {"index": 2, "usage": {"input_tokens": 3000000000}},
+            {"index": 3, "usage": {"input_tokens": -4}},
+            {"index": 4, "usage": {"input_tokens": 1.5}},
+            {"index": 5, "usage": {}},
+            {"index": 6},
+            {"usage": {"input_tokens": 2}},
+            {"index": "x", "usage": {"input_tokens": 3}}
+        ]}"#;
+        assert_eq!(
+            parse_usage_entries(body),
+            vec![
+                entry(Some(0), 5),
+                entry(Some(2), 3_000_000_000),
+                entry(Some(0), 2),
+                entry(None, 3),
+            ]
+        );
+    }
+
+    /// Counts beyond i64 saturate rather than being dropped, so they still
+    /// trip the caller's overflow cap and anomaly metric.
+    #[test]
+    fn usage_entries_saturate_counts_above_i64_max() {
+        let body = br#"{"data": [
+            {"index": 0, "usage": {"input_tokens": 5}},
+            {"index": 1, "usage": {"input_tokens": 18446744073709551615}}
+        ]}"#;
+        assert_eq!(
+            parse_usage_entries(body),
+            vec![entry(Some(0), 5), entry(Some(1), i64::MAX)]
+        );
+    }
+
+    #[test]
+    fn usage_entries_empty_for_unexpected_bodies() {
+        assert!(parse_usage_entries(b"not json").is_empty());
+        assert!(parse_usage_entries(br#"{"data": "nope"}"#).is_empty());
+        assert!(parse_usage_entries(br#"{"model": "m"}"#).is_empty());
+    }
+
+    #[test]
+    fn parse_response_saturates_counts_above_i64_max() {
+        let body = br#"{"data": [
+            {"index": 0, "spans": [], "usage": {"input_tokens": 18446744073709551615}},
+            {"index": 1, "spans": [], "usage": {"input_tokens": 1}}
+        ]}"#;
+        let (_, input_tokens) = parse_response(body, 2).unwrap();
+        assert_eq!(input_tokens, i64::MAX);
+    }
 
     #[test]
     fn parse_basic_response() {

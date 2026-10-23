@@ -4,6 +4,7 @@ use crate::{models::User, retry_db};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::Utc;
+use services::auth::{OAuthUserInfo, UserId};
 use services::common::RepositoryError;
 use tracing::debug;
 use uuid::Uuid;
@@ -31,14 +32,15 @@ impl UserRepository {
 
         let row = retry_db!("create_new_user", {
             let now = Utc::now();
-            let client = self
+            let mut client = self
                 .pool
                 .get()
                 .await
                 .context("Failed to get database connection")
                 .map_err(RepositoryError::PoolError)?;
 
-            client
+            let tx = client.transaction().await.map_err(map_db_error)?;
+            let row = tx
                 .query_one(
                     r#"
             INSERT INTO users (
@@ -62,7 +64,14 @@ impl UserRepository {
                     ],
                 )
                 .await
-                .map_err(map_db_error)
+                .map_err(map_db_error)?;
+            if auth_provider == "near" {
+                tx.query_one("SELECT ensure_near_personal_organization($1)", &[&id])
+                    .await
+                    .map_err(map_db_error)?;
+            }
+            tx.commit().await.map_err(map_db_error)?;
+            Ok(row)
         })?;
 
         debug!("Created/updated user: {}", id);
@@ -133,10 +142,18 @@ impl UserRepository {
                 .context("Failed to get database connection")
                 .map_err(RepositoryError::PoolError)?;
 
-            client.query_opt(
-            "SELECT * FROM users WHERE auth_provider = $1 AND provider_user_id = $2 AND is_active = true",
-            &[&auth_provider, &provider_user_id],
-        ).await.map_err(map_db_error)
+            client
+                .query_opt(
+                    "SELECT u.* FROM users u
+                     WHERE u.auth_provider = $1 AND u.provider_user_id = $2 AND u.is_active = true
+                     UNION ALL
+                     SELECT u.* FROM user_oauth_identities i JOIN users u ON u.id = i.user_id
+                     WHERE i.provider = $1 AND i.provider_user_id = $2 AND u.is_active = true
+                     LIMIT 1",
+                    &[&auth_provider, &provider_user_id],
+                )
+                .await
+                .map_err(map_db_error)
         })?;
 
         match row {
@@ -157,7 +174,7 @@ impl UserRepository {
 
             client
                 .execute(
-                    "UPDATE users SET last_login_at = NOW() WHERE id = $1",
+                    "UPDATE users SET last_login_at = NOW() WHERE id = $1 AND is_active = true",
                     &[&id],
                 )
                 .await
@@ -254,6 +271,7 @@ impl UserRepository {
             WHERE ($1::BOOLEAN IS NULL OR is_active = $1)
               AND ($2::TEXT IS NULL
                    OR email ILIKE ('%' || $2 || '%') ESCAPE '\'
+                   OR contact_email ILIKE ('%' || $2 || '%') ESCAPE '\'
                    OR username ILIKE ('%' || $2 || '%') ESCAPE '\'
                    OR display_name ILIKE ('%' || $2 || '%') ESCAPE '\'
                    OR id::TEXT ILIKE ('%' || $2 || '%') ESCAPE '\'
@@ -284,6 +302,7 @@ impl UserRepository {
             WHERE ($3::BOOLEAN IS NULL OR is_active = $3)
               AND ($4::TEXT IS NULL
                    OR email ILIKE ('%' || $4 || '%') ESCAPE '\'
+                   OR contact_email ILIKE ('%' || $4 || '%') ESCAPE '\'
                    OR username ILIKE ('%' || $4 || '%') ESCAPE '\'
                    OR display_name ILIKE ('%' || $4 || '%') ESCAPE '\'
                    OR id::TEXT ILIKE ('%' || $4 || '%') ESCAPE '\'
@@ -344,6 +363,7 @@ impl UserRepository {
             WHERE ($1::BOOLEAN IS NULL OR u.is_active = $1)
               AND ($2::TEXT IS NULL
                    OR u.email ILIKE ('%' || $2 || '%') ESCAPE '\'
+                   OR u.contact_email ILIKE ('%' || $2 || '%') ESCAPE '\'
                    OR u.username ILIKE ('%' || $2 || '%') ESCAPE '\'
                    OR u.display_name ILIKE ('%' || $2 || '%') ESCAPE '\'
                    OR u.id::TEXT ILIKE ('%' || $2 || '%') ESCAPE '\'
@@ -386,7 +406,10 @@ impl UserRepository {
                 LEFT JOIN organization_members om ON u.id = om.user_id AND om.role = 'owner'
                 LEFT JOIN organizations o ON om.organization_id = o.id AND o.is_active = true
                 LEFT JOIN LATERAL (
-                    SELECT SUM(spend_limit)::BIGINT AS spend_limit
+                    SELECT CASE
+                        WHEN COUNT(spend_limit) = 0 THEN NULL
+                        ELSE LEAST(SUM(spend_limit), 9223372036854775807)::BIGINT
+                    END AS spend_limit
                     FROM organization_limits_history
                     WHERE organization_id = o.id
                       AND effective_until IS NULL
@@ -395,6 +418,7 @@ impl UserRepository {
                 WHERE ($3::BOOLEAN IS NULL OR u.is_active = $3)
                   AND ($4::TEXT IS NULL
                        OR u.email ILIKE ('%' || $4 || '%') ESCAPE '\'
+                       OR u.contact_email ILIKE ('%' || $4 || '%') ESCAPE '\'
                        OR u.username ILIKE ('%' || $4 || '%') ESCAPE '\'
                        OR u.display_name ILIKE ('%' || $4 || '%') ESCAPE '\'
                        OR u.id::TEXT ILIKE ('%' || $4 || '%') ESCAPE '\'
@@ -527,6 +551,9 @@ impl UserRepository {
             auth_provider: row.get("auth_provider"),
             provider_user_id: row.get("provider_user_id"),
             tokens_revoked_at: row.get("tokens_revoked_at"),
+            contact_email: row.get("contact_email"),
+            contact_email_verified_at: row.get("contact_email_verified_at"),
+            email_opt_in_at: row.get("email_opt_in_at"),
         })
     }
 }
@@ -547,12 +574,76 @@ fn db_user_to_service_user(db_user: User) -> services::auth::User {
         created_at: db_user.created_at,
         updated_at: db_user.updated_at,
         tokens_revoked_at: db_user.tokens_revoked_at,
+        contact_email: db_user.contact_email,
+        contact_email_verified_at: db_user.contact_email_verified_at,
+        email_opt_in_at: db_user.email_opt_in_at,
     }
 }
 
 // Implement the service trait
 #[async_trait]
 impl services::auth::UserRepository for UserRepository {
+    async fn try_link_oauth_identity_by_email(
+        &self,
+        info: &OAuthUserInfo,
+    ) -> anyhow::Result<Option<services::auth::User>> {
+        if !info.can_auto_link_by_email() {
+            return Ok(None);
+        }
+        let client = self.pool.get().await?;
+        // Require authoritative, verified evidence for the original identity too.
+        // Lock both records so email or authority cannot change mid-link.
+        client.execute(
+            "WITH existing_user AS (
+                SELECT u.id FROM users u JOIN user_oauth_identities i
+                ON i.user_id=u.id AND i.provider=u.auth_provider
+                AND i.provider_user_id=u.provider_user_id
+                WHERE u.email=$1 AND u.is_active=true
+                AND u.auth_provider IN ('google','github') AND u.auth_provider<>$2
+                AND i.email=u.email AND i.email_verified=true AND i.email_authoritative=true
+                FOR UPDATE OF u,i
+             )
+             INSERT INTO user_oauth_identities (user_id,provider,provider_user_id,email,email_verified,email_authoritative)
+             SELECT id,$2,$3,$1,true,true FROM existing_user ON CONFLICT DO NOTHING",
+            &[&info.email, &info.provider, &info.provider_user_id],
+        ).await.map_err(map_db_error)?;
+        drop(client);
+        // A concurrent login/link may already own this stable provider identity.
+        // Resolve its actual owner rather than treating DO NOTHING as a bind.
+        Ok(self
+            .get_by_provider(&info.provider, &info.provider_user_id)
+            .await?
+            .map(db_user_to_service_user))
+    }
+
+    async fn observe_oauth_identity(
+        &self,
+        user_id: UserId,
+        info: &OAuthUserInfo,
+    ) -> anyhow::Result<()> {
+        if !matches!(info.provider.as_str(), "google" | "github") {
+            return Ok(());
+        }
+        let client = self.pool.get().await?;
+        let count = client
+            .execute(
+                "UPDATE user_oauth_identities SET email=$4, email_verified=$5, email_authoritative=$6
+             WHERE user_id=$1 AND provider=$2 AND provider_user_id=$3",
+                &[
+                    &user_id.0,
+                    &info.provider,
+                    &info.provider_user_id,
+                    &info.email,
+                    &info.email_verified,
+                    &info.email_authoritative,
+                ],
+            )
+            .await
+            .map_err(map_db_error)?;
+        anyhow::ensure!(count == 1, "OAuth identity does not belong to this account");
+        Ok(())
+    }
+
     async fn create(
         &self,
         email: String,
@@ -633,7 +724,7 @@ impl services::auth::UserRepository for UserRepository {
 
             client
                 .execute(
-                    "UPDATE users SET email = $2, updated_at = NOW() WHERE id = $1",
+                    "UPDATE users SET email = $2, updated_at = NOW() WHERE id = $1 AND is_active = true",
                     &[&id.0, &email],
                 )
                 .await

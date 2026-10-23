@@ -14,6 +14,7 @@
 //! cases; model-specific pricing restrictions need separate policy.
 
 use crate::middleware::auth::AuthenticatedApiKey;
+use crate::middleware::RequestedModel;
 use crate::models::AnthropicErrorResponse;
 use crate::routes::api::AppState;
 use crate::routes::common::{
@@ -31,7 +32,7 @@ use inference_providers::{
 };
 use services::completions::hash_inference_id_to_uuid;
 use services::completions::ports::{CompletionError, ConcurrentRequestGuard};
-use services::models::{ModelWithPricing, ModelsError, ModelsServiceTrait};
+use services::models::{ModelCaller, ModelWithPricing, ModelsError, ModelsServiceTrait};
 use services::usage::{
     five_minute_cache_write_rate, CacheWriteBilling, InferenceType, ProviderAttribution,
     RecordUsageServiceRequest, StopReason, UsageServiceTrait,
@@ -408,6 +409,7 @@ pub async fn messages(
     Extension(api_key): Extension<AuthenticatedApiKey>,
     RawQuery(query): RawQuery,
     headers: HeaderMap,
+    requested_model: RequestedModel,
     body: Bytes,
 ) -> Response {
     handle_request(
@@ -417,6 +419,7 @@ pub async fn messages(
         headers,
         body,
         AnthropicRawEndpoint::Messages,
+        requested_model,
     )
     .await
 }
@@ -435,6 +438,8 @@ pub async fn count_tokens(
         headers,
         body,
         AnthropicRawEndpoint::CountTokens,
+        // Token counting is not inference: nothing reads this slot.
+        RequestedModel::default(),
     )
     .await
 }
@@ -446,6 +451,7 @@ async fn handle_request(
     headers: HeaderMap,
     body: Bytes,
     endpoint: AnthropicRawEndpoint,
+    requested_model: RequestedModel,
 ) -> Response {
     let prepared = match prepare_request(
         &headers,
@@ -460,6 +466,7 @@ async fn handle_request(
 
     let (model, alias_from) = match resolve_model(
         app_state.models_service.as_ref(),
+        ModelCaller::Organization(api_key.organization.id.0),
         &headers,
         &prepared.requested_model,
     )
@@ -468,6 +475,9 @@ async fn handle_request(
         Ok(model) => model,
         Err(response) => return response,
     };
+    // The canonical name: the client's spelling may have been normalized
+    // before it resolved.
+    requested_model.set(&model.model_name);
 
     let billing_seed = match prepare_billing_seed(
         endpoint,
@@ -907,6 +917,7 @@ fn normalized_beta_header(
 
 async fn resolve_model(
     models_service: &dyn ModelsServiceTrait,
+    caller: ModelCaller,
     headers: &HeaderMap,
     requested: &str,
 ) -> Result<(ModelWithPricing, Option<String>), Response> {
@@ -916,10 +927,13 @@ async fn resolve_model(
         format!("anthropic/{requested}")
     };
 
-    let model = match models_service.resolve_and_get_model(&normalized).await {
+    let model = match models_service
+        .resolve_and_get_model(&normalized, caller)
+        .await
+    {
         Ok(model) => model,
         Err(ModelsError::NotFound(_)) if normalized != requested => models_service
-            .resolve_and_get_model(requested)
+            .resolve_and_get_model(requested, caller)
             .await
             .map_err(model_resolution_error)?,
         Err(error) => return Err(model_resolution_error(error)),
@@ -1114,11 +1128,6 @@ async fn record_native_usage(
     // upstream response carried no id.
     let inference_id = usage.inference_id().unwrap_or_else(Uuid::new_v4);
     let request = RecordUsageServiceRequest {
-        discount: None,
-        organization_id: context.organization_id,
-        workspace_id: context.workspace_id,
-        api_key_id: context.api_key_id,
-        model_id: context.model_id,
         input_tokens,
         output_tokens,
         cache_read_tokens: usage.cache_read_tokens_for_billing(),
@@ -1126,18 +1135,19 @@ async fn record_native_usage(
             tokens: usage.cache_write_tokens_for_billing(),
             cost_per_token: context.cache_write_cost_per_token,
         }),
-        profiled_cache_write_tokens: 0,
-        requested_service_tier: None,
-        provider_service_tier: None,
-        inference_type: context.inference_type,
-        ttft_ms: None,
-        avg_itl_ms: None,
         inference_id: Some(inference_id),
         provider_request_id: usage.provider_request_id,
         stop_reason: Some(stop_reason),
-        response_id: None,
-        image_count: None,
         provider_attribution: context.provider_attribution,
+        ..RecordUsageServiceRequest::base(
+            services::usage::BillingIdentity {
+                organization_id: context.organization_id,
+                workspace_id: context.workspace_id,
+                api_key_id: context.api_key_id,
+                model_id: context.model_id,
+            },
+            context.inference_type,
+        )
     };
 
     context
@@ -1756,16 +1766,6 @@ redact-thinking-2026-02-12";
 
     #[async_trait::async_trait]
     impl UsageServiceTrait for RecordingUsageService {
-        async fn calculate_cost(
-            &self,
-            _model_id: &str,
-            _input_tokens: i32,
-            _output_tokens: i32,
-            _cache_read_tokens: i32,
-        ) -> Result<services::usage::CostBreakdown, services::usage::UsageError> {
-            unimplemented!()
-        }
-
         async fn record_usage(
             &self,
             request: RecordUsageServiceRequest,
@@ -1867,6 +1867,7 @@ redact-thinking-2026-02-12";
             &self,
             _organization_id: Uuid,
             _start_date: chrono::DateTime<chrono::Utc>,
+            _end_date: Option<chrono::DateTime<chrono::Utc>>,
         ) -> Result<Vec<services::usage::UsageByModelEntry>, services::usage::UsageError> {
             unimplemented!()
         }

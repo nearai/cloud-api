@@ -65,14 +65,20 @@ pub fn selected(models: &[String], canonical_model: &str, body: &Value) -> bool 
 
 impl NativeResponsesService {
     /// Resolve aliases before checking the canonical allowlist. Non-selected
-    /// requests retain legacy validation and error handling.
-    pub async fn selected_model(&self, body: &Value) -> Option<ModelWithPricing> {
+    /// requests retain legacy validation and error handling. A model the
+    /// caller may not use is never selected: the request takes the legacy
+    /// path and gets its unknown-model answer.
+    pub async fn selected_model(
+        &self,
+        body: &Value,
+        caller: crate::models::ModelCaller,
+    ) -> Option<ModelWithPricing> {
         if self.models.is_empty() || !inference_providers::responses_raw::is_stateless(body) {
             return None;
         }
         let model = self
             .models_service
-            .resolve_and_get_model(body["model"].as_str()?)
+            .resolve_and_get_model(body["model"].as_str()?, caller)
             .await
             .ok()?;
         selected(&self.models, &model.model_name, body).then_some(model)
@@ -263,6 +269,7 @@ impl Usage {
                 completion_tokens: count("output_tokens")?,
                 total_tokens: count("total_tokens")?,
                 prompt_tokens_details: usage.get("input_tokens_details").cloned(),
+                ..Default::default()
             });
         }
         match response["status"].as_str() {
@@ -298,27 +305,25 @@ impl Billing {
         let id = usage.id.clone();
         if let Some(tokens) = usage.tokens {
             let request = RecordUsageServiceRequest {
-                discount: None,
-                organization_id: self.organization_id,
-                workspace_id: self.workspace_id,
-                api_key_id: self.api_key_id,
-                model_id: self.model_id,
                 input_tokens: tokens.prompt_tokens,
                 output_tokens: tokens.completion_tokens,
                 cache_read_tokens: tokens.cached_tokens(),
-                cache_write: None,
                 profiled_cache_write_tokens: tokens.cache_write_tokens(),
                 requested_service_tier: Some(TextServiceTier::Default),
                 provider_service_tier: usage.tier,
-                inference_type: self.inference_type,
-                ttft_ms: None,
-                avg_itl_ms: None,
                 inference_id: id.as_deref().map(hash_inference_id_to_uuid),
                 provider_request_id: id.clone(),
                 stop_reason: Some(reason),
-                response_id: None,
-                image_count: None,
                 provider_attribution: self.attribution,
+                ..RecordUsageServiceRequest::base(
+                    crate::usage::BillingIdentity {
+                        organization_id: self.organization_id,
+                        workspace_id: self.workspace_id,
+                        api_key_id: self.api_key_id,
+                        model_id: self.model_id,
+                    },
+                    self.inference_type,
+                )
             };
             if let Err(e) = self.service.usage_service.record_usage(request).await {
                 tracing::error!(error = %e, "Failed to record native Responses usage");

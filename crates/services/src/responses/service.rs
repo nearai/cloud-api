@@ -109,15 +109,17 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
             .and_then(|_| request.validate_stateless())
             .map_err(errors::ResponseError::InvalidParams)?;
 
-        // Resolve once before spawning the worker. Endpoint validation must
-        // take precedence over the image guard: a decision-capable model,
-        // including one that also advertises image output, belongs on
-        // /v1/systemone and must return a direct HTTP 400 for both stream
-        // variants. The explicit NATIVE_RESPONSES_MODELS route is handled
-        // before this typed adapter.
+        // Reuse the lookup needed for image dispatch, but perform it before
+        // starting the stream or tools so endpoint errors remain HTTP 400s.
+        // A model this organization may not use is `None`, like an unknown
+        // one: no endpoint check and no image dispatch for it, and the
+        // completion service answers the request as an unknown model.
         let model = self
             .completion_service
-            .get_model(&request.model)
+            .get_model(
+                &request.model,
+                crate::models::ModelCaller::Organization(organization_id),
+            )
             .await
             .ok()
             .flatten();
@@ -1180,8 +1182,11 @@ impl ResponseServiceImpl {
             );
         }
 
+        // `session_hint` stays None: /responses does not read or forward
+        // `x-session-id` (unlike /chat/completions).
         let completion_request = CompletionRequest {
             request_priority: process_context.request_priority,
+            session_hint: None,
             request_id: process_context.request_id,
             model: process_context.request.model.clone(),
             messages: messages.to_vec(),

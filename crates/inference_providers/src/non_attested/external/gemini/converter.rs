@@ -7,8 +7,8 @@
 //! - Tool call support
 
 use crate::{
-    chunk_builder::ChunkContext, ChatMessage, CompletionError, FunctionCall, MessageRole,
-    SSEEventParser, StreamChunk, TokenUsage, ToolCall, ToolDefinition,
+    chunk_builder::ChunkContext, models::CompletionTokensDetails, ChatMessage, CompletionError,
+    FunctionCall, MessageRole, SSEEventParser, StreamChunk, TokenUsage, ToolCall, ToolDefinition,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -248,15 +248,69 @@ pub struct GeminiCandidate {
 }
 
 /// Gemini usage metadata
+///
+/// Google's `totalTokenCount` is the sum of four separately reported counts:
+/// `promptTokenCount`, `toolUsePromptTokenCount`, `candidatesTokenCount` and
+/// `thoughtsTokenCount`. We read the parts and rebuild the total from them
+/// (see `to_token_usage`), so `totalTokenCount` itself is not parsed.
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct GeminiUsageMetadata {
+    /// Prompt size, including the cached part (`cached_content_token_count`).
     #[serde(default)]
     pub prompt_token_count: i32,
+    /// Visible output only. Thinking is reported in `thoughts_token_count`.
     #[serde(default)]
     pub candidates_token_count: i32,
+    /// Thinking tokens. Google bills them at the output rate, on top of
+    /// `candidates_token_count`. Absent on models that do not think.
     #[serde(default)]
-    pub total_token_count: i32,
+    pub thoughts_token_count: i32,
+    /// Prompt tokens served from Google's cache (explicit or implicit). A
+    /// subset of `prompt_token_count`, not an addition to it.
+    #[serde(default)]
+    pub cached_content_token_count: i32,
+    /// Input tokens Google's built-in tools (search, code execution, URL
+    /// context) feed back to the model. Reported outside `prompt_token_count`
+    /// and billed as input. This backend only sends function declarations, so
+    /// the field is absent today.
+    #[serde(default)]
+    pub tool_use_prompt_token_count: i32,
+}
+
+impl GeminiUsageMetadata {
+    /// Convert to the OpenAI-shaped usage that billing reads.
+    ///
+    /// - `prompt_tokens` = prompt + tool-use prompt
+    /// - `completion_tokens` = candidates + thoughts
+    /// - `total_tokens` = `prompt_tokens` + `completion_tokens`, which equals
+    ///   Google's `totalTokenCount`
+    ///
+    /// Thinking is also exposed as `completion_tokens_details.reasoning_tokens`
+    /// and cache hits as `prompt_tokens_details.cached_tokens`; both are
+    /// omitted when zero. A negative count is treated as zero.
+    pub fn to_token_usage(&self) -> TokenUsage {
+        let thoughts = self.thoughts_token_count.max(0);
+        let cached = self.cached_content_token_count.max(0);
+        let prompt_tokens = self
+            .prompt_token_count
+            .max(0)
+            .saturating_add(self.tool_use_prompt_token_count.max(0));
+        let completion_tokens = self.candidates_token_count.max(0).saturating_add(thoughts);
+
+        TokenUsage {
+            prompt_tokens,
+            completion_tokens,
+            total_tokens: prompt_tokens.saturating_add(completion_tokens),
+            prompt_tokens_details: (cached > 0)
+                .then(|| serde_json::json!({ "cached_tokens": cached })),
+            completion_tokens_details: (thoughts > 0).then(|| CompletionTokensDetails {
+                reasoning_tokens: Some(thoughts),
+                ..Default::default()
+            }),
+            reasoning_tokens: None,
+        }
+    }
 }
 
 /// Gemini response format
@@ -264,8 +318,10 @@ pub struct GeminiUsageMetadata {
 #[serde(rename_all = "camelCase")]
 pub struct GeminiResponse {
     pub candidates: Vec<GeminiCandidate>,
+    /// `None` when the event carried no `usageMetadata`, which is not the
+    /// same as zero usage.
     #[serde(default)]
-    pub usage_metadata: GeminiUsageMetadata,
+    pub usage_metadata: Option<GeminiUsageMetadata>,
 }
 
 // =============================================================================
@@ -488,9 +544,6 @@ fn contains_ref_key(value: &serde_json::Value) -> bool {
 //
 // TODO(follow-up): `{"const": X}` could be rewritten to `{"enum": [X]}` rather
 // than stripped — Gemini accepts `enum`, preserving the original constraint.
-// Same pattern would apply to `{"type": [..., "null"]}` unions which OpenAI
-// clients sometimes emit but Gemini's OpenAPI subset doesn't accept.
-// Both are out of scope for this PR (which just stops the 400s).
 const GEMINI_UNSUPPORTED_SCHEMA_KEYS: &[&str] = &[
     // OpenAPI / JSON Schema validation keywords Gemini does not implement
     // (alphabetized within group)
@@ -527,12 +580,10 @@ const GEMINI_UNSUPPORTED_SCHEMA_KEYS: &[&str] = &[
     "definitions",
 ];
 
-/// Recursively strip schema keywords that Gemini does not accept.
+/// Strip unsupported schema keywords and normalize JSON Schema type arrays.
 ///
-/// Walks `value` in-place. At each object, removes keys listed in
-/// `GEMINI_UNSUPPORTED_SCHEMA_KEYS`, then recurses into the surviving values
-/// and any array elements. This handles nested schemas (e.g. inside
-/// `properties`, `items`, `anyOf`) at arbitrary depth.
+/// Only descend through schema-valued keywords. Values of `default`, `example`,
+/// and `enum` are instance data, even when they contain keys such as `type`.
 ///
 /// Special case: keys inside `properties` (and equivalent maps like `$defs`,
 /// `definitions`, `patternProperties`, `dependentSchemas`) are **user-defined
@@ -542,15 +593,26 @@ const GEMINI_UNSUPPORTED_SCHEMA_KEYS: &[&str] = &[
 /// `{"properties": {"const": {"type": "string"}}}` would lose the `const`
 /// parameter entirely. Reported by gemini-code-assist on PR #610.
 fn sanitize_schema_for_gemini(value: &mut serde_json::Value) {
+    visit_gemini_schema_nodes(value, |map| {
+        for key in GEMINI_UNSUPPORTED_SCHEMA_KEYS {
+            map.remove(*key);
+        }
+        normalize_gemini_type_array(map);
+    });
+    // Finish every type intersection before introducing Gemini's nullable
+    // representation; the intersection helpers operate on explicit types.
+    visit_gemini_schema_nodes(value, compact_gemini_nullable_union);
+}
+
+fn visit_gemini_schema_nodes(
+    value: &mut serde_json::Value,
+    transform: fn(&mut serde_json::Map<String, serde_json::Value>),
+) {
     // Maps whose keys are user-defined names (not schema keywords). For these,
     // we only sanitize the values, never the key set.
     //
-    // Note: only `properties` is currently functionally active here. The other
-    // four are themselves in `GEMINI_UNSUPPORTED_SCHEMA_KEYS` and get stripped
-    // before the iter_mut() loop below ever sees them. They are listed here
-    // defensively so that if a future Gemini revision starts accepting them
-    // and they are removed from the unsupported list, the user-name protection
-    // automatically applies without a separate code change.
+    // The sanitizer removes the other four maps after visiting their children.
+    // Keep their user-name protection if Gemini starts supporting them later.
     const USER_NAMED_KEY_MAPS: &[&str] = &[
         "properties",
         "$defs",
@@ -561,32 +623,192 @@ fn sanitize_schema_for_gemini(value: &mut serde_json::Value) {
 
     match value {
         serde_json::Value::Object(map) => {
-            for key in GEMINI_UNSUPPORTED_SCHEMA_KEYS {
-                map.remove(*key);
-            }
             for (k, v) in map.iter_mut() {
                 if USER_NAMED_KEY_MAPS.contains(&k.as_str()) {
                     // The map's keys are parameter names; only recurse into values.
                     if let Some(inner) = v.as_object_mut() {
                         for inner_v in inner.values_mut() {
-                            sanitize_schema_for_gemini(inner_v);
+                            visit_gemini_schema_nodes(inner_v, transform);
                         }
-                        continue;
                     }
-                    // Fall through to regular recursion if the value isn't an
-                    // object (malformed schema); the general path handles
-                    // non-objects safely via the `_ => {}` arm.
+                } else if matches!(
+                    k.as_str(),
+                    "items" | "prefixItems" | "anyOf" | "oneOf" | "allOf" | "not"
+                ) {
+                    // Add new schema-valued keywords here, never instance data.
+                    visit_gemini_schema_nodes(v, transform);
                 }
-                sanitize_schema_for_gemini(v);
             }
+            transform(map);
         }
         serde_json::Value::Array(arr) => {
             for v in arr.iter_mut() {
-                sanitize_schema_for_gemini(v);
+                visit_gemini_schema_nodes(v, transform);
             }
         }
         _ => {}
     }
+}
+
+/// Keep type-specific fields such as properties and items on a typed node.
+/// Only fold unconstrained T/null alternatives; richer unions stay explicit.
+fn compact_gemini_nullable_union(map: &mut serde_json::Map<String, serde_json::Value>) {
+    if map.contains_key("type") {
+        return;
+    }
+    let Some(branches) = map.get("anyOf").and_then(serde_json::Value::as_array) else {
+        return;
+    };
+    if branches.len() != 2
+        || !branches.iter().all(|branch| {
+            branch.as_object().is_some_and(|branch| {
+                branch.len() == 1
+                    && branch
+                        .get("type")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|kind| JSON_SCHEMA_TYPES.contains(&kind))
+            })
+        })
+    {
+        return;
+    }
+    let kind = match (branches[0]["type"].as_str(), branches[1]["type"].as_str()) {
+        (Some("null"), Some(kind)) | (Some(kind), Some("null")) if kind != "null" => {
+            kind.to_string()
+        }
+        _ => return,
+    };
+    let nullable = if let Some(values) = map.get("enum") {
+        // A string enum excluding null must not gain null as a valid value.
+        // Other enum forms have separate Gemini compatibility limitations;
+        // preserve them instead of dropping or coercing their values here.
+        if kind != "string"
+            || !values.as_array().is_some_and(|values| {
+                !values.is_empty() && values.iter().all(serde_json::Value::is_string)
+            })
+        {
+            return;
+        }
+        false
+    } else {
+        true
+    };
+    map.remove("anyOf");
+    map.insert("type".to_string(), serde_json::Value::String(kind));
+    if nullable {
+        map.insert("nullable".to_string(), serde_json::Value::Bool(true));
+    } else {
+        map.remove("nullable");
+    }
+}
+
+const JSON_SCHEMA_TYPES: &[&str] = &[
+    "string", "number", "integer", "boolean", "object", "array", "null",
+];
+
+fn normalize_gemini_type_array(map: &mut serde_json::Map<String, serde_json::Value>) {
+    let Some(types) = map.get("type").and_then(serde_json::Value::as_array) else {
+        return;
+    };
+    // Leave malformed schemas for upstream validation; never turn an invalid
+    // type constraint into an unconstrained schema.
+    if types.is_empty()
+        || types.iter().enumerate().any(|(index, value)| {
+            !value
+                .as_str()
+                .is_some_and(|name| JSON_SCHEMA_TYPES.contains(&name))
+                || types[..index].contains(value)
+        })
+    {
+        return;
+    }
+    let types = types.clone();
+    if types.len() == 1 {
+        map.insert("type".to_string(), types[0].clone());
+        return;
+    }
+
+    if let Some(any_of) = map.get_mut("anyOf") {
+        let Some(branches) = any_of.as_array_mut() else {
+            return;
+        };
+        if !branches.iter().all(can_constrain_gemini_schema_type) {
+            return;
+        }
+        // `type` and an existing `anyOf` are an intersection. Push the type
+        // constraint into its branches instead of overwriting the alternatives
+        // or cloning their subtrees once per type (exponential when nested).
+        branches.retain_mut(|branch| constrain_gemini_schema_type(branch, &types));
+        if branches.is_empty() {
+            // An empty repeated protobuf field may be treated as absent. Keep
+            // the rejected type array instead of emitting an unconstrained
+            // Gemini schema for an impossible intersection.
+            return;
+        }
+    } else {
+        map.insert("anyOf".to_string(), gemini_type_alternatives(&types));
+    }
+    map.remove("type");
+}
+
+fn gemini_type_alternatives(types: &[serde_json::Value]) -> serde_json::Value {
+    serde_json::Value::Array(
+        types
+            .iter()
+            .map(|kind| serde_json::json!({"type": kind}))
+            .collect(),
+    )
+}
+
+/// Only distribute over object schemas with supported scalar types. Boolean
+/// schemas and malformed alternatives are already unsupported by Gemini's
+/// Schema message; preserve them along with the original type array.
+fn can_constrain_gemini_schema_type(schema: &serde_json::Value) -> bool {
+    let Some(map) = schema.as_object() else {
+        return false;
+    };
+    if map.get("type").is_some_and(|value| {
+        !value
+            .as_str()
+            .is_some_and(|name| JSON_SCHEMA_TYPES.contains(&name))
+    }) {
+        return false;
+    }
+    map.get("anyOf").is_none_or(|value| {
+        value
+            .as_array()
+            .is_some_and(|branches| branches.iter().all(can_constrain_gemini_schema_type))
+    })
+}
+
+/// Intersect an already-sanitized schema with the allowed types. False means
+/// the branch accepts no values and can be removed from its parent's anyOf.
+fn constrain_gemini_schema_type(
+    schema: &mut serde_json::Value,
+    types: &[serde_json::Value],
+) -> bool {
+    let map = schema.as_object_mut().expect("object schema checked above");
+    if let Some(kind) = map.get("type").and_then(serde_json::Value::as_str) {
+        if types.iter().any(|allowed| allowed == kind)
+            || (kind == "integer" && types.iter().any(|allowed| allowed == "number"))
+        {
+            return true;
+        }
+        if kind == "number" && types.iter().any(|allowed| allowed == "integer") {
+            map.insert("type".to_string(), serde_json::json!("integer"));
+            return true;
+        }
+        return false;
+    }
+    if let Some(branches) = map
+        .get_mut("anyOf")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        branches.retain_mut(|branch| constrain_gemini_schema_type(branch, types));
+        return !branches.is_empty();
+    }
+    map.insert("anyOf".to_string(), gemini_type_alternatives(types));
+    true
 }
 
 /// Outcome of translating an OpenAI `response_format` into Gemini's
@@ -766,8 +988,9 @@ pub struct GeminiParserState {
     pub request_id: String,
     pub created: i64,
     pub chunk_index: i64,
-    pub prompt_tokens: i32,
-    pub completion_tokens: i32,
+    /// Usage from the latest event that reported it. Gemini restates
+    /// cumulative counts, so the last report is the total for the request.
+    pub usage: TokenUsage,
 }
 
 impl GeminiParserState {
@@ -777,8 +1000,7 @@ impl GeminiParserState {
             request_id: format!("gemini-{}", Uuid::new_v4()),
             created: chrono::Utc::now().timestamp(),
             chunk_index: 0,
-            prompt_tokens: 0,
-            completion_tokens: 0,
+            usage: TokenUsage::default(),
         }
     }
 
@@ -807,9 +1029,11 @@ impl SSEEventParser for GeminiEventParser {
         let candidate = &response.candidates[0];
         let ctx = state.chunk_context();
 
-        // Update token counts
-        state.prompt_tokens = response.usage_metadata.prompt_token_count;
-        state.completion_tokens = response.usage_metadata.candidates_token_count;
+        // Update token counts. An event without `usageMetadata` keeps the last
+        // reported counts; resetting them would bill the request as 0 tokens.
+        if let Some(usage_metadata) = &response.usage_metadata {
+            state.usage = usage_metadata.to_token_usage();
+        }
 
         let is_first = state.chunk_index == 0;
         state.chunk_index += 1;
@@ -837,12 +1061,7 @@ impl SSEEventParser for GeminiEventParser {
             ctx.tool_calls_chunk(
                 tool_calls.unwrap(),
                 finish_reason,
-                Some(TokenUsage {
-                    prompt_tokens: state.prompt_tokens,
-                    completion_tokens: state.completion_tokens,
-                    total_tokens: state.prompt_tokens + state.completion_tokens,
-                    prompt_tokens_details: None,
-                }),
+                Some(state.usage.clone()),
             )
         } else if is_first {
             // First chunk with role and possibly text
@@ -853,35 +1072,17 @@ impl SSEEventParser for GeminiEventParser {
                 }
             }
             chunk.choices[0].finish_reason = finish_reason;
-            chunk.usage = Some(TokenUsage {
-                prompt_tokens: state.prompt_tokens,
-                completion_tokens: state.completion_tokens,
-                total_tokens: state.prompt_tokens + state.completion_tokens,
-                prompt_tokens_details: None,
-            });
+            chunk.usage = Some(state.usage.clone());
             chunk
         } else if let Some(t) = text {
             // Subsequent text chunk
             let mut chunk = ctx.text_chunk(t);
             chunk.choices[0].finish_reason = finish_reason;
-            chunk.usage = Some(TokenUsage {
-                prompt_tokens: state.prompt_tokens,
-                completion_tokens: state.completion_tokens,
-                total_tokens: state.prompt_tokens + state.completion_tokens,
-                prompt_tokens_details: None,
-            });
+            chunk.usage = Some(state.usage.clone());
             chunk
         } else {
             // Empty chunk with just finish reason
-            ctx.finish_chunk(
-                finish_reason,
-                TokenUsage {
-                    prompt_tokens: state.prompt_tokens,
-                    completion_tokens: state.completion_tokens,
-                    total_tokens: state.prompt_tokens + state.completion_tokens,
-                    prompt_tokens_details: None,
-                },
-            )
+            ctx.finish_chunk(finish_reason, state.usage.clone())
         };
 
         Ok(Some(StreamChunk::Chat(chunk)))
@@ -1424,6 +1625,165 @@ mod tests {
     }
 
     #[test]
+    fn test_type_arrays_preserve_existing_anyof_and_sibling_constraints() {
+        let mut schema = serde_json::json!({
+            "type": ["string", "number"],
+            "description": "A label or a non-negative count",
+            "enum": ["red", 2, -1, false],
+            "anyOf": [
+                {"type": ["string", "boolean"], "enum": ["red", false]},
+                {"type": "integer", "minimum": 0},
+                {"type": "boolean"}
+            ]
+        });
+        sanitize_schema_for_gemini(&mut schema);
+        assert_eq!(
+            schema,
+            serde_json::json!({
+                "description": "A label or a non-negative count",
+                "enum": ["red", 2, -1, false],
+                "anyOf": [
+                    {"anyOf": [{"type": "string"}], "enum": ["red", false]},
+                    {"type": "integer", "minimum": 0}
+                ]
+            })
+        );
+    }
+
+    #[test]
+    fn test_type_array_intersections_respect_integer_as_a_subset_of_number() {
+        for (outer_type, inner_type) in [("integer", "number"), ("number", "integer")] {
+            let mut schema = serde_json::json!({
+                "type": [outer_type, "null"],
+                "anyOf": [
+                    {"type": inner_type, "minimum": 0},
+                    {"type": "string"},
+                    {"type": "null"}
+                ]
+            });
+            sanitize_schema_for_gemini(&mut schema);
+            assert_eq!(
+                schema,
+                serde_json::json!({"anyOf": [
+                    {"type": "integer", "minimum": 0},
+                    {"type": "null"}
+                ]})
+            );
+        }
+
+        let mut impossible = serde_json::json!({
+            "type": ["string", "null"],
+            "anyOf": [{"type": "boolean"}]
+        });
+        sanitize_schema_for_gemini(&mut impossible);
+        // Keep the rejected type array: an empty protobuf anyOf alone cannot
+        // reliably represent an intersection that accepts no values.
+        assert_eq!(
+            impossible,
+            serde_json::json!({"type": ["string", "null"], "anyOf": []})
+        );
+    }
+
+    #[test]
+    fn test_type_array_normalization_preserves_property_names_and_instance_data() {
+        let data = serde_json::json!({
+            "type": ["string", "null"],
+            "const": "ordinary data",
+            "properties": {"type": ["number", "null"]}
+        });
+        let mut schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "type": {"type": ["string", "null"]},
+                "anyOf": {"type": ["string"]},
+                "nullable": {"type": ["boolean", "null"]}
+            },
+            "required": ["type", "anyOf"],
+            "default": data.clone(),
+            "example": data.clone(),
+            "enum": [data.clone()]
+        });
+        sanitize_schema_for_gemini(&mut schema);
+        assert_eq!(
+            schema["properties"],
+            serde_json::json!({
+                "type": {"type": "string", "nullable": true},
+                "anyOf": {"type": "string"},
+                "nullable": {"type": "boolean", "nullable": true}
+            })
+        );
+        assert_eq!(schema["required"], serde_json::json!(["type", "anyOf"]));
+        assert_eq!(schema["default"], data);
+        assert_eq!(schema["example"], data);
+        assert_eq!(schema["enum"], serde_json::json!([data]));
+    }
+
+    #[test]
+    fn test_type_array_normalization_leaves_malformed_constraints_unchanged() {
+        for original in [
+            serde_json::json!({"type": []}),
+            serde_json::json!({"type": ["string", 1]}),
+            serde_json::json!({"type": ["string", "unknown"]}),
+            serde_json::json!({"type": ["string", "string"]}),
+            serde_json::json!({"type": ["string", "null"], "anyOf": []}),
+            serde_json::json!({"type": ["string", "null"], "anyOf": {"type": "string"}}),
+            serde_json::json!({"type": ["string", "null"], "anyOf": [true]}),
+            serde_json::json!({"type": ["string", "null"], "anyOf": [{"type": []}]}),
+        ] {
+            let mut schema = original.clone();
+            sanitize_schema_for_gemini(&mut schema);
+            assert_eq!(schema, original);
+        }
+
+        let mut null_only = serde_json::json!({"type": ["null"]});
+        sanitize_schema_for_gemini(&mut null_only);
+        assert_eq!(null_only, serde_json::json!({"type": "null"}));
+    }
+
+    #[test]
+    fn test_nullable_compaction_preserves_enum_values_and_branch_constraints() {
+        for original in [
+            serde_json::json!({
+                "anyOf": [{"type": "string", "minLength": 1}, {"type": "null"}]
+            }),
+            serde_json::json!({
+                "anyOf": [{"type": "string"}, {"type": "null"}],
+                "enum": ["ready", null]
+            }),
+            serde_json::json!({
+                "anyOf": [{"type": "object"}, {"type": "null"}],
+                "enum": [{"type": ["string", "null"]}, null]
+            }),
+            serde_json::json!({
+                "anyOf": [{"type": "string"}, {"type": "null"}],
+                "enum": []
+            }),
+        ] {
+            let mut schema = original.clone();
+            sanitize_schema_for_gemini(&mut schema);
+            assert_eq!(schema, original);
+        }
+    }
+
+    #[test]
+    fn test_nested_type_array_intersections_do_not_duplicate_subtrees() {
+        let mut schema = serde_json::json!({"description": "leaf"});
+        for _ in 0..32 {
+            schema = serde_json::json!({"type": ["string", "null"], "anyOf": [schema]});
+        }
+        let original_size = serde_json::to_vec(&schema).unwrap().len();
+        sanitize_schema_for_gemini(&mut schema);
+        let serialized = serde_json::to_string(&schema).unwrap();
+        assert!(serialized.len() < original_size);
+        assert_eq!(serialized.matches("leaf").count(), 1);
+        assert_eq!(serialized.matches("\"type\":\"string\"").count(), 1);
+        assert_eq!(serialized.matches("\"nullable\":true").count(), 1);
+        let normalized = schema.clone();
+        sanitize_schema_for_gemini(&mut schema);
+        assert_eq!(schema, normalized);
+    }
+
+    #[test]
     fn test_convert_tools_sanitizes_parameters() {
         // End-to-end: convert_tools must produce Gemini-clean schemas. This is
         // the regression test for the pi-coding-agent bug —
@@ -1752,5 +2112,288 @@ mod tests {
 
         let response: GeminiResponse = serde_json::from_str(json).unwrap();
         assert!(response.candidates[0].content.is_none());
+    }
+
+    // Usage accounting. Google reports thinking outside `candidatesTokenCount`
+    // and bills it at the output rate, so `completion_tokens` has to carry
+    // both or we pay Google for tokens we never charge for.
+
+    fn token_usage(json: serde_json::Value) -> TokenUsage {
+        serde_json::from_value::<GeminiUsageMetadata>(json)
+            .unwrap()
+            .to_token_usage()
+    }
+
+    /// Counts from a `gemini-2.5-pro` response to a short arithmetic prompt:
+    /// 26 visible tokens, 2,706 thinking tokens.
+    #[test]
+    fn test_usage_counts_thinking_as_completion_tokens() {
+        let usage = token_usage(serde_json::json!({
+            "promptTokenCount": 71,
+            "candidatesTokenCount": 26,
+            "thoughtsTokenCount": 2706,
+            "totalTokenCount": 2803
+        }));
+
+        assert_eq!(usage.prompt_tokens, 71);
+        assert_eq!(usage.completion_tokens, 26 + 2706);
+        assert_eq!(usage.total_tokens, 2803);
+        assert_eq!(usage.reasoning_tokens(), Some(2706));
+        assert_eq!(usage.cached_tokens(), 0);
+        assert!(usage.prompt_tokens_details.is_none());
+    }
+
+    /// `promptTokenCount` already includes the cached part, so the cached
+    /// count is reported as a subset and never added on top.
+    #[test]
+    fn test_usage_reports_cached_tokens_without_double_counting() {
+        let usage = token_usage(serde_json::json!({
+            "promptTokenCount": 5000,
+            "cachedContentTokenCount": 4096,
+            "candidatesTokenCount": 10,
+            "totalTokenCount": 5010
+        }));
+
+        assert_eq!(usage.prompt_tokens, 5000);
+        assert_eq!(usage.cached_tokens(), 4096);
+        assert_eq!(usage.completion_tokens, 10);
+        assert_eq!(usage.total_tokens, 5010);
+        assert!(usage.completion_tokens_details.is_none());
+    }
+
+    #[test]
+    fn test_usage_with_thinking_and_cache_together() {
+        let usage = token_usage(serde_json::json!({
+            "promptTokenCount": 5000,
+            "cachedContentTokenCount": 4096,
+            "candidatesTokenCount": 10,
+            "thoughtsTokenCount": 300,
+            "totalTokenCount": 5310
+        }));
+
+        assert_eq!(usage.prompt_tokens, 5000);
+        assert_eq!(usage.cached_tokens(), 4096);
+        assert_eq!(usage.completion_tokens, 310);
+        assert_eq!(usage.total_tokens, 5310);
+        assert_eq!(usage.reasoning_tokens(), Some(300));
+    }
+
+    /// A model that neither thinks nor hits the cache: same numbers as
+    /// before, and no detail objects on the wire.
+    #[test]
+    fn test_usage_without_thinking_or_cache_is_unchanged() {
+        let usage = token_usage(serde_json::json!({
+            "promptTokenCount": 10,
+            "candidatesTokenCount": 5,
+            "totalTokenCount": 15
+        }));
+
+        assert_eq!(
+            serde_json::to_value(&usage).unwrap(),
+            serde_json::json!({
+                "prompt_tokens": 10,
+                "completion_tokens": 5,
+                "total_tokens": 15
+            })
+        );
+
+        // Explicit zeros behave like absent fields.
+        let zeros = token_usage(serde_json::json!({
+            "promptTokenCount": 10,
+            "candidatesTokenCount": 5,
+            "thoughtsTokenCount": 0,
+            "cachedContentTokenCount": 0,
+            "totalTokenCount": 15
+        }));
+        assert!(zeros.prompt_tokens_details.is_none());
+        assert!(zeros.completion_tokens_details.is_none());
+    }
+
+    /// Thinking cut off by `MAX_TOKENS` before any visible output: Google
+    /// omits `candidatesTokenCount` but still bills the thoughts.
+    #[test]
+    fn test_usage_bills_thinking_when_no_visible_output() {
+        let usage = token_usage(serde_json::json!({
+            "promptTokenCount": 8,
+            "thoughtsTokenCount": 120,
+            "totalTokenCount": 128
+        }));
+
+        assert_eq!(usage.completion_tokens, 120);
+        assert_eq!(usage.total_tokens, 128);
+        assert_eq!(usage.reasoning_tokens(), Some(120));
+    }
+
+    #[test]
+    fn test_usage_treats_negative_counts_as_zero() {
+        let usage = token_usage(serde_json::json!({
+            "promptTokenCount": -1,
+            "cachedContentTokenCount": -2,
+            "candidatesTokenCount": -3,
+            "thoughtsTokenCount": -4,
+            "toolUsePromptTokenCount": -5
+        }));
+
+        assert_eq!(usage.prompt_tokens, 0);
+        assert_eq!(usage.completion_tokens, 0);
+        assert_eq!(usage.total_tokens, 0);
+        assert!(usage.prompt_tokens_details.is_none());
+        assert!(usage.completion_tokens_details.is_none());
+    }
+
+    /// Tool-use prompt tokens sit outside `promptTokenCount` and are billed
+    /// as input. Counts from Google's URL-context example.
+    #[test]
+    fn test_usage_adds_tool_use_prompt_tokens_to_prompt() {
+        let usage = token_usage(serde_json::json!({
+            "promptTokenCount": 27,
+            "toolUsePromptTokenCount": 10309,
+            "candidatesTokenCount": 45,
+            "thoughtsTokenCount": 31,
+            "totalTokenCount": 10412
+        }));
+
+        assert_eq!(usage.prompt_tokens, 27 + 10309);
+        assert_eq!(usage.completion_tokens, 45 + 31);
+        assert_eq!(usage.total_tokens, 10412);
+    }
+
+    fn parse_usage(state: &mut GeminiParserState, event: serde_json::Value) -> TokenUsage {
+        let chunk = GeminiEventParser::parse_event(state, &event.to_string())
+            .unwrap()
+            .expect("event should produce a chunk");
+        let StreamChunk::Chat(chat) = chunk else {
+            panic!("expected a chat chunk");
+        };
+        chat.usage.expect("chunk should carry usage")
+    }
+
+    /// Streaming restates cumulative usage on every event. The final chunk,
+    /// which is what billing records, carries candidates + thoughts.
+    #[test]
+    fn test_streaming_usage_counts_thinking_and_cache() {
+        let mut state = GeminiParserState::new("gemini-2.5-pro".to_string());
+
+        let first = parse_usage(
+            &mut state,
+            serde_json::json!({
+                "candidates": [{"content": {"role": "model", "parts": [{"text": "The"}]}}],
+                "usageMetadata": {
+                    "promptTokenCount": 5000,
+                    "cachedContentTokenCount": 4096,
+                    "candidatesTokenCount": 1,
+                    "thoughtsTokenCount": 2706,
+                    "totalTokenCount": 7707
+                }
+            }),
+        );
+        // An interrupted stream is billed from the last usage seen, so the
+        // thinking has to be counted from the first chunk on.
+        assert_eq!(first.completion_tokens, 1 + 2706);
+
+        let last = parse_usage(
+            &mut state,
+            serde_json::json!({
+                "candidates": [{
+                    "content": {"role": "model", "parts": [{"text": " answer is 42."}]},
+                    "finishReason": "STOP"
+                }],
+                "usageMetadata": {
+                    "promptTokenCount": 5000,
+                    "cachedContentTokenCount": 4096,
+                    "candidatesTokenCount": 26,
+                    "thoughtsTokenCount": 2706,
+                    "totalTokenCount": 7732
+                }
+            }),
+        );
+        assert_eq!(last.prompt_tokens, 5000);
+        assert_eq!(last.cached_tokens(), 4096);
+        assert_eq!(last.completion_tokens, 26 + 2706);
+        assert_eq!(last.total_tokens, 7732);
+        assert_eq!(last.reasoning_tokens(), Some(2706));
+    }
+
+    #[test]
+    fn test_streaming_usage_without_thinking_or_cache_is_unchanged() {
+        let mut state = GeminiParserState::new("gemini-2.0-flash".to_string());
+        let usage = parse_usage(
+            &mut state,
+            serde_json::json!({
+                "candidates": [{
+                    "content": {"role": "model", "parts": [{"text": "Hello"}]},
+                    "finishReason": "STOP"
+                }],
+                "usageMetadata": {
+                    "promptTokenCount": 10,
+                    "candidatesTokenCount": 1,
+                    "totalTokenCount": 11
+                }
+            }),
+        );
+
+        assert_eq!(usage.prompt_tokens, 10);
+        assert_eq!(usage.completion_tokens, 1);
+        assert_eq!(usage.total_tokens, 11);
+        assert!(usage.prompt_tokens_details.is_none());
+        assert!(usage.completion_tokens_details.is_none());
+    }
+
+    /// Billing records the usage on the last chunk, so an event that omits
+    /// `usageMetadata` must not reset the counts reported before it.
+    #[test]
+    fn test_streaming_event_without_usage_keeps_last_counts() {
+        let mut state = GeminiParserState::new("gemini-2.5-pro".to_string());
+        parse_usage(
+            &mut state,
+            serde_json::json!({
+                "candidates": [{"content": {"role": "model", "parts": [{"text": "4"}]}}],
+                "usageMetadata": {
+                    "promptTokenCount": 71,
+                    "candidatesTokenCount": 26,
+                    "thoughtsTokenCount": 2706,
+                    "totalTokenCount": 2803
+                }
+            }),
+        );
+
+        let last = parse_usage(
+            &mut state,
+            serde_json::json!({
+                "candidates": [{
+                    "content": {"role": "model", "parts": [{"text": "2"}]},
+                    "finishReason": "STOP"
+                }]
+            }),
+        );
+        assert_eq!(last.prompt_tokens, 71);
+        assert_eq!(last.completion_tokens, 2732);
+        assert_eq!(last.total_tokens, 2803);
+    }
+
+    /// Tool calls go out on their own chunk type; it must carry the same usage.
+    #[test]
+    fn test_streaming_tool_call_chunk_counts_thinking() {
+        let mut state = GeminiParserState::new("gemini-2.5-pro".to_string());
+        let usage = parse_usage(
+            &mut state,
+            serde_json::json!({
+                "candidates": [{
+                    "content": {"role": "model", "parts": [{
+                        "functionCall": {"name": "web_search", "args": {"query": "weather"}}
+                    }]},
+                    "finishReason": "STOP"
+                }],
+                "usageMetadata": {
+                    "promptTokenCount": 40,
+                    "candidatesTokenCount": 12,
+                    "thoughtsTokenCount": 500,
+                    "totalTokenCount": 552
+                }
+            }),
+        );
+
+        assert_eq!(usage.completion_tokens, 512);
+        assert_eq!(usage.total_tokens, 552);
     }
 }

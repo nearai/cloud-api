@@ -62,6 +62,7 @@ pub mod chunk_builder;
 pub mod mock;
 pub mod models;
 pub mod non_attested;
+pub mod placement_io;
 pub mod responses_raw;
 pub mod rotation;
 pub mod spki_verifier;
@@ -97,9 +98,10 @@ pub use models::{
     EmbeddingError, FinishReason, FunctionChoice, FunctionDefinition, ImageData, ImageEditError,
     ImageEditParams, ImageEditResponse, ImageEditResponseWithBytes, ImageGenerationError,
     ImageGenerationParams, ImageGenerationResponse, ImageGenerationResponseWithBytes, MessageRole,
-    ModelInfo, PrivacyClassifyError, RerankError, RerankParams, RerankResponse, RerankResult,
-    RerankUsage, ScoreError, ScoreParams, ScoreResponse, ScoreResult, ScoreUsage, StreamChunk,
-    StreamOptions, TokenUsage, ToolChoice, ToolDefinition, TranscriptionSegment, TranscriptionWord,
+    ModelInfo, PlacementContext, PrivacyClassifyError, RerankError, RerankParams, RerankResponse,
+    RerankResult, RerankUsage, ScoreError, ScoreParams, ScoreResponse, ScoreResult, ScoreUsage,
+    StreamChunk, StreamOptions, TokenUsage, ToolChoice, ToolDefinition, TranscriptionSegment,
+    TranscriptionWord,
 };
 pub use sse_parser::{
     new_external_sse_parser, new_sse_parser, BufferedSSEParser, SSEEvent, SSEEventParser, SSEParser,
@@ -160,6 +162,8 @@ pub enum ProviderSource {
     External,
     /// A Chutes-attested third party (`attested::chutes`).
     Chutes,
+    /// A Tinfoil-attested third party (attested::tinfoil).
+    Tinfoil,
 }
 
 impl ProviderSource {
@@ -168,6 +172,102 @@ impl ProviderSource {
             ProviderSource::Vllm => "vllm",
             ProviderSource::External => "external",
             ProviderSource::Chutes => "chutes",
+            ProviderSource::Tinfoil => "tinfoil",
+        }
+    }
+
+    /// Every source, in discriminant order (`DisabledSources` bit order).
+    pub const ALL: [ProviderSource; 4] = [Self::Vllm, Self::External, Self::Chutes, Self::Tinfoil];
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|v| v.as_str() == s)
+    }
+}
+
+/// A set of provider sources, one bit per [`ProviderSource`]. `Copy` so it
+/// can live in the admin settings snapshot.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DisabledSources(u8);
+
+impl DisabledSources {
+    const fn bit(s: ProviderSource) -> u8 {
+        1 << (s as u8)
+    }
+
+    pub const fn contains(self, s: ProviderSource) -> bool {
+        self.0 & Self::bit(s) != 0
+    }
+
+    pub fn insert(&mut self, s: ProviderSource) {
+        self.0 |= Self::bit(s)
+    }
+
+    pub fn iter(self) -> impl Iterator<Item = ProviderSource> {
+        ProviderSource::ALL
+            .into_iter()
+            .filter(move |s| self.contains(*s))
+    }
+}
+
+/// Who served a request: the trust tier plus the concrete source. Drives the
+/// `x-serving-provider` response header label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ServingProvider {
+    pub tier: ProviderTier,
+    pub source: ProviderSource,
+}
+
+impl ServingProvider {
+    pub fn of<P: InferenceProvider + ?Sized>(p: &P) -> Self {
+        Self {
+            tier: p.tier(),
+            source: p.provider_source(),
+        }
+    }
+
+    /// A plaintext, non-attested external provider (OpenAI-compatible, Anthropic, Gemini).
+    pub const EXTERNAL: ServingProvider = ServingProvider {
+        tier: ProviderTier::NonAttested,
+        source: ProviderSource::External,
+    };
+
+    /// `x-serving-provider` value: "near" | "non-attested" | <3P source name>.
+    /// An `Attested3p` tier with a non-3P source (inconsistent attribution)
+    /// is clamped to "attested-3p" rather than emitting "vllm"/"external".
+    pub const fn label(self) -> &'static str {
+        match self.tier {
+            ProviderTier::Near => "near",
+            ProviderTier::NonAttested => "non-attested",
+            ProviderTier::Attested3p => match self.source {
+                ProviderSource::Chutes | ProviderSource::Tinfoil => self.source.as_str(),
+                ProviderSource::Vllm | ProviderSource::External => "attested-3p",
+            },
+        }
+    }
+}
+
+/// Which providers an attestation report request is restricted to
+/// (`?provider=near|chutes|tinfoil`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ProviderFilter {
+    /// NEAR AI's own attested fleet.
+    Near,
+    /// Attested third-party providers of one concrete source.
+    Source(ProviderSource),
+}
+
+impl ProviderFilter {
+    pub fn matches<P: InferenceProvider + ?Sized>(self, p: &P) -> bool {
+        match self {
+            Self::Near => p.tier() == ProviderTier::Near,
+            Self::Source(s) => p.tier() == ProviderTier::Attested3p && p.provider_source() == s,
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Near => "near",
+            Self::Source(s) => s.as_str(),
         }
     }
 }
@@ -201,7 +301,29 @@ impl ProviderTier {
 pub trait BackendVerifier: Send + Sync {
     /// Connect to `base_url`, verify the backend's attestation, and return a client
     /// whose H2 connection is pinned to that verified backend.
-    async fn create_verified_client(&self, base_url: &str) -> Result<Client, String>;
+    async fn create_verified_client(&self, base_url: &str) -> Result<Client, BackendVerifyError>;
+}
+
+/// Why [`BackendVerifier::create_verified_client`] failed.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum BackendVerifyError {
+    /// The attestation report was verified, but the certificate presented on
+    /// the connection that carried it is not the attested one (or the report
+    /// attests no fingerprint, or the certificate could not be read). Report
+    /// and certificate come from the same connection, so verifying the same
+    /// backend again gives the same result: callers should not retry.
+    #[error("{0}")]
+    ChannelBinding(String),
+    /// Any other failure (connection, HTTP status, report parsing, quote or
+    /// GPU evidence verification). May be transient.
+    #[error("{0}")]
+    Other(String),
+}
+
+impl From<String> for BackendVerifyError {
+    fn from(message: String) -> Self {
+        Self::Other(message)
+    }
 }
 
 /// Try to extract a human-readable error message from a JSON error response body.
@@ -255,6 +377,49 @@ impl StreamingResultExt for StreamingResult {
     fn peekable(self) -> PeekableStreamingResult {
         StreamExt::peekable(self)
     }
+}
+
+/// Verified `host_id -> backend index` map from the latest discovery cycle,
+/// plus the attested signing keys for those hosts. Built only from probes
+/// that carried a verified [`placement::snapshot::HostKey`]-worthy replica
+/// report key, so an unmapped host is never routed to by the placer — it
+/// falls open onto `Fleet::acquire_index` instead.
+#[derive(Clone, Default)]
+pub struct BackendHosts {
+    pub index_by_host: std::collections::HashMap<String, usize>,
+    pub keys: placement::KeyRegistry,
+    pub count: usize,
+}
+
+/// Outcome of [`InferenceProvider::poll_backend_count`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CountPoll {
+    /// Not polled: no placement, no host that has published, or no rotation.
+    Skipped,
+    /// The count read failed; nothing changed.
+    Failed,
+    Unchanged,
+    /// The count is unchanged but the host map was built for another count:
+    /// the rediscovery a change asked for has not landed yet.
+    HostMapStale,
+    /// The healthy count moved from `old` to `new`, and `new` is stored.
+    Changed {
+        old: usize,
+        new: usize,
+    },
+}
+
+/// One discovery cycle's results for a provider (see
+/// [`InferenceProvider::apply_discovery`]).
+pub struct DiscoveryPush {
+    /// [`InferenceProvider::count_generation`] read before the cycle began.
+    pub generation: u64,
+    pub count: usize,
+    pub keys: std::collections::HashMap<String, Vec<usize>>,
+    pub hosts: BackendHosts,
+    /// The cycle covered every healthy backend. A cycle that did not, and
+    /// saw no replica-report key, keeps the provider's last key registry.
+    pub complete: bool,
 }
 
 #[async_trait]
@@ -478,16 +643,53 @@ pub trait InferenceProvider {
     /// override this default no-op.
     fn set_backend_keys(&self, _map: std::collections::HashMap<String, Vec<usize>>) {}
 
-    /// Exact input-token count via the backend's tokenizer (`POST /v1/tokenize`,
-    /// proxied to the engine's native tokenize endpoint). The pool calls this
-    /// only when a cheap byte-based estimate lands near a context-capacity
-    /// boundary and the model has providers with different context windows, so
-    /// the tier decision is made on real token counts rather than a ±25%
-    /// heuristic. Best-effort: `None` means "unsupported or failed" and the
-    /// caller falls back to the heuristic. Implementations MUST send the text
-    /// only over their attested/verified transport (it is customer content)
-    /// and MUST NOT log it. Default: unsupported.
-    async fn count_tokens(&self, _model: &str, _text: String) -> Option<u64> {
+    /// Update the provider's verified host map from discovery: which backend
+    /// index each attested host holds this cycle, and the attested keys for
+    /// those hosts. Default is a no-op — only providers that participate in
+    /// smart placement override it. Rebuilt every discovery cycle; a partial
+    /// cycle may omit hosts, which is accepted (the placer treats an unmapped
+    /// host as legacy and fails open).
+    fn set_backend_hosts(&self, _hosts: BackendHosts) {}
+
+    /// Re-read the healthy backend count (`GET /backends/count`) with
+    /// `client`, for a provider whose placement hosts have published, and
+    /// store it at once when it changed. Model-proxy maps rotation index
+    /// `-i<N>` over its live healthy set, so a changed count means the host
+    /// map from the last discovery may point indices at the wrong hosts;
+    /// storing the count makes that map stale, and placement legacy, until
+    /// the next discovery. Default: [`CountPoll::Skipped`].
+    async fn poll_backend_count(&self, _client: &reqwest::Client) -> CountPoll {
+        CountPoll::Skipped
+    }
+
+    /// The version of this provider's backend count: every applied
+    /// discovery push and every count change [`Self::poll_backend_count`]
+    /// stores advances it. Read it before a discovery cycle starts and pass
+    /// it back in [`DiscoveryPush::generation`].
+    fn count_generation(&self) -> u64 {
+        0
+    }
+
+    /// Apply a discovery cycle's count, key map and host map, unless the
+    /// count moved on since the cycle began (a newer poll or push): then the
+    /// whole push is discarded and `false` returned, so a slow cycle never
+    /// replaces a newer count with the one it read. Default: apply
+    /// unconditionally.
+    fn apply_discovery(&self, push: DiscoveryPush) -> bool {
+        self.set_backend_count(push.count);
+        self.set_backend_keys(push.keys);
+        self.set_backend_hosts(push.hosts);
+        true
+    }
+
+    /// Install smart placement for this provider's model. Default is a no-op — only
+    /// providers that participate in smart placement override it; without
+    /// it every request takes the existing routing path.
+    fn set_placement(&self, _handles: placement_io::PlacementHandles) {}
+
+    /// The tier of the installed smart-placement placer, `None` when
+    /// placement is not installed on this provider.
+    fn placement_tier(&self) -> Option<placement::policy::Tier> {
         None
     }
 
@@ -513,7 +715,45 @@ pub trait InferenceProvider {
 
 #[cfg(test)]
 mod provider_tier_tests {
-    use super::ProviderTier;
+    use super::{ProviderSource, ProviderTier, ServingProvider};
+
+    #[test]
+    fn serving_label_is_near_non_attested_or_3p_source() {
+        use ProviderSource::*;
+        use ProviderTier::*;
+        assert_eq!(
+            ServingProvider {
+                tier: Near,
+                source: Vllm
+            }
+            .label(),
+            "near"
+        );
+        assert_eq!(
+            ServingProvider {
+                tier: NonAttested,
+                source: External
+            }
+            .label(),
+            "non-attested"
+        );
+        assert_eq!(
+            ServingProvider {
+                tier: Attested3p,
+                source: Chutes
+            }
+            .label(),
+            "chutes"
+        );
+        assert_eq!(
+            ServingProvider {
+                tier: Attested3p,
+                source: Tinfoil
+            }
+            .label(),
+            "tinfoil"
+        );
+    }
 
     #[test]
     fn attested_tiers_gate_the_verified_badge() {
@@ -567,5 +807,94 @@ mod extract_error_message_tests {
         let body =
             r#"{"error":{"message":"from envelope"},"message":"from flat","type":"whatever"}"#;
         assert_eq!(extract_error_message(body), "from envelope");
+    }
+}
+
+#[cfg(test)]
+mod provider_identity_tests {
+    use super::*;
+    use crate::mock::MockProvider;
+
+    fn mock(tier: ProviderTier, source: ProviderSource) -> MockProvider {
+        MockProvider::new()
+            .with_tier(tier)
+            .with_provider_source(source)
+    }
+
+    #[test]
+    fn filter_source_matches_only_same_attested_3p_source() {
+        let chutes = mock(ProviderTier::Attested3p, ProviderSource::Chutes);
+        let tinfoil = mock(ProviderTier::Attested3p, ProviderSource::Tinfoil);
+        assert!(ProviderFilter::Source(ProviderSource::Chutes).matches(&chutes));
+        assert!(!ProviderFilter::Source(ProviderSource::Chutes).matches(&tinfoil));
+        assert!(ProviderFilter::Source(ProviderSource::Tinfoil).matches(&tinfoil));
+        assert!(!ProviderFilter::Near.matches(&chutes));
+    }
+
+    #[test]
+    fn filter_source_never_matches_near_or_non_attested() {
+        for source in ProviderSource::ALL {
+            for tier in [ProviderTier::Near, ProviderTier::NonAttested] {
+                let p = mock(tier, source);
+                assert!(!ProviderFilter::Source(source).matches(&p));
+            }
+        }
+        assert!(ProviderFilter::Near.matches(&mock(ProviderTier::Near, ProviderSource::Vllm)));
+        assert!(!ProviderFilter::Near
+            .matches(&mock(ProviderTier::NonAttested, ProviderSource::External)));
+    }
+
+    #[test]
+    fn disabled_sources_round_trips_every_source() {
+        let mut d = DisabledSources::default();
+        assert_eq!(d.iter().count(), 0);
+        for (i, s) in ProviderSource::ALL.into_iter().enumerate() {
+            assert!(!d.contains(s));
+            d.insert(s);
+            assert!(d.contains(s));
+            assert_eq!(d.iter().count(), i + 1);
+            assert_eq!(ProviderSource::parse(s.as_str()), Some(s));
+        }
+        assert_eq!(d.iter().collect::<Vec<_>>(), ProviderSource::ALL.to_vec());
+        assert_eq!(ProviderSource::parse("banana"), None);
+        let mut one = DisabledSources::default();
+        one.insert(ProviderSource::Tinfoil);
+        assert_eq!(
+            one.iter().collect::<Vec<_>>(),
+            vec![ProviderSource::Tinfoil]
+        );
+    }
+
+    #[test]
+    fn serving_label_clamps_inconsistent_attested_3p_source() {
+        let l = |tier, source| ServingProvider { tier, source }.label();
+        assert_eq!(
+            l(ProviderTier::Attested3p, ProviderSource::Chutes),
+            "chutes"
+        );
+        assert_eq!(
+            l(ProviderTier::Attested3p, ProviderSource::Tinfoil),
+            "tinfoil"
+        );
+        assert_eq!(
+            l(ProviderTier::Attested3p, ProviderSource::External),
+            "attested-3p"
+        );
+        assert_eq!(
+            l(ProviderTier::Attested3p, ProviderSource::Vllm),
+            "attested-3p"
+        );
+        assert_eq!(l(ProviderTier::Near, ProviderSource::External), "near");
+        assert_eq!(ServingProvider::EXTERNAL.label(), "non-attested");
+    }
+
+    #[test]
+    fn mock_attested_3p_defaults_source_to_chutes() {
+        let m = MockProvider::new().with_tier(ProviderTier::Attested3p);
+        assert_eq!(m.provider_source(), ProviderSource::Chutes);
+        let m = MockProvider::new()
+            .with_provider_source(ProviderSource::Tinfoil)
+            .with_tier(ProviderTier::Attested3p);
+        assert_eq!(m.provider_source(), ProviderSource::Tinfoil);
     }
 }

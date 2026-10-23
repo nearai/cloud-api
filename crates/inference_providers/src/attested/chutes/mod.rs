@@ -49,6 +49,7 @@ use serde_json::{json, Value};
 
 use self::client::{ChutesClient, ChutesClientError, InvokeMode, InvokeRequest};
 use self::verifier_port::ChutesInstanceVerifier;
+use crate::attested::openai_wire::{gate_stream_usage, request_body, sanitize_response_object};
 use crate::{
     AttestationError, AudioTranscriptionError, AudioTranscriptionParams,
     AudioTranscriptionResponse, ChatCompletionParams, ChatCompletionResponse,
@@ -207,6 +208,8 @@ pub struct Provider {
 struct CachedInstances {
     instances: Vec<client::E2eInstance>,
     expires_at: std::time::Instant,
+    /// A late rejection must not invalidate a newer discovery batch.
+    generation: u64,
 }
 
 /// Base64 keys are case-sensitive. Match the same trimmed discovery value that
@@ -224,8 +227,16 @@ impl CachedInstances {
         Self {
             instances: Vec::new(),
             expires_at: std::time::Instant::now(),
+            generation: 0,
         }
     }
+}
+
+struct InvokeNonce {
+    token: String,
+    generation: u64,
+    /// Local cache deadline, including the safety margin, not server expiry.
+    expires_at: std::time::Instant,
 }
 
 /// Everything needed to invoke a verified instance: the targeting headers, the
@@ -233,7 +244,7 @@ impl CachedInstances {
 struct PreparedInvoke {
     chute_id: String,
     instance_id: String,
-    nonce_token: String,
+    nonce: InvokeNonce,
     blob: Vec<u8>,
     session: e2ee::ResponseSession,
 }
@@ -329,6 +340,9 @@ impl Provider {
             .iter()
             .any(|i| is_candidate(i, model_pub_key));
         if guard.expires_at <= std::time::Instant::now() || !usable {
+            // Include discovery latency in the lifetime instead of extending
+            // the upstream TTL by however long the response takes to arrive.
+            let discovery_started = std::time::Instant::now();
             let fresh = self
                 .client
                 .discover_instances(chute_id)
@@ -343,11 +357,28 @@ impl Provider {
                 .filter(|s| *s > 0)
                 .map(|s| (s as u64).min(120))
                 .unwrap_or(30);
+            let ttl = std::time::Duration::from_secs(ttl);
+            // Leave usable time for short-lived batches without extending the
+            // upstream lifetime when discovery itself is slow.
+            let margin = std::time::Duration::from_secs(5).min(ttl / 2);
+            let expires_at = discovery_started + (ttl - margin);
+            let now = std::time::Instant::now();
+            if expires_at <= now {
+                tracing::warn!(
+                    chute_id,
+                    nonce_ttl_ms = ttl.as_millis() as u64,
+                    discovery_elapsed_ms = now.duration_since(discovery_started).as_millis() as u64,
+                    "Chutes discovery exhausted the usable nonce lifetime"
+                );
+                return Err(availability::retryable_provider_unavailable(
+                    "discover instances",
+                    "nonce batch expired before discovery completed",
+                ));
+            }
             *guard = CachedInstances {
                 instances: fresh.instances,
-                expires_at: std::time::Instant::now()
-                    + std::time::Duration::from_secs(ttl)
-                        .saturating_sub(std::time::Duration::from_secs(5)),
+                expires_at,
+                generation: guard.generation + 1,
             };
         }
         Ok(guard.instances.clone())
@@ -356,22 +387,75 @@ impl Provider {
     /// Atomically consume one single-use nonce token for `instance_id` from the
     /// cached snapshot (the point that PREVENTS reuse: a popped token is gone from
     /// the cache, so no concurrent request can hand out the same one). Returns
-    /// `None` if the instance/key is no longer present or its pool is already drained —
-    /// the caller then moves to the next candidate (and a fully drained chute
-    /// refreshes on the next [`Self::discover_cached`]).
+    /// `None` if the instance/key changed or its pool drained. An expired batch
+    /// returns a retryable error immediately: no remaining candidate can use it.
     async fn take_nonce(
         &self,
         chute_id: &str,
         instance_id: &str,
         e2e_pubkey: &str,
-    ) -> Option<String> {
+    ) -> Result<Option<InvokeNonce>, CompletionError> {
         let cell = self.chute_cache(chute_id);
         let mut guard = cell.lock().await;
-        let inst = guard
+        if guard.expires_at <= std::time::Instant::now() {
+            tracing::debug!(
+                chute_id,
+                instance_id,
+                "Chutes nonce batch expired during verification"
+            );
+            return Err(availability::retryable_provider_unavailable(
+                "consume Chutes nonce",
+                "nonce batch expired during verification",
+            ));
+        }
+        let Some(inst) = guard
             .instances
             .iter_mut()
-            .find(|i| i.instance_id == instance_id && i.e2e_pubkey.trim() == e2e_pubkey)?;
-        inst.nonces.pop()
+            .find(|i| i.instance_id == instance_id && i.e2e_pubkey.trim() == e2e_pubkey)
+        else {
+            return Ok(None);
+        };
+        let token = inst.nonces.pop();
+        Ok(token.map(|token| InvokeNonce {
+            token,
+            generation: guard.generation,
+            expires_at: guard.expires_at,
+        }))
+    }
+
+    /// Discard a rejected batch before the provider pool retries. This applies
+    /// only before an invoke response/stream is accepted, never mid-stream.
+    async fn handle_invoke_error(
+        &self,
+        ctx: &str,
+        chute_id: &str,
+        instance_id: &str,
+        nonce: &InvokeNonce,
+        error: client::ChutesClientError,
+    ) -> CompletionError {
+        if let client::ChutesClientError::Status { status, body } = &error {
+            if availability::stale_invoke_target(ctx, *status, body) {
+                let cell = self.chute_cache(chute_id);
+                let mut guard = cell.lock().await;
+                let invalidated = guard.generation == nonce.generation;
+                let now = std::time::Instant::now();
+                if invalidated {
+                    guard.expires_at = now;
+                }
+                tracing::warn!(
+                    chute_id,
+                    instance_id,
+                    upstream_status = status,
+                    nonce_batch = nonce.generation,
+                    cache_invalidated = invalidated,
+                    nonce_cache_expired = nonce.expires_at <= now,
+                    nonce_cache_remaining_ms =
+                        nonce.expires_at.saturating_duration_since(now).as_millis() as u64,
+                    "Chutes rejected invoke nonce; retry requires a fresh discovery batch"
+                );
+            }
+        }
+        Self::map_client_error(ctx, error)
     }
 
     /// Map a Chutes HTTP-client error to a `CompletionError`. Only statuses that
@@ -389,7 +473,8 @@ impl Provider {
     ///   retry the round). Preserving 408 still beats the prior flat 502 because
     ///   it surfaces the timeout and enables that same-round fallthrough.
     ///
-    /// Every other status — notably `400 / 413 / 422` — is deliberately collapsed
+    /// Stale invoke targets (400 or the nonce-specific 403) become retryable 503s.
+    /// Every other status — notably `400 / 403 / 413 / 422` — is deliberately collapsed
     /// to a generic `CompletionError(msg)` (which masks as a 502). Discovery /
     /// evidence / invoke requests are internally constructed, so a 4xx there is
     /// never the customer's fault; preserving it would hit `map_provider_error`'s
@@ -400,8 +485,8 @@ impl Provider {
     fn map_client_error(ctx: &str, e: client::ChutesClientError) -> CompletionError {
         let msg = format!("{ctx}: {e}");
         match e {
-            client::ChutesClientError::Status { status: 400, body }
-                if availability::stale_invoke_target(ctx, &body) =>
+            client::ChutesClientError::Status { status, body }
+                if availability::stale_invoke_target(ctx, status, &body) =>
             {
                 availability::retryable_provider_unavailable(ctx, "stale Chutes E2E target")
             }
@@ -550,12 +635,12 @@ impl Provider {
             // Consume a single-use nonce token from the CACHE (not from the local
             // snapshot's `inst.nonces`), so it can never be handed to a concurrent
             // request for the same instance (#774). A token drained between the
-            // snapshot and here just moves us to the next candidate; if every
-            // candidate's pool is drained the request fails (retryable), and the
-            // next request's `discover_cached` refreshes the now-empty chute.
+            // snapshot and here just moves us to the next candidate. An expired
+            // batch or fully drained pool returns a retryable error so the next
+            // attempt refreshes discovery and repeats verification.
             let nonce = match self
                 .take_nonce(&chute_id, &inst.instance_id, e2e_pubkey)
-                .await
+                .await?
             {
                 Some(n) => n,
                 None => {
@@ -567,18 +652,19 @@ impl Provider {
                     continue;
                 }
             };
-            // IDs only (privacy-safe): which attested instance + vetted config
-            // served the request, so an operator can trace it during an incident.
+            // Record the selected instance and local nonce lifetime, never the token.
             tracing::info!(
                 instance_id = %inst.instance_id,
                 measurement_config = %info.measurement_config,
                 gpu_verdict = %info.gpu_verdict,
+                nonce_batch = nonce.generation,
+                nonce_cache_remaining_ms = nonce.expires_at.saturating_duration_since(std::time::Instant::now()).as_millis() as u64,
                 "Chutes instance verified; routing request"
             );
             return Ok(PreparedInvoke {
                 chute_id,
                 instance_id: inst.instance_id.clone(),
-                nonce_token: nonce,
+                nonce,
                 blob,
                 session,
             });
@@ -595,144 +681,30 @@ impl Provider {
     }
 }
 
-/// Internal `extra` keys that must never reach Chutes (a third party): the
-/// tracing identifiers and the client-facing-E2EE markers. `ChatCompletionParams`
-/// flattens `extra` into the top-level body, so these would otherwise leak.
-const INTERNAL_KEYS: &[&str] = {
-    use crate::attested::nearai::{encryption_headers as eh, tracing_headers as th};
-    &[
-        th::REQUEST_ID,
-        th::ORG_ID,
-        th::WORKSPACE_ID,
-        eh::SIGNING_ALGO,
-        eh::CLIENT_PUB_KEY,
-        eh::MODEL_PUB_KEY,
-        eh::ENCRYPTION_VERSION,
-        eh::ENCRYPT_ALL_FIELDS,
-    ]
-};
+/// Fields Chutes surfaces beyond the common OpenAI shape: `chutes_verification`
+/// (the attestation receipt, deliberately surfaced) and `hidden_states` (the
+/// intentional unmodeled passthrough).
+const CHUTES_EXTRA_TOP_FIELDS: &[&str] = &["chutes_verification", "hidden_states"];
 
-/// Standard OpenAI chat-response / chunk fields kept at the TOP LEVEL, plus the two
-/// extras this crate deliberately passes through. This is an ALLOWLIST (#780 →
-/// #781 follow-up): model-specific serving internals vary too much to denylist
-/// reliably (e.g. kimi-k2.6 emits `templated_prompt`, `prompt_token_ids`,
-/// `prompt_logprobs`, `kv_transfer_params`, … alongside the already-known
-/// `prompt_sha256`/`template_sha256`/`metadata`), so anything NOT on this list is
-/// dropped by default.
+/// Compatibility note (shared `openai_wire` module, #1213): Chutes output is
+/// byte-for-byte unchanged for standard OpenAI shapes (pinned by
+/// `standard_nested_*` tests below). The one intentional change is that unknown
+/// keys nested inside retained containers (tool calls, `function`, logprobs
+/// entries, annotations, usage details) are now stripped too; the pre-refactor
+/// Chutes sanitizer only filtered the top level, each choice and the
+/// message/delta object.
 ///
-/// Kept:
-/// - the standard OpenAI top-level fields — incl. `system_fingerprint` and
-///   `service_tier`, which ARE standard (do NOT confuse them with serving internals);
-/// - `chutes_verification` — the attestation receipt, deliberately surfaced;
-/// - `hidden_states` — the intentional unmodeled passthrough.
-const ALLOWED_TOP_LEVEL_FIELDS: &[&str] = &[
-    "id",
-    "object",
-    "created",
-    "model",
-    "choices",
-    "usage",
-    "system_fingerprint",
-    "service_tier",
-    "chutes_verification",
-    "hidden_states",
-];
+/// `reasoning` and `reasoning_content` are BOTH kept on a message (some models
+/// emit one, some the other, some both; we never drop a legit reasoning field).
+const CHUTES_EXTRA_MESSAGE_FIELDS: &[&str] = &["reasoning"];
 
-/// Standard OpenAI fields kept on each element of `choices` (both the non-stream
-/// `message`-bearing shape and the stream `delta`-bearing shape). Anything else
-/// (e.g. sglang's `matched_stop`, `token_ids`, `stop_reason`) is dropped. `message`
-/// and `delta` are recursed into via [`ALLOWED_MESSAGE_FIELDS`].
-const ALLOWED_CHOICE_FIELDS: &[&str] = &["index", "delta", "message", "finish_reason", "logprobs"];
-
-/// Standard OpenAI fields kept on a `choices[].message` (non-stream) or
-/// `choices[].delta` (stream). Drops model-specific message internals (e.g. a
-/// delta-nested `matched_stop`/`token_ids`). `reasoning` and `reasoning_content`
-/// are BOTH kept (some models emit one, some the other, some both — we never drop a
-/// legit reasoning field).
-const ALLOWED_MESSAGE_FIELDS: &[&str] = &[
-    "role",
-    "content",
-    "reasoning_content",
-    "reasoning",
-    "tool_calls",
-    "function_call",
-    "refusal",
-    "annotations",
-    "name",
-    "tool_call_id",
-];
-
-/// Drop from `obj` every key that is NOT on `allowed`, in place.
-fn retain_allowed(obj: &mut serde_json::Map<String, Value>, allowed: &[&str]) {
-    obj.retain(|k, _| allowed.contains(&k.as_str()));
-}
-
-/// Sanitize a decrypted response object to the standard OpenAI shape by ALLOWLIST
-/// (#780 → #781 follow-up), in place: keep only [`ALLOWED_TOP_LEVEL_FIELDS`] at the
-/// top level, [`ALLOWED_CHOICE_FIELDS`] on each `choices[]` element, and
-/// [`ALLOWED_MESSAGE_FIELDS`] on each `choices[].message` / `choices[].delta`.
-/// Everything else — known internals (`prompt_sha256`, `template_sha256`,
-/// `metadata`, `matched_stop`, …) AND unknown future internals — is dropped, so a
-/// Chutes response matches the clean shape returned for first-party / Anthropic /
-/// OpenAI models. The deliberately-kept extras `chutes_verification` (attestation
-/// receipt) and `hidden_states` (passthrough) are on the top-level allowlist and
-/// survive untouched. Takes the object map directly — the caller has already
-/// established it's a JSON object (a non-object body is kept verbatim). Used on both
-/// non-stream paths and per `data:` chunk on the stream path.
-///
-/// Conservative under-strip: when in doubt a field is added to the allowlist
-/// (keeping a stray field is safer than dropping a legitimate one), but the known
-/// serving internals above are deliberately absent and therefore dropped.
+/// Sanitize a decrypted Chutes response object to the standard OpenAI shape by
+/// ALLOWLIST (see [`openai_wire::sanitize_response_object`]), in place, plus the
+/// two deliberately kept extras above. Takes the object map directly: the caller
+/// has already established it is a JSON object. Used on both non-stream paths and
+/// per `data:` chunk on the stream path.
 fn strip_internal_response_fields(obj: &mut serde_json::Map<String, Value>) {
-    retain_allowed(obj, ALLOWED_TOP_LEVEL_FIELDS);
-    if let Some(choices) = obj.get_mut("choices").and_then(Value::as_array_mut) {
-        for choice in choices {
-            if let Some(choice_obj) = choice.as_object_mut() {
-                retain_allowed(choice_obj, ALLOWED_CHOICE_FIELDS);
-                // Recurse into the message (non-stream) and delta (stream) shapes.
-                for inner in ["message", "delta"] {
-                    if let Some(m) = choice_obj.get_mut(inner).and_then(Value::as_object_mut) {
-                        retain_allowed(m, ALLOWED_MESSAGE_FIELDS);
-                    }
-                }
-            }
-        }
-    }
-}
-
-/// Gate the `usage` field of a streamed chunk object to the OpenAI spec (#781 L1),
-/// in place. Per spec, intermediate chunks carry `usage: null`; `usage` appears only
-/// on the FINAL chunk, and only when the request set `stream_options.include_usage`.
-/// We force `include_usage: true` upstream so billing always sees usage (see
-/// [`request_body`]), so this gates only what reaches the CLIENT:
-///
-/// - a chunk with a non-empty `choices` array is an INTERMEDIATE content chunk → its
-///   `usage` is always stripped (covers vLLM's `continuous_usage_stats`, which would
-///   otherwise populate `usage` on every chunk);
-/// - a chunk with an empty `choices` array is the FINAL usage-only chunk → its
-///   `usage` is kept iff `include_usage` was requested, else stripped.
-///
-/// Returns `true` when the chunk was the FINAL usage-only chunk and the client did
-/// NOT request usage: OpenAI emits no final usage chunk at all in that case, so the
-/// caller must suppress the whole chunk from the client stream rather than forward
-/// a gutted `choices: []` husk (strict SDK parsers reject it, and cost-tracking
-/// clients read it as zero usage) — see [`rewrite_sse_event_model`].
-///
-/// NOTE: this gates only `raw_bytes` (the bytes the passthrough route forwards to the
-/// client). The parsed `chunk.usage` is left intact so `InterceptStream` can still
-/// read it for billing/limits — see [`rewrite_sse_event_model`].
-fn gate_stream_usage(obj: &mut serde_json::Map<String, Value>, include_usage: bool) -> bool {
-    if !obj.contains_key("usage") {
-        return false;
-    }
-    let is_final = obj
-        .get("choices")
-        .and_then(Value::as_array)
-        .is_none_or(|c| c.is_empty());
-    if !is_final || !include_usage {
-        obj.remove("usage");
-    }
-    is_final && !include_usage
+    sanitize_response_object(obj, CHUTES_EXTRA_TOP_FIELDS, CHUTES_EXTRA_MESSAGE_FIELDS);
 }
 
 /// Rewrite the `model` field of a decrypted OpenAI SSE event to the canonical id
@@ -1338,45 +1310,6 @@ fn stream_with_think_extraction(
     Box::pin(s)
 }
 
-/// An OpenAI request body (as JSON) with `model` pinned, `stream` set, and all
-/// internal/tracing/E2EE-marker keys stripped (never sent to the third party).
-fn request_body(model: &str, params: &ChatCompletionParams, stream: bool) -> Result<Value, String> {
-    let mut v = serde_json::to_value(params).map_err(|e| format!("serialize params: {e}"))?;
-    if let Some(obj) = v.as_object_mut() {
-        obj.insert("model".to_string(), json!(model));
-        obj.insert("stream".to_string(), json!(stream));
-        if stream {
-            // Force usage onto the final stream chunk so streamed tokens are
-            // billed and counted against org limits (the OpenAI-compatible
-            // default omits it, and our SSE adapter drops Chutes' outer
-            // usage-only events). Matches every other provider.
-            //
-            // Merge into any client-supplied `stream_options` (e.g.
-            // `continuous_usage_stats`) rather than clobbering the whole object —
-            // we only need to *guarantee* `include_usage`.
-            match obj.get_mut("stream_options").and_then(Value::as_object_mut) {
-                Some(existing) => {
-                    existing.insert("include_usage".to_string(), json!(true));
-                }
-                None => {
-                    obj.insert(
-                        "stream_options".to_string(),
-                        json!({ "include_usage": true }),
-                    );
-                }
-            }
-        }
-        // Strip internal identifiers + client-E2EE markers so they never reach
-        // Chutes inside the (encrypted) request body.
-        for k in INTERNAL_KEYS {
-            obj.remove(*k);
-        }
-    } else {
-        return Err("chat params did not serialize to a JSON object".to_string());
-    }
-    Ok(v)
-}
-
 /// Reject a request that carries client-facing E2EE intent (the client asked
 /// cloud-api to encrypt the response to its key). The attested Chutes path does
 /// not implement that response encryption, so we **reject** rather than silently
@@ -1435,18 +1368,31 @@ impl InferenceProvider for Provider {
             .and_then(Value::as_str);
         let prep = self.verify_and_prepare(&body, model_pub_key).await?;
 
-        let resp_blob = self
+        let resp_blob = match self
             .client
             .invoke_nonstream(&InvokeRequest {
                 chute_id: &prep.chute_id,
                 instance_id: &prep.instance_id,
-                nonce_token: &prep.nonce_token,
+                nonce_token: &prep.nonce.token,
                 path: CHAT_PATH,
                 mode: InvokeMode::NonStream,
                 blob: prep.blob,
             })
             .await
-            .map_err(|e| Self::map_client_error("Chutes /e2e/invoke", e))?;
+        {
+            Ok(response) => response,
+            Err(error) => {
+                return Err(self
+                    .handle_invoke_error(
+                        "Chutes /e2e/invoke",
+                        &prep.chute_id,
+                        &prep.instance_id,
+                        &prep.nonce,
+                        error,
+                    )
+                    .await);
+            }
+        };
 
         let plaintext = prep
             .session
@@ -1496,7 +1442,7 @@ impl InferenceProvider for Provider {
         Ok(ChatCompletionResponseWithBytes {
             response,
             raw_bytes,
-            serving_tier: crate::ProviderTier::Attested3p,
+            serving: crate::ServingProvider::of(self),
         })
     }
 
@@ -1539,18 +1485,31 @@ impl InferenceProvider for Provider {
             .and_then(Value::as_str);
         let prep = self.verify_and_prepare(&body, model_pub_key).await?;
 
-        let resp = self
+        let resp = match self
             .client
             .invoke_stream(&InvokeRequest {
                 chute_id: &prep.chute_id,
                 instance_id: &prep.instance_id,
-                nonce_token: &prep.nonce_token,
+                nonce_token: &prep.nonce.token,
                 path: CHAT_PATH,
                 mode: InvokeMode::Stream,
                 blob: prep.blob,
             })
             .await
-            .map_err(|e| Self::map_client_error("Chutes /e2e/invoke (stream)", e))?;
+        {
+            Ok(response) => response,
+            Err(error) => {
+                return Err(self
+                    .handle_invoke_error(
+                        "Chutes /e2e/invoke (stream)",
+                        &prep.chute_id,
+                        &prep.instance_id,
+                        &prep.nonce,
+                        error,
+                    )
+                    .await);
+            }
+        };
 
         // Decrypt the E2EE SSE into OpenAI SSEEvents (transport errors → CompletionError).
         let byte_stream = resp.bytes_stream().map(|r| {
@@ -1804,6 +1763,8 @@ mod tests {
     use super::*;
     use crate::attested::chutes::evidence::InstanceEvidence;
     use crate::attested::chutes::verifier_port::VerifiedInstanceInfo;
+    use crate::attested::nearai::placement_headers as ph;
+    use crate::attested::openai_wire::INTERNAL_KEYS;
 
     /// Issue #774: a Chutes upstream HTTP status (notably the `/e2e/instances`
     /// rate-limit 429) must surface as a RETRYABLE `HttpError { status_code }`, not
@@ -1884,7 +1845,7 @@ mod tests {
     fn map_client_error_masks_internal_4xx_to_avoid_client_blame_and_leak() {
         use client::ChutesClientError;
 
-        for status in [400u16, 413, 422] {
+        for status in [400u16, 403, 413, 422] {
             let mapped = Provider::map_client_error(
                 "Chutes /e2e/invoke",
                 ChutesClientError::Status {
@@ -1976,6 +1937,7 @@ mod tests {
                 })
                 .collect(),
             expires_at: std::time::Instant::now() + std::time::Duration::from_secs(3600),
+            generation: 1,
         }
     }
 
@@ -2068,16 +2030,26 @@ mod tests {
         // The cell really is the consumption point: seed it and consume via take_nonce.
         *a1.lock().await = cached(&[("i1", &["only-token"])]);
         assert_eq!(
-            p.take_nonce("chute-A", "i1", "cGs=").await.as_deref(),
+            p.take_nonce("chute-A", "i1", "cGs=")
+                .await
+                .unwrap()
+                .map(|nonce| nonce.token)
+                .as_deref(),
             Some("only-token"),
             "take_nonce consumes from the shared cell"
         );
         assert!(
-            p.take_nonce("chute-A", "i1", "cGs=").await.is_none(),
+            p.take_nonce("chute-A", "i1", "cGs=")
+                .await
+                .unwrap()
+                .is_none(),
             "second take on a 1-token pool drains it → None (no reuse)"
         );
         assert!(
-            p.take_nonce("chute-A", "absent", "cGs=").await.is_none(),
+            p.take_nonce("chute-A", "absent", "cGs=")
+                .await
+                .unwrap()
+                .is_none(),
             "missing instance → None"
         );
     }
@@ -2205,6 +2177,172 @@ mod tests {
             );
             assert_eq!(v["choices"][0]["index"], 0);
             assert_eq!(v["choices"][0]["message"]["content"], "hi");
+        }
+    }
+
+    /// Guard for the shared `openai_wire` refactor: the Chutes allow-lists must
+    /// keep exactly the keys the pre-refactor in-file lists kept (literals copied
+    /// from before the move), at every level.
+    #[test]
+    fn chutes_allowlists_match_the_pre_refactor_lists() {
+        const TOP: &[&str] = &[
+            "id",
+            "object",
+            "created",
+            "model",
+            "choices",
+            "usage",
+            "system_fingerprint",
+            "service_tier",
+            "chutes_verification",
+            "hidden_states",
+        ];
+        const CHOICE: &[&str] = &["index", "delta", "message", "finish_reason", "logprobs"];
+        const MESSAGE: &[&str] = &[
+            "role",
+            "content",
+            "reasoning_content",
+            "reasoning",
+            "tool_calls",
+            "function_call",
+            "refusal",
+            "annotations",
+            "name",
+            "tool_call_id",
+        ];
+        let probe = |allowed: &[&str]| {
+            let mut m = serde_json::Map::new();
+            for k in allowed.iter().chain(
+                [
+                    "prompt_text",
+                    "token_ids",
+                    "p",
+                    "metadata",
+                    "matched_stop",
+                    "usage_",
+                ]
+                .iter(),
+            ) {
+                m.insert((*k).to_string(), json!(1));
+            }
+            m
+        };
+        let mut top = probe(TOP);
+        let mut choice = probe(CHOICE);
+        choice.insert("delta".into(), Value::Object(probe(MESSAGE)));
+        choice.insert("message".into(), Value::Object(probe(MESSAGE)));
+        top.insert("choices".into(), json!([Value::Object(choice)]));
+        strip_internal_response_fields(&mut top);
+        let keys = |m: &serde_json::Map<String, Value>| {
+            let mut k: Vec<_> = m.keys().cloned().collect();
+            k.sort();
+            k
+        };
+        let sorted = |a: &[&str]| {
+            let mut k: Vec<String> = a.iter().map(|s| s.to_string()).collect();
+            k.sort();
+            k
+        };
+        assert_eq!(keys(&top), sorted(TOP));
+        let c = top["choices"][0].as_object().unwrap();
+        assert_eq!(keys(c), sorted(CHOICE));
+        assert_eq!(keys(c["delta"].as_object().unwrap()), sorted(MESSAGE));
+        assert_eq!(keys(c["message"].as_object().unwrap()), sorted(MESSAGE));
+    }
+
+    // ---- Nested-sanitization compatibility (#1213 review) ------------------
+    //
+    // Chutes output is unchanged for standard OpenAI shapes; unknown keys nested
+    // inside retained containers are now stripped (INTENTIONAL, since the shared
+    // `openai_wire` module was introduced). The pre-refactor sanitizer filtered
+    // only the top level, each choice and the message/delta object, so for a
+    // standard-only payload its output was the input re-serialized (serde_json
+    // sorts keys, so the literals below are written in sorted key order and the
+    // expected bytes are the input bytes).
+
+    /// Standard non-stream body with every nested container populated.
+    const STD_NESTED_BODY: &str = r#"{"choices":[{"finish_reason":"tool_calls","index":0,"logprobs":{"content":[{"bytes":[104,105],"logprob":-0.5,"token":"hi","top_logprobs":[{"bytes":[104,105],"logprob":-0.5,"token":"hi"}]}],"refusal":null},"message":{"annotations":[{"type":"url_citation","url_citation":{"end_index":5,"start_index":0,"title":"T","url":"https://example.com"}}],"content":"hi","role":"assistant","tool_calls":[{"function":{"arguments":"{\"a\":1}","name":"f"},"id":"call_1","index":0,"type":"function"}]}}],"created":0,"id":"c","model":"m","object":"chat.completion","usage":{"completion_tokens":2,"completion_tokens_details":{"reasoning_tokens":1},"prompt_tokens":3,"prompt_tokens_details":{"cached_tokens":1},"total_tokens":5}}"#;
+
+    /// Same shape as a stream chunk (`delta`).
+    const STD_NESTED_CHUNK: &str = r#"{"choices":[{"delta":{"annotations":[{"type":"url_citation","url_citation":{"end_index":5,"start_index":0,"title":"T","url":"https://example.com"}}],"content":"hi","role":"assistant","tool_calls":[{"function":{"arguments":"{\"a\":1}","name":"f"},"id":"call_1","index":0,"type":"function"}]},"finish_reason":"tool_calls","index":0,"logprobs":{"content":[{"bytes":[104,105],"logprob":-0.5,"token":"hi","top_logprobs":[{"bytes":[104,105],"logprob":-0.5,"token":"hi"}]}],"refusal":null}}],"created":0,"id":"c","model":"m","object":"chat.completion.chunk"}"#;
+
+    /// Final usage-only stream chunk (what a client that asked for usage receives).
+    const STD_USAGE_CHUNK: &str = r#"{"choices":[],"created":0,"id":"c","model":"m","object":"chat.completion.chunk","usage":{"completion_tokens":2,"completion_tokens_details":{"reasoning_tokens":1},"prompt_tokens":3,"prompt_tokens_details":{"cached_tokens":1},"total_tokens":5}}"#;
+
+    /// The standard payload with an unknown key injected into every nested
+    /// container (tool call, function, logprob entry, top_logprob, annotation,
+    /// url_citation, both usage detail objects).
+    fn with_nested_unknowns(std: &str) -> String {
+        let mut v: Value = serde_json::from_str(std).unwrap();
+        fn inject(v: &mut Value) {
+            v.as_object_mut()
+                .unwrap()
+                .insert("x_internal".into(), json!("leak"));
+        }
+        let msg_key = if v["choices"][0].get("delta").is_some() {
+            "delta"
+        } else {
+            "message"
+        };
+        if v["choices"][0].is_object() {
+            let m = &mut v["choices"][0][msg_key];
+            inject(&mut m["tool_calls"][0]);
+            inject(&mut m["tool_calls"][0]["function"]);
+            inject(&mut m["annotations"][0]);
+            inject(&mut m["annotations"][0]["url_citation"]);
+        }
+        if v["choices"][0].is_object() {
+            let l = &mut v["choices"][0]["logprobs"];
+            inject(l);
+            inject(&mut l["content"][0]);
+            inject(&mut l["content"][0]["top_logprobs"][0]);
+        }
+        if v.get("usage").is_some() {
+            inject(&mut v["usage"]);
+            inject(&mut v["usage"]["prompt_tokens_details"]);
+            inject(&mut v["usage"]["completion_tokens_details"]);
+        }
+        serde_json::to_string(&v).unwrap()
+    }
+
+    fn sse_through_chutes(payload: &str) -> String {
+        let ev = SSEEvent {
+            raw_bytes: bytes::Bytes::from(format!("data: {payload}\n\n")),
+            chunk: Some(crate::StreamChunk::Chat(
+                serde_json::from_str(payload).expect("parse chunk"),
+            )),
+            raw_passthrough: true,
+        };
+        let out = rewrite_sse_event_model(ev, None, true);
+        String::from_utf8(out.raw_bytes.to_vec()).unwrap()
+    }
+
+    #[test]
+    fn standard_nested_non_stream_body_is_byte_identical() {
+        let out = transform_response_json(STD_NESTED_BODY.as_bytes(), None).expect("transform");
+        assert_eq!(String::from_utf8(out).unwrap(), STD_NESTED_BODY);
+    }
+
+    #[test]
+    fn standard_nested_sse_event_is_byte_identical() {
+        for std in [STD_NESTED_CHUNK, STD_USAGE_CHUNK] {
+            assert_eq!(sse_through_chutes(std), format!("data: {std}\n\n"));
+        }
+    }
+
+    #[test]
+    fn unknown_keys_nested_in_retained_containers_are_stripped_intentionally() {
+        // INTENTIONAL compatibility change from the shared `openai_wire` module:
+        // the pre-refactor Chutes sanitizer left these nested keys in place.
+        let dirty = with_nested_unknowns(STD_NESTED_BODY);
+        assert!(dirty.contains("x_internal"));
+        let out = transform_response_json(dirty.as_bytes(), None).expect("transform");
+        assert_eq!(String::from_utf8(out).unwrap(), STD_NESTED_BODY);
+
+        for std in [STD_NESTED_CHUNK, STD_USAGE_CHUNK] {
+            let dirty = with_nested_unknowns(std);
+            assert!(dirty.contains("x_internal"));
+            assert_eq!(sse_through_chutes(&dirty), format!("data: {std}\n\n"));
         }
     }
 
@@ -2880,20 +3018,14 @@ mod tests {
 
     #[test]
     fn request_body_strips_internal_and_e2ee_keys() {
-        use crate::attested::nearai::{encryption_headers as eh, tracing_headers as th};
         let mut params: ChatCompletionParams =
             serde_json::from_value(json!({"model": "m", "messages": []})).unwrap();
-        // Internal identifiers + client-E2EE markers must never reach Chutes.
-        for k in [
-            th::REQUEST_ID,
-            th::ORG_ID,
-            th::WORKSPACE_ID,
-            eh::SIGNING_ALGO,
-            eh::CLIENT_PUB_KEY,
-            eh::MODEL_PUB_KEY,
-            eh::ENCRYPTION_VERSION,
-            eh::ENCRYPT_ALL_FIELDS,
-        ] {
+        // Internal identifiers, client-E2EE markers, and placement affinity
+        // keys must never reach Chutes.
+        for k in INTERNAL_KEYS {
+            params.extra.insert((*k).to_string(), json!("leak"));
+        }
+        for k in ph::LEGACY_DENIED_EXTRA_KEYS {
             params.extra.insert(k.to_string(), json!("leak"));
         }
         let body = request_body("m", &params, false).unwrap();
@@ -2902,6 +3034,12 @@ mod tests {
             assert!(
                 !obj.contains_key(*k),
                 "internal key {k} must not reach Chutes in the request body"
+            );
+        }
+        for k in ph::LEGACY_DENIED_EXTRA_KEYS {
+            assert!(
+                !obj.contains_key(k),
+                "legacy placement key {k} must not reach Chutes in the request body"
             );
         }
     }

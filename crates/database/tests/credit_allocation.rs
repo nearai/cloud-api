@@ -153,7 +153,7 @@ async fn priority_splits_exactly_and_records_overage() -> anyhow::Result<()> {
         );
         assert_eq!(row.funded_amount, Some(cost - unfunded));
         assert_eq!(row.unfunded_amount, Some(unfunded));
-        assert_eq!(row.allocation_policy_version.as_deref(), Some("v1"));
+        assert_eq!(row.allocation_policy_version.as_deref(), Some("v2"));
         cleanup_usage_fixtures(&pool, &[org.org_id], &[]).await?;
     }
 
@@ -252,7 +252,35 @@ async fn retry_keeps_original_split_and_conflicting_retry_is_rejected() -> anyho
     let request = usage(&org, &model, inference_id, 12);
     let original = repository.record_usage(request.clone()).await?;
     set_limit(&limits, org.org_id, "grant", 100).await?;
+    let balance_before = pool
+        .get()
+        .await?
+        .query_one(
+            "SELECT total_spent, total_requests, total_tokens, unresolved_unfunded_amount FROM organization_balance WHERE organization_id = $1",
+            &[&org.org_id],
+        )
+        .await?;
     let retried = repository.record_usage(request.clone()).await?;
+
+    let balance_after = pool
+        .get()
+        .await?
+        .query_one(
+            "SELECT total_spent, total_requests, total_tokens, unresolved_unfunded_amount FROM organization_balance WHERE organization_id = $1",
+            &[&org.org_id],
+        )
+        .await?;
+    for column in [
+        "total_spent",
+        "total_requests",
+        "total_tokens",
+        "unresolved_unfunded_amount",
+    ] {
+        assert_eq!(
+            balance_before.get::<_, i64>(column),
+            balance_after.get::<_, i64>(column)
+        );
+    }
 
     assert!(!retried.was_inserted);
     assert_eq!(retried.id, original.id);
@@ -644,9 +672,21 @@ async fn every_credit_source_automatically_settles_overage() -> anyhow::Result<(
         assert_eq!(original.unfunded_amount, Some(5));
 
         let expected_source = if credit_type == "staking_farm" {
-            OrganizationStakingFarmSourcesRepository::new(pool.clone())
+            // update_staking_farm_limit only writes for an org with an active source.
+            pool.get()
+                .await?
+                .execute(
+                    "INSERT INTO organization_staking_farm_sources (
+                        organization_id, near_account_id, network_id, contract_id,
+                        farm_product_id, credit_nano_usd_per_reward_unit, status
+                    ) VALUES ($1, $2, 'testnet', 'stake.test', 'cloud-credits', 1, 'active')",
+                    &[&org.org_id, &format!("alloc-{}.test", org.org_id.simple())],
+                )
+                .await?;
+            let applied = OrganizationStakingFarmSourcesRepository::new(pool.clone())
                 .update_staking_farm_limit(org.org_id, 7, None)
                 .await?;
+            assert!(applied);
             CREDIT_SOURCE_HOUSE_OF_STAKE.to_string()
         } else {
             set_limit(&limits, org.org_id, credit_type, 7).await?;
@@ -674,7 +714,7 @@ async fn every_credit_source_automatically_settles_overage() -> anyhow::Result<(
             allocations[0].source.as_deref(),
             Some(expected_source.as_str())
         );
-        assert_eq!(allocations[0].policy_version, "v1");
+        assert_eq!(allocations[0].policy_version, "v2");
 
         let phase: String = pool
             .get()
@@ -686,6 +726,13 @@ async fn every_credit_source_automatically_settles_overage() -> anyhow::Result<(
             .await?
             .get(0);
         assert_eq!(phase, "overage_settlement");
+        pool.get()
+            .await?
+            .execute(
+                "DELETE FROM organization_staking_farm_sources WHERE organization_id = $1",
+                &[&org.org_id],
+            )
+            .await?;
         cleanup_usage_fixtures(&pool, &[org.org_id], &[]).await?;
     }
 
@@ -821,7 +868,7 @@ async fn same_credit_type_settlement_is_append_only_and_reports_effective_fundin
     assert_eq!(
         phases_and_versions,
         vec![
-            ("posting".to_string(), "v1".to_string()),
+            ("posting".to_string(), "v2".to_string()),
             (
                 "overage_settlement".to_string(),
                 "settlement-v2".to_string()
@@ -858,7 +905,7 @@ async fn settlement_funds_oldest_overages_first() -> anyhow::Result<()> {
         .await?;
 
     set_limit(&limits, org.org_id, "grant", 4).await?;
-    let history = usage_repository
+    let (history, _) = usage_repository
         .get_usage_history(org.org_id, Some(10), Some(0))
         .await?;
     let first_history = history.iter().find(|row| row.id == first.id).unwrap();
@@ -1040,5 +1087,789 @@ async fn concurrent_inference_and_service_cannot_double_spend_capacity() -> anyh
         .await?
         .execute("DELETE FROM services WHERE id = $1", &[&service_id])
         .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn credit_status_reports_consumption_and_funding_columns() -> anyhow::Result<()> {
+    let pool = test_pool().await?;
+    let limits = OrganizationLimitsRepository::new(pool.clone());
+    let repository = OrganizationUsageRepository::new(pool.clone());
+    let org = insert_org_fixture(&pool).await?;
+    let model = insert_model(&pool, "allocation-status-columns").await?;
+    set_limit(&limits, org.org_id, "grant", 50).await?;
+    set_limit(&limits, org.org_id, "payment", 30).await?;
+    pool.get()
+        .await?
+        .execute(
+            "UPDATE organization_balance SET legacy_unattributed_amount = 7 WHERE organization_id = $1",
+            &[&org.org_id],
+        )
+        .await?;
+    repository
+        .record_usage(usage(&org, &model, Uuid::new_v4(), 90))
+        .await?;
+
+    let (status, unfunded, unattributed) = limits.get_current_credit_status(org.org_id).await?;
+    assert_eq!(status.len(), 2);
+    let find = |credit_type: &str| {
+        status
+            .iter()
+            .find(|s| s.limit.credit_type == credit_type)
+            .unwrap()
+    };
+    assert_eq!((find("grant").consumed, find("grant").available), (50, 0));
+    assert_eq!(
+        (find("payment").consumed, find("payment").available),
+        (23, 7)
+    );
+    assert_eq!(unfunded, 17);
+    assert_eq!(unattributed, 7);
+
+    cleanup_usage_fixtures(&pool, &[org.org_id], &[model.id]).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn credit_status_without_limit_rows_is_empty() -> anyhow::Result<()> {
+    let pool = test_pool().await?;
+    let limits = OrganizationLimitsRepository::new(pool.clone());
+    let org = insert_org_fixture(&pool).await?;
+
+    pool.get()
+        .await?
+        .execute(
+            "UPDATE organization_balance SET legacy_unattributed_amount = 7 WHERE organization_id = $1",
+            &[&org.org_id],
+        )
+        .await?;
+
+    let (status, unfunded, unattributed) = limits.get_current_credit_status(org.org_id).await?;
+    assert!(status.is_empty());
+    assert_eq!(unfunded, 0);
+    assert_eq!(unattributed, 0);
+
+    cleanup_usage_fixtures(&pool, &[org.org_id], &[]).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn credit_status_reads_one_snapshot_during_concurrent_usage() -> anyhow::Result<()> {
+    const UNIT_COST: i64 = 3;
+    const WRITES: usize = 40;
+    let pool = test_pool().await?;
+    let limits = OrganizationLimitsRepository::new(pool.clone());
+    let repository = OrganizationUsageRepository::new(pool.clone());
+    let org = insert_org_fixture(&pool).await?;
+    let model = insert_model(&pool, "allocation-status-snapshot").await?;
+    set_limit(&limits, org.org_id, "grant", 50).await?;
+    set_limit(&limits, org.org_id, "payment", 20).await?;
+
+    let done = std::sync::atomic::AtomicBool::new(false);
+    let writer = async {
+        let mut result = anyhow::Ok(());
+        for _ in 0..WRITES {
+            if let Err(e) = repository
+                .record_usage(usage(&org, &model, Uuid::new_v4(), UNIT_COST))
+                .await
+            {
+                result = Err(e);
+                break;
+            }
+        }
+        // Always release the reader, so a writer failure surfaces instead of hanging.
+        done.store(true, std::sync::atomic::Ordering::SeqCst);
+        result
+    };
+    let reader = async {
+        let mut reads = 0;
+        while !done.load(std::sync::atomic::Ordering::SeqCst) {
+            let (status, unfunded, _) = limits.get_current_credit_status(org.org_id).await?;
+            let total = status.iter().map(|s| s.consumed).sum::<i64>() + unfunded;
+            assert_eq!(total % UNIT_COST, 0, "torn read: total={total}");
+            reads += 1;
+        }
+        anyhow::Ok(reads)
+    };
+    let (written, reads) = tokio::join!(writer, reader);
+    written?;
+    assert!(reads? > 0);
+
+    let (status, unfunded, _) = limits.get_current_credit_status(org.org_id).await?;
+    let total = status.iter().map(|s| s.consumed).sum::<i64>() + unfunded;
+    assert_eq!(total, UNIT_COST * WRITES as i64);
+
+    cleanup_usage_fixtures(&pool, &[org.org_id], &[model.id]).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn inference_function_matches_service_allocation_for_credit_boundaries() -> anyhow::Result<()>
+{
+    let pool = test_pool().await?;
+    let client = pool.get().await?;
+    let functions: i64 = client
+        .query_one(
+            "SELECT COUNT(*) FROM pg_proc WHERE proname = 'record_organization_usage'",
+            &[],
+        )
+        .await?
+        .get(0);
+    assert_eq!(functions, 1);
+    drop(client);
+
+    let limits = OrganizationLimitsRepository::new(pool.clone());
+    let inference_repo = OrganizationUsageRepository::new(pool.clone());
+    let service_repo = OrganizationServiceUsageRepository::new(pool.clone());
+    let model = insert_model(&pool, "function-allocation-parity").await?;
+    for (cost, credit_limits, legacy) in [
+        (9_i64, vec![], 0_i64),
+        (5, vec![("grant", 10)], 0),
+        (9, vec![("grant", 3), ("payment", 10)], 0),
+        (9, vec![("grant", 5), ("payment", 6)], 4),
+        (0, vec![("grant", 10)], 0),
+    ] {
+        let inference_org = insert_org_fixture(&pool).await?;
+        let service_org = insert_org_fixture(&pool).await?;
+        for (credit_type, amount) in &credit_limits {
+            set_limit(&limits, inference_org.org_id, credit_type, *amount).await?;
+            set_limit(&limits, service_org.org_id, credit_type, *amount).await?;
+        }
+        if legacy > 0 {
+            let client = pool.get().await?;
+            for org_id in [inference_org.org_id, service_org.org_id] {
+                client
+                    .execute(
+                        "UPDATE organization_balance SET legacy_unattributed_amount = $2 WHERE organization_id = $1",
+                        &[&org_id, &legacy],
+                    )
+                    .await?;
+            }
+        }
+        let service_id = Uuid::new_v4();
+        pool.get()
+            .await?
+            .execute(
+                "INSERT INTO services (id, service_name, display_name, unit, cost_per_unit) VALUES ($1, $2, 'Parity service', 'request', $3)",
+                &[&service_id, &format!("function-parity-{service_id}"), &cost],
+            )
+            .await?;
+        let inference = inference_repo
+            .record_usage(usage(&inference_org, &model, Uuid::new_v4(), cost))
+            .await?;
+        let service = service_repo
+            .record_usage(&RecordServiceUsageRequest {
+                organization_id: service_org.org_id,
+                workspace_id: service_org.workspace_a_id,
+                api_key_id: service_org.api_key_a_id,
+                service_id,
+                quantity: 1,
+                total_cost: cost,
+                inference_id: Some(Uuid::new_v4()),
+            })
+            .await?;
+        let normalize = |allocations: Option<Vec<services::usage::CreditAllocation>>| {
+            allocations
+                .unwrap_or_default()
+                .into_iter()
+                .map(|allocation| {
+                    (
+                        allocation.credit_type,
+                        allocation.amount,
+                        allocation.source,
+                        allocation.policy_version,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            normalize(inference.credit_allocations),
+            normalize(service.credit_allocations)
+        );
+        assert_eq!(inference.funded_amount, service.funded_amount);
+        assert_eq!(inference.unfunded_amount, service.unfunded_amount);
+        let client = pool.get().await?;
+        let mut accounting = Vec::new();
+        for org_id in [inference_org.org_id, service_org.org_id] {
+            let row = client
+                .query_one(
+                    "SELECT total_spent, unresolved_unfunded_amount FROM organization_balance WHERE organization_id = $1",
+                    &[&org_id],
+                )
+                .await?;
+            let consumption: serde_json::Value = client
+                .query_one(
+                    "SELECT COALESCE(jsonb_agg(jsonb_build_object('type', credit_type, 'amount', amount) ORDER BY credit_type), '[]'::jsonb) FROM organization_credit_consumption WHERE organization_id = $1",
+                    &[&org_id],
+                )
+                .await?
+                .get(0);
+            accounting.push((row.get::<_, i64>(0), row.get::<_, i64>(1), consumption));
+        }
+        assert_eq!(accounting[0], accounting[1]);
+        drop(client);
+        cleanup_usage_fixtures(&pool, &[inference_org.org_id, service_org.org_id], &[]).await?;
+        pool.get()
+            .await?
+            .execute("DELETE FROM services WHERE id = $1", &[&service_id])
+            .await?;
+    }
+    cleanup_usage_fixtures(&pool, &[], &[model.id]).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn inference_function_preserves_missing_account_errors() -> anyhow::Result<()> {
+    let pool = test_pool().await?;
+    let repository = OrganizationUsageRepository::new(pool.clone());
+    let model = insert_model(&pool, "function-missing-account").await?;
+    let org = insert_org_fixture(&pool).await?;
+    let mut missing = usage(&org, &model, Uuid::new_v4(), 3);
+    missing.organization_id = Uuid::new_v4();
+    let error = repository.record_usage(missing).await.unwrap_err();
+    assert!(matches!(
+        error.downcast_ref::<services::common::RepositoryError>(),
+        Some(services::common::RepositoryError::NotFound(message))
+            if message.contains("Organization not found:")
+    ));
+
+    pool.get()
+        .await?
+        .execute(
+            "DELETE FROM organization_balance WHERE organization_id = $1",
+            &[&org.org_id],
+        )
+        .await?;
+    let error = repository
+        .record_usage(usage(&org, &model, Uuid::new_v4(), 3))
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error.downcast_ref::<services::common::RepositoryError>(),
+        Some(services::common::RepositoryError::ValidationFailed(message))
+            if message == "organization accounting balance is missing"
+    ));
+    let count: i64 = pool
+        .get()
+        .await?
+        .query_one(
+            "SELECT COUNT(*) FROM organization_usage_log WHERE organization_id = $1",
+            &[&org.org_id],
+        )
+        .await?
+        .get(0);
+    assert_eq!(count, 0);
+    cleanup_usage_fixtures(&pool, &[org.org_id], &[model.id]).await?;
+    Ok(())
+}
+
+// Simulate rollout-era rows: total consumption exists, but funding does not.
+async fn seed_legacy_consumption(
+    pool: &database::DbPool,
+    org: &OrgFixture,
+    model: &ModelFixture,
+    amount: i64,
+) -> anyhow::Result<Uuid> {
+    let row = OrganizationUsageRepository::new(pool.clone())
+        .record_usage(usage(org, model, Uuid::new_v4(), amount))
+        .await?;
+    let client = pool.get().await?;
+    client
+        .execute(
+            "DELETE FROM usage_credit_allocations WHERE organization_id=$1",
+            &[&org.org_id],
+        )
+        .await?;
+    client
+        .execute(
+            "DELETE FROM organization_credit_consumption WHERE organization_id=$1",
+            &[&org.org_id],
+        )
+        .await?;
+    client
+        .execute(
+            concat!(
+                "UPDATE organization_usage_log SET funded_amount=NULL, unfunded_amount=NULL, ",
+                "allocation_policy_version=NULL WHERE id=$1",
+            ),
+            &[&row.id],
+        )
+        .await?;
+    client
+        .execute(
+            "UPDATE organization_balance SET legacy_unattributed_amount=$2 WHERE organization_id=$1",
+            &[&org.org_id, &amount],
+        )
+        .await?;
+    Ok(row.id)
+}
+
+#[tokio::test]
+async fn reconciliation_preview_commit_replay_and_future_usage() -> anyhow::Result<()> {
+    use database::repositories::credit_reconciliation::{
+        CreditReconciliationRepository, ReconciliationError,
+    };
+
+    let pool = test_pool().await?;
+    let org = insert_org_fixture(&pool).await?;
+    let model = insert_model(&pool, "legacy-reconciliation").await?;
+    let limits = OrganizationLimitsRepository::new(pool.clone());
+    set_limit(&limits, org.org_id, "payment", 100).await?;
+    set_limit(&limits, org.org_id, "postpay", 200).await?;
+    let legacy_id = seed_legacy_consumption(&pool, &org, &model, 80).await?;
+
+    let repository = CreditReconciliationRepository::new(pool.clone());
+    let actor = Uuid::new_v4();
+    let amounts = [("payment".to_string(), 80)].into_iter().collect();
+
+    let mixed = [("payment".to_string(), 30), ("postpay".to_string(), 20)]
+        .into_iter()
+        .collect();
+
+    let partial = repository
+        .reconcile(
+            org.org_id,
+            &mixed,
+            "mixed-preview",
+            "Reviewed partial split",
+            actor,
+            true,
+        )
+        .await?;
+    assert_eq!(partial.after.legacy_unattributed_amount, 30);
+    assert_eq!(partial.after.aggregate_available, 220);
+    assert_eq!(partial.after.credits["payment"].consumed, 30);
+    assert_eq!(partial.after.credits["postpay"].consumed, 20);
+
+    let preview = repository
+        .reconcile(
+            org.org_id,
+            &amounts,
+            "opening",
+            "Verified prepaid usage",
+            actor,
+            true,
+        )
+        .await?;
+    assert_eq!(preview.before.aggregate_available, 220);
+    assert_eq!(preview.after.aggregate_available, 220);
+    assert_eq!(preview.after.credits["payment"].available, 20);
+    assert_eq!(preview.after.credits["postpay"].available, 200);
+    assert!(preview.reconciliation_id.is_none());
+    let client = pool.get().await?;
+    assert_eq!(
+        client
+            .query_one(
+                "SELECT COUNT(*) FROM organization_credit_reconciliations WHERE organization_id=$1",
+                &[&org.org_id]
+            )
+            .await?
+            .get::<_, i64>(0),
+        0
+    );
+    assert_eq!(limits.get_current_credit_status(org.org_id).await?.2, 80);
+
+    drop(client);
+
+    let committed = repository
+        .reconcile(
+            org.org_id,
+            &amounts,
+            "opening",
+            "Verified prepaid usage",
+            actor,
+            false,
+        )
+        .await?;
+    assert_eq!(committed.after, preview.after);
+
+    let request = usage(&org, &model, Uuid::new_v4(), 30);
+    let usages = OrganizationUsageRepository::new(pool.clone());
+    let new_usage = usages.record_usage(request.clone()).await?;
+    let split = new_usage.credit_allocations.unwrap();
+    assert_eq!(
+        split
+            .iter()
+            .map(|a| (a.credit_type.as_str(), a.amount))
+            .collect::<Vec<_>>(),
+        vec![("payment", 20), ("postpay", 10)]
+    );
+    assert_eq!(usages.record_usage(request).await?.total_cost, 30);
+
+    // Replay returns the original snapshots, even after new consumption.
+    assert_eq!(
+        repository
+            .reconcile(
+                org.org_id,
+                &amounts,
+                "opening",
+                "Verified prepaid usage",
+                actor,
+                false
+            )
+            .await?,
+        committed
+    );
+
+    for (key, reason, values) in [
+        ("opening", "Different reason", amounts.clone()),
+        ("second", "No unknown remains", amounts.clone()),
+    ] {
+        let error = repository
+            .reconcile(org.org_id, &values, key, reason, actor, false)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<ReconciliationError>(),
+            Some(ReconciliationError::Conflict(_))
+        ));
+    }
+    let client = pool.get().await?;
+
+    let old = client
+        .query_one(
+            "SELECT funded_amount, unfunded_amount FROM organization_usage_log WHERE id=$1",
+            &[&legacy_id],
+        )
+        .await?;
+    assert!(old.get::<_, Option<i64>>(0).is_none());
+    assert!(old.get::<_, Option<i64>>(1).is_none());
+
+    let saved = client
+        .query_one(
+            concat!(
+                "SELECT created_by, amounts, result FROM organization_credit_reconciliations WHERE ",
+                "organization_id=$1",
+            ),
+            &[&org.org_id],
+        )
+        .await?;
+    assert_eq!(saved.get::<_, Uuid>(0), actor);
+
+    let (statuses, _, unknown) = limits.get_current_credit_status(org.org_id).await?;
+    assert_eq!(unknown, 0);
+    assert_eq!(
+        statuses
+            .iter()
+            .find(|s| s.limit.credit_type == "payment")
+            .unwrap()
+            .consumed,
+        100
+    );
+    assert_eq!(
+        statuses
+            .iter()
+            .find(|s| s.limit.credit_type == "postpay")
+            .unwrap()
+            .consumed,
+        10
+    );
+
+    drop(client);
+
+    cleanup_usage_fixtures(&pool, &[org.org_id], &[model.id]).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn reconciliation_rejects_invalid_positions_and_coordinates_discount_corrections(
+) -> anyhow::Result<()> {
+    use database::repositories::credit_reconciliation::{
+        CreditReconciliationRepository, ReconciliationError,
+    };
+    use database::repositories::organization_usage_discount::{
+        DiscountError, OrganizationUsageDiscountRepository,
+    };
+
+    let pool = test_pool().await?;
+    let org = insert_org_fixture(&pool).await?;
+    let model = insert_model(&pool, "legacy-validation").await?;
+    let limits = OrganizationLimitsRepository::new(pool.clone());
+    set_limit(&limits, org.org_id, "payment", 100).await?;
+    seed_legacy_consumption(&pool, &org, &model, 80).await?;
+
+    let repository = CreditReconciliationRepository::new(pool.clone());
+    let actor: Uuid = pool
+        .get()
+        .await?
+        .query_one(
+            "SELECT created_by_user_id FROM workspaces WHERE id=$1",
+            &[&org.workspace_a_id],
+        )
+        .await?
+        .get(0);
+    for (kind, amount, invalid) in [
+        ("other", 1, true),
+        ("payment", 0, true),
+        ("payment", -1, true),
+        ("payment", 81, false),
+        ("postpay", 1, false),
+    ] {
+        let error = repository
+            .reconcile(
+                org.org_id,
+                &[(kind.into(), amount)].into_iter().collect(),
+                "test",
+                "review",
+                actor,
+                false,
+            )
+            .await
+            .unwrap_err();
+        assert!(match error.downcast_ref::<ReconciliationError>() {
+            Some(ReconciliationError::Invalid(_)) => invalid,
+            Some(ReconciliationError::Conflict(_)) => !invalid,
+            _ => false,
+        });
+    }
+
+    set_limit(&limits, org.org_id, "payment", 50).await?;
+    let amounts = [("payment".to_string(), 80)].into_iter().collect();
+    assert!(repository
+        .reconcile(org.org_id, &amounts, "opening", "review", actor, false)
+        .await
+        .is_err());
+    set_limit(&limits, org.org_id, "payment", 100).await?;
+
+    let discounts = OrganizationUsageDiscountRepository::new(pool.clone());
+    let historical = discounts
+        .save(
+            org.org_id,
+            1000,
+            Some(chrono::Utc::now() - chrono::Duration::days(1)),
+            actor,
+        )
+        .await?;
+    assert_eq!(historical.status, "applying");
+    assert!(repository
+        .reconcile(org.org_id, &amounts, "opening", "review", actor, false)
+        .await
+        .is_err());
+
+    // Finish correction before establishing opening consumption.
+    while discounts.get(org.org_id).await?.unwrap().status == "applying" {
+        discounts.apply_batch(org.org_id).await?;
+    }
+
+    let adjusted = [("payment".to_string(), 72)].into_iter().collect();
+    repository
+        .reconcile(org.org_id, &adjusted, "opening", "review", actor, false)
+        .await?;
+
+    let second_org = insert_org_fixture(&pool).await?;
+    set_limit(&limits, second_org.org_id, "payment", 100).await?;
+    seed_legacy_consumption(&pool, &second_org, &model, 80).await?;
+    repository
+        .reconcile(
+            second_org.org_id,
+            &amounts,
+            "opening",
+            "review",
+            actor,
+            false,
+        )
+        .await?;
+
+    let error = discounts
+        .save(
+            second_org.org_id,
+            1000,
+            Some(chrono::Utc::now() - chrono::Duration::days(1)),
+            actor,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error.downcast_ref::<DiscountError>(),
+        Some(DiscountError::ReconciledHistory)
+    ));
+
+    // Future-only discounts remain supported.
+    discounts.save(second_org.org_id, 1000, None, actor).await?;
+
+    cleanup_usage_fixtures(&pool, &[org.org_id, second_org.org_id], &[model.id]).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn concurrent_reconciliations_and_new_usage_charge_once() -> anyhow::Result<()> {
+    use database::repositories::credit_reconciliation::CreditReconciliationRepository;
+
+    let pool = test_pool().await?;
+    let org = insert_org_fixture(&pool).await?;
+    let model = insert_model(&pool, "legacy-concurrent").await?;
+    let limits = OrganizationLimitsRepository::new(pool.clone());
+    set_limit(&limits, org.org_id, "payment", 100).await?;
+    set_limit(&limits, org.org_id, "postpay", 200).await?;
+    seed_legacy_consumption(&pool, &org, &model, 80).await?;
+
+    let repository = CreditReconciliationRepository::new(pool.clone());
+    let amounts = [("payment".to_string(), 80)].into_iter().collect();
+    let actor = Uuid::new_v4();
+    let usages = OrganizationUsageRepository::new(pool.clone());
+
+    let (a, b, c) = tokio::join!(
+        repository.reconcile(org.org_id, &amounts, "opening", "review", actor, false),
+        repository.reconcile(org.org_id, &amounts, "opening", "review", actor, false),
+        usages.record_usage(usage(&org, &model, Uuid::new_v4(), 10)),
+    );
+    assert_eq!(a?, b?);
+    assert_eq!(c?.total_cost, 10);
+
+    let (statuses, debt, unknown) = limits.get_current_credit_status(org.org_id).await?;
+    assert_eq!((debt, unknown), (0, 0));
+    assert_eq!(
+        statuses
+            .iter()
+            .find(|s| s.limit.credit_type == "payment")
+            .unwrap()
+            .consumed,
+        90
+    );
+    let client = pool.get().await?;
+    assert_eq!(
+        client
+            .query_one(
+                "SELECT COUNT(*) FROM organization_credit_reconciliations WHERE organization_id=$1",
+                &[&org.org_id]
+            )
+            .await?
+            .get::<_, i64>(0),
+        1
+    );
+
+    drop(client);
+
+    cleanup_usage_fixtures(&pool, &[org.org_id], &[model.id]).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn reconciliation_snapshot_retains_expired_credit_consumption() -> anyhow::Result<()> {
+    use database::repositories::credit_reconciliation::CreditReconciliationRepository;
+
+    let pool = test_pool().await?;
+    let org = insert_org_fixture(&pool).await?;
+    let model = insert_model(&pool, "reconciliation-retired").await?;
+    let limits = OrganizationLimitsRepository::new(pool.clone());
+    set_limit(&limits, org.org_id, "payment", 100).await?;
+    set_limit(&limits, org.org_id, "postpay", 200).await?;
+    seed_legacy_consumption(&pool, &org, &model, 80).await?;
+    set_limit(&limits, org.org_id, "grant", 5).await?;
+    OrganizationUsageRepository::new(pool.clone())
+        .record_usage(usage(&org, &model, Uuid::new_v4(), 5))
+        .await?;
+    let client = pool.get().await?;
+    client
+        .execute(
+            concat!(
+                "UPDATE organization_limits_history SET effective_until=clock_timestamp() WHERE ",
+                "organization_id=$1 AND credit_type='grant' AND effective_until IS NULL",
+            ),
+            &[&org.org_id],
+        )
+        .await?;
+
+    let repository = CreditReconciliationRepository::new(pool.clone());
+    let amounts = [("payment".to_string(), 80)].into_iter().collect();
+
+    let result = repository
+        .reconcile(
+            org.org_id,
+            &amounts,
+            " opening ",
+            "review",
+            Uuid::new_v4(),
+            false,
+        )
+        .await?;
+    assert_eq!(result.schema_version, 1);
+    assert!(!result.before.credits["grant"].active);
+    assert_eq!(result.before.credits["grant"].consumed, 5);
+    assert_eq!(result.before.credits["grant"].available, 0);
+    assert_eq!(
+        result.after.credits["grant"],
+        result.before.credits["grant"]
+    );
+    assert_eq!(
+        repository
+            .reconcile(
+                org.org_id,
+                &amounts,
+                "opening",
+                "review",
+                Uuid::new_v4(),
+                false
+            )
+            .await?,
+        result
+    );
+    assert_eq!(client
+        .query_one("SELECT idempotency_key FROM organization_credit_reconciliations WHERE organization_id=$1", &[&org.org_id])
+        .await?.get::<_,String>(0), "opening");
+
+    // Currency diagnostics identify the offending position, even if not selected.
+    client
+        .execute(
+            concat!(
+                "UPDATE organization_limits_history SET currency='USDT' WHERE organization_id=$1 AND ",
+                "credit_type='postpay' AND effective_until IS NULL",
+            ),
+            &[&org.org_id],
+        )
+        .await?;
+
+    let error = repository
+        .reconcile(org.org_id, &amounts, "next", "review", Uuid::new_v4(), true)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("postpay is USDT"));
+
+    drop(client);
+
+    cleanup_usage_fixtures(&pool, &[org.org_id], &[model.id]).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn reconciliation_lock_timeout_is_a_retryable_conflict() -> anyhow::Result<()> {
+    use database::repositories::credit_reconciliation::{
+        CreditReconciliationRepository, ReconciliationError,
+    };
+
+    let pool = test_pool().await?;
+    let org = insert_org_fixture(&pool).await?;
+    let mut client = pool.get().await?;
+    let tx = client.transaction().await?;
+    tx.query_one(
+        "SELECT id FROM organizations WHERE id=$1 FOR UPDATE",
+        &[&org.org_id],
+    )
+    .await?;
+
+    let repository = CreditReconciliationRepository::new(pool.clone());
+
+    let error = repository
+        .reconcile(
+            org.org_id,
+            &[("payment".into(), 1)].into_iter().collect(),
+            "busy",
+            "review",
+            Uuid::new_v4(),
+            false,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error.downcast_ref::<ReconciliationError>(),
+        Some(ReconciliationError::Conflict(_))
+    ));
+    assert!(error.to_string().contains("busy"));
+
+    tx.rollback().await?;
+
+    drop(client);
+
+    cleanup_usage_fixtures(&pool, &[org.org_id], &[]).await?;
     Ok(())
 }

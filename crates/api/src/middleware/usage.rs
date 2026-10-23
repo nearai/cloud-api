@@ -276,7 +276,7 @@ pub async fn anthropic_usage_check_middleware(
 mod tests {
     use super::*;
     use services::usage::{
-        CostBreakdown, InferenceCost, InferenceUsageHistoryQuery, InferenceUsageReportQuery,
+        InferenceCost, InferenceUsageHistoryQuery, InferenceUsageReportQuery,
         InferenceUsageReportRow, OrganizationBalanceInfo, OrganizationCreditLimit,
         OrganizationLimit, RecordUsageApiRequest, RecordUsageServiceRequest, UsageByModelEntry,
         UsageError, UsageLogEntry,
@@ -325,16 +325,6 @@ mod tests {
 
     #[async_trait::async_trait]
     impl UsageServiceTrait for MockUsageService {
-        async fn calculate_cost(
-            &self,
-            _model_id: &str,
-            _input_tokens: i32,
-            _output_tokens: i32,
-            _cache_read_tokens: i32,
-        ) -> Result<CostBreakdown, UsageError> {
-            unimplemented!()
-        }
-
         async fn record_usage(
             &self,
             _request: RecordUsageServiceRequest,
@@ -426,6 +416,7 @@ mod tests {
             &self,
             _organization_id: Uuid,
             _start_date: chrono::DateTime<chrono::Utc>,
+            _end_date: Option<chrono::DateTime<chrono::Utc>>,
         ) -> Result<Vec<UsageByModelEntry>, UsageError> {
             unimplemented!()
         }

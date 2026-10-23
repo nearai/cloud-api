@@ -22,7 +22,7 @@ fn minimal_model_upsert(extra_aliases: &[&str]) -> serde_json::Value {
     v
 }
 
-async fn create_model(
+pub(crate) async fn create_model(
     server: &axum_test::TestServer,
     name: &str,
     aliases: &[&str],
@@ -48,7 +48,7 @@ async fn deprecate(
         .await
 }
 
-async fn seed_recent_usage(
+pub(crate) async fn seed_recent_usage(
     database: &database::Database,
     organization_id: uuid::Uuid,
     workspace_id: uuid::Uuid,

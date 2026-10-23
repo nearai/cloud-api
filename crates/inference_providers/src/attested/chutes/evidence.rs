@@ -82,6 +82,28 @@ pub struct GpuEvidence {
     pub arch: String,
 }
 
+/// `GET /chutes/{chute_id}/evidence?nonce=...` read **without** an API key.
+/// Each entry also carries `attested_body` (JSON with our nonce, the quote and
+/// the GPU evidence) and its `signature` by the instance certificate's key;
+/// see `report_data::PublicEvidenceVerifier`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PublicEvidenceResponse {
+    #[serde(default, deserialize_with = "null_default")]
+    pub evidence: Vec<PublicInstanceEvidence>,
+    #[serde(default, deserialize_with = "null_default")]
+    pub failed_instance_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PublicInstanceEvidence {
+    #[serde(flatten)]
+    pub evidence: InstanceEvidence,
+    #[serde(default)]
+    pub signature: Option<String>,
+    #[serde(default)]
+    pub attested_body: Option<String>,
+}
+
 impl EvidenceResponse {
     /// Find the evidence for a specific instance id.
     pub fn instance(&self, instance_id: &str) -> Option<&InstanceEvidence> {
@@ -92,6 +114,21 @@ impl EvidenceResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn public_evidence_keeps_signature_and_attested_body() {
+        let r: PublicEvidenceResponse = serde_json::from_str(
+            r#"{"evidence":[{"tee_type":"tdx","quote":"q","gpu_evidence":null,
+                "instance_id":"i1","certificate":"c","signature":"s","attested_body":"b"}],
+               "failed_instance_ids":["i2"],"excluded_instance_ids":[]}"#,
+        )
+        .unwrap();
+        assert_eq!(r.evidence[0].evidence.instance_id, "i1");
+        assert_eq!(r.evidence[0].evidence.quote, "q");
+        assert_eq!(r.evidence[0].signature.as_deref(), Some("s"));
+        assert_eq!(r.evidence[0].attested_body.as_deref(), Some("b"));
+        assert_eq!(r.failed_instance_ids, vec!["i2".to_string()]);
+    }
 
     const SAMPLE: &str = r#"{
         "evidence": [

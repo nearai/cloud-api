@@ -1,7 +1,7 @@
 //! TypeSafe-compatible typed decisions, with the same billing and trust policy
 //! for external and self-hosted providers.
 use crate::{
-    middleware::{auth::AuthenticatedApiKey, RequestBodyHash},
+    middleware::{auth::AuthenticatedApiKey, RequestBodyHash, RequestedModel},
     models::ErrorResponse,
     routes::{api::AppState, common, completions, extractors::OpenAiJson},
 };
@@ -12,17 +12,20 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use inference_providers::{CompletionError, SystemOneRequest, SystemOneResponse};
+use inference_providers::{
+    CompletionError, ProviderSource, ProviderTier, ServingProvider, SystemOneRequest,
+    SystemOneResponse,
+};
 use services::{
     attestation::SignatureKind,
     completions::hash_inference_id_to_uuid,
-    models::ModelsError,
-    usage::{InferenceType, RecordUsageServiceRequest, ServedProviderTier, StopReason},
+    models::{ModelCaller, ModelsError},
+    usage::{InferenceType, ProviderAttribution, RecordUsageServiceRequest, StopReason},
 };
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-pub const HEADER_SIGNATURE_ID: &str = "x-signature-id";
+pub const HEADER_GENERATION_ID: &str = "x-generation-id";
 
 #[utoipa::path(
     post,
@@ -30,7 +33,7 @@ pub const HEADER_SIGNATURE_ID: &str = "x-signature-id";
     tag = "Decisions",
     request_body = SystemOneRequest,
     responses(
-        (status = 200, description = "Typed decisions. X-Signature-Id identifies the receipt at /v1/signature/{id}; Inference-Id identifies billing usage.", body = SystemOneResponse),
+        (status = 200, description = "Typed decisions. X-Generation-Id identifies the receipt at /v1/signature/{id}; Inference-Id identifies billing usage.", body = SystemOneResponse),
         (status = 400, description = "Invalid request or model modality", body = ErrorResponse),
         (status = 401, description = "Authentication required", body = ErrorResponse),
         (status = 429, description = "Rate or concurrency limit", body = ErrorResponse),
@@ -43,8 +46,10 @@ pub async fn systemone(
     Extension(api_key): Extension<AuthenticatedApiKey>,
     Extension(body_hash): Extension<RequestBodyHash>,
     headers: HeaderMap,
+    requested_model: RequestedModel,
     OpenAiJson(mut request): OpenAiJson<SystemOneRequest>,
 ) -> Response {
+    requested_model.set(&request.model);
     if let Err(message) = request.validate() {
         return error(StatusCode::BAD_REQUEST, message);
     }
@@ -67,7 +72,10 @@ pub async fn systemone(
     }
     let model = match state
         .models_service
-        .resolve_and_get_model(&request.model)
+        .resolve_and_get_model(
+            &request.model,
+            ModelCaller::Organization(api_key.organization.id.0),
+        )
         .await
     {
         Ok(model) => model,
@@ -134,31 +142,25 @@ pub async fn systemone(
     // client disconnects while waiting for persistence.
     let finalize = tokio::spawn(async move {
         let _slot = slot;
-        let id = &served.signature_id;
-        let inference_id = hash_inference_id_to_uuid(id);
+        let decision_id = &served.decision_id;
+        let inference_id = hash_inference_id_to_uuid(decision_id);
         let usage = &served.response.response.usage;
         let usage_request = RecordUsageServiceRequest {
-            organization_id: api_key.organization.id.0,
-            workspace_id: api_key.workspace.id.0,
-            api_key_id,
-            model_id: model.id,
             input_tokens: usage.input_tokens,
             output_tokens: usage.output_tokens,
-            cache_read_tokens: 0,
-            cache_write: None,
-            profiled_cache_write_tokens: 0,
-            requested_service_tier: None,
-            provider_service_tier: None,
-            inference_type: InferenceType::Decisions,
-            ttft_ms: None,
-            avg_itl_ms: None,
             inference_id: Some(inference_id),
-            provider_request_id: Some(id.clone()),
+            provider_request_id: Some(decision_id.clone()),
             stop_reason: Some(StopReason::Completed),
-            response_id: None,
-            image_count: None,
             provider_attribution: served.provider_attribution,
-            discount: None,
+            ..RecordUsageServiceRequest::base(
+                services::usage::BillingIdentity {
+                    organization_id: api_key.organization.id.0,
+                    workspace_id: api_key.workspace.id.0,
+                    api_key_id,
+                    model_id: model.id,
+                },
+                InferenceType::Decisions,
+            )
         };
         let signature = async {
             let result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -166,14 +168,14 @@ pub async fn systemone(
                     SignatureKind::ProviderTee => {
                         state
                             .attestation_service
-                            .store_stream_chat_signature_from_provider(id)
+                            .store_stream_chat_signature_from_provider(decision_id)
                             .await
                     }
                     SignatureKind::Gateway => {
                         state
                             .attestation_service
                             .store_chat_signature_and_unpin(
-                                id,
+                                decision_id,
                                 body_hash.hash,
                                 hex::encode(Sha256::digest(&served.response.raw_bytes)),
                             )
@@ -187,10 +189,10 @@ pub async fn systemone(
             // cancels that write or the gateway helper's own cleanup.
             state
                 .attestation_service
-                .release_chat_signature_pin(id)
+                .release_chat_signature_pin(decision_id)
                 .await;
             if !matches!(result, Ok(Ok(()))) {
-                tracing::error!(signature_id = %id, "System One signature finalization failed or timed out");
+                tracing::error!(decision_id = %decision_id, "System One signature finalization failed or timed out");
             }
         };
         tokio::join!(
@@ -201,23 +203,15 @@ pub async fn systemone(
                 "System One"
             ),
         );
-        let tier = completions::provider_tier_to_str(
-            match served.provider_attribution.served_provider_tier {
-                Some(ServedProviderTier::Near) => inference_providers::ProviderTier::Near,
-                Some(ServedProviderTier::Attested3p) => {
-                    inference_providers::ProviderTier::Attested3p
-                }
-                _ => inference_providers::ProviderTier::NonAttested,
-            },
-        );
+        let tier = serving_from_attribution(&served.provider_attribution).label();
         let mut response = Response::builder()
             .header(header::CONTENT_TYPE, "application/json")
-            .header(HEADER_SIGNATURE_ID, id)
+            .header(HEADER_GENERATION_ID, decision_id)
             .header(completions::HEADER_INFERENCE_ID, inference_id.to_string())
             .header("x-serving-provider", tier)
             .header(
                 header::ACCESS_CONTROL_EXPOSE_HEADERS,
-                "X-Signature-Id, Inference-Id, X-Serving-Provider, X-Model-Alias-Resolved",
+                "X-Generation-Id, Inference-Id, X-Serving-Provider, X-Model-Alias-Resolved",
             );
         if let Some(alias) = alias {
             response = response.header(common::HEADER_MODEL_ALIAS_RESOLVED, alias);
@@ -281,9 +275,68 @@ fn provider_error(err: CompletionError) -> Response {
     error(status, "System One provider could not complete the request")
 }
 
+/// Rebuild the serving provider from the recorded usage attribution so the
+/// `x-serving-provider` label matches the chat-completions routes.
+fn serving_from_attribution(a: &ProviderAttribution) -> ServingProvider {
+    let tier = a
+        .served_provider_tier
+        .map_or(ProviderTier::NonAttested, ProviderTier::from);
+    let source = a
+        .served_provider_type
+        .map_or(ProviderSource::External, ProviderSource::from);
+    ServingProvider { tier, source }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use services::usage::{ServedProviderTier, ServedProviderType};
     use utoipa::OpenApi;
+
+    fn attribution(
+        tier: Option<ServedProviderTier>,
+        ty: Option<ServedProviderType>,
+    ) -> ProviderAttribution {
+        ProviderAttribution {
+            served_provider_tier: tier,
+            served_provider_type: ty,
+            served_via_fallback: false,
+        }
+    }
+
+    #[test]
+    fn serving_label_from_attribution() {
+        let label = |t, y| serving_from_attribution(&attribution(t, y)).label();
+        assert_eq!(
+            label(
+                Some(ServedProviderTier::Near),
+                Some(ServedProviderType::Vllm)
+            ),
+            "near"
+        );
+        assert_eq!(
+            label(
+                Some(ServedProviderTier::Attested3p),
+                Some(ServedProviderType::Chutes)
+            ),
+            "chutes"
+        );
+        assert_eq!(
+            label(
+                Some(ServedProviderTier::Attested3p),
+                Some(ServedProviderType::Tinfoil)
+            ),
+            "tinfoil"
+        );
+        assert_eq!(
+            label(
+                Some(ServedProviderTier::NonAttested),
+                Some(ServedProviderType::External)
+            ),
+            "non-attested"
+        );
+        assert_eq!(label(None, None), "non-attested");
+    }
 
     #[tokio::test]
     async fn systemone_upstream_rate_limit_is_distinct_from_gateway_limit() {
@@ -302,7 +355,7 @@ mod tests {
     }
 
     #[test]
-    fn systemone_openapi_keeps_usage_schemas_distinct() {
+    fn systemone_openapi_matches_request_and_usage_contracts() {
         let spec = serde_json::to_value(crate::openapi::ApiDoc::openapi()).unwrap();
         assert_eq!(
             spec["paths"]["/v1/systemone"]["post"]["requestBody"]["content"]["application/json"]
@@ -310,6 +363,12 @@ mod tests {
             "#/components/schemas/SystemOneRequest",
         );
         let schemas = &spec["components"]["schemas"];
+        for question in schemas["SystemOneQuestion"]["oneOf"].as_array().unwrap() {
+            assert!(question["required"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("instructions")));
+        }
         assert!(schemas["Usage"]["properties"].get("total_tokens").is_some());
         assert!(schemas["SystemOneUsage"]["properties"]
             .get("total_tokens")
@@ -318,5 +377,61 @@ mod tests {
             schemas["SystemOneResponse"]["properties"]["usage"]["$ref"],
             "#/components/schemas/SystemOneUsage",
         );
+    }
+
+    #[tokio::test]
+    async fn systemone_requires_instructions_at_the_json_boundary() {
+        use axum::extract::FromRequest;
+        use serde_json::{json, Value};
+
+        for question in [
+            json!({"type":"noul"}),
+            json!({"type":"choice","criteria":{"billing":null,"other":null}}),
+            json!({"type":"score","criteria":["low","high"]}),
+        ] {
+            for (case, instructions) in [("missing", None), ("null", Some(Value::Null))] {
+                let mut question = question.clone();
+                let missing = instructions.is_none();
+                if let Some(value) = instructions {
+                    question["instructions"] = value;
+                }
+                let request = axum::http::Request::builder()
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({"model":"jev","state":"Refund please","questions":{"q":question}})
+                            .to_string(),
+                    ))
+                    .unwrap();
+                let rejection = match OpenAiJson::<SystemOneRequest>::from_request(request, &())
+                    .await
+                {
+                    Ok(_) => panic!("{case} instructions must be rejected; question: {question}"),
+                    Err(rejection) => rejection,
+                };
+                let response = rejection.into_response();
+                let status = response.status();
+                let bytes = axum::body::to_bytes(response.into_body(), 4096)
+                    .await
+                    .unwrap();
+                let error: Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(
+                    status,
+                    StatusCode::BAD_REQUEST,
+                    "{case} instructions; question: {question}; error: {error}"
+                );
+                assert_eq!(
+                    error["error"]["type"], "invalid_request_error",
+                    "{case} instructions; question: {question}; error: {error}"
+                );
+                if missing {
+                    assert!(
+                        error["error"]["message"]
+                            .as_str()
+                            .is_some_and(|message| message.contains("missing field `instructions`")),
+                        "{case} instructions; question: {question}; error: {error}"
+                    );
+                }
+            }
+        }
     }
 }

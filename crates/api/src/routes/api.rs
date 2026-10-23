@@ -29,6 +29,7 @@ pub struct AppState {
     pub reporting_token_service:
         Arc<dyn services::reporting_tokens::OrganizationReportingTokenService>,
     pub user_service: Arc<dyn services::user::UserServiceTrait + Send + Sync>,
+    pub contact_email_service: Arc<services::contact_email::ContactEmailService>,
     pub files_service: Arc<dyn FileServiceTrait + Send + Sync>,
     pub inference_provider_pool: Arc<services::inference_provider_pool::InferenceProviderPool>,
     pub metrics_service: Arc<dyn services::metrics::MetricsServiceTrait>,
@@ -50,8 +51,9 @@ use crate::routes::{
     organizations::*,
     users::{
         accept_invitation, create_access_token, decline_invitation, get_current_user,
-        get_user_refresh_tokens, get_user_status, list_user_invitations, revoke_all_user_tokens,
-        revoke_user_refresh_token, update_current_user_profile,
+        get_user_refresh_tokens, get_user_status, list_user_invitations, remove_contact_email,
+        request_contact_email, revoke_all_user_tokens, revoke_user_refresh_token,
+        update_current_user_profile, verify_contact_email,
     },
 };
 
@@ -95,6 +97,10 @@ pub fn build_management_router(app_state: AppState, auth_state: AuthState) -> Ro
         .route(
             "/{id}/members/{user_id}",
             put(update_organization_member).delete(remove_organization_member),
+        )
+        .route(
+            "/{id}/staking/farm/bind",
+            post(crate::routes::staking_farm::bind_organization_staking_farm),
         )
         // // MCP Connector management
         // .route(
@@ -171,6 +177,10 @@ pub fn build_management_router(app_state: AppState, auth_state: AuthState) -> Ro
         .route("/me", get(get_current_user))
         .route("/me/status", get(get_user_status))
         .route("/me/profile", put(update_current_user_profile))
+        .route(
+            "/me/contact-email",
+            axum::routing::post(request_contact_email).delete(remove_contact_email),
+        )
         .route("/me/invitations", get(list_user_invitations))
         .route(
             "/me/invitations/{invitation_id}/accept",
@@ -199,6 +209,15 @@ pub fn build_management_router(app_state: AppState, auth_state: AuthState) -> Ro
             crate::middleware::auth::refresh_middleware,
         ));
 
+    // Contact email confirmation is public: the emailed token is the credential,
+    // and the link may be opened in a browser with no session.
+    let contact_email_verify_routes = Router::new()
+        .route(
+            "/users/contact-email/verify",
+            axum::routing::post(verify_contact_email),
+        )
+        .with_state(app_state.clone());
+
     // Combine all routes with appropriate auth middleware
     Router::new()
         .route(
@@ -210,4 +229,5 @@ pub fn build_management_router(app_state: AppState, auth_state: AuthState) -> Ro
         .with_state(app_state)
         .layer(from_fn_with_state(auth_state, auth_middleware))
         .merge(refresh_token_routes)
+        .merge(contact_email_verify_routes)
 }

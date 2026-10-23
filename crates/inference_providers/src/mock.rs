@@ -296,7 +296,12 @@ impl ResponseTemplate {
         self
     }
 
-    fn token_usage(&self, input_tokens: i32, output_tokens: i32) -> TokenUsage {
+    fn token_usage(
+        &self,
+        input_tokens: i32,
+        output_tokens: i32,
+        reasoning_tokens: i32,
+    ) -> TokenUsage {
         let mut usage = TokenUsage::new(input_tokens, output_tokens);
         let mut details = serde_json::Map::new();
         if let Some(tokens) = self.cache_tokens {
@@ -307,6 +312,11 @@ impl ResponseTemplate {
         }
         if !details.is_empty() {
             usage.prompt_tokens_details = Some(details.into());
+        }
+        // A reasoning model served by SGLang reports its reasoning count as a
+        // top-level `usage.reasoning_tokens`, not in `completion_tokens_details`.
+        if self.reasoning_content.is_some() {
+            usage.reasoning_tokens = Some(reasoning_tokens);
         }
         usage
     }
@@ -353,8 +363,14 @@ impl ResponseTemplate {
         requested_service_tier: Option<String>,
     ) -> ChatCompletionResponse {
         let model = self.model_override.clone().unwrap_or(model);
-        // Calculate output tokens as word count of content
-        let output_tokens = self.content.split_whitespace().count() as i32;
+        // Reasoning is part of the completion. Count it like the streamed
+        // chunks do: one token per `' '`-separated segment (see
+        // `generate_chunks`), so both modes report the same reasoning count.
+        let reasoning_tokens = self
+            .reasoning_content
+            .as_deref()
+            .map_or(0, |reasoning| reasoning.split(' ').count() as i32);
+        let output_tokens = self.content.split_whitespace().count() as i32 + reasoning_tokens;
 
         // Convert tool calls if present
         let tool_calls = self.tool_calls.as_ref().map(|calls| {
@@ -412,7 +428,7 @@ impl ResponseTemplate {
                 .clone()
                 .or(requested_service_tier),
             system_fingerprint: None,
-            usage: self.token_usage(input_tokens, output_tokens),
+            usage: self.token_usage(input_tokens, output_tokens, reasoning_tokens),
             prompt_logprobs: None,
             prompt_token_ids: None,
             kv_transfer_params: None,
@@ -434,12 +450,14 @@ impl ResponseTemplate {
         let model = self.model_override.clone().unwrap_or(model);
         let mut chunks = Vec::new();
         let mut output_token_count = 0;
+        let mut reasoning_token_count = 0;
 
         // Stream reasoning content word by word if present
         if let Some(reasoning) = &self.reasoning_content {
             let words: Vec<&str> = reasoning.split(' ').collect();
             for (i, word) in words.iter().enumerate() {
                 output_token_count += 1;
+                reasoning_token_count += 1;
                 let word_with_space = if i == 0 {
                     word.to_string()
                 } else {
@@ -467,7 +485,11 @@ impl ResponseTemplate {
                         finish_reason: None,
                         token_ids: None,
                     }],
-                    usage: Some(self.token_usage(input_tokens, output_token_count)),
+                    usage: Some(self.token_usage(
+                        input_tokens,
+                        output_token_count,
+                        reasoning_token_count,
+                    )),
                     service_tier: self
                         .service_tier_override
                         .clone()
@@ -517,7 +539,11 @@ impl ResponseTemplate {
                         finish_reason,
                         token_ids: None,
                     }],
-                    usage: Some(self.token_usage(input_tokens, output_token_count)),
+                    usage: Some(self.token_usage(
+                        input_tokens,
+                        output_token_count,
+                        reasoning_token_count,
+                    )),
                     service_tier: self
                         .service_tier_override
                         .clone()
@@ -568,7 +594,11 @@ impl ResponseTemplate {
                         finish_reason: None,
                         token_ids: None,
                     }],
-                    usage: Some(self.token_usage(input_tokens, output_token_count)),
+                    usage: Some(self.token_usage(
+                        input_tokens,
+                        output_token_count,
+                        reasoning_token_count,
+                    )),
                     service_tier: self
                         .service_tier_override
                         .clone()
@@ -624,7 +654,11 @@ impl ResponseTemplate {
                             finish_reason,
                             token_ids: None,
                         }],
-                        usage: Some(self.token_usage(input_tokens, output_token_count)),
+                        usage: Some(self.token_usage(
+                            input_tokens,
+                            output_token_count,
+                            reasoning_token_count,
+                        )),
                         service_tier: self
                             .service_tier_override
                             .clone()
@@ -645,7 +679,7 @@ impl ResponseTemplate {
             model,
             system_fingerprint: None,
             choices: vec![],
-            usage: Some(self.token_usage(input_tokens, output_token_count)),
+            usage: Some(self.token_usage(input_tokens, output_token_count, reasoning_token_count)),
             service_tier: self
                 .service_tier_override
                 .clone()
@@ -677,6 +711,19 @@ struct MockConfig {
     embedding_error_override: Option<EmbeddingError>,
     /// When set, all audio transcription calls return this error instead of a response.
     audio_transcription_error_override: Option<AudioTranscriptionError>,
+    /// When set, privacy classify calls return this instead of running the
+    /// built-in shape-based detector.
+    privacy_classify_override: Option<PrivacyClassifyOverride>,
+}
+
+/// Scripted privacy-classify outcome for [`MockProvider::set_privacy_classify_override`].
+/// Lets tests drive unusual upstream usage shapes and upstream HTTP failures.
+#[derive(Clone, Debug)]
+pub enum PrivacyClassifyOverride {
+    /// Return this JSON body verbatim as the upstream response.
+    Body(serde_json::Value),
+    /// Fail as if the upstream returned this HTTP status.
+    HttpError { status_code: u16, message: String },
 }
 
 /// Builder for configuring a single expectation
@@ -727,7 +774,8 @@ pub struct MockProvider {
     /// `NonAttested`. Set via [`MockProvider::with_tier`] to exercise tiered
     /// provider selection (e.g. a `Near` primary with an `Attested3p` fallback).
     tier: crate::ProviderTier,
-    provider_source: crate::ProviderSource,
+    /// Explicit source; `None` derives it from the tier (Attested3p => Chutes).
+    provider_source: Option<crate::ProviderSource>,
     /// Value reported by [`InferenceProvider::supports_streaming`]; defaults to
     /// `true`. Set via [`MockProvider::with_streaming_support`] to exercise the
     /// streaming-capability filter (e.g. a Chutes-like fallback with streaming off).
@@ -747,9 +795,21 @@ pub struct MockProvider {
     /// order. Lets lifecycle tests assert the signature-fetch routing pin was
     /// released. `std::sync::Mutex` because the trait method is synchronous.
     unpinned_chat_ids: Arc<std::sync::Mutex<Vec<String>>>,
+    /// `signing_algo` of every [`InferenceProvider::get_attestation_report`]
+    /// call, in call order, so tests can assert what the gateway forwarded.
+    attestation_signing_algos: Arc<std::sync::Mutex<Vec<Option<String>>>>,
+    /// What [`InferenceProvider::poll_backend_count`] reports; defaults to
+    /// `Skipped`. Set via [`MockProvider::with_count_poll`].
+    count_poll: crate::CountPoll,
 }
 
 impl MockProvider {
+    /// Set what this mock's backend-count poll reports.
+    pub fn with_count_poll(mut self, poll: crate::CountPoll) -> Self {
+        self.count_poll = poll;
+        self
+    }
+
     pub fn with_systemone_handler(
         mut self,
         handler: impl Fn(
@@ -797,18 +857,21 @@ impl MockProvider {
                 stream_error_override: None,
                 embedding_error_override: None,
                 audio_transcription_error_override: None,
+                privacy_classify_override: None,
             })),
             last_chat_params: Arc::new(Mutex::new(None)),
             chat_request_priorities: Arc::new(Mutex::new(Vec::new())),
             chat_completion_call_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             fail_attestation: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tier: crate::ProviderTier::NonAttested,
-            provider_source: crate::ProviderSource::External,
+            provider_source: None,
             supports_streaming: true,
             supports_client_e2ee: true,
             supports_chat_signatures: true,
+            count_poll: crate::CountPoll::Skipped,
             per_request_public_key: None,
             unpinned_chat_ids: Arc::new(std::sync::Mutex::new(Vec::new())),
+            attestation_signing_algos: Arc::new(std::sync::Mutex::new(Vec::new())),
             responses_handler: None,
             systemone_handler: None,
         }
@@ -828,18 +891,21 @@ impl MockProvider {
                 stream_error_override: None,
                 embedding_error_override: None,
                 audio_transcription_error_override: None,
+                privacy_classify_override: None,
             })),
             last_chat_params: Arc::new(Mutex::new(None)),
             chat_request_priorities: Arc::new(Mutex::new(Vec::new())),
             chat_completion_call_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             fail_attestation: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tier: crate::ProviderTier::NonAttested,
-            provider_source: crate::ProviderSource::External,
+            provider_source: None,
             supports_streaming: true,
             supports_client_e2ee: true,
             supports_chat_signatures: true,
+            count_poll: crate::CountPoll::Skipped,
             per_request_public_key: None,
             unpinned_chat_ids: Arc::new(std::sync::Mutex::new(Vec::new())),
+            attestation_signing_algos: Arc::new(std::sync::Mutex::new(Vec::new())),
             responses_handler: None,
             systemone_handler: None,
         }
@@ -857,18 +923,21 @@ impl MockProvider {
                 stream_error_override: None,
                 embedding_error_override: None,
                 audio_transcription_error_override: None,
+                privacy_classify_override: None,
             })),
             last_chat_params: Arc::new(Mutex::new(None)),
             chat_request_priorities: Arc::new(Mutex::new(Vec::new())),
             chat_completion_call_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             fail_attestation: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tier: crate::ProviderTier::NonAttested,
-            provider_source: crate::ProviderSource::External,
+            provider_source: None,
             supports_streaming: true,
             supports_client_e2ee: true,
             supports_chat_signatures: true,
+            count_poll: crate::CountPoll::Skipped,
             per_request_public_key: None,
             unpinned_chat_ids: Arc::new(std::sync::Mutex::new(Vec::new())),
+            attestation_signing_algos: Arc::new(std::sync::Mutex::new(Vec::new())),
             responses_handler: None,
             systemone_handler: None,
         }
@@ -883,7 +952,7 @@ impl MockProvider {
     }
 
     pub fn with_provider_source(mut self, provider_source: crate::ProviderSource) -> Self {
-        self.provider_source = provider_source;
+        self.provider_source = Some(provider_source);
         self
     }
 
@@ -945,6 +1014,15 @@ impl MockProvider {
         self.unpinned_chat_ids
             .lock()
             .map(|ids| ids.clone())
+            .unwrap_or_default()
+    }
+
+    /// `signing_algo` of every attestation-report call, in call order.
+    /// Includes the calls pool registration makes to fetch signing keys.
+    pub fn attestation_signing_algos(&self) -> Vec<Option<String>> {
+        self.attestation_signing_algos
+            .lock()
+            .map(|algos| algos.clone())
             .unwrap_or_default()
     }
 
@@ -1010,6 +1088,13 @@ impl MockProvider {
     ) {
         let mut config = self.config.lock().await;
         config.audio_transcription_error_override = error;
+    }
+
+    /// Override privacy classify responses (body or HTTP error). Pass `None`
+    /// to restore the built-in detector.
+    pub async fn set_privacy_classify_override(&self, outcome: Option<PrivacyClassifyOverride>) {
+        let mut config = self.config.lock().await;
+        config.privacy_classify_override = outcome;
     }
 
     /// Generate a completion ID
@@ -1166,7 +1251,12 @@ impl crate::InferenceProvider for MockProvider {
     }
 
     fn provider_source(&self) -> crate::ProviderSource {
-        self.provider_source
+        self.provider_source.unwrap_or(match self.tier {
+            crate::ProviderTier::Attested3p => crate::ProviderSource::Chutes,
+            crate::ProviderTier::Near | crate::ProviderTier::NonAttested => {
+                crate::ProviderSource::External
+            }
+        })
     }
 
     fn supports_streaming(&self) -> bool {
@@ -1179,6 +1269,10 @@ impl crate::InferenceProvider for MockProvider {
 
     fn supports_chat_signatures(&self) -> bool {
         self.supports_chat_signatures
+    }
+
+    async fn poll_backend_count(&self, _client: &reqwest::Client) -> crate::CountPoll {
+        self.count_poll
     }
 
     fn supports_per_request_pubkey_routing(&self, public_key: &str) -> bool {
@@ -1414,7 +1508,7 @@ impl crate::InferenceProvider for MockProvider {
         Ok(ChatCompletionResponseWithBytes {
             response,
             raw_bytes,
-            serving_tier: self.tier(),
+            serving: crate::ServingProvider::of(self),
         })
     }
 
@@ -1629,6 +1723,21 @@ impl crate::InferenceProvider for MockProvider {
         body: bytes::Bytes,
         _extra: std::collections::HashMap<String, serde_json::Value>,
     ) -> Result<bytes::Bytes, PrivacyClassifyError> {
+        if let Some(outcome) = self.config.lock().await.privacy_classify_override.clone() {
+            return match outcome {
+                PrivacyClassifyOverride::Body(json) => serde_json::to_vec(&json)
+                    .map(bytes::Bytes::from)
+                    .map_err(|e| PrivacyClassifyError::RequestFailed(e.to_string())),
+                PrivacyClassifyOverride::HttpError {
+                    status_code,
+                    message,
+                } => Err(PrivacyClassifyError::HttpError {
+                    status_code,
+                    message,
+                }),
+            };
+        }
+
         // Echo the requested model so round-trip assertions in tests are meaningful.
         let parsed: serde_json::Value =
             serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
@@ -1722,12 +1831,22 @@ impl crate::InferenceProvider for MockProvider {
         _signing_address: Option<String>,
         _include_tls_fingerprint: bool,
     ) -> Result<serde_json::Map<String, serde_json::Value>, AttestationError> {
+        if let Ok(mut algos) = self.attestation_signing_algos.lock() {
+            algos.push(signing_algo.clone());
+        }
         if self
             .fail_attestation
             .load(std::sync::atomic::Ordering::Relaxed)
         {
             return Err(AttestationError::FetchError(
                 "Mock attestation failure (simulating blocked backend)".to_string(),
+            ));
+        }
+        // Same check as inference-proxy: only the exact lowercase names pass.
+        if !matches!(signing_algo.as_deref(), None | Some("ecdsa" | "ed25519")) {
+            return Err(AttestationError::FetchError(
+                "HTTP 400 Bad Request: Invalid signing algorithm. Must be 'ed25519' or 'ecdsa'"
+                    .to_string(),
             ));
         }
         let mut report = serde_json::Map::new();

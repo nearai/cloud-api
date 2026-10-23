@@ -222,24 +222,6 @@ impl std::fmt::Display for StopReason {
 
 #[async_trait::async_trait]
 pub trait UsageServiceTrait: Send + Sync {
-    /// Calculate cost for a given model and token usage.
-    ///
-    /// Uses the same semantics as `record_usage` and the internal `compute_token_cost` helper:
-    /// - Formula: `(input - cache_read) * input_rate + cache_read * cache_read_rate + output * output_rate`,
-    ///   where `cache_read` is the effective cached token count (see below).
-    /// - **Capping**: The provided `cached_tokens` (or `cache_read_tokens`) is treated as
-    ///   `min(cached_tokens, input_tokens).max(0)`; i.e. cached count is never negative and never exceeds input.
-    /// - **Cache pricing disabled**: When the model’s `cache_read_cost_per_token` is `None`, cache pricing is
-    ///   disabled and all input tokens (including cached) are billed at `input_cost_per_token` (cached tokens
-    ///   are not free). `Some(0)` means cached tokens are genuinely free; `Some(x)` bills them at `x`.
-    async fn calculate_cost(
-        &self,
-        model_id: &str,
-        input_tokens: i32,
-        output_tokens: i32,
-        cache_read_tokens: i32,
-    ) -> Result<CostBreakdown, UsageError>;
-
     /// Record usage after an API call completes
     async fn record_usage(
         &self,
@@ -268,7 +250,8 @@ pub trait UsageServiceTrait: Send + Sync {
     ) -> Result<Option<OrganizationBalanceInfo>, UsageError>;
 
     /// Get usage history for an organization
-    /// Returns a tuple of (entries, total_count)
+    /// Returns a tuple of (entries, total), where total is the organization's
+    /// recorded request count rather than a scan of its rows
     async fn get_usage_history(
         &self,
         organization_id: Uuid,
@@ -319,12 +302,14 @@ pub trait UsageServiceTrait: Send + Sync {
         inference_ids: Vec<Uuid>,
     ) -> Result<Vec<InferenceCost>, UsageError>;
 
-    /// Get per-model usage aggregation for an organization since `start_date`.
+    /// Get per-model usage aggregation for an organization from `start_date` up to
+    /// `end_date` (exclusive; open-ended when `None`).
     /// Returns one row per model: summed tokens, summed cost (nano-dollars), and request count.
     async fn get_usage_by_model(
         &self,
         organization_id: Uuid,
         start_date: DateTime<Utc>,
+        end_date: Option<DateTime<Utc>>,
     ) -> Result<Vec<UsageByModelEntry>, UsageError>;
 
     async fn list_inference_usage_report(
@@ -354,7 +339,8 @@ pub trait UsageRepository: Send + Sync {
     ) -> anyhow::Result<Option<OrganizationBalanceInfo>>;
 
     /// Get usage history for an organization
-    /// Returns a tuple of (entries, total_count)
+    /// Returns a tuple of (entries, total), where total is the organization's
+    /// recorded request count rather than a scan of its rows
     async fn get_usage_history(
         &self,
         organization_id: Uuid,
@@ -397,11 +383,13 @@ pub trait UsageRepository: Send + Sync {
         provider_request_id: &str,
     ) -> anyhow::Result<Option<StopReason>>;
 
-    /// Get per-model usage aggregation for an organization since `start_date`.
+    /// Get per-model usage aggregation for an organization from `start_date` up to
+    /// `end_date` (exclusive; open-ended when `None`).
     async fn get_usage_by_model(
         &self,
         organization_id: Uuid,
         start_date: DateTime<Utc>,
+        end_date: Option<DateTime<Utc>>,
     ) -> anyhow::Result<Vec<UsageByModelEntry>>;
 
     async fn list_inference_usage_report(
@@ -585,7 +573,7 @@ pub enum RecordUsageApiRequest {
 }
 
 /// Request to record usage (service layer)
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CacheWriteBilling {
     /// Cache-write tokens, included in `input_tokens`.
     pub tokens: i32,
@@ -593,7 +581,7 @@ pub struct CacheWriteBilling {
     pub cost_per_token: i64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct RecordUsageServiceRequest {
     pub organization_id: Uuid,
     pub workspace_id: Uuid,
@@ -634,6 +622,63 @@ pub struct RecordUsageServiceRequest {
     pub discount: Option<UsageDiscount>,
 }
 
+/// Who a usage row bills and for which catalog model. Named fields keep the
+/// four same-typed ids from being transposed at a call site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BillingIdentity {
+    pub organization_id: Uuid,
+    pub workspace_id: Uuid,
+    pub api_key_id: Uuid,
+    pub model_id: Uuid,
+}
+
+impl RecordUsageServiceRequest {
+    /// A request carrying only who is billed and the kind of inference, with
+    /// every measurement zero or absent. Callers fill in what they measured
+    /// with struct-update syntax:
+    ///
+    /// ```ignore
+    /// RecordUsageServiceRequest {
+    ///     input_tokens,
+    ///     stop_reason: Some(StopReason::Completed),
+    ///     ..RecordUsageServiceRequest::base(identity, InferenceType::Embedding)
+    /// }
+    /// ```
+    ///
+    /// A new billing field gets its neutral value here, once.
+    pub fn base(identity: BillingIdentity, inference_type: InferenceType) -> Self {
+        let BillingIdentity {
+            organization_id,
+            workspace_id,
+            api_key_id,
+            model_id,
+        } = identity;
+        Self {
+            organization_id,
+            workspace_id,
+            api_key_id,
+            model_id,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write: None,
+            profiled_cache_write_tokens: 0,
+            requested_service_tier: None,
+            provider_service_tier: None,
+            inference_type,
+            ttft_ms: None,
+            avg_itl_ms: None,
+            inference_id: None,
+            provider_request_id: None,
+            stop_reason: None,
+            response_id: None,
+            image_count: None,
+            provider_attribution: ProviderAttribution::default(),
+            discount: None,
+        }
+    }
+}
+
 /// Basis points in one whole (100%).
 const DISCOUNT_BASIS_POINTS_PER_UNIT: i128 = 10_000;
 
@@ -663,6 +708,16 @@ pub struct DiscountedCosts {
 }
 
 impl UsageDiscount {
+    /// Organization discounts accept whole basis points, including fully discounted usage.
+    pub fn from_basis_points(basis_points: u16) -> Result<Self, UsageError> {
+        if basis_points == 0 || basis_points > 10_000 {
+            return Err(UsageError::ValidationError(
+                "discount_basis_points must be between 1 and 10000".into(),
+            ));
+        }
+        Ok(Self { basis_points })
+    }
+
     /// Parse a fraction of the list price such as `0.2` (20% off).
     ///
     /// Returns `Ok(None)` for `0` (no discount). Rejects non-finite values,
@@ -853,8 +908,14 @@ pub struct OrganizationLimit {
 pub struct OrganizationCreditLimit {
     pub credit_type: String,
     pub source: Option<String>,
+    /// Gross allocated amount before transfers.
     pub amount: i64,
+    /// Nonnegative capacity transferred out to other organizations.
+    pub transferred_out: i64,
+    /// Net capacity for this source: `max(amount - transferred_out, 0)`.
+    pub effective_capacity: i64,
     pub consumed: i64,
+    /// Remaining spendable capacity: `max(effective_capacity - consumed, 0)`.
     pub available: i64,
     pub currency: String,
 }
@@ -904,6 +965,8 @@ pub enum UsageCheckResult {
 #[derive(Debug, Clone)]
 pub struct OrganizationBalanceInfo {
     pub organization_id: Uuid,
+    /// Historical consumption not yet assigned to a credit type, in nano-USD.
+    pub legacy_unattributed_amount: i64,
     pub total_spent: i64,
     pub last_usage_at: Option<DateTime<Utc>>,
     pub total_requests: i64,

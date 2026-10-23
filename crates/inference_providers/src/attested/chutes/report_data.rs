@@ -60,6 +60,13 @@ pub enum ReportDataError {
          instance's key (expected {expected}, got {got})"
     )]
     TlsBindingMismatch { expected: String, got: String },
+    /// The public evidence lacks `attested_body`/`signature`, or the signature
+    /// does not verify under the instance certificate's key.
+    #[error("signed evidence body: {0}")]
+    SignedBody(String),
+    /// The signed body does not carry our nonce or the presented quote.
+    #[error("signed evidence body does not match the request: {0}")]
+    SignedBodyMismatch(String),
 }
 
 /// `SHA256(nonce ‖ e2e_pubkey)` over the **verbatim string** forms — the value
@@ -97,15 +104,7 @@ impl ChutesReportDataVerifier {
         //    value (no `0x` prefix). It is hashed verbatim into the binding below,
         //    so accepting a prefixed form would let it validate yet bind
         //    differently from its bare form — reject the prefix outright.
-        let nonce_bytes = hex::decode(nonce).map_err(|e| {
-            ReportDataError::NonceFormat(format!("expected bare 32-byte hex (no 0x): {e}"))
-        })?;
-        if nonce_bytes.len() != 32 {
-            return Err(ReportDataError::NonceFormat(format!(
-                "got {} bytes, want 32",
-                nonce_bytes.len()
-            )));
-        }
+        check_nonce(nonce)?;
 
         // 2. The attested key must be a well-formed ML-KEM-768 key. (Decoded
         //    only to validate; the binding hashes the verbatim base64 string.)
@@ -132,15 +131,114 @@ impl ChutesReportDataVerifier {
         }
 
         // 4. TLS/identity binding: report_data[32:64] == SHA256(SPKI(cert)).
-        let spki_fp = compute_spki_fingerprint_from_der(cert_der).map_err(ReportDataError::Spki)?;
-        let got_tail = hex::encode(&report_data[32..64]);
-        if spki_fp != got_tail {
-            return Err(ReportDataError::TlsBindingMismatch {
-                expected: spki_fp,
-                got: got_tail,
-            });
-        }
+        check_cert_binding(report_data, cert_der)
+    }
+}
 
+fn check_nonce(nonce: &str) -> Result<(), ReportDataError> {
+    let nonce_bytes = hex::decode(nonce).map_err(|e| {
+        ReportDataError::NonceFormat(format!("expected bare 32-byte hex (no 0x): {e}"))
+    })?;
+    if nonce_bytes.len() != 32 {
+        return Err(ReportDataError::NonceFormat(format!(
+            "got {} bytes, want 32",
+            nonce_bytes.len()
+        )));
+    }
+    Ok(())
+}
+
+/// `report_data[32:64] == SHA256(SPKI(cert))`: the quote vouches for this
+/// instance certificate.
+fn check_cert_binding(report_data: &[u8; 64], cert_der: &[u8]) -> Result<(), ReportDataError> {
+    let spki_fp = compute_spki_fingerprint_from_der(cert_der).map_err(ReportDataError::Spki)?;
+    let got_tail = hex::encode(&report_data[32..64]);
+    if spki_fp != got_tail {
+        return Err(ReportDataError::TlsBindingMismatch {
+            expected: spki_fp,
+            got: got_tail,
+        });
+    }
+    Ok(())
+}
+
+/// Verifies the binding of Chutes' **public** `/evidence` response, which
+/// needs no API key and carries no E2EE key. Fail-closed.
+///
+/// The chain: the (separately DCAP-verified) quote binds the instance
+/// certificate (`report_data[32:64]`); that certificate's RSA key signs
+/// `attested_body`; the body carries our nonce and the same quote. Together
+/// these prove the quote is fresh and came from the certified instance.
+/// `report_data[0:32]` is `SHA256(nonce ‖ e2e_pubkey)`, which cannot be
+/// recomputed without the E2EE key; the caller uses those bytes as the GPU
+/// evidence nonce instead, which keeps the GPU evidence tied to this quote.
+///
+/// Used only by the measurement sync probe. Serving keeps
+/// [`ChutesReportDataVerifier`], which also binds the E2EE key that requests
+/// are encrypted to.
+pub struct PublicEvidenceVerifier;
+
+impl PublicEvidenceVerifier {
+    /// - `report_data` — the verified quote's 64-byte `report_data`.
+    /// - `nonce` — the exact nonce sent in the `/evidence` query.
+    /// - `cert_der` — the instance certificate as raw DER.
+    /// - `quote_b64`, `attested_body_b64`, `signature_b64` — the evidence
+    ///   entry's `quote`, `attested_body` and `signature` fields.
+    pub fn verify(
+        &self,
+        report_data: &[u8; 64],
+        nonce: &str,
+        cert_der: &[u8],
+        quote_b64: &str,
+        attested_body_b64: &str,
+        signature_b64: &str,
+    ) -> Result<(), ReportDataError> {
+        use base64::Engine;
+        check_nonce(nonce)?;
+        check_cert_binding(report_data, cert_der)?;
+
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let body = b64
+            .decode(attested_body_b64)
+            .map_err(|e| ReportDataError::SignedBody(format!("attested_body base64: {e}")))?;
+        let signature = b64
+            .decode(signature_b64)
+            .map_err(|e| ReportDataError::SignedBody(format!("signature base64: {e}")))?;
+        let (_, cert) = x509_parser::parse_x509_certificate(cert_der)
+            .map_err(|e| ReportDataError::SignedBody(format!("certificate: {e}")))?;
+        let rsa_public_key = &cert.public_key().subject_public_key.data;
+        ring::signature::UnparsedPublicKey::new(
+            &ring::signature::RSA_PKCS1_2048_8192_SHA256,
+            rsa_public_key.as_ref(),
+        )
+        .verify(&body, &signature)
+        .map_err(|_| {
+            ReportDataError::SignedBody(
+                "signature does not verify under the instance certificate".to_string(),
+            )
+        })?;
+
+        #[derive(serde::Deserialize)]
+        struct SignedBody {
+            nonce: String,
+            evidence: SignedEvidence,
+        }
+        #[derive(serde::Deserialize)]
+        struct SignedEvidence {
+            tdx_quote: String,
+        }
+        let signed: SignedBody = serde_json::from_slice(&body)
+            .map_err(|e| ReportDataError::SignedBody(format!("attested_body json: {e}")))?;
+        if signed.nonce != nonce {
+            return Err(ReportDataError::SignedBodyMismatch(
+                "nonce differs from the one sent".to_string(),
+            ));
+        }
+        if signed.evidence.tdx_quote != quote_b64 {
+            return Err(ReportDataError::SignedBodyMismatch(
+                "quote differs from the presented quote".to_string(),
+            ));
+        }
         Ok(())
     }
 }
@@ -148,6 +246,149 @@ impl ChutesReportDataVerifier {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Public (keyless) evidence binding ─────────────────────────────────
+    // Fixture made with openssl: a self-signed RSA-2048 instance cert, and
+    // `attested_body` = {"evidence":{"tdx_quote":"BAACAIE=",...},"nonce":"abab…"}
+    // signed with its key (PKCS#1 v1.5, SHA-256). OTHER_SIG is the same body
+    // signed by a different key.
+    const PUB_CERT_B64: &str = "MIIDHzCCAgegAwIBAgIUDB4/QG92ANm2/023qikd8uskcjgwDQYJKoZIhvcNAQELBQAwHzEdMBsGA1UEAwwUY2h1dGVzLXRlc3QtaW5zdGFuY2UwHhcNMjYxMDA3MTgyODUwWhcNMzYxMDA0MTgyODUwWjAfMR0wGwYDVQQDDBRjaHV0ZXMtdGVzdC1pbnN0YW5jZTCCASIwDQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEBAL3/QO9w9OeuimrsRlj6b72qlsjLd7rpm1Y+Nho+M93l3IAjeDPAilkH7RffeCcZooE1cT/SSrQWzh1TvcfECPZOqt2gToBvNh13d3ddSu9O2SnhPuDcQRS4cHoFXsjDu3TXHgL5dOXAZwtE5oqJY3jZ9VDmrPxCwoGbItHi+lMlrmWP5yZKX2Oqaipy/BxY3Y+9BTnmRVpFXzYf9UnkBVfYpWgWHNbN/tQ2zUE7F0S1Gjd/vPW+qE6/iaRfgC6gO3HwEpdmy47uxYlFq4FyB8t+kOZKQJDvtcdijuwD+0qCFqZpmZXnVpyyl/bYg5ZYuYDgCvqI9IYAzKZdy55HdnMCAwEAAaNTMFEwHQYDVR0OBBYEFHAxXUr1bEiEXTC2vWfYJwHN3LR0MB8GA1UdIwQYMBaAFHAxXUr1bEiEXTC2vWfYJwHN3LR0MA8GA1UdEwEB/wQFMAMBAf8wDQYJKoZIhvcNAQELBQADggEBAKoi++rtmMCMZIa1HZAKSTLlY9M8CvBGYwfqufmvU0YTFj/Ft4PhJG4uUJ86JlY2xQ2u+8cfTxch31R69wKHMZHXuYPwf1gv1VceaGXirS7tYDdvUGbkkBlRpEs84EuvLNhSQLOJsQ+B3y/2qgG3F7F1WDPTvodAp+5aS7v7JURUMCD/i7HxYfsrQfj6HwY/OT+DoA1V6XhD50uJlrE/mltg7TVBvKexeDD1gnCZrBcTvkPXFSY7RjUrfvyprKOMLM7BfEtaRYbmAR7XkHLBUH8LTNIqwW3QnjyaNrZPwrbC1G+wPXt3yAmqzGgpXvAFilVH1HRJLXkuSgI67EjFRI8=";
+    const PUB_SPKI_FP: &str = "db9c155349726bdd975d1f423a80621194b05d42e6040cef1358d8ccb56d2e8a";
+    const PUB_BODY_B64: &str = "eyJldmlkZW5jZSI6eyJ0ZHhfcXVvdGUiOiJCQUFDQUlFPSIsIm52dHJ1c3RfZXZpZGVuY2UiOltdfSwibm9uY2UiOiJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiIn0=";
+    const PUB_SIG_B64: &str = "TF+UZO+3+JgY3vxuNCBO3JJ240PQWEmOj0WBzEgLJQXMylEhHZkAalmPAdenNi8UXjfGl96FPSHAbDaYMmbGO27yNW/+L0aJQvY1VHTjronvpSb76dDajSdlbVo4I68sDSBupFNQlRkgKUZ/2QdCbQq9hPGD7A2tpWIuPay24DXB1txxAgJo5Ryje3Z/jRxaf72rSnhwQyHpvGO+HFKeAkOzvh28Ds10vXDM/OnHEuiMxTMg0CEDFaRTFbRsmrqxWkW5C8brSuaO3pEv2I1qjKiKgVxh25wQPQNDDeI+2UrMIK9Riz67y61PJQ+MM5PI/U8Pb8K2d+qmHnlBnBlP1g==";
+    const PUB_OTHER_SIG_B64: &str = "SEpwyzB/uYjNnutDNa3HZxhmpCAWhH+sXR842KtM3AUZsxTlndxCr7NRrJZu23PSG8Y/x9wCwc5rUPFRoopPlF9k5EyLLXNTbCdzM2AT6uetb66Zw8N+kT/GhQB8W+xhZIclS6ZPN+R4hXw7TY4BZfZlFSNqwhBKBq94ZT6XPXNRA1jficZbwrd04ABe8e+o+vLRVH5P7ppgAXmeYP00d15t4TFI5VCHHLEyLhE73TKp7hFZHAzP+GiGhMK/TgfYuo72e78KiqeSulu4+ePrLm+dsVmghQ2Y9IIaoazmPmXNidJ/h1NfUTmWcbM4E5BZxWeD/SLjaZcW2smxe1LKtg==";
+    const PUB_QUOTE_B64: &str = "BAACAIE=";
+
+    fn pub_cert() -> Vec<u8> {
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD
+            .decode(PUB_CERT_B64)
+            .unwrap()
+    }
+
+    fn pub_report_data() -> [u8; 64] {
+        let mut rd = [0u8; 64];
+        rd[32..].copy_from_slice(&hex::decode(PUB_SPKI_FP).unwrap());
+        rd
+    }
+
+    fn verify_public(
+        rd: &[u8; 64],
+        nonce: &str,
+        quote: &str,
+        body: &str,
+        sig: &str,
+    ) -> Result<(), ReportDataError> {
+        PublicEvidenceVerifier.verify(rd, nonce, &pub_cert(), quote, body, sig)
+    }
+
+    #[test]
+    fn public_evidence_signed_by_the_bound_cert_verifies() {
+        let nonce = "ab".repeat(32);
+        verify_public(
+            &pub_report_data(),
+            &nonce,
+            PUB_QUOTE_B64,
+            PUB_BODY_B64,
+            PUB_SIG_B64,
+        )
+        .expect("fixture must verify");
+    }
+
+    #[test]
+    fn public_evidence_rejects_a_different_nonce() {
+        let err = verify_public(
+            &pub_report_data(),
+            &"cd".repeat(32),
+            PUB_QUOTE_B64,
+            PUB_BODY_B64,
+            PUB_SIG_B64,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, ReportDataError::SignedBodyMismatch(_)),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn public_evidence_rejects_a_quote_other_than_the_signed_one() {
+        let err = verify_public(
+            &pub_report_data(),
+            &"ab".repeat(32),
+            "BAACAIF=",
+            PUB_BODY_B64,
+            PUB_SIG_B64,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, ReportDataError::SignedBodyMismatch(_)),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn public_evidence_rejects_a_signature_from_another_key() {
+        let err = verify_public(
+            &pub_report_data(),
+            &"ab".repeat(32),
+            PUB_QUOTE_B64,
+            PUB_BODY_B64,
+            PUB_OTHER_SIG_B64,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ReportDataError::SignedBody(_)), "{err}");
+    }
+
+    #[test]
+    fn public_evidence_rejects_a_tampered_body() {
+        use base64::Engine;
+        let mut body = base64::engine::general_purpose::STANDARD
+            .decode(PUB_BODY_B64)
+            .unwrap();
+        *body.last_mut().unwrap() = b' ';
+        let tampered = base64::engine::general_purpose::STANDARD.encode(body);
+        let err = verify_public(
+            &pub_report_data(),
+            &"ab".repeat(32),
+            PUB_QUOTE_B64,
+            &tampered,
+            PUB_SIG_B64,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ReportDataError::SignedBody(_)), "{err}");
+    }
+
+    #[test]
+    fn public_evidence_rejects_a_cert_not_bound_in_the_quote() {
+        let mut rd = pub_report_data();
+        rd[40] ^= 0xff;
+        let err = verify_public(
+            &rd,
+            &"ab".repeat(32),
+            PUB_QUOTE_B64,
+            PUB_BODY_B64,
+            PUB_SIG_B64,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, ReportDataError::TlsBindingMismatch { .. }),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn public_evidence_rejects_a_non_hex_nonce() {
+        let err = verify_public(
+            &pub_report_data(),
+            "zz",
+            PUB_QUOTE_B64,
+            PUB_BODY_B64,
+            PUB_SIG_B64,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ReportDataError::NonceFormat(_)), "{err}");
+    }
     use base64::Engine;
 
     // The synthetic self-signed fixture reused from the transform tests. Its SPKI

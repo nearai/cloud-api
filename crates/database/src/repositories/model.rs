@@ -7,6 +7,7 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use services::common::RepositoryError;
+use tokio_postgres::types::Type;
 use tokio_postgres::Row;
 
 // Default reason for soft delete operations
@@ -19,6 +20,21 @@ fn parse_text_pricing(
         .map(services::usage::TextPricingProfile::from_json)
         .transpose()
         .map_err(|error| anyhow::anyhow!(error.to_string()))
+}
+
+fn parse_pending_pricing_changes(
+    value: Option<serde_json::Value>,
+) -> Result<Vec<services::models::ModelPricingChange>> {
+    let changes: Vec<services::models::ModelPricingChange> = value
+        .map(serde_json::from_value)
+        .transpose()?
+        .unwrap_or_default();
+    for change in &changes {
+        if let Some(profile) = &change.new_text_pricing {
+            profile.validate()?;
+        }
+    }
+    Ok(changes)
 }
 
 /// Serialize optional modalities to JSON value for database storage.
@@ -72,7 +88,7 @@ impl ModelRepository {
     /// Returns every active model — the list is small (~tens of entries) and
     /// the result is cached in the service layer, so pagination is unused on
     /// the public `/v1/model/list` endpoint.
-    pub async fn get_all_active_models(&self) -> Result<Vec<Model>> {
+    async fn get_all_active_model_rows(&self) -> Result<Vec<Row>> {
         let rows = retry_db!("get_all_active_models", {
             let client = self
                 .pool
@@ -92,7 +108,20 @@ impl ModelRepository {
                         m.input_modalities, m.output_modalities, m.inference_url,
                         m.hugging_face_id, m.quantization, m.max_output_length,
                         m.supported_sampling_parameters, m.supported_features, m.datacenters,
-                        m.is_ready, m.deprecation_date, m.openrouter_slug, m.allow_free,
+                        m.is_ready, m.deprecation_date, m.successor_model_name, m.openrouter_slug, m.allow_free, m.is_listed,
+                        (
+                            SELECT jsonb_agg(jsonb_build_object(
+                                'effective_at', change.effective_at,
+                                'status', change.status,
+                                'new_input_cost_per_token', change.new_input_cost_per_token,
+                                'new_output_cost_per_token', change.new_output_cost_per_token,
+                                'new_cache_read_cost_per_token', change.new_cache_read_cost_per_token,
+                                'new_cost_per_image', change.new_cost_per_image,
+                                'new_text_pricing', change.new_text_pricing
+                            ))
+                            FROM scheduled_model_pricing_changes change
+                            WHERE change.model_id = m.id AND change.status = 'pending'
+                        ) AS pricing_changes,
                         COALESCE(array_agg(a.alias_name) FILTER (WHERE a.alias_name IS NOT NULL), '{}') AS aliases
                     FROM models m
                     LEFT JOIN model_aliases a ON a.canonical_model_id = m.id AND a.is_active = true
@@ -106,11 +135,7 @@ impl ModelRepository {
                 .map_err(map_db_error)
         })?;
 
-        let models = rows
-            .into_iter()
-            .map(|row| self.row_to_model(&row))
-            .collect();
-        Ok(models)
+        Ok(rows)
     }
 
     /// Get count of all models (optionally including inactive)
@@ -175,7 +200,7 @@ impl ModelRepository {
                             m.input_modalities, m.output_modalities, m.inference_url,
                             m.hugging_face_id, m.quantization, m.max_output_length,
                             m.supported_sampling_parameters, m.supported_features, m.datacenters,
-                            m.is_ready, m.deprecation_date, m.openrouter_slug, m.allow_free,
+                            m.is_ready, m.deprecation_date, m.successor_model_name, m.openrouter_slug, m.allow_free, m.is_listed,
                             COALESCE(array_agg(a.alias_name) FILTER (WHERE a.alias_name IS NOT NULL), '{}') AS aliases
                         FROM models m
                         LEFT JOIN model_aliases a ON a.canonical_model_id = m.id AND a.is_active = true
@@ -199,7 +224,7 @@ impl ModelRepository {
                             m.input_modalities, m.output_modalities, m.inference_url,
                             m.hugging_face_id, m.quantization, m.max_output_length,
                             m.supported_sampling_parameters, m.supported_features, m.datacenters,
-                            m.is_ready, m.deprecation_date, m.openrouter_slug, m.allow_free,
+                            m.is_ready, m.deprecation_date, m.successor_model_name, m.openrouter_slug, m.allow_free, m.is_listed,
                             COALESCE(array_agg(a.alias_name) FILTER (WHERE a.alias_name IS NOT NULL), '{}') AS aliases
                         FROM models m
                         LEFT JOIN model_aliases a ON a.canonical_model_id = m.id AND a.is_active = true
@@ -241,7 +266,7 @@ impl ModelRepository {
                         input_cost_per_token, output_cost_per_token, cost_per_image, cache_read_cost_per_token, text_pricing,
                         context_length, verifiable, is_active, owned_by, created_at, updated_at,
                         provider_type, provider_config, attestation_supported,
-                        input_modalities, output_modalities, inference_url, hugging_face_id, quantization, max_output_length, supported_sampling_parameters, supported_features, datacenters, is_ready, deprecation_date, openrouter_slug, allow_free
+                        input_modalities, output_modalities, inference_url, hugging_face_id, quantization, max_output_length, supported_sampling_parameters, supported_features, datacenters, is_ready, deprecation_date, successor_model_name, openrouter_slug, allow_free, is_listed
                     FROM models
                     WHERE model_name = $1
                     "#,
@@ -269,18 +294,18 @@ impl ModelRepository {
                 .map_err(RepositoryError::PoolError)?;
 
             client
-                .query(
+                .query_typed(
                     r#"
                     SELECT
                         id, model_name, model_display_name, model_description, model_icon,
                         input_cost_per_token, output_cost_per_token, cost_per_image, cache_read_cost_per_token, text_pricing,
                         context_length, verifiable, is_active, owned_by, created_at, updated_at,
                         provider_type, provider_config, attestation_supported,
-                        input_modalities, output_modalities, inference_url, hugging_face_id, quantization, max_output_length, supported_sampling_parameters, supported_features, datacenters, is_ready, deprecation_date, openrouter_slug, allow_free
+                        input_modalities, output_modalities, inference_url, hugging_face_id, quantization, max_output_length, supported_sampling_parameters, supported_features, datacenters, is_ready, deprecation_date, successor_model_name, openrouter_slug, allow_free, is_listed
                     FROM models
                     WHERE id = $1
                     "#,
-                    &[&model_id],
+                    &[(model_id, Type::UUID)],
                 )
                 .await
                 .map_err(map_db_error)
@@ -296,75 +321,11 @@ impl ModelRepository {
     /// Get model by model name (public API - only active models)
     /// Searches model_name (canonical name) field only
     pub async fn get_active_model_by_name(&self, model_name: &str) -> Result<Option<Model>> {
-        let rows = retry_db!("get_active_model_by_name", {
-            let client = self
-                .pool
-                .get()
-                .await
-                .context("Failed to get database connection")
-                .map_err(RepositoryError::PoolError)?;
-
-            client
-                .query(
-                    r#"
-                    SELECT
-                        m.id,
-                        m.model_name,
-                        m.model_display_name,
-                        m.model_description,
-                        m.model_icon,
-                        m.input_cost_per_token,
-                        m.output_cost_per_token,
-                        m.cost_per_image,
-                        m.cache_read_cost_per_token,
-                        m.text_pricing,
-                        m.context_length,
-                        m.verifiable,
-                        m.is_active,
-                        m.owned_by,
-                        m.created_at,
-                        m.updated_at,
-                        m.provider_type,
-                        m.provider_config,
-                        m.attestation_supported,
-                        m.input_modalities,
-                        m.output_modalities,
-                        m.inference_url,
-                        m.hugging_face_id,
-                        m.quantization,
-                        m.max_output_length,
-                        m.supported_sampling_parameters,
-                        m.supported_features,
-                        m.datacenters,
-                        m.is_ready,
-                        m.deprecation_date,
-                        m.openrouter_slug,
-                        m.allow_free,
-                        COALESCE(
-                            array_agg(ma.alias_name)
-                            FILTER (WHERE ma.alias_name IS NOT NULL),
-                            '{}'
-                        ) AS aliases
-                    FROM models m
-                    LEFT JOIN model_aliases ma
-                        ON ma.canonical_model_id = m.id
-                        AND ma.is_active = true
-                    WHERE m.is_active = true
-                    AND m.model_name = $1
-                    GROUP BY m.id
-                    LIMIT 1;
-                    "#,
-                    &[&model_name],
-                )
-                .await
-                .map_err(map_db_error)
-        })?;
-
-        if let Some(row) = rows.first() {
-            Ok(Some(self.row_to_model(row)))
-        } else {
-            Ok(None)
-        }
+        Ok(self
+            .get_active_model_row(model_name, false, "get_active_model_by_name")
+            .await?
+            .as_ref()
+            .map(|row| self.row_to_model(row)))
     }
 
     /// Update model pricing and metadata (or insert if not exists - upsert)
@@ -421,6 +382,8 @@ impl ModelRepository {
         let deprecation_date_value: Option<DateTime<Utc>> =
             update_request.deprecation_date.flatten();
         let deprecation_date_clear: bool = matches!(update_request.deprecation_date, Some(None));
+        let successor_value: Option<String> = update_request.successor_model_name.clone().flatten();
+        let successor_clear: bool = matches!(update_request.successor_model_name, Some(None));
         let openrouter_slug_value: Option<String> =
             update_request.openrouter_slug.clone().flatten();
         let openrouter_slug_clear: bool = matches!(update_request.openrouter_slug, Some(None));
@@ -430,6 +393,13 @@ impl ModelRepository {
         let text_pricing_value: Option<serde_json::Value> =
             update_request.text_pricing.clone().flatten();
         let text_pricing_clear: bool = matches!(update_request.text_pricing, Some(None));
+        // Compare-and-set for provider_config: when the caller merged its write
+        // into a stored snapshot, update only while the row still holds it, or
+        // already holds the value being written (an idempotent write loses
+        // nothing, e.g. two identical creates racing).
+        let provider_config_check: bool = update_request.expected_provider_config.is_some();
+        let expected_provider_config: Option<serde_json::Value> =
+            update_request.expected_provider_config.clone().flatten();
 
         let row = retry_db!("upsert_model_pricing", {
             let client = self
@@ -442,7 +412,7 @@ impl ModelRepository {
             let row = if existing.is_some() {
                 // Model exists - do UPDATE (partial updates work)
                 let updated_row = client
-                    .query_one(
+                    .query_opt(
                         r#"
                         UPDATE models SET
                             input_cost_per_token = COALESCE($2, input_cost_per_token),
@@ -471,15 +441,20 @@ impl ModelRepository {
                             datacenters = COALESCE($24, datacenters),
                             is_ready = CASE WHEN $27 THEN NULL ELSE COALESCE($25, is_ready) END,
                             deprecation_date = CASE WHEN $28 THEN NULL ELSE COALESCE($26, deprecation_date) END,
+                            successor_model_name = CASE WHEN $28 OR $36 THEN NULL ELSE COALESCE($35, successor_model_name) END,
                             openrouter_slug = CASE WHEN $30 THEN NULL ELSE COALESCE($29, openrouter_slug) END,
                             allow_free = COALESCE($31, allow_free),
+                            is_listed = COALESCE($37, is_listed),
                             updated_at = NOW()
                         WHERE model_name = $1
+                          AND (NOT $38
+                               OR provider_config IS NOT DISTINCT FROM $39
+                               OR provider_config IS NOT DISTINCT FROM $14)
                         RETURNING id, model_name, model_display_name, model_description, model_icon,
                                   input_cost_per_token, output_cost_per_token, cost_per_image, cache_read_cost_per_token, text_pricing,
                                   context_length, verifiable, is_active, owned_by, created_at, updated_at,
                                   provider_type, provider_config, attestation_supported,
-                                  input_modalities, output_modalities, inference_url, hugging_face_id, quantization, max_output_length, supported_sampling_parameters, supported_features, datacenters, is_ready, deprecation_date, openrouter_slug, allow_free
+                                  input_modalities, output_modalities, inference_url, hugging_face_id, quantization, max_output_length, supported_sampling_parameters, supported_features, datacenters, is_ready, deprecation_date, successor_model_name, openrouter_slug, allow_free, is_listed
                         "#,
                         &[
                             &model_name,
@@ -516,10 +491,20 @@ impl ModelRepository {
                             &cache_read_clear,
                             &text_pricing_value,
                             &text_pricing_clear,
+                            &successor_value,
+                            &successor_clear,
+                            &update_request.is_listed,
+                            &provider_config_check,
+                            &expected_provider_config,
                         ],
                     )
                     .await
                     .map_err(map_db_error)?;
+                // No row: provider_config changed since the caller read it.
+                // Returned as None so the retry loop does not re-run the write.
+                let Some(updated_row) = updated_row else {
+                    return Ok(None);
+                };
 
                 // Record history: close previous history record and insert new one
                 let model_id: uuid::Uuid = updated_row.get("id");
@@ -534,7 +519,7 @@ impl ModelRepository {
                 .await
                 .map_err(RepositoryError::DatabaseError)?;
 
-                updated_row
+                Some(updated_row)
             } else {
                 // Model doesn't exist - do INSERT with ON CONFLICT to handle race conditions
                 // Use INSERT ... ON CONFLICT to handle race conditions where another
@@ -549,7 +534,8 @@ impl ModelRepository {
                             context_length, verifiable, is_active, owned_by,
                             provider_type, provider_config, attestation_supported,
                             input_modalities, output_modalities, inference_url, hugging_face_id, quantization, max_output_length, supported_sampling_parameters, supported_features, datacenters,
-                            is_ready, deprecation_date, openrouter_slug, allow_free, text_pricing
+                            is_ready, deprecation_date, openrouter_slug, allow_free, text_pricing,
+                            successor_model_name, is_listed
                         ) VALUES (
                             $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
                             COALESCE($12, $13),
@@ -564,7 +550,9 @@ impl ModelRepository {
                             COALESCE($23, ARRAY[]::TEXT[]),
                             COALESCE($24, ARRAY[]::TEXT[]),
                             $25, $26, $27, $30,
-                            COALESCE($32, false), $33
+                            COALESCE($32, false), $33,
+                            CASE WHEN $29 THEN NULL ELSE $35 END,
+                            COALESCE($37, true)
                         )
                         ON CONFLICT (model_name) DO UPDATE SET
                             input_cost_per_token = EXCLUDED.input_cost_per_token,
@@ -596,14 +584,16 @@ impl ModelRepository {
                             datacenters = COALESCE($25, models.datacenters),
                             is_ready = CASE WHEN $28 THEN NULL ELSE COALESCE($26, models.is_ready) END,
                             deprecation_date = CASE WHEN $29 THEN NULL ELSE COALESCE($27, models.deprecation_date) END,
+                            successor_model_name = CASE WHEN $29 OR $36 THEN NULL ELSE COALESCE($35, models.successor_model_name) END,
                             openrouter_slug = CASE WHEN $31 THEN NULL ELSE COALESCE($30, models.openrouter_slug) END,
                             allow_free = COALESCE($32, models.allow_free),
+                            is_listed = COALESCE($37, models.is_listed),
                             updated_at = NOW()
                         RETURNING id, model_name, model_display_name, model_description, model_icon,
                                   input_cost_per_token, output_cost_per_token, cost_per_image, cache_read_cost_per_token, text_pricing,
                                   context_length, verifiable, is_active, owned_by, created_at, updated_at,
                                   provider_type, provider_config, attestation_supported,
-                                  input_modalities, output_modalities, inference_url, hugging_face_id, quantization, max_output_length, supported_sampling_parameters, supported_features, datacenters, is_ready, deprecation_date, openrouter_slug, allow_free
+                                  input_modalities, output_modalities, inference_url, hugging_face_id, quantization, max_output_length, supported_sampling_parameters, supported_features, datacenters, is_ready, deprecation_date, successor_model_name, openrouter_slug, allow_free, is_listed
                         "#,
                         &[
                             &model_name,
@@ -643,6 +633,9 @@ impl ModelRepository {
                             &update_request.allow_free,
                             &text_pricing_value,
                             &text_pricing_clear,
+                            &successor_value,
+                            &successor_clear,
+                            &update_request.is_listed,
                         ],
                     )
                     .await
@@ -661,11 +654,12 @@ impl ModelRepository {
                 .await
                 .map_err(RepositoryError::DatabaseError)?;
 
-                inserted_row
+                Some(inserted_row)
             };
 
             Ok(row)
         })?;
+        let row = row.ok_or(RepositoryError::TransactionConflict)?;
 
         Ok(self.row_to_model(&row))
     }
@@ -706,6 +700,7 @@ impl ModelRepository {
         let is_ready_value: Option<bool> = req.is_ready.flatten();
         let deprecation_date_value: Option<DateTime<Utc>> = req.deprecation_date.flatten();
         let openrouter_slug_value: Option<String> = req.openrouter_slug.clone().flatten();
+        let successor_value: Option<String> = req.successor_model_name.clone().flatten();
         // Absent and explicit-null both insert NULL = cache pricing disabled.
         let cache_read_value: Option<i64> = req.cache_read_cost_per_token.flatten();
         let text_pricing_value: Option<serde_json::Value> = req.text_pricing.clone().flatten();
@@ -730,7 +725,8 @@ impl ModelRepository {
                         context_length, verifiable, is_active, owned_by,
                         provider_type, provider_config, attestation_supported,
                         input_modalities, output_modalities, inference_url, hugging_face_id, quantization, max_output_length, supported_sampling_parameters, supported_features, datacenters,
-                        is_ready, deprecation_date, openrouter_slug, allow_free, text_pricing
+                        is_ready, deprecation_date, openrouter_slug, allow_free, text_pricing,
+                        successor_model_name, is_listed
                     ) VALUES (
                         $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
                         COALESCE($12, $13),
@@ -742,14 +738,16 @@ impl ModelRepository {
                         COALESCE($23, ARRAY[]::TEXT[]),
                         COALESCE($24, ARRAY[]::TEXT[]),
                         $25, $26, $27, $28,
-                        COALESCE($29, false), $30
+                        COALESCE($29, false), $30,
+                        $31,
+                        COALESCE($32, true)
                     )
                     ON CONFLICT (model_name) DO NOTHING
                     RETURNING id, model_name, model_display_name, model_description, model_icon,
                               input_cost_per_token, output_cost_per_token, cost_per_image, cache_read_cost_per_token, text_pricing,
                               context_length, verifiable, is_active, owned_by, created_at, updated_at,
                               provider_type, provider_config, attestation_supported,
-                              input_modalities, output_modalities, inference_url, hugging_face_id, quantization, max_output_length, supported_sampling_parameters, supported_features, datacenters, is_ready, deprecation_date, openrouter_slug, allow_free
+                              input_modalities, output_modalities, inference_url, hugging_face_id, quantization, max_output_length, supported_sampling_parameters, supported_features, datacenters, is_ready, deprecation_date, successor_model_name, openrouter_slug, allow_free, is_listed
                     "#,
                     &[
                         &model_name,
@@ -782,6 +780,8 @@ impl ModelRepository {
                         &openrouter_slug_value,
                         &req.allow_free,
                         &text_pricing_value,
+                        &successor_value,
+                        &req.is_listed,
                     ],
                 )
                 .await
@@ -833,17 +833,19 @@ impl ModelRepository {
                         context_length, verifiable, is_active, owned_by,
                         provider_type, provider_config, attestation_supported,
                         input_modalities, output_modalities, inference_url, hugging_face_id, quantization, max_output_length, supported_sampling_parameters, supported_features, datacenters,
-                        is_ready, deprecation_date, openrouter_slug, allow_free, text_pricing
+                        is_ready, deprecation_date, openrouter_slug, allow_free, text_pricing,
+                        successor_model_name, is_listed
                     ) VALUES (
                         $1, $2, $3, $4, $5, $6, $7, $8,
                         $9, $10, $11, $12, $13, $14, $15, $16, $17, $18,
-                        $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29
+                        $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29,
+                        $30, $31
                     )
                     RETURNING id, model_name, model_display_name, model_description, model_icon,
                               input_cost_per_token, output_cost_per_token, cost_per_image, cache_read_cost_per_token, text_pricing,
                               context_length, verifiable, is_active, owned_by, created_at, updated_at,
                               provider_type, provider_config, attestation_supported,
-                              input_modalities, output_modalities, inference_url, hugging_face_id, quantization, max_output_length, supported_sampling_parameters, supported_features, datacenters, is_ready, deprecation_date, openrouter_slug, allow_free
+                              input_modalities, output_modalities, inference_url, hugging_face_id, quantization, max_output_length, supported_sampling_parameters, supported_features, datacenters, is_ready, deprecation_date, successor_model_name, openrouter_slug, allow_free, is_listed
                     "#,
                     &[
                         &model.model_name,
@@ -875,6 +877,8 @@ impl ModelRepository {
                         &model.openrouter_slug,
                         &model.allow_free,
                         &model.text_pricing,
+                        &model.successor_model_name,
+                        &model.is_listed,
                     ],
                 )
                 .await
@@ -903,7 +907,7 @@ impl ModelRepository {
                         model_icon, verifiable, is_active, owned_by,
                         provider_type, provider_config, attestation_supported,
                         input_modalities, output_modalities, inference_url, hugging_face_id, quantization, max_output_length, supported_sampling_parameters, supported_features, datacenters,
-                        is_ready, deprecation_date, openrouter_slug, allow_free,
+                        is_ready, deprecation_date, successor_model_name, openrouter_slug, allow_free, is_listed,
                         effective_from, effective_until, changed_by_user_id, changed_by_user_email,
                         change_reason, created_at
                     FROM model_history
@@ -946,7 +950,7 @@ impl ModelRepository {
                         model_icon, verifiable, is_active, owned_by,
                         provider_type, provider_config, attestation_supported,
                         input_modalities, output_modalities, inference_url, hugging_face_id, quantization, max_output_length, supported_sampling_parameters, supported_features, datacenters,
-                        is_ready, deprecation_date, openrouter_slug, allow_free,
+                        is_ready, deprecation_date, successor_model_name, openrouter_slug, allow_free, is_listed,
                         effective_from, effective_until, changed_by_user_id, changed_by_user_email,
                         change_reason, created_at
                     FROM model_history
@@ -1021,7 +1025,7 @@ impl ModelRepository {
                         h.input_modalities, h.output_modalities, h.inference_url,
                         h.hugging_face_id, h.quantization, h.max_output_length,
                         h.supported_sampling_parameters, h.supported_features, h.datacenters,
-                        h.is_ready, h.deprecation_date, h.openrouter_slug, h.allow_free,
+                        h.is_ready, h.deprecation_date, h.successor_model_name, h.openrouter_slug, h.allow_free, h.is_listed,
                         h.effective_from, h.effective_until, h.changed_by_user_id, h.changed_by_user_email,
                         h.change_reason, h.created_at
                     FROM model_history h
@@ -1069,7 +1073,7 @@ impl ModelRepository {
                               input_cost_per_token, output_cost_per_token, cost_per_image, cache_read_cost_per_token, text_pricing,
                               context_length, verifiable, is_active, owned_by, created_at, updated_at,
                               provider_type, provider_config, attestation_supported,
-                              input_modalities, output_modalities, inference_url, hugging_face_id, quantization, max_output_length, supported_sampling_parameters, supported_features, datacenters, is_ready, deprecation_date, openrouter_slug, allow_free
+                              input_modalities, output_modalities, inference_url, hugging_face_id, quantization, max_output_length, supported_sampling_parameters, supported_features, datacenters, is_ready, deprecation_date, successor_model_name, openrouter_slug, allow_free, is_listed
                     "#,
                     &[&model_name],
                 )
@@ -1166,14 +1170,16 @@ impl ModelRepository {
                     changed_by_user_email,
                     change_reason,
                     created_at,
-                    text_pricing
+                    text_pricing,
+                    successor_model_name,
+                    is_listed
                 ) VALUES (
                     $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19,
                     $20, $21, $22,
                     COALESCE($23, ARRAY[]::TEXT[]),
                     COALESCE($24, ARRAY[]::TEXT[]),
                     $25, $26, $27, $28, $29,
-                    NOW(), NULL, $30, $31, $32, NOW(), $33
+                    NOW(), NULL, $30, $31, $32, NOW(), $33, $34, $35
                 )
                 "#,
                 &[
@@ -1248,6 +1254,11 @@ impl ModelRepository {
                         .try_get::<_, Option<serde_json::Value>>("text_pricing")
                         .ok()
                         .flatten(),
+                    &model_row
+                        .try_get::<_, Option<String>>("successor_model_name")
+                        .ok()
+                        .flatten(),
+                    &model_row.try_get::<_, bool>("is_listed").unwrap_or(true),
                 ],
             )
             .await
@@ -1292,7 +1303,20 @@ impl ModelRepository {
     /// Resolve a model identifier (alias or canonical name) and return the full model details
     /// Returns None if the model is not found or not active
     pub async fn resolve_and_get_model(&self, identifier: &str) -> Result<Option<Model>> {
-        let row = retry_db!("resolve_and_get_model", {
+        Ok(self
+            .get_active_model_row(identifier, true, "resolve_and_get_model")
+            .await?
+            .as_ref()
+            .map(|row| self.row_to_model(row)))
+    }
+
+    async fn get_active_model_row(
+        &self,
+        identifier: &str,
+        resolve_alias: bool,
+        operation: &'static str,
+    ) -> Result<Option<Row>> {
+        let row = retry_db!(operation, {
             let client = self
                 .pool
                 .get()
@@ -1300,8 +1324,9 @@ impl ModelRepository {
                 .context("Failed to get database connection")
                 .map_err(RepositoryError::PoolError)?;
 
+            // One-shot typed query: one round trip, see repositories/mod.rs.
             client
-                .query_opt(
+                .query_typed_opt(
                     r#"
                     SELECT
                         m.id,
@@ -1334,8 +1359,23 @@ impl ModelRepository {
                         m.datacenters,
                         m.is_ready,
                         m.deprecation_date,
+                        m.successor_model_name,
                         m.openrouter_slug,
                         m.allow_free,
+                        m.is_listed,
+                        (
+                            SELECT jsonb_agg(jsonb_build_object(
+                                'effective_at', change.effective_at,
+                                'status', change.status,
+                                'new_input_cost_per_token', change.new_input_cost_per_token,
+                                'new_output_cost_per_token', change.new_output_cost_per_token,
+                                'new_cache_read_cost_per_token', change.new_cache_read_cost_per_token,
+                                'new_cost_per_image', change.new_cost_per_image,
+                                'new_text_pricing', change.new_text_pricing
+                            ))
+                            FROM scheduled_model_pricing_changes change
+                            WHERE change.model_id = m.id AND change.status = 'pending'
+                        ) AS pricing_changes,
                         COALESCE(
                             array_agg(ma_all.alias_name)
                             FILTER (WHERE ma_all.alias_name IS NOT NULL),
@@ -1348,24 +1388,113 @@ impl ModelRepository {
                     WHERE m.is_active = true
                     AND (
                         m.model_name = $1
-                        OR EXISTS (
+                        OR ($2 AND EXISTS (
                             SELECT 1
                             FROM model_aliases ma_match
                             WHERE ma_match.canonical_model_id = m.id
                             AND ma_match.alias_name = $1
                             AND ma_match.is_active = true
-                        )
+                        ))
                     )
                     GROUP BY m.id
                     LIMIT 1;
                     "#,
-                    &[&identifier],
+                    &[(&identifier, Type::VARCHAR), (&resolve_alias, Type::BOOL)],
                 )
                 .await
                 .map_err(map_db_error)
         })?;
 
-        Ok(row.map(|r| self.row_to_model(&r)))
+        Ok(row)
+    }
+
+    /// Whether the organization holds a grant for the model that is in
+    /// effect. A grant held by an inactive organization, or on an inactive
+    /// model, has no effect.
+    pub async fn organization_has_model_access(
+        &self,
+        organization_id: uuid::Uuid,
+        model_id: uuid::Uuid,
+    ) -> Result<bool> {
+        let row = retry_db!("organization_has_model_access", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
+
+            // One-shot typed query: one round trip, see repositories/mod.rs.
+            client
+                .query_typed_opt(
+                    r#"
+                    SELECT 1
+                    FROM organization_model_access a
+                    JOIN organizations o ON o.id = a.organization_id
+                    JOIN models m ON m.id = a.model_id
+                    WHERE a.organization_id = $1
+                      AND a.model_id = $2
+                      AND o.is_active = true
+                      AND m.is_active = true
+                    "#,
+                    &[(&organization_id, Type::UUID), (&model_id, Type::UUID)],
+                )
+                .await
+                .map_err(map_db_error)
+        })?;
+
+        Ok(row.is_some())
+    }
+
+    /// Every unlisted model, active or not, with the active organizations
+    /// that hold a grant for it, ordered by model name. A model nobody may
+    /// use is listed with no organizations.
+    ///
+    /// Inactive models are included on purpose. The reader takes a model that
+    /// is absent from the list to be unrestricted, and it may still be
+    /// serving a model that was deactivated here.
+    pub async fn list_restricted_model_access(
+        &self,
+    ) -> Result<Vec<services::models::RestrictedModelAccess>> {
+        let rows = retry_db!("list_restricted_model_access", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
+
+            client
+                .query(
+                    r#"
+                    SELECT
+                        m.model_name,
+                        COALESCE(
+                            array_agg(o.id ORDER BY o.id) FILTER (WHERE o.id IS NOT NULL),
+                            '{}'
+                        ) AS organization_ids
+                    FROM models m
+                    LEFT JOIN organization_model_access a ON a.model_id = m.id
+                    LEFT JOIN organizations o
+                        ON o.id = a.organization_id
+                        AND o.is_active = true
+                    WHERE m.is_listed = false
+                    GROUP BY m.id
+                    ORDER BY m.model_name
+                    "#,
+                    &[],
+                )
+                .await
+                .map_err(map_db_error)
+        })?;
+
+        Ok(rows
+            .iter()
+            .map(|row| services::models::RestrictedModelAccess {
+                model_name: row.get("model_name"),
+                organization_ids: row.get("organization_ids"),
+            })
+            .collect())
     }
 
     /// Helper method to convert database row to Model
@@ -1419,8 +1548,12 @@ impl ModelRepository {
             datacenters: row.try_get("datacenters").ok().flatten(),
             is_ready: row.try_get("is_ready").ok().flatten(),
             deprecation_date: row.try_get("deprecation_date").ok().flatten(),
+            successor_model_name: row.try_get("successor_model_name").ok().flatten(),
             openrouter_slug: row.try_get("openrouter_slug").ok().flatten(),
             allow_free: row.try_get("allow_free").unwrap_or(false),
+            // A query that forgets the column must hide the model, not
+            // publish one that was unlisted.
+            is_listed: row.try_get("is_listed").unwrap_or(false),
         }
     }
 
@@ -1471,8 +1604,10 @@ impl ModelRepository {
             datacenters: row.try_get("datacenters").ok().flatten(),
             is_ready: row.try_get("is_ready").ok().flatten(),
             deprecation_date: row.try_get("deprecation_date").ok().flatten(),
+            successor_model_name: row.try_get("successor_model_name").ok().flatten(),
             openrouter_slug: row.try_get("openrouter_slug").ok().flatten(),
             allow_free: row.try_get("allow_free").unwrap_or(false),
+            is_listed: row.try_get("is_listed").unwrap_or(true),
             effective_from: row.get("effective_from"),
             effective_until: row.get("effective_until"),
             changed_by_user_id: row.get("changed_by_user_id"),
@@ -1551,7 +1686,7 @@ impl ModelRepository {
                         m.input_modalities, m.output_modalities, m.inference_url,
                         m.hugging_face_id, m.quantization, m.max_output_length,
                         m.supported_sampling_parameters, m.supported_features, m.datacenters,
-                        m.is_ready, m.deprecation_date, m.openrouter_slug, m.allow_free,
+                        m.is_ready, m.deprecation_date, m.successor_model_name, m.openrouter_slug, m.allow_free, m.is_listed,
                         COALESCE(array_agg(a.alias_name) FILTER (WHERE a.alias_name IS NOT NULL), '{}') AS aliases
                     FROM models m
                     LEFT JOIN model_aliases a ON a.canonical_model_id = m.id AND a.is_active = true
@@ -1601,47 +1736,72 @@ impl services::inference_provider_pool::ExternalModelsSource for ModelRepository
     }
 }
 
-// Implement ModelsRepository trait from services
+impl ModelRepository {
+    fn model_with_pricing_from_row(&self, row: Row) -> Result<services::models::ModelWithPricing> {
+        let m = self.row_to_model(&row);
+        let mut model = services::models::ModelWithPricing {
+            id: m.id,
+            model_name: m.model_name,
+            model_display_name: m.model_display_name,
+            model_description: m.model_description,
+            model_icon: m.model_icon,
+            input_cost_per_token: m.input_cost_per_token,
+            output_cost_per_token: m.output_cost_per_token,
+            cost_per_image: m.cost_per_image,
+            cache_read_cost_per_token: m.cache_read_cost_per_token,
+            text_pricing: parse_text_pricing(m.text_pricing)?,
+            upcoming_pricing: None,
+            context_length: m.context_length,
+            verifiable: m.verifiable,
+            aliases: m.aliases,
+            owned_by: m.owned_by,
+            provider_type: m.provider_type,
+            provider_config: m.provider_config,
+            attestation_supported: m.attestation_supported,
+            input_modalities: m.input_modalities,
+            output_modalities: m.output_modalities,
+            inference_url: m.inference_url,
+            hugging_face_id: m.hugging_face_id,
+            quantization: m.quantization,
+            max_output_length: m.max_output_length,
+            supported_sampling_parameters: m.supported_sampling_parameters,
+            supported_features: m.supported_features,
+            datacenters: m.datacenters,
+            is_ready: m.is_ready,
+            deprecation_date: m.deprecation_date,
+            successor_model_name: m.successor_model_name,
+            openrouter_slug: m.openrouter_slug,
+            is_listed: m.is_listed,
+            created_at: m.created_at,
+        };
+        model.upcoming_pricing = match parse_pending_pricing_changes(row.get("pricing_changes")) {
+            Ok(changes) => {
+                services::models::UpcomingModelPricing::earliest_pending(&model, &changes)
+            }
+            Err(error) => {
+                // Notices are advisory. Drop the entire set rather than promoting
+                // a later valid row to the earliest notice. Live prices above
+                // still require strict validation because they drive billing.
+                tracing::warn!(
+                    model_id = %model.id,
+                    error = %error,
+                    "Ignoring invalid pending pricing notice metadata"
+                );
+                None
+            }
+        };
+        Ok(model)
+    }
+}
+
+// All notice metadata is read in the model query's snapshot and cached with it.
 #[async_trait]
 impl services::models::ModelsRepository for ModelRepository {
     async fn get_all_active_models(&self) -> Result<Vec<services::models::ModelWithPricing>> {
-        let models = self.get_all_active_models().await?;
-        models
+        self.get_all_active_model_rows()
+            .await?
             .into_iter()
-            .map(|m| {
-                Ok(services::models::ModelWithPricing {
-                    id: m.id,
-                    model_name: m.model_name,
-                    model_display_name: m.model_display_name,
-                    model_description: m.model_description,
-                    model_icon: m.model_icon,
-                    input_cost_per_token: m.input_cost_per_token,
-                    output_cost_per_token: m.output_cost_per_token,
-                    cost_per_image: m.cost_per_image,
-                    cache_read_cost_per_token: m.cache_read_cost_per_token,
-                    text_pricing: parse_text_pricing(m.text_pricing)?,
-                    context_length: m.context_length,
-                    verifiable: m.verifiable,
-                    aliases: m.aliases,
-                    owned_by: m.owned_by,
-                    provider_type: m.provider_type,
-                    provider_config: m.provider_config,
-                    attestation_supported: m.attestation_supported,
-                    input_modalities: m.input_modalities,
-                    output_modalities: m.output_modalities,
-                    inference_url: m.inference_url,
-                    hugging_face_id: m.hugging_face_id,
-                    quantization: m.quantization,
-                    max_output_length: m.max_output_length,
-                    supported_sampling_parameters: m.supported_sampling_parameters,
-                    supported_features: m.supported_features,
-                    datacenters: m.datacenters,
-                    is_ready: m.is_ready,
-                    deprecation_date: m.deprecation_date,
-                    openrouter_slug: m.openrouter_slug,
-                    created_at: m.created_at,
-                })
-            })
+            .map(|row| self.model_with_pricing_from_row(row))
             .collect()
     }
 
@@ -1649,42 +1809,9 @@ impl services::models::ModelsRepository for ModelRepository {
         &self,
         model_name: &str,
     ) -> Result<Option<services::models::ModelWithPricing>> {
-        let model_opt = self.get_active_model_by_name(model_name).await?;
-        model_opt
-            .map(|m| {
-                Ok(services::models::ModelWithPricing {
-                    id: m.id,
-                    model_name: m.model_name,
-                    model_display_name: m.model_display_name,
-                    model_description: m.model_description,
-                    model_icon: m.model_icon,
-                    input_cost_per_token: m.input_cost_per_token,
-                    output_cost_per_token: m.output_cost_per_token,
-                    cost_per_image: m.cost_per_image,
-                    cache_read_cost_per_token: m.cache_read_cost_per_token,
-                    text_pricing: parse_text_pricing(m.text_pricing)?,
-                    context_length: m.context_length,
-                    verifiable: m.verifiable,
-                    aliases: m.aliases,
-                    owned_by: m.owned_by,
-                    provider_type: m.provider_type,
-                    provider_config: m.provider_config,
-                    attestation_supported: m.attestation_supported,
-                    input_modalities: m.input_modalities,
-                    output_modalities: m.output_modalities,
-                    inference_url: m.inference_url,
-                    hugging_face_id: m.hugging_face_id,
-                    quantization: m.quantization,
-                    max_output_length: m.max_output_length,
-                    supported_sampling_parameters: m.supported_sampling_parameters,
-                    supported_features: m.supported_features,
-                    datacenters: m.datacenters,
-                    is_ready: m.is_ready,
-                    deprecation_date: m.deprecation_date,
-                    openrouter_slug: m.openrouter_slug,
-                    created_at: m.created_at,
-                })
-            })
+        self.get_active_model_row(model_name, false, "get_model_by_name")
+            .await?
+            .map(|row| self.model_with_pricing_from_row(row))
             .transpose()
     }
 
@@ -1692,46 +1819,28 @@ impl services::models::ModelsRepository for ModelRepository {
         &self,
         identifier: &str,
     ) -> Result<Option<services::models::ModelWithPricing>> {
-        let model_opt = self.resolve_and_get_model(identifier).await?;
-        model_opt
-            .map(|m| {
-                Ok(services::models::ModelWithPricing {
-                    id: m.id,
-                    model_name: m.model_name,
-                    model_display_name: m.model_display_name,
-                    model_description: m.model_description,
-                    model_icon: m.model_icon,
-                    input_cost_per_token: m.input_cost_per_token,
-                    output_cost_per_token: m.output_cost_per_token,
-                    cost_per_image: m.cost_per_image,
-                    cache_read_cost_per_token: m.cache_read_cost_per_token,
-                    text_pricing: parse_text_pricing(m.text_pricing)?,
-                    context_length: m.context_length,
-                    verifiable: m.verifiable,
-                    aliases: m.aliases,
-                    owned_by: m.owned_by,
-                    provider_type: m.provider_type,
-                    provider_config: m.provider_config,
-                    attestation_supported: m.attestation_supported,
-                    input_modalities: m.input_modalities,
-                    output_modalities: m.output_modalities,
-                    inference_url: m.inference_url,
-                    hugging_face_id: m.hugging_face_id,
-                    quantization: m.quantization,
-                    max_output_length: m.max_output_length,
-                    supported_sampling_parameters: m.supported_sampling_parameters,
-                    supported_features: m.supported_features,
-                    datacenters: m.datacenters,
-                    is_ready: m.is_ready,
-                    deprecation_date: m.deprecation_date,
-                    openrouter_slug: m.openrouter_slug,
-                    created_at: m.created_at,
-                })
-            })
+        self.get_active_model_row(identifier, true, "resolve_and_get_model")
+            .await?
+            .map(|row| self.model_with_pricing_from_row(row))
             .transpose()
     }
 
     async fn get_configured_model_names(&self) -> Result<Vec<String>> {
         self.get_configured_model_names().await
+    }
+
+    async fn organization_has_model_access(
+        &self,
+        organization_id: uuid::Uuid,
+        model_id: uuid::Uuid,
+    ) -> Result<bool> {
+        self.organization_has_model_access(organization_id, model_id)
+            .await
+    }
+
+    async fn list_restricted_model_access(
+        &self,
+    ) -> Result<Vec<services::models::RestrictedModelAccess>> {
+        self.list_restricted_model_access().await
     }
 }

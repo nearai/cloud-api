@@ -32,13 +32,15 @@ impl CreditEmailNotificationRepository {
         let transaction = client.transaction().await?;
         let rows = transaction.query(r#"
             WITH balances AS (
-                SELECT o.id, o.name, olh.credit_type, olh.spend_limit,
-                       GREATEST(olh.spend_limit - COALESCE(occ.amount, 0), 0)::BIGINT AS remaining
+                SELECT o.id, o.name, capacity.credit_type,
+                       capacity.effective_capacity AS spend_limit,
+                       GREATEST(capacity.effective_capacity - COALESCE(occ.amount, 0), 0)::BIGINT AS remaining
                 FROM organizations o
-                JOIN organization_limits_history olh ON olh.organization_id = o.id AND olh.effective_until IS NULL
+                JOIN organization_credit_capacities capacity
+                  ON capacity.organization_id = o.id AND capacity.effective_until IS NULL
                 LEFT JOIN organization_credit_consumption occ
-                  ON occ.organization_id = o.id AND occ.credit_type = olh.credit_type
-                WHERE o.is_active = true AND olh.spend_limit > 0
+                  ON occ.organization_id = o.id AND occ.credit_type = capacity.credit_type
+                WHERE o.is_active = true AND capacity.effective_capacity > 0
             )
             SELECT id, name, credit_type, spend_limit, remaining
             FROM balances
@@ -85,7 +87,7 @@ impl CreditEmailNotificationRepository {
             for recipient in recipients {
                 let recipient_email: String = recipient.get("email");
                 let inserted = transaction.query_opt(
-                    "INSERT INTO email_notification_deliveries (event_type, resource_id, event_key, recipient_email) VALUES ('credit_balance', $1, $2, $3) ON CONFLICT DO NOTHING RETURNING resource_id",
+                    "INSERT INTO email_notification_deliveries (event_type, resource_id, event_key, recipient_email) VALUES ('credit_balance', $1, $2, $3) ON CONFLICT (event_type, resource_id, event_key, recipient_email) DO UPDATE SET claimed_at = NOW() WHERE email_notification_deliveries.sent_at IS NULL AND email_notification_deliveries.claimed_at < NOW() - INTERVAL '30 minutes' RETURNING resource_id",
                     &[&resource_id, &event_key, &recipient_email],
                 ).await?;
                 if inserted.is_some() {
@@ -120,6 +122,20 @@ impl CreditEmailNotificationRepository {
         let resource_id = format!("{organization_id}:{credit_type}");
         let event_key = threshold.to_string();
         client.execute("DELETE FROM email_notification_deliveries WHERE event_type = 'credit_balance' AND resource_id = $1 AND event_key = $2 AND recipient_email = $3", &[&resource_id, &event_key, &recipient_email]).await?;
+        Ok(())
+    }
+
+    pub async fn mark_sent(
+        &self,
+        organization_id: Uuid,
+        credit_type: &str,
+        threshold: i16,
+        recipient_email: &str,
+    ) -> Result<()> {
+        let client = self.pool.get().await?;
+        let resource_id = format!("{organization_id}:{credit_type}");
+        let event_key = threshold.to_string();
+        client.execute("UPDATE email_notification_deliveries SET sent_at = NOW() WHERE event_type = 'credit_balance' AND resource_id = $1 AND event_key = $2 AND recipient_email = $3", &[&resource_id, &event_key, &recipient_email]).await?;
         Ok(())
     }
 }

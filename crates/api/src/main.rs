@@ -165,7 +165,19 @@ async fn main() {
                                 ),
                             };
                             match credit_email_sender.send_credit_balance_alert(&email).await {
-                                Ok(services::email::EmailDeliveryOutcome::Sent { .. }) => {}
+                                Ok(services::email::EmailDeliveryOutcome::Sent { .. }) => {
+                                    if let Err(error) = credit_email_repository
+                                        .mark_sent(
+                                            candidate.organization_id,
+                                            &candidate.credit_type,
+                                            candidate.threshold_percent,
+                                            recipient_email,
+                                        )
+                                        .await
+                                    {
+                                        tracing::warn!(organization_id = %candidate.organization_id, credit_type = %candidate.credit_type, error = %error, "Failed to mark credit balance alert as sent");
+                                    }
+                                }
                                 Ok(services::email::EmailDeliveryOutcome::Skipped) => {
                                     let _ = credit_email_repository
                                         .release_claim(

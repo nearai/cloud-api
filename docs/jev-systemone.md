@@ -2,18 +2,17 @@
 
 ## Design
 
-Jev is a decision model, not a chat or image model. Cloud API exposes
-`POST /v1/systemone` using the [TypeSafe protocol](https://api.typesafe.ai/openapi.json).
-The protocol name is the HTTP path; `decisions` is the output modality used
-by [OpenRouter](https://openrouter.ai/typesafe/jev-1.13/api).
-TypeSafe describes System One and typed decisions but does not publish
-OpenRouter's `input_modalities` / `output_modalities` catalog fields.
+Jev returns typed decisions from text and, on supported providers, images.
+Cloud API exposes `POST /v1/systemone` using
+[OpenRouter's System One JSON contract](https://openrouter.ai/openapi.json).
+The protocol name is the HTTP path; `decisions` is the output modality.
+Input capabilities are declared per model through `input_modalities`.
 
 Two independent axes determine behavior:
 
 | Axis | Hosted Jev | Self-hosted TEE System One |
 | --- | --- | --- |
-| Input / output | `text` / `decisions` | `text` / `decisions` |
+| Input / output | Model-declared inputs / `decisions` | Model-declared inputs / `decisions` |
 | Catalog provider type | `external` | `vllm` (existing NEAR fleet adapter) |
 | Backend transport | `typesafe` | NEAR attested transport |
 | Attestation / verifiable | false / false | true / true |
@@ -87,6 +86,9 @@ For OpenRouter's System One compatibility endpoint, use
 `base_url: https://openrouter.ai/api/v1`, its model ID in `model_name`, and an
 OpenRouter API key. The adapter appends `/systemone`; it does not translate to
 OpenRouter's separate alpha decisions API.
+For image-capable OpenRouter models such as `typesafe/jev-1.14`, set
+`inputModalities: ["text", "image"]` and use that OpenRouter model ID in
+`providerConfig.model_name`.
 
 ## Call and verify
 
@@ -117,10 +119,42 @@ Content-Type: application/json
 `state` and question instructions accept text, objects, or arrays. Every question
 requires `instructions`; missing or null instructions return 400 before inference.
 `noul` criteria are optional, choice criteria have 1–255 entries,
-and score criteria have 1–10 levels. Score's lower bound follows the official
+and score criteria have 1–10 levels. A `box` question requires `instructions`
+and has no `criteria`. Score's lower bound follows the official
 OpenAPI (the prose guide recommends at least two). Unknown request fields,
 including `stream`, are rejected. The gateway validates answer types, keys,
 numeric ranges, and nonnegative token counts before recording usage.
+
+### Images and Box through OpenRouter
+
+Use OpenRouter's JSON `image_url` parts with base64 PNG or JPEG data URLs:
+
+```json
+{
+  "model": "typesafe/jev-1.14",
+  "state": [
+    "A receipt attached to a refund request.",
+    {"type": "image_url", "image_url": {"url": "data:image/png;base64,<image-data>"}}
+  ],
+  "questions": {
+    "receipt": {"type": "box", "instructions": "Locate the entire receipt."}
+  }
+}
+```
+
+Register the model with the OpenRouter configuration above before calling it.
+Jev also accepts image parts nested in `state`, `instructions`, and `criteria`;
+these JSON values pass through unchanged. See
+[OpenRouter's image formats and limits](https://openrouter.ai/docs/guides/community/multimodal-decisions).
+Cloud API's request-body limit is 25 MiB, including base64. The endpoint accepts
+JSON; TypeSafe-native `assets` and multipart uploads are outside this contract.
+
+A Box answer contains `type: "box"`, a `box` object with numeric `top`, `bottom`,
+`left`, and `right` edges, and optional `confidence`, matching OpenRouter's schema.
+Box requires an upstream model that supports it, such as Jev 1.14. To check
+whether a target exists, include a Noul question alongside the Box.
+
+### Receipts and billing
 
 The successful response body is returned **byte for byte** from the provider,
 including unknown response extensions and its reported model name. No ID or
@@ -186,7 +220,8 @@ unknown fields on otherwise valid upstream responses are preserved verbatim.
 The existing image receipt issue is tracked separately in
 [#1125](https://github.com/nearai/cloud-api/issues/1125).
 
-Tests cover wire compatibility, model overrides, raw bytes, sanitized upstream
+Tests cover wire compatibility, Box answers with optional confidence, JSON image
+parts, model overrides, raw bytes, sanitized upstream
 errors, both receipt algorithms, billing/catalog discovery, alias and modality
 validation, TEE ID storage boundaries, invalid usage, trust-preserving fallback,
 and receipt/billing finalization after client disconnect. Fleet

@@ -369,6 +369,20 @@ mod tests {
                 .unwrap()
                 .contains(&serde_json::json!("instructions")));
         }
+        let box_answer = schemas["SystemOneAnswer"]["oneOf"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|answer| answer["properties"]["type"]["enum"] == serde_json::json!(["box"]))
+            .unwrap();
+        assert_eq!(
+            box_answer["properties"]["box"]["$ref"],
+            "#/components/schemas/SystemOneBoxCoordinates"
+        );
+        assert!(!box_answer["required"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("confidence")));
         assert!(schemas["Usage"]["properties"].get("total_tokens").is_some());
         assert!(schemas["SystemOneUsage"]["properties"]
             .get("total_tokens")
@@ -388,6 +402,7 @@ mod tests {
             json!({"type":"noul"}),
             json!({"type":"choice","criteria":{"billing":null,"other":null}}),
             json!({"type":"score","criteria":["low","high"]}),
+            json!({"type":"box"}),
         ] {
             for (case, instructions) in [("missing", None), ("null", Some(Value::Null))] {
                 let mut question = question.clone();

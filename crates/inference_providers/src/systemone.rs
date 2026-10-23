@@ -51,6 +51,9 @@ pub enum Question {
         instructions: Content,
         criteria: Vec<Content>,
     },
+    Box {
+        instructions: Content,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -120,6 +123,22 @@ pub enum Answer {
         probabilities: BTreeMap<String, f64>,
         legend: BTreeMap<String, Content>,
     },
+    Box {
+        #[serde(rename = "box")]
+        bounds: BoxCoordinates,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        confidence: Option<f64>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[cfg_attr(feature = "openapi", schema(as = SystemOneBoxCoordinates))]
+pub struct BoxCoordinates {
+    pub top: f64,
+    pub bottom: f64,
+    pub left: f64,
+    pub right: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -204,6 +223,14 @@ impl SystemOneResponseWithBytes {
                             legend.contains_key(&key)
                                 && probabilities.get(&key).is_some_and(probability)
                         })
+                }
+                (Question::Box { .. }, Some(Answer::Box { bounds, confidence })) => {
+                    // OpenRouter specifies numeric edges and optional confidence,
+                    // without coordinate bounds or ordering constraints.
+                    [bounds.top, bounds.bottom, bounds.left, bounds.right]
+                        .into_iter()
+                        .all(f64::is_finite)
+                        && confidence.is_none_or(f64::is_finite)
                 }
                 _ => false,
             };

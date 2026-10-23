@@ -7,7 +7,8 @@ fn request() -> SystemOneRequest {
         "questions":{
             "billing":{"type":"noul","instructions":"Is this about billing?"},
             "route":{"type":"choice","instructions":"Which team should handle this?","criteria":{"billing":null,"other":"Other requests"}},
-            "urgency":{"type":"score","instructions":"How urgent is this?","criteria":["low",{"label":"high"}]}
+            "urgency":{"type":"score","instructions":"How urgent is this?","criteria":["low",{"label":"high"}]},
+            "receipt":{"type":"box","instructions":"Locate the receipt."}
         }
     }))
     .unwrap()
@@ -21,7 +22,8 @@ fn response() -> serde_json::Value {
             "route":{"type":"choice","choice":"billing","confidence":0.9,
                 "probabilities":{"billing":0.9,"other":0.1}},
             "urgency":{"type":"score","score":0.6,"confidence":0.8,
-                "probabilities":{"0":0.4,"1":0.6},"legend":{"0":"low","1":{"label":"high"}}}
+                "probabilities":{"0":0.4,"1":0.6},"legend":{"0":"low","1":{"label":"high"}}},
+            "receipt":{"type":"box","box":{"top":0.1,"bottom":0.9,"left":0.2,"right":0.8}}
         },
         "usage":{"input_tokens":120,"output_tokens":3}
     })
@@ -74,6 +76,7 @@ fn rejects_invalid_question_shapes_and_bounds() {
         json!({"type":"score","instructions":"Rate urgency.","criteria":[]}),
         json!({"type":"score","instructions":"Rate urgency.","criteria":vec!["level";11]}),
         json!({"type":"noul","instructions":"Is this urgent?","extra":"ignored?"}),
+        json!({"type":"box","instructions":"Locate the receipt.","criteria":[]}),
     ] {
         let value = json!({"model":"jev","state":"content","questions":{"q":patch}});
         assert!(serde_json::from_value::<SystemOneRequest>(value)
@@ -96,6 +99,17 @@ fn rejects_unbillable_or_mismatched_provider_results() {
         ("/answers/billing/noul", json!(1.1)),
         ("/answers/route/choice", json!("unknown")),
         ("/answers/urgency/score", json!(2)),
+        ("/answers/receipt", json!({"type":"noul","noul":0.9})),
+        (
+            "/answers/receipt/box",
+            json!({"top":0.1,"bottom":0.9,"left":0.2}),
+        ),
+        ("/answers/receipt/box/top", json!("0.1")),
+        ("/answers/receipt/box/right", json!(null)),
+        (
+            "/answers/receipt",
+            json!({"type":"box","box":{"top":0.1,"bottom":0.9,"left":0.2,"right":0.8},"confidence":"high"}),
+        ),
         ("/answers", json!({})),
     ];
     for (path, replacement) in cases {
@@ -106,6 +120,28 @@ fn rejects_unbillable_or_mismatched_provider_results() {
                 .is_err(),
             "{path}"
         );
+    }
+}
+
+#[test]
+fn box_answers_accept_optional_confidence_and_unconstrained_numeric_edges() {
+    for confidence in [None, Some(0.9)] {
+        let mut value = response();
+        // OpenRouter's schema does not require normalized or ordered edges.
+        value["answers"]["receipt"]["box"] =
+            json!({"top":10.0,"bottom":-1.0,"left":0.5,"right":0.5});
+        if let Some(confidence) = confidence {
+            value["answers"]["receipt"]["confidence"] = json!(confidence);
+        }
+        let raw = serde_json::to_vec_pretty(&value).unwrap();
+        let parsed = SystemOneResponseWithBytes::parse(raw.clone(), &request()).unwrap();
+        assert_eq!(parsed.raw_bytes, raw);
+        match &parsed.response.answers["receipt"] {
+            Answer::Box {
+                confidence: actual, ..
+            } => assert_eq!(*actual, confidence),
+            answer => panic!("expected Box answer, got {answer:?}"),
+        }
     }
 }
 

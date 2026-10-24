@@ -430,6 +430,44 @@ mod tests {
     use futures_util::StreamExt;
 
     #[tokio::test]
+    async fn test_sse_preserves_plaintext_and_encrypted_logprob_bytes() {
+        for bytes in [
+            serde_json::json!([65, 0, 255]),
+            serde_json::json!("04aabbcc"),
+        ] {
+            let logprobs = serde_json::json!({"content": [{
+                "token": "token-or-ciphertext", "logprob": -1.0, "bytes": bytes,
+                "top_logprobs": [{"token": "alternative", "logprob": -2.0, "bytes": bytes}]
+            }]});
+            let chunk = serde_json::json!({
+                "id": "chat-test", "object": "chat.completion.chunk", "created": 1, "model": "test",
+                "choices": [{"index": 0, "delta": {"content": "encrypted"}, "logprobs": logprobs}]
+            });
+            let wire = format!("data: {chunk}\n\ndata: [DONE]\n\n");
+            let stream = futures_util::stream::iter(vec![Ok::<_, reqwest::Error>(Bytes::from(
+                wire.clone(),
+            ))]);
+            let events: Vec<_> = new_sse_parser(stream, true).collect().await;
+            let mut forwarded = Vec::new();
+            let mut parsed_chunks = 0;
+            for event in events {
+                let event = event.unwrap();
+                assert!(event.raw_passthrough);
+                forwarded.extend_from_slice(&event.raw_bytes);
+                if let Some(StreamChunk::Chat(chunk)) = event.chunk {
+                    parsed_chunks += 1;
+                    assert_eq!(
+                        serde_json::to_value(chunk).unwrap()["choices"][0]["logprobs"],
+                        logprobs
+                    );
+                }
+            }
+            assert_eq!(parsed_chunks, 1);
+            assert_eq!(forwarded, wire.as_bytes());
+        }
+    }
+
+    #[tokio::test]
     async fn test_sse_parser_multiple_events_in_single_packet() {
         // Simulate multiple SSE events arriving in a single network packet
         // This tests that the parser doesn't lose events when process_buffer() returns multiple results

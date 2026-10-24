@@ -95,6 +95,7 @@ mod patroni_failover;
 mod privacy_classify;
 mod privacy_redact;
 mod privacy_settlement;
+mod privacy_signatures;
 mod provider_errors;
 mod reasoning;
 mod reporting_usage;

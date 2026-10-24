@@ -125,13 +125,6 @@ impl CreditEmailScheduler {
             .iter()
             .map(|credit| credit.effective_capacity)
             .fold(0_i64, i64::saturating_add);
-        if effective_capacity <= 0 {
-            return Ok(self
-                .reconcile_claims(organization, &snapshot.version, None, &[])
-                .await?
-                .is_some());
-        }
-
         // Usage admission blocks while unresolved overage exists. Treat that state as exhausted
         // so the notification and request gate never disagree about whether credits are usable.
         let remaining = if limit.unfunded > 0 {
@@ -139,9 +132,17 @@ impl CreditEmailScheduler {
         } else {
             limit.available
         };
-        let Some(threshold) =
+        // A present limit with no effective capacity is exhausted, not replenished. Organizations
+        // that have never had a limit are handled by the `snapshot.limit` branch above.
+        let threshold = if effective_capacity <= 0 {
+            self.thresholds
+                .iter()
+                .copied()
+                .find(|threshold| *threshold == 0)
+        } else {
             threshold_for_balance(remaining, effective_capacity, &self.thresholds)
-        else {
+        };
+        let Some(threshold) = threshold else {
             return Ok(self
                 .reconcile_claims(organization, &snapshot.version, None, &[])
                 .await?
@@ -894,6 +895,42 @@ mod tests {
                 effective_capacity: 100,
                 consumed: 75,
                 available: 25,
+                currency: "USD".to_string(),
+            }],
+        });
+        let scheduler = CreditEmailScheduler::new(
+            repository.clone(),
+            limits,
+            Arc::new(NoopEmailSender),
+            vec![0, 10, 20],
+            None,
+        );
+
+        scheduler.run_once().await.unwrap();
+
+        assert_eq!(
+            repository.reconciliations.lock().await[0].threshold,
+            Some(0)
+        );
+    }
+
+    #[tokio::test]
+    async fn active_zero_capacity_uses_exhausted_threshold() {
+        let repository = repository(Vec::new());
+        let limits = Arc::new(FixedLimitsRepository {
+            limit: OrganizationLimit {
+                spend_limit: 0,
+                available: 0,
+                unfunded: 0,
+            },
+            breakdown: vec![OrganizationCreditLimit {
+                credit_type: "payment".to_string(),
+                source: None,
+                amount: 0,
+                transferred_out: 0,
+                effective_capacity: 0,
+                consumed: 0,
+                available: 0,
                 currency: "USD".to_string(),
             }],
         });

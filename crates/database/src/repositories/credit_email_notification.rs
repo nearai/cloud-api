@@ -1,6 +1,7 @@
-use crate::pool::DbPool;
-use anyhow::Result;
+use crate::{pool::DbPool, repositories::utils::map_db_error, retry_db};
+use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
+use services::common::RepositoryError;
 use services::usage::ports::{
     CreditEmailClaimResult,
     CreditEmailNotificationRepository as CreditEmailNotificationRepositoryPort,
@@ -303,10 +304,16 @@ impl CreditEmailNotificationRepositoryPort for CreditEmailNotificationRepository
         recipient_user_id: Uuid,
         claim_token: Uuid,
     ) -> Result<()> {
-        let client = self.pool.get().await?;
-        client
-            .execute(
-                r#"
+        retry_db!("mark_credit_balance_email_sent", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
+            client
+                .execute(
+                    r#"
                 UPDATE email_notification_deliveries
                 SET sent_at = CASE WHEN rearm_after_dispatch THEN NULL ELSE NOW() END,
                     claimed_at = CASE
@@ -319,15 +326,17 @@ impl CreditEmailNotificationRepositoryPort for CreditEmailNotificationRepository
                   AND recipient_user_id = $4 AND claim_token = $5
                   AND sent_at IS NULL AND dispatch_started_at IS NOT NULL
                 "#,
-                &[
-                    &EVENT_TYPE,
-                    &Self::resource_id(organization_id),
-                    &threshold.to_string(),
-                    &recipient_user_id,
-                    &claim_token,
-                ],
-            )
-            .await?;
+                    &[
+                        &EVENT_TYPE,
+                        &Self::resource_id(organization_id),
+                        &threshold.to_string(),
+                        &recipient_user_id,
+                        &claim_token,
+                    ],
+                )
+                .await
+                .map_err(map_db_error)
+        })?;
         Ok(())
     }
 }

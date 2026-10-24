@@ -6,8 +6,8 @@ use crate::retry_db;
 use anyhow::{Context, Result};
 use chrono::Utc;
 use services::common::RepositoryError;
-use tokio_postgres::types::Type;
-use tokio_postgres::Row;
+use sha2::{Digest, Sha256};
+use tokio_postgres::{GenericClient, Row};
 use uuid::Uuid;
 
 #[derive(Debug, Clone)]
@@ -160,7 +160,7 @@ impl OrganizationLimitsRepository {
             Ok::<tokio_postgres::Row, RepositoryError>(row)
         })?;
 
-        Ok(self.row_to_limits_history(&row))
+        Ok(Self::row_to_limits_history(&row))
     }
 
     /// Get all current active limits for an organization (one per credit type)
@@ -192,10 +192,7 @@ impl OrganizationLimitsRepository {
                 .map_err(map_db_error)
         })?;
 
-        let limits = rows
-            .iter()
-            .map(|row| self.row_to_limits_history(row))
-            .collect();
+        let limits = rows.iter().map(Self::row_to_limits_history).collect();
         Ok(limits)
     }
 
@@ -206,22 +203,41 @@ impl OrganizationLimitsRepository {
         &self,
         organization_id: Uuid,
     ) -> Result<(Vec<CurrentCreditStatus>, i64, i64)> {
+        let (statuses, unfunded, unattributed, _) = self
+            .get_current_credit_status_with_version(organization_id)
+            .await?;
+        Ok((statuses, unfunded, unattributed))
+    }
+
+    pub(crate) async fn get_current_credit_status_with_version(
+        &self,
+        organization_id: Uuid,
+    ) -> Result<(Vec<CurrentCreditStatus>, i64, i64, String)> {
         // One statement, one snapshot: a single statement reads a consistent
         // view on its own, so no transaction is needed. (The org `FOR UPDATE`
         // lock only keeps consumption and balance moving together in one
         // commit; the snapshot guarantee does not depend on it.) With no
         // active limit rows the result is empty (callers treat that as "no
         // limits").
-        let rows = retry_db!("get_current_credit_status", {
+        retry_db!("get_current_credit_status", {
             let client = self
                 .pool
                 .get()
                 .await
                 .context("Failed to get database connection")
                 .map_err(RepositoryError::PoolError)?;
-            client
-                .query_typed(
-                    r#"
+            Self::load_current_credit_status(&**client, organization_id).await
+        })
+        .map_err(Into::into)
+    }
+
+    pub(crate) async fn load_current_credit_status<C: GenericClient + Sync>(
+        client: &C,
+        organization_id: Uuid,
+    ) -> std::result::Result<(Vec<CurrentCreditStatus>, i64, i64, String), RepositoryError> {
+        let rows = client
+            .query(
+                r#"
                 SELECT olh.id, olh.organization_id, olh.spend_limit, olh.credit_type,
                        olh.source, olh.currency, olh.effective_from, olh.effective_until,
                        olh.changed_by, olh.change_reason, olh.changed_by_user_id,
@@ -239,11 +255,10 @@ impl OrganizationLimitsRepository {
                 WHERE olh.organization_id = $1 AND olh.effective_until IS NULL
                 ORDER BY olh.credit_type, olh.effective_from DESC
                 "#,
-                    &[(&organization_id, Type::UUID)],
-                )
-                .await
-                .map_err(map_db_error)
-        })?;
+                &[&organization_id],
+            )
+            .await
+            .map_err(map_db_error)?;
         let (unfunded, unattributed) = rows.first().map_or((0, 0), |row| {
             (
                 row.get::<_, i64>("unfunded"),
@@ -253,7 +268,7 @@ impl OrganizationLimitsRepository {
         let statuses = rows
             .iter()
             .map(|row| {
-                let limit = self.row_to_limits_history(row);
+                let limit = Self::row_to_limits_history(row);
                 let consumed = row.get::<_, i64>("consumed");
                 CurrentCreditStatus {
                     available: row
@@ -266,8 +281,33 @@ impl OrganizationLimitsRepository {
                     consumed,
                 }
             })
-            .collect();
-        Ok((statuses, unfunded, unattributed))
+            .collect::<Vec<_>>();
+        let version = Self::credit_status_version(&statuses, unfunded, unattributed);
+        Ok((statuses, unfunded, unattributed, version))
+    }
+
+    fn credit_status_version(
+        statuses: &[CurrentCreditStatus],
+        unfunded: i64,
+        unattributed: i64,
+    ) -> String {
+        let mut digest = Sha256::new();
+        digest.update(unfunded.to_be_bytes());
+        digest.update(unattributed.to_be_bytes());
+        for status in statuses {
+            digest.update(status.limit.id.as_bytes());
+            digest.update(status.limit.spend_limit.to_be_bytes());
+            digest.update(status.transferred_out.to_be_bytes());
+            digest.update(status.effective_capacity.to_be_bytes());
+            digest.update(status.consumed.to_be_bytes());
+            digest.update(status.limit.credit_type.as_bytes());
+            digest.update([0]);
+            if let Some(source) = &status.limit.source {
+                digest.update(source.as_bytes());
+            }
+            digest.update([0]);
+        }
+        hex::encode(digest.finalize())
     }
 
     /// Count limits history for an organization
@@ -326,13 +366,13 @@ impl OrganizationLimitsRepository {
 
         let history = rows
             .into_iter()
-            .map(|row| self.row_to_limits_history(&row))
+            .map(|row| Self::row_to_limits_history(&row))
             .collect();
         Ok(history)
     }
 
     /// Helper method to convert database row to OrganizationLimitsHistory
-    fn row_to_limits_history(&self, row: &Row) -> OrganizationLimitsHistory {
+    fn row_to_limits_history(row: &Row) -> OrganizationLimitsHistory {
         OrganizationLimitsHistory {
             id: row.get("id"),
             organization_id: row.get("organization_id"),

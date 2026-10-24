@@ -17,6 +17,7 @@ pub mod attestation;
 pub mod contact_email;
 pub mod conversation;
 pub mod credit_allocation;
+pub mod credit_email_notification;
 pub mod feature_request;
 pub mod file;
 pub mod lifecycle;

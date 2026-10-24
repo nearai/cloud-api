@@ -30,6 +30,34 @@ async fn erasure_deletes_linked_oauth_identities() {
 }
 
 #[tokio::test]
+async fn erasure_deletes_credit_email_delivery_claims() {
+    let (server, database) = setup_test_server_with_database().await;
+    let (_, user_id, email) = new_user(&database).await;
+    let client = database.pool().get().await.unwrap();
+    client
+        .execute(
+            "INSERT INTO email_notification_deliveries \
+             (event_type, resource_id, event_key, recipient_user_id) \
+             VALUES ('credit_balance', $1, '10', $2)",
+            &[&format!("{}:combined", uuid::Uuid::new_v4()), &user_id],
+        )
+        .await
+        .unwrap();
+
+    let response = erase(&server, user_id, &email).await;
+    assert_eq!(response.status_code(), 200, "{}", response.text());
+    assert_eq!(
+        count(
+            &client,
+            "SELECT COUNT(*) FROM email_notification_deliveries WHERE recipient_user_id = $1",
+            &user_id,
+        )
+        .await,
+        0
+    );
+}
+
+#[tokio::test]
 async fn retry_sweeps_content_written_after_erasure() {
     let (server, database) = setup_test_server_with_database().await;
     let (session, user_id, email) = new_user(&database).await;

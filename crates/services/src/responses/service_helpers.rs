@@ -580,6 +580,19 @@ pub struct ToolCallInfo {
     pub thought_signature: Option<String>,
 }
 
+/// A custom function call that Cloud returns verbatim for the client to run.
+///
+/// Unlike the legacy server-executed tool representation, `arguments` is not
+/// parsed, repaired, or reserialized. A client may replay it exactly alongside
+/// its `function_call_output` in a subsequent stateless request.
+#[derive(Debug, Clone)]
+pub struct ClientManagedFunctionCall {
+    pub id: String,
+    pub name: String,
+    pub arguments: String,
+    pub thought_signature: Option<String>,
+}
+
 /// Result of processing a completion stream
 ///
 /// Contains the accumulated text, detected tool calls, and stream status.
@@ -588,7 +601,7 @@ pub struct ProcessStreamResult {
     /// The accumulated text content from the stream
     pub text: String,
     /// Tool calls detected in the stream
-    pub tool_calls: Vec<ToolCallInfo>,
+    pub tool_calls: Vec<ClientManagedFunctionCall>,
     /// Whether the stream terminated with an error (client disconnect, network error, etc.)
     /// When true, the response may be incomplete and the agent loop should stop.
     pub stream_error: bool,

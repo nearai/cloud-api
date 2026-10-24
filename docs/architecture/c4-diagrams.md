@@ -25,8 +25,8 @@ The NEAR AI Cloud API is a **multi-tenant AI inference platform** running in a *
 
 2. **Data Plane** (API Key Auth)
    - OpenAI-compatible chat completions
-   - Platform-specific response API
-   - Conversation management
+   - Stateless Responses compatibility API
+   - Temporary Conversation/File views and retained per-resource deletion
    - TEE attestation
 
 ### Authentication Model
@@ -60,7 +60,7 @@ graph TB
     end
     
     %% External Actors
-    WebApp["<b>Web Application</b><br/>[Browser/SPA]<br/><br/>Interactive UI for<br/>managing organizations<br/>and conversations"]
+    WebApp["<b>Web Application</b><br/>[Browser/SPA]<br/><br/>Interactive UI for<br/>managing organizations<br/>and viewing legacy migration data"]
     
     APIClient["<b>API Client</b><br/>[External Application]<br/><br/>Third-party applications<br/>using API keys for<br/>programmatic access"]
     
@@ -68,10 +68,10 @@ graph TB
     
     OrgAdmin["<b>Organization Admin</b><br/>[Person]<br/><br/>Manages organization,<br/>workspaces, and<br/>team members"]
     
-    EndUser["<b>End User</b><br/>[Person]<br/><br/>Uses AI inference<br/>capabilities through<br/>conversations"]
+    EndUser["<b>End User</b><br/>[Person]<br/><br/>Uses AI inference<br/>capabilities through<br/>client applications"]
     
     %% External Systems
-    PostgreSQL["<b>PostgreSQL Database</b><br/>[Database System]<br/><br/>Stores organizations,<br/>users, conversations,<br/>and usage data"]
+    PostgreSQL["<b>PostgreSQL Database</b><br/>[Database System]<br/><br/>Stores organizations,<br/>users, legacy conversation data,<br/>and usage data"]
     
     GitHubOAuth["<b>GitHub OAuth</b><br/>[Identity Provider]<br/><br/>Provides authentication<br/>via GitHub accounts"]
     
@@ -136,8 +136,8 @@ graph TB
                 WorkspaceRoutes["<b>Workspace Routes</b><br/>Workspace & API key<br/>management"]
                 UserRoutes["<b>User Routes</b><br/>Profile, invitations,<br/>sessions"]
                 CompletionRoutes["<b>Completion Routes</b><br/>Chat & text<br/>completions"]
-                ConvRoutes["<b>Conversation Routes</b><br/>Create & manage<br/>conversations"]
-                ResponseRoutes["<b>Response Routes</b><br/>Streaming AI<br/>responses"]
+                ConvRoutes["<b>Conversation Routes</b><br/>Temporary migration<br/>views and deletion"]
+                ResponseRoutes["<b>Response Routes</b><br/>Stateless one-shot<br/>AI responses"]
                 ModelRoutes["<b>Model Routes</b><br/>List available<br/>models"]
                 UsageRoutes["<b>Usage Routes</b><br/>Tracking & billing<br/>data"]
                 AttestationRoutes["<b>Attestation Routes</b><br/>TEE verification<br/>& signatures"]
@@ -152,8 +152,8 @@ graph TB
                 AuthService["<b>Auth Service</b><br/>Authentication<br/>& authorization"]
                 OrgService["<b>Organization Service</b><br/>Multi-tenant<br/>management"]
                 UserService["<b>User Service</b><br/>User & session<br/>management"]
-                ConvService["<b>Conversation Service</b><br/>Conversation<br/>lifecycle"]
-                ResponseService["<b>Response Service</b><br/>AI completion<br/>orchestration"]
+                ConvService["<b>Conversation Service</b><br/>Temporary migration<br/>views and deletion"]
+                ResponseService["<b>Response Service</b><br/>Stateless one-shot<br/>Responses compatibility"]
                 CompletionService["<b>Completion Service</b><br/>Model inference<br/>coordination"]
                 ModelService["<b>Model Service</b><br/>Model catalog<br/>& pricing"]
                 UsageService["<b>Usage Service</b><br/>Usage tracking<br/>& limits"]
@@ -168,7 +168,7 @@ graph TB
                 SessionRepo["<b>Session Repository</b>"]
                 APIKeyRepo["<b>API Key Repository</b>"]
                 ConvRepo["<b>Conversation Repository</b>"]
-                ResponseRepo["<b>Response Repository</b>"]
+                ResponseRepo["<b>Legacy Response Repository</b><br/>Retained history data"]
                 ModelRepo["<b>Model Repository</b>"]
                 UsageRepo["<b>Usage Repository</b>"]
                 AttestationRepo["<b>Attestation Repository</b>"]
@@ -181,7 +181,7 @@ graph TB
     end
     
     %% External Containers
-    Database[("<b>PostgreSQL Database</b><br/>[Container: PostgreSQL 16]<br/><br/>Stores:<br/>• Organizations & workspaces<br/>• Users & sessions<br/>• Conversations & responses<br/>• Usage & billing data<br/>• API keys<br/>• Chat signatures")]
+    Database[("<b>PostgreSQL Database</b><br/>[Container: PostgreSQL 16]<br/><br/>Stores:<br/>• Organizations & workspaces<br/>• Users & sessions<br/>• Legacy conversations & responses<br/>• Usage & billing data<br/>• API keys<br/>• Chat signatures")]
     
     GitHubAuth["<b>GitHub OAuth</b><br/>[External API]<br/><br/>OAuth 2.0<br/>authentication"]
     
@@ -238,7 +238,6 @@ graph TB
     
     %% Service Dependencies
     ResponseService --> CompletionService
-    ResponseService --> ConvService
     ResponseService --> UsageService
     CompletionService --> ProviderPool
     CompletionService --> ModelService
@@ -257,7 +256,6 @@ graph TB
     UserService --> UserRepo
     UserService --> SessionRepo
     ConvService --> ConvRepo
-    ResponseService --> ResponseRepo
     ModelService --> ModelRepo
     UsageService --> UsageRepo
     AttestationService --> AttestationRepo
@@ -312,8 +310,8 @@ graph TB
 | **Workspace Routes** | Workspace and API key management | Session (OAuth) |
 | **User Routes** | User profile, invitations, sessions | Session (OAuth) |
 | **Completion Routes** | Chat & text completions (OpenAI-compatible) | API Key |
-| **Conversation Routes** | Conversation lifecycle management | API Key |
-| **Response Routes** | AI response requests (streaming/non-streaming) | API Key |
+| **Conversation Routes** | Temporary known-ID views and per-resource deletion; other paths return `410` | API Key |
+| **Response Routes** | Stateless one-shot inference; response history returns `410` | API Key |
 | **Model Routes** | List available models | API Key |
 | **Usage Routes** | Usage tracking, billing, limits | Session (OAuth) |
 | **Attestation Routes** | TEE attestation reports, chat signatures | API Key |
@@ -324,8 +322,8 @@ graph TB
 | **Auth Service** | Session & API key validation, OAuth integration | User Repo, Session Repo, API Key Repo, OAuth Providers |
 | **Organization Service** | Multi-tenant organization & workspace management | Organization Repo, Workspace Repo |
 | **User Service** | User management, profile updates | User Repo, Session Repo |
-| **Conversation Service** | Conversation creation & retrieval | Conversation Repo |
-| **Response Service** | Orchestrates AI completion requests | Completion Service, Usage Service, Response Repo |
+| **Conversation Service** | Temporary workspace-scoped views and per-resource deletion | Conversation Repo |
+| **Response Service** | Default typed stateless adapter: one Chat Completions request; explicit native allowlist bypasses it | Completion Service, Usage Service |
 | **Completion Service** | Coordinates with inference providers | Provider Pool, Model Service |
 | **Model Service** | Manages model catalog & pricing | Model Repo |
 | **Usage Service** | Tracks token usage, enforces limits | Usage Repo, Organization Repo |
@@ -340,8 +338,8 @@ graph TB
 | **Workspace Repository** | workspaces | Workspace management |
 | **Session Repository** | sessions | Session creation, validation, cleanup |
 | **API Key Repository** | api_keys | API key creation, validation, revocation |
-| **Conversation Repository** | conversations | Conversation storage & retrieval |
-| **Response Repository** | responses | AI response storage & history |
+| **Conversation Repository** | conversations | Temporary migration views and account-cleanup deletion |
+| **Legacy Response Repository** | responses | Retained historical response data; not used by stateless Responses |
 | **Model Repository** | models, model_pricing | Model catalog & pricing data |
 | **Usage Repository** | Various usage tracking tables | Usage tracking, billing calculations |
 | **Attestation Repository** | chat_signatures | Cryptographic signatures & attestation |
@@ -492,37 +490,36 @@ sequenceDiagram
     Note over Client,Database: Streaming provides real-time response<br/>while tracking usage
 ```
 
-### 4. Response Creation Flow (Platform-specific API)
+### 4. Default Typed Stateless Response Creation Flow (Platform-specific API)
 
-Creating an AI response linked to a conversation using the platform-specific API.
+`POST /v1/responses` is a stateless compatibility API. The default typed
+adapter normalizes an omitted `store` to `false`, then creates one Chat
+Completions inference request; it does not link to a Conversation or persist
+response/item history. A canonical model explicitly listed in
+`NATIVE_RESPONSES_MODELS`, with an explicitly supplied `store: false` request,
+is a narrow exception: it makes one native provider Responses request instead.
+That path remains stateless, writes no response/item history, and never runs a
+server-side agent loop or executes built-in/remote MCP tools. Image-generation
+and image-editing models are rejected on both paths. The diagram below
+describes the default typed adapter.
 
 ```mermaid
 sequenceDiagram
     actor Client
     participant PlatformAPI
     participant ResponseService
-    participant ConversationService
     participant CompletionService
-    participant Database
     participant vLLM
+    participant AttestationService
     
-    Client->>PlatformAPI: POST /v1/responses<br/>{ model: "llama-3", conversation_id: "conv_xxx", input: {...} }
+    Client->>PlatformAPI: POST /v1/responses<br/>{ model: "llama-3", store: false, input: {...} }
     
-    PlatformAPI->>PlatformAPI: Validate API key (middleware)
+    PlatformAPI->>PlatformAPI: Validate API key and stateless fields
     
     PlatformAPI->>ResponseService: create_response_stream(request)
-    
-    ResponseService->>Database: INSERT responses<br/>(status: in_progress)
-    Database-->>ResponseService: response_id
-    
     ResponseService-->>Client: SSE: response.created<br/>{ id: "resp_xxx", status: "in_progress" }
     
-    alt conversation_id provided
-        ResponseService->>ConversationService: Get conversation
-        ConversationService->>Database: SELECT conversation
-        Database-->>ConversationService: Conversation record
-        ResponseService->>ResponseService: Append to conversation context
-    end
+    ResponseService->>ResponseService: Build request-scoped message context
     
     ResponseService->>CompletionService: create_completion_stream()
     CompletionService->>vLLM: POST /v1/chat/completions
@@ -536,61 +533,56 @@ sequenceDiagram
     vLLM-->>CompletionService: Completion done + usage
     CompletionService-->>ResponseService: Complete + usage
     
-    ResponseService->>Database: UPDATE responses<br/>(status: completed, output_message, usage)
-    Database-->>ResponseService: Updated
+    opt Completed-response attestation succeeds
+        ResponseService->>AttestationService: Store response ID + digest signatures
+    end
     
     ResponseService-->>Client: SSE: response.completed<br/>{ status: "completed", usage: {...} }
     
-    Note over Client,Database: Response is stored and linked<br/>to conversation for history
+    Note over Client,AttestationService: No responses/response_items row, response history,<br/>server tool execution, or agent loop is used
 ```
 
-### 5. External Function Call Flow (Tool Use)
+### 5. Default Typed Client-Managed Function Call Flow (Tool Use)
 
-Multi-turn flow where the LLM requests an external function, the client executes
-it, and resumes the response with the result. This covers custom functions,
-code_interpreter, and computer tools (all client-executed).
+Multi-turn flow where the model requests a custom function and the client
+executes it. Only `type: "function"` tools are accepted by Responses;
+server-executed/builtin tools are rejected.
 
 ```mermaid
 sequenceDiagram
     actor Client
     participant PlatformAPI
     participant ResponseService
-    participant Database
+    participant CompletionService
+    participant vLLM
 
-    Note over Client,Database: Turn 1 - LLM requests a function call
+    Note over Client,vLLM: Turn 1 - model requests a client-managed function
 
     Client->>PlatformAPI: POST /v1/responses<br/>{ model, input, tools: [{ type: "function", name: "get_weather", ... }] }
     PlatformAPI->>ResponseService: create_response_stream(request)
-    ResponseService->>Database: INSERT response (status: in_progress)
-
     ResponseService-->>Client: SSE: response.created
-
-    Note over ResponseService: LLM emits a tool_call for "get_weather"
-
-    ResponseService->>Database: INSERT response_item (FunctionCall)<br/>call_id is unique per call (generated if LLM omits it)
+    ResponseService->>CompletionService: One Chat Completions inference
+    CompletionService->>vLLM: POST /v1/chat/completions
+    vLLM-->>CompletionService: Function call for "get_weather"
+    CompletionService-->>ResponseService: Function call
     ResponseService-->>Client: SSE: response.output_item.added (FunctionCall)<br/>{ call_id, name: "get_weather", arguments: "..." }
-    ResponseService->>Database: UPDATE response (status: incomplete)
     ResponseService-->>Client: SSE: response.incomplete<br/>{ reason: "function_call_required" }
 
-    Note over Client,Database: Turn 2 - Client provides function output
+    Client->>Client: Execute get_weather and retain its own transcript
 
-    Client->>PlatformAPI: POST /v1/responses<br/>{ model, previous_response_id: "resp_xxx",<br/>  input: [{ type: "function_call_output", call_id, output: "72°F" }] }
+    Note over Client,vLLM: Turn 2 - new stateless request with replayed context
+
+    Client->>PlatformAPI: POST /v1/responses<br/>{ model, store: false, tools, input: [...history,<br/>{ type: "function_call", call_id, name, arguments },<br/>{ type: "function_call_output", call_id, output: "72°F" }] }
     PlatformAPI->>ResponseService: create_response_stream(request)
-
-    ResponseService->>Database: SELECT response WHERE id = resp_xxx AND workspace_id = caller's workspace
-    Note over ResponseService: Workspace ownership verified (prevents IDOR)
-
-    ResponseService->>Database: SELECT response_items WHERE response_id = resp_xxx
-    Note over ResponseService: Validate each call_id matches exactly one FunctionCall
-
-    ResponseService->>Database: INSERT new response (status: in_progress)
-    ResponseService-->>Client: SSE: response.created
-
-    Note over ResponseService: Resume inference with function result in context
-
+    ResponseService->>ResponseService: Map supplied replay into this request's provider context
+    ResponseService->>CompletionService: One Chat Completions inference
+    CompletionService->>vLLM: POST /v1/chat/completions
+    vLLM-->>CompletionService: Completion
+    CompletionService-->>ResponseService: Completion
     ResponseService-->>Client: SSE: response.output_text.delta
-    ResponseService->>Database: UPDATE response (status: completed)
     ResponseService-->>Client: SSE: response.completed
+
+    Note over Client,vLLM: Cloud never executes the function, looks up history,<br/>or starts an agent loop; arguments are replayed unchanged
 ```
 
 ### 6. Model Discovery Flow
@@ -621,9 +613,6 @@ sequenceDiagram
     
     Note over ProviderPool: Ready to handle completion requests<br/>with round-robin load balancing
     
-    alt Model already in use
-        ProviderPool->>ProviderPool: Keep existing sticky routes<br/>(chat_id -> provider mapping)
-    end
 ```
 
 ### 7. Organization Invitation Flow
@@ -777,47 +766,43 @@ sequenceDiagram
     Note over UsageMiddleware,Database: Usage tracked per request<br/>for billing and analytics
 ```
 
-### 10. Response Lifecycle State Diagram
+### 10. Stateless Response Request Lifecycle
 
-State transitions for AI response objects throughout their lifecycle.
+Request-scoped states emitted while serving a single stateless Responses
+request. These are not durable response-history states.
 
 ```mermaid
 stateDiagram-v2
-    [*] --> in_progress: POST /v1/responses
+    [*] --> in_progress: POST /v1/responses (store: false)
 
     in_progress --> completed: Inference successful
-    in_progress --> incomplete: Function call required
+    in_progress --> incomplete: Client-managed function call required
     in_progress --> failed: Inference error
-    in_progress --> cancelled: User cancels<br/>(POST /responses/{id}/cancel)
 
-    incomplete --> in_progress: Client submits FunctionCallOutput<br/>(POST /v1/responses with previous_response_id)
+    incomplete --> [*]: Client executes the function
 
-    completed --> [*]: Response stored
-    incomplete --> [*]: Client does not resume
-    failed --> [*]: Error logged
-    cancelled --> [*]: Marked cancelled
+    completed --> [*]: Response delivered, not stored
+    failed --> [*]: Error delivered
 
     note right of in_progress
-        Streaming tokens to client
-        Tracking usage
+        Default typed adapter: one Chat Completions inference
+        Streaming tokens and tracking usage
     end note
 
     note right of incomplete
-        LLM requested external function call
-        FunctionCall items stored with unique call_ids
-        Waiting for client to execute and resume
+        Model requested a custom function
+        Client owns execution and transcript
+        A later request replays the call and output
     end note
 
     note right of completed
-        Final response stored
-        Usage recorded
-        Conversation updated
+        No response/item history is written
+        Best-effort digest signature may be stored
     end note
 
     note right of failed
-        Error details saved
-        Partial usage tracked
-        Client notified
+        No server-side continuation or cancel path
+        Client receives the failure
     end note
 ```
 
@@ -920,18 +905,9 @@ flowchart TD
     ParseResponse --> CreateProviders[Create vLLM Provider<br/>Instances]
     CreateProviders --> UpdateCache[Update Provider Pool]
     
-    CheckCache -->|Yes| CheckConversation{Conversation ID<br/>Provided?}
-    UpdateCache --> CheckConversation
-    
-    CheckConversation -->|Yes| CheckSticky{Sticky Route<br/>Exists?}
-    CheckSticky -->|Yes| UseSticky[Use Existing Provider<br/>for Consistency]
-    CheckSticky -->|No| RoundRobin[Round-Robin Selection]
-    RoundRobin --> SaveSticky[Save Sticky Route<br/>conversation_id -> provider]
-    
-    CheckConversation -->|No| RoundRobin
-    
-    UseSticky --> CheckHealth{Provider<br/>Healthy?}
-    SaveSticky --> CheckHealth
+    CheckCache -->|Yes| RoundRobin[Round-Robin Selection]
+    UpdateCache --> RoundRobin
+    RoundRobin --> CheckHealth{Provider<br/>Healthy?}
     
     CheckHealth -->|No| RemoveProvider[Remove from Pool]
     RemoveProvider --> RoundRobin
@@ -942,7 +918,6 @@ flowchart TD
     UpdateStats --> End([Response Complete])
     
     style CheckCache fill:#e3f2fd
-    style UseSticky fill:#fff3e0
     style RoundRobin fill:#e8f5e9
     style CheckHealth fill:#fce4ec
     style SendRequest fill:#c8e6c9
@@ -1074,8 +1049,8 @@ Database
    - SHA-256 hashed storage
    - Tracks last usage and expiration
    - Enforces organization limits
-   - **Used for**: AI completions, conversations, responses, attestation
-   - **Endpoints**: `/v1/chat/completions`, `/v1/completions`, `/v1/conversations/*`, `/v1/responses/*`, `/v1/attestation/*`
+   - **Used for**: AI completions, stateless Responses, temporary Conversation/File migration views and retained per-resource deletion, attestation
+   - **Endpoints**: `/v1/chat/completions`, `/v1/completions`, `/v1/responses`, temporary `/v1/conversations/*` and `/v1/files/*` views/deletions, `/v1/attestation/*`
 
 **Key Principle**: These auth methods are **mutually exclusive**. Management operations use session tokens, AI operations use API keys.
 
@@ -1093,13 +1068,13 @@ POST /v1/completions
 - Usage tracked automatically
 - **Event Stream Format**: Standard OpenAI format with `[DONE]` terminator
 
-#### B. Response API (Platform-specific)
+#### B. Responses API (Stateless Compatibility)
 ```
 POST /v1/responses
 ```
-- Platform-specific conversation management
-- Links to conversation history
-- Richer metadata support
+- Stateless compatibility layer over Chat Completions for the default model path
+- Client-managed context; no response or conversation-history persistence
+- Responses event shape and richer metadata support
 - **Event Types**:
   - `response.created` - Initial response metadata
   - `response.output_text.delta` - Incremental text chunks
@@ -1144,7 +1119,6 @@ The system discovers available models dynamically:
 - No hardcoded model configuration
 - Automatic scaling with new inference servers
 - Round-robin load balancing
-- Sticky routing for conversations (chat_id → provider)
 
 ### 6. Trusted Execution Environment (TEE)
 
@@ -1165,6 +1139,12 @@ Client → GET /attestation → Cloud API
 ---
 
 ## Data Model Overview
+
+> Stage I migration note: the Conversation and Response tables shown below are
+> legacy data retained for the export window. Stateless `POST /v1/responses`
+> does not create, read, or update `responses` or `response_items` rows, and
+> response-history routes return `410 Gone`. The retained Conversation/File
+> views and their underlying wiring are removed only in Stage III.
 
 ### Core Entities
 
@@ -1298,7 +1278,7 @@ erDiagram
 |------|-------------|
 | **Organization Owner** | Full control: manage members, workspaces, API keys, settings |
 | **Organization Admin** | Manage members, create workspaces, manage API keys |
-| **Organization Member** | Use API keys, create conversations, view organization |
+| **Organization Member** | Use API keys and view organization |
 | **API Key** | Scoped to workspace, inherits organization limits |
 
 ### Rate Limiting & Usage Control
@@ -1411,18 +1391,35 @@ erDiagram
 - `GET /v1/model/{model_name}` - Get model details with pricing (public)
 
 **Conversations:**
-- `POST /v1/conversations` - Create conversation
-- `GET /v1/conversations/{id}` - Get conversation
-- `POST /v1/conversations/{id}` - Update conversation
-- `DELETE /v1/conversations/{id}` - Delete conversation
-- `GET /v1/conversations/{id}/items` - List conversation items
+- `POST /v1/conversations/batch` - Retrieve known conversations for migration/export
+- `GET /v1/conversations/{id}` - Get a workspace-scoped conversation
+- `GET /v1/conversations/{id}/items` - List a workspace-scoped conversation's items
+- `DELETE /v1/conversations/{id}` - Retained normal deletion for account cleanup
+- All other Conversation methods and legacy descendants - Authenticated `410 Gone`
+
+**Files:**
+- `GET /v1/files` - List workspace-scoped files for migration/export
+- `GET /v1/files/{id}` - Get workspace-scoped file metadata
+- `GET /v1/files/{id}/content` - Get workspace-scoped file content
+- `DELETE /v1/files/{id}` - Retained normal deletion for account cleanup
+- All other File methods and legacy descendants - Authenticated `410 Gone`
+
+> The temporary Conversation/File views and retained per-resource deletes use
+> API-key/workspace authorization and `Cache-Control: no-store`. They are not
+> new export or Conversation-list APIs; the surfaces are removed in Stage III
+> after the migration/export window and account-deletion lifecycle.
 
 **Responses (Platform-specific):**
-- `POST /v1/responses` - Create AI response (streaming/non-streaming)
-- `GET /v1/responses/{id}` - Get response details
-- `DELETE /v1/responses/{id}` - Delete response
-- `POST /v1/responses/{id}/cancel` - Cancel in-progress response
-- `GET /v1/responses/{id}/input_items` - List input items
+- `POST /v1/responses` - Stateless `store: false` inference; default typed adapter makes one Chat Completions call, while an explicit `NATIVE_RESPONSES_MODELS` allowlist uses one native provider Responses call
+- `GET`/`DELETE /v1/responses/{id}` - Authenticated `410 Gone` (history retired)
+- `POST /v1/responses/{id}/cancel` - Authenticated `410 Gone` (history retired)
+- `GET /v1/responses/{id}/input_items` - Authenticated `410 Gone` (history retired)
+
+> Responses accepts only custom client-managed `function` tools. Clients keep
+> history and replay a raw `function_call` plus its matching
+> `function_call_output` in a fresh request; Cloud neither executes tools nor
+> runs an agent loop. Responses, including retired-history responses, use
+> `Cache-Control: no-store`.
 
 **Attestation:**
 - `GET /v1/signature/{chat_id}` - Get chat signature
@@ -1455,13 +1452,12 @@ The NEAR AI Cloud API is a modern, multi-tenant AI inference platform built with
 
 **Separation of Concerns:**
 - **Management Plane** (Session Auth): Organization, workspace, user, and API key management
-- **Data Plane** (API Key Auth): AI completions, conversations, responses, and attestation
+- **Data Plane** (API Key Auth): AI completions, stateless Responses, temporary Conversation/File views and retained per-resource deletion, and attestation
 - This separation enables secure multi-tenant operations with clear boundaries
 
 **Scalability:**
 - Dynamic model discovery enables horizontal scaling of inference capacity
 - Round-robin load balancing across multiple vLLM providers
-- Sticky routing for conversations ensures consistency
 
 **Security:**
 - All sensitive operations run in TEE with attestation
@@ -1474,4 +1470,3 @@ For additional details, see:
 - API documentation: OpenAPI/Swagger UI (when server is running)
 - Service interfaces: `/crates/services/src/*/ports.rs`
 - Configuration: `/config/config.yaml`
-

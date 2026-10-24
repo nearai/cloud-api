@@ -20,6 +20,43 @@ async fn native_routing_is_disabled_when_allowlist_is_empty() {
     native_flow("openai/gpt-6-astra", false).await;
 }
 
+#[tokio::test]
+async fn native_stateless_responses_reject_image_output_models() {
+    let model = format!("native-image-{}", uuid::Uuid::new_v4());
+    let (server, _pool, _, _) = setup_test_server_with_pool_and_config(|config| {
+        config.native_responses_models = vec![model.clone()];
+    })
+    .await;
+
+    let mut batch = api::models::BatchUpdateModelApiRequest::new();
+    batch.insert(
+        model.clone(),
+        serde_json::from_value(json!({
+            "inputCostPerToken":{"amount":1000,"currency":"USD"},
+            "outputCostPerToken":{"amount":2000,"currency":"USD"},
+            "modelDisplayName":"Native image fixture",
+            "modelDescription":"Must be rejected by Responses",
+            "contextLength":10000,"maxOutputLength":1000,"isActive":true,"ownedBy":"openai",
+            "verifiable":false,"inputModalities":["text"],"outputModalities":["image"]
+        }))
+        .unwrap(),
+    );
+    admin_batch_upsert_models(&server, batch, get_session_id()).await;
+
+    let org = setup_org_with_credits(&server, 10_000_000_000).await;
+    let key = get_api_key_for_org(&server, org.id).await;
+    let response = server
+        .post("/v1/responses")
+        .add_header("Authorization", format!("Bearer {key}"))
+        .json(&json!({"model":model,"store":false,"input":"draw a cat"}))
+        .await;
+
+    assert_eq!(response.status_code(), 400, "{}", response.text());
+    assert!(response
+        .text()
+        .contains("Image generation and image editing"));
+}
+
 async fn native_flow(prefix: &str, enabled: bool) {
     let model = format!("{prefix}-{}", uuid::Uuid::new_v4());
     let alias = format!("native-alias-{}", uuid::Uuid::new_v4());
@@ -132,27 +169,35 @@ async fn native_flow(prefix: &str, enabled: bool) {
     ];
     assert_eq!(captured.lock().unwrap().len(), 2);
 
-    // Both explicit and default storage must still persist local response records.
-    for store in [Some(true), None] {
-        let mut legacy = json!({"model":model,"input":"hello"});
-        if let Some(store) = store {
-            legacy["store"] = json!(store);
-        }
-        let response = server
-            .post("/v1/responses")
-            .add_header("Authorization", &auth)
-            .json(&legacy)
-            .await;
-        assert_eq!(response.status_code(), 200, "{}", response.text());
-        let value: Value = response.json();
-        assert!(stored_response(&database, value["id"].as_str().unwrap()).await);
-        let followup = server.post("/v1/responses")
-            .add_header("Authorization", &auth)
-            .json(&json!({"model":model,"store":false,"previous_response_id":value["id"],"input":"follow up"}))
-            .await;
-        assert_eq!(followup.status_code(), 200, "{}", followup.text());
-        assert_eq!(captured.lock().unwrap().len(), 2);
-    }
+    // Stateful and history-linked requests are rejected before either transport
+    // starts inference. An omitted `store` falls back to the typed stateless
+    // adapter rather than implicitly selecting native routing.
+    server
+        .post("/v1/responses")
+        .add_header("Authorization", &auth)
+        .json(&json!({"model":model,"store":true,"input":"hello"}))
+        .await
+        .assert_status_bad_request();
+    server
+        .post("/v1/responses")
+        .add_header("Authorization", &auth)
+        .json(&json!({"model":model,"store":false,"previous_response_id":"resp_stale","input":"follow up"}))
+        .await
+        .assert_status_bad_request();
+
+    let omitted_store = server
+        .post("/v1/responses")
+        .add_header("Authorization", &auth)
+        .json(&json!({"model":model,"input":"hello"}))
+        .await;
+    assert_eq!(omitted_store.status_code(), 200, "{}", omitted_store.text());
+    let omitted_store: Value = omitted_store.json();
+    assert!(
+        !stored_response(&database, omitted_store["id"].as_str().unwrap()).await,
+        "typed stateless output must not be stored"
+    );
+    assert_eq!(captured.lock().unwrap().len(), 2);
+    assert!(provider.last_chat_params().await.is_some());
     let response = server
         .post("/v1/responses")
         .add_header("Authorization", &auth)

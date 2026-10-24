@@ -53,7 +53,6 @@ mod concurrent_limit;
 mod contact_email;
 mod conversations;
 mod credit_types;
-mod cross_workspace;
 mod database_encryption;
 mod default_organization_deletion;
 mod deser_error_envelope;
@@ -70,7 +69,6 @@ mod glm52_tier_routing;
 mod health;
 mod invitations;
 mod ita_attestation;
-mod mcp;
 mod mcp_server;
 mod message_metadata;
 mod model_alias_transparency;
@@ -101,8 +99,8 @@ mod reporting_usage;
 mod repositories;
 mod request_id_contract;
 mod rerank;
-mod response_signature_verification;
 mod responses_native;
+mod responses_stateless;
 mod score;
 mod serving_provider;
 mod session_logout;
@@ -120,9 +118,6 @@ mod usage_responses;
 mod user_erasure;
 mod user_erasure_lookup;
 mod vpc_login;
-mod web_context_search;
-mod web_search_citations;
-
 /// Run by nextest's setup script after this E2E binary has already been built.
 /// Keeping bootstrap in the same binary avoids a second cold compile/link in CI.
 #[tokio::test]

@@ -26,9 +26,11 @@ lookup or priority cache. The next authenticated request sees a committed update
 already-running requests, their tool iterations, and background title generation
 retain the priority captured when the request began.
 
-Chat completions, legacy text completions, and Responses use the same internal
-metadata, including streaming and non-streaming calls and provider retries. The
-NEAR AI provider sends `X-NearAI-Priority` using that metadata. Customer headers
+Chat completions, legacy text completions, and the default typed Responses
+adapter use the same internal metadata, including streaming and non-streaming
+calls and provider retries. The explicit `NATIVE_RESPONSES_MODELS` transport
+is a separate provider-native path and does not accept client priority fields.
+The NEAR AI provider sends `X-NearAI-Priority` using that metadata. Customer headers
 and body fields cannot override it. Internal priority metadata is never serialized
 into provider JSON and is not sent in external-provider headers. OpenAI
 `service_tier` remains independent.

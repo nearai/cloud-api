@@ -1566,6 +1566,10 @@ pub fn build_completion_routes(
             .layer(from_fn_with_state(
                 auth_state_middleware.clone(),
                 middleware::auth::anthropic_auth_middleware_with_workspace_context,
+            ))
+            .layer(from_fn_with_state(
+                middleware::BodyHashLimit(AUDIO_TRANSCRIPTION_MAX_BODY_SIZE),
+                middleware::body_hash_middleware,
             ));
 
         // Token counting is free and has its own Anthropic rate-limit class.

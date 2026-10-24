@@ -27,6 +27,55 @@ impl PgOrganizationRepository {
         Self { pool }
     }
 
+    async fn confirm_role_change_commit(
+        &self,
+        result: Result<(), RepositoryError>,
+        org_id: Uuid,
+        audit_id: Uuid,
+    ) -> Result<(), RepositoryError> {
+        let Err(commit_error) = result else {
+            return Ok(());
+        };
+        let confirmed = retry_db!("confirm_member_role_commit", {
+            let mut client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
+            let transaction = client.transaction().await.map_err(map_db_error)?;
+            transaction
+                .batch_execute("SET LOCAL lock_timeout = '5s'; SET LOCAL statement_timeout = '5s'")
+                .await
+                .map_err(map_db_error)?;
+            // Wait for the original transaction to commit or roll back before
+            // taking the audit snapshot. Read from the current write pool.
+            transaction
+                .query_opt(
+                    "SELECT id FROM organizations WHERE id = $1 FOR UPDATE",
+                    &[&org_id],
+                )
+                .await
+                .map_err(map_db_error)?;
+            let committed: bool = transaction.query_one(
+                "SELECT EXISTS (SELECT 1 FROM organization_member_role_audit_log WHERE id = $1 AND organization_id = $2)",
+                &[&audit_id, &org_id],
+            ).await.map_err(map_db_error)?.get(0);
+            // This transaction only read data. Its cleanup cannot invalidate
+            // the committed audit record we just observed.
+            let _ = transaction.rollback().await;
+            Ok(committed)
+        });
+        match confirmed {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(commit_error),
+            Err(_) => {
+                tracing::warn!(organization_id = %org_id, audit_id = %audit_id, "Unable to confirm member role change commit");
+                Err(commit_error)
+            }
+        }
+    }
+
     /// Get the owner of an organization by looking up the owner role in organization_members
     async fn get_organization_owner(&self, org_id: Uuid) -> Result<Option<Uuid>> {
         let row = retry_db!("get_organization_owner", {
@@ -434,8 +483,9 @@ impl PgOrganizationRepository {
         user_id: Uuid,
         request: DbUpdateOrganizationMemberRequest,
         requester_user_id: Uuid,
-    ) -> Result<DbOrganizationMember, RepositoryError> {
-        let row = retry_db!("update_member_role", {
+    ) -> Result<OrganizationMemberRoleUpdate, RepositoryError> {
+        let audit_id = Uuid::new_v4();
+        let (commit_result, row, previous_role) = retry_db!("update_member_role", {
             let mut client = self
                 .pool
                 .get()
@@ -480,7 +530,8 @@ impl PgOrganizationRepository {
                 .await
                 .map_err(map_db_error)?
                 .ok_or_else(|| RepositoryError::NotFound("organization member".to_string()))?;
-            if current.get::<_, String>("role") == "owner" {
+            let previous_role: String = current.get("role");
+            if previous_role == "owner" {
                 return Err(RepositoryError::ValidationFailed(
                     "Cannot change the owner's role. Use transfer ownership instead.".to_string(),
                 ));
@@ -503,16 +554,36 @@ impl PgOrganizationRepository {
                 )
                 .await
                 .map_err(map_db_error)?;
-            transaction.commit().await.map_err(map_db_error)?;
-            Ok(row)
+            if previous_role != request.role.to_string().to_lowercase() {
+                transaction.execute(
+                    "INSERT INTO organization_member_role_audit_log (id, organization_id, member_user_id, changed_by_user_id, previous_role, new_role) VALUES ($1, $2, $3, $4, $5, $6)",
+                    &[&audit_id, &org_id, &user_id, &requester_user_id, &previous_role, &request.role.to_string().to_lowercase()],
+                ).await.map_err(map_db_error)?;
+            }
+            // Keep COMMIT outside the retry result: never replay the mutation.
+            Ok((
+                transaction.commit().await.map_err(map_db_error),
+                row,
+                previous_role,
+            ))
         })?;
+        self.confirm_role_change_commit(commit_result, org_id, audit_id)
+            .await?;
 
         debug!(
             "Updated member {} in organization {} to role {:?}",
             user_id, org_id, request.role
         );
-        self.row_to_db_org_member(row)
-            .map_err(RepositoryError::DataConversionError)
+        Ok(OrganizationMemberRoleUpdate {
+            member: self
+                .row_to_db_org_member(row)
+                .and_then(|member| self.db_to_domain_member(member))
+                .map_err(RepositoryError::DataConversionError)?,
+            previous_role: self
+                .role_str_to_domain_role(&previous_role)
+                .map_err(RepositoryError::DataConversionError)?,
+            additional_changes: Vec::new(),
+        })
     }
 
     /// Remove a member from an organization
@@ -1089,16 +1160,13 @@ impl OrganizationRepository for PgOrganizationRepository {
         user_id: Uuid,
         request: UpdateOrganizationMemberRequest,
         requester_user_id: Uuid,
-    ) -> Result<OrganizationMember, RepositoryError> {
+    ) -> Result<OrganizationMemberRoleUpdate, RepositoryError> {
         let db_request = DbUpdateOrganizationMemberRequest {
             role: self.domain_to_db_role(request.role),
         };
 
-        let db_member = self
-            .update_member_internal(org_id, user_id, db_request, requester_user_id)
-            .await?;
-        self.db_to_domain_member(db_member)
-            .map_err(RepositoryError::DataConversionError)
+        self.update_member_internal(org_id, user_id, db_request, requester_user_id)
+            .await
     }
 
     async fn update_member_role_with_audit(
@@ -1112,8 +1180,8 @@ impl OrganizationRepository for PgOrganizationRepository {
             .domain_to_db_role(request.role)
             .to_string()
             .to_lowercase();
-
-        let (row, previous_role) = retry_db!("update_member_role_with_audit", {
+        let audit_id = Uuid::new_v4();
+        let update = retry_db!("update_member_role_with_audit", {
             let mut client = self
                 .pool
                 .get()
@@ -1150,6 +1218,7 @@ impl OrganizationRepository for PgOrganizationRepository {
                 ));
             }
 
+            let mut demoted_owner_ids = Vec::new();
             let row = if previous_role == new_role {
                 current
             } else if new_role == "owner" {
@@ -1174,6 +1243,7 @@ impl OrganizationRepository for PgOrganizationRepository {
                     .iter()
                     .map(|owner| owner.get::<_, Uuid>("user_id"))
                     .collect::<Vec<_>>();
+                demoted_owner_ids.clone_from(&current_owner_ids);
 
                 transaction
                     .execute(
@@ -1201,22 +1271,24 @@ impl OrganizationRepository for PgOrganizationRepository {
                 transaction
                     .execute(
                         "INSERT INTO organization_member_role_audit_log (
+                             id,
                              organization_id,
                              member_user_id,
                              changed_by_user_id,
                              previous_role,
                              new_role
                          )
-                         SELECT $1::uuid, prior_owner.user_id, $2::uuid, 'owner', 'admin'
+                         SELECT uuid_generate_v4(), $1::uuid, prior_owner.user_id, $2::uuid, 'owner', 'admin'
                          FROM UNNEST($3::uuid[]) AS prior_owner(user_id)
                          UNION ALL
-                         SELECT $1::uuid, $4::uuid, $2::uuid, $5, 'owner'",
+                         SELECT $6::uuid, $1::uuid, $4::uuid, $2::uuid, $5, 'owner'",
                         &[
                             &org_id,
                             &changed_by_user_id,
                             &current_owner_ids,
                             &user_id,
                             &previous_role,
+                            &audit_id,
                         ],
                     )
                     .await
@@ -1237,18 +1309,20 @@ impl OrganizationRepository for PgOrganizationRepository {
                 transaction
                     .execute(
                         "INSERT INTO organization_member_role_audit_log (
+                             id,
                              organization_id,
                              member_user_id,
                              changed_by_user_id,
                              previous_role,
                              new_role
-                         ) VALUES ($1, $2, $3, $4, $5)",
+                         ) VALUES ($6, $1, $2, $3, $4, $5)",
                         &[
                             &org_id,
                             &user_id,
                             &changed_by_user_id,
                             &previous_role,
                             &new_role,
+                            &audit_id,
                         ],
                     )
                     .await
@@ -1256,9 +1330,16 @@ impl OrganizationRepository for PgOrganizationRepository {
                 row
             };
 
-            transaction.commit().await.map_err(map_db_error)?;
-            Ok((row, previous_role))
+            Ok((
+                transaction.commit().await.map_err(map_db_error),
+                row,
+                previous_role,
+                demoted_owner_ids,
+            ))
         })?;
+        let (commit_result, row, previous_role, demoted_owner_ids) = update;
+        self.confirm_role_change_commit(commit_result, org_id, audit_id)
+            .await?;
 
         let previous_role = self
             .role_str_to_domain_role(&previous_role)
@@ -1271,6 +1352,14 @@ impl OrganizationRepository for PgOrganizationRepository {
         Ok(OrganizationMemberRoleUpdate {
             member,
             previous_role,
+            additional_changes: demoted_owner_ids
+                .into_iter()
+                .map(|user_id| OrganizationMemberRoleChange {
+                    user_id: UserId(user_id),
+                    previous_role: MemberRole::Owner,
+                    new_role: MemberRole::Admin,
+                })
+                .collect(),
         })
     }
 

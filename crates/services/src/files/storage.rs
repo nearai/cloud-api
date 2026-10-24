@@ -235,3 +235,44 @@ impl StorageTrait for MockStorage {
         Ok(files.contains_key(key))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use aws_sdk_s3::{
+        config::{BehaviorVersion, Credentials, Region},
+        presigning::PresigningConfig,
+    };
+
+    use super::*;
+
+    #[tokio::test]
+    async fn regional_s3_requests_use_sigv4_without_sigv4a() {
+        let config = aws_sdk_s3::Config::builder()
+            .behavior_version(BehaviorVersion::latest())
+            .region(Region::new("us-east-1"))
+            .credentials_provider(Credentials::new(
+                "test-access-key",
+                "test-secret-key",
+                None,
+                None,
+                "test",
+            ))
+            .build();
+        let client = S3Client::from_conf(config);
+
+        // Presigning exercises endpoint resolution and signing without AWS I/O.
+        let request = client
+            .get_object()
+            .bucket("regional-test-bucket")
+            .key("test-object")
+            .presigned(PresigningConfig::expires_in(Duration::from_secs(60)).unwrap())
+            .await
+            .unwrap();
+
+        assert!(request.uri().contains("X-Amz-Algorithm=AWS4-HMAC-SHA256"));
+        assert!(request.uri().contains("us-east-1%2Fs3%2Faws4_request"));
+        assert!(request.uri().contains("X-Amz-Signature="));
+    }
+}

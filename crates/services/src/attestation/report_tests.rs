@@ -19,7 +19,7 @@ use super::{
 };
 use crate::{
     inference_provider_pool::InferenceProviderPool,
-    models::{ModelWithPricing, ModelsRepository},
+    models::{ModelCaller, ModelWithPricing, ModelsRepository},
 };
 
 const MODEL: &str = "test-org/attested-model";
@@ -117,6 +117,52 @@ fn catalog_model() -> ModelWithPricing {
     }
 }
 
+/// Catalog holding `MODEL` as an unlisted model that one organization holds a
+/// grant for.
+struct RestrictedModelRepository {
+    granted_organization: Uuid,
+}
+
+#[async_trait]
+impl ModelsRepository for RestrictedModelRepository {
+    async fn get_all_active_models(&self) -> anyhow::Result<Vec<ModelWithPricing>> {
+        Ok(vec![unlisted_catalog_model()])
+    }
+
+    async fn get_model_by_name(
+        &self,
+        model_name: &str,
+    ) -> anyhow::Result<Option<ModelWithPricing>> {
+        Ok((model_name == MODEL).then(unlisted_catalog_model))
+    }
+
+    async fn resolve_and_get_model(
+        &self,
+        identifier: &str,
+    ) -> anyhow::Result<Option<ModelWithPricing>> {
+        Ok((identifier == MODEL).then(unlisted_catalog_model))
+    }
+
+    async fn get_configured_model_names(&self) -> anyhow::Result<Vec<String>> {
+        Ok(vec![MODEL.to_string()])
+    }
+
+    async fn organization_has_model_access(
+        &self,
+        organization_id: Uuid,
+        _model_id: Uuid,
+    ) -> anyhow::Result<bool> {
+        Ok(organization_id == self.granted_organization)
+    }
+}
+
+fn unlisted_catalog_model() -> ModelWithPricing {
+    ModelWithPricing {
+        is_listed: false,
+        ..catalog_model()
+    }
+}
+
 /// Service whose pool serves `MODEL` from a recording `MockProvider`. Returns
 /// the number of attestation calls pool registration already made, so tests
 /// can look only at the calls their own requests caused.
@@ -153,6 +199,7 @@ async fn mixed_case_signing_algo_is_forwarded_lowercased() {
                 None,
                 false,
                 None,
+                ModelCaller::Anonymous,
             )
             .await
             .unwrap_or_else(|e| panic!("{requested} must be accepted: {e}"));
@@ -178,6 +225,7 @@ async fn omitted_signing_algo_leaves_the_backend_default() {
             None,
             false,
             None,
+            ModelCaller::Anonymous,
         )
         .await
         .expect("omitted signing_algo must succeed");
@@ -199,6 +247,7 @@ async fn unknown_model_is_a_client_error_and_skips_the_backend() {
                 None,
                 false,
                 None,
+                ModelCaller::Anonymous,
             )
             .await
         {
@@ -230,6 +279,7 @@ async fn unsupported_signing_algo_is_rejected_before_the_backend() {
             None,
             false,
             None,
+            ModelCaller::Anonymous,
         )
         .await;
 
@@ -254,6 +304,7 @@ async fn no_nonce_cache_is_keyed_on_the_normalized_algo() {
             None,
             false,
             None,
+            ModelCaller::Anonymous,
         )
     };
 
@@ -305,7 +356,15 @@ async fn no_nonce_cache_does_not_serve_a_source_disabled_after_caching() {
             .build(),
     );
     let fetch = |filter: Option<ProviderFilter>| {
-        service.get_attestation_report(Some(MODEL.to_string()), None, None, None, false, filter)
+        service.get_attestation_report(
+            Some(MODEL.to_string()),
+            None,
+            None,
+            None,
+            false,
+            filter,
+            ModelCaller::Anonymous,
+        )
     };
     let chutes_filter = Some(ProviderFilter::Source(ProviderSource::Chutes));
 
@@ -326,5 +385,84 @@ async fn no_nonce_cache_does_not_serve_a_source_disabled_after_caching() {
     assert!(
         fetch(chutes_filter).await.is_err(),
         "filtered request must not be served a cached report from a disabled source"
+    );
+}
+
+/// An unlisted model has a report only for a caller that may use it. The
+/// check must not depend on the no-nonce cache: a report cached for an
+/// organization that holds a grant must not be served to anyone else.
+#[tokio::test]
+async fn unlisted_model_report_is_refused_like_an_unknown_model_even_when_cached() {
+    let (mut service, provider, baseline) = report_service().await;
+    let granted = Uuid::new_v4();
+    service.models_repository = Arc::new(RestrictedModelRepository {
+        granted_organization: granted,
+    });
+    service.report_cache = Some(
+        moka::future::Cache::builder()
+            .max_capacity(16)
+            .time_to_live(Duration::from_secs(60))
+            .build(),
+    );
+    let fetch = |model: &str, nonce: Option<&str>, caller: ModelCaller| {
+        service.get_attestation_report(
+            Some(model.to_string()),
+            None,
+            nonce.map(str::to_string),
+            None,
+            false,
+            None,
+            caller,
+        )
+    };
+
+    // The granted organization gets the report, and the nonce-less one is
+    // now cached.
+    let granted_caller = ModelCaller::Organization(granted);
+    fetch(MODEL, None, granted_caller)
+        .await
+        .expect("no-nonce report for the granted organization");
+    fetch(MODEL, Some(NONCE), granted_caller)
+        .await
+        .expect("nonce report for the granted organization");
+    let backend_calls = backend_algos_since(&provider, baseline).len();
+    assert_eq!(backend_calls, 2);
+
+    for caller in [
+        ModelCaller::Organization(Uuid::new_v4()),
+        ModelCaller::Anonymous,
+    ] {
+        for nonce in [None, Some(NONCE)] {
+            let refused = match fetch(MODEL, nonce, caller).await {
+                Ok(_) => panic!("{caller:?} must not get a report for the unlisted model"),
+                Err(error) => error,
+            };
+            let unknown = match fetch("test-org/no-such-model", nonce, caller).await {
+                Ok(_) => panic!("unknown model must be rejected"),
+                Err(error) => error,
+            };
+            assert!(matches!(refused, AttestationError::UnknownModel(_)));
+            assert!(matches!(unknown, AttestationError::UnknownModel(_)));
+            assert_eq!(
+                refused.to_string().replace(MODEL, "<model>"),
+                unknown
+                    .to_string()
+                    .replace("test-org/no-such-model", "<model>")
+            );
+        }
+    }
+    // The refusals never reached the backend.
+    assert_eq!(
+        backend_algos_since(&provider, baseline).len(),
+        backend_calls
+    );
+
+    // The cached report still serves the organization that may read it.
+    fetch(MODEL, None, granted_caller)
+        .await
+        .expect("cached report for the granted organization");
+    assert_eq!(
+        backend_algos_since(&provider, baseline).len(),
+        backend_calls
     );
 }

@@ -112,8 +112,14 @@ pub struct CreditLimitBreakdownResponse {
     pub credit_type: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
+    /// Gross allocated amount before transfers.
     pub amount: i64,
+    /// Nonnegative capacity transferred out to other organizations.
+    pub transferred_out: i64,
+    /// Net capacity for this source: `max(amount - transferred_out, 0)`.
+    pub effective_capacity: i64,
     pub consumed: i64,
+    /// Remaining spendable capacity: `max(effective_capacity - consumed, 0)`.
     pub available: i64,
     pub currency: String,
 }
@@ -147,6 +153,8 @@ pub async fn compute_organization_balance_response(
             credit_type: limit.credit_type,
             source: limit.source,
             amount: limit.amount,
+            transferred_out: limit.transferred_out,
+            effective_capacity: limit.effective_capacity,
             consumed: limit.consumed,
             available: limit.available,
             currency: limit.currency,

@@ -6,9 +6,9 @@
 //!
 //! | Route                           | Auth    | Rationale |
 //! |---------------------------------|---------|-----------|
-//! | `GET /v1/attestation/report`    | API key | Data-plane endpoint, documented as key-protected. Key validation only — retrieval is not billed and never creates usage records. |
+//! | `GET /v1/attestation/report`    | API key | Data-plane endpoint, documented as key-protected. Key validation only — retrieval is not billed and never creates usage records. The key's organization decides whether an unlisted model resolves. |
 //! | `GET /v1/signature/{chat_id}`   | API key | Requires a valid API key, then looks up the response ID. The shared lookup does not enforce ownership by organization or API key. |
-//! | `GET /v1/attestation/ita-token` | Public  | Deliberate exception — see `build_public_attestation_routes`. |
+//! | `GET /v1/attestation/ita-token` | Public  | Deliberate exception — see `build_public_attestation_routes`. Listed models only. |
 //! | `GET /v1/attestation/pins` | Public | Deliberate exception — see `build_public_attestation_routes`. |
 
 use crate::{ohttp_gateway::OhttpAttestation, routes::api::AppState};

@@ -1155,6 +1155,26 @@ pub struct ModelsResponse {
     pub data: Vec<ModelInfo>,
 }
 
+/// `GET /v1/internal/model-access`: which organizations may use each
+/// restricted model. A model that is absent from `models` is unrestricted.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ModelAccessDocument {
+    /// Always `"model_access"`.
+    pub object: String,
+    /// One entry per unlisted model, active or not, ordered by model name.
+    pub models: Vec<ModelAccessDocumentEntry>,
+}
+
+/// One restricted model of [`ModelAccessDocument`].
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ModelAccessDocumentEntry {
+    /// Canonical model name, the `id` of `GET /v1/internal/models`.
+    pub id: String,
+    /// The active organizations that hold a grant. Empty when nobody may use
+    /// the model.
+    pub organization_ids: Vec<uuid::Uuid>,
+}
+
 /// Model pricing information.
 ///
 /// `input` / `output` are the legacy HuggingFace-style fields (USD per million
@@ -1286,7 +1306,8 @@ pub struct ModelInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub deprecation_date: Option<String>,
     /// Recommended replacement for a model with a planned deprecation
-    /// (canonical model id). Omitted when none is set.
+    /// (canonical model id). Omitted when none is set. The public catalogs
+    /// name only a listed successor.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub successor_model_id: Option<String>,
     /// Human-readable description (OpenRouter `description`).
@@ -1922,7 +1943,12 @@ pub enum ResponseTool {
         parameters: Option<serde_json::Value>,
     },
     #[serde(rename = "web_search")]
-    WebSearch {},
+    WebSearch {
+        /// Maximum results per search (0–20); zero disables searches. Overrides the model's count when set.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[schema(minimum = 0, maximum = 20)]
+        count: Option<u32>,
+    },
     #[serde(rename = "web_context_search")]
     WebContextSearch {},
     #[serde(rename = "file_search")]
@@ -2607,6 +2633,17 @@ impl CreateResponseRequest {
     pub fn validate(&self) -> Result<(), String> {
         if self.model.trim().is_empty() {
             return Err("Model cannot be empty".to_string());
+        }
+
+        for tool in self.tools.iter().flatten() {
+            if let ResponseTool::WebSearch {
+                count: Some(count), ..
+            } = tool
+            {
+                if *count > services::web_search::WEB_SEARCH_MAX_COUNT {
+                    return Err("web_search count must be between 0 and 20".to_string());
+                }
+            }
         }
 
         if let Some(max_tokens) = self.max_output_tokens {
@@ -4105,7 +4142,8 @@ pub struct ModelMetadata {
     #[serde(rename = "deprecationDate", skip_serializing_if = "Option::is_none")]
     pub deprecation_date: Option<String>,
     /// Recommended replacement for a model with a planned deprecation
-    /// (canonical model id). Omitted when none is set.
+    /// (canonical model id). Omitted when none is set. The public catalogs
+    /// name only a listed successor.
     #[serde(rename = "successorModelId", skip_serializing_if = "Option::is_none")]
     pub successor_model_id: Option<String>,
     /// OpenRouter `openrouter.slug` override (lowercase `author/slug`). Omitted
@@ -4113,8 +4151,9 @@ pub struct ModelMetadata {
     /// `openrouter: { slug }` object; the admin view exposes the raw value.
     #[serde(rename = "openrouterSlug", skip_serializing_if = "Option::is_none")]
     pub openrouter_slug: Option<String>,
-    /// Whether the model appears in the public model catalogs. Set on admin
-    /// views only; the public catalog endpoints omit it.
+    /// Whether the model is listed. An unlisted model is left out of the
+    /// public model catalogs and only organizations that hold a grant may
+    /// use it. Set on admin views only; the public catalog endpoints omit it.
     #[serde(rename = "isListed", skip_serializing_if = "Option::is_none")]
     pub is_listed: Option<bool>,
 }
@@ -4169,11 +4208,14 @@ pub struct UpdateModelApiRequest {
     /// Required to be set explicitly when activating a zero-price model.
     #[serde(rename = "allowFree", skip_serializing_if = "Option::is_none")]
     pub allow_free: Option<bool>,
-    /// `false` keeps the model out of the public model catalogs
-    /// (`GET /v1/models`, `GET /v1/model/list`, `GET /v1/model/{name}`) while
-    /// it stays active and billable; `true` lists it again. Omitted = leave
-    /// unchanged (new models are listed). It is a catalog switch only: a
-    /// model that has an inference URL can still be called by name.
+    /// `false` unlists the model. It stays active and billable, but it
+    /// leaves the public model catalogs (`GET /v1/models`,
+    /// `GET /v1/model/list`, `GET /v1/model/{name}`) and becomes restricted:
+    /// only organizations that hold a grant
+    /// (`PUT /v1/admin/models/{model_name}/access/{org_id}`) may use it, and
+    /// everyone else is answered as if the model did not exist. `true` lists
+    /// it again and opens it to every caller. Omitted = leave unchanged (new
+    /// models are listed).
     #[serde(rename = "isListed", skip_serializing_if = "Option::is_none")]
     pub is_listed: Option<bool>,
     pub aliases: Option<Vec<String>>,
@@ -4648,7 +4690,8 @@ pub struct ModelHistoryEntry {
     /// If true, this model was allowed to serve without pricing at this point in time.
     #[serde(rename = "allowFree")]
     pub allow_free: bool,
-    /// Whether the model was in the public model catalogs at this point in time.
+    /// Whether the model was listed (in the public model catalogs and open to
+    /// every caller) at this point in time.
     #[serde(rename = "isListed")]
     pub is_listed: bool,
 }
@@ -4682,6 +4725,8 @@ pub enum CreditType {
     Payment,
     #[serde(rename = "staking_farm", alias = "STAKING_FARM")]
     StakingFarm,
+    #[serde(alias = "TRANSFER")]
+    Transfer,
     #[serde(alias = "POSTPAY")]
     Postpay,
 }
@@ -4692,6 +4737,7 @@ impl std::fmt::Display for CreditType {
             CreditType::Grant => write!(f, "grant"),
             CreditType::Payment => write!(f, "payment"),
             CreditType::StakingFarm => write!(f, "staking_farm"),
+            CreditType::Transfer => write!(f, "transfer"),
             CreditType::Postpay => write!(f, "postpay"),
         }
     }
@@ -4704,6 +4750,7 @@ impl CreditType {
             CreditType::Grant => "grant",
             CreditType::Payment => "payment",
             CreditType::StakingFarm => "staking_farm",
+            CreditType::Transfer => "transfer",
             CreditType::Postpay => "postpay",
         }
     }
@@ -4721,6 +4768,7 @@ impl std::str::FromStr for CreditType {
             "grant" => Ok(Self::Grant),
             "payment" => Ok(Self::Payment),
             "staking_farm" => Ok(Self::StakingFarm),
+            "transfer" => Ok(Self::Transfer),
             "postpay" => Ok(Self::Postpay),
             _ => Err(ParseCreditTypeError),
         }
@@ -4909,8 +4957,41 @@ pub struct FileDeleteResponse {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::models::*;
     use serde_json::json;
+
+    #[test]
+    fn test_web_search_count_validation_and_round_trip() {
+        for count in [None, Some(1), Some(5), Some(20), Some(0), Some(21)] {
+            let mut tool = serde_json::json!({"type": "web_search"});
+            if let Some(count) = count {
+                tool["count"] = serde_json::json!(count);
+            }
+            let request: CreateResponseRequest = serde_json::from_value(serde_json::json!({
+                "model": "test", "input": "Search the web", "tools": [tool.clone()]
+            }))
+            .unwrap();
+            assert_eq!(
+                request.validate().is_ok(),
+                count.is_none_or(|n| (0..=20).contains(&n))
+            );
+            let serialized = serde_json::to_value(&request.tools).unwrap();
+            assert_eq!(serialized[0], tool);
+        }
+        for count in [
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+            serde_json::json!("5"),
+            serde_json::json!(4294967296u64),
+        ] {
+            assert!(
+                serde_json::from_value::<CreateResponseRequest>(serde_json::json!({
+                    "model": "test", "tools": [{"type": "web_search", "count": count}]
+                }))
+                .is_err()
+            );
+        }
+    }
 
     #[test]
     fn nano_dollars_zero_renders_as_bare_zero() {
@@ -6123,7 +6204,7 @@ pub struct ScoreUsage {
 
 #[cfg(test)]
 mod credit_type_tests {
-    use super::CreditType;
+    use crate::models::CreditType;
 
     #[test]
     fn postpay_serializes_and_accepts_supported_casing() {
@@ -6145,7 +6226,7 @@ mod credit_type_tests {
 
 #[cfg(test)]
 mod input_modality_tests {
-    use super::*;
+    use crate::models::*;
 
     fn msg(content: Option<MessageContent>) -> Message {
         Message {

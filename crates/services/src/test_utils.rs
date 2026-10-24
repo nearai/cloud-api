@@ -64,6 +64,7 @@ impl AttestationServiceTrait for MockAttestationService {
         _signing_address: Option<String>,
         _include_tls_fingerprint: bool,
         _provider_filter: Option<ProviderFilter>,
+        _caller: crate::models::ModelCaller,
     ) -> Result<AttestationReport, AttestationError> {
         Err(AttestationError::InternalError(
             "Not implemented".to_string(),

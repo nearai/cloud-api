@@ -83,7 +83,7 @@ pub(super) fn test_model(model_name: &str) -> ModelWithPricing {
     }
 }
 
-fn completion_request(model: &str) -> ports::CompletionRequest {
+pub(super) fn completion_request(model: &str) -> ports::CompletionRequest {
     ports::CompletionRequest {
         request_priority: 0,
         session_hint: None,

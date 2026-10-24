@@ -257,13 +257,15 @@ async fn load_position(tx: &Transaction<'_>, org: Uuid) -> Result<AccountingPosi
     let rows = tx
         .query(
         r#"WITH active AS (
-            SELECT credit_type, spend_limit, currency FROM organization_limits_history
+            SELECT credit_type, spend_limit, effective_capacity, currency
+            FROM organization_credit_capacities
             WHERE organization_id=$1 AND effective_until IS NULL
         ), consumed AS (
             SELECT credit_type, amount FROM organization_credit_consumption WHERE organization_id=$1
         ) SELECT COALESCE(l.credit_type,c.credit_type) AS credit_type,
                  l.credit_type IS NOT NULL AS active, COALESCE(l.spend_limit,0)::BIGINT AS spend_limit,
-                 l.currency, COALESCE(c.amount,0)::BIGINT AS consumed
+                 l.currency, COALESCE(l.effective_capacity,0)::BIGINT AS effective_capacity,
+                 COALESCE(c.amount,0)::BIGINT AS consumed
           FROM active l FULL JOIN consumed c USING (credit_type)"#,
         &[&org],
     )
@@ -297,7 +299,9 @@ async fn load_position(tx: &Transaction<'_>, org: Uuid) -> Result<AccountingPosi
                 spend_limit,
                 consumed,
                 available: if active {
-                    spend_limit.saturating_sub(consumed).max(0)
+                    row.get::<_, i64>("effective_capacity")
+                        .saturating_sub(consumed)
+                        .max(0)
                 } else {
                     0
                 },

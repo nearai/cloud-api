@@ -1,6 +1,7 @@
 [workspace]
 members = ["crates/*"]
 resolver = "2"
+exclude = ["vendor/dstack-sdk"]
 
 [workspace.package]
 edition = "2021"
@@ -8,3 +9,6 @@ version = "0.0.0"
 authors = ["support@near.ai"]
 license = "MIT"
 description = "NEAR AI Cloud API"
+
+[patch.crates-io]
+dstack-sdk = { path = "vendor/dstack-sdk" }

@@ -8,7 +8,9 @@ use crate::email::{
 use anyhow::Result;
 use async_trait::async_trait;
 pub use ports::*;
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
+
+const MEMBER_PERMISSION_EMAIL_TIMEOUT: Duration = Duration::from_secs(15);
 
 pub struct OrganizationServiceImpl {
     repository: Arc<dyn OrganizationRepository>,
@@ -366,13 +368,27 @@ impl OrganizationServiceImpl {
             actor_name,
             members_url: format!("{base_url}/dashboard/organizations/{}/members", org.id.0),
         };
-        if let Err(error) = self
-            .email_sender
-            .send_member_permission_changed(&email)
+        let email_sender = self.email_sender.clone();
+        let organization_id = org.id.clone();
+        // Delivery is best effort after the committed mutation. Give each
+        // recipient its own task so one slow provider response cannot block
+        // the mutation response or another recipient's security notification.
+        tokio::spawn(async move {
+            match tokio::time::timeout(
+                MEMBER_PERMISSION_EMAIL_TIMEOUT,
+                email_sender.send_member_permission_changed(&email),
+            )
             .await
-        {
-            tracing::warn!(organization_id = %org.id.0, member_id = %member_id.0, error = %error.sanitized_message(), "Failed to send member role-change email");
-        }
+            {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => {
+                    tracing::warn!(organization_id = %organization_id.0, member_id = %member_id.0, error = %error.sanitized_message(), "Failed to send member role-change email");
+                }
+                Err(_) => {
+                    tracing::warn!(organization_id = %organization_id.0, member_id = %member_id.0, "Member role-change email delivery timed out");
+                }
+            }
+        });
     }
 
     fn settings_from_organization(org: &Organization) -> ports::OrganizationSettings {
@@ -2288,6 +2304,10 @@ mod tests {
         outcome: Result<EmailDeliveryOutcome, EmailError>,
         sent_to: Mutex<Vec<String>>,
         permission_changes: Mutex<Vec<MemberPermissionChangedEmail>>,
+        permission_attempted: tokio::sync::Notify,
+        blocked_recipient: Mutex<Option<String>>,
+        blocked_delivery_cancelled: std::sync::atomic::AtomicBool,
+        blocked_delivery_finished: tokio::sync::Notify,
     }
 
     #[async_trait]
@@ -2297,6 +2317,26 @@ mod tests {
             email: &MemberPermissionChangedEmail,
         ) -> Result<EmailDeliveryOutcome, EmailError> {
             self.permission_changes.lock().unwrap().push(email.clone());
+            self.permission_attempted.notify_one();
+            let blocked = self.blocked_recipient.lock().unwrap().as_deref()
+                == Some(email.recipient_email.as_str());
+            if blocked {
+                struct PendingDelivery<'a>(
+                    &'a std::sync::atomic::AtomicBool,
+                    &'a tokio::sync::Notify,
+                );
+                impl Drop for PendingDelivery<'_> {
+                    fn drop(&mut self) {
+                        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+                        self.1.notify_one();
+                    }
+                }
+                let _pending = PendingDelivery(
+                    &self.blocked_delivery_cancelled,
+                    &self.blocked_delivery_finished,
+                );
+                std::future::pending::<()>().await;
+            }
             self.outcome.clone()
         }
 
@@ -2408,6 +2448,10 @@ mod tests {
             outcome,
             sent_to: Mutex::new(Vec::new()),
             permission_changes: Mutex::new(Vec::new()),
+            permission_attempted: tokio::sync::Notify::new(),
+            blocked_recipient: Mutex::new(None),
+            blocked_delivery_cancelled: std::sync::atomic::AtomicBool::new(false),
+            blocked_delivery_finished: tokio::sync::Notify::new(),
         });
         let user_repo = Arc::new(StubUserRepo {
             inviter,

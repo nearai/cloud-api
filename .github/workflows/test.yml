@@ -213,9 +213,9 @@ jobs:
       with:
         cache-key: e2e
 
-    - name: Run typed-query, credit-allocation, credit-transfer, session, and binding regressions
+    - name: Run typed-query, credit, session, binding, and member-role regressions
       run: |
-        cargo test --locked -p database --test hot_path_typed_queries --test billing_typed_queries --test credit_allocation --test session_rotation --test staking_wallet_binding -- --test-threads=4
+        cargo test --locked -p database --test hot_path_typed_queries --test billing_typed_queries --test credit_allocation --test session_rotation --test staking_wallet_binding --test member_role_notifications -- --test-threads=4
         # Fault injection changes shared table constraints; isolate this binary.
         cargo test --locked -p database --test credit_transfers -- --test-threads=1
       env:

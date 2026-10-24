@@ -419,26 +419,7 @@ impl ApiKeyRepository {
         id: Uuid,
         spend_limit: Option<i64>,
     ) -> Result<ApiKey, RepositoryError> {
-        let row = retry_db!("update_api_key_spend_limit", {
-            let client = self
-                .pool
-                .get()
-                .await
-                .context("Failed to get database connection")
-                .map_err(RepositoryError::PoolError)?;
-
-            client
-                .query_one(
-                    "UPDATE api_keys SET spend_limit = $1 WHERE id = $2 RETURNING *",
-                    &[&spend_limit, &id],
-                )
-                .await
-                .map_err(map_db_error)
-        })?;
-
-        debug!("Updated spend limit for API key: {}", id);
-        self.row_to_api_key(row)
-            .map_err(RepositoryError::DataConversionError)
+        self.update(id, None, None, Some(spend_limit), None).await
     }
 
     /// Update an API key (name, expires_at, and/or spend_limit)
@@ -450,6 +431,20 @@ impl ApiKeyRepository {
         spend_limit: Option<Option<i64>>,
         is_active: Option<bool>,
     ) -> Result<ApiKey, RepositoryError> {
+        let (_, updated) = self
+            .update_with_previous(id, name, expires_at, spend_limit, is_active)
+            .await?;
+        Ok(updated)
+    }
+
+    async fn update_with_previous(
+        &self,
+        id: Uuid,
+        name: Option<String>,
+        expires_at: Option<Option<DateTime<Utc>>>,
+        spend_limit: Option<Option<i64>>,
+        is_active: Option<bool>,
+    ) -> Result<(ApiKey, ApiKey), RepositoryError> {
         // Build dynamic UPDATE query based on provided fields
         let mut updates = Vec::new();
         let mut params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = Vec::new();
@@ -479,14 +474,6 @@ impl ApiKeyRepository {
             param_idx += 1;
         }
 
-        if updates.is_empty() {
-            // No fields to update, just return the existing key
-            return self
-                .get_by_id(id)
-                .await?
-                .ok_or_else(|| RepositoryError::NotFound("API key".to_string()));
-        }
-
         let query = format!(
             "UPDATE api_keys SET {} WHERE id = ${} RETURNING *",
             updates.join(", "),
@@ -495,23 +482,49 @@ impl ApiKeyRepository {
 
         params.push(&id);
 
-        let row = retry_db!("update_api_key", {
-            let client = self
+        let (previous, updated) = retry_db!("update_api_key", {
+            let mut client = self
                 .pool
                 .get()
                 .await
                 .context("Failed to get database connection")
                 .map_err(RepositoryError::PoolError)?;
 
-            client
-                .query_one(&query, &params[..])
+            let transaction = client.transaction().await.map_err(map_db_error)?;
+            // A separate pre-read may become stale while another writer updates
+            // this key. Capture the actual transition while holding its row lock.
+            let previous = transaction
+                .query_opt(
+                    "SELECT * FROM api_keys WHERE id = $1 AND deleted_at IS NULL FOR UPDATE",
+                    &[&id],
+                )
+                .await
+                .map_err(map_db_error)?
+                .ok_or_else(|| RepositoryError::NotFound("API key".to_string()))?;
+            let updated = if updates.is_empty() {
+                previous.clone()
+            } else {
+                transaction
+                    .query_one(&query, &params[..])
+                    .await
+                    .map_err(map_db_error)?
+            };
+            // COMMIT may have succeeded even if its acknowledgement is lost.
+            // Keep its error outside retry_db so replay cannot erase the transition.
+            Ok(transaction
+                .commit()
                 .await
                 .map_err(map_db_error)
-        })?;
+                .map(|()| (previous, updated)))
+        })??;
 
         debug!("Updated API key: {}", id);
-        self.row_to_api_key(row)
-            .map_err(RepositoryError::DataConversionError)
+        Ok((
+            self.row_to_api_key(previous)
+                .map_err(RepositoryError::DataConversionError)?,
+            self.row_to_api_key(updated)
+                .map_err(RepositoryError::DataConversionError)?,
+        ))
     }
 
     // Helper function to convert database row to ApiKey (without usage data)
@@ -679,12 +692,17 @@ impl services::workspace::ports::ApiKeyRepository for ApiKeyRepository {
         &self,
         id: services::workspace::ApiKeyId,
         spend_limit: Option<i64>,
-    ) -> Result<services::workspace::ApiKey, RepositoryError> {
+    ) -> Result<services::workspace::ApiKeyUpdate, RepositoryError> {
         let uuid = Uuid::parse_str(&id.0)
             .context("Invalid UUID format")
             .map_err(RepositoryError::DataConversionError)?;
-        let db_api_key = self.update_spend_limit(uuid, spend_limit).await?;
-        Ok(db_apikey_to_workspace_service(None, db_api_key))
+        let (previous, updated) = self
+            .update_with_previous(uuid, None, None, Some(spend_limit), None)
+            .await?;
+        Ok(services::workspace::ApiKeyUpdate {
+            previous: db_apikey_to_workspace_service(None, previous),
+            updated: db_apikey_to_workspace_service(None, updated),
+        })
     }
 
     async fn update(
@@ -694,14 +712,17 @@ impl services::workspace::ports::ApiKeyRepository for ApiKeyRepository {
         expires_at: Option<Option<DateTime<Utc>>>,
         spend_limit: Option<Option<i64>>,
         is_active: Option<bool>,
-    ) -> Result<services::workspace::ApiKey, RepositoryError> {
+    ) -> Result<services::workspace::ApiKeyUpdate, RepositoryError> {
         let uuid = Uuid::parse_str(&id.0)
             .context("Invalid UUID format")
             .map_err(RepositoryError::DataConversionError)?;
-        let db_api_key = self
-            .update(uuid, name, expires_at, spend_limit, is_active)
+        let (previous, updated) = self
+            .update_with_previous(uuid, name, expires_at, spend_limit, is_active)
             .await?;
-        Ok(db_apikey_to_workspace_service(None, db_api_key))
+        Ok(services::workspace::ApiKeyUpdate {
+            previous: db_apikey_to_workspace_service(None, previous),
+            updated: db_apikey_to_workspace_service(None, updated),
+        })
     }
 
     async fn count_by_workspace(

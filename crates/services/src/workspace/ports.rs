@@ -61,6 +61,13 @@ pub struct ApiKey {
     pub usage: Option<i64>,
 }
 
+/// The committed transition, captured under the same row lock as the update.
+#[derive(Debug, Clone)]
+pub struct ApiKeyUpdate {
+    pub previous: ApiKey,
+    pub updated: ApiKey,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct CreateApiKeyRequest {
     pub name: String,
@@ -121,6 +128,7 @@ pub enum ApiKeyOrderDirection {
 }
 
 // Repository trait for workspace data access
+#[cfg_attr(test, mockall::automock)]
 #[async_trait]
 pub trait WorkspaceRepository: Send + Sync {
     async fn get_by_id(
@@ -190,6 +198,7 @@ pub trait WorkspaceRepository: Send + Sync {
 }
 
 // Repository trait for API key data access
+#[cfg_attr(test, mockall::automock)]
 #[async_trait]
 pub trait ApiKeyRepository: Send + Sync {
     async fn validate(&self, api_key: String) -> Result<Option<ApiKey>, RepositoryError>;
@@ -215,7 +224,7 @@ pub trait ApiKeyRepository: Send + Sync {
         &self,
         id: ApiKeyId,
         spend_limit: Option<i64>,
-    ) -> Result<ApiKey, RepositoryError>;
+    ) -> Result<ApiKeyUpdate, RepositoryError>;
 
     async fn update(
         &self,
@@ -224,7 +233,7 @@ pub trait ApiKeyRepository: Send + Sync {
         expires_at: Option<Option<DateTime<Utc>>>,
         spend_limit: Option<Option<i64>>,
         is_active: Option<bool>,
-    ) -> Result<ApiKey, RepositoryError>;
+    ) -> Result<ApiKeyUpdate, RepositoryError>;
 
     /// Count API keys for a workspace
     async fn count_by_workspace(&self, workspace_id: WorkspaceId) -> Result<i64, RepositoryError>;

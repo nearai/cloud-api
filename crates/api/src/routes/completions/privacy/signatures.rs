@@ -64,7 +64,7 @@ pub(super) async fn finalize(
         }
         if let Some(id) = served.identity.response_id.as_deref() {
             let stored = tokio::time::timeout(
-                Duration::from_secs(STREAM_SIGNATURE_STORE_TIMEOUT_SECS),
+                SIGNATURE_STORE_TIMEOUT,
                 state.attestation_service.store_chat_signature(
                     id,
                     served.request_hash,

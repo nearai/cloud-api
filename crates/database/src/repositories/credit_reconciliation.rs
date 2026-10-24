@@ -229,15 +229,24 @@ fn validate_request(amounts: &BTreeMap<String, i64>, key: &str, reason: &str) ->
         )
         .into());
     }
-    if amounts.is_empty() || amounts.len() > 4 {
-        return Err(invalid("Specify one to four credit types").into());
+    if amounts.is_empty() || amounts.len() > 5 {
+        return Err(invalid("Specify one to five credit types").into());
     }
 
     amounts.iter().try_fold(0_i64, |sum, (kind, amount)| {
-        if !matches!(kind.as_str(), "grant" | "payment" | "staking_farm" | "postpay") || *amount <= 0 {
-            return Err(invalid("Amounts must be positive integer nano-USD for grant, payment, staking_farm or postpay").into());
+        if !matches!(
+            kind.as_str(),
+            "grant" | "payment" | "staking_farm" | "transfer" | "postpay"
+        ) || *amount <= 0
+        {
+            return Err(invalid(
+                "Amounts must be positive integer nano-USD for grant, payment, staking_farm, transfer or postpay",
+            )
+            .into());
         }
-        sum.checked_add(*amount).ok_or_else(|| invalid("Reconciliation amount overflow").into())
+
+        sum.checked_add(*amount)
+            .ok_or_else(|| invalid("Reconciliation amount overflow").into())
     })
 }
 
@@ -372,16 +381,43 @@ mod tests {
     use super::*;
 
     #[test]
-    fn too_many_types_reports_the_actual_constraint() {
-        let amounts = ["grant", "payment", "staking_farm", "postpay", "extra"]
+    fn accepts_all_five_credit_types() {
+        let amounts = ["grant", "payment", "staking_farm", "transfer", "postpay"]
             .into_iter()
-            .map(|key| (key.to_string(), 1))
+            .map(|kind| (kind.to_string(), 1))
             .collect();
+
+        assert_eq!(validate_request(&amounts, "key", "reason").unwrap(), 5);
+    }
+
+    #[test]
+    fn rejects_invalid_transfer_amounts_and_unknown_types() {
+        for (kind, amount) in [("transfer", 0), ("transfer", -1), ("unknown", 1)] {
+            let amounts = [(kind.to_string(), amount)].into_iter().collect();
+
+            assert!(validate_request(&amounts, "key", "reason").is_err());
+        }
+    }
+
+    #[test]
+    fn too_many_types_reports_the_actual_constraint() {
+        let amounts = [
+            "grant",
+            "payment",
+            "staking_farm",
+            "transfer",
+            "postpay",
+            "extra",
+        ]
+        .into_iter()
+        .map(|key| (key.to_string(), 1))
+        .collect();
+
         assert_eq!(
             validate_request(&amounts, "key", "reason")
                 .unwrap_err()
                 .to_string(),
-            "Specify one to four credit types"
+            "Specify one to five credit types"
         );
     }
 }

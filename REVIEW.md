@@ -16,6 +16,10 @@ Evidence is the code, not the PR description. The description, commit messages, 
 
 Post nothing below Medium.
 
+## Database freeze
+
+A diff that adds or edits a file under `crates/database/src/migrations/`, changes SQL, queries, transactions, or row types in a frozen repository, or changes behavior of a moved service or route is a **High** finding, blocking unless the PR links the matching cloud-platform PR or states an exception approved under the repo's review requirements. The frozen list and rules are in `.claude/rules/database.md`. Tables in the `cloud_api_responses` class, docs, and behavior-neutral tests are fine. A read is not exempt: a changed `SELECT` filter or projection changes SQL and behavior.
+
 ## Always check
 
 1. **Privacy**: every added or changed log, metric label, `Debug` output, or `#[instrument]` against `.claude/rules/privacy-logging.md`. A confirmed leak is Critical.

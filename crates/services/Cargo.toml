@@ -47,13 +47,18 @@ near-api = "0.8.6"
 dstack-sdk = "0.1.3"
 dstack-sdk-types = "0.1.2"
 ed25519-dalek = { version = "2.1", features = ["rand_core"] }
-k256 = { version = "0.13", features = ["ecdsa", "arithmetic"] }
+k256 = { version = "0.14", features = ["ecdsa", "arithmetic"] }
 sha3 = "0.12"
-jsonwebtoken = { version = "10.3.0", features = ["rust_crypto"] }
+# AWS-LC avoids the affected RustCrypto elliptic-curve dependency chain.
+jsonwebtoken = { version = "10.3.0", features = ["aws_lc_rs"] }
 regex = "1.12"
-# AWS S3 for file storage
+# Regional S3 uses SigV4; SigV4a pulls in crypto-bigint affected by RUSTSEC-2026-0387.
 aws-config = { version = "1.8", features = ["behavior-version-latest"] }
-aws-sdk-s3 = { version = "1.134", default-features = false, features = ["sigv4a", "http-1x", "default-https-client", "rt-tokio"] }
+aws-sdk-s3 = { version = "1.134", default-features = false, features = [
+    "http-1x",
+    "default-https-client",
+    "rt-tokio",
+] }
 # Encryption for file storage
 aes-gcm = "0.10"
 # HMAC for VPC signature verification
@@ -67,7 +72,13 @@ sha2 = "0.11"
 # stack is needed); ring verifies the report's raw ECDSA-P384 signature.
 ring = "0.17"
 x509-parser = { version = "0.18", features = ["verify"] }
-dcap-qvl = "0.5"
+# Keep the existing default ring verifier without also enabling RustCrypto.
+dcap-qvl = { version = "0.5", default-features = false, features = [
+    "std",
+    "report",
+    "ring",
+    "default-x509",
+] }
 moka = { version = "0.12.15", features = ["future"] }
 bloomfilter = "3.0.1"
 mockall = { version = "0.14", optional = true }

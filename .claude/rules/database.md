@@ -2,7 +2,19 @@
 paths:
   - "crates/database/**"
   - "crates/services/src/**/ports.rs"
-  - "crates/services/src/{usage,admin,admin_settings,organization_credits,reporting_tokens,service_usage,staking_farm,models}/**"
+  - "crates/services/src/usage/**"
+  - "crates/services/src/admin/**"
+  - "crates/services/src/admin_settings/**"
+  - "crates/services/src/organization_credits/**"
+  - "crates/services/src/reporting_tokens/**"
+  - "crates/services/src/service_usage/**"
+  - "crates/services/src/staking_farm/**"
+  - "crates/services/src/models/**"
+  - "crates/services/src/aml.rs"
+  - "crates/services/src/email.rs"
+  - "crates/services/src/common.rs"
+  - "crates/services/src/reporting_usage.rs"
+  - "crates/services/src/staking_farm.rs"
   - "crates/api/src/routes/**"
 ---
 

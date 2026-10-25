@@ -192,7 +192,11 @@ jobs:
                column, or API field), grep for the callers and read them.
             4. Check the existing discussion. Skip points already raised. If an
                unresolved point is still unaddressed in the code, say so in one line.
-            5. Report only what `REVIEW.md` says to report, at its severities. Every
+            5. Database freeze: flag any diff that touches `crates/database/src/migrations/`, changes
+               SQL, queries, or row types in a frozen repository, or changes behavior of a moved
+               service or route (lists in `.claude/rules/database.md`) as a **High** blocking
+               finding, unless the PR links the matching cloud-platform PR or an owner exception.
+            6. Report only what `REVIEW.md` says to report, at its severities. Every
                finding names the concrete failure (input or state, what goes wrong,
                where); design findings also name the existing path the change should use.
 

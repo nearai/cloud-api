@@ -2,11 +2,29 @@
 paths:
   - "crates/database/**"
   - "crates/services/src/**/ports.rs"
+  - "crates/services/src/{usage,admin,admin_settings,organization_credits,reporting_tokens,service_usage,staking_farm,models}/**"
+  - "crates/api/src/routes/**"
 ---
 
 # Database and migrations
 
 PostgreSQL 16 behind Patroni, pooled with deadpool. Repositories in `crates/database/src/repositories/` implement the service-layer traits from `ports.rs`.
+
+## Database freeze (until phase 2)
+
+The schema and the data logic for chat-completion usage, admin APIs, admin config and user console APIs moved to `nearai/cloud-platform`, which now owns the schema. Its migrations are byte-identical copies of ours at commit `ba1e37ba` (manifest-checked), and it has a drift check against this repo. Until phase 2 removes the moved code from here, a database change that lands only in cloud-api silently diverges the two services. No migration has landed here since the pin.
+
+1. **No new or edited files in `crates/database/src/migrations/`** (`sql/` and `out_of_band/`). Schema changes go to cloud-platform (`crates/schema`); coordinate before cloud-api relies on them.
+2. **No changes to SQL, queries, transactions, or row types** in the frozen repositories below, and no behavior changes to the moved services and routes, unless the same change is made in cloud-platform as a coordinated pair of PRs, each linking the other. Bug fixes follow the same rule: fix in both.
+3. **Allowed**: the `cloud_api_responses` tables, reads that do not change SQL, docs, and tests that do not change behavior.
+4. **Exceptions** are stated in the PR and approved under the repo's normal review requirements.
+5. The freeze lifts when phase 2 cuts cloud-api over to cloud-platform and deletes the moved code.
+
+Frozen repositories (`crates/database/src/repositories/`, tables owned by `cloud-platform`): `admin_access_token`, `admin_composite`, `admin_settings`, `aml`, `analytics` (and `analytics/`), `api_key`, `attestation`, `contact_email`, `credit_allocation`, `credit_reconciliation`, `credit_transfers`, `feature_request`, `lifecycle`, `model`, `model_alias`, `model_repository_impl`, `near_nonce`, `oauth_state`, `organization`, `organization_credentials`, `organization_invitation`, `organization_limits`, `organization_limits_repository_impl`, `organization_reporting_token`, `organization_reporting_token_row`, `organization_service_usage`, `organization_service_usage_reporting_summary`, `organization_staking_farm_sources`, `organization_usage`, `organization_usage_discount`, `organization_usage_reporting`, `organization_usage_reporting_summary`, `reporting_query`, `reporting_usage_summary`, `service`, `service_usage_repository_impl`, `session`, `staking_wallet_binding`, `usage_hourly`, `usage_repository_impl`, `user`, `user_erasure`, `workspace`, plus `sql/`, `retry.rs`, `utils.rs`, and `crates/database/src/{pool,models}.rs`. `user_erasure.rs` also deletes `cloud_api_responses` rows; those statements stay editable only if no `cloud-platform` table statement changes.
+
+Frozen services and routes: `crates/services/src/{usage,admin,admin_settings,organization_credits,reporting_tokens,service_usage,staking_farm,models}`, `crates/services/src/{aml,email,common,reporting_usage,staking_farm}.rs`, and the route modules for usage, billing, admin, services, feature requests, organizations, organization members, workspaces, users, reporting, credit transfers, credentials, policy and staking farm in `crates/api/src/routes/`. These lists are the freeze; cloud-platform's drift check (`scripts/cloud-api-moved-paths.txt`) watches a subset of them.
+
+Not frozen (`cloud_api_responses` tables): `conversations`, `database_encryption_jobs`, `files`, `mcp_connector_usage`, `mcp_connectors`, `response_items`, `responses`, in `conversation`, `response`, `response_item`, `file`, and `mcp_connector`. Table ownership: `crates/schema/ownership.toml` in cloud-platform. A table not listed there is a schema change: rule 1.
 
 ## Prefer typed Rust parsing over a new migration
 

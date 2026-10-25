@@ -28,7 +28,7 @@ The schema and the data logic for chat-completion usage, admin APIs, admin confi
 
 1. **No new or edited files in `crates/database/src/migrations/`** (`sql/` and `out_of_band/`). Schema changes go to cloud-platform (`crates/schema`); coordinate before cloud-api relies on them.
 2. **No changes to SQL, queries, transactions, or row types** in the frozen repositories below, and no behavior changes to the moved services and routes, unless the same change is made in cloud-platform as a coordinated pair of PRs, each linking the other. Bug fixes follow the same rule: fix in both.
-3. **Allowed**: the `cloud_api_responses` tables, reads that do not change SQL, docs, and tests that do not change behavior.
+3. **Allowed**: the `cloud_api_responses` tables, code that calls frozen repositories without changing their SQL or behavior, docs, and tests that do not change behavior.
 4. **Exceptions** are stated in the PR and approved under the repo's normal review requirements.
 5. The freeze lifts when phase 2 cuts cloud-api over to cloud-platform and deletes the moved code.
 

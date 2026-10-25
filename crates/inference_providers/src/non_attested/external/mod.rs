@@ -31,6 +31,8 @@ pub mod openai_compatible;
 pub mod typesafe;
 
 #[cfg(test)]
+mod retention_tests;
+#[cfg(test)]
 mod routing_policy_tests;
 
 use crate::{
@@ -471,6 +473,7 @@ impl InferenceProvider for ExternalProvider {
         _request_hash: String,
     ) -> Result<StreamingResult, CompletionError> {
         params.strip_client_priority();
+        params.strip_third_party_retention();
         strip_internal_keys(&mut params.extra);
         self.inject_extra_request_body(&mut params.extra);
         self.backend
@@ -485,6 +488,7 @@ impl InferenceProvider for ExternalProvider {
         _request_hash: String,
     ) -> Result<ChatCompletionResponseWithBytes, CompletionError> {
         params.strip_client_priority();
+        params.strip_third_party_retention();
         strip_internal_keys(&mut params.extra);
         self.inject_extra_request_body(&mut params.extra);
         self.backend

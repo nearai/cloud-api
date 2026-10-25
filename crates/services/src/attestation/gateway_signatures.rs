@@ -95,17 +95,63 @@ impl AttestationService {
         let message_hash = hasher.finalize();
         let (signature, recid): (EcdsaSignature, RecoveryId) = self
             .ecdsa_signing_key
-            .sign_prehash_recoverable(&message_hash)
-            .map_err(|e| {
-                tracing::error!("Failed to create recoverable ECDSA signature: {}", e);
-                AttestationError::InternalError(format!(
-                    "Failed to create recoverable ECDSA signature: {e}"
-                ))
-            })?;
+            .sign_prehash_recoverable(&message_hash);
 
         let mut signature_bytes = signature.to_bytes().to_vec();
         signature_bytes.push(27u8 + (recid.to_byte() & 1));
         let addr = self.get_signing_address_hex("ecdsa")?;
         Ok((format!("0x{}", hex::encode(signature_bytes)), addr))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use config::ExternalProvidersConfig;
+    use k256::ecdsa::{Signature, SigningKey, VerifyingKey};
+
+    use super::*;
+    use crate::attestation::chat_signature_lifecycle_tests::{
+        lifecycle_service, RecordingRepository,
+    };
+    use crate::inference_provider_pool::InferenceProviderPool;
+
+    #[test]
+    fn ecdsa_gateway_signature_preserves_legacy_wire_format() {
+        let pool = Arc::new(InferenceProviderPool::new(
+            None,
+            ExternalProvidersConfig::default(),
+        ));
+        let mut service = lifecycle_service(Arc::new(RecordingRepository::default()), pool);
+        let key = SigningKey::from_slice(&[1; 32]).unwrap();
+        service.ecdsa_verifying_key = Arc::new(*key.verifying_key());
+        service.ecdsa_signing_key = Arc::new(key);
+
+        let (signature, address) = service
+            .sign_ecdsa_gateway_signature("request-hash:response-hash")
+            .unwrap();
+
+        // Recorded using k256 0.13.4 before the dependency upgrade. This checks
+        // EIP-191 framing, deterministic signing, low-S encoding and Ethereum v.
+        assert_eq!(
+            signature,
+            concat!(
+                "0x",
+                "c4949d98d11acafc9db9059591c185ecc1ba39048a8b6b95524d9317bee50f4538",
+                "37a274a9db76a3075e2ad3c8f37908c05fe35791e39cdc66d55bb6720ecb031c",
+            ),
+        );
+        assert_eq!(address, "0x1a642f0e3c3af545e7acbd38b07251b3990914f1");
+
+        let bytes = hex::decode(signature.trim_start_matches("0x")).unwrap();
+        let signature = Signature::from_slice(&bytes[..64]).unwrap();
+        let recovery_id = RecoveryId::from_byte(bytes[64] - 27).unwrap();
+        let digest =
+            Keccak256::digest(b"\x19Ethereum Signed Message:\n26request-hash:response-hash");
+        let recovered =
+            VerifyingKey::recover_from_prehash(&digest, &signature, recovery_id).unwrap();
+
+        assert_eq!(recovered, *service.ecdsa_verifying_key);
     }
 }

@@ -24,8 +24,8 @@ use tokio::sync::{Notify, Semaphore};
 
 const NONCE: &str = "0000000000000000000000000000000000000000000000000000000000000001";
 
-/// Stands in for evidence collection: counts report builds, and holds every
-/// nonce-bearing build until the test releases it.
+/// Stands in for evidence collection: counts report builds, and holds each
+/// build until the test releases it.
 #[derive(Clone, Default)]
 struct HeldReportService {
     builds: Arc<AtomicUsize>,
@@ -78,17 +78,15 @@ impl services::attestation::ports::AttestationServiceTrait for HeldReportService
         &self,
         _model: Option<String>,
         _signing_algo: Option<String>,
-        nonce: Option<String>,
+        _nonce: Option<String>,
         _signing_address: Option<String>,
         _include_tls_fingerprint: bool,
         _provider_filter: Option<inference_providers::ProviderFilter>,
         _caller: ModelCaller,
     ) -> Result<AttestationReport, AttestationError> {
         self.builds.fetch_add(1, Ordering::SeqCst);
-        if nonce.is_some() {
-            self.entered.notify_one();
-            self.release.notified().await;
-        }
+        self.entered.notify_one();
+        self.release.notified().await;
         Err(AttestationError::ProviderError("test report".to_string()))
     }
 
@@ -114,7 +112,7 @@ fn anonymous_report_server(service: HeldReportService, permits: usize) -> axum_t
         attestation_service: Arc::new(service),
         models_service: Arc::new(TestModelsService::default()),
         ohttp_attestation: None,
-        anonymous_fresh_reports: Arc::new(Semaphore::new(permits)),
+        anonymous_reports: Arc::new(Semaphore::new(permits)),
     };
     let app = Router::new()
         .route(
@@ -125,54 +123,61 @@ fn anonymous_report_server(service: HeldReportService, permits: usize) -> axum_t
     axum_test::TestServer::new(app)
 }
 
-/// With every anonymous permit taken, another anonymous request with a nonce
-/// is refused with 429 before any evidence is collected. A nonce-less request
-/// is not limited, and the permit returns once the held build finishes.
+/// With every anonymous permit taken, any other anonymous request is refused
+/// with 429 before evidence is collected: one with a nonce, and one without a
+/// nonce whose new `signing_address` would miss the report cache. The permit
+/// returns once the held build finishes.
 #[tokio::test]
-async fn anonymous_nonce_requests_past_the_limit_are_refused_before_evidence_collection() {
+async fn anonymous_requests_past_the_limit_are_refused_before_evidence_collection() {
     let service = HeldReportService::default();
     let server = anonymous_report_server(service.clone(), 1);
+    let with_address = |address: &'static str| {
+        server
+            .get("/attestation/report")
+            .add_query_param("signing_address", address)
+    };
     let with_nonce = || {
         server
             .get("/attestation/report")
             .add_query_param("nonce", NONCE)
     };
 
-    let (held, (refused, builds_after_refusal, cached)) = tokio::join!(with_nonce(), async {
+    let (held, (refused, builds_after_refusal)) = tokio::join!(with_address("0x01"), async {
         service.entered.notified().await;
-        // Without the limit this request would wait on the held build.
-        let refused = tokio::time::timeout(Duration::from_secs(5), with_nonce())
-            .await
-            .unwrap_or_else(|_| panic!("the request past the limit reached evidence collection"));
+        // Without the limit these requests would wait on the held build.
+        let refused = tokio::time::timeout(Duration::from_secs(5), async {
+            [with_address("0x02").await, with_nonce().await]
+        })
+        .await
+        .unwrap_or_else(|_| panic!("a request past the limit reached evidence collection"));
         let builds_after_refusal = service.builds();
-        let cached = server.get("/attestation/report").await;
         service.release.notify_one();
-        (refused, builds_after_refusal, cached)
+        (refused, builds_after_refusal)
     });
 
-    assert_eq!(refused.status_code(), StatusCode::TOO_MANY_REQUESTS);
-    assert_eq!(
-        refused
-            .headers()
-            .get("retry-after")
-            .and_then(|value| value.to_str().ok()),
-        Some("1")
-    );
-    assert_eq!(
-        refused.json::<ErrorResponse>().error.r#type,
-        "rate_limit_exceeded"
-    );
+    for response in &refused {
+        assert_eq!(response.status_code(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            response
+                .headers()
+                .get("retry-after")
+                .and_then(|value| value.to_str().ok()),
+            Some("1")
+        );
+        assert_eq!(
+            response.json::<ErrorResponse>().error.r#type,
+            "rate_limit_exceeded"
+        );
+    }
     assert_eq!(
         builds_after_refusal, 1,
-        "the refused request must not reach evidence collection"
+        "a refused request must not reach evidence collection"
     );
-    assert_ne!(cached.status_code(), StatusCode::TOO_MANY_REQUESTS);
     assert_ne!(held.status_code(), StatusCode::TOO_MANY_REQUESTS);
-    assert_eq!(service.builds(), 2);
 
-    // The permit is back: the next nonce-bearing request is served.
+    // The permit is back: the next request is served.
     service.release.notify_one();
-    let next = with_nonce().await;
+    let next = with_address("0x03").await;
     assert_ne!(next.status_code(), StatusCode::TOO_MANY_REQUESTS);
-    assert_eq!(service.builds(), 3);
+    assert_eq!(service.builds(), 2);
 }

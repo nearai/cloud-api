@@ -17,15 +17,16 @@ use serde::{Deserialize, Serialize};
 use services::models::ModelCaller;
 use utoipa::{IntoParams, ToSchema};
 
-/// Anonymous report requests that carry a nonce, allowed to run at once on
-/// one instance. A nonce skips the report cache, so each of these collects
-/// fresh gateway and model evidence; without a bound, anyone could keep the
-/// evidence collectors busy. Requests with an API key and nonce-less requests
-/// (served from the short-TTL cache) do not take a permit.
-pub(crate) const ANONYMOUS_FRESH_REPORT_CONCURRENCY: usize = 8;
+/// Anonymous report requests allowed to run at once on one instance. Any of
+/// them can collect fresh gateway and model evidence: a nonce skips the report
+/// cache, and without one a new `signing_address` (or any other part of the
+/// cache key) misses it. Without a bound, anyone could keep the evidence
+/// collectors busy. A cache hit holds its permit for milliseconds. Requests
+/// with an API key do not take a permit.
+pub(crate) const ANONYMOUS_REPORT_CONCURRENCY: usize = 8;
 
 /// Seconds a client is told to wait when every anonymous permit is taken.
-const ANONYMOUS_FRESH_REPORT_RETRY_AFTER_SECS: u32 = 1;
+const ANONYMOUS_REPORT_RETRY_AFTER_SECS: u32 = 1;
 
 /// Query parameters for attestation report
 #[derive(Debug, Serialize, Deserialize, ToSchema, IntoParams)]
@@ -173,7 +174,7 @@ impl From<services::attestation::models::AttestationReport> for AttestationRespo
         (status = 200, description = "Attestation report retrieved", body = AttestationResponse),
         (status = 400, description = "Invalid nonce, signing_algo or provider, or unknown model (a model the caller may not use is reported as unknown)", body = ErrorResponse),
         (status = 401, description = "An API key was sent and is invalid", body = ErrorResponse),
-        (status = 429, description = "Too many anonymous requests with a nonce in progress; retry after `Retry-After` seconds or send an API key", body = ErrorResponse),
+        (status = 429, description = "Too many anonymous requests in progress; retry after `Retry-After` seconds or send an API key", body = ErrorResponse),
         (status = 503, description = "Service unavailable", body = ErrorResponse)
     ),
     security(
@@ -194,10 +195,10 @@ pub async fn get_attestation_report(
         None => ModelCaller::Anonymous,
     };
     // Held until the report is built.
-    let _fresh_report_permit = if caller == ModelCaller::Anonymous && params.nonce.is_some() {
-        match state.anonymous_fresh_reports.clone().try_acquire_owned() {
+    let _report_permit = if caller == ModelCaller::Anonymous {
+        match state.anonymous_reports.clone().try_acquire_owned() {
             Ok(permit) => Some(permit),
-            Err(_) => return Ok(anonymous_fresh_reports_busy()),
+            Err(_) => return Ok(anonymous_reports_busy()),
         }
     } else {
         None
@@ -257,16 +258,16 @@ pub async fn get_attestation_report(
     Ok(http_response)
 }
 
-fn anonymous_fresh_reports_busy() -> axum::response::Response {
-    tracing::debug!("Anonymous fresh attestation report refused: all permits in use");
+fn anonymous_reports_busy() -> axum::response::Response {
+    tracing::debug!("Anonymous attestation report refused: all permits in use");
     (
         StatusCode::TOO_MANY_REQUESTS,
         [(
             RETRY_AFTER,
-            HeaderValue::from(ANONYMOUS_FRESH_REPORT_RETRY_AFTER_SECS),
+            HeaderValue::from(ANONYMOUS_REPORT_RETRY_AFTER_SECS),
         )],
         ResponseJson(ErrorResponse::new(
-            "Too many anonymous attestation requests with a nonce are in progress. \
+            "Too many anonymous attestation requests are in progress. \
              Retry shortly, or send an API key."
                 .to_string(),
             "rate_limit_exceeded".to_string(),

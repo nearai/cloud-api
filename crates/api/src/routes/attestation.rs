@@ -6,7 +6,7 @@
 //!
 //! | Route                           | Auth    | Rationale |
 //! |---------------------------------|---------|-----------|
-//! | `GET /v1/attestation/report`    | Optional API key | Public so a client can verify the gateway before it sends a credential. Anonymous callers see listed models only; a key that is sent is validated, and its organization decides whether an unlisted model resolves. Anonymous requests that carry a nonce collect fresh evidence, so only `ANONYMOUS_FRESH_REPORT_CONCURRENCY` of them run at once per instance (429 beyond that). Retrieval is not billed and never creates usage records. |
+//! | `GET /v1/attestation/report`    | Optional API key | Public so a client can verify the gateway before it sends a credential. Anonymous callers see listed models only; a key that is sent is validated, and its organization decides whether an unlisted model resolves. Anonymous requests can collect fresh evidence (a nonce or a report-cache miss), so only `ANONYMOUS_REPORT_CONCURRENCY` of them run at once per instance (429 beyond that). Retrieval is not billed and never creates usage records. |
 //! | `GET /v1/signature/{chat_id}`   | API key | Requires a valid API key, then looks up the response ID. The shared lookup does not enforce ownership by organization or API key. |
 //! | `GET /v1/attestation/ita-token` | Public  | Deliberate exception — see `build_public_attestation_routes`. Listed models only. |
 //! | `GET /v1/attestation/pins` | Public | Deliberate exception — see `build_public_attestation_routes`. |
@@ -43,9 +43,9 @@ pub struct AttestationRouteState {
     pub attestation_service: Arc<dyn services::attestation::ports::AttestationServiceTrait>,
     pub models_service: Arc<dyn ModelsServiceTrait>,
     pub ohttp_attestation: Option<OhttpAttestation>,
-    /// Permits for anonymous report requests that carry a nonce; see
-    /// [`report::ANONYMOUS_FRESH_REPORT_CONCURRENCY`].
-    pub anonymous_fresh_reports: Arc<Semaphore>,
+    /// Permits for anonymous report requests; see
+    /// [`report::ANONYMOUS_REPORT_CONCURRENCY`].
+    pub anonymous_reports: Arc<Semaphore>,
 }
 
 impl From<AppState> for AttestationRouteState {
@@ -54,9 +54,7 @@ impl From<AppState> for AttestationRouteState {
             attestation_service: app_state.attestation_service,
             models_service: app_state.models_service,
             ohttp_attestation: app_state.ohttp_attestation,
-            anonymous_fresh_reports: Arc::new(Semaphore::new(
-                report::ANONYMOUS_FRESH_REPORT_CONCURRENCY,
-            )),
+            anonymous_reports: Arc::new(Semaphore::new(report::ANONYMOUS_REPORT_CONCURRENCY)),
         }
     }
 }

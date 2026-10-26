@@ -40,7 +40,21 @@ impl services::usage::ports::OrganizationLimitsRepository for OrganizationLimits
         &self,
         organization_id: Uuid,
     ) -> anyhow::Result<Vec<OrganizationCreditLimit>> {
-        let (limits, _, _) = self.get_current_credit_status(organization_id).await?;
+        let (mut limits, _, unattributed) = self.get_current_credit_status(organization_id).await?;
+
+        // With one active credit type, legacy spend has only one current
+        // capacity bucket to reduce. Fold it into that type so its breakdown
+        // agrees with the aggregate remaining balance. With multiple types,
+        // keep the legacy amount unattributed rather than inventing a split.
+        if let [status] = limits.as_mut_slice() {
+            status.consumed = status.consumed.saturating_add(unattributed);
+            status.available = status
+                .limit
+                .spend_limit
+                .saturating_sub(status.consumed)
+                .max(0);
+        }
+
         Ok(limits
             .into_iter()
             .map(|status| OrganizationCreditLimit {

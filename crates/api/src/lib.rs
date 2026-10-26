@@ -406,12 +406,21 @@ pub async fn init_domain_services_with_pool(
         database::repositories::OrganizationUsageRepository::new(database.pool().clone()),
     ) as Arc<dyn services::usage::UsageRepository>;
 
+    // Create models service. It owns the model-resolve cache (models and
+    // access decisions on unlisted models) that the attestation and completion
+    // services below share, so its invalidation reaches all three.
+    let models_service = Arc::new(services::models::ModelsServiceImpl::new(
+        inference_provider_pool.clone(),
+        models_repo.clone(),
+    ));
+
     // Create attestation service
     let attestation_service = Arc::new(
         services::attestation::AttestationService::init(
             attestation_repo,
             inference_provider_pool.clone(),
             models_repo.clone(),
+            models_service.model_resolve_cache(),
             metrics_service.clone(),
             usage_repository_for_attestation,
             config.ita.clone(),
@@ -419,12 +428,6 @@ pub async fn init_domain_services_with_pool(
         .await
         .unwrap(),
     );
-
-    // Create models service
-    let models_service = Arc::new(services::models::ModelsServiceImpl::new(
-        inference_provider_pool.clone(),
-        models_repo.clone(),
-    ));
 
     // Prepare repositories for usage service (will be created after workspace service)
     let usage_repository = Arc::new(
@@ -1563,6 +1566,10 @@ pub fn build_completion_routes(
             .layer(from_fn_with_state(
                 auth_state_middleware.clone(),
                 middleware::auth::anthropic_auth_middleware_with_workspace_context,
+            ))
+            .layer(from_fn_with_state(
+                middleware::BodyHashLimit(AUDIO_TRANSCRIPTION_MAX_BODY_SIZE),
+                middleware::body_hash_middleware,
             ));
 
         // Token counting is free and has its own Anthropic rate-limit class.
@@ -1861,11 +1868,14 @@ pub fn build_conversation_routes(
 /// Route classification (nearai/infra#193) — see `routes/attestation.rs` for
 /// the full table:
 /// - `GET /v1/attestation/report` and `GET /v1/signature/{chat_id}` require an
-///   API key (`auth_middleware_with_api_key`). The middleware validates the key
-///   and confirms its workspace and organization remain active (rejecting
-///   missing/invalid/expired/deactivated credentials with 401); like
-///   the signature route, report retrieval is non-billable — no usage or
-///   billing records are created.
+///   API key (`auth_middleware_with_workspace_context`). The middleware
+///   validates the key and confirms its workspace and organization remain
+///   active (rejecting missing/invalid/expired/deactivated credentials with
+///   401); like the signature route, report retrieval is non-billable — no
+///   usage or billing records are created. It is the same check as
+///   `auth_middleware_with_api_key`, and it also hands the handler the key's
+///   organization: the report route needs it to decide whether the caller
+///   may ask about an unlisted model.
 /// - `GET /v1/attestation/ita-token` and `GET /v1/attestation/pins` are
 ///   deliberately public; the rationale is documented on
 ///   `build_public_attestation_routes`.
@@ -1881,7 +1891,7 @@ pub fn build_attestation_routes(
         .with_state(attestation_route_state.clone())
         .layer(from_fn_with_state(
             auth_state_middleware.clone(),
-            auth_middleware_with_api_key,
+            middleware::auth::auth_middleware_with_workspace_context,
         ));
 
     // One section per attested backup provider; add new providers here.
@@ -2085,8 +2095,10 @@ pub fn build_gateway_routes(
 /// `CLOUD_API_USAGE_TOKEN` service secret rather than the standard `sk-…`
 /// API-key middleware. Mounted under `/v1/internal/*` after the global
 /// `/v1` nest. Routes: `POST /internal/usage` (inference-proxy's
-/// service-token usage reporter) and `GET /internal/models` (the model
-/// catalog including unlisted models, for a gateway lane). Further internal
+/// service-token usage reporter), `GET /internal/models` (the model
+/// catalog including unlisted models, for a gateway lane) and
+/// `GET /internal/model-access` (which organizations may use each unlisted
+/// model, for a gateway lane that enforces access itself). Further internal
 /// endpoints can be added here without touching the sk-auth stack.
 pub fn build_internal_routes(app_state: AppState) -> Router {
     Router::new()
@@ -2097,6 +2109,10 @@ pub fn build_internal_routes(app_state: AppState) -> Router {
         .route(
             "/internal/models",
             get(crate::routes::completions::models_internal),
+        )
+        .route(
+            "/internal/model-access",
+            get(crate::routes::completions::model_access_internal),
         )
         .with_state(app_state)
 }
@@ -2354,6 +2370,19 @@ fn build_admin_routes_with_options(
         .route(
             "/admin/models/{model_name}/deprecation/confirm",
             axum::routing::post(confirm_model_deprecation),
+        )
+        .route(
+            "/admin/models/{model_name}/access",
+            axum::routing::get(crate::routes::admin_model_access::get_model_access),
+        )
+        .route(
+            "/admin/models/{model_name}/access/{org_id}",
+            axum::routing::put(crate::routes::admin_model_access::grant_model_access)
+                .delete(crate::routes::admin_model_access::revoke_model_access),
+        )
+        .route(
+            "/admin/organizations/{org_id}/model-access",
+            axum::routing::get(crate::routes::admin_model_access::list_organization_model_access),
         )
         .route("/admin/services", axum::routing::post(create_service))
         .route("/admin/services/{id}", axum::routing::patch(update_service))

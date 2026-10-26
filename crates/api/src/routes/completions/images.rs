@@ -59,7 +59,10 @@ pub async fn image_generations(
     // Resolve model to get UUID for usage tracking
     let model = match app_state
         .models_service
-        .get_model_by_name(&request.model)
+        .get_model_by_name(
+            &request.model,
+            ModelCaller::Organization(api_key.organization.id.0),
+        )
         .await
     {
         Ok(model) => model,
@@ -457,7 +460,10 @@ pub async fn image_edits(
     // Resolve model to get UUID for usage tracking
     let model = match app_state
         .models_service
-        .get_model_by_name(&request.model)
+        .get_model_by_name(
+            &request.model,
+            ModelCaller::Organization(api_key.organization.id.0),
+        )
         .await
     {
         Ok(model) => model,

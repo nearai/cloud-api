@@ -2,7 +2,7 @@ use crate::common::*;
 use chrono::{Duration, Timelike, Utc};
 use futures::FutureExt;
 use serde_json::{json, Value};
-use services::models::ModelsServiceTrait;
+use services::models::{ModelCaller, ModelsServiceTrait};
 use std::{panic::AssertUnwindSafe, sync::Arc};
 
 const HEADER: &str = "x-model-pricing-change-date";
@@ -342,7 +342,7 @@ async fn serial_scheduler_replaces_the_notice_with_the_announced_tiered_prices()
     }
     let resolved = fixture
         .models
-        .resolve_and_get_model(&fixture.alias)
+        .resolve_and_get_model(&fixture.alias, ModelCaller::Trusted)
         .await
         .unwrap();
     assert!(resolved.upcoming_pricing.is_none());
@@ -366,7 +366,7 @@ async fn assert_invalid_pending_profile_is_advisory(profile: Value) {
         // Exercise the canonical-only repository path as well as alias resolution.
         let model = fixture
             .models
-            .get_model_by_name(&fixture.model)
+            .get_model_by_name(&fixture.model, ModelCaller::Trusted)
             .await
             .unwrap();
         assert!(model.upcoming_pricing.is_none());

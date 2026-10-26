@@ -38,6 +38,8 @@ pub(crate) fn admin_operation(method: &Method, matched_path: &str) -> AdminOpera
             "/admin/models"
                 | "/admin/models/pricing-changes"
                 | "/admin/models/{model_name}/history"
+                | "/admin/models/{model_name}/access"
+                | "/admin/organizations/{org_id}/model-access"
                 | "/admin/organizations/{org_id}/limits/history"
                 | "/admin/organizations/{org_id}/usage/balance"
                 | "/admin/organizations/{org_id}/usage-discount"
@@ -137,6 +139,24 @@ mod tests {
             assert_eq!(admin_operation(&Method::GET, path), AdminOperation::Read);
             assert_eq!(admin_operation(&Method::PATCH, path), AdminOperation::Write);
             assert_eq!(admin_operation(&Method::PUT, path), AdminOperation::Write);
+        }
+    }
+
+    #[test]
+    fn model_access_listings_are_reads_and_grant_and_revoke_are_writes() {
+        for prefix in ["/v1", ""] {
+            for listing in [
+                "/admin/models/{model_name}/access",
+                "/admin/organizations/{org_id}/model-access",
+            ] {
+                let path = format!("{prefix}{listing}");
+                assert_eq!(admin_operation(&Method::GET, &path), AdminOperation::Read);
+                assert_eq!(admin_operation(&Method::PUT, &path), AdminOperation::Write);
+            }
+            let grant = format!("{prefix}/admin/models/{{model_name}}/access/{{org_id}}");
+            for method in [Method::PUT, Method::DELETE, Method::GET] {
+                assert_eq!(admin_operation(&method, &grant), AdminOperation::Write);
+            }
         }
     }
 

@@ -286,6 +286,7 @@ pub(super) fn lifecycle_service(
         repository,
         inference_provider_pool: pool.clone(),
         models_repository: Arc::new(EmptyModelsRepository),
+        model_resolve_cache: crate::models::new_model_resolve_cache(),
         metrics_service: Arc::new(NoopMetricsService),
         usage_repository: Arc::new(NoopUsageRepository),
         vpc_info: None,

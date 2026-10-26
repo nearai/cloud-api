@@ -208,6 +208,67 @@ async fn typed_hot_path_queries_repeat_on_one_pool() -> anyhow::Result<()> {
         .await?
         .is_none());
 
+    // model::organization_has_model_access: no grant, then a grant, which
+    // counts only while the organization and the model are both active
+    for _ in 0..3 {
+        assert!(
+            !models
+                .organization_has_model_access(org_id, model_id)
+                .await?
+        );
+    }
+    {
+        let client = pool.get().await?;
+        client
+            .execute(
+                "INSERT INTO organization_model_access (organization_id, model_id, created_by_user_id) VALUES ($1, $2, $3)",
+                &[&org_id, &model_id, &user_id],
+            )
+            .await?;
+        for _ in 0..3 {
+            assert!(
+                models
+                    .organization_has_model_access(org_id, model_id)
+                    .await?
+            );
+        }
+        assert!(
+            !models
+                .organization_has_model_access(Uuid::new_v4(), model_id)
+                .await?
+        );
+        assert!(
+            !models
+                .organization_has_model_access(org_id, Uuid::new_v4())
+                .await?
+        );
+        for (table, id) in [("models", model_id), ("organizations", org_id)] {
+            client
+                .execute(
+                    &format!("UPDATE {table} SET is_active = false WHERE id = $1"),
+                    &[&id],
+                )
+                .await?;
+            assert!(
+                !models
+                    .organization_has_model_access(org_id, model_id)
+                    .await?,
+                "a grant must not count while its row in {table} is inactive"
+            );
+            client
+                .execute(
+                    &format!("UPDATE {table} SET is_active = true WHERE id = $1"),
+                    &[&id],
+                )
+                .await?;
+        }
+        assert!(
+            models
+                .organization_has_model_access(org_id, model_id)
+                .await?
+        );
+    }
+
     // organization concurrent limit
     let orgs = PgOrganizationRepository::new(pool.clone());
     for _ in 0..3 {

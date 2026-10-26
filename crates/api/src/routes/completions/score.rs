@@ -52,7 +52,10 @@ pub async fn score(
     // Models must be registered in the database to be available for use
     let model = match app_state
         .models_service
-        .get_model_by_name(&request.model)
+        .get_model_by_name(
+            &request.model,
+            ModelCaller::Organization(api_key.organization.id.0),
+        )
         .await
     {
         Ok(model) => model,

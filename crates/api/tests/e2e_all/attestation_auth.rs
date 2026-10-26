@@ -50,6 +50,30 @@ async fn test_attestation_report_without_auth_is_served() {
     }
 }
 
+/// Parameter validation runs for anonymous callers too: an invalid nonce is a
+/// 400 without an Authorization header.
+#[tokio::test]
+async fn test_attestation_report_without_auth_invalid_nonce_is_400() {
+    let server = setup_test_server().await;
+    let model = setup_qwen_model(&server).await;
+
+    let response = server
+        .get(&format!("{}&nonce=ff", report_url(&model)))
+        .await;
+
+    assert_eq!(
+        response.status_code(),
+        400,
+        "invalid nonce without a key must 400, got: {}",
+        response.text()
+    );
+    let body: serde_json::Value = response.json();
+    assert_eq!(
+        body["error"]["type"], "invalid_request_error",
+        "unexpected 400 envelope: {body}"
+    );
+}
+
 /// A malformed Authorization header (non-Bearer scheme) must return 401.
 #[tokio::test]
 async fn test_attestation_report_malformed_auth_returns_401() {

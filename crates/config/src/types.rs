@@ -114,7 +114,8 @@ pub struct CreditAllocationConfig {
     pub policy_version: String,
 }
 
-pub const SUPPORTED_CREDIT_TYPES: [&str; 4] = ["grant", "staking_farm", "payment", "postpay"];
+pub const SUPPORTED_CREDIT_TYPES: [&str; 5] =
+    ["grant", "staking_farm", "transfer", "payment", "postpay"];
 
 impl Default for CreditAllocationConfig {
     fn default() -> Self {
@@ -123,7 +124,7 @@ impl Default for CreditAllocationConfig {
                 .into_iter()
                 .map(str::to_string)
                 .collect(),
-            policy_version: "v1".to_string(),
+            policy_version: "v2".to_string(),
         }
     }
 }
@@ -131,6 +132,17 @@ impl Default for CreditAllocationConfig {
 impl CreditAllocationConfig {
     pub fn from_env() -> Result<Self, String> {
         let defaults = Self::default();
+        // A pinned historical label must not silently acquire a new default
+        // allocation order when the binary is upgraded.
+        if env::var("CREDIT_USAGE_ORDER").is_err()
+            && env::var("CREDIT_ALLOCATION_POLICY_VERSION")
+                .is_ok_and(|version| version.trim() != defaults.policy_version)
+        {
+            return Err(
+                "Set CREDIT_USAGE_ORDER explicitly when pinning a nondefault CREDIT_ALLOCATION_POLICY_VERSION"
+                    .into(),
+            );
+        }
         let priority = env::var("CREDIT_USAGE_ORDER")
             .unwrap_or_else(|_| defaults.priority.join(","))
             .split(',')
@@ -1853,12 +1865,16 @@ mod tests {
         let defaults = CreditAllocationConfig::from_env().unwrap();
         assert_eq!(
             defaults.priority,
-            ["grant", "staking_farm", "payment", "postpay"]
+            ["grant", "staking_farm", "transfer", "payment", "postpay"]
         );
-        assert_eq!(defaults.policy_version, "v1");
+        assert_eq!(defaults.policy_version, "v2");
 
         std::env::set_var("CREDIT_ALLOCATION_POLICY_VERSION", "");
         assert!(CreditAllocationConfig::from_env().is_err());
+        std::env::set_var("CREDIT_ALLOCATION_POLICY_VERSION", "v1");
+        assert!(CreditAllocationConfig::from_env().is_err());
+
+        std::env::set_var("CREDIT_USAGE_ORDER", defaults.priority.join(","));
         std::env::set_var("CREDIT_ALLOCATION_POLICY_VERSION", "v".repeat(50));
         assert_eq!(
             CreditAllocationConfig::from_env()
@@ -1877,7 +1893,7 @@ mod tests {
         let _env = CreditAllocationEnvGuard::new();
         std::env::set_var(
             "CREDIT_USAGE_ORDER",
-            "payment, staking_farm, postpay, grant",
+            "payment, staking_farm, transfer, postpay, grant",
         );
         std::env::set_var("CREDIT_ALLOCATION_POLICY_VERSION", "emergency-v2");
 
@@ -1885,7 +1901,7 @@ mod tests {
 
         assert_eq!(
             config.priority,
-            ["payment", "staking_farm", "postpay", "grant"]
+            ["payment", "staking_farm", "transfer", "postpay", "grant"]
         );
         assert_eq!(config.policy_version, "emergency-v2");
     }

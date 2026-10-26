@@ -124,16 +124,22 @@ impl services::models::ModelsServiceTrait for NoopModelsService {
     async fn get_model_by_name(
         &self,
         _model_name: &str,
+        _caller: services::models::ModelCaller,
     ) -> Result<services::models::ModelWithPricing, services::models::ModelsError> {
         unimplemented!()
     }
     async fn resolve_and_get_model(
         &self,
         _identifier: &str,
+        _caller: services::models::ModelCaller,
     ) -> Result<services::models::ModelWithPricing, services::models::ModelsError> {
         unimplemented!()
     }
-    async fn resolve_alias_cached(&self, _identifier: &str) -> Option<String> {
+    async fn resolve_alias_cached(
+        &self,
+        _identifier: &str,
+        _caller: services::models::ModelCaller,
+    ) -> Option<String> {
         None
     }
     async fn get_configured_model_names(

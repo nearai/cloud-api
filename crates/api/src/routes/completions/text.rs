@@ -257,13 +257,15 @@ pub(super) async fn completions_inner(
     // service resolves aliases for this endpoint exactly like chat, so it
     // gets the same contract: x-no-aliasing rejects, and aliased responses
     // carry the warning + x-model-alias-resolved header.
-    if let Err(resp) = reject_if_aliased(&app_state.models_service, &headers, &request.model).await
+    let caller = ModelCaller::Organization(api_key.organization.id.0);
+    if let Err(resp) =
+        reject_if_aliased(&app_state.models_service, caller, &headers, &request.model).await
     {
         return resp;
     }
     let alias_canonical = app_state
         .models_service
-        .resolve_alias_cached(&request.model)
+        .resolve_alias_cached(&request.model, caller)
         .await;
 
     let resolved_model_name = alias_canonical.as_deref().unwrap_or(&request.model);
@@ -475,7 +477,7 @@ pub(super) async fn completions_inner(
                                 };
                                 if let Some(chat_id) = chat_id {
                                     match tokio::time::timeout(
-                                        Duration::from_secs(STREAM_SIGNATURE_STORE_TIMEOUT_SECS),
+                                        SIGNATURE_STORE_TIMEOUT,
                                         attestation_service.store_chat_signature(
                                             &chat_id,
                                             request_hash,

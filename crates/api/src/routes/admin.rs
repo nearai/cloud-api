@@ -1457,6 +1457,16 @@ pub async fn update_organization_limits(
         )
     })?;
 
+    if request.credit_type == CreditType::Transfer {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            ResponseJson(ErrorResponse::new(
+                "Transfer credits are system-owned".into(),
+                "invalid_credit_type".into(),
+            )),
+        ));
+    }
+
     // Extract admin user ID and email from authenticated user
     let admin_user_id = admin_user.0.id;
     let admin_user_email = admin_user.0.email.clone();
@@ -3907,13 +3917,13 @@ pub struct MetricsQueryParams {
     pub end: Option<String>,
 }
 
-const CREDIT_TYPE_QUERY_DESCRIPTION: &str = "Filter consumed inference usage by grant, staking_farm, payment, or postpay. Costs include only saved matching allocations, including settlements. Each matching request and its full tokens count once; counts are not additive across credit types. Unattributed historical usage is excluded. Period totals may increase until outstanding unfunded usage is settled. Omit for all usage.";
+const CREDIT_TYPE_QUERY_DESCRIPTION: &str = "Filter consumed inference usage by grant, staking_farm, transfer, payment, or postpay. Costs include only saved matching allocations, including settlements. Each matching request and its full tokens count once; counts are not additive across credit types. Unattributed historical usage is excluded. Period totals may increase until outstanding unfunded usage is settled. Omit for all usage.";
 
 #[derive(Debug, serde::Deserialize)]
 pub struct OrganizationMetricsQueryParams {
     #[serde(flatten)]
     pub metrics: MetricsQueryParams,
-    /// Optional saved credit allocation type: grant, staking_farm, payment, or postpay.
+    /// Optional saved credit allocation type: grant, staking_farm, transfer, payment, or postpay.
     pub credit_type: Option<String>,
 }
 
@@ -4563,7 +4573,7 @@ pub struct TimeSeriesQueryParams {
 pub struct OrganizationTimeSeriesQueryParams {
     #[serde(flatten)]
     pub metrics: TimeSeriesQueryParams,
-    /// Optional saved credit allocation type: grant, staking_farm, payment, or postpay.
+    /// Optional saved credit allocation type: grant, staking_farm, transfer, payment, or postpay.
     pub credit_type: Option<String>,
 }
 

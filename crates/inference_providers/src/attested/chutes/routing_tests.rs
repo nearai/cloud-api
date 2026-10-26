@@ -121,27 +121,32 @@ async fn mount_invoke(
             assert_eq!(body["model"], "upstream");
             assert_eq!(body["stream"], streaming);
             assert!(body.get(MODEL_PUB_KEY).is_none());
-            if streaming {
-                let (init, frame) = instance_stream(&response_key, b"data: [DONE]");
-                ResponseTemplate::new(200)
-                    .insert_header("content-type", "text/event-stream")
-                    .set_body_string(format!(
-                        "data: {}\n\ndata: {}\n\n",
-                        json!({"e2e_init": b64(&init)}),
-                        json!({"e2e": b64(&frame)})
-                    ))
-            } else {
-                ResponseTemplate::new(200).set_body_bytes(instance_seal_response(
-                    &response_key,
-                    &json!({"id": "chat-test", "object": "chat.completion", "created": 0,
-                            "model": "upstream", "choices": [],
-                            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}}),
-                ))
-            }
+            invoke_reply(&response_key, streaming)
         })
         .expect(1)
         .mount_as_scoped(server)
         .await
+}
+
+/// An empty completion sealed to the client's response key.
+fn invoke_reply(response_key: &[u8], streaming: bool) -> ResponseTemplate {
+    if streaming {
+        let (init, frame) = instance_stream(response_key, b"data: [DONE]");
+        ResponseTemplate::new(200)
+            .insert_header("content-type", "text/event-stream")
+            .set_body_string(format!(
+                "data: {}\n\ndata: {}\n\n",
+                json!({"e2e_init": b64(&init)}),
+                json!({"e2e": b64(&frame)})
+            ))
+    } else {
+        ResponseTemplate::new(200).set_body_bytes(instance_seal_response(
+            response_key,
+            &json!({"id": "chat-test", "object": "chat.completion", "created": 0,
+                    "model": "upstream", "choices": [],
+                    "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}}),
+        ))
+    }
 }
 
 async fn chat(
@@ -149,9 +154,18 @@ async fn chat(
     key: Option<&str>,
     streaming: bool,
 ) -> Result<(), CompletionError> {
-    let mut params: ChatCompletionParams =
+    let params: ChatCompletionParams =
         serde_json::from_value(json!({"model": "model", "messages": [], "stream": streaming}))
             .unwrap();
+    send_chat(provider, params, key, streaming).await
+}
+
+async fn send_chat(
+    provider: &Provider,
+    mut params: ChatCompletionParams,
+    key: Option<&str>,
+    streaming: bool,
+) -> Result<(), CompletionError> {
     if let Some(key) = key {
         params.extra.insert(MODEL_PUB_KEY.into(), json!(key));
     }
@@ -186,6 +200,66 @@ async fn pinned_chat_verifies_encrypts_and_invokes_only_the_matching_key() {
         let _invoke = mount_invoke(&server, "pinned", dk, streaming).await;
         chat(&provider, Some(&key), streaming).await.unwrap();
         assert_eq!(*verifier.calls.lock().unwrap(), [("pinned".into(), key)]);
+    }
+}
+
+/// Sends what the Responses path builds (our user id, `store: true`,
+/// `metadata`) plus client copies of `store` and `metadata` (and of `user`
+/// when given), and returns the plaintext the instance decrypted, i.e. the
+/// body before E2EE.
+async fn decrypted_chat_body(streaming: bool, client_user: Option<&str>) -> Value {
+    let (dk, pk) = instance_keypair();
+    let key = b64(&pk);
+    let verifier = Arc::new(RecordingVerifier::default());
+    let (provider, server) = fixture(&[("pinned", &key)], verifier).await;
+    let bodies = Arc::new(Mutex::new(Vec::new()));
+    let seen = bodies.clone();
+    Mock::given(method("POST"))
+        .and(path("/e2e/invoke"))
+        .respond_with(move |request: &Request| {
+            let (body, response_key) = instance_open_request(&dk, &request.body);
+            seen.lock().unwrap().push(body);
+            invoke_reply(&response_key, streaming)
+        })
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut params: ChatCompletionParams = serde_json::from_value(json!({
+        "model": "model", "messages": [], "stream": streaming,
+        "user": "00000000-0000-4000-8000-000000000001",
+        "store": true, "metadata": {"ticket": "synthetic"}
+    }))
+    .unwrap();
+    params.extra.insert("store".into(), json!(true));
+    params
+        .extra
+        .insert("metadata".into(), json!({"client": "synthetic"}));
+    if let Some(user) = client_user {
+        params.extra.insert("user".into(), json!(user));
+    }
+    send_chat(&provider, params, Some(&key), streaming)
+        .await
+        .unwrap();
+    let body = bodies.lock().unwrap().pop().unwrap();
+    assert_eq!(body["model"], "upstream");
+    body
+}
+
+#[tokio::test]
+async fn chat_body_sends_no_user_store_or_metadata() {
+    for streaming in [false, true] {
+        let body = decrypted_chat_body(streaming, None).await;
+        for field in ["user", "store", "metadata"] {
+            assert!(body.get(field).is_none(), "{field} reached Chutes");
+        }
+    }
+}
+
+#[tokio::test]
+async fn chat_body_keeps_the_clients_own_user() {
+    for streaming in [false, true] {
+        let body = decrypted_chat_body(streaming, Some("client-end-user")).await;
+        assert_eq!(body["user"], "client-end-user");
     }
 }
 

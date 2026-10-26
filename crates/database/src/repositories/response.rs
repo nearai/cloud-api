@@ -507,6 +507,7 @@ impl ResponseRepositoryTrait for PgResponseRepository {
             tool_choice: ResponseToolChoiceOutput::Auto("auto".to_string()),
             tools: request.tools.clone().unwrap_or_else(|| {
                 vec![ResponseTool::WebSearch {
+                    count: None,
                     filters: None,
                     search_context_size: Some("medium".to_string()),
                     user_location: Some(UserLocation {

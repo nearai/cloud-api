@@ -44,9 +44,13 @@ hex = "0.4"
 subtle = "2.6"
 bytes = "1.11"
 http-body-util = "0.1"
-# AWS S3 for file storage
+# Regional S3 uses SigV4; SigV4a pulls in crypto-bigint affected by RUSTSEC-2026-0387.
 aws-config = { version = "1.8", features = ["behavior-version-latest"] }
-aws-sdk-s3 = { version = "1.134", default-features = false, features = ["sigv4a", "http-1x", "default-https-client", "rt-tokio"] }
+aws-sdk-s3 = { version = "1.134", default-features = false, features = [
+    "http-1x",
+    "default-https-client",
+    "rt-tokio",
+] }
 # NEAR wallet authentication
 near-api = "0.8.6"
 base64 = "0.22"
@@ -72,7 +76,7 @@ tokio-test = "0.4"
 sha2 = "0.11"
 base64 = "0.22.1"
 dotenvy = "0.15.7"
-k256 = { version = "0.13", features = ["ecdsa", "arithmetic"] }
+k256 = { version = "0.14", features = ["ecdsa", "arithmetic"] }
 sha3 = "0.12"
 hmac = "0.13"
 deadpool-postgres = { version = "0.14", features = ["rt_tokio_1"] }

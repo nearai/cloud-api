@@ -1,6 +1,8 @@
 use dstack_sdk::dstack_client;
 use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
 use k256::ecdsa::{SigningKey as EcdsaSigningKey, VerifyingKey as EcdsaVerifyingKey};
+#[cfg(debug_assertions)]
+use k256::elliptic_curve::Generate;
 use rand_core::OsRng;
 use sha3::{Digest, Keccak256};
 
@@ -22,7 +24,7 @@ impl AttestationService {
             ed25519_address
         );
 
-        let ecdsa_signing_key = EcdsaSigningKey::random(&mut csprng);
+        let ecdsa_signing_key = EcdsaSigningKey::generate();
         let ecdsa_verifying_key = *ecdsa_signing_key.verifying_key();
         let ecdsa_address_raw = Self::ecdsa_public_key_to_ethereum_address(&ecdsa_verifying_key);
         tracing::info!(
@@ -117,7 +119,7 @@ impl AttestationService {
     }
 
     fn ecdsa_public_key_to_ethereum_address(verifying_key: &EcdsaVerifyingKey) -> Vec<u8> {
-        let encoded_point = verifying_key.to_encoded_point(false);
+        let encoded_point = verifying_key.to_sec1_point(false);
         let point_bytes = encoded_point.as_bytes();
         let uncompressed_pubkey = &point_bytes[1..65];
         let hash = Keccak256::digest(uncompressed_pubkey);

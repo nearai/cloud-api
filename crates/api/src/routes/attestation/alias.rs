@@ -3,19 +3,27 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::{Json as ResponseJson, Response},
 };
-use services::models::ModelsServiceTrait;
+use services::models::{ModelCaller, ModelsServiceTrait};
 use std::sync::Arc;
 
+/// The `(requested, canonical)` pair when `model` is an alias `caller` may
+/// use. A model the caller may not use is `NotFound` here, so its canonical
+/// name is never disclosed and the attestation service answers the request
+/// like one for an unknown model.
 pub(super) async fn resolve_attestation_alias(
     model: Option<&str>,
     models_service: &Arc<dyn ModelsServiceTrait>,
+    caller: ModelCaller,
     headers: &HeaderMap,
 ) -> Result<Option<(String, String)>, (StatusCode, ResponseJson<ErrorResponse>)> {
     let Some(requested) = model else {
         return Ok(None);
     };
 
-    match models_service.resolve_and_get_model(requested).await {
+    match models_service
+        .resolve_and_get_model(requested, caller)
+        .await
+    {
         Ok(m) if m.model_name != requested => {
             if crate::routes::common::no_aliasing_requested(headers) {
                 return Err((

@@ -150,6 +150,39 @@ async fn ita_token_route_rejects_alias_when_no_aliasing_requested() {
     assert!(attestation.queries().is_empty());
 }
 
+/// The route is public: it must ask for the model as an anonymous caller, and
+/// must not name the canonical model behind an alias that caller cannot use.
+#[tokio::test]
+async fn ita_token_route_resolves_the_model_as_an_anonymous_caller() {
+    let attestation = RecordingItaAttestationService::err(AttestationError::UnknownModel(
+        "alias-model".to_string(),
+    ));
+    let models = TestModelsService::with_unlisted_alias("alias-model", "canonical-model");
+    let server = public_ita_server(attestation.clone(), models.clone());
+
+    let response = server
+        .get("/attestation/ita-token")
+        .add_query_param("model", "alias-model")
+        .add_header(crate::routes::common::HEADER_NO_ALIASING, "true")
+        .await;
+
+    assert_eq!(
+        models.callers(),
+        vec![services::models::ModelCaller::Anonymous]
+    );
+    // Not the alias rejection, which would name the canonical model: the
+    // request reaches the service and gets its unknown-model answer.
+    assert_eq!(response.status_code(), StatusCode::BAD_REQUEST);
+    assert!(response.maybe_header(HEADER_MODEL_ALIAS_RESOLVED).is_none());
+    let body = response.text();
+    assert!(!body.contains("canonical-model"), "{body}");
+    assert!(body.contains("Model 'alias-model' not found"), "{body}");
+    assert_eq!(
+        attestation.only_query().model.as_deref(),
+        Some("alias-model")
+    );
+}
+
 #[tokio::test]
 async fn ita_token_route_maps_service_errors_to_http_contract() {
     for scenario in [

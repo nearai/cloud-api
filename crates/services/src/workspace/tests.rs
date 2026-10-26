@@ -674,6 +674,50 @@ async fn slow_sender_does_not_block_mutation_response() {
     gate.add_permits(1);
 }
 
+#[tokio::test(start_paused = true)]
+async fn stalled_sender_times_out_and_continues_to_the_next_recipient() {
+    let owner = member(MemberRole::Owner, true, "owner@example.com");
+    let admin = member(MemberRole::Admin, true, "admin@example.com");
+    let requester = owner.user_id.clone();
+    let before = key(requester.clone());
+    let gate = Arc::new(Semaphore::new(0));
+    let (attempts, mut receiver) = mpsc::unbounded_channel();
+    let sender = Arc::new(RecordingEmailSender {
+        attempts,
+        fail: false,
+        gate: Some(gate.clone()),
+    });
+    let service = service(&before, &before, true, vec![owner, admin], sender, true);
+    let result = tokio::time::timeout(
+        Duration::from_secs(2),
+        service.revoke_api_key(before.workspace_id, before.id, requester),
+    )
+    .await;
+    assert!(result.expect("mutation waited on email delivery").unwrap());
+    assert_eq!(
+        receive(&mut receiver).await.recipient_email,
+        "owner@example.com"
+    );
+
+    // The first delivery stays blocked. The second must be attempted after
+    // the full-send deadline, without waiting for a real provider or wall time.
+    let started = tokio::time::Instant::now();
+    let second = tokio::time::timeout(Duration::from_secs(16), receiver.recv())
+        .await
+        .expect("stalled delivery blocked the next recipient")
+        .expect("notification channel closed");
+    assert_eq!(second.recipient_email, "admin@example.com");
+    assert!(started.elapsed() >= Duration::from_secs(15));
+    gate.add_permits(1);
+    drop(service);
+    assert!(
+        tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+            .await
+            .expect("notification task did not finish")
+            .is_none()
+    );
+}
+
 #[test]
 fn spend_limits_preserve_nano_dollar_precision() {
     for (value, expected) in [

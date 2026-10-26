@@ -4,7 +4,7 @@ pub mod ports;
 mod tests;
 
 pub use ports::*;
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use crate::auth::ports::UserId;
 use crate::common::RepositoryError;
@@ -14,6 +14,8 @@ use crate::organization::{
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+
+const API_KEY_CHANGE_EMAIL_TIMEOUT: Duration = Duration::from_secs(15);
 
 pub struct WorkspaceServiceImpl {
     workspace_repository: Arc<dyn WorkspaceRepository>,
@@ -136,8 +138,21 @@ impl WorkspaceServiceImpl {
         let api_key_id = key.id.clone();
         tokio::spawn(async move {
             for email in emails {
-                if let Err(error) = email_sender.send_api_key_changed(&email).await {
-                    tracing::warn!(workspace_id = %workspace_id.0, api_key_id = %api_key_id.0, error = %error.sanitized_message(), "Failed to send API key change email");
+                // Include response-body reads in each recipient's deadline so
+                // a stalled delivery cannot suppress the remaining notices.
+                match tokio::time::timeout(
+                    API_KEY_CHANGE_EMAIL_TIMEOUT,
+                    email_sender.send_api_key_changed(&email),
+                )
+                .await
+                {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(error)) => {
+                        tracing::warn!(workspace_id = %workspace_id.0, api_key_id = %api_key_id.0, error = %error.sanitized_message(), "Failed to send API key change email");
+                    }
+                    Err(_) => {
+                        tracing::warn!(workspace_id = %workspace_id.0, api_key_id = %api_key_id.0, "API key change email delivery timed out");
+                    }
                 }
             }
         });

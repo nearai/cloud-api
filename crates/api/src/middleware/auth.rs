@@ -247,6 +247,25 @@ pub async fn auth_middleware_with_workspace_context(
     }
 }
 
+/// Optional API key with workspace/organization context resolution.
+///
+/// A request without an `Authorization` header passes through with no
+/// `AuthenticatedApiKey` extension, so the handler serves it anonymously. A
+/// header that is present is validated exactly as in
+/// `auth_middleware_with_workspace_context`: a malformed, unknown, expired or
+/// revoked key still gets a 401 rather than silently falling back.
+pub async fn optional_auth_middleware_with_workspace_context(
+    State(state): State<AuthState>,
+    request: Request,
+    next: Next,
+) -> Result<Response, (StatusCode, axum::Json<crate::models::ErrorResponse>)> {
+    if !request.headers().contains_key("authorization") {
+        debug!("No Authorization header, serving anonymously");
+        return Ok(next.run(request).await);
+    }
+    auth_middleware_with_workspace_context(State(state), request, next).await
+}
+
 /// Native Anthropic auth accepts the SDK's `x-api-key` header as well as the
 /// Cloud API Bearer form, while keeping Cloud API as the credential authority.
 pub async fn anthropic_auth_middleware_with_workspace_context(

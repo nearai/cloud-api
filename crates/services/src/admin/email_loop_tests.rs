@@ -483,6 +483,13 @@ struct CountingEmailSender {
 
 #[async_trait]
 impl EmailSender for CountingEmailSender {
+    async fn send_member_permission_changed(
+        &self,
+        _email: &crate::email::MemberPermissionChangedEmail,
+    ) -> Result<EmailDeliveryOutcome, EmailError> {
+        unimplemented!("not used by the model email loop tests")
+    }
+
     async fn send_invitation(
         &self,
         _email: &crate::email::InvitationEmail,

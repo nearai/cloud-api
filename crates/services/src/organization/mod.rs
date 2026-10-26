@@ -1,11 +1,16 @@
 pub mod ports;
 use super::auth::ports::{UserId, UserRepository};
 use super::common::RepositoryError;
-use crate::email::{EmailDeliveryOutcome, EmailSender, InvitationEmail, NoopEmailSender};
+use crate::email::{
+    deliverable_email, EmailDeliveryOutcome, EmailSender, InvitationEmail,
+    MemberPermissionChangedEmail, NoopEmailSender,
+};
 use anyhow::Result;
 use async_trait::async_trait;
 pub use ports::*;
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
+
+const MEMBER_PERMISSION_EMAIL_TIMEOUT: Duration = Duration::from_secs(15);
 
 pub struct OrganizationServiceImpl {
     repository: Arc<dyn OrganizationRepository>,
@@ -316,6 +321,74 @@ impl OrganizationServiceImpl {
         }
 
         Ok(member.role)
+    }
+
+    async fn send_member_permission_changed_email(
+        &self,
+        org: &Organization,
+        member_id: UserId,
+        previous_role: MemberRole,
+        new_role: MemberRole,
+        actor_id: UserId,
+    ) {
+        if previous_role == new_role {
+            return;
+        }
+        let Some(base_url) = self
+            .invitations_url
+            .as_deref()
+            .and_then(|url| url.strip_suffix("/dashboard/invitations"))
+        else {
+            return;
+        };
+        let Ok(Some(user)) = self.user_repository.get_by_id(member_id.clone()).await else {
+            tracing::warn!(organization_id = %org.id.0, member_id = %member_id.0, "Unable to load member for role-change email");
+            return;
+        };
+        let Some(recipient_email) = deliverable_email(
+            &user.email,
+            user.contact_email.as_deref(),
+            user.contact_email_verified_at,
+        ) else {
+            return;
+        };
+        let actor_name = self
+            .user_repository
+            .get_by_id(actor_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|actor| actor.display_name.unwrap_or(actor.username));
+        let email = MemberPermissionChangedEmail {
+            recipient_email: recipient_email.to_string(),
+            organization_name: org.name.clone(),
+            previous_role: previous_role.to_string(),
+            new_role: new_role.to_string(),
+            changed_at: chrono::Utc::now(),
+            actor_name,
+            members_url: format!("{base_url}/dashboard/organizations/{}/members", org.id.0),
+        };
+        let email_sender = self.email_sender.clone();
+        let organization_id = org.id.clone();
+        // Delivery is best effort after the committed mutation. Give each
+        // recipient its own task so one slow provider response cannot block
+        // the mutation response or another recipient's security notification.
+        tokio::spawn(async move {
+            match tokio::time::timeout(
+                MEMBER_PERMISSION_EMAIL_TIMEOUT,
+                email_sender.send_member_permission_changed(&email),
+            )
+            .await
+            {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => {
+                    tracing::warn!(organization_id = %organization_id.0, member_id = %member_id.0, error = %error.sanitized_message(), "Failed to send member role-change email");
+                }
+                Err(_) => {
+                    tracing::warn!(organization_id = %organization_id.0, member_id = %member_id.0, "Member role-change email delivery timed out");
+                }
+            }
+        });
     }
 
     fn settings_from_organization(org: &Organization) -> ports::OrganizationSettings {
@@ -673,10 +746,20 @@ impl OrganizationServiceTrait for OrganizationServiceImpl {
 
         let request = UpdateOrganizationMemberRequest { role: new_role };
 
-        self.repository
+        let updated = self
+            .repository
             .update_member(organization_id.0, member_id.0, request, requester_id.0)
             .await
-            .map_err(Self::map_repository_error)
+            .map_err(Self::map_repository_error)?;
+        self.send_member_permission_changed_email(
+            &org,
+            member_id,
+            updated.previous_role,
+            updated.member.role.clone(),
+            requester_id,
+        )
+        .await;
+        Ok(updated.member)
     }
 
     /// Check if a user is a member of an organization (private helper)
@@ -995,7 +1078,9 @@ impl OrganizationServiceTrait for OrganizationServiceImpl {
         new_role: MemberRole,
         changed_by_user_id: UserId,
     ) -> Result<ports::OrganizationMemberRoleUpdate, OrganizationError> {
-        self.repository
+        let org = self.get_organization(organization_id.clone()).await?;
+        let updated = self
+            .repository
             .update_member_role_with_audit(
                 organization_id.0,
                 member_id.0,
@@ -1009,7 +1094,26 @@ impl OrganizationServiceTrait for OrganizationServiceImpl {
                     OrganizationError::InvalidParams(message)
                 }
                 error => Self::map_repository_error(error),
-            })
+            })?;
+        self.send_member_permission_changed_email(
+            &org,
+            member_id,
+            updated.previous_role.clone(),
+            updated.member.role.clone(),
+            changed_by_user_id.clone(),
+        )
+        .await;
+        for change in &updated.additional_changes {
+            self.send_member_permission_changed_email(
+                &org,
+                change.user_id.clone(),
+                change.previous_role.clone(),
+                change.new_role.clone(),
+                changed_by_user_id.clone(),
+            )
+            .await;
+        }
+        Ok(updated)
     }
 
     /// Remove member with last owner protection (private helper)
@@ -1740,6 +1844,8 @@ impl OrganizationServiceTrait for OrganizationServiceImpl {
 
 #[cfg(test)]
 mod tests {
+    mod permission_email_tests;
+
     use super::*;
     use crate::auth::ports::{User, UserRole};
     use crate::email::{EmailDeliveryOutcome, EmailError};
@@ -1892,7 +1998,7 @@ mod tests {
             _: Uuid,
             _: UpdateOrganizationMemberRequest,
             _: Uuid,
-        ) -> Result<OrganizationMember, RepositoryError> {
+        ) -> Result<OrganizationMemberRoleUpdate, RepositoryError> {
             unimplemented!()
         }
 
@@ -1958,6 +2064,7 @@ mod tests {
     struct StubUserRepo {
         inviter: User,
         get_by_id_calls: Mutex<usize>,
+        notification_users: std::collections::HashMap<UserId, User>,
     }
 
     #[async_trait]
@@ -1984,9 +2091,14 @@ mod tests {
             unimplemented!()
         }
 
-        async fn get_by_id(&self, _: UserId) -> anyhow::Result<Option<User>> {
+        async fn get_by_id(&self, user_id: UserId) -> anyhow::Result<Option<User>> {
             *self.get_by_id_calls.lock().unwrap() += 1;
-            Ok(Some(self.inviter.clone()))
+            Ok(Some(
+                self.notification_users
+                    .get(&user_id)
+                    .unwrap_or(&self.inviter)
+                    .clone(),
+            ))
         }
 
         async fn get_by_email(&self, _: &str) -> anyhow::Result<Option<User>> {
@@ -2191,10 +2303,43 @@ mod tests {
     struct StubEmailSender {
         outcome: Result<EmailDeliveryOutcome, EmailError>,
         sent_to: Mutex<Vec<String>>,
+        permission_changes: Mutex<Vec<MemberPermissionChangedEmail>>,
+        permission_attempted: tokio::sync::Notify,
+        blocked_recipient: Mutex<Option<String>>,
+        blocked_delivery_cancelled: std::sync::atomic::AtomicBool,
+        blocked_delivery_finished: tokio::sync::Notify,
     }
 
     #[async_trait]
     impl EmailSender for StubEmailSender {
+        async fn send_member_permission_changed(
+            &self,
+            email: &MemberPermissionChangedEmail,
+        ) -> Result<EmailDeliveryOutcome, EmailError> {
+            self.permission_changes.lock().unwrap().push(email.clone());
+            self.permission_attempted.notify_one();
+            let blocked = self.blocked_recipient.lock().unwrap().as_deref()
+                == Some(email.recipient_email.as_str());
+            if blocked {
+                struct PendingDelivery<'a>(
+                    &'a std::sync::atomic::AtomicBool,
+                    &'a tokio::sync::Notify,
+                );
+                impl Drop for PendingDelivery<'_> {
+                    fn drop(&mut self) {
+                        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+                        self.1.notify_one();
+                    }
+                }
+                let _pending = PendingDelivery(
+                    &self.blocked_delivery_cancelled,
+                    &self.blocked_delivery_finished,
+                );
+                std::future::pending::<()>().await;
+            }
+            self.outcome.clone()
+        }
+
         async fn send_invitation(
             &self,
             email: &InvitationEmail,
@@ -2302,10 +2447,16 @@ mod tests {
         let email_sender = Arc::new(StubEmailSender {
             outcome,
             sent_to: Mutex::new(Vec::new()),
+            permission_changes: Mutex::new(Vec::new()),
+            permission_attempted: tokio::sync::Notify::new(),
+            blocked_recipient: Mutex::new(None),
+            blocked_delivery_cancelled: std::sync::atomic::AtomicBool::new(false),
+            blocked_delivery_finished: tokio::sync::Notify::new(),
         });
         let user_repo = Arc::new(StubUserRepo {
             inviter,
             get_by_id_calls: Mutex::new(0),
+            notification_users: Default::default(),
         });
         let service = OrganizationServiceImpl::new_with_email_sender(
             Arc::new(StubOrgRepo {
@@ -2382,6 +2533,7 @@ mod tests {
                 email_opt_in_at: None,
             },
             get_by_id_calls: Mutex::new(0),
+            notification_users: Default::default(),
         });
         let invitation_repo = Arc::new(StubInvitationRepo {
             records: Mutex::new(Vec::new()),
@@ -2597,6 +2749,7 @@ mod tests {
                 email_opt_in_at: None,
             },
             get_by_id_calls: Mutex::new(0),
+            notification_users: Default::default(),
         });
         let invitation_repo = Arc::new(StubInvitationRepo {
             records: Mutex::new(Vec::new()),

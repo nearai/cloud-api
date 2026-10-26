@@ -668,6 +668,13 @@ mod tests {
 
     #[async_trait]
     impl EmailSender for RecordingSender {
+        async fn send_member_permission_changed(
+            &self,
+            _email: &crate::email::MemberPermissionChangedEmail,
+        ) -> Result<EmailDeliveryOutcome, EmailError> {
+            unimplemented!("not used by the contact email tests")
+        }
+
         async fn send_invitation(
             &self,
             _: &InvitationEmail,

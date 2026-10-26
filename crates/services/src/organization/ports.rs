@@ -79,6 +79,14 @@ pub struct OrganizationMember {
 pub struct OrganizationMemberRoleUpdate {
     pub member: OrganizationMember,
     pub previous_role: MemberRole,
+    pub additional_changes: Vec<OrganizationMemberRoleChange>,
+}
+
+#[derive(Debug, Clone)]
+pub struct OrganizationMemberRoleChange {
+    pub user_id: UserId,
+    pub previous_role: MemberRole,
+    pub new_role: MemberRole,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -400,13 +408,14 @@ pub trait OrganizationRepository: Send + Sync {
         invited_by: Uuid,
     ) -> Result<OrganizationMember, RepositoryError>;
 
+    /// Return the previous role read under the same lock as the update.
     async fn update_member(
         &self,
         org_id: Uuid,
         user_id: Uuid,
         request: UpdateOrganizationMemberRequest,
         requester_user_id: Uuid,
-    ) -> Result<OrganizationMember, RepositoryError>;
+    ) -> Result<OrganizationMemberRoleUpdate, RepositoryError>;
 
     /// Atomically update a member role and record the system administrator
     /// responsible for the change. Promoting an existing member to owner transfers

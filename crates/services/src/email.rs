@@ -58,6 +58,17 @@ pub struct InvitationEmail {
 }
 
 #[derive(Debug, Clone)]
+pub struct MemberPermissionChangedEmail {
+    pub recipient_email: String,
+    pub organization_name: String,
+    pub previous_role: String,
+    pub new_role: String,
+    pub changed_at: DateTime<Utc>,
+    pub actor_name: Option<String>,
+    pub members_url: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct ModelDeprecationEmail {
     pub recipient_email: String,
     pub model_id: String,
@@ -150,12 +161,24 @@ pub trait EmailSender: Send + Sync {
         &self,
         email: &ContactEmailVerificationEmail,
     ) -> Result<EmailDeliveryOutcome, EmailError>;
+
+    async fn send_member_permission_changed(
+        &self,
+        email: &MemberPermissionChangedEmail,
+    ) -> Result<EmailDeliveryOutcome, EmailError>;
 }
 
 pub struct NoopEmailSender;
 
 #[async_trait]
 impl EmailSender for NoopEmailSender {
+    async fn send_member_permission_changed(
+        &self,
+        _email: &MemberPermissionChangedEmail,
+    ) -> Result<EmailDeliveryOutcome, EmailError> {
+        Ok(EmailDeliveryOutcome::Skipped)
+    }
+
     async fn send_invitation(
         &self,
         _email: &InvitationEmail,
@@ -383,6 +406,25 @@ impl EmailSender for ResendEmailSender {
             message_id: Some(response.id),
         })
     }
+
+    async fn send_member_permission_changed(
+        &self,
+        email: &MemberPermissionChangedEmail,
+    ) -> Result<EmailDeliveryOutcome, EmailError> {
+        let rendered = render_member_permission_changed_email(email);
+        let request = ResendSendEmailRequest {
+            from: self.from_email.clone(),
+            to: vec![email.recipient_email.clone()],
+            subject: rendered.subject,
+            html: rendered.html_body,
+            text: rendered.text_body,
+            reply_to: self.reply_to.clone(),
+        };
+        let response = self.transport.send_email(&self.api_key, request).await?;
+        Ok(EmailDeliveryOutcome::Sent {
+            message_id: Some(response.id),
+        })
+    }
 }
 
 pub fn sender_from_config(
@@ -476,6 +518,43 @@ pub fn render_invitation_email(email: &InvitationEmail) -> RenderedEmail {
         url = email.invitations_url,
     );
 
+    RenderedEmail {
+        subject,
+        html_body,
+        text_body,
+    }
+}
+
+pub fn render_member_permission_changed_email(
+    email: &MemberPermissionChangedEmail,
+) -> RenderedEmail {
+    let changed_at = email.changed_at.format("%B %-d, %Y at %H:%M UTC");
+    let actor = email.actor_name.as_deref().unwrap_or("An administrator");
+    let subject = format!("Your role in {} has changed", email.organization_name);
+    let html_body = format!(
+        r#"<!doctype html>
+<html lang="en">
+  <body style="font-family:Arial,sans-serif;line-height:1.5;color:#111827;">
+    <h1 style="font-size:20px;margin-bottom:16px;">Organization role changed</h1>
+    <p>Your role in <strong>{organization}</strong> changed from <strong>{previous}</strong> to <strong>{new}</strong>.</p>
+    <p>Changed by {actor} on {changed_at}.</p>
+    <p><a href="{url}">View organization members</a></p>
+  </body>
+</html>"#,
+        organization = escape_html(&email.organization_name),
+        previous = escape_html(&email.previous_role),
+        new = escape_html(&email.new_role),
+        actor = escape_html(actor),
+        changed_at = escape_html(&changed_at.to_string()),
+        url = escape_html(&email.members_url),
+    );
+    let text_body = format!(
+        "Organization role changed\n\nYour role in {organization} changed from {previous} to {new}.\n\nChanged by {actor} on {changed_at}.\n\nView organization members: {url}\n",
+        organization = email.organization_name,
+        previous = email.previous_role,
+        new = email.new_role,
+        url = email.members_url,
+    );
     RenderedEmail {
         subject,
         html_body,
@@ -1269,5 +1348,21 @@ mod tests {
         };
 
         assert!(error.sanitized_message().contains("RESEND_API_KEY"));
+    }
+
+    #[test]
+    fn member_permission_email_contains_roles_and_safe_link() {
+        let rendered = render_member_permission_changed_email(&MemberPermissionChangedEmail {
+            recipient_email: "member@example.com".into(),
+            organization_name: "A&B".into(),
+            previous_role: "member".into(),
+            new_role: "admin".into(),
+            changed_at: Utc::now(),
+            actor_name: Some("Owner".into()),
+            members_url: "https://cloud.example.com/members?a=1&b=2".into(),
+        });
+        assert!(rendered.text_body.contains("member to admin"));
+        assert!(rendered.html_body.contains("A&amp;B"));
+        assert!(rendered.html_body.contains("a=1&amp;b=2"));
     }
 }

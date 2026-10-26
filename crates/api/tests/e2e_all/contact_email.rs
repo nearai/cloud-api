@@ -66,6 +66,13 @@ impl RecordingEmailSender {
 
 #[async_trait]
 impl EmailSender for RecordingEmailSender {
+    async fn send_member_permission_changed(
+        &self,
+        _email: &services::email::MemberPermissionChangedEmail,
+    ) -> Result<EmailDeliveryOutcome, EmailError> {
+        Ok(EmailDeliveryOutcome::Skipped)
+    }
+
     async fn send_invitation(
         &self,
         _email: &InvitationEmail,

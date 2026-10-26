@@ -135,9 +135,11 @@ impl From<services::attestation::models::AttestationReport> for AttestationRespo
 
 /// Get attestation report
 ///
-/// Get hardware attestation report for TEE verification. Requires an API key
-/// (nearai/infra#193); report retrieval is non-billable — no usage or billing
-/// records are created.
+/// Get hardware attestation report for TEE verification. The API key is
+/// optional, so a client can verify the gateway before it sends any
+/// credential. Without a key, listed models only; with one, also the unlisted
+/// models the key's organization may use. A key that is sent must be valid.
+/// Report retrieval is non-billable — no usage or billing records are created.
 ///
 /// With `model=...&provider=chutes`, the Chutes entry in `model_attestations` includes
 /// `quote_b64`, `certificate_b64`, `e2e_pubkey`, `nonce`, and `gpu_evidence` for
@@ -159,11 +161,12 @@ impl From<services::attestation::models::AttestationReport> for AttestationRespo
     ),
     responses(
         (status = 200, description = "Attestation report retrieved", body = AttestationResponse),
-        (status = 400, description = "Invalid nonce, signing_algo or provider, or unknown model (a model the key's organization may not use is reported as unknown)", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid API key", body = ErrorResponse),
+        (status = 400, description = "Invalid nonce, signing_algo or provider, or unknown model (a model the caller may not use is reported as unknown)", body = ErrorResponse),
+        (status = 401, description = "An API key was sent and is invalid", body = ErrorResponse),
         (status = 503, description = "Service unavailable", body = ErrorResponse)
     ),
     security(
+        (),
         ("api_key" = [])
     ),
     tag = "Attestation"
@@ -171,11 +174,14 @@ impl From<services::attestation::models::AttestationReport> for AttestationRespo
 pub async fn get_attestation_report(
     Query(params): Query<AttestationQuery>,
     State(state): State<AttestationRouteState>,
-    Extension(api_key): Extension<AuthenticatedApiKey>,
+    api_key: Option<Extension<AuthenticatedApiKey>>,
     headers: HeaderMap,
 ) -> Result<axum::response::Response, (StatusCode, ResponseJson<ErrorResponse>)> {
     // An unlisted model has a report only for an organization that may use it.
-    let caller = ModelCaller::Organization(api_key.organization.id.0);
+    let caller = match api_key {
+        Some(Extension(api_key)) => ModelCaller::Organization(api_key.organization.id.0),
+        None => ModelCaller::Anonymous,
+    };
     let alias_resolved = resolve_attestation_alias(
         params.model.as_deref(),
         &state.models_service,

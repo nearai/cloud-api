@@ -1,14 +1,14 @@
-// E2E tests for attestation route authentication (nearai/infra#193):
+// E2E tests for attestation route authentication.
 //
 // Route classification under test (mirrors crates/api/src/routes/attestation.rs):
-//   - GET /v1/attestation/report    -> API key required (non-billable)
-//   - GET /v1/signature/{chat_id}   -> API key required (unchanged)
+//   - GET /v1/attestation/report    -> API key optional (non-billable)
+//   - GET /v1/signature/{chat_id}   -> API key required
 //   - GET /v1/attestation/ita-token -> public (explicit, documented decision)
 //   - GET /v1/attestation/pins -> public (explicit, documented decision)
 //
-// Covers: missing/malformed/invalid/expired/revoked credentials -> 401,
-// valid key -> 200 across query variants, and that report retrieval creates
-// no usage/billing records.
+// Covers: no Authorization header -> 200 on the report, a key that is sent
+// but malformed/invalid/expired/revoked -> 401, valid key -> 200 across query
+// variants, and that report retrieval creates no usage/billing records.
 
 use crate::common::*;
 
@@ -21,25 +21,33 @@ fn report_url(model: &str) -> String {
 // GET /v1/attestation/report — credential rejection matrix
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Missing Authorization header must return the standard 401 envelope.
+/// Without an Authorization header the report is served anonymously, so a
+/// client can verify the gateway before it sends any credential.
 #[tokio::test]
-async fn test_attestation_report_missing_auth_returns_401() {
+async fn test_attestation_report_without_auth_is_served() {
     let server = setup_test_server().await;
     let model = setup_qwen_model(&server).await;
 
-    let response = server.get(&report_url(&model)).await;
+    let nonce = "deadbeef".repeat(8); // 32 bytes = 64 hex chars
+    let base = report_url(&model);
+    for url in [
+        base.clone(),
+        format!("{base}&signing_algo=ecdsa&nonce={nonce}"),
+    ] {
+        let response = server.get(&url).await;
 
-    assert_eq!(
-        response.status_code(),
-        401,
-        "unauthenticated attestation report must 401, got: {}",
-        response.text()
-    );
-    let body: serde_json::Value = response.json();
-    assert_eq!(
-        body["error"]["type"], "missing_auth_header",
-        "unexpected 401 envelope: {body}"
-    );
+        assert_eq!(
+            response.status_code(),
+            200,
+            "anonymous attestation report must succeed for {url}: {}",
+            response.text()
+        );
+        let body: serde_json::Value = response.json();
+        assert!(
+            body.get("gateway_attestation").is_some(),
+            "report body missing gateway_attestation for {url}: {body}"
+        );
+    }
 }
 
 /// A malformed Authorization header (non-Bearer scheme) must return 401.

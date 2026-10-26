@@ -1,18 +1,28 @@
 pub mod ports;
 
+#[cfg(test)]
+mod tests;
+
 pub use ports::*;
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use crate::auth::ports::UserId;
 use crate::common::RepositoryError;
-use crate::organization::{OrganizationId, OrganizationServiceTrait};
+use crate::email::{deliverable_email, ApiKeyChangedEmail, EmailSender, NoopEmailSender};
+use crate::organization::{
+    MemberRole, OrganizationError, OrganizationId, OrganizationServiceTrait,
+};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+
+const API_KEY_CHANGE_EMAIL_TIMEOUT: Duration = Duration::from_secs(15);
 
 pub struct WorkspaceServiceImpl {
     workspace_repository: Arc<dyn WorkspaceRepository>,
     api_key_repository: Arc<dyn ApiKeyRepository>,
     organization_service: Arc<dyn OrganizationServiceTrait>,
+    email_sender: Arc<dyn EmailSender>,
+    frontend_base_url: Option<String>,
 }
 
 impl WorkspaceServiceImpl {
@@ -21,11 +31,131 @@ impl WorkspaceServiceImpl {
         api_key_repository: Arc<dyn ApiKeyRepository>,
         organization_service: Arc<dyn OrganizationServiceTrait>,
     ) -> Self {
+        Self::new_with_email_sender(
+            workspace_repository,
+            api_key_repository,
+            organization_service,
+            Arc::new(NoopEmailSender),
+            None,
+        )
+    }
+
+    pub fn new_with_email_sender(
+        workspace_repository: Arc<dyn WorkspaceRepository>,
+        api_key_repository: Arc<dyn ApiKeyRepository>,
+        organization_service: Arc<dyn OrganizationServiceTrait>,
+        email_sender: Arc<dyn EmailSender>,
+        frontend_base_url: Option<String>,
+    ) -> Self {
         Self {
             workspace_repository,
             api_key_repository,
             organization_service,
+            email_sender,
+            frontend_base_url,
         }
+    }
+
+    async fn notify_api_key_change(
+        &self,
+        workspace: &Workspace,
+        organization: &crate::organization::Organization,
+        key: &ApiKey,
+        requester_id: UserId,
+        change: String,
+    ) {
+        let Some(base_url) = self.frontend_base_url.as_deref() else {
+            return;
+        };
+        let members = match self
+            .organization_service
+            .get_members_for_api_key_notification(organization.id.clone())
+            .await
+        {
+            Ok(members) => members,
+            Err(error) => {
+                // Organization errors can include customer data; log only their kind.
+                let error_kind = match error {
+                    OrganizationError::NotFound => "not_found",
+                    OrganizationError::UserNotFound => "user_not_found",
+                    OrganizationError::Unauthorized(_) => "unauthorized",
+                    OrganizationError::InvalidParams(_) => "invalid_params",
+                    OrganizationError::AlreadyExists => "already_exists",
+                    OrganizationError::StakingWalletBound => "staking_wallet_bound",
+                    OrganizationError::DefaultOrganization => "default_organization",
+                    OrganizationError::InternalError(_) => "internal_error",
+                    OrganizationError::AlreadyMember => "already_member",
+                };
+                tracing::warn!(organization_id = %organization.id.0, workspace_id = %workspace.id.0, api_key_id = %key.id.0, lookup = "member_list", error_kind, "Failed to load API key change email recipients");
+                return;
+            }
+        };
+        let actor_name = members
+            .iter()
+            .find(|member| member.user_id == requester_id)
+            .map(|member| {
+                member
+                    .user
+                    .display_name
+                    .clone()
+                    .unwrap_or_else(|| member.user.username.clone())
+            });
+        let recipients = members
+            .iter()
+            .filter(|member| {
+                member.user.is_active
+                    && (member.user_id == key.created_by_user_id
+                        || matches!(member.role, MemberRole::Owner | MemberRole::Admin))
+            })
+            .map(|member| &member.user);
+        let mut emails = Vec::new();
+        for user in recipients {
+            let Some(recipient_email) = deliverable_email(
+                &user.email,
+                user.contact_email.as_deref(),
+                user.contact_email_verified_at,
+            ) else {
+                continue;
+            };
+            emails.push(ApiKeyChangedEmail {
+                recipient_email: recipient_email.to_string(),
+                organization_name: organization.name.clone(),
+                workspace_name: workspace.name.clone(),
+                key_name: key.name.clone(),
+                key_prefix: key.key_prefix.clone(),
+                change: change.clone(),
+                changed_at: Utc::now(),
+                actor_name: actor_name.clone(),
+                keys_url: format!(
+                    "{}/dashboard/organizations/{}/keys",
+                    base_url.trim_end_matches('/'),
+                    organization.id.0
+                ),
+            });
+        }
+        let email_sender = self.email_sender.clone();
+        let workspace_id = workspace.id.clone();
+        let api_key_id = key.id.clone();
+        tokio::spawn(async move {
+            for email in emails {
+                // Include response-body reads in each recipient's deadline so
+                // a stalled delivery cannot suppress the remaining notices.
+                match tokio::time::timeout(
+                    API_KEY_CHANGE_EMAIL_TIMEOUT,
+                    email_sender.send_api_key_changed(&email),
+                )
+                .await
+                {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(error)) => {
+                        tracing::warn!(workspace_id = %workspace_id.0, api_key_id = %api_key_id.0, error = %error.sanitized_message(), "Failed to send API key change email");
+                    }
+                    Err(_) => {
+                        tracing::warn!(workspace_id = %workspace_id.0, api_key_id = %api_key_id.0, "API key change email delivery timed out");
+                    }
+                }
+            }
+        });
     }
 
     /// Convert RepositoryError to WorkspaceError
@@ -350,7 +480,8 @@ impl WorkspaceServiceTrait for WorkspaceServiceImpl {
         spend_limit: Option<i64>,
     ) -> Result<ApiKey, WorkspaceError> {
         // Check permissions
-        self.check_workspace_permission(workspace_id.clone(), requester_id)
+        let (workspace, organization) = self
+            .check_workspace_permission(workspace_id.clone(), requester_id.clone())
             .await?;
 
         // Verify the API key belongs to this workspace
@@ -366,12 +497,31 @@ impl WorkspaceServiceTrait for WorkspaceServiceImpl {
         }
 
         // Update the spend limit
-        self.api_key_repository
+        let ApiKeyUpdate { previous, updated } = self
+            .api_key_repository
             .update_spend_limit(api_key_id, spend_limit)
             .await
-            .map_err(|e| {
-                WorkspaceError::InternalError(format!("Failed to update API key spend limit: {e}"))
-            })
+            .map_err(|error| match error {
+                RepositoryError::NotFound(_) => WorkspaceError::ApiKeyNotFound,
+                error => WorkspaceError::InternalError(format!(
+                    "Failed to update API key spend limit: {error}"
+                )),
+            })?;
+        if previous.spend_limit != updated.spend_limit {
+            self.notify_api_key_change(
+                &workspace,
+                &organization,
+                &updated,
+                requester_id,
+                format!(
+                    "Spend limit changed from {} to {}",
+                    format_spend_limit(previous.spend_limit),
+                    format_spend_limit(updated.spend_limit)
+                ),
+            )
+            .await;
+        }
+        Ok(updated)
     }
 
     async fn update_api_key(
@@ -385,7 +535,8 @@ impl WorkspaceServiceTrait for WorkspaceServiceImpl {
         is_active: Option<bool>,
     ) -> Result<ApiKey, WorkspaceError> {
         // Check permissions
-        self.check_workspace_permission(workspace_id.clone(), requester_id)
+        let (workspace, organization) = self
+            .check_workspace_permission(workspace_id.clone(), requester_id.clone())
             .await?;
 
         // Verify the API key belongs to this workspace
@@ -417,10 +568,40 @@ impl WorkspaceServiceTrait for WorkspaceServiceImpl {
         }
 
         // Update the API key
-        self.api_key_repository
+        let ApiKeyUpdate { previous, updated } = self
+            .api_key_repository
             .update(api_key_id, name, expires_at, spend_limit, is_active)
             .await
-            .map_err(Self::map_repository_error)
+            .map_err(|error| match error {
+                RepositoryError::NotFound(_) => WorkspaceError::ApiKeyNotFound,
+                error => Self::map_repository_error(error),
+            })?;
+        let mut changes = Vec::new();
+        if previous.is_active != updated.is_active {
+            changes.push(if updated.is_active {
+                "API key enabled".to_string()
+            } else {
+                "API key disabled".to_string()
+            });
+        }
+        if previous.spend_limit != updated.spend_limit {
+            changes.push(format!(
+                "Spend limit changed from {} to {}",
+                format_spend_limit(previous.spend_limit),
+                format_spend_limit(updated.spend_limit)
+            ));
+        }
+        if !changes.is_empty() {
+            self.notify_api_key_change(
+                &workspace,
+                &organization,
+                &updated,
+                requester_id,
+                changes.join("; "),
+            )
+            .await;
+        }
+        Ok(updated)
     }
 
     async fn can_manage_api_keys(
@@ -578,7 +759,8 @@ impl WorkspaceServiceTrait for WorkspaceServiceImpl {
         requester_id: UserId,
     ) -> Result<bool, WorkspaceError> {
         // Check permissions
-        self.check_workspace_permission(workspace_id.clone(), requester_id)
+        let (workspace, organization) = self
+            .check_workspace_permission(workspace_id.clone(), requester_id.clone())
             .await?;
 
         // Verify the API key belongs to this workspace
@@ -594,9 +776,35 @@ impl WorkspaceServiceTrait for WorkspaceServiceImpl {
         }
 
         // Revoke the API key
-        self.api_key_repository
+        let revoked = self
+            .api_key_repository
             .revoke(api_key_id)
             .await
-            .map_err(|e| WorkspaceError::InternalError(format!("Failed to revoke API key: {e}")))
+            .map_err(|e| WorkspaceError::InternalError(format!("Failed to revoke API key: {e}")))?;
+        if revoked {
+            self.notify_api_key_change(
+                &workspace,
+                &organization,
+                &api_key,
+                requester_id,
+                "API key revoked".to_string(),
+            )
+            .await;
+        }
+        Ok(revoked)
     }
+}
+
+fn format_spend_limit(value: Option<i64>) -> String {
+    value
+        .map(|nano| {
+            let magnitude = nano.unsigned_abs();
+            let mut fraction = format!("{:09}", magnitude % 1_000_000_000);
+            while fraction.len() > 2 && fraction.ends_with('0') {
+                fraction.pop();
+            }
+            let sign = if nano < 0 { "-" } else { "" };
+            format!("{sign}${}.{fraction}", magnitude / 1_000_000_000)
+        })
+        .unwrap_or_else(|| "unlimited".to_string())
 }

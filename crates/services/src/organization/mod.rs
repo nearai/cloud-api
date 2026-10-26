@@ -810,6 +810,37 @@ impl OrganizationServiceTrait for OrganizationServiceImpl {
         Ok(members_with_users)
     }
 
+    async fn get_members_for_api_key_notification(
+        &self,
+        organization_id: OrganizationId,
+    ) -> Result<Vec<OrganizationMemberWithUser>, OrganizationError> {
+        // Reuse the organization-scoped repository query without a mutable actor
+        // authorization or a separate count that can become stale before the read.
+        let members = self
+            .repository
+            .list_members_paginated(organization_id.0, i64::MAX, 0)
+            .await
+            .map_err(Self::map_repository_error)?;
+        let mut members_with_users = Vec::new();
+        for member in members {
+            let user = self
+                .user_repository
+                .get_by_id(member.user_id.clone())
+                .await
+                .map_err(|error| OrganizationError::InternalError(error.to_string()))?;
+            if let Some(user) = user {
+                members_with_users.push(OrganizationMemberWithUser {
+                    organization_id: member.organization_id,
+                    user_id: member.user_id,
+                    role: member.role,
+                    joined_at: member.joined_at,
+                    user,
+                });
+            }
+        }
+        Ok(members_with_users)
+    }
+
     /// Invite members by email (batch operation, private helper)
     async fn invite_members_by_email(
         &self,
@@ -2322,6 +2353,54 @@ mod tests {
         );
 
         (service, invitation_repo, email_sender, user_repo)
+    }
+
+    #[tokio::test]
+    async fn api_key_notification_members_are_org_scoped_without_actor_authorization_or_count_cap()
+    {
+        for lookup_fails in [false, true] {
+            let (mut service, _, _, users) = make_service(Ok(EmailDeliveryOutcome::Skipped), None);
+            let org_id = OrganizationId(Uuid::new_v4());
+            let expected_org = org_id.clone();
+            let member = OrganizationMember {
+                organization_id: org_id.clone(),
+                user_id: users.inviter.id.clone(),
+                role: MemberRole::Owner,
+                joined_at: chrono::Utc::now(),
+            };
+            let mut repository = MockOrganizationRepository::new();
+            repository.expect_get_member().never();
+            repository.expect_get_member_count().never();
+            repository.expect_get_by_id().never();
+            repository
+                .expect_list_members_paginated()
+                .times(1)
+                .withf(move |id, limit, offset| {
+                    *id == expected_org.0 && *limit == i64::MAX && *offset == 0
+                })
+                .returning(move |_, _, _| {
+                    if lookup_fails {
+                        Err(RepositoryError::QueryTimeout)
+                    } else {
+                        Ok(vec![member.clone()])
+                    }
+                });
+            service.repository = Arc::new(repository);
+            let result = service
+                .get_members_for_api_key_notification(org_id.clone())
+                .await;
+            if lookup_fails {
+                assert!(matches!(result, Err(OrganizationError::InternalError(_))));
+                assert_eq!(*users.get_by_id_calls.lock().unwrap(), 0);
+            } else {
+                let members = result.unwrap();
+                assert_eq!(members.len(), 1);
+                assert_eq!(members[0].organization_id, org_id);
+                assert_eq!(members[0].user_id, users.inviter.id);
+                assert_eq!(members[0].user.id, users.inviter.id);
+                assert_eq!(*users.get_by_id_calls.lock().unwrap(), 1);
+            }
+        }
     }
 
     fn make_settings_service(

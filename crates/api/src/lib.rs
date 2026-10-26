@@ -197,7 +197,7 @@ pub fn init_auth_services(database: Arc<Database>, config: &ApiConfig) -> AuthCo
                 as Arc<dyn services::organization::ports::OrganizationRepository>,
             user_repository.clone(),
             invitation_repo,
-            email_sender,
+            email_sender.clone(),
             invitations_url,
         ),
     )
@@ -456,11 +456,16 @@ pub async fn init_domain_services_with_pool(
         database.pool().clone(),
     )) as Arc<dyn services::workspace::ApiKeyRepository>;
 
-    let workspace_service = Arc::new(services::workspace::WorkspaceServiceImpl::new(
-        workspace_repository,
-        api_key_repository,
-        organization_service.clone(),
-    ))
+    let workspace_service = Arc::new(
+        services::workspace::WorkspaceServiceImpl::new_with_email_sender(
+            workspace_repository,
+            api_key_repository,
+            organization_service.clone(),
+            services::email::sender_from_config(&config.invitation_email)
+                .expect("Failed to initialize API key notification email sender"),
+            config.invitation_email.frontend_base_url.clone(),
+        ),
+    )
         as Arc<dyn services::workspace::WorkspaceServiceTrait + Send + Sync>;
 
     // Now create usage service with workspace_service

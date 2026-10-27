@@ -3693,6 +3693,7 @@ dependencies = [
 [[package]]
 name = "near-api"
 version = "0.8.6"
+source = "git+https://github.com/nearai/near-api-rs?rev=9ee3848688b2eee698cd132c7e43bea061af8f0b#9ee3848688b2eee698cd132c7e43bea061af8f0b"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -3717,8 +3718,7 @@ dependencies = [
 [[package]]
 name = "near-api-types"
 version = "0.8.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "48aac696975885828c0abfa00d017a3da3681b79f214bd8c5c0092d1f97d55e4"
+source = "git+https://github.com/nearai/near-api-rs?rev=9ee3848688b2eee698cd132c7e43bea061af8f0b#9ee3848688b2eee698cd132c7e43bea061af8f0b"
 dependencies = [
  "base64 0.22.1",
  "borsh",

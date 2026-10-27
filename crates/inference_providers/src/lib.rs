@@ -461,6 +461,7 @@ pub trait InferenceProvider {
         &self,
         _request: SystemOneRequest,
         _request_hash: String,
+        _model_pub_key: Option<&str>,
     ) -> Result<SystemOneResponseWithBytes, CompletionError> {
         Err(CompletionError::CompletionError(
             "System One is unavailable for this provider".into(),

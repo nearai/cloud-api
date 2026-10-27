@@ -4712,6 +4712,7 @@ impl InferenceProviderPool {
         &self,
         request: inference_providers::SystemOneRequest,
         request_hash: String,
+        model_pub_key: Option<&str>,
         fallback_disabled: bool,
     ) -> Result<AttributedSystemOne, CompletionError> {
         let hints = ChatRoutingHints {
@@ -4722,14 +4723,16 @@ impl InferenceProviderPool {
             .retry_with_fallback_caps(
                 &request.model,
                 "systemone",
-                None,
+                model_pub_key,
                 false,
                 &hints,
                 |provider| {
                     let request = request.clone();
                     let request_hash = request_hash.clone();
                     async move {
-                        let response = provider.systemone(request, request_hash).await?;
+                        let response = provider
+                            .systemone(request, request_hash, model_pub_key)
+                            .await?;
                         if provider.tier().is_attested() && provider.supports_chat_signatures() {
                             response.provider_decision_id()?;
                         }

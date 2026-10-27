@@ -162,7 +162,7 @@ async fn setup() -> Fixture {
 
     let provider = Arc::new(
         MockProvider::new_accept_all()
-            .with_systemone_handler(|request| {
+            .with_systemone_handler(|request, _| {
                 let raw = serde_json::to_vec(&json!({
                     "id": format!("decision-{}", Uuid::new_v4()),
                     "model": "decision-model",

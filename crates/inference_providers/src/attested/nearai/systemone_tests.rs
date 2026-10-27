@@ -1,6 +1,7 @@
 use super::{Config, Provider};
 use crate::{InferenceProvider, SystemOneRequest};
 use serde_json::json;
+use std::collections::HashMap;
 use wiremock::{
     matchers::{header, method, path},
     Mock, MockServer, ResponseTemplate,
@@ -20,7 +21,7 @@ fn systemone_distributes_requests_and_spills_concurrent_duplicates() {
         for request in 0..256 {
             let lease = provider
                 .fleet
-                .acquire_systemone_index(&request.to_string())
+                .acquire_systemone_index(&request.to_string(), None)
                 .unwrap();
             reached.insert(lease.index());
         }
@@ -29,7 +30,7 @@ fn systemone_distributes_requests_and_spills_concurrent_duplicates() {
             .map(|_| {
                 provider
                     .fleet
-                    .acquire_systemone_index("same-request")
+                    .acquire_systemone_index("same-request", None)
                     .unwrap()
             })
             .collect();
@@ -58,8 +59,60 @@ async fn systemone_fleet_does_not_replay_invalid_responses_or_read_timeouts() {
     fleet_case(422, false, false).await;
 }
 
-async fn fleet_case(status: u16, malformed: bool, timeout: bool) {
-    let server = MockServer::start().await;
+#[tokio::test]
+async fn systemone_fleet_uses_chat_key_policy_for_requests_and_retries() {
+    for keys in [
+        HashMap::from([("selected-key".into(), vec![0, 2])]),
+        HashMap::from([("selected-key".into(), vec![1])]),
+        HashMap::new(),
+        HashMap::from([("other-key".into(), vec![2])]),
+        HashMap::from([("selected-key".into(), vec![3])]),
+    ] {
+        let server = MockServer::start().await;
+        let port = server.address().port();
+        let provider = fleet_provider(&server);
+        provider.fleet.set_backend_keys(keys);
+        let first = provider
+            .fleet
+            .acquire_index(&[], Some("selected-key"))
+            .unwrap()
+            .index();
+        let allowed: Vec<_> = std::iter::once(first)
+            .chain(
+                provider
+                    .fleet
+                    .fallback_indices_for(first, Some("selected-key")),
+            )
+            .collect();
+        for index in 0..3 {
+            Mock::given(method("POST"))
+                .and(path("/v1/systemone"))
+                .and(header("host", format!("jev-i{index}.fleet.test:{port}")))
+                .respond_with(ResponseTemplate::new(503))
+                .expect(u64::from(allowed.contains(&index)))
+                .mount(&server)
+                .await;
+        }
+        let request: SystemOneRequest = serde_json::from_value(json!({
+            "model":"jev", "state":"x",
+            "questions":{"q":{"type":"noul","instructions":"Is this about billing?"}}
+        }))
+        .unwrap();
+        let response = provider
+            .systemone(request, "hash".into(), Some("selected-key"))
+            .await;
+        assert!(matches!(
+            response,
+            Err(crate::CompletionError::HttpError {
+                status_code: 503,
+                ..
+            })
+        ));
+        assert_eq!(provider.fleet.active_prefix_loads(), 0);
+    }
+}
+
+fn fleet_provider(server: &MockServer) -> Provider {
     let port = server.address().port();
     let provider = Provider::new(Config {
         base_url: format!("http://jev.fleet.test:{port}"),
@@ -76,9 +129,16 @@ async fn fleet_case(status: u16, malformed: bool, timeout: bool) {
     for index in 0..3 {
         *provider.fleet.index_clients[index].lock().unwrap() = Some(client.clone());
     }
+    provider
+}
+
+async fn fleet_case(status: u16, malformed: bool, timeout: bool) {
+    let server = MockServer::start().await;
+    let port = server.address().port();
+    let provider = fleet_provider(&server);
     let first = provider
         .fleet
-        .acquire_systemone_index("original-hash")
+        .acquire_systemone_index("original-hash", None)
         .unwrap()
         .index();
     let next = provider.fleet.fallback_indices_for(first, None)[0];
@@ -108,7 +168,9 @@ async fn fleet_case(status: u16, malformed: bool, timeout: bool) {
     let request: SystemOneRequest = serde_json::from_value(json!({"model":"jev","state":"x",
         "questions":{"q":{"type":"noul","instructions":"Is this about billing?"}}}))
     .unwrap();
-    let response = provider.systemone(request, "original-hash".into()).await;
+    let response = provider
+        .systemone(request, "original-hash".into(), Some("selected-key"))
+        .await;
     if retry {
         let id = format!("decision:tee.{next}/receipt?version=1");
         assert_eq!(response.unwrap().provider_decision_id().unwrap(), id);

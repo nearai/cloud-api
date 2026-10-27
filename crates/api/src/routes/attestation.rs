@@ -1,12 +1,12 @@
 //! Attestation route handlers.
 //!
-//! Route classification (nearai/infra#193). Every attestation route must be
+//! Route classification. Every attestation route must be
 //! listed here with an explicit auth decision; wiring lives in
 //! `build_attestation_routes` (crate root):
 //!
 //! | Route                           | Auth    | Rationale |
 //! |---------------------------------|---------|-----------|
-//! | `GET /v1/attestation/report`    | API key | Data-plane endpoint, documented as key-protected. Key validation only — retrieval is not billed and never creates usage records. The key's organization decides whether an unlisted model resolves. |
+//! | `GET /v1/attestation/report`    | Optional API key | Public so a client can verify the gateway before it sends a credential. Anonymous callers see listed models only; a key that is sent is validated, and its organization decides whether an unlisted model resolves. Anonymous requests can collect fresh evidence (a nonce or a report-cache miss), so only `ANONYMOUS_REPORT_CONCURRENCY` of them run at once per instance (429 beyond that). Retrieval is not billed and never creates usage records. |
 //! | `GET /v1/signature/{chat_id}`   | API key | Requires a valid API key, then looks up the response ID. The shared lookup does not enforce ownership by organization or API key. |
 //! | `GET /v1/attestation/ita-token` | Public  | Deliberate exception — see `build_public_attestation_routes`. Listed models only. |
 //! | `GET /v1/attestation/pins` | Public | Deliberate exception — see `build_public_attestation_routes`. |
@@ -15,6 +15,7 @@ use crate::{ohttp_gateway::OhttpAttestation, routes::api::AppState};
 use axum::{routing::get, Router};
 use services::models::ModelsServiceTrait;
 use std::sync::Arc;
+use tokio::sync::Semaphore;
 
 mod alias;
 mod errors;
@@ -42,6 +43,9 @@ pub struct AttestationRouteState {
     pub attestation_service: Arc<dyn services::attestation::ports::AttestationServiceTrait>,
     pub models_service: Arc<dyn ModelsServiceTrait>,
     pub ohttp_attestation: Option<OhttpAttestation>,
+    /// Permits for anonymous report requests; see
+    /// [`report::ANONYMOUS_REPORT_CONCURRENCY`].
+    pub anonymous_reports: Arc<Semaphore>,
 }
 
 impl From<AppState> for AttestationRouteState {
@@ -50,15 +54,16 @@ impl From<AppState> for AttestationRouteState {
             attestation_service: app_state.attestation_service,
             models_service: app_state.models_service,
             ohttp_attestation: app_state.ohttp_attestation,
+            anonymous_reports: Arc::new(Semaphore::new(report::ANONYMOUS_REPORT_CONCURRENCY)),
         }
     }
 }
 
 /// Attestation routes that are served WITHOUT authentication.
 ///
-/// Only `GET /v1/attestation/ita-token` and `GET /v1/attestation/pins`
-/// are public, and keeping them public is an explicit, documented decision
-/// (nearai/infra#193). For `ita-token`:
+/// `GET /v1/attestation/ita-token` and `GET /v1/attestation/pins` take no
+/// credential at all, and keeping them public is an explicit, documented
+/// decision. For `ita-token`:
 ///
 /// - The response contains exclusively TEE attestation evidence signed by
 ///   Intel Trust Authority (gateway and model provider JWTs) — no customer
@@ -78,8 +83,8 @@ impl From<AppState> for AttestationRouteState {
 ///
 /// Any route added here must be justified the same way and reflected in the
 /// classification table in the module docs above. `GET /v1/attestation/report`
-/// deliberately does NOT belong here: it is an API-key-protected data-plane
-/// endpoint (see `build_attestation_routes` in the crate root).
+/// is not here because it reads an API key when one is sent (see
+/// `build_attestation_routes` in the crate root).
 pub fn build_public_attestation_routes(
     state: AttestationRouteState,
     pins_sources: Vec<Arc<dyn services::attestation::pins_view::ProviderPinsSource>>,
@@ -104,6 +109,7 @@ mod tests {
 
     mod ita_token_route_test_support;
     mod ita_token_route_tests;
+    mod report_route_tests;
 
     #[test]
     fn signature_not_found_uses_standard_not_found_envelope() {

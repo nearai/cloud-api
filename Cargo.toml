@@ -15,3 +15,6 @@ description = "NEAR AI Cloud API"
 # Remove when an upstream release supports clients without the affected tree.
 [patch.crates-io]
 dstack-sdk = { path = "vendor/dstack-sdk" }
+
+# Upgrade zstd until an upstream near-api release includes near/near-api-rs#152.
+near-api = { git = "https://github.com/nearai/near-api-rs", rev = "9ee3848688b2eee698cd132c7e43bea061af8f0b" }

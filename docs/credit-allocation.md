@@ -96,8 +96,12 @@ reclassify a reviewed portion of `legacy_unattributed_amount` using:
 ```
 
 All amounts are positive integer nano-USD. Supported names are `grant`,
-`payment`, `staking_farm`, and `postpay`. A nonempty reason (up to 2000 characters)
-and a per-organization idempotency key (up to 100 characters) are required.
+`payment`, `staking_farm`, `transfer`, and `postpay`. Use `transfer` to attribute
+reviewed legacy consumption to received credits. Transfer adjustments cannot
+exceed the remaining unconsumed received-transfer capacity; reconciliation does
+not create received credits or change the transfer ledger.
+A nonempty reason (up to 2000 characters) and a per-organization idempotency key
+(up to 100 characters) are required.
 The endpoint requires an admin session or read-write admin access token;
 read-only tokens cannot preview or commit this operation.
 

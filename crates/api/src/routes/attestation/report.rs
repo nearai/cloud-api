@@ -8,14 +8,25 @@ use crate::{
 };
 use axum::{
     extract::{Query, State},
-    http::{HeaderMap, StatusCode},
-    response::Json as ResponseJson,
+    http::{header::RETRY_AFTER, HeaderMap, HeaderValue, StatusCode},
+    response::{IntoResponse, Json as ResponseJson},
     Extension,
 };
 use inference_providers::{ProviderFilter, ProviderSource};
 use serde::{Deserialize, Serialize};
 use services::models::ModelCaller;
 use utoipa::{IntoParams, ToSchema};
+
+/// Anonymous report requests allowed to run at once on one instance. Any of
+/// them can collect fresh gateway and model evidence: a nonce skips the report
+/// cache, and without one a new `signing_address` (or any other part of the
+/// cache key) misses it. Without a bound, anyone could keep the evidence
+/// collectors busy. A cache hit holds its permit for milliseconds. Requests
+/// with an API key do not take a permit.
+pub(crate) const ANONYMOUS_REPORT_CONCURRENCY: usize = 8;
+
+/// Seconds a client is told to wait when every anonymous permit is taken.
+const ANONYMOUS_REPORT_RETRY_AFTER_SECS: u32 = 1;
 
 /// Query parameters for attestation report
 #[derive(Debug, Serialize, Deserialize, ToSchema, IntoParams)]
@@ -135,9 +146,11 @@ impl From<services::attestation::models::AttestationReport> for AttestationRespo
 
 /// Get attestation report
 ///
-/// Get hardware attestation report for TEE verification. Requires an API key
-/// (nearai/infra#193); report retrieval is non-billable — no usage or billing
-/// records are created.
+/// Get hardware attestation report for TEE verification. The API key is
+/// optional, so a client can verify the gateway before it sends any
+/// credential. Without a key, listed models only; with one, also the unlisted
+/// models the key's organization may use. A key that is sent must be valid.
+/// Report retrieval is non-billable — no usage or billing records are created.
 ///
 /// With `model=...&provider=chutes`, the Chutes entry in `model_attestations` includes
 /// `quote_b64`, `certificate_b64`, `e2e_pubkey`, `nonce`, and `gpu_evidence` for
@@ -159,11 +172,13 @@ impl From<services::attestation::models::AttestationReport> for AttestationRespo
     ),
     responses(
         (status = 200, description = "Attestation report retrieved", body = AttestationResponse),
-        (status = 400, description = "Invalid nonce, signing_algo or provider, or unknown model (a model the key's organization may not use is reported as unknown)", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid API key", body = ErrorResponse),
+        (status = 400, description = "Invalid nonce, signing_algo or provider, or unknown model (a model the caller may not use is reported as unknown)", body = ErrorResponse),
+        (status = 401, description = "An API key was sent and is invalid", body = ErrorResponse),
+        (status = 429, description = "Too many anonymous requests in progress; retry after `Retry-After` seconds or send an API key", body = ErrorResponse),
         (status = 503, description = "Service unavailable", body = ErrorResponse)
     ),
     security(
+        (),
         ("api_key" = [])
     ),
     tag = "Attestation"
@@ -171,11 +186,23 @@ impl From<services::attestation::models::AttestationReport> for AttestationRespo
 pub async fn get_attestation_report(
     Query(params): Query<AttestationQuery>,
     State(state): State<AttestationRouteState>,
-    Extension(api_key): Extension<AuthenticatedApiKey>,
+    api_key: Option<Extension<AuthenticatedApiKey>>,
     headers: HeaderMap,
 ) -> Result<axum::response::Response, (StatusCode, ResponseJson<ErrorResponse>)> {
     // An unlisted model has a report only for an organization that may use it.
-    let caller = ModelCaller::Organization(api_key.organization.id.0);
+    let caller = match api_key {
+        Some(Extension(api_key)) => ModelCaller::Organization(api_key.organization.id.0),
+        None => ModelCaller::Anonymous,
+    };
+    // Held until the report is built.
+    let _report_permit = if caller == ModelCaller::Anonymous {
+        match state.anonymous_reports.clone().try_acquire_owned() {
+            Ok(permit) => Some(permit),
+            Err(_) => return Ok(anonymous_reports_busy()),
+        }
+    } else {
+        None
+    };
     let alias_resolved = resolve_attestation_alias(
         params.model.as_deref(),
         &state.models_service,
@@ -229,6 +256,24 @@ pub async fn get_attestation_report(
         attach_alias_header(&mut http_response, &requested, &canonical);
     }
     Ok(http_response)
+}
+
+fn anonymous_reports_busy() -> axum::response::Response {
+    tracing::debug!("Anonymous attestation report refused: all permits in use");
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        [(
+            RETRY_AFTER,
+            HeaderValue::from(ANONYMOUS_REPORT_RETRY_AFTER_SECS),
+        )],
+        ResponseJson(ErrorResponse::new(
+            "Too many anonymous attestation requests are in progress. \
+             Retry shortly, or send an API key."
+                .to_string(),
+            "rate_limit_exceeded".to_string(),
+        )),
+    )
+        .into_response()
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]

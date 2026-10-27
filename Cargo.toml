@@ -1,7 +1,7 @@
 [workspace]
 members = ["crates/*"]
 resolver = "2"
-exclude = ["vendor/dstack-sdk"]
+exclude = ["vendor/dstack-sdk", "vendor/near-api"]
 
 [workspace.package]
 edition = "2021"
@@ -15,3 +15,7 @@ description = "NEAR AI Cloud API"
 # Remove when an upstream release supports clients without the affected tree.
 [patch.crates-io]
 dstack-sdk = { path = "vendor/dstack-sdk" }
+
+# near-api 0.8.6 requires vulnerable zstd 0.13; patch only its dependency floor.
+# See vendor/near-api/README.md for provenance and removal criteria.
+near-api = { path = "vendor/near-api" }

@@ -1,0 +1,649 @@
+use near_api_types::{
+    AccountId, Action, Data, NearToken, Reference,
+    ft::FungibleTokenMetadata,
+    json::U128,
+    nft::{NFTContractMetadata, Token},
+    tokens::{FTBalance, STORAGE_COST_PER_BYTE, UserBalance},
+    transaction::PrepopulateTransaction,
+    transaction::actions::TransferAction,
+};
+use serde_json::json;
+
+use crate::{
+    NetworkConfig, StorageDeposit,
+    advanced::{query_request::QueryRequest, query_rpc::SimpleQueryRpc},
+    common::{
+        query::{
+            AccountViewHandler, CallResultHandler, MultiQueryHandler, MultiRequestBuilder,
+            PostprocessHandler, RequestBuilder,
+        },
+        send::Transactionable,
+    },
+    contract::Contract,
+    errors::{ArgumentValidationError, FTValidatorError, ValidationError},
+    transactions::{ConstructTransaction, TransactionWithSign},
+};
+
+// This is not too long as most of the size is a links to the docs
+#[allow(clippy::too_long_first_doc_paragraph)]
+/// A wrapper struct that simplifies interactions with
+/// [NEAR](https://docs.near.org/concepts/basics/tokens),
+/// [FT](https://docs.near.org/build/primitives/ft),
+/// [NFT](https://docs.near.org/build/primitives/nft)
+///
+/// This struct provides convenient methods to interact with different types of tokens on NEAR Protocol:
+/// - [Native NEAR](https://docs.near.org/concepts/basics/tokens) token operations
+/// - Fungible Token - [Documentation and examples](https://docs.near.org/build/primitives/ft), [NEP-141](https://github.com/near/NEPs/blob/master/neps/nep-0141.md)    
+/// - Non-Fungible Token - [Documentation and examples](https://docs.near.org/build/primitives/nft), [NEP-171](https://github.com/near/NEPs/blob/master/neps/nep-0171.md)
+///
+/// ## Examples
+///
+/// ### Fungible Token Operations
+/// ```
+/// use near_api::*;
+///
+/// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+/// let bob_tokens = Tokens::account("bob.testnet".parse()?);
+///
+/// // Check FT balance
+/// let balance = bob_tokens.ft_balance("usdt.tether-token.near".parse()?).fetch_from_mainnet().await?;
+/// println!("Bob balance: {}", balance);
+///
+/// // Transfer FT tokens
+/// bob_tokens.send_to("alice.testnet".parse()?)
+///     .ft(
+///         "usdt.tether-token.near".parse()?,
+///         USDT_BALANCE.with_whole_amount(100)
+///     )
+///     .with_signer(Signer::from_ledger()?)
+///     .send_to_mainnet()
+///     .await?;
+/// # Ok(())
+/// # }
+/// ```
+///
+/// ### NFT Operations
+/// ```
+/// use near_api::*;
+///
+/// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+/// let alice_tokens = Tokens::account("alice.testnet".parse()?);
+///
+/// // Check NFT assets
+/// let tokens = alice_tokens.nft_assets("nft-contract.testnet".parse()?).fetch_from_testnet().await?;
+/// println!("NFT count: {}", tokens.data.len());
+///
+/// // Transfer NFT
+/// alice_tokens.send_to("bob.testnet".parse()?)
+///     .nft("nft-contract.testnet".parse()?, "token-id".to_string())
+///     .with_signer(Signer::from_ledger()?)
+///     .send_to_testnet()
+///     .await?;
+/// # Ok(())
+/// # }
+/// ```
+///
+/// ### NEAR Token Operations
+/// ```
+/// use near_api::*;
+///
+/// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+/// let alice_account = Tokens::account("alice.testnet".parse()?);
+///
+/// // Check NEAR balance
+/// let balance = alice_account.near_balance().fetch_from_testnet().await?;
+/// println!("NEAR balance: {}", balance.total);
+///
+/// // Send NEAR
+/// alice_account.send_to("bob.testnet".parse()?)
+///     .near(NearToken::from_near(1))
+///     .with_signer(Signer::from_ledger()?)
+///     .send_to_testnet()
+///     .await?;
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug, Clone)]
+pub struct Tokens {
+    account_id: AccountId,
+}
+
+impl Tokens {
+    pub const fn account(account_id: AccountId) -> Self {
+        Self { account_id }
+    }
+
+    /// Returns the underlying account ID for this tokens wrapper.
+    ///
+    /// # Example
+    /// ```rust,no_run
+    /// use near_api::*;
+    ///
+    /// # fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let tokens = Tokens::account("alice.testnet".parse()?);
+    /// let account_id = tokens.account_id();
+    /// println!("Account ID: {}", account_id);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub const fn account_id(&self) -> &AccountId {
+        &self.account_id
+    }
+
+    /// Converts this tokens wrapper to an Account for account-related operations.
+    ///
+    /// # Example
+    /// ```rust,no_run
+    /// use near_api::*;
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let tokens = Tokens::account("alice.testnet".parse()?);
+    /// let account = tokens.as_account();
+    /// let account_info = account.view().fetch_from_testnet().await?;
+    /// println!("Account info: {:?}", account_info);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn as_account(&self) -> crate::account::Account {
+        crate::account::Account(self.account_id.clone())
+    }
+
+    /// Fetches the total NEAR balance ([UserBalance]) of the account.
+    ///
+    /// ## Example
+    /// ```rust,no_run
+    /// use near_api::*;
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let alice_tokens = Tokens::account("alice.testnet".parse()?);
+    /// let balance = alice_tokens.near_balance().fetch_from_testnet().await?;
+    /// println!("Alice's NEAR balance: {:?}", balance);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn near_balance(
+        &self,
+    ) -> RequestBuilder<PostprocessHandler<UserBalance, AccountViewHandler>> {
+        let request = QueryRequest::ViewAccount {
+            account_id: self.account_id.clone(),
+        };
+
+        RequestBuilder::new(
+            SimpleQueryRpc { request },
+            Reference::Optimistic,
+            AccountViewHandler,
+        )
+        .map(|account| {
+            let account = account.data;
+            let storage_locked = NearToken::from_yoctonear(
+                account.storage_usage as u128 * STORAGE_COST_PER_BYTE.as_yoctonear(),
+            );
+            UserBalance {
+                total: account.amount,
+                storage_locked,
+                storage_usage: account.storage_usage,
+                locked: account.locked,
+            }
+        })
+    }
+
+    /// Prepares a new contract query (`nft_metadata`) for fetching the NFT metadata ([NFTContractMetadata]).
+    ///
+    /// The function depends that the contract implements [`NEP-171`](https://nomicon.io/Standards/Tokens/NonFungibleToken/Core#nep-171)
+    ///
+    /// ## Example
+    /// ```rust,no_run
+    /// use near_api::*;
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let metadata = Tokens::nft_metadata("nft-contract.testnet".parse()?)
+    ///     .fetch_from_testnet()
+    ///     .await?;
+    /// println!("NFT metadata: {:?}", metadata);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn nft_metadata(
+        contract_id: AccountId,
+    ) -> RequestBuilder<CallResultHandler<NFTContractMetadata>> {
+        Contract(contract_id)
+            .call_function("nft_metadata", ())
+            .read_only()
+    }
+
+    /// Prepares a new contract query (`nft_tokens_for_owner`) for fetching the NFT assets of the account ([Vec]<[Token]>).
+    ///
+    /// The function depends that the contract implements [`NEP-171`](https://nomicon.io/Standards/Tokens/NonFungibleToken/Core#nep-171)
+    ///
+    /// ## Example
+    /// ```rust,no_run
+    /// use near_api::*;
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let alice_tokens = Tokens::account("alice.testnet".parse()?);
+    /// let alice_assets = alice_tokens.nft_assets("nft-contract.testnet".parse()?)
+    ///     .fetch_from_testnet()
+    ///     .await?;
+    /// println!("Alice's NFT assets: {:?}", alice_assets);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn nft_assets(
+        &self,
+        nft_contract: AccountId,
+    ) -> RequestBuilder<CallResultHandler<Vec<Token>>> {
+        Contract(nft_contract)
+            .call_function(
+                "nft_tokens_for_owner",
+                json!({
+                    "account_id": self.account_id.to_string(),
+                }),
+            )
+            .read_only()
+    }
+
+    /// Prepares a new contract query (`ft_metadata`) for fetching the FT metadata ([FungibleTokenMetadata]).
+    ///
+    /// The function depends that the contract implements [`NEP-141`](https://nomicon.io/Standards/Tokens/FungibleToken/Core#nep-141)
+    ///
+    /// ## Example
+    /// ```rust,no_run
+    /// use near_api::*;
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let metadata = Tokens::ft_metadata("usdt.tether-token.near".parse()?)
+    ///     .fetch_from_testnet()
+    ///     .await?
+    ///     .data;
+    /// println!("FT metadata: {} {}", metadata.name, metadata.symbol);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn ft_metadata(
+        contract_id: AccountId,
+    ) -> RequestBuilder<CallResultHandler<FungibleTokenMetadata>> {
+        Contract(contract_id)
+            .call_function("ft_metadata", ())
+            .read_only()
+    }
+
+    /// Prepares a new contract query (`ft_balance_of`, `ft_metadata`) for fetching the [FTBalance] of the account.
+    ///
+    /// This query is a multi-query, meaning it will fetch the FT metadata and the FT balance of the account.
+    /// The result is then postprocessed to create a `FTBalance` instance.
+    ///
+    /// The function depends that the contract implements [`NEP-141`](https://nomicon.io/Standards/Tokens/FungibleToken/Core#nep-141)
+    ///
+    /// # Example
+    /// ```rust,no_run
+    /// use near_api::*;
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let alice_usdt_balance = Tokens::account("alice.near".parse()?)
+    ///     .ft_balance("usdt.tether-token.near".parse()?)
+    ///     .fetch_from_mainnet()
+    ///     .await?;
+    /// println!("Alice's USDT balance: {}", alice_usdt_balance);
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[allow(clippy::type_complexity)]
+    pub fn ft_balance(
+        &self,
+        ft_contract: AccountId,
+    ) -> MultiRequestBuilder<
+        PostprocessHandler<
+            FTBalance,
+            MultiQueryHandler<(
+                CallResultHandler<FungibleTokenMetadata>,
+                CallResultHandler<U128>,
+            )>,
+        >,
+    > {
+        let handler = MultiQueryHandler::new((
+            CallResultHandler::<FungibleTokenMetadata>::new(),
+            CallResultHandler::<U128>::new(),
+        ));
+
+        MultiRequestBuilder::new(handler, Reference::Optimistic)
+            .add_query_builder(Self::ft_metadata(ft_contract.clone()))
+            .add_query_builder(
+                Contract(ft_contract)
+                    .call_function(
+                        "ft_balance_of",
+                        json!({
+                            "account_id": self.account_id.clone()
+                        }),
+                    )
+                    .read_only::<()>(),
+            )
+            .map(
+                |(metadata, amount): (Data<FungibleTokenMetadata>, Data<U128>)| {
+                    FTBalance::with_decimals(metadata.data.decimals).with_amount(amount.data.0)
+                },
+            )
+    }
+
+    /// Prepares a new transaction builder for sending tokens to another account.
+    ///
+    /// This builder is used to construct transactions for sending NEAR, FT, and NFT tokens.
+    ///
+    /// ## Sending NEAR
+    /// ```rust,no_run
+    /// use near_api::*;
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let alice_tokens = Tokens::account("alice.near".parse()?);
+    ///
+    /// let result = alice_tokens.send_to("bob.near".parse()?)
+    ///     .near(NearToken::from_near(1))
+    ///     .with_signer(Signer::from_ledger()?)
+    ///     .send_to_mainnet()
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// ## Sending FT
+    /// ```rust,no_run
+    /// use near_api::*;
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let alice_tokens = Tokens::account("alice.near".parse()?);
+    ///
+    /// let result = alice_tokens.send_to("bob.near".parse()?)
+    ///     .ft("usdt.tether-token.near".parse()?, USDT_BALANCE.with_whole_amount(100))
+    ///     .with_signer(Signer::from_ledger()?)
+    ///     .send_to_mainnet()
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// ## Sending NFT
+    /// ```rust,no_run
+    /// use near_api::*;
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let alice_tokens = Tokens::account("alice.near".parse()?);
+    ///
+    /// let result = alice_tokens.send_to("bob.near".parse()?)
+    ///     .nft("nft-contract.testnet".parse()?, "token-id".to_string())
+    ///     .with_signer(Signer::from_ledger()?)
+    ///     .send_to_testnet()
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn send_to(&self, receiver_id: AccountId) -> SendToBuilder {
+        SendToBuilder {
+            from: self.account_id.clone(),
+            receiver_id,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SendToBuilder {
+    from: AccountId,
+    receiver_id: AccountId,
+}
+
+impl SendToBuilder {
+    /// Prepares a new transaction for sending NEAR tokens to another account.
+    pub fn near(self, amount: NearToken) -> ConstructTransaction {
+        ConstructTransaction::new(self.from, self.receiver_id)
+            .add_action(Action::Transfer(TransferAction { deposit: amount }))
+    }
+
+    /// Prepares a new transaction contract call (`ft_transfer`, `ft_metadata`, `storage_balance_of`, `storage_deposit`) for sending FT tokens to another account.
+    ///
+    /// Please note that if the receiver does not have enough storage, we will automatically deposit 100 milliNEAR for storage from
+    /// the sender.
+    ///
+    /// The provided function depends that the contract implements [`NEP-141`](https://nomicon.io/Standards/Tokens/FungibleToken/Core#nep-141)
+    ///
+    /// For transferring tokens and calling a receiver contract method in a single transaction, see [`ft_call`](Self::ft_call).
+    pub fn ft(
+        self,
+        ft_contract: AccountId,
+        amount: FTBalance,
+    ) -> TransactionWithSign<FTTransactionable> {
+        let transaction = Contract(ft_contract)
+            .call_function(
+                "ft_transfer",
+                json!({
+                    "receiver_id": self.receiver_id,
+                    "amount": amount.amount().to_string(),
+                }),
+            )
+            .transaction()
+            .deposit(NearToken::from_yoctonear(1))
+            .with_signer_account(self.from);
+
+        TransactionWithSign {
+            tx: FTTransactionable {
+                receiver: self.receiver_id,
+                transaction: transaction.transaction,
+                decimals: amount.decimals(),
+            },
+        }
+    }
+
+    /// Prepares a new transaction contract call (`nft_transfer`) for sending NFT tokens to another account.
+    ///
+    /// The provided function depends that the contract implements [`NEP-171`](https://nomicon.io/Standards/Tokens/NonFungibleToken/Core#nep-171)
+    ///
+    /// For transferring an NFT and calling a receiver contract method in a single transaction, see [`nft_call`](Self::nft_call).
+    pub fn nft(self, nft_contract: AccountId, token_id: String) -> ConstructTransaction {
+        Contract(nft_contract)
+            .call_function(
+                "nft_transfer",
+                json!({
+                    "receiver_id": self.receiver_id,
+                    "token_id": token_id
+                }),
+            )
+            .transaction()
+            .deposit(NearToken::from_yoctonear(1))
+            .with_signer_account(self.from)
+    }
+
+    /// Prepares a new transaction contract call (`ft_transfer_call`, `ft_metadata`, `storage_balance_of`, `storage_deposit`) for transferring FT tokens and calling a receiver contract method.
+    ///
+    /// This method enables transferring tokens and invoking a receiver contract method in a single transaction.
+    /// The receiver contract must implement `ft_on_transfer` according to NEP-141.
+    ///
+    /// Please note that if the receiver does not have enough storage, we will automatically deposit 100 milliNEAR for storage from
+    /// the sender.
+    ///
+    /// The provided function depends that the contract implements [`NEP-141`](https://nomicon.io/Standards/Tokens/FungibleToken/Core#nep-141)
+    ///
+    /// ## Example
+    /// ```rust,no_run
+    /// use near_api::*;
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let alice_tokens = Tokens::account("alice.near".parse()?);
+    ///
+    /// let result = alice_tokens.send_to("contract.near".parse()?)
+    ///     .ft_call(
+    ///         "usdt.tether-token.near".parse()?,
+    ///         USDT_BALANCE.with_whole_amount(100),
+    ///         "deposit".to_string(),
+    ///     )
+    ///     .with_signer(Signer::from_ledger()?)
+    ///     .send_to_mainnet()
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn ft_call(
+        self,
+        ft_contract: AccountId,
+        amount: FTBalance,
+        msg: String,
+    ) -> TransactionWithSign<FTTransactionable> {
+        let transaction = Contract(ft_contract)
+            .call_function(
+                "ft_transfer_call",
+                json!({
+                    "receiver_id": self.receiver_id,
+                    "amount": amount.amount().to_string(),
+                    "msg": msg,
+                }),
+            )
+            .transaction()
+            .deposit(NearToken::from_yoctonear(1))
+            .with_signer_account(self.from);
+
+        TransactionWithSign {
+            tx: FTTransactionable {
+                receiver: self.receiver_id,
+                transaction: transaction.transaction,
+                decimals: amount.decimals(),
+            },
+        }
+    }
+
+    /// Prepares a new transaction contract call (`nft_transfer_call`) for transferring an NFT and calling a receiver contract method.
+    ///
+    /// This method enables "transfer and call" functionality, allowing a user to attach an NFT to a function call
+    /// on a separate contract in a single transaction. The receiver contract must implement `nft_on_transfer` according to NEP-171.
+    ///
+    /// The provided function depends that the contract implements [`NEP-171`](https://nomicon.io/Standards/Tokens/NonFungibleToken/Core#nep-171)
+    ///
+    /// ## Example
+    /// ```rust,no_run
+    /// use near_api::*;
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let alice_tokens = Tokens::account("alice.near".parse()?);
+    ///
+    /// let result = alice_tokens.send_to("marketplace.near".parse()?)
+    ///     .nft_call(
+    ///         "nft-contract.testnet".parse()?,
+    ///         "token-123".to_string(),
+    ///         "list_for_sale".to_string(),
+    ///     )
+    ///     .with_signer(Signer::from_ledger()?)
+    ///     .send_to_testnet()
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn nft_call(
+        self,
+        nft_contract: AccountId,
+        token_id: String,
+        msg: String,
+    ) -> ConstructTransaction {
+        Contract(nft_contract)
+            .call_function(
+                "nft_transfer_call",
+                json!({
+                    "receiver_id": self.receiver_id,
+                    "token_id": token_id,
+                    "msg": msg,
+                }),
+            )
+            .transaction()
+            .deposit(NearToken::from_yoctonear(1))
+            .with_signer_account(self.from)
+    }
+}
+
+/// The structs validates the decimals correctness on runtime level before
+/// sending the ft tokens as well as deposits 100 milliNear of the deposit if
+/// the receiver doesn't have any allocated storage in the provided FT contract
+#[derive(Clone, Debug)]
+pub struct FTTransactionable {
+    transaction: Result<PrepopulateTransaction, ArgumentValidationError>,
+    receiver: AccountId,
+    decimals: u8,
+}
+
+impl FTTransactionable {
+    pub async fn check_decimals(&self, network: &NetworkConfig) -> Result<(), ValidationError> {
+        let transaction = match &self.transaction {
+            Ok(transaction) => transaction,
+            Err(e) => return Err(e.to_owned().into()),
+        };
+
+        let metadata = Tokens::ft_metadata(transaction.receiver_id.clone());
+
+        let Ok(metadata) = metadata.fetch_from(network).await else {
+            // If there is no metadata, than we can't check it
+            return Ok(());
+        };
+
+        if metadata.data.decimals != self.decimals {
+            Err(FTValidatorError::DecimalsMismatch {
+                expected: metadata.data.decimals,
+                got: self.decimals,
+            })?;
+        }
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl Transactionable for FTTransactionable {
+    fn prepopulated(&self) -> Result<PrepopulateTransaction, ArgumentValidationError> {
+        self.transaction.clone()
+    }
+
+    async fn validate_with_network(
+        &self,
+        network: &NetworkConfig,
+    ) -> core::result::Result<(), ValidationError> {
+        self.check_decimals(network).await?;
+
+        let transaction = match &self.transaction {
+            Ok(transaction) => transaction,
+            Err(_) => return Ok(()),
+        };
+
+        let storage_balance = StorageDeposit::on_contract(transaction.receiver_id.clone())
+            .view_account_storage(self.receiver.clone())
+            .fetch_from(network)
+            .await
+            .map_err(ValidationError::QueryError)?;
+
+        if storage_balance.data.is_none() {
+            Err(FTValidatorError::StorageDepositNeeded)?;
+        }
+
+        Ok(())
+    }
+
+    async fn edit_with_network(
+        &mut self,
+        network: &NetworkConfig,
+    ) -> core::result::Result<(), ValidationError> {
+        self.check_decimals(network).await?;
+
+        let transaction = match &mut self.transaction {
+            Ok(transaction) => transaction,
+            Err(_) => return Ok(()),
+        };
+
+        let storage_balance = StorageDeposit::on_contract(transaction.receiver_id.clone())
+            .view_account_storage(self.receiver.clone())
+            .fetch_from(network)
+            .await
+            .map_err(ValidationError::QueryError)?;
+
+        if storage_balance.data.is_none() {
+            let mut action = StorageDeposit::on_contract(transaction.receiver_id.clone())
+                .deposit(self.receiver.clone(), NearToken::from_millinear(100))
+                .into_transaction()
+                .with_signer_account(transaction.signer_id.clone())
+                .prepopulated()?
+                .actions;
+            action.append(&mut transaction.actions);
+            transaction.actions = action;
+        }
+        Ok(())
+    }
+}

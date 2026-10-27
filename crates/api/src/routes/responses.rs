@@ -86,7 +86,7 @@ mod tests {
             }
             let result = validate_legacy_encryption_headers(&headers);
             if version == Some("3") {
-                let (status, _) = result.err().expect("v3 must be rejected at the route");
+                let (status, _) = result.expect_err("v3 must be rejected at the route");
                 assert_eq!(status, StatusCode::BAD_REQUEST);
             } else {
                 assert!(result.is_ok());

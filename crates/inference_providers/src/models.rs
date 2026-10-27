@@ -1290,13 +1290,37 @@ pub struct RerankResponse {
     pub usage: Option<RerankUsage>,
 }
 
+/// A numeric rerank score or its E2EE ciphertext.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(untagged)]
+pub enum RerankScore {
+    Plain(f64),
+    Encrypted(String),
+}
+
+impl RerankScore {
+    pub fn as_number(&self) -> Option<f64> {
+        match self {
+            Self::Plain(score) => Some(*score),
+            Self::Encrypted(_) => None,
+        }
+    }
+}
+
+impl From<f64> for RerankScore {
+    fn from(score: f64) -> Self {
+        Self::Plain(score)
+    }
+}
+
 /// Individual reranked result
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RerankResult {
     /// Index of the document in the original input
     pub index: i32,
-    /// Relevance score (typically 0.0 to 1.0)
-    pub relevance_score: f64,
+    /// Relevance score (typically 0.0 to 1.0), or E2EE ciphertext.
+    pub relevance_score: RerankScore,
     /// The document (can be string or object depending on provider)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub document: Option<serde_json::Value>,

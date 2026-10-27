@@ -25,6 +25,10 @@ pub(super) fn assert_production_logs_exclude_forbidden_expressions() {
             include_str!("../../routes/completions/privacy.rs"),
         ),
         (
+            "crates/api/src/routes/completions/privacy/signatures.rs",
+            include_str!("../../routes/completions/privacy/signatures.rs"),
+        ),
+        (
             "crates/api/src/routes/completions/rerank.rs",
             include_str!("../../routes/completions/rerank.rs"),
         ),
@@ -99,25 +103,11 @@ pub(super) fn assert_production_logs_exclude_forbidden_expressions() {
 
     // Splitting a route file must not silently drop the new files from this scan.
     let completions_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src/routes/completions");
-    for entry in std::fs::read_dir(completions_dir).expect("read routes/completions") {
-        let entry = entry.expect("routes/completions entry");
-        assert!(
-            !entry
-                .file_type()
-                .expect("routes/completions entry type")
-                .is_dir(),
-            "routes/completions has a subdirectory; extend this scan to cover it"
-        );
-        let file_name = entry.file_name().into_string().expect("utf-8 file name");
-        if !file_name.ends_with(".rs") {
-            continue;
-        }
-        let label = format!("crates/api/src/routes/completions/{file_name}");
-        assert!(
-            sources.iter().any(|(path, _)| *path == label),
-            "{label} is not covered by the production log privacy scan; add it to `sources`"
-        );
-    }
+    assert_directory_is_covered(
+        std::path::Path::new(completions_dir),
+        "crates/api/src/routes/completions",
+        &sources,
+    );
 
     for (path, source) in sources {
         for (line, body) in logging_macro_bodies(source) {
@@ -157,6 +147,26 @@ pub(super) fn assert_production_logs_exclude_forbidden_expressions() {
             assert!(
                 !logs_raw_email_field(&code),
                 "{path}:{line} production logging macro must not log raw email fields: {body}"
+            );
+        }
+    }
+}
+
+fn assert_directory_is_covered(dir: &std::path::Path, label: &str, sources: &[(&str, &str)]) {
+    for entry in std::fs::read_dir(dir).expect("read production source directory") {
+        let entry = entry.expect("production source entry");
+        let file_name = entry.file_name().into_string().expect("utf-8 file name");
+        let label = format!("{label}/{file_name}");
+        if entry
+            .file_type()
+            .expect("production source entry type")
+            .is_dir()
+        {
+            assert_directory_is_covered(&entry.path(), &label, sources);
+        } else if file_name.ends_with(".rs") {
+            assert!(
+                sources.iter().any(|(path, _)| *path == label),
+                "{label} is not covered by the production log privacy scan; add it to `sources`"
             );
         }
     }

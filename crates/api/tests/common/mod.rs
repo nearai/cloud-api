@@ -1400,7 +1400,7 @@ pub fn verify_ecdsa_signature(
 
     // Convert recovered public key to Ethereum address
     // Get uncompressed public key (65 bytes: 0x04 + 32 bytes x + 32 bytes y)
-    let encoded_point = recovered_key.to_encoded_point(false);
+    let encoded_point = recovered_key.to_sec1_point(false);
     let point_bytes = encoded_point.as_bytes();
 
     // Extract x and y coordinates (skip the 0x04 prefix, take 64 bytes)

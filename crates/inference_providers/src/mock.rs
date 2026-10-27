@@ -735,6 +735,8 @@ impl MockExpectationBuilder {
 
 type ResponsesHandler =
     Arc<dyn Fn(serde_json::Value) -> crate::responses_raw::ResponsesRawResponse + Send + Sync>;
+type PrivacyClassifyHandler =
+    Arc<dyn Fn(bytes::Bytes) -> Result<bytes::Bytes, PrivacyClassifyError> + Send + Sync>;
 type SystemOneHandler = Arc<
     dyn Fn(
             crate::SystemOneRequest,
@@ -748,6 +750,7 @@ type SystemOneHandler = Arc<
 pub struct MockProvider {
     responses_handler: Option<ResponsesHandler>,
     systemone_handler: Option<SystemOneHandler>,
+    privacy_classify_handler: Option<PrivacyClassifyHandler>,
     /// List of available mock models
     models: Vec<ModelInfo>,
     /// Map of chat_id to (request_hash, response_hash) for signature generation
@@ -797,6 +800,18 @@ impl MockProvider {
     /// Set what this mock's backend-count poll reports.
     pub fn with_count_poll(mut self, poll: crate::CountPoll) -> Self {
         self.count_poll = poll;
+        self
+    }
+
+    /// Inspect native Privacy requests and return exact response bytes in tests.
+    pub fn with_privacy_classify_handler(
+        mut self,
+        handler: impl Fn(bytes::Bytes) -> Result<bytes::Bytes, PrivacyClassifyError>
+            + Send
+            + Sync
+            + 'static,
+    ) -> Self {
+        self.privacy_classify_handler = Some(Arc::new(handler));
         self
     }
 
@@ -864,6 +879,7 @@ impl MockProvider {
             attestation_signing_algos: Arc::new(std::sync::Mutex::new(Vec::new())),
             responses_handler: None,
             systemone_handler: None,
+            privacy_classify_handler: None,
         }
     }
 
@@ -897,6 +913,7 @@ impl MockProvider {
             attestation_signing_algos: Arc::new(std::sync::Mutex::new(Vec::new())),
             responses_handler: None,
             systemone_handler: None,
+            privacy_classify_handler: None,
         }
     }
 
@@ -928,6 +945,7 @@ impl MockProvider {
             attestation_signing_algos: Arc::new(std::sync::Mutex::new(Vec::new())),
             responses_handler: None,
             systemone_handler: None,
+            privacy_classify_handler: None,
         }
     }
 
@@ -1702,6 +1720,9 @@ impl crate::InferenceProvider for MockProvider {
         body: bytes::Bytes,
         _extra: std::collections::HashMap<String, serde_json::Value>,
     ) -> Result<bytes::Bytes, PrivacyClassifyError> {
+        if let Some(handler) = &self.privacy_classify_handler {
+            return handler(body);
+        }
         if let Some(outcome) = self.config.lock().await.privacy_classify_override.clone() {
             return match outcome {
                 PrivacyClassifyOverride::Body(json) => serde_json::to_vec(&json)

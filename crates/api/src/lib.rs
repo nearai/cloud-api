@@ -1566,6 +1566,10 @@ pub fn build_completion_routes(
             .layer(from_fn_with_state(
                 auth_state_middleware.clone(),
                 middleware::auth::anthropic_auth_middleware_with_workspace_context,
+            ))
+            .layer(from_fn_with_state(
+                middleware::BodyHashLimit(AUDIO_TRANSCRIPTION_MAX_BODY_SIZE),
+                middleware::body_hash_middleware,
             ));
 
         // Token counting is free and has its own Anthropic rate-limit class.
@@ -1861,17 +1865,18 @@ pub fn build_conversation_routes(
 
 /// Build attestation routes with auth.
 ///
-/// Route classification (nearai/infra#193) — see `routes/attestation.rs` for
-/// the full table:
-/// - `GET /v1/attestation/report` and `GET /v1/signature/{chat_id}` require an
-///   API key (`auth_middleware_with_workspace_context`). The middleware
-///   validates the key and confirms its workspace and organization remain
-///   active (rejecting missing/invalid/expired/deactivated credentials with
-///   401); like the signature route, report retrieval is non-billable — no
-///   usage or billing records are created. It is the same check as
-///   `auth_middleware_with_api_key`, and it also hands the handler the key's
-///   organization: the report route needs it to decide whether the caller
-///   may ask about an unlisted model.
+/// Route classification — see `routes/attestation.rs` for the full table:
+/// - `GET /v1/signature/{chat_id}` requires an API key
+///   (`auth_middleware_with_workspace_context`). The middleware validates the
+///   key and confirms its workspace and organization remain active (rejecting
+///   missing/invalid/expired/deactivated credentials with 401).
+/// - `GET /v1/attestation/report` takes an optional API key
+///   (`optional_auth_middleware_with_workspace_context`). Without one the
+///   report is served anonymously for listed models, so a client can verify
+///   the gateway before it sends any credential. A key that is sent is
+///   validated the same way, and its organization decides whether an unlisted
+///   model resolves. Retrieval is non-billable either way — no usage or
+///   billing records are created.
 /// - `GET /v1/attestation/ita-token` and `GET /v1/attestation/pins` are
 ///   deliberately public; the rationale is documented on
 ///   `build_public_attestation_routes`.
@@ -1882,12 +1887,18 @@ pub fn build_attestation_routes(
 ) -> Router {
     let attestation_route_state = attestation::AttestationRouteState::from(app_state);
     let authenticated_routes = Router::new()
-        .route("/attestation/report", get(get_attestation_report))
         .route("/signature/{chat_id}", get(get_signature))
         .with_state(attestation_route_state.clone())
         .layer(from_fn_with_state(
             auth_state_middleware.clone(),
             middleware::auth::auth_middleware_with_workspace_context,
+        ));
+    let optional_key_routes = Router::new()
+        .route("/attestation/report", get(get_attestation_report))
+        .with_state(attestation_route_state.clone())
+        .layer(from_fn_with_state(
+            auth_state_middleware.clone(),
+            middleware::auth::optional_auth_middleware_with_workspace_context,
         ));
 
     // One section per attested backup provider; add new providers here.
@@ -1900,6 +1911,7 @@ pub fn build_attestation_routes(
 
     Router::new()
         .merge(authenticated_routes)
+        .merge(optional_key_routes)
         .merge(public_routes)
 }
 
@@ -2889,9 +2901,8 @@ mod tests {
 
     #[test]
     fn test_openapi_ita_token_endpoint_is_public() {
-        // /v1/attestation/ita-token and /v1/attestation/pins are the
-        // ONLY public attestation routes — explicit, documented decisions
-        // (nearai/infra#193); see
+        // /v1/attestation/ita-token and /v1/attestation/pins take no
+        // credential at all — explicit, documented decisions; see
         // `build_public_attestation_routes` in routes/attestation.rs.
         let spec = match serde_json::to_value(ApiDoc::openapi()) {
             Ok(spec) => spec,
@@ -2922,9 +2933,9 @@ mod tests {
     }
 
     #[test]
-    fn test_openapi_attestation_report_requires_api_key() {
-        // nearai/infra#193: /v1/attestation/report is an API-key-protected
-        // data-plane endpoint. The OpenAPI contract must match the runtime
+    fn test_openapi_attestation_report_api_key_is_optional() {
+        // /v1/attestation/report serves anonymous callers and reads an API key
+        // when one is sent. The OpenAPI contract must match the runtime
         // auth middleware.
         let spec = serde_json::to_value(ApiDoc::openapi()).unwrap();
         let report_get = &spec["paths"]["/v1/attestation/report"]["get"];
@@ -2935,8 +2946,8 @@ mod tests {
         );
         assert_eq!(
             report_get["security"],
-            serde_json::json!([{ "api_key": [] }]),
-            "/v1/attestation/report must require api_key security"
+            serde_json::json!([{}, { "api_key": [] }]),
+            "/v1/attestation/report must declare api_key security as optional"
         );
     }
 

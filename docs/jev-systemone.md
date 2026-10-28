@@ -146,8 +146,32 @@ Register the model with the OpenRouter configuration above before calling it.
 Jev also accepts image parts nested in `state`, `instructions`, and `criteria`;
 these JSON values pass through unchanged. See
 [OpenRouter's image formats and limits](https://openrouter.ai/docs/guides/community/multimodal-decisions).
+
+Alternatively, send each image once in a JSON `assets` map and use its reference
+in `state`, `instructions`, or `criteria`:
+
+```json
+{
+  "model": "typesafe/jev-1.14",
+  "state": {"photo": "receipt-ref"},
+  "assets": {
+    "receipt-ref": {"type": "image", "format": "png", "data_base64": "<image-data>"}
+  },
+  "questions": {
+    "receipt": {"type": "box", "instructions": "Locate the receipt in receipt-ref."}
+  }
+}
+```
+
+`type` is optional; `format` is `png`, `jpg`, or `jpeg`. `data_base64` contains
+standard base64 without a data URL prefix. Cloud API forwards assets and reference
+strings unchanged; OpenRouter resolves them and checks image data and reference
+usage. Every asset must be referenced. On Jev, references can appear inside longer
+strings, and a Score `legend` preserves the original criterion reference. Inline
+`image_url` parts and assets may be mixed.
+
 Cloud API's request-body limit is 25 MiB, including base64. The endpoint accepts
-JSON; TypeSafe-native `assets` and multipart uploads are outside this contract.
+JSON; multipart uploads and asset `part` fields are unsupported.
 
 A Box answer contains `type: "box"`, a `box` object with numeric `top`, `bottom`,
 `left`, and `right` edges, and optional `confidence`, matching OpenRouter's schema.
@@ -221,7 +245,7 @@ The existing image receipt issue is tracked separately in
 [#1125](https://github.com/nearai/cloud-api/issues/1125).
 
 Tests cover wire compatibility, Box answers with optional confidence, JSON image
-parts, model overrides, raw bytes, sanitized upstream
+parts and asset references, model overrides, raw bytes, sanitized upstream
 errors, both receipt algorithms, billing/catalog discovery, alias and modality
 validation, TEE ID storage boundaries, invalid usage, trust-preserving fallback,
 and receipt/billing finalization after client disconnect. Fleet

@@ -31,6 +31,38 @@ pub struct SystemOneRequest {
     pub model: String,
     pub state: Content,
     pub questions: BTreeMap<String, Question>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assets: Option<BTreeMap<String, ImageAsset>>,
+}
+
+/// JSON image data keyed by reference; reference resolution belongs to the provider.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "openapi", schema(as = SystemOneImageAsset))]
+pub struct ImageAsset {
+    #[serde(rename = "type", default, skip_serializing_if = "Option::is_none")]
+    pub asset_type: Option<ImageAssetType>,
+    pub format: ImageFormat,
+    pub data_base64: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "lowercase")]
+#[cfg_attr(feature = "openapi", schema(as = SystemOneImageAssetType))]
+pub enum ImageAssetType {
+    Image,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "lowercase")]
+#[cfg_attr(feature = "openapi", schema(as = SystemOneImageFormat))]
+pub enum ImageFormat {
+    Png,
+    Jpg,
+    Jpeg,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

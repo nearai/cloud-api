@@ -69,6 +69,46 @@ fn question_instructions_are_required_and_preserve_structured_content() {
 }
 
 #[test]
+fn json_image_assets_preserve_references_and_optional_type() {
+    for format in ["png", "jpg", "jpeg"] {
+        for include_type in [false, true] {
+            let mut value = serde_json::to_value(request()).unwrap();
+            value["state"] = json!({"photo": "receipt-ref"});
+            value["questions"]["receipt"]["instructions"] = json!("Locate receipt-ref");
+            value["assets"] = json!({"receipt-ref": {
+                "format": format, "data_base64": "Zml4dHVyZQ=="
+            }});
+            if include_type {
+                value["assets"]["receipt-ref"]["type"] = json!("image");
+            }
+            let parsed: SystemOneRequest = serde_json::from_value(value.clone()).unwrap();
+            parsed.validate().unwrap();
+            assert_eq!(serde_json::to_value(parsed).unwrap(), value);
+        }
+    }
+    assert!(serde_json::to_value(request())
+        .unwrap()
+        .get("assets")
+        .is_none());
+}
+
+#[test]
+fn rejects_multipart_asset_fields_and_invalid_json_asset_shapes() {
+    for asset in [
+        json!({"part": "photo"}),
+        json!({"format": "png", "data_base64": "Zml4dHVyZQ==", "part": "photo"}),
+        json!({"format": "webp", "data_base64": "Zml4dHVyZQ=="}),
+        json!({"type": "audio", "format": "png", "data_base64": "Zml4dHVyZQ=="}),
+        json!({"format": "png"}),
+        json!({"format": "png", "data_base64": 12}),
+    ] {
+        let mut value = serde_json::to_value(request()).unwrap();
+        value["assets"] = json!({"photo": asset});
+        assert!(serde_json::from_value::<SystemOneRequest>(value).is_err());
+    }
+}
+
+#[test]
 fn rejects_invalid_question_shapes_and_bounds() {
     for patch in [
         json!({"type":"unknown"}),

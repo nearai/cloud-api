@@ -363,6 +363,17 @@ mod tests {
             "#/components/schemas/SystemOneRequest",
         );
         let schemas = &spec["components"]["schemas"];
+        assert_eq!(
+            schemas["SystemOneRequest"]["properties"]["assets"]["additionalProperties"]["$ref"],
+            "#/components/schemas/SystemOneImageAsset"
+        );
+        assert_eq!(
+            schemas["SystemOneImageAsset"]["additionalProperties"],
+            serde_json::json!(false)
+        );
+        assert!(schemas["SystemOneImageAsset"]["properties"]
+            .get("part")
+            .is_none());
         for question in schemas["SystemOneQuestion"]["oneOf"].as_array().unwrap() {
             assert!(question["required"]
                 .as_array()
@@ -391,6 +402,22 @@ mod tests {
             schemas["SystemOneResponse"]["properties"]["usage"]["$ref"],
             "#/components/schemas/SystemOneUsage",
         );
+    }
+
+    #[tokio::test]
+    async fn systemone_rejects_multipart_at_the_json_boundary() {
+        use axum::extract::FromRequest;
+
+        let request = axum::http::Request::builder()
+            .header(
+                header::CONTENT_TYPE,
+                "multipart/form-data; boundary=fixture",
+            )
+            .body(Body::from("--fixture--\r\n"))
+            .unwrap();
+        assert!(OpenAiJson::<SystemOneRequest>::from_request(request, &())
+            .await
+            .is_err());
     }
 
     #[tokio::test]

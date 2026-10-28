@@ -11,7 +11,7 @@ use std::sync::{
     Arc,
 };
 use wiremock::{
-    matchers::{body_partial_json, header, method, path},
+    matchers::{body_json, body_partial_json, header, method, path},
     Mock, MockServer, ResponseTemplate,
 };
 
@@ -210,16 +210,27 @@ async fn systemone_openrouter_box_preserves_images_billing_and_receipts() {
     // Opaque transport fixture: image decoding belongs to the upstream provider.
     let image =
         json!({"type":"image_url","image_url":{"url":"data:image/png;base64,Zml4dHVyZQ=="}});
-    let mut body = request(&model);
-    body["state"] = json!(["Refund request", image, {"attachment":image}]);
-    body["questions"]["billing"]["criteria"] = json!({"true":image});
-    body["questions"]["receipt"] =
-        json!({"type":"box","instructions":["Locate the receipt in",image]});
-    let request_text = serde_json::to_string_pretty(&body).unwrap();
-    let mut forwarded = body;
-    forwarded["model"] = json!("typesafe/jev-1.14");
-
-    for confidence in [None, Some(0.9)] {
+    for (confidence, asset_refs) in [(None, false), (Some(0.9), false), (Some(0.9), true)] {
+        let mut body = request(&model);
+        body["state"] = json!(["Refund request", image, {"attachment":image}]);
+        body["questions"]["billing"]["criteria"] = json!({"true":image});
+        body["questions"]["receipt"] =
+            json!({"type":"box","instructions":["Locate the receipt in",image]});
+        if asset_refs {
+            body["assets"] = json!({"receipt-ref": {
+                "format":"png", "data_base64":"Zml4dHVyZQ=="
+            }});
+            body["state"] = json!(["Refund request", image, {"attachment":"receipt-ref"}]);
+            body["questions"]["billing"]["criteria"] = json!({"true":"receipt-ref"});
+            body["questions"]["receipt"]["instructions"] = json!("Locate receipt-ref now");
+            body["questions"]["match"] = json!({
+                "type":"score", "instructions":"Rate the match.",
+                "criteria":["No match", "receipt-ref"]
+            });
+        }
+        let request_text = serde_json::to_string_pretty(&body).unwrap();
+        let mut forwarded = body;
+        forwarded["model"] = json!("typesafe/jev-1.14");
         let id = format!("gen-dec-{}", uuid::Uuid::new_v4());
         let mut response_body = result(Some(&id));
         response_body["model"] = json!("typesafe/jev-1.14-20261014");
@@ -228,12 +239,19 @@ async fn systemone_openrouter_box_preserves_images_billing_and_receipts() {
         if let Some(confidence) = confidence {
             response_body["answers"]["receipt"]["confidence"] = json!(confidence);
         }
+        if asset_refs {
+            response_body["answers"]["match"] = json!({
+                "type":"score", "score":1.0, "confidence":0.9,
+                "probabilities":{"0":0.1,"1":0.9},
+                "legend":{"0":"No match","1":"receipt-ref"}
+            });
+        }
         let raw = serde_json::to_string_pretty(&response_body).unwrap();
         let _mock = Mock::given(method("POST"))
             .and(path("/api/v1/systemone"))
             .and(header("authorization", "Bearer fixture-openrouter-key"))
             .and(header("content-type", "application/json"))
-            .and(body_partial_json(forwarded.clone()))
+            .and(body_json(forwarded))
             .respond_with(ResponseTemplate::new(200).set_body_raw(raw.clone(), "application/json"))
             .expect(1)
             .mount_as_scoped(&upstream)

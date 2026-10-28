@@ -397,6 +397,46 @@ pub struct ResponseReasoningConfig {
     pub effort: Option<String>,
 }
 
+/// `reasoning.effort` values the orchestrated Responses path forwards to the
+/// chat-completions backend as `reasoning_effort`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReasoningEffort {
+    None,
+    Minimal,
+    Low,
+    Medium,
+    High,
+    XHigh,
+}
+
+impl ReasoningEffort {
+    pub const EXPECTED: &'static str = "none, minimal, low, medium, high, xhigh";
+
+    /// Strict: only the exact lowercase names parse; anything else is `None`.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "none" => Some(Self::None),
+            "minimal" => Some(Self::Minimal),
+            "low" => Some(Self::Low),
+            "medium" => Some(Self::Medium),
+            "high" => Some(Self::High),
+            "xhigh" => Some(Self::XHigh),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Minimal => "minimal",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::XHigh => "xhigh",
+        }
+    }
+}
+
 /// Complete response object
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ResponseObject {

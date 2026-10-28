@@ -844,6 +844,14 @@ pub struct TextLogProbs {
     pub text_offset: Vec<i64>,
 }
 
+/// UTF-8 token bytes or field-level E2EE ciphertext, forwarded without decryption.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum LogProbBytes {
+    Plain(Vec<u8>),
+    Encrypted(String),
+}
+
 /// Log probability information for a single token
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TokenLogProb {
@@ -851,8 +859,8 @@ pub struct TokenLogProb {
     pub token: String,
     /// Log probability of the token
     pub logprob: f32,
-    /// UTF-8 bytes of the token
-    pub bytes: Vec<u8>,
+    /// UTF-8 bytes of the token, or their encrypted wire representation
+    pub bytes: LogProbBytes,
     /// Top alternative tokens at this position
     #[serde(skip_serializing_if = "Option::is_none")]
     pub top_logprobs: Option<Vec<TopLogProb>>,
@@ -865,8 +873,8 @@ pub struct TopLogProb {
     pub token: String,
     /// Log probability of the token
     pub logprob: f32,
-    /// UTF-8 bytes of the token
-    pub bytes: Vec<u8>,
+    /// UTF-8 bytes of the token, or their encrypted wire representation
+    pub bytes: LogProbBytes,
 }
 
 /// Generic streaming chunk that can represent either format
@@ -1282,13 +1290,37 @@ pub struct RerankResponse {
     pub usage: Option<RerankUsage>,
 }
 
+/// A numeric rerank score or its E2EE ciphertext.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(untagged)]
+pub enum RerankScore {
+    Plain(f64),
+    Encrypted(String),
+}
+
+impl RerankScore {
+    pub fn as_number(&self) -> Option<f64> {
+        match self {
+            Self::Plain(score) => Some(*score),
+            Self::Encrypted(_) => None,
+        }
+    }
+}
+
+impl From<f64> for RerankScore {
+    fn from(score: f64) -> Self {
+        Self::Plain(score)
+    }
+}
+
 /// Individual reranked result
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RerankResult {
     /// Index of the document in the original input
     pub index: i32,
-    /// Relevance score (typically 0.0 to 1.0)
-    pub relevance_score: f64,
+    /// Relevance score (typically 0.0 to 1.0), or E2EE ciphertext.
+    pub relevance_score: RerankScore,
     /// The document (can be string or object depending on provider)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub document: Option<serde_json::Value>,
@@ -1518,6 +1550,28 @@ pub fn detect_audio_content_type(filename: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chat_response_preserves_plaintext_and_encrypted_logprob_bytes() {
+        for bytes in [
+            serde_json::json!([65, 0, 255]),
+            serde_json::json!("04aabbcc"),
+        ] {
+            let logprobs = serde_json::json!({"content": [{
+                "token": "token-or-ciphertext", "logprob": -1.0, "bytes": bytes,
+                "top_logprobs": [{"token": "alternative", "logprob": -2.0, "bytes": bytes}]
+            }]});
+            let response: ChatCompletionResponse = serde_json::from_value(serde_json::json!({
+                "id": "chat-test", "object": "chat.completion", "created": 1, "model": "test",
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": "encrypted"},
+                    "logprobs": logprobs, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+            }))
+            .unwrap();
+            let serialized = serde_json::to_value(response).unwrap();
+            assert_eq!(serialized["choices"][0]["logprobs"], logprobs);
+        }
+    }
 
     #[test]
     fn placement_context_is_not_serialized() {

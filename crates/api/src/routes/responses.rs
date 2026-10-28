@@ -41,9 +41,25 @@ fn not_implemented_error(message: impl Into<String>) -> NotImplementedErrorRespo
     )
 }
 
+fn validate_legacy_encryption_headers(
+    headers: &HeaderMap,
+) -> Result<crate::routes::common::EncryptionHeaders, (StatusCode, ResponseJson<ErrorResponse>)> {
+    let encryption = crate::routes::common::validate_encryption_headers(headers)?;
+    if encryption.encryption_version.as_deref() == Some("3") {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            ResponseJson(ErrorResponse::new(
+                "E2EE v3 is supported on /v1/chat/completions. The legacy /v1/responses tool flow does not support it.".to_string(),
+                "unsupported_encryption_version".to_string(),
+            )),
+        ));
+    }
+    Ok(encryption)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::not_implemented_error;
+    use super::{not_implemented_error, validate_legacy_encryption_headers};
     use crate::routes::common::{HEADER_SHOULD_RETRY, SHOULD_RETRY_FALSE};
     use axum::{http::StatusCode, response::IntoResponse};
 
@@ -59,6 +75,23 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some(SHOULD_RETRY_FALSE)
         );
+    }
+
+    #[test]
+    fn legacy_responses_rejects_v3_and_preserves_older_versions() {
+        for version in [None, Some("1"), Some("2"), Some("3")] {
+            let mut headers = axum::http::HeaderMap::new();
+            if let Some(version) = version {
+                headers.insert("x-encryption-version", version.parse().unwrap());
+            }
+            let result = validate_legacy_encryption_headers(&headers);
+            if version == Some("3") {
+                let (status, _) = result.expect_err("v3 must be rejected at the route");
+                assert_eq!(status, StatusCode::BAD_REQUEST);
+            } else {
+                assert!(result.is_ok());
+            }
+        }
     }
 }
 
@@ -334,7 +367,7 @@ async fn create_legacy_response(
     }
 
     // Extract and validate encryption headers if present
-    let encryption_headers = match crate::routes::common::validate_encryption_headers(&headers) {
+    let encryption_headers = match validate_legacy_encryption_headers(&headers) {
         Ok(headers) => headers,
         Err(err) => return err.into_response(),
     };

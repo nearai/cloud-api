@@ -217,6 +217,39 @@ async fn test_responses_reasoning_effort_forwarded() {
     }
 }
 
+/// `reasoning.effort` is a closed set on the orchestrated `/v1/responses`
+/// path: a value outside it is a 400 before any provider call, whatever the
+/// backend would have done with it.
+#[tokio::test]
+async fn test_responses_reasoning_effort_outside_closed_set_rejected() {
+    let (server, mock, model, api_key) = setup().await;
+
+    mock.when(RequestMatcher::Any)
+        .respond_with(ResponseTemplate::new("ok"))
+        .await;
+
+    let response = server
+        .post("/v1/responses")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&serde_json::json!({
+            "model": model,
+            "input": "Say hi.",
+            "reasoning": {"effort": "High"},
+            "max_output_tokens": 10,
+            "store": false,
+            "stream": false,
+        }))
+        .await;
+
+    assert_eq!(response.status_code(), 400, "got: {}", response.text());
+    let body: serde_json::Value = response.json();
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+    assert!(
+        mock.last_chat_params().await.is_none(),
+        "provider must not be called"
+    );
+}
+
 /// Anthropic's Messages API rejects `reasoning_effort` with a 400, so the
 /// orchestrated `/v1/responses` path does not forward it for Anthropic-backed
 /// models (the selector stays a no-op there instead of failing the request).

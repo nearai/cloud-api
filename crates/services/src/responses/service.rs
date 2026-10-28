@@ -30,6 +30,8 @@ enum AgentLoopResult {
 struct ProcessStreamContext {
     request: models::CreateResponseRequest,
     model: Option<crate::models::ModelWithPricing>,
+    /// `request.reasoning.effort`, parsed before the stream starts.
+    reasoning_effort: Option<models::ReasoningEffort>,
     user_id: crate::UserId,
     api_key_id: String,
     request_id: uuid::Uuid,
@@ -175,6 +177,7 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
                     .to_string(),
             ));
         }
+        let reasoning_effort = Self::parse_reasoning_effort(request.reasoning.as_ref())?;
 
         // Reuse the lookup needed for image dispatch, but perform it before
         // starting the stream or tools so endpoint errors remain HTTP 400s.
@@ -236,6 +239,7 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
             let context = ProcessStreamContext {
                 request,
                 model,
+                reasoning_effort,
                 user_id,
                 api_key_id,
                 request_id,
@@ -1417,6 +1421,25 @@ impl ResponseServiceImpl {
         Ok(())
     }
 
+    /// Parse `reasoning.effort` into the closed set this path forwards, so an
+    /// unknown value is a 400 on every backend instead of depending on
+    /// whether the provider happens to read the field.
+    fn parse_reasoning_effort(
+        reasoning: Option<&models::ResponseReasoningConfig>,
+    ) -> Result<Option<models::ReasoningEffort>, errors::ResponseError> {
+        let Some(effort) = reasoning.and_then(|reasoning| reasoning.effort.as_deref()) else {
+            return Ok(None);
+        };
+        models::ReasoningEffort::parse(effort)
+            .map(Some)
+            .ok_or_else(|| {
+                errors::ResponseError::InvalidParams(format!(
+                    "reasoning.effort must be one of: {}",
+                    models::ReasoningEffort::EXPECTED
+                ))
+            })
+    }
+
     /// `reasoning.effort` as the chat-completions `reasoning_effort` field.
     ///
     /// Not forwarded to Anthropic-backed models: the Messages API rejects
@@ -1424,13 +1447,13 @@ impl ResponseServiceImpl {
     /// instead of failing the request. Also skipped when the model could not
     /// be resolved, since its backend is then unknown.
     fn reasoning_effort_for_completion(
-        reasoning: Option<&models::ResponseReasoningConfig>,
+        effort: Option<models::ReasoningEffort>,
         model: Option<&crate::models::ModelWithPricing>,
     ) -> Option<serde_json::Value> {
-        let effort = reasoning?.effort.as_ref()?;
+        let effort = effort?;
         match model {
             Some(model) if !model.is_anthropic_backend() => {
-                Some(serde_json::Value::String(effort.clone()))
+                Some(serde_json::Value::String(effort.as_str().to_string()))
             }
             _ => None,
         }
@@ -1472,7 +1495,7 @@ impl ResponseServiceImpl {
                 extra.insert("tool_choice".to_string(), serde_json::to_value(tc).unwrap());
             }
             if let Some(effort) = Self::reasoning_effort_for_completion(
-                process_context.request.reasoning.as_ref(),
+                process_context.reasoning_effort,
                 process_context.model.as_ref(),
             ) {
                 extra.insert("reasoning_effort".to_string(), effort);
@@ -4689,6 +4712,37 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_reasoning_effort_accepts_closed_set() {
+        for value in ["none", "minimal", "low", "medium", "high", "xhigh"] {
+            let parsed = ResponseServiceImpl::parse_reasoning_effort(Some(&effort(Some(value))))
+                .unwrap()
+                .unwrap();
+            assert_eq!(parsed.as_str(), value);
+        }
+        // The route defaults `reasoning` to `{effort: None}`.
+        assert_eq!(
+            ResponseServiceImpl::parse_reasoning_effort(Some(&effort(None))).unwrap(),
+            None
+        );
+        assert_eq!(
+            ResponseServiceImpl::parse_reasoning_effort(None).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn test_parse_reasoning_effort_rejects_values_outside_closed_set() {
+        for value in ["High", "bogus", "", " low", "max"] {
+            let err = ResponseServiceImpl::parse_reasoning_effort(Some(&effort(Some(value))))
+                .expect_err(value);
+            assert!(
+                matches!(&err, errors::ResponseError::InvalidParams(msg) if msg.contains("reasoning.effort")),
+                "{value:?}: {err:?}"
+            );
+        }
+    }
+
+    #[test]
     fn test_reasoning_effort_forwarded_for_chat_completions_backends() {
         for model in [
             catalog_model("external", Some("openai_compatible")),
@@ -4697,10 +4751,10 @@ mod tests {
         ] {
             assert_eq!(
                 ResponseServiceImpl::reasoning_effort_for_completion(
-                    Some(&effort(Some("high"))),
+                    Some(models::ReasoningEffort::XHigh),
                     Some(&model),
                 ),
-                Some(serde_json::json!("high")),
+                Some(serde_json::json!("xhigh")),
                 "provider_config: {:?}",
                 model.provider_config
             );
@@ -4712,7 +4766,7 @@ mod tests {
         let model = catalog_model("external", Some("anthropic"));
         assert_eq!(
             ResponseServiceImpl::reasoning_effort_for_completion(
-                Some(&effort(Some("high"))),
+                Some(models::ReasoningEffort::High),
                 Some(&model),
             ),
             None
@@ -4722,17 +4776,15 @@ mod tests {
     #[test]
     fn test_reasoning_effort_absent_or_unresolved_model_not_forwarded() {
         let model = catalog_model("external", Some("openai_compatible"));
-        // The route defaults `reasoning` to `{effort: None}`.
-        assert_eq!(
-            ResponseServiceImpl::reasoning_effort_for_completion(Some(&effort(None)), Some(&model)),
-            None
-        );
         assert_eq!(
             ResponseServiceImpl::reasoning_effort_for_completion(None, Some(&model)),
             None
         );
         assert_eq!(
-            ResponseServiceImpl::reasoning_effort_for_completion(Some(&effort(Some("low"))), None),
+            ResponseServiceImpl::reasoning_effort_for_completion(
+                Some(models::ReasoningEffort::Low),
+                None
+            ),
             None
         );
     }

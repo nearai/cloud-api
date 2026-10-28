@@ -1,11 +1,16 @@
 use chrono::{DateTime, Duration, Utc};
 use config::NearConfig;
-use near_api::{signer::NEP413Payload, types::Signature, AccountId, NetworkConfig, PublicKey};
+use near_kit::{
+    signer::{PublicKey, Signature},
+    standards::nep413::{self, NonceValidation, SignMessageParams, VerifyOptions},
+    AccountId, Near,
+};
 use std::sync::Arc;
 use url::Url;
 
 use super::ports::{AuthServiceTrait, NearNonceRepository, OAuthUserInfo, Session};
 
+const WALLET_VERIFICATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 const MAX_NONCE_AGE_MS: u64 = 5 * 60 * 1000; // 5 minutes
 const EXPECTED_MESSAGE: &str = "Sign in to NEAR AI Cloud";
 const ACCESS_TOKEN_LIFETIME_HOURS: i64 = 1;
@@ -51,7 +56,7 @@ pub struct NearAuthService {
     auth_service: Arc<dyn AuthServiceTrait>,
     nonce_repository: Arc<dyn NearNonceRepository>,
     config: NearConfig,
-    network_config: NetworkConfig,
+    network_config: Near,
 }
 
 /// Validates that a nonce timestamp is within the acceptable window
@@ -98,7 +103,7 @@ impl NearAuthService {
                 config.rpc_url
             )
         });
-        let network_config = NetworkConfig::from_rpc_url(&config.network_id, rpc_url);
+        let network_config = Near::custom(rpc_url.to_string(), config.network_id.clone()).build();
         Self {
             auth_service,
             nonce_repository,
@@ -137,7 +142,7 @@ impl NearAuthService {
     pub async fn verify_and_authenticate(
         &self,
         signed_message: SignedMessage,
-        payload: NEP413Payload,
+        payload: SignMessageParams,
         ip_address: Option<String>,
         user_agent: String,
         encoding_key: String,
@@ -182,7 +187,7 @@ impl NearAuthService {
             anyhow::anyhow!(e)
         })?;
 
-        // 5. Verify signature AND public key ownership via near-api
+        // 5. Verify signature AND public key ownership via near-kit
         verify_wallet_control(&payload, &signed_message, &self.network_config).await?;
 
         // 6. Consume nonce AFTER signature verification (replay protection)
@@ -242,28 +247,49 @@ impl NearAuthService {
 /// Verify a NEP-413 signature and its account access key without creating a session.
 /// The caller owns challenge scoping, expiry and atomic replay prevention.
 pub async fn verify_wallet_control(
-    payload: &NEP413Payload,
+    payload: &SignMessageParams,
     message: &SignedMessage,
-    network: &NetworkConfig,
+    network: &Near,
 ) -> anyhow::Result<()> {
-    let valid = payload
-        .verify(
-            &message.account_id,
-            message.public_key,
-            &message.signature,
+    // Login validates timestamped nonces; binding uses random challenge nonces.
+    // Both callers enforce expiry and atomic replay protection themselves.
+    let signed = nep413::SignedMessage {
+        account_id: message.account_id.clone(),
+        public_key: message.public_key.clone(),
+        signature: message.signature.clone(),
+        state: message.state.clone(),
+    };
+
+    let valid = tokio::time::timeout(
+        WALLET_VERIFICATION_TIMEOUT,
+        nep413::verify(
+            &signed,
+            payload,
             network,
-        )
-        .await
-        .map_err(|error| {
-            // Preserve an observable error category without logging proof/RPC payloads.
-            tracing::warn!(error_category = ?std::mem::discriminant(&error), "NEP-413 verifier error");
-            anyhow::anyhow!(NearAuthError::SignatureVerificationFailed(
-                "wallet verification unavailable".into()
-            ))
-        })?;
+            VerifyOptions {
+                nonce_validation: NonceValidation::None,
+                require_full_access: true,
+            },
+        ),
+    )
+    .await
+    .map_err(|_| {
+        anyhow::anyhow!(NearAuthError::SignatureVerificationFailed(
+            "wallet verification timed out".into()
+        ))
+    })?
+    .map_err(|error| {
+        // Preserve an observable error category without logging proof/RPC payloads.
+        tracing::warn!(error_category = ?std::mem::discriminant(&error), "NEP-413 verifier error");
+        anyhow::anyhow!(NearAuthError::SignatureVerificationFailed(
+            "wallet verification unavailable".into()
+        ))
+    })?;
+
     if !valid {
         return Err(anyhow::anyhow!(NearAuthError::InvalidSignature));
     }
+
     Ok(())
 }
 
@@ -271,6 +297,40 @@ pub async fn verify_wallet_control(
 mod tests {
     use super::*;
     use chrono::TimeZone;
+
+    #[test]
+    fn nep413_hash_matches_wallet_fixtures_with_and_without_callback() {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+
+        // Sender/Meteor fixtures also used by near-api-rs. Expected hashes are
+        // SHA-256 of the NEP-413 tag followed by the Borsh-encoded payload.
+        for (callback_url, expected) in [
+            (
+                None,
+                "036a114cfadb42200dc972aff40b994039571359cbcdd34be9c097d472351038",
+            ),
+            (
+                Some("http://localhost:3000"),
+                "ca89aebc4b822cb0618aa785dca563acee228e2631cff9adb7ce44989c5e8874",
+            ),
+        ] {
+            let payload = SignMessageParams {
+                message: "Hello NEAR!".into(),
+                nonce: STANDARD
+                    .decode("KNV0cOpvJ50D5vfF9pqWom8wo2sliQ4W+Wa7uZ3Uk6Y=")
+                    .unwrap()
+                    .try_into()
+                    .unwrap(),
+                recipient: "example.near".into(),
+                callback_url: callback_url.map(str::to_owned),
+                state: None,
+            };
+
+            let hash = nep413::serialize_message(&payload);
+
+            assert_eq!(hex::encode(hash.as_bytes()), expected);
+        }
+    }
 
     #[test]
     fn test_rejects_out_of_range_timestamp() {

@@ -2,8 +2,9 @@ pub mod binding;
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
 use config::StakingFarmConfig;
-use near_api::{Contract, Data, NetworkConfig};
+use near_kit::Near;
 use serde::{Deserialize, Serialize};
+use std::future::IntoFuture;
 use std::{
     collections::HashSet,
     sync::{Arc, Mutex, MutexGuard},
@@ -182,14 +183,14 @@ impl StakingFarmAmlGate for crate::aml::AmlService {
 
 #[derive(Debug, Clone)]
 pub struct NearRpcStakingFarmClient {
-    network_config: NetworkConfig,
+    network_config: Near,
 }
 
 impl NearRpcStakingFarmClient {
     pub fn new(rpc_url: String, network_id: String) -> anyhow::Result<Self> {
-        let rpc_url = rpc_url.parse()?;
+        let rpc_url = url::Url::parse(&rpc_url)?;
         Ok(Self {
-            network_config: NetworkConfig::from_rpc_url(&network_id, rpc_url),
+            network_config: Near::custom(rpc_url.to_string(), network_id).build(),
         })
     }
 }
@@ -201,20 +202,17 @@ impl StakingFarmContractClient for NearRpcStakingFarmClient {
         account_id: &str,
         contract_id: &str,
     ) -> anyhow::Result<FarmAccount> {
-        let contract = Contract(contract_id.parse()?);
-        let account: Data<FarmAccount> = tokio::time::timeout(
+        let account: FarmAccount = tokio::time::timeout(
             std::time::Duration::from_secs(NEAR_RPC_TIMEOUT_SECS),
-            contract
-                .call_function(
-                    "get_farm_account",
-                    serde_json::json!({ "account_id": account_id }),
-                )
-                .read_only()
-                .fetch_from(&self.network_config),
+            self.network_config
+                .view(contract_id, "get_farm_account")
+                .finality(near_kit::rpc::Finality::Optimistic)
+                .args(serde_json::json!({ "account_id": account_id }))
+                .into_future(),
         )
         .await
         .map_err(|_| anyhow::anyhow!("staking farm RPC timed out"))??;
-        Ok(account.data)
+        Ok(account)
     }
 }
 
@@ -593,6 +591,56 @@ fn ensure_configured(config: &StakingFarmConfig) -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use std::sync::Mutex;
+
+    #[tokio::test]
+    async fn near_rpc_reads_farm_account_with_optimistic_finality() {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        use wiremock::{
+            matchers::{body_partial_json, method},
+            Mock, MockServer, ResponseTemplate,
+        };
+
+        let server = MockServer::start().await;
+        let result = serde_json::json!({
+            "accumulated_reward_units": "100",
+            "pending_reward_units": "20",
+            "total_earned_reward_units": "120",
+            "active_positions": [],
+        });
+        Mock::given(method("POST"))
+            .and(body_partial_json(serde_json::json!({
+                "method": "EXPERIMENTAL_call_function",
+                "params": {
+                    "account_id": "farm.near",
+                    "method_name": "get_farm_account",
+                    "args_base64": STANDARD.encode(br#"{"account_id":"alice.near"}"#),
+                    "finality": "optimistic",
+                },
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "result": serde_json::to_vec(&result).unwrap(),
+                    "logs": [],
+                    "block_height": 1,
+                    "block_hash": "11111111111111111111111111111111",
+                },
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = NearRpcStakingFarmClient::new(server.uri(), "mainnet".into()).unwrap();
+
+        let account = client
+            .get_farm_account("alice.near", "farm.near")
+            .await
+            .unwrap();
+
+        assert_eq!(account.accumulated_reward_units, "100");
+        assert_eq!(account.pending_reward_units, "20");
+        assert_eq!(account.total_earned_reward_units, "120");
+    }
 
     struct MockStakingFarmRepository {
         source: Mutex<Option<OrganizationStakingFarmSource>>,

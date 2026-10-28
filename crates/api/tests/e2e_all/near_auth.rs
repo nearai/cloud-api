@@ -283,7 +283,7 @@ async fn test_near_login_zero_timestamp_nonce() {
 // Tests that require valid NEAR wallet signatures (replay attack prevention,
 // user creation/linking) are not included due to the following limitations:
 //
-// 1. The `payload.verify()` method from near-api crate performs RPC calls to
+// 1. The NEP-413 verifier from near-kit performs RPC calls to
 //    the NEAR blockchain to verify that the public key actually belongs to
 //    the account_id. This RPC verification cannot be easily mocked or bypassed
 //    in integration tests.

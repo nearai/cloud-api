@@ -189,7 +189,7 @@ pub struct AuthResponse {
 
 // NEAR authentication types
 use base64::prelude::*;
-use near_api::signer::NEP413Payload;
+use near_kit::standards::nep413::SignMessageParams;
 
 /// Request body for NEAR authentication (NEP-413)
 #[derive(Debug, Deserialize)]
@@ -232,13 +232,25 @@ impl TryFrom<NearSignedMessageJson> for services::auth::near::SignedMessage {
     type Error = anyhow::Error;
 
     fn try_from(msg: NearSignedMessageJson) -> Result<Self, Self::Error> {
-        use near_api::types::Signature;
+        use near_kit::signer::Signature;
 
-        let public_key: near_api::PublicKey = msg.public_key.parse()?;
+        let public_key: near_kit::signer::PublicKey = msg.public_key.parse()?;
 
         // Parse base64 signature and create Signature based on key type
         let sig_bytes = BASE64_STANDARD.decode(&msg.signature)?;
-        let signature = Signature::from_parts(public_key.key_type(), &sig_bytes)?;
+        let signature = match public_key.key_type() {
+            near_kit::signer::KeyType::Ed25519 => Signature::ed25519_from_bytes(
+                sig_bytes
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("Invalid Ed25519 signature length"))?,
+            ),
+            near_kit::signer::KeyType::Secp256k1 => Signature::secp256k1_from_bytes(
+                sig_bytes
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("Invalid Secp256k1 signature length"))?,
+            ),
+            near_kit::signer::KeyType::MlDsa65 => anyhow::bail!("Unsupported wallet key type"),
+        };
 
         Ok(services::auth::near::SignedMessage {
             account_id: msg.account_id.parse()?,
@@ -249,7 +261,7 @@ impl TryFrom<NearSignedMessageJson> for services::auth::near::SignedMessage {
     }
 }
 
-impl TryFrom<NearPayloadJson> for NEP413Payload {
+impl TryFrom<NearPayloadJson> for SignMessageParams {
     type Error = anyhow::Error;
 
     fn try_from(payload: NearPayloadJson) -> Result<Self, Self::Error> {
@@ -259,11 +271,12 @@ impl TryFrom<NearPayloadJson> for NEP413Payload {
             .try_into()
             .map_err(|_| anyhow::anyhow!("Nonce must be exactly 32 bytes"))?;
 
-        Ok(NEP413Payload {
+        Ok(SignMessageParams {
             message: payload.message,
             nonce,
             recipient: payload.recipient,
             callback_url: payload.callback_url,
+            state: None,
         })
     }
 }
@@ -887,6 +900,41 @@ pub async fn login_page() -> Html<&'static str> {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn near_wallet_signature_decoding_preserves_key_types_and_rejects_bad_lengths() {
+        use near_kit::signer::SecretKey;
+
+        for secret_key in [
+            SecretKey::ed25519_from_bytes([7; 32]),
+            SecretKey::secp256k1_from_bytes([7; 32]).unwrap(),
+        ] {
+            let signature = secret_key.sign(&[9; 32]);
+            let request = NearSignedMessageJson {
+                account_id: "alice.near".into(),
+                public_key: secret_key.public_key().to_string(),
+                signature: BASE64_STANDARD.encode(signature.as_bytes()),
+                state: Some("wallet-state".into()),
+            };
+
+            let decoded = services::auth::near::SignedMessage::try_from(request.clone()).unwrap();
+
+            assert_eq!(decoded.signature, signature);
+            assert_eq!(decoded.public_key, secret_key.public_key());
+            assert_eq!(decoded.state, request.state);
+
+            for length in [
+                0,
+                signature.as_bytes().len() - 1,
+                signature.as_bytes().len() + 1,
+            ] {
+                let mut invalid = request.clone();
+                invalid.signature = BASE64_STANDARD.encode(vec![0; length]);
+
+                assert!(services::auth::near::SignedMessage::try_from(invalid).is_err());
+            }
+        }
+    }
 
     fn cors() -> config::CorsConfig {
         config::CorsConfig {

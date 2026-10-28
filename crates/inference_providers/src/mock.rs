@@ -1663,14 +1663,19 @@ impl crate::InferenceProvider for MockProvider {
                     (params.documents.len() as f64 - i as f64) / params.documents.len() as f64;
                 RerankResult {
                     index: i as i32,
-                    relevance_score,
+                    relevance_score: relevance_score.into(),
                     document: Some(serde_json::Value::String(params.documents[i].clone())),
                 }
             })
             .collect();
 
         // Sort by relevance score descending
-        results.sort_by(|a, b| b.relevance_score.partial_cmp(&a.relevance_score).unwrap());
+        results.sort_by(|a, b| {
+            b.relevance_score
+                .as_number()
+                .partial_cmp(&a.relevance_score.as_number())
+                .unwrap()
+        });
 
         let response = RerankResponse {
             id: format!("rerank-{}", self.generate_id()),

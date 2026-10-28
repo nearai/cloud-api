@@ -11,6 +11,16 @@
       "tag": "v0.0.157"
     },
     {
+      "measurement": "9134838da8aa4e1792566b2988820340356517c4db0c94261eb8154843e0357554ba72fcf185f950d9301fbede574c90",
+      "repo": "tinfoilsh/confidential-model-router",
+      "tag": "v0.0.167"
+    },
+    {
+      "measurement": "9b2804758af9474e15dbac41c3082a6f8d8e643a9a4873cbd3edc2fd553cc4d5ced5effe6d5ce9e5050d300d16022d29",
+      "repo": "tinfoilsh/confidential-model-router",
+      "tag": "v0.0.162"
+    },
+    {
       "measurement": "9b5493714af482656d43d963774da1185a611dac14a46a03cfbde5a2984201a9d41fc2b6a5f81b806e58acae104226a6",
       "repo": "tinfoilsh/confidential-model-router",
       "tag": "v0.0.158"
@@ -29,9 +39,80 @@
       "measurement": "ee157fe3d1732da3089c4fafc09e556bc28bd8d6f2a5a499ff39971f619b9c339fcccfab1989513c42f2cb0b5a8d2ff3",
       "repo": "tinfoilsh/confidential-model-router",
       "tag": "v0.0.161"
+    },
+    {
+      "measurement": "ffb708f1bb0fcb489faa6455680f3efb99f582f6183da219fbd109b7a72017f0011a25e00431016dbc5d38d0b450b0b4",
+      "repo": "tinfoilsh/confidential-model-router",
+      "tag": "v0.0.166"
     }
   ],
   "models": {
+    "decision-27b": [
+      {
+        "registers": [
+          "04af6db754354b763b7f550f4f378513ee851c0036a8f026a3e26815027756a5dfd501acce61f7245bc2c3f8903549ba",
+          "a787299fe2e84295a406dde367abac5b40128c1e13aa81dfde4a5c2e39682e45cde7bb84cefc7f33f25ac645fc265030",
+          "ba62fda92dbecf8b9fd2fde3c45987174bb7117d045c448b01d72a1e7d5721d9063e720bb51be51c596e190a56a178c6"
+        ],
+        "repo": "tinfoilsh/confidential-decision-models",
+        "tag": "v0.0.3"
+      }
+    ],
+    "decision-4b": [
+      {
+        "registers": [
+          "04af6db754354b763b7f550f4f378513ee851c0036a8f026a3e26815027756a5dfd501acce61f7245bc2c3f8903549ba",
+          "a787299fe2e84295a406dde367abac5b40128c1e13aa81dfde4a5c2e39682e45cde7bb84cefc7f33f25ac645fc265030",
+          "ba62fda92dbecf8b9fd2fde3c45987174bb7117d045c448b01d72a1e7d5721d9063e720bb51be51c596e190a56a178c6"
+        ],
+        "repo": "tinfoilsh/confidential-decision-models",
+        "tag": "v0.0.3"
+      }
+    ],
+    "decision-9b": [
+      {
+        "registers": [
+          "04af6db754354b763b7f550f4f378513ee851c0036a8f026a3e26815027756a5dfd501acce61f7245bc2c3f8903549ba",
+          "a787299fe2e84295a406dde367abac5b40128c1e13aa81dfde4a5c2e39682e45cde7bb84cefc7f33f25ac645fc265030",
+          "ba62fda92dbecf8b9fd2fde3c45987174bb7117d045c448b01d72a1e7d5721d9063e720bb51be51c596e190a56a178c6"
+        ],
+        "repo": "tinfoilsh/confidential-decision-models",
+        "tag": "v0.0.3"
+      }
+    ],
+    "decision-large": [
+      {
+        "registers": [
+          "9bc1df4c17a40722934fd4ca5e15160b9d782ec16107981aaa6324449fdee8575a2ad7fcc0b101d3f5e11b976e37c9a5",
+          "a787299fe2e84295a406dde367abac5b40128c1e13aa81dfde4a5c2e39682e45cde7bb84cefc7f33f25ac645fc265030",
+          "25e8ee4b7f39f61ee0567cb6208fba92ce73d03be933a54ec4b259eef66daf7cb2962b7899a8b0ac0135a596ae742184"
+        ],
+        "repo": "tinfoilsh/confidential-decision-models",
+        "tag": "v0.0.4"
+      }
+    ],
+    "decision-medium": [
+      {
+        "registers": [
+          "9bc1df4c17a40722934fd4ca5e15160b9d782ec16107981aaa6324449fdee8575a2ad7fcc0b101d3f5e11b976e37c9a5",
+          "a787299fe2e84295a406dde367abac5b40128c1e13aa81dfde4a5c2e39682e45cde7bb84cefc7f33f25ac645fc265030",
+          "25e8ee4b7f39f61ee0567cb6208fba92ce73d03be933a54ec4b259eef66daf7cb2962b7899a8b0ac0135a596ae742184"
+        ],
+        "repo": "tinfoilsh/confidential-decision-models",
+        "tag": "v0.0.4"
+      }
+    ],
+    "decision-small": [
+      {
+        "registers": [
+          "9bc1df4c17a40722934fd4ca5e15160b9d782ec16107981aaa6324449fdee8575a2ad7fcc0b101d3f5e11b976e37c9a5",
+          "a787299fe2e84295a406dde367abac5b40128c1e13aa81dfde4a5c2e39682e45cde7bb84cefc7f33f25ac645fc265030",
+          "25e8ee4b7f39f61ee0567cb6208fba92ce73d03be933a54ec4b259eef66daf7cb2962b7899a8b0ac0135a596ae742184"
+        ],
+        "repo": "tinfoilsh/confidential-decision-models",
+        "tag": "v0.0.4"
+      }
+    ],
     "deepseek-v4-1-flash": [
       {
         "registers": [
@@ -55,15 +136,51 @@
       },
       {
         "registers": [
+          "55ed28ba39a320c7985272557a250aa783ddbea8cd1be57ee25b76aad3b3372377665af79019ba497b7adfd1a3760778",
+          "482d0a481acfdf35c0e90b17faf98d313b3d26e948ab34cb349e5cc7b49f9dee85b56c0e20db740832d122285fac8e4f",
+          "beaced7050b85af7ec594e021c7f73ad8e80452f5159deee3f9b613827d72bacac26931367af474fccd7aabac262bf04"
+        ],
+        "repo": "tinfoilsh/confidential-doc-upload",
+        "tag": "v0.0.38"
+      },
+      {
+        "registers": [
           "5f796a5b6cee04f80f45cfabc512ef5160d70237847d22f294c43f95cb68c3ece18958324a975abe5a82dc8ae2fba661",
           "a787299fe2e84295a406dde367abac5b40128c1e13aa81dfde4a5c2e39682e45cde7bb84cefc7f33f25ac645fc265030",
           "7cf45ba2b4f33acd104019425f32d5b37c31384b9d95ef5be6256200d31ff56b1428e23616e28305f87092702f3d7d8a"
         ],
         "repo": "tinfoilsh/confidential-doc-upload",
         "tag": "v0.0.37"
+      },
+      {
+        "registers": [
+          "ac86a9d710eb124fe073cb8a880acdba84c8a8581f3730cd1294c307d0f83b84c4a279bfde7c36cfff6d12437b840a51",
+          "482d0a481acfdf35c0e90b17faf98d313b3d26e948ab34cb349e5cc7b49f9dee85b56c0e20db740832d122285fac8e4f",
+          "8a3716626a1982060eb41ff27f296b4b3ce69775ffbff108471c61bc2e8940d7df8ff7532b166b4697d81b456fa32e19"
+        ],
+        "repo": "tinfoilsh/confidential-doc-upload",
+        "tag": "v0.0.39"
       }
     ],
     "gemma4-31b": [
+      {
+        "registers": [
+          "15222099ed86f552cb889ff7f3c28960688ef821f94b6c8479088106253708cbdfa540a7960470f4563e3a08b0796f33",
+          "7e57f9877b4533e7dcb8dd7419dfaf422f3c7cef6fd337a4eaf27ae90a751ff04945ef0d4fb6c3753285cb1f09ce048e",
+          "1a22519bf72d807d8e668409e59611feebf1e2168208e360bab4d5816822b46c70997f58d18ef59e2e4c08fb72180fc7"
+        ],
+        "repo": "tinfoilsh/confidential-gemma4-31b",
+        "tag": "v0.0.28"
+      },
+      {
+        "registers": [
+          "2600aceb6752e0470d8ffa802e4d1ab75a8ce419ae05c82fae74ad3acaac425eb71fcb59d43696d293d5895c9f57b150",
+          "482d0a481acfdf35c0e90b17faf98d313b3d26e948ab34cb349e5cc7b49f9dee85b56c0e20db740832d122285fac8e4f",
+          "7e1d5d4095d0f6a933ff5a05f7c1fda612ce698b9731157ada80a370a7309cabf87d8058d4f1f722592d1035cb5a0807"
+        ],
+        "repo": "tinfoilsh/confidential-gemma4-31b",
+        "tag": "v0.0.29"
+      },
       {
         "registers": [
           "42fbc892c9ad2446f82571b5bf1b9de153af87c0c8a63dad1e6f20e9ece0c77ab8380d7e426cab5e32b9b6f73db2febf",
@@ -185,6 +302,15 @@
         ],
         "repo": "tinfoilsh/confidential-nomic-embed-text",
         "tag": "v0.0.29"
+      },
+      {
+        "registers": [
+          "df1f0d12e1db2e7bdd2e35214cdd364e5532992d92cf104137c67278d8477c685454724075e1f257f4ebde575c70e224",
+          "a787299fe2e84295a406dde367abac5b40128c1e13aa81dfde4a5c2e39682e45cde7bb84cefc7f33f25ac645fc265030",
+          "761db50bb44fffce7cdf4c9a76e99cfb915a4492df4264f12d0c0b4bdbdecc795baedba443fb553e13637487cc5e4057"
+        ],
+        "repo": "tinfoilsh/confidential-small-models",
+        "tag": "v0.0.1"
       }
     ],
     "pii-filter": [
@@ -196,6 +322,15 @@
         ],
         "repo": "tinfoilsh/confidential-pii-cpu",
         "tag": "v0.3.1"
+      },
+      {
+        "registers": [
+          "d72d603c21d1f8928b52d77381dee6d3ab2096a8e69c71f5f4d9daae7f192e1c4a9a3ec86b64aa779a8e4c6f4b8055ad",
+          "482d0a481acfdf35c0e90b17faf98d313b3d26e948ab34cb349e5cc7b49f9dee85b56c0e20db740832d122285fac8e4f",
+          "4a49f7cb01956b098117fbc90bfa422c6b5b17deed212c010ad1e3bbce1b26495f0b0aa5f5c2057872b5db8ad7b82576"
+        ],
+        "repo": "tinfoilsh/confidential-pii-cpu",
+        "tag": "v0.3.3"
       }
     ],
     "qwen3-tts": [
@@ -270,6 +405,15 @@
       }
     ],
     "websearch": [
+      {
+        "registers": [
+          "0946d142db4cb0df451ecb4cac70dc531569bde62d482ffa950ab4395cc8301793468389a389571dcd01e29a63fc361d",
+          "482d0a481acfdf35c0e90b17faf98d313b3d26e948ab34cb349e5cc7b49f9dee85b56c0e20db740832d122285fac8e4f",
+          "62dcfd638fda1e1682a74e0ea9f0a737e6693c19b6b8c7f9c1d8369452ec6bd984a165615da4caa37f7c51117bc2df32"
+        ],
+        "repo": "tinfoilsh/confidential-websearch",
+        "tag": "v0.5.16"
+      },
       {
         "registers": [
           "67221ad236d779a275bace2528d692030da2693b4396285758f37385e6f242aa40c218069edbfbcef51130326611aafb",

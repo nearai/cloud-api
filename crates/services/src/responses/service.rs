@@ -1417,6 +1417,25 @@ impl ResponseServiceImpl {
         Ok(())
     }
 
+    /// `reasoning.effort` as the chat-completions `reasoning_effort` field.
+    ///
+    /// Not forwarded to Anthropic-backed models: the Messages API rejects
+    /// `reasoning_effort` with a 400, so there the selector stays a no-op
+    /// instead of failing the request. Also skipped when the model could not
+    /// be resolved, since its backend is then unknown.
+    fn reasoning_effort_for_completion(
+        reasoning: Option<&models::ResponseReasoningConfig>,
+        model: Option<&crate::models::ModelWithPricing>,
+    ) -> Option<serde_json::Value> {
+        let effort = reasoning?.effort.as_ref()?;
+        match model {
+            Some(model) if !model.is_anthropic_backend() => {
+                Some(serde_json::Value::String(effort.clone()))
+            }
+            _ => None,
+        }
+    }
+
     /// Run the agent loop - repeatedly call completion API and execute tool calls
     #[allow(clippy::too_many_arguments)]
     async fn run_agent_loop(
@@ -1451,6 +1470,12 @@ impl ResponseServiceImpl {
             }
             if let Some(tc) = tool_choice {
                 extra.insert("tool_choice".to_string(), serde_json::to_value(tc).unwrap());
+            }
+            if let Some(effort) = Self::reasoning_effort_for_completion(
+                process_context.request.reasoning.as_ref(),
+                process_context.model.as_ref(),
+            ) {
+                extra.insert("reasoning_effort".to_string(), effort);
             }
 
             // Add encryption headers to extra for passing to completion service
@@ -4614,5 +4639,101 @@ mod tests {
         let result = truncate_safe(&title, 57);
         assert!(result.ends_with("..."));
         assert_eq!(result.chars().count(), 60); // 57 + "..."
+    }
+
+    fn catalog_model(
+        provider_type: &str,
+        backend: Option<&str>,
+    ) -> crate::models::ModelWithPricing {
+        crate::models::ModelWithPricing {
+            upcoming_pricing: None,
+            id: uuid::Uuid::new_v4(),
+            model_name: "test/model".to_string(),
+            model_display_name: "Test".to_string(),
+            model_description: "test model".to_string(),
+            model_icon: None,
+            input_cost_per_token: 1,
+            output_cost_per_token: 1,
+            cost_per_image: 0,
+            cache_read_cost_per_token: None,
+            text_pricing: None,
+            context_length: 4096,
+            verifiable: false,
+            aliases: Vec::new(),
+            owned_by: "test".to_string(),
+            provider_type: provider_type.to_string(),
+            provider_config: backend.map(|backend| serde_json::json!({ "backend": backend })),
+            attestation_supported: false,
+            input_modalities: Some(vec!["text".to_string()]),
+            output_modalities: Some(vec!["text".to_string()]),
+            inference_url: None,
+            hugging_face_id: None,
+            quantization: None,
+            max_output_length: None,
+            supported_sampling_parameters: Vec::new(),
+            supported_features: Vec::new(),
+            datacenters: None,
+            is_ready: None,
+            deprecation_date: None,
+            successor_model_name: None,
+            openrouter_slug: None,
+            is_listed: true,
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    fn effort(value: Option<&str>) -> models::ResponseReasoningConfig {
+        models::ResponseReasoningConfig {
+            effort: value.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn test_reasoning_effort_forwarded_for_chat_completions_backends() {
+        for model in [
+            catalog_model("external", Some("openai_compatible")),
+            catalog_model("external", Some("gemini")),
+            catalog_model("vllm", None),
+        ] {
+            assert_eq!(
+                ResponseServiceImpl::reasoning_effort_for_completion(
+                    Some(&effort(Some("high"))),
+                    Some(&model),
+                ),
+                Some(serde_json::json!("high")),
+                "provider_config: {:?}",
+                model.provider_config
+            );
+        }
+    }
+
+    #[test]
+    fn test_reasoning_effort_not_forwarded_for_anthropic_backend() {
+        let model = catalog_model("external", Some("anthropic"));
+        assert_eq!(
+            ResponseServiceImpl::reasoning_effort_for_completion(
+                Some(&effort(Some("high"))),
+                Some(&model),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn test_reasoning_effort_absent_or_unresolved_model_not_forwarded() {
+        let model = catalog_model("external", Some("openai_compatible"));
+        // The route defaults `reasoning` to `{effort: None}`.
+        assert_eq!(
+            ResponseServiceImpl::reasoning_effort_for_completion(Some(&effort(None)), Some(&model)),
+            None
+        );
+        assert_eq!(
+            ResponseServiceImpl::reasoning_effort_for_completion(None, Some(&model)),
+            None
+        );
+        assert_eq!(
+            ResponseServiceImpl::reasoning_effort_for_completion(Some(&effort(Some("low"))), None),
+            None
+        );
     }
 }

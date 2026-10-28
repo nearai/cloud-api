@@ -172,6 +172,111 @@ async fn test_chat_template_kwargs_forwarded() {
     );
 }
 
+/// `reasoning.effort` on the orchestrated `/v1/responses` path reaches the
+/// chat-completions provider as `reasoning_effort`, and is absent when unset.
+#[tokio::test]
+async fn test_responses_reasoning_effort_forwarded() {
+    let (server, mock, model, api_key) = setup().await;
+
+    mock.when(RequestMatcher::Any)
+        .respond_with(ResponseTemplate::new("ok"))
+        .await;
+
+    for (reasoning, expected) in [
+        (serde_json::json!({"effort": "high"}), Some("high")),
+        (serde_json::json!({}), None),
+    ] {
+        let response = server
+            .post("/v1/responses")
+            .add_header("Authorization", format!("Bearer {api_key}"))
+            .json(&serde_json::json!({
+                "model": model,
+                "input": "Say hi.",
+                "reasoning": reasoning,
+                "max_output_tokens": 10,
+                "store": false,
+                "stream": false,
+            }))
+            .await;
+
+        assert_eq!(
+            response.status_code(),
+            200,
+            "responses request should succeed, got: {}",
+            response.text()
+        );
+        let params = mock.last_chat_params().await.expect("provider was called");
+        assert_eq!(
+            params
+                .extra
+                .get("reasoning_effort")
+                .and_then(|v| v.as_str()),
+            expected,
+            "reasoning: {reasoning}"
+        );
+    }
+}
+
+/// Anthropic's Messages API rejects `reasoning_effort` with a 400, so the
+/// orchestrated `/v1/responses` path does not forward it for Anthropic-backed
+/// models (the selector stays a no-op there instead of failing the request).
+#[tokio::test]
+async fn test_responses_reasoning_effort_not_forwarded_to_anthropic() {
+    let (server, pool, mock, _db) = setup_test_server_with_pool().await;
+    let model = format!("anthropic/effort-fixture-{}", uuid::Uuid::new_v4());
+    let mut batch = api::models::BatchUpdateModelApiRequest::new();
+    batch.insert(
+        model.clone(),
+        serde_json::from_value(serde_json::json!({
+            "inputCostPerToken": {"amount": 3000, "currency": "USD"},
+            "outputCostPerToken": {"amount": 15000, "currency": "USD"},
+            "modelDisplayName": "Anthropic effort fixture",
+            "modelDescription": "Anthropic backend reasoning effort test",
+            "contextLength": 200000,
+            "maxOutputLength": 1024,
+            "verifiable": false,
+            "isActive": true,
+            "providerType": "external",
+            "providerConfig": {"backend": "anthropic", "base_url": "https://api.anthropic.com/v1"},
+            "attestationSupported": false
+        }))
+        .unwrap(),
+    );
+    admin_batch_upsert_models(&server, batch, get_session_id()).await;
+    pool.register_provider(model.clone(), mock.clone()).await;
+    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id).await;
+
+    mock.when(RequestMatcher::Any)
+        .respond_with(ResponseTemplate::new("ok"))
+        .await;
+
+    let response = server
+        .post("/v1/responses")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&serde_json::json!({
+            "model": model,
+            "input": "Say hi.",
+            "reasoning": {"effort": "high"},
+            "max_output_tokens": 10,
+            "store": false,
+            "stream": false,
+        }))
+        .await;
+
+    assert_eq!(
+        response.status_code(),
+        200,
+        "responses request should succeed, got: {}",
+        response.text()
+    );
+    let params = mock.last_chat_params().await.expect("provider was called");
+    assert!(
+        !params.extra.contains_key("reasoning_effort"),
+        "reasoning_effort must not reach the Anthropic backend"
+    );
+}
+
 const REASONING: &str = "Let me think step by step about the question.";
 
 /// The mock engine reports one token per reasoning word.

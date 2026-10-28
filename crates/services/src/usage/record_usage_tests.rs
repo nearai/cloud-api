@@ -151,6 +151,13 @@ impl OrganizationLimitsRepository for UnusedLimitsRepository {
     ) -> anyhow::Result<Vec<OrganizationCreditLimit>> {
         unimplemented!()
     }
+
+    async fn get_current_credit_snapshot(
+        &self,
+        _: Uuid,
+    ) -> anyhow::Result<OrganizationCreditSnapshot> {
+        unimplemented!()
+    }
 }
 
 fn model() -> ModelPricing {

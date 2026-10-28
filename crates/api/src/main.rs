@@ -117,6 +117,33 @@ async fn main() {
         .start(config.server.usage_hourly_interval_secs)
         .await;
 
+    // Scan outside the inference path. Durable per-recipient claims prevent
+    // duplicate delivery when multiple API replicas run the scheduler. Do not
+    // take locks or write claims when credit email is disabled.
+    let credit_email_scheduler = if config.invitation_email.credit_email_enabled {
+        let scheduler = Arc::new(services::usage::CreditEmailScheduler::new(
+            Arc::new(
+                database::repositories::credit_email_notification::CreditEmailNotificationRepository::new(
+                    database.pool().clone(),
+                ),
+            ),
+            Arc::new(
+                database::repositories::OrganizationLimitsRepository::with_accounting_config(
+                    database.pool().clone(),
+                    &config.credit_allocation,
+                ),
+            ),
+            services::email::credit_email_sender_from_config(&config.invitation_email)
+                .expect("Failed to initialize credit alert email sender"),
+            config.invitation_email.credit_email_thresholds.clone(),
+            config.invitation_email.frontend_base_url.clone(),
+        ));
+        scheduler.clone().start().await;
+        Some(scheduler)
+    } else {
+        None
+    };
+
     // A durable per-org claim prevents replica duplication. Keep two jobs in
     // flight so a slow final verification does not stall every other organization.
     let discount_repository = database::repositories::organization_usage_discount::OrganizationUsageDiscountRepository::new(database.pool().clone());
@@ -163,7 +190,10 @@ async fn main() {
         domain_services.inference_provider_pool,
         pricing_scheduler,
         usage_hourly_scheduler,
-        discount_worker,
+        BackgroundWorkers {
+            discount: discount_worker,
+            credit_email: credit_email_scheduler,
+        },
     )
     .await;
 }
@@ -179,6 +209,11 @@ fn load_configuration() -> ApiConfig {
     })
 }
 
+struct BackgroundWorkers {
+    discount: tokio::task::JoinHandle<()>,
+    credit_email: Option<Arc<services::usage::CreditEmailScheduler>>,
+}
+
 /// Start the HTTP server with graceful shutdown on SIGTERM/SIGINT
 async fn start_server(
     app: axum::Router,
@@ -187,7 +222,7 @@ async fn start_server(
     inference_provider_pool: Arc<InferenceProviderPool>,
     pricing_scheduler: Arc<ModelPricingScheduler>,
     usage_hourly_scheduler: Arc<services::usage::UsageHourlyScheduler>,
-    discount_worker: tokio::task::JoinHandle<()>,
+    workers: BackgroundWorkers,
 ) {
     let bind_address = format!("{}:{}", config.server.host, config.server.port);
     let listener = tokio::net::TcpListener::bind(&bind_address)
@@ -207,8 +242,15 @@ async fn start_server(
     let server = axum::serve(listener, app).with_graceful_shutdown(shutdown_signal());
 
     let result = server.await;
-    discount_worker.abort();
-    let _ = discount_worker.await;
+    let BackgroundWorkers {
+        discount,
+        credit_email,
+    } = workers;
+    discount.abort();
+    let _ = discount.await;
+    if let Some(credit_email) = credit_email {
+        credit_email.shutdown().await;
+    }
     match result {
         Ok(_) => {
             tracing::info!("Server shutdown successfully, initiating coordinated cleanup");

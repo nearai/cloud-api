@@ -156,6 +156,7 @@ const APPROVED: &[ApprovedGroup] = &[
     ApprovedGroup { table: "api_keys", columns: &["key_hash", "name", "key_prefix"], reason: "API credentials are one-way hashed; name and prefix are query/display metadata" },
     ApprovedGroup { table: "chat_signatures", columns: &["chat_id", "text", "signature", "signing_address", "signing_algo", "signature_kind"], reason: "Publicly verifiable signature material required for lookup and verification" },
     ApprovedGroup { table: "database_encryption_jobs", columns: &["mode", "status", "scope", "actions", "cursor", "progress", "last_error_class", "last_error_message"], reason: "Non-customer operational migration state with redacted diagnostics" },
+    ApprovedGroup { table: "email_notification_deliveries", columns: &["event_type", "resource_id", "event_key"], reason: "Restricted transactional email-delivery deduplication state required for indexed claims and retry control; recipients are referenced by UUID" },
     ApprovedGroup { table: "feature_request_targets", columns: &["kind", "key", "title", "status"], reason: "Product catalog and workflow state" },
     ApprovedGroup { table: "feature_request_votes", columns: &["note", "source"], reason: "User-submitted product feedback intentionally available to administrators" },
     ApprovedGroup { table: "files", columns: &["purpose"], reason: "Queryable protocol enum; file-identifying fields are encrypted separately" },

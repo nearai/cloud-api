@@ -1,3 +1,4 @@
+pub mod credit_email_scheduler;
 pub mod hourly_scheduler;
 pub mod ports;
 mod pricing;
@@ -16,6 +17,7 @@ use crate::metrics::{
     },
     MetricsServiceTrait,
 };
+pub use credit_email_scheduler::*;
 pub use hourly_scheduler::*;
 pub use ports::*;
 pub use provider_attribution::*;

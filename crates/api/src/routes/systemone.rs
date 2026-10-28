@@ -372,12 +372,37 @@ mod tests {
             "#/components/schemas/SystemOneRequest",
         );
         let schemas = &spec["components"]["schemas"];
+        assert_eq!(
+            schemas["SystemOneRequest"]["properties"]["assets"]["additionalProperties"]["$ref"],
+            "#/components/schemas/SystemOneImageAsset"
+        );
+        assert_eq!(
+            schemas["SystemOneImageAsset"]["additionalProperties"],
+            serde_json::json!(false)
+        );
+        assert!(schemas["SystemOneImageAsset"]["properties"]
+            .get("part")
+            .is_none());
         for question in schemas["SystemOneQuestion"]["oneOf"].as_array().unwrap() {
             assert!(question["required"]
                 .as_array()
                 .unwrap()
                 .contains(&serde_json::json!("instructions")));
         }
+        let box_answer = schemas["SystemOneAnswer"]["oneOf"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|answer| answer["properties"]["type"]["enum"] == serde_json::json!(["box"]))
+            .unwrap();
+        assert_eq!(
+            box_answer["properties"]["box"]["$ref"],
+            "#/components/schemas/SystemOneBoxCoordinates"
+        );
+        assert!(!box_answer["required"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("confidence")));
         assert!(schemas["Usage"]["properties"].get("total_tokens").is_some());
         assert!(schemas["SystemOneUsage"]["properties"]
             .get("total_tokens")
@@ -389,6 +414,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn systemone_rejects_multipart_at_the_json_boundary() {
+        use axum::extract::FromRequest;
+
+        let request = axum::http::Request::builder()
+            .header(
+                header::CONTENT_TYPE,
+                "multipart/form-data; boundary=fixture",
+            )
+            .body(Body::from("--fixture--\r\n"))
+            .unwrap();
+        assert!(OpenAiJson::<SystemOneRequest>::from_request(request, &())
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
     async fn systemone_requires_instructions_at_the_json_boundary() {
         use axum::extract::FromRequest;
         use serde_json::{json, Value};
@@ -397,6 +438,7 @@ mod tests {
             json!({"type":"noul"}),
             json!({"type":"choice","criteria":{"billing":null,"other":null}}),
             json!({"type":"score","criteria":["low","high"]}),
+            json!({"type":"box"}),
         ] {
             for (case, instructions) in [("missing", None), ("null", Some(Value::Null))] {
                 let mut question = question.clone();

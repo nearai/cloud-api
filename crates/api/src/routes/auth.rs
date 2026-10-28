@@ -238,17 +238,22 @@ impl TryFrom<NearSignedMessageJson> for services::auth::near::SignedMessage {
 
         // Parse base64 signature and create Signature based on key type
         let sig_bytes = BASE64_STANDARD.decode(&msg.signature)?;
+        let sig_len = sig_bytes.len();
         let signature = match public_key.key_type() {
-            near_kit::signer::KeyType::Ed25519 => Signature::ed25519_from_bytes(
-                sig_bytes
-                    .try_into()
-                    .map_err(|_| anyhow::anyhow!("Invalid Ed25519 signature length"))?,
-            ),
-            near_kit::signer::KeyType::Secp256k1 => Signature::secp256k1_from_bytes(
-                sig_bytes
-                    .try_into()
-                    .map_err(|_| anyhow::anyhow!("Invalid Secp256k1 signature length"))?,
-            ),
+            near_kit::signer::KeyType::Ed25519 => {
+                Signature::ed25519_from_bytes(sig_bytes.try_into().map_err(|_| {
+                    anyhow::anyhow!(
+                        "Invalid Ed25519 signature length: expected 64 bytes, got {sig_len}"
+                    )
+                })?)
+            }
+            near_kit::signer::KeyType::Secp256k1 => {
+                Signature::secp256k1_from_bytes(sig_bytes.try_into().map_err(|_| {
+                    anyhow::anyhow!(
+                        "Invalid Secp256k1 signature length: expected 65 bytes, got {sig_len}"
+                    )
+                })?)
+            }
             near_kit::signer::KeyType::MlDsa65 => anyhow::bail!("Unsupported wallet key type"),
         };
 
@@ -276,6 +281,7 @@ impl TryFrom<NearPayloadJson> for SignMessageParams {
             nonce,
             recipient: payload.recipient,
             callback_url: payload.callback_url,
+            // Wallet callback state is not part of the NEP-413 signed payload.
             state: None,
         })
     }

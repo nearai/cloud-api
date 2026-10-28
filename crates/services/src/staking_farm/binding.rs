@@ -580,7 +580,7 @@ mod tests {
             tampered.message.push_str("other destination");
 
             assert!(verifier.verify(&tampered, &message).await.is_err());
-            // A tampered signature must be rejected before another RPC request.
+            // A tampered message must fail signature verification before another RPC request.
             server.verify().await;
         }
     }

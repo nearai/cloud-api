@@ -183,14 +183,14 @@ impl StakingFarmAmlGate for crate::aml::AmlService {
 
 #[derive(Debug, Clone)]
 pub struct NearRpcStakingFarmClient {
-    network_config: Near,
+    network: Near,
 }
 
 impl NearRpcStakingFarmClient {
     pub fn new(rpc_url: String, network_id: String) -> anyhow::Result<Self> {
         let rpc_url = url::Url::parse(&rpc_url)?;
         Ok(Self {
-            network_config: Near::custom(rpc_url.to_string(), network_id).build(),
+            network: Near::custom(rpc_url.to_string(), network_id).build(),
         })
     }
 }
@@ -204,8 +204,9 @@ impl StakingFarmContractClient for NearRpcStakingFarmClient {
     ) -> anyhow::Result<FarmAccount> {
         let account: FarmAccount = tokio::time::timeout(
             std::time::Duration::from_secs(NEAR_RPC_TIMEOUT_SECS),
-            self.network_config
+            self.network
                 .view(contract_id, "get_farm_account")
+                // Preserve near-api's optimistic reads during the client migration.
                 .finality(near_kit::rpc::Finality::Optimistic)
                 .args(serde_json::json!({ "account_id": account_id }))
                 .into_future(),
@@ -640,6 +641,7 @@ mod tests {
         assert_eq!(account.accumulated_reward_units, "100");
         assert_eq!(account.pending_reward_units, "20");
         assert_eq!(account.total_earned_reward_units, "120");
+        server.verify().await;
     }
 
     struct MockStakingFarmRepository {

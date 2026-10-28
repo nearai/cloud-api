@@ -56,7 +56,7 @@ pub struct NearAuthService {
     auth_service: Arc<dyn AuthServiceTrait>,
     nonce_repository: Arc<dyn NearNonceRepository>,
     config: NearConfig,
-    network_config: Near,
+    network: Near,
 }
 
 /// Validates that a nonce timestamp is within the acceptable window
@@ -103,12 +103,12 @@ impl NearAuthService {
                 config.rpc_url
             )
         });
-        let network_config = Near::custom(rpc_url.to_string(), config.network_id.clone()).build();
+        let network = Near::custom(rpc_url.to_string(), config.network_id.clone()).build();
         Self {
             auth_service,
             nonce_repository,
             config,
-            network_config,
+            network,
         }
     }
 
@@ -188,7 +188,7 @@ impl NearAuthService {
         })?;
 
         // 5. Verify signature AND public key ownership via near-kit
-        verify_wallet_control(&payload, &signed_message, &self.network_config).await?;
+        verify_wallet_control(&payload, &signed_message, &self.network).await?;
 
         // 6. Consume nonce AFTER signature verification (replay protection)
         // This prevents attackers from burning legitimate nonces with invalid signatures
@@ -274,6 +274,10 @@ pub async fn verify_wallet_control(
     )
     .await
     .map_err(|_| {
+        tracing::warn!(
+            timeout_secs = WALLET_VERIFICATION_TIMEOUT.as_secs(),
+            "NEP-413 wallet verification timed out"
+        );
         anyhow::anyhow!(NearAuthError::SignatureVerificationFailed(
             "wallet verification timed out".into()
         ))
@@ -314,7 +318,7 @@ mod tests {
                 "ca89aebc4b822cb0618aa785dca563acee228e2631cff9adb7ce44989c5e8874",
             ),
         ] {
-            let payload = SignMessageParams {
+            let mut payload = SignMessageParams {
                 message: "Hello NEAR!".into(),
                 nonce: STANDARD
                     .decode("KNV0cOpvJ50D5vfF9pqWom8wo2sliQ4W+Wa7uZ3Uk6Y=")
@@ -329,6 +333,10 @@ mod tests {
             let hash = nep413::serialize_message(&payload);
 
             assert_eq!(hex::encode(hash.as_bytes()), expected);
+
+            payload.state = Some("wallet-callback-state".into());
+
+            assert_eq!(nep413::serialize_message(&payload), hash);
         }
     }
 

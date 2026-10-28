@@ -52,7 +52,7 @@ aws-sdk-s3 = { version = "1.134", default-features = false, features = [
     "rt-tokio",
 ] }
 # NEAR wallet authentication
-near-kit = "0.18.3"
+near-kit = { version = "0.18.3", default-features = false, features = ["rpc"] }
 base64 = "0.22"
 # Ordered collections
 indexmap = "2"

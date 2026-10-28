@@ -170,8 +170,7 @@ usage. Every asset must be referenced. On Jev, references can appear inside long
 strings, and a Score `legend` preserves the original criterion reference. Inline
 `image_url` parts and assets may be mixed.
 
-Cloud API's request-body limit is 25 MiB, including base64. The endpoint accepts
-JSON; multipart uploads and asset `part` fields are unsupported.
+The endpoint accepts JSON with a 25 MiB request-body limit, including base64.
 
 A Box answer contains `type: "box"`, a `box` object with numeric `top`, `bottom`,
 `left`, and `right` edges, and optional `confidence`, matching OpenRouter's schema.

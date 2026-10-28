@@ -735,8 +735,13 @@ impl MockExpectationBuilder {
 
 type ResponsesHandler =
     Arc<dyn Fn(serde_json::Value) -> crate::responses_raw::ResponsesRawResponse + Send + Sync>;
+type PrivacyClassifyHandler =
+    Arc<dyn Fn(bytes::Bytes) -> Result<bytes::Bytes, PrivacyClassifyError> + Send + Sync>;
 type SystemOneHandler = Arc<
-    dyn Fn(crate::SystemOneRequest) -> Result<crate::SystemOneResponseWithBytes, CompletionError>
+    dyn Fn(
+            crate::SystemOneRequest,
+            Option<&str>,
+        ) -> Result<crate::SystemOneResponseWithBytes, CompletionError>
         + Send
         + Sync,
 >;
@@ -745,6 +750,7 @@ type SystemOneHandler = Arc<
 pub struct MockProvider {
     responses_handler: Option<ResponsesHandler>,
     systemone_handler: Option<SystemOneHandler>,
+    privacy_classify_handler: Option<PrivacyClassifyHandler>,
     /// List of available mock models
     models: Vec<ModelInfo>,
     /// Map of chat_id to (request_hash, response_hash) for signature generation
@@ -797,10 +803,23 @@ impl MockProvider {
         self
     }
 
+    /// Inspect native Privacy requests and return exact response bytes in tests.
+    pub fn with_privacy_classify_handler(
+        mut self,
+        handler: impl Fn(bytes::Bytes) -> Result<bytes::Bytes, PrivacyClassifyError>
+            + Send
+            + Sync
+            + 'static,
+    ) -> Self {
+        self.privacy_classify_handler = Some(Arc::new(handler));
+        self
+    }
+
     pub fn with_systemone_handler(
         mut self,
         handler: impl Fn(
                 crate::SystemOneRequest,
+                Option<&str>,
             ) -> Result<crate::SystemOneResponseWithBytes, CompletionError>
             + Send
             + Sync
@@ -860,6 +879,7 @@ impl MockProvider {
             attestation_signing_algos: Arc::new(std::sync::Mutex::new(Vec::new())),
             responses_handler: None,
             systemone_handler: None,
+            privacy_classify_handler: None,
         }
     }
 
@@ -893,6 +913,7 @@ impl MockProvider {
             attestation_signing_algos: Arc::new(std::sync::Mutex::new(Vec::new())),
             responses_handler: None,
             systemone_handler: None,
+            privacy_classify_handler: None,
         }
     }
 
@@ -924,6 +945,7 @@ impl MockProvider {
             attestation_signing_algos: Arc::new(std::sync::Mutex::new(Vec::new())),
             responses_handler: None,
             systemone_handler: None,
+            privacy_classify_handler: None,
         }
     }
 
@@ -1193,12 +1215,13 @@ impl crate::InferenceProvider for MockProvider {
         &self,
         request: crate::SystemOneRequest,
         request_hash: String,
+        model_pub_key: Option<&str>,
     ) -> Result<crate::SystemOneResponseWithBytes, CompletionError> {
         let handler = self
             .systemone_handler
             .as_ref()
             .ok_or_else(|| CompletionError::CompletionError("No System One fixture".into()))?;
-        let response = handler(request)?;
+        let response = handler(request, model_pub_key)?;
         if let Some(id) = &response.response.id {
             self.register_signature_hashes(
                 id.clone(),
@@ -1697,6 +1720,9 @@ impl crate::InferenceProvider for MockProvider {
         body: bytes::Bytes,
         _extra: std::collections::HashMap<String, serde_json::Value>,
     ) -> Result<bytes::Bytes, PrivacyClassifyError> {
+        if let Some(handler) = &self.privacy_classify_handler {
+            return handler(body);
+        }
         if let Some(outcome) = self.config.lock().await.privacy_classify_override.clone() {
             return match outcome {
                 PrivacyClassifyOverride::Body(json) => serde_json::to_vec(&json)

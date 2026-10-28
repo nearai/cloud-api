@@ -8,6 +8,10 @@ This service runs in a Trusted Execution Environment, and customer trust depends
 
 Also: API keys and session tokens are SHA-256 hashed before storage, customer data is encrypted at rest and in transit, authentication flows use HTTPS/TLS, and secrets never go into the repository.
 
+## Database freeze
+
+**IMPORTANT: do not add or edit migrations, and do not change SQL, queries, or behavior of the code that moved to `nearai/cloud-platform`, without the matching cloud-platform PR or an owner exception.** cloud-platform now owns the schema; a change here alone silently diverges the two services until phase 2. The full rules and the frozen file list are in `.claude/rules/database.md`.
+
 ## Project overview
 
 NEAR AI Cloud API is a Rust multi-tenant AI inference platform running in a TEE:
@@ -92,7 +96,7 @@ A discovery server is polled (every 5 minutes by default). `GET /models` returns
 
 ### Database
 
-PostgreSQL 16 with deadpool pooling and Patroni (automatic leader discovery, read-replica balancing). Refinery SQL migrations in `crates/database/src/migrations/sql/` run on startup. Rules for schema changes: `.claude/rules/database.md`.
+PostgreSQL 16 with deadpool pooling and Patroni (automatic leader discovery, read-replica balancing). Refinery SQL migrations in `crates/database/src/migrations/sql/` run on startup. The schema is frozen here: `.claude/rules/database.md`.
 
 ### Configuration
 
@@ -115,7 +119,7 @@ Each rule has one home; other files point to it rather than restating it.
 | `.claude/rules/privacy-logging.md` | `crates/**/*.rs` | what may and may not be logged |
 | `.claude/rules/architecture.md` | `crates/**/*.rs` | layers, extending existing seams, errors, runtime config, file size |
 | `.claude/rules/rust-correctness.md` | `crates/**/*.rs` | panics, untrusted input, fail-closed, async, races, rolling deploys |
-| `.claude/rules/database.md` | `crates/database/**`, `ports.rs` | typed parsing vs migrations, migration mechanics, queries |
+| `.claude/rules/database.md` | `crates/database/**`, `ports.rs`, moved services and routes | database freeze, typed parsing vs migrations, migration mechanics, queries |
 | `.claude/rules/testing.md` | tests, `.config/nextest.toml` | tests that can fail, e2e isolation on a shared database |
 | `.claude/rules/ci-workflows.md` | `.github/**`, `scripts/**` | workflow trust boundaries, concurrency, required checks |
 | `REVIEW.md` | pull requests | severity, what to report and skip |

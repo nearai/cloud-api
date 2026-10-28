@@ -1481,6 +1481,7 @@ impl InferenceProvider for Fleet {
         &self,
         request: SystemOneRequest,
         request_hash: String,
+        model_pub_key: Option<&str>,
     ) -> Result<SystemOneResponseWithBytes, CompletionError> {
         let mut headers = self
             .build_headers()
@@ -1490,11 +1491,11 @@ impl InferenceProvider for Fleet {
             HeaderValue::from_str(&request_hash)
                 .map_err(|_| CompletionError::CompletionError("Invalid request hash".into()))?,
         );
-        let mut lease = self.acquire_systemone_index(&request_hash);
+        let mut lease = self.acquire_systemone_index(&request_hash, model_pub_key);
         let route_key = lease.as_ref().map(|lease| lease.route_key());
         let indices = match &lease {
             Some(lease) => std::iter::once(lease.index())
-                .chain(self.fallback_indices_for(lease.index(), None))
+                .chain(self.fallback_indices_for(lease.index(), model_pub_key))
                 .map(Some)
                 .collect::<Vec<_>>(),
             None => vec![None],
@@ -2777,8 +2778,11 @@ impl InferenceProvider for Provider {
         &self,
         request: SystemOneRequest,
         request_hash: String,
+        model_pub_key: Option<&str>,
     ) -> Result<SystemOneResponseWithBytes, CompletionError> {
-        self.fleet.systemone(request, request_hash).await
+        self.fleet
+            .systemone(request, request_hash, model_pub_key)
+            .await
     }
 
     /// NEAR AI's own attested TEE fleet — the primary tier for any model NEAR

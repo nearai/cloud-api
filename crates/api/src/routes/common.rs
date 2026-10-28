@@ -2,7 +2,11 @@ use crate::models::ErrorResponse;
 use axum::{http::HeaderMap, http::StatusCode, response::Json as ResponseJson};
 use services::completions::CompletionError;
 use services::organization::OrganizationError;
+use std::time::Duration;
 use uuid::Uuid;
+
+/// Bound gateway receipt storage before returning a response or SSE terminator.
+pub(super) const SIGNATURE_STORE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// HTTP 429 "Too Many Requests" — used here for the "all backends exhausted;
 /// please retry with exponential backoff" case. Surfaced when

@@ -162,7 +162,7 @@ async fn setup() -> Fixture {
 
     let provider = Arc::new(
         MockProvider::new_accept_all()
-            .with_systemone_handler(|request| {
+            .with_systemone_handler(|request, _| {
                 let raw = serde_json::to_vec(&json!({
                     "id": format!("decision-{}", Uuid::new_v4()),
                     "model": "decision-model",
@@ -1960,6 +1960,52 @@ async fn public_ita_token_route_treats_an_unlisted_model_as_unknown() {
         "{:?}",
         fake_ita.paths()
     );
+}
+
+/// The attestation report takes an optional API key. Without one no
+/// organization is known, so an unlisted model is unknown even when some
+/// organization holds a grant; that organization's key still gets the report.
+#[tokio::test]
+async fn anonymous_attestation_report_treats_an_unlisted_model_as_unknown() {
+    let fixture = setup().await;
+    let server = &fixture.server;
+    let org = organization(server).await;
+    grant(server, &fixture.text, &org.id).await;
+
+    let report = |model: &str, api_key: Option<&str>, strict: bool| {
+        let mut request = server.get(&format!(
+            "/v1/attestation/report?model={}&nonce={NONCE}",
+            urlencoding::encode(model)
+        ));
+        if let Some(api_key) = api_key {
+            request = request.add_header("Authorization", format!("Bearer {api_key}"));
+        }
+        if strict {
+            request = request.add_header("x-no-aliasing", "true");
+        }
+        request
+    };
+    for (name, strict) in [
+        (&fixture.text, false),
+        (&fixture.text_alias, false),
+        (&fixture.text_alias, true),
+    ] {
+        let unknown = unknown_twin(name);
+        let refused = report(name, None, strict).await;
+        assert_eq!(refused.status_code(), 400, "{}", refused.text());
+        assert!(
+            !refused.text().contains(&format!("'{}'", fixture.text)) || name == &fixture.text,
+            "the anonymous report named the canonical model: {}",
+            refused.text()
+        );
+        assert_eq!(
+            observe(&refused, name),
+            observe(&report(&unknown, None, strict).await, &unknown)
+        );
+    }
+
+    let granted = report(&fixture.text, Some(&org.api_key), false).await;
+    assert_eq!(granted.status_code(), 200, "{}", granted.text());
 }
 
 /// The public catalog detail route keeps answering 404 for an unlisted model.

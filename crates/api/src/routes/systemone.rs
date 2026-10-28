@@ -32,10 +32,14 @@ pub const HEADER_GENERATION_ID: &str = "x-generation-id";
     path = "/v1/systemone",
     tag = "Decisions",
     request_body = SystemOneRequest,
+    params(
+        ("x-model-pub-key" = Option<String>, Header, description = "Signing public key from the model attestation, used for plaintext routing")
+    ),
     responses(
         (status = 200, description = "Typed decisions. X-Generation-Id identifies the receipt at /v1/signature/{id}; Inference-Id identifies billing usage.", body = SystemOneResponse),
         (status = 400, description = "Invalid request or model modality", body = ErrorResponse),
         (status = 401, description = "Authentication required", body = ErrorResponse),
+        (status = 421, description = "Selected model signing key is unavailable", body = ErrorResponse),
         (status = 429, description = "Rate or concurrency limit", body = ErrorResponse),
         (status = 502, description = "Invalid provider response", body = ErrorResponse)
     ),
@@ -57,11 +61,9 @@ pub async fn systemone(
         Ok(value) => value,
         Err(response) => return response.into_response(),
     };
-    // Encrypted state/questions and key-pinned routing need a separate protocol
-    // contract. Never silently send an encrypted request to a plaintext fallback.
+    // A model public key selects the signer without enabling encryption.
     if encryption.signing_algo.is_some()
         || encryption.client_pub_key.is_some()
-        || encryption.model_pub_key.is_some()
         || encryption.encryption_version.is_some()
         || encryption.encrypt_all_fields.is_some()
     {
@@ -128,6 +130,7 @@ pub async fn systemone(
         .systemone_with_attribution(
             request,
             body_hash.hash.clone(),
+            encryption.model_pub_key.as_deref(),
             !api_key.organization.fallback_enabled(),
         )
         .await
@@ -244,6 +247,12 @@ fn error(status: StatusCode, message: &str) -> Response {
 }
 
 fn provider_error(err: CompletionError) -> Response {
+    if matches!(err, CompletionError::NoPubKeyProvider(_)) {
+        return error(
+            StatusCode::MISDIRECTED_REQUEST,
+            "The selected model signing key is unavailable. Refresh your attestation report and retry.",
+        );
+    }
     if matches!(
         err,
         CompletionError::HttpError {

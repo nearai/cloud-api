@@ -15,6 +15,17 @@ impl ModelWithPricing {
             .is_some_and(|modalities| modalities.iter().any(|value| value == modality))
     }
 
+    /// External model served through the Anthropic Messages backend.
+    pub fn is_anthropic_backend(&self) -> bool {
+        self.provider_type == "external"
+            && self
+                .provider_config
+                .as_ref()
+                .and_then(|config| config.get("backend"))
+                .and_then(serde_json::Value::as_str)
+                == Some("anthropic")
+    }
+
     /// Check an already resolved model; never perform another catalog lookup.
     /// Image/audio output alone does not imply a dedicated protocol, and legacy
     /// models with missing modality metadata retain their existing behavior.

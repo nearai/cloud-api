@@ -1552,7 +1552,13 @@ use near_kit::standards::nep413::SignMessageParams;
 use rand::RngExt;
 
 pub const NEAR_TEST_ACCOUNT: &str = "testuser.near";
-pub const NEAR_TEST_PUBLIC_KEY: &str = "ed25519:7FmyF5aYxwHKVvpBJxWrRi58EXQhG5KUkCb3Jv8TzWqM";
+
+fn near_test_public_key() -> String {
+    // Use a valid curve point so malformed-key rejection does not mask auth checks.
+    near_kit::signer::SecretKey::ed25519_from_bytes([7; 32])
+        .public_key()
+        .to_string()
+}
 
 fn generate_test_signature() -> String {
     use base64::prelude::*;
@@ -1596,7 +1602,7 @@ pub fn create_near_auth_request_json(
     serde_json::json!({
         "signed_message": {
             "accountId": account_id,
-            "publicKey": NEAR_TEST_PUBLIC_KEY,
+            "publicKey": near_test_public_key(),
             "signature": generate_test_signature(),
         },
         "payload": {

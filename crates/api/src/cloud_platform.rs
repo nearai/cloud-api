@@ -7,7 +7,6 @@
 
 use std::sync::Arc;
 
-use axum::body::{to_bytes, Body};
 use axum::extract::{Request, State};
 use axum::http::header::{AUTHORIZATION, CONTENT_TYPE};
 use axum::http::{HeaderMap, StatusCode};
@@ -24,8 +23,6 @@ use services::models::ModelsRepository;
 use crate::models::ErrorResponse;
 
 const AREA_TAG: &str = "area:check_api_key";
-/// Largest body the shadow comparison reads. A key check answer is a few hundred bytes.
-const SHADOW_BODY_LIMIT: usize = 64 * 1024;
 
 /// The key-check area as the gateway route needs it.
 #[derive(Clone)]
@@ -177,9 +174,11 @@ pub async fn check_api_key_from_cloud_platform(
     }
 }
 
-/// Shadow mode for the key check: the local route answers, and cloud-platform's
-/// verdict for the same key is compared with it. A difference is counted by field
-/// (`status`, or `body` for 200 and 402). A cloud-platform failure is not a difference.
+/// Shadow mode for the key check. The local route's response is returned
+/// unchanged and without waiting: cloud-platform's verdict for the same key
+/// is compared in a spawned task, and a status difference is counted. Bodies
+/// are not compared, since comparing them would mean buffering the response.
+/// A cloud-platform failure is not a difference.
 pub async fn shadow_check_api_key(
     State(route): State<CheckApiKeyRoute>,
     request: Request,
@@ -187,35 +186,26 @@ pub async fn shadow_check_api_key(
 ) -> Response {
     let bearer = bearer_token(request.headers()).ok().map(str::to_owned);
     let response = next.run(request).await;
-    let Some(bearer) = bearer else {
-        return response;
-    };
-    let Ok(verdict) = route.verdicts.check(&bearer).await else {
-        return response;
-    };
-    let (parts, body) = response.into_parts();
-    let bytes = match to_bytes(body, SHADOW_BODY_LIMIT).await {
-        Ok(bytes) => bytes,
-        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-    };
-    let field = if parts.status != verdict.status {
-        Some("status")
-    } else if matches!(parts.status, StatusCode::OK | StatusCode::PAYMENT_REQUIRED)
-        && bytes != verdict.body
-    {
-        Some("body")
-    } else {
-        None
-    };
-    if let (Some(field), Some(metrics)) = (field, &route.metrics) {
-        let field_tag = format!("field:{field}");
-        metrics.record_count(
-            database::cp_client::client::METRIC_CP_SHADOW_MISMATCH,
-            1,
-            &[AREA_TAG, &field_tag],
-        );
+    if let Some(bearer) = bearer {
+        let local_status = response.status();
+        let verdicts = route.verdicts.clone();
+        let metrics = route.metrics.clone();
+        tokio::spawn(async move {
+            let Ok(verdict) = verdicts.check(&bearer).await else {
+                return;
+            };
+            if verdict.status != local_status {
+                if let Some(metrics) = metrics {
+                    metrics.record_count(
+                        database::cp_client::client::METRIC_CP_SHADOW_MISMATCH,
+                        1,
+                        &[AREA_TAG, "field:status"],
+                    );
+                }
+            }
+        });
     }
-    axum::response::Response::from_parts(parts, Body::from(bytes))
+    response
 }
 
 #[cfg(test)]
@@ -441,17 +431,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shadow_serves_the_local_answer_and_counts_a_status_difference() {
+    async fn shadow_returns_the_local_answer_unchanged_without_waiting_for_cloud_platform() {
         let server = MockServer::start().await;
+        // cloud-platform is slow and disagrees with the local answer.
         Mock::given(any())
-            .respond_with(ResponseTemplate::new(402).set_body_string(r#"{"error":{}}"#))
+            .respond_with(
+                ResponseTemplate::new(402)
+                    .set_body_string(r#"{"error":{}}"#)
+                    .set_delay(Duration::from_millis(1500)),
+            )
             .mount(&server)
             .await;
         let metrics = Arc::new(CapturingMetricsService::new());
         let route = CheckApiKeyRoute {
             mode: AreaMode::Shadow,
             verdicts: Arc::new(ApiKeyVerdicts::new(
-                cp_client(&server),
+                // A deadline longer than the slow answer, so the comparison completes.
+                Arc::new(
+                    CpClient::new(
+                        &server.uri(),
+                        Some("sk-service".to_string()),
+                        &CpClientConfig {
+                            read_timeout: Duration::from_secs(5),
+                            ..CpClientConfig::default()
+                        },
+                        None,
+                    )
+                    .unwrap(),
+                ),
                 Duration::from_secs(60),
             )),
             metrics: Some(metrics.clone() as Arc<dyn MetricsServiceTrait>),
@@ -459,16 +466,28 @@ mod tests {
         let router = Router::new()
             .route("/check_api_key", post(|| async { (StatusCode::OK, VALID) }))
             .layer(from_fn_with_state(route, shadow_check_api_key));
+        let started = std::time::Instant::now();
         let (status, body) = call(router, Some("sk-shadow")).await;
+        assert!(started.elapsed() < Duration::from_millis(1000));
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body, VALID.as_bytes());
-        let fields: Vec<String> = metrics
-            .get_metrics()
-            .into_iter()
-            .filter(|metric| metric.name == database::cp_client::client::METRIC_CP_SHADOW_MISMATCH)
-            .flat_map(|metric| metric.tags)
-            .filter(|tag| tag.starts_with("field:"))
-            .collect();
+        // The comparison lands later, in the background.
+        let mut fields = Vec::new();
+        for _ in 0..50 {
+            fields = metrics
+                .get_metrics()
+                .into_iter()
+                .filter(|metric| {
+                    metric.name == database::cp_client::client::METRIC_CP_SHADOW_MISMATCH
+                })
+                .flat_map(|metric| metric.tags)
+                .filter(|tag| tag.starts_with("field:"))
+                .collect();
+            if !fields.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
         assert_eq!(fields, ["field:status"]);
     }
 }

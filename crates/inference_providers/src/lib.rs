@@ -417,8 +417,8 @@ pub struct DiscoveryPush {
     pub count: usize,
     pub keys: std::collections::HashMap<String, Vec<usize>>,
     pub hosts: BackendHosts,
-    /// The cycle covered every healthy backend. A cycle that did not, and
-    /// saw no replica-report key, keeps the provider's last key registry.
+    /// The cycle covered every healthy backend. A partial cycle at the same
+    /// count keeps a non-empty prior key map; a complete cycle replaces it.
     pub complete: bool,
 }
 

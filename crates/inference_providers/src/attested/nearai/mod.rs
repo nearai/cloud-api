@@ -1061,6 +1061,15 @@ impl Fleet {
         status_code == 408 || status_code == 429 || (500..=599).contains(&status_code)
     }
 
+    fn is_decryption_message(error: &CompletionError) -> bool {
+        matches!(error, CompletionError::HttpError { status_code: 400, message, .. }
+            if message.trim().eq_ignore_ascii_case("Decryption failed"))
+    }
+
+    fn is_decryption_failure(&self, error: &CompletionError, pinned_pub_key: Option<&str>) -> bool {
+        pinned_pub_key.is_some() && self.is_multi_key() && Self::is_decryption_message(error)
+    }
+
     /// Walk the fallback indices (ordered fastest-EMA first) until one returns
     /// a 2xx (or every backend has been exhausted). Called by `chat_completion`
     /// after the sticky index's attempt returns 5xx/429. Each index uses its
@@ -1090,6 +1099,7 @@ impl Fleet {
         // 429 by call-site construction) instead of returning a misleading
         // `CompletionError(...)` that would classify as
         // `retryable_connection_keyword`.
+        let retry_decryption = Self::is_decryption_message(&canonical_err);
         let mut last_error = canonical_err;
         for &index in indices {
             let url = match self.rotation_url(index as u64, "/v1/chat/completions") {
@@ -1143,7 +1153,9 @@ impl Fleet {
                     message: crate::extract_error_message(&error_text),
                     is_external: false,
                 };
-                if Fleet::is_rotation_retryable_status(status_code) {
+                if Fleet::is_rotation_retryable_status(status_code)
+                    || (retry_decryption && Self::is_decryption_message(&err))
+                {
                     tracing::debug!(
                         index,
                         status_code,
@@ -1219,6 +1231,7 @@ impl Fleet {
         // if the fallback produces only transport errors, we fall back to
         // `canonical_err` (always HttpError 5xx/429 by call-site
         // construction).
+        let retry_decryption = Self::is_decryption_message(&canonical_err);
         let mut last_error = canonical_err;
         for &index in indices {
             let url = match self.rotation_url(index as u64, "/v1/chat/completions") {
@@ -1249,7 +1262,8 @@ impl Fleet {
                     // it the same way, so surface immediately rather than
                     // burn the remaining indices on a doomed request.
                     CompletionError::HttpError { status_code, .. }
-                        if !Fleet::is_rotation_retryable_status(*status_code) =>
+                        if !(Fleet::is_rotation_retryable_status(*status_code)
+                            || retry_decryption && Self::is_decryption_message(&e)) =>
                     {
                         return Err(e);
                     }
@@ -1493,7 +1507,7 @@ impl InferenceProvider for Fleet {
         );
         let mut lease = self.acquire_systemone_index(&request_hash, model_pub_key);
         let route_key = lease.as_ref().map(|lease| lease.route_key());
-        let indices = match &lease {
+        let mut indices = match &lease {
             Some(lease) => std::iter::once(lease.index())
                 .chain(self.fallback_indices_for(lease.index(), model_pub_key))
                 .map(Some)
@@ -1502,7 +1516,13 @@ impl InferenceProvider for Fleet {
         };
         let timeout_seconds = self.config.completion_timeout_seconds.max(1) as u64;
         let mut last_error = None;
-        for index in indices {
+        let mut attempted = std::collections::HashSet::new();
+        let mut next = 0;
+        while let Some(index) = indices.get(next).copied() {
+            next += 1;
+            if let Some(index) = index {
+                attempted.insert(index);
+            }
             let _lease = lease.take().or_else(|| {
                 index
                     .zip(route_key)
@@ -1544,15 +1564,36 @@ impl InferenceProvider for Fleet {
                 Err(error) => {
                     // Never replay a successful but malformed response or an
                     // ambiguous read timeout. Those may already have incurred cost.
+                    let retry_decryption =
+                        index.is_some() && self.is_decryption_failure(&error, model_pub_key);
                     let retryable = match &error {
                         CompletionError::HttpError { status_code, .. } => {
-                            Self::is_rotation_retryable_status(*status_code)
+                            Self::is_rotation_retryable_status(*status_code) || retry_decryption
                         }
                         CompletionError::CompletionError(_) => true,
                         _ => false,
                     };
                     if !retryable {
                         return Err(error);
+                    }
+                    if retry_decryption {
+                        if let Some(tried) = index {
+                            let candidates: Vec<_> = self
+                                .decryption_fallback_indices(tried, model_pub_key)
+                                .into_iter()
+                                .filter(|candidate| !attempted.contains(candidate))
+                                .collect();
+                            if !candidates.is_empty() {
+                                self.warn_decryption_failover(
+                                    &request.model,
+                                    tried,
+                                    candidates.len(),
+                                    model_pub_key.unwrap_or_default(),
+                                );
+                            }
+                            indices.truncate(next);
+                            indices.extend(candidates.into_iter().map(Some));
+                        }
                     }
                     if let Some(index) = index {
                         if matches!(error, CompletionError::CompletionError(_)) {
@@ -1828,49 +1869,77 @@ impl InferenceProvider for Fleet {
             include_tls_fingerprint: include_tls_fingerprint.then_some(true),
         };
 
-        // Build URL with optional query parameters
-        let url = format!(
-            "{}/v1/attestation/report?{}",
-            self.config.base_url,
-            serde_urlencoded::to_string(&query).map_err(|_| AttestationError::Unknown(
-                "Failed to serialize query string".to_string()
-            ))?
-        );
-
+        let query_string = serde_urlencoded::to_string(&query).map_err(|_| {
+            AttestationError::Unknown("Failed to serialize query string".to_string())
+        })?;
         let headers = self.build_headers().map_err(AttestationError::FetchError)?;
-
-        let response = self
-            .client
-            .get(&url)
-            .headers(headers)
-            .timeout(self.config.control_timeout())
-            .send()
-            .await
-            .map_err(|e| AttestationError::FetchError(e.to_string()))?;
-
-        // Handle 404 responses (expected when signing_address doesn't match)
-        if response.status() == 404 {
-            return Err(AttestationError::SigningAddressNotFound(
-                query.signing_address.unwrap_or_default().to_string(),
-            ));
-        }
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let error_text = response
-                .text()
+        let rotation_count = if query.signing_address.is_some() {
+            self.rotation_count()
+        } else {
+            0
+        };
+        let attempts = rotation_count.max(1);
+        let mut last_error = None;
+        for index in 0..attempts {
+            let (client, base_url) = if rotation_count == 0 {
+                (
+                    self.client.clone(),
+                    format!("{}/v1/attestation/report", self.config.base_url),
+                )
+            } else {
+                let client = match self.get_or_verify_index_client(index).await {
+                    Ok(client) => client,
+                    Err(error) => {
+                        last_error = Some(AttestationError::FetchError(error.to_string()));
+                        continue;
+                    }
+                };
+                let Some(url) = self.rotation_url(index as u64, "/v1/attestation/report") else {
+                    last_error = Some(AttestationError::FetchError(
+                        "Failed to build rotation URL".to_string(),
+                    ));
+                    continue;
+                };
+                (client, url)
+            };
+            let url = format!("{base_url}?{query_string}");
+            let response = match client
+                .get(&url)
+                .headers(headers.clone())
+                .timeout(self.config.control_timeout())
+                .send()
                 .await
-                .unwrap_or_else(|e| format!("Failed to read error response body: {e}"));
-            return Err(AttestationError::FetchError(format!(
-                "HTTP {status}: {error_text}",
-            )));
+            {
+                Ok(response) => response,
+                Err(error) => {
+                    last_error = Some(AttestationError::FetchError(error.to_string()));
+                    continue;
+                }
+            };
+            if response.status() == 404 {
+                continue;
+            }
+            if !response.status().is_success() {
+                let status = response.status();
+                let error_text = response
+                    .text()
+                    .await
+                    .unwrap_or_else(|error| format!("Failed to read error response body: {error}"));
+                last_error = Some(AttestationError::FetchError(format!(
+                    "HTTP {status}: {error_text}"
+                )));
+                continue;
+            }
+            match response.json().await {
+                Ok(report) => return Ok(report),
+                Err(error) => {
+                    last_error = Some(AttestationError::InvalidResponse(error.to_string()));
+                }
+            }
         }
-
-        let attestation_report = response
-            .json()
-            .await
-            .map_err(|e| AttestationError::InvalidResponse(e.to_string()))?;
-        Ok(attestation_report)
+        Err(last_error.unwrap_or_else(|| {
+            AttestationError::SigningAddressNotFound(query.signing_address.unwrap_or_default())
+        }))
     }
 
     /// Lists all available models from the vLLM server
@@ -2100,23 +2169,38 @@ impl InferenceProvider for Fleet {
                     }
                 }
             }
-            Err(canonical_err) => match &canonical_err {
-                CompletionError::HttpError { status_code, .. }
-                    if Fleet::is_rotation_retryable_status(*status_code) =>
-                {
-                    drop(route_lease);
-                    self.try_stream_fallback_indices(
-                        &self.fallback_indices_for(index, pinned_pub_key.as_deref()),
-                        route_key,
-                        &streaming_params,
-                        &headers,
-                        &request_hash,
-                        canonical_err,
-                    )
-                    .await
+            Err(canonical_err) => {
+                let retry_decryption =
+                    self.is_decryption_failure(&canonical_err, pinned_pub_key.as_deref());
+                let retry_status = matches!(&canonical_err, CompletionError::HttpError { status_code, .. }
+                    if Fleet::is_rotation_retryable_status(*status_code));
+                if !retry_decryption && !retry_status {
+                    return Err(canonical_err);
                 }
-                _ => Err(canonical_err),
-            },
+                let indices = if retry_decryption {
+                    self.decryption_fallback_indices(index, pinned_pub_key.as_deref())
+                } else {
+                    self.fallback_indices_for(index, pinned_pub_key.as_deref())
+                };
+                if retry_decryption && !indices.is_empty() {
+                    self.warn_decryption_failover(
+                        &streaming_params.model,
+                        index,
+                        indices.len(),
+                        pinned_pub_key.as_deref().unwrap_or_default(),
+                    );
+                }
+                drop(route_lease);
+                self.try_stream_fallback_indices(
+                    &indices,
+                    route_key,
+                    &streaming_params,
+                    &headers,
+                    &request_hash,
+                    canonical_err,
+                )
+                .await
+            }
         }
     }
 
@@ -2283,11 +2367,26 @@ impl InferenceProvider for Fleet {
             // EMA via their pooled, verified index clients. If one is healthy,
             // the request succeeds and we record the index for signature
             // retrieval.
-            if Fleet::is_rotation_retryable_status(status_code) {
+            let retry_decryption =
+                self.is_decryption_failure(&canonical_err, pinned_pub_key.as_deref());
+            if Fleet::is_rotation_retryable_status(status_code) || retry_decryption {
+                let indices = if retry_decryption {
+                    self.decryption_fallback_indices(index, pinned_pub_key.as_deref())
+                } else {
+                    self.fallback_indices_for(index, pinned_pub_key.as_deref())
+                };
+                if retry_decryption && !indices.is_empty() {
+                    self.warn_decryption_failover(
+                        &non_streaming_params.model,
+                        index,
+                        indices.len(),
+                        pinned_pub_key.as_deref().unwrap_or_default(),
+                    );
+                }
                 drop(route_lease);
                 return self
                     .try_chat_completion_fallback_indices(
-                        &self.fallback_indices_for(index, pinned_pub_key.as_deref()),
+                        &indices,
                         route_key,
                         &non_streaming_params,
                         &headers,
@@ -5566,6 +5665,263 @@ mod tests {
         assert_eq!(order, vec![2]);
         assert!(!order.contains(&1));
         assert!(!order.contains(&3));
+    }
+
+    #[test]
+    fn partial_discovery_keeps_key_map_until_complete_or_count_change() {
+        let provider = rotation_provider(2);
+        let initial = HashMap::from([
+            ("key-a".to_string(), vec![0]),
+            ("key-b".to_string(), vec![1]),
+        ]);
+        let push = |provider: &Provider, count, keys, complete| crate::DiscoveryPush {
+            generation: provider.fleet.current_count_generation(),
+            count,
+            keys,
+            hosts: crate::BackendHosts::default(),
+            complete,
+        };
+        assert!(provider
+            .fleet
+            .apply_discovery_push(push(&provider, 2, initial, true)));
+        assert!(provider.fleet.is_multi_key());
+        assert!(provider
+            .fleet
+            .apply_discovery_push(push(&provider, 2, HashMap::new(), false)));
+        assert!(
+            matches!(provider.fleet.key_group("key-b", 2), super::fleet::KeyGroup::Indices(v) if v == vec![1])
+        );
+        assert!(provider.fleet.is_multi_key());
+        let replacement = HashMap::from([("key-c".to_string(), vec![0])]);
+        assert!(provider
+            .fleet
+            .apply_discovery_push(push(&provider, 3, replacement, false)));
+        assert!(
+            matches!(provider.fleet.key_group("key-c", 3), super::fleet::KeyGroup::Indices(v) if v == vec![0])
+        );
+        assert!(provider.fleet.is_multi_key());
+        assert!(provider
+            .fleet
+            .apply_discovery_push(push(&provider, 3, HashMap::new(), true)));
+        assert!(matches!(
+            provider.fleet.key_group("key-c", 3),
+            super::fleet::KeyGroup::Unrestricted
+        ));
+        assert!(!provider.fleet.is_multi_key());
+    }
+
+    #[test]
+    fn decryption_fallback_prefers_pinned_group_and_excludes_tried_key() {
+        let provider = rotation_provider(5);
+        provider.fleet.set_backend_keys(HashMap::from([
+            ("key-a".to_string(), vec![0, 2]),
+            ("key-b".to_string(), vec![1, 3]),
+        ]));
+        for _ in 0..super::fleet::TTFT_WARMUP_SAMPLES {
+            provider.fleet.record_ttft(1, 100.0);
+            provider.fleet.record_ttft(2, 50.0);
+            provider.fleet.record_ttft(3, 200.0);
+        }
+        assert_eq!(
+            provider.fleet.decryption_fallback_indices(1, Some("KEY-A")),
+            vec![2, 0, 4]
+        );
+        provider.fleet.set_backend_keys(HashMap::new());
+        assert_eq!(
+            provider.fleet.decryption_fallback_indices(1, Some("key-a")),
+            vec![0, 2, 3, 4]
+        );
+    }
+
+    mod decryption_retry_tests {
+        use super::*;
+        use crate::InferenceProvider;
+        use futures_util::TryStreamExt;
+
+        async fn rotation_pair() -> (Provider, MockServer, MockServer) {
+            let wrong = MockServer::start().await;
+            let right = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/chat/completions"))
+                .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                    "error": {"message": "Decryption failed"}
+                })))
+                .mount(&wrong)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/v1/chat/completions"))
+                .respond_with(|request: &wiremock::Request| {
+                    let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                    if body["stream"] == true {
+                        ResponseTemplate::new(200).set_body_raw(
+                            "data: {\"id\":\"from-second\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"test\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+                            "text/event-stream",
+                        )
+                    } else {
+                        ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                            "id": "from-second", "object": "chat.completion", "created": 0,
+                            "model": "test", "choices": [{"index": 0, "message": {
+                                "role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+                            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+                        }))
+                    }
+                })
+                .mount(&right)
+                .await;
+            let provider = Provider::new(Config {
+                base_url: "http://glm.mock.test".to_string(),
+                api_key: None,
+                completion_timeout_seconds: 5,
+                control_timeout_seconds: 5,
+            });
+            provider.set_backend_count(2);
+            *provider.fleet.index_clients[0].lock().unwrap() = Some(
+                reqwest::Client::builder()
+                    .no_proxy()
+                    .resolve("glm-i0.mock.test", *wrong.address())
+                    .build()
+                    .unwrap(),
+            );
+            *provider.fleet.index_clients[1].lock().unwrap() = Some(
+                reqwest::Client::builder()
+                    .no_proxy()
+                    .resolve("glm-i1.mock.test", *right.address())
+                    .build()
+                    .unwrap(),
+            );
+            (provider, wrong, right)
+        }
+
+        fn params(pinned: bool) -> ChatCompletionParams {
+            let mut params: ChatCompletionParams = serde_json::from_value(serde_json::json!({
+                "model": "test", "messages": []
+            }))
+            .unwrap();
+            if pinned {
+                params
+                    .extra
+                    .insert("x_model_pub_key".to_string(), serde_json::json!("key-a"));
+            }
+            params
+        }
+
+        fn multi_key(provider: &Provider) {
+            assert!(provider.fleet.apply_discovery_push(crate::DiscoveryPush {
+                generation: provider.fleet.current_count_generation(),
+                count: 2,
+                keys: HashMap::from([
+                    ("key-a".to_string(), vec![0]),
+                    ("key-b".to_string(), vec![1]),
+                ]),
+                hosts: crate::BackendHosts::default(),
+                complete: true,
+            }));
+        }
+
+        #[tokio::test]
+        async fn pinned_multikey_nonstream_decryption_retries_second_index() {
+            let (provider, wrong, right) = rotation_pair().await;
+            multi_key(&provider);
+            let response = provider
+                .chat_completion(params(true), "hash-1".into())
+                .await
+                .unwrap();
+            assert_eq!(response.response.id, "from-second");
+            assert_eq!(wrong.received_requests().await.unwrap().len(), 1);
+            assert_eq!(right.received_requests().await.unwrap().len(), 1);
+        }
+
+        #[tokio::test]
+        async fn pinned_multikey_stream_decryption_retries_second_index() {
+            let (provider, wrong, right) = rotation_pair().await;
+            multi_key(&provider);
+            let stream = provider
+                .chat_completion_stream(params(true), "hash-2".into())
+                .await
+                .unwrap();
+            let events: Vec<_> = stream.try_collect().await.unwrap();
+            assert!(!events.is_empty());
+            assert_eq!(wrong.received_requests().await.unwrap().len(), 1);
+            assert_eq!(right.received_requests().await.unwrap().len(), 1);
+        }
+
+        #[tokio::test]
+        async fn homogeneous_or_unpinned_decryption_does_not_retry() {
+            for multikey in [false, true] {
+                let (provider, wrong, right) = rotation_pair().await;
+                if multikey {
+                    multi_key(&provider);
+                }
+                let result = provider
+                    .chat_completion(params(!multikey), "hash-3".into())
+                    .await;
+                assert!(matches!(
+                    result,
+                    Err(CompletionError::HttpError {
+                        status_code: 400,
+                        ..
+                    })
+                ));
+                assert_eq!(wrong.received_requests().await.unwrap().len(), 1);
+                assert!(right.received_requests().await.unwrap().is_empty());
+            }
+        }
+
+        #[tokio::test]
+        async fn attestation_signing_address_scans_rotation_indices() {
+            let (provider, first, second) = rotation_pair().await;
+            Mock::given(method("GET"))
+                .and(path("/v1/attestation/report"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "report": "from-second"
+                })))
+                .mount(&second)
+                .await;
+            let report = provider
+                .get_attestation_report("test".into(), None, None, Some("address-a".into()), false)
+                .await
+                .unwrap();
+            assert_eq!(report["report"], "from-second");
+            assert_eq!(first.received_requests().await.unwrap().len(), 1);
+            assert_eq!(second.received_requests().await.unwrap().len(), 1);
+        }
+
+        #[tokio::test]
+        async fn attestation_signing_address_all_404_is_not_found() {
+            let (provider, first, second) = rotation_pair().await;
+            let result = provider
+                .get_attestation_report("test".into(), None, None, Some("address-a".into()), false)
+                .await;
+            assert!(
+                matches!(result, Err(AttestationError::SigningAddressNotFound(addr)) if addr == "address-a")
+            );
+            assert_eq!(first.received_requests().await.unwrap().len(), 1);
+            assert_eq!(second.received_requests().await.unwrap().len(), 1);
+        }
+
+        #[tokio::test]
+        async fn attestation_without_address_uses_one_canonical_get() {
+            let canonical = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/v1/attestation/report"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "report": "canonical"
+                })))
+                .mount(&canonical)
+                .await;
+            let provider = Provider::new(Config {
+                base_url: canonical.uri(),
+                api_key: None,
+                completion_timeout_seconds: 5,
+                control_timeout_seconds: 5,
+            });
+            let report = provider
+                .get_attestation_report("test".into(), None, None, None, false)
+                .await
+                .unwrap();
+            assert_eq!(report["report"], "canonical");
+            assert_eq!(canonical.received_requests().await.unwrap().len(), 1);
+        }
     }
 
     #[test]

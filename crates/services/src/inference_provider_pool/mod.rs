@@ -455,6 +455,9 @@ struct DiscoveryOutcome {
     /// — see `failure_reasons` for the category. `discover_model` returns
     /// without issuing any rotation calls in that case.
     backend_count: usize,
+    /// A transient count fetch failed, so this cycle must not push any state.
+    /// An authoritative count of zero leaves this false.
+    count_unknown: bool,
     /// Number of discovery HTTP calls that returned a response.
     successful_calls: usize,
     /// Number of discovery HTTP calls that failed (timeout, transport error, 4xx/5xx).
@@ -544,6 +547,25 @@ where
 }
 
 impl DiscoveryOutcome {
+    fn push_to_provider(
+        &self,
+        provider: &(dyn InferenceProvider + Send + Sync),
+        generation: u64,
+    ) -> Option<bool> {
+        if self.count_unknown {
+            return None;
+        }
+        Some(
+            provider.apply_discovery(inference_providers::DiscoveryPush {
+                generation,
+                count: self.backend_count,
+                keys: self.key_index_map(),
+                hosts: self.backend_hosts(),
+                complete: self.replaced_state,
+            }),
+        )
+    }
+
     /// All distinct pubkeys observed this cycle, preserving probe order.
     fn distinct_pubkeys(&self) -> Vec<String> {
         let mut seen = HashSet::new();
@@ -2183,6 +2205,7 @@ impl InferenceProviderPool {
             .pinned_count();
         DiscoveryOutcome {
             backend_count,
+            count_unknown: false,
             successful_calls: 0,
             failed_calls: 0,
             new_fingerprints: 0,
@@ -2192,6 +2215,31 @@ impl InferenceProviderPool {
             failure_reasons,
             verify_failures: 0,
             replaced_state: false,
+        }
+    }
+
+    fn count_fetch_result(
+        result: rotation::CountFetch,
+        fingerprint_state: &Arc<std::sync::RwLock<FingerprintState>>,
+        failure_reasons: &mut Vec<String>,
+    ) -> Result<usize, Box<DiscoveryOutcome>> {
+        match result {
+            rotation::CountFetch::Ok(0) => {
+                failure_reasons.push("count_zero: proxy reports 0 healthy backends".to_string());
+                Err(Box::new(Self::empty_outcome(
+                    fingerprint_state,
+                    0,
+                    std::mem::take(failure_reasons),
+                )))
+            }
+            rotation::CountFetch::Ok(count) => Ok(count),
+            rotation::CountFetch::Err(reason) => {
+                failure_reasons.push(reason);
+                let mut outcome =
+                    Self::empty_outcome(fingerprint_state, 0, std::mem::take(failure_reasons));
+                outcome.count_unknown = true;
+                Err(Box::new(outcome))
+            }
         }
     }
 
@@ -2385,25 +2433,14 @@ impl InferenceProviderPool {
                 return Self::empty_outcome(&fingerprint_state, 0, failure_reasons);
             }
         };
-        let backend_count =
-            match rotation::fetch_backend_count(&count_client, &parts, COUNT_TIMEOUT).await {
-                rotation::CountFetch::Ok(0) => {
-                    // Authoritatively no healthy backends right now. Don't issue
-                    // calls; don't replace the pin set (transient registry hiccup
-                    // shouldn't evict verified state). Provider-level fail-closed
-                    // paths handle the no-backend case at request time. Record
-                    // `count_zero` so DD can distinguish this from a count-fetch
-                    // failure (which would carry a `count_*:` reason instead).
-                    failure_reasons
-                        .push("count_zero: proxy reports 0 healthy backends".to_string());
-                    return Self::empty_outcome(&fingerprint_state, 0, failure_reasons);
-                }
-                rotation::CountFetch::Ok(n) => n,
-                rotation::CountFetch::Err(reason) => {
-                    failure_reasons.push(reason);
-                    return Self::empty_outcome(&fingerprint_state, 0, failure_reasons);
-                }
-            };
+        let backend_count = match Self::count_fetch_result(
+            rotation::fetch_backend_count(&count_client, &parts, COUNT_TIMEOUT).await,
+            &fingerprint_state,
+            &mut failure_reasons,
+        ) {
+            Ok(count) => count,
+            Err(outcome) => return *outcome,
+        };
 
         // Defense-in-depth: cap the fan-out. A bogus registry reading (race
         // during a deploy, partial split) could otherwise spawn an unbounded
@@ -2701,6 +2738,7 @@ impl InferenceProviderPool {
 
         DiscoveryOutcome {
             backend_count,
+            count_unknown: false,
             successful_calls,
             failed_calls,
             new_fingerprints,
@@ -6011,19 +6049,17 @@ impl InferenceProviderPool {
                 // Applied as one versioned push: a count the fast poll stored
                 // after this cycle began is newer, so the push is discarded
                 // (the poll keeps the model pending for rediscovery).
-                let applied = provider.apply_discovery(inference_providers::DiscoveryPush {
-                    generation,
-                    count: outcome.backend_count,
-                    keys: outcome.key_index_map(),
-                    hosts: outcome.backend_hosts(),
-                    complete: outcome.replaced_state,
-                });
-                if !applied {
-                    info!(
+                match outcome.push_to_provider(provider.as_ref(), generation) {
+                    None => info!(
+                        model = %model_name,
+                        "Discovery push skipped because backend count is unknown"
+                    ),
+                    Some(false) => info!(
                         model = %model_name,
                         backend_count = outcome.backend_count,
                         "Discovery push older than a polled backend count; discarded"
-                    );
+                    ),
+                    Some(true) => {}
                 }
 
                 let ptr = Arc::as_ptr(&provider) as *const () as usize;
@@ -6992,6 +7028,7 @@ mod tests {
     ) -> DiscoveryOutcome {
         DiscoveryOutcome {
             backend_count,
+            count_unknown: false,
             successful_calls: backend_probes.len(),
             failed_calls: 0,
             new_fingerprints: 0,
@@ -7002,6 +7039,43 @@ mod tests {
             verify_failures: 0,
             replaced_state: false,
         }
+    }
+
+    #[test]
+    fn count_unknown_skips_push_but_count_zero_is_authoritative() {
+        let provider = nearai::Provider::new(nearai::Config::new(
+            "https://glm.completions.near.ai".to_string(),
+            None,
+            None,
+        ));
+        provider.set_backend_count(2);
+        let generation = provider.count_generation();
+        let state = Arc::new(std::sync::RwLock::new(FingerprintState::Bootstrap));
+        let outcome = InferenceProviderPool::count_fetch_result(
+            rotation::CountFetch::Err("count_connect: unavailable".to_string()),
+            &state,
+            &mut vec![],
+        )
+        .unwrap_err();
+        assert!(outcome.count_unknown);
+        assert_eq!(
+            outcome.push_to_provider(&provider, provider.count_generation()),
+            None
+        );
+        assert_eq!(provider.count_generation(), generation);
+
+        let outcome = InferenceProviderPool::count_fetch_result(
+            rotation::CountFetch::Ok(0),
+            &state,
+            &mut vec![],
+        )
+        .unwrap_err();
+        assert!(!outcome.count_unknown);
+        assert_eq!(
+            outcome.push_to_provider(&provider, provider.count_generation()),
+            Some(true)
+        );
+        assert_eq!(provider.count_generation(), generation + 1);
     }
 
     #[test]

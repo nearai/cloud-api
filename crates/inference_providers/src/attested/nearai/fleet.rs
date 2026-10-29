@@ -32,7 +32,7 @@ use reqwest::Client;
 use sha2::{Digest, Sha256};
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::Semaphore;
@@ -274,10 +274,14 @@ pub(super) struct Fleet {
     /// Live request counts by routing key and backend index. Entries exist only
     /// while a request is in flight and contain no prompt or response content.
     prefix_loads: Arc<Mutex<PrefixLoads>>,
-    /// Pubkey (lowercase hex) to rotation indices that can serve it, from the
-    /// last discovery cycle. Empty means no restriction. A backend-count
-    /// change clears this because the index-to-backend binding is then stale.
+    /// Pubkey (lowercase hex) to rotation indices that can serve it. A partial
+    /// cycle at the same count keeps a non-empty prior map; a complete cycle
+    /// replaces it. A count change clears stale index bindings before adopting
+    /// the new map. Empty means no restriction.
     backend_keys: Arc<RwLock<HashMap<String, Vec<usize>>>>,
+    /// Whether discovery last proved multiple keys. Partial cycles cannot
+    /// clear this signal; only complete homogeneous coverage can.
+    multi_key: AtomicBool,
     /// Verified host map from the last discovery cycle (host_id -> backend
     /// index, plus attested keys); empty until the first cycle. Rebuilt
     /// wholesale each cycle. The placement hook maps a placed host to its
@@ -296,6 +300,7 @@ pub(super) struct Fleet {
     /// Epoch-ms of the last `UnknownKey` warning, so a client stuck on a stale
     /// attestation cannot flood the log from the request hot path.
     last_unknown_key_warn_ms: AtomicU64,
+    last_decryption_warn_ms: AtomicU64,
     /// Provider config (base_url, api_key, timeouts).
     pub(super) config: Config,
     /// General-purpose client for non-completion requests (attestation, models).
@@ -342,10 +347,12 @@ impl Fleet {
             ])),
             prefix_loads: Arc::new(Mutex::new(HashMap::new())),
             backend_keys: Arc::new(RwLock::new(HashMap::new())),
+            multi_key: AtomicBool::new(false),
             backend_hosts: Arc::new(ArcSwap::from_pointee(BackendHosts::default())),
             placement: ArcSwapOption::empty(),
             placement_ledger: Mutex::new(HashMap::new()),
             last_unknown_key_warn_ms: AtomicU64::new(0),
+            last_decryption_warn_ms: AtomicU64::new(0),
             config,
             client,
             fallback_client,
@@ -642,6 +649,49 @@ impl Fleet {
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
         idxs
+    }
+
+    /// After a decryption 400, try other key groups before returning the error.
+    /// The failed index's known key group cannot decrypt the same ciphertext.
+    pub(super) fn decryption_fallback_indices(
+        &self,
+        tried: usize,
+        pinned_pub_key: Option<&str>,
+    ) -> Vec<usize> {
+        let count = self.rotation_count();
+        let keys = self.backend_keys.read().unwrap_or_else(|e| e.into_inner());
+        let same_key: HashSet<usize> = keys
+            .values()
+            .filter(|indices| indices.contains(&tried))
+            .flat_map(|indices| indices.iter().copied())
+            .collect();
+        let preferred = pinned_pub_key
+            .map(str::to_lowercase)
+            .and_then(|key| keys.get(&key));
+        let mut idxs: Vec<usize> = (0..count)
+            .filter(|index| *index != tried && !same_key.contains(index))
+            .collect();
+        let stats = lock(&self.backend_stats);
+        idxs.sort_by(|&a, &b| {
+            let rank = |index: usize| {
+                let stat = stats[index];
+                (
+                    !preferred.is_some_and(|indices| indices.contains(&index)),
+                    stat.samples < TTFT_WARMUP_SAMPLES || stat.ttft_ewma_ms <= 0.0,
+                )
+            };
+            rank(a).cmp(&rank(b)).then_with(|| {
+                stats[a]
+                    .ttft_ewma_ms
+                    .partial_cmp(&stats[b].ttft_ewma_ms)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+        });
+        idxs
+    }
+
+    pub(super) fn is_multi_key(&self) -> bool {
+        self.multi_key.load(Ordering::Relaxed)
     }
 
     /// Number of rotation-SNI indices to fan out across, clamped to the
@@ -1066,18 +1116,32 @@ impl Fleet {
         *lock(&self.count_generation)
     }
 
-    /// See `InferenceProvider::apply_discovery`. A cycle that was not
-    /// complete and saw no replica-report key keeps the last non-empty key
-    /// registry, so a publishing model does not go silent over a discovery
-    /// hiccup; a complete cycle that saw none clears it.
+    /// See `InferenceProvider::apply_discovery`. A partial cycle at the same
+    /// count keeps a non-empty key map; a complete cycle replaces it, including
+    /// an empty map that proves the fleet is homogeneous again. A count change
+    /// invalidates old index bindings and adopts the new cycle's map.
     pub(super) fn apply_discovery_push(&self, push: crate::DiscoveryPush) -> bool {
         let mut generation = lock(&self.count_generation);
         if push.generation != *generation {
             return false;
         }
         *generation += 1;
+        let count_changed = self.backend_count() != push.count;
         self.store_backend_count(push.count);
-        self.set_backend_keys(push.keys);
+        let saw_multiple_keys = !push.keys.is_empty();
+        let has_keys = !self
+            .backend_keys
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty();
+        if push.complete || count_changed || !has_keys {
+            self.set_backend_keys(push.keys);
+        }
+        if saw_multiple_keys {
+            self.multi_key.store(true, Ordering::Relaxed);
+        } else if push.complete {
+            self.multi_key.store(false, Ordering::Relaxed);
+        }
         let mut hosts = push.hosts;
         if hosts.keys.by_host.is_empty() && !push.complete {
             hosts.keys = self.backend_hosts.load().keys.clone();
@@ -1143,23 +1207,42 @@ impl Fleet {
     }
 
     pub(super) fn should_warn_unknown_key(&self, now_ms: u64) -> bool {
-        let mut last_warn_ms = self.last_unknown_key_warn_ms.load(Ordering::Relaxed);
+        Self::should_warn_at(&self.last_unknown_key_warn_ms, now_ms)
+    }
+
+    fn should_warn_at(last: &AtomicU64, now_ms: u64) -> bool {
+        let mut last_warn_ms = last.load(Ordering::Relaxed);
         loop {
             if last_warn_ms != 0
                 && now_ms.saturating_sub(last_warn_ms) < UNKNOWN_KEY_WARN_INTERVAL_MS
             {
                 return false;
             }
-            match self.last_unknown_key_warn_ms.compare_exchange(
-                last_warn_ms,
-                now_ms,
-                Ordering::AcqRel,
-                Ordering::Relaxed,
-            ) {
+            match last.compare_exchange(last_warn_ms, now_ms, Ordering::AcqRel, Ordering::Relaxed) {
                 Ok(_) => return true,
                 Err(observed) => last_warn_ms = observed,
             }
         }
+    }
+
+    pub(super) fn warn_decryption_failover(
+        &self,
+        model: &str,
+        tried_index: usize,
+        candidates: usize,
+        pinned_pub_key: &str,
+    ) {
+        if !Self::should_warn_at(&self.last_decryption_warn_ms, epoch_ms()) {
+            return;
+        }
+        let pub_key_prefix: String = pinned_pub_key.chars().take(16).collect();
+        tracing::warn!(
+            model,
+            tried_index,
+            candidates,
+            pub_key_prefix = %pub_key_prefix,
+            "Pinned request failed decryption; trying another backend key group"
+        );
     }
 
     fn resolve_key_group(&self, pinned_pub_key: Option<&str>, count: usize) -> KeyGroup {

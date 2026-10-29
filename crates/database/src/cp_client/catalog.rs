@@ -6,7 +6,8 @@
 //!   compared with it; each difference is counted by field.
 //! - `on`: cloud-platform answers. Model lists, lookups and names are cached
 //!   for `CP_CATALOG_CACHE_TTL_SECS`, and a failed reload serves the last good
-//!   copy. Model access is cached the same way, and a failed read denies.
+//!   copy. Model access is cached the same way; a failed read is an error,
+//!   which fails the request closed and is not cached.
 //!
 //! Model access is answered only for the end caller's own API key, so it
 //! needs the caller credential in scope ([`with_caller_credential`]). Without
@@ -423,15 +424,17 @@ impl ModelsRepository for CatalogModels {
                 }
                 Ok(local)
             }
+            // No answer is an error, not a denial: the request fails closed, and the
+            // models service does not cache a failed lookup, so the next request
+            // asks again instead of inheriting a transient "no access".
             AreaMode::On => match self.remote_access(organization_id, model_id).await {
                 Ok(has_access) => Ok(has_access),
-                // No answer means no grant is known: deny, and do not cache the failure.
                 Err(error) => {
                     tracing::warn!(
                         error_kind = error.kind(),
-                        "cloud-platform model access read failed; denying"
+                        "cloud-platform model access read failed"
                     );
-                    Ok(false)
+                    Err(anyhow::Error::from(error))
                 }
             },
         }
@@ -873,11 +876,11 @@ mod tests {
         let catalog = adapter(&server, AreaMode::On, vec![], Duration::from_secs(30), None);
         let org = Uuid::from_u128(9);
 
-        // No caller key in scope: deny without calling cloud-platform.
-        assert!(!catalog
+        // No caller key in scope: fail without calling cloud-platform.
+        assert!(catalog
             .organization_has_model_access(org, model_id())
             .await
-            .unwrap());
+            .is_err());
 
         let granted = with_caller_credential("sk-caller".to_string(), async {
             (
@@ -896,22 +899,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn model_access_without_an_answer_denies() {
+    async fn model_access_without_an_answer_is_an_error_not_a_cached_denial() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/v1/internal/catalog/model-access"))
             .respond_with(ResponseTemplate::new(503))
+            .up_to_n_times(1)
             .mount(&server)
             .await;
         let catalog = adapter(&server, AreaMode::On, vec![], Duration::from_secs(30), None);
-        let denied = with_caller_credential("sk-caller".to_string(), async {
+        let answer = with_caller_credential("sk-caller".to_string(), async {
+            catalog
+                .organization_has_model_access(Uuid::from_u128(9), model_id())
+                .await
+        })
+        .await;
+        assert!(answer.is_err());
+        // Not cached: once cloud-platform answers, the next read sees the grant.
+        Mock::given(method("GET"))
+            .and(path("/v1/internal/catalog/model-access"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"has_access": true})))
+            .mount(&server)
+            .await;
+        let granted = with_caller_credential("sk-caller".to_string(), async {
             catalog
                 .organization_has_model_access(Uuid::from_u128(9), model_id())
                 .await
                 .unwrap()
         })
         .await;
-        assert!(!denied);
+        assert!(granted);
     }
 
     #[tokio::test]

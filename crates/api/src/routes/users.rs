@@ -352,8 +352,8 @@ pub async fn get_user_status(
 ///
 /// Updates the profile information for the currently authenticated user.
 #[utoipa::path(
-    patch,
-    path = "/v1/users/me",
+    put,
+    path = "/v1/users/me/profile",
     tag = "Users",
     request_body = UpdateUserProfileRequest,
     responses(

@@ -128,6 +128,8 @@ Each rule has one home; other files point to it rather than restating it.
 
 With the server running: Scalar UI at http://localhost:3000/docs, OpenAPI spec at http://localhost:3000/api-docs/openapi.json (generated from `utoipa` annotations).
 
+Routes moving to `nearai/cloud-platform` are marked `deprecated` in that spec by the list in `crates/api/src/openapi_deprecation.rs` (documentation only; behavior is unchanged). Add a route to that list when it moves; content and inference routes stay unmarked.
+
 ## Troubleshooting
 
 - **Tests fail to connect to the database**: make sure PostgreSQL is on port 5432 with the `env.example` credentials (see the docker command above).

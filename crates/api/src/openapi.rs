@@ -1,4 +1,5 @@
 use crate::models::*;
+use crate::openapi_deprecation::DeprecatedRoutesAddon;
 use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme};
 use utoipa::{Modify, OpenApi};
 
@@ -7,7 +8,11 @@ use utoipa::{Modify, OpenApi};
 #[openapi(
     info(
         title = "NEAR AI Cloud API",
-        description = "A comprehensive cloud API for AI model inference, conversation management, and organization administration.\n\n## Authentication\n\nThis API supports five authentication methods:\n\n1. **Access Token (JWT)**: Use `Authorization: Bearer <jwt_token>` with a short-lived JWT access token for most API endpoints. Obtain this by calling POST /users/me/access_tokens with a refresh token.\n2. **Refresh Token**: Use `Authorization: Bearer <refresh_token>` (prefix: `rt_`) only with POST /users/me/access_tokens to create new JWT access tokens. Obtained from OAuth login.\n3. **API Key (Programmatic Access)**: Use `Authorization: Bearer sk-<api_key>` with an API key (prefix: `sk-`).\n4. **Reporting Token (Read-only Usage Reporting)**: Use `Authorization: Bearer rpt-<reporting_token>` only with usage reporting endpoints.\n5. **Admin Access Token**: Use `Authorization: Bearer adm_<token>` with approved admin operations. `read_only` permits explicitly approved reads across organizations; `read_write` preserves admin-token write access. Token management always requires an admin session.\n\nClick the **Authorize** button above to configure authentication.",
+        description = "A comprehensive cloud API for AI model inference, conversation management, and organization administration.\n\n## Authentication\n\nThis API supports five authentication methods:\n\n1. **Access Token (JWT)**: Use `Authorization: Bearer <jwt_token>` with a short-lived JWT access token for most API endpoints. Obtain this by calling POST /users/me/access_tokens with a refresh token.\n2. **Refresh Token**: Use `Authorization: Bearer <refresh_token>` (prefix: `rt_`) only with POST /users/me/access_tokens to create new JWT access tokens. Obtained from OAuth login.\n3. **API Key (Programmatic Access)**: Use `Authorization: Bearer sk-<api_key>` with an API key (prefix: `sk-`).\n4. **Reporting Token (Read-only Usage Reporting)**: Use `Authorization: Bearer rpt-<reporting_token>` only with usage reporting endpoints.\n5. **Admin Access Token**: Use `Authorization: Bearer adm_<token>` with approved admin operations. `read_only` permits explicitly approved reads across organizations; `read_write` preserves admin-token write access. Token management always requires an admin session.\n\nClick the **Authorize** button above to configure authentication.
+
+## Deprecations
+
+Operations marked deprecated (account, organization, workspace, API key, usage, billing, admin and catalog-administration endpoints) are moving to cloud-platform with the same paths and semantics. Inference and content endpoints (chat completions, responses, conversations, embeddings, images, audio, files, attestation) are unaffected.",
         version = "1.0.0",
         contact(
             name = "NEAR AI Team",
@@ -448,7 +453,11 @@ use utoipa::{Modify, OpenApi};
             services::admin::ModelGpuAllocation,
         ),
     ),
-    modifiers(&SecurityAddon, &AdminPermissionsAddon)
+    modifiers(
+        &SecurityAddon,
+        &AdminPermissionsAddon,
+        &DeprecatedRoutesAddon
+    )
     // No servers - let client determine the URL dynamically
 )]
 pub struct ApiDoc;

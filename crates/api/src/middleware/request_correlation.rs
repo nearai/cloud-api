@@ -38,9 +38,11 @@ pub async fn request_correlation_middleware(mut request: Request<Body>, next: Ne
         path = %path,
     );
 
-    let mut response = async move { next.run(request).await }
-        .instrument(span)
-        .await;
+    // Calls to cloud-platform made while serving this request carry its id.
+    let mut response =
+        database::cp_client::with_request_id(request_id, async move { next.run(request).await })
+            .instrument(span)
+            .await;
     if let Ok(value) = HeaderValue::from_str(&request_id.to_string()) {
         response.headers_mut().insert(REQUEST_ID_HEADER, value);
         prevent_request_id_caching(response.headers_mut());

@@ -27,11 +27,15 @@ pub struct CpClientConfig {
     /// `CLOUD_PLATFORM_BREAKER_OPEN_MS` (default 5000): how long a breaker
     /// stays open before one probe is let through.
     pub breaker_open: Duration,
-    /// `CP_CATALOG_CACHE_TTL_SECS` (default 30): catalog cache lifetime, and
-    /// the lifetime of a model-access answer before its bounded stale window.
+    /// `CP_CATALOG_CACHE_TTL_SECS` (default 30): how long a catalog answer is
+    /// fresh.
     pub catalog_ttl: Duration,
-    /// `CP_CHECK_API_KEY_TTL_SECS` (default 300): cached key verdict
-    /// lifetime, before ±20% jitter.
+    /// `CP_CATALOG_MAX_STALE_SECS` (default 300): how long after its fetch a
+    /// model lookup may still be served while cloud-platform is down. Past it,
+    /// the lookup fails, so a stale `is_listed` cannot skip the grant check.
+    pub catalog_max_stale: Duration,
+    /// `CP_CHECK_API_KEY_TTL_SECS` (default 300): the longest a cached key
+    /// verdict is served. Each verdict lives between 80% and 100% of it.
     pub check_api_key_ttl: Duration,
 }
 
@@ -46,6 +50,7 @@ impl Default for CpClientConfig {
             breaker_failures: 5,
             breaker_open: Duration::from_secs(5),
             catalog_ttl: Duration::from_secs(30),
+            catalog_max_stale: Duration::from_secs(300),
             check_api_key_ttl: Duration::from_secs(300),
         }
     }
@@ -120,6 +125,7 @@ impl CpClientConfig {
             breaker_failures,
             breaker_open: millis("CLOUD_PLATFORM_BREAKER_OPEN_MS", defaults.breaker_open)?,
             catalog_ttl: secs("CP_CATALOG_CACHE_TTL_SECS", defaults.catalog_ttl)?,
+            catalog_max_stale: secs("CP_CATALOG_MAX_STALE_SECS", defaults.catalog_max_stale)?,
             check_api_key_ttl: secs("CP_CHECK_API_KEY_TTL_SECS", defaults.check_api_key_ttl)?,
         }))
     }

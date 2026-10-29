@@ -25,6 +25,7 @@ use crate::models::ErrorResponse;
 pub struct CloudPlatform {
     pub client: Arc<CpClient>,
     pub catalog_ttl: Duration,
+    pub catalog_max_stale: Duration,
     pub check_api_key_ttl: Duration,
 }
 
@@ -42,6 +43,7 @@ pub fn build(
     Ok(Some(CloudPlatform {
         client: Arc::new(client),
         catalog_ttl: config.catalog_ttl,
+        catalog_max_stale: config.catalog_max_stale,
         check_api_key_ttl: config.check_api_key_ttl,
     }))
 }
@@ -57,6 +59,7 @@ pub fn models_repository(
             local,
             cp.client.clone(),
             cp.catalog_ttl,
+            cp.catalog_max_stale,
             metrics,
         )),
         None => local,

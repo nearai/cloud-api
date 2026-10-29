@@ -1,12 +1,16 @@
 //! Catalog reads: the `ModelsRepository` reads served by cloud-platform's
 //! internal catalog routes when the client is configured.
 //!
-//! - Model lists, lookups and names are cached for `CP_CATALOG_CACHE_TTL_SECS`,
-//!   and a failed reload serves the last good copy.
-//! - Model access is cached for one TTL with no stale fallback. When the answer
-//!   has expired and cloud-platform cannot give a new one, the read fails: the
-//!   request is refused, and the outer models-service cache does not store the
-//!   error. So a revoked grant is honoured for at most one TTL.
+//! - Model lists and names are cached for `CP_CATALOG_CACHE_TTL_SECS`. A failed
+//!   reload serves the last good copy, without a time limit: these are listings
+//!   and do not grant access.
+//! - Model lookups are cached the same way, but the last good copy is served
+//!   for at most `CP_CATALOG_MAX_STALE_SECS` after it was fetched; then the
+//!   lookup fails. A lookup decides whether a model is listed, which gates the
+//!   grant check, so a stale `is_listed` must not outlive that bound.
+//! - Model access is not cached here. The models service caches each decision
+//!   for one TTL, which is the only bound on a grant. A failed read is an error,
+//!   which fails the request closed and is not cached.
 //!
 //! Model access is answered only for the end caller's own API key, so it needs
 //! the caller credential in scope ([`with_caller_credential`]). Without one the
@@ -182,7 +186,6 @@ pub struct CatalogModels {
     models: KeyedCache<(), Vec<ModelWithPricing>>,
     lookups: KeyedCache<(String, bool), Option<ModelWithPricing>>,
     names: KeyedCache<(), Vec<String>>,
-    access: KeyedCache<(Uuid, Uuid), bool>,
 }
 
 impl CatalogModels {
@@ -190,6 +193,7 @@ impl CatalogModels {
         local: Arc<dyn ModelsRepository>,
         client: Arc<CpClient>,
         ttl: Duration,
+        max_stale: Duration,
         metrics: Option<Arc<dyn MetricsServiceTrait>>,
     ) -> Self {
         Self {
@@ -198,13 +202,8 @@ impl CatalogModels {
             ttl,
             metrics,
             models: KeyedCache::new(StaleUse::Forever),
-            lookups: KeyedCache::new(StaleUse::Forever),
+            lookups: KeyedCache::new(StaleUse::MaxAge(max_stale)),
             names: KeyedCache::new(StaleUse::Forever),
-            // Authorization: no stale answer is served. An expired answer is
-            // refetched, and when cloud-platform cannot answer the read fails, so the
-            // outer models-service cache (which does not store errors) never holds
-            // an allow past one TTL.
-            access: KeyedCache::new(StaleUse::Never),
         }
     }
 
@@ -302,35 +301,30 @@ impl CatalogModels {
         Ok(loaded.value)
     }
 
+    /// Not cached here: the models service caches each decision for one TTL, the
+    /// only bound on a grant. An expired or unanswered read is an error.
     async fn remote_access(&self, organization_id: Uuid, model_id: Uuid) -> Result<bool, CpError> {
-        let loaded = self
-            .access
-            .get_or_load((organization_id, model_id), || async {
-                // The route answers only for the key's own organization, so the
-                // caller's key is the only credential that can ask.
-                let token = current_caller_credential().ok_or(CpError::NoCallerCredential)?;
-                let organization = organization_id.to_string();
-                let model = model_id.to_string();
-                let response = self
-                    .client
-                    .send(
-                        CallType::ModelAccessRead,
-                        Method::GET,
-                        ACCESS,
-                        &[
-                            ("organization_id", organization.as_str()),
-                            ("model_id", model.as_str()),
-                        ],
-                        Credential::Caller(&token),
-                        None,
-                    )
-                    .await?;
-                let answer: ModelAccessDto = expect_ok(response)?.json()?;
-                Ok((answer.has_access, self.ttl))
-            })
+        // The route answers only for the key's own organization, so the caller's
+        // key is the only credential that can ask.
+        let token = current_caller_credential().ok_or(CpError::NoCallerCredential)?;
+        let organization = organization_id.to_string();
+        let model = model_id.to_string();
+        let response = self
+            .client
+            .send(
+                CallType::ModelAccessRead,
+                Method::GET,
+                ACCESS,
+                &[
+                    ("organization_id", organization.as_str()),
+                    ("model_id", model.as_str()),
+                ],
+                Credential::Caller(&token),
+                None,
+            )
             .await?;
-        self.record_stale(loaded.stale);
-        Ok(loaded.value)
+        let answer: ModelAccessDto = expect_ok(response)?.json()?;
+        Ok(answer.has_access)
     }
 }
 
@@ -462,6 +456,16 @@ mod tests {
         ttl: Duration,
         metrics: Option<Arc<CapturingMetricsService>>,
     ) -> CatalogModels {
+        adapter_bounded(server, local, ttl, Duration::from_secs(300), metrics)
+    }
+
+    fn adapter_bounded(
+        server: &MockServer,
+        local: Vec<ModelWithPricing>,
+        ttl: Duration,
+        max_stale: Duration,
+        metrics: Option<Arc<CapturingMetricsService>>,
+    ) -> CatalogModels {
         let metrics: Option<Arc<dyn MetricsServiceTrait>> =
             metrics.map(|m| m as Arc<dyn MetricsServiceTrait>);
         CatalogModels::new(
@@ -471,6 +475,7 @@ mod tests {
             }),
             Arc::new(client(server)),
             ttl,
+            max_stale,
             metrics,
         )
     }
@@ -560,14 +565,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn model_access_needs_the_callers_key_and_is_cached() {
+    async fn model_access_needs_the_callers_key_and_is_not_cached_here() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/v1/internal/catalog/model-access"))
             .and(header("authorization", "Bearer sk-caller"))
             .and(query_param("model_id", model_id().to_string().as_str()))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({"has_access": true})))
-            .expect(1)
+            .expect(2)
             .mount(&server)
             .await;
         let catalog = adapter(&server, vec![], Duration::from_secs(30), None);
@@ -579,6 +584,7 @@ mod tests {
             .await
             .is_err());
 
+        // Every decision is fetched: the models service owns the one-TTL cache.
         let granted = with_caller_credential("sk-caller".to_string(), async {
             (
                 catalog
@@ -596,7 +602,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_expired_allow_is_not_served_during_an_outage() {
+    async fn an_allow_is_not_served_stale_during_an_outage() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/v1/internal/catalog/model-access"))
@@ -609,8 +615,7 @@ mod tests {
             .respond_with(ResponseTemplate::new(503))
             .mount(&server)
             .await;
-        let ttl = Duration::from_millis(50);
-        let catalog = adapter(&server, vec![], ttl, None);
+        let catalog = adapter(&server, vec![], Duration::from_millis(50), None);
         let org = Uuid::from_u128(9);
         let check = || async {
             with_caller_credential("sk-caller".to_string(), async {
@@ -619,9 +624,43 @@ mod tests {
             .await
         };
         assert!(check().await.unwrap());
-        // Expired and cloud-platform down: no stale allow, so the request fails closed.
-        tokio::time::sleep(ttl + Duration::from_millis(10)).await;
+        // Cloud-platform is down: no earlier allow is reused, so the request fails closed.
         assert!(check().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_listed_model_past_the_stale_bound_fails_the_authorization_lookup() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/internal/catalog/model-lookup"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(remote_json("m", 200)))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/internal/catalog/model-lookup"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+        let catalog = adapter_bounded(
+            &server,
+            vec![],
+            Duration::from_millis(50),
+            Duration::from_millis(150),
+            None,
+        );
+        assert!(catalog
+            .get_model_by_name("m")
+            .await
+            .unwrap()
+            .is_some_and(|model| model.is_listed));
+        // Expired, within the bound: the last good lookup is served.
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert!(catalog.get_model_by_name("m").await.unwrap().is_some());
+        // Past the bound since the fetch: the authorization path errors rather
+        // than trusting a stale is_listed.
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        assert!(catalog.get_model_by_name("m").await.is_err());
     }
 
     #[tokio::test]

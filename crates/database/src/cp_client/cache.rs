@@ -21,24 +21,31 @@ pub const MAX_CACHE_KEYS: usize = 4096;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StaleUse {
     /// Serve the last good answer for as long as the reload keeps failing
-    /// (catalog data such as the model list and lookups: an outage must not
-    /// empty the catalog).
+    /// (listings: an outage must not empty the catalog).
     Forever,
+    /// Serve the last good answer only while it is younger than this, measured
+    /// from the fetch. Used where a stale answer decides access.
+    MaxAge(Duration),
     /// Never serve an answer past its expiry (key verdicts: after the TTL the
     /// caller gets an outage, not an old verdict).
     Never,
 }
 
 impl StaleUse {
-    /// Whether an expired answer may still be served when a reload fails.
-    fn keeps_expired(self) -> bool {
-        matches!(self, StaleUse::Forever)
+    /// Whether an expired answer fetched at `fetched_at` may be served now.
+    fn may_serve_expired(self, fetched_at: Instant, now: Instant) -> bool {
+        match self {
+            StaleUse::Forever => true,
+            StaleUse::MaxAge(max_age) => now < fetched_at + max_age,
+            StaleUse::Never => false,
+        }
     }
 }
 
 #[derive(Debug)]
 struct Entry<V> {
     value: V,
+    fetched_at: Instant,
     expires_at: Instant,
 }
 
@@ -113,9 +120,11 @@ impl<K: Eq + Hash + Clone, V: Clone> KeyedCache<K, V> {
         }
         match load().await {
             Ok((value, ttl)) => {
+                let fetched_at = Instant::now();
                 *entry = Some(Entry {
                     value: value.clone(),
-                    expires_at: Instant::now() + ttl,
+                    fetched_at,
+                    expires_at: fetched_at + ttl,
                 });
                 Ok(Loaded {
                     value,
@@ -123,10 +132,16 @@ impl<K: Eq + Hash + Clone, V: Clone> KeyedCache<K, V> {
                 })
             }
             Err(error) => match entry.as_ref() {
-                Some(stored) if self.stale.keeps_expired() => Ok(Loaded {
-                    value: stored.value.clone(),
-                    stale: true,
-                }),
+                Some(stored)
+                    if self
+                        .stale
+                        .may_serve_expired(stored.fetched_at, Instant::now()) =>
+                {
+                    Ok(Loaded {
+                        value: stored.value.clone(),
+                        stale: true,
+                    })
+                }
                 _ => Err(error),
             },
         }
@@ -175,7 +190,7 @@ impl<K: Eq + Hash + Clone, V: Clone> KeyedCache<K, V> {
             match entry.as_ref() {
                 None => candidates.push((None, key.clone())),
                 Some(stored) if now < stored.expires_at => {}
-                Some(stored) if self.stale.keeps_expired() => {}
+                Some(stored) if self.stale.may_serve_expired(stored.fetched_at, now) => {}
                 Some(stored) => candidates.push((Some(stored.expires_at), key.clone())),
             }
         }

@@ -45,8 +45,17 @@ pub struct Loaded<V> {
 
 pub struct KeyedCache<K, V> {
     slots: Mutex<HashMap<K, Slot<V>>>,
+    /// Keys beyond `capacity`. Shared among concurrent callers while loading,
+    /// and removed once idle, so they stay single-flight without being stored.
+    overflow: Mutex<HashMap<K, Slot<V>>>,
     capacity: usize,
     stale: StaleUse,
+}
+
+fn locked<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 impl<K: Eq + Hash + Clone, V: Clone> KeyedCache<K, V> {
@@ -57,6 +66,7 @@ impl<K: Eq + Hash + Clone, V: Clone> KeyedCache<K, V> {
     pub fn with_capacity(stale: StaleUse, capacity: usize) -> Self {
         Self {
             slots: Mutex::new(HashMap::new()),
+            overflow: Mutex::new(HashMap::new()),
             capacity,
             stale,
         }
@@ -71,7 +81,17 @@ impl<K: Eq + Hash + Clone, V: Clone> KeyedCache<K, V> {
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<(V, Duration), E>>,
     {
-        let slot = self.slot_for(key);
+        let slot = self.slot_for(&key);
+        let result = self.load_into(&slot, load).await;
+        self.release(&key, slot);
+        result
+    }
+
+    async fn load_into<E, F, Fut>(&self, slot: &Slot<V>, load: F) -> Result<Loaded<V>, E>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<(V, Duration), E>>,
+    {
         let mut entry = slot.lock().await;
         if let Some(stored) = entry.as_ref() {
             if Instant::now() < stored.expires_at {
@@ -111,38 +131,76 @@ impl<K: Eq + Hash + Clone, V: Clone> KeyedCache<K, V> {
         }
     }
 
-    /// The slot for `key`. A key beyond the capacity gets a slot that is not
-    /// stored, so it is loaded without caching.
-    fn slot_for(&self, key: K) -> Slot<V> {
-        let mut slots = self
-            .slots
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(slot) = slots.get(&key) {
+    /// The slot for `key`. A key already known keeps its slot. A new key is
+    /// stored while there is room; past the capacity it goes to the overflow
+    /// map, which still gives one shared slot per key while it is loading.
+    fn slot_for(&self, key: &K) -> Slot<V> {
+        let mut slots = locked(&self.slots);
+        let mut overflow = locked(&self.overflow);
+        if let Some(slot) = slots.get(key) {
+            return slot.clone();
+        }
+        if let Some(slot) = overflow.get(key) {
             return slot.clone();
         }
         if slots.len() >= self.capacity {
-            let now = Instant::now();
-            slots.retain(|_, slot| {
-                // Keep a slot in use, and any slot holding an unexpired answer.
-                Arc::strong_count(slot) > 1
-                    || slot
-                        .try_lock()
-                        .map(|entry| entry.as_ref().is_some_and(|e| now < e.expires_at))
-                        .unwrap_or(true)
-            });
-            if slots.len() >= self.capacity {
-                return Arc::new(AsyncMutex::new(None));
-            }
+            self.evict_idle(&mut slots);
         }
         let slot: Slot<V> = Arc::new(AsyncMutex::new(None));
-        slots.insert(key, slot.clone());
+        if slots.len() < self.capacity {
+            slots.insert(key.clone(), slot.clone());
+        } else {
+            overflow.insert(key.clone(), slot.clone());
+        }
         slot
+    }
+
+    /// Drops an overflow slot once nobody is loading or waiting on it.
+    fn release(&self, key: &K, slot: Slot<V>) {
+        let mut overflow = locked(&self.overflow);
+        let is_overflow = overflow
+            .get(key)
+            .is_some_and(|shared| Arc::ptr_eq(shared, &slot));
+        drop(slot);
+        if is_overflow
+            && overflow
+                .get(key)
+                .is_some_and(|shared| Arc::strong_count(shared) == 1)
+        {
+            overflow.remove(key);
+        }
+    }
+
+    /// Makes room by dropping slots that hold nothing, or whose stored answer
+    /// can no longer be served. Slots in use are kept, and so is every
+    /// last-good answer under `StaleUse::Forever`: those must survive capacity
+    /// pressure, so a catalog outage can still be answered from them.
+    fn evict_idle(&self, slots: &mut HashMap<K, Slot<V>>) {
+        let now = Instant::now();
+        slots.retain(|_, slot| {
+            if Arc::strong_count(slot) > 1 {
+                return true;
+            }
+            match slot.try_lock() {
+                // Locked means a load is running on it.
+                Err(_) => true,
+                Ok(entry) => match (entry.as_ref(), self.stale) {
+                    (None, _) => false,
+                    (Some(_), StaleUse::Forever) => true,
+                    (Some(stored), StaleUse::Never) => now < stored.expires_at,
+                },
+            }
+        });
     }
 
     #[cfg(test)]
     fn len(&self) -> usize {
-        self.slots.lock().unwrap().len()
+        locked(&self.slots).len()
+    }
+
+    #[cfg(test)]
+    fn overflow_len(&self) -> usize {
+        locked(&self.overflow).len()
     }
 }
 
@@ -246,5 +304,57 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(cache.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn last_good_entries_survive_capacity_pressure() {
+        let cache: KeyedCache<&'static str, u32> = KeyedCache::with_capacity(StaleUse::Forever, 2);
+        for (key, value) in [("a", 1), ("b", 2)] {
+            // Expired at once: only the last-good copy is left.
+            cache
+                .get_or_load::<&str, _, _>(key, || async move { Ok((value, Duration::ZERO)) })
+                .await
+                .unwrap();
+        }
+        // A third key arrives at capacity; it is loaded but not stored over them.
+        cache
+            .get_or_load::<&str, _, _>("c", || async { Ok((3, Duration::from_secs(30))) })
+            .await
+            .unwrap();
+        for (key, value) in [("a", 1), ("b", 2)] {
+            let loaded = cache
+                .get_or_load::<&str, _, _>(key, || async { Err("down") })
+                .await
+                .unwrap();
+            assert_eq!(loaded, Loaded { value, stale: true }, "{key}");
+        }
+    }
+
+    #[tokio::test]
+    async fn overflow_keys_stay_single_flight_and_are_released() {
+        let cache: Arc<KeyedCache<&'static str, u32>> =
+            Arc::new(KeyedCache::with_capacity(StaleUse::Forever, 0));
+        let loads = Arc::new(AtomicUsize::new(0));
+        let mut tasks = Vec::new();
+        for _ in 0..8 {
+            let cache = cache.clone();
+            let loads = loads.clone();
+            tasks.push(tokio::spawn(async move {
+                cache
+                    .get_or_load::<(), _, _>("k", || async {
+                        loads.fetch_add(1, Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_millis(30)).await;
+                        Ok((7, Duration::from_secs(30)))
+                    })
+                    .await
+            }));
+        }
+        for task in tasks {
+            assert_eq!(task.await.unwrap().unwrap().value, 7);
+        }
+        assert_eq!(loads.load(Ordering::SeqCst), 1);
+        // Nothing was stored, and the idle overflow slot is gone.
+        assert_eq!(cache.len(), 0);
+        assert_eq!(cache.overflow_len(), 0);
     }
 }

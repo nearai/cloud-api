@@ -145,6 +145,18 @@ pub struct AuthenticatedReportingToken {
     pub scope: ReportingTokenScope,
 }
 
+/// Runs the rest of an API-key request with the caller's key in scope, for the
+/// cloud-platform reads that answer only for that key (model access).
+async fn with_caller_key(
+    token: Option<String>,
+    request: impl std::future::Future<Output = Response>,
+) -> Response {
+    match token {
+        Some(token) => database::cp_client::with_caller_credential(token, request).await,
+        None => request.await,
+    }
+}
+
 pub async fn auth_middleware_with_api_key(
     State(state): State<AuthState>,
     request: Request,
@@ -184,13 +196,16 @@ pub async fn auth_middleware_with_api_key(
         ))
     };
 
+    let caller_token = auth_header
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .map(str::to_owned);
     match auth_result {
         Ok(api_key) => {
             // Clone request to add extension
             debug!(api_key_id = %api_key.id.0, "Adding API key to request");
             let mut request = request;
             request.extensions_mut().insert(api_key);
-            Ok(next.run(request).await)
+            Ok(with_caller_key(caller_token, next.run(request)).await)
         }
         Err(error) => Err(error),
     }
@@ -236,12 +251,15 @@ pub async fn auth_middleware_with_workspace_context(
         ))
     };
 
+    let caller_token = auth_header
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .map(str::to_owned);
     match auth_result {
         Ok(authenticated_api_key) => {
             debug!("Adding authenticated API key with workspace context to request");
             let mut request = request;
             request.extensions_mut().insert(authenticated_api_key);
-            Ok(next.run(request).await)
+            Ok(with_caller_key(caller_token, next.run(request)).await)
         }
         Err(error) => Err(error),
     }

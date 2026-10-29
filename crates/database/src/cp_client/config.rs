@@ -161,8 +161,18 @@ impl CpClientConfig {
                 check_api_key: mode("CP_CHECK_API_KEY")?,
             },
         };
-        if config.flags.any_enabled() && config.base_url.is_none() {
-            return Err("CLOUD_PLATFORM_URL is required when a CP_* area is not off".to_string());
+        if config.flags.any_enabled() {
+            if config.base_url.is_none() {
+                return Err(
+                    "CLOUD_PLATFORM_URL is required when a CP_* area is not off".to_string()
+                );
+            }
+            if config.api_key_file.is_none() {
+                return Err(
+                    "CLOUD_PLATFORM_API_KEY_FILE is required when a CP_* area is not off"
+                        .to_string(),
+                );
+            }
         }
         Ok(config)
     }
@@ -193,12 +203,20 @@ mod tests {
     }
 
     #[test]
-    fn an_enabled_area_requires_a_url() {
-        assert!(config(&[("CP_CATALOG", "shadow")]).is_err());
+    fn an_enabled_area_requires_a_url_and_a_key_file_named_in_the_error() {
+        let error = config(&[("CP_CATALOG", "shadow")]).unwrap_err();
+        assert!(error.contains("CLOUD_PLATFORM_URL"), "{error}");
+        let error = config(&[
+            ("CP_CATALOG", "shadow"),
+            ("CLOUD_PLATFORM_URL", "http://10.0.2.2:24410"),
+        ])
+        .unwrap_err();
+        assert!(error.contains("CLOUD_PLATFORM_API_KEY_FILE"), "{error}");
         let config = config(&[
             ("CP_CATALOG", "shadow"),
             ("CP_CHECK_API_KEY", "ON"),
             ("CLOUD_PLATFORM_URL", "http://10.0.2.2:24410"),
+            ("CLOUD_PLATFORM_API_KEY_FILE", "/run/secrets/cp-key"),
             ("CLOUD_PLATFORM_READ_TIMEOUT_MS", "900"),
         ])
         .unwrap();

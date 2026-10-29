@@ -1,5 +1,6 @@
 #[doc(hidden)]
 pub mod attested_3p_startup;
+pub mod cloud_platform;
 pub mod consts;
 pub mod conversions;
 pub mod database_encryption;
@@ -120,6 +121,8 @@ pub struct DomainServices {
     pub service_usage_service:
         Arc<dyn services::service_usage::ServiceUsageServiceTrait + Send + Sync>,
     pub admin_settings_service: Arc<services::admin_settings::AdminSettingsService>,
+    /// The gateway key check when `CP_CHECK_API_KEY` is not off.
+    pub cloud_platform_check_api_key: Option<cloud_platform::CheckApiKeyRoute>,
 }
 
 /// Controls process-level background work started while the application router
@@ -391,6 +394,31 @@ pub async fn init_domain_services_with_pool(
         database.pool().clone(),
     ));
 
+    // Cloud-platform areas. Each service takes the implementation its CP_* flag selects;
+    // with every flag off no client is built and the local repositories are used as before.
+    let cp_config = database::cp_client::CpClientConfig::from_env()
+        .unwrap_or_else(|error| panic!("cloud-platform configuration: {error}"));
+    let cp_client = cloud_platform::build_client(&cp_config, metrics_service.clone())
+        .unwrap_or_else(|error| panic!("cloud-platform client: {error:#}"));
+    let catalog_models = cloud_platform::models_repository(
+        cp_config.flags.catalog,
+        models_repo.clone() as Arc<dyn services::models::ModelsRepository>,
+        cp_client.as_ref(),
+        cp_config.catalog_ttl,
+        Some(metrics_service.clone()),
+    );
+    let signature_repo = cloud_platform::signature_repository(
+        cp_config.flags.signature_read,
+        attestation_repo.clone() as Arc<dyn services::attestation::ports::AttestationRepository>,
+        cp_client.as_ref(),
+        Some(metrics_service.clone()),
+    );
+    let cloud_platform_check_api_key = cloud_platform::check_api_key_route(
+        &cp_config,
+        cp_client.as_ref(),
+        Some(metrics_service.clone()),
+    );
+
     // Note: inference_url models and external providers are loaded in init_inference_providers.
     // Periodic refresh is also started there.
 
@@ -411,15 +439,15 @@ pub async fn init_domain_services_with_pool(
     // services below share, so its invalidation reaches all three.
     let models_service = Arc::new(services::models::ModelsServiceImpl::new(
         inference_provider_pool.clone(),
-        models_repo.clone(),
+        catalog_models.clone(),
     ));
 
     // Create attestation service
     let attestation_service = Arc::new(
         services::attestation::AttestationService::init(
-            attestation_repo,
+            signature_repo,
             inference_provider_pool.clone(),
-            models_repo.clone(),
+            catalog_models.clone(),
             models_service.model_resolve_cache(),
             metrics_service.clone(),
             usage_repository_for_attestation,
@@ -484,7 +512,7 @@ pub async fn init_domain_services_with_pool(
         attestation_service.clone(),
         usage_service.clone(),
         metrics_service.clone(),
-        models_repo.clone() as Arc<dyn services::models::ModelsRepository>,
+        catalog_models.clone(),
         org_limit_repository,
     )
     .with_model_resolve_cache(models_service.model_resolve_cache());
@@ -654,6 +682,7 @@ pub async fn init_domain_services_with_pool(
     };
 
     DomainServices {
+        cloud_platform_check_api_key,
         conversation_service,
         response_service,
         completion_service,
@@ -1232,6 +1261,7 @@ pub fn build_app_with_config_and_options(
         app_state.clone(),
         &auth_components.auth_state_middleware,
         usage_state.clone(),
+        domain_services.cloud_platform_check_api_key.clone(),
     );
 
     let internal_routes = build_internal_routes(app_state.clone());
@@ -2082,8 +2112,21 @@ pub fn build_gateway_routes(
     app_state: AppState,
     auth_state_middleware: &AuthState,
     usage_state: middleware::UsageState,
+    cp_check: Option<cloud_platform::CheckApiKeyRoute>,
 ) -> Router {
-    Router::new()
+    if let Some(route) = cp_check
+        .as_ref()
+        .filter(|route| route.mode == database::cp_client::AreaMode::On)
+    {
+        // cloud-platform decides: the local key and credit checks do not run on this route.
+        return Router::new()
+            .route(
+                "/check_api_key",
+                post(cloud_platform::check_api_key_from_cloud_platform),
+            )
+            .with_state(route.verdicts.clone());
+    }
+    let router = Router::new()
         .route(
             "/check_api_key",
             post(crate::routes::gateway::check_api_key),
@@ -2096,7 +2139,15 @@ pub fn build_gateway_routes(
         .layer(from_fn_with_state(
             auth_state_middleware.clone(),
             middleware::auth::auth_middleware_with_workspace_context,
-        ))
+        ));
+    match cp_check {
+        // Shadow: the local route answers and cloud-platform's verdict is compared with it.
+        Some(route) => router.layer(from_fn_with_state(
+            route,
+            cloud_platform::shadow_check_api_key,
+        )),
+        None => router,
+    }
 }
 
 /// Build internal-only routes authenticated by the shared

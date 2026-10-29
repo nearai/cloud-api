@@ -21,11 +21,27 @@ pub const MAX_CACHE_KEYS: usize = 4096;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StaleUse {
     /// Serve the last good answer for as long as the reload keeps failing
-    /// (catalog reads: an outage must not empty the catalog).
+    /// (catalog data such as the model list and lookups: an outage must not
+    /// empty the catalog).
     Forever,
+    /// Serve the last good answer for at most this long past its expiry, then
+    /// fail. Used for authorization decisions: a stale allow must not outlive
+    /// a bounded window.
+    Bounded(Duration),
     /// Never serve an answer past its expiry (key verdicts: after the TTL the
     /// caller gets an outage, not an old verdict).
     Never,
+}
+
+impl StaleUse {
+    /// Whether an entry that expired at `expires_at` may still be served.
+    fn servable(self, expires_at: Instant, now: Instant) -> bool {
+        match self {
+            StaleUse::Forever => true,
+            StaleUse::Bounded(grace) => now < expires_at + grace,
+            StaleUse::Never => false,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -81,10 +97,12 @@ impl<K: Eq + Hash + Clone, V: Clone> KeyedCache<K, V> {
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<(V, Duration), E>>,
     {
-        let slot = self.slot_for(&key);
-        let result = self.load_into(&slot, load).await;
-        self.release(&key, slot);
-        result
+        let guard = ReleaseOverflow {
+            cache: self,
+            slot: self.slot_for(&key),
+            key,
+        };
+        self.load_into(&guard.slot, load).await
     }
 
     async fn load_into<E, F, Fut>(&self, slot: &Slot<V>, load: F) -> Result<Loaded<V>, E>
@@ -113,21 +131,14 @@ impl<K: Eq + Hash + Clone, V: Clone> KeyedCache<K, V> {
                 })
             }
             Err(error) => match entry.as_ref() {
-                Some(stored) if self.may_serve_stale() => Ok(Loaded {
-                    value: stored.value.clone(),
-                    stale: true,
-                }),
+                Some(stored) if self.stale.servable(stored.expires_at, Instant::now()) => {
+                    Ok(Loaded {
+                        value: stored.value.clone(),
+                        stale: true,
+                    })
+                }
                 _ => Err(error),
             },
-        }
-    }
-
-    /// Only reached for a stored entry that has already expired (a fresh one
-    /// returns before a load), so `Never` is always false here.
-    fn may_serve_stale(&self) -> bool {
-        match self.stale {
-            StaleUse::Forever => true,
-            StaleUse::Never => false,
         }
     }
 
@@ -155,22 +166,6 @@ impl<K: Eq + Hash + Clone, V: Clone> KeyedCache<K, V> {
         slot
     }
 
-    /// Drops an overflow slot once nobody is loading or waiting on it.
-    fn release(&self, key: &K, slot: Slot<V>) {
-        let mut overflow = locked(&self.overflow);
-        let is_overflow = overflow
-            .get(key)
-            .is_some_and(|shared| Arc::ptr_eq(shared, &slot));
-        drop(slot);
-        if is_overflow
-            && overflow
-                .get(key)
-                .is_some_and(|shared| Arc::strong_count(shared) == 1)
-        {
-            overflow.remove(key);
-        }
-    }
-
     /// Makes room by dropping slots that hold nothing, or whose stored answer
     /// can no longer be served. Slots in use are kept, and so is every
     /// last-good answer under `StaleUse::Forever`: those must survive capacity
@@ -184,10 +179,9 @@ impl<K: Eq + Hash + Clone, V: Clone> KeyedCache<K, V> {
             match slot.try_lock() {
                 // Locked means a load is running on it.
                 Err(_) => true,
-                Ok(entry) => match (entry.as_ref(), self.stale) {
-                    (None, _) => false,
-                    (Some(_), StaleUse::Forever) => true,
-                    (Some(stored), StaleUse::Never) => now < stored.expires_at,
+                Ok(entry) => match entry.as_ref() {
+                    None => false,
+                    Some(stored) => self.stale.servable(stored.expires_at, now),
                 },
             }
         });
@@ -201,6 +195,27 @@ impl<K: Eq + Hash + Clone, V: Clone> KeyedCache<K, V> {
     #[cfg(test)]
     fn overflow_len(&self) -> usize {
         locked(&self.overflow).len()
+    }
+}
+
+/// Removes an overflow slot when its load ends, including when the load is
+/// cancelled (the future is dropped). Only the last holder removes it: the
+/// map and this guard are the only owners, so the count is two.
+struct ReleaseOverflow<'a, K: Eq + Hash + Clone, V: Clone> {
+    cache: &'a KeyedCache<K, V>,
+    key: K,
+    slot: Slot<V>,
+}
+
+impl<K: Eq + Hash + Clone, V: Clone> Drop for ReleaseOverflow<'_, K, V> {
+    fn drop(&mut self) {
+        let mut overflow = locked(&self.cache.overflow);
+        if overflow
+            .get(&self.key)
+            .is_some_and(|shared| Arc::ptr_eq(shared, &self.slot) && Arc::strong_count(shared) == 2)
+        {
+            overflow.remove(&self.key);
+        }
     }
 }
 
@@ -356,5 +371,62 @@ mod tests {
         // Nothing was stored, and the idle overflow slot is gone.
         assert_eq!(cache.len(), 0);
         assert_eq!(cache.overflow_len(), 0);
+    }
+
+    #[tokio::test]
+    async fn cancelled_overflow_loads_leave_no_entries_behind() {
+        let cache: Arc<KeyedCache<u32, u32>> =
+            Arc::new(KeyedCache::with_capacity(StaleUse::Forever, 0));
+        let mut tasks = Vec::new();
+        for key in 0..50 {
+            let cache = cache.clone();
+            tasks.push(tokio::spawn(async move {
+                cache
+                    .get_or_load::<(), _, _>(key, || async {
+                        tokio::time::sleep(Duration::from_secs(10)).await;
+                        Ok((key, Duration::from_secs(30)))
+                    })
+                    .await
+            }));
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(cache.overflow_len(), 50);
+        for task in &tasks {
+            task.abort();
+        }
+        for task in tasks {
+            let _ = task.await;
+        }
+        assert_eq!(cache.overflow_len(), 0);
+        assert_eq!(cache.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn bounded_stale_serves_one_grace_period_then_fails() {
+        let cache: KeyedCache<(), u32> =
+            KeyedCache::new(StaleUse::Bounded(Duration::from_millis(100)));
+        cache
+            .get_or_load::<&str, _, _>((), || async { Ok((1, Duration::from_millis(20))) })
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        // Expired but within the grace period: the last answer is served.
+        let stale = cache
+            .get_or_load::<&str, _, _>((), || async { Err("down") })
+            .await
+            .unwrap();
+        assert_eq!(
+            stale,
+            Loaded {
+                value: 1,
+                stale: true
+            }
+        );
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        // Past the grace period: no answer, so the caller fails closed.
+        assert!(cache
+            .get_or_load::<&str, _, _>((), || async { Err("down") })
+            .await
+            .is_err());
     }
 }

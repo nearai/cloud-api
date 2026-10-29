@@ -207,7 +207,8 @@ impl CatalogModels {
             models: KeyedCache::new(StaleUse::Forever),
             lookups: KeyedCache::new(StaleUse::Forever),
             names: KeyedCache::new(StaleUse::Forever),
-            access: KeyedCache::new(StaleUse::Forever),
+            // Authorization: a last-good answer is served for at most one more TTL.
+            access: KeyedCache::new(StaleUse::Bounded(ttl)),
         }
     }
 
@@ -896,6 +897,38 @@ mod tests {
         })
         .await;
         assert_eq!(granted, (true, true));
+    }
+
+    #[tokio::test]
+    async fn an_expired_allow_is_denied_once_the_stale_bound_passes() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/internal/catalog/model-access"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"has_access": true})))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/internal/catalog/model-access"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+        let ttl = Duration::from_millis(50);
+        let catalog = adapter(&server, AreaMode::On, vec![], ttl, None);
+        let org = Uuid::from_u128(9);
+        let check = || async {
+            with_caller_credential("sk-caller".to_string(), async {
+                catalog.organization_has_model_access(org, model_id()).await
+            })
+            .await
+        };
+        assert!(check().await.unwrap());
+        // Expired, cloud-platform down, still inside one TTL of grace: the old allow holds.
+        tokio::time::sleep(ttl + Duration::from_millis(10)).await;
+        assert!(check().await.unwrap());
+        // Past the grace bound: no answer, so the request fails closed.
+        tokio::time::sleep(ttl + Duration::from_millis(40)).await;
+        assert!(check().await.is_err());
     }
 
     #[tokio::test]

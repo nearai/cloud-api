@@ -11,6 +11,7 @@ pub mod cache;
 pub mod catalog;
 pub mod client;
 pub mod config;
+pub mod signature;
 
 pub use catalog::CatalogModels;
 pub use client::{
@@ -18,3 +19,4 @@ pub use client::{
     CpClient, CpError, CpResponse, Credential,
 };
 pub use config::{AreaFlags, AreaMode, CpClientConfig};
+pub use signature::ChatSignatureReads;

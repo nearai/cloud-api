@@ -128,6 +128,14 @@ impl CpClientConfig {
             catalog_max_stale: secs("CP_CATALOG_MAX_STALE_SECS", defaults.catalog_max_stale)?,
             check_api_key_ttl: secs("CP_CHECK_API_KEY_TTL_SECS", defaults.check_api_key_ttl)?,
         }))
+        .and_then(|config| match config {
+            Some(config) if config.catalog_ttl > config.catalog_max_stale => Err(format!(
+                "CP_CATALOG_CACHE_TTL_SECS ({}s) must not exceed CP_CATALOG_MAX_STALE_SECS ({}s)",
+                config.catalog_ttl.as_secs(),
+                config.catalog_max_stale.as_secs()
+            )),
+            other => Ok(other),
+        })
     }
 }
 
@@ -183,5 +191,26 @@ mod tests {
     fn invalid_tuning_is_refused_once_configured() {
         assert!(config(&[URL, KEY, ("CLOUD_PLATFORM_READ_TIMEOUT_MS", "0")]).is_err());
         assert!(config(&[URL, KEY, ("CLOUD_PLATFORM_BREAKER_FAILURES", "x")]).is_err());
+    }
+
+    #[test]
+    fn a_catalog_ttl_longer_than_the_max_stale_bound_is_refused_naming_both() {
+        let error = config(&[
+            URL,
+            KEY,
+            ("CP_CATALOG_CACHE_TTL_SECS", "120"),
+            ("CP_CATALOG_MAX_STALE_SECS", "60"),
+        ])
+        .unwrap_err();
+        assert!(error.contains("CP_CATALOG_CACHE_TTL_SECS"), "{error}");
+        assert!(error.contains("CP_CATALOG_MAX_STALE_SECS"), "{error}");
+        // Equal is allowed.
+        assert!(config(&[
+            URL,
+            KEY,
+            ("CP_CATALOG_CACHE_TTL_SECS", "60"),
+            ("CP_CATALOG_MAX_STALE_SECS", "60"),
+        ])
+        .is_ok());
     }
 }

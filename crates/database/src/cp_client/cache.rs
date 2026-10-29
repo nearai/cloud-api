@@ -32,7 +32,19 @@ pub enum StaleUse {
 }
 
 impl StaleUse {
-    /// Whether an expired answer fetched at `fetched_at` may be served now.
+    /// Whether an answer fetched at `fetched_at` may be served at `now` while it
+    /// is still within its TTL. A fresh answer is usable only while its age is at
+    /// most the max age too, so the bound holds even when the TTL is longer.
+    fn fresh_at(self, expires_at: Instant, fetched_at: Instant, now: Instant) -> bool {
+        now < expires_at
+            && match self {
+                StaleUse::MaxAge(max_age) => now < fetched_at + max_age,
+                StaleUse::Forever | StaleUse::Never => true,
+            }
+    }
+
+    /// Whether an answer fetched at `fetched_at` may be served at `now` after a
+    /// failed reload.
     fn may_serve_expired(self, fetched_at: Instant, now: Instant) -> bool {
         match self {
             StaleUse::Forever => true,
@@ -111,7 +123,10 @@ impl<K: Eq + Hash + Clone, V: Clone> KeyedCache<K, V> {
     {
         let mut entry = slot.lock().await;
         if let Some(stored) = entry.as_ref() {
-            if Instant::now() < stored.expires_at {
+            if self
+                .stale
+                .fresh_at(stored.expires_at, stored.fetched_at, Instant::now())
+            {
                 return Ok(Loaded {
                     value: stored.value.clone(),
                     stale: false,
@@ -189,7 +204,10 @@ impl<K: Eq + Hash + Clone, V: Clone> KeyedCache<K, V> {
             };
             match entry.as_ref() {
                 None => candidates.push((None, key.clone())),
-                Some(stored) if now < stored.expires_at => {}
+                Some(stored)
+                    if self
+                        .stale
+                        .fresh_at(stored.expires_at, stored.fetched_at, now) => {}
                 Some(stored) if self.stale.may_serve_expired(stored.fetched_at, now) => {}
                 Some(stored) => candidates.push((Some(stored.expires_at), key.clone())),
             }
@@ -480,6 +498,29 @@ mod tests {
             .unwrap();
         assert_eq!(
             served,
+            Loaded {
+                value: 2,
+                stale: false
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn a_max_age_bound_holds_even_when_the_ttl_is_longer() {
+        let cache: KeyedCache<(), u32> =
+            KeyedCache::new(StaleUse::MaxAge(Duration::from_millis(100)));
+        cache
+            .get_or_load::<&str, _, _>((), || async { Ok((1, Duration::from_secs(60))) })
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        // Still inside its 60 s TTL, but older than the max age: it is reloaded.
+        let loaded = cache
+            .get_or_load::<&str, _, _>((), || async { Ok((2, Duration::from_secs(60))) })
+            .await
+            .unwrap();
+        assert_eq!(
+            loaded,
             Loaded {
                 value: 2,
                 stale: false

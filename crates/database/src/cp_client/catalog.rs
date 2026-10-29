@@ -3,9 +3,10 @@
 //!
 //! - Model lists, lookups and names are cached for `CP_CATALOG_CACHE_TTL_SECS`,
 //!   and a failed reload serves the last good copy.
-//! - Model access is cached the same way, but a last-good answer is served for
-//!   at most one more TTL; after that the read fails. A failed read is an error,
-//!   which fails the request closed and is not cached.
+//! - Model access is cached for one TTL with no stale fallback. When the answer
+//!   has expired and cloud-platform cannot give a new one, the read fails: the
+//!   request is refused, and the outer models-service cache does not store the
+//!   error. So a revoked grant is honoured for at most one TTL.
 //!
 //! Model access is answered only for the end caller's own API key, so it needs
 //! the caller credential in scope ([`with_caller_credential`]). Without one the
@@ -199,8 +200,11 @@ impl CatalogModels {
             models: KeyedCache::new(StaleUse::Forever),
             lookups: KeyedCache::new(StaleUse::Forever),
             names: KeyedCache::new(StaleUse::Forever),
-            // Authorization: a last-good answer is served for at most one more TTL.
-            access: KeyedCache::new(StaleUse::Bounded(ttl)),
+            // Authorization: no stale answer is served. An expired answer is
+            // refetched, and when cloud-platform cannot answer the read fails, so the
+            // outer models-service cache (which does not store errors) never holds
+            // an allow past one TTL.
+            access: KeyedCache::new(StaleUse::Never),
         }
     }
 
@@ -592,7 +596,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_expired_allow_is_denied_once_the_stale_bound_passes() {
+    async fn an_expired_allow_is_not_served_during_an_outage() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/v1/internal/catalog/model-access"))
@@ -615,11 +619,8 @@ mod tests {
             .await
         };
         assert!(check().await.unwrap());
-        // Expired, cloud-platform down, still inside one TTL of grace: the old allow holds.
+        // Expired and cloud-platform down: no stale allow, so the request fails closed.
         tokio::time::sleep(ttl + Duration::from_millis(10)).await;
-        assert!(check().await.unwrap());
-        // Past the grace bound: no answer, so the request fails closed.
-        tokio::time::sleep(ttl + Duration::from_millis(40)).await;
         assert!(check().await.is_err());
     }
 

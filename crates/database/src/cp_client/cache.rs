@@ -24,23 +24,15 @@ pub enum StaleUse {
     /// (catalog data such as the model list and lookups: an outage must not
     /// empty the catalog).
     Forever,
-    /// Serve the last good answer for at most this long past its expiry, then
-    /// fail. Used for authorization decisions: a stale allow must not outlive
-    /// a bounded window.
-    Bounded(Duration),
     /// Never serve an answer past its expiry (key verdicts: after the TTL the
     /// caller gets an outage, not an old verdict).
     Never,
 }
 
 impl StaleUse {
-    /// Whether an entry that expired at `expires_at` may still be served.
-    fn servable(self, expires_at: Instant, now: Instant) -> bool {
-        match self {
-            StaleUse::Forever => true,
-            StaleUse::Bounded(grace) => now < expires_at + grace,
-            StaleUse::Never => false,
-        }
+    /// Whether an expired answer may still be served when a reload fails.
+    fn keeps_expired(self) -> bool {
+        matches!(self, StaleUse::Forever)
     }
 }
 
@@ -131,12 +123,10 @@ impl<K: Eq + Hash + Clone, V: Clone> KeyedCache<K, V> {
                 })
             }
             Err(error) => match entry.as_ref() {
-                Some(stored) if self.stale.servable(stored.expires_at, Instant::now()) => {
-                    Ok(Loaded {
-                        value: stored.value.clone(),
-                        stale: true,
-                    })
-                }
+                Some(stored) if self.stale.keeps_expired() => Ok(Loaded {
+                    value: stored.value.clone(),
+                    stale: true,
+                }),
                 _ => Err(error),
             },
         }
@@ -155,7 +145,7 @@ impl<K: Eq + Hash + Clone, V: Clone> KeyedCache<K, V> {
             return slot.clone();
         }
         if slots.len() >= self.capacity {
-            self.evict_idle(&mut slots);
+            self.make_room(&mut slots);
         }
         let slot: Slot<V> = Arc::new(AsyncMutex::new(None));
         if slots.len() < self.capacity {
@@ -166,25 +156,34 @@ impl<K: Eq + Hash + Clone, V: Clone> KeyedCache<K, V> {
         slot
     }
 
-    /// Makes room by dropping slots that hold nothing, or whose stored answer
-    /// can no longer be served. Slots in use are kept, and so is every
-    /// last-good answer under `StaleUse::Forever`: those must survive capacity
-    /// pressure, so a catalog outage can still be answered from them.
-    fn evict_idle(&self, slots: &mut HashMap<K, Slot<V>>) {
+    /// Makes room for one more key. Only idle slots that can no longer serve
+    /// an answer are candidates: empty slots, and expired entries whose stale
+    /// use has run out. Fresh entries, in-flight loads and last-good answers
+    /// (under `Forever`) are never evicted. Candidates go oldest first, and
+    /// only as many as needed. When none qualify, the caller uses the overflow
+    /// path instead.
+    fn make_room(&self, slots: &mut HashMap<K, Slot<V>>) {
         let now = Instant::now();
-        slots.retain(|_, slot| {
+        let mut candidates: Vec<(Option<Instant>, K)> = Vec::new();
+        for (key, slot) in slots.iter() {
             if Arc::strong_count(slot) > 1 {
-                return true;
+                continue;
             }
-            match slot.try_lock() {
-                // Locked means a load is running on it.
-                Err(_) => true,
-                Ok(entry) => match entry.as_ref() {
-                    None => false,
-                    Some(stored) => self.stale.servable(stored.expires_at, now),
-                },
+            let Ok(entry) = slot.try_lock() else {
+                continue;
+            };
+            match entry.as_ref() {
+                None => candidates.push((None, key.clone())),
+                Some(stored) if now < stored.expires_at => {}
+                Some(stored) if self.stale.keeps_expired() => {}
+                Some(stored) => candidates.push((Some(stored.expires_at), key.clone())),
             }
-        });
+        }
+        candidates.sort_by_key(|(expires_at, _)| *expires_at);
+        let excess = (slots.len() + 1).saturating_sub(self.capacity);
+        for (_, key) in candidates.into_iter().take(excess) {
+            slots.remove(&key);
+        }
     }
 
     #[cfg(test)]
@@ -402,31 +401,74 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bounded_stale_serves_one_grace_period_then_fails() {
-        let cache: KeyedCache<(), u32> =
-            KeyedCache::new(StaleUse::Bounded(Duration::from_millis(100)));
-        cache
-            .get_or_load::<&str, _, _>((), || async { Ok((1, Duration::from_millis(20))) })
-            .await
-            .unwrap();
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        // Expired but within the grace period: the last answer is served.
-        let stale = cache
-            .get_or_load::<&str, _, _>((), || async { Err("down") })
+    async fn fresh_entries_survive_capacity_pressure_during_an_outage() {
+        let cache: KeyedCache<&'static str, u32> = KeyedCache::with_capacity(StaleUse::Never, 2);
+        for (key, value) in [("a", 1), ("b", 2)] {
+            cache
+                .get_or_load::<&str, _, _>(
+                    key,
+                    || async move { Ok((value, Duration::from_secs(30))) },
+                )
+                .await
+                .unwrap();
+        }
+        // The cache is full of fresh answers, so the new key is served uncached.
+        let loaded = cache
+            .get_or_load::<&str, _, _>("c", || async { Ok((3, Duration::from_secs(30))) })
             .await
             .unwrap();
         assert_eq!(
-            stale,
+            loaded,
             Loaded {
-                value: 1,
-                stale: true
+                value: 3,
+                stale: false
             }
         );
-        tokio::time::sleep(Duration::from_millis(150)).await;
-        // Past the grace period: no answer, so the caller fails closed.
-        assert!(cache
-            .get_or_load::<&str, _, _>((), || async { Err("down") })
+        assert_eq!(cache.len(), 2);
+        // Outage: the earlier answers still serve, without calling the loader.
+        for (key, value) in [("a", 1), ("b", 2)] {
+            let loaded = cache
+                .get_or_load::<&str, _, _>(key, || async { Err("down") })
+                .await
+                .unwrap();
+            assert_eq!(
+                loaded,
+                Loaded {
+                    value,
+                    stale: false
+                },
+                "{key}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn expired_unservable_entries_make_room_oldest_first() {
+        let cache: KeyedCache<&'static str, u32> = KeyedCache::with_capacity(StaleUse::Never, 2);
+        cache
+            .get_or_load::<&str, _, _>("old", || async { Ok((1, Duration::ZERO)) })
             .await
-            .is_err());
+            .unwrap();
+        cache
+            .get_or_load::<&str, _, _>("fresh", || async { Ok((2, Duration::from_secs(30))) })
+            .await
+            .unwrap();
+        cache
+            .get_or_load::<&str, _, _>("new", || async { Ok((3, Duration::from_secs(30))) })
+            .await
+            .unwrap();
+        // "old" was evicted to make room; "fresh" is kept and stored with "new".
+        assert_eq!(cache.len(), 2);
+        let served = cache
+            .get_or_load::<&str, _, _>("fresh", || async { Err("down") })
+            .await
+            .unwrap();
+        assert_eq!(
+            served,
+            Loaded {
+                value: 2,
+                stale: false
+            }
+        );
     }
 }

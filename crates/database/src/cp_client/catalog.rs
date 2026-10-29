@@ -4,10 +4,17 @@
 //! - Model lists and names are cached for `CP_CATALOG_CACHE_TTL_SECS`. A failed
 //!   reload serves the last good copy, without a time limit: these are listings
 //!   and do not grant access.
-//! - Model lookups are cached the same way, but the last good copy is served
-//!   for at most `CP_CATALOG_MAX_STALE_SECS` after it was fetched; then the
-//!   lookup fails. A lookup decides whether a model is listed, which gates the
-//!   grant check, so a stale `is_listed` must not outlive that bound.
+//! - Model lookups are cached the same way, but an answer is used only while
+//!   it is at most `CP_CATALOG_MAX_STALE_SECS - OUTER_RESOLVE_CACHE_TTL` old
+//!   (measured from the fetch). The models service caches a resolved answer for
+//!   a further `OUTER_RESOLVE_CACHE_TTL`, so this keeps the total within the
+//!   bound. Past it the lookup fails. A lookup decides whether a model is
+//!   listed, which gates the grant check, so a stale `is_listed` must not
+//!   outlive that bound.
+//!
+//! End to end: a change to a model's listing or grants is honoured within at
+//! most `CP_CATALOG_MAX_STALE_SECS` of the last successful fetch, including the
+//! outer resolve cache. Startup refuses settings that leave no room for it.
 //! - Model access is not cached here. The models service caches each decision
 //!   for one TTL, which is the only bound on a grant. A failed read is an error,
 //!   which fails the request closed and is not cached.
@@ -42,6 +49,12 @@ const MODELS: &[&str] = &["v1", "internal", "catalog", "models"];
 const LOOKUP: &[&str] = &["v1", "internal", "catalog", "model-lookup"];
 const NAMES: &[&str] = &["v1", "internal", "catalog", "model-names"];
 const ACCESS: &[&str] = &["v1", "internal", "catalog", "model-access"];
+
+/// How long the models service's resolve cache keeps a resolved answer. It is
+/// `MODEL_RESOLVE_CACHE_TTL_SECS` in `services/src/models/mod.rs`, a frozen
+/// module this adapter cannot change. Keep the two equal: a lookup must not be
+/// used past `CP_CATALOG_MAX_STALE_SECS` once that cache has held it.
+pub const OUTER_RESOLVE_CACHE_TTL: Duration = Duration::from_secs(30);
 const AREA_TAG: &str = "area:catalog";
 
 /// `GET /v1/internal/catalog/models` item. Only the fields cloud-api reads;
@@ -196,13 +209,34 @@ impl CatalogModels {
         max_stale: Duration,
         metrics: Option<Arc<dyn MetricsServiceTrait>>,
     ) -> Self {
+        Self::with_outer_hold(
+            local,
+            client,
+            ttl,
+            max_stale,
+            OUTER_RESOLVE_CACHE_TTL,
+            metrics,
+        )
+    }
+
+    /// `outer_hold` is how long the outer cache keeps a resolved answer; production
+    /// passes [`OUTER_RESOLVE_CACHE_TTL`].
+    fn with_outer_hold(
+        local: Arc<dyn ModelsRepository>,
+        client: Arc<CpClient>,
+        ttl: Duration,
+        max_stale: Duration,
+        outer_hold: Duration,
+        metrics: Option<Arc<dyn MetricsServiceTrait>>,
+    ) -> Self {
         Self {
             local,
             client,
             ttl,
             metrics,
             models: KeyedCache::new(StaleUse::Forever),
-            lookups: KeyedCache::new(StaleUse::MaxAge(max_stale)),
+            // Measured from the fetch, and reduced by the outer cache's hold.
+            lookups: KeyedCache::new(StaleUse::MaxAge(max_stale.saturating_sub(outer_hold))),
             names: KeyedCache::new(StaleUse::Forever),
         }
     }
@@ -466,9 +500,20 @@ mod tests {
         max_stale: Duration,
         metrics: Option<Arc<CapturingMetricsService>>,
     ) -> CatalogModels {
+        adapter_with_outer_hold(server, local, ttl, max_stale, Duration::ZERO, metrics)
+    }
+
+    fn adapter_with_outer_hold(
+        server: &MockServer,
+        local: Vec<ModelWithPricing>,
+        ttl: Duration,
+        max_stale: Duration,
+        outer_hold: Duration,
+        metrics: Option<Arc<CapturingMetricsService>>,
+    ) -> CatalogModels {
         let metrics: Option<Arc<dyn MetricsServiceTrait>> =
             metrics.map(|m| m as Arc<dyn MetricsServiceTrait>);
-        CatalogModels::new(
+        CatalogModels::with_outer_hold(
             Arc::new(FakeLocal {
                 models: local,
                 access: true,
@@ -476,6 +521,7 @@ mod tests {
             Arc::new(client(server)),
             ttl,
             max_stale,
+            outer_hold,
             metrics,
         )
     }
@@ -694,5 +740,38 @@ mod tests {
         })
         .await;
         assert!(granted);
+    }
+
+    #[tokio::test]
+    async fn a_stale_lookup_stops_before_the_outer_resolve_cache_could_extend_it() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/internal/catalog/model-lookup"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(remote_json("m", 200)))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/internal/catalog/model-lookup"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+        // A 400 ms bound with a 50 ms outer hold leaves 350 ms of stale serving,
+        // so the lookup stops before the bound itself.
+        let catalog = adapter_with_outer_hold(
+            &server,
+            vec![],
+            Duration::from_millis(10),
+            Duration::from_millis(400),
+            Duration::from_millis(50),
+            None,
+        );
+        assert!(catalog.get_model_by_name("m").await.unwrap().is_some());
+        // Stale and inside the usable window: served.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(catalog.get_model_by_name("m").await.unwrap().is_some());
+        // Past the usable window: an error, so the outer cache never holds it.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(catalog.get_model_by_name("m").await.is_err());
     }
 }

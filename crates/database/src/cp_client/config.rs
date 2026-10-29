@@ -8,6 +8,8 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+use super::catalog::OUTER_RESOLVE_CACHE_TTL;
+
 #[derive(Debug, Clone)]
 pub struct CpClientConfig {
     /// `CLOUD_PLATFORM_URL`, e.g. `http://10.0.2.2:24410`.
@@ -129,11 +131,20 @@ impl CpClientConfig {
             check_api_key_ttl: secs("CP_CHECK_API_KEY_TTL_SECS", defaults.check_api_key_ttl)?,
         }))
         .and_then(|config| match config {
-            Some(config) if config.catalog_ttl > config.catalog_max_stale => Err(format!(
-                "CP_CATALOG_CACHE_TTL_SECS ({}s) must not exceed CP_CATALOG_MAX_STALE_SECS ({}s)",
-                config.catalog_ttl.as_secs(),
-                config.catalog_max_stale.as_secs()
-            )),
+            // The models service holds a resolved lookup for 30 s more, so the bound
+            // must leave room for the TTL plus that hold (see
+            // `catalog::OUTER_RESOLVE_CACHE_TTL`).
+            Some(config)
+                if config.catalog_max_stale
+                    < config.catalog_ttl + OUTER_RESOLVE_CACHE_TTL =>
+            {
+                Err(format!(
+                    "CP_CATALOG_MAX_STALE_SECS ({}s) must be at least CP_CATALOG_CACHE_TTL_SECS ({}s) + {}s",
+                    config.catalog_max_stale.as_secs(),
+                    config.catalog_ttl.as_secs(),
+                    OUTER_RESOLVE_CACHE_TTL.as_secs()
+                ))
+            }
             other => Ok(other),
         })
     }
@@ -194,23 +205,25 @@ mod tests {
     }
 
     #[test]
-    fn a_catalog_ttl_longer_than_the_max_stale_bound_is_refused_naming_both() {
+    fn a_max_stale_bound_without_room_for_the_outer_hold_is_refused_naming_both() {
         let error = config(&[
-            URL,
-            KEY,
-            ("CP_CATALOG_CACHE_TTL_SECS", "120"),
-            ("CP_CATALOG_MAX_STALE_SECS", "60"),
-        ])
-        .unwrap_err();
-        assert!(error.contains("CP_CATALOG_CACHE_TTL_SECS"), "{error}");
-        assert!(error.contains("CP_CATALOG_MAX_STALE_SECS"), "{error}");
-        // Equal is allowed.
-        assert!(config(&[
             URL,
             KEY,
             ("CP_CATALOG_CACHE_TTL_SECS", "60"),
             ("CP_CATALOG_MAX_STALE_SECS", "60"),
         ])
+        .unwrap_err();
+        assert!(error.contains("CP_CATALOG_CACHE_TTL_SECS"), "{error}");
+        assert!(error.contains("CP_CATALOG_MAX_STALE_SECS"), "{error}");
+        // TTL + 30 s is the least room that is allowed.
+        assert!(config(&[
+            URL,
+            KEY,
+            ("CP_CATALOG_CACHE_TTL_SECS", "60"),
+            ("CP_CATALOG_MAX_STALE_SECS", "90"),
+        ])
         .is_ok());
+        // The defaults (30 s TTL, 300 s bound) pass.
+        assert!(config(&[URL, KEY]).unwrap().is_some());
     }
 }

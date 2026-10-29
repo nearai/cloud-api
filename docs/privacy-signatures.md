@@ -55,3 +55,13 @@ its locally rewritten output. This change does not affect automatic redaction
 on Chat Completions. Receipt storage contains hashes, IDs and signatures rather
 than raw inputs, detected spans or redacted text. Hashing is not anonymization;
 request/response hashes can still reveal whether a candidate payload matches.
+
+## Cloud-platform signature reads (`CP_SIGNATURE_READ`)
+
+`CP_SIGNATURE_READ=on` serves chat-signature reads from cloud-platform's
+`GET /v1/internal/chat-signatures/{chat_id}`. It relies on the shared database:
+cloud-api writes `chat_signatures` locally, and cloud-platform reads the same
+table. Do not enable `on` if the two services are given separate databases,
+unless the signature writes also go to cloud-platform. `shadow` compares both
+answers and counts differences (`presence` or `signature`) without changing what
+is served, and is the way to confirm a split has not happened.

@@ -9,7 +9,7 @@
 //! A miss is a 200 whose `signature` is null. That maps to the same
 //! `SignatureNotFound` the local repository returns, so the provider-pool
 //! fallback in the attestation service runs unchanged. Writes always stay
-//! local: see the note on [`ChatSignatureReads`].
+//! local. `on` relies on the shared database: see [`ChatSignatureReads`].
 
 use std::sync::Arc;
 
@@ -74,10 +74,13 @@ impl SignatureDto {
 /// The chat-signature read adapter. Other `AttestationRepository` methods are
 /// the local repository's.
 ///
-/// Writes stay local because cloud-platform does not yet receive signatures
-/// from cloud-api. A cloud-platform read is correct only once the matching
-/// write (`PUT /v1/internal/chat-signatures`) is live, so `on` must not be set
-/// before then. Shadow reports that gap as `presence` mismatches.
+/// `on` relies on the shared database. cloud-api writes `chat_signatures`
+/// locally, and cloud-platform reads the same table (cloud-platform owns it;
+/// see `crates/schema/ownership.toml` in cloud-platform). A signature cloud-api
+/// stores is therefore visible to cloud-platform's read. Do not enable `on` if
+/// the two services are ever given separate databases, unless the writes also
+/// go to cloud-platform (`PUT /v1/internal/chat-signatures`). Shadow reports a
+/// gap between the two as `presence` mismatches.
 pub struct ChatSignatureReads {
     mode: AreaMode,
     local: Arc<dyn AttestationRepository>,

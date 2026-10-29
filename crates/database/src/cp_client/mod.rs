@@ -9,11 +9,13 @@
 
 pub mod cache;
 pub mod catalog;
+pub mod check_api_key;
 pub mod client;
 pub mod config;
 pub mod signature;
 
 pub use catalog::CatalogModels;
+pub use check_api_key::{ApiKeyVerdicts, Verdict};
 pub use client::{
     current_caller_credential, with_caller_credential, with_request_id, BreakerState, CallType,
     CpClient, CpError, CpResponse, Credential,

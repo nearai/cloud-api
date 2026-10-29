@@ -2,7 +2,8 @@
 //! cloud-platform's verdict.
 //!
 //! A 200 (valid, with the credit gate passed) and a 402 (refused by the credit
-//! gate) are cached for `CP_CHECK_API_KEY_TTL_SECS` with ±20% jitter, so
+//! gate) are cached for at most `CP_CHECK_API_KEY_TTL_SECS`, shortened by up to
+//! 20% (jitter only ever shortens, so no verdict outlives the TTL), so
 //! expiries do not synchronize. A 401 is not cached, so a newly created key is
 //! accepted at once. Concurrent checks of one key make one call.
 //!
@@ -92,9 +93,10 @@ impl ApiKeyVerdicts {
     }
 }
 
-/// `ttl` scaled by a factor in [0.8, 1.2): `unit` is in [0, 1).
+/// `ttl` scaled by a factor in [0.8, 1.0): `unit` is in [0, 1). Downward only,
+/// so no verdict lives longer than the configured TTL.
 fn jittered(ttl: Duration, unit: f64) -> Duration {
-    ttl.mul_f64(0.8 + 0.4 * unit)
+    ttl.mul_f64(0.8 + 0.2 * unit)
 }
 
 /// A random number in [0, 1). The source only has to spread expiries, so the
@@ -121,14 +123,19 @@ mod tests {
         r#"{"valid":true,"organization_id":"o","workspace_id":"w","api_key_id":"k"}"#;
 
     #[test]
-    fn jitter_stays_within_twenty_percent() {
+    fn jitter_only_shortens_and_never_exceeds_the_ttl() {
         let ttl = Duration::from_secs(300);
+        // The shortest verdict is 80% of the TTL; the longest is the TTL itself.
         assert!(jittered(ttl, 0.0) >= Duration::from_millis(239_999));
-        assert!(jittered(ttl, 0.999_999) < Duration::from_secs(360));
-        assert!(jittered(ttl, 0.999_999) > Duration::from_secs(359));
+        assert!(jittered(ttl, 0.0) <= Duration::from_millis(240_001));
+        assert!(jittered(ttl, 0.999_999) <= ttl);
+        assert!(jittered(ttl, 0.999_999) > Duration::from_secs(299));
         for _ in 0..10_000 {
             let got = jittered(ttl, unit_interval());
-            assert!(got >= Duration::from_millis(239_999) && got < Duration::from_secs(360));
+            assert!(
+                got >= Duration::from_millis(239_999) && got <= ttl,
+                "{got:?}"
+            );
         }
     }
 

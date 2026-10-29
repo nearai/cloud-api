@@ -398,6 +398,7 @@ pub async fn init_domain_services_with_pool(
     // with every flag off no client is built and the local repositories are used as before.
     let cp_config = database::cp_client::CpClientConfig::from_env()
         .unwrap_or_else(|error| panic!("cloud-platform configuration: {error}"));
+    database::cp_client::client::set_areas_enabled(cp_config.flags.any_enabled());
     let cp_client = cloud_platform::build_client(&cp_config, metrics_service.clone())
         .unwrap_or_else(|error| panic!("cloud-platform client: {error:#}"));
     let catalog_models = cloud_platform::models_repository(

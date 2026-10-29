@@ -132,6 +132,17 @@ impl CpClientConfig {
                 .map(|value| AreaMode::parse(&value).map_err(|e| format!("{name}: {e}")))
                 .unwrap_or(Ok(AreaMode::Off))
         };
+        // The flags decide first. With every area off, the other settings are
+        // not read, so an invalid one cannot stop a deployment that uses none of
+        // cloud-platform.
+        let flags = AreaFlags {
+            catalog: mode("CP_CATALOG")?,
+            signature_read: mode("CP_SIGNATURE_READ")?,
+            check_api_key: mode("CP_CHECK_API_KEY")?,
+        };
+        if !flags.any_enabled() {
+            return Ok(Self { flags, ..defaults });
+        }
         let breaker_failures = match positive("CLOUD_PLATFORM_BREAKER_FAILURES")? {
             None => defaults.breaker_failures,
             Some(n) => u32::try_from(n)
@@ -155,11 +166,7 @@ impl CpClientConfig {
             breaker_open: millis("CLOUD_PLATFORM_BREAKER_OPEN_MS", defaults.breaker_open)?,
             catalog_ttl: secs("CP_CATALOG_CACHE_TTL_SECS", defaults.catalog_ttl)?,
             check_api_key_ttl: secs("CP_CHECK_API_KEY_TTL_SECS", defaults.check_api_key_ttl)?,
-            flags: AreaFlags {
-                catalog: mode("CP_CATALOG")?,
-                signature_read: mode("CP_SIGNATURE_READ")?,
-                check_api_key: mode("CP_CHECK_API_KEY")?,
-            },
+            flags,
         };
         if config.flags.any_enabled() {
             if config.base_url.is_none() {
@@ -227,9 +234,30 @@ mod tests {
     }
 
     #[test]
-    fn invalid_values_are_refused() {
+    fn invalid_values_are_refused_once_an_area_is_on() {
         assert!(config(&[("CP_CATALOG", "maybe")]).is_err());
-        assert!(config(&[("CLOUD_PLATFORM_READ_TIMEOUT_MS", "0")]).is_err());
-        assert!(config(&[("CLOUD_PLATFORM_BREAKER_FAILURES", "x")]).is_err());
+        let on = [
+            ("CP_CATALOG", "on"),
+            ("CLOUD_PLATFORM_URL", "http://10.0.2.2:24410"),
+            ("CLOUD_PLATFORM_API_KEY_FILE", "/run/secrets/cp-key"),
+        ];
+        let with = |extra: (&'static str, &'static str)| {
+            let mut vars = on.to_vec();
+            vars.push(extra);
+            config(&vars)
+        };
+        assert!(with(("CLOUD_PLATFORM_READ_TIMEOUT_MS", "0")).is_err());
+        assert!(with(("CLOUD_PLATFORM_BREAKER_FAILURES", "x")).is_err());
+    }
+
+    #[test]
+    fn all_off_ignores_every_other_setting() {
+        let config = config(&[
+            ("CLOUD_PLATFORM_READ_TIMEOUT_MS", "0"),
+            ("CLOUD_PLATFORM_BREAKER_FAILURES", "x"),
+            ("CP_CATALOG_CACHE_TTL_SECS", "nope"),
+        ])
+        .unwrap();
+        assert_eq!(config.flags, AreaFlags::default());
     }
 }

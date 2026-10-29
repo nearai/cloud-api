@@ -145,6 +145,17 @@ pub struct AuthenticatedReportingToken {
     pub scope: ReportingTokenScope,
 }
 
+/// The caller's bearer token to carry into cloud-platform reads. Copied only
+/// for a successful key, and only when some cloud-platform area is on.
+fn caller_key(auth_header: Option<&str>) -> Option<String> {
+    if !database::cp_client::client::areas_enabled() {
+        return None;
+    }
+    auth_header
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .map(str::to_owned)
+}
+
 /// Runs the rest of an API-key request with the caller's key in scope, for the
 /// cloud-platform reads that answer only for that key (model access).
 async fn with_caller_key(
@@ -196,13 +207,11 @@ pub async fn auth_middleware_with_api_key(
         ))
     };
 
-    let caller_token = auth_header
-        .and_then(|value| value.strip_prefix("Bearer "))
-        .map(str::to_owned);
     match auth_result {
         Ok(api_key) => {
             // Clone request to add extension
             debug!(api_key_id = %api_key.id.0, "Adding API key to request");
+            let caller_token = caller_key(auth_header);
             let mut request = request;
             request.extensions_mut().insert(api_key);
             Ok(with_caller_key(caller_token, next.run(request)).await)
@@ -251,12 +260,10 @@ pub async fn auth_middleware_with_workspace_context(
         ))
     };
 
-    let caller_token = auth_header
-        .and_then(|value| value.strip_prefix("Bearer "))
-        .map(str::to_owned);
     match auth_result {
         Ok(authenticated_api_key) => {
             debug!("Adding authenticated API key with workspace context to request");
+            let caller_token = caller_key(auth_header);
             let mut request = request;
             request.extensions_mut().insert(authenticated_api_key);
             Ok(with_caller_key(caller_token, next.run(request)).await)

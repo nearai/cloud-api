@@ -12,7 +12,7 @@ use utoipa::{Modify, OpenApi};
 
 ## Deprecations
 
-Operations marked deprecated (account, organization, workspace, API key, usage, billing, admin and catalog-administration endpoints) are moving to cloud-platform with the same paths and semantics. Inference and content endpoints (chat completions, responses, conversations, embeddings, images, audio, files, attestation) are unaffected.",
+Operations marked deprecated (account, organization, workspace, API key, usage, billing, admin and catalog-administration endpoints) are moving to cloud-platform at the same path. The cloud-platform base URL has not been published yet, and behaviour may differ in edge cases. Inference and content endpoints (chat completions, responses, conversations, embeddings, images, audio, files, attestation) are unaffected.",
         version = "1.0.0",
         contact(
             name = "NEAR AI Team",

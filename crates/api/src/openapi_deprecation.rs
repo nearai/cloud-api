@@ -11,9 +11,12 @@ use utoipa::openapi::{Deprecated, OpenApi};
 use utoipa::Modify;
 
 /// Added at the start of each deprecated operation's description.
-pub const DEPRECATION_NOTE: &str = "**Deprecated:** this endpoint is moving to cloud-platform      (same path and semantics). Check the cloud-platform API before building new integrations.";
+pub const DEPRECATION_NOTE: &str = "**Deprecated:** this endpoint is moving to cloud-platform at the same path; the cloud-platform base URL will be announced. Behaviour may differ in edge cases.";
 
 /// Lowercase HTTP method and OpenAPI path of every operation to deprecate.
+///
+/// Not listed: `/v1/auth/*`, which moves too but has no `#[utoipa::path]`
+/// annotation, so it is not in the generated spec for the hook to mark.
 pub const MOVED_TO_CLOUD_PLATFORM: &[(&str, &str)] = &[
     ("get", "/v1/admin/access-tokens"),
     ("post", "/v1/admin/access-tokens"),
@@ -145,6 +148,7 @@ pub const MOVED_TO_CLOUD_PLATFORM: &[(&str, &str)] = &[
     ("get", "/v1/staking/farm/config"),
     ("post", "/v1/users/contact-email/verify"),
     ("get", "/v1/users/me"),
+    ("patch", "/v1/users/me"),
     ("post", "/v1/users/me/access-tokens"),
     ("post", "/v1/users/me/contact-email"),
     ("delete", "/v1/users/me/contact-email"),
@@ -227,7 +231,10 @@ mod tests {
         let doc = spec();
         for (method, path) in MOVED_TO_CLOUD_PLATFORM {
             let operation = &doc["paths"][*path][*method];
-            assert!(operation.is_object(), "{method} {path} is not in the spec");
+            assert!(
+                operation.is_object(),
+                "{method} {path}: listed route not found in the spec: was it renamed (update the list) or removed (delete the entry)?"
+            );
             assert_eq!(operation["deprecated"], true, "{method} {path}");
             assert!(
                 operation["description"]

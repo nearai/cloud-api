@@ -18,9 +18,14 @@ pub const METRIC_CP_ERRORS: &str = "cloud_api.cp_client.errors";
 pub const METRIC_CP_LATENCY: &str = "cloud_api.cp_client.latency";
 /// 0 closed, 1 half-open, 2 open; recorded on every transition.
 pub const METRIC_CP_BREAKER_STATE: &str = "cloud_api.cp_client.breaker_state";
+/// A shadow-mode comparison that differed, tagged `field:<name>` (static names only).
+pub const METRIC_CP_SHADOW_MISMATCH: &str = "cloud_api.cp_client.shadow_mismatch";
+/// A read answered from the last good copy because cloud-platform failed.
+pub const METRIC_CP_STALE: &str = "cloud_api.cp_client.stale_served";
 
 tokio::task_local! {
     static REQUEST_ID: Uuid;
+    static CALLER_CREDENTIAL: String;
 }
 
 /// Run `fut` with `request_id` sent as `x-request-id` on every
@@ -33,6 +38,18 @@ fn current_request_id() -> Uuid {
     REQUEST_ID
         .try_with(|id| *id)
         .unwrap_or_else(|_| Uuid::new_v4())
+}
+
+/// Run `fut` with the end caller's API key in scope, for the reads that
+/// cloud-platform answers only for that key (model access). The key stays in
+/// memory for the request and is never logged.
+pub async fn with_caller_credential<F: std::future::Future>(token: String, fut: F) -> F::Output {
+    CALLER_CREDENTIAL.scope(token, fut).await
+}
+
+/// The end caller's API key in scope, if the request carries one.
+pub fn current_caller_credential() -> Option<String> {
+    CALLER_CREDENTIAL.try_with(|token| token.clone()).ok()
 }
 
 /// Each call type has its own deadline class and breaker.
@@ -93,12 +110,16 @@ pub enum CpError {
     Decode,
     #[error("no cloud-platform service credential configured")]
     NoCredential,
+    #[error("no caller credential in scope for cloud-platform")]
+    NoCallerCredential,
     #[error("invalid cloud-platform request")]
     InvalidRequest,
 }
 
 impl CpError {
-    fn kind(&self) -> &'static str {
+    /// A fixed label for logs and metrics. Never the error text, which can
+    /// carry a URL.
+    pub fn kind(&self) -> &'static str {
         match self {
             Self::BreakerOpen => "breaker_open",
             Self::Timeout => "timeout",
@@ -106,6 +127,7 @@ impl CpError {
             Self::Status(_) => "status",
             Self::Decode => "decode",
             Self::NoCredential => "no_credential",
+            Self::NoCallerCredential => "no_caller_credential",
             Self::InvalidRequest => "invalid_request",
         }
     }

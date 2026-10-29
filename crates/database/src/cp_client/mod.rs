@@ -7,10 +7,14 @@
 //! The DTOs here hold only the fields cloud-api reads and ignore unknown
 //! fields, so cloud-platform can add fields without breaking cloud-api.
 
+pub mod cache;
+pub mod catalog;
 pub mod client;
 pub mod config;
 
+pub use catalog::CatalogModels;
 pub use client::{
-    with_request_id, BreakerState, CallType, CpClient, CpError, CpResponse, Credential,
+    current_caller_credential, with_caller_credential, with_request_id, BreakerState, CallType,
+    CpClient, CpError, CpResponse, Credential,
 };
 pub use config::{AreaFlags, AreaMode, CpClientConfig};

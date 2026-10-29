@@ -167,6 +167,16 @@ struct BreakerInner {
     consecutive_failures: u32,
     open_until: Option<Instant>,
     probe_in_flight: bool,
+    /// Advanced by every transition. A call records against the epoch it
+    /// started in, so a completion from before the last transition is stale.
+    epoch: u64,
+}
+
+/// What a call holds from `try_acquire` until it is recorded.
+#[derive(Debug, Clone, Copy)]
+struct Ticket {
+    probe: bool,
+    epoch: u64,
 }
 
 /// Opens after `threshold` consecutive failures; after `cooldown` lets one
@@ -187,6 +197,7 @@ impl Breaker {
                 consecutive_failures: 0,
                 open_until: None,
                 probe_in_flight: false,
+                epoch: 0,
             }),
         }
     }
@@ -205,36 +216,58 @@ impl Breaker {
     }
 
     /// Whether a call may go out now; a half-open breaker admits one probe.
-    fn try_acquire(&self) -> Result<Option<BreakerState>, ()> {
+    fn try_acquire(&self) -> Result<Ticket, ()> {
         let mut inner = self.inner.lock().unwrap();
         match Self::state_of(&inner, Instant::now()) {
-            BreakerState::Closed => Ok(None),
+            BreakerState::Closed => Ok(Ticket {
+                probe: false,
+                epoch: inner.epoch,
+            }),
             BreakerState::Open => Err(()),
             BreakerState::HalfOpen if inner.probe_in_flight => Err(()),
             BreakerState::HalfOpen => {
                 inner.probe_in_flight = true;
-                Ok(Some(BreakerState::HalfOpen))
+                Ok(Ticket {
+                    probe: true,
+                    epoch: inner.epoch,
+                })
             }
         }
     }
 
-    /// Returns the new state when it changed.
-    fn record(&self, success: bool) -> Option<BreakerState> {
+    /// Records a finished call and returns the new state when it changed.
+    ///
+    /// Only the half-open probe closes an open breaker. A call from an older
+    /// epoch (one that started before the breaker last changed state) is
+    /// ignored, so a late success cannot close a breaker that opened after it
+    /// started.
+    fn record(&self, ticket: Ticket, success: bool) -> Option<BreakerState> {
         let mut inner = self.inner.lock().unwrap();
         let now = Instant::now();
         let before = Self::state_of(&inner, now);
-        let was_probe = std::mem::take(&mut inner.probe_in_flight);
-        if success {
+        if ticket.probe {
+            inner.probe_in_flight = false;
+            if success {
+                inner.consecutive_failures = 0;
+                inner.open_until = None;
+            } else {
+                inner.consecutive_failures = inner.consecutive_failures.saturating_add(1);
+                inner.open_until = Some(now + self.cooldown);
+            }
+            inner.epoch += 1;
+        } else if ticket.epoch != inner.epoch {
+            return None;
+        } else if success {
             inner.consecutive_failures = 0;
-            inner.open_until = None;
         } else {
             inner.consecutive_failures = inner.consecutive_failures.saturating_add(1);
-            if was_probe || inner.consecutive_failures >= self.threshold {
+            if inner.consecutive_failures >= self.threshold {
                 inner.open_until = Some(now + self.cooldown);
+                inner.epoch += 1;
             }
         }
         let after = Self::state_of(&inner, now);
-        (after != before || was_probe).then_some(after)
+        (after != before || ticket.probe).then_some(after)
     }
 }
 
@@ -354,17 +387,14 @@ impl CpClient {
         };
         let url = self.url(segments, query)?;
         let breaker = &self.breakers[call.index()];
-        let probe = match breaker.try_acquire() {
-            Err(()) => return Err(CpError::BreakerOpen),
-            Ok(Some(state)) => {
-                self.breaker_changed(call, state);
-                true
-            }
-            Ok(None) => false,
-        };
+        let ticket = breaker.try_acquire().map_err(|()| CpError::BreakerOpen)?;
+        if ticket.probe {
+            self.breaker_changed(call, BreakerState::HalfOpen);
+        }
         let mut probe_guard = ProbeGuard {
             breaker,
-            armed: probe,
+            ticket,
+            armed: ticket.probe,
         };
         let timeout = if call.is_write() {
             self.write_timeout
@@ -391,7 +421,7 @@ impl CpClient {
         }
         .await;
         probe_guard.armed = false;
-        if let Some(state) = breaker.record(outcome.is_ok()) {
+        if let Some(state) = breaker.record(ticket, outcome.is_ok()) {
             self.breaker_changed(call, state);
         }
         outcome
@@ -436,13 +466,14 @@ impl CpClient {
 /// for a fresh cooldown instead of staying "probe in flight" forever.
 struct ProbeGuard<'a> {
     breaker: &'a Breaker,
+    ticket: Ticket,
     armed: bool,
 }
 
 impl Drop for ProbeGuard<'_> {
     fn drop(&mut self) {
         if self.armed {
-            let _ = self.breaker.record(false);
+            let _ = self.breaker.record(self.ticket, false);
         }
     }
 }
@@ -743,13 +774,31 @@ pub(crate) mod tests {
     #[test]
     fn failed_probe_reopens() {
         let breaker = Breaker::new(1, Duration::from_millis(0));
-        assert!(breaker.try_acquire().is_ok());
-        breaker.record(false);
+        let first = breaker.try_acquire().unwrap();
+        breaker.record(first, false);
         // Cooldown 0: immediately half-open, one probe only.
-        assert_eq!(breaker.try_acquire(), Ok(Some(BreakerState::HalfOpen)));
-        assert_eq!(breaker.try_acquire(), Err(()));
-        breaker.record(false);
+        let probe = breaker.try_acquire().unwrap();
+        assert!(probe.probe);
+        assert_eq!(breaker.try_acquire().map(|t| t.probe), Err(()));
+        breaker.record(probe, false);
         assert!(breaker.inner.lock().unwrap().open_until.is_some());
+    }
+
+    #[test]
+    fn a_late_success_does_not_close_an_opened_breaker() {
+        let breaker = Breaker::new(1, Duration::from_millis(200));
+        // Two calls start while the breaker is closed; one fails and opens it.
+        let early = breaker.try_acquire().unwrap();
+        let failing = breaker.try_acquire().unwrap();
+        assert_eq!(breaker.record(failing, false), Some(BreakerState::Open));
+        // The early call succeeds late: it must not close the breaker.
+        assert_eq!(breaker.record(early, true), None);
+        assert_eq!(breaker.state(), BreakerState::Open);
+        std::thread::sleep(Duration::from_millis(250));
+        // Only the half-open probe closes it.
+        let probe = breaker.try_acquire().unwrap();
+        assert!(probe.probe);
+        assert_eq!(breaker.record(probe, true), Some(BreakerState::Closed));
     }
 
     #[test]

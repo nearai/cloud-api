@@ -354,11 +354,18 @@ impl CpClient {
         };
         let url = self.url(segments, query)?;
         let breaker = &self.breakers[call.index()];
-        match breaker.try_acquire() {
+        let probe = match breaker.try_acquire() {
             Err(()) => return Err(CpError::BreakerOpen),
-            Ok(Some(state)) => self.breaker_changed(call, state),
-            Ok(None) => {}
-        }
+            Ok(Some(state)) => {
+                self.breaker_changed(call, state);
+                true
+            }
+            Ok(None) => false,
+        };
+        let mut probe_guard = ProbeGuard {
+            breaker,
+            armed: probe,
+        };
         let timeout = if call.is_write() {
             self.write_timeout
         } else {
@@ -383,6 +390,7 @@ impl CpClient {
             Ok(CpResponse { status, body })
         }
         .await;
+        probe_guard.armed = false;
         if let Some(state) = breaker.record(outcome.is_ok()) {
             self.breaker_changed(call, state);
         }
@@ -423,6 +431,34 @@ impl CpClient {
     }
 }
 
+/// Settles a half-open probe whose call is dropped before it completes (the
+/// caller went away). The probe counts as a failure, so the breaker reopens
+/// for a fresh cooldown instead of staying "probe in flight" forever.
+struct ProbeGuard<'a> {
+    breaker: &'a Breaker,
+    armed: bool,
+}
+
+impl Drop for ProbeGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self.breaker.record(false);
+        }
+    }
+}
+
+/// Set once at startup: whether any cloud-platform area is on. While false,
+/// request paths skip every cloud-platform scope and credential copy.
+static AREAS_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_areas_enabled(enabled: bool) {
+    AREAS_ENABLED.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn areas_enabled() -> bool {
+    AREAS_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 // The reqwest error is not logged or returned: its text carries the URL.
 fn classify(error: reqwest::Error) -> CpError {
     if error.is_timeout() {
@@ -442,7 +478,7 @@ fn read_key_file(path: &std::path::Path) -> anyhow::Result<String> {
             .permissions()
             .mode();
         if mode & 0o077 != 0 {
-            anyhow::bail!("CLOUD_PLATFORM_API_KEY_FILE must have mode 0600");
+            anyhow::bail!("CLOUD_PLATFORM_API_KEY_FILE must be owner-only (0400 or 0600)");
         }
     }
     let key = std::fs::read_to_string(path)
@@ -639,6 +675,69 @@ pub(crate) mod tests {
         ] {
             assert!(names.iter().any(|name| name == expected), "{expected}");
         }
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_probe_reopens_the_breaker_instead_of_wedging_it() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/fail"))
+            .respond_with(ResponseTemplate::new(503))
+            .up_to_n_times(5)
+            .mount(&server)
+            .await;
+        // The probe hangs past the caller's deadline and is dropped mid-flight.
+        Mock::given(method("GET"))
+            .and(path("/fail"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_millis(800)))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/fail"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        let client = client(&server);
+        let call = || {
+            client.send(
+                CallType::CatalogRead,
+                Method::GET,
+                &["fail"],
+                &[],
+                Credential::Service,
+                None,
+            )
+        };
+        for _ in 0..5 {
+            assert!(call().await.is_err());
+        }
+        assert_eq!(
+            client.breaker_state(CallType::CatalogRead),
+            BreakerState::Open
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert_eq!(
+            client.breaker_state(CallType::CatalogRead),
+            BreakerState::HalfOpen
+        );
+        let dropped = tokio::time::timeout(Duration::from_millis(50), call()).await;
+        assert!(dropped.is_err(), "the probe should still be in flight");
+        // Not wedged: the dropped probe reopened the breaker for a fresh cooldown.
+        assert_eq!(
+            client.breaker_state(CallType::CatalogRead),
+            BreakerState::Open
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert_eq!(
+            client.breaker_state(CallType::CatalogRead),
+            BreakerState::HalfOpen
+        );
+        assert!(call().await.is_ok());
+        assert_eq!(
+            client.breaker_state(CallType::CatalogRead),
+            BreakerState::Closed
+        );
     }
 
     #[test]

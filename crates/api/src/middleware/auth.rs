@@ -148,7 +148,7 @@ pub struct AuthenticatedReportingToken {
 /// The caller's bearer token to carry into cloud-platform reads. Copied only
 /// for a successful key, and only when some cloud-platform area is on.
 fn caller_key(auth_header: Option<&str>) -> Option<String> {
-    if !database::cp_client::client::areas_enabled() {
+    if !database::cp_client::client::configured() {
         return None;
     }
     auth_header

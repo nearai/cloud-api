@@ -1,4 +1,4 @@
-//! Key-check area (`CP_CHECK_API_KEY`): `POST /v1/check_api_key` answered from
+//! `POST /v1/check_api_key` answered from
 //! cloud-platform's verdict.
 //!
 //! A 200 (valid, with the credit gate passed) and a 402 (refused by the credit

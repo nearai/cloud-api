@@ -1,15 +1,17 @@
-//! Signature area (`CP_SIGNATURE_READ`): the chat-signature read, served by
-//! cloud-platform's `GET /v1/internal/chat-signatures/{chat_id}`.
-//!
-//! - `off`: the local repository answers, and cloud-platform is never called.
-//! - `shadow`: the local answer is served and compared with cloud-platform's;
-//!   a difference is counted by field (`presence` for a hit on one side only).
-//! - `on`: cloud-platform answers. Signature reads are not cached.
+//! Chat-signature reads, served by cloud-platform's
+//! `GET /v1/internal/chat-signatures/{chat_id}` when the client is configured.
 //!
 //! A miss is a 200 whose `signature` is null. That maps to the same
 //! `SignatureNotFound` the local repository returns, so the provider-pool
-//! fallback in the attestation service runs unchanged. Writes always stay
-//! local. `on` relies on the shared database: see [`ChatSignatureReads`].
+//! fallback in the attestation service runs unchanged. Signature reads are not
+//! cached.
+//!
+//! This relies on the shared database. cloud-api writes `chat_signatures`
+//! locally, and cloud-platform reads the same table (cloud-platform owns it;
+//! see `crates/schema/ownership.toml` in cloud-platform). A signature cloud-api
+//! stores is therefore visible to cloud-platform's read. Do not configure the
+//! client if the two services are ever given separate databases, unless the
+//! writes also go to cloud-platform (`PUT /v1/internal/chat-signatures`).
 
 use std::sync::Arc;
 
@@ -18,12 +20,8 @@ use reqwest::{Method, StatusCode};
 use serde::Deserialize;
 use services::attestation::models::{AttestationError, ChatSignature, SignatureKind};
 use services::attestation::ports::AttestationRepository;
-use services::metrics::MetricsServiceTrait;
 
-use super::client::{CallType, CpClient, CpError, Credential, METRIC_CP_SHADOW_MISMATCH};
-use super::config::AreaMode;
-
-const AREA_TAG: &str = "area:signature";
+use super::client::{CallType, CpClient, CpError, Credential};
 
 /// `GET /v1/internal/chat-signatures/{chat_id}` body. `stop_reason` is not
 /// read: the attestation service takes it from usage, as before.
@@ -71,43 +69,16 @@ impl SignatureDto {
     }
 }
 
-/// The chat-signature read adapter. Other `AttestationRepository` methods are
-/// the local repository's.
-///
-/// `on` relies on the shared database. cloud-api writes `chat_signatures`
-/// locally, and cloud-platform reads the same table (cloud-platform owns it;
-/// see `crates/schema/ownership.toml` in cloud-platform). A signature cloud-api
-/// stores is therefore visible to cloud-platform's read. Do not enable `on` if
-/// the two services are ever given separate databases, unless the writes also
-/// go to cloud-platform (`PUT /v1/internal/chat-signatures`). Shadow reports a
-/// gap between the two as `presence` mismatches.
+/// The chat-signature read adapter. Writes and the other `AttestationRepository`
+/// methods are the local repository's.
 pub struct ChatSignatureReads {
-    mode: AreaMode,
     local: Arc<dyn AttestationRepository>,
     client: Arc<CpClient>,
-    metrics: Option<Arc<dyn MetricsServiceTrait>>,
 }
 
 impl ChatSignatureReads {
-    pub fn new(
-        mode: AreaMode,
-        local: Arc<dyn AttestationRepository>,
-        client: Arc<CpClient>,
-        metrics: Option<Arc<dyn MetricsServiceTrait>>,
-    ) -> Self {
-        Self {
-            mode,
-            local,
-            client,
-            metrics,
-        }
-    }
-
-    fn record_mismatch(&self, field: &'static str) {
-        if let Some(metrics) = &self.metrics {
-            let field_tag = format!("field:{field}");
-            metrics.record_count(METRIC_CP_SHADOW_MISMATCH, 1, &[AREA_TAG, &field_tag]);
-        }
+    pub fn new(local: Arc<dyn AttestationRepository>, client: Arc<CpClient>) -> Self {
+        Self { local, client }
     }
 
     async fn remote(
@@ -131,22 +102,6 @@ impl ChatSignatureReads {
         }
         let lookup: SignatureLookupDto = response.json()?;
         Ok(lookup.signature.map(SignatureDto::into_signature))
-    }
-
-    /// Cloud-platform's answer as the local repository would report it.
-    async fn remote_result(
-        &self,
-        chat_id: &str,
-        signing_algo: &str,
-    ) -> Result<ChatSignature, AttestationError> {
-        match self.remote(chat_id, signing_algo).await {
-            Ok(Some(signature)) => Ok(signature),
-            Ok(None) => Err(not_found(chat_id, signing_algo)),
-            Err(error) => Err(AttestationError::RepositoryError(format!(
-                "cloud-platform signature read failed: {}",
-                error.kind()
-            ))),
-        }
     }
 }
 
@@ -177,32 +132,13 @@ impl AttestationRepository for ChatSignatureReads {
         chat_id: &str,
         signing_algo: &str,
     ) -> Result<ChatSignature, AttestationError> {
-        match self.mode {
-            AreaMode::Off => self.local.get_chat_signature(chat_id, signing_algo).await,
-            AreaMode::Shadow => {
-                let served = self.local.get_chat_signature(chat_id, signing_algo).await;
-                let remote = self.remote_result(chat_id, signing_algo).await;
-                match (&served, &remote) {
-                    (Ok(local), Ok(remote)) => {
-                        if local.text != remote.text
-                            || local.signature != remote.signature
-                            || local.signing_address != remote.signing_address
-                            || local.signing_algo != remote.signing_algo
-                            || local.signature_kind != remote.signature_kind
-                        {
-                            self.record_mismatch("signature");
-                        }
-                    }
-                    (Ok(_), Err(AttestationError::SignatureNotFound(_)))
-                    | (Err(AttestationError::SignatureNotFound(_)), Ok(_)) => {
-                        self.record_mismatch("presence");
-                    }
-                    // A cloud-platform failure is not a difference.
-                    _ => {}
-                }
-                served
-            }
-            AreaMode::On => self.remote_result(chat_id, signing_algo).await,
+        match self.remote(chat_id, signing_algo).await {
+            Ok(Some(signature)) => Ok(signature),
+            Ok(None) => Err(not_found(chat_id, signing_algo)),
+            Err(error) => Err(AttestationError::RepositoryError(format!(
+                "cloud-platform signature read failed: {}",
+                error.kind()
+            ))),
         }
     }
 }
@@ -212,7 +148,6 @@ mod tests {
     use super::super::client::tests::client;
     use super::*;
     use serde_json::json;
-    use services::metrics::capturing::CapturingMetricsService;
     use wiremock::matchers::{any, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -241,29 +176,10 @@ mod tests {
         }
     }
 
-    fn stored() -> ChatSignature {
-        ChatSignature {
-            text: "a:b".to_string(),
-            signature: "0xsig".to_string(),
-            signing_address: "0xaddr".to_string(),
-            signing_algo: "ecdsa".to_string(),
-            signature_kind: Some(SignatureKind::Gateway),
-        }
-    }
-
-    fn reads(
-        server: &MockServer,
-        mode: AreaMode,
-        local: Option<ChatSignature>,
-        metrics: Option<Arc<CapturingMetricsService>>,
-    ) -> ChatSignatureReads {
-        let metrics: Option<Arc<dyn MetricsServiceTrait>> =
-            metrics.map(|m| m as Arc<dyn MetricsServiceTrait>);
+    fn reads(server: &MockServer, local: Option<ChatSignature>) -> ChatSignatureReads {
         ChatSignatureReads::new(
-            mode,
             Arc::new(FakeLocal { stored: local }),
             Arc::new(client(server)),
-            metrics,
         )
     }
 
@@ -282,21 +198,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn off_never_calls_cloud_platform() {
-        let server = MockServer::start().await;
-        Mock::given(any())
-            .respond_with(ResponseTemplate::new(200))
-            .expect(0)
-            .mount(&server)
-            .await;
-        let signature = reads(&server, AreaMode::Off, Some(stored()), None)
-            .get_chat_signature("chatcmpl-1", "ecdsa")
-            .await
-            .unwrap();
-        assert_eq!(signature.signature, "0xsig");
-    }
-
-    #[tokio::test]
     async fn on_maps_a_found_row() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
@@ -306,7 +207,7 @@ mod tests {
             .expect(1)
             .mount(&server)
             .await;
-        let signature = reads(&server, AreaMode::On, None, None)
+        let signature = reads(&server, None)
             .get_chat_signature("chatcmpl-1", "ecdsa")
             .await
             .unwrap();
@@ -326,7 +227,7 @@ mod tests {
             .expect(1)
             .mount(&server)
             .await;
-        let error = reads(&server, AreaMode::On, None, None)
+        let error = reads(&server, None)
             .get_chat_signature("chatcmpl-9", "ecdsa")
             .await
             .unwrap_err();
@@ -342,7 +243,7 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(body))
             .mount(&server)
             .await;
-        let signature = reads(&server, AreaMode::On, None, None)
+        let signature = reads(&server, None)
             .get_chat_signature("chatcmpl-1", "ecdsa")
             .await
             .unwrap();
@@ -357,7 +258,7 @@ mod tests {
             .expect(2)
             .mount(&server)
             .await;
-        let adapter = reads(&server, AreaMode::On, None, None);
+        let adapter = reads(&server, None);
         adapter
             .get_chat_signature("chatcmpl-1", "ecdsa")
             .await
@@ -375,38 +276,10 @@ mod tests {
             .respond_with(ResponseTemplate::new(503))
             .mount(&server)
             .await;
-        let error = reads(&server, AreaMode::On, None, None)
+        let error = reads(&server, None)
             .get_chat_signature("chatcmpl-1", "ecdsa")
             .await
             .unwrap_err();
         assert!(matches!(error, AttestationError::RepositoryError(_)));
-    }
-
-    #[tokio::test]
-    async fn shadow_serves_local_and_counts_a_presence_difference() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"signature": null})))
-            .mount(&server)
-            .await;
-        let metrics = Arc::new(CapturingMetricsService::new());
-        let served = reads(
-            &server,
-            AreaMode::Shadow,
-            Some(stored()),
-            Some(metrics.clone()),
-        )
-        .get_chat_signature("chatcmpl-1", "ecdsa")
-        .await
-        .unwrap();
-        assert_eq!(served.signature, "0xsig");
-        let fields: Vec<String> = metrics
-            .get_metrics()
-            .into_iter()
-            .filter(|metric| metric.name == METRIC_CP_SHADOW_MISMATCH)
-            .flat_map(|metric| metric.tags)
-            .filter(|tag| tag.starts_with("field:"))
-            .collect();
-        assert_eq!(fields, ["field:presence"]);
     }
 }

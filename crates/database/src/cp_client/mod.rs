@@ -1,8 +1,8 @@
 //! Adapters that serve existing `services` ports from cloud-platform.
 //!
-//! Each area is chosen at composition time by its `CP_*` flag
-//! (`off|shadow|on`, see [`config::AreaMode`]); the local repositories stay
-//! as the `off` implementation and as the comparison in `shadow`.
+//! They are used only when the client is configured (`CLOUD_PLATFORM_URL` and
+//! `CLOUD_PLATFORM_API_KEY_FILE` both set). Unconfigured, cloud-api never builds
+//! them; the local repositories serve everything.
 //!
 //! The DTOs here hold only the fields cloud-api reads and ignore unknown
 //! fields, so cloud-platform can add fields without breaking cloud-api.
@@ -20,5 +20,5 @@ pub use client::{
     current_caller_credential, with_caller_credential, with_request_id, BreakerState, CallType,
     CpClient, CpError, CpResponse, Credential,
 };
-pub use config::{AreaFlags, AreaMode, CpClientConfig};
+pub use config::CpClientConfig;
 pub use signature::ChatSignatureReads;

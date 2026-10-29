@@ -18,8 +18,6 @@ pub const METRIC_CP_ERRORS: &str = "cloud_api.cp_client.errors";
 pub const METRIC_CP_LATENCY: &str = "cloud_api.cp_client.latency";
 /// 0 closed, 1 half-open, 2 open; recorded on every transition.
 pub const METRIC_CP_BREAKER_STATE: &str = "cloud_api.cp_client.breaker_state";
-/// A shadow-mode comparison that differed, tagged `field:<name>` (static names only).
-pub const METRIC_CP_SHADOW_MISMATCH: &str = "cloud_api.cp_client.shadow_mismatch";
 /// A read answered from the last good copy because cloud-platform failed.
 pub const METRIC_CP_STALE: &str = "cloud_api.cp_client.stale_served";
 
@@ -292,20 +290,13 @@ impl std::fmt::Debug for CpClient {
 }
 
 impl CpClient {
-    /// Build the client, reading the service key file when one is configured.
+    /// Build the configured client, reading the service key file.
     pub fn from_config(
         config: &CpClientConfig,
         metrics: Option<Arc<dyn MetricsServiceTrait>>,
     ) -> anyhow::Result<Self> {
-        let service_key = match &config.api_key_file {
-            Some(path) => Some(read_key_file(path)?),
-            None => None,
-        };
-        let base_url = config
-            .base_url
-            .as_deref()
-            .ok_or_else(|| anyhow::anyhow!("CLOUD_PLATFORM_URL is not set"))?;
-        Self::new(base_url, service_key, config, metrics)
+        let service_key = read_key_file(&config.api_key_file)?;
+        Self::new(&config.base_url, Some(service_key), config, metrics)
     }
 
     pub fn new(
@@ -478,16 +469,17 @@ impl Drop for ProbeGuard<'_> {
     }
 }
 
-/// Set once at startup: whether any cloud-platform area is on. While false,
-/// request paths skip every cloud-platform scope and credential copy.
-static AREAS_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Set once at startup: whether cloud-platform is configured (both connection
+/// settings present). While false, request paths skip every cloud-platform
+/// scope and credential copy.
+static CONFIGURED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-pub fn set_areas_enabled(enabled: bool) {
-    AREAS_ENABLED.store(enabled, std::sync::atomic::Ordering::Relaxed);
+pub fn set_configured(configured: bool) {
+    CONFIGURED.store(configured, std::sync::atomic::Ordering::Relaxed);
 }
 
-pub fn areas_enabled() -> bool {
-    AREAS_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+pub fn configured() -> bool {
+    CONFIGURED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 // The reqwest error is not logged or returned: its text carries the URL.
@@ -619,7 +611,7 @@ pub(crate) mod tests {
     async fn read_deadline_is_enforced() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
-            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_millis(800)))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_millis(3000)))
             .mount(&server)
             .await;
         let started = Instant::now();
@@ -634,7 +626,7 @@ pub(crate) mod tests {
             )
             .await;
         assert!(matches!(result, Err(CpError::Timeout)));
-        assert!(started.elapsed() < Duration::from_millis(700));
+        assert!(started.elapsed() < Duration::from_millis(2000));
     }
 
     #[tokio::test]

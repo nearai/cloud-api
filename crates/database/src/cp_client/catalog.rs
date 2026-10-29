@@ -1,22 +1,19 @@
-//! Catalog area (`CP_CATALOG`): the `ModelsRepository` reads, served by
-//! cloud-platform's internal catalog routes.
+//! Catalog reads: the `ModelsRepository` reads served by cloud-platform's
+//! internal catalog routes when the client is configured.
 //!
-//! - `off`: the local repository answers, and cloud-platform is never called.
-//! - `shadow`: the local answer is served and the cloud-platform answer is
-//!   compared with it; each difference is counted by field.
-//! - `on`: cloud-platform answers. Model lists, lookups and names are cached
-//!   for `CP_CATALOG_CACHE_TTL_SECS`, and a failed reload serves the last good
-//!   copy. Model access is cached the same way; a failed read is an error,
+//! - Model lists, lookups and names are cached for `CP_CATALOG_CACHE_TTL_SECS`,
+//!   and a failed reload serves the last good copy.
+//! - Model access is cached the same way, but a last-good answer is served for
+//!   at most one more TTL; after that the read fails. A failed read is an error,
 //!   which fails the request closed and is not cached.
 //!
-//! Model access is answered only for the end caller's own API key, so it
-//! needs the caller credential in scope ([`with_caller_credential`]). Without
-//! one it denies. `list_restricted_model_access` has no route and always
-//! reads the local database.
+//! Model access is answered only for the end caller's own API key, so it needs
+//! the caller credential in scope ([`with_caller_credential`]). Without one the
+//! read fails. `list_restricted_model_access` has no route and always reads the
+//! local database.
 //!
 //! [`with_caller_credential`]: super::client::with_caller_credential
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -33,10 +30,8 @@ use uuid::Uuid;
 
 use super::cache::{KeyedCache, Loaded, StaleUse};
 use super::client::{
-    current_caller_credential, CallType, CpClient, CpError, CpResponse, Credential,
-    METRIC_CP_SHADOW_MISMATCH, METRIC_CP_STALE,
+    current_caller_credential, CallType, CpClient, CpError, CpResponse, Credential, METRIC_CP_STALE,
 };
-use super::config::AreaMode;
 
 const MODELS: &[&str] = &["v1", "internal", "catalog", "models"];
 const LOOKUP: &[&str] = &["v1", "internal", "catalog", "model-lookup"];
@@ -179,7 +174,6 @@ impl CatalogModelDto {
 
 /// The `ModelsRepository` adapter for the catalog area.
 pub struct CatalogModels {
-    mode: AreaMode,
     local: Arc<dyn ModelsRepository>,
     client: Arc<CpClient>,
     ttl: Duration,
@@ -192,14 +186,12 @@ pub struct CatalogModels {
 
 impl CatalogModels {
     pub fn new(
-        mode: AreaMode,
         local: Arc<dyn ModelsRepository>,
         client: Arc<CpClient>,
         ttl: Duration,
         metrics: Option<Arc<dyn MetricsServiceTrait>>,
     ) -> Self {
         Self {
-            mode,
             local,
             client,
             ttl,
@@ -217,16 +209,6 @@ impl CatalogModels {
             if let Some(metrics) = &self.metrics {
                 metrics.record_count(METRIC_CP_STALE, 1, &[AREA_TAG]);
             }
-        }
-    }
-
-    fn record_mismatches(&self, fields: &[&'static str]) {
-        let Some(metrics) = &self.metrics else {
-            return;
-        };
-        for field in fields {
-            let field_tag = format!("field:{field}");
-            metrics.record_count(METRIC_CP_SHADOW_MISMATCH, 1, &[AREA_TAG, &field_tag]);
         }
     }
 
@@ -359,47 +341,25 @@ fn expect_ok(response: CpResponse) -> Result<CpResponse, CpError> {
 #[async_trait]
 impl ModelsRepository for CatalogModels {
     async fn get_all_active_models(&self) -> anyhow::Result<Vec<ModelWithPricing>> {
-        match self.mode {
-            AreaMode::Off => self.local.get_all_active_models().await,
-            AreaMode::Shadow => {
-                let local = self.local.get_all_active_models().await?;
-                if let Ok(remote) = self.remote_models().await {
-                    self.record_mismatches(&diff_lists(&local, &remote));
-                }
-                Ok(local)
-            }
-            AreaMode::On => Ok(self.remote_models().await?),
-        }
+        Ok(self.remote_models().await?)
     }
 
     async fn get_model_by_name(
         &self,
         model_name: &str,
     ) -> anyhow::Result<Option<ModelWithPricing>> {
-        self.lookup(model_name, false).await
+        Ok(self.remote_lookup(model_name, false).await?)
     }
 
     async fn resolve_and_get_model(
         &self,
         identifier: &str,
     ) -> anyhow::Result<Option<ModelWithPricing>> {
-        self.lookup(identifier, true).await
+        Ok(self.remote_lookup(identifier, true).await?)
     }
 
     async fn get_configured_model_names(&self) -> anyhow::Result<Vec<String>> {
-        match self.mode {
-            AreaMode::Off => self.local.get_configured_model_names().await,
-            AreaMode::Shadow => {
-                let local = self.local.get_configured_model_names().await?;
-                if let Ok(remote) = self.remote_names().await {
-                    if sorted(local.clone()) != sorted(remote) {
-                        self.record_mismatches(&["model_names"]);
-                    }
-                }
-                Ok(local)
-            }
-            AreaMode::On => Ok(self.remote_names().await?),
-        }
+        Ok(self.remote_names().await?)
     }
 
     async fn organization_has_model_access(
@@ -407,37 +367,18 @@ impl ModelsRepository for CatalogModels {
         organization_id: Uuid,
         model_id: Uuid,
     ) -> anyhow::Result<bool> {
-        match self.mode {
-            AreaMode::Off => {
-                self.local
-                    .organization_has_model_access(organization_id, model_id)
-                    .await
+        // No answer is an error, not a denial: the request fails closed, and the
+        // models service does not cache a failed lookup, so the next request
+        // asks again instead of inheriting a transient "no access".
+        match self.remote_access(organization_id, model_id).await {
+            Ok(has_access) => Ok(has_access),
+            Err(error) => {
+                tracing::warn!(
+                    error_kind = error.kind(),
+                    "cloud-platform model access read failed"
+                );
+                Err(anyhow::Error::from(error))
             }
-            AreaMode::Shadow => {
-                let local = self
-                    .local
-                    .organization_has_model_access(organization_id, model_id)
-                    .await?;
-                if let Ok(remote) = self.remote_access(organization_id, model_id).await {
-                    if remote != local {
-                        self.record_mismatches(&["has_access"]);
-                    }
-                }
-                Ok(local)
-            }
-            // No answer is an error, not a denial: the request fails closed, and the
-            // models service does not cache a failed lookup, so the next request
-            // asks again instead of inheriting a transient "no access".
-            AreaMode::On => match self.remote_access(organization_id, model_id).await {
-                Ok(has_access) => Ok(has_access),
-                Err(error) => {
-                    tracing::warn!(
-                        error_kind = error.kind(),
-                        "cloud-platform model access read failed"
-                    );
-                    Err(anyhow::Error::from(error))
-                }
-            },
         }
     }
 
@@ -445,154 +386,6 @@ impl ModelsRepository for CatalogModels {
         // No cloud-platform route lists grants; this read stays local.
         self.local.list_restricted_model_access().await
     }
-}
-
-impl CatalogModels {
-    async fn lookup(
-        &self,
-        identifier: &str,
-        resolve: bool,
-    ) -> anyhow::Result<Option<ModelWithPricing>> {
-        let local = || async {
-            if resolve {
-                self.local.resolve_and_get_model(identifier).await
-            } else {
-                self.local.get_model_by_name(identifier).await
-            }
-        };
-        match self.mode {
-            AreaMode::Off => local().await,
-            AreaMode::Shadow => {
-                let served = local().await?;
-                if let Ok(remote) = self.remote_lookup(identifier, resolve).await {
-                    self.record_mismatches(&diff_option(served.as_ref(), remote.as_ref()));
-                }
-                Ok(served)
-            }
-            AreaMode::On => Ok(self.remote_lookup(identifier, resolve).await?),
-        }
-    }
-}
-
-fn sorted(mut names: Vec<String>) -> Vec<String> {
-    names.sort();
-    names
-}
-
-/// Field names that differ between two models. Remote `provider_config` is
-/// redacted, so `api_key` is left out of the comparison on both sides.
-fn diff_model(local: &ModelWithPricing, remote: &ModelWithPricing) -> Vec<&'static str> {
-    let mut fields = Vec::new();
-    macro_rules! compare {
-        ($($field:ident),+ $(,)?) => {
-            $(
-                if local.$field != remote.$field {
-                    fields.push(stringify!($field));
-                }
-            )+
-        };
-    }
-    compare!(
-        id,
-        model_name,
-        model_display_name,
-        model_description,
-        model_icon,
-        input_cost_per_token,
-        output_cost_per_token,
-        cost_per_image,
-        cache_read_cost_per_token,
-        text_pricing,
-        context_length,
-        verifiable,
-        aliases,
-        owned_by,
-        provider_type,
-        attestation_supported,
-        input_modalities,
-        output_modalities,
-        inference_url,
-        hugging_face_id,
-        quantization,
-        max_output_length,
-        supported_sampling_parameters,
-        supported_features,
-        datacenters,
-        is_ready,
-        deprecation_date,
-        successor_model_name,
-        openrouter_slug,
-        is_listed,
-        created_at,
-    );
-    if without_api_key(&local.provider_config) != without_api_key(&remote.provider_config) {
-        fields.push("provider_config");
-    }
-    if upcoming_differs(&local.upcoming_pricing, &remote.upcoming_pricing) {
-        fields.push("upcoming_pricing");
-    }
-    fields
-}
-
-fn without_api_key(config: &Option<serde_json::Value>) -> Option<serde_json::Value> {
-    config.clone().map(|mut value| {
-        if let Some(object) = value.as_object_mut() {
-            object.remove("api_key");
-        }
-        value
-    })
-}
-
-fn upcoming_differs(
-    local: &Option<UpcomingModelPricing>,
-    remote: &Option<UpcomingModelPricing>,
-) -> bool {
-    match (local, remote) {
-        (None, None) => false,
-        (Some(a), Some(b)) => {
-            a.effective_at != b.effective_at
-                || a.input_cost_per_token != b.input_cost_per_token
-                || a.output_cost_per_token != b.output_cost_per_token
-                || a.cache_read_cost_per_token != b.cache_read_cost_per_token
-                || a.cost_per_image != b.cost_per_image
-                || a.text_pricing != b.text_pricing
-        }
-        _ => true,
-    }
-}
-
-fn diff_option(
-    local: Option<&ModelWithPricing>,
-    remote: Option<&ModelWithPricing>,
-) -> Vec<&'static str> {
-    match (local, remote) {
-        (None, None) => Vec::new(),
-        (Some(local), Some(remote)) => diff_model(local, remote),
-        _ => vec!["presence"],
-    }
-}
-
-/// Compares two model lists by name. A model present on one side only is
-/// `model_set`; a model on both sides contributes its differing fields.
-fn diff_lists(local: &[ModelWithPricing], remote: &[ModelWithPricing]) -> Vec<&'static str> {
-    let local: BTreeMap<&str, &ModelWithPricing> = local
-        .iter()
-        .map(|model| (model.model_name.as_str(), model))
-        .collect();
-    let remote: BTreeMap<&str, &ModelWithPricing> = remote
-        .iter()
-        .map(|model| (model.model_name.as_str(), model))
-        .collect();
-    let mut fields = Vec::new();
-    if local.keys().ne(remote.keys()) {
-        fields.push("model_set");
-    }
-    for (name, local_model) in &local {
-        if let Some(remote_model) = remote.get(name) {
-            fields.extend(diff_model(local_model, remote_model));
-        }
-    }
-    fields
 }
 
 #[cfg(test)]
@@ -603,7 +396,7 @@ mod tests {
     use async_trait::async_trait;
     use serde_json::json;
     use services::metrics::capturing::CapturingMetricsService;
-    use wiremock::matchers::{any, header, method, path, query_param};
+    use wiremock::matchers::{header, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     /// A local repository with fixed answers.
@@ -638,48 +431,6 @@ mod tests {
         Uuid::from_u128(7)
     }
 
-    fn created_at() -> DateTime<Utc> {
-        "2026-01-01T00:00:00Z".parse().unwrap()
-    }
-
-    fn local_model(name: &str, context_length: i32) -> ModelWithPricing {
-        ModelWithPricing {
-            id: model_id(),
-            model_name: name.to_string(),
-            model_display_name: name.to_string(),
-            model_description: "d".to_string(),
-            model_icon: None,
-            input_cost_per_token: 1,
-            output_cost_per_token: 2,
-            cost_per_image: 0,
-            cache_read_cost_per_token: None,
-            text_pricing: None,
-            upcoming_pricing: None,
-            context_length,
-            verifiable: true,
-            aliases: vec![],
-            owned_by: "x".to_string(),
-            provider_type: "vllm".to_string(),
-            provider_config: None,
-            attestation_supported: true,
-            input_modalities: None,
-            output_modalities: None,
-            inference_url: None,
-            hugging_face_id: None,
-            quantization: None,
-            max_output_length: None,
-            supported_sampling_parameters: vec![],
-            supported_features: vec![],
-            datacenters: None,
-            is_ready: None,
-            deprecation_date: None,
-            successor_model_name: None,
-            openrouter_slug: None,
-            is_listed: true,
-            created_at: created_at(),
-        }
-    }
-
     fn remote_json(name: &str, context_length: i32) -> serde_json::Value {
         json!({
             "id": model_id(),
@@ -703,7 +454,6 @@ mod tests {
 
     fn adapter(
         server: &MockServer,
-        mode: AreaMode,
         local: Vec<ModelWithPricing>,
         ttl: Duration,
         metrics: Option<Arc<CapturingMetricsService>>,
@@ -711,7 +461,6 @@ mod tests {
         let metrics: Option<Arc<dyn MetricsServiceTrait>> =
             metrics.map(|m| m as Arc<dyn MetricsServiceTrait>);
         CatalogModels::new(
-            mode,
             Arc::new(FakeLocal {
                 models: local,
                 access: true,
@@ -720,34 +469,6 @@ mod tests {
             ttl,
             metrics,
         )
-    }
-
-    #[tokio::test]
-    async fn off_never_calls_cloud_platform() {
-        let server = MockServer::start().await;
-        Mock::given(any())
-            .respond_with(ResponseTemplate::new(200))
-            .expect(0)
-            .mount(&server)
-            .await;
-        let catalog = adapter(
-            &server,
-            AreaMode::Off,
-            vec![local_model("m", 100)],
-            Duration::from_secs(30),
-            None,
-        );
-        let models = catalog.get_all_active_models().await.unwrap();
-        assert_eq!(models.len(), 1);
-        assert!(catalog.get_model_by_name("m").await.unwrap().is_some());
-        assert!(catalog.resolve_and_get_model("m").await.unwrap().is_some());
-        assert_eq!(catalog.get_configured_model_names().await.unwrap(), ["m"]);
-        let _ = with_caller_credential(
-            "sk-caller".to_string(),
-            catalog.organization_has_model_access(Uuid::nil(), model_id()),
-        )
-        .await
-        .unwrap();
     }
 
     #[tokio::test]
@@ -760,7 +481,7 @@ mod tests {
             .expect(1)
             .mount(&server)
             .await;
-        let catalog = adapter(&server, AreaMode::On, vec![], Duration::from_secs(30), None);
+        let catalog = adapter(&server, vec![], Duration::from_secs(30), None);
         assert!(catalog
             .get_model_by_name("missing")
             .await
@@ -777,7 +498,7 @@ mod tests {
             .expect(1)
             .mount(&server)
             .await;
-        let catalog = adapter(&server, AreaMode::On, vec![], Duration::from_secs(30), None);
+        let catalog = adapter(&server, vec![], Duration::from_secs(30), None);
         for _ in 0..3 {
             let models = catalog.get_all_active_models().await.unwrap();
             assert_eq!(models[0].context_length, 200);
@@ -801,7 +522,6 @@ mod tests {
         let metrics = Arc::new(CapturingMetricsService::new());
         let catalog = adapter(
             &server,
-            AreaMode::On,
             vec![],
             Duration::from_millis(20),
             Some(metrics.clone()),
@@ -828,39 +548,11 @@ mod tests {
             .expect(5)
             .mount(&server)
             .await;
-        let catalog = adapter(&server, AreaMode::On, vec![], Duration::from_secs(30), None);
+        let catalog = adapter(&server, vec![], Duration::from_secs(30), None);
         for _ in 0..6 {
             assert!(catalog.get_all_active_models().await.is_err());
         }
         // The expect(5) above proves the sixth call never reached the server.
-    }
-
-    #[tokio::test]
-    async fn shadow_serves_the_local_answer_and_counts_mismatches_by_field() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/v1/internal/catalog/models"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!([remote_json("m", 200)])))
-            .mount(&server)
-            .await;
-        let metrics = Arc::new(CapturingMetricsService::new());
-        let catalog = adapter(
-            &server,
-            AreaMode::Shadow,
-            vec![local_model("m", 100)],
-            Duration::from_secs(30),
-            Some(metrics.clone()),
-        );
-        let served = catalog.get_all_active_models().await.unwrap();
-        assert_eq!(served[0].context_length, 100);
-        let mismatches: Vec<String> = metrics
-            .get_metrics()
-            .into_iter()
-            .filter(|metric| metric.name == METRIC_CP_SHADOW_MISMATCH)
-            .flat_map(|metric| metric.tags)
-            .filter(|tag| tag.starts_with("field:"))
-            .collect();
-        assert_eq!(mismatches, ["field:context_length"]);
     }
 
     #[tokio::test]
@@ -874,7 +566,7 @@ mod tests {
             .expect(1)
             .mount(&server)
             .await;
-        let catalog = adapter(&server, AreaMode::On, vec![], Duration::from_secs(30), None);
+        let catalog = adapter(&server, vec![], Duration::from_secs(30), None);
         let org = Uuid::from_u128(9);
 
         // No caller key in scope: fail without calling cloud-platform.
@@ -914,7 +606,7 @@ mod tests {
             .mount(&server)
             .await;
         let ttl = Duration::from_millis(50);
-        let catalog = adapter(&server, AreaMode::On, vec![], ttl, None);
+        let catalog = adapter(&server, vec![], ttl, None);
         let org = Uuid::from_u128(9);
         let check = || async {
             with_caller_credential("sk-caller".to_string(), async {
@@ -940,7 +632,7 @@ mod tests {
             .up_to_n_times(1)
             .mount(&server)
             .await;
-        let catalog = adapter(&server, AreaMode::On, vec![], Duration::from_secs(30), None);
+        let catalog = adapter(&server, vec![], Duration::from_secs(30), None);
         let answer = with_caller_credential("sk-caller".to_string(), async {
             catalog
                 .organization_has_model_access(Uuid::from_u128(9), model_id())
@@ -962,12 +654,5 @@ mod tests {
         })
         .await;
         assert!(granted);
-    }
-
-    #[tokio::test]
-    async fn diff_lists_reports_membership_and_fields() {
-        let local = vec![local_model("a", 1), local_model("b", 2)];
-        let remote = vec![local_model("a", 9)];
-        assert_eq!(diff_lists(&local, &remote), ["model_set", "context_length"]);
     }
 }

@@ -42,7 +42,7 @@ pub async fn request_correlation_middleware(mut request: Request<Body>, next: Ne
     // Only when some cloud-platform area is on: with every flag off the request
     // carries no extra scope.
     let run = async move { next.run(request).await };
-    let mut response = if database::cp_client::client::areas_enabled() {
+    let mut response = if database::cp_client::client::configured() {
         database::cp_client::with_request_id(request_id, run)
             .instrument(span)
             .await

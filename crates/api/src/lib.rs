@@ -121,8 +121,8 @@ pub struct DomainServices {
     pub service_usage_service:
         Arc<dyn services::service_usage::ServiceUsageServiceTrait + Send + Sync>,
     pub admin_settings_service: Arc<services::admin_settings::AdminSettingsService>,
-    /// The gateway key check when `CP_CHECK_API_KEY` is not off.
-    pub cloud_platform_check_api_key: Option<cloud_platform::CheckApiKeyRoute>,
+    /// The gateway key-check verdicts, present when cloud-platform is configured.
+    pub cloud_platform_check_api_key: Option<Arc<database::cp_client::ApiKeyVerdicts>>,
 }
 
 /// Controls process-level background work started while the application router
@@ -394,31 +394,24 @@ pub async fn init_domain_services_with_pool(
         database.pool().clone(),
     ));
 
-    // Cloud-platform areas. Each service takes the implementation its CP_* flag selects;
-    // with every flag off no client is built and the local repositories are used as before.
+    // Cloud-platform: configured by CLOUD_PLATFORM_URL and CLOUD_PLATFORM_API_KEY_FILE.
+    // Unconfigured, none of this is built and the local repositories serve every read.
     let cp_config = database::cp_client::CpClientConfig::from_env()
         .unwrap_or_else(|error| panic!("cloud-platform configuration: {error}"));
-    database::cp_client::client::set_areas_enabled(cp_config.flags.any_enabled());
-    let cp_client = cloud_platform::build_client(&cp_config, metrics_service.clone())
+    let cloud_platform = cloud_platform::build(cp_config.as_ref(), metrics_service.clone())
         .unwrap_or_else(|error| panic!("cloud-platform client: {error:#}"));
+    database::cp_client::client::set_configured(cloud_platform.is_some());
     let catalog_models = cloud_platform::models_repository(
-        cp_config.flags.catalog,
         models_repo.clone() as Arc<dyn services::models::ModelsRepository>,
-        cp_client.as_ref(),
-        cp_config.catalog_ttl,
+        cloud_platform.as_ref(),
         Some(metrics_service.clone()),
     );
     let signature_repo = cloud_platform::signature_repository(
-        cp_config.flags.signature_read,
         attestation_repo.clone() as Arc<dyn services::attestation::ports::AttestationRepository>,
-        cp_client.as_ref(),
-        Some(metrics_service.clone()),
+        cloud_platform.as_ref(),
     );
-    let cloud_platform_check_api_key = cloud_platform::check_api_key_route(
-        &cp_config,
-        cp_client.as_ref(),
-        Some(metrics_service.clone()),
-    );
+    let cloud_platform_check_api_key =
+        cloud_platform::check_api_key_verdicts(cloud_platform.as_ref());
 
     // Note: inference_url models and external providers are loaded in init_inference_providers.
     // Periodic refresh is also started there.
@@ -2113,21 +2106,18 @@ pub fn build_gateway_routes(
     app_state: AppState,
     auth_state_middleware: &AuthState,
     usage_state: middleware::UsageState,
-    cp_check: Option<cloud_platform::CheckApiKeyRoute>,
+    cloud_platform_verdicts: Option<Arc<database::cp_client::ApiKeyVerdicts>>,
 ) -> Router {
-    if let Some(route) = cp_check
-        .as_ref()
-        .filter(|route| route.mode == database::cp_client::AreaMode::On)
-    {
+    if let Some(verdicts) = cloud_platform_verdicts {
         // cloud-platform decides: the local key and credit checks do not run on this route.
         return Router::new()
             .route(
                 "/check_api_key",
                 post(cloud_platform::check_api_key_from_cloud_platform),
             )
-            .with_state(route.verdicts.clone());
+            .with_state(verdicts);
     }
-    let router = Router::new()
+    Router::new()
         .route(
             "/check_api_key",
             post(crate::routes::gateway::check_api_key),
@@ -2140,15 +2130,7 @@ pub fn build_gateway_routes(
         .layer(from_fn_with_state(
             auth_state_middleware.clone(),
             middleware::auth::auth_middleware_with_workspace_context,
-        ));
-    match cp_check {
-        // Shadow: the local route answers and cloud-platform's verdict is compared with it.
-        Some(route) => router.layer(from_fn_with_state(
-            route,
-            cloud_platform::shadow_check_api_key,
-        )),
-        None => router,
-    }
+        ))
 }
 
 /// Build internal-only routes authenticated by the shared

@@ -12,7 +12,7 @@ use utoipa::{Modify, OpenApi};
 
 ## Deprecations
 
-Operations marked deprecated (account, organization, workspace, API key, usage, billing, admin and catalog-administration endpoints) are moving to cloud-platform at the same path. The cloud-platform base URL has not been published yet, and behaviour may differ in edge cases. Inference and content endpoints (chat completions, responses, conversations, embeddings, images, audio, files, attestation) are unaffected.",
+Operations marked deprecated (account, organization, workspace, invitation, API key, usage, billing, service pricing, staking, feature request, admin and catalog-administration endpoints) are moving to cloud-platform at the same path. The cloud-platform base URL has not been published yet, and behaviour may differ in edge cases. Inference and content endpoints (chat completions, responses, conversations, embeddings, images, audio, files, attestation) are unaffected.",
         version = "1.0.0",
         contact(
             name = "NEAR AI Team",
@@ -252,6 +252,13 @@ Operations marked deprecated (account, organization, workspace, API key, usage, 
         schemas(
             // Health check models
             crate::routes::health::HealthResponse,
+            // List query parameter enums: utoipa does not collect types used only in `params`
+            crate::routes::organizations::OrganizationOrderBy,
+            crate::routes::organizations::OrganizationOrderDirection,
+            crate::routes::workspaces::WorkspaceOrderBy,
+            crate::routes::workspaces::WorkspaceOrderDirection,
+            crate::routes::workspaces::ApiKeyOrderBy,
+            crate::routes::workspaces::ApiKeyOrderDirection,
             // Core API models
             ChatCompletionRequest, ChatCompletionResponse, Message, CompletionUsage,
             CompletionRequest, CompletionPrompt, StopSequences, CompletionResponse,

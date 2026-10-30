@@ -317,4 +317,32 @@ Original."
         deprecate(&mut bare);
         assert_eq!(bare.description.as_deref(), Some(DEPRECATION_NOTE));
     }
+
+    /// Every `$ref` in the generated spec names a registered component, so newly
+    /// documented operations cannot publish dangling schema references.
+    #[test]
+    fn every_schema_reference_resolves() {
+        fn refs(value: &Value, out: &mut Vec<String>) {
+            match value {
+                Value::Object(map) => {
+                    if let Some(Value::String(target)) = map.get("$ref") {
+                        out.push(target.clone());
+                    }
+                    map.values().for_each(|v| refs(v, out));
+                }
+                Value::Array(items) => items.iter().for_each(|v| refs(v, out)),
+                _ => {}
+            }
+        }
+        let spec = spec();
+        let mut found = Vec::new();
+        refs(&spec, &mut found);
+        let mut missing: Vec<String> = found
+            .into_iter()
+            .filter(|target| spec.pointer(target.trim_start_matches('#')).is_none())
+            .collect();
+        missing.sort();
+        missing.dedup();
+        assert!(missing.is_empty(), "unresolved $ref: {missing:?}");
+    }
 }

@@ -400,7 +400,9 @@ pub async fn init_domain_services_with_pool(
         .unwrap_or_else(|error| panic!("cloud-platform configuration: {error}"));
     let cloud_platform = cloud_platform::build(cp_config.as_ref(), metrics_service.clone())
         .unwrap_or_else(|error| panic!("cloud-platform client: {error:#}"));
-    database::cp_client::client::set_configured(cloud_platform.is_some());
+    if cloud_platform.is_some() {
+        database::cp_client::client::mark_configured();
+    }
     let catalog_models = cloud_platform::models_repository(
         models_repo.clone() as Arc<dyn services::models::ModelsRepository>,
         cloud_platform.as_ref(),

@@ -68,7 +68,7 @@ async fn check_api_key_is_cloud_platforms_verdict_and_grants_use_the_callers_key
     })
     .await;
     // Request scopes copy the caller's key only when the client is configured.
-    database::cp_client::client::set_configured(true);
+    database::cp_client::client::mark_configured();
 
     // /v1/check_api_key: cloud-platform's verdict, body byte for byte.
     let response = server

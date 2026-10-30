@@ -473,13 +473,15 @@ impl Drop for ProbeGuard<'_> {
     }
 }
 
-/// Set once at startup: whether cloud-platform is configured (both connection
-/// settings present). While false, request paths skip every cloud-platform
-/// scope and credential copy.
+/// Whether cloud-platform is configured (both connection settings present).
+/// While false, request paths skip every cloud-platform scope and credential
+/// copy. It only ever turns on: startup marks it when the client is built, and
+/// nothing turns it off, so servers sharing a process (tests) cannot clear it
+/// under each other. With the client unbuilt the scopes it enables are unread.
 static CONFIGURED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-pub fn set_configured(configured: bool) {
-    CONFIGURED.store(configured, std::sync::atomic::Ordering::Relaxed);
+pub fn mark_configured() {
+    CONFIGURED.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
 pub fn configured() -> bool {

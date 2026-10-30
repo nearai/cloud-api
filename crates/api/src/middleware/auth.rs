@@ -1337,7 +1337,7 @@ mod tests {
 
         #[tokio::test]
         async fn native_messages_resolves_a_granted_unlisted_model_with_the_callers_key() {
-            database::cp_client::client::set_configured(true);
+            database::cp_client::client::mark_configured();
             let server = MockServer::start().await;
             Mock::given(method("GET"))
                 .and(path("/v1/internal/catalog/model-lookup"))

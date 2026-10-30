@@ -10,8 +10,13 @@
 # The script reads no .env file and no other configuration. Callers resolve their own settings
 # and pass these in: the seed binary, the test helpers, and CI do this.
 #
-# The migrator sends no TLS and accepts plaintext only to local hosts: loopback, localhost, or a
-# single-label name such as a compose service.
+# For local and CI databases only. The migrator sends no TLS and accepts plaintext only to local
+# hosts: loopback, localhost, or a single-label name such as a compose service. It has no CA
+# option, so it cannot reach a TLS-only database such as RDS. Deployed environments are migrated
+# by the deploy pipeline (cloud-platform migrate), never by this script.
+#
+# Local development with compose gets the schema from the `schema` service (docker compose run
+# --rm schema, also run by `make dev`). Use this script for a non-compose local Postgres.
 #
 # SCHEMA_DOCKER_NETWORK overrides the docker --network value (default: host). On Docker Desktop,
 # localhost is routed through a single-label alias to the host gateway instead.

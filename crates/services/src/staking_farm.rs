@@ -190,7 +190,10 @@ impl NearRpcStakingFarmClient {
     pub fn new(rpc_url: String, network_id: String) -> anyhow::Result<Self> {
         let rpc_url = url::Url::parse(&rpc_url)?;
         Ok(Self {
-            network: Near::custom(rpc_url.to_string(), network_id).build(),
+            // Usage checks refresh staking inline; leave retries to the next sync.
+            network: Near::custom(rpc_url.to_string(), network_id)
+                .retry_config(near_kit::rpc::RetryConfig::none())
+                .build(),
         })
     }
 }
@@ -642,6 +645,28 @@ mod tests {
         assert_eq!(account.pending_reward_units, "20");
         assert_eq!(account.total_earned_reward_units, "120");
         server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn staking_rpc_does_not_retry_transient_http_errors() {
+        use wiremock::{matchers::method, Mock, MockServer, ResponseTemplate};
+
+        for status in [429, 500, 503] {
+            let rpc = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(status))
+                .expect(1)
+                .mount(&rpc)
+                .await;
+            let client = NearRpcStakingFarmClient::new(rpc.uri(), "testnet".into()).unwrap();
+
+            let result = client
+                .get_farm_account("alice.testnet", "farm.testnet")
+                .await;
+
+            assert!(result.is_err(), "HTTP {status}");
+            rpc.verify().await;
+        }
     }
 
     struct MockStakingFarmRepository {

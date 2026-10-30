@@ -276,26 +276,180 @@ async fn test_near_login_zero_timestamp_nonce() {
     println!("✅ Correctly rejected zero-timestamp nonce");
 }
 
-// ============================================
-// Note: Signature Verification Limitation
-// ============================================
-//
-// Tests that require valid NEAR wallet signatures (replay attack prevention,
-// user creation/linking) are not included due to the following limitations:
-//
-// 1. The NEP-413 verifier from near-kit performs RPC calls to
-//    the NEAR blockchain to verify that the public key actually belongs to
-//    the account_id. This RPC verification cannot be easily mocked or bypassed
-//    in integration tests.
-//
-// 2. To properly test these scenarios, we would need either:
-//    - A real NEAR testnet account with valid private keys
-//    - Dependency injection of a trait-based verifier (architectural change)
-//    - Access to mock NEAR RPC responses
-//
-// 3. The current test suite validates all input validation and business logic
-//    constraints (message format, recipient validation, nonce timestamp validation,
-//    nonce replay detection in database), which cover the security-critical paths.
-//
-// Full integration tests for user creation and replay protection can be added
-// in the future if the architecture is modified to support signature verification mocking.
+/// Exercise real NEP-413 verification and database replay protection with only RPC mocked.
+#[tokio::test]
+async fn test_near_login_signed_proofs_and_access_key_ownership() {
+    use base64::Engine;
+    use near_kit::{signer::SecretKey, standards::nep413::serialize_message};
+    use serde_json::{json, Value};
+    use uuid::Uuid;
+    use wiremock::{
+        matchers::{body_partial_json, method},
+        Mock, MockServer, ResponseTemplate,
+    };
+
+    for secret_key in [
+        SecretKey::ed25519_from_bytes([7; 32]),
+        SecretKey::secp256k1_from_bytes([7; 32]).unwrap(),
+        SecretKey::ml_dsa65_from_seed([7; 32]),
+    ] {
+        let rpc = MockServer::start().await;
+        let (server, _) = setup_test_server_with_config_and_database(|config| {
+            config.auth.mock = false;
+            config.auth.near.rpc_url = rpc.uri();
+        })
+        .await;
+        let account = format!("login-{}.testnet", Uuid::new_v4().simple());
+        let public_key = secret_key.public_key().to_string();
+        let payload = create_near_test_payload(0);
+        let signature = secret_key.sign(serialize_message(&payload).as_bytes());
+        let body = json!({
+            "signed_message": {
+                "accountId": account,
+                "publicKey": public_key,
+                "signature": base64::engine::general_purpose::STANDARD.encode(signature.as_bytes()),
+            },
+            "payload": {
+                "message": payload.message,
+                "nonce": payload.nonce,
+                "recipient": payload.recipient,
+            },
+        });
+
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({
+                "method": "EXPERIMENTAL_view_access_key",
+                "params": {
+                    "finality": "optimistic",
+                    "account_id": account,
+                    "public_key": public_key,
+                },
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "block_hash": "11111111111111111111111111111111",
+                    "block_height": 1,
+                    "nonce": 0,
+                    "permission": "FullAccess",
+                },
+            })))
+            .expect(2)
+            .mount(&rpc)
+            .await;
+
+        let response = server
+            .post("/v1/auth/near")
+            .add_header("User-Agent", MOCK_USER_AGENT)
+            .json(&body)
+            .await;
+
+        assert_eq!(
+            response.status_code(),
+            StatusCode::OK,
+            "{}",
+            response.text()
+        );
+        let authenticated = response.json::<Value>();
+        assert!(authenticated["access_token"]
+            .as_str()
+            .is_some_and(|v| !v.is_empty()));
+        assert!(authenticated["refresh_token"]
+            .as_str()
+            .is_some_and(|v| !v.is_empty()));
+        assert_eq!(authenticated["user"]["provider"], "near");
+        assert_eq!(
+            authenticated["user"]["email"],
+            services::email::near_placeholder_email(&account)
+        );
+
+        let replay = server
+            .post("/v1/auth/near")
+            .add_header("User-Agent", MOCK_USER_AGENT)
+            .json(&body)
+            .await;
+
+        assert_eq!(replay.status_code(), StatusCode::UNAUTHORIZED);
+        rpc.verify().await;
+        rpc.reset().await;
+
+        for permission in [
+            json!({
+                "FunctionCall": {
+                    "allowance": null,
+                    "receiver_id": "app.testnet",
+                    "method_names": [],
+                },
+            }),
+            Value::Null,
+        ] {
+            let other_account = format!("other-{}.testnet", Uuid::new_v4().simple());
+            let mut rejected_body = body.clone();
+            rejected_body["signed_message"]["accountId"] = json!(other_account);
+            let fresh_payload = create_near_test_payload(0);
+            let fresh_signature = secret_key.sign(serialize_message(&fresh_payload).as_bytes());
+            rejected_body["payload"]["nonce"] = json!(fresh_payload.nonce);
+            rejected_body["signed_message"]["signature"] =
+                json!(base64::engine::general_purpose::STANDARD.encode(fresh_signature.as_bytes()));
+            let reply = if permission.is_null() {
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "error": {
+                        "code": -32000,
+                        "message": "Server error",
+                        "data": "access key does not exist",
+                        "name": "HANDLER_ERROR",
+                        "cause": {
+                            "name": "UNKNOWN_ACCESS_KEY",
+                            "info": {
+                                "public_key": public_key,
+                            },
+                        },
+                    },
+                })
+            } else {
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": {
+                        "block_hash": "11111111111111111111111111111111",
+                        "block_height": 1,
+                        "nonce": 0,
+                        "permission": permission,
+                    },
+                })
+            };
+
+            Mock::given(method("POST"))
+                .and(body_partial_json(json!({
+                    "method": "EXPERIMENTAL_view_access_key",
+                    "params": {
+                        "finality": "optimistic",
+                        "account_id": other_account,
+                        "public_key": public_key,
+                    },
+                })))
+                .respond_with(ResponseTemplate::new(200).set_body_json(reply))
+                .expect(1)
+                .mount(&rpc)
+                .await;
+
+            let rejected = server
+                .post("/v1/auth/near")
+                .add_header("User-Agent", MOCK_USER_AGENT)
+                .json(&rejected_body)
+                .await;
+
+            assert_eq!(
+                rejected.status_code(),
+                StatusCode::UNAUTHORIZED,
+                "{}",
+                rejected.text()
+            );
+            rpc.verify().await;
+            rpc.reset().await;
+        }
+    }
+}

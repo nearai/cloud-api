@@ -234,6 +234,11 @@ impl TryFrom<NearSignedMessageJson> for services::auth::near::SignedMessage {
     fn try_from(msg: NearSignedMessageJson) -> Result<Self, Self::Error> {
         use near_kit::signer::Signature;
 
+        // ML-DSA-65 is the largest supported key; bound base58 work before parsing.
+        if msg.public_key.len() > 3_000 {
+            return Err(anyhow::anyhow!("Public key exceeds 3000 bytes"));
+        }
+
         let public_key: near_kit::signer::PublicKey = msg.public_key.parse()?;
 
         // Parse base64 signature and create Signature based on key type
@@ -940,6 +945,18 @@ mod tests {
             assert_eq!(decoded.state, request.state);
             assert!(decoded.signature.verify(&[9; 32], &decoded.public_key));
             assert!(!decoded.signature.verify(&[8; 32], &decoded.public_key));
+
+            for length in [3_000, 3_001, 10_000] {
+                let mut invalid = request.clone();
+                invalid.public_key = "1".repeat(length);
+                let error = services::auth::near::SignedMessage::try_from(invalid).unwrap_err();
+
+                assert_eq!(
+                    error.to_string() == "Public key exceeds 3000 bytes",
+                    length > 3_000,
+                    "public key length {length}",
+                );
+            }
 
             for length in [
                 0,

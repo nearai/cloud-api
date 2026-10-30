@@ -112,6 +112,58 @@ async fn systemone_fleet_uses_chat_key_policy_for_requests_and_retries() {
     }
 }
 
+#[tokio::test]
+async fn systemone_pinned_multikey_decryption_retries_other_key_group() {
+    let server = MockServer::start().await;
+    let port = server.address().port();
+    let provider = fleet_provider(&server);
+    assert!(provider.fleet.apply_discovery_push(crate::DiscoveryPush {
+        generation: provider.fleet.current_count_generation(),
+        count: 3,
+        keys: HashMap::from([
+            ("selected-key".into(), vec![0]),
+            ("other-key".into(), vec![1]),
+        ]),
+        hosts: crate::BackendHosts::default(),
+        complete: true,
+    }));
+    Mock::given(method("POST"))
+        .and(path("/v1/systemone"))
+        .and(header("host", format!("jev-i0.fleet.test:{port}")))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+            "error": {"message": "Decryption failed"}
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let id = "decision:tee.1/receipt?version=1";
+    Mock::given(method("POST"))
+        .and(path("/v1/systemone"))
+        .and(header("host", format!("jev-i1.fleet.test:{port}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": id, "model": "jev", "answers": {"q": {"type": "noul", "noul": 0.8}},
+            "usage": {"input_tokens": 7, "output_tokens": 1}
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let request: SystemOneRequest = serde_json::from_value(json!({
+        "model": "jev", "state": "x",
+        "questions": {"q": {"type": "noul", "instructions": "Is this about billing?"}}
+    }))
+    .unwrap();
+    let response = provider
+        .systemone(request, "hash".into(), Some("selected-key"))
+        .await
+        .unwrap();
+    assert_eq!(response.provider_decision_id().unwrap(), id);
+    assert_eq!(
+        provider.fleet.signature_rotation.lock().unwrap().get(id),
+        Some(&1)
+    );
+    server.verify().await;
+}
+
 fn fleet_provider(server: &MockServer) -> Provider {
     let port = server.address().port();
     let provider = Provider::new(Config {

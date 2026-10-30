@@ -218,9 +218,16 @@ jobs:
         cache-key: e2e
 
     # The schema comes from nearai/cloud-platform. The database helpers and the nextest
-    # bootstrap run scripts/apply-schema.sh, which pulls the pinned image.
-    - name: Log in to GHCR for the cloud-platform schema image
-      run: echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+    # bootstrap run scripts/apply-schema.sh, which pulls the pinned image. The login goes into
+    # a job-private DOCKER_CONFIG, so no credential is left in the shared runner's docker
+    # config; the cleanup step at the end of the job removes it.
+    - name: Log in to GHCR for the cloud-platform schema image (job-private config)
+      run: |
+        docker_config="$RUNNER_TEMP/docker-config-e2e"
+        mkdir -p "$docker_config"
+        chmod 700 "$docker_config"
+        echo "DOCKER_CONFIG=$docker_config" >> "$GITHUB_ENV"
+        DOCKER_CONFIG="$docker_config" bash -c 'echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin'
       env:
         GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -255,6 +262,10 @@ jobs:
         TEST_DATABASE_NAME: platform_api_e2e
         RUST_LOG: debug
         DEV: "true"
+
+    - name: Remove the job-private GHCR login
+      if: always()
+      run: rm -rf "$RUNNER_TEMP/docker-config-e2e"
 
   script-test:
     name: Script tests

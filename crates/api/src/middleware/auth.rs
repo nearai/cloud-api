@@ -145,6 +145,31 @@ pub struct AuthenticatedReportingToken {
     pub scope: ReportingTokenScope,
 }
 
+/// The caller's API key to carry into cloud-platform reads. Copied only for a
+/// successful key, and only when some cloud-platform area is on.
+fn caller_key(token: Option<&str>) -> Option<String> {
+    if !database::cp_client::client::configured() {
+        return None;
+    }
+    token.map(str::to_owned)
+}
+
+fn bearer(auth_header: Option<&str>) -> Option<&str> {
+    auth_header.and_then(|value| value.strip_prefix("Bearer "))
+}
+
+/// Runs the rest of an API-key request with the caller's key in scope, for the
+/// cloud-platform reads that answer only for that key (model access).
+async fn with_caller_key(
+    token: Option<String>,
+    request: impl std::future::Future<Output = Response>,
+) -> Response {
+    match token {
+        Some(token) => database::cp_client::with_caller_credential(token, request).await,
+        None => request.await,
+    }
+}
+
 pub async fn auth_middleware_with_api_key(
     State(state): State<AuthState>,
     request: Request,
@@ -188,9 +213,10 @@ pub async fn auth_middleware_with_api_key(
         Ok(api_key) => {
             // Clone request to add extension
             debug!(api_key_id = %api_key.id.0, "Adding API key to request");
+            let caller_token = caller_key(bearer(auth_header));
             let mut request = request;
             request.extensions_mut().insert(api_key);
-            Ok(next.run(request).await)
+            Ok(with_caller_key(caller_token, next.run(request)).await)
         }
         Err(error) => Err(error),
     }
@@ -239,9 +265,10 @@ pub async fn auth_middleware_with_workspace_context(
     match auth_result {
         Ok(authenticated_api_key) => {
             debug!("Adding authenticated API key with workspace context to request");
+            let caller_token = caller_key(bearer(auth_header));
             let mut request = request;
             request.extensions_mut().insert(authenticated_api_key);
-            Ok(next.run(request).await)
+            Ok(with_caller_key(caller_token, next.run(request)).await)
         }
         Err(error) => Err(error),
     }
@@ -282,9 +309,10 @@ pub async fn anthropic_auth_middleware_with_workspace_context(
             anthropic_auth_rejection(status, error.error.message)
         })?;
 
+    let caller_token = caller_key(Some(token));
     let mut request = request;
     request.extensions_mut().insert(authenticated);
-    Ok(next.run(request).await)
+    Ok(with_caller_key(caller_token, next.run(request)).await)
 }
 
 /// Authentication middleware that validates session tokens only
@@ -1006,5 +1034,387 @@ mod tests {
         assert_eq!(anthropic_auth_token(&headers), Ok("sk-sdk"));
 
         assert!(anthropic_auth_token(&HeaderMap::new()).is_err());
+    }
+
+    mod caller_scope {
+        use super::*;
+        use async_trait::async_trait;
+        use axum::routing::post;
+        use axum::{Extension, Router};
+        use chrono::{DateTime, Utc};
+        use services::common::RepositoryError;
+        use services::models::{resolve_model_cached, ModelCaller, ModelsRepository};
+        use services::organization::{Organization, OrganizationId};
+        use services::reporting_tokens::{
+            CreateOrganizationReportingTokenRequest, CreatedOrganizationReportingToken,
+            OrganizationReportingToken, OrganizationReportingTokenService,
+        };
+        use services::workspace::{
+            ApiKey, ApiKeyId, ApiKeyOrderBy, ApiKeyOrderDirection, ApiKeyRepository,
+            CreateApiKeyRequest, Workspace, WorkspaceId, WorkspaceOrderBy, WorkspaceOrderDirection,
+            WorkspaceRepository,
+        };
+        use tower::ServiceExt;
+        use uuid::Uuid;
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        const CALLER: &str = "sk-caller-0123456789abcdef0123456789ab";
+        const UNLISTED: &str = "unlisted/model";
+
+        fn organization_id() -> Uuid {
+            Uuid::from_u128(9)
+        }
+
+        fn workspace_id() -> Uuid {
+            Uuid::from_u128(8)
+        }
+
+        /// Knows one key, `CALLER`.
+        struct OneKey;
+        #[async_trait]
+        impl ApiKeyRepository for OneKey {
+            async fn validate(&self, key: String) -> Result<Option<ApiKey>, RepositoryError> {
+                Ok((key == CALLER).then(|| ApiKey {
+                    id: ApiKeyId("k".to_string()),
+                    key: None,
+                    key_prefix: "sk-calle".to_string(),
+                    name: "k".to_string(),
+                    workspace_id: WorkspaceId(workspace_id()),
+                    created_by_user_id: services::auth::UserId(Uuid::nil()),
+                    created_at: Utc::now(),
+                    expires_at: None,
+                    last_used_at: None,
+                    is_active: true,
+                    deleted_at: None,
+                    spend_limit: None,
+                    usage: None,
+                }))
+            }
+            async fn create(&self, _: CreateApiKeyRequest) -> Result<ApiKey, RepositoryError> {
+                unimplemented!()
+            }
+            async fn get_by_id(&self, _: ApiKeyId) -> Result<Option<ApiKey>, RepositoryError> {
+                unimplemented!()
+            }
+            async fn list_by_workspace_paginated(
+                &self,
+                _: WorkspaceId,
+                _: i64,
+                _: i64,
+                _: Option<ApiKeyOrderBy>,
+                _: Option<ApiKeyOrderDirection>,
+            ) -> Result<Vec<ApiKey>, RepositoryError> {
+                unimplemented!()
+            }
+            async fn delete(&self, _: ApiKeyId) -> Result<bool, RepositoryError> {
+                unimplemented!()
+            }
+            async fn update_last_used(&self, _: ApiKeyId) -> Result<(), RepositoryError> {
+                Ok(())
+            }
+            async fn update_spend_limit(
+                &self,
+                _: ApiKeyId,
+                _: Option<i64>,
+            ) -> Result<ApiKey, RepositoryError> {
+                unimplemented!()
+            }
+            async fn update(
+                &self,
+                _: ApiKeyId,
+                _: Option<String>,
+                _: Option<Option<DateTime<Utc>>>,
+                _: Option<Option<i64>>,
+                _: Option<bool>,
+            ) -> Result<ApiKey, RepositoryError> {
+                unimplemented!()
+            }
+            async fn count_by_workspace(&self, _: WorkspaceId) -> Result<i64, RepositoryError> {
+                unimplemented!()
+            }
+            async fn check_name_duplication(
+                &self,
+                _: WorkspaceId,
+                _: &str,
+            ) -> Result<bool, RepositoryError> {
+                unimplemented!()
+            }
+            async fn revoke(&self, _: ApiKeyId) -> Result<bool, RepositoryError> {
+                unimplemented!()
+            }
+            async fn get_all_active_key_hashes(&self) -> Result<Vec<String>, RepositoryError> {
+                Ok(vec![])
+            }
+            async fn get_active_key_hashes_created_after(
+                &self,
+                _: DateTime<Utc>,
+            ) -> Result<Vec<String>, RepositoryError> {
+                Ok(vec![])
+            }
+        }
+
+        /// Every workspace belongs to one active organization.
+        struct OneWorkspace;
+        #[async_trait]
+        impl WorkspaceRepository for OneWorkspace {
+            async fn get_by_id(
+                &self,
+                _: WorkspaceId,
+            ) -> Result<Option<Workspace>, RepositoryError> {
+                unimplemented!()
+            }
+            async fn get_by_name(
+                &self,
+                _: Uuid,
+                _: &str,
+            ) -> Result<Option<Workspace>, RepositoryError> {
+                unimplemented!()
+            }
+            async fn get_workspace_with_organization(
+                &self,
+                id: WorkspaceId,
+            ) -> Result<Option<(Workspace, Organization)>, RepositoryError> {
+                let owner = services::auth::UserId(Uuid::nil());
+                Ok(Some((
+                    Workspace {
+                        id,
+                        name: "w".to_string(),
+                        description: None,
+                        organization_id: OrganizationId(organization_id()),
+                        created_by_user_id: owner.clone(),
+                        created_at: Utc::now(),
+                        updated_at: Utc::now(),
+                        is_active: true,
+                        settings: None,
+                    },
+                    Organization {
+                        request_priority: 0,
+                        id: OrganizationId(organization_id()),
+                        name: "o".to_string(),
+                        description: None,
+                        owner_id: owner,
+                        settings: serde_json::json!({}),
+                        is_active: true,
+                        created_at: Utc::now(),
+                        updated_at: Utc::now(),
+                    },
+                )))
+            }
+            async fn list_by_organization(
+                &self,
+                _: OrganizationId,
+            ) -> Result<Vec<Workspace>, RepositoryError> {
+                unimplemented!()
+            }
+            async fn list_by_organization_paginated(
+                &self,
+                _: OrganizationId,
+                _: i64,
+                _: i64,
+                _: Option<WorkspaceOrderBy>,
+                _: Option<WorkspaceOrderDirection>,
+            ) -> Result<Vec<Workspace>, RepositoryError> {
+                unimplemented!()
+            }
+            async fn create(
+                &self,
+                _: String,
+                _: Option<String>,
+                _: OrganizationId,
+                _: services::auth::UserId,
+            ) -> Result<Workspace, RepositoryError> {
+                unimplemented!()
+            }
+            async fn update(
+                &self,
+                _: WorkspaceId,
+                _: Option<String>,
+                _: Option<String>,
+                _: Option<serde_json::Value>,
+            ) -> Result<Option<Workspace>, RepositoryError> {
+                unimplemented!()
+            }
+            async fn delete(&self, _: WorkspaceId) -> Result<bool, RepositoryError> {
+                unimplemented!()
+            }
+            async fn count_by_organization(
+                &self,
+                _: OrganizationId,
+            ) -> Result<i64, RepositoryError> {
+                unimplemented!()
+            }
+            async fn list_by_user(
+                &self,
+                _: services::auth::UserId,
+                _: i64,
+            ) -> Result<Vec<Workspace>, RepositoryError> {
+                unimplemented!()
+            }
+        }
+
+        struct NoReportingTokens;
+        #[async_trait]
+        impl OrganizationReportingTokenService for NoReportingTokens {
+            async fn create(
+                &self,
+                _: CreateOrganizationReportingTokenRequest,
+            ) -> Result<CreatedOrganizationReportingToken, RepositoryError> {
+                unimplemented!()
+            }
+            async fn validate(
+                &self,
+                _: &str,
+            ) -> Result<Option<ValidatedOrganizationReportingToken>, RepositoryError> {
+                Ok(None)
+            }
+            async fn get_by_id(
+                &self,
+                _: Uuid,
+            ) -> Result<Option<OrganizationReportingToken>, RepositoryError> {
+                unimplemented!()
+            }
+            async fn list_active_by_organization(
+                &self,
+                _: Uuid,
+            ) -> Result<Vec<OrganizationReportingToken>, RepositoryError> {
+                unimplemented!()
+            }
+            async fn revoke(&self, _: Uuid, _: Uuid) -> Result<bool, RepositoryError> {
+                unimplemented!()
+            }
+        }
+
+        fn auth_state() -> AuthState {
+            AuthState::new(
+                Arc::new(OAuthManager::new(None, None).unwrap()),
+                Arc::new(services::auth::MockAuthService {
+                    apikey_repository: Arc::new(OneKey),
+                }),
+                Arc::new(OneWorkspace),
+                Arc::new(NoReportingTokens),
+                Arc::new(database::repositories::AdminAccessTokenRepository::new(
+                    database::DbPool::uninitialized(),
+                )),
+                Vec::new(),
+                String::new(),
+            )
+        }
+
+        fn unlisted_model_json() -> serde_json::Value {
+            serde_json::json!({
+                "id": Uuid::from_u128(7),
+                "model_name": UNLISTED,
+                "model_display_name": UNLISTED,
+                "model_description": "d",
+                "input_cost_per_token": 1,
+                "output_cost_per_token": 2,
+                "cost_per_image": 0,
+                "context_length": 4096,
+                "verifiable": true,
+                "owned_by": "x",
+                "provider_type": "vllm",
+                "attestation_supported": true,
+                "is_listed": false,
+                "created_at": "2026-01-01T00:00:00Z",
+            })
+        }
+
+        /// Resolves the unlisted model for the authenticated organization, the
+        /// way the native messages route does, with a fresh resolve cache.
+        async fn resolve(
+            axum::extract::State(models): axum::extract::State<Arc<dyn ModelsRepository>>,
+            Extension(key): Extension<AuthenticatedApiKey>,
+        ) -> StatusCode {
+            let cache = services::models::new_model_resolve_cache();
+            let caller = ModelCaller::Organization(key.organization.id.0);
+            match resolve_model_cached(&cache, models.as_ref(), UNLISTED, caller).await {
+                Ok(Some(_)) => StatusCode::OK,
+                Ok(None) => StatusCode::NOT_FOUND,
+                Err(_) => StatusCode::BAD_GATEWAY,
+            }
+        }
+
+        #[tokio::test]
+        async fn native_messages_resolves_a_granted_unlisted_model_with_the_callers_key() {
+            database::cp_client::client::mark_configured();
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/v1/internal/catalog/model-lookup"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(unlisted_model_json()))
+                .mount(&server)
+                .await;
+            // Only the caller's own key may ask: once per credential form below.
+            Mock::given(method("GET"))
+                .and(path("/v1/internal/catalog/model-access"))
+                .and(header("authorization", format!("Bearer {CALLER}").as_str()))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({"has_access": true})),
+                )
+                .expect(2)
+                .mount(&server)
+                .await;
+            let client = database::cp_client::CpClient::new(
+                &server.uri(),
+                Some("sk-service".to_string()),
+                &database::cp_client::CpClientConfig::default(),
+                None,
+            )
+            .unwrap();
+            struct NoLocal;
+            #[async_trait]
+            impl ModelsRepository for NoLocal {
+                async fn get_all_active_models(
+                    &self,
+                ) -> anyhow::Result<Vec<services::models::ModelWithPricing>> {
+                    Ok(Vec::new())
+                }
+                async fn get_model_by_name(
+                    &self,
+                    _: &str,
+                ) -> anyhow::Result<Option<services::models::ModelWithPricing>> {
+                    Ok(None)
+                }
+                async fn resolve_and_get_model(
+                    &self,
+                    _: &str,
+                ) -> anyhow::Result<Option<services::models::ModelWithPricing>> {
+                    Ok(None)
+                }
+                async fn get_configured_model_names(&self) -> anyhow::Result<Vec<String>> {
+                    Ok(Vec::new())
+                }
+            }
+            let models: Arc<dyn ModelsRepository> =
+                Arc::new(database::cp_client::CatalogModels::new(
+                    Arc::new(NoLocal),
+                    Arc::new(client),
+                    std::time::Duration::from_secs(30),
+                    std::time::Duration::from_secs(300),
+                    None,
+                ));
+            let router = Router::new()
+                .route("/v1/messages", post(resolve))
+                .with_state(models)
+                .layer(axum::middleware::from_fn_with_state(
+                    auth_state(),
+                    anthropic_auth_middleware_with_workspace_context,
+                ));
+
+            for (name, value) in [
+                ("x-api-key", CALLER.to_string()),
+                ("authorization", format!("Bearer {CALLER}")),
+            ] {
+                let request = Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .header(name, value)
+                    .body(axum::body::Body::empty())
+                    .unwrap();
+                let response = router.clone().oneshot(request).await.unwrap();
+                assert_eq!(response.status(), StatusCode::OK, "{name}");
+            }
+        }
     }
 }

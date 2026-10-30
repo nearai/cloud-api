@@ -1,5 +1,6 @@
 #[doc(hidden)]
 pub mod attested_3p_startup;
+pub mod cloud_platform;
 pub mod consts;
 pub mod conversions;
 pub mod database_encryption;
@@ -120,6 +121,11 @@ pub struct DomainServices {
     pub service_usage_service:
         Arc<dyn services::service_usage::ServiceUsageServiceTrait + Send + Sync>,
     pub admin_settings_service: Arc<services::admin_settings::AdminSettingsService>,
+    /// The gateway key-check verdicts, present when cloud-platform is configured.
+    pub cloud_platform_check_api_key: Option<Arc<database::cp_client::ApiKeyVerdicts>>,
+    /// The catalog adapter behind `models_service`, present when cloud-platform
+    /// is configured. Invalidated with the models cache.
+    pub cloud_platform_catalog: Option<Arc<database::cp_client::CatalogModels>>,
 }
 
 /// Controls process-level background work started while the application router
@@ -391,6 +397,31 @@ pub async fn init_domain_services_with_pool(
         database.pool().clone(),
     ));
 
+    // Cloud-platform: configured by CLOUD_PLATFORM_URL and CLOUD_PLATFORM_API_KEY_FILE.
+    // Unconfigured, none of this is built and the local repositories serve every read.
+    let cp_config = database::cp_client::CpClientConfig::from_env()
+        .unwrap_or_else(|error| panic!("cloud-platform configuration: {error}"));
+    let cloud_platform = cloud_platform::build(cp_config.as_ref(), metrics_service.clone())
+        .unwrap_or_else(|error| panic!("cloud-platform client: {error:#}"));
+    if cloud_platform.is_some() {
+        database::cp_client::client::mark_configured();
+    }
+    let cloud_platform_catalog = cloud_platform::catalog_models(
+        models_repo.clone() as Arc<dyn services::models::ModelsRepository>,
+        cloud_platform.as_ref(),
+        Some(metrics_service.clone()),
+    );
+    let catalog_models = cloud_platform::models_repository(
+        models_repo.clone() as Arc<dyn services::models::ModelsRepository>,
+        cloud_platform_catalog.as_ref(),
+    );
+    let signature_repo = cloud_platform::signature_repository(
+        attestation_repo.clone() as Arc<dyn services::attestation::ports::AttestationRepository>,
+        cloud_platform.as_ref(),
+    );
+    let cloud_platform_check_api_key =
+        cloud_platform::check_api_key_verdicts(cloud_platform.as_ref());
+
     // Note: inference_url models and external providers are loaded in init_inference_providers.
     // Periodic refresh is also started there.
 
@@ -411,15 +442,15 @@ pub async fn init_domain_services_with_pool(
     // services below share, so its invalidation reaches all three.
     let models_service = Arc::new(services::models::ModelsServiceImpl::new(
         inference_provider_pool.clone(),
-        models_repo.clone(),
+        catalog_models.clone(),
     ));
 
     // Create attestation service
     let attestation_service = Arc::new(
         services::attestation::AttestationService::init(
-            attestation_repo,
+            signature_repo,
             inference_provider_pool.clone(),
-            models_repo.clone(),
+            catalog_models.clone(),
             models_service.model_resolve_cache(),
             metrics_service.clone(),
             usage_repository_for_attestation,
@@ -484,7 +515,7 @@ pub async fn init_domain_services_with_pool(
         attestation_service.clone(),
         usage_service.clone(),
         metrics_service.clone(),
-        models_repo.clone() as Arc<dyn services::models::ModelsRepository>,
+        catalog_models.clone(),
         org_limit_repository,
     )
     .with_model_resolve_cache(models_service.model_resolve_cache());
@@ -654,6 +685,8 @@ pub async fn init_domain_services_with_pool(
     };
 
     DomainServices {
+        cloud_platform_check_api_key,
+        cloud_platform_catalog,
         conversation_service,
         response_service,
         completion_service,
@@ -1232,6 +1265,7 @@ pub fn build_app_with_config_and_options(
         app_state.clone(),
         &auth_components.auth_state_middleware,
         usage_state.clone(),
+        domain_services.cloud_platform_check_api_key.clone(),
     );
 
     let internal_routes = build_internal_routes(app_state.clone());
@@ -1299,7 +1333,10 @@ pub fn build_app_with_config_and_options(
             analytics_service,
             staking_farm_service: app_state.staking_farm_service.clone(),
             aml_service: app_state.aml_service.clone(),
-            models_service: domain_services.models_service.clone(),
+            models_service: cloud_platform::invalidating_models_service(
+                domain_services.models_service.clone(),
+                domain_services.cloud_platform_catalog.clone(),
+            ),
             completion_service: domain_services.completion_service.clone(),
             organization_service: domain_services.organization_service.clone(),
             usage_service: domain_services.usage_service.clone(),
@@ -2082,7 +2119,17 @@ pub fn build_gateway_routes(
     app_state: AppState,
     auth_state_middleware: &AuthState,
     usage_state: middleware::UsageState,
+    cloud_platform_verdicts: Option<Arc<database::cp_client::ApiKeyVerdicts>>,
 ) -> Router {
+    if let Some(verdicts) = cloud_platform_verdicts {
+        // cloud-platform decides: the local key and credit checks do not run on this route.
+        return Router::new()
+            .route(
+                "/check_api_key",
+                post(cloud_platform::check_api_key_from_cloud_platform),
+            )
+            .with_state(verdicts);
+    }
     Router::new()
         .route(
             "/check_api_key",
@@ -2211,7 +2258,8 @@ pub struct AdminRouteServices {
     pub analytics_service: Arc<services::admin::AnalyticsService>,
     pub staking_farm_service: Arc<services::staking_farm::StakingFarmService>,
     pub aml_service: Arc<services::aml::AmlService>,
-    pub models_service: Arc<services::models::ModelsServiceImpl>,
+    /// Invalidated by admin writes: see `cloud_platform::invalidating_models_service`.
+    pub models_service: Arc<dyn services::models::ModelsServiceTrait>,
     pub completion_service: Arc<services::CompletionServiceImpl>,
     pub organization_service:
         Arc<dyn services::organization::OrganizationServiceTrait + Send + Sync>,
@@ -2288,7 +2336,7 @@ fn build_admin_routes_with_options(
     // `/v1/admin/organizations/{org_id}/concurrent-limit`.
     let admin_service = Arc::new(AdminServiceImpl::new(
         admin_repository as Arc<dyn services::admin::AdminRepository>,
-        services.models_service as Arc<dyn services::models::ModelsServiceTrait>,
+        services.models_service,
         services.completion_service.clone()
             as Arc<dyn services::completions::CompletionServiceTrait>,
         services::email::sender_from_config(&config.invitation_email)

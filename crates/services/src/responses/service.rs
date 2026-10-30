@@ -218,7 +218,9 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
         let model_pub_key_clone = model_pub_key.clone();
         let encryption_version_clone = encryption_version.clone();
 
-        tokio::spawn(async move {
+        // The worker resolves the model again, which for an unlisted model may
+        // need the caller's key (cloud-platform model access).
+        crate::caller_credential::spawn_with_caller_credential(async move {
             let mut tool_registry = tools::ToolRegistry::new();
             if let Some(provider) = web_search_provider {
                 tool_registry.register(Arc::new(tools::WebSearchToolExecutor::new(provider)));

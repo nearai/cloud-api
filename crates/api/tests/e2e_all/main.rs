@@ -49,6 +49,7 @@ mod chat_encryption;
 mod check_api_key;
 mod chutes_catalog;
 mod client_disconnect;
+mod cloud_platform_routes;
 mod concurrent_limit;
 mod contact_email;
 mod conversations;

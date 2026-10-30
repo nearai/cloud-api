@@ -28,12 +28,11 @@ help:
 
 ## Database & Seeding
 
-# The schema is owned by nearai/cloud-platform; scripts/apply-schema.sh applies it from the
-# pinned image. The script and the seed binary both read DATABASE_* from .env, with exported
-# variables taking precedence (see scripts/apply-schema.sh for the full order).
+# The seed binary resolves its database settings the same way the API does (.env, then the
+# environment), applies the pinned cloud-platform schema through scripts/apply-schema.sh, then
+# seeds. cloud-api never migrates on its own.
 seed:
 	@echo "Applying the cloud-platform schema and seeding..."
-	scripts/apply-schema.sh
 	cargo run --bin seed -p database
 
 ## Services

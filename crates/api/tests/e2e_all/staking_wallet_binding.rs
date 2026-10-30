@@ -84,7 +84,8 @@ async fn binding_route_verifies_proof_authorization_retry_and_profile_responses(
     assert_eq!(prepared.status_code(), 200, "{}", prepared.text());
     let challenge = prepared.json::<BindingChallenge>();
     assert_eq!(challenge.organization_id.to_string(), org.id);
-    let secret_key = SecretKey::ed25519_from_bytes([7; 32]);
+    // Exercise the larger ML-DSA-65 proof through HTTP, persistence, and retries.
+    let secret_key = SecretKey::ml_dsa65_from_seed([7; 32]);
     let public_key = secret_key.public_key();
     let hash = serialize_message(&challenge.payload.nep413().unwrap());
     let signature = secret_key.sign(hash.as_bytes());

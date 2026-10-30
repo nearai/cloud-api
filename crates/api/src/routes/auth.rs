@@ -254,7 +254,16 @@ impl TryFrom<NearSignedMessageJson> for services::auth::near::SignedMessage {
                     )
                 })?)
             }
-            near_kit::signer::KeyType::MlDsa65 => anyhow::bail!("Unsupported wallet key type"),
+            near_kit::signer::KeyType::MlDsa65 => {
+                let expected_len = public_key.key_type().signature_len();
+                let bytes = sig_bytes.into_boxed_slice().try_into().map_err(|_| {
+                    anyhow::anyhow!(
+                        "Invalid ML-DSA-65 signature length: expected {expected_len} bytes, got {sig_len}"
+                    )
+                })?;
+
+                Signature::ml_dsa65_from_bytes(bytes)
+            }
         };
 
         Ok(services::auth::near::SignedMessage {
@@ -914,6 +923,7 @@ mod tests {
         for secret_key in [
             SecretKey::ed25519_from_bytes([7; 32]),
             SecretKey::secp256k1_from_bytes([7; 32]).unwrap(),
+            SecretKey::ml_dsa65_from_seed([7; 32]),
         ] {
             let signature = secret_key.sign(&[9; 32]);
             let request = NearSignedMessageJson {
@@ -928,6 +938,8 @@ mod tests {
             assert_eq!(decoded.signature, signature);
             assert_eq!(decoded.public_key, secret_key.public_key());
             assert_eq!(decoded.state, request.state);
+            assert!(decoded.signature.verify(&[9; 32], &decoded.public_key));
+            assert!(!decoded.signature.verify(&[8; 32], &decoded.public_key));
 
             for length in [
                 0,

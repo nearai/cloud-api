@@ -506,82 +506,94 @@ mod tests {
         };
 
         let c = challenge();
-        let message = proof(&c.payload).await;
 
-        for permission in [
-            serde_json::json!("FullAccess"),
-            serde_json::json!({
-                "FunctionCall": {
-                    "allowance": null,
-                    "receiver_id": "stake.testnet",
-                    "method_names": [],
-                },
-            }),
-            serde_json::Value::Null,
+        for secret_key in [
+            near_kit::signer::SecretKey::ed25519_from_bytes([7; 32]),
+            near_kit::signer::SecretKey::ml_dsa65_from_seed([7; 32]),
         ] {
-            let server = MockServer::start().await;
-            let full_access = permission == serde_json::json!("FullAccess");
-            let response = if permission.is_null() {
+            let hash = near_kit::standards::nep413::serialize_message(&c.payload.nep413().unwrap());
+            let message = SignedMessage {
+                account_id: "alice.testnet".parse().unwrap(),
+                public_key: secret_key.public_key(),
+                signature: secret_key.sign(hash.as_bytes()),
+                state: None,
+            };
+
+            for permission in [
+                serde_json::json!("FullAccess"),
                 serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "id": 1,
-                    "error": {
-                        "code": -32000,
-                        "message": "Server error",
-                        "data": "Access key does not exist",
-                        "name": "HANDLER_ERROR",
-                        "cause": {
-                            "name": "UNKNOWN_ACCESS_KEY",
-                            "info": {
-                                "public_key": message.public_key,
-                                "block_height": 1,
-                                "block_hash": "11111111111111111111111111111111",
+                    "FunctionCall": {
+                        "allowance": null,
+                        "receiver_id": "stake.testnet",
+                        "method_names": [],
+                    },
+                }),
+                serde_json::Value::Null,
+            ] {
+                let server = MockServer::start().await;
+                let full_access = permission == serde_json::json!("FullAccess");
+                let response = if permission.is_null() {
+                    serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "error": {
+                            "code": -32000,
+                            "message": "Server error",
+                            "data": "Access key does not exist",
+                            "name": "HANDLER_ERROR",
+                            "cause": {
+                                "name": "UNKNOWN_ACCESS_KEY",
+                                "info": {
+                                    "public_key": message.public_key,
+                                    "block_height": 1,
+                                    "block_hash": "11111111111111111111111111111111",
+                                },
                             },
                         },
-                    },
+                    })
+                } else {
+                    serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "result": {
+                            "block_hash": "11111111111111111111111111111111",
+                            "block_height": 1,
+                            "nonce": 0,
+                            "permission": permission,
+                        },
+                    })
+                };
+                Mock::given(method("POST"))
+                    .and(body_partial_json(serde_json::json!({
+                        "method": "EXPERIMENTAL_view_access_key",
+                        "params": {
+                            "account_id": message.account_id,
+                            "public_key": message.public_key,
+                            "finality": "optimistic",
+                        },
+                    })))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(response))
+                    .expect(1)
+                    .mount(&server)
+                    .await;
+                let verifier = NearBindingVerifier::new(&NearConfig {
+                    rpc_url: server.uri(),
+                    network_id: "testnet".into(),
+                    expected_recipient: "cloud.example".into(),
                 })
-            } else {
-                serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "id": 1,
-                    "result": {
-                        "block_hash": "11111111111111111111111111111111",
-                        "block_height": 1,
-                        "nonce": 0,
-                        "permission": permission,
-                    },
-                })
-            };
-            Mock::given(method("POST"))
-                .and(body_partial_json(serde_json::json!({
-                    "method": "EXPERIMENTAL_view_access_key",
-                    "params": {
-                        "account_id": message.account_id,
-                        "public_key": message.public_key,
-                        "finality": "optimistic",
-                    },
-                })))
-                .respond_with(ResponseTemplate::new(200).set_body_json(response))
-                .expect(1)
-                .mount(&server)
-                .await;
-            let verifier = NearBindingVerifier::new(&NearConfig {
-                rpc_url: server.uri(),
-                network_id: "testnet".into(),
-                expected_recipient: "cloud.example".into(),
-            })
-            .unwrap();
+                .unwrap();
 
-            let result = verifier.verify(&c.payload, &message).await;
+                let result = verifier.verify(&c.payload, &message).await;
 
-            assert_eq!(result.is_ok(), full_access);
+                assert_eq!(result.is_ok(), full_access);
 
-            let mut tampered = c.payload.clone();
-            tampered.message.push_str("other destination");
+                let mut tampered = c.payload.clone();
+                tampered.message.push_str("other destination");
 
-            assert!(verifier.verify(&tampered, &message).await.is_err());
-            // A tampered message must fail signature verification before another RPC request.
-            server.verify().await;
+                assert!(verifier.verify(&tampered, &message).await.is_err());
+                // A tampered message must fail signature verification before another RPC request.
+                server.verify().await;
+            }
         }
     }
 }

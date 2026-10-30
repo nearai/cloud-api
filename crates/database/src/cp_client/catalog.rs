@@ -4,7 +4,8 @@
 //! - Model lists and names are cached for `CP_CATALOG_CACHE_TTL_SECS`. A failed
 //!   reload serves the last good copy, without a time limit: these are listings
 //!   and do not grant access.
-//! - Model lookups are cached the same way, but an answer is used only while
+//! - Model lookups that find a model are cached the same way (a miss is not
+//!   cached, so a newly added model resolves at once), but an answer is used only while
 //!   it is at most `CP_CATALOG_MAX_STALE_SECS - OUTER_RESOLVE_CACHE_TTL` old
 //!   (measured from the fetch). The models service caches a resolved answer for
 //!   a further `OUTER_RESOLVE_CACHE_TTL`, so this keeps the total within the
@@ -299,7 +300,9 @@ impl CatalogModels {
                     )
                     .await?;
                 match response.status {
-                    StatusCode::NOT_FOUND => Ok((None, self.ttl)),
+                    // A miss is not cached (zero lifetime), so a model added
+                    // after it resolves on the next lookup.
+                    StatusCode::NOT_FOUND => Ok((None, Duration::ZERO)),
                     StatusCode::OK => {
                         let model = response.json::<CatalogModelDto>()?.into_model()?;
                         Ok((Some(model), self.ttl))
@@ -542,6 +545,37 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn a_lookup_miss_is_not_cached_so_a_new_model_resolves_next_call() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/internal/catalog/model-lookup"))
+            .respond_with(ResponseTemplate::new(404))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/internal/catalog/model-lookup"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(remote_json("new", 100)))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let catalog = adapter(&server, vec![], Duration::from_secs(30), None);
+        assert!(catalog
+            .resolve_and_get_model("new")
+            .await
+            .unwrap()
+            .is_none());
+        let found = catalog.resolve_and_get_model("new").await.unwrap().unwrap();
+        assert_eq!(found.model_name, "new");
+        // The hit keeps its TTL: no further call.
+        assert!(catalog
+            .resolve_and_get_model("new")
+            .await
+            .unwrap()
+            .is_some());
     }
 
     #[tokio::test]

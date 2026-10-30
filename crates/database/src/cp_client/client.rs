@@ -23,8 +23,11 @@ pub const METRIC_CP_STALE: &str = "cloud_api.cp_client.stale_served";
 
 tokio::task_local! {
     static REQUEST_ID: Uuid;
-    static CALLER_CREDENTIAL: String;
 }
+
+// The caller's key lives in `services` so request work spawned there (the
+// Responses worker) can carry it into the spawned task.
+pub use services::caller_credential::{current_caller_credential, with_caller_credential};
 
 /// Run `fut` with `request_id` sent as `x-request-id` on every
 /// cloud-platform call it makes. Calls outside a scope get a fresh id.
@@ -36,18 +39,6 @@ fn current_request_id() -> Uuid {
     REQUEST_ID
         .try_with(|id| *id)
         .unwrap_or_else(|_| Uuid::new_v4())
-}
-
-/// Run `fut` with the end caller's API key in scope, for the reads that
-/// cloud-platform answers only for that key (model access). The key stays in
-/// memory for the request and is never logged.
-pub async fn with_caller_credential<F: std::future::Future>(token: String, fut: F) -> F::Output {
-    CALLER_CREDENTIAL.scope(token, fut).await
-}
-
-/// The end caller's API key in scope, if the request carries one.
-pub fn current_caller_credential() -> Option<String> {
-    CALLER_CREDENTIAL.try_with(|token| token.clone()).ok()
 }
 
 /// Each call type has its own deadline class and breaker.

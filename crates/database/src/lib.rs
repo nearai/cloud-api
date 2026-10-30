@@ -1,5 +1,6 @@
 pub mod cluster_manager;
 pub mod constants;
+pub mod cp_client;
 pub mod field_encryption;
 pub mod migrations;
 pub mod mock;

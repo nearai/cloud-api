@@ -61,10 +61,16 @@ regex = "1.12"
 # For Patroni discovery
 reqwest = { version = "0.12", features = ["json"] }
 
+# For the cloud-platform client (cp_client)
+bytes = "1.11"
+
 # For TLS connections to PostgreSQL
 postgres-native-tls = "0.5"
 # Own the vendored TLS requirement instead of relying on an unrelated NEAR client.
 native-tls = { version = "0.2", features = ["vendored"] }
+
+[dev-dependencies]
+wiremock = "0.6"
 
 [features]
 # Exposes test-only helpers (e.g. Patroni cluster-state injection) to

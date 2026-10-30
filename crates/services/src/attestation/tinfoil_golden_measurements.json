@@ -36,6 +36,11 @@
       "tag": "v0.0.159"
     },
     {
+      "measurement": "e716274321b31eaf1301d3eddfbe477da1a69c6a8afeea9f8cd36b6546d94728ffb88b4eb11f0a4cc76e40e3b294b8a7",
+      "repo": "tinfoilsh/confidential-model-router",
+      "tag": "v0.0.168"
+    },
+    {
       "measurement": "ee157fe3d1732da3089c4fafc09e556bc28bd8d6f2a5a499ff39971f619b9c339fcccfab1989513c42f2cb0b5a8d2ff3",
       "repo": "tinfoilsh/confidential-model-router",
       "tag": "v0.0.161"
@@ -189,6 +194,15 @@
         ],
         "repo": "tinfoilsh/confidential-gemma4-31b",
         "tag": "v0.0.25"
+      },
+      {
+        "registers": [
+          "54edbd861326a2579555dd06a4feabe8ef8de9de3bd2d5acf6b240d6a678c5dc0a63929ae2caf3f30285b4985cd95e70",
+          "758adac43a82a5f3146342660caefea0a7714414dd9055c4a56d1502273d85bbad86d625096a206c9335c23d05df3f99",
+          "067f19f55df948695d7bf9ed87d742fdf68429114cf488f5cfd3a63e97b12db8abec501a2765cf5a76b5bbf593d8feed"
+        ],
+        "repo": "tinfoilsh/confidential-gemma4-31b",
+        "tag": "v0.0.30"
       }
     ],
     "glm-5-3": [
@@ -209,6 +223,15 @@
         ],
         "repo": "tinfoilsh/confidential-glm5-3-nvfp4",
         "tag": "v0.0.3"
+      },
+      {
+        "registers": [
+          "acf16e1da6a4fabf453b2f1219307adaffbb8c93243b702352c38487fda8ba9dabe98f96913e42022eeec77c6640cecd",
+          "758adac43a82a5f3146342660caefea0a7714414dd9055c4a56d1502273d85bbad86d625096a206c9335c23d05df3f99",
+          "9c127c595d8e650650c3ad6ace249dc43d035e05cded7ed9b9f5080ea2dbe9e913f3a56125ed700f8b327e1b19524fdb"
+        ],
+        "repo": "tinfoilsh/confidential-glm5-3-nvfp4",
+        "tag": "v0.0.10"
       },
       {
         "registers": [
@@ -280,6 +303,15 @@
         ],
         "repo": "tinfoilsh/confidential-kimi-k3",
         "tag": "v0.0.15"
+      },
+      {
+        "registers": [
+          "7fb2b796a4b31bf1c60585dcac994b2c3c920cf8a3519a69259bb5fd1a81e6e2e9d023f6706e55de15fae88609a7e5c4",
+          "758adac43a82a5f3146342660caefea0a7714414dd9055c4a56d1502273d85bbad86d625096a206c9335c23d05df3f99",
+          "c872566644f962ee4061f629187f2650b7b423a8311a4f823ae7913f924359fec10548f9c86736c198b3727c383642b7"
+        ],
+        "repo": "tinfoilsh/confidential-kimi-k3",
+        "tag": "v0.0.16"
       }
     ],
     "llama3-3-70b": [
@@ -314,6 +346,15 @@
       }
     ],
     "pii-filter": [
+      {
+        "registers": [
+          "093ae06ffa2f01a79dff929a7ddf4cdd11916271a112a586e49d578d9562e6653559831c3313953a8f44978c4cccbcd9",
+          "482d0a481acfdf35c0e90b17faf98d313b3d26e948ab34cb349e5cc7b49f9dee85b56c0e20db740832d122285fac8e4f",
+          "58c96277dd571e221380338860948130a52b672a6363f0a19d711ed102c6c2ef0c0d189573eefe5a0c2ba6defbf4e148"
+        ],
+        "repo": "tinfoilsh/confidential-pii-cpu",
+        "tag": "v0.4.0"
+      },
       {
         "registers": [
           "3c4e2f83d30061f7cdd5a3509cbe81bb7fd1a75c7653dcb695aadf35f7ca5e6476d3a24d30b704cb448773be12d0481b",

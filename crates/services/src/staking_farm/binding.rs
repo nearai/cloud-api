@@ -4,7 +4,7 @@ use crate::{aml::AmlFlow, auth::near::SignedMessage};
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
 use config::{NearConfig, StakingFarmConfig};
-use near_api::{signer::NEP413Payload, AccountId, NetworkConfig};
+use near_kit::{standards::nep413::SignMessageParams, AccountId, Near};
 use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -37,8 +37,8 @@ pub struct BindingPayload {
     pub recipient: String,
 }
 impl BindingPayload {
-    pub fn nep413(&self) -> anyhow::Result<NEP413Payload> {
-        Ok(NEP413Payload {
+    pub fn nep413(&self) -> anyhow::Result<SignMessageParams> {
+        Ok(SignMessageParams {
             message: self.message.clone(),
             nonce: self
                 .nonce
@@ -47,6 +47,7 @@ impl BindingPayload {
                 .map_err(|_| BindingError::InvalidChallenge)?,
             recipient: self.recipient.clone(),
             callback_url: None,
+            state: None,
         })
     }
 }
@@ -121,12 +122,16 @@ pub trait BindingVerifier: Send + Sync {
         -> anyhow::Result<()>;
 }
 pub struct NearBindingVerifier {
-    network: NetworkConfig,
+    network: Near,
 }
 impl NearBindingVerifier {
     pub fn new(config: &NearConfig) -> anyhow::Result<Self> {
         Ok(Self {
-            network: NetworkConfig::from_rpc_url(&config.network_id, config.rpc_url.parse()?),
+            network: Near::custom(
+                url::Url::parse(&config.rpc_url)?.to_string(),
+                config.network_id.clone(),
+            )
+            .build(),
         })
     }
 }
@@ -353,18 +358,12 @@ mod tests {
         }
     }
     async fn proof(payload: &BindingPayload) -> SignedMessage {
-        // Public test-only seed from NEAR's NEP-413 test fixtures.
-        let signer = near_api::signer::Signer::from_seed_phrase(
-            "fatal edge jacket cash hard pass gallery fabric whisper size rain biology",
-            None,
-        )
-        .unwrap();
-        let public_key = signer.get_public_key().await.unwrap();
+        let secret_key = near_kit::signer::SecretKey::ed25519_from_bytes([7; 32]);
+        let public_key = secret_key.public_key();
         let account_id: AccountId = "alice.testnet".parse().unwrap();
-        let signature = signer
-            .sign_message_nep413(account_id.clone(), public_key, &payload.nep413().unwrap())
-            .await
-            .unwrap();
+        let hash = near_kit::standards::nep413::serialize_message(&payload.nep413().unwrap());
+        let signature = secret_key.sign(hash.as_bytes());
+
         SignedMessage {
             account_id,
             public_key,
@@ -501,30 +500,100 @@ mod tests {
     }
     #[tokio::test]
     async fn real_nep413_verifier_requires_full_access_and_rejects_modified_payload() {
-        use wiremock::{matchers::method, Mock, MockServer, ResponseTemplate};
+        use wiremock::{
+            matchers::{body_partial_json, method},
+            Mock, MockServer, ResponseTemplate,
+        };
+
         let c = challenge();
-        let message = proof(&c.payload).await;
-        for full_access in [true, false] {
-            let server = MockServer::start().await;
-            let permission = if full_access {
-                serde_json::json!("FullAccess")
-            } else {
-                serde_json::json!({"FunctionCall":{"allowance":null,"receiver_id":"stake.testnet","method_names":[]}})
+
+        for secret_key in [
+            near_kit::signer::SecretKey::ed25519_from_bytes([7; 32]),
+            near_kit::signer::SecretKey::ml_dsa65_from_seed([7; 32]),
+        ] {
+            let hash = near_kit::standards::nep413::serialize_message(&c.payload.nep413().unwrap());
+            let message = SignedMessage {
+                account_id: "alice.testnet".parse().unwrap(),
+                public_key: secret_key.public_key(),
+                signature: secret_key.sign(hash.as_bytes()),
+                state: None,
             };
-            Mock::given(method("POST")).respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"jsonrpc":"2.0","id":"dontcare","result":{"block_hash":"11111111111111111111111111111111","block_height":1,"nonce":0,"permission":permission}}))).mount(&server).await;
-            let verifier = NearBindingVerifier::new(&NearConfig {
-                rpc_url: server.uri(),
-                network_id: "testnet".into(),
-                expected_recipient: "cloud.example".into(),
-            })
-            .unwrap();
-            assert_eq!(
-                verifier.verify(&c.payload, &message).await.is_ok(),
-                full_access
-            );
-            let mut tampered = c.payload.clone();
-            tampered.message.push_str("other destination");
-            assert!(verifier.verify(&tampered, &message).await.is_err());
+
+            for permission in [
+                serde_json::json!("FullAccess"),
+                serde_json::json!({
+                    "FunctionCall": {
+                        "allowance": null,
+                        "receiver_id": "stake.testnet",
+                        "method_names": [],
+                    },
+                }),
+                serde_json::Value::Null,
+            ] {
+                let server = MockServer::start().await;
+                let full_access = permission == serde_json::json!("FullAccess");
+                let response = if permission.is_null() {
+                    serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "error": {
+                            "code": -32000,
+                            "message": "Server error",
+                            "data": "Access key does not exist",
+                            "name": "HANDLER_ERROR",
+                            "cause": {
+                                "name": "UNKNOWN_ACCESS_KEY",
+                                "info": {
+                                    "public_key": message.public_key,
+                                    "block_height": 1,
+                                    "block_hash": "11111111111111111111111111111111",
+                                },
+                            },
+                        },
+                    })
+                } else {
+                    serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "result": {
+                            "block_hash": "11111111111111111111111111111111",
+                            "block_height": 1,
+                            "nonce": 0,
+                            "permission": permission,
+                        },
+                    })
+                };
+                Mock::given(method("POST"))
+                    .and(body_partial_json(serde_json::json!({
+                        "method": "EXPERIMENTAL_view_access_key",
+                        "params": {
+                            "account_id": message.account_id,
+                            "public_key": message.public_key,
+                            "finality": "optimistic",
+                        },
+                    })))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(response))
+                    .expect(1)
+                    .mount(&server)
+                    .await;
+                let verifier = NearBindingVerifier::new(&NearConfig {
+                    rpc_url: server.uri(),
+                    network_id: "testnet".into(),
+                    expected_recipient: "cloud.example".into(),
+                })
+                .unwrap();
+
+                let result = verifier.verify(&c.payload, &message).await;
+
+                assert_eq!(result.is_ok(), full_access);
+
+                let mut tampered = c.payload.clone();
+                tampered.message.push_str("other destination");
+
+                assert!(verifier.verify(&tampered, &message).await.is_err());
+                // A tampered message must fail signature verification before another RPC request.
+                server.verify().await;
+            }
         }
     }
 }

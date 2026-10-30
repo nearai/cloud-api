@@ -361,7 +361,7 @@ pub fn normalize_near_account_id(account_id: &str) -> String {
 
 pub fn validate_near_account_id(account_id: &str) -> Result<String, AmlError> {
     let normalized = normalize_near_account_id(account_id);
-    let Ok(_) = normalized.parse::<near_api::AccountId>() else {
+    let Ok(_) = normalized.parse::<near_kit::AccountId>() else {
         return Err(AmlError::InvalidAccountId);
     };
     Ok(normalized)

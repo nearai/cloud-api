@@ -28,11 +28,10 @@ help:
 
 ## Database & Seeding
 
-# The seed binary resolves its database settings the same way the API does (.env, then the
-# environment), applies the pinned cloud-platform schema through scripts/apply-schema.sh, then
-# seeds. cloud-api never migrates on its own.
+# Seeds the database the API connects to. Seeding does not apply the schema: run `make dev`
+# (compose schema service) or scripts/apply-schema.sh first.
 seed:
-	@echo "Applying the cloud-platform schema and seeding..."
+	@echo "Seeding..."
 	cargo run --bin seed -p database
 
 ## Services
@@ -44,9 +43,13 @@ api:
 	@echo ""
 	cargo run --bin api
 
+# The compose `schema` service applies the pinned cloud-platform schema to the compose Postgres
+# and exits; `docker compose run` returns its exit status, so a failed schema stops here.
 dev:
 	@echo "Starting development environment..."
 	@echo ""
+	docker compose up -d postgres
+	docker compose run --rm schema
 	$(MAKE) seed && \
 	echo "" && \
 	echo "Seed complete! Starting API server on http://localhost:3000" && \

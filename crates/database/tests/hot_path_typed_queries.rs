@@ -38,7 +38,9 @@ fn pool_config() -> Config {
 
 async fn test_pool() -> anyhow::Result<DbPool> {
     schema::ensure_schema().await?;
-    Ok(DbPool::new(pool_config().create_pool(Some(Runtime::Tokio1), NoTls)?))
+    Ok(DbPool::new(
+        pool_config().create_pool(Some(Runtime::Tokio1), NoTls)?,
+    ))
 }
 
 fn signature(algo: &str, text: &str, kind: Option<SignatureKind>) -> ChatSignature {

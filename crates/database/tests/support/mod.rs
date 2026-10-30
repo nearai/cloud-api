@@ -47,7 +47,9 @@ pub fn ts(year: i32, month: u32, day: u32, hour: u32) -> DateTime<Utc> {
 
 pub async fn test_pool() -> anyhow::Result<DbPool> {
     schema::ensure_schema().await?;
-    Ok(DbPool::new(pool_config().create_pool(Some(Runtime::Tokio1), NoTls)?))
+    Ok(DbPool::new(
+        pool_config().create_pool(Some(Runtime::Tokio1), NoTls)?,
+    ))
 }
 
 pub async fn insert_org_fixture(pool: &DbPool) -> anyhow::Result<OrgFixture> {

@@ -83,7 +83,7 @@ jobs:
           # and none of it is Rust-relevant.
           RUST=true
           if [ -n "$CHANGED" ] && ! echo "$CHANGED" | grep -qE \
-            '(\.rs$|(^|/)Cargo\.(toml|lock)$|^crates/[^/]+/src/.*\.json$|^crates/database/src/migrations/|^\.github/workflows/test\.yml$|^\.github/actions/setup-rust-ci/|^\.config/nextest\.toml$|^rust-toolchain\.toml$|^\.cargo/config\.toml$|^scripts/check_dep_guards\.sh$)'; then
+            '(\.rs$|(^|/)Cargo\.(toml|lock)$|^crates/[^/]+/src/.*\.json$|^scripts/apply-schema\.sh$|^scripts/cloud-platform-schema\.env$|^\.github/workflows/test\.yml$|^\.github/actions/setup-rust-ci/|^\.config/nextest\.toml$|^rust-toolchain\.toml$|^\.cargo/config\.toml$|^scripts/check_dep_guards\.sh$)'; then
             RUST=false
           fi
           echo "rust=$RUST" >> "$GITHUB_OUTPUT"
@@ -176,7 +176,7 @@ jobs:
   # End-to-end tests. All e2e tests are compiled into a single binary
   # (tests/e2e_all/) for faster linking. Isolation comes from UUID-scoped
   # orgs/workspaces/keys on a shared database, not separate databases.
-  # A nextest setup script creates/migrates that database exactly once, then
+  # A nextest setup script creates that database and applies the schema exactly once, then
   # e2e concurrency is capped by .config/nextest.toml at 4 active tests. Most
   # pools are capped at 4 connections; even tests with a second pool leave
   # PostgreSQL headroom for runner-side services.
@@ -187,6 +187,10 @@ jobs:
     if: ${{ needs.changes.outputs.rust == 'true' }}
     runs-on: [self-hosted, infra]
     environment: Cloud API test env
+    permissions:
+      contents: read
+      # Pulls the cloud-platform schema image (scripts/cloud-platform-schema.env).
+      packages: read
 
     services:
       postgres:
@@ -212,6 +216,20 @@ jobs:
       uses: ./.github/actions/setup-rust-ci
       with:
         cache-key: e2e
+
+    # The schema comes from nearai/cloud-platform. The database helpers and the nextest
+    # bootstrap run scripts/apply-schema.sh, which pulls the pinned image. The login goes into
+    # a job-private DOCKER_CONFIG, so no credential is left in the shared runner's docker
+    # config; the cleanup step at the end of the job removes it.
+    - name: Log in to GHCR for the cloud-platform schema image (job-private config)
+      run: |
+        docker_config="$RUNNER_TEMP/docker-config-e2e"
+        mkdir -p "$docker_config"
+        chmod 700 "$docker_config"
+        echo "DOCKER_CONFIG=$docker_config" >> "$GITHUB_ENV"
+        DOCKER_CONFIG="$docker_config" bash -c 'echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin'
+      env:
+        GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
     - name: Run typed-query, credit-allocation, credit-transfer, session, and binding regressions
       run: |
@@ -244,6 +262,10 @@ jobs:
         TEST_DATABASE_NAME: platform_api_e2e
         RUST_LOG: debug
         DEV: "true"
+
+    - name: Remove the job-private GHCR login
+      if: always()
+      run: rm -rf "$RUNNER_TEMP/docker-config-e2e"
 
   script-test:
     name: Script tests

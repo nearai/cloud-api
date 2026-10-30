@@ -7,7 +7,7 @@ help:
 	@echo "  make dev           Seed database and run API server (recommended)"
 	@echo ""
 	@echo "Setup & Database:"
-	@echo "  make seed          Run database migrations and seed data"
+	@echo "  make seed          Apply the cloud-platform schema and seed data"
 	@echo ""
 	@echo "Running Services:"
 	@echo "  make api           Run the API server (port 3000)"
@@ -28,8 +28,10 @@ help:
 
 ## Database & Seeding
 
+# Seeds the database the API connects to. Seeding does not apply the schema: run `make dev`
+# (compose schema service) or scripts/apply-schema.sh first.
 seed:
-	@echo "Running database migrations and seeding..."
+	@echo "Seeding..."
 	cargo run --bin seed -p database
 
 ## Services
@@ -41,10 +43,14 @@ api:
 	@echo ""
 	cargo run --bin api
 
+# The compose `schema` service applies the pinned cloud-platform schema to the compose Postgres
+# and exits; `docker compose run` returns its exit status, so a failed schema stops here.
 dev:
 	@echo "Starting development environment..."
 	@echo ""
-	cargo run --bin seed -p database && \
+	docker compose up -d postgres
+	docker compose run --rm schema
+	$(MAKE) seed && \
 	echo "" && \
 	echo "Seed complete! Starting API server on http://localhost:3000" && \
 	echo "  Documentation: http://localhost:3000/docs" && \

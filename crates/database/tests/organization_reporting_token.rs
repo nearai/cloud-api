@@ -1,5 +1,5 @@
 use chrono::{Duration, Utc};
-use database::{migrations, DbPool};
+use database::DbPool;
 use deadpool::Runtime;
 use deadpool_postgres::Config;
 use services::common::REPORTING_TOKEN_PREFIX;
@@ -7,11 +7,11 @@ use services::reporting_tokens::ports::{
     CreateOrganizationReportingTokenRequest, OrganizationReportingTokenRepository as _,
     REPORTING_TOKEN_SCOPE_USAGE_READ,
 };
-use tokio::sync::OnceCell;
 use tokio_postgres::NoTls;
 use uuid::Uuid;
 
-static MIGRATED: OnceCell<()> = OnceCell::const_new();
+#[path = "support/schema.rs"]
+mod schema;
 
 fn pool_config() -> Config {
     let mut config = Config::new();
@@ -30,11 +30,10 @@ fn pool_config() -> Config {
 }
 
 async fn test_pool() -> anyhow::Result<DbPool> {
-    let pool = DbPool::new(pool_config().create_pool(Some(Runtime::Tokio1), NoTls)?);
-    MIGRATED
-        .get_or_try_init(|| async { migrations::run(&pool).await })
-        .await?;
-    Ok(pool)
+    schema::ensure_schema().await?;
+    Ok(DbPool::new(
+        pool_config().create_pool(Some(Runtime::Tokio1), NoTls)?,
+    ))
 }
 
 async fn insert_org_and_user(pool: &DbPool) -> anyhow::Result<(Uuid, Uuid)> {

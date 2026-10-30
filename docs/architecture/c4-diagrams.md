@@ -1330,7 +1330,7 @@ erDiagram
 - **Language**: Rust (latest stable)
 - **Web Framework**: Axum (async HTTP server)
 - **Database**: PostgreSQL 16
-- **Migrations**: Refinery (SQL migrations)
+- **Schema**: owned by nearai/cloud-platform and applied by its `migrate` step before deploy; cloud-api does not migrate
 - **ORM**: SQLx (compile-time SQL verification)
 
 ### External Integrations
@@ -1470,7 +1470,7 @@ The NEAR AI Cloud API is a modern, multi-tenant AI inference platform built with
 - Cryptographic chat signatures for content verification
 
 For additional details, see:
-- Database schema: `/crates/database/src/migrations/sql/`
+- Database schema: `nearai/cloud-platform`, `crates/schema/migrations/sql/` (applied by `scripts/apply-schema.sh` locally)
 - API documentation: OpenAPI/Swagger UI (when server is running)
 - Service interfaces: `/crates/services/src/*/ports.rs`
 - Configuration: `/config/config.yaml`

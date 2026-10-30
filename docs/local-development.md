@@ -22,6 +22,7 @@ real inference backends.
 
 ```bash
 # Postgres only — runs the API on the host so you get fast rebuilds.
+# Postgres only. `make dev` below also starts it and applies the schema.
 docker compose up -d postgres
 
 cp env.example .env
@@ -33,8 +34,8 @@ cp env.example .env
 make dev
 ```
 
-`make dev` runs migrations, seeds the mock admin user, and starts the API
-on `http://localhost:3000`. Useful endpoints once it's up:
+`make dev` starts the compose Postgres, applies the cloud-platform schema through the compose
+`schema` service, seeds the mock admin user, and starts the API on `http://localhost:3000`. Useful endpoints once it's up:
 
 | Path                          | Purpose                              |
 | ----------------------------- | ------------------------------------ |
@@ -58,6 +59,30 @@ in containers. It's slower to iterate on (full image rebuild per change)
 but useful for reproducing a containerized environment. Set `DD_API_KEY`
 in `.env` if you want the Datadog agent to actually report; otherwise the
 agent will start, complain in logs, and the API will still work.
+
+The `schema` service runs once before `api` starts. It applies the
+cloud-platform schema from the pinned image (`scripts/cloud-platform-schema.env`,
+or `CLOUD_PLATFORM_IMAGE` if you set it in `.env`) to the compose Postgres.
+The API waits for it to finish successfully, so a fresh volume is never
+served against an empty database. The database secret is a dev file,
+`docker/schema-dev-db-secret.json`, mounted read-only; the password is not in
+the environment or on any command line.
+
+The image is private. Run `docker login ghcr.io` with a token that can read
+`nearai/cloud-platform` packages before the first `up`. Check the schema step
+with `docker compose logs schema`.
+
+`make seed` runs the seed binary only. It loads its settings as the API does
+(`.env`, the environment, `DATABASE_PASSWORD_FILE`) and seeds that database. It
+does not apply the schema, so the schema must already be there. `make dev` does
+that first: it starts the compose Postgres, runs the `schema` service to
+completion, then seeds and starts the API on the host.
+
+Without compose (your own local Postgres), apply the schema with
+`scripts/apply-schema.sh`. It takes explicit `PGHOST`, `PGPORT`, `PGDATABASE`,
+`PGUSER` and `PGPASSWORD` and reads no `.env`. It is for local and CI databases
+only, since it uses plaintext to local hosts. Deployed environments are migrated
+by the deploy pipeline.
 
 ## 3. Auth flows for manual testing
 
@@ -246,7 +271,7 @@ matching `models` row.
 #    (vLLM, SGLang, ollama-compat, etc.)
 
 # 2. Insert a model row that targets it. The columns below are the
-#    bare minimum — check `crates/database/src/migrations/sql/` for the
+#    bare minimum — check `crates/schema/migrations/sql/` in `nearai/cloud-platform` for the
 #    latest schema (it drifts faster than this doc does).
 #
 #    URL: use http://localhost:8002 when cloud-api runs on the host

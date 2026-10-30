@@ -66,7 +66,8 @@ bytes = "1.11"
 
 # For TLS connections to PostgreSQL
 postgres-native-tls = "0.5"
-native-tls = "0.2"
+# Own the vendored TLS requirement instead of relying on an unrelated NEAR client.
+native-tls = { version = "0.2", features = ["vendored"] }
 
 [dev-dependencies]
 wiremock = "0.6"

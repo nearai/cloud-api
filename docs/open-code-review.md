@@ -1,46 +1,15 @@
 # OpenCodeReview dogfooding
 
-The OpenCodeReview workflow builds the NEAR AI provider from the immutable
-`OCR_REF` commit in `nearai/open-code-review` while the integration awaits an
-upstream release. The current pin includes the provider changes in
-[alibaba/open-code-review#1758](https://github.com/alibaba/open-code-review/pull/1758).
+**On hold:** keep this PR unmerged while the private-repository pilot in [nearai-cloud-ui#465](https://github.com/nearai/nearai-cloud-ui/pull/465) is the priority.
 
-## Configuration
+Add a production NEAR AI API key as the repository Actions secret `PRIVATE_OCR_API_KEY`. Once installed on the base/default branch, the workflow automatically reviews same-repository, non-draft PRs when opened or marked ready for review (`pull_request_target`). An owner, member, or collaborator can also trigger a review with a PR comment starting with `/ocr`. New commits do not automatically rerun reviews; use `/ocr` to rerun.
 
-- `OCR_LLM_AUTH_TOKEN` remains the API-key secret. It must contain a production
-  NEAR AI API key; the workflow passes it as `NEARAI_API_KEY` only to the review
-  step, without writing it to OCR's configuration file.
-- Requests use `https://cloud-api.near.ai/v1`.
-- The model defaults to `z-ai/glm-5.3-flash`. Set the repository variable
-  `OCR_NEARAI_MODEL` to choose another canonical model ID with E2EE and model-TEE
-  support. Unsupported models fail rather than weakening the policy.
-- The legacy `OCR_LLM_URL` and `OCR_LLM_MODEL` secrets are no longer used by this
-  workflow. E2EE and `model-tee` verification are explicitly required.
+The workflow fixes the API URL to `https://cloud-api.near.ai/v1` and the model to `deepseek-ai/DeepSeek-V4.1-Flash-1017-abliterated`. It builds OpenCodeReview from commit `bc197a163ac59cab372ab0ba0daa8fc7fc180b45` of `nearai/open-code-review`.
 
-The existing triggers remain: same-repository PRs opened or marked ready, and
-`/ocr` comments from owners, members, or collaborators. Comment-triggered reviews
-can include fork PRs. The workflow executes only the trusted workflow revision
-and pinned OCR source; it fetches the PR commits as data without checking out or
-executing PR code. Review rules come from the trusted checkout.
+E2EE and `model-tee` verification are mandatory. OCR's NEAR AI provider verifies attestation before each completion request and verifies response signatures before returning results. There is no separate synthetic preflight or custom publication gate. A nonzero OCR exit stops publication; successful exits, including partial reviews, use OCR's standard comment publisher.
 
-## Results and rollout
+Only the review inference step receives the dedicated API key. The workflow checks out trusted base/default-branch scripts and rules, fetches PR commits as data, and does not execute PR code or build the application. Publication checks that the PR head has not changed.
 
-Publication requires a zero OCR exit code, complete review coverage, at least one
-verified completion, and no failed, pending, or cancelled requests. A no-op review
-is explicitly reported as skipped, without claiming inference verification. The
-workflow checks the PR head again before posting to avoid publishing a review
-against a newer commit.
+Source is plaintext on the GitHub-hosted runner before encryption, and findings are posted to the private PR. E2EE protects inference transport to the verified model environment; it does not hide source from GitHub or the runner. Raw result and stderr files are not uploaded as artifacts and are removed after the run. OCR may also keep local session data on the ephemeral runner.
 
-The Actions step summary records the verification count and policy. Result JSON
-and stderr are retained as workflow artifacts for seven days; these can contain
-source code and review content and are not encrypted by inference E2EE.
-
-Because these triggers use the base/default-branch workflow, this PR's new flow
-must be merged before `/ocr` can exercise it. After merging, trigger `/ocr` on a
-small PR and confirm the verification summary and posted review. No live
-inference is performed by the local workflow tests.
-
-To update the dogfood build, change `OCR_REF` to a reviewed commit and rerun
-`actionlint` plus the Python script tests. Once the NEAR AI provider is released
-upstream, replace the source build with a pinned release that retains the same
-verification and publication checks.
+Validate the workflow with `actionlint .github/workflows/open-code-review.yml`. A live smoke test requires the secret and a merged workflow; post `/ocr` on a small PR and inspect the run and review results.

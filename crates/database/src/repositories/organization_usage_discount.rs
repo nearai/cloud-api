@@ -8,7 +8,7 @@ use serde::Serialize;
 use services::common::RepositoryError;
 use services::usage::ports::UsageDiscount;
 use std::time::Duration;
-use tokio_postgres::{Row, Transaction};
+use tokio_postgres::{error::SqlState, Row, Transaction};
 use uuid::Uuid;
 
 pub const BATCH_SIZE: i64 = 500;
@@ -171,7 +171,8 @@ impl OrganizationUsageDiscountRepository {
         let tx = client.transaction().await?;
         tx.batch_execute("SET LOCAL statement_timeout = '5s'; SET LOCAL lock_timeout = '2s'")
             .await?;
-        // All posting, credit changes and correction batches take this lock first.
+        // Posting and credit changes take this lock first; correction batches take it
+        // before they change counters.
         if tx
             .query_opt(
                 "SELECT id FROM organizations WHERE id = $1 FOR UPDATE",
@@ -259,16 +260,8 @@ impl OrganizationUsageDiscountRepository {
         let tx = client.transaction().await?;
         tx.batch_execute("SET LOCAL statement_timeout = '30s'; SET LOCAL lock_timeout = '2s'")
             .await?;
-        if tx
-            .query_opt(
-                "SELECT id FROM organizations WHERE id = $1 FOR UPDATE SKIP LOCKED",
-                &[&organization_id],
-            )
-            .await?
-            .is_none()
-        {
-            return Ok(false);
-        }
+        // The rule row fences overlapping workers. The organization lock comes last,
+        // after the row work: live charging waits on it without a timeout.
         let Some(rule_row) = tx.query_opt("SELECT * FROM organization_usage_discounts WHERE organization_id = $1 AND status = 'applying' FOR UPDATE", &[&organization_id]).await? else {
             return Ok(false);
         };
@@ -278,8 +271,8 @@ impl OrganizationUsageDiscountRepository {
         let rule = OrganizationUsageDiscount::from_row(&rule_row);
         let cursor_at: Option<DateTime<Utc>> = rule_row.get("cursor_created_at");
         let cursor_id: Option<Uuid> = rule_row.get("cursor_usage_id");
-        // Serialize cost corrections with aggregate replacement. Do not wait while
-        // holding the organization lock if the hourly scheduler is already running.
+        // Serialize cost corrections with aggregate replacement. Do not wait if the
+        // hourly scheduler is already running.
         let locked: bool = tx
             .query_one(
                 "SELECT pg_try_advisory_xact_lock($1)",
@@ -331,7 +324,10 @@ impl OrganizationUsageDiscountRepository {
         ensure!(inserted == ids.len() as u64, "Incomplete discount batch");
         // Reverse each original posting in descending priority, never reclassifying
         // later usage into the newly released capacity. Original entries stay immutable.
-        let counters = tx.query_one(r#"WITH portions AS (
+        // The released amounts per credit type reach the counters under the organization lock.
+        let reductions = tx
+            .query(
+                r#"WITH portions AS (
                 SELECT a.id, a.credit_type, a.amount,
                        j.original_total_cost - j.net_input_cost - j.net_output_cost AS delta,
                        COALESCE(SUM(a.amount) OVER (PARTITION BY a.inference_usage_id
@@ -344,19 +340,17 @@ impl OrganizationUsageDiscountRepository {
                 INSERT INTO usage_credit_allocation_reversals (allocation_id, rule_id, amount)
                 SELECT id, $1, LEAST(amount, delta - preceding)::BIGINT FROM portions
                 WHERE delta > preceding RETURNING allocation_id, amount
-            ), reductions AS (
-                SELECT a.credit_type, SUM(r.amount)::BIGINT AS amount
+            ) SELECT a.credit_type::TEXT AS credit_type, SUM(r.amount)::BIGINT AS amount
                 FROM reversed r JOIN usage_credit_allocations a ON a.id = r.allocation_id
-                GROUP BY a.credit_type
-            ), updated AS (
-                UPDATE organization_credit_consumption c SET amount = c.amount - r.amount, updated_at = clock_timestamp()
-                FROM reductions r WHERE c.organization_id = $3 AND c.credit_type = r.credit_type RETURNING c.credit_type
-            ) SELECT (SELECT COUNT(*) FROM reductions) = (SELECT COUNT(*) FROM updated) AS consistent"#,
-            &[&rule.id, &ids, &organization_id]).await?;
-        ensure!(
-            counters.get::<_, bool>("consistent"),
-            "Missing credit consumption counter"
-        );
+                GROUP BY a.credit_type"#,
+                &[&rule.id, &ids],
+            )
+            .await?;
+        let credit_types: Vec<String> = reductions
+            .iter()
+            .map(|row| row.get("credit_type"))
+            .collect();
+        let released: Vec<i64> = reductions.iter().map(|row| row.get("amount")).collect();
         tx.execute(r#"UPDATE organization_usage_log u
             SET input_cost = j.net_input_cost, output_cost = j.net_output_cost,
                 total_cost = j.net_input_cost + j.net_output_cost,
@@ -381,12 +375,6 @@ impl OrganizationUsageDiscountRepository {
             .await?;
         let delta: i64 = totals.get("delta");
         let legacy: i64 = totals.get("legacy");
-        let balances = tx.execute(r#"UPDATE organization_balance
-            SET total_spent = total_spent - $2, legacy_unattributed_amount = legacy_unattributed_amount - $3,
-                updated_at = clock_timestamp()
-            WHERE organization_id = $1 AND total_spent >= $2 AND legacy_unattributed_amount >= $3"#,
-            &[&organization_id, &delta, &legacy]).await?;
-        ensure!(balances == 1, "Discount balance does not reconcile");
         tx.execute(r#"WITH deltas AS (
                 SELECT date_trunc('hour', u.created_at, 'UTC') AS hour, u.organization_id,
                     u.workspace_id, u.api_key_id, u.model_id, u.model_name, u.inference_type,
@@ -412,6 +400,41 @@ impl OrganizationUsageDiscountRepository {
             )"#, &[&ids]).await?
 .get(0);
         ensure!(consistent, "Discount allocation does not reconcile");
+        // Only the counters change under the organization lock, so live charging waits
+        // milliseconds rather than the whole batch. A duplicate report for a row in this
+        // batch can hold the lock while it waits for this transaction: PostgreSQL aborts
+        // one of the two and that one retries. A busy lock also rolls the batch back.
+        match tx
+            .query_opt(
+                "SELECT id FROM organizations WHERE id = $1 FOR UPDATE",
+                &[&organization_id],
+            )
+            .await
+        {
+            Ok(Some(_)) => {}
+            Ok(None) => return Ok(false),
+            Err(error) if lock_unavailable(&error) => return Ok(false),
+            Err(error) => return Err(error.into()),
+        }
+        let counters = tx
+            .execute(
+                r#"UPDATE organization_credit_consumption c
+            SET amount = c.amount - r.amount, updated_at = clock_timestamp()
+            FROM UNNEST($2::TEXT[], $3::BIGINT[]) AS r(credit_type, amount)
+            WHERE c.organization_id = $1 AND c.credit_type = r.credit_type"#,
+                &[&organization_id, &credit_types, &released],
+            )
+            .await?;
+        ensure!(
+            counters == credit_types.len() as u64,
+            "Missing credit consumption counter"
+        );
+        let balances = tx.execute(r#"UPDATE organization_balance
+            SET total_spent = total_spent - $2, legacy_unattributed_amount = legacy_unattributed_amount - $3,
+                updated_at = clock_timestamp()
+            WHERE organization_id = $1 AND total_spent >= $2 AND legacy_unattributed_amount >= $3"#,
+            &[&organization_id, &delta, &legacy]).await?;
+        ensure!(balances == 1, "Discount balance does not reconcile");
         let last = rows.last().expect("nonempty batch");
         let last_at: DateTime<Utc> = last.get("created_at");
         let last_id: Uuid = last.get("id");
@@ -587,6 +610,12 @@ impl OrganizationUsageDiscountRepository {
         }
         result
     }
+}
+
+fn lock_unavailable(error: &tokio_postgres::Error) -> bool {
+    error.code().is_some_and(|code| {
+        *code == SqlState::LOCK_NOT_AVAILABLE || *code == SqlState::T_R_DEADLOCK_DETECTED
+    })
 }
 
 async fn validate_history(

@@ -72,10 +72,16 @@ The image is private. Run `docker login ghcr.io` with a token that can read
 `nearai/cloud-platform` packages before the first `up`. Check the schema step
 with `docker compose logs schema`.
 
-Settings precedence for `make seed`, `scripts/apply-schema.sh` and the seed
-binary: exported shell variables win, then `.env`, then defaults. The script
-reads `PG*` first and `DATABASE_*` second, so a `.env` with `DATABASE_*` values
-applies to the schema step and to the seed binary alike.
+`make seed` (also run by `make dev`) is the seed binary. It loads its database
+settings exactly as the API does, from `.env` and the environment, including
+`DATABASE_PASSWORD_FILE`. It then runs `scripts/apply-schema.sh` against that same
+database with the resolved values, and only then seeds. The schema step needs a
+direct connection (`DATABASE_CONNECTION_MODE=direct`); Patroni clusters are
+migrated by cloud-platform's migrate step instead.
+
+`scripts/apply-schema.sh` can also be run by hand. It takes explicit libpq
+variables only (`PGHOST`, `PGPORT`, `PGDATABASE`, `PGUSER`, `PGPASSWORD`), reads no
+`.env`, and fails if any of them is missing.
 
 ## 3. Auth flows for manual testing
 

@@ -4,7 +4,8 @@
 //! A miss is a 200 whose `signature` is null. That maps to the same
 //! `SignatureNotFound` the local repository returns, so the provider-pool
 //! fallback in the attestation service runs unchanged. Signature reads are not
-//! cached.
+//! cached. When cloud-platform cannot answer (any client error), the read
+//! falls back to the local repository, which reads the same table.
 //!
 //! This relies on the shared database. cloud-api writes `chat_signatures`
 //! locally, and cloud-platform reads the same table (cloud-platform owns it;
@@ -135,10 +136,15 @@ impl AttestationRepository for ChatSignatureReads {
         match self.remote(chat_id, signing_algo).await {
             Ok(Some(signature)) => Ok(signature),
             Ok(None) => Err(not_found(chat_id, signing_algo)),
-            Err(error) => Err(AttestationError::RepositoryError(format!(
-                "cloud-platform signature read failed: {}",
-                error.kind()
-            ))),
+            // Both services read the same table, so an outage falls back to
+            // the local read instead of failing the lookup.
+            Err(error) => {
+                tracing::warn!(
+                    error_kind = error.kind(),
+                    "cloud-platform signature read failed; reading locally"
+                );
+                self.local.get_chat_signature(chat_id, signing_algo).await
+            }
         }
     }
 }
@@ -269,8 +275,51 @@ mod tests {
             .unwrap();
     }
 
+    fn local_row() -> ChatSignature {
+        ChatSignature {
+            text: "local:text".to_string(),
+            signature: "0xlocal".to_string(),
+            signing_address: "0xlocaladdr".to_string(),
+            signing_algo: "ecdsa".to_string(),
+            signature_kind: Some(SignatureKind::ProviderTee),
+        }
+    }
+
     #[tokio::test]
-    async fn an_unreachable_cloud_platform_is_a_repository_error_not_a_miss() {
+    async fn an_unavailable_cloud_platform_falls_back_to_the_local_row() {
+        let server = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(503))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let signature = reads(&server, Some(local_row()))
+            .get_chat_signature("chatcmpl-1", "ecdsa")
+            .await
+            .unwrap();
+        assert_eq!(signature.signature, "0xlocal");
+    }
+
+    #[tokio::test]
+    async fn a_timed_out_read_falls_back_to_the_local_row() {
+        let server = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(found_body())
+                    .set_delay(std::time::Duration::from_millis(1500)),
+            )
+            .mount(&server)
+            .await;
+        let signature = reads(&server, Some(local_row()))
+            .get_chat_signature("chatcmpl-1", "ecdsa")
+            .await
+            .unwrap();
+        assert_eq!(signature.signature, "0xlocal");
+    }
+
+    #[tokio::test]
+    async fn an_outage_with_no_local_row_is_the_local_miss() {
         let server = MockServer::start().await;
         Mock::given(any())
             .respond_with(ResponseTemplate::new(503))
@@ -280,6 +329,6 @@ mod tests {
             .get_chat_signature("chatcmpl-1", "ecdsa")
             .await
             .unwrap_err();
-        assert!(matches!(error, AttestationError::RepositoryError(_)));
+        assert!(matches!(error, AttestationError::SignatureNotFound(_)));
     }
 }

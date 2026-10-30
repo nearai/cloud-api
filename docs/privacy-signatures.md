@@ -61,7 +61,9 @@ request/response hashes can still reveal whether a candidate payload matches.
 When `CLOUD_PLATFORM_URL` and `CLOUD_PLATFORM_API_KEY_FILE` are both set,
 chat-signature reads are served from cloud-platform's
 `GET /v1/internal/chat-signatures/{chat_id}` instead of the local repository.
-Unset, nothing changes. There is no other switch.
+Unset, nothing changes. There is no other switch. When cloud-platform cannot
+answer (an error, timeout or open breaker), the read falls back to the local
+repository.
 
 This relies on the shared database: cloud-api writes `chat_signatures` locally,
 and cloud-platform reads the same table. Do not configure the client if the two

@@ -2,7 +2,6 @@ pub mod cluster_manager;
 pub mod constants;
 pub mod cp_client;
 pub mod field_encryption;
-pub mod migrations;
 pub mod mock;
 pub mod models;
 pub mod patroni_discovery;
@@ -156,11 +155,6 @@ impl Database {
         let mut db = Self::new(pool);
         db.cluster_manager = Some(cluster_manager);
         Ok(db)
-    }
-
-    /// Run database migrations
-    pub async fn run_migrations(&self) -> Result<()> {
-        migrations::run(&self.pool).await
     }
 
     async fn from_direct_postgres_config(config: &config::DatabaseConfig) -> Result<Self> {

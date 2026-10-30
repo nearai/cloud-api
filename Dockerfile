@@ -93,10 +93,6 @@ WORKDIR /app
 # Copy the built binary
 COPY --from=builder /app/target/release/api /app/api
 
-# Copy the migration SQL files
-RUN mkdir -p /app/crates/database/src/migrations/sql
-COPY --from=builder --chmod=0664 /app/crates/database/src/migrations/sql/*.sql /app/crates/database/src/migrations/sql/
-
 # Copy the pinned package list from builder stage
 COPY --from=builder --chmod=0664 /app/pinned-packages-builder.txt /app/pinned-packages-builder.txt
 

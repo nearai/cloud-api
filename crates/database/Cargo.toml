@@ -63,7 +63,8 @@ reqwest = { version = "0.12", features = ["json"] }
 
 # For TLS connections to PostgreSQL
 postgres-native-tls = "0.5"
-native-tls = "0.2"
+# Own the vendored TLS requirement instead of relying on an unrelated NEAR client.
+native-tls = { version = "0.2", features = ["vendored"] }
 
 [features]
 # Exposes test-only helpers (e.g. Patroni cluster-state injection) to

@@ -1,71 +1,35 @@
 #!/usr/bin/env bash
-# Apply the ledger schema to a PostgreSQL database.
+# Apply the ledger schema to one PostgreSQL database by running the `migrate` subcommand of
+# the image pinned in scripts/cloud-platform-schema.env. That is the migrator that runs before
+# every deploy. Applying an up-to-date database is a no-op. cloud-api never migrates.
 #
-# The schema is owned by nearai/cloud-platform. This runs the `migrate` subcommand of the
-# image pinned in scripts/cloud-platform-schema.env, which is the same migrator that runs
-# before every deploy. Applying an up-to-date database is a no-op. cloud-api never migrates.
+# Usage: scripts/apply-schema.sh
 #
-# Connection settings, highest precedence first (the same order the seed binary uses for
-# .env, where exported variables win over the file):
-#   1. exported PGHOST, PGPORT, PGUSER, PGPASSWORD, PGDATABASE
-#   2. exported DATABASE_HOST, DATABASE_PORT, DATABASE_USERNAME, DATABASE_PASSWORD, DATABASE_NAME
-#   3. the same names in the repo's .env, read without overriding anything above
-#   4. defaults: localhost, 5432, postgres, empty password. PGDATABASE or DATABASE_NAME is required.
+# Connection: explicit libpq variables only, all required:
+#   PGHOST, PGPORT, PGDATABASE, PGUSER   and   PGPASSWORD (may be empty, must be set)
+# The script reads no .env file and no other configuration. Callers resolve their own settings
+# and pass these in: the seed binary, the test helpers, and CI do this.
 #
-# The migrator sends no TLS to local hosts only (loopback, localhost, or a single-label name
-# such as a compose service) and refuses any other host.
+# The migrator sends no TLS and accepts plaintext only to local hosts: loopback, localhost, or a
+# single-label name such as a compose service.
 #
-# SCHEMA_DOCKER_NETWORK overrides the docker --network value. The default is host, except on
-# Docker Desktop, where localhost is mapped to the host gateway through a single-label alias.
+# SCHEMA_DOCKER_NETWORK overrides the docker --network value (default: host). On Docker Desktop,
+# localhost is routed through a single-label alias to the host gateway instead.
 set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-repo_root="$(cd "$script_dir/.." && pwd)"
 
-eval "$(python3 -I - "$repo_root/.env" <<'PY'
-import os, shlex, sys
-
-def read_dotenv(path):
-    values = {}
-    try:
-        with open(path, encoding="utf-8") as fh:
-            for raw in fh:
-                line = raw.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                if line.startswith("export "):
-                    line = line[len("export "):]
-                key, _, value = line.partition("=")
-                value = value.strip()
-                if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
-                    value = value[1:-1]
-                values[key.strip()] = value
-    except FileNotFoundError:
-        pass
-    return values
-
-env = {**read_dotenv(sys.argv[1]), **os.environ}
-
-def pick(name, legacy, default=""):
-    for key in (name, legacy):
-        if env.get(key):
-            return env[key]
-    return default
-
-settings = {
-    "PGHOST": pick("PGHOST", "DATABASE_HOST", "localhost"),
-    "PGPORT": pick("PGPORT", "DATABASE_PORT", "5432"),
-    "PGUSER": pick("PGUSER", "DATABASE_USERNAME", "postgres"),
-    "PGPASSWORD": pick("PGPASSWORD", "DATABASE_PASSWORD", ""),
-    "PGDATABASE": pick("PGDATABASE", "DATABASE_NAME", ""),
-}
-for name, value in settings.items():
-    print(f"export {name}={shlex.quote(value)}")
-PY
-)"
-
-if [[ -z "${PGDATABASE:-}" ]]; then
-  echo "apply-schema: PGDATABASE (or DATABASE_NAME) must name the database to migrate" >&2
+missing=()
+for name in PGHOST PGPORT PGDATABASE PGUSER; do
+  [[ -n "${!name:-}" ]] || missing+=("$name")
+done
+if [[ ${#missing[@]} -gt 0 ]]; then
+  echo "apply-schema: required variables not set: ${missing[*]}" >&2
+  echo "apply-schema: usage: PGHOST=... PGPORT=... PGDATABASE=... PGUSER=... PGPASSWORD=... scripts/apply-schema.sh" >&2
+  exit 1
+fi
+if [[ -z "${PGPASSWORD+x}" ]]; then
+  echo "apply-schema: PGPASSWORD must be set (it may be empty)" >&2
   exit 1
 fi
 

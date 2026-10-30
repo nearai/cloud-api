@@ -60,11 +60,11 @@ application retry behavior; this does not guarantee interruption-free failover.
 - Verify connectivity from the application CVM to RDS, including security groups,
   routes and DNS. The TLS bridge used by RDS to subscribe to the source CVM is
   a different connection path and is not needed for application-to-RDS access.
-- Prepare compatible schemas/extensions and coordinate existing startup migrations
-  with logical replication. Changing the endpoint does not copy any data.
+- Prepare compatible schemas/extensions and coordinate schema changes (applied by
+  `cloud-platform migrate`, not at cloud-api startup) with logical replication. Changing the endpoint does not copy any data.
 - Preserve the field-encryption keys, key IDs and settings required to read the
   migrated ciphertext. RDS storage encryption does not replace application keys.
-- Rehearse application reads/writes, migrations and RDS failover in staging.
+- Rehearse application reads/writes, the cloud-platform schema apply and RDS failover in staging.
   Coordinate final synchronization, sequence state, write cutover and rollback
   before switching the live application. Keep the application on the source until
   those gates pass; do not let both databases accept independent application writes.

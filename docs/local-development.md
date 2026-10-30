@@ -33,7 +33,7 @@ cp env.example .env
 make dev
 ```
 
-`make dev` runs migrations, seeds the mock admin user, and starts the API
+`make dev` applies the cloud-platform schema, seeds the mock admin user, and starts the API
 on `http://localhost:3000`. Useful endpoints once it's up:
 
 | Path                          | Purpose                              |
@@ -246,7 +246,7 @@ matching `models` row.
 #    (vLLM, SGLang, ollama-compat, etc.)
 
 # 2. Insert a model row that targets it. The columns below are the
-#    bare minimum — check `crates/database/src/migrations/sql/` for the
+#    bare minimum — check `crates/schema/migrations/sql/` in `nearai/cloud-platform` for the
 #    latest schema (it drifts faster than this doc does).
 #
 #    URL: use http://localhost:8002 when cloud-api runs on the host

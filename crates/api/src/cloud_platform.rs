@@ -13,11 +13,12 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use database::cp_client::{
-    ApiKeyVerdicts, CatalogModels, ChatSignatureReads, CpClient, CpClientConfig, Verdict,
+    ApiKeyVerdicts, CatalogModels, ChatSignatureReads, CpClient, CpClientConfig,
+    InvalidatesCatalog, Verdict,
 };
 use services::attestation::ports::AttestationRepository;
 use services::metrics::MetricsServiceTrait;
-use services::models::ModelsRepository;
+use services::models::{ModelsRepository, ModelsServiceImpl, ModelsServiceTrait};
 
 use crate::models::ErrorResponse;
 
@@ -48,21 +49,45 @@ pub fn build(
     }))
 }
 
-/// The models repository: the catalog adapter when configured, else the local one.
-pub fn models_repository(
+/// The catalog adapter, when configured.
+pub fn catalog_models(
     local: Arc<dyn ModelsRepository>,
     cloud_platform: Option<&CloudPlatform>,
     metrics: Option<Arc<dyn MetricsServiceTrait>>,
-) -> Arc<dyn ModelsRepository> {
-    match cloud_platform {
-        Some(cp) => Arc::new(CatalogModels::new(
+) -> Option<Arc<CatalogModels>> {
+    cloud_platform.map(|cp| {
+        Arc::new(CatalogModels::new(
             local,
             cp.client.clone(),
             cp.catalog_ttl,
             cp.catalog_max_stale,
             metrics,
-        )),
+        ))
+    })
+}
+
+/// The models repository: the catalog adapter when configured, else the local one.
+pub fn models_repository(
+    local: Arc<dyn ModelsRepository>,
+    catalog: Option<&Arc<CatalogModels>>,
+) -> Arc<dyn ModelsRepository> {
+    match catalog {
+        Some(catalog) => catalog.clone(),
         None => local,
+    }
+}
+
+/// The models service for the callers that invalidate it (admin writes, the
+/// pricing scheduler). Unconfigured, it is the models service itself. With the
+/// catalog adapter, invalidating it also makes the adapter's cached answers
+/// stale, so the models service's caches do not reload from them.
+pub fn invalidating_models_service(
+    models_service: Arc<ModelsServiceImpl>,
+    catalog: Option<Arc<CatalogModels>>,
+) -> Arc<dyn ModelsServiceTrait> {
+    match catalog {
+        Some(catalog) => Arc::new(InvalidatesCatalog::new(models_service, catalog)),
+        None => models_service,
     }
 }
 
@@ -244,12 +269,80 @@ mod tests {
     fn unconfigured_builds_nothing_and_keeps_every_local_implementation() {
         assert!(build(None, metrics()).unwrap().is_none());
         let local_models: Arc<dyn ModelsRepository> = Arc::new(NoModels);
-        let chosen = models_repository(local_models.clone(), None, None);
+        assert!(catalog_models(local_models.clone(), None, None).is_none());
+        let chosen = models_repository(local_models.clone(), None);
         assert!(Arc::ptr_eq(&chosen, &local_models));
         let local_attestations: Arc<dyn AttestationRepository> = Arc::new(NoAttestations);
         let chosen = signature_repository(local_attestations.clone(), None);
         assert!(Arc::ptr_eq(&chosen, &local_attestations));
         assert!(check_api_key_verdicts(None).is_none());
+    }
+
+    #[tokio::test]
+    async fn unconfigured_invalidation_goes_to_the_models_service_itself() {
+        let models_service = Arc::new(ModelsServiceImpl::new(
+            Arc::new(
+                services::inference_provider_pool::InferenceProviderPool::new(
+                    None,
+                    config::ExternalProvidersConfig::default(),
+                ),
+            ),
+            Arc::new(NoModels),
+        ));
+        let chosen = invalidating_models_service(models_service.clone(), None);
+        let expected: Arc<dyn ModelsServiceTrait> = models_service;
+        assert!(Arc::ptr_eq(&chosen, &expected));
+    }
+
+    #[tokio::test]
+    async fn invalidating_the_models_cache_makes_the_next_read_ask_cloud_platform() {
+        let server = MockServer::start().await;
+        let model = serde_json::json!({
+            "id": uuid::Uuid::from_u128(7),
+            "model_name": "m",
+            "model_display_name": "m",
+            "model_description": "d",
+            "input_cost_per_token": 1,
+            "output_cost_per_token": 2,
+            "cost_per_image": 0,
+            "context_length": 100,
+            "verifiable": true,
+            "owned_by": "x",
+            "provider_type": "vllm",
+            "attestation_supported": true,
+            "is_listed": true,
+            "created_at": "2026-01-01T00:00:00Z",
+        });
+        Mock::given(method("GET"))
+            .and(path("/v1/internal/catalog/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([model])))
+            .expect(2)
+            .mount(&server)
+            .await;
+        let catalog = Arc::new(CatalogModels::new(
+            Arc::new(NoModels),
+            cp_client(&server),
+            Duration::from_secs(30),
+            Duration::from_secs(300),
+            None,
+        ));
+        let models_service = Arc::new(ModelsServiceImpl::new(
+            Arc::new(
+                services::inference_provider_pool::InferenceProviderPool::new(
+                    None,
+                    config::ExternalProvidersConfig::default(),
+                ),
+            ),
+            models_repository(Arc::new(NoModels), Some(&catalog)),
+        ));
+        let models = invalidating_models_service(models_service, Some(catalog));
+        // Fetched once, then served from the caches.
+        for _ in 0..2 {
+            assert_eq!(models.get_models_with_pricing().await.unwrap().len(), 1);
+        }
+        models.invalidate_models_cache().await;
+        // Both the outer cache and the catalog adapter reload: a second call.
+        assert_eq!(models.get_models_with_pricing().await.unwrap().len(), 1);
     }
 
     #[test]

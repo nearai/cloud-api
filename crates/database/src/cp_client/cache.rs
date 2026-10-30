@@ -7,6 +7,9 @@
 //! calling again in turn; a caller arriving after it finished starts a new
 //! one. A failed load is never stored. Keys can come from request input, so
 //! the map is bounded: a key that does not fit is loaded without being stored.
+//!
+//! [`KeyedCache::invalidate`] makes every stored answer stale: the next read
+//! reloads, and the old answer is kept only as the stale fallback.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -62,6 +65,8 @@ struct Entry<V> {
     value: V,
     fetched_at: Instant,
     expires_at: Instant,
+    /// The cache's epoch when the load started.
+    epoch: u64,
 }
 
 struct SlotState<V, E> {
@@ -104,6 +109,9 @@ pub struct KeyedCache<K, V, E> {
     overflow: Mutex<HashMap<K, Slot<V, E>>>,
     capacity: usize,
     stale: StaleUse,
+    /// Bumped by [`Self::invalidate`]. An entry loaded in an earlier epoch is
+    /// never fresh.
+    epoch: AtomicU64,
 }
 
 fn locked<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -123,7 +131,24 @@ impl<K: Eq + Hash + Clone, V: Clone, E: Clone> KeyedCache<K, V, E> {
             overflow: Mutex::new(HashMap::new()),
             capacity,
             stale,
+            epoch: AtomicU64::new(0),
         }
+    }
+
+    /// Makes every stored answer, and any load in flight, stale: the next read
+    /// of each key reloads. A stored answer still serves as the stale copy
+    /// after a failed reload, as the policy allows. Callers already waiting on
+    /// a load in flight still get its outcome.
+    pub fn invalidate(&self) {
+        self.epoch.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Whether `stored` may be served as fresh at `now`.
+    fn is_fresh(&self, stored: &Entry<V>, now: Instant) -> bool {
+        stored.epoch == self.epoch.load(Ordering::Acquire)
+            && self
+                .stale
+                .fresh_at(stored.expires_at, stored.fetched_at, now)
     }
 
     /// The value for `key`: a fresh stored one, or the result of `load`.
@@ -165,16 +190,14 @@ impl<K: Eq + Hash + Clone, V: Clone, E: Clone> KeyedCache<K, V, E> {
             }
         }
         if let Some(stored) = state.entry.as_ref() {
-            if self
-                .stale
-                .fresh_at(stored.expires_at, stored.fetched_at, Instant::now())
-            {
+            if self.is_fresh(stored, Instant::now()) {
                 return Ok(Loaded {
                     value: stored.value.clone(),
                     stale: false,
                 });
             }
         }
+        let epoch = self.epoch.load(Ordering::Acquire);
         let outcome = match load().await {
             Ok((value, ttl)) => {
                 let fetched_at = Instant::now();
@@ -182,6 +205,7 @@ impl<K: Eq + Hash + Clone, V: Clone, E: Clone> KeyedCache<K, V, E> {
                     value: value.clone(),
                     fetched_at,
                     expires_at: fetched_at + ttl,
+                    epoch,
                 });
                 Ok(Loaded {
                     value,
@@ -254,10 +278,7 @@ impl<K: Eq + Hash + Clone, V: Clone, E: Clone> KeyedCache<K, V, E> {
             };
             match state.entry.as_ref() {
                 None => candidates.push((None, key.clone())),
-                Some(stored)
-                    if self
-                        .stale
-                        .fresh_at(stored.expires_at, stored.fetched_at, now) => {}
+                Some(stored) if self.is_fresh(stored, now) => {}
                 Some(stored) if self.stale.may_serve_expired(stored.fetched_at, now) => {}
                 Some(stored) => candidates.push((Some(stored.expires_at), key.clone())),
             }
@@ -379,6 +400,46 @@ mod tests {
                 .ok();
             assert_eq!(loads.load(Ordering::SeqCst), 2, "{outcome:?}");
         }
+    }
+
+    #[tokio::test]
+    async fn invalidate_makes_the_next_read_reload_and_keeps_the_stale_copy() {
+        let cache: KeyedCache<(), u32, &'static str> = KeyedCache::new(StaleUse::Forever);
+        cache
+            .get_or_load((), || async { Ok((1, Duration::from_secs(30))) })
+            .await
+            .unwrap();
+        cache.invalidate();
+        let loaded = cache
+            .get_or_load((), || async { Ok((2, Duration::from_secs(30))) })
+            .await
+            .unwrap();
+        assert_eq!(loaded.value, 2);
+        // Fresh again until the next invalidation, which an outage then
+        // answers from the last good copy.
+        let loaded = cache
+            .get_or_load((), || async { Err("down") })
+            .await
+            .unwrap();
+        assert_eq!(
+            loaded,
+            Loaded {
+                value: 2,
+                stale: false
+            }
+        );
+        cache.invalidate();
+        let loaded = cache
+            .get_or_load((), || async { Err("down") })
+            .await
+            .unwrap();
+        assert_eq!(
+            loaded,
+            Loaded {
+                value: 2,
+                stale: true
+            }
+        );
     }
 
     #[tokio::test]

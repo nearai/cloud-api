@@ -13,6 +13,10 @@
 //!   listed, which gates the grant check, so a stale `is_listed` must not
 //!   outlive that bound.
 //!
+//! An admin write that invalidates the models service's caches must also call
+//! [`CatalogModels::invalidate`] (through [`InvalidatesCatalog`]), or the outer
+//! caches reload from these still-fresh answers.
+//!
 //! End to end: a change to a model's listing or grants is honoured within at
 //! most `CP_CATALOG_MAX_STALE_SECS` of the last successful fetch, including the
 //! outer resolve cache. Startup refuses settings that leave no room for it.
@@ -36,7 +40,8 @@ use reqwest::{Method, StatusCode};
 use serde::Deserialize;
 use services::metrics::MetricsServiceTrait;
 use services::models::{
-    ModelWithPricing, ModelsRepository, RestrictedModelAccess, UpcomingModelPricing,
+    ModelCaller, ModelInfo, ModelWithPricing, ModelsError, ModelsRepository, ModelsServiceTrait,
+    RestrictedModelAccess, UpcomingModelPricing,
 };
 use services::usage::TextPricingProfile;
 use uuid::Uuid;
@@ -242,6 +247,14 @@ impl CatalogModels {
         }
     }
 
+    /// Makes the cached lists and lookups stale, so the next read of each asks
+    /// cloud-platform. The old answers stay as the outage fallback.
+    pub fn invalidate(&self) {
+        self.models.invalidate();
+        self.lookups.invalidate();
+        self.names.invalidate();
+    }
+
     fn record_stale(&self, loaded_stale: bool) {
         if loaded_stale {
             if let Some(metrics) = &self.metrics {
@@ -423,6 +436,89 @@ impl ModelsRepository for CatalogModels {
     }
 }
 
+/// Every call goes to `inner`; `invalidate_models_cache` also invalidates the
+/// catalog adapter, first, so a reload of `inner` asks cloud-platform.
+pub struct InvalidatesCatalog {
+    inner: Arc<dyn ModelsServiceTrait>,
+    catalog: Arc<CatalogModels>,
+}
+
+impl InvalidatesCatalog {
+    pub fn new(inner: Arc<dyn ModelsServiceTrait>, catalog: Arc<CatalogModels>) -> Self {
+        Self { inner, catalog }
+    }
+}
+
+#[async_trait]
+impl ModelsServiceTrait for InvalidatesCatalog {
+    async fn get_models(&self) -> Result<Vec<ModelInfo>, ModelsError> {
+        self.inner.get_models().await
+    }
+
+    async fn get_models_with_pricing(&self) -> Result<Vec<ModelWithPricing>, ModelsError> {
+        self.inner.get_models_with_pricing().await
+    }
+
+    async fn get_public_models_with_pricing(&self) -> Result<Vec<ModelWithPricing>, ModelsError> {
+        self.inner.get_public_models_with_pricing().await
+    }
+
+    async fn get_model_by_name(
+        &self,
+        model_name: &str,
+        caller: ModelCaller,
+    ) -> Result<ModelWithPricing, ModelsError> {
+        self.inner.get_model_by_name(model_name, caller).await
+    }
+
+    async fn resolve_and_get_model(
+        &self,
+        identifier: &str,
+        caller: ModelCaller,
+    ) -> Result<ModelWithPricing, ModelsError> {
+        self.inner.resolve_and_get_model(identifier, caller).await
+    }
+
+    async fn caller_can_use_model(
+        &self,
+        caller: ModelCaller,
+        model: &ModelWithPricing,
+    ) -> Result<bool, ModelsError> {
+        self.inner.caller_can_use_model(caller, model).await
+    }
+
+    async fn resolve_public_model(
+        &self,
+        identifier: &str,
+    ) -> Result<ModelWithPricing, ModelsError> {
+        self.inner.resolve_public_model(identifier).await
+    }
+
+    async fn resolve_alias_cached(&self, identifier: &str, caller: ModelCaller) -> Option<String> {
+        self.inner.resolve_alias_cached(identifier, caller).await
+    }
+
+    async fn get_configured_model_names(&self) -> Result<Vec<String>, ModelsError> {
+        self.inner.get_configured_model_names().await
+    }
+
+    async fn get_restricted_model_access(&self) -> Result<Vec<RestrictedModelAccess>, ModelsError> {
+        self.inner.get_restricted_model_access().await
+    }
+
+    async fn invalidate_models_cache(&self) {
+        self.catalog.invalidate();
+        self.inner.invalidate_models_cache().await;
+    }
+
+    async fn invalidate_model_access(&self, organization_id: Uuid, model_id: Uuid) {
+        // Grants are not cached by the catalog adapter.
+        self.inner
+            .invalidate_model_access(organization_id, model_id)
+            .await;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::client::tests::client;
@@ -591,6 +687,36 @@ mod tests {
         for _ in 0..3 {
             let models = catalog.get_all_active_models().await.unwrap();
             assert_eq!(models[0].context_length, 200);
+        }
+    }
+
+    #[tokio::test]
+    async fn invalidate_makes_the_next_reads_ask_cloud_platform_again() {
+        let server = MockServer::start().await;
+        for (route, body) in [
+            (
+                "/v1/internal/catalog/models",
+                json!([remote_json("m", 200)]),
+            ),
+            ("/v1/internal/catalog/model-lookup", remote_json("m", 200)),
+            ("/v1/internal/catalog/model-names", json!(["m"])),
+        ] {
+            Mock::given(method("GET"))
+                .and(path(route))
+                .respond_with(ResponseTemplate::new(200).set_body_json(body))
+                .expect(2)
+                .mount(&server)
+                .await;
+        }
+        let catalog = adapter(&server, vec![], Duration::from_secs(30), None);
+        for _ in 0..2 {
+            // The second read of each is cached; only the invalidation reloads.
+            for _ in 0..2 {
+                assert_eq!(catalog.get_all_active_models().await.unwrap().len(), 1);
+                assert!(catalog.resolve_and_get_model("m").await.unwrap().is_some());
+                assert_eq!(catalog.get_configured_model_names().await.unwrap(), ["m"]);
+            }
+            catalog.invalidate();
         }
     }
 

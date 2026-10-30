@@ -12,6 +12,11 @@
 //! route turns into a 503, never a 401, so an outage is not taken for a
 //! revoked key.
 //!
+//! At most [`MAX_IN_FLIGHT`] calls to cloud-platform run at once; a check
+//! that would exceed it is refused at once with [`CpError::Overloaded`] (a
+//! 503, like an outage, never a 401) rather than queued. Cached verdicts are
+//! not bounded.
+//!
 //! Cache keys are SHA-256 digests of the bearer token; the token itself is
 //! never stored in the cache or logged.
 
@@ -28,6 +33,12 @@ use super::client::{CallType, CpClient, CpError, Credential};
 
 const PATH: &[&str] = &["v1", "check_api_key"];
 
+/// Remote key checks in flight at once. Fixed: an estimate, sized well above
+/// the steady load (only keys without a fresh verdict are asked, and
+/// concurrent checks of one key share a call) so it binds only under a flood
+/// of distinct unknown keys.
+pub const MAX_IN_FLIGHT: usize = 64;
+
 /// cloud-platform's answer for one key: its status and body, forwarded as is.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Verdict {
@@ -39,14 +50,20 @@ pub struct ApiKeyVerdicts {
     client: Arc<CpClient>,
     ttl: Duration,
     cache: KeyedCache<[u8; 32], Verdict>,
+    in_flight: tokio::sync::Semaphore,
 }
 
 impl ApiKeyVerdicts {
     pub fn new(client: Arc<CpClient>, ttl: Duration) -> Self {
+        Self::with_max_in_flight(client, ttl, MAX_IN_FLIGHT)
+    }
+
+    fn with_max_in_flight(client: Arc<CpClient>, ttl: Duration, max_in_flight: usize) -> Self {
         Self {
             client,
             ttl,
             cache: KeyedCache::new(StaleUse::Never),
+            in_flight: tokio::sync::Semaphore::new(max_in_flight),
         }
     }
 
@@ -58,6 +75,10 @@ impl ApiKeyVerdicts {
         let loaded = self
             .cache
             .get_or_load(key, || async {
+                let _permit = self
+                    .in_flight
+                    .try_acquire()
+                    .map_err(|_| CpError::Overloaded)?;
                 let response = self
                     .client
                     .send(
@@ -241,6 +262,45 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(150)).await;
         // Expired and unreachable: no verdict, so the route answers 503.
         assert!(checks.check("sk-outage").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn checks_past_the_in_flight_bound_are_refused_not_queued() {
+        let server = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(VALID)
+                    .set_delay(Duration::from_millis(200)),
+            )
+            .expect(2)
+            .mount(&server)
+            .await;
+        let checks = Arc::new(ApiKeyVerdicts::with_max_in_flight(
+            Arc::new(client(&server)),
+            Duration::from_secs(60),
+            1,
+        ));
+        let first = tokio::spawn({
+            let checks = checks.clone();
+            async move { checks.check("sk-first").await }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        // A second key while the first call holds the only permit.
+        assert!(matches!(
+            checks.check("sk-second").await,
+            Err(CpError::Overloaded)
+        ));
+        assert_eq!(first.await.unwrap().unwrap().status, StatusCode::OK);
+        // The permit is back, and a cached verdict never needs one.
+        assert_eq!(
+            checks.check("sk-second").await.unwrap().status,
+            StatusCode::OK
+        );
+        assert_eq!(
+            checks.check("sk-first").await.unwrap().status,
+            StatusCode::OK
+        );
     }
 
     #[tokio::test]

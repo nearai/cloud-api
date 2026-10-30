@@ -120,9 +120,27 @@ fn verdict_response(verdict: Verdict) -> Response {
         .into_response()
 }
 
+/// The local key path's answer to a key that is not even well formed
+/// (`AuthService::validate_api_key` returns `Unauthorized`, which the key
+/// middleware renders as this 401).
+fn malformed_key() -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(ErrorResponse::new(
+            "Invalid or expired API key".to_string(),
+            "invalid_api_key".to_string(),
+        )),
+    )
+        .into_response()
+}
+
 /// `POST /v1/check_api_key` when cloud-platform is configured: cloud-platform's
 /// verdict, with no local key or credit check on this route. An outage with no
-/// fresh verdict is a 503, never a 401.
+/// fresh verdict, or too many key checks in flight, is a 503, never a 401.
+///
+/// A key that fails cloud-api's own format check (`sk-` and 35 characters,
+/// `services::common::is_valid_api_key_format`, the first step of the local
+/// key validation) is refused here without a call, as the local path does.
 pub async fn check_api_key_from_cloud_platform(
     State(verdicts): State<Arc<ApiKeyVerdicts>>,
     headers: HeaderMap,
@@ -131,6 +149,9 @@ pub async fn check_api_key_from_cloud_platform(
         Ok(bearer) => bearer,
         Err(error) => return unauthorized(error),
     };
+    if !services::common::is_valid_api_key_format(bearer) {
+        return malformed_key();
+    }
     match verdicts.check(bearer).await {
         Ok(verdict) => verdict_response(verdict),
         Err(error) => {
@@ -286,6 +307,10 @@ mod tests {
     const VALID: &str =
         r#"{"valid":true,"organization_id":"o","workspace_id":"w","api_key_id":"k"}"#;
 
+    /// Well formed: `sk-` and 32 more characters.
+    const CALLER: &str = "sk-0123456789abcdef0123456789abcdef";
+    const OTHER: &str = "sk-fedcba9876543210fedcba9876543210";
+
     #[tokio::test]
     async fn refuses_a_missing_key_without_calling_cloud_platform() {
         let server = MockServer::start().await;
@@ -309,7 +334,7 @@ mod tests {
             .expect(1)
             .mount(&server)
             .await;
-        let (status, body) = call(on_router(&server), Some("sk-caller")).await;
+        let (status, body) = call(on_router(&server), Some(CALLER)).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body, VALID.as_bytes());
     }
@@ -321,7 +346,29 @@ mod tests {
             .respond_with(ResponseTemplate::new(503))
             .mount(&server)
             .await;
-        let (status, _) = call(on_router(&server), Some("sk-down")).await;
+        let (status, _) = call(on_router(&server), Some(OTHER)).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn refuses_a_malformed_key_as_the_local_path_does_without_calling_cloud_platform() {
+        let server = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(200).set_body_string(VALID))
+            .expect(0)
+            .mount(&server)
+            .await;
+        assert!(services::common::is_valid_api_key_format(CALLER));
+        for malformed in [
+            "sk-short",
+            "pk-0123456789abcdef0123456789abcdef",
+            &format!("{CALLER}0"),
+        ] {
+            let (status, body) = call(on_router(&server), Some(malformed)).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{malformed}");
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["error"]["type"], "invalid_api_key");
+            assert_eq!(body["error"]["message"], "Invalid or expired API key");
+        }
     }
 }

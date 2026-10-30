@@ -114,6 +114,8 @@ pub enum CpError {
     NoCallerCredential,
     #[error("invalid cloud-platform request")]
     InvalidRequest,
+    #[error("too many cloud-platform calls in flight")]
+    Overloaded,
 }
 
 impl CpError {
@@ -130,6 +132,7 @@ impl CpError {
             Self::NoCredential => "no_credential",
             Self::NoCallerCredential => "no_caller_credential",
             Self::InvalidRequest => "invalid_request",
+            Self::Overloaded => "overloaded",
         }
     }
 }

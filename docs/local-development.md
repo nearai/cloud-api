@@ -22,6 +22,7 @@ real inference backends.
 
 ```bash
 # Postgres only — runs the API on the host so you get fast rebuilds.
+# The schema is not applied by compose here; `make dev` / `make seed` apply it (see below).
 docker compose up -d postgres
 
 cp env.example .env
@@ -58,6 +59,23 @@ in containers. It's slower to iterate on (full image rebuild per change)
 but useful for reproducing a containerized environment. Set `DD_API_KEY`
 in `.env` if you want the Datadog agent to actually report; otherwise the
 agent will start, complain in logs, and the API will still work.
+
+The `schema` service runs once before `api` starts. It applies the
+cloud-platform schema from the pinned image (`scripts/cloud-platform-schema.env`,
+or `CLOUD_PLATFORM_IMAGE` if you set it in `.env`) to the compose Postgres.
+The API waits for it to finish successfully, so a fresh volume is never
+served against an empty database. The database secret is a dev file,
+`docker/schema-dev-db-secret.json`, mounted read-only; the password is not in
+the environment or on any command line.
+
+The image is private. Run `docker login ghcr.io` with a token that can read
+`nearai/cloud-platform` packages before the first `up`. Check the schema step
+with `docker compose logs schema`.
+
+Settings precedence for `make seed`, `scripts/apply-schema.sh` and the seed
+binary: exported shell variables win, then `.env`, then defaults. The script
+reads `PG*` first and `DATABASE_*` second, so a `.env` with `DATABASE_*` values
+applies to the schema step and to the seed binary alike.
 
 ## 3. Auth flows for manual testing
 

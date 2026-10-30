@@ -51,6 +51,25 @@ services:
       timeout: 5s
       retries: 3
 
+  # One-shot: applies the cloud-platform schema (pinned image, same as scripts/apply-schema.sh)
+  # to the compose postgres before the API starts. The default below must equal
+  # CLOUD_PLATFORM_IMAGE in scripts/cloud-platform-schema.env; scripts/tests/test_schema_pin.py
+  # checks that. The DB secret is a file mounted read-only (dev credentials, the same values as
+  # POSTGRES_PASSWORD above); the password is not passed in the environment or on argv.
+  schema:
+    image: ${CLOUD_PLATFORM_IMAGE:-ghcr.io/nearai/cloud-platform:sha-5519b11c6d53ac145cf33cc19fa99a9fd60d7968}
+    command: ["migrate"]
+    restart: "no"
+    environment:
+      DB_SECRET_FILE: /run/secrets/dev-db-secret.json
+      # Plaintext is allowed only for the single-label compose host `postgres`.
+      CLOUD_PLATFORM_ALLOW_PLAINTEXT_DB: "1"
+    volumes:
+      - ./docker/schema-dev-db-secret.json:/run/secrets/dev-db-secret.json:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+
   api:
     build: .
     ports:
@@ -67,6 +86,8 @@ services:
     volumes:
       - ./config:/app/config:ro
     depends_on:
+      schema:
+        condition: service_completed_successfully
       postgres:
         condition: service_healthy
       datadog-agent:

@@ -366,6 +366,20 @@ pub struct ChatCompletionParams {
 }
 
 impl ChatCompletionParams {
+    /// Streaming fields on an upstream request are the server's to set. They
+    /// leave `extra` as well: it serializes after the typed fields, so a copy
+    /// there would replace them on the wire.
+    pub fn set_stream_fields(&mut self, continuous_usage_stats: Option<bool>) {
+        self.stream = Some(true);
+        self.stream_options = Some(StreamOptions {
+            include_usage: Some(true),
+            continuous_usage_stats,
+            extra: Default::default(),
+        });
+        self.extra.remove("stream");
+        self.extra.remove("stream_options");
+    }
+
     /// Customer JSON cannot select scheduler policy, including in adapters
     /// that use the original request sidecar. Preserve unrelated provider fields.
     pub fn strip_client_priority(&mut self) {
@@ -1550,6 +1564,37 @@ pub fn detect_audio_content_type(filename: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn set_stream_fields_is_the_only_copy_on_the_wire() {
+        for value in [
+            serde_json::Value::Null,
+            serde_json::json!("x"),
+            serde_json::json!([]),
+            serde_json::json!(true),
+            serde_json::json!({"include_usage": false}),
+        ] {
+            let mut params: ChatCompletionParams = serde_json::from_value(serde_json::json!({
+                "model": "m",
+                "messages": [],
+            }))
+            .unwrap();
+            params.extra.insert("stream_options".to_string(), value);
+            params
+                .extra
+                .insert("stream".to_string(), serde_json::json!(false));
+
+            params.set_stream_fields(Some(true));
+
+            let wire = serde_json::to_string(&params).unwrap();
+            assert_eq!(wire.matches("\"stream_options\"").count(), 1);
+            assert_eq!(wire.matches("\"stream\"").count(), 1);
+            let parsed: serde_json::Value = serde_json::from_str(&wire).unwrap();
+            assert_eq!(parsed["stream"], true);
+            assert_eq!(parsed["stream_options"]["include_usage"], true);
+            assert_eq!(parsed["stream_options"]["continuous_usage_stats"], true);
+        }
+    }
 
     #[test]
     fn chat_response_preserves_plaintext_and_encrypted_logprob_bytes() {

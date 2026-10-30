@@ -1,17 +1,16 @@
-use database::{migrations, DbPool};
+use database::DbPool;
 use deadpool::Runtime;
 use deadpool_postgres::Config;
-use tokio::sync::OnceCell;
 use tokio_postgres::NoTls;
 
-static MIGRATED: OnceCell<()> = OnceCell::const_new();
+#[path = "schema.rs"]
+mod schema;
 
 pub async fn test_pool() -> anyhow::Result<DbPool> {
-    let pool = DbPool::new(pool_config().create_pool(Some(Runtime::Tokio1), NoTls)?);
-    MIGRATED
-        .get_or_try_init(|| async { migrations::run(&pool).await })
-        .await?;
-    Ok(pool)
+    schema::ensure_schema().await?;
+    Ok(DbPool::new(
+        pool_config().create_pool(Some(Runtime::Tokio1), NoTls)?,
+    ))
 }
 
 fn pool_config() -> Config {

@@ -4,6 +4,7 @@ pub mod aml;
 pub mod attestation;
 pub mod auth;
 pub mod auto_redact;
+pub mod caller_credential;
 pub mod common;
 pub mod completions;
 pub mod contact_email;

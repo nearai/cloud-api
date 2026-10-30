@@ -37,8 +37,9 @@ pub struct CpClientConfig {
     /// model lookup may still be served while cloud-platform is down. Past it,
     /// the lookup fails, so a stale `is_listed` cannot skip the grant check.
     pub catalog_max_stale: Duration,
-    /// `CP_CHECK_API_KEY_TTL_SECS` (default 300): the longest a cached key
-    /// verdict is served. Each verdict lives between 80% and 100% of it.
+    /// `CP_CHECK_API_KEY_TTL_SECS` (default 60): the longest a cached key
+    /// verdict is served, so a revoked key or an exhausted credit limit takes
+    /// effect within a minute. Each verdict lives between 80% and 100% of it.
     pub check_api_key_ttl: Duration,
 }
 
@@ -54,7 +55,7 @@ impl Default for CpClientConfig {
             breaker_open: Duration::from_secs(5),
             catalog_ttl: Duration::from_secs(30),
             catalog_max_stale: Duration::from_secs(300),
-            check_api_key_ttl: Duration::from_secs(300),
+            check_api_key_ttl: Duration::from_secs(60),
         }
     }
 }
@@ -218,7 +219,7 @@ mod tests {
         assert_eq!(config.base_url, "https://10.0.2.2:24410");
         assert_eq!(config.read_timeout, Duration::from_millis(900));
         assert_eq!(config.catalog_ttl, Duration::from_secs(30));
-        assert_eq!(config.check_api_key_ttl, Duration::from_secs(300));
+        assert_eq!(config.check_api_key_ttl, Duration::from_secs(60));
     }
 
     #[test]

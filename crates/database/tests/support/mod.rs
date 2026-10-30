@@ -1,12 +1,11 @@
 use chrono::{DateTime, TimeZone, Utc};
-use database::{migrations, DbPool};
+use database::DbPool;
 use deadpool::Runtime;
 use deadpool_postgres::Config;
-use tokio::sync::OnceCell;
 use tokio_postgres::NoTls;
 use uuid::Uuid;
 
-static MIGRATED: OnceCell<()> = OnceCell::const_new();
+pub mod schema;
 
 pub struct OrgFixture {
     pub org_id: Uuid,
@@ -47,11 +46,8 @@ pub fn ts(year: i32, month: u32, day: u32, hour: u32) -> DateTime<Utc> {
 }
 
 pub async fn test_pool() -> anyhow::Result<DbPool> {
-    let pool = DbPool::new(pool_config().create_pool(Some(Runtime::Tokio1), NoTls)?);
-    MIGRATED
-        .get_or_try_init(|| async { migrations::run(&pool).await })
-        .await?;
-    Ok(pool)
+    schema::ensure_schema().await?;
+    Ok(DbPool::new(pool_config().create_pool(Some(Runtime::Tokio1), NoTls)?))
 }
 
 pub async fn insert_org_fixture(pool: &DbPool) -> anyhow::Result<OrgFixture> {

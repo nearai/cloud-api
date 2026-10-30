@@ -263,8 +263,10 @@ async fn bootstrap_shared_db_once() -> Result<()> {
         info!(database = %db_name, "Created shared e2e database");
     }
 
-    // Run migrations while still holding the advisory lock so direct cargo
-    // invocations cannot race on refinery's schema history table.
+    // Apply the schema while still holding the advisory lock so direct cargo
+    // invocations cannot race on the schema history table.
+    apply_schema_script(&host, port, &user, &password, &db_name).await?;
+
     let db_config = config::DatabaseConfig {
         connection_mode: config::DatabaseConnectionMode::Patroni,
         primary_app_id: "postgres-test".to_string(),
@@ -304,13 +306,35 @@ async fn bootstrap_shared_db_once() -> Result<()> {
         )
         .context("create the e2e migration connection pool")?;
     let database = Database::new(migration_pool.into());
-    database
-        .run_migrations()
-        .await
-        .context("run migrations on the shared e2e database")?;
     seed_shared_test_fixtures(&database).await?;
 
     debug!(database = %db_name, "Shared e2e database is ready");
+    Ok(())
+}
+
+/// Apply the cloud-platform-owned schema with `scripts/apply-schema.sh`, which runs the
+/// pinned cloud-platform migrator. The script is idempotent.
+async fn apply_schema_script(
+    host: &str,
+    port: u16,
+    user: &str,
+    password: &str,
+    db_name: &str,
+) -> Result<()> {
+    let script = concat!(env!("CARGO_MANIFEST_DIR"), "/../../scripts/apply-schema.sh");
+    let status = tokio::process::Command::new(script)
+        .env("PGHOST", host)
+        .env("PGPORT", port.to_string())
+        .env("PGUSER", user)
+        .env("PGPASSWORD", password)
+        .env("PGDATABASE", db_name)
+        .status()
+        .await
+        .context("run scripts/apply-schema.sh")?;
+    anyhow::ensure!(
+        status.success(),
+        "scripts/apply-schema.sh failed with {status}"
+    );
     Ok(())
 }
 
@@ -487,7 +511,7 @@ async fn bootstrap_shared_db_with_retry() -> Result<()> {
     Err(last_error.expect("at least one e2e database bootstrap attempt must run"))
 }
 
-/// Bootstrap the shared database once: create it if missing and run migrations.
+/// Bootstrap the shared database once: create it if missing, apply the schema, and seed fixtures.
 ///
 /// The nextest setup script calls this before launching any e2e test processes.
 /// `OnceCell` and the PostgreSQL advisory lock preserve compatibility with direct

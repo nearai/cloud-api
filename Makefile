@@ -7,7 +7,7 @@ help:
 	@echo "  make dev           Seed database and run API server (recommended)"
 	@echo ""
 	@echo "Setup & Database:"
-	@echo "  make seed          Run database migrations and seed data"
+	@echo "  make seed          Apply the cloud-platform schema and seed data"
 	@echo ""
 	@echo "Running Services:"
 	@echo "  make api           Run the API server (port 3000)"
@@ -28,8 +28,16 @@ help:
 
 ## Database & Seeding
 
+# The schema is owned by nearai/cloud-platform; scripts/apply-schema.sh applies it from the
+# pinned image. cloud-api never migrates.
 seed:
-	@echo "Running database migrations and seeding..."
+	@echo "Applying the cloud-platform schema and seeding..."
+	PGHOST="$${PGHOST:-$${DATABASE_HOST:-localhost}}" \
+	PGPORT="$${PGPORT:-$${DATABASE_PORT:-5432}}" \
+	PGDATABASE="$${PGDATABASE:-$${DATABASE_NAME:-platform_api}}" \
+	PGUSER="$${PGUSER:-$${DATABASE_USERNAME:-postgres}}" \
+	PGPASSWORD="$${PGPASSWORD:-$${DATABASE_PASSWORD:-postgres}}" \
+	scripts/apply-schema.sh
 	cargo run --bin seed -p database
 
 ## Services
@@ -44,7 +52,7 @@ api:
 dev:
 	@echo "Starting development environment..."
 	@echo ""
-	cargo run --bin seed -p database && \
+	$(MAKE) seed && \
 	echo "" && \
 	echo "Seed complete! Starting API server on http://localhost:3000" && \
 	echo "  Documentation: http://localhost:3000/docs" && \

@@ -80,6 +80,15 @@ impl CallType {
         self as usize
     }
 
+    /// The largest response body read for this call type. The catalog list is
+    /// the one large answer; every other answer is a single small object.
+    fn body_limit(self) -> usize {
+        match self {
+            Self::CatalogRead => 4 * 1024 * 1024,
+            Self::ModelAccessRead | Self::SignatureRead | Self::CheckApiKey => 1024 * 1024,
+        }
+    }
+
     fn is_write(self) -> bool {
         // Increment 1 has reads only; writes get `write_timeout` when added.
         false
@@ -106,6 +115,8 @@ pub enum CpError {
     Status(StatusCode),
     #[error("cloud-platform response could not be decoded")]
     Decode,
+    #[error("cloud-platform response body is too large")]
+    TooLarge,
     #[error("no cloud-platform service credential configured")]
     NoCredential,
     #[error("no caller credential in scope for cloud-platform")]
@@ -124,6 +135,7 @@ impl CpError {
             Self::Transport => "transport",
             Self::Status(_) => "status",
             Self::Decode => "decode",
+            Self::TooLarge => "too_large",
             Self::NoCredential => "no_credential",
             Self::NoCallerCredential => "no_caller_credential",
             Self::InvalidRequest => "invalid_request",
@@ -402,7 +414,7 @@ impl CpClient {
         let outcome = async {
             let response = request.send().await.map_err(classify)?;
             let status = response.status();
-            let body = response.bytes().await.map_err(classify)?;
+            let body = read_body(response, call.body_limit()).await?;
             if status.is_server_error() {
                 return Err(CpError::Status(status));
             }
@@ -487,6 +499,27 @@ fn classify(error: reqwest::Error) -> CpError {
     } else {
         CpError::Transport
     }
+}
+
+/// Reads the body, refusing one larger than `limit` bytes whatever the
+/// status. The declared length is checked first; the body is then read in
+/// chunks and refused as soon as it passes the limit, so an oversized answer
+/// is never held in full.
+async fn read_body(mut response: reqwest::Response, limit: usize) -> Result<Bytes, CpError> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > limit as u64)
+    {
+        return Err(CpError::TooLarge);
+    }
+    let mut body = bytes::BytesMut::new();
+    while let Some(chunk) = response.chunk().await.map_err(classify)? {
+        if body.len() + chunk.len() > limit {
+            return Err(CpError::TooLarge);
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body.freeze())
 }
 
 /// Read the service API key, refusing a file that group or others can read.
@@ -759,6 +792,64 @@ pub(crate) mod tests {
             client.breaker_state(CallType::CatalogRead),
             BreakerState::Closed
         );
+    }
+
+    #[tokio::test]
+    async fn an_oversized_body_is_refused_whatever_the_status_and_counts_as_a_failure() {
+        let server = MockServer::start().await;
+        let oversized = vec![b'x'; CallType::SignatureRead.body_limit() + 1];
+        Mock::given(method("GET"))
+            .and(path("/big"))
+            .respond_with(ResponseTemplate::new(404).set_body_bytes(oversized))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/limit"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(vec![b'x'; CallType::SignatureRead.body_limit()]),
+            )
+            .mount(&server)
+            .await;
+        let client = client(&server);
+        let call = |segments: &'static [&'static str]| {
+            client.send(
+                CallType::SignatureRead,
+                Method::GET,
+                segments,
+                &[],
+                Credential::Service,
+                None,
+            )
+        };
+        // Exactly at the limit is read.
+        assert_eq!(
+            call(&["limit"]).await.unwrap().body.len(),
+            CallType::SignatureRead.body_limit()
+        );
+        for _ in 0..5 {
+            assert!(matches!(call(&["big"]).await, Err(CpError::TooLarge)));
+        }
+        assert_eq!(
+            client.breaker_state(CallType::SignatureRead),
+            BreakerState::Open
+        );
+    }
+
+    #[tokio::test]
+    async fn read_body_reads_up_to_the_limit_and_refuses_past_it() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![b'x'; 64]))
+            .mount(&server)
+            .await;
+        let response = reqwest::get(server.uri()).await.unwrap();
+        assert!(matches!(
+            read_body(response, 63).await,
+            Err(CpError::TooLarge)
+        ));
+        let response = reqwest::get(server.uri()).await.unwrap();
+        assert_eq!(read_body(response, 64).await.unwrap().len(), 64);
     }
 
     #[test]

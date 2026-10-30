@@ -305,11 +305,9 @@ impl CpClient {
         config: &CpClientConfig,
         metrics: Option<Arc<dyn MetricsServiceTrait>>,
     ) -> anyhow::Result<Self> {
+        super::config::check_base_url(base_url).map_err(anyhow::Error::msg)?;
         let base_url = Url::parse(base_url)
             .map_err(|_| anyhow::anyhow!("CLOUD_PLATFORM_URL is not a valid URL"))?;
-        if base_url.cannot_be_a_base() || !matches!(base_url.scheme(), "http" | "https") {
-            anyhow::bail!("CLOUD_PLATFORM_URL must be an http(s) base URL");
-        }
         let http = reqwest::Client::builder()
             .connect_timeout(config.connect_timeout)
             .redirect(reqwest::redirect::Policy::none())

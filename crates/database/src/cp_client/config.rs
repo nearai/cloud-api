@@ -12,7 +12,8 @@ use super::catalog::OUTER_RESOLVE_CACHE_TTL;
 
 #[derive(Debug, Clone)]
 pub struct CpClientConfig {
-    /// `CLOUD_PLATFORM_URL`, e.g. `http://10.0.2.2:24410`.
+    /// `CLOUD_PLATFORM_URL`, e.g. `https://cloud-platform.internal:24410`.
+    /// Must be https; plain http is accepted only for a loopback host.
     pub base_url: String,
     /// `CLOUD_PLATFORM_API_KEY_FILE`: cloud-api's own API key, used for calls
     /// made with no end caller. The file must be owner-only (0400 or 0600).
@@ -89,6 +90,7 @@ impl CpClientConfig {
             }
             (Some(base_url), Some(api_key_file)) => (base_url, api_key_file),
         };
+        check_base_url(&base_url)?;
 
         // Tuning is read only for a configured client.
         let defaults = Self::default();
@@ -150,6 +152,37 @@ impl CpClientConfig {
     }
 }
 
+/// Refuses a `CLOUD_PLATFORM_URL` that is not an https base URL. Calls carry
+/// API keys, so plain http is allowed only to a loopback host (127.0.0.0/8,
+/// `::1`, `localhost`). The error never includes the value.
+pub fn check_base_url(base_url: &str) -> Result<(), String> {
+    let url = reqwest::Url::parse(base_url)
+        .map_err(|_| "CLOUD_PLATFORM_URL is not a valid URL".to_string())?;
+    if url.cannot_be_a_base() {
+        return Err("CLOUD_PLATFORM_URL must be an https base URL".to_string());
+    }
+    match url.scheme() {
+        "https" => Ok(()),
+        "http" if is_loopback(&url) => Ok(()),
+        _ => Err(
+            "CLOUD_PLATFORM_URL must use https (http is allowed only for a loopback host)"
+                .to_string(),
+        ),
+    }
+}
+
+fn is_loopback(url: &reqwest::Url) -> bool {
+    match url.host_str() {
+        Some("localhost") => true,
+        Some(host) => host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback()),
+        None => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -163,7 +196,7 @@ mod tests {
         CpClientConfig::from_lookup(|name| vars.get(name).cloned())
     }
 
-    const URL: (&str, &str) = ("CLOUD_PLATFORM_URL", "http://10.0.2.2:24410");
+    const URL: (&str, &str) = ("CLOUD_PLATFORM_URL", "https://10.0.2.2:24410");
     const KEY: (&str, &str) = ("CLOUD_PLATFORM_API_KEY_FILE", "/run/secrets/cp-key");
 
     #[test]
@@ -182,7 +215,7 @@ mod tests {
         let config = config(&[URL, KEY, ("CLOUD_PLATFORM_READ_TIMEOUT_MS", "900")])
             .unwrap()
             .unwrap();
-        assert_eq!(config.base_url, "http://10.0.2.2:24410");
+        assert_eq!(config.base_url, "https://10.0.2.2:24410");
         assert_eq!(config.read_timeout, Duration::from_millis(900));
         assert_eq!(config.catalog_ttl, Duration::from_secs(30));
         assert_eq!(config.check_api_key_ttl, Duration::from_secs(300));
@@ -196,6 +229,28 @@ mod tests {
         let error = config(&[KEY]).unwrap_err();
         assert!(error.contains("CLOUD_PLATFORM_URL"), "{error}");
         assert!(!error.contains("/run/secrets"), "{error}");
+    }
+
+    #[test]
+    fn plain_http_is_refused_unless_the_host_is_loopback() {
+        for url in [
+            "http://example",
+            "http://10.0.2.2:24410",
+            "ftp://example",
+            "not a url",
+        ] {
+            let error = config(&[("CLOUD_PLATFORM_URL", url), KEY]).unwrap_err();
+            assert!(error.contains("CLOUD_PLATFORM_URL"), "{error}");
+            assert!(!error.contains(url), "{error}");
+        }
+        for url in [
+            "https://example",
+            "http://127.0.0.1:9",
+            "http://[::1]:9",
+            "http://localhost:9",
+        ] {
+            assert!(config(&[("CLOUD_PLATFORM_URL", url), KEY]).is_ok(), "{url}");
+        }
     }
 
     #[test]

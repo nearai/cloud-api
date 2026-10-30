@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::PathBuf;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, Context, Result};
 use database::Database;
 use tracing::info;
 
@@ -25,10 +25,6 @@ async fn main() -> Result<()> {
         .map_err(|e| anyhow!("Failed to load database config: {e}"))?;
     info!("Database configuration loaded");
 
-    // Apply the pinned cloud-platform schema to the database resolved above, before seeding.
-    apply_schema(&db_config)?;
-    info!("Schema applied");
-
     // Connect to database
     let database = Database::from_config(&db_config)
         .await
@@ -38,37 +34,6 @@ async fn main() -> Result<()> {
     // Run seed scripts
     run_seed_scripts(&database).await?;
     info!("Database seeding completed");
-    Ok(())
-}
-
-/// Run scripts/apply-schema.sh against the database this binary is about to seed. The settings
-/// come from the same config as the connection; the password travels in the child's environment,
-/// never on argv or in logs. Only direct connections are supported: a Patroni cluster is migrated
-/// by cloud-platform's migrate step, not from here.
-fn apply_schema(db_config: &config::DatabaseConfig) -> Result<()> {
-    if db_config.connection_mode != config::DatabaseConnectionMode::Direct {
-        bail!(
-            "seed applies the schema only to a direct connection (DATABASE_CONNECTION_MODE=direct); \
-             Patroni clusters are migrated by cloud-platform migrate"
-        );
-    }
-    let host = db_config
-        .host
-        .as_deref()
-        .filter(|host| !host.trim().is_empty())
-        .ok_or_else(|| anyhow!("DATABASE_HOST is required to apply the schema"))?;
-    let script = concat!(env!("CARGO_MANIFEST_DIR"), "/../../scripts/apply-schema.sh");
-    let status = std::process::Command::new(script)
-        .env("PGHOST", host)
-        .env("PGPORT", db_config.port.to_string())
-        .env("PGDATABASE", &db_config.database)
-        .env("PGUSER", &db_config.username)
-        .env("PGPASSWORD", &db_config.password)
-        .status()
-        .context("run scripts/apply-schema.sh")?;
-    if !status.success() {
-        bail!("scripts/apply-schema.sh failed with {status}");
-    }
     Ok(())
 }
 

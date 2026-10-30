@@ -22,7 +22,7 @@ real inference backends.
 
 ```bash
 # Postgres only — runs the API on the host so you get fast rebuilds.
-# The schema is not applied by compose here; `make dev` / `make seed` apply it (see below).
+# Postgres only. `make dev` below also starts it and applies the schema.
 docker compose up -d postgres
 
 cp env.example .env
@@ -34,8 +34,8 @@ cp env.example .env
 make dev
 ```
 
-`make dev` applies the cloud-platform schema, seeds the mock admin user, and starts the API
-on `http://localhost:3000`. Useful endpoints once it's up:
+`make dev` starts the compose Postgres, applies the cloud-platform schema through the compose
+`schema` service, seeds the mock admin user, and starts the API on `http://localhost:3000`. Useful endpoints once it's up:
 
 | Path                          | Purpose                              |
 | ----------------------------- | ------------------------------------ |
@@ -72,16 +72,17 @@ The image is private. Run `docker login ghcr.io` with a token that can read
 `nearai/cloud-platform` packages before the first `up`. Check the schema step
 with `docker compose logs schema`.
 
-`make seed` (also run by `make dev`) is the seed binary. It loads its database
-settings exactly as the API does, from `.env` and the environment, including
-`DATABASE_PASSWORD_FILE`. It then runs `scripts/apply-schema.sh` against that same
-database with the resolved values, and only then seeds. The schema step needs a
-direct connection (`DATABASE_CONNECTION_MODE=direct`); Patroni clusters are
-migrated by cloud-platform's migrate step instead.
+`make seed` runs the seed binary only. It loads its settings as the API does
+(`.env`, the environment, `DATABASE_PASSWORD_FILE`) and seeds that database. It
+does not apply the schema, so the schema must already be there. `make dev` does
+that first: it starts the compose Postgres, runs the `schema` service to
+completion, then seeds and starts the API on the host.
 
-`scripts/apply-schema.sh` can also be run by hand. It takes explicit libpq
-variables only (`PGHOST`, `PGPORT`, `PGDATABASE`, `PGUSER`, `PGPASSWORD`), reads no
-`.env`, and fails if any of them is missing.
+Without compose (your own local Postgres), apply the schema with
+`scripts/apply-schema.sh`. It takes explicit `PGHOST`, `PGPORT`, `PGDATABASE`,
+`PGUSER` and `PGPASSWORD` and reads no `.env`. It is for local and CI databases
+only, since it uses plaintext to local hosts. Deployed environments are migrated
+by the deploy pipeline.
 
 ## 3. Auth flows for manual testing
 

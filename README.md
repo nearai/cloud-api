@@ -33,7 +33,7 @@ A Rust-based cloud API for AI model inference, conversation management, and orga
    ```
 
    This automatically:
-   - Applies the cloud-platform schema with `scripts/apply-schema.sh` (needs Docker to pull the pinned image)
+   - Applies the cloud-platform schema through the compose `schema` service (needs Docker and the pinned image)
    - Seeds the database with development data
    - Starts the API server on http://localhost:3000
 
@@ -47,7 +47,7 @@ The schema is owned by [nearai/cloud-platform](https://github.com/nearai/cloud-p
 cloud-api has no migrations and never migrates at startup. A schema change lands in
 cloud-platform first; this repo then bumps the image pin in
 `scripts/cloud-platform-schema.env`. `scripts/apply-schema.sh` applies the pinned schema to a
-local or test database, and `make seed` and the test setup call it. Deploys run
+local or test database; `make dev` applies it through the compose `schema` service. Deploys run
 `cloud-platform migrate` before cloud-api starts.
 
 ## Testing

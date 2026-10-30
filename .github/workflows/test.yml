@@ -83,7 +83,7 @@ jobs:
           # and none of it is Rust-relevant.
           RUST=true
           if [ -n "$CHANGED" ] && ! echo "$CHANGED" | grep -qE \
-            '(\.rs$|(^|/)Cargo\.(toml|lock)$|^crates/[^/]+/src/.*\.json$|^crates/database/src/migrations/|^\.github/workflows/test\.yml$|^\.github/actions/setup-rust-ci/|^\.config/nextest\.toml$|^rust-toolchain\.toml$|^\.cargo/config\.toml$|^scripts/check_dep_guards\.sh$)'; then
+            '(\.rs$|(^|/)Cargo\.(toml|lock)$|^crates/[^/]+/src/.*\.json$|^scripts/apply-schema\.sh$|^scripts/cloud-platform-schema\.env$|^\.github/workflows/test\.yml$|^\.github/actions/setup-rust-ci/|^\.config/nextest\.toml$|^rust-toolchain\.toml$|^\.cargo/config\.toml$|^scripts/check_dep_guards\.sh$)'; then
             RUST=false
           fi
           echo "rust=$RUST" >> "$GITHUB_OUTPUT"
@@ -187,6 +187,10 @@ jobs:
     if: ${{ needs.changes.outputs.rust == 'true' }}
     runs-on: [self-hosted, infra]
     environment: Cloud API test env
+    permissions:
+      contents: read
+      # Pulls the cloud-platform schema image (scripts/cloud-platform-schema.env).
+      packages: read
 
     services:
       postgres:
@@ -212,6 +216,13 @@ jobs:
       uses: ./.github/actions/setup-rust-ci
       with:
         cache-key: e2e
+
+    # The schema comes from nearai/cloud-platform. The database helpers and the nextest
+    # bootstrap run scripts/apply-schema.sh, which pulls the pinned image.
+    - name: Log in to GHCR for the cloud-platform schema image
+      run: echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+      env:
+        GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
     - name: Run typed-query, credit-allocation, credit-transfer, session, and binding regressions
       run: |

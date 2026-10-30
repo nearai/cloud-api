@@ -29,14 +29,10 @@ help:
 ## Database & Seeding
 
 # The schema is owned by nearai/cloud-platform; scripts/apply-schema.sh applies it from the
-# pinned image. cloud-api never migrates.
+# pinned image. The script and the seed binary both read DATABASE_* from .env, with exported
+# variables taking precedence (see scripts/apply-schema.sh for the full order).
 seed:
 	@echo "Applying the cloud-platform schema and seeding..."
-	PGHOST="$${PGHOST:-$${DATABASE_HOST:-localhost}}" \
-	PGPORT="$${PGPORT:-$${DATABASE_PORT:-5432}}" \
-	PGDATABASE="$${PGDATABASE:-$${DATABASE_NAME:-platform_api}}" \
-	PGUSER="$${PGUSER:-$${DATABASE_USERNAME:-postgres}}" \
-	PGPASSWORD="$${PGPASSWORD:-$${DATABASE_PASSWORD:-postgres}}" \
 	scripts/apply-schema.sh
 	cargo run --bin seed -p database
 

@@ -5,7 +5,8 @@
 //! gate) are cached for at most `CP_CHECK_API_KEY_TTL_SECS`, shortened by up to
 //! 20% (jitter only ever shortens, so no verdict outlives the TTL), so
 //! expiries do not synchronize. A 401 is not cached, so a newly created key is
-//! accepted at once. Concurrent checks of one key make one call.
+//! accepted at once. Concurrent checks of one key make one call and share its
+//! outcome, a 401 or an error included.
 //!
 //! When cloud-platform cannot answer, a cached verdict is served until it
 //! expires; after that [`ApiKeyVerdicts::check`] returns an error, which the
@@ -49,7 +50,7 @@ pub struct Verdict {
 pub struct ApiKeyVerdicts {
     client: Arc<CpClient>,
     ttl: Duration,
-    cache: KeyedCache<[u8; 32], Verdict>,
+    cache: KeyedCache<[u8; 32], Verdict, CpError>,
     in_flight: tokio::sync::Semaphore,
 }
 
@@ -234,6 +235,59 @@ mod tests {
         for task in tasks {
             assert_eq!(task.await.unwrap().unwrap().status, StatusCode::OK);
         }
+    }
+
+    /// Eight concurrent checks of one key that get no cacheable verdict.
+    /// Returns how long they all took.
+    async fn concurrent_uncached_checks(
+        server: &MockServer,
+        expect: impl Fn(&Result<Verdict, CpError>) -> bool,
+    ) -> Duration {
+        let checks = verdicts(server, Duration::from_secs(60));
+        let started = std::time::Instant::now();
+        let mut tasks = Vec::new();
+        for _ in 0..8 {
+            let checks = checks.clone();
+            tasks.push(tokio::spawn(async move { checks.check("sk-slow").await }));
+        }
+        for task in tasks {
+            let result = task.await.unwrap();
+            assert!(expect(&result), "{result:?}");
+        }
+        started.elapsed()
+    }
+
+    #[tokio::test]
+    async fn concurrent_checks_share_one_uncached_401() {
+        let server = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(401).set_delay(Duration::from_millis(200)))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let took = concurrent_uncached_checks(
+            &server,
+            |result| matches!(result, Ok(verdict) if verdict.status == StatusCode::UNAUTHORIZED),
+        )
+        .await;
+        // One call's time, not eight in turn (1.6 s).
+        assert!(took < Duration::from_millis(600), "{took:?}");
+    }
+
+    #[tokio::test]
+    async fn concurrent_checks_share_one_timed_out_call() {
+        let server = MockServer::start().await;
+        // Slower than the 300 ms read timeout.
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(2)))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let took =
+            concurrent_uncached_checks(&server, |result| matches!(result, Err(CpError::Timeout)))
+                .await;
+        // About one timeout, not eight in turn (2.4 s).
+        assert!(took < Duration::from_millis(900), "{took:?}");
     }
 
     #[tokio::test]

@@ -197,9 +197,9 @@ pub struct CatalogModels {
     client: Arc<CpClient>,
     ttl: Duration,
     metrics: Option<Arc<dyn MetricsServiceTrait>>,
-    models: KeyedCache<(), Vec<ModelWithPricing>>,
-    lookups: KeyedCache<(String, bool), Option<ModelWithPricing>>,
-    names: KeyedCache<(), Vec<String>>,
+    models: KeyedCache<(), Vec<ModelWithPricing>, CpError>,
+    lookups: KeyedCache<(String, bool), Option<ModelWithPricing>, CpError>,
+    names: KeyedCache<(), Vec<String>, CpError>,
 }
 
 impl CatalogModels {

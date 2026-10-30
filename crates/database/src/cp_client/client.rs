@@ -94,7 +94,7 @@ pub enum Credential<'a> {
     Service,
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum CpError {
     #[error("cloud-platform breaker open")]
     BreakerOpen,

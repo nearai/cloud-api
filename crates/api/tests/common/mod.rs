@@ -920,6 +920,81 @@ pub async fn create_org_and_api_key(
     (api_key_resp.key.clone().unwrap(), api_key_resp)
 }
 
+/// Seed retained conversation items without calling a public write endpoint.
+/// This fixture supports read/isolation coverage before and after write retirement.
+pub async fn seed_conversation_history(
+    database: &Arc<database::Database>,
+    organization_id: uuid::Uuid,
+    item_count: usize,
+) -> (services::conversations::models::Conversation, Vec<String>) {
+    use services::conversations::ports::ConversationRepository;
+    use services::responses::models::{
+        ResponseContentItem, ResponseId, ResponseItemStatus, ResponseOutputItem,
+    };
+    use services::responses::ports::{ResponseItemRepositoryTrait, ResponseRepositoryTrait};
+
+    let row = database
+        .pool()
+        .get()
+        .await
+        .expect("database connection")
+        .query_one(
+            "SELECT w.id, k.id FROM workspaces w JOIN api_keys k ON k.workspace_id = w.id \
+             WHERE w.organization_id = $1 LIMIT 1",
+            &[&organization_id],
+        )
+        .await
+        .expect("fixture workspace and API key");
+    let workspace = services::workspace::WorkspaceId(row.get(0));
+    let api_key_id = row.get(1);
+    let conversation = database
+        .conversations
+        .create(workspace.clone(), api_key_id, serde_json::json!({}))
+        .await
+        .expect("seed conversation");
+    let root_response_id = database
+        .responses
+        .get_or_create_root_response(conversation.id, workspace, api_key_id)
+        .await
+        .expect("seed structural response");
+    let response_id = ResponseId(
+        root_response_id
+            .strip_prefix("resp_")
+            .unwrap()
+            .parse()
+            .expect("root response UUID"),
+    );
+    let mut item_ids = Vec::new();
+    for index in 0..item_count {
+        let item_id = format!("msg_{}", uuid::Uuid::new_v4());
+        database
+            .response_items
+            .create(
+                response_id.clone(),
+                api_key_id,
+                Some(conversation.id),
+                ResponseOutputItem::Message {
+                    id: item_id.clone(),
+                    response_id: root_response_id.clone(),
+                    previous_response_id: None,
+                    next_response_ids: vec![],
+                    created_at: 0,
+                    status: ResponseItemStatus::Completed,
+                    role: "user".to_string(),
+                    content: vec![ResponseContentItem::InputText {
+                        text: format!("retained item {index}"),
+                    }],
+                    model: "history-fixture".to_string(),
+                    metadata: None,
+                },
+            )
+            .await
+            .expect("seed retained item");
+        item_ids.push(item_id);
+    }
+    (conversation, item_ids)
+}
+
 /// The privacy-filter fixture is seeded before nextest starts. Keep this helper
 /// for call-site readability without rewriting the shared model row per test.
 pub async fn setup_privacy_filter_model(_server: &axum_test::TestServer) {}

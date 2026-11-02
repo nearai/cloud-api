@@ -391,7 +391,7 @@ async fn test_deleted_api_key_cannot_be_used() {
 
     let api_key = api_key_resp.key.clone().unwrap();
 
-    // A valid key reaches the temporary read-only Files view before deletion.
+    // Verify key works before deletion
     let response = server
         .get("/v1/files?limit=1")
         .add_header("Authorization", format!("Bearer {api_key}"))
@@ -400,7 +400,7 @@ async fn test_deleted_api_key_cannot_be_used() {
     assert_eq!(
         response.status_code(),
         200,
-        "Valid API key should reach the temporary Files read view before deletion"
+        "API key should work before deletion"
     );
 
     // Delete the API key
@@ -892,7 +892,7 @@ async fn test_api_key_authentication() {
 
     let (api_key, _) = create_org_and_api_key(&server).await;
 
-    // A valid API key reaches the temporary read-only Files view.
+    // Test valid API key
     let response = server
         .get("/v1/files?limit=1")
         .add_header("Authorization", format!("Bearer {api_key}"))
@@ -901,7 +901,7 @@ async fn test_api_key_authentication() {
     assert_eq!(
         response.status_code(),
         200,
-        "Valid API key should reach the temporary Files read view"
+        "Valid API key should be accepted"
     );
 
     // Test invalid API key

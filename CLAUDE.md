@@ -81,7 +81,9 @@ The separation is deliberate: interactive users manage resources, programs run i
 - **Chat Completions** (`POST /v1/chat/completions`, `/v1/completions`): drop-in OpenAI-compatible API, SSE streaming with a `[DONE]` terminator, plus non-streaming.
 - **Responses** (`POST /v1/responses`): stateless, with events `response.created`, `response.output_text.delta`, `response.completed`, and `response.failed`. Omitted `store` is normalized to `false`; `store: true`, `conversation`, `previous_response_id`, and `background: true` are rejected. Clients provide all prior context in each request.
   - The default typed adapter makes one Chat Completions inference. A canonical model explicitly listed in `NATIVE_RESPONSES_MODELS`, with explicit `store: false`, instead uses one provider-native Responses inference. Neither path writes raw response/item history.
-  - Only client-managed custom `type: "function"` tools are supported. Cloud returns a `function_call` without executing it; the client supplies that call and its matching `function_call_output` in the next request. Builtin/remote tools, file input, and image-generation/editing output models are rejected. The independent root `POST /mcp` web-search endpoint is retained.
+  - Client-managed `function` and `custom` tools are supported, including tools grouped in a `namespace` and Codex's leading developer `additional_tools` declarations. Clients execute returned calls and replay each call with its matching output and prior context in a new request. Preserve `call_id`, names, raw arguments or custom input, and provider metadata such as `thought_signature`.
+  - Typed replay accepts assistant `output_text` and plaintext `reasoning` items, using reasoning content or its summary as prior assistant context. Encrypted-only reasoning requires a native Responses backend. The typed adapter supports text custom tools and the Codex `exec` Lark source grammar; other grammars require a native backend.
+  - Generated tool calls finish with `response.output_item.done`; a successful model turn ends with `response.completed`, including when tools await client execution. Reasoning uses `response.reasoning_text.delta`; failures expose `response.error` in `response.failed` and preserve partial usage. Builtin/remote tools, file input, and image-generation/editing output models are rejected. The independent root `POST /mcp` web-search endpoint is retained.
   - Completed-response gateway attestation remains best-effort: when persistence succeeds, `GET /v1/signature/resp_*` returns signatures over request/response digests, not raw content. Interrupted streams create no partial `resp_*` attestation record.
   - Named response-history routes (`/v1/responses/{id}`, its `/cancel` and `/input_items` paths) return authenticated `410 Gone`.
 
@@ -94,15 +96,11 @@ Client → CompletionService → Provider Pool → provider → inference server
 
 The engine is streaming-first: tokens reach users in real time, usage is tracked during the stream rather than after, and non-streaming clients get the collected stream.
 
-### Temporary Stage I data access
+### Conversations and Files
 
-Existing Conversation/File data remains available through authenticated, workspace-scoped routes with `Cache-Control: no-store`:
+Conversations and Files remain authenticated, workspace-scoped resource APIs. Conversation creation, retrieval, updates, pinning, archiving, cloning, item creation, and deletion are available. Files support upload, listing, metadata/content retrieval, and deletion.
 
-- Retrieval: `POST /v1/conversations/batch`, `GET /v1/conversations/{id}`, `GET /v1/conversations/{id}/items`, `GET /v1/files`, `GET /v1/files/{id}`, and `GET /v1/files/{id}/content`.
-- Resource deletion: `DELETE /v1/conversations/{id}` and `DELETE /v1/files/{id}` remain available for the existing account-deletion workflow.
-- Creation, upload, all other mutations, and unsupported legacy Conversation/File paths return `410 Gone`.
-
-The historical schemas and repositories remain for these bounded routes. Data deletion and schema removal are separate work; retired APIs must not be wired back to them.
+These resources have their own storage lifecycle. Stateless Responses accepts caller-provided context instead of linking to stored Conversations or Files.
 
 ### Model discovery
 

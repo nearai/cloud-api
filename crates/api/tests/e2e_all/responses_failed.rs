@@ -108,7 +108,11 @@ async fn responses_failure_retains_partial_output_and_usage_without_replaying_hi
             let events = events(&result.text());
             let failed = failed_response(&events);
             assert_eq!(failed["response"]["error"]["code"], "rate_limit_exceeded");
-            assert_eq!(failed["response"]["error"]["message"], "Too many requests");
+            // Completion errors expose the gateway's normalized public message.
+            assert!(failed["response"]["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("Rate limit exceeded"));
             assert_eq!(failed["status_code"], 429);
             assert_eq!(failed["response"]["output"].as_array().unwrap().len(), 1);
             assert_eq!(

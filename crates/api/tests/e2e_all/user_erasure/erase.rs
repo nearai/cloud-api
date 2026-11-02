@@ -13,27 +13,28 @@ async fn erase_personal_org_user_removes_content_and_identity_keeps_usage() {
     let usage_before = wait_for_usage(&client, org).await;
     assert!(usage_before > 0, "fixture must produce a usage row");
 
-    let conv = server
-        .post("/v1/conversations")
-        .add_header("Authorization", format!("Bearer {api_key}"))
-        .json(&serde_json::json!({}))
-        .await;
-    assert_eq!(conv.status_code(), 201, "{}", conv.text());
-    let file = server
-        .post("/v1/files")
-        .add_header("Authorization", format!("Bearer {api_key}"))
-        .multipart(
-            axum_test::multipart::MultipartForm::new()
-                .add_text("purpose", "user_data")
-                .add_part(
-                    "file",
-                    axum_test::multipart::Part::bytes(b"secret".to_vec())
-                        .file_name("notes.txt")
-                        .mime_type("text/plain"),
-                ),
-        )
-        .await;
-    assert_eq!(file.status_code(), 201, "{}", file.text());
+    let conversation = seed_retained_conversation(&database, org).await;
+    database::repositories::FileRepository::new(database.pool().clone())
+        .create(services::files::ports::CreateFileParams {
+            filename: "notes.txt".to_string(),
+            bytes: 6,
+            content_type: "text/plain".to_string(),
+            purpose: "user_data".to_string(),
+            storage_key: format!("erasure-fixture/{}", uuid::Uuid::new_v4()),
+            workspace_id: conversation.workspace_id.0,
+            uploaded_by_api_key_id: conversation.api_key_id,
+            expires_at: None,
+        })
+        .await
+        .unwrap();
+    let in_org = "SELECT COUNT(*) FROM {} WHERE workspace_id IN (SELECT id FROM workspaces WHERE organization_id = $1)";
+    for table in ["conversations", "responses", "files"] {
+        assert_eq!(
+            count(&client, &in_org.replace("{}", table), &org).await,
+            1,
+            "fixture must seed retained {table}"
+        );
+    }
 
     let response = erase(&server, user_id, &email).await;
     assert_eq!(response.status_code(), 200, "{}", response.text());
@@ -49,7 +50,6 @@ async fn erase_personal_org_user_removes_content_and_identity_keeps_usage() {
         .await;
     assert_eq!(after.status_code(), 401, "{}", after.text());
 
-    let in_org = "SELECT COUNT(*) FROM {} WHERE workspace_id IN (SELECT id FROM workspaces WHERE organization_id = $1)";
     for table in ["conversations", "responses", "files"] {
         assert_eq!(
             count(&client, &in_org.replace("{}", table), &org).await,
@@ -191,6 +191,7 @@ async fn erase_after_ownership_transfer_keeps_team_org_and_keys() {
     let team = create_org_with_session(&server, &session).await;
     add_member(&database, &team.id, teammate, "member").await;
     let team_key = get_api_key_for_org_with_session(&server, team.id.clone(), &session).await;
+    let conversation = seed_retained_conversation(&database, team.id.parse().unwrap()).await;
     transfer_ownership(&server, &team.id, teammate).await;
 
     assert_eq!(erase(&server, owner, &owner_email).await.status_code(), 200);
@@ -207,13 +208,12 @@ async fn erase_after_ownership_transfer_keeps_team_org_and_keys() {
         1
     );
     let ok = server
-        .post("/v1/conversations")
+        .get(&format!("/v1/conversations/{}", conversation.id))
         .add_header("Authorization", format!("Bearer {team_key}"))
-        .json(&serde_json::json!({}))
         .await;
     assert_eq!(
         ok.status_code(),
-        201,
+        200,
         "a key created in a retained org belongs to the org: {}",
         ok.text()
     );

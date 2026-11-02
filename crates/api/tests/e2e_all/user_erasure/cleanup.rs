@@ -207,13 +207,9 @@ async fn retry_does_not_sweep_retained_team_org() {
     let (_s2, teammate, _) = new_user(&database).await;
     let team = create_org_with_session(&server, &session).await;
     add_member(&database, &team.id, teammate, "member").await;
-    let team_key = get_api_key_for_org_with_session(&server, team.id.clone(), &session).await;
-    let created = server
-        .post("/v1/conversations")
-        .add_header("Authorization", format!("Bearer {team_key}"))
-        .json(&serde_json::json!({}))
-        .await;
-    assert_eq!(created.status_code(), 201, "{}", created.text());
+    get_api_key_for_org_with_session(&server, team.id.clone(), &session).await;
+    let team_uuid: uuid::Uuid = team.id.parse().unwrap();
+    seed_retained_conversation(&database, team_uuid).await;
     transfer_ownership(&server, &team.id, teammate).await;
 
     assert_eq!(erase(&server, owner, &email).await.status_code(), 200);
@@ -222,7 +218,6 @@ async fn retry_does_not_sweep_retained_team_org() {
     assert_eq!(again.json::<serde_json::Value>()["already_erased"], true);
 
     let client = database.pool().get().await.unwrap();
-    let team_uuid: uuid::Uuid = team.id.parse().unwrap();
     assert_eq!(
         count(
             &client,

@@ -405,7 +405,7 @@ fn parse_optional_i32_env(key: &str, default: Option<i32>) -> Result<Option<i32>
 /// Operational limits for the programmatic usage-reporting API.
 ///
 /// Reporting is disabled by default because its production indexes are built
-/// concurrently outside refinery. Operators enable it only after completing
+/// concurrently outside a migration transaction. Operators enable it only after completing
 /// the rollout checklist in `docs/usage-reporting-rollout.md`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UsageReportingConfig {

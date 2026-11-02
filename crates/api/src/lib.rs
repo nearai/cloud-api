@@ -144,21 +144,16 @@ impl Default for AppBuildOptions {
     }
 }
 
-/// Initialize database connection and run migrations
+/// Initialize the database connection.
+///
+/// The schema belongs to nearai/cloud-platform and is applied by its `migrate` step before
+/// this service deploys, so startup never migrates.
 pub async fn init_database(db_config: &config::DatabaseConfig) -> Arc<Database> {
     let database = Arc::new(
         Database::from_config(db_config)
             .await
             .expect("Failed to connect to database"),
     );
-
-    // Run database migrations
-    tracing::info!("Starting database migrations...");
-    database
-        .run_migrations()
-        .await
-        .expect("Failed to run database migrations");
-    tracing::info!("Database migrations completed.");
 
     // Start periodic pool status logging
     let pool = database.pool().clone();

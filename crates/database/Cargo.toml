@@ -45,9 +45,6 @@ dotenvy = "0.15.7"
 services = { path = "../services" }
 config = { path = "../config" }
 
-# For database migrations
-refinery = { version = "0.9", features = ["tokio-postgres"] }
-
 # For hashing API keys and session tokens
 sha2 = "0.11"
 hex = "0.4"

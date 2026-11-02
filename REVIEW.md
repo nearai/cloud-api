@@ -18,7 +18,7 @@ Post nothing below Medium.
 
 ## Database freeze
 
-A diff that adds or edits a file under `crates/database/src/migrations/`, changes SQL, queries, transactions, or row types in a frozen repository, or changes behavior of a moved service or route is a **High** finding, blocking unless the PR links the matching cloud-platform PR or states an exception approved under the repo's review requirements. The frozen list and rules are in `.claude/rules/database.md`. Tables in the `cloud_api_responses` class, docs, and behavior-neutral tests are fine. A read is not exempt: a changed `SELECT` filter or projection changes SQL and behavior.
+A diff that adds schema SQL to this repo, bumps `scripts/cloud-platform-schema.env` before the matching cloud-platform change is merged, changes SQL, queries, transactions, or row types in a frozen repository, or changes behavior of a moved service or route is a **High** finding, blocking unless the PR links the matching cloud-platform PR or states an exception approved under the repo's review requirements. The frozen list and rules are in `.claude/rules/database.md`. Tables in the `cloud_api_responses` class, docs, and behavior-neutral tests are fine. A read is not exempt: a changed `SELECT` filter or projection changes SQL and behavior.
 
 ## Always check
 

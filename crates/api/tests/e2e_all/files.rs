@@ -33,6 +33,7 @@ struct RetainedFileFixture {
     owner_key: String,
     foreign_key: String,
     file: services::files::File,
+    repository: database::repositories::FileRepository,
     storage: Arc<MockStorage>,
 }
 
@@ -61,7 +62,8 @@ async fn retained_file_fixture() -> RetainedFileFixture {
         )
         .await
         .expect("seed encrypted mock storage");
-    let file = database::repositories::FileRepository::new(database.pool().clone())
+    let repository = database::repositories::FileRepository::new(database.pool().clone());
+    let file = repository
         .create(services::files::CreateFileParams {
             filename: "retained.bin".to_string(),
             bytes: RETAINED_CONTENT.len() as i64,
@@ -79,6 +81,7 @@ async fn retained_file_fixture() -> RetainedFileFixture {
         owner_key,
         foreign_key,
         file,
+        repository,
         storage,
     }
 }
@@ -154,6 +157,90 @@ async fn retained_files_are_readable_only_by_the_owning_workspace() {
         assert_no_store(&foreign);
         assert_no_store(&unknown);
         assert_eq!(foreign.text(), unknown.text());
+    }
+}
+
+#[tokio::test]
+async fn retained_files_paginate_in_both_orders_with_purpose_filters() {
+    let fixture = retained_file_fixture().await;
+    let mut files = vec![fixture.file.clone()];
+    for (index, purpose) in ["assistants", "user_data", "assistants", "user_data"]
+        .into_iter()
+        .enumerate()
+    {
+        // The repository orders and cursors by created_at, without an ID tie-break.
+        // Space these test-local inserts and verify their returned timestamps.
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        let storage_key = format!("retained-fixture/{}", uuid::Uuid::new_v4());
+        fixture
+            .storage
+            .upload(
+                &storage_key,
+                RETAINED_CONTENT.to_vec(),
+                "application/octet-stream",
+            )
+            .await
+            .expect("seed retained content");
+        let file = fixture
+            .repository
+            .create(services::files::CreateFileParams {
+                filename: format!("retained-{index}.bin"),
+                bytes: RETAINED_CONTENT.len() as i64,
+                content_type: "application/octet-stream".to_string(),
+                purpose: purpose.to_string(),
+                storage_key,
+                workspace_id: fixture.file.workspace_id,
+                uploaded_by_api_key_id: fixture.file.uploaded_by_api_key_id,
+                expires_at: None,
+            })
+            .await
+            .expect("seed retained metadata");
+        assert!(file.created_at > files.last().unwrap().created_at);
+        files.push(file);
+    }
+
+    for order in ["asc", "desc"] {
+        for purpose in [None, Some("assistants"), Some("user_data")] {
+            let mut expected: Vec<String> = files
+                .iter()
+                .filter(|file| purpose.is_none_or(|purpose| file.purpose == purpose))
+                .map(|file| format!("{PREFIX_FILE}{}", file.id))
+                .collect();
+            if order == "desc" {
+                expected.reverse();
+            }
+            let mut after = None;
+            for (page_index, expected_page) in expected.chunks(2).enumerate() {
+                let mut path = format!("/v1/files?limit=2&order={order}");
+                if let Some(purpose) = purpose {
+                    path.push_str(&format!("&purpose={purpose}"));
+                }
+                if let Some(cursor) = &after {
+                    path.push_str(&format!("&after={cursor}"));
+                }
+                let response = fixture
+                    .server
+                    .get(&path)
+                    .add_header("Authorization", format!("Bearer {}", fixture.owner_key))
+                    .await;
+                assert_eq!(response.status_code(), 200, "{path}");
+                assert_no_store(&response);
+                let page: api::models::FileListResponse = response.json();
+                let ids: Vec<String> = page.data.iter().map(|file| file.id.clone()).collect();
+                assert_eq!(
+                    ids.as_slice(),
+                    expected_page,
+                    "pages must contain every matching file exactly once in {order} order: {path}"
+                );
+                assert_eq!(page.first_id.as_ref(), expected_page.first());
+                assert_eq!(page.last_id.as_ref(), expected_page.last());
+                assert_eq!(page.has_more, (page_index + 1) * 2 < expected.len());
+                if let Some(purpose) = purpose {
+                    assert!(page.data.iter().all(|file| file.purpose == purpose));
+                }
+                after = page.last_id;
+            }
+        }
     }
 }
 

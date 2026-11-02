@@ -32,6 +32,7 @@ impl<'a> ToolEventContext<'a> {
             item: None,
             item_id: Some(self.tool_call_id.to_string()),
             part: None,
+            arguments: None,
             delta: None,
             text: None,
             error: None,

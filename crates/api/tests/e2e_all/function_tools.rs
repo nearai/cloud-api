@@ -62,11 +62,8 @@ async fn stateless_function_call_is_replayed_by_the_client_without_server_histor
         first.text()
     );
     let first = first.json::<serde_json::Value>();
-    assert_eq!(first["status"], "incomplete");
-    assert_eq!(
-        first["incomplete_details"]["reason"],
-        "function_call_required"
-    );
+    assert_eq!(first["status"], "completed");
+    assert!(first["incomplete_details"].is_null());
     assert_eq!(
         mock.chat_completion_call_count(),
         1,
@@ -83,6 +80,7 @@ async fn stateless_function_call_is_replayed_by_the_client_without_server_histor
         .as_str()
         .expect("function call has call_id")
         .to_string();
+    assert_eq!(function_call["status"], "completed");
     assert_eq!(
         function_call["thought_signature"],
         "gemini-thought-signature"
@@ -176,6 +174,239 @@ async fn stateless_function_call_is_replayed_by_the_client_without_server_histor
 }
 
 #[tokio::test]
+async fn stateless_stream_completes_parallel_function_items_and_replays_without_history() {
+    let (server, _pool, mock, database) = setup_test_server_with_pool().await;
+    let model = setup_qwen_model(&server).await;
+    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id).await;
+
+    let prompt = "Compare the weather in Shanghai and Beijing.";
+    let preamble = "I will check both cities.";
+    let answer = "Shanghai is 22°C and Beijing is 18°C.";
+    let arguments = [r#"{"location": "Shanghai"}"#, r#"{"location": "Beijing"}"#];
+    mock.when(RequestMatcher::PromptWithTools {
+        prompt: mock_prompts::build_prompt(prompt),
+        tool_names: vec!["get_weather".to_string()],
+    })
+    .respond_with(ResponseTemplate::new(preamble).with_tool_calls(vec![
+        ToolCall::new("get_weather", arguments[0]),
+        ToolCall::new("get_weather", arguments[1]),
+    ]))
+    .await;
+    mock.set_default_response(ResponseTemplate::new(answer))
+        .await;
+
+    let tools = serde_json::json!([{
+        "type": "function",
+        "name": "get_weather",
+        "parameters": {
+            "type": "object",
+            "properties": {"location": {"type": "string"}},
+            "required": ["location"]
+        }
+    }]);
+    let first = server
+        .post("/v1/responses")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&serde_json::json!({
+            "model": model,
+            "input": prompt,
+            "store": false,
+            "stream": true,
+            "parallel_tool_calls": true,
+            "tools": tools,
+        }))
+        .await;
+    assert_eq!(first.status_code(), 200, "first stream: {}", first.text());
+    let first_events = response_events(&first.text());
+    assert!(first_events
+        .iter()
+        .all(|event| event["type"] != "response.failed"));
+    let first_completed = first_events.last().expect("first stream has events");
+    assert_eq!(first_completed["type"], "response.completed");
+    let first_response = &first_completed["response"];
+    assert_eq!(first_response["status"], "completed");
+    assert!(first_response["incomplete_details"].is_null());
+    assert_eq!(mock.chat_completion_call_count(), 1);
+
+    let first_output = first_response["output"]
+        .as_array()
+        .expect("first stream has final output");
+    assert_eq!(first_output.len(), 3, "text and two function calls");
+    assert_eq!(first_output[0]["type"], "message");
+    assert_eq!(first_output[0]["content"][0]["text"], preamble);
+
+    // Every output item gets its own slot. In particular, a preceding text
+    // item must not share output_index with the first function call.
+    let added_items: Vec<_> = first_events
+        .iter()
+        .filter(|event| event["type"] == "response.output_item.added")
+        .collect();
+    assert_eq!(added_items.len(), first_output.len());
+    for (output_index, item) in first_output.iter().enumerate() {
+        assert_eq!(item["status"], "completed");
+        let added = added_items
+            .iter()
+            .find(|event| event["item"]["id"] == item["id"])
+            .expect("every final output item was added");
+        assert_eq!(added["output_index"], output_index);
+    }
+
+    let function_calls = &first_output[1..];
+    assert_ne!(function_calls[0]["call_id"], function_calls[1]["call_id"]);
+    for (index, call) in function_calls.iter().enumerate() {
+        assert_eq!(call["type"], "function_call");
+        assert_eq!(call["name"], "get_weather");
+        assert_eq!(call["arguments"], arguments[index]);
+        assert_ne!(call["id"], call["call_id"]);
+
+        let lifecycle: Vec<_> = first_events
+            .iter()
+            .filter(|event| event["item"]["id"] == call["id"] || event["item_id"] == call["id"])
+            .collect();
+        let types: Vec<_> = lifecycle
+            .iter()
+            .filter_map(|event| event["type"].as_str())
+            .collect();
+        assert_eq!(types.first(), Some(&"response.output_item.added"));
+        assert_eq!(types.last(), Some(&"response.output_item.done"));
+        let arguments_done_index = types
+            .iter()
+            .position(|event_type| *event_type == "response.function_call_arguments.done")
+            .expect("function arguments must finish before the item");
+        assert!(
+            arguments_done_index > 1,
+            "arguments must have streamed deltas"
+        );
+        assert_eq!(arguments_done_index, lifecycle.len() - 2);
+        assert!(types[1..arguments_done_index]
+            .iter()
+            .all(|event_type| *event_type == "response.function_call_arguments.delta"));
+        let streamed_arguments: String = lifecycle[1..arguments_done_index]
+            .iter()
+            .map(|event| event["delta"].as_str().expect("argument delta is text"))
+            .collect();
+        assert_eq!(streamed_arguments, arguments[index]);
+        assert_eq!(lifecycle[0]["item"]["status"], "in_progress");
+        assert_eq!(lifecycle[0]["item"]["arguments"], "");
+        assert_eq!(
+            lifecycle[arguments_done_index]["arguments"],
+            arguments[index]
+        );
+        assert_eq!(lifecycle[arguments_done_index]["item_id"], call["id"]);
+        assert_ne!(lifecycle[arguments_done_index]["item_id"], call["call_id"]);
+        assert_eq!(lifecycle.last().unwrap()["item"], *call);
+        for event in lifecycle {
+            assert_eq!(event["output_index"], index + 1);
+        }
+    }
+
+    // Replay exactly the items a streaming client received, including the
+    // preamble and both parallel calls, with client-produced results.
+    let results = [r#"{"temperature_c":22}"#, r#"{"temperature_c":18}"#];
+    let mut input = vec![serde_json::json!({"role": "user", "content": prompt})];
+    input.extend(first_output.iter().cloned());
+    for (call, result) in function_calls.iter().zip(results) {
+        input.push(serde_json::json!({
+            "type": "function_call_output",
+            "call_id": call["call_id"],
+            "output": result,
+        }));
+    }
+    let second = server
+        .post("/v1/responses")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&serde_json::json!({
+            "model": model,
+            "store": false,
+            "stream": true,
+            "parallel_tool_calls": true,
+            "input": input,
+            "tools": tools,
+        }))
+        .await;
+    assert_eq!(
+        second.status_code(),
+        200,
+        "replay stream: {}",
+        second.text()
+    );
+    let second_events = response_events(&second.text());
+    assert!(second_events
+        .iter()
+        .all(|event| event["type"] != "response.failed"));
+    let second_completed = second_events.last().expect("replay stream has events");
+    assert_eq!(second_completed["type"], "response.completed");
+    let second_response = &second_completed["response"];
+    assert_eq!(second_response["status"], "completed");
+    assert_eq!(second_response["output"].as_array().unwrap().len(), 1);
+    assert_eq!(second_response["output"][0]["content"][0]["text"], answer);
+    assert_eq!(mock.chat_completion_call_count(), 2);
+
+    let params = mock
+        .last_chat_params()
+        .await
+        .expect("replay reached provider");
+    let assistant = params
+        .messages
+        .iter()
+        .find(|message| message.role == MessageRole::Assistant && message.tool_calls.is_some())
+        .expect("provider received the replayed assistant turn");
+    assert_eq!(assistant.content, Some(serde_json::json!(preamble)));
+    let replayed_calls = assistant.tool_calls.as_ref().unwrap();
+    assert_eq!(replayed_calls.len(), 2);
+    let replayed_results: Vec<_> = params
+        .messages
+        .iter()
+        .filter(|message| message.role == MessageRole::Tool)
+        .collect();
+    assert_eq!(replayed_results.len(), 2);
+    for (index, call) in function_calls.iter().enumerate() {
+        let call_id = call["call_id"].as_str().unwrap();
+        assert_eq!(replayed_calls[index].id.as_deref(), Some(call_id));
+        assert_eq!(
+            replayed_calls[index].function.arguments.as_deref(),
+            Some(arguments[index])
+        );
+        assert_eq!(
+            replayed_results[index].tool_call_id.as_deref(),
+            Some(call_id)
+        );
+        assert_eq!(
+            replayed_results[index].content,
+            Some(serde_json::json!(results[index]))
+        );
+    }
+
+    // Query only this test's generated IDs, never shared database totals.
+    let client = database.pool().get().await.unwrap();
+    for response in [first_response, second_response] {
+        let id = response["id"].as_str().unwrap();
+        let id = uuid::Uuid::parse_str(id.strip_prefix("resp_").unwrap()).unwrap();
+        let row = client
+            .query_one(
+                "SELECT EXISTS(SELECT 1 FROM responses WHERE id = $1), \
+                 EXISTS(SELECT 1 FROM response_items WHERE response_id = $1)",
+                &[&id],
+            )
+            .await
+            .unwrap();
+        assert!(
+            !row.get::<_, bool>(0),
+            "response history must not be stored"
+        );
+        assert!(!row.get::<_, bool>(1), "response items must not be stored");
+    }
+}
+
+fn response_events(body: &str) -> Vec<serde_json::Value> {
+    body.lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .map(|data| serde_json::from_str(data).expect("SSE data must be valid JSON"))
+        .collect()
+}
+
+#[tokio::test]
 async fn stateless_response_without_tools_completes_after_one_completion() {
     let (server, _pool, mock, _database) = setup_test_server_with_pool().await;
     let model = setup_qwen_model(&server).await;
@@ -212,7 +443,7 @@ async fn stateless_response_without_tools_completes_after_one_completion() {
 async fn stateless_custom_web_search_function_is_not_executed_as_a_builtin_tool() {
     // Install a working built-in web-search provider. If the custom function
     // below were accidentally claimed by the built-in executor, this response
-    // would continue after server-side search rather than pause for the client.
+    // would continue after server-side search rather than return the call to the client.
     let (server, _database, mock) = setup_test_server_with_search_providers(
         Arc::new(MockWebSearchProvider::default_results()),
         None,
@@ -262,16 +493,15 @@ async fn stateless_custom_web_search_function_is_not_executed_as_a_builtin_tool(
         response.text()
     );
     let response = response.json::<serde_json::Value>();
-    assert_eq!(response["status"], "incomplete");
-    assert_eq!(
-        response["incomplete_details"]["reason"],
-        "function_call_required"
-    );
+    assert_eq!(response["status"], "completed");
+    assert!(response["incomplete_details"].is_null());
     assert!(response["output"]
         .as_array()
         .expect("response has output")
         .iter()
-        .any(|item| item["type"] == "function_call" && item["name"] == "web_search"));
+        .any(|item| item["type"] == "function_call"
+            && item["name"] == "web_search"
+            && item["status"] == "completed"));
 }
 
 #[tokio::test]

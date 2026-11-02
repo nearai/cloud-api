@@ -7,7 +7,7 @@
 //! Flow:
 //! 1. Client defines functions in `tools` array with type: "function"
 //! 2. LLM calls the function with arguments
-//! 3. Server returns response with status=incomplete, reason="function_call_required"
+//! 3. Server returns the function call for client execution
 //! 4. Client executes the function externally
 //! 5. Client sends a new `store: false` request containing the returned
 //!    `function_call` item and the matching `function_call_output` item

@@ -1072,6 +1072,7 @@ mod tests {
             item: None,
             item_id: None,
             part: None,
+            arguments: None,
             delta: None,
             text: None,
             error: None,

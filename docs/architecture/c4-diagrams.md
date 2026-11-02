@@ -565,8 +565,11 @@ sequenceDiagram
     CompletionService->>vLLM: POST /v1/chat/completions
     vLLM-->>CompletionService: Function call for "get_weather"
     CompletionService-->>ResponseService: Function call
-    ResponseService-->>Client: SSE: response.output_item.added (FunctionCall)<br/>{ call_id, name: "get_weather", arguments: "..." }
-    ResponseService-->>Client: SSE: response.incomplete<br/>{ reason: "function_call_required" }
+    ResponseService-->>Client: SSE: response.output_item.added (FunctionCall)<br/>{ id, call_id, name: "get_weather", arguments: "", status: "in_progress" }
+    ResponseService-->>Client: SSE: response.function_call_arguments.delta<br/>{ item_id: id, output_index, delta: "..." }
+    ResponseService-->>Client: SSE: response.function_call_arguments.done<br/>{ item_id: id, output_index, arguments: "..." }
+    ResponseService-->>Client: SSE: response.output_item.done (FunctionCall)<br/>{ id, call_id, arguments: "...", status: "completed" }
+    ResponseService-->>Client: SSE: response.completed<br/>{ status: "completed" }
 
     Client->>Client: Execute get_weather and retain its own transcript
 

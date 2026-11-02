@@ -397,7 +397,7 @@ impl ToolExecutor for WebSearchToolExecutor {
 
 #[cfg(test)]
 mod tests {
-    use crate::responses::models::CreateResponseRequest;
+    use crate::responses::models::{CreateResponseRequest, ResponseTool};
     use crate::responses::tools::ports::WebSearchError;
     use crate::responses::tools::web_search::*;
     use std::sync::{Arc as StdArc, Mutex};
@@ -458,10 +458,15 @@ mod tests {
                 .unwrap(),
         });
         let executor = WebSearchToolExecutor::new(provider);
-        let request = serde_json::from_value(serde_json::json!({
-            "model": "test", "tools": [{"type": "web_search", "count": 0}]
-        }))
-        .unwrap();
+        // Exercise the retained internal executor directly; stateless Responses
+        // deliberately rejects builtin web_search in public request JSON.
+        let mut request = create_test_request();
+        request.tools = Some(vec![ResponseTool::WebSearch {
+            count: Some(0),
+            filters: None,
+            search_context_size: None,
+            user_location: None,
+        }]);
         let call = ToolCallInfo {
             id: None,
             tool_type: WEB_SEARCH_TOOL_NAME.to_string(),
@@ -483,11 +488,13 @@ mod tests {
     fn test_web_search_count_configuration_overrides_model_arguments() {
         for configured in [None, Some(0), Some(1), Some(5), Some(20)] {
             for model_count in [None, Some(2), Some(10), Some(20)] {
-                let request = serde_json::from_value(serde_json::json!({
-                    "model": "test",
-                    "tools": [{"type": "web_search", "count": configured}]
-                }))
-                .unwrap();
+                let mut request = create_test_request();
+                request.tools = Some(vec![ResponseTool::WebSearch {
+                    count: configured,
+                    filters: None,
+                    search_context_size: None,
+                    user_location: None,
+                }]);
                 let call = ToolCallInfo {
                     id: None,
                     tool_type: WEB_SEARCH_TOOL_NAME.to_string(),

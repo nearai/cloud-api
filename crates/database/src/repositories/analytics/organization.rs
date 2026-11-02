@@ -152,7 +152,7 @@ fn hourly_metrics_sql() -> MetricsSql {
 fn credit_type_metrics_sql() -> String {
     format!(
         "{CREDIT_TYPE_USAGE_CTE}\n{}",
-        include_str!("organization_credit_metrics.sql")
+        include_str!("../sql/organization_credit_metrics.sql")
     )
 }
 

@@ -1,4 +1,5 @@
 use crate::models::*;
+use crate::openapi_deprecation::DeprecatedRoutesAddon;
 use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme};
 use utoipa::{Modify, OpenApi};
 
@@ -7,7 +8,11 @@ use utoipa::{Modify, OpenApi};
 #[openapi(
     info(
         title = "NEAR AI Cloud API",
-        description = "A comprehensive cloud API for AI model inference, conversation management, and organization administration.\n\n## Authentication\n\nThis API supports five authentication methods:\n\n1. **Access Token (JWT)**: Use `Authorization: Bearer <jwt_token>` with a short-lived JWT access token for most API endpoints. Obtain this by calling POST /users/me/access_tokens with a refresh token.\n2. **Refresh Token**: Use `Authorization: Bearer <refresh_token>` (prefix: `rt_`) only with POST /users/me/access_tokens to create new JWT access tokens. Obtained from OAuth login.\n3. **API Key (Programmatic Access)**: Use `Authorization: Bearer sk-<api_key>` with an API key (prefix: `sk-`).\n4. **Reporting Token (Read-only Usage Reporting)**: Use `Authorization: Bearer rpt-<reporting_token>` only with usage reporting endpoints.\n5. **Admin Access Token**: Use `Authorization: Bearer adm_<token>` with approved admin operations. `read_only` permits explicitly approved reads across organizations; `read_write` preserves admin-token write access. Token management always requires an admin session.\n\nClick the **Authorize** button above to configure authentication.",
+        description = "A comprehensive cloud API for AI model inference, conversation management, and organization administration.\n\n## Authentication\n\nThis API supports five authentication methods:\n\n1. **Access Token (JWT)**: Use `Authorization: Bearer <jwt_token>` with a short-lived JWT access token for most API endpoints. Obtain this by calling POST /users/me/access_tokens with a refresh token.\n2. **Refresh Token**: Use `Authorization: Bearer <refresh_token>` (prefix: `rt_`) only with POST /users/me/access_tokens to create new JWT access tokens. Obtained from OAuth login.\n3. **API Key (Programmatic Access)**: Use `Authorization: Bearer sk-<api_key>` with an API key (prefix: `sk-`).\n4. **Reporting Token (Read-only Usage Reporting)**: Use `Authorization: Bearer rpt-<reporting_token>` only with usage reporting endpoints.\n5. **Admin Access Token**: Use `Authorization: Bearer adm_<token>` with approved admin operations. `read_only` permits explicitly approved reads across organizations; `read_write` preserves admin-token write access. Token management always requires an admin session.\n\nClick the **Authorize** button above to configure authentication.
+
+## Deprecations
+
+Operations marked deprecated (account, organization, workspace, invitation, API key, usage, billing, service pricing, staking, feature request, admin and catalog-administration endpoints) are moving to cloud-platform at the same path. The cloud-platform base URL has not been published yet, and behaviour may differ in edge cases. Inference and content endpoints (chat completions, responses, conversations, embeddings, images, audio, files, attestation) are unaffected.",
         version = "1.0.0",
         contact(
             name = "NEAR AI Team",
@@ -84,6 +89,8 @@ use utoipa::{Modify, OpenApi};
         crate::routes::organizations::get_organization,
         crate::routes::organizations::update_organization,
         crate::routes::organizations::delete_organization,
+        crate::routes::organizations::get_organization_settings,
+        crate::routes::organizations::patch_organization_settings,
         // Organization Members endpoints
         crate::routes::organization_members::add_organization_member,
         crate::routes::organization_members::invite_organization_member_by_email,
@@ -132,6 +139,7 @@ use utoipa::{Modify, OpenApi};
         crate::routes::usage::get_organization_usage_history,
         crate::routes::usage::get_organization_usage_by_model,
         crate::routes::usage::get_api_key_usage_history,
+        crate::routes::usage::get_service_usage_history,
         crate::routes::usage::get_user_organization_metrics,
         crate::routes::usage::get_user_organization_timeseries,
         // Staking farm endpoints
@@ -191,6 +199,9 @@ use utoipa::{Modify, OpenApi};
         crate::routes::admin::get_platform_metrics,
         crate::routes::admin::get_organization_timeseries,
         crate::routes::admin::get_platform_timeseries,
+        crate::routes::admin::list_organizations,
+        crate::routes::admin::get_model_consumption_timeseries,
+        crate::routes::admin::get_performance_timeseries,
         crate::routes::admin::get_billing_summary,
         crate::routes::admin::get_model_revenue,
         crate::routes::admin::get_revenue_density,
@@ -241,6 +252,13 @@ use utoipa::{Modify, OpenApi};
         schemas(
             // Health check models
             crate::routes::health::HealthResponse,
+            // List query parameter enums: utoipa does not collect types used only in `params`
+            crate::routes::organizations::OrganizationOrderBy,
+            crate::routes::organizations::OrganizationOrderDirection,
+            crate::routes::workspaces::WorkspaceOrderBy,
+            crate::routes::workspaces::WorkspaceOrderDirection,
+            crate::routes::workspaces::ApiKeyOrderBy,
+            crate::routes::workspaces::ApiKeyOrderDirection,
             // Core API models
             ChatCompletionRequest, ChatCompletionResponse, Message, CompletionUsage,
             CompletionRequest, CompletionPrompt, StopSequences, CompletionResponse,
@@ -448,7 +466,11 @@ use utoipa::{Modify, OpenApi};
             services::admin::ModelGpuAllocation,
         ),
     ),
-    modifiers(&SecurityAddon, &AdminPermissionsAddon)
+    modifiers(
+        &SecurityAddon,
+        &AdminPermissionsAddon,
+        &DeprecatedRoutesAddon
+    )
     // No servers - let client determine the URL dynamically
 )]
 pub struct ApiDoc;

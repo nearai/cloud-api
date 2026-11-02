@@ -8,6 +8,7 @@ pub mod middleware;
 pub mod models;
 pub mod ohttp_gateway;
 pub mod openapi;
+pub mod openapi_deprecation;
 pub mod routes;
 
 use crate::ohttp_gateway::{OhttpAttestation, OhttpGateway};

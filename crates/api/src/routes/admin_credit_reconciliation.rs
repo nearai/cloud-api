@@ -20,6 +20,8 @@ pub struct CreditReconciliationRequest {
     /// Unique per organization. Repeating identical terms returns the original result.
     pub idempotency_key: String,
     /// Positive nano-USD amounts to move from unknown consumption into credit types.
+    /// Supports grant, payment, staking_farm, transfer, and postpay.
+    /// Transfer adjustments cannot exceed unconsumed received-credit capacity.
     pub amounts: BTreeMap<String, i64>,
     /// Explanation and reference to supporting billing/contract records.
     pub reason: String,
@@ -45,7 +47,7 @@ pub struct CreditPositionResponse {
 
 #[derive(Debug, Serialize, ToSchema)]
 pub struct AccountingPositionResponse {
-    /// Positions keyed by credit type (grant, payment, staking_farm, or postpay).
+    /// Positions keyed by credit type (grant, payment, staking_farm, transfer, or postpay).
     /// Includes active limits and recorded consumption for inactive types.
     pub credits: BTreeMap<String, CreditPositionResponse>,
     /// Historical consumption still lacking a credit type, in nano-USD.

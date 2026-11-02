@@ -1,0 +1,32 @@
+name: Feature request
+description: Propose a capability or improvement for NEAR AI Cloud API.
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please search existing issues before submitting a request.
+        Report security vulnerabilities [privately](https://github.com/nearai/cloud-api/security/advisories/new).
+        Use sanitized examples without credentials, personal data, or private prompt or response content.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or use case
+      description: Who needs this, what are they trying to do, and what limitation do they encounter today?
+    validations:
+      required: true
+
+  - type: textarea
+    id: outcome
+    attributes:
+      label: Desired behavior
+      description: Describe the expected outcome and how we would know it is working. An implementation proposal is optional.
+    validations:
+      required: true
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Alternatives and additional context
+      description: Optional. Include workarounds, alternatives, related issues, or API compatibility and rollout constraints.

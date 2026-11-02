@@ -97,7 +97,10 @@ async fn main() {
     // instance: due rows are claimed atomically (FOR UPDATE SKIP LOCKED).
     let pricing_scheduler = Arc::new(ModelPricingScheduler::new(
         Arc::new(AdminCompositeRepository::new(database.pool().clone())),
-        domain_services.models_service.clone(),
+        api::cloud_platform::invalidating_models_service(
+            domain_services.models_service.clone(),
+            domain_services.cloud_platform_catalog.clone(),
+        ),
     ));
     pricing_scheduler
         .clone()

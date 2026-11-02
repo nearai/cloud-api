@@ -4,12 +4,13 @@
 //! The per-endpoint differences pinned here are deliberate and must survive
 //! any refactor of how these requests are built:
 //! - `inference_id` is the v5 hash of the provider id for images, score and
-//!   System One, but a random v4 for audio, rerank, embeddings and privacy
-//!   classify/redact/auto-redact.
+//!   System One and privacy classify/redact with a valid upstream id. It is a
+//!   random v4 for audio, rerank, embeddings, auto-redact and privacy responses
+//!   without a valid upstream id (as returned by the default MockProvider).
 //! - A failed record fails the request closed (500) for audio, rerank,
-//!   embeddings, classify and redact; image generation/edit, score and System
-//!   One return 200 and retry the identical request asynchronously; the
-//!   auto-redact classify charge is best-effort and never retried.
+//!   and embeddings; image generation/edit, score, System One and privacy
+//!   classify/redact return 200 and retry the identical request asynchronously;
+//!   the auto-redact classify charge is best-effort and never retried.
 
 use crate::common::*;
 use services::completions::hash_inference_id_to_uuid;
@@ -636,11 +637,16 @@ async fn privacy_classify_records_summed_tokens_with_random_id() {
 }
 
 #[tokio::test]
-async fn privacy_classify_fails_closed_on_record_failure() {
+async fn privacy_classify_falls_back_to_async_retry_on_record_failure() {
     let f = fixture(1, &[]).await;
     let response = post_json(&f, "/v1/privacy/classify", classify_body()).await;
-    assert_eq!(response.status_code(), 500, "{}", response.text());
-    f.recorder.wait_for(1).await;
+    assert_eq!(response.status_code(), 200, "{}", response.text());
+    let records = f.recorder.wait_for(2).await;
+    assert_same_request(&records[0], &records[1]);
+    assert_eq!(
+        response.header("Inference-Id"),
+        records[0].inference_id.unwrap().to_string()
+    );
 }
 
 #[tokio::test]
@@ -660,11 +666,16 @@ async fn privacy_redact_records_as_classify_with_random_id() {
 }
 
 #[tokio::test]
-async fn privacy_redact_fails_closed_on_record_failure() {
+async fn privacy_redact_falls_back_to_async_retry_on_record_failure() {
     let f = fixture(1, &[]).await;
     let response = post_json(&f, "/v1/privacy/redact", redact_body()).await;
-    assert_eq!(response.status_code(), 500, "{}", response.text());
-    f.recorder.wait_for(1).await;
+    assert_eq!(response.status_code(), 200, "{}", response.text());
+    let records = f.recorder.wait_for(2).await;
+    assert_same_request(&records[0], &records[1]);
+    assert_eq!(
+        response.header("Inference-Id"),
+        records[0].inference_id.unwrap().to_string()
+    );
 }
 
 // ---------------------------------------------------------------- auto-redact

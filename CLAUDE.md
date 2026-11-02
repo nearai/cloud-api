@@ -8,6 +8,10 @@ This service runs in a Trusted Execution Environment, and customer trust depends
 
 Also: API keys and session tokens are SHA-256 hashed before storage, customer data is encrypted at rest and in transit, authentication flows use HTTPS/TLS, and secrets never go into the repository.
 
+## Database freeze
+
+**IMPORTANT: cloud-api has no migrations. Schema changes land in `nearai/cloud-platform` first, and this repo only bumps the pin in `scripts/cloud-platform-schema.env`. Do not change SQL, queries, or behavior of the code that moved to `nearai/cloud-platform` without the matching cloud-platform PR or an owner exception.** cloud-platform owns the schema; a change here alone silently diverges the two services until phase 2. The full rules and the frozen file list are in `.claude/rules/database.md`.
+
 ## Project overview
 
 NEAR AI Cloud API is a Rust multi-tenant AI inference platform running in a TEE:
@@ -25,7 +29,7 @@ cargo fmt --all -- --check              # CI format check
 cargo clippy --all-targets --all-features -- -D warnings   # CI lint
 bash scripts/check_dep_guards.sh        # CI dependency guards
 cargo nextest run --lib --bins          # unit tests
-cargo nextest run test_create_conversation                  # tests matching a name
+cargo nextest run --test e2e_all -E 'test(responses_stateless)'   # stateless Responses coverage
 cargo nextest run --test e2e_all        # database-backed e2e (needs PostgreSQL)
 cargo nextest run --test e2e_all -E 'test(/^module_name::test_name$/)'   # one e2e test
 TEST_DATABASE_NAME=platform_api_e2e_local cargo nextest run --test e2e_all   # per-checkout e2e DB
@@ -35,36 +39,7 @@ cargo nextest run --test integration_tests   # vLLM integration (needs a vLLM se
 Local PostgreSQL for tests:
 
 ```bash
-# Run unit tests (library and binary tests only)
-cargo nextest run --lib --bins
-
-# Run all database-backed e2e tests (requires PostgreSQL running)
-cargo nextest run --test e2e_all
-
-# Run one e2e test exactly
-cargo nextest run --test e2e_all -E 'test(/^module_name::test_name$/)'
-
-# Run the stateless Responses e2e module
-cargo nextest run --test e2e_all -E 'test(responses_stateless)'
-
-# Run vLLM integration tests (requires vLLM server)
-cargo nextest run --test integration_tests
-
-# Run a specific test by name
-cargo nextest run --test e2e_all -E 'test(responses_stateless::completed_stateless_response_exposes_gateway_signature_when_persisted)'
-```
-
-### Database Setup for Tests
-```bash
-# Using Docker (recommended)
-docker run --name test-postgres \
-  -e POSTGRES_PASSWORD=postgres \
-  -e POSTGRES_DB=platform_api \
-  -p 5432:5432 \
-  -d postgres:latest
-
-# Then run tests against a database dedicated to this checkout
-TEST_DATABASE_NAME=platform_api_e2e_local cargo nextest run --test e2e_all
+docker run --name test-postgres -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=platform_api -p 5432:5432 -d postgres:latest
 ```
 
 ## Architecture
@@ -75,7 +50,7 @@ Cargo workspace:
 crates/
 ├── api/                  # HTTP routes and server (Axum)
 ├── services/             # domain logic; each domain declares its traits in ports.rs
-├── database/             # repositories implementing those traits; SQL migrations
+├── database/             # repositories implementing those traits
 ├── config/               # environment-based configuration
 └── inference_providers/  # inference backend abstraction (vLLM and attested providers)
 ```
@@ -99,120 +74,43 @@ Organization (tenant root)
 - **Session-based OAuth** (GitHub, Google) for management: `/v1/organizations/*`, `/v1/workspaces/*`, `/v1/users/*`. The hashed session token is stored in the database and returned as an HTTP-only cookie.
 - **API keys** for inference: `/v1/chat/completions`, `/v1/responses/*`, `/v1/conversations/*`, attestation. `Authorization: Bearer sk-live-...` or `sk-test-...`; SHA-256 hashed, workspace-scoped, with last-used tracking and optional expiry.
 
-**2. API Key-Based (AI Inference Operations)**
-- Used for: Chat completions, Responses, and attestation
-- Endpoints: `/v1/chat/completions`, `POST /v1/responses`, `/v1/signature/{chat_id}`, `/v1/attestation/*`
-- Format: `Authorization: Bearer sk-live-xxx` or `Authorization: Bearer sk-test-xxx`
-- Storage: SHA-256 hashed, workspace-scoped
-- Tracking: Last used timestamp, optional expiration
+The separation is deliberate: interactive users manage resources, programs run inference, and each plane has a clear security boundary. Never let one route accept both.
 
 ### Inference
 
 - **Chat Completions** (`POST /v1/chat/completions`, `/v1/completions`): drop-in OpenAI-compatible API, SSE streaming with a `[DONE]` terminator, plus non-streaming.
-- **Responses** (`POST /v1/responses`): linked to conversation history, with events `response.created`, `response.output_text.delta`, `response.completed`, `response.failed`. Supports client-executed tools (function calls, code_interpreter, computer) and server-executed web_search, file_search, and MCP. On a function call the response pauses as `incomplete`; the client resumes with `previous_response_id` plus `FunctionCallOutput`. Resumption verifies workspace ownership of `previous_response_id` and that each `call_id` maps to exactly one stored function call.
+- **Responses** (`POST /v1/responses`): stateless, with events `response.created`, `response.output_text.delta`, `response.completed`, and `response.failed`. Omitted `store` is normalized to `false`; `store: true`, `conversation`, `previous_response_id`, and `background: true` are rejected. Clients provide all prior context in each request.
+  - The default typed adapter makes one Chat Completions inference. A canonical model explicitly listed in `NATIVE_RESPONSES_MODELS`, with explicit `store: false`, instead uses one provider-native Responses inference. Neither path writes raw response/item history.
+  - Only client-managed custom `type: "function"` tools are supported. Cloud returns a `function_call` without executing it; the client supplies that call and its matching `function_call_output` in the next request. Builtin/remote tools, file input, and image-generation/editing output models are rejected. The independent root `POST /mcp` web-search endpoint is retained.
+  - Completed-response gateway attestation remains best-effort: when persistence succeeds, `GET /v1/signature/resp_*` returns signatures over request/response digests, not raw content. Interrupted streams create no partial `resp_*` attestation record.
+  - Named response-history routes (`/v1/responses/{id}`, its `/cancel` and `/input_items` paths) return authenticated `410 Gone`.
 
 Streaming flow:
 
 ```
-POST /v1/chat/completions
-POST /v1/completions
-```
-- Drop-in replacement for OpenAI API
-- Supports streaming (SSE) and non-streaming
-- Standard OpenAI format with `[DONE]` terminator
-
-**B. Responses API (single-turn, stateless)**
-```
-POST /v1/responses
-```
-- `store: false` is the only supported mode; an omitted `store` is treated as `false` and `store: true` is rejected
-- Clients send all needed prior context in each request. Conversations, `previous_response_id`, background responses, and response-history endpoints are retired or unsupported.
-- Raw request/response content, response items, and conversation history are not persisted.
-- The default typed adapter makes one Chat Completions inference. A canonical model explicitly allowlisted through `NATIVE_RESPONSES_MODELS`, with an explicit `store: false` request, instead makes one native provider Responses inference; both paths remain stateless and write no response/item history.
-- **Existing completed-response attestation is preserved best-effort**: when its signature write succeeds, `GET /v1/signature/resp_*` can retrieve the response ID and signatures over SHA-256 request/response digests. The signature material contains no raw request or response content. A disconnected stream has no completed `resp_*` attestation record or legacy disconnect fallback.
-- Event types: `response.created`, `response.output_text.delta`, `response.completed`, `response.failed`
-- Only custom `type: "function"` tools are supported. They are client-managed: Cloud returns a `function_call` but never executes it; the client sends the original call and its matching `function_call_output` in a later fresh `store: false` request with its own history.
-- Server-executed Responses tools—including `web_search`, `web_context_search`, `file_search`, `code_interpreter`, `computer`, and remote `mcp`—plus file input and image-generation/editing output models are rejected. The independent root `POST /mcp` endpoint continues to expose web search and is not part of Responses execution.
-- During Stage I, existing Conversation/File data remains available through authenticated, workspace-scoped migration routes: `POST /v1/conversations/batch`, `GET /v1/conversations/{conversation_id}`, `GET /v1/conversations/{conversation_id}/items`, `DELETE /v1/conversations/{conversation_id}`, `GET /v1/files`, `GET /v1/files/{file_id}`, `GET /v1/files/{file_id}/content`, and `DELETE /v1/files/{file_id}`. They return `Cache-Control: no-store`; creation, upload, all other mutations, and unsupported legacy paths return `410 Gone`.
-
-**Streaming Flow**:
-```
-Client → CompletionService → Provider Pool (round-robin)
-    → vLLM Provider → Inference Server → SSE Stream
-    → InterceptStream (captures TTFT, ITL, tokens)
-    → Usage tracking (atomic with completion)
+Client → CompletionService → Provider Pool → provider → inference server → SSE
+    → InterceptStream (TTFT, ITL, token counts) → usage tracking (atomic with completion)
 ```
 
-### Dynamic Model Discovery
-- Discovery Server polled every 5 minutes (configurable)
-- `GET /models` returns available models and their vLLM endpoints
-- Provider Pool updated dynamically (no hardcoded models)
-- Load balancing: round-robin for new requests
+The engine is streaming-first: tokens reach users in real time, usage is tracked during the stream rather than after, and non-streaming clients get the collected stream.
+
+### Temporary Stage I data access
+
+Existing Conversation/File data remains available through authenticated, workspace-scoped routes with `Cache-Control: no-store`:
+
+- Retrieval: `POST /v1/conversations/batch`, `GET /v1/conversations/{id}`, `GET /v1/conversations/{id}/items`, `GET /v1/files`, `GET /v1/files/{id}`, and `GET /v1/files/{id}/content`.
+- Resource deletion: `DELETE /v1/conversations/{id}` and `DELETE /v1/files/{id}` remain available for the existing account-deletion workflow.
+- Creation, upload, all other mutations, and unsupported legacy Conversation/File paths return `410 Gone`.
+
+The historical schemas and repositories remain for these bounded routes. Data deletion and schema removal are separate work; retired APIs must not be wired back to them.
 
 ### Model discovery
 
-Historical Conversation, Response, ResponseItem, and File schemas/repositories remain for now,
-but the retired public APIs must not be wired back to them. Data deletion and schema removal are
-separate work.
-
-### External Billing / Credits Service
+A discovery server is polled (every 5 minutes by default). `GET /models` returns models and their endpoints, and the provider pool updates dynamically, so there are no hardcoded models: capacity scales as servers are added or removed and failed providers drop out. New requests are balanced round-robin; conversations use sticky routing.
 
 ### Database
 
-- `../nearai-cloud-ui/app/api/stripe/webhook/route.ts` handles Stripe checkout webhooks.
-- `../nearai-cloud-ui/app/api/credit/sync/route.ts` recalculates payment credits from Stripe + Hot Labs.
-- `../nearai-cloud-ui/lib/webhook-utils.ts` calls `PATCH /v1/admin/organizations/{org_id}/limits`.
-
-That service uses `NEAR_AI_CLOUD_ADMIN_ACCESS_TOKEN` and optional `BILLING_SERVICE_USER_AGENT`
-to update organization spend limits in Cloud API after purchases/refunds or manual syncs.
-In Cloud API, the target endpoint is `crates/api/src/routes/admin.rs` (`update_organization_limits`).
-
-## Critical Files & Locations
-
-### Adding a New API Endpoint
-1. Create route handler in `crates/api/src/routes/`
-2. Implement service in `crates/services/src/{domain}/`
-   - Define trait in `ports.rs`
-   - Implement service in `mod.rs` or `service.rs`
-3. Add repository if needed in `crates/database/src/repositories/`
-4. Map route in `crates/api/src/lib.rs` (see `routes()` function)
-
-### Service Modules (16 total)
-Located in `crates/services/src/`:
-- `auth` - Session creation, JWT, OAuth2
-- `organization` - Org management, member roles, invitations
-- `workspace` - Workspace CRUD, settings
-- `user` - User profiles, session management
-- `completions` - AI completion orchestration
-- `conversations` - Legacy state module with temporary Stage I migration routes; only per-conversation deletion remains enabled
-- `responses` - Request-scoped, stateless response orchestration with client-managed custom function calls
-- `attestation` - TEE attestation reports, chat signatures
-- `models` - Model catalog and pricing
-- `usage` - Token tracking, limit enforcement, billing
-- `inference_provider_pool` - Model discovery, load balancing
-- `mcp` - Model Context Protocol client management
-- `files` - Legacy state module with temporary Stage I migration routes; only per-file deletion remains enabled
-- `metrics` - OpenTelemetry metrics
-- `admin` - Admin operations, analytics
-- `common` - Shared utilities
-
-### Route Handlers (18 total)
-Located in `crates/api/src/routes/`:
-- `auth.rs` - OAuth flows, login, logout, sessions
-- `organizations.rs` - Organization CRUD
-- `organization_members.rs` - Member management, invitations
-- `workspaces.rs` - Workspace & API key management
-- `users.rs` - User profile, invitations, sessions
-- `completions.rs` - Chat & text completions
-- `conversations.rs` - Temporary authenticated, no-store Stage I migration routes; only per-conversation deletion remains enabled
-- `responses.rs` - Stateless AI response streaming with client-managed custom function calls
-- `models.rs` - Model catalog
-- `usage.rs` - Usage tracking, billing
-- `attestation.rs` - TEE verification, signatures
-- `admin.rs` - Admin endpoints
-- `files.rs` - Temporary authenticated, no-store Stage I migration routes; only per-file deletion remains enabled
-- `health.rs` - Health checks
-- `api.rs` - API versioning
+PostgreSQL 16 with deadpool pooling and Patroni (automatic leader discovery, read-replica balancing). The schema is owned by `nearai/cloud-platform`: cloud-api never migrates at startup. `scripts/apply-schema.sh` applies the pinned schema to local and test databases. See `.claude/rules/database.md`.
 
 ### Configuration
 
@@ -235,37 +133,14 @@ Each rule has one home; other files point to it rather than restating it.
 | `.claude/rules/privacy-logging.md` | `crates/**/*.rs` | what may and may not be logged |
 | `.claude/rules/architecture.md` | `crates/**/*.rs` | layers, extending existing seams, errors, runtime config, file size |
 | `.claude/rules/rust-correctness.md` | `crates/**/*.rs` | panics, untrusted input, fail-closed, async, races, rolling deploys |
-| `.claude/rules/database.md` | `crates/database/**`, `ports.rs` | typed parsing vs migrations, migration mechanics, queries |
+| `.claude/rules/database.md` | `crates/database/**`, `ports.rs`, moved services and routes | database freeze, typed parsing vs migrations, migration mechanics, queries |
 | `.claude/rules/testing.md` | tests, `.config/nextest.toml` | tests that can fail, e2e isolation on a shared database |
 | `.claude/rules/ci-workflows.md` | `.github/**`, `scripts/**` | workflow trust boundaries, concurrency, required checks |
 | `REVIEW.md` | pull requests | severity, what to report and skip |
 
 ## API documentation
 
-### Why Hexagonal Architecture?
-- Services are framework-independent (can swap Axum for another framework)
-- Easy to mock for testing (inject fake repositories)
-- Domain logic isolated from infrastructure concerns
-- Multiple implementations possible (SQL, cache, mock)
-
-### Why Streaming-First?
-- Real-time token delivery improves UX
-- Usage tracking happens during streaming (not after)
-- SSE provides simple, reliable transport
-- Non-streaming clients can collect stream and return complete response
-
-### Why Dynamic Model Discovery?
-- No hardcoded model configuration
-- Automatic scaling as inference servers added/removed
-- Graceful handling of provider failures
-
-## API Documentation
-
-When server is running:
-- **Scalar UI**: http://localhost:3000/docs
-- **OpenAPI Spec**: http://localhost:3000/api-docs/openapi.json
-
-Generated from Rust code using `utoipa` annotations.
+With the server running: Scalar UI at http://localhost:3000/docs, OpenAPI spec at http://localhost:3000/api-docs/openapi.json (generated from `utoipa` annotations).
 
 ## Troubleshooting
 

@@ -2127,3 +2127,129 @@ async fn non_usd_capacity_is_not_transferable_and_backing_cannot_change_currency
 
     Ok(())
 }
+
+#[tokio::test]
+async fn reconcile_received_credit_consumption_with_capacity_and_replay_guards(
+) -> anyhow::Result<()> {
+    use database::repositories::credit_reconciliation::CreditReconciliationRepository;
+
+    let pool = test_pool().await?;
+    let (sender, owner) = organization(&pool).await?;
+    let (recipient, _) = organization(&pool).await?;
+    let transfers = CreditTransferRepository::new(pool.clone(), &Default::default());
+    let reconciliations = CreditReconciliationRepository::new(pool.clone());
+
+    fund(&pool, sender.org_id, "payment", 100).await?;
+    transfers
+        .policy(sender.org_id, Some((true, owner, "Test reconciliation")))
+        .await?;
+    transfers
+        .transfer(
+            sender.org_id,
+            &TransferActor::Owner(owner),
+            "received-credit",
+            &request(recipient.org_id, "payment", 50),
+        )
+        .await?;
+
+    // Model reviewed historical spend that has not yet been assigned a type.
+    let client = pool.get().await?;
+    client
+        .execute(
+            "UPDATE organization_balance SET legacy_unattributed_amount = 60 WHERE organization_id = $1",
+            &[&recipient.org_id],
+        )
+        .await?;
+    let excessive = [("transfer".to_string(), 51)].into_iter().collect();
+    let error = reconciliations
+        .reconcile(
+            recipient.org_id,
+            &excessive,
+            "too-much",
+            "Review",
+            owner,
+            false,
+        )
+        .await
+        .unwrap_err();
+
+    assert!(error.to_string().contains("remaining limit"));
+
+    let amounts = [("transfer".to_string(), 20)].into_iter().collect();
+    let preview = reconciliations
+        .reconcile(
+            recipient.org_id,
+            &amounts,
+            "reviewed",
+            "Review",
+            owner,
+            true,
+        )
+        .await?;
+
+    assert!(preview.reconciliation_id.is_none());
+    assert_eq!(preview.before.credits["transfer"].consumed, 0);
+    assert_eq!(preview.after.credits["transfer"].consumed, 20);
+    assert_eq!(preview.after.credits["transfer"].available, 30);
+    assert_eq!(preview.after.legacy_unattributed_amount, 40);
+    assert_eq!(
+        preview.before.aggregate_available,
+        preview.after.aggregate_available
+    );
+
+    let committed = reconciliations
+        .reconcile(
+            recipient.org_id,
+            &amounts,
+            "reviewed",
+            "Review",
+            owner,
+            false,
+        )
+        .await?;
+    let replay = reconciliations
+        .reconcile(
+            recipient.org_id,
+            &amounts,
+            "reviewed",
+            "Review",
+            owner,
+            false,
+        )
+        .await?;
+
+    assert!(committed.reconciliation_id.is_some());
+    assert_eq!(committed.before, preview.before);
+    assert_eq!(committed.after, preview.after);
+    assert_eq!(replay, committed);
+
+    let excessive = [("transfer".to_string(), 31)].into_iter().collect();
+    assert!(reconciliations
+        .reconcile(
+            recipient.org_id,
+            &excessive,
+            "remaining",
+            "Review",
+            owner,
+            false
+        )
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("remaining limit"));
+
+    let audit_count: i64 = client
+        .query_one(
+            "SELECT COUNT(*) FROM organization_credit_reconciliations WHERE organization_id = $1",
+            &[&recipient.org_id],
+        )
+        .await?
+        .get(0);
+    assert_eq!(audit_count, 1);
+    assert_eq!(
+        transfers.reconciliation(recipient.org_id).await?["consistent"],
+        true
+    );
+
+    Ok(())
+}

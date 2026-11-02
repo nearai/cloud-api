@@ -1047,9 +1047,7 @@ pub(super) async fn chat_completions_inner(
 
                                         if let Some(chat_id) = chat_id {
                                             match tokio::time::timeout(
-                                                Duration::from_secs(
-                                                    STREAM_SIGNATURE_STORE_TIMEOUT_SECS,
-                                                ),
+                                                SIGNATURE_STORE_TIMEOUT,
                                                 attestation_service_for_chain.store_chat_signature(
                                                     &chat_id,
                                                     request_hash.clone(),
@@ -1097,9 +1095,7 @@ pub(super) async fn chat_completions_inner(
                                             hex::encode(hasher.clone().finalize())
                                         };
                                         match tokio::time::timeout(
-                                            Duration::from_secs(
-                                                STREAM_SIGNATURE_STORE_TIMEOUT_SECS,
-                                            ),
+                                            SIGNATURE_STORE_TIMEOUT,
                                             attestation_service_for_chain.store_chat_signature(
                                                 &chat_id,
                                                 request_hash.clone(),

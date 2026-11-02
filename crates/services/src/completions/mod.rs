@@ -1247,14 +1247,7 @@ impl CompletionServiceImpl {
     fn anthropic_cache_write_rate(
         model: &crate::models::ModelWithPricing,
     ) -> Result<Option<i64>, ports::CompletionError> {
-        let is_anthropic = model.provider_type == "external"
-            && model
-                .provider_config
-                .as_ref()
-                .and_then(|config| config.get("backend"))
-                .and_then(serde_json::Value::as_str)
-                == Some("anthropic");
-        if !is_anthropic {
+        if !model.is_anthropic_backend() {
             return Ok(None);
         }
 

@@ -13,8 +13,12 @@
 //! work. `ANTHROPIC_DENIED_BETAS` is the global operator kill-switch for these
 //! cases; model-specific pricing restrictions need separate policy.
 
+mod signatures;
+#[cfg(test)]
+mod usage_tests;
+
 use crate::middleware::auth::AuthenticatedApiKey;
-use crate::middleware::RequestedModel;
+use crate::middleware::{RequestBodyHash, RequestedModel};
 use crate::models::AnthropicErrorResponse;
 use crate::routes::api::AppState;
 use crate::routes::common::{
@@ -44,6 +48,8 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 use uuid::Uuid;
 
+use signatures::{valid_message_id, MessageSigningContext};
+
 const MAX_SSE_USAGE_LINE_BYTES: usize = 256 * 1024;
 /// Cap on bytes buffered while waiting for `message_start` to reveal the
 /// provider message id at stream start. The id normally arrives in the first
@@ -70,6 +76,12 @@ struct PreparedRequest {
     stream: bool,
     beta_query: bool,
     headers: AnthropicRawHeaders,
+}
+
+struct NativeRequestContext {
+    endpoint: AnthropicRawEndpoint,
+    requested_model: RequestedModel,
+    signing: Option<MessageSigningContext>,
 }
 
 #[derive(Debug)]
@@ -182,34 +194,50 @@ struct NativeBillingSeed {
 #[derive(Default)]
 struct SseUsageParser {
     line_buffer: Vec<u8>,
+    data_buffer: Vec<u8>,
     usage: NativeUsage,
     discarding_oversized_line: bool,
+    discarding_oversized_event: bool,
+    message_started: bool,
+    finished: bool,
+    #[cfg(test)]
+    parsed_events: usize,
 }
 
 impl SseUsageParser {
     fn push(&mut self, bytes: &[u8]) {
-        let mut bytes = bytes;
-        if self.discarding_oversized_line {
-            let Some(newline) = bytes.iter().position(|byte| *byte == b'\n') else {
-                return;
-            };
-            self.discarding_oversized_line = false;
-            bytes = &bytes[newline + 1..];
-        }
-        self.line_buffer.extend_from_slice(bytes);
-        if self.line_buffer.len() > MAX_SSE_USAGE_LINE_BYTES && !self.line_buffer.contains(&b'\n') {
-            self.discarding_oversized_line = true;
-            self.line_buffer.clear();
-            tracing::warn!("Native Anthropic usage tee skipped an oversized SSE line");
+        if self.finished {
             return;
         }
-
-        while let Some(newline) = self.line_buffer.iter().position(|byte| *byte == b'\n') {
-            let mut line = self.line_buffer.drain(..=newline).collect::<Vec<_>>();
+        // Scan each incoming byte once, without repeatedly draining/shifting
+        // a chunk containing many short lines.
+        for segment in bytes.split_inclusive(|byte| *byte == b'\n') {
+            if !self.discarding_oversized_line {
+                if self.line_buffer.len() + segment.len() > MAX_SSE_USAGE_LINE_BYTES {
+                    self.discarding_oversized_line = true;
+                    self.discarding_oversized_event = true;
+                    self.line_buffer.clear();
+                    self.data_buffer.clear();
+                    tracing::warn!("Native Anthropic usage tee skipped an oversized SSE line");
+                } else {
+                    self.line_buffer.extend_from_slice(segment);
+                }
+            }
+            if !segment.ends_with(b"\n") {
+                continue;
+            }
+            if self.discarding_oversized_line {
+                self.discarding_oversized_line = false;
+                continue;
+            }
+            let mut line = std::mem::take(&mut self.line_buffer);
             while matches!(line.last(), Some(b'\n' | b'\r')) {
                 line.pop();
             }
             self.process_line(&line);
+            if self.finished {
+                break;
+            }
         }
     }
 
@@ -218,10 +246,23 @@ impl SseUsageParser {
             let line = std::mem::take(&mut self.line_buffer);
             self.process_line(&line);
         }
+        // EOF/disconnect may leave valid usage without the final SSE separator.
+        self.finish_event();
         std::mem::take(&mut self.usage)
     }
 
     fn process_line(&mut self, line: &[u8]) {
+        if self.finished {
+            return;
+        }
+        if line.is_empty() {
+            self.finish_event();
+            self.discarding_oversized_event = false;
+            return;
+        }
+        if self.discarding_oversized_event {
+            return;
+        }
         let Some(data) = line.strip_prefix(b"data:") else {
             return;
         };
@@ -229,21 +270,49 @@ impl SseUsageParser {
         if data == b"[DONE]" {
             return;
         }
-        let Ok(event) = serde_json::from_slice::<serde_json::Value>(data) else {
+        if self.data_buffer.len() + data.len() + 1 > MAX_SSE_USAGE_LINE_BYTES {
+            self.data_buffer.clear();
+            self.discarding_oversized_event = true;
             return;
-        };
-        self.apply_event(&event);
+        }
+        if !self.data_buffer.is_empty() {
+            self.data_buffer.push(b'\n');
+        }
+        self.data_buffer.extend_from_slice(data);
+    }
+
+    fn finish_event(&mut self) {
+        let data = std::mem::take(&mut self.data_buffer);
+        if self.finished || self.discarding_oversized_event || data.is_empty() {
+            return;
+        }
+        #[cfg(test)]
+        {
+            self.parsed_events += 1;
+        }
+        // SSE joins all data lines before dispatch. Parse only at the event
+        // boundary, rather than re-scanning a growing, incomplete JSON value.
+        if let Ok(event) = serde_json::from_slice::<serde_json::Value>(&data) {
+            self.apply_event(&event);
+        }
     }
 
     fn apply_event(&mut self, event: &serde_json::Value) {
         match event.get("type").and_then(serde_json::Value::as_str) {
             Some("message_start") => {
+                if self.message_started {
+                    return;
+                }
+                // An unusable ID still ends the initial peek. It must not
+                // hold back the stream or be replaced by a later start event.
+                self.message_started = true;
                 let Some(message) = event.get("message") else {
                     return;
                 };
                 self.usage.provider_request_id = message
                     .get("id")
                     .and_then(serde_json::Value::as_str)
+                    .filter(|id| valid_message_id(id))
                     .map(str::to_string);
                 if let Some(usage) = message.get("usage") {
                     self.usage.apply_usage(usage);
@@ -262,6 +331,10 @@ impl SseUsageParser {
                 }
             }
             Some("error") => self.usage.stop_reason = Some(StopReason::ProviderError),
+            Some("message_stop") => {
+                self.usage.stop_reason.get_or_insert(StopReason::Completed);
+                self.finished = true;
+            }
             _ => {}
         }
     }
@@ -381,7 +454,8 @@ impl NativeUsageStream {
     async fn peek_message_id(&mut self) {
         use futures_util::StreamExt as _;
         let mut peeked_bytes = 0usize;
-        while self.parser.usage.provider_request_id.is_none()
+        while !self.parser.message_started
+            && !self.parser.finished
             && peeked_bytes < MAX_STREAM_ID_PEEK_BYTES
         {
             match self.inner.next().await {
@@ -407,19 +481,24 @@ impl NativeUsageStream {
 pub async fn messages(
     State(app_state): State<AppState>,
     Extension(api_key): Extension<AuthenticatedApiKey>,
+    Extension(body_hash): Extension<RequestBodyHash>,
     RawQuery(query): RawQuery,
     headers: HeaderMap,
     requested_model: RequestedModel,
     body: Bytes,
 ) -> Response {
+    let signing = MessageSigningContext::new(app_state.attestation_service.clone(), body_hash.hash);
     handle_request(
         app_state,
         api_key,
         query,
         headers,
         body,
-        AnthropicRawEndpoint::Messages,
-        requested_model,
+        NativeRequestContext {
+            endpoint: AnthropicRawEndpoint::Messages,
+            requested_model,
+            signing: Some(signing),
+        },
     )
     .await
 }
@@ -437,9 +516,12 @@ pub async fn count_tokens(
         query,
         headers,
         body,
-        AnthropicRawEndpoint::CountTokens,
-        // Token counting is not inference: nothing reads this slot.
-        RequestedModel::default(),
+        NativeRequestContext {
+            endpoint: AnthropicRawEndpoint::CountTokens,
+            // Token counting is not inference: nothing reads this slot.
+            requested_model: RequestedModel::default(),
+            signing: None,
+        },
     )
     .await
 }
@@ -450,9 +532,13 @@ async fn handle_request(
     query: Option<String>,
     headers: HeaderMap,
     body: Bytes,
-    endpoint: AnthropicRawEndpoint,
-    requested_model: RequestedModel,
+    context: NativeRequestContext,
 ) -> Response {
+    let NativeRequestContext {
+        endpoint,
+        requested_model,
+        signing,
+    } = context;
     let prepared = match prepare_request(
         &headers,
         query.as_deref(),
@@ -568,6 +654,7 @@ async fn handle_request(
         billing,
         concurrent_slot,
         alias_from,
+        signing,
     )
     .await
 }
@@ -995,6 +1082,7 @@ async fn build_upstream_response(
     billing: Option<NativeBillingContext>,
     concurrent_slot: Option<ConcurrentRequestGuard>,
     alias_from: Option<String>,
+    signing: Option<MessageSigningContext>,
 ) -> Response {
     let status = upstream.status;
     if status.is_success() && endpoint == AnthropicRawEndpoint::Messages && !stream {
@@ -1022,15 +1110,42 @@ async fn build_upstream_response(
         };
         let reason = usage.stop_reason.clone().unwrap_or(StopReason::Incomplete);
         let inference_id = usage.inference_id();
-        if let Some(billing) = billing {
-            if let Err(error) = record_native_usage(billing, usage, reason).await {
-                tracing::error!(error = %error, "Failed to record native Anthropic usage");
-                return anthropic_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "api_error",
-                    "Failed to record usage",
-                );
+        let message_id = usage.provider_request_id.clone();
+        let response_hash = signatures::body_hash(&bytes);
+        // Once a full response has arrived, cancellation must not interrupt
+        // billing or receipt storage. Only hashes/IDs enter the signing task.
+        let finalized = tokio::spawn(async move {
+            if let Some(billing) = billing {
+                record_native_usage(billing, usage, reason).await?;
             }
+            if let (Some(signing), Some(id)) = (signing, message_id) {
+                signing.store(id, response_hash).await;
+            }
+            Ok::<_, services::usage::UsageError>(())
+        })
+        .await;
+        let failed = match finalized {
+            Ok(Ok(())) => false,
+            Ok(Err(error)) => {
+                tracing::error!(error = %error, "Failed to record native Anthropic usage");
+                true
+            }
+            Err(error) => {
+                // JoinError's Display can include an arbitrary panic payload.
+                tracing::error!(
+                    task_panicked = error.is_panic(),
+                    task_cancelled = error.is_cancelled(),
+                    "Native Anthropic usage finalization task failed"
+                );
+                true
+            }
+        };
+        if failed {
+            return anthropic_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "api_error",
+                "Failed to record usage",
+            );
         }
         return response_from_bytes(status, upstream.headers, bytes, alias_from, inference_id);
     }
@@ -1041,6 +1156,8 @@ async fn build_upstream_response(
         // client disconnect (or the peek timeout) during the peek still runs
         // its Drop and records whatever usage the parser has seen.
         let mut usage_stream = NativeUsageStream {
+            // Observe usage before signature framing so cancellation cannot
+            // lose usage in an upstream chunk or an incomplete SSE frame.
             inner: upstream.body,
             parser: SseUsageParser::default(),
             prelude: VecDeque::new(),
@@ -1056,7 +1173,11 @@ async fn build_upstream_response(
                 "Native Anthropic stream did not reveal a message id before response start"
             );
         }
-        Body::from_stream(usage_stream)
+        let usage_stream: AnthropicRawBody = Box::pin(usage_stream);
+        Body::from_stream(match signing {
+            Some(signing) => signatures::signed_stream(usage_stream, signing),
+            None => usage_stream,
+        })
     } else {
         Body::from_stream(upstream.body)
     };
@@ -1085,6 +1206,7 @@ fn parse_non_stream_usage(body: &[u8]) -> Result<NativeUsage, &'static str> {
         provider_request_id: response
             .get("id")
             .and_then(serde_json::Value::as_str)
+            .filter(|id| valid_message_id(id))
             .map(str::to_string),
         input_tokens,
         output_tokens,
@@ -1586,11 +1708,11 @@ redact-thinking-2026-02-12";
     fn sse_usage_parser_resumes_after_oversized_content_line() {
         let mut parser = SseUsageParser::default();
         parser.push(
-            b"data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_stream\",\"usage\":{\"input_tokens\":4}}}\n",
+            b"data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_stream\",\"usage\":{\"input_tokens\":4}}}\n\n",
         );
         parser.push(&vec![b'x'; MAX_SSE_USAGE_LINE_BYTES + 1]);
         parser.push(
-            b"\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":9}}\n",
+            b"\n\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":9}}\n",
         );
         let usage = parser.finish();
 
@@ -1760,8 +1882,9 @@ redact-thinking-2026-02-12";
     /// Returning Err spares constructing a full UsageLogEntry — the request
     /// is captured before the result is inspected.
     #[derive(Default)]
-    struct RecordingUsageService {
-        records: std::sync::Mutex<Vec<RecordUsageServiceRequest>>,
+    pub(super) struct RecordingUsageService {
+        pub(super) records: std::sync::Mutex<Vec<RecordUsageServiceRequest>>,
+        pub(super) panic_on_record: bool,
     }
 
     #[async_trait::async_trait]
@@ -1770,6 +1893,7 @@ redact-thinking-2026-02-12";
             &self,
             request: RecordUsageServiceRequest,
         ) -> Result<services::usage::UsageLogEntry, services::usage::UsageError> {
+            assert!(!self.panic_on_record, "fixture usage panic");
             self.records
                 .lock()
                 .expect("records mutex should not poison")
@@ -1889,7 +2013,9 @@ redact-thinking-2026-02-12";
         }
     }
 
-    fn billing_context(usage_service: Arc<RecordingUsageService>) -> NativeBillingContext {
+    pub(super) fn billing_context(
+        usage_service: Arc<RecordingUsageService>,
+    ) -> NativeBillingContext {
         NativeBillingContext {
             usage_service,
             organization_id: Uuid::new_v4(),
@@ -1904,7 +2030,7 @@ redact-thinking-2026-02-12";
 
     /// Billing runs on a spawned blocking task after the stream finishes;
     /// poll briefly instead of racing it.
-    async fn wait_for_recorded_usage(
+    pub(super) async fn wait_for_recorded_usage(
         usage_service: &RecordingUsageService,
     ) -> RecordUsageServiceRequest {
         for _ in 0..200 {

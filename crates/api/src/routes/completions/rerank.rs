@@ -4,9 +4,19 @@ fn apply_rerank_response_options(
     request: &crate::models::RerankRequest,
     response: &mut inference_providers::RerankResponse,
 ) {
-    response
+    // The model proxy sorts encrypted scores before encryption.
+    if response
         .results
-        .sort_by(|a, b| b.relevance_score.total_cmp(&a.relevance_score));
+        .iter()
+        .all(|r| r.relevance_score.as_number().is_some())
+    {
+        response.results.sort_by(|a, b| {
+            b.relevance_score
+                .as_number()
+                .unwrap()
+                .total_cmp(&a.relevance_score.as_number().unwrap())
+        });
+    }
 
     if let Some(top_n) = request.top_n {
         response.results.truncate(top_n);
@@ -58,17 +68,17 @@ mod rerank_response_options_tests {
             results: vec![
                 inference_providers::RerankResult {
                     index: 2,
-                    relevance_score: 0.4,
+                    relevance_score: 0.4.into(),
                     document: Some(json!({"text": "Tokyo", "multi_modal": null})),
                 },
                 inference_providers::RerankResult {
                     index: 0,
-                    relevance_score: 0.9,
+                    relevance_score: 0.9.into(),
                     document: Some(json!({"text": "Paris", "multi_modal": null})),
                 },
                 inference_providers::RerankResult {
                     index: 1,
-                    relevance_score: 0.1,
+                    relevance_score: 0.1.into(),
                     document: Some(json!({"text": "Berlin", "multi_modal": null})),
                 },
             ],
@@ -87,6 +97,28 @@ mod rerank_response_options_tests {
 
         let indices: Vec<i32> = response.results.iter().map(|result| result.index).collect();
         assert_eq!(indices, vec![0, 2]);
+    }
+
+    #[test]
+    fn encrypted_scores_preserve_provider_order_and_ciphertext() {
+        let wire = json!({
+            "id": "rerank-encrypted", "model": "test",
+            "results": [
+                {"index": 2, "relevance_score": "aabb", "document": {"text": "ccdd"}},
+                {"index": 0, "relevance_score": "eeff"},
+                {"index": 1, "relevance_score": "0011"}
+            ]
+        });
+        let mut response: inference_providers::RerankResponse =
+            serde_json::from_value(wire).unwrap();
+        apply_rerank_response_options(&request(Some(2), Some(false)), &mut response);
+        let output = serde_json::to_value(response).unwrap();
+        assert_eq!(output["results"][0]["index"], 2);
+        assert_eq!(output["results"][1]["index"], 0);
+        assert_eq!(output["results"][0]["relevance_score"], "aabb");
+        assert_eq!(output["results"][1]["relevance_score"], "eeff");
+        assert_eq!(output["results"].as_array().unwrap().len(), 2);
+        assert!(output["results"][0].get("document").is_none());
     }
 
     #[test]

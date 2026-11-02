@@ -31,13 +31,6 @@ async fn main() -> Result<()> {
         .context("Failed to connect to database")?;
     info!("Connected to database");
 
-    // Run migrations
-    database
-        .run_migrations()
-        .await
-        .context("Failed to run migrations")?;
-    info!("Database migrations completed");
-
     // Run seed scripts
     run_seed_scripts(&database).await?;
     info!("Database seeding completed");

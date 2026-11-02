@@ -1131,8 +1131,8 @@ pub struct RerankResponse {
 pub struct RerankResult {
     /// Index of the document in the original input
     pub index: i32,
-    /// Relevance score (typically 0.0 to 1.0)
-    pub relevance_score: f64,
+    /// Relevance score (typically 0.0 to 1.0), or E2EE ciphertext.
+    pub relevance_score: inference_providers::RerankScore,
     /// The document (can be string or object depending on provider)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub document: Option<serde_json::Value>,

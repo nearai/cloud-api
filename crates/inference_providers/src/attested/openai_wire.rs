@@ -288,7 +288,9 @@ pub(crate) fn gate_stream_usage(
 /// An OpenAI request body (as JSON) with `model` pinned, `stream` set, and all
 /// internal/tracing/E2EE-marker keys stripped (never sent to the third party).
 /// Keep in sync with [`INTERNAL_KEYS`] and `ph::LEGACY_DENIED_EXTRA_KEYS`: a new
-/// nearai marker key must be added there or it is forwarded upstream.
+/// nearai marker key must be added there or it is forwarded upstream. Callers
+/// clear `user`, `store` and `metadata` first with
+/// [`ChatCompletionParams::strip_third_party_retention`].
 pub(crate) fn request_body(
     model: &str,
     params: &ChatCompletionParams,

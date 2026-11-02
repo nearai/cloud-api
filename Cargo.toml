@@ -1,6 +1,7 @@
 [workspace]
 members = ["crates/*"]
 resolver = "2"
+exclude = ["vendor/dstack-sdk"]
 
 [workspace.package]
 edition = "2021"
@@ -8,3 +9,9 @@ version = "0.0.0"
 authors = ["support@near.ai"]
 license = "MIT"
 description = "NEAR AI Cloud API"
+
+# Client-only dstack-sdk patch removes the Alloy/Ethereum dependency chain
+# affected by RUSTSEC-2026-0387. See vendor/dstack-sdk/README.md for provenance.
+# Remove when an upstream release supports clients without the affected tree.
+[patch.crates-io]
+dstack-sdk = { path = "vendor/dstack-sdk" }

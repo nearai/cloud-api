@@ -1360,6 +1360,9 @@ impl InferenceProvider for Provider {
         // `request_body` — the upstream may 400 on an unknown `cache_control`
         // content-part field (it only matters on the Anthropic upstream).
         crate::strip_cache_control(&mut params.messages);
+        // Our internal user id, `store` and `metadata` never reach the third
+        // party; a client's own `user` stays in `extra`.
+        params.strip_third_party_retention();
         let body = request_body(&self.model_name, &params, false)
             .map_err(CompletionError::CompletionError)?;
         let model_pub_key = params
@@ -1469,6 +1472,7 @@ impl InferenceProvider for Provider {
         // #666: drop Anthropic prompt-caching breakpoints before serialization
         // (see the non-streaming path for the rationale).
         crate::strip_cache_control(&mut params.messages);
+        params.strip_third_party_retention();
         // Capture the CLIENT's usage intent before `request_body` force-sets
         // `include_usage: true` upstream (we always request usage so billing sees
         // it; #781 L1 gates what the client receives). A client opts in via

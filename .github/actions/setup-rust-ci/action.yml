@@ -25,13 +25,38 @@ runs:
       with:
         components: ${{ inputs.components }}
 
-    - name: Install cargo-nextest
-      uses: taiki-e/install-action@nextest
+    # The dedicated CI runners are persistent and keep ~/.cargo/bin between jobs, so
+    # download these tools only when missing. Two runs on them failed inside
+    # taiki-e/install-action (truncated, then checksum-mismatched nextest download);
+    # versions are pinned so "already installed" is a well-defined check. The pins live
+    # only in this step's env; the install steps read them from its outputs.
+    - name: Check cached cargo tools
+      id: tools
+      shell: bash
+      run: |
+        echo "nextest-version=${NEXTEST_VERSION}" >> "$GITHUB_OUTPUT"
+        echo "sccache-version=${SCCACHE_VERSION}" >> "$GITHUB_OUTPUT"
+        if cargo nextest --version 2>/dev/null | grep -q "cargo-nextest ${NEXTEST_VERSION}"; then
+          echo "nextest=true" >> "$GITHUB_OUTPUT"
+        fi
+        if sccache --version 2>/dev/null | grep -q "sccache ${SCCACHE_VERSION}"; then
+          echo "sccache=true" >> "$GITHUB_OUTPUT"
+        fi
+      env:
+        NEXTEST_VERSION: 0.9.150
+        SCCACHE_VERSION: 0.19.0
 
-    - name: Install sccache
+    - name: Install cargo-nextest
+      if: steps.tools.outputs.nextest != 'true'
       uses: taiki-e/install-action@v2
       with:
-        tool: sccache
+        tool: nextest@${{ steps.tools.outputs.nextest-version }}
+
+    - name: Install sccache
+      if: steps.tools.outputs.sccache != 'true'
+      uses: taiki-e/install-action@v2
+      with:
+        tool: sccache@${{ steps.tools.outputs.sccache-version }}
 
     - name: Install mold linker
       shell: bash

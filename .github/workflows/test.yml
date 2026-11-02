@@ -12,6 +12,9 @@ on:
   # Include stacked PRs targeting another feature branch.
   pull_request:
 
+permissions:
+  contents: read
+
 # A new push to a PR supersedes the previous run, so cancel it instead of letting
 # it hold self-hosted runners. Non-PR runs get a unique group (run_id): a shared
 # group would serialize main/develop pushes and GitHub would cancel the pending
@@ -28,8 +31,8 @@ env:
   # swatinem/rust-cache (which caches target/) by caching at the object-file
   # granularity, so dependency recompiles after a Cargo.lock bump or a
   # feature-flag change are served from cache. On a self-hosted runner the
-  # default cache dir (~/.cache/sccache) persists across runs on disk, so
-  # no actions/cache step is needed.
+  # cache dir persists across runs on disk (the dedicated CI host sets
+  # SCCACHE_DIR per repo), so no actions/cache step is needed.
   RUSTC_WRAPPER: sccache
   # Use the mold linker on Linux for much faster linking of the large test
   # binaries (5-crate workspace, ~400 deps). We pass -fuse-ld=mold through
@@ -83,7 +86,7 @@ jobs:
           # and none of it is Rust-relevant.
           RUST=true
           if [ -n "$CHANGED" ] && ! echo "$CHANGED" | grep -qE \
-            '(\.rs$|(^|/)Cargo\.(toml|lock)$|^crates/[^/]+/src/.*\.json$|^crates/database/src/migrations/|^\.github/workflows/test\.yml$|^\.github/actions/setup-rust-ci/|^\.config/nextest\.toml$|^rust-toolchain\.toml$|^\.cargo/config\.toml$|^scripts/check_dep_guards\.sh$)'; then
+            '(\.rs$|(^|/)Cargo\.(toml|lock)$|^crates/[^/]+/src/.*\.json$|^scripts/apply-schema\.sh$|^scripts/cloud-platform-schema\.env$|^\.github/workflows/test\.yml$|^\.github/actions/setup-rust-ci/|^\.config/nextest\.toml$|^rust-toolchain\.toml$|^\.cargo/config\.toml$|^scripts/check_dep_guards\.sh$)'; then
             RUST=false
           fi
           echo "rust=$RUST" >> "$GITHUB_OUTPUT"
@@ -91,9 +94,15 @@ jobs:
 
   lint:
     name: Lint
+    timeout-minutes: 30
     needs: changes
     if: ${{ needs.changes.outputs.rust == 'true' }}
-    runs-on: [self-hosted, infra]
+    # Same-repo pushes/PRs run on the dedicated CI host (ci-build-1, no deploy
+    # credentials); fork PRs fall back to GitHub-hosted. A fork could edit this
+    # expression, so the enforcement on ci-build-1 is a root-owned job-started
+    # hook that refuses fork pull requests. Same expression on unit-test,
+    # integration-test and (with the infra label) e2e-test.
+    runs-on: ${{ (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","ci-cloud-api"]') || 'ubuntu-latest' }}
 
     steps:
     - uses: actions/checkout@v7
@@ -119,9 +128,11 @@ jobs:
   # #[test] functions use mocks and do not establish real DB connections.
   unit-test:
     name: Unit tests
+    timeout-minutes: 45
     needs: changes
     if: ${{ needs.changes.outputs.rust == 'true' }}
-    runs-on: [self-hosted, infra]
+    # Fork guard: see the lint job.
+    runs-on: ${{ (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","ci-cloud-api"]') || 'ubuntu-latest' }}
 
     steps:
     - uses: actions/checkout@v7
@@ -134,7 +145,10 @@ jobs:
     - name: Run unit tests
       run: cargo nextest run --lib --bins
       env:
-        POSTGRES_PRIMARY_APP_ID: ${{ secrets.POSTGRES_PRIMARY_APP_ID }}
+        # This job has no `environment:`, so the "Cloud API test env" secrets
+        # were never available here; keep the variables set (some config
+        # loaders panic when unset) but empty, without referencing secrets.
+        POSTGRES_PRIMARY_APP_ID: ""
         DATABASE_HOST: localhost
         DATABASE_PORT: 5432
         DATABASE_NAME: platform_api
@@ -142,11 +156,11 @@ jobs:
         DATABASE_PASSWORD: postgres
         DATABASE_MAX_CONNECTIONS: 5
         DATABASE_TLS_ENABLED: "false"
-        MODEL_DISCOVERY_SERVER_URL: ${{ secrets.MODEL_DISCOVERY_SERVER_URL }}
-        MODEL_DISCOVERY_API_KEY: ${{ secrets.MODEL_DISCOVERY_API_KEY }}
-        AUTH_ADMIN_DOMAINS: ${{ secrets.AUTH_ADMIN_DOMAINS }}
-        AUTH_ENCODING_KEY: ${{ secrets.AUTH_ENCODING_KEY }}
-        BRAVE_SEARCH_PRO_API_KEY: ${{ secrets.BRAVE_SEARCH_PRO_API_KEY }}
+        MODEL_DISCOVERY_SERVER_URL: ""
+        MODEL_DISCOVERY_API_KEY: ""
+        AUTH_ADMIN_DOMAINS: ""
+        AUTH_ENCODING_KEY: ""
+        BRAVE_SEARCH_PRO_API_KEY: ""
         DEV: "true"
 
   # vLLM provider integration tests. Uses MockProvider by default
@@ -155,9 +169,11 @@ jobs:
   # block the e2e suite.
   integration-test:
     name: Integration tests
+    timeout-minutes: 45
     needs: changes
     if: ${{ needs.changes.outputs.rust == 'true' }}
-    runs-on: [self-hosted, infra]
+    # Fork guard: see the lint job.
+    runs-on: ${{ (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","ci-cloud-api"]') || 'ubuntu-latest' }}
 
     steps:
     - uses: actions/checkout@v7
@@ -168,15 +184,13 @@ jobs:
         cache-key: integration
 
     - name: Run integration tests
+      # MockProvider unless USE_REAL_VLLM is set; the real-vLLM test is #[ignore].
       run: cargo nextest run --test integration_tests
-      env:
-        VLLM_BASE_URL: ${{ secrets.VLLM_BASE_URL }}
-        VLLM_API_KEY: ${{ secrets.VLLM_API_KEY }}
 
   # End-to-end tests. All e2e tests are compiled into a single binary
   # (tests/e2e_all/) for faster linking. Isolation comes from UUID-scoped
   # orgs/workspaces/keys on a shared database, not separate databases.
-  # A nextest setup script creates/migrates that database exactly once, then
+  # A nextest setup script creates that database and applies the schema exactly once, then
   # e2e concurrency is capped by .config/nextest.toml at 4 active tests. Most
   # pools are capped at 4 connections; even tests with a second pool leave
   # PostgreSQL headroom for runner-side services.
@@ -185,8 +199,14 @@ jobs:
     timeout-minutes: 60
     needs: changes
     if: ${{ needs.changes.outputs.rust == 'true' }}
-    runs-on: [self-hosted, infra]
-    environment: Cloud API test env
+    # Fork guard: see the lint job.
+    # Runs on the dedicated CI runners: on the shared infra (gpu) runners the schema
+    # migrator container cannot reach the postgres service.
+    runs-on: ${{ (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","ci-cloud-api"]') || 'ubuntu-latest' }}
+    permissions:
+      contents: read
+      # Pulls the cloud-platform schema image (scripts/cloud-platform-schema.env).
+      packages: read
 
     services:
       postgres:
@@ -202,8 +222,9 @@ jobs:
           --health-retries 5
           --shm-size=256mb
         ports:
-          # E2E clients run on the host; keep the temporary test database local.
-          - 127.0.0.1:5432:5432
+          # E2E clients run on the host; keep the temporary test database local. Docker picks
+          # the host port, so concurrent jobs on a shared runner host don't collide.
+          - 127.0.0.1::5432
 
     steps:
     - uses: actions/checkout@v7
@@ -213,37 +234,54 @@ jobs:
       with:
         cache-key: e2e
 
-    - name: Run typed-query, credit-allocation, credit-transfer, session, and binding regressions
+    # The schema comes from nearai/cloud-platform. The database helpers and the nextest
+    # bootstrap run scripts/apply-schema.sh, which pulls the pinned image. The login goes into
+    # a job-private DOCKER_CONFIG, so no credential is left in the shared runner's docker
+    # config; the cleanup step at the end of the job removes it.
+    - name: Log in to GHCR for the cloud-platform schema image (job-private config)
       run: |
-        cargo test --locked -p database --test hot_path_typed_queries --test billing_typed_queries --test credit_allocation --test session_rotation --test staking_wallet_binding -- --test-threads=4
+        docker_config="$RUNNER_TEMP/docker-config-e2e"
+        mkdir -p "$docker_config"
+        chmod 700 "$docker_config"
+        echo "DOCKER_CONFIG=$docker_config" >> "$GITHUB_ENV"
+        DOCKER_CONFIG="$docker_config" bash -c 'echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin'
+      env:
+        GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Run typed-query, credit, analytics, session, and binding regressions
+      run: |
+        cargo test --locked -p database --test hot_path_typed_queries --test billing_typed_queries --test credit_allocation --test session_rotation --test staking_wallet_binding --test organization_credit_metrics -- --test-threads=4
         # Fault injection changes shared table constraints; isolate this binary.
         cargo test --locked -p database --test credit_transfers -- --test-threads=1
       env:
         PGHOST: localhost
-        PGPORT: 5432
+        PGPORT: ${{ job.services.postgres.ports['5432'] }}
         PGDATABASE: platform_api
         PGUSER: postgres
         PGPASSWORD: postgres
 
     - name: Run e2e tests
       run: cargo nextest run --test e2e_all
+      # No secrets: the e2e harness builds its config in crates/api/tests/common (mock auth
+      # key, mock inference providers) and reads no auth or discovery secrets.
       env:
-        POSTGRES_PRIMARY_APP_ID: ${{ secrets.POSTGRES_PRIMARY_APP_ID }}
+        # The app builds the Brave provider at startup and panics without a key; no e2e test
+        # calls the real Brave API, so a placeholder is enough.
+        BRAVE_SEARCH_PRO_API_KEY: e2e-placeholder
         DATABASE_HOST: localhost
-        DATABASE_PORT: 5432
+        DATABASE_PORT: ${{ job.services.postgres.ports['5432'] }}
         DATABASE_NAME: platform_api
         DATABASE_USERNAME: postgres
         DATABASE_PASSWORD: postgres
         DATABASE_MAX_CONNECTIONS: 5
         DATABASE_TLS_ENABLED: "false"
-        MODEL_DISCOVERY_SERVER_URL: ${{ secrets.MODEL_DISCOVERY_SERVER_URL }}
-        MODEL_DISCOVERY_API_KEY: ${{ secrets.MODEL_DISCOVERY_API_KEY }}
-        AUTH_ENCODING_KEY: ${{ secrets.AUTH_ENCODING_KEY }}
-        AUTH_ADMIN_DOMAINS: ${{ secrets.AUTH_ADMIN_DOMAINS }}
-        BRAVE_SEARCH_PRO_API_KEY: ${{ secrets.BRAVE_SEARCH_PRO_API_KEY }}
         TEST_DATABASE_NAME: platform_api_e2e
         RUST_LOG: debug
         DEV: "true"
+
+    - name: Remove the job-private GHCR login
+      if: always()
+      run: rm -rf "$RUNNER_TEMP/docker-config-e2e"
 
   script-test:
     name: Script tests

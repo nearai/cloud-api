@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 //! Test utilities for e2e tests.
 //!
-//! All tests share a single database (bootstrapped once with migrations).
+//! All tests share a single database (bootstrapped once with the cloud-platform schema).
 //! Each test gets its own 4-connection pool. Isolation comes from UUID-scoped
 //! orgs/workspaces/keys, not separate databases.
 

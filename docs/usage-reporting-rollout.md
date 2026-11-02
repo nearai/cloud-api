@@ -11,8 +11,10 @@ Run the out-of-band script outside a transaction during a low-traffic window:
 ```bash
 psql "$DATABASE_URL" \
   --set ON_ERROR_STOP=1 \
-  --file crates/database/src/migrations/out_of_band/usage_reporting_indexes.sql
+  --file path/to/cloud-platform/crates/schema/migrations/out_of_band/usage_reporting_indexes.sql
 ```
+
+The script is owned by `nearai/cloud-platform`, at `crates/schema/migrations/out_of_band/usage_reporting_indexes.sql` in that repo.
 
 `CREATE INDEX CONCURRENTLY` can leave an invalid index after interruption. Re-run the script only after checking and removing any invalid index with the same name.
 

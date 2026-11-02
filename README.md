@@ -33,13 +33,22 @@ A Rust-based cloud API for AI model inference, conversation management, and orga
    ```
 
    This automatically:
-   - Runs all database migrations
+   - Applies the cloud-platform schema through the compose `schema` service (needs Docker and the pinned image)
    - Seeds the database with development data
    - Starts the API server on http://localhost:3000
 
 For an end-to-end walkthrough — mock auth, creating an org/workspace/API key,
 and exercising chat completions with `curl` — see
 [`docs/local-development.md`](docs/local-development.md).
+
+## Database schema
+
+The schema is owned by [nearai/cloud-platform](https://github.com/nearai/cloud-platform).
+cloud-api has no migrations and never migrates at startup. A schema change lands in
+cloud-platform first; this repo then bumps the image pin in
+`scripts/cloud-platform-schema.env`. `scripts/apply-schema.sh` applies the pinned schema to a
+local or test database; `make dev` applies it through the compose `schema` service. Deploys run
+`cloud-platform migrate` before cloud-api starts.
 
 ## Testing
 
@@ -67,7 +76,7 @@ make test
 
 Tests use the same environment variables as the main application (from `env.example`).
 If environment variables are not set, tests use sensible defaults for local testing.
-The nextest setup script creates and migrates `TEST_DATABASE_NAME` once before the
+The nextest setup script creates `TEST_DATABASE_NAME` and applies the schema once before the
 E2E processes start.
 
 #### Option 1: Using Docker (Recommended)

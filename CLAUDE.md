@@ -10,7 +10,7 @@ Also: API keys and session tokens are SHA-256 hashed before storage, customer da
 
 ## Database freeze
 
-**IMPORTANT: do not add or edit migrations, and do not change SQL, queries, or behavior of the code that moved to `nearai/cloud-platform`, without the matching cloud-platform PR or an owner exception.** cloud-platform now owns the schema; a change here alone silently diverges the two services until phase 2. The full rules and the frozen file list are in `.claude/rules/database.md`.
+**IMPORTANT: cloud-api has no migrations. Schema changes land in `nearai/cloud-platform` first, and this repo only bumps the pin in `scripts/cloud-platform-schema.env`. Do not change SQL, queries, or behavior of the code that moved to `nearai/cloud-platform` without the matching cloud-platform PR or an owner exception.** cloud-platform owns the schema; a change here alone silently diverges the two services until phase 2. The full rules and the frozen file list are in `.claude/rules/database.md`.
 
 ## Project overview
 
@@ -50,7 +50,7 @@ Cargo workspace:
 crates/
 ├── api/                  # HTTP routes and server (Axum)
 ├── services/             # domain logic; each domain declares its traits in ports.rs
-├── database/             # repositories implementing those traits; SQL migrations
+├── database/             # repositories implementing those traits
 ├── config/               # environment-based configuration
 └── inference_providers/  # inference backend abstraction (vLLM and attested providers)
 ```
@@ -96,7 +96,7 @@ A discovery server is polled (every 5 minutes by default). `GET /models` returns
 
 ### Database
 
-PostgreSQL 16 with deadpool pooling and Patroni (automatic leader discovery, read-replica balancing). Refinery SQL migrations in `crates/database/src/migrations/sql/` run on startup. The schema is frozen here: `.claude/rules/database.md`.
+PostgreSQL 16 with deadpool pooling and Patroni (automatic leader discovery, read-replica balancing). The schema is owned by `nearai/cloud-platform`: cloud-api never migrates at startup. `scripts/apply-schema.sh` applies the pinned schema to local and test databases. See `.claude/rules/database.md`.
 
 ### Configuration
 

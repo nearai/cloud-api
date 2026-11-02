@@ -66,8 +66,9 @@ attestation.
 
 ## Rollout validation
 
-Apply the additive migration before the new server handles requests (the normal
-startup migration path does this). Old servers remain compatible with the added
+Apply the additive schema change before the new server handles requests. cloud-platform
+owns it, and the deploy's `cloud-platform migrate` step applies it; cloud-api does not migrate
+at startup. Old servers remain compatible with the added
 column; use a schema-preserving application rollback if needed.
 
 Before production rollout, validate the new Cloud API build against staging CVM

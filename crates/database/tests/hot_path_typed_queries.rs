@@ -7,18 +7,18 @@ use database::repositories::{
     ApiKeyRepository, ModelRepository, OrganizationStakingFarmSourcesRepository,
     OrganizationUsageRepository, WorkspaceRepository,
 };
-use database::{migrations, DbPool, PgAttestationRepository, PgOrganizationRepository};
+use database::{DbPool, PgAttestationRepository, PgOrganizationRepository};
 use deadpool::Runtime;
 use deadpool_postgres::Config;
 use services::attestation::{ports::AttestationRepository as _, ChatSignature, SignatureKind};
 use services::common::hash_api_key;
 use services::completions::ports::OrganizationConcurrentLimitRepository as _;
 use services::staking_farm::{StakingFarmRepository as _, UpsertStakingFarmSourceRequest};
-use tokio::sync::OnceCell;
 use tokio_postgres::NoTls;
 use uuid::Uuid;
 
-static MIGRATED: OnceCell<()> = OnceCell::const_new();
+#[path = "support/schema.rs"]
+mod schema;
 
 fn pool_config() -> Config {
     let mut config = Config::new();
@@ -37,11 +37,10 @@ fn pool_config() -> Config {
 }
 
 async fn test_pool() -> anyhow::Result<DbPool> {
-    let pool = DbPool::new(pool_config().create_pool(Some(Runtime::Tokio1), NoTls)?);
-    MIGRATED
-        .get_or_try_init(|| async { migrations::run(&pool).await })
-        .await?;
-    Ok(pool)
+    schema::ensure_schema().await?;
+    Ok(DbPool::new(
+        pool_config().create_pool(Some(Runtime::Tokio1), NoTls)?,
+    ))
 }
 
 fn signature(algo: &str, text: &str, kind: Option<SignatureKind>) -> ChatSignature {

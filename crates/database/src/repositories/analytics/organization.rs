@@ -16,18 +16,30 @@ use tokio_postgres::Transaction;
 use uuid::Uuid;
 
 // Keep one row per inference request, even when posting and settlement both
-// allocate the requested credit type.
+// allocate the requested credit type. A regular join lets PostgreSQL choose a
+// set-based plan instead of running a correlated aggregate for every request.
+// Multiple report sections share this CTE; PostgreSQL materializes it once.
 const CREDIT_TYPE_USAGE_CTE: &str = r#"
     WITH metric_usage AS (
-        SELECT ul.*, allocation.amount AS filtered_cost
+        SELECT
+            ul.id,
+            ul.workspace_id,
+            ul.api_key_id,
+            ul.model_name,
+            ul.created_at,
+            ul.input_tokens,
+            ul.output_tokens,
+            ul.cache_read_tokens,
+            ul.ttft_ms,
+            ul.avg_itl_ms,
+            SUM(a.amount)::BIGINT AS filtered_cost
         FROM organization_usage_log ul
-        LEFT JOIN LATERAL (
-            SELECT SUM(a.amount)::BIGINT AS amount
-            FROM effective_usage_credit_allocations a
-            WHERE a.inference_usage_id = ul.id AND a.credit_type = $4
-        ) allocation ON true
-        WHERE ul.organization_id = $1 AND ul.created_at >= $2 AND ul.created_at < $3
-          AND allocation.amount > 0
+        JOIN effective_usage_credit_allocations a ON a.inference_usage_id = ul.id
+        WHERE ul.organization_id = $1
+          AND ul.created_at >= $2 AND ul.created_at < $3
+          AND a.organization_id = $1 AND a.credit_type = $4
+        GROUP BY ul.id
+        HAVING SUM(a.amount) > 0
     )
 "#;
 
@@ -135,87 +147,14 @@ fn hourly_metrics_sql() -> MetricsSql {
     }
 }
 
-// ponytail: credit_type filters read raw organization_usage_log because allocations settle after
-// posting (settle_unfunded_usage), so usage_hourly cannot carry them. Ceiling: a filtered window
-// must finish within this repository's statement timeout as a per-org raw scan. Upgrade path: an
-// allocation-aware aggregate recomputed after settlement, once settlement has a completion signal.
-/// Raw usage with saved credit-type allocations for organization `$1` over the exact
-/// `[$2, $3)`, credit type `$4`.
-fn credit_type_metrics_sql() -> MetricsSql {
-    let cte = CREDIT_TYPE_USAGE_CTE;
-    MetricsSql {
-        summary: format!(
-            r#"{cte}
-            SELECT
-                COUNT(*)::bigint as requests,
-                COALESCE(SUM(input_tokens), 0)::bigint as input_tokens,
-                COALESCE(SUM(output_tokens), 0)::bigint as output_tokens,
-                COALESCE(SUM(cache_read_tokens), 0)::bigint as cache_read_tokens,
-                COALESCE(SUM(filtered_cost), 0)::bigint as cost_nano,
-                COUNT(DISTINCT api_key_id)::bigint as unique_api_keys,
-                COUNT(ttft_ms)::bigint as ttft_measured_requests,
-                COUNT(*) FILTER (WHERE ttft_ms < 5000)::bigint as ttft_under_5s_requests,
-                COUNT(*) FILTER (WHERE ttft_ms < 10000)::bigint as ttft_under_10s_requests,
-                COUNT(*) FILTER (WHERE ttft_ms < 60000)::bigint as ttft_under_60s_requests
-            FROM metric_usage
-            "#
-        ),
-        by_workspace: format!(
-            r#"{cte}
-            SELECT
-                w.id as workspace_id,
-                w.name as workspace_name,
-                COUNT(ul.id)::bigint as requests,
-                COALESCE(SUM(ul.input_tokens), 0)::bigint as input_tokens,
-                COALESCE(SUM(ul.output_tokens), 0)::bigint as output_tokens,
-                COALESCE(SUM(ul.cache_read_tokens), 0)::bigint as cache_read_tokens,
-                COALESCE(SUM(ul.filtered_cost), 0)::bigint as cost_nano
-            FROM workspaces w
-            LEFT JOIN metric_usage ul ON ul.workspace_id = w.id
-            WHERE w.organization_id = $1
-            GROUP BY w.id, w.name
-            ORDER BY requests DESC
-            "#
-        ),
-        by_api_key: format!(
-            r#"{cte}
-            SELECT
-                ak.id as api_key_id,
-                ak.name as api_key_name,
-                COUNT(ul.id)::bigint as requests,
-                COALESCE(SUM(ul.filtered_cost), 0)::bigint as cost_nano
-            FROM api_keys ak
-            LEFT JOIN metric_usage ul ON ul.api_key_id = ak.id
-            WHERE ak.workspace_id IN (
-                SELECT id FROM workspaces WHERE organization_id = $1
-            )
-            GROUP BY ak.id, ak.name
-            ORDER BY requests DESC
-            "#
-        ),
-        by_model: format!(
-            r#"{cte}
-            SELECT
-                ul.model_name,
-                COUNT(*)::bigint as requests,
-                COALESCE(SUM(ul.input_tokens), 0)::bigint as input_tokens,
-                COALESCE(SUM(ul.output_tokens), 0)::bigint as output_tokens,
-                COALESCE(SUM(ul.cache_read_tokens), 0)::bigint as cache_read_tokens,
-                COALESCE(SUM(ul.filtered_cost), 0)::bigint as cost_nano,
-                AVG(ul.ttft_ms)::double precision as avg_ttft_ms,
-                PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY ul.ttft_ms)::double precision as p95_ttft_ms,
-                AVG(ul.avg_itl_ms)::double precision as avg_itl_ms,
-                PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY ul.avg_itl_ms)::double precision as p95_itl_ms,
-                COUNT(ul.ttft_ms)::bigint as ttft_measured_requests,
-                COUNT(*) FILTER (WHERE ul.ttft_ms < 5000)::bigint as ttft_under_5s_requests,
-                COUNT(*) FILTER (WHERE ul.ttft_ms < 10000)::bigint as ttft_under_10s_requests,
-                COUNT(*) FILTER (WHERE ul.ttft_ms < 60000)::bigint as ttft_under_60s_requests
-            FROM metric_usage ul
-            GROUP BY ul.model_name
-            ORDER BY requests DESC
-            "#
-        ),
-    }
+// Credit allocations can settle or be reversed after posting, so these reports
+// must read the live ledger rather than usage_hourly. Reuse the filtered rows in
+// one statement instead of repeating the raw scan and allocation join four times.
+fn credit_type_metrics_sql() -> String {
+    format!(
+        "{CREDIT_TYPE_USAGE_CTE}\n{}",
+        include_str!("organization_credit_metrics.sql")
+    )
 }
 
 /// Bind parameters: `$1..$3` are the organization and range; `$4` (raw bodies only) is the
@@ -254,13 +193,33 @@ pub(super) async fn get_organization_metrics_with_client(
     credit_type: Option<&str>,
 ) -> Result<OrganizationMetrics, RepositoryError> {
     let (org_id, start, end) = window;
-    let sql = match credit_type {
-        None => hourly_metrics_sql(),
-        // Raw credit_type body: see the ponytail on credit_type_metrics_sql.
-        Some(_) => credit_type_metrics_sql(),
-    };
-    let params = bind(&org_id, &start, &end, &credit_type);
     let org_name = organization_name(tx, deadline, org_id).await?;
+    let params = bind(&org_id, &start, &end, &credit_type);
+
+    if credit_type.is_some() {
+        arm(tx, deadline).await?;
+        let row = tx
+            .query_one(&credit_type_metrics_sql(), &params)
+            .await
+            .map_err(map_db_error)?;
+
+        return Ok(OrganizationMetrics {
+            organization_id: org_id,
+            organization_name: org_name,
+            period_start: start,
+            period_end: end,
+            summary: serde_json::from_value(row.get("summary"))
+                .map_err(|error| RepositoryError::DataConversionError(error.into()))?,
+            by_workspace: serde_json::from_value(row.get("by_workspace"))
+                .map_err(|error| RepositoryError::DataConversionError(error.into()))?,
+            by_api_key: serde_json::from_value(row.get("by_api_key"))
+                .map_err(|error| RepositoryError::DataConversionError(error.into()))?,
+            by_model: serde_json::from_value(row.get("by_model"))
+                .map_err(|error| RepositoryError::DataConversionError(error.into()))?,
+        });
+    }
+
+    let sql = hourly_metrics_sql();
 
     arm(tx, deadline).await?;
     let summary_row = tx
@@ -384,10 +343,8 @@ pub(super) async fn get_organization_timeseries_with_client(
             "#
             ),
         ),
-        // ponytail: credit_type filters read raw organization_usage_log because allocations settle after
-        // posting (settle_unfunded_usage), so usage_hourly cannot carry them. Ceiling: a filtered window
-        // must finish within this repository's statement timeout as a per-org raw scan. Upgrade path: an
-        // allocation-aware aggregate recomputed after settlement, once settlement has a completion signal.
+        // Use the same live allocation join as the summary report. Daily/weekly
+        // buckets still filter on the original usage time, not settlement time.
         Some(_) => {
             let cte = CREDIT_TYPE_USAGE_CTE;
             format!(

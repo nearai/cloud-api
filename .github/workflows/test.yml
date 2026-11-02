@@ -242,6 +242,10 @@ jobs:
         PGDATABASE: platform_api
         PGUSER: postgres
         PGPASSWORD: postgres
+        # The migrator container joins the job network and reaches the service by its alias;
+        # host networking does not reach the published port on the infra runners.
+        SCHEMA_DOCKER_NETWORK: ${{ job.services.postgres.network }}
+        SCHEMA_PGHOST: postgres
 
     - name: Run e2e tests
       run: cargo nextest run --test e2e_all
@@ -260,6 +264,8 @@ jobs:
         AUTH_ADMIN_DOMAINS: ${{ secrets.AUTH_ADMIN_DOMAINS }}
         BRAVE_SEARCH_PRO_API_KEY: ${{ secrets.BRAVE_SEARCH_PRO_API_KEY }}
         TEST_DATABASE_NAME: platform_api_e2e
+        SCHEMA_DOCKER_NETWORK: ${{ job.services.postgres.network }}
+        SCHEMA_PGHOST: postgres
         RUST_LOG: debug
         DEV: "true"
 

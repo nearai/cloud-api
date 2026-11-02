@@ -20,6 +20,8 @@
 #
 # SCHEMA_DOCKER_NETWORK overrides the docker --network value (default: host). On Docker Desktop,
 # localhost is routed through a single-label alias to the host gateway instead.
+# SCHEMA_PGHOST overrides the host the migrator container connects to, for callers whose PGHOST
+# is right for the host but not for that network (CI: the service alias on the job network).
 set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -70,6 +72,9 @@ if [[ -z "${SCHEMA_DOCKER_NETWORK:-}" && "$docker_os" == "Docker Desktop" \
   net_args=(--add-host "dbhost:host-gateway")
   export PGHOST=dbhost
 fi
+if [[ -n "${SCHEMA_PGHOST:-}" ]]; then
+  export PGHOST="$SCHEMA_PGHOST"
+fi
 
 # The secret is streamed on stdin and read through DB_SECRET_FILE=/dev/stdin, so the
 # password never reaches a file on disk or the process arguments.
@@ -100,7 +105,7 @@ status=$?
 set -e
 
 if [[ $status -ne 0 ]]; then
-  echo "apply-schema: migrate exited with $status (database ${configured_host}:${PGPORT}/${PGDATABASE})." >&2
-  echo "apply-schema: if the container cannot reach that database, set SCHEMA_DOCKER_NETWORK to a docker network that can, or set PGHOST to the address the container should use." >&2
+  echo "apply-schema: migrate exited with $status (database ${PGHOST}:${PGPORT}/${PGDATABASE}, configured as ${configured_host})." >&2
+  echo "apply-schema: if the container cannot reach that database, set SCHEMA_DOCKER_NETWORK to a docker network that can, and SCHEMA_PGHOST (or PGHOST) to the address the container should use." >&2
   exit "$status"
 fi

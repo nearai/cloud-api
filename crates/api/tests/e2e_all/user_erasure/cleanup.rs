@@ -209,7 +209,7 @@ async fn retry_does_not_sweep_retained_team_org() {
     add_member(&database, &team.id, teammate, "member").await;
     get_api_key_for_org_with_session(&server, team.id.clone(), &session).await;
     let team_uuid: uuid::Uuid = team.id.parse().unwrap();
-    seed_retained_conversation(&database, team_uuid).await;
+    seed_conversation_history(&database, team_uuid, 0).await;
     transfer_ownership(&server, &team.id, teammate).await;
 
     assert_eq!(erase(&server, owner, &email).await.status_code(), 200);

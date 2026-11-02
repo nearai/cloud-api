@@ -13,7 +13,7 @@ async fn erase_personal_org_user_removes_content_and_identity_keeps_usage() {
     let usage_before = wait_for_usage(&client, org).await;
     assert!(usage_before > 0, "fixture must produce a usage row");
 
-    let conversation = seed_retained_conversation(&database, org).await;
+    let conversation = seed_conversation_history(&database, org, 0).await.0;
     database::repositories::FileRepository::new(database.pool().clone())
         .create(services::files::ports::CreateFileParams {
             filename: "notes.txt".to_string(),
@@ -191,7 +191,9 @@ async fn erase_after_ownership_transfer_keeps_team_org_and_keys() {
     let team = create_org_with_session(&server, &session).await;
     add_member(&database, &team.id, teammate, "member").await;
     let team_key = get_api_key_for_org_with_session(&server, team.id.clone(), &session).await;
-    let conversation = seed_retained_conversation(&database, team.id.parse().unwrap()).await;
+    let conversation = seed_conversation_history(&database, team.id.parse().unwrap(), 0)
+        .await
+        .0;
     transfer_ownership(&server, &team.id, teammate).await;
 
     assert_eq!(erase(&server, owner, &owner_email).await.status_code(), 200);

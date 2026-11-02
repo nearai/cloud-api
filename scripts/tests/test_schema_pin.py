@@ -26,8 +26,9 @@ class SchemaPinTest(unittest.TestCase):
         self.assertIsNotNone(match, "docker-compose.yml has no CLOUD_PLATFORM_IMAGE default")
         self.assertEqual(match.group(1), pinned_image())
 
-    def test_pin_is_a_tagged_or_digest_reference(self):
-        self.assertRegex(pinned_image(), r"^ghcr\.io/nearai/cloud-platform[:@]\S+$")
+    def test_pin_is_a_digest_reference(self):
+        # Tags can be re-pushed; only the digest fixes which migrations get applied.
+        self.assertRegex(pinned_image(), r"^ghcr\.io/nearai/cloud-platform(:\S+)?@sha256:[0-9a-f]{64}$")
 
 
 if __name__ == "__main__":

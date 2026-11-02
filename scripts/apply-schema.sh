@@ -62,6 +62,7 @@ fi
 
 docker_os="$(docker info --format '{{.OperatingSystem}}' 2>/dev/null || true)"
 net_args=(--network "${SCHEMA_DOCKER_NETWORK:-host}")
+configured_host="$PGHOST"
 if [[ -z "${SCHEMA_DOCKER_NETWORK:-}" && "$docker_os" == "Docker Desktop" \
       && "$PGHOST" =~ ^(localhost|127\.0\.0\.1|::1)$ ]]; then
   # Docker Desktop host networking does not reach the Mac's localhost. The migrator accepts
@@ -85,8 +86,13 @@ print(json.dumps({
 '
 }
 
+if ! secret="$(secret_json)"; then
+  echo "apply-schema: could not build the DB secret (python3 is required and PGPORT must be a number)" >&2
+  exit 1
+fi
+
 set +e
-secret_json | docker run --rm -i "${net_args[@]}" \
+printf '%s' "$secret" | docker run --rm -i "${net_args[@]}" \
   -e DB_SECRET_FILE=/dev/stdin \
   -e CLOUD_PLATFORM_ALLOW_PLAINTEXT_DB=1 \
   "$CLOUD_PLATFORM_IMAGE" migrate
@@ -94,7 +100,7 @@ status=$?
 set -e
 
 if [[ $status -ne 0 ]]; then
-  echo "apply-schema: migrate exited with $status (database ${PGHOST}:${PGPORT}/${PGDATABASE})." >&2
+  echo "apply-schema: migrate exited with $status (database ${configured_host}:${PGPORT}/${PGDATABASE})." >&2
   echo "apply-schema: if the container cannot reach that database, set SCHEMA_DOCKER_NETWORK to a docker network that can, or set PGHOST to the address the container should use." >&2
   exit "$status"
 fi

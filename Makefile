@@ -7,7 +7,7 @@ help:
 	@echo "  make dev           Seed database and run API server (recommended)"
 	@echo ""
 	@echo "Setup & Database:"
-	@echo "  make seed          Apply the cloud-platform schema and seed data"
+	@echo "  make seed          Seed data only (apply the schema first: make dev or scripts/apply-schema.sh)"
 	@echo ""
 	@echo "Running Services:"
 	@echo "  make api           Run the API server (port 3000)"

@@ -322,14 +322,19 @@ async fn apply_schema_script(
     db_name: &str,
 ) -> Result<()> {
     let script = concat!(env!("CARGO_MANIFEST_DIR"), "/../../scripts/apply-schema.sh");
-    let status = tokio::process::Command::new(script)
+    let mut command = tokio::process::Command::new(script);
+    command
         .env("PGHOST", host)
         .env("PGPORT", port.to_string())
         .env("PGUSER", user)
         .env("PGPASSWORD", password)
         .env("PGDATABASE", db_name)
-        .status()
+        .kill_on_drop(true);
+    // Bounds an image pull plus the migrator's own lock wait, so a hang fails and the
+    // bootstrap retry can run instead of stalling with the advisory lock held.
+    let status = tokio::time::timeout(Duration::from_secs(600), command.status())
         .await
+        .context("scripts/apply-schema.sh timed out")?
         .context("run scripts/apply-schema.sh")?;
     anyhow::ensure!(
         status.success(),

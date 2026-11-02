@@ -71,42 +71,6 @@ pub(crate) async fn personal_org_id(server: &axum_test::TestServer, session: &st
         .to_string()
 }
 
-/// Seed content retained from before Stage I disabled conversation writes.
-/// Include the structural response that the former create endpoint produced.
-async fn seed_retained_conversation(
-    database: &std::sync::Arc<database::Database>,
-    org: uuid::Uuid,
-) -> services::conversations::models::Conversation {
-    use services::conversations::ports::ConversationRepository;
-    use services::responses::ports::ResponseRepositoryTrait;
-
-    let row = database
-        .pool()
-        .get()
-        .await
-        .unwrap()
-        .query_one(
-            "SELECT w.id, k.id FROM workspaces w JOIN api_keys k ON k.workspace_id = w.id \
-         WHERE w.organization_id = $1 LIMIT 1",
-            &[&org],
-        )
-        .await
-        .unwrap();
-    let workspace = services::workspace::WorkspaceId(row.get(0));
-    let key = row.get(1);
-    let conversation = database
-        .conversations
-        .create(workspace.clone(), key, serde_json::json!({}))
-        .await
-        .unwrap();
-    database
-        .responses
-        .get_or_create_root_response(conversation.id, workspace, key)
-        .await
-        .unwrap();
-    conversation
-}
-
 pub(crate) async fn preview(
     server: &axum_test::TestServer,
     user_id: uuid::Uuid,

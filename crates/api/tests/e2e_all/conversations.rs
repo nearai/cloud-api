@@ -35,6 +35,15 @@ async fn conversation_migration_routes_require_an_api_key() {
 
     assert_eq!(
         server
+            .post("/v1/conversations")
+            .json(&serde_json::json!({}))
+            .await
+            .status_code(),
+        401,
+        "disabled writes must authenticate before returning the migration response"
+    );
+    assert_eq!(
+        server
             .post("/v1/conversations/batch")
             .json(&serde_json::json!({ "ids": [UNKNOWN_CONVERSATION_ID] }))
             .await
@@ -110,6 +119,56 @@ async fn conversation_migration_routes_reach_workspace_scoped_handlers_and_are_n
 }
 
 #[tokio::test]
+async fn retained_conversation_can_be_deleted_by_its_owner() {
+    let (server, database) = setup_test_server_with_database().await;
+    let org = create_org(&server).await;
+    let api_key = get_api_key_for_org(&server, org.id.clone()).await;
+    let (conversation, _) = seed_conversation_history(&database, org.id.parse().unwrap(), 2).await;
+    let conversation_id = conversation.id.to_string();
+
+    let items = server
+        .get(&format!("/v1/conversations/{conversation_id}/items"))
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .await;
+    assert_eq!(items.status_code(), 200);
+    assert_no_store(&items);
+    assert_eq!(
+        items.json::<api::models::ConversationItemList>().data.len(),
+        2
+    );
+
+    let deleted = server
+        .delete(&format!("/v1/conversations/{conversation_id}"))
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .await;
+    assert_eq!(deleted.status_code(), 200);
+    assert_no_store(&deleted);
+    let deleted: api::models::ConversationDeleteResult = deleted.json();
+    assert_eq!(deleted.id, conversation_id);
+    assert_eq!(deleted.object, "conversation.deleted");
+    assert!(deleted.deleted);
+
+    for suffix in ["", "/items"] {
+        let missing = server
+            .get(&format!("/v1/conversations/{conversation_id}{suffix}"))
+            .add_header("Authorization", format!("Bearer {api_key}"))
+            .await;
+        assert_eq!(missing.status_code(), 404);
+        assert_no_store(&missing);
+    }
+    let batch = server
+        .post("/v1/conversations/batch")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&serde_json::json!({ "ids": [conversation_id] }))
+        .await;
+    assert_eq!(batch.status_code(), 200);
+    assert_no_store(&batch);
+    let batch: api::models::ConversationBatchResponse = batch.json();
+    assert!(batch.data.is_empty());
+    assert_eq!(batch.missing_ids, vec![conversation_id]);
+}
+
+#[tokio::test]
 async fn all_conversation_mutations_except_delete_remain_gone_after_authentication() {
     let server = setup_test_server().await;
     let (api_key, _) = create_org_and_api_key(&server).await;
@@ -167,7 +226,7 @@ async fn all_conversation_mutations_except_delete_remain_gone_after_authenticati
     for (method, path) in routes {
         assert_conversation_write_is_gone(
             server
-                .method(method.clone(), path)
+                .method(method, path)
                 .add_header("Authorization", format!("Bearer {api_key}"))
                 .await,
         );

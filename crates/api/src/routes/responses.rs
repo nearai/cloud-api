@@ -12,6 +12,7 @@ use axum::{
 use bytes::Bytes;
 use futures::stream::StreamExt;
 use services::attestation::ports::AttestationServiceTrait;
+use services::responses::client_tools::{normalize_request, ClientToolAdapter};
 use services::responses::errors::ResponseError as ServiceResponseError;
 use services::responses::models::*;
 use services::responses::ports::ResponseServiceTrait;
@@ -19,9 +20,13 @@ use services::responses::service::ResponseServiceImpl;
 use sha2::{Digest, Sha256};
 use std::convert::Infallible;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 use tracing::debug;
+
+#[path = "responses/client_tool_schema.rs"]
+mod client_tool_schema;
+pub use client_tool_schema::{StatelessResponseToolSchema, StatelessToolChoiceSchema};
 
 /// Bound best-effort attestation persistence so a database problem never
 /// prevents a completed inference response from being delivered.
@@ -34,7 +39,7 @@ const RESPONSE_ATTESTATION_STORE_TIMEOUT: Duration = Duration::from_secs(5);
 /// `store` to `false`. A canonical model explicitly listed in
 /// `NATIVE_RESPONSES_MODELS` uses the provider's native Responses transport
 /// only when `store: false` is explicitly supplied. That exception remains
-/// stateless and permits only client-managed function tools, but can preserve
+/// stateless and permits only client-managed tools, but can preserve
 /// validated provider-native fields that this typed schema does not model.
 #[derive(serde::Deserialize, utoipa::ToSchema)]
 pub struct StatelessCreateResponseRequestSchema {
@@ -60,7 +65,7 @@ pub struct StatelessCreateResponseRequestSchema {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<StatelessResponseToolSchema>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub tool_choice: Option<ResponseToolChoice>,
+    pub tool_choice: Option<StatelessToolChoiceSchema>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parallel_tool_calls: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -104,11 +109,31 @@ pub enum StatelessResponseInputSchema {
 #[derive(serde::Deserialize, utoipa::ToSchema)]
 #[serde(untagged)]
 pub enum StatelessResponseInputItemSchema {
+    AdditionalTools {
+        #[serde(rename = "type")]
+        type_: AdditionalToolsType,
+        /// Must be `developer`; declarations precede the conversation items.
+        role: String,
+        tools: Vec<StatelessResponseToolSchema>,
+    },
+    Reasoning {
+        #[serde(rename = "type")]
+        type_: ReasoningType,
+        #[serde(default)]
+        summary: Vec<ReasoningSummaryPart>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        content: Option<Vec<ReasoningTextPart>>,
+        /// Encrypted-only reasoning requires a native Responses model.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        encrypted_content: Option<String>,
+    },
     FunctionCall {
         #[serde(rename = "type")]
         type_: FunctionCallType,
         call_id: String,
         name: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        namespace: Option<String>,
         arguments: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         thought_signature: Option<String>,
@@ -117,7 +142,22 @@ pub enum StatelessResponseInputItemSchema {
         #[serde(rename = "type")]
         type_: FunctionCallOutputType,
         call_id: String,
-        output: String,
+        output: StatelessToolOutputSchema,
+    },
+    CustomToolCall {
+        #[serde(rename = "type")]
+        type_: CustomToolCallType,
+        call_id: String,
+        name: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        namespace: Option<String>,
+        input: String,
+    },
+    CustomToolCallOutput {
+        #[serde(rename = "type")]
+        type_: CustomToolCallOutputType,
+        call_id: String,
+        output: StatelessToolOutputSchema,
     },
     Message {
         role: String,
@@ -150,16 +190,39 @@ pub enum StatelessResponseContentPartSchema {
 }
 
 #[derive(serde::Deserialize, utoipa::ToSchema)]
+pub enum AdditionalToolsType {
+    #[serde(rename = "additional_tools")]
+    AdditionalTools,
+}
+
+#[derive(serde::Deserialize, utoipa::ToSchema)]
+pub enum CustomToolCallType {
+    #[serde(rename = "custom_tool_call")]
+    CustomToolCall,
+}
+
+#[derive(serde::Deserialize, utoipa::ToSchema)]
+pub enum CustomToolCallOutputType {
+    #[serde(rename = "custom_tool_call_output")]
+    CustomToolCallOutput,
+}
+
+#[derive(serde::Deserialize, utoipa::ToSchema)]
+#[serde(untagged)]
+pub enum StatelessToolOutputSchema {
+    Text(String),
+    Parts(Vec<StatelessToolOutputTextSchema>),
+}
+
+#[derive(serde::Deserialize, utoipa::ToSchema)]
 #[serde(tag = "type")]
-pub enum StatelessResponseToolSchema {
-    #[serde(rename = "function")]
-    Function {
-        name: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        description: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        parameters: Option<serde_json::Value>,
-    },
+pub enum StatelessToolOutputTextSchema {
+    #[serde(rename = "input_text")]
+    InputText { text: String },
+    #[serde(rename = "output_text")]
+    OutputText { text: String },
+    #[serde(rename = "text")]
+    Text { text: String },
 }
 
 // Helper functions for error mapping
@@ -323,16 +386,19 @@ impl StreamingResponseAttestation {
     /// frame itself.
     fn record_event(
         &mut self,
-        event: &ResponseStreamEvent,
+        event: &serde_json::Value,
         sse_bytes: &[u8],
     ) -> Option<(String, String)> {
         if self.response_id.is_none() {
-            self.response_id = event.response.as_ref().map(|response| response.id.clone());
+            self.response_id = event
+                .pointer("/response/id")
+                .and_then(|id| id.as_str())
+                .map(str::to_owned);
         }
 
         self.response_hasher.update(sse_bytes);
 
-        if self.completed || event.event_type != "response.completed" {
+        if self.completed || event["type"] != "response.completed" {
             return None;
         }
         self.completed = true;
@@ -374,20 +440,96 @@ async fn persist_response_attestation(
 /// Store an attestation for a non-streaming response before sending it.
 async fn persist_non_streaming_response_attestation(
     attestation_service: &dyn AttestationServiceTrait,
-    response: &ResponseObject,
+    response_id: &str,
+    response_bytes: &[u8],
     request_hash: String,
 ) {
-    // This serialization is request-local and is immediately reduced to a
-    // digest. The response itself is not written to the attestation store.
-    let response_json = serde_json::to_vec(response).expect("response serialization failed");
-    let response_hash = hex::encode(Sha256::digest(&response_json));
+    let response_hash = hex::encode(Sha256::digest(response_bytes));
     persist_response_attestation(
         attestation_service,
-        &response.id,
+        response_id,
         request_hash,
         response_hash,
     )
     .await;
+}
+
+async fn signed_non_streaming_response(
+    response: ResponseObject,
+    adapter: &ClientToolAdapter,
+    attestation_service: &dyn AttestationServiceTrait,
+    request_hash: String,
+) -> axum::response::Response {
+    let response_json = match serde_json::to_value(&response)
+        .map_err(|_| ())
+        .and_then(|value| adapter.response(value).map_err(|_| ()))
+    {
+        Ok(value) => value,
+        Err(()) => {
+            tracing::error!("Response client-tool serialization failed");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ResponseJson(ErrorResponse::new(
+                    "Failed to serialize the response's client tools".to_string(),
+                    "server_error".to_string(),
+                )),
+            )
+                .into_response();
+        }
+    };
+    // Serialize once: both the attestation and HTTP body use these exact bytes.
+    let response_bytes = response_json.to_string().into_bytes();
+    persist_non_streaming_response_attestation(
+        attestation_service,
+        &response.id,
+        &response_bytes,
+        request_hash,
+    )
+    .await;
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/json")],
+        response_bytes,
+    )
+        .into_response()
+}
+
+fn client_tool_serialization_failure(
+    event: &ResponseStreamEvent,
+    response_id: Option<&str>,
+) -> serde_json::Value {
+    let response = event.response.as_ref();
+    let response_id = response
+        .map(|response| response.id.as_str())
+        .or(response_id)
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("resp_{}", uuid::Uuid::new_v4().simple()));
+    let error = serde_json::json!({
+        "type": "server_error",
+        "code": "server_error",
+        "message": "Failed to serialize the response's client tools",
+        "param": null,
+    });
+    // Do not expose a malformed internal wrapper or retain transcript content
+    // to recover an invariant failure. The service validates calls beforehand.
+    serde_json::json!({
+        "type": "response.failed",
+        "sequence_number": event.sequence_number.unwrap_or(0),
+        "response": {
+            "id": response_id,
+            "object": "response",
+            "created_at": response.map(|response| response.created_at).unwrap_or_else(|| chrono::Utc::now().timestamp()),
+            "model": response.map(|response| response.model.as_str()),
+            "status": "failed",
+            "error": error,
+            "output": [],
+            "usage": event.usage.as_ref().or_else(|| response.map(|response| &response.usage)),
+            "incomplete_details": null,
+            "store": false,
+        },
+        "error": error,
+        "status_code": 500,
+    })
 }
 
 /// Convert response events into signed SSE frames. The response-completed
@@ -396,40 +538,63 @@ async fn persist_non_streaming_response_attestation(
 /// timed-out write does not change the inference result.
 fn signed_response_sse_stream(
     stream: Pin<Box<dyn futures::Stream<Item = ResponseStreamEvent> + Send>>,
+    adapter: ClientToolAdapter,
     attestation_service: Arc<dyn AttestationServiceTrait>,
     request_hash: String,
 ) -> Pin<Box<dyn futures::Stream<Item = Result<Bytes, Infallible>> + Send>> {
-    let signature_state = Arc::new(Mutex::new(StreamingResponseAttestation::default()));
+    let state = (
+        stream,
+        adapter.stream(),
+        StreamingResponseAttestation::default(),
+        false,
+    );
+    Box::pin(futures::stream::unfold(
+        state,
+        move |(mut stream, mut adapter, mut signature_state, ended)| {
+            let attestation_service = attestation_service.clone();
+            let request_hash = request_hash.clone();
+            async move {
+                if ended {
+                    return None;
+                }
+                let event = stream.next().await?;
+                let (event, ended) = match serde_json::to_value(&event)
+                    .map_err(|_| ())
+                    .and_then(|value| adapter.event(value).map_err(|_| ()))
+                {
+                    Ok(value) => (value, false),
+                    Err(()) => {
+                        tracing::error!("Response stream client-tool serialization failed");
+                        (
+                            client_tool_serialization_failure(
+                                &event,
+                                signature_state.response_id.as_deref(),
+                            ),
+                            true,
+                        )
+                    }
+                };
+                let event_type = event["type"].as_str().unwrap_or("response.failed");
+                let sse_bytes = format!("event: {event_type}\ndata: {event}\n\n");
+                let signature = signature_state.record_event(&event, sse_bytes.as_bytes());
 
-    Box::pin(stream.then(move |event| {
-        let signature_state = signature_state.clone();
-        let attestation_service = attestation_service.clone();
-        let request_hash = request_hash.clone();
+                if let Some((response_id, response_hash)) = signature {
+                    persist_response_attestation(
+                        attestation_service.as_ref(),
+                        &response_id,
+                        request_hash,
+                        response_hash,
+                    )
+                    .await;
+                }
 
-        async move {
-            let json = serde_json::to_string(&event).expect("event serialization failed");
-            let sse_bytes = format!("event: {}\ndata: {}\n\n", event.event_type, json);
-
-            let signature = {
-                let mut state = signature_state
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                state.record_event(&event, sse_bytes.as_bytes())
-            };
-
-            if let Some((response_id, response_hash)) = signature {
-                persist_response_attestation(
-                    attestation_service.as_ref(),
-                    &response_id,
-                    request_hash,
-                    response_hash,
-                )
-                .await;
+                Some((
+                    Ok::<Bytes, Infallible>(Bytes::from(sse_bytes)),
+                    (stream, adapter, signature_state, ended),
+                ))
             }
-
-            Ok::<Bytes, Infallible>(Bytes::from(sse_bytes))
-        }
-    }))
+        },
+    ))
 }
 
 /// Return an explicit migration response for the retired response-history API.
@@ -469,7 +634,7 @@ pub async fn response_history_gone() -> axum::response::Response {
     responses(
         (
             status = 200,
-            description = "Polymorphic success response. The default typed adapter returns the ResponseObject schema as JSON for non-streaming requests. An allowlisted native request forwards its provider-native response shape, which can include native reasoning fields outside ResponseObject. Streaming requests use text/event-stream on either path.",
+            description = "Polymorphic success response. The default typed adapter returns ResponseObject metadata with client-managed function/custom call items and optional namespaces as JSON for non-streaming requests. An allowlisted native request forwards its provider-native response shape, which can include native reasoning fields outside ResponseObject. Streaming requests use text/event-stream on either path.",
             content(
                 (serde_json::Value = "application/json"),
                 ("text/event-stream")
@@ -493,26 +658,20 @@ pub async fn create_response(
     requested_model: RequestedModel,
     OpenAiJson(raw): OpenAiJson<Box<serde_json::value::RawValue>>,
 ) -> axum::response::Response {
-    // Keep the original JSON for legacy typed extraction (including its errors).
-    let body = serde_json::from_str::<serde_json::Value>(raw.get()).ok();
-    if let Some(model) = body
-        .as_ref()
-        .and_then(|body| body.get("model"))
-        .and_then(|model| model.as_str())
-    {
+    let body = match axum::Json::<serde_json::Value>::from_bytes(raw.get().as_bytes()) {
+        Ok(axum::Json(body)) => body,
+        Err(error) => return super::extractors::OpenAiJsonRejection(error).into_response(),
+    };
+    if let Some(model) = body.get("model").and_then(|model| model.as_str()) {
         requested_model.set(model);
     }
-    let native = if let Some(body) = body.as_ref() {
-        state
-            .native_service
-            .selected_model(
-                body,
-                services::models::ModelCaller::Organization(api_key.organization.id.0),
-            )
-            .await
-    } else {
-        None
-    };
+    let native = state
+        .native_service
+        .selected_model(
+            &body,
+            services::models::ModelCaller::Organization(api_key.organization.id.0),
+        )
+        .await;
     if let Some(model) = native {
         return super::responses_native::handle(
             state.native_service,
@@ -520,15 +679,15 @@ pub async fn create_response(
             api_key,
             headers,
             body_hash.hash,
-            body.expect("selected request has valid JSON"),
+            body,
         )
         .await;
     }
     // All other requests use the typed stateless adapter and its validation.
     // Native-only fields never pass through that conversion.
-    let request = match axum::Json::<CreateResponseRequest>::from_bytes(raw.get().as_bytes()) {
-        Ok(axum::Json(request)) => request,
-        Err(e) => return super::extractors::OpenAiJsonRejection(e).into_response(),
+    let request = match typed_response_request(body) {
+        Ok(request) => request,
+        Err(response) => return *response,
     };
     create_legacy_response(
         State(state),
@@ -539,6 +698,29 @@ pub async fn create_response(
         OpenAiJson(request),
     )
     .await
+}
+
+fn typed_response_request(
+    body: serde_json::Value,
+) -> Result<CreateResponseRequest, Box<axum::response::Response>> {
+    let (body, adapter) = normalize_request(body).map_err(|message| {
+        Box::new(
+            (
+                StatusCode::BAD_REQUEST,
+                ResponseJson(ErrorResponse::new(
+                    message,
+                    "invalid_request_error".to_string(),
+                )),
+            )
+                .into_response(),
+        )
+    })?;
+    let axum::Json(mut request) = axum::Json::<CreateResponseRequest>::from_bytes(
+        body.to_string().as_bytes(),
+    )
+    .map_err(|error| Box::new(super::extractors::OpenAiJsonRejection(error).into_response()))?;
+    request.client_tool_adapter = adapter;
+    Ok(request)
 }
 
 async fn create_legacy_response(
@@ -612,6 +794,7 @@ async fn create_legacy_response(
 
     // Store model for logging before moving request
     let model = request.model.clone();
+    let client_tool_adapter = request.client_tool_adapter.clone();
 
     // Check if streaming is requested
     if request.stream.unwrap_or(false) {
@@ -648,6 +831,7 @@ async fn create_legacy_response(
 
                 let byte_stream = signed_response_sse_stream(
                     stream,
+                    client_tool_adapter,
                     state.attestation_service.clone(),
                     body_hash.hash.clone(),
                 );
@@ -665,7 +849,7 @@ async fn create_legacy_response(
                 tracing::error!(
                     user_id = %api_key.api_key.created_by_user_id.0,
                     model = %model,
-                    error = %error,
+                    status_code = error.http_status_code(),
                     "Failed to create streaming response"
                 );
                 let status_code = map_response_error_to_status(&error);
@@ -799,7 +983,11 @@ async fn create_legacy_response(
                         }
                         "response.failed" => {
                             status = ResponseStatus::Failed;
-                            failed_error = event.error.clone();
+                            failed_error = event
+                                .response
+                                .as_ref()
+                                .and_then(|response| response.error.clone())
+                                .or_else(|| event.error.clone());
                             failed_status_code = event.status_code;
                             if event.usage.is_some() {
                                 tracked_usage = event.usage.clone();
@@ -894,20 +1082,19 @@ async fn create_legacy_response(
                 // It stores only the response ID and signatures over
                 // request/response digests, never the response body. Failures
                 // and timeouts leave the no-store inference response unchanged.
-                persist_non_streaming_response_attestation(
+                signed_non_streaming_response(
+                    response,
+                    &client_tool_adapter,
                     state.attestation_service.as_ref(),
-                    &response,
                     body_hash.hash.clone(),
                 )
-                .await;
-
-                (StatusCode::OK, ResponseJson(response)).into_response()
+                .await
             }
             Err(error) => {
                 tracing::error!(
                     user_id = %api_key.api_key.created_by_user_id.0,
                     model = %model,
-                    error = %error,
+                    status_code = error.http_status_code(),
                     "Failed to create non-streaming response"
                 );
                 let status_code = map_response_error_to_status(&error);
@@ -926,6 +1113,7 @@ mod tests {
         ita::{ItaTokenQuery, ItaTokenResponse},
         AttestationError, SignatureLookupResult,
     };
+    use std::sync::Mutex;
 
     #[test]
     fn legacy_responses_rejects_v3_and_preserves_older_versions() {
@@ -1087,6 +1275,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_stream_preserves_error_envelope_without_storing_completed_attestation() {
+        let attestation_service = Arc::new(RecordingAttestationService::default());
+        let mut response = sample_response("resp_failed_test");
+        response.status = ResponseStatus::Failed;
+        response.error = Some(services::responses::models::ResponseError {
+            message: "Request rejected by provider".to_string(),
+            type_: "invalid_request_error".to_string(),
+            param: None,
+            code: Some("invalid_prompt".to_string()),
+        });
+        let failed = stream_event("response.failed", Some(response));
+        let mut stream = signed_response_sse_stream(
+            Box::pin(futures::stream::iter([failed])),
+            ClientToolAdapter::default(),
+            attestation_service.clone(),
+            "request-hash".to_string(),
+        );
+        let frame = stream.next().await.unwrap().unwrap();
+        let text = std::str::from_utf8(&frame).unwrap();
+        let data = text
+            .lines()
+            .find_map(|line| line.strip_prefix("data: "))
+            .unwrap();
+        let event: serde_json::Value = serde_json::from_str(data).unwrap();
+        assert_eq!(event["type"], "response.failed");
+        assert_eq!(event["response"]["id"], "resp_failed_test");
+        assert_eq!(
+            event["response"]["error"]["message"],
+            "Request rejected by provider"
+        );
+        assert!(attestation_service.stored_response_signatures().is_empty());
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
     async fn response_history_is_explicitly_gone() {
         let response = response_history_gone().await;
         assert_eq!(response.status(), StatusCode::GONE);
@@ -1107,6 +1330,7 @@ mod tests {
         ];
         let mut stream = signed_response_sse_stream(
             Box::pin(futures::stream::iter(events)),
+            ClientToolAdapter::default(),
             attestation.clone(),
             "request-digest".to_string(),
         );
@@ -1146,6 +1370,7 @@ mod tests {
                 stream_event("response.output_text.delta", None),
                 stream_event("response.completed", Some(sample_response(response_id))),
             ])),
+            ClientToolAdapter::default(),
             attestation.clone(),
             "request-digest".to_string(),
         );
@@ -1165,21 +1390,259 @@ mod tests {
         let attestation = RecordingAttestationService::default();
         let response = sample_response("resp_33333333-3333-4333-8333-333333333333");
 
-        persist_non_streaming_response_attestation(
+        let http_response = signed_non_streaming_response(
+            response.clone(),
+            &ClientToolAdapter::default(),
             &attestation,
-            &response,
             "request-digest".to_string(),
         )
         .await;
+        assert_eq!(http_response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(http_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+            serde_json::to_value(&response).unwrap()
+        );
 
         let signatures = attestation.stored_response_signatures();
         assert_eq!(signatures.len(), 1);
         let (stored_response_id, request_hash, response_hash) = &signatures[0];
         assert_eq!(stored_response_id, &response.id);
         assert_eq!(request_hash, "request-digest");
-        let expected_hash = hex::encode(Sha256::digest(
-            serde_json::to_vec(&response).expect("response serialization"),
-        ));
+        let expected_hash = hex::encode(Sha256::digest(&body));
         assert_eq!(response_hash, &expected_hash);
+    }
+
+    fn custom_tool_request() -> (CreateResponseRequest, String) {
+        let request = typed_response_request(serde_json::json!({
+            "model": "test-model",
+            "tools": [{"type":"namespace", "name":"workspace", "tools":[
+                {"type":"custom", "name":"apply_patch", "format":{"type":"text"}}
+            ]}],
+            "tool_choice": {"type":"custom", "namespace":"workspace", "name":"apply_patch"},
+            "input": "Apply the patch"
+        }))
+        .unwrap();
+        let tools = serde_json::to_value(&request.tools).unwrap();
+        let name = tools[0]["name"].as_str().unwrap().to_string();
+        (request, name)
+    }
+
+    fn custom_function_item(name: &str, arguments: &str, status: &str) -> ResponseOutputItem {
+        serde_json::from_value(serde_json::json!({
+            "type":"function_call", "id":"fc_custom", "response_id":"resp_custom",
+            "call_id":"call_custom", "name":name, "arguments":arguments,
+            "status":status, "model":"test-model"
+        }))
+        .unwrap()
+    }
+
+    fn frame_json(frame: &Bytes) -> serde_json::Value {
+        let text = std::str::from_utf8(frame).unwrap();
+        let data = text
+            .lines()
+            .find_map(|line| line.strip_prefix("data: "))
+            .unwrap();
+        serde_json::from_str(data).unwrap()
+    }
+
+    #[test]
+    fn typed_route_normalizes_inline_custom_tools_and_replay_before_deserialization() {
+        let request = typed_response_request(serde_json::json!({
+            "model":"test-model",
+            "input":[
+                {"type":"additional_tools", "role":"developer", "tools":[
+                    {"type":"custom", "name":"exec", "format":{"type":"text"}}
+                ]},
+                {"type":"custom_tool_call", "call_id":"call_exec", "name":"exec", "input":"print(1)"},
+                {"type":"custom_tool_call_output", "call_id":"call_exec", "output":[{"type":"input_text", "text":"1"}]},
+                {"role":"user", "content":"Continue"}
+            ]
+        })).unwrap();
+        request.validate_stateless().unwrap();
+        let input = serde_json::to_value(&request.input).unwrap();
+        let tools = serde_json::to_value(&request.tools).unwrap();
+        assert_eq!(input.as_array().unwrap().len(), 3);
+        assert_eq!(input[0]["type"], "function_call");
+        assert_eq!(input[0]["name"], tools[0]["name"]);
+        assert_eq!(input[1]["type"], "function_call_output");
+        assert_eq!(input[1]["output"], "1");
+    }
+
+    #[tokio::test]
+    async fn streaming_custom_tool_attestation_hashes_transformed_headers_and_data() {
+        let (request, name) = custom_tool_request();
+        let input = "*** Begin Patch\n*** End Patch\n";
+        let arguments = serde_json::json!({"input":input}).to_string();
+        let mut completed = sample_response("resp_custom");
+        completed.tools = request.tools.clone().unwrap();
+        completed.output = vec![custom_function_item(&name, &arguments, "completed")];
+        let mut added = stream_event("response.output_item.added", None);
+        added.item = Some(custom_function_item(&name, "", "in_progress"));
+        added.output_index = Some(0);
+        let mut delta = stream_event("response.function_call_arguments.delta", None);
+        delta.item_id = Some("fc_custom".to_string());
+        delta.output_index = Some(0);
+        delta.delta = Some(arguments.clone());
+        let mut done = stream_event("response.function_call_arguments.done", None);
+        done.item_id = Some("fc_custom".to_string());
+        done.output_index = Some(0);
+        done.arguments = Some(arguments);
+        let mut item_done = stream_event("response.output_item.done", None);
+        item_done.item = completed.output.first().cloned();
+        item_done.output_index = Some(0);
+        let events = vec![
+            stream_event("response.created", Some(sample_response("resp_custom"))),
+            added,
+            delta,
+            done,
+            item_done,
+            stream_event("response.completed", Some(completed)),
+        ];
+        let attestation = Arc::new(RecordingAttestationService::default());
+        let mut stream = signed_response_sse_stream(
+            Box::pin(futures::stream::iter(events)),
+            request.client_tool_adapter,
+            attestation.clone(),
+            "custom-request-digest".to_string(),
+        );
+        let mut frames = Vec::new();
+        while let Some(frame) = stream.next().await {
+            frames.push(frame.unwrap());
+            assert_eq!(
+                attestation.stored_response_signatures().len(),
+                usize::from(frames.len() == 6)
+            );
+        }
+        assert_eq!(frames.len(), 6);
+        let added = frame_json(&frames[1]);
+        assert_eq!(added["item"]["type"], "custom_tool_call");
+        assert_eq!(added["item"]["namespace"], "workspace");
+        assert_eq!(added["item"]["name"], "apply_patch");
+        assert_eq!(added["item"]["input"], "");
+        assert!(std::str::from_utf8(&frames[2])
+            .unwrap()
+            .starts_with("event: response.custom_tool_call_input.delta\n"));
+        assert_eq!(frame_json(&frames[2])["delta"], input);
+        assert!(std::str::from_utf8(&frames[3])
+            .unwrap()
+            .starts_with("event: response.custom_tool_call_input.done\n"));
+        assert_eq!(frame_json(&frames[3])["input"], input);
+        assert_eq!(frame_json(&frames[4])["item"]["input"], input);
+        let final_response = frame_json(&frames[5]);
+        assert_eq!(final_response["response"]["output"][0]["input"], input);
+        assert_eq!(final_response["response"]["tools"][0]["type"], "namespace");
+        let actual_bytes: Vec<u8> = frames
+            .iter()
+            .flat_map(|frame| frame.iter().copied())
+            .collect();
+        assert_eq!(
+            attestation.stored_response_signatures(),
+            vec![(
+                "resp_custom".to_string(),
+                "custom-request-digest".to_string(),
+                hex::encode(Sha256::digest(actual_bytes))
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn non_streaming_custom_tool_attestation_matches_returned_json_bytes() {
+        let (request, name) = custom_tool_request();
+        let mut response = sample_response("resp_custom");
+        response.tools = request.tools.unwrap();
+        response.output = vec![custom_function_item(
+            &name,
+            r#"{"input":"patch"}"#,
+            "completed",
+        )];
+        let attestation = RecordingAttestationService::default();
+        let http_response = signed_non_streaming_response(
+            response,
+            &request.client_tool_adapter,
+            &attestation,
+            "custom-request-digest".to_string(),
+        )
+        .await;
+        assert_eq!(http_response.status(), StatusCode::OK);
+        assert_eq!(
+            http_response.headers()[header::CONTENT_TYPE],
+            "application/json"
+        );
+        let bytes = axum::body::to_bytes(http_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["output"][0]["type"], "custom_tool_call");
+        assert_eq!(body["output"][0]["namespace"], "workspace");
+        assert_eq!(body["output"][0]["name"], "apply_patch");
+        assert_eq!(body["output"][0]["input"], "patch");
+        assert!(body["output"][0].get("arguments").is_none());
+        assert_eq!(body["tools"][0]["type"], "namespace");
+        assert_eq!(
+            attestation.stored_response_signatures(),
+            vec![(
+                "resp_custom".to_string(),
+                "custom-request-digest".to_string(),
+                hex::encode(Sha256::digest(&bytes))
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_custom_wrapper_fails_closed_without_completed_attestation() {
+        let (request, name) = custom_tool_request();
+        let mut response = sample_response("resp_custom");
+        response.output = vec![custom_function_item(
+            &name,
+            "malformed wrapper",
+            "completed",
+        )];
+        response.usage = Usage::new(7, 3);
+        let mut malformed = stream_event("response.completed", Some(response.clone()));
+        malformed.sequence_number = Some(2);
+        let attestation = Arc::new(RecordingAttestationService::default());
+        let mut stream = signed_response_sse_stream(
+            Box::pin(futures::stream::iter([
+                stream_event("response.created", Some(sample_response("resp_custom"))),
+                malformed,
+                stream_event("response.completed", Some(sample_response("resp_custom"))),
+            ])),
+            request.client_tool_adapter.clone(),
+            attestation.clone(),
+            "request-digest".to_string(),
+        );
+        stream.next().await.unwrap().unwrap();
+        let failure = stream.next().await.unwrap().unwrap();
+        assert!(std::str::from_utf8(&failure)
+            .unwrap()
+            .starts_with("event: response.failed\n"));
+        let event = frame_json(&failure);
+        assert_eq!(event["sequence_number"], 2);
+        assert_eq!(event["response"]["id"], "resp_custom");
+        assert_eq!(event["response"]["status"], "failed");
+        assert_eq!(event["response"]["error"]["code"], "server_error");
+        assert_eq!(event["response"]["usage"]["total_tokens"], 10);
+        assert_eq!(event["response"]["output"], serde_json::json!([]));
+        assert!(stream.next().await.is_none());
+        assert!(attestation.stored_response_signatures().is_empty());
+
+        let http_response = signed_non_streaming_response(
+            response,
+            &request.client_tool_adapter,
+            attestation.as_ref(),
+            "request-digest".to_string(),
+        )
+        .await;
+        assert_eq!(http_response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = axum::body::to_bytes(http_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let error: ErrorResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error.error.r#type, "server_error");
+        assert!(!error.error.message.contains("malformed wrapper"));
+        assert!(attestation.stored_response_signatures().is_empty());
     }
 }

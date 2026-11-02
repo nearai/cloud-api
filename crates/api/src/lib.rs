@@ -3151,7 +3151,7 @@ mod tests {
     }
 
     #[test]
-    fn test_openapi_responses_only_advertises_client_managed_function_tools() {
+    fn test_openapi_responses_only_advertises_client_managed_tools() {
         let spec = serde_json::to_value(ApiDoc::openapi()).unwrap();
         let request_tools_schema = &spec["components"]["schemas"]
             ["StatelessCreateResponseRequestSchema"]["properties"]["tools"];
@@ -3169,10 +3169,27 @@ mod tests {
         );
 
         let serialized_tool_schema = serde_json::to_string(response_tool_schema).unwrap();
-        assert!(
-            serialized_tool_schema.contains("function"),
-            "typed Responses OpenAPI schema must retain custom function tools"
-        );
+        for supported_tool in ["function", "custom", "namespace"] {
+            assert!(
+                serialized_tool_schema.contains(supported_tool),
+                "typed Responses OpenAPI schema must advertise {supported_tool}"
+            );
+        }
+        let input_schema = serde_json::to_string(
+            &spec["components"]["schemas"]["StatelessResponseInputItemSchema"],
+        )
+        .unwrap();
+        for supported_item in [
+            "AdditionalToolsType",
+            "CustomToolCallType",
+            "CustomToolCallOutputType",
+            "ReasoningType",
+        ] {
+            assert!(
+                input_schema.contains(supported_item),
+                "typed Responses input schema must advertise {supported_item}"
+            );
+        }
         for server_executed_tool in [
             "web_search",
             "web_context_search",

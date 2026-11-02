@@ -178,6 +178,7 @@ mod tests {
             .collect();
 
         CreateResponseRequest {
+            client_tool_adapter: Default::default(),
             model: "test".to_string(),
             input: None,
             instructions: None,
@@ -204,6 +205,7 @@ mod tests {
 
     fn create_test_request_no_tools() -> CreateResponseRequest {
         CreateResponseRequest {
+            client_tool_adapter: Default::default(),
             model: "test".to_string(),
             input: None,
             instructions: None,
@@ -313,6 +315,7 @@ mod tests {
 
     fn create_test_request_with_code_interpreter() -> CreateResponseRequest {
         CreateResponseRequest {
+            client_tool_adapter: Default::default(),
             model: "test".to_string(),
             input: None,
             instructions: None,
@@ -339,6 +342,7 @@ mod tests {
 
     fn create_test_request_with_computer() -> CreateResponseRequest {
         CreateResponseRequest {
+            client_tool_adapter: Default::default(),
             model: "test".to_string(),
             input: None,
             instructions: None,

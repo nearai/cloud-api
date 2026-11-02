@@ -101,6 +101,8 @@ mod reporting_usage;
 mod repositories;
 mod request_id_contract;
 mod rerank;
+mod responses_client_tools;
+mod responses_failed;
 mod responses_native;
 mod responses_stateless;
 mod score;

@@ -1,5 +1,8 @@
 use crate::common::*;
 use axum::http::Method;
+use services::files::storage::{MockStorage, StorageTrait};
+use services::id_prefixes::PREFIX_FILE;
+use std::sync::Arc;
 
 const UNKNOWN_FILE_ID: &str = "file-00000000-0000-0000-0000-000000000000";
 
@@ -21,6 +24,206 @@ fn assert_file_write_is_gone(response: axum_test::TestResponse) {
     let error = response.json::<api::models::ErrorResponse>();
     assert_eq!(error.error.r#type, "gone");
     assert!(error.error.message.contains("temporarily limited"));
+}
+
+const RETAINED_CONTENT: &[u8] = b"retained file\0contents\n";
+
+struct RetainedFileFixture {
+    server: axum_test::TestServer,
+    owner_key: String,
+    foreign_key: String,
+    file: services::files::File,
+    storage: Arc<MockStorage>,
+}
+
+/// Prepare existing data directly; public uploads are disabled during migration.
+async fn retained_file_fixture() -> RetainedFileFixture {
+    let storage = Arc::new(MockStorage::new(test_config().s3.encryption_key));
+    let service_storage = storage.clone();
+    let (server, database) =
+        setup_test_server_with_domain_services(move |domain_services, database| {
+            domain_services.files_service = Arc::new(services::files::FileServiceImpl::new(
+                Arc::new(database::repositories::FileRepository::new(
+                    database.pool().clone(),
+                )),
+                service_storage,
+            ));
+        })
+        .await;
+    let (owner_key, owner) = create_org_and_api_key(&server).await;
+    let (foreign_key, _) = create_org_and_api_key(&server).await;
+    let storage_key = format!("retained-fixture/{}", uuid::Uuid::new_v4());
+    storage
+        .upload(
+            &storage_key,
+            RETAINED_CONTENT.to_vec(),
+            "application/octet-stream",
+        )
+        .await
+        .expect("seed encrypted mock storage");
+    let file = database::repositories::FileRepository::new(database.pool().clone())
+        .create(services::files::CreateFileParams {
+            filename: "retained.bin".to_string(),
+            bytes: RETAINED_CONTENT.len() as i64,
+            content_type: "application/octet-stream".to_string(),
+            purpose: "user_data".to_string(),
+            storage_key,
+            workspace_id: owner.workspace_id.parse().unwrap(),
+            uploaded_by_api_key_id: owner.id.parse().unwrap(),
+            expires_at: None,
+        })
+        .await
+        .expect("seed retained file metadata");
+    RetainedFileFixture {
+        server,
+        owner_key,
+        foreign_key,
+        file,
+        storage,
+    }
+}
+
+#[tokio::test]
+async fn retained_files_are_readable_only_by_the_owning_workspace() {
+    let fixture = retained_file_fixture().await;
+    let file_id = format!("{PREFIX_FILE}{}", fixture.file.id);
+    let metadata = fixture
+        .server
+        .get(&format!("/v1/files/{file_id}"))
+        .add_header("Authorization", format!("Bearer {}", fixture.owner_key))
+        .await;
+    assert_eq!(metadata.status_code(), 200);
+    assert_no_store(&metadata);
+    let metadata: api::models::FileUploadResponse = metadata.json();
+    assert_eq!(metadata.id, file_id);
+    assert_eq!(metadata.filename, "retained.bin");
+    assert_eq!(metadata.bytes, RETAINED_CONTENT.len() as i64);
+    assert_eq!(metadata.purpose, "user_data");
+
+    let content = fixture
+        .server
+        .get(&format!("/v1/files/{file_id}/content"))
+        .add_header("Authorization", format!("Bearer {}", fixture.owner_key))
+        .await;
+    assert_eq!(content.status_code(), 200);
+    assert_no_store(&content);
+    assert_eq!(content.as_bytes().as_ref(), RETAINED_CONTENT);
+    assert_eq!(
+        content.headers().get("content-type").unwrap(),
+        "application/octet-stream"
+    );
+
+    let owner_list = fixture
+        .server
+        .get("/v1/files")
+        .add_header("Authorization", format!("Bearer {}", fixture.owner_key))
+        .await;
+    assert_eq!(owner_list.status_code(), 200);
+    assert_no_store(&owner_list);
+    let owner_list: api::models::FileListResponse = owner_list.json();
+    assert_eq!(owner_list.data.len(), 1);
+    assert_eq!(owner_list.data[0].id, file_id);
+    assert_eq!(owner_list.data[0].filename, "retained.bin");
+    assert!(!owner_list.has_more);
+
+    let foreign_list = fixture
+        .server
+        .get("/v1/files")
+        .add_header("Authorization", format!("Bearer {}", fixture.foreign_key))
+        .await;
+    assert_eq!(foreign_list.status_code(), 200);
+    assert_no_store(&foreign_list);
+    assert!(foreign_list
+        .json::<api::models::FileListResponse>()
+        .data
+        .is_empty());
+
+    for suffix in ["", "/content"] {
+        let foreign = fixture
+            .server
+            .get(&format!("/v1/files/{file_id}{suffix}"))
+            .add_header("Authorization", format!("Bearer {}", fixture.foreign_key))
+            .await;
+        let unknown = fixture
+            .server
+            .get(&format!("/v1/files/{UNKNOWN_FILE_ID}{suffix}"))
+            .add_header("Authorization", format!("Bearer {}", fixture.foreign_key))
+            .await;
+        assert_eq!(foreign.status_code(), 404);
+        assert_eq!(unknown.status_code(), 404);
+        assert_no_store(&foreign);
+        assert_no_store(&unknown);
+        assert_eq!(foreign.text(), unknown.text());
+    }
+}
+
+#[tokio::test]
+async fn retained_file_deletion_is_workspace_scoped_and_removes_content() {
+    let fixture = retained_file_fixture().await;
+    let file_id = format!("{PREFIX_FILE}{}", fixture.file.id);
+    let foreign = fixture
+        .server
+        .delete(&format!("/v1/files/{file_id}"))
+        .add_header("Authorization", format!("Bearer {}", fixture.foreign_key))
+        .await;
+    let unknown = fixture
+        .server
+        .delete(&format!("/v1/files/{UNKNOWN_FILE_ID}"))
+        .add_header("Authorization", format!("Bearer {}", fixture.foreign_key))
+        .await;
+    assert_eq!(foreign.status_code(), 404);
+    assert_eq!(unknown.status_code(), 404);
+    assert_no_store(&foreign);
+    assert_no_store(&unknown);
+    assert_eq!(foreign.text(), unknown.text());
+    assert!(fixture
+        .storage
+        .exists(&fixture.file.storage_key)
+        .await
+        .unwrap());
+
+    let still_readable = fixture
+        .server
+        .get(&format!("/v1/files/{file_id}/content"))
+        .add_header("Authorization", format!("Bearer {}", fixture.owner_key))
+        .await;
+    assert_eq!(still_readable.status_code(), 200);
+    assert_no_store(&still_readable);
+    assert_eq!(still_readable.as_bytes().as_ref(), RETAINED_CONTENT);
+
+    let deleted = fixture
+        .server
+        .delete(&format!("/v1/files/{file_id}"))
+        .add_header("Authorization", format!("Bearer {}", fixture.owner_key))
+        .await;
+    assert_eq!(deleted.status_code(), 200);
+    assert_no_store(&deleted);
+    let deleted: api::models::FileDeleteResponse = deleted.json();
+    assert_eq!(deleted.id, file_id);
+    assert!(deleted.deleted);
+    assert!(!fixture
+        .storage
+        .exists(&fixture.file.storage_key)
+        .await
+        .unwrap());
+
+    for suffix in ["", "/content"] {
+        let missing = fixture
+            .server
+            .get(&format!("/v1/files/{file_id}{suffix}"))
+            .add_header("Authorization", format!("Bearer {}", fixture.owner_key))
+            .await;
+        assert_eq!(missing.status_code(), 404);
+        assert_no_store(&missing);
+    }
+    let list = fixture
+        .server
+        .get("/v1/files")
+        .add_header("Authorization", format!("Bearer {}", fixture.owner_key))
+        .await;
+    assert_eq!(list.status_code(), 200);
+    assert_no_store(&list);
+    assert!(list.json::<api::models::FileListResponse>().data.is_empty());
 }
 
 #[tokio::test]

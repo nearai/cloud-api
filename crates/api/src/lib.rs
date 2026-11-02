@@ -3176,7 +3176,10 @@ mod tests {
         assert!(description
             .contains("default typed adapter sends exactly one Chat Completions inference"));
         assert!(description.contains("NATIVE_RESPONSES_MODELS"));
-        assert!(description.contains("Only client-managed `function` tools are supported"));
+        assert!(description.contains("client-managed `function` and `custom` tools"));
+        assert!(description.contains("tools grouped in a `namespace`"));
+        assert!(description.contains("plaintext `reasoning` items"));
+        assert!(!description.contains("but not reasoning"));
         assert!(description.contains("Image-generation/editing models are rejected on both paths"));
         assert!(description.contains("POST /mcp"));
     }

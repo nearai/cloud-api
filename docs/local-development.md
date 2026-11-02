@@ -91,7 +91,8 @@ The API has two mutually-exclusive auth methods:
 - **Session auth** (cookies / `Authorization: Bearer rt_…`) for the
   management plane: organizations, workspaces, users, API keys.
 - **API key auth** (`Authorization: Bearer sk-…`) for the data plane:
-  chat completions, responses, and attestation.
+  chat completions, responses, temporary Conversation/File migration access,
+  and attestation.
 
 ### Mock session auth (no real OAuth)
 

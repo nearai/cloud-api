@@ -214,6 +214,8 @@ and returns `Cache-Control: no-store`. Creation, upload, and every Conversation
 or File mutation other than the existing per-resource `DELETE` routes return
 `410 Gone`. The temporary routes will be removed after data migration.
 
+### Stateless Responses
+
 `POST /v1/responses` remains stateless and does not accept a Conversation
 reference, response history, or File input. The default typed adapter treats
 an omitted `store` as `false` and rejects `store: true`; native routing is

@@ -199,11 +199,10 @@ jobs:
     timeout-minutes: 60
     needs: changes
     if: ${{ needs.changes.outputs.rust == 'true' }}
-    # Fork guard: see the lint job. Fork PRs get no environment secrets either way.
+    # Fork guard: see the lint job.
     # Runs on the dedicated CI runners: on the shared infra (gpu) runners the schema
     # migrator container cannot reach the postgres service.
     runs-on: ${{ (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","ci-cloud-api"]') || 'ubuntu-latest' }}
-    environment: Cloud API test env
     permissions:
       contents: read
       # Pulls the cloud-platform schema image (scripts/cloud-platform-schema.env).
@@ -263,8 +262,9 @@ jobs:
 
     - name: Run e2e tests
       run: cargo nextest run --test e2e_all
+      # No secrets: the e2e harness builds its config in crates/api/tests/common (mock auth
+      # key, mock inference providers) and reads no auth, discovery or search secrets.
       env:
-        POSTGRES_PRIMARY_APP_ID: ${{ secrets.POSTGRES_PRIMARY_APP_ID }}
         DATABASE_HOST: localhost
         DATABASE_PORT: ${{ job.services.postgres.ports['5432'] }}
         DATABASE_NAME: platform_api
@@ -272,11 +272,6 @@ jobs:
         DATABASE_PASSWORD: postgres
         DATABASE_MAX_CONNECTIONS: 5
         DATABASE_TLS_ENABLED: "false"
-        MODEL_DISCOVERY_SERVER_URL: ${{ secrets.MODEL_DISCOVERY_SERVER_URL }}
-        MODEL_DISCOVERY_API_KEY: ${{ secrets.MODEL_DISCOVERY_API_KEY }}
-        AUTH_ENCODING_KEY: ${{ secrets.AUTH_ENCODING_KEY }}
-        AUTH_ADMIN_DOMAINS: ${{ secrets.AUTH_ADMIN_DOMAINS }}
-        BRAVE_SEARCH_PRO_API_KEY: ${{ secrets.BRAVE_SEARCH_PRO_API_KEY }}
         TEST_DATABASE_NAME: platform_api_e2e
         RUST_LOG: debug
         DEV: "true"

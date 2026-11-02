@@ -1,6 +1,8 @@
 use crate::common::*;
 use axum::http::Method;
 
+mod history;
+
 const UNKNOWN_CONVERSATION_ID: &str = "conv_00000000-0000-0000-0000-000000000000";
 
 fn assert_no_store(response: &axum_test::TestResponse) {

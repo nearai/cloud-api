@@ -200,7 +200,9 @@ jobs:
     needs: changes
     if: ${{ needs.changes.outputs.rust == 'true' }}
     # Fork guard: see the lint job. Fork PRs get no environment secrets either way.
-    runs-on: ${{ (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","infra"]') || 'ubuntu-latest' }}
+    # Runs on the dedicated CI runners: on the shared infra (gpu) runners the schema
+    # migrator container cannot reach the postgres service.
+    runs-on: ${{ (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","ci-cloud-api"]') || 'ubuntu-latest' }}
     environment: Cloud API test env
     permissions:
       contents: read
@@ -221,8 +223,9 @@ jobs:
           --health-retries 5
           --shm-size=256mb
         ports:
-          # E2E clients run on the host; keep the temporary test database local.
-          - 127.0.0.1:5432:5432
+          # E2E clients run on the host; keep the temporary test database local. Docker picks
+          # the host port, so concurrent jobs on a shared runner host don't collide.
+          - 127.0.0.1::5432
 
     steps:
     - uses: actions/checkout@v7
@@ -253,7 +256,7 @@ jobs:
         cargo test --locked -p database --test credit_transfers -- --test-threads=1
       env:
         PGHOST: localhost
-        PGPORT: 5432
+        PGPORT: ${{ job.services.postgres.ports['5432'] }}
         PGDATABASE: platform_api
         PGUSER: postgres
         PGPASSWORD: postgres
@@ -263,7 +266,7 @@ jobs:
       env:
         POSTGRES_PRIMARY_APP_ID: ${{ secrets.POSTGRES_PRIMARY_APP_ID }}
         DATABASE_HOST: localhost
-        DATABASE_PORT: 5432
+        DATABASE_PORT: ${{ job.services.postgres.ports['5432'] }}
         DATABASE_NAME: platform_api
         DATABASE_USERNAME: postgres
         DATABASE_PASSWORD: postgres

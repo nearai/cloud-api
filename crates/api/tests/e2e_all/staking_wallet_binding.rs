@@ -2,7 +2,7 @@ use super::common::{
     create_org, get_session_id, setup_test_server_with_config_and_database, MOCK_USER_AGENT,
 };
 use base64::Engine;
-use near_api::signer::Signer;
+use near_kit::{signer::SecretKey, standards::nep413::serialize_message};
 use serde_json::{json, Value};
 use services::staking_farm::binding::BindingChallenge;
 use uuid::Uuid;
@@ -46,11 +46,20 @@ async fn binding_route_rejects_disabled_feature() {
 #[tokio::test]
 async fn binding_route_verifies_proof_authorization_retry_and_profile_responses() {
     let rpc = MockServer::start().await;
-    Mock::given(method("POST")).respond_with(ResponseTemplate::new(200).set_body_json(json!({
-        "jsonrpc":"2.0","id":"dontcare","result":{
-            "block_hash":"11111111111111111111111111111111","block_height":1,"nonce":0,"permission":"FullAccess"
-        }
-    }))).mount(&rpc).await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "block_hash": "11111111111111111111111111111111",
+                "block_height": 1,
+                "nonce": 0,
+                "permission": "FullAccess",
+            },
+        })))
+        .mount(&rpc)
+        .await;
+
     let (server, database) = setup_test_server_with_config_and_database(|config| {
         config.auth.near.rpc_url = rpc.uri();
         config.auth.near.network_id = "testnet".into();
@@ -75,29 +84,24 @@ async fn binding_route_verifies_proof_authorization_retry_and_profile_responses(
     assert_eq!(prepared.status_code(), 200, "{}", prepared.text());
     let challenge = prepared.json::<BindingChallenge>();
     assert_eq!(challenge.organization_id.to_string(), org.id);
-    let signer = Signer::from_seed_phrase(
-        "fatal edge jacket cash hard pass gallery fabric whisper size rain biology",
-        None,
-    )
-    .unwrap();
-    let public_key = signer.get_public_key().await.unwrap();
-    let signature = signer
-        .sign_message_nep413(
-            account.parse().unwrap(),
-            public_key,
-            &challenge.payload.nep413().unwrap(),
-        )
-        .await
-        .unwrap();
-    let signature = match signature {
-        near_api::types::Signature::ED25519(signature) => {
-            base64::engine::general_purpose::STANDARD.encode(signature.to_bytes())
-        }
-        _ => panic!("test signer must be ED25519"),
-    };
-    let confirm = json!({"phase":"confirm","challenge_id":challenge.challenge_id,
-        "idempotency_key":Uuid::new_v4(),"acknowledged_terms_version":challenge.binding_terms_version,
-        "signed_message":{"accountId":account,"publicKey":public_key.to_string(),"signature":signature}});
+    // Exercise the larger ML-DSA-65 proof through HTTP, persistence, and retries.
+    let secret_key = SecretKey::ml_dsa65_from_seed([7; 32]);
+    let public_key = secret_key.public_key();
+    let hash = serialize_message(&challenge.payload.nep413().unwrap());
+    let signature = secret_key.sign(hash.as_bytes());
+    let signature = base64::engine::general_purpose::STANDARD.encode(signature.as_bytes());
+
+    let confirm = json!({
+        "phase": "confirm",
+        "challenge_id": challenge.challenge_id,
+        "idempotency_key": Uuid::new_v4(),
+        "acknowledged_terms_version": challenge.binding_terms_version,
+        "signed_message": {
+            "accountId": account,
+            "publicKey": public_key.to_string(),
+            "signature": signature,
+        },
+    });
     let mut wrong_terms = confirm.clone();
     wrong_terms["acknowledged_terms_version"] = json!("different-version");
     let rejected = server

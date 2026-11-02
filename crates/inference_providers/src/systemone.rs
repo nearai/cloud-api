@@ -31,6 +31,38 @@ pub struct SystemOneRequest {
     pub model: String,
     pub state: Content,
     pub questions: BTreeMap<String, Question>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assets: Option<BTreeMap<String, ImageAsset>>,
+}
+
+/// JSON image data keyed by reference; reference resolution belongs to the provider.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "openapi", schema(as = SystemOneImageAsset))]
+pub struct ImageAsset {
+    #[serde(rename = "type", default, skip_serializing_if = "Option::is_none")]
+    pub asset_type: Option<ImageAssetType>,
+    pub format: ImageFormat,
+    pub data_base64: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "lowercase")]
+#[cfg_attr(feature = "openapi", schema(as = SystemOneImageAssetType))]
+pub enum ImageAssetType {
+    Image,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "lowercase")]
+#[cfg_attr(feature = "openapi", schema(as = SystemOneImageFormat))]
+pub enum ImageFormat {
+    Png,
+    Jpg,
+    Jpeg,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -50,6 +82,9 @@ pub enum Question {
     Score {
         instructions: Content,
         criteria: Vec<Content>,
+    },
+    Box {
+        instructions: Content,
     },
 }
 
@@ -120,6 +155,22 @@ pub enum Answer {
         probabilities: BTreeMap<String, f64>,
         legend: BTreeMap<String, Content>,
     },
+    Box {
+        #[serde(rename = "box")]
+        bounds: BoxCoordinates,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        confidence: Option<f64>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[cfg_attr(feature = "openapi", schema(as = SystemOneBoxCoordinates))]
+pub struct BoxCoordinates {
+    pub top: f64,
+    pub bottom: f64,
+    pub left: f64,
+    pub right: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -204,6 +255,14 @@ impl SystemOneResponseWithBytes {
                             legend.contains_key(&key)
                                 && probabilities.get(&key).is_some_and(probability)
                         })
+                }
+                (Question::Box { .. }, Some(Answer::Box { bounds, confidence })) => {
+                    // OpenRouter specifies numeric edges and optional confidence,
+                    // without coordinate bounds or ordering constraints.
+                    [bounds.top, bounds.bottom, bounds.left, bounds.right]
+                        .into_iter()
+                        .all(f64::is_finite)
+                        && confidence.is_none_or(f64::is_finite)
                 }
                 _ => false,
             };

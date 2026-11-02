@@ -11,7 +11,7 @@ use std::sync::{
     Arc,
 };
 use wiremock::{
-    matchers::{body_partial_json, header, method, path},
+    matchers::{body_json, body_partial_json, header, method, path},
     Mock, MockServer, ResponseTemplate,
 };
 
@@ -206,6 +206,97 @@ async fn systemone_external_catalog_alias_billing_and_gateway_signatures() {
 }
 
 #[tokio::test]
+async fn systemone_openrouter_box_preserves_images_billing_and_receipts() {
+    let upstream = MockServer::start().await;
+    let (server, _, _, database) = setup_test_server_with_pool().await;
+    let (model, _) = catalog(
+        &server,
+        Some(json!({
+            "backend":"typesafe","base_url":format!("{}/api/v1",upstream.uri()),
+            "model_name":"typesafe/jev-1.14","api_key":"fixture-openrouter-key"
+        })),
+        true,
+    )
+    .await;
+    let key = auth(&server).await;
+    // Opaque transport fixture: image decoding belongs to the upstream provider.
+    let image =
+        json!({"type":"image_url","image_url":{"url":"data:image/png;base64,Zml4dHVyZQ=="}});
+    for (confidence, asset_refs) in [(None, false), (Some(0.9), false), (Some(0.9), true)] {
+        let mut body = request(&model);
+        body["state"] = json!(["Refund request", image, {"attachment":image}]);
+        body["questions"]["billing"]["criteria"] = json!({"true":image});
+        body["questions"]["receipt"] =
+            json!({"type":"box","instructions":["Locate the receipt in",image]});
+        if asset_refs {
+            body["assets"] = json!({"receipt-ref": {
+                "format":"png", "data_base64":"Zml4dHVyZQ=="
+            }});
+            body["state"] = json!(["Refund request", image, {"attachment":"receipt-ref"}]);
+            body["questions"]["billing"]["criteria"] = json!({"true":"receipt-ref"});
+            body["questions"]["receipt"]["instructions"] = json!("Locate receipt-ref now");
+            body["questions"]["match"] = json!({
+                "type":"score", "instructions":"Rate the match.",
+                "criteria":["No match", "receipt-ref"]
+            });
+        }
+        let request_text = serde_json::to_string_pretty(&body).unwrap();
+        let mut forwarded = body;
+        forwarded["model"] = json!("typesafe/jev-1.14");
+        let id = format!("gen-dec-{}", uuid::Uuid::new_v4());
+        let mut response_body = result(Some(&id));
+        response_body["model"] = json!("typesafe/jev-1.14-20261014");
+        response_body["answers"]["receipt"] =
+            json!({"type":"box","box":{"top":0.1,"bottom":0.9,"left":0.2,"right":0.8}});
+        if let Some(confidence) = confidence {
+            response_body["answers"]["receipt"]["confidence"] = json!(confidence);
+        }
+        if asset_refs {
+            response_body["answers"]["match"] = json!({
+                "type":"score", "score":1.0, "confidence":0.9,
+                "probabilities":{"0":0.1,"1":0.9},
+                "legend":{"0":"No match","1":"receipt-ref"}
+            });
+        }
+        let raw = serde_json::to_string_pretty(&response_body).unwrap();
+        let _mock = Mock::given(method("POST"))
+            .and(path("/api/v1/systemone"))
+            .and(header("authorization", "Bearer fixture-openrouter-key"))
+            .and(header("content-type", "application/json"))
+            .and(body_json(forwarded))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(raw.clone(), "application/json"))
+            .expect(1)
+            .mount_as_scoped(&upstream)
+            .await;
+        let response = server
+            .post("/v1/systemone")
+            .add_header("Authorization", format!("Bearer {key}"))
+            .add_header("Content-Type", "application/json")
+            .bytes(Bytes::from(request_text.clone()))
+            .await;
+        assert_eq!(response.status_code(), 200, "{}", response.text());
+        assert_eq!(response.text(), raw);
+        assert_eq!(response.header("x-generation-id"), id.as_str());
+        assert_signatures(&server, &key, &id, "gateway", &request_text, &raw).await;
+        let inference_id =
+            uuid::Uuid::parse_str(response.header("inference-id").to_str().unwrap()).unwrap();
+        let client = database.pool().get().await.unwrap();
+        let row = client
+            .query_one(
+                "SELECT input_tokens, output_tokens, total_cost, inference_type
+                 FROM organization_usage_log WHERE inference_id = $1",
+                &[&inference_id],
+            )
+            .await
+            .unwrap();
+        assert_eq!(row.get::<_, i32>("input_tokens"), 10);
+        assert_eq!(row.get::<_, i32>("output_tokens"), 3);
+        assert_eq!(row.get::<_, i64>("total_cost"), 36);
+        assert_eq!(row.get::<_, String>("inference_type"), "decisions");
+    }
+}
+
+#[tokio::test]
 async fn systemone_external_generation_header_indexes_gateway_signatures() {
     let upstream = MockServer::start().await;
     let upstream_id = format!("gen:decision.{}/result", uuid::Uuid::new_v4());
@@ -279,19 +370,28 @@ async fn systemone_uses_actual_provider_trust_and_signature_capability() {
                 .with_tier(tier)
                 .with_provider_source(source)
                 .with_chat_signature_support(signatures)
-                .with_systemone_handler(move |req| {
+                .with_systemone_handler(move |req, _| {
                     SystemOneResponseWithBytes::parse(response_bytes.clone(), &req)
                 }),
         );
         pool.register_provider(model.clone(), provider.clone())
             .await;
         let request_text = serde_json::to_string(&request(&model)).unwrap();
-        let response = server
+        let mut call = server
             .post("/v1/systemone")
             .add_header("Authorization", format!("Bearer {key}"))
-            .add_header("Content-Type", "application/json")
-            .bytes(Bytes::from(request_text.clone()))
-            .await;
+            .add_header("Content-Type", "application/json");
+        if kind == "provider_tee" {
+            let report = provider
+                .get_attestation_report(model.clone(), Some("ecdsa".into()), None, None, false)
+                .await
+                .unwrap();
+            call = call.add_header(
+                "x-model-pub-key",
+                report["signing_public_key"].as_str().unwrap(),
+            );
+        }
+        let response = call.bytes(Bytes::from(request_text.clone())).await;
         assert_eq!(response.status_code(), 200, "{}", response.text());
         assert_eq!(response.as_bytes(), raw.as_slice());
         assert_eq!(
@@ -343,6 +443,84 @@ async fn systemone_uses_actual_provider_trust_and_signature_capability() {
 }
 
 #[tokio::test]
+async fn systemone_public_key_restricts_provider_fallback() {
+    let (server, pool, _, _) = setup_test_server_with_pool().await;
+    let key = auth(&server).await;
+    let (model, alias) = catalog(&server, None, true).await;
+    let model_key = "ab".repeat(32);
+    let primary_key = model_key.clone();
+    let fallback_key = model_key.clone();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counter = calls.clone();
+    pool.register_provider(
+        model.clone(),
+        Arc::new(
+            MockProvider::new_accept_all()
+                .with_tier(ProviderTier::Near)
+                .with_per_request_pubkey_routing(model_key.clone())
+                .with_systemone_handler(move |_, model_pub_key| {
+                    assert_eq!(model_pub_key, Some(primary_key.as_str()));
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    Err(CompletionError::HttpError {
+                        status_code: 503,
+                        message: "unavailable".into(),
+                        is_external: false,
+                    })
+                }),
+        ),
+    )
+    .await;
+    let decision_id = format!("decision-{}", uuid::Uuid::new_v4());
+    let response_bytes = serde_json::to_vec(&result(Some(&decision_id))).unwrap();
+    let fallback = Arc::new(
+        MockProvider::new_accept_all()
+            .with_tier(ProviderTier::Attested3p)
+            .with_per_request_pubkey_routing(model_key.clone())
+            .with_systemone_handler(move |req, model_pub_key| {
+                assert_eq!(model_pub_key, Some(fallback_key.as_str()));
+                SystemOneResponseWithBytes::parse(response_bytes.clone(), &req)
+            }),
+    );
+    // A fallback with another key must not be used when the selected provider fails.
+    pool.register_pinned_secondary_provider(
+        model.clone(),
+        Arc::new(
+            MockProvider::new_accept_all()
+                .with_tier(ProviderTier::Attested3p)
+                .with_systemone_handler(|_, _| panic!("must keep the selected signing identity")),
+        ),
+        None,
+    )
+    .await;
+    for (pin, status) in [("cd".repeat(32), 421), (model_key.clone(), 503)] {
+        let response = server
+            .post("/v1/systemone")
+            .add_header("Authorization", format!("Bearer {key}"))
+            .add_header("x-model-pub-key", pin)
+            .json(&request(&alias))
+            .await;
+        assert_eq!(response.status_code(), status, "{}", response.text());
+        if status == 421 {
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+        }
+    }
+    assert!(
+        calls.load(Ordering::SeqCst) > 1,
+        "the selected provider was retried"
+    );
+    pool.register_pinned_secondary_provider(model.clone(), fallback, None)
+        .await;
+    let response = server
+        .post("/v1/systemone")
+        .add_header("Authorization", format!("Bearer {key}"))
+        .add_header("x-model-pub-key", model_key)
+        .json(&request(&alias))
+        .await;
+    assert_eq!(response.status_code(), 200, "{}", response.text());
+    assert_eq!(response.header("x-generation-id"), decision_id.as_str());
+}
+
+#[tokio::test]
 async fn systemone_rejects_invalid_requests_before_inference() {
     let (server, pool, mock, _) = setup_test_server_with_pool_and_config(|config| {
         // This regression covers the ordinary typed route, not the explicit
@@ -357,7 +535,7 @@ async fn systemone_rejects_invalid_requests_before_inference() {
     pool.register_provider(
         model.clone(),
         Arc::new(
-            MockProvider::new_accept_all().with_systemone_handler(move |_| {
+            MockProvider::new_accept_all().with_systemone_handler(move |_, _| {
                 counter.fetch_add(1, Ordering::SeqCst);
                 panic!("invalid requests must not reach inference");
             }),
@@ -375,6 +553,7 @@ async fn systemone_rejects_invalid_requests_before_inference() {
         json!({"type":"noul"}),
         json!({"type":"choice","criteria":{"billing":null,"other":null}}),
         json!({"type":"score","criteria":["low","high"]}),
+        json!({"type":"box"}),
     ] {
         for instructions in [None, Some(Value::Null)] {
             let mut question = question.clone();
@@ -580,7 +759,7 @@ async fn systemone_retains_upstream_validation_status_without_retry_or_state_ech
     pool.register_provider(
         model.clone(),
         Arc::new(
-            MockProvider::new_accept_all().with_systemone_handler(move |_| {
+            MockProvider::new_accept_all().with_systemone_handler(move |_, _| {
                 counter.fetch_add(1, Ordering::SeqCst);
                 Err(CompletionError::HttpError {
                     status_code: 422,
@@ -617,7 +796,7 @@ async fn systemone_rejects_missing_tee_id_and_invalid_usage_without_billing() {
             Arc::new(
                 MockProvider::new_accept_all()
                     .with_tier(ProviderTier::Near)
-                    .with_systemone_handler(move |req| {
+                    .with_systemone_handler(move |req, _| {
                         SystemOneResponseWithBytes::parse(raw.clone(), &req)
                     }),
             ),
@@ -649,7 +828,7 @@ async fn systemone_fallback_respects_trust_and_organization_policy() {
     let primary = Arc::new(
         MockProvider::new_accept_all()
             .with_tier(ProviderTier::Near)
-            .with_systemone_handler(|_| {
+            .with_systemone_handler(|_, _| {
                 Err(CompletionError::HttpError {
                     status_code: 503,
                     message: "unavailable".into(),
@@ -663,7 +842,7 @@ async fn systemone_fallback_respects_trust_and_organization_policy() {
         MockProvider::new_accept_all()
             .with_tier(ProviderTier::Attested3p)
             .with_chat_signature_support(false)
-            .with_systemone_handler(move |req| {
+            .with_systemone_handler(move |req, _| {
                 counter.fetch_add(1, Ordering::SeqCst);
                 SystemOneResponseWithBytes::parse(serde_json::to_vec(&result(None)).unwrap(), &req)
             }),
@@ -675,14 +854,14 @@ async fn systemone_fallback_respects_trust_and_organization_policy() {
     pool.register_pinned_secondary_provider(
         model.clone(),
         Arc::new(
-            MockProvider::new_accept_all().with_systemone_handler(|_| panic!("trust downgrade")),
+            MockProvider::new_accept_all().with_systemone_handler(|_, _| panic!("trust downgrade")),
         ),
         None,
     )
     .await;
     let req = serde_json::from_value(request(&model)).unwrap();
     let served = pool
-        .systemone_with_attribution(req, "hash".into(), false)
+        .systemone_with_attribution(req, "hash".into(), None, false)
         .await
         .unwrap();
     assert_eq!(
@@ -693,7 +872,7 @@ async fn systemone_fallback_respects_trust_and_organization_policy() {
     assert_eq!(hits.load(Ordering::SeqCst), 1);
     let req = serde_json::from_value(request(&model)).unwrap();
     assert!(pool
-        .systemone_with_attribution(req, "hash".into(), true)
+        .systemone_with_attribution(req, "hash".into(), None, true)
         .await
         .is_err());
     assert_eq!(hits.load(Ordering::SeqCst), 1);
@@ -711,7 +890,7 @@ async fn systemone_invalid_success_and_timeout_never_invoke_a_second_provider() 
             Arc::new(
                 MockProvider::new_accept_all()
                     .with_tier(ProviderTier::Near)
-                    .with_systemone_handler(move |req| {
+                    .with_systemone_handler(move |req, _| {
                         calls.fetch_add(1, Ordering::SeqCst);
                         if scenario == "timeout" {
                             Err(CompletionError::Timeout {
@@ -738,7 +917,9 @@ async fn systemone_invalid_success_and_timeout_never_invoke_a_second_provider() 
             Arc::new(
                 MockProvider::new_accept_all()
                     .with_tier(ProviderTier::Attested3p)
-                    .with_systemone_handler(|_| panic!("must not issue a second paid inference")),
+                    .with_systemone_handler(|_, _| {
+                        panic!("must not issue a second paid inference")
+                    }),
             ),
             None,
         )
@@ -747,6 +928,7 @@ async fn systemone_invalid_success_and_timeout_never_invoke_a_second_provider() 
             .systemone_with_attribution(
                 serde_json::from_value(request(&model)).unwrap(),
                 "hash".into(),
+                None,
                 false,
             )
             .await
@@ -818,7 +1000,7 @@ async fn systemone_finalization_survives_client_disconnect() {
     let provider = Arc::new(
         MockProvider::new_accept_all()
             .with_tier(ProviderTier::Near)
-            .with_systemone_handler(move |req| {
+            .with_systemone_handler(move |req, _| {
                 let attempt = counter.fetch_add(1, Ordering::SeqCst);
                 let id = if attempt == 0 {
                     response_id.clone()

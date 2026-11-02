@@ -1,5 +1,6 @@
 #[doc(hidden)]
 pub mod attested_3p_startup;
+pub mod cloud_platform;
 pub mod consts;
 pub mod conversions;
 pub mod database_encryption;
@@ -120,6 +121,11 @@ pub struct DomainServices {
     pub service_usage_service:
         Arc<dyn services::service_usage::ServiceUsageServiceTrait + Send + Sync>,
     pub admin_settings_service: Arc<services::admin_settings::AdminSettingsService>,
+    /// The gateway key-check verdicts, present when cloud-platform is configured.
+    pub cloud_platform_check_api_key: Option<Arc<database::cp_client::ApiKeyVerdicts>>,
+    /// The catalog adapter behind `models_service`, present when cloud-platform
+    /// is configured. Invalidated with the models cache.
+    pub cloud_platform_catalog: Option<Arc<database::cp_client::CatalogModels>>,
 }
 
 /// Controls process-level background work started while the application router
@@ -138,21 +144,16 @@ impl Default for AppBuildOptions {
     }
 }
 
-/// Initialize database connection and run migrations
+/// Initialize the database connection.
+///
+/// The schema belongs to nearai/cloud-platform and is applied by its `migrate` step before
+/// this service deploys, so startup never migrates.
 pub async fn init_database(db_config: &config::DatabaseConfig) -> Arc<Database> {
     let database = Arc::new(
         Database::from_config(db_config)
             .await
             .expect("Failed to connect to database"),
     );
-
-    // Run database migrations
-    tracing::info!("Starting database migrations...");
-    database
-        .run_migrations()
-        .await
-        .expect("Failed to run database migrations");
-    tracing::info!("Database migrations completed.");
 
     // Start periodic pool status logging
     let pool = database.pool().clone();
@@ -391,6 +392,31 @@ pub async fn init_domain_services_with_pool(
         database.pool().clone(),
     ));
 
+    // Cloud-platform: configured by CLOUD_PLATFORM_URL and CLOUD_PLATFORM_API_KEY_FILE.
+    // Unconfigured, none of this is built and the local repositories serve every read.
+    let cp_config = database::cp_client::CpClientConfig::from_env()
+        .unwrap_or_else(|error| panic!("cloud-platform configuration: {error}"));
+    let cloud_platform = cloud_platform::build(cp_config.as_ref(), metrics_service.clone())
+        .unwrap_or_else(|error| panic!("cloud-platform client: {error:#}"));
+    if cloud_platform.is_some() {
+        database::cp_client::client::mark_configured();
+    }
+    let cloud_platform_catalog = cloud_platform::catalog_models(
+        models_repo.clone() as Arc<dyn services::models::ModelsRepository>,
+        cloud_platform.as_ref(),
+        Some(metrics_service.clone()),
+    );
+    let catalog_models = cloud_platform::models_repository(
+        models_repo.clone() as Arc<dyn services::models::ModelsRepository>,
+        cloud_platform_catalog.as_ref(),
+    );
+    let signature_repo = cloud_platform::signature_repository(
+        attestation_repo.clone() as Arc<dyn services::attestation::ports::AttestationRepository>,
+        cloud_platform.as_ref(),
+    );
+    let cloud_platform_check_api_key =
+        cloud_platform::check_api_key_verdicts(cloud_platform.as_ref());
+
     // Note: inference_url models and external providers are loaded in init_inference_providers.
     // Periodic refresh is also started there.
 
@@ -411,15 +437,15 @@ pub async fn init_domain_services_with_pool(
     // services below share, so its invalidation reaches all three.
     let models_service = Arc::new(services::models::ModelsServiceImpl::new(
         inference_provider_pool.clone(),
-        models_repo.clone(),
+        catalog_models.clone(),
     ));
 
     // Create attestation service
     let attestation_service = Arc::new(
         services::attestation::AttestationService::init(
-            attestation_repo,
+            signature_repo,
             inference_provider_pool.clone(),
-            models_repo.clone(),
+            catalog_models.clone(),
             models_service.model_resolve_cache(),
             metrics_service.clone(),
             usage_repository_for_attestation,
@@ -484,7 +510,7 @@ pub async fn init_domain_services_with_pool(
         attestation_service.clone(),
         usage_service.clone(),
         metrics_service.clone(),
-        models_repo.clone() as Arc<dyn services::models::ModelsRepository>,
+        catalog_models.clone(),
         org_limit_repository,
     )
     .with_model_resolve_cache(models_service.model_resolve_cache());
@@ -644,6 +670,8 @@ pub async fn init_domain_services_with_pool(
     };
 
     DomainServices {
+        cloud_platform_check_api_key,
+        cloud_platform_catalog,
         conversation_service,
         response_service,
         completion_service,
@@ -1173,6 +1201,7 @@ pub fn build_app_with_config_and_options(
         app_state.clone(),
         &auth_components.auth_state_middleware,
         usage_state.clone(),
+        domain_services.cloud_platform_check_api_key.clone(),
     );
 
     let internal_routes = build_internal_routes(app_state.clone());
@@ -1240,7 +1269,10 @@ pub fn build_app_with_config_and_options(
             analytics_service,
             staking_farm_service: app_state.staking_farm_service.clone(),
             aml_service: app_state.aml_service.clone(),
-            models_service: domain_services.models_service.clone(),
+            models_service: cloud_platform::invalidating_models_service(
+                domain_services.models_service.clone(),
+                domain_services.cloud_platform_catalog.clone(),
+            ),
             completion_service: domain_services.completion_service.clone(),
             organization_service: domain_services.organization_service.clone(),
             usage_service: domain_services.usage_service.clone(),
@@ -1507,6 +1539,10 @@ pub fn build_completion_routes(
             .layer(from_fn_with_state(
                 auth_state_middleware.clone(),
                 middleware::auth::anthropic_auth_middleware_with_workspace_context,
+            ))
+            .layer(from_fn_with_state(
+                middleware::BodyHashLimit(AUDIO_TRANSCRIPTION_MAX_BODY_SIZE),
+                middleware::body_hash_middleware,
             ));
 
         // Token counting is free and has its own Anthropic rate-limit class.
@@ -1824,17 +1860,18 @@ where
 
 /// Build attestation routes with auth.
 ///
-/// Route classification (nearai/infra#193) — see `routes/attestation.rs` for
-/// the full table:
-/// - `GET /v1/attestation/report` and `GET /v1/signature/{chat_id}` require an
-///   API key (`auth_middleware_with_workspace_context`). The middleware
-///   validates the key and confirms its workspace and organization remain
-///   active (rejecting missing/invalid/expired/deactivated credentials with
-///   401); like the signature route, report retrieval is non-billable — no
-///   usage or billing records are created. It is the same check as
-///   `auth_middleware_with_api_key`, and it also hands the handler the key's
-///   organization: the report route needs it to decide whether the caller
-///   may ask about an unlisted model.
+/// Route classification — see `routes/attestation.rs` for the full table:
+/// - `GET /v1/signature/{chat_id}` requires an API key
+///   (`auth_middleware_with_workspace_context`). The middleware validates the
+///   key and confirms its workspace and organization remain active (rejecting
+///   missing/invalid/expired/deactivated credentials with 401).
+/// - `GET /v1/attestation/report` takes an optional API key
+///   (`optional_auth_middleware_with_workspace_context`). Without one the
+///   report is served anonymously for listed models, so a client can verify
+///   the gateway before it sends any credential. A key that is sent is
+///   validated the same way, and its organization decides whether an unlisted
+///   model resolves. Retrieval is non-billable either way — no usage or
+///   billing records are created.
 /// - `GET /v1/attestation/ita-token` and `GET /v1/attestation/pins` are
 ///   deliberately public; the rationale is documented on
 ///   `build_public_attestation_routes`.
@@ -1845,12 +1882,18 @@ pub fn build_attestation_routes(
 ) -> Router {
     let attestation_route_state = attestation::AttestationRouteState::from(app_state);
     let authenticated_routes = Router::new()
-        .route("/attestation/report", get(get_attestation_report))
         .route("/signature/{chat_id}", get(get_signature))
         .with_state(attestation_route_state.clone())
         .layer(from_fn_with_state(
             auth_state_middleware.clone(),
             middleware::auth::auth_middleware_with_workspace_context,
+        ));
+    let optional_key_routes = Router::new()
+        .route("/attestation/report", get(get_attestation_report))
+        .with_state(attestation_route_state.clone())
+        .layer(from_fn_with_state(
+            auth_state_middleware.clone(),
+            middleware::auth::optional_auth_middleware_with_workspace_context,
         ));
 
     // One section per attested backup provider; add new providers here.
@@ -1863,6 +1906,7 @@ pub fn build_attestation_routes(
 
     Router::new()
         .merge(authenticated_routes)
+        .merge(optional_key_routes)
         .merge(public_routes)
 }
 
@@ -2077,7 +2121,17 @@ pub fn build_gateway_routes(
     app_state: AppState,
     auth_state_middleware: &AuthState,
     usage_state: middleware::UsageState,
+    cloud_platform_verdicts: Option<Arc<database::cp_client::ApiKeyVerdicts>>,
 ) -> Router {
+    if let Some(verdicts) = cloud_platform_verdicts {
+        // cloud-platform decides: the local key and credit checks do not run on this route.
+        return Router::new()
+            .route(
+                "/check_api_key",
+                post(cloud_platform::check_api_key_from_cloud_platform),
+            )
+            .with_state(verdicts);
+    }
     Router::new()
         .route(
             "/check_api_key",
@@ -2216,7 +2270,8 @@ pub struct AdminRouteServices {
     pub analytics_service: Arc<services::admin::AnalyticsService>,
     pub staking_farm_service: Arc<services::staking_farm::StakingFarmService>,
     pub aml_service: Arc<services::aml::AmlService>,
-    pub models_service: Arc<services::models::ModelsServiceImpl>,
+    /// Invalidated by admin writes: see `cloud_platform::invalidating_models_service`.
+    pub models_service: Arc<dyn services::models::ModelsServiceTrait>,
     pub completion_service: Arc<services::CompletionServiceImpl>,
     pub organization_service:
         Arc<dyn services::organization::OrganizationServiceTrait + Send + Sync>,
@@ -2293,7 +2348,7 @@ fn build_admin_routes_with_options(
     // `/v1/admin/organizations/{org_id}/concurrent-limit`.
     let admin_service = Arc::new(AdminServiceImpl::new(
         admin_repository as Arc<dyn services::admin::AdminRepository>,
-        services.models_service as Arc<dyn services::models::ModelsServiceTrait>,
+        services.models_service,
         services.completion_service.clone()
             as Arc<dyn services::completions::CompletionServiceTrait>,
         services::email::sender_from_config(&config.invitation_email)
@@ -2987,9 +3042,8 @@ mod tests {
 
     #[test]
     fn test_openapi_ita_token_endpoint_is_public() {
-        // /v1/attestation/ita-token and /v1/attestation/pins are the
-        // ONLY public attestation routes — explicit, documented decisions
-        // (nearai/infra#193); see
+        // /v1/attestation/ita-token and /v1/attestation/pins take no
+        // credential at all — explicit, documented decisions; see
         // `build_public_attestation_routes` in routes/attestation.rs.
         let spec = match serde_json::to_value(ApiDoc::openapi()) {
             Ok(spec) => spec,
@@ -3020,9 +3074,9 @@ mod tests {
     }
 
     #[test]
-    fn test_openapi_attestation_report_requires_api_key() {
-        // nearai/infra#193: /v1/attestation/report is an API-key-protected
-        // data-plane endpoint. The OpenAPI contract must match the runtime
+    fn test_openapi_attestation_report_api_key_is_optional() {
+        // /v1/attestation/report serves anonymous callers and reads an API key
+        // when one is sent. The OpenAPI contract must match the runtime
         // auth middleware.
         let spec = serde_json::to_value(ApiDoc::openapi()).unwrap();
         let report_get = &spec["paths"]["/v1/attestation/report"]["get"];
@@ -3033,8 +3087,8 @@ mod tests {
         );
         assert_eq!(
             report_get["security"],
-            serde_json::json!([{ "api_key": [] }]),
-            "/v1/attestation/report must require api_key security"
+            serde_json::json!([{}, { "api_key": [] }]),
+            "/v1/attestation/report must declare api_key security as optional"
         );
     }
 

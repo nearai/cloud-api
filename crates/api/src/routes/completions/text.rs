@@ -477,7 +477,7 @@ pub(super) async fn completions_inner(
                                 };
                                 if let Some(chat_id) = chat_id {
                                     match tokio::time::timeout(
-                                        Duration::from_secs(STREAM_SIGNATURE_STORE_TIMEOUT_SECS),
+                                        SIGNATURE_STORE_TIMEOUT,
                                         attestation_service.store_chat_signature(
                                             &chat_id,
                                             request_hash,

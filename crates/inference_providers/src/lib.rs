@@ -99,9 +99,9 @@ pub use models::{
     ImageEditParams, ImageEditResponse, ImageEditResponseWithBytes, ImageGenerationError,
     ImageGenerationParams, ImageGenerationResponse, ImageGenerationResponseWithBytes, MessageRole,
     ModelInfo, PlacementContext, PrivacyClassifyError, RerankError, RerankParams, RerankResponse,
-    RerankResult, RerankUsage, ScoreError, ScoreParams, ScoreResponse, ScoreResult, ScoreUsage,
-    StreamChunk, StreamOptions, TokenUsage, ToolChoice, ToolDefinition, TranscriptionSegment,
-    TranscriptionWord,
+    RerankResult, RerankScore, RerankUsage, ScoreError, ScoreParams, ScoreResponse, ScoreResult,
+    ScoreUsage, StreamChunk, StreamOptions, TokenUsage, ToolChoice, ToolDefinition,
+    TranscriptionSegment, TranscriptionWord,
 };
 pub use sse_parser::{
     new_external_sse_parser, new_sse_parser, BufferedSSEParser, SSEEvent, SSEEventParser, SSEParser,
@@ -461,6 +461,7 @@ pub trait InferenceProvider {
         &self,
         _request: SystemOneRequest,
         _request_hash: String,
+        _model_pub_key: Option<&str>,
     ) -> Result<SystemOneResponseWithBytes, CompletionError> {
         Err(CompletionError::CompletionError(
             "System One is unavailable for this provider".into(),

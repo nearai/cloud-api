@@ -220,6 +220,7 @@ pub(super) fn public_ita_server(
         attestation_service: Arc::new(attestation_service),
         models_service: Arc::new(models_service),
         ohttp_attestation: None,
+        anonymous_reports: Arc::new(tokio::sync::Semaphore::new(1)),
     };
     let app = Router::new()
         .route("/attestation/ita-token", axum::routing::get(get_ita_token))

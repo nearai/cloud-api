@@ -16,7 +16,7 @@ use inference_providers::StreamChunk;
 // The tests run in CI and require a running vllm-proxy instance with encryption support.
 
 /// Helper function to fetch the model public key from the attestation report endpoint.
-/// The endpoint requires an API key (nearai/infra#193).
+/// The API key is optional on this endpoint; these callers send one.
 async fn get_model_public_key(
     server: &TestServer,
     api_key: &str,

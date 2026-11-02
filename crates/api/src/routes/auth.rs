@@ -189,7 +189,7 @@ pub struct AuthResponse {
 
 // NEAR authentication types
 use base64::prelude::*;
-use near_api::signer::NEP413Payload;
+use near_kit::standards::nep413::SignMessageParams;
 
 /// Request body for NEAR authentication (NEP-413)
 #[derive(Debug, Deserialize)]
@@ -232,13 +232,44 @@ impl TryFrom<NearSignedMessageJson> for services::auth::near::SignedMessage {
     type Error = anyhow::Error;
 
     fn try_from(msg: NearSignedMessageJson) -> Result<Self, Self::Error> {
-        use near_api::types::Signature;
+        use near_kit::signer::Signature;
 
-        let public_key: near_api::PublicKey = msg.public_key.parse()?;
+        // ML-DSA-65 is the largest supported key; bound base58 work before parsing.
+        if msg.public_key.len() > 3_000 {
+            return Err(anyhow::anyhow!("Public key exceeds 3000 bytes"));
+        }
+
+        let public_key: near_kit::signer::PublicKey = msg.public_key.parse()?;
 
         // Parse base64 signature and create Signature based on key type
         let sig_bytes = BASE64_STANDARD.decode(&msg.signature)?;
-        let signature = Signature::from_parts(public_key.key_type(), &sig_bytes)?;
+        let sig_len = sig_bytes.len();
+        let signature = match public_key.key_type() {
+            near_kit::signer::KeyType::Ed25519 => {
+                Signature::ed25519_from_bytes(sig_bytes.try_into().map_err(|_| {
+                    anyhow::anyhow!(
+                        "Invalid Ed25519 signature length: expected 64 bytes, got {sig_len}"
+                    )
+                })?)
+            }
+            near_kit::signer::KeyType::Secp256k1 => {
+                Signature::secp256k1_from_bytes(sig_bytes.try_into().map_err(|_| {
+                    anyhow::anyhow!(
+                        "Invalid Secp256k1 signature length: expected 65 bytes, got {sig_len}"
+                    )
+                })?)
+            }
+            near_kit::signer::KeyType::MlDsa65 => {
+                let expected_len = public_key.key_type().signature_len();
+                let bytes = sig_bytes.into_boxed_slice().try_into().map_err(|_| {
+                    anyhow::anyhow!(
+                        "Invalid ML-DSA-65 signature length: expected {expected_len} bytes, got {sig_len}"
+                    )
+                })?;
+
+                Signature::ml_dsa65_from_bytes(bytes)
+            }
+        };
 
         Ok(services::auth::near::SignedMessage {
             account_id: msg.account_id.parse()?,
@@ -249,7 +280,7 @@ impl TryFrom<NearSignedMessageJson> for services::auth::near::SignedMessage {
     }
 }
 
-impl TryFrom<NearPayloadJson> for NEP413Payload {
+impl TryFrom<NearPayloadJson> for SignMessageParams {
     type Error = anyhow::Error;
 
     fn try_from(payload: NearPayloadJson) -> Result<Self, Self::Error> {
@@ -259,11 +290,13 @@ impl TryFrom<NearPayloadJson> for NEP413Payload {
             .try_into()
             .map_err(|_| anyhow::anyhow!("Nonce must be exactly 32 bytes"))?;
 
-        Ok(NEP413Payload {
+        Ok(SignMessageParams {
             message: payload.message,
             nonce,
             recipient: payload.recipient,
             callback_url: payload.callback_url,
+            // Wallet callback state is not part of the NEP-413 signed payload.
+            state: None,
         })
     }
 }
@@ -887,6 +920,56 @@ pub async fn login_page() -> Html<&'static str> {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn near_wallet_signature_decoding_preserves_key_types_and_rejects_bad_lengths() {
+        use near_kit::signer::SecretKey;
+
+        for secret_key in [
+            SecretKey::ed25519_from_bytes([7; 32]),
+            SecretKey::secp256k1_from_bytes([7; 32]).unwrap(),
+            SecretKey::ml_dsa65_from_seed([7; 32]),
+        ] {
+            let signature = secret_key.sign(&[9; 32]);
+            let request = NearSignedMessageJson {
+                account_id: "alice.near".into(),
+                public_key: secret_key.public_key().to_string(),
+                signature: BASE64_STANDARD.encode(signature.as_bytes()),
+                state: Some("wallet-state".into()),
+            };
+
+            let decoded = services::auth::near::SignedMessage::try_from(request.clone()).unwrap();
+
+            assert_eq!(decoded.signature, signature);
+            assert_eq!(decoded.public_key, secret_key.public_key());
+            assert_eq!(decoded.state, request.state);
+            assert!(decoded.signature.verify(&[9; 32], &decoded.public_key));
+            assert!(!decoded.signature.verify(&[8; 32], &decoded.public_key));
+
+            for length in [3_000, 3_001, 10_000] {
+                let mut invalid = request.clone();
+                invalid.public_key = "1".repeat(length);
+                let error = services::auth::near::SignedMessage::try_from(invalid).unwrap_err();
+
+                assert_eq!(
+                    error.to_string() == "Public key exceeds 3000 bytes",
+                    length > 3_000,
+                    "public key length {length}",
+                );
+            }
+
+            for length in [
+                0,
+                signature.as_bytes().len() - 1,
+                signature.as_bytes().len() + 1,
+            ] {
+                let mut invalid = request.clone();
+                invalid.signature = BASE64_STANDARD.encode(vec![0; length]);
+
+                assert!(services::auth::near::SignedMessage::try_from(invalid).is_err());
+            }
+        }
+    }
 
     fn cors() -> config::CorsConfig {
         config::CorsConfig {

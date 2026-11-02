@@ -989,7 +989,7 @@ async fn test_has_audio_content_detection() {
 const MOCK_ECDSA_PUB_KEY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
 /// Helper function to fetch the model public key from the attestation report endpoint.
-/// The endpoint requires an API key (nearai/infra#193).
+/// The API key is optional on this endpoint; these callers send one.
 async fn get_model_public_key(
     server: &axum_test::TestServer,
     api_key: &str,

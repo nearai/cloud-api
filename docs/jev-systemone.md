@@ -2,18 +2,17 @@
 
 ## Design
 
-Jev is a decision model, not a chat or image model. Cloud API exposes
-`POST /v1/systemone` using the [TypeSafe protocol](https://api.typesafe.ai/openapi.json).
-The protocol name is the HTTP path; `decisions` is the output modality used
-by [OpenRouter](https://openrouter.ai/typesafe/jev-1.13/api).
-TypeSafe describes System One and typed decisions but does not publish
-OpenRouter's `input_modalities` / `output_modalities` catalog fields.
+Jev returns typed decisions from text and, on supported providers, images.
+Cloud API exposes `POST /v1/systemone` using
+[OpenRouter's System One JSON contract](https://openrouter.ai/openapi.json).
+The protocol name is the HTTP path; `decisions` is the output modality.
+Input capabilities are declared per model through `input_modalities`.
 
 Two independent axes determine behavior:
 
 | Axis | Hosted Jev | Self-hosted TEE System One |
 | --- | --- | --- |
-| Input / output | `text` / `decisions` | `text` / `decisions` |
+| Input / output | Model-declared inputs / `decisions` | Model-declared inputs / `decisions` |
 | Catalog provider type | `external` | `vllm` (existing NEAR fleet adapter) |
 | Backend transport | `typesafe` | NEAR attested transport |
 | Attestation / verifiable | false / false | true / true |
@@ -32,12 +31,13 @@ back to plaintext. Signature selection uses the **actual serving provider's**
 trust tier and signature capability, including fallback, rather than catalog flags.
 An attested provider without per-response signatures receives a gateway receipt.
 
-Self-hosted decision requests use request-key routing with bounded spillover
-across verified fleet backends. Retryable HTTP errors and connection failures
-can try another instance; its response ID pins subsequent signature retrieval
+Self-hosted decision requests use request-key routing with bounded spillover.
+`X-Model-Pub-Key` uses the same provider selection and backend key-affinity policy
+as Chat Completions. Retryable HTTP errors and connection failures can try
+another eligible instance; its response ID pins subsequent signature retrieval
 to that instance. Invalid successful responses, invalid TEE receipt IDs and
-ambiguous transport/read timeouts stop both instance and provider fallback to
-avoid issuing another paid inference.
+ambiguous transport/read timeouts stop
+both instance and provider fallback to avoid issuing another paid inference.
 
 Endpoint compatibility is checked against an already resolved model, including
 aliases. Chat Completions and legacy Completions share the same service check.
@@ -87,6 +87,9 @@ For OpenRouter's System One compatibility endpoint, use
 `base_url: https://openrouter.ai/api/v1`, its model ID in `model_name`, and an
 OpenRouter API key. The adapter appends `/systemone`; it does not translate to
 OpenRouter's separate alpha decisions API.
+For image-capable OpenRouter models such as `typesafe/jev-1.14`, set
+`inputModalities: ["text", "image"]` and use that OpenRouter model ID in
+`providerConfig.model_name`.
 
 ## Call and verify
 
@@ -117,10 +120,65 @@ Content-Type: application/json
 `state` and question instructions accept text, objects, or arrays. Every question
 requires `instructions`; missing or null instructions return 400 before inference.
 `noul` criteria are optional, choice criteria have 1–255 entries,
-and score criteria have 1–10 levels. Score's lower bound follows the official
+and score criteria have 1–10 levels. A `box` question requires `instructions`
+and has no `criteria`. Score's lower bound follows the official
 OpenAPI (the prose guide recommends at least two). Unknown request fields,
 including `stream`, are rejected. The gateway validates answer types, keys,
 numeric ranges, and nonnegative token counts before recording usage.
+
+### Images and Box through OpenRouter
+
+Use OpenRouter's JSON `image_url` parts with base64 PNG or JPEG data URLs:
+
+```json
+{
+  "model": "typesafe/jev-1.14",
+  "state": [
+    "A receipt attached to a refund request.",
+    {"type": "image_url", "image_url": {"url": "data:image/png;base64,<image-data>"}}
+  ],
+  "questions": {
+    "receipt": {"type": "box", "instructions": "Locate the entire receipt."}
+  }
+}
+```
+
+Register the model with the OpenRouter configuration above before calling it.
+Jev also accepts image parts nested in `state`, `instructions`, and `criteria`;
+these JSON values pass through unchanged. See
+[OpenRouter's image formats and limits](https://openrouter.ai/docs/guides/community/multimodal-decisions).
+
+Alternatively, send each image once in a JSON `assets` map and use its reference
+in `state`, `instructions`, or `criteria`:
+
+```json
+{
+  "model": "typesafe/jev-1.14",
+  "state": {"photo": "receipt-ref"},
+  "assets": {
+    "receipt-ref": {"type": "image", "format": "png", "data_base64": "<image-data>"}
+  },
+  "questions": {
+    "receipt": {"type": "box", "instructions": "Locate the receipt in receipt-ref."}
+  }
+}
+```
+
+`type` is optional; `format` is `png`, `jpg`, or `jpeg`. `data_base64` contains
+standard base64 without a data URL prefix. Cloud API forwards assets and reference
+strings unchanged; OpenRouter resolves them and checks image data and reference
+usage. Every asset must be referenced. On Jev, references can appear inside longer
+strings, and a Score `legend` preserves the original criterion reference. Inline
+`image_url` parts and assets may be mixed.
+
+The endpoint accepts JSON with a 25 MiB request-body limit, including base64.
+
+A Box answer contains `type: "box"`, a `box` object with numeric `top`, `bottom`,
+`left`, and `right` edges, and optional `confidence`, matching OpenRouter's schema.
+Box requires an upstream model that supports it, such as Jev 1.14. To check
+whether a target exists, include a Noul question alongside the Box.
+
+### Receipts and billing
 
 The successful response body is returned **byte for byte** from the provider,
 including unknown response extensions and its reported model name. No ID or
@@ -171,6 +229,10 @@ The underlying TEE server/model proxy must implement:
 4. Expose the existing `/v1/signature/{id}` contract for both algorithms,
    signing the original request hash and the exact response bytes.
 
+To select a signing identity, send `X-Model-Pub-Key` from the model's attestation
+report. The request remains plaintext. If no matching provider is available,
+the endpoint returns 421; refresh the attestation before retrying.
+
 The NEAR adapter uses the verified backend client and retains the backend
 rotation index for signature retrieval, then releases the pin after finalization.
 Missing/invalid TEE IDs fail closed rather than fabricating a provider receipt.
@@ -179,14 +241,14 @@ Cloud API does not add System One support to the model server itself.
 ## Scope and validation
 
 `/v1/responses`, `/v1/chat/completions`, and `/v1/completions` reject decision models with a pointer to
-`/v1/systemone`. There is no streaming, E2EE, or key-pinned routing contract for
-this endpoint yet; encryption/routing-key headers are explicitly rejected.
+`/v1/systemone`. Streaming and E2EE are unavailable; encryption headers are rejected.
 Unknown request fields are rejected until their behavior is explicitly supported;
 unknown fields on otherwise valid upstream responses are preserved verbatim.
 The existing image receipt issue is tracked separately in
 [#1125](https://github.com/nearai/cloud-api/issues/1125).
 
-Tests cover wire compatibility, model overrides, raw bytes, sanitized upstream
+Tests cover wire compatibility, Box answers with optional confidence, JSON image
+parts and asset references, model overrides, raw bytes, sanitized upstream
 errors, both receipt algorithms, billing/catalog discovery, alias and modality
 validation, TEE ID storage boundaries, invalid usage, trust-preserving fallback,
 and receipt/billing finalization after client disconnect. Fleet

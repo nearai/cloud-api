@@ -263,8 +263,11 @@ jobs:
     - name: Run e2e tests
       run: cargo nextest run --test e2e_all
       # No secrets: the e2e harness builds its config in crates/api/tests/common (mock auth
-      # key, mock inference providers) and reads no auth, discovery or search secrets.
+      # key, mock inference providers) and reads no auth or discovery secrets.
       env:
+        # The app builds the Brave provider at startup and panics without a key; no e2e test
+        # calls the real Brave API, so a placeholder is enough.
+        BRAVE_SEARCH_PRO_API_KEY: e2e-placeholder
         DATABASE_HOST: localhost
         DATABASE_PORT: ${{ job.services.postgres.ports['5432'] }}
         DATABASE_NAME: platform_api

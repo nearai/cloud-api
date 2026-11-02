@@ -544,9 +544,11 @@ sequenceDiagram
 
 ### 5. Default Typed Client-Managed Function Call Flow (Tool Use)
 
-Multi-turn flow where the model requests a custom function and the client
-executes it. Only `type: "function"` tools are accepted by Responses;
-server-executed/builtin tools are rejected.
+Multi-turn flow where the model requests a function and the client executes
+it. Responses also accepts client-managed `custom` tools and namespaces of
+function/custom tools; server-executed/builtin tools are rejected. The
+[compatibility guide](../local-development.md#stateless-responses-and-attestation-retention)
+describes custom formats, Codex tool declarations, and reasoning replay.
 
 ```mermaid
 sequenceDiagram
@@ -778,11 +780,8 @@ request. These are not durable response-history states.
 stateDiagram-v2
     [*] --> in_progress: POST /v1/responses (store: false)
 
-    in_progress --> completed: Inference successful
-    in_progress --> incomplete: Client-managed function call required
+    in_progress --> completed: Text or client-managed tool calls generated
     in_progress --> failed: Inference error
-
-    incomplete --> [*]: Client executes the function
 
     completed --> [*]: Response delivered, not stored
     failed --> [*]: Error delivered
@@ -792,13 +791,9 @@ stateDiagram-v2
         Streaming tokens and tracking usage
     end note
 
-    note right of incomplete
-        Model requested a custom function
-        Client owns execution and transcript
-        A later request replays the call and output
-    end note
-
     note right of completed
+        Client executes any requested tools
+        A later request replays calls and outputs
         No response/item history is written
         Best-effort digest signature may be stored
     end note
@@ -1081,8 +1076,10 @@ POST /v1/responses
 - **Event Types**:
   - `response.created` - Initial response metadata
   - `response.output_text.delta` - Incremental text chunks
+  - `response.reasoning_text.delta` - Reasoning text with its content index
+  - `response.output_item.done` - Completed text, reasoning, or client tool item
   - `response.completed` - Final response with usage
-  - `response.failed` - Error handling
+  - `response.failed` - Failed response object with `response.error`
 
 **Flow**:
 ```
@@ -1418,10 +1415,10 @@ erDiagram
 - `POST /v1/responses/{id}/cancel` - Authenticated `410 Gone` (history retired)
 - `GET /v1/responses/{id}/input_items` - Authenticated `410 Gone` (history retired)
 
-> Responses accepts only custom client-managed `function` tools. Clients keep
-> history and replay a raw `function_call` plus its matching
-> `function_call_output` in a fresh request; Cloud neither executes tools nor
-> runs an agent loop. Responses, including retired-history responses, use
+> Responses accepts client-managed `function` and `custom` tools, including
+> namespaced tools. Clients keep history and replay the returned call and its
+> matching output in a fresh request; Cloud neither executes tools nor runs an
+> agent loop. Responses, including retired-history responses, use
 > `Cache-Control: no-store`.
 
 **Attestation:**

@@ -40,6 +40,9 @@ impl From<Uuid> for ResponseItemId {
 /// Request to create a response
 #[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct CreateResponseRequest {
+    #[serde(skip)]
+    #[schema(ignore)]
+    pub client_tool_adapter: super::client_tools::ClientToolAdapter,
     pub model: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub input: Option<ResponseInput>,
@@ -103,6 +106,24 @@ pub enum ResponseInput {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(untagged)]
 pub enum ResponseInputItem {
+    /// Plaintext reasoning replayed with the assistant's function calls.
+    Reasoning {
+        #[serde(rename = "type")]
+        type_: ReasoningType,
+        #[serde(default, with = "super::reasoning_wire::summary")]
+        #[schema(value_type = Vec<ReasoningSummaryPart>)]
+        summary: String,
+        #[serde(
+            default,
+            with = "super::reasoning_wire::content",
+            skip_serializing_if = "String::is_empty"
+        )]
+        #[schema(value_type = Option<Vec<ReasoningTextPart>>)]
+        content: String,
+        /// Opaque reasoning is only supported by the native Responses path.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        encrypted_content: Option<String>,
+    },
     McpApprovalResponse {
         #[serde(rename = "type")]
         type_: McpApprovalResponseType,
@@ -156,10 +177,19 @@ pub enum McpListToolsType {
     McpListTools,
 }
 
+pub use super::reasoning_wire::{ReasoningSummaryPart, ReasoningTextPart};
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq)]
+pub enum ReasoningType {
+    #[serde(rename = "reasoning")]
+    Reasoning,
+}
+
 impl ResponseInputItem {
     pub fn role(&self) -> Option<&str> {
         match self {
             ResponseInputItem::Message { role, .. } => Some(role),
+            ResponseInputItem::Reasoning { .. } => None,
             ResponseInputItem::McpApprovalResponse { .. } => None,
             ResponseInputItem::McpListTools { .. } => None,
             ResponseInputItem::FunctionCall { .. } => None,
@@ -170,6 +200,7 @@ impl ResponseInputItem {
     pub fn content(&self) -> Option<&ResponseContent> {
         match self {
             ResponseInputItem::Message { content, .. } => Some(content),
+            ResponseInputItem::Reasoning { .. } => None,
             ResponseInputItem::McpApprovalResponse { .. } => None,
             ResponseInputItem::McpListTools { .. } => None,
             ResponseInputItem::FunctionCall { .. } => None,
@@ -180,6 +211,7 @@ impl ResponseInputItem {
     pub fn metadata(&self) -> Option<&serde_json::Value> {
         match self {
             ResponseInputItem::Message { metadata, .. } => metadata.as_ref(),
+            ResponseInputItem::Reasoning { .. } => None,
             ResponseInputItem::McpApprovalResponse { .. } => None,
             ResponseInputItem::McpListTools { .. } => None,
             ResponseInputItem::FunctionCall { .. } => None,
@@ -199,6 +231,7 @@ impl ResponseInputItem {
                 ..
             } => Some((approval_request_id, *approve)),
             ResponseInputItem::Message { .. } => None,
+            ResponseInputItem::Reasoning { .. } => None,
             ResponseInputItem::McpListTools { .. } => None,
             ResponseInputItem::FunctionCall { .. } => None,
             ResponseInputItem::FunctionCallOutput { .. } => None,
@@ -676,7 +709,15 @@ pub enum ResponseOutputItem {
         #[serde(default)]
         created_at: i64,
         status: ResponseItemStatus,
+        #[serde(default, with = "super::reasoning_wire::summary")]
+        #[schema(value_type = Vec<ReasoningSummaryPart>)]
         summary: String,
+        #[serde(
+            default,
+            with = "super::reasoning_wire::content",
+            skip_serializing_if = "String::is_empty"
+        )]
+        #[schema(value_type = Option<Vec<ReasoningTextPart>>)]
         content: String,
         model: String,
     },
@@ -1388,6 +1429,19 @@ impl CreateResponseRequest {
 
             for item in items {
                 match item {
+                    ResponseInputItem::Reasoning {
+                        content,
+                        summary,
+                        encrypted_content,
+                        ..
+                    } if content.is_empty()
+                        && summary.is_empty()
+                        && encrypted_content
+                            .as_ref()
+                            .is_some_and(|text| !text.is_empty()) =>
+                    {
+                        return Err("Encrypted-only reasoning replay requires a model using native Responses; the typed adapter requires plaintext reasoning content or summary.".to_string());
+                    }
                     ResponseInputItem::McpApprovalResponse { .. }
                     | ResponseInputItem::McpListTools { .. } => {
                         return Err(
@@ -1559,6 +1613,7 @@ mod tests {
 
     fn stateless_request() -> CreateResponseRequest {
         CreateResponseRequest {
+            client_tool_adapter: Default::default(),
             model: "gpt-4".to_string(),
             input: Some(ResponseInput::Text("Hello".to_string())),
             instructions: None,
@@ -1933,6 +1988,7 @@ mod tests {
     #[test]
     fn test_create_response_request_rejects_non_positive_max_output_tokens() {
         let base_request = CreateResponseRequest {
+            client_tool_adapter: Default::default(),
             model: "gpt-4".to_string(),
             input: None,
             instructions: None,
@@ -2004,6 +2060,7 @@ mod tests {
 
         // Test that valid metadata passes validation
         let request_with_small_metadata = CreateResponseRequest {
+            client_tool_adapter: Default::default(),
             model: "gpt-4".to_string(),
             input: None,
             instructions: None,
@@ -2035,6 +2092,7 @@ mod tests {
         // Test that metadata exceeding the limit fails validation
         let large_string = "x".repeat(MAX_METADATA_SIZE_BYTES + 1);
         let request_with_large_metadata = CreateResponseRequest {
+            client_tool_adapter: Default::default(),
             model: "gpt-4".to_string(),
             input: None,
             instructions: None,
@@ -2070,6 +2128,7 @@ mod tests {
     fn test_create_response_request_validates_without_metadata() {
         // Test that request without metadata passes validation
         let request_without_metadata = CreateResponseRequest {
+            client_tool_adapter: Default::default(),
             model: "gpt-4".to_string(),
             input: None,
             instructions: None,
@@ -2179,6 +2238,7 @@ mod tests {
 
         // Test that valid input message metadata passes validation
         let request_with_small_input_metadata = CreateResponseRequest {
+            client_tool_adapter: Default::default(),
             model: "gpt-4".to_string(),
             input: Some(ResponseInput::Items(vec![ResponseInputItem::Message {
                 role: "user".to_string(),
@@ -2214,6 +2274,7 @@ mod tests {
         // Test that input message metadata exceeding the limit fails validation
         let large_string = "x".repeat(MAX_METADATA_SIZE_BYTES + 1);
         let request_with_large_input_metadata = CreateResponseRequest {
+            client_tool_adapter: Default::default(),
             model: "gpt-4".to_string(),
             input: Some(ResponseInput::Items(vec![ResponseInputItem::Message {
                 role: "user".to_string(),

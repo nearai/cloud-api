@@ -331,7 +331,7 @@ Provider refresh runs every 300s by default
 | `POST /v1/workspaces/{id}/api-keys`         | session  | Returns plaintext `key` — store it, it isn't shown again    |
 | `GET  /v1/models`                           | public   | OpenAI-compatible model catalog with pricing metadata       |
 | `POST /v1/chat/completions`                 | API key  | OpenAI-compatible. Add `"stream": true` for SSE             |
-| `POST /v1/responses`                        | API key  | Stateless `store: false` inference; client-managed function tools only |
+| `POST /v1/responses`                        | API key  | Stateless `store: false` inference; client-managed function/custom tools and namespaces |
 | `POST /v1/conversations/batch`, `GET /v1/conversations/{id}`, `GET /v1/conversations/{id}/items`, `DELETE /v1/conversations/{id}` | API key | Temporary workspace-scoped migration routes; only per-conversation deletion remains enabled |
 | `GET /v1/files`, `GET /v1/files/{id}`, `GET /v1/files/{id}/content`, `DELETE /v1/files/{id}` | API key | Temporary workspace-scoped migration routes; only per-file deletion remains enabled |
 | `POST /mcp`                                 | API key  | Independent MCP server exposing the `web_search` tool       |
@@ -356,19 +356,54 @@ model explicitly listed in `NATIVE_RESPONSES_MODELS`, with an explicit
 That narrow exception remains stateless, writes no response/item history, and
 does not run an agent loop or execute built-in or remote MCP tools.
 
-Custom `function` tools are client-managed. Cloud returns a `function_call`
-item but does not execute it. To continue after running the function, the
-client sends a fresh `store: false` request containing the original
-`function_call` and its matching `function_call_output`; it must not use
-`previous_response_id` or `conversation`. Send the same custom function tool
-definitions again in `tools` on every request so the model can continue to
-call them if needed.
+Tools are executed by the client. Both paths accept `function` and `custom`
+tools, either at the top level or inside a `namespace` containing those tool
+types. Codex's leading developer `additional_tools` declarations are accepted
+as a tool catalog. Keep these declarations before conversation items.
 
-The default typed compatibility path accepts a raw `function_call` item from a
-previous response, its matching `function_call_output`, and assistant
-`message` content parts of type `output_text` as caller-managed message
-history. It does not support reasoning items or arbitrary full
-`response.output` replay; reasoning-model compatibility is separate work.
+| Custom tool format | Default typed adapter | Native Responses |
+| --- | --- | --- |
+| Omitted format or `{"type":"text"}` | Supported | Forwarded to the provider |
+| Codex 0.166 `exec` Lark source grammar | Supported, including its nonempty input requirement | Forwarded to the provider |
+| Other grammars | Rejected with a request to use a native backend | Forwarded for provider validation |
+
+`tool_choice` accepts `auto`, `none`, `required`, or a named choice such as
+`{"type":"function","name":"lookup"}`. Named choices can include a
+`namespace`; use `"type":"custom"` for a custom tool.
+
+To continue after executing a tool, send a new `store: false` request with
+the transcript and tool definitions. Retain the returned items, identifiers,
+and metadata such as `thought_signature` when present:
+
+- Replay a `function_call` with its matching `function_call_output`, preserving
+  its `name`, optional `namespace`, `call_id`, and unchanged `arguments`.
+- Replay a `custom_tool_call` with its matching `custom_tool_call_output`,
+  preserving `name`, optional `namespace`, `call_id`, and `input`.
+- Include assistant messages with `output_text` parts and any returned
+  plaintext `reasoning` items. The typed adapter uses reasoning `content`
+  when available, otherwise its `summary`, as prior assistant context.
+  Encrypted-only reasoning requires a native Responses model; it is not
+  decoded by the Chat Completions adapter.
+
+Tool outputs may be strings or text-part arrays on the typed path. Use
+`call_id` to match a result to its call; the separate item `id` identifies
+stream events. Each generated item, including parallel calls and preceding
+text or reasoning, has its own `output_index`.
+
+With `stream: true`, generated calls progress from `response.output_item.added`
+through argument/input delta and done events to `response.output_item.done`.
+A successful model turn ends with `response.completed` and status `completed`,
+including when the client must execute tools next. Reasoning uses
+`response.reasoning_text.delta` with a `content_index`. Completed reasoning
+items have a `summary` array of `summary_text` parts and an optional `content`
+array of `reasoning_text` parts. A failure
+after streaming starts is delivered as `response.failed`, with
+`response.status: "failed"` and details in `response.error`.
+
+Place system/developer instructions before conversation history. The typed
+adapter combines the leading instruction messages in order, including the
+organization policy and request `instructions`, for models requiring one
+initial system message. User, assistant, and tool history retains its order.
 
 Existing completed-response gateway attestation is preserved on a best-effort
 basis. When its signature write succeeds, `GET /v1/signature/resp_*` can
@@ -377,8 +412,6 @@ the signature material contains no raw request or response content. A stream
 that disconnects before completion creates no `resp_*` attestation record or
 legacy disconnect fallback.
 
-Only client-managed custom `function` tools are supported by
-`POST /v1/responses`, including the native allowlisted path.
 Server-executed tools are rejected locally: `web_search`,
 `web_context_search`, `file_search`, `code_interpreter`, `computer`, and
 remote `mcp` tools. Image-generation and image-editing models are rejected on
@@ -386,8 +419,7 @@ both paths. The default typed adapter's successful requests make exactly one
 Chat Completions call. This does not affect the separate `POST /mcp` MCP
 server, which continues to expose its independent `web_search` tool, or the
 `/v1/images/*` endpoints. Native allowlisted requests may preserve validated
-provider-native fields such as reasoning data rather than passing through the
-typed adapter.
+provider-native fields such as encrypted reasoning and grammar definitions.
 
 Responses itself rejects conversation linkage, response history, and file
 input. During the temporary migration/export window, the authenticated,

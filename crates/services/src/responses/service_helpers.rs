@@ -12,10 +12,8 @@ use uuid::Uuid;
 
 /// Atomically-updated mirror of `ResponseStreamContext`'s token counters.
 ///
-/// `process_response_stream` owns `ctx` and drops it when it returns. The outer
-/// `tokio::spawn` task that emits `response.failed` on error needs visibility
-/// into accumulated usage after `ctx` is gone, so `ctx` writes through this
-/// shared handle on every update; the outer scope reads it via `snapshot`.
+/// Both completed and failed terminal events use the accumulated usage, even
+/// when an upstream stream ends after producing only part of its output.
 #[derive(Default)]
 pub struct UsageTracker {
     input_tokens: AtomicI32,
@@ -243,6 +241,57 @@ impl EventEmitter {
             usage: Some(usage),
         };
         self.send(event).await
+    }
+
+    /// Emit the failed Response object clients expect, retaining legacy
+    /// top-level error/status/usage for consumers of the existing adapter.
+    pub async fn emit_failed(
+        &mut self,
+        ctx: &mut ResponseStreamContext,
+        mut response: models::ResponseObject,
+        error: &errors::ResponseError,
+    ) -> Result<(), errors::ResponseError> {
+        let status_code = error.http_status_code();
+        let legacy_error = error.response_error();
+        let mut response_error = legacy_error.clone();
+        if response_error.code.is_none() {
+            response_error.code = Some(
+                match status_code {
+                    429 => "rate_limit_exceeded",
+                    400..=499 => "invalid_prompt",
+                    _ => "server_error",
+                }
+                .to_string(),
+            );
+        }
+        response.status = models::ResponseStatus::Failed;
+        response.error = Some(response_error);
+        response.incomplete_details = None;
+        response.usage = ctx.usage_tracker.snapshot();
+        let usage = ctx.usage_tracker.has_data().then(|| response.usage.clone());
+
+        self.send(models::ResponseStreamEvent {
+            event_type: "response.failed".to_string(),
+            sequence_number: Some(ctx.next_sequence()),
+            response: Some(response),
+            output_index: None,
+            content_index: None,
+            item: None,
+            item_id: None,
+            part: None,
+            arguments: None,
+            delta: None,
+            text: None,
+            error: Some(legacy_error),
+            status_code: Some(status_code),
+            logprobs: None,
+            obfuscation: None,
+            annotation_index: None,
+            annotation: None,
+            conversation_title: None,
+            usage,
+        })
+        .await
     }
 
     /// Emit output_item.added event
@@ -495,11 +544,11 @@ impl EventEmitter {
         delta: String,
     ) -> Result<(), errors::ResponseError> {
         let event = models::ResponseStreamEvent {
-            event_type: "response.reasoning.delta".to_string(),
+            event_type: "response.reasoning_text.delta".to_string(),
             sequence_number: Some(ctx.next_sequence()),
             response: None,
             output_index: Some(ctx.output_item_index),
-            content_index: None,
+            content_index: Some(0),
             item: None,
             item_id: Some(reasoning_id),
             part: None,
@@ -540,12 +589,8 @@ impl EventEmitter {
             model: ctx.model.clone(),
         };
 
-        // Emit done event
-        self.emit_item_done(ctx, item.clone(), reasoning_id.to_string())
-            .await?;
-
-        // Store the reasoning item in the database
-        if let Err(e) = response_items_repository
+        // Use the decorated item in both the stream and final response.
+        let item = match response_items_repository
             .create(
                 ctx.response_id.clone(),
                 ctx.api_key_id,
@@ -554,8 +599,37 @@ impl EventEmitter {
             )
             .await
         {
-            tracing::error!("Failed to store reasoning item in database: {}", e);
-        }
+            Ok(stored) => stored,
+            Err(e) => {
+                tracing::error!("Failed to store reasoning item in database: {}", e);
+                item
+            }
+        };
+
+        self.send(models::ResponseStreamEvent {
+            event_type: "response.reasoning_text.done".to_string(),
+            sequence_number: Some(ctx.next_sequence()),
+            response: None,
+            output_index: Some(ctx.output_item_index),
+            content_index: Some(0),
+            item: None,
+            item_id: Some(reasoning_id.to_string()),
+            part: None,
+            arguments: None,
+            delta: None,
+            text: Some(content.to_string()),
+            error: None,
+            status_code: None,
+            logprobs: None,
+            obfuscation: None,
+            annotation_index: None,
+            annotation: None,
+            conversation_title: None,
+            usage: None,
+        })
+        .await?;
+        self.emit_item_done(ctx, item, reasoning_id.to_string())
+            .await?;
 
         Ok(())
     }

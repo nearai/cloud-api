@@ -9,6 +9,10 @@ use crate::completions::ports::CompletionServiceTrait;
 use crate::responses::tools;
 use crate::responses::{errors, models, ports, transient};
 
+#[cfg(test)]
+#[path = "failure_tests.rs"]
+mod failure_tests;
+
 /// Context for processing a response stream
 struct ProcessStreamContext {
     request: models::CreateResponseRequest,
@@ -16,7 +20,6 @@ struct ProcessStreamContext {
     /// `request.reasoning.effort`, parsed before the stream starts.
     reasoning_effort: Option<models::ReasoningEffort>,
     user_id: crate::UserId,
-    api_key_id: String,
     request_id: uuid::Uuid,
     organization_id: uuid::Uuid,
     workspace_id: uuid::Uuid,
@@ -80,7 +83,6 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
         errors::ResponseError,
     > {
         use futures::channel::mpsc;
-        use futures::SinkExt;
 
         // Defend the service boundary as well as the HTTP route: this service
         // only executes a single stateless request.
@@ -120,12 +122,26 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
         request.background = Some(false);
 
         // Create a channel for streaming events
-        let (mut tx, rx) = mpsc::unbounded::<models::ResponseStreamEvent>();
+        let (tx, rx) = mpsc::unbounded::<models::ResponseStreamEvent>();
 
         // Each request gets its own in-memory repositories. This preserves the
         // Responses event shape without creating, reading, or updating rows in
         // `responses` or `response_items`.
         let (response_repository, response_items_repository) = transient::repositories();
+        // Allocate the response before starting the worker so even failures
+        // while preparing its input have a stable Responses envelope.
+        let api_key_uuid = Uuid::parse_str(&api_key_id)
+            .map_err(|_| errors::ResponseError::InternalError("Invalid API key ID".to_string()))?;
+        let initial_response = response_repository
+            .create(
+                crate::workspace::WorkspaceId(workspace_id),
+                api_key_uuid,
+                request.clone(),
+            )
+            .await
+            .map_err(|_| {
+                errors::ResponseError::InternalError("Failed to create response".to_string())
+            })?;
 
         // Clone necessary references for the async task
         let completion_service = self.completion_service.clone();
@@ -138,8 +154,6 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
         // The worker resolves the model again, which for an unlisted model may
         // need the caller's key (cloud-platform model access).
         crate::caller_credential::spawn_with_caller_credential(async move {
-            // Shared tracker so the outer error handler can read accumulated
-            // usage after `ctx` is dropped on Err from process_response_stream.
             let usage_tracker = crate::responses::service_helpers::UsageTracker::new();
 
             let context = ProcessStreamContext {
@@ -147,7 +161,6 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
                 model,
                 reasoning_effort,
                 user_id,
-                api_key_id,
                 request_id,
                 organization_id,
                 workspace_id,
@@ -164,58 +177,20 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
                 organization_service,
             };
 
-            if let Err(e) =
-                Self::process_response_stream(tx.clone(), context, usage_tracker.clone()).await
+            if Self::process_response_stream(
+                tx,
+                context,
+                initial_response,
+                api_key_uuid,
+                usage_tracker,
+            )
+            .await
+            .is_err()
             {
-                let status_code = e.http_status_code();
-                if e.is_client_caused() {
-                    // Client-caused (invalid params, model chat-template rejection,
-                    // bad tool call, ...). The client gets a structured 4xx /
-                    // response.failed event — not an infra failure, so keep the
-                    // ERROR stream clean for real incidents.
-                    tracing::warn!(
-                        status_code,
-                        "Client error processing response stream: {:?}",
-                        e
-                    );
-                } else {
-                    tracing::error!(status_code, "Error processing response stream: {:?}", e);
-                }
-
-                // Attach accumulated usage so downstream (e.g. non-streaming
-                // route fallback, billing) can bill for partial work done
-                // before the failure.
-                let usage = if usage_tracker.has_data() {
-                    Some(usage_tracker.snapshot())
-                } else {
-                    None
-                };
-
-                let error_event = models::ResponseStreamEvent {
-                    event_type: "response.failed".to_string(),
-                    sequence_number: None,
-                    response: None,
-                    output_index: None,
-                    content_index: None,
-                    item: None,
-                    item_id: None,
-                    part: None,
-                    arguments: None,
-                    delta: None,
-                    text: Some(e.to_string()),
-                    error: Some(e.response_error()),
-                    status_code: Some(e.http_status_code()),
-                    logprobs: None,
-                    obfuscation: None,
-                    annotation_index: None,
-                    annotation: None,
-                    conversation_title: None,
-                    usage,
-                };
-                let result = tx.send(error_event).await;
-                if let Err(e) = result {
-                    tracing::error!("Error sending error event: {e:?}");
-                }
+                // The worker handles inference failures while its response
+                // and sequence state are still available. A remaining error
+                // means the receiver could not accept its terminal event.
+                tracing::debug!("Response stream receiver closed before terminal event");
             }
         });
 
@@ -458,10 +433,7 @@ impl ResponseServiceImpl {
                     Self::accumulate_tool_calls(&sse_event, &mut tool_call_accumulator);
                 }
                 Err(e) => {
-                    tracing::warn!(
-                        "Error in completion stream (client disconnect or stream error): {}",
-                        e
-                    );
+                    tracing::warn!("Completion stream interrupted");
                     stream_error = true;
                     stream_error_cause = Some(errors::ResponseError::from(
                         crate::completions::CompletionServiceImpl::map_provider_error(
@@ -479,22 +451,50 @@ impl ResponseServiceImpl {
 
         // A provider may go straight from reasoning to function calls without
         // emitting message text. Close that item before assigning tool slots.
-        // Preserve the original provider error if the stream was interrupted.
-        if reasoning_item_emitted && !stream_error {
-            emitter
-                .emit_reasoning_completed(
-                    ctx,
-                    &reasoning_item_id,
-                    &reasoning_buffer,
-                    response_items_repository,
-                )
-                .await?;
+        // On interruption retain the partial item for response.failed without
+        // announcing that reasoning generation completed.
+        if reasoning_item_emitted {
             ctx.add_reasoning_tokens(
                 crate::responses::service_helpers::ResponseStreamContext::estimate_tokens(
                     &reasoning_buffer,
                 ),
             );
-            ctx.next_output_index();
+            if stream_error {
+                let partial = models::ResponseOutputItem::Reasoning {
+                    id: reasoning_item_id.clone(),
+                    response_id: ctx.response_id_str.clone(),
+                    previous_response_id: ctx.previous_response_id.clone(),
+                    next_response_ids: vec![],
+                    created_at: ctx.created_at,
+                    status: models::ResponseItemStatus::InProgress,
+                    summary: String::new(),
+                    content: reasoning_buffer,
+                    model: ctx.model.clone(),
+                };
+                if response_items_repository
+                    .create(
+                        ctx.response_id.clone(),
+                        ctx.api_key_id,
+                        ctx.conversation_id,
+                        partial,
+                    )
+                    .await
+                    .is_err()
+                {
+                    // Retention must not replace the provider's original error.
+                    tracing::warn!("Failed to retain partial reasoning for failed response");
+                }
+            } else {
+                emitter
+                    .emit_reasoning_completed(
+                        ctx,
+                        &reasoning_item_id,
+                        &reasoning_buffer,
+                        response_items_repository,
+                    )
+                    .await?;
+                ctx.next_output_index();
+            }
         }
 
         // If we have message content, close it with done events and retain it
@@ -514,8 +514,14 @@ impl ResponseServiceImpl {
         // Do not route their raw arguments through the legacy builtin parser:
         // that parser can repair and reserialize JSON for server-executed
         // search tools, which would corrupt a client replay.
-        let tool_calls_detected =
-            Self::convert_client_function_calls(tool_call_accumulator, request)?;
+        // Interrupted function/custom arguments can be incomplete JSON. Do
+        // not validate or expose them as calls, or mask a provider error with
+        // an argument-conversion error.
+        let tool_calls_detected = if stream_error {
+            Vec::new()
+        } else {
+            Self::convert_client_function_calls(tool_call_accumulator, request)?
+        };
 
         Ok(crate::responses::service_helpers::ProcessStreamResult {
             text: current_text,
@@ -640,36 +646,13 @@ impl ResponseServiceImpl {
     async fn process_response_stream(
         tx: futures::channel::mpsc::UnboundedSender<models::ResponseStreamEvent>,
         context: ProcessStreamContext,
+        initial_response: models::ResponseObject,
+        api_key_uuid: Uuid,
         usage_tracker: Arc<crate::responses::service_helpers::UsageTracker>,
     ) -> Result<(), errors::ResponseError> {
         tracing::info!("Starting response stream processing");
 
         let workspace_id_domain = crate::workspace::WorkspaceId(context.workspace_id);
-
-        let messages = Self::build_stateless_messages(
-            &context.request,
-            context.organization_id,
-            context.user_id.clone(),
-            &context.organization_service,
-        )
-        .await?;
-
-        // Create the response in the request-scoped store before creating its
-        // output items, preserving event ordering without a database row.
-        let api_key_uuid = Uuid::parse_str(&context.api_key_id).map_err(|e| {
-            errors::ResponseError::InternalError(format!("Invalid API key ID: {e}"))
-        })?;
-        let initial_response = context
-            .response_repository
-            .create(
-                workspace_id_domain.clone(),
-                api_key_uuid,
-                context.request.clone(),
-            )
-            .await
-            .map_err(|e| {
-                errors::ResponseError::InternalError(format!("Failed to create response: {e}"))
-            })?;
 
         // Extract response_id from the created response
         let response_id = Self::extract_response_uuid(&initial_response)?;
@@ -677,24 +660,6 @@ impl ResponseServiceImpl {
         // Stateless validation guarantees no conversation reference is present.
         let conversation_id = None;
 
-        // Store request input as response items and keep the IDs created for
-        // this request. Input may contain historical assistant messages, so
-        // role alone cannot distinguish it from generated output later.
-        let input_item_ids = if let Some(input) = &context.request.input {
-            Self::store_input_as_response_items(
-                &context.response_items_repository,
-                response_id.clone(),
-                api_key_uuid,
-                input,
-                &context.request.model,
-                context.request.metadata.as_ref(),
-            )
-            .await?
-        } else {
-            HashSet::new()
-        };
-
-        // Initialize context and emitter
         let mut ctx = crate::responses::service_helpers::ResponseStreamContext::new(
             response_id.clone(),
             api_key_uuid,
@@ -706,175 +671,189 @@ impl ResponseServiceImpl {
             usage_tracker,
         );
         let mut emitter = crate::responses::service_helpers::EventEmitter::new(tx);
+        let mut input_item_ids = HashSet::new();
+        let mut input_prepared = false;
 
-        // Event: response.created
-        emitter
-            .emit_created(&mut ctx, initial_response.clone())
-            .await?;
+        // Keep the response and sequence context alive until every fallible
+        // stage has finished, including transcript preparation and streaming.
+        let result: Result<(), errors::ResponseError> = async {
+            emitter
+                .emit_created(&mut ctx, initial_response.clone())
+                .await?;
 
-        // Event: response.in_progress
-        emitter
-            .emit_in_progress(&mut ctx, initial_response.clone())
-            .await?;
-
-        let tools = tools::prepare_tools(&context.request);
-        let tool_choice = tools::prepare_tool_choice(&context.request);
-
-        // The default typed Responses adapter is a stateless compatibility
-        // layer over exactly one Chat Completions request. Client-defined
-        // functions are returned to the caller; Cloud never executes them or
-        // starts another completion.
-        let one_shot_result: Result<String, errors::ResponseError> = async {
-            let stream_result = Self::run_completion_once(
-                &mut ctx,
-                &mut emitter,
-                &messages,
-                &context,
-                &tools,
-                &tool_choice,
+            let messages = Self::build_stateless_messages(
+                &context.request,
+                context.organization_id,
+                context.user_id.clone(),
+                &context.organization_service,
             )
             .await?;
 
-            if stream_result.stream_error {
-                return Err(stream_result
-                    .stream_error_cause
-                    .unwrap_or(errors::ResponseError::StreamInterrupted));
-            }
+            // Store request input as response items and keep the IDs created for
+            // this request. Input may contain historical assistant messages, so
+            // role alone cannot distinguish it from generated output later.
+            input_item_ids = if let Some(input) = &context.request.input {
+                Self::store_input_as_response_items(
+                    &context.response_items_repository,
+                    response_id.clone(),
+                    api_key_uuid,
+                    input,
+                    &context.request.model,
+                    context.request.metadata.as_ref(),
+                )
+                .await?
+            } else {
+                HashSet::new()
+            };
+            input_prepared = true;
 
-            // `process_completion_stream` emits any text item. Preserve the
-            // previous output-index transition before adding function calls.
-            if !stream_result.text.is_empty() {
-                ctx.next_output_index();
-            }
+            // Event: response.in_progress
+            emitter
+                .emit_in_progress(&mut ctx, initial_response.clone())
+                .await?;
 
-            Self::emit_client_function_calls(
-                &mut ctx,
-                &mut emitter,
-                &context.response_items_repository,
-                stream_result.tool_calls,
-            )
+            let tools = tools::prepare_tools(&context.request);
+            let tool_choice = tools::prepare_tool_choice(&context.request);
+
+            // The default typed Responses adapter is a stateless compatibility
+            // layer over exactly one Chat Completions request. Client-defined
+            // functions are returned to the caller; Cloud never executes them or
+            // starts another completion.
+            let final_response_text: String = async {
+                let stream_result = Self::run_completion_once(
+                    &mut ctx,
+                    &mut emitter,
+                    &messages,
+                    &context,
+                    &tools,
+                    &tool_choice,
+                )
+                .await?;
+
+                if stream_result.stream_error {
+                    return Err(stream_result
+                        .stream_error_cause
+                        .unwrap_or(errors::ResponseError::StreamInterrupted));
+                }
+
+                // `process_completion_stream` emits any text item. Preserve the
+                // previous output-index transition before adding function calls.
+                if !stream_result.text.is_empty() {
+                    ctx.next_output_index();
+                }
+
+                Self::emit_client_function_calls(
+                    &mut ctx,
+                    &mut emitter,
+                    &context.response_items_repository,
+                    stream_result.tool_calls,
+                )
+                .await?;
+
+                Ok::<_, errors::ResponseError>(stream_result.text)
+            }
             .await?;
 
-            Ok(stream_result.text)
+            // Build final response
+            let mut final_response = initial_response.clone();
+            final_response.status = models::ResponseStatus::Completed;
+            final_response.incomplete_details = None;
+
+            // Load all response items from the database for this response
+            let response_items = context
+                .response_items_repository
+                .list_by_response(ctx.response_id.clone())
+                .await
+                .map_err(|e| {
+                    errors::ResponseError::InternalError(format!(
+                        "Failed to load response items: {e}"
+                    ))
+                })?;
+
+            final_response.output = Self::select_output_items(response_items, &input_item_ids);
+
+            // Set usage from accumulated token counts
+            final_response.usage = models::Usage::new_with_reasoning_and_cache(
+                ctx.total_input_tokens,
+                ctx.total_output_tokens,
+                ctx.reasoning_tokens,
+                ctx.total_cached_tokens,
+            );
+            tracing::debug!(
+                "Final response usage: input={}, output={}, reasoning={}, total={}",
+                ctx.total_input_tokens,
+                ctx.total_output_tokens,
+                ctx.reasoning_tokens,
+                ctx.total_input_tokens + ctx.total_output_tokens
+            );
+
+            // Serialize usage to JSON for database storage
+            let usage_json = serde_json::to_value(&final_response.usage).map_err(|e| {
+                errors::ResponseError::InternalError(format!("Failed to serialize usage: {e}"))
+            })?;
+
+            if context
+                .response_repository
+                .update(
+                    ctx.response_id.clone(),
+                    workspace_id_domain.clone(),
+                    Some(final_response_text),
+                    final_response.status.clone(),
+                    Some(usage_json),
+                )
+                .await
+                .is_err()
+            {
+                tracing::warn!("Failed to update response with usage");
+            }
+
+            // Event: response.completed
+            emitter.emit_completed(&mut ctx, final_response).await?;
+
+            tracing::info!("Response stream completed successfully");
+            Ok(())
         }
         .await;
 
-        let (final_response_text, final_status) = match &one_shot_result {
-            // Producing a function call completes this model turn. The client
-            // executes it and submits the result in a separate request.
-            Ok(text) => (text.clone(), models::ResponseStatus::Completed),
-            Err(_) => (String::new(), models::ResponseStatus::Failed),
-        };
+        if let Err(error) = result {
+            let status_code = error.http_status_code();
+            let error_type = error.response_error().type_;
+            if error.is_client_caused() {
+                tracing::warn!(status_code, error_type, "Response stream failed");
+            } else {
+                tracing::error!(status_code, error_type, "Response stream failed");
+            }
 
-        // Build final response
-        let mut final_response = initial_response;
-        final_response.status = final_status;
-        final_response.incomplete_details = None;
-
-        // Load all response items from the database for this response
-        let response_items = context
-            .response_items_repository
-            .list_by_response(ctx.response_id.clone())
-            .await
-            .map_err(|e| {
-                errors::ResponseError::InternalError(format!("Failed to load response items: {e}"))
-            })?;
-
-        final_response.output = Self::select_output_items(response_items, &input_item_ids);
-
-        // Set usage from accumulated token counts
-        final_response.usage = models::Usage::new_with_reasoning_and_cache(
-            ctx.total_input_tokens,
-            ctx.total_output_tokens,
-            ctx.reasoning_tokens,
-            ctx.total_cached_tokens,
-        );
-        tracing::debug!(
-            "Final response usage: input={}, output={}, reasoning={}, total={}",
-            ctx.total_input_tokens,
-            ctx.total_output_tokens,
-            ctx.reasoning_tokens,
-            ctx.total_input_tokens + ctx.total_output_tokens
-        );
-
-        // Serialize usage to JSON for database storage
-        let usage_json = serde_json::to_value(&final_response.usage).map_err(|e| {
-            errors::ResponseError::InternalError(format!("Failed to serialize usage: {e}"))
-        })?;
-
-        // On a one-shot completion failure, emit response.failed rather than
-        // trying to repair the model output with another inference request.
-        // Keep any partial output already emitted by the stream, but mark the
-        // response as failed in the request-scoped repository.
-        match one_shot_result {
-            Err(e) => {
-                // Include error message in content so users can understand why it failed
-                if final_response.output.is_empty() {
-                    let failed_item = models::ResponseOutputItem::Message {
-                        id: format!("msg_{}", Uuid::new_v4().simple()),
-                        response_id: ctx.response_id_str.clone(),
-                        previous_response_id: ctx.previous_response_id.clone(),
-                        next_response_ids: vec![],
-                        created_at: ctx.created_at,
-                        status: models::ResponseItemStatus::Failed,
-                        role: "assistant".to_string(),
-                        content: vec![models::ResponseContentItem::OutputText {
-                            text: e.to_string(),
-                            annotations: vec![],
-                            logprobs: vec![],
-                        }],
-                        model: ctx.model.clone(),
-                        metadata: None,
-                    };
-                    if let Err(create_err) = context
-                        .response_items_repository
-                        .create(
-                            ctx.response_id.clone(),
-                            ctx.api_key_id,
-                            ctx.conversation_id,
-                            failed_item,
-                        )
-                        .await
-                    {
-                        tracing::warn!("Failed to store failed response item: {}", create_err);
-                    }
-                }
-                if let Err(e) = context
-                    .response_repository
-                    .update(
-                        ctx.response_id.clone(),
-                        workspace_id_domain.clone(),
-                        Some(final_response_text),
-                        models::ResponseStatus::Failed,
-                        Some(usage_json),
-                    )
+            let mut failed_response = initial_response;
+            // Input preparation can fail partway through retaining client
+            // history. Never return those historical items as generated output.
+            if input_prepared {
+                if let Ok(items) = context
+                    .response_items_repository
+                    .list_by_response(ctx.response_id.clone())
                     .await
                 {
-                    tracing::warn!("Failed to update response with usage: {}", e);
-                }
-                return Err(e);
-            }
-            Ok(_) => {
-                if let Err(e) = context
-                    .response_repository
-                    .update(
-                        ctx.response_id.clone(),
-                        workspace_id_domain.clone(),
-                        Some(final_response_text),
-                        final_response.status.clone(),
-                        Some(usage_json),
-                    )
-                    .await
-                {
-                    tracing::warn!("Failed to update response with usage: {}", e);
+                    failed_response.output = Self::select_output_items(items, &input_item_ids);
                 }
             }
+            if context
+                .response_repository
+                .update(
+                    ctx.response_id.clone(),
+                    workspace_id_domain,
+                    None,
+                    models::ResponseStatus::Failed,
+                    serde_json::to_value(ctx.usage_tracker.snapshot()).ok(),
+                )
+                .await
+                .is_err()
+            {
+                tracing::warn!("Failed to update failed response with usage");
+            }
+            emitter
+                .emit_failed(&mut ctx, failed_response, &error)
+                .await?;
         }
-
-        // Event: response.completed
-        emitter.emit_completed(&mut ctx, final_response).await?;
-
-        tracing::info!("Response stream completed successfully");
         Ok(())
     }
 
@@ -991,7 +970,7 @@ impl ResponseServiceImpl {
             stop: None,
             stream: Some(true),
             user_id: process_context.user_id.clone(),
-            api_key_id: process_context.api_key_id.to_string(),
+            api_key_id: ctx.api_key_id.to_string(),
             organization_id: process_context.organization_id,
             workspace_id: process_context.workspace_id,
             fallback_enabled: process_context.fallback_enabled,
@@ -1138,6 +1117,9 @@ impl ResponseServiceImpl {
                     )));
                 }
 
+                request.client_tool_adapter.validate_arguments(&name, &entry.arguments)
+                    .map_err(errors::ResponseError::InvalidParams)?;
+
                 let id = match entry.id {
                     Some(id) if id.trim().is_empty() => {
                         return Err(errors::ResponseError::InvalidParams(format!(
@@ -1221,7 +1203,8 @@ impl ResponseServiceImpl {
                         // context below. They are not part of this response's
                         // output and must not be returned as newly generated
                         // items.
-                        models::ResponseInputItem::FunctionCall { .. } => {
+                        models::ResponseInputItem::FunctionCall { .. }
+                        | models::ResponseInputItem::Reasoning { .. } => {
                             continue;
                         }
                         models::ResponseInputItem::FunctionCallOutput {
@@ -1390,6 +1373,28 @@ impl ResponseServiceImpl {
         pending_function_calls: &mut Vec<crate::completions::ports::CompletionToolCall>,
     ) -> bool {
         match input_item {
+            models::ResponseInputItem::Reasoning {
+                content, summary, ..
+            } => {
+                let reasoning = if content.is_empty() { summary } else { content };
+                if !reasoning.is_empty() {
+                    let assistant = pending_assistant_message.get_or_insert_with(|| {
+                        crate::completions::ports::CompletionMessage {
+                            role: "assistant".to_string(),
+                            content: serde_json::Value::String(String::new()),
+                            tool_call_id: None,
+                            tool_calls: None,
+                            reasoning_content: None,
+                        }
+                    });
+                    let existing = assistant.reasoning_content.get_or_insert_with(String::new);
+                    if !existing.is_empty() {
+                        existing.push_str("\n\n");
+                    }
+                    existing.push_str(reasoning);
+                }
+                true
+            }
             models::ResponseInputItem::FunctionCall {
                 call_id,
                 name,
@@ -1424,6 +1429,33 @@ impl ResponseServiceImpl {
             }
             _ => false,
         }
+    }
+
+    /// Reasoning precedes assistant text in Responses output, but both belong
+    /// to the same assistant turn when replayed to Chat Completions.
+    fn append_replayed_assistant_message(
+        mut message: crate::completions::ports::CompletionMessage,
+        messages: &mut Vec<crate::completions::ports::CompletionMessage>,
+        pending_assistant_message: &mut Option<crate::completions::ports::CompletionMessage>,
+        pending_function_calls: &mut Vec<crate::completions::ports::CompletionToolCall>,
+    ) {
+        if pending_function_calls.is_empty()
+            && pending_assistant_message.as_ref().is_some_and(|pending| {
+                pending.content == serde_json::Value::String(String::new())
+                    && pending.reasoning_content.is_some()
+            })
+        {
+            message.reasoning_content = pending_assistant_message
+                .take()
+                .and_then(|pending| pending.reasoning_content);
+        } else {
+            Self::flush_replayed_function_calls(
+                messages,
+                pending_assistant_message,
+                pending_function_calls,
+            );
+        }
+        *pending_assistant_message = Some(message);
     }
 
     /// Build provider messages solely from the current request.
@@ -1530,12 +1562,12 @@ impl ResponseServiceImpl {
                             // provider assistant turn. Other roles remain
                             // individual messages in caller-supplied order.
                             if role == "assistant" {
-                                Self::flush_replayed_function_calls(
+                                Self::append_replayed_assistant_message(
+                                    message,
                                     &mut messages,
                                     &mut pending_assistant_message,
                                     &mut pending_function_calls,
                                 );
-                                pending_assistant_message = Some(message);
                             } else {
                                 Self::flush_replayed_function_calls(
                                     &mut messages,
@@ -1546,6 +1578,7 @@ impl ResponseServiceImpl {
                             }
                         }
                         models::ResponseInputItem::McpApprovalResponse { .. }
+                        | models::ResponseInputItem::Reasoning { .. }
                         | models::ResponseInputItem::McpListTools { .. }
                         | models::ResponseInputItem::FunctionCall { .. }
                         | models::ResponseInputItem::FunctionCallOutput { .. } => {}
@@ -1560,7 +1593,7 @@ impl ResponseServiceImpl {
             None => {}
         }
 
-        Ok(messages)
+        Ok(super::message_normalization::normalize_leading_instructions(messages))
     }
 
     /// Convert supported text/image request parts without consulting the Files
@@ -1927,6 +1960,10 @@ impl ResponseServiceImpl {
 }
 
 #[cfg(test)]
+#[path = "reasoning_replay_tests.rs"]
+mod reasoning_replay_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::responses::tools::WEB_SEARCH_TOOL_NAME;
@@ -2038,6 +2075,35 @@ mod tests {
                 status: models::ResponseItemStatus::Completed, content, ..
             } if content == "Compare both cities."));
             assert!(ctx.reasoning_tokens > 0);
+            let reasoning_wire = serde_json::to_value(&stored[0]).unwrap();
+            assert_eq!(reasoning_wire["summary"], serde_json::json!([]));
+            assert_eq!(
+                reasoning_wire["content"],
+                serde_json::json!([
+                    {"type":"reasoning_text", "text":"Compare both cities."}
+                ])
+            );
+            let reasoning_deltas: Vec<_> = events
+                .iter()
+                .filter(|event| event.event_type == "response.reasoning_text.delta")
+                .collect();
+            assert!(!reasoning_deltas.is_empty());
+            assert!(reasoning_deltas
+                .iter()
+                .all(|event| event.content_index == Some(0)));
+            assert_eq!(
+                reasoning_deltas
+                    .iter()
+                    .map(|event| event.delta.as_deref().unwrap())
+                    .collect::<String>(),
+                "Compare both cities."
+            );
+            let reasoning_done = events
+                .iter()
+                .find(|event| event.event_type == "response.reasoning_text.done")
+                .unwrap();
+            assert_eq!(reasoning_done.text.as_deref(), Some("Compare both cities."));
+            assert_eq!(reasoning_done.content_index, Some(0));
             for (output_index, item) in stored.iter().enumerate() {
                 let lifecycle: Vec<_> = events
                     .iter()
@@ -2109,6 +2175,7 @@ mod tests {
         let workspace_id = crate::workspace::WorkspaceId(Uuid::new_v4());
         let api_key_id = Uuid::new_v4();
         let request = models::CreateResponseRequest {
+            client_tool_adapter: Default::default(),
             model: "test-model".to_string(),
             input: None,
             instructions: None,
@@ -2293,6 +2360,7 @@ mod tests {
     #[test]
     fn custom_function_conversion_preserves_raw_arguments_without_builtin_repair() {
         let request = models::CreateResponseRequest {
+            client_tool_adapter: Default::default(),
             model: "test-model".to_string(),
             input: None,
             instructions: None,
@@ -2349,6 +2417,7 @@ mod tests {
     #[test]
     fn custom_function_conversion_generates_a_call_id_only_when_omitted() {
         let request = models::CreateResponseRequest {
+            client_tool_adapter: Default::default(),
             model: "test-model".to_string(),
             input: None,
             instructions: None,

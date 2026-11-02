@@ -101,8 +101,8 @@ async fn stateless_responses_reject_persistent_fields() {
 }
 
 #[tokio::test]
-async fn stateless_responses_reject_unsupported_tool_types_during_deserialization() {
-    // The request enum must reject builtin types before the handler reaches
+async fn stateless_responses_reject_hosted_tools_before_provider_work() {
+    // Request normalization must reject builtin types before the handler reaches
     // service validation or provider work. A mock makes that boundary
     // observable. The MCP URL uses the reserved `.invalid` TLD so it cannot
     // point to a real third party if this behavior ever regresses.
@@ -163,12 +163,12 @@ async fn stateless_responses_reject_unsupported_tool_types_during_deserializatio
         );
         assert!(
             error.error.message.contains(tool_type),
-            "deserialization rejection should identify {tool_type}: {}",
+            "local rejection should identify {tool_type}: {}",
             error.error.message
         );
         assert!(
             error.error.message.contains("function"),
-            "the function-only tool enum should reject {tool_type}: {}",
+            "the client-managed tool adapter should reject {tool_type}: {}",
             error.error.message
         );
         assert!(

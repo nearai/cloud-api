@@ -26,6 +26,8 @@ use std::{
 };
 use uuid::Uuid;
 
+const CLIENT_TOOLS_ERROR: &str = "Native stateless Responses supports only valid client-managed function, custom, and namespace tools; hosted tools are unavailable";
+
 #[derive(Clone)]
 pub struct NativeResponsesService {
     pub models: Vec<String>,
@@ -108,6 +110,8 @@ impl NativeResponsesService {
                 "Image generation and image editing are not supported by /v1/responses. Use /v1/images/generations or /v1/images/edits.",
             ));
         }
+        body = crate::responses::client_tools::normalize_native_request(body)
+            .map_err(|_| NativeResponsesError::InvalidRequest(CLIENT_TOOLS_ERROR))?;
         validate(&body).map_err(NativeResponsesError::InvalidRequest)?;
         let guard = self
             .completion_service
@@ -205,12 +209,7 @@ fn validate(body: &Value) -> Result<(), &'static str> {
     {
         return Err("instructions must be a string");
     }
-    if let Some(tools) = body.get("tools").filter(|v| !v.is_null()) {
-        let tools = tools.as_array().ok_or("tools must be an array")?;
-        if tools.iter().any(|t| t["type"] != "function") {
-            return Err("Native stateless Responses supports client-managed function tools only");
-        }
-    }
+    crate::responses::client_tools::validate_native_tools(body).map_err(|_| CLIENT_TOOLS_ERROR)?;
     if body.get("prompt").is_some_and(|v| !v.is_null()) {
         return Err("Stored prompt references are unavailable for native stateless Responses");
     }
@@ -222,7 +221,14 @@ fn validate(body: &Value) -> Result<(), &'static str> {
         for item in input.as_array().into_iter().flatten() {
             if !matches!(
                 item["type"].as_str(),
-                None | Some("message" | "function_call" | "function_call_output" | "reasoning")
+                None | Some(
+                    "message"
+                        | "function_call"
+                        | "function_call_output"
+                        | "custom_tool_call"
+                        | "custom_tool_call_output"
+                        | "reasoning"
+                )
             ) {
                 return Err("Unsupported input item for native stateless Responses");
             }

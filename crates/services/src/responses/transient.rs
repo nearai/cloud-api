@@ -91,7 +91,15 @@ fn initial_response(request: models::CreateResponseRequest) -> (Uuid, models::Re
             service_tier: "default".to_string(),
             store: false,
             temperature: request.temperature.unwrap_or(1.0),
-            tool_choice: models::ResponseToolChoiceOutput::Auto("auto".to_string()),
+            tool_choice: match request.tool_choice {
+                Some(models::ResponseToolChoice::Auto(mode)) => {
+                    models::ResponseToolChoiceOutput::Auto(mode)
+                }
+                Some(models::ResponseToolChoice::Specific { type_, function }) => {
+                    models::ResponseToolChoiceOutput::Object { type_, function }
+                }
+                None => models::ResponseToolChoiceOutput::Auto("auto".to_string()),
+            },
             // Stateless Responses only supports caller-defined functions.
             // Never advertise the formerly implicit server-side web_search
             // builtin when the caller did not configure any tools.
@@ -467,8 +475,24 @@ impl ports::ResponseItemRepositoryTrait for TransientResponseItemsRepository {
 mod tests {
     use super::*;
 
+    #[test]
+    fn initial_response_preserves_the_requested_tool_choice() {
+        for choice in [
+            serde_json::json!("required"),
+            serde_json::json!({"type":"function", "function":{"name":"lookup"}}),
+        ] {
+            let request = serde_json::from_value(serde_json::json!({
+                "model":"test", "tool_choice":choice
+            }))
+            .unwrap();
+            let (_, response) = initial_response(request);
+            assert_eq!(serde_json::to_value(response.tool_choice).unwrap(), choice);
+        }
+    }
+
     fn request() -> models::CreateResponseRequest {
         models::CreateResponseRequest {
+            client_tool_adapter: Default::default(),
             model: "test-model".to_string(),
             input: None,
             instructions: None,

@@ -7,7 +7,7 @@ use utoipa::{Modify, OpenApi};
 #[openapi(
     info(
         title = "NEAR AI Cloud API",
-        description = "A comprehensive cloud API for AI model inference, conversation management, and organization administration.\n\n## Authentication\n\nThis API supports five authentication methods:\n\n1. **Access Token (JWT)**: Use `Authorization: Bearer <jwt_token>` with a short-lived JWT access token for most API endpoints. Obtain this by calling POST /users/me/access_tokens with a refresh token.\n2. **Refresh Token**: Use `Authorization: Bearer <refresh_token>` (prefix: `rt_`) only with POST /users/me/access_tokens to create new JWT access tokens. Obtained from OAuth login.\n3. **API Key (Programmatic Access)**: Use `Authorization: Bearer sk-<api_key>` with an API key (prefix: `sk-`).\n4. **Reporting Token (Read-only Usage Reporting)**: Use `Authorization: Bearer rpt-<reporting_token>` only with usage reporting endpoints.\n5. **Admin Access Token**: Use `Authorization: Bearer adm_<token>` with approved admin operations. `read_only` permits explicitly approved reads across organizations; `read_write` preserves admin-token write access. Token management always requires an admin session.\n\nClick the **Authorize** button above to configure authentication.",
+        description = "A comprehensive cloud API for AI model inference, temporary confidential-data migration views, and organization administration.\n\n## Authentication\n\nThis API supports five authentication methods:\n\n1. **Access Token (JWT)**: Use `Authorization: Bearer <jwt_token>` with a short-lived JWT access token for most API endpoints. Obtain this by calling POST /users/me/access_tokens with a refresh token.\n2. **Refresh Token**: Use `Authorization: Bearer <refresh_token>` (prefix: `rt_`) only with POST /users/me/access_tokens to create new JWT access tokens. Obtained from OAuth login.\n3. **API Key (Programmatic Access)**: Use `Authorization: Bearer sk-<api_key>` with an API key (prefix: `sk-`).\n4. **Reporting Token (Read-only Usage Reporting)**: Use `Authorization: Bearer rpt-<reporting_token>` only with usage reporting endpoints.\n5. **Admin Access Token**: Use `Authorization: Bearer adm_<token>` with approved admin operations. `read_only` permits explicitly approved reads across organizations; `read_write` preserves admin-token write access. Token management always requires an admin session.\n\nClick the **Authorize** button above to configure authentication.",
         version = "1.0.0",
         contact(
             name = "NEAR AI Team",
@@ -26,8 +26,8 @@ use utoipa::{Modify, OpenApi};
         (name = "Score", description = "Text similarity scoring endpoints"),
         (name = "Privacy", description = "Privacy classification (PII span detection) endpoints"),
         (name = "Models", description = "Public model catalog and information"),
-        (name = "Conversations", description = "Conversation management"),
-        (name = "Files", description = "File upload and management"),
+        (name = "Conversations", description = "Temporary authenticated, workspace-scoped migration access for export and account deletion. Only `POST /v1/conversations/batch`, `GET /v1/conversations/{conversation_id}`, `GET /v1/conversations/{conversation_id}/items`, and `DELETE /v1/conversations/{conversation_id}` are available. Conversation creation and every other mutation return `410 Gone`; this surface will be removed after data migration. Migration responses use `Cache-Control: no-store`."),
+        (name = "Files", description = "Temporary authenticated, workspace-scoped migration access for export and account deletion. Only `GET /v1/files`, `GET /v1/files/{file_id}`, `GET /v1/files/{file_id}/content`, and `DELETE /v1/files/{file_id}` are available. Upload and every other mutation return `410 Gone`; this surface will be removed after data migration. Migration responses use `Cache-Control: no-store`."),
         (name = "Responses", description = "Stateless response inference. The default typed adapter accepts an omitted `store` as `false` and rejects `store: true`; native routing requires an explicitly supplied `store: false`. Raw request/response content, response items, and history are not persisted. Clients must include any prior context in each request. The default typed adapter sends exactly one Chat Completions inference. A canonical model explicitly configured through `NATIVE_RESPONSES_MODELS`, with an explicit `store: false` request, instead sends one native provider Responses inference.\n\nBoth paths accept client-managed `function` and `custom` tools, including tools grouped in a `namespace`, and leading developer `additional_tools` declarations. Cloud returns calls without executing them; clients replay each `function_call` or `custom_tool_call` with its matching output and caller-managed history. Preserve `call_id`, names, namespaces, raw arguments or custom input, and provider metadata such as `thought_signature`. The typed replay path accepts assistant `output_text` parts and plaintext `reasoning` items, using reasoning content or its summary as prior assistant context. Encrypted-only reasoning requires a native Responses backend. The typed adapter supports text custom tools and the Codex `exec` Lark source grammar; other grammars require a native backend.\n\nEach generated item has its own `output_index`. Tool calls finish with `response.output_item.done`; a successful model turn ends with `response.completed`, including when tools await client execution. Reasoning uses `response.reasoning_text.delta`; failures expose `response.error` in `response.failed` and preserve partial usage.\n\nBuilt-in/server-executed tools (`web_search`, `web_context_search`, `file_search`, `code_interpreter`, `computer`, and remote `mcp`) are rejected and neither path runs an agent loop. Image-generation/editing models are rejected on both paths. The separate `POST /mcp` endpoint exposes its `web_search` tool independently of Responses; use `/v1/images/*` for image generation/editing. Existing completed-response gateway attestation is preserved best-effort: when the signature write succeeds, `GET /v1/signature/resp_*` retrieves signatures over SHA-256 request/response digests, never raw content. Interrupted streams create no `resp_*` attestation record or legacy disconnect fallback. Responses rejects conversation linkage, response history, and file input; the separate Conversation and File endpoints are not part of Responses inference."),
         (name = "Organizations", description = "Organization management"),
         (name = "Organization Members", description = "Organization member and invitation management"),
@@ -60,25 +60,16 @@ use utoipa::{Modify, OpenApi};
         // Model endpoints (public model catalog)
         crate::routes::models::list_models,
         crate::routes::models::get_model_by_name,
-        // Conversation endpoints
-        crate::routes::conversations::create_conversation,
+        // Temporary Conversation migration routes
         crate::routes::conversations::batch_get_conversations,
         crate::routes::conversations::get_conversation,
-        crate::routes::conversations::update_conversation,
-        crate::routes::conversations::delete_conversation,
-        crate::routes::conversations::pin_conversation,
-        crate::routes::conversations::unpin_conversation,
-        crate::routes::conversations::archive_conversation,
-        crate::routes::conversations::unarchive_conversation,
-        crate::routes::conversations::clone_conversation,
         crate::routes::conversations::list_conversation_items,
-        crate::routes::conversations::create_conversation_items,
-        // Files endpoints
-        crate::routes::files::upload_file,
+        crate::routes::conversations::delete_conversation,
+        // Temporary File migration routes
         crate::routes::files::list_files,
         crate::routes::files::get_file,
-        crate::routes::files::delete_file,
         crate::routes::files::get_file_content,
+        crate::routes::files::delete_file,
         // Response endpoints
         crate::routes::responses::create_response,
         // Organization endpoints
@@ -306,12 +297,11 @@ use utoipa::{Modify, OpenApi};
             crate::routes::users::RequestContactEmailRequest,
             crate::routes::users::VerifyContactEmailRequest,
             crate::routes::users::ContactEmailStatusResponse,
-            // Conversation models
-            CreateConversationRequest, UpdateConversationRequest,
+            // Temporary Conversation migration models
             BatchConversationsRequest, ConversationBatchResponse, ConversationObject,
             ConversationItemList, ConversationDeleteResult,
-            // File models
-            FileUploadResponse, ExpiresAfter, FileListResponse, FileDeleteResponse,
+            // Temporary File migration models
+            FileUploadResponse, FileListResponse, FileDeleteResponse,
             // Response models
             crate::routes::responses::StatelessCreateResponseRequestSchema, ResponseObject,
             // Attestation models

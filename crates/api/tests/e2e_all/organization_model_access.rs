@@ -705,7 +705,7 @@ fn nested_route_path(builder: &str, route_at: usize, path: &str) -> String {
 /// Every `.route("<path>", <method>(..))` call in a router source file, as
 /// (method, path) pairs. MethodRouter parameters require an `ANY` decision:
 /// the model-access inventory covers all methods passed to that path. The
-/// Route-layout tests separately check the exact supported methods.
+/// Stage I route-layout tests separately check the exact read/delete/410 split.
 /// Comment lines and the unit-test module are left out.
 fn registered_routes(source: &str) -> Vec<(String, String)> {
     const METHODS: &[&str] = &[
@@ -844,18 +844,14 @@ fn every_registered_route_has_a_model_access_decision() {
         ("ANY", "/responses/{response_id}/input_items"),
         // The MCP endpoint serves web search only.
         ("POST", "/mcp"),
-        ("POST", "/conversations"),
-        ("POST", "/conversations/batch"),
-        ("GET", "/conversations/{conversation_id}"),
-        ("POST", "/conversations/{conversation_id}"),
-        ("DELETE", "/conversations/{conversation_id}"),
-        ("POST", "/conversations/{conversation_id}/pin"),
-        ("DELETE", "/conversations/{conversation_id}/pin"),
-        ("POST", "/conversations/{conversation_id}/archive"),
-        ("DELETE", "/conversations/{conversation_id}/archive"),
-        ("POST", "/conversations/{conversation_id}/clone"),
-        ("GET", "/conversations/{conversation_id}/items"),
-        ("POST", "/conversations/{conversation_id}/items"),
+        // Stage I migration surfaces take no model name on any method.
+        ("ANY", "/conversations"),
+        ("ANY", "/conversations/"),
+        ("ANY", "/conversations/batch"),
+        ("ANY", "/conversations/{conversation_id}"),
+        ("ANY", "/conversations/{conversation_id}/"),
+        ("ANY", "/conversations/{conversation_id}/items"),
+        ("ANY", "/conversations/{conversation_id}/{*legacy_path}"),
         // Looked up by chat id. The `model` query parameter is not read.
         ("GET", "/signature/{chat_id}"),
         ("GET", "/organizations/{org_id}/workspaces"),
@@ -875,11 +871,12 @@ fn every_registered_route_has_a_model_access_decision() {
             "GET",
             "/workspaces/{workspace_id}/api-keys/{key_id}/usage/history",
         ),
-        ("POST", "/files"),
-        ("GET", "/files"),
-        ("GET", "/files/{file_id}"),
-        ("DELETE", "/files/{file_id}"),
-        ("GET", "/files/{file_id}/content"),
+        ("ANY", "/files"),
+        ("ANY", "/files/"),
+        ("ANY", "/files/{file_id}"),
+        ("ANY", "/files/{file_id}/"),
+        ("ANY", "/files/{file_id}/content"),
+        ("ANY", "/files/{file_id}/{*legacy_path}"),
         ("POST", "/feature-requests"),
         // An organization's own usage and costs.
         ("POST", "/billing/costs"),

@@ -91,7 +91,8 @@ The API has two mutually-exclusive auth methods:
 - **Session auth** (cookies / `Authorization: Bearer rt_…`) for the
   management plane: organizations, workspaces, users, API keys.
 - **API key auth** (`Authorization: Bearer sk-…`) for the data plane:
-  chat completions, responses, conversations, files, and attestation.
+  chat completions, responses, temporary Conversation/File migration access,
+  and attestation.
 
 ### Mock session auth (no real OAuth)
 
@@ -332,8 +333,8 @@ Provider refresh runs every 300s by default
 | `GET  /v1/models`                           | public   | OpenAI-compatible model catalog with pricing metadata       |
 | `POST /v1/chat/completions`                 | API key  | OpenAI-compatible. Add `"stream": true` for SSE             |
 | `POST /v1/responses`                        | API key  | Stateless `store: false` inference; client-managed function/custom tools and namespaces |
-| `/v1/conversations`, `/v1/conversations/{id}` and item routes | API key | Workspace-scoped Conversation creation, retrieval, updates, item management, and deletion |
-| `/v1/files`, `/v1/files/{id}`, `/v1/files/{id}/content` | API key | Workspace-scoped File upload, listing, metadata/content retrieval, and deletion |
+| `POST /v1/conversations/batch`, `GET /v1/conversations/{id}`, `GET /v1/conversations/{id}/items`, `DELETE /v1/conversations/{id}` | API key | Temporary workspace-scoped migration routes; only per-conversation deletion remains enabled |
+| `GET /v1/files`, `GET /v1/files/{id}`, `GET /v1/files/{id}/content`, `DELETE /v1/files/{id}` | API key | Temporary workspace-scoped migration routes; only per-file deletion remains enabled |
 | `POST /mcp`                                 | API key  | Independent MCP server exposing the `web_search` tool       |
 | `GET  /v1/attestation/report`               | API key  | TEE attestation (503 outside a CVM unless `DEV=true` in debug builds) |
 | `GET  /v1/attestation/ita-token`            | public   | Intel Trust Authority JWT wrapper (requires ITA env vars)   |
@@ -422,10 +423,19 @@ server, which continues to expose its independent `web_search` tool, or the
 provider-native fields such as encrypted reasoning and grammar definitions.
 
 Responses itself rejects conversation linkage, response history, and file
-input. The separate Conversation and File APIs retain their normal resource
-operations: creating and updating conversations and their items, uploading
-files, retrieving resources, and deleting them. These workspace-scoped APIs
-require an API key; stored resources are independent of Responses inference.
+input. During the temporary migration/export window, the authenticated,
+workspace-scoped migration routes remain available:
+
+- `POST /v1/conversations/batch`, `GET /v1/conversations/{id}`,
+  `GET /v1/conversations/{id}/items`, and `DELETE /v1/conversations/{id}`;
+- `GET /v1/files`, `GET /v1/files/{id}`, `GET /v1/files/{id}/content`, and
+  `DELETE /v1/files/{id}`.
+
+These routes preserve existing retrieval behavior and keep per-resource
+deletion available to support existing account deletion; they are not a new
+export API or a new Conversation-list endpoint. They send `Cache-Control:
+no-store`. Creation, upload, pinning, archiving, cloning, item creation, and
+every other Conversation or File mutation return `410 Gone`.
 
 ## 7. Troubleshooting
 

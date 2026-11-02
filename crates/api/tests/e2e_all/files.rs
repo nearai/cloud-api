@@ -1,811 +1,328 @@
-// Import common test utilities
-
 use crate::common::*;
+use axum::http::Method;
+use services::files::storage::{MockStorage, StorageTrait};
 use services::id_prefixes::PREFIX_FILE;
+use std::sync::Arc;
 
-/// Helper function to upload a file
-async fn upload_file(
-    server: &axum_test::TestServer,
-    api_key: &str,
-    filename: &str,
-    content: &[u8],
-    content_type: &str,
-    purpose: &str,
-) -> axum_test::TestResponse {
-    server
-        .post("/v1/files")
-        .add_header("Authorization", format!("Bearer {api_key}"))
-        .multipart(
-            axum_test::multipart::MultipartForm::new()
-                .add_text("purpose", purpose)
-                .add_part(
-                    "file",
-                    axum_test::multipart::Part::bytes(content.to_vec())
-                        .file_name(filename)
-                        .mime_type(content_type),
-                ),
+const UNKNOWN_FILE_ID: &str = "file-00000000-0000-0000-0000-000000000000";
+
+fn assert_no_store(response: &axum_test::TestResponse) {
+    assert_eq!(
+        response
+            .headers()
+            .get("cache-control")
+            .and_then(|value| value.to_str().ok()),
+        Some("no-store"),
+        "temporary confidential-data migration views must not be cacheable"
+    );
+}
+
+fn assert_file_write_is_gone(response: axum_test::TestResponse) {
+    assert_eq!(response.status_code(), 410);
+    assert_no_store(&response);
+
+    let error = response.json::<api::models::ErrorResponse>();
+    assert_eq!(error.error.r#type, "gone");
+    assert!(error.error.message.contains("temporarily limited"));
+}
+
+const RETAINED_CONTENT: &[u8] = b"retained file\0contents\n";
+
+struct RetainedFileFixture {
+    server: axum_test::TestServer,
+    owner_key: String,
+    foreign_key: String,
+    file: services::files::File,
+    storage: Arc<MockStorage>,
+}
+
+/// Prepare existing data directly; public uploads are disabled during migration.
+async fn retained_file_fixture() -> RetainedFileFixture {
+    let storage = Arc::new(MockStorage::new(test_config().s3.encryption_key));
+    let service_storage = storage.clone();
+    let (server, database) =
+        setup_test_server_with_domain_services(move |domain_services, database| {
+            domain_services.files_service = Arc::new(services::files::FileServiceImpl::new(
+                Arc::new(database::repositories::FileRepository::new(
+                    database.pool().clone(),
+                )),
+                service_storage,
+            ));
+        })
+        .await;
+    let (owner_key, owner) = create_org_and_api_key(&server).await;
+    let (foreign_key, _) = create_org_and_api_key(&server).await;
+    let storage_key = format!("retained-fixture/{}", uuid::Uuid::new_v4());
+    storage
+        .upload(
+            &storage_key,
+            RETAINED_CONTENT.to_vec(),
+            "application/octet-stream",
         )
         .await
-}
-
-/// Helper function to upload a file with expiration
-async fn upload_file_with_expiration(
-    server: &axum_test::TestServer,
-    api_key: &str,
-    filename: &str,
-    content: &[u8],
-    content_type: &str,
-    purpose: &str,
-    expires_after_seconds: i64,
-) -> axum_test::TestResponse {
-    server
-        .post("/v1/files")
-        .add_header("Authorization", format!("Bearer {api_key}"))
-        .multipart(
-            axum_test::multipart::MultipartForm::new()
-                .add_text("purpose", purpose)
-                .add_text("expires_after[anchor]", "created_at")
-                .add_text("expires_after[seconds]", expires_after_seconds.to_string())
-                .add_part(
-                    "file",
-                    axum_test::multipart::Part::bytes(content.to_vec())
-                        .file_name(filename)
-                        .mime_type(content_type),
-                ),
-        )
+        .expect("seed encrypted mock storage");
+    let file = database::repositories::FileRepository::new(database.pool().clone())
+        .create(services::files::CreateFileParams {
+            filename: "retained.bin".to_string(),
+            bytes: RETAINED_CONTENT.len() as i64,
+            content_type: "application/octet-stream".to_string(),
+            purpose: "user_data".to_string(),
+            storage_key,
+            workspace_id: owner.workspace_id.parse().unwrap(),
+            uploaded_by_api_key_id: owner.id.parse().unwrap(),
+            expires_at: None,
+        })
         .await
-}
-
-#[tokio::test]
-async fn test_upload_file_success() {
-    let server = setup_test_server().await;
-    let (api_key, _) = create_org_and_api_key(&server).await;
-
-    let content = b"Hello, this is a test file!";
-    let response = upload_file(
-        &server,
-        &api_key,
-        "test.txt",
-        content,
-        "text/plain",
-        "user_data",
-    )
-    .await;
-
-    assert_eq!(response.status_code(), 201);
-    let file: api::models::FileUploadResponse = response.json();
-    assert!(file.id.starts_with(PREFIX_FILE));
-    assert_eq!(file.object, "file");
-    assert_eq!(file.bytes, content.len() as i64);
-    assert_eq!(file.filename, "test.txt");
-    assert_eq!(file.purpose, "user_data");
-    assert!(file.created_at > 0);
-    assert!(file.expires_at.is_none());
-}
-
-#[tokio::test]
-async fn test_upload_file_with_expiration() {
-    let server = setup_test_server().await;
-    let (api_key, _) = create_org_and_api_key(&server).await;
-
-    let content = b"Temporary file";
-    let expires_after_seconds = 86400; // 1 day
-    let response = upload_file_with_expiration(
-        &server,
-        &api_key,
-        "temp.txt",
-        content,
-        "text/plain",
-        "user_data",
-        expires_after_seconds,
-    )
-    .await;
-
-    assert_eq!(response.status_code(), 201);
-    let file: api::models::FileUploadResponse = response.json();
-    assert!(file.expires_at.is_some());
-    assert!(file.expires_at.unwrap() > file.created_at);
-}
-
-#[tokio::test]
-async fn test_upload_json_file() {
-    let server = setup_test_server().await;
-    let (api_key, _) = create_org_and_api_key(&server).await;
-
-    let content = br#"{"key": "value", "number": 42}"#;
-    let response = upload_file(
-        &server,
-        &api_key,
-        "data.json",
-        content,
-        "application/json",
-        "user_data",
-    )
-    .await;
-
-    assert_eq!(response.status_code(), 201);
-    let file: api::models::FileUploadResponse = response.json();
-    assert_eq!(file.filename, "data.json");
-    assert_eq!(file.bytes, content.len() as i64);
-}
-
-#[tokio::test]
-async fn test_upload_binary_file() {
-    let server = setup_test_server().await;
-    let (api_key, _) = create_org_and_api_key(&server).await;
-
-    let content = vec![0u8, 1, 2, 3, 4, 5, 255, 254, 253];
-    let response = upload_file(
-        &server,
-        &api_key,
-        "binary.bin",
-        &content,
-        "application/octet-stream",
-        "user_data",
-    )
-    .await;
-
-    assert_eq!(response.status_code(), 201);
-    let file: api::models::FileUploadResponse = response.json();
-    assert_eq!(file.bytes, content.len() as i64);
-}
-
-#[tokio::test]
-async fn test_upload_file_invalid_purpose() {
-    let server = setup_test_server().await;
-    let (api_key, _) = create_org_and_api_key(&server).await;
-
-    let content = b"Test content";
-    let response = upload_file(
-        &server,
-        &api_key,
-        "test.txt",
-        content,
-        "text/plain",
-        "invalid_purpose",
-    )
-    .await;
-
-    assert_eq!(response.status_code(), 400);
-    let error: api::models::ErrorResponse = response.json();
-    assert!(error.error.message.contains("Invalid file purpose"));
-}
-
-#[tokio::test]
-async fn test_upload_file_invalid_mime_type() {
-    let server = setup_test_server().await;
-    let (api_key, _) = create_org_and_api_key(&server).await;
-
-    let content = b"Test content";
-    let response = upload_file(
-        &server,
-        &api_key,
-        "test.exe",
-        content,
-        "application/x-msdownload",
-        "user_data",
-    )
-    .await;
-
-    assert_eq!(response.status_code(), 400);
-    let error: api::models::ErrorResponse = response.json();
-    assert!(error.error.message.contains("Invalid file type"));
-}
-
-#[tokio::test]
-async fn test_upload_file_missing_purpose() {
-    let server = setup_test_server().await;
-    let (api_key, _) = create_org_and_api_key(&server).await;
-
-    let response = server
-        .post("/v1/files")
-        .add_header("Authorization", format!("Bearer {api_key}"))
-        .multipart(
-            axum_test::multipart::MultipartForm::new().add_part(
-                "file",
-                axum_test::multipart::Part::bytes(b"Test content".to_vec())
-                    .file_name("test.txt")
-                    .mime_type("text/plain"),
-            ),
-        )
-        .await;
-
-    assert_eq!(response.status_code(), 400);
-    let error: api::models::ErrorResponse = response.json();
-    assert!(error
-        .error
-        .message
-        .contains("Missing required field: purpose"));
-}
-
-#[tokio::test]
-async fn test_upload_file_unauthorized() {
-    let server = setup_test_server().await;
-
-    let content = b"Test content";
-    let response = upload_file(
-        &server,
-        "invalid-api-key",
-        "test.txt",
-        content,
-        "text/plain",
-        "user_data",
-    )
-    .await;
-
-    assert_eq!(response.status_code(), 401);
-}
-
-#[tokio::test]
-async fn test_list_files() {
-    let server = setup_test_server().await;
-    let (api_key, _) = create_org_and_api_key(&server).await;
-
-    // Upload multiple files
-    for i in 1..=5 {
-        let content = format!("File content {i}");
-        upload_file(
-            &server,
-            &api_key,
-            &format!("file{i}.txt"),
-            content.as_bytes(),
-            "text/plain",
-            "user_data",
-        )
-        .await;
+        .expect("seed retained file metadata");
+    RetainedFileFixture {
+        server,
+        owner_key,
+        foreign_key,
+        file,
+        storage,
     }
+}
 
-    // List files
-    let response = server
+#[tokio::test]
+async fn retained_files_are_readable_only_by_the_owning_workspace() {
+    let fixture = retained_file_fixture().await;
+    let file_id = format!("{PREFIX_FILE}{}", fixture.file.id);
+    let metadata = fixture
+        .server
+        .get(&format!("/v1/files/{file_id}"))
+        .add_header("Authorization", format!("Bearer {}", fixture.owner_key))
+        .await;
+    assert_eq!(metadata.status_code(), 200);
+    assert_no_store(&metadata);
+    let metadata: api::models::FileUploadResponse = metadata.json();
+    assert_eq!(metadata.id, file_id);
+    assert_eq!(metadata.filename, "retained.bin");
+    assert_eq!(metadata.bytes, RETAINED_CONTENT.len() as i64);
+    assert_eq!(metadata.purpose, "user_data");
+
+    let content = fixture
+        .server
+        .get(&format!("/v1/files/{file_id}/content"))
+        .add_header("Authorization", format!("Bearer {}", fixture.owner_key))
+        .await;
+    assert_eq!(content.status_code(), 200);
+    assert_no_store(&content);
+    assert_eq!(content.as_bytes().as_ref(), RETAINED_CONTENT);
+    assert_eq!(
+        content.headers().get("content-type").unwrap(),
+        "application/octet-stream"
+    );
+
+    let owner_list = fixture
+        .server
         .get("/v1/files")
-        .add_header("Authorization", format!("Bearer {api_key}"))
+        .add_header("Authorization", format!("Bearer {}", fixture.owner_key))
         .await;
-
-    assert_eq!(response.status_code(), 200);
-    let list: api::models::FileListResponse = response.json();
-    assert_eq!(list.object, "list");
-    assert!(list.data.len() >= 5);
-    assert!(list.first_id.is_some());
-    assert!(list.last_id.is_some());
-}
-
-#[tokio::test]
-async fn test_list_files_with_limit() {
-    let server = setup_test_server().await;
-    let (api_key, _) = create_org_and_api_key(&server).await;
-
-    // Upload multiple files
-    for i in 1..=5 {
-        let content = format!("File content {i}");
-        upload_file(
-            &server,
-            &api_key,
-            &format!("file{i}.txt"),
-            content.as_bytes(),
-            "text/plain",
-            "user_data",
-        )
-        .await;
-    }
-
-    // List with limit
-    let response = server
-        .get("/v1/files?limit=2")
-        .add_header("Authorization", format!("Bearer {api_key}"))
-        .await;
-
-    assert_eq!(response.status_code(), 200);
-    let list: api::models::FileListResponse = response.json();
-    assert_eq!(list.data.len(), 2);
-    assert!(list.has_more);
-}
-
-#[tokio::test]
-async fn test_list_files_with_pagination() {
-    let server = setup_test_server().await;
-    let (api_key, _) = create_org_and_api_key(&server).await;
-
-    // Upload multiple files
-    for i in 1..=5 {
-        let content = format!("File content {i}");
-        upload_file(
-            &server,
-            &api_key,
-            &format!("file{i}.txt"),
-            content.as_bytes(),
-            "text/plain",
-            "user_data",
-        )
-        .await;
-    }
-
-    // Get first page
-    let response = server
-        .get("/v1/files?limit=2")
-        .add_header("Authorization", format!("Bearer {api_key}"))
-        .await;
-
-    assert_eq!(response.status_code(), 200);
-    let first_page: api::models::FileListResponse = response.json();
-    assert_eq!(first_page.data.len(), 2);
-
-    // Get second page using cursor
-    let after_id = first_page.last_id.unwrap();
-    let response = server
-        .get(&format!("/v1/files?limit=2&after={after_id}"))
-        .add_header("Authorization", format!("Bearer {api_key}"))
-        .await;
-
-    assert_eq!(response.status_code(), 200);
-    let second_page: api::models::FileListResponse = response.json();
-    assert!(!second_page.data.is_empty());
-    // Ensure we got different files
-    assert_ne!(first_page.data[0].id, second_page.data[0].id);
-}
-
-#[tokio::test]
-async fn test_list_files_with_purpose_filter() {
-    let server = setup_test_server().await;
-    let (api_key, _) = create_org_and_api_key(&server).await;
-
-    // Upload files with different purposes
-    upload_file(
-        &server,
-        &api_key,
-        "assistants_file.txt",
-        b"Assistants content",
-        "text/plain",
-        "assistants",
-    )
-    .await;
-
-    upload_file(
-        &server,
-        &api_key,
-        "user_file.txt",
-        b"User content",
-        "text/plain",
-        "user_data",
-    )
-    .await;
-
-    // List only assistants files
-    let response = server
-        .get("/v1/files?purpose=assistants")
-        .add_header("Authorization", format!("Bearer {api_key}"))
-        .await;
-
-    assert_eq!(response.status_code(), 200);
-    let list: api::models::FileListResponse = response.json();
-    for file in &list.data {
-        assert_eq!(file.purpose, "assistants");
-    }
-}
-
-#[tokio::test]
-async fn test_list_files_with_order() {
-    let server = setup_test_server().await;
-    let (api_key, _) = create_org_and_api_key(&server).await;
-
-    // Upload multiple files
-    for i in 1..=3 {
-        let content = format!("File content {i}");
-        upload_file(
-            &server,
-            &api_key,
-            &format!("file{i}.txt"),
-            content.as_bytes(),
-            "text/plain",
-            "user_data",
-        )
-        .await;
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await; // Ensure different timestamps
-    }
-
-    // List in ascending order
-    let response = server
-        .get("/v1/files?order=asc")
-        .add_header("Authorization", format!("Bearer {api_key}"))
-        .await;
-
-    assert_eq!(response.status_code(), 200);
-    let asc_list: api::models::FileListResponse = response.json();
-
-    // List in descending order
-    let response = server
-        .get("/v1/files?order=desc")
-        .add_header("Authorization", format!("Bearer {api_key}"))
-        .await;
-
-    assert_eq!(response.status_code(), 200);
-    let desc_list: api::models::FileListResponse = response.json();
-
-    // Verify order is different
-    if asc_list.data.len() >= 2 && desc_list.data.len() >= 2 {
-        assert!(asc_list.data[0].created_at <= asc_list.data[1].created_at);
-        assert!(desc_list.data[0].created_at >= desc_list.data[1].created_at);
-    }
-}
-
-#[tokio::test]
-async fn test_get_file_metadata() {
-    let server = setup_test_server().await;
-    let (api_key, _) = create_org_and_api_key(&server).await;
-
-    // Upload a file
-    let content = b"Test file content";
-    let upload_response = upload_file(
-        &server,
-        &api_key,
-        "metadata_test.txt",
-        content,
-        "text/plain",
-        "user_data",
-    )
-    .await;
-
-    assert_eq!(upload_response.status_code(), 201);
-    let uploaded_file: api::models::FileUploadResponse = upload_response.json();
-
-    // Get file metadata
-    let response = server
-        .get(&format!("/v1/files/{}", uploaded_file.id))
-        .add_header("Authorization", format!("Bearer {api_key}"))
-        .await;
-
-    assert_eq!(response.status_code(), 200);
-    let file: api::models::FileUploadResponse = response.json();
-    assert_eq!(file.id, uploaded_file.id);
-    assert_eq!(file.filename, "metadata_test.txt");
-    assert_eq!(file.bytes, content.len() as i64);
-    assert_eq!(file.purpose, "user_data");
-}
-
-#[tokio::test]
-async fn test_get_file_metadata_not_found() {
-    let server = setup_test_server().await;
-    let (api_key, _) = create_org_and_api_key(&server).await;
-
-    let response = server
-        .get("/v1/files/file-00000000-0000-0000-0000-000000000000")
-        .add_header("Authorization", format!("Bearer {api_key}"))
-        .await;
-
-    assert_eq!(response.status_code(), 404);
-}
-
-#[tokio::test]
-async fn test_get_file_content() {
-    let server = setup_test_server().await;
-    let (api_key, _) = create_org_and_api_key(&server).await;
-
-    // Upload a file
-    let content = b"This is the file content that should be returned";
-    let upload_response = upload_file(
-        &server,
-        &api_key,
-        "content_test.txt",
-        content,
-        "text/plain",
-        "user_data",
-    )
-    .await;
-
-    assert_eq!(upload_response.status_code(), 201);
-    let uploaded_file: api::models::FileUploadResponse = upload_response.json();
-
-    // Get file content
-    let response = server
-        .get(&format!("/v1/files/{}/content", uploaded_file.id))
-        .add_header("Authorization", format!("Bearer {api_key}"))
-        .await;
-
-    assert_eq!(response.status_code(), 200);
-
-    // Verify headers
-    let content_type = response
-        .headers()
-        .get("content-type")
-        .unwrap()
-        .to_str()
-        .unwrap();
-    assert_eq!(content_type, "text/plain");
-
-    let content_length = response
-        .headers()
-        .get("content-length")
-        .unwrap()
-        .to_str()
-        .unwrap();
-    assert_eq!(content_length, content.len().to_string());
-
-    let content_disposition = response
-        .headers()
-        .get("content-disposition")
-        .unwrap()
-        .to_str()
-        .unwrap();
-    assert!(content_disposition.contains("content_test.txt"));
-
-    // Verify content
-    let body = response.as_bytes();
-    assert_eq!(body.as_ref(), &content[..]);
-}
-
-#[tokio::test]
-async fn test_get_binary_file_content() {
-    let server = setup_test_server().await;
-    let (api_key, _) = create_org_and_api_key(&server).await;
-
-    // Upload a binary file
-    let content = vec![0u8, 1, 2, 3, 4, 5, 255, 254, 253];
-    let upload_response = upload_file(
-        &server,
-        &api_key,
-        "binary.bin",
-        &content,
-        "application/octet-stream",
-        "user_data",
-    )
-    .await;
-
-    assert_eq!(upload_response.status_code(), 201);
-    let uploaded_file: api::models::FileUploadResponse = upload_response.json();
-
-    // Get file content
-    let response = server
-        .get(&format!("/v1/files/{}/content", uploaded_file.id))
-        .add_header("Authorization", format!("Bearer {api_key}"))
-        .await;
-
-    assert_eq!(response.status_code(), 200);
-
-    // Verify binary content matches exactly
-    let body = response.as_bytes();
-    assert_eq!(body.to_vec(), content);
-}
-
-#[tokio::test]
-async fn test_get_file_content_not_found() {
-    let server = setup_test_server().await;
-    let (api_key, _) = create_org_and_api_key(&server).await;
-
-    let response = server
-        .get("/v1/files/file-00000000-0000-0000-0000-000000000000/content")
-        .add_header("Authorization", format!("Bearer {api_key}"))
-        .await;
-
-    assert_eq!(response.status_code(), 404);
-}
-
-#[tokio::test]
-async fn test_delete_file() {
-    let server = setup_test_server().await;
-    let (api_key, _) = create_org_and_api_key(&server).await;
-
-    // Upload a file
-    let content = b"File to be deleted";
-    let upload_response = upload_file(
-        &server,
-        &api_key,
-        "delete_test.txt",
-        content,
-        "text/plain",
-        "user_data",
-    )
-    .await;
-
-    assert_eq!(upload_response.status_code(), 201);
-    let uploaded_file: api::models::FileUploadResponse = upload_response.json();
-
-    // Delete the file
-    let response = server
-        .delete(&format!("/v1/files/{}", uploaded_file.id))
-        .add_header("Authorization", format!("Bearer {api_key}"))
-        .await;
-
-    assert_eq!(response.status_code(), 200);
-    let delete_response: api::models::FileDeleteResponse = response.json();
-    assert_eq!(delete_response.id, uploaded_file.id);
-    assert_eq!(delete_response.object, "file");
-    assert!(delete_response.deleted);
-
-    // Verify file is deleted
-    let response = server
-        .get(&format!("/v1/files/{}", uploaded_file.id))
-        .add_header("Authorization", format!("Bearer {api_key}"))
-        .await;
-
-    assert_eq!(response.status_code(), 404);
-}
-
-#[tokio::test]
-async fn test_delete_file_not_found() {
-    let server = setup_test_server().await;
-    let (api_key, _) = create_org_and_api_key(&server).await;
-
-    let response = server
-        .delete("/v1/files/file-00000000-0000-0000-0000-000000000000")
-        .add_header("Authorization", format!("Bearer {api_key}"))
-        .await;
-
-    assert_eq!(response.status_code(), 404);
-}
-
-#[tokio::test]
-async fn test_file_isolation_between_workspaces() {
-    let server = setup_test_server().await;
-
-    // Create two organizations with API keys
-    let org1 = create_org(&server).await;
-    let api_key1 = get_api_key_for_org(&server, org1.id.clone()).await;
-
-    let org2 = create_org(&server).await;
-    let api_key2 = get_api_key_for_org(&server, org2.id.clone()).await;
-
-    // Upload file with first workspace
-    let content = b"Workspace 1 file";
-    let upload_response = upload_file(
-        &server,
-        &api_key1,
-        "workspace1.txt",
-        content,
-        "text/plain",
-        "user_data",
-    )
-    .await;
-
-    assert_eq!(upload_response.status_code(), 201);
-    let file1: api::models::FileUploadResponse = upload_response.json();
-
-    // Try to access with second workspace - should fail
-    let response = server
-        .get(&format!("/v1/files/{}", file1.id))
-        .add_header("Authorization", format!("Bearer {api_key2}"))
-        .await;
-
-    assert_eq!(response.status_code(), 404);
-
-    // Try to delete with second workspace - should fail
-    let response = server
-        .delete(&format!("/v1/files/{}", file1.id))
-        .add_header("Authorization", format!("Bearer {api_key2}"))
-        .await;
-
-    assert_eq!(response.status_code(), 404);
-
-    // Verify first workspace can still access
-    let response = server
-        .get(&format!("/v1/files/{}", file1.id))
-        .add_header("Authorization", format!("Bearer {api_key1}"))
-        .await;
-
-    assert_eq!(response.status_code(), 200);
-}
-
-#[tokio::test]
-async fn test_upload_and_download_large_file() {
-    let server = setup_test_server().await;
-    let (api_key, _) = create_org_and_api_key(&server).await;
-
-    // Create a 1MB file
-    let content = vec![42u8; 1024 * 1024];
-    let upload_response = upload_file(
-        &server,
-        &api_key,
-        "large_file.bin",
-        &content,
-        "application/octet-stream",
-        "user_data",
-    )
-    .await;
-
-    assert_eq!(upload_response.status_code(), 201);
-    let uploaded_file: api::models::FileUploadResponse = upload_response.json();
-    assert_eq!(uploaded_file.bytes, content.len() as i64);
-
-    // Download and verify
-    let response = server
-        .get(&format!("/v1/files/{}/content", uploaded_file.id))
-        .add_header("Authorization", format!("Bearer {api_key}"))
-        .await;
-
-    assert_eq!(response.status_code(), 200);
-    let body = response.as_bytes();
-    assert_eq!(body.len(), content.len());
-    assert_eq!(body.to_vec(), content);
-}
-
-#[tokio::test]
-async fn test_file_id_formats() {
-    let server = setup_test_server().await;
-    let (api_key, _) = create_org_and_api_key(&server).await;
-
-    // Upload a file
-    let content = b"Test content";
-    let upload_response = upload_file(
-        &server,
-        &api_key,
-        "test.txt",
-        content,
-        "text/plain",
-        "user_data",
-    )
-    .await;
-
-    assert_eq!(upload_response.status_code(), 201);
-    let uploaded_file: api::models::FileUploadResponse = upload_response.json();
-
-    // Test with file prefix
-    let response = server
-        .get(&format!("/v1/files/{}", uploaded_file.id))
-        .add_header("Authorization", format!("Bearer {api_key}"))
-        .await;
-    assert_eq!(response.status_code(), 200);
-
-    // Test without file prefix (strip prefix from ID)
-    let id_without_prefix = uploaded_file.id.strip_prefix(PREFIX_FILE).unwrap();
-    let response = server
-        .get(&format!("/v1/files/{id_without_prefix}"))
-        .add_header("Authorization", format!("Bearer {api_key}"))
-        .await;
-    assert_eq!(response.status_code(), 200);
-}
-
-#[tokio::test]
-async fn test_complete_file_lifecycle() {
-    let server = setup_test_server().await;
-    let (api_key, _) = create_org_and_api_key(&server).await;
-
-    // 1. Upload file
-    let content = b"Complete lifecycle test";
-    let upload_response = upload_file(
-        &server,
-        &api_key,
-        "lifecycle.txt",
-        content,
-        "text/plain",
-        "user_data",
-    )
-    .await;
-    assert_eq!(upload_response.status_code(), 201);
-    let file: api::models::FileUploadResponse = upload_response.json();
-
-    // 2. List files (should include our file)
-    let list_response = server
+    assert_eq!(owner_list.status_code(), 200);
+    assert_no_store(&owner_list);
+    let owner_list: api::models::FileListResponse = owner_list.json();
+    assert_eq!(owner_list.data.len(), 1);
+    assert_eq!(owner_list.data[0].id, file_id);
+    assert_eq!(owner_list.data[0].filename, "retained.bin");
+    assert!(!owner_list.has_more);
+
+    let foreign_list = fixture
+        .server
         .get("/v1/files")
-        .add_header("Authorization", format!("Bearer {api_key}"))
+        .add_header("Authorization", format!("Bearer {}", fixture.foreign_key))
         .await;
-    assert_eq!(list_response.status_code(), 200);
-    let list: api::models::FileListResponse = list_response.json();
-    assert!(list.data.iter().any(|f| f.id == file.id));
+    assert_eq!(foreign_list.status_code(), 200);
+    assert_no_store(&foreign_list);
+    assert!(foreign_list
+        .json::<api::models::FileListResponse>()
+        .data
+        .is_empty());
 
-    // 3. Get metadata
-    let get_response = server
-        .get(&format!("/v1/files/{}", file.id))
-        .add_header("Authorization", format!("Bearer {api_key}"))
-        .await;
-    assert_eq!(get_response.status_code(), 200);
+    for suffix in ["", "/content"] {
+        let foreign = fixture
+            .server
+            .get(&format!("/v1/files/{file_id}{suffix}"))
+            .add_header("Authorization", format!("Bearer {}", fixture.foreign_key))
+            .await;
+        let unknown = fixture
+            .server
+            .get(&format!("/v1/files/{UNKNOWN_FILE_ID}{suffix}"))
+            .add_header("Authorization", format!("Bearer {}", fixture.foreign_key))
+            .await;
+        assert_eq!(foreign.status_code(), 404);
+        assert_eq!(unknown.status_code(), 404);
+        assert_no_store(&foreign);
+        assert_no_store(&unknown);
+        assert_eq!(foreign.text(), unknown.text());
+    }
+}
 
-    // 4. Download content
-    let content_response = server
-        .get(&format!("/v1/files/{}/content", file.id))
-        .add_header("Authorization", format!("Bearer {api_key}"))
+#[tokio::test]
+async fn retained_file_deletion_is_workspace_scoped_and_removes_content() {
+    let fixture = retained_file_fixture().await;
+    let file_id = format!("{PREFIX_FILE}{}", fixture.file.id);
+    let foreign = fixture
+        .server
+        .delete(&format!("/v1/files/{file_id}"))
+        .add_header("Authorization", format!("Bearer {}", fixture.foreign_key))
         .await;
-    assert_eq!(content_response.status_code(), 200);
-    assert_eq!(content_response.as_bytes().as_ref(), &content[..]);
+    let unknown = fixture
+        .server
+        .delete(&format!("/v1/files/{UNKNOWN_FILE_ID}"))
+        .add_header("Authorization", format!("Bearer {}", fixture.foreign_key))
+        .await;
+    assert_eq!(foreign.status_code(), 404);
+    assert_eq!(unknown.status_code(), 404);
+    assert_no_store(&foreign);
+    assert_no_store(&unknown);
+    assert_eq!(foreign.text(), unknown.text());
+    assert!(fixture
+        .storage
+        .exists(&fixture.file.storage_key)
+        .await
+        .unwrap());
 
-    // 5. Delete file
-    let delete_response = server
-        .delete(&format!("/v1/files/{}", file.id))
-        .add_header("Authorization", format!("Bearer {api_key}"))
+    let still_readable = fixture
+        .server
+        .get(&format!("/v1/files/{file_id}/content"))
+        .add_header("Authorization", format!("Bearer {}", fixture.owner_key))
         .await;
-    assert_eq!(delete_response.status_code(), 200);
+    assert_eq!(still_readable.status_code(), 200);
+    assert_no_store(&still_readable);
+    assert_eq!(still_readable.as_bytes().as_ref(), RETAINED_CONTENT);
 
-    // 6. Verify deletion
-    let get_response = server
-        .get(&format!("/v1/files/{}", file.id))
+    let deleted = fixture
+        .server
+        .delete(&format!("/v1/files/{file_id}"))
+        .add_header("Authorization", format!("Bearer {}", fixture.owner_key))
+        .await;
+    assert_eq!(deleted.status_code(), 200);
+    assert_no_store(&deleted);
+    let deleted: api::models::FileDeleteResponse = deleted.json();
+    assert_eq!(deleted.id, file_id);
+    assert!(deleted.deleted);
+    assert!(!fixture
+        .storage
+        .exists(&fixture.file.storage_key)
+        .await
+        .unwrap());
+
+    for suffix in ["", "/content"] {
+        let missing = fixture
+            .server
+            .get(&format!("/v1/files/{file_id}{suffix}"))
+            .add_header("Authorization", format!("Bearer {}", fixture.owner_key))
+            .await;
+        assert_eq!(missing.status_code(), 404);
+        assert_no_store(&missing);
+    }
+    let list = fixture
+        .server
+        .get("/v1/files")
+        .add_header("Authorization", format!("Bearer {}", fixture.owner_key))
+        .await;
+    assert_eq!(list.status_code(), 200);
+    assert_no_store(&list);
+    assert!(list.json::<api::models::FileListResponse>().data.is_empty());
+}
+
+#[tokio::test]
+async fn file_migration_routes_require_an_api_key() {
+    let server = setup_test_server().await;
+
+    for path in [
+        "/v1/files".to_string(),
+        format!("/v1/files/{UNKNOWN_FILE_ID}"),
+        format!("/v1/files/{UNKNOWN_FILE_ID}/content"),
+    ] {
+        assert_eq!(
+            server.get(&path).await.status_code(),
+            401,
+            "temporary view must require an API key: {path}"
+        );
+    }
+    assert_eq!(
+        server
+            .delete(&format!("/v1/files/{UNKNOWN_FILE_ID}"))
+            .await
+            .status_code(),
+        401
+    );
+}
+
+#[tokio::test]
+async fn file_migration_routes_reach_workspace_scoped_handlers_and_are_no_store() {
+    let server = setup_test_server().await;
+    let (api_key, _) = create_org_and_api_key(&server).await;
+
+    let list = server
+        .get("/v1/files?limit=1")
         .add_header("Authorization", format!("Bearer {api_key}"))
         .await;
-    assert_eq!(get_response.status_code(), 404);
+    assert_eq!(list.status_code(), 200);
+    assert_no_store(&list);
+
+    for path in [
+        format!("/v1/files/{UNKNOWN_FILE_ID}"),
+        format!("/v1/files/{UNKNOWN_FILE_ID}/content"),
+    ] {
+        let response = server
+            .get(&path)
+            .add_header("Authorization", format!("Bearer {api_key}"))
+            .await;
+        assert_eq!(
+            response.status_code(),
+            404,
+            "temporary view must reach its workspace-scoped read handler: {path}"
+        );
+        assert_no_store(&response);
+    }
+
+    let delete = server
+        .delete(&format!("/v1/files/{UNKNOWN_FILE_ID}"))
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .await;
+    assert_eq!(
+        delete.status_code(),
+        404,
+        "DELETE must reach its original workspace-scoped handler rather than the 410 fallback"
+    );
+    assert_no_store(&delete);
+}
+
+#[tokio::test]
+async fn all_file_mutations_except_delete_remain_gone_after_authentication() {
+    let server = setup_test_server().await;
+    let (api_key, _) = create_org_and_api_key(&server).await;
+    let routes = [
+        (Method::POST, "/v1/files"),
+        (Method::DELETE, "/v1/files"),
+        (
+            Method::PATCH,
+            "/v1/files/file-00000000-0000-0000-0000-000000000000",
+        ),
+        (
+            Method::GET,
+            "/v1/files/file-00000000-0000-0000-0000-000000000000/",
+        ),
+        (
+            Method::DELETE,
+            "/v1/files/file-00000000-0000-0000-0000-000000000000/",
+        ),
+        (
+            Method::DELETE,
+            "/v1/files/file-00000000-0000-0000-0000-000000000000/content",
+        ),
+        (Method::PUT, "/v1/files/legacy/nested/path"),
+        (Method::GET, "/v1/files/"),
+    ];
+
+    for (method, path) in routes {
+        assert_file_write_is_gone(
+            server
+                .method(method.clone(), path)
+                .add_header("Authorization", format!("Bearer {api_key}"))
+                .await,
+        );
+    }
 }

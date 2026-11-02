@@ -96,11 +96,15 @@ Client → CompletionService → Provider Pool → provider → inference server
 
 The engine is streaming-first: tokens reach users in real time, usage is tracked during the stream rather than after, and non-streaming clients get the collected stream.
 
-### Conversations and Files
+### Temporary Stage I data access
 
-Conversations and Files remain authenticated, workspace-scoped resource APIs. Conversation creation, retrieval, updates, pinning, archiving, cloning, item creation, and deletion are available. Files support upload, listing, metadata/content retrieval, and deletion.
+Existing Conversation/File data remains available through authenticated, workspace-scoped routes with `Cache-Control: no-store`:
 
-These resources have their own storage lifecycle. Stateless Responses accepts caller-provided context instead of linking to stored Conversations or Files.
+- Retrieval: `POST /v1/conversations/batch`, `GET /v1/conversations/{id}`, `GET /v1/conversations/{id}/items`, `GET /v1/files`, `GET /v1/files/{id}`, and `GET /v1/files/{id}/content`.
+- Resource deletion: `DELETE /v1/conversations/{id}` and `DELETE /v1/files/{id}` remain available for the existing account-deletion workflow.
+- Creation, upload, all other mutations, and unsupported legacy Conversation/File paths return `410 Gone`.
+
+The historical schemas and repositories remain for these bounded routes. Data deletion and schema removal are separate work; retired APIs must not be wired back to them.
 
 ### Model discovery
 

@@ -758,7 +758,7 @@ pub enum ResponseOutputItem {
         /// replaying the function call (for example Gemini's thought signature).
         #[serde(skip_serializing_if = "Option::is_none")]
         thought_signature: Option<String>,
-        /// Status: "in_progress" when pending client execution
+        /// Generation status; "completed" means the client can execute the call.
         status: String,
         model: String,
     },
@@ -808,7 +808,12 @@ impl ResponseOutputItem {
             ResponseOutputItem::McpListTools { .. } => ResponseItemStatus::Completed,
             ResponseOutputItem::McpCall { .. } => ResponseItemStatus::Completed,
             ResponseOutputItem::McpApprovalRequest { .. } => ResponseItemStatus::InProgress,
-            ResponseOutputItem::FunctionCall { .. } => ResponseItemStatus::InProgress,
+            ResponseOutputItem::FunctionCall { status, .. } => match status.as_str() {
+                "completed" => ResponseItemStatus::Completed,
+                "failed" => ResponseItemStatus::Failed,
+                "cancelled" => ResponseItemStatus::Cancelled,
+                _ => ResponseItemStatus::InProgress,
+            },
             ResponseOutputItem::FunctionCallOutput { .. } => ResponseItemStatus::Completed,
         }
     }
@@ -1099,6 +1104,8 @@ pub struct ResponseStreamEvent {
     pub part: Option<ResponseOutputContent>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub delta: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub arguments: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1601,16 +1608,18 @@ mod tests {
     }
 
     #[test]
-    fn test_web_search_count_validation_and_round_trip() {
+    fn test_internal_web_search_count_validation_and_round_trip() {
         for count in [None, Some(1), Some(5), Some(20), Some(0), Some(21)] {
             let mut tool = serde_json::json!({"type": "web_search"});
             if let Some(count) = count {
                 tool["count"] = serde_json::json!(count);
             }
-            let request: CreateResponseRequest = serde_json::from_value(serde_json::json!({
-                "model": "test", "input": "Search the web", "tools": [tool.clone()]
-            }))
-            .unwrap();
+            // Builtin tools are no longer accepted by the public request
+            // deserializer, but retained internal tools still validate count.
+            let mut request = stateless_request();
+            request.tools = Some(vec![
+                serde_json::from_value::<ResponseTool>(tool.clone()).unwrap()
+            ]);
             assert_eq!(
                 request.validate().is_ok(),
                 count.is_none_or(|n| (0..=20).contains(&n))
@@ -1624,12 +1633,10 @@ mod tests {
             serde_json::json!("5"),
             serde_json::json!(4294967296u64),
         ] {
-            assert!(
-                serde_json::from_value::<CreateResponseRequest>(serde_json::json!({
-                    "model": "test", "tools": [{"type": "web_search", "count": count}]
-                }))
-                .is_err()
-            );
+            assert!(serde_json::from_value::<ResponseTool>(serde_json::json!({
+                "type": "web_search", "count": count
+            }))
+            .is_err());
         }
     }
 

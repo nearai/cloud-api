@@ -200,6 +200,7 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
                     item: None,
                     item_id: None,
                     part: None,
+                    arguments: None,
                     delta: None,
                     text: Some(e.to_string()),
                     error: Some(e.response_error()),
@@ -255,7 +256,8 @@ impl ResponseServiceImpl {
         emitter: &mut crate::responses::service_helpers::EventEmitter,
         ctx: &mut crate::responses::service_helpers::ResponseStreamContext,
         response_items_repository: &Arc<dyn ports::ResponseItemRepositoryTrait>,
-        process_context: &ProcessStreamContext,
+        request: &models::CreateResponseRequest,
+        organization_id: Uuid,
     ) -> Result<crate::responses::service_helpers::ProcessStreamResult, errors::ResponseError> {
         use crate::responses::service_helpers::ToolCallAccumulator;
         use futures::StreamExt;
@@ -463,16 +465,36 @@ impl ResponseServiceImpl {
                     stream_error = true;
                     stream_error_cause = Some(errors::ResponseError::from(
                         crate::completions::CompletionServiceImpl::map_provider_error(
-                            &process_context.request.model,
+                            &request.model,
                             &e,
                             "responses stream",
-                            process_context.organization_id,
+                            organization_id,
                         ),
                     ));
                     // Don't return early - save partial response below
                     break;
                 }
             }
+        }
+
+        // A provider may go straight from reasoning to function calls without
+        // emitting message text. Close that item before assigning tool slots.
+        // Preserve the original provider error if the stream was interrupted.
+        if reasoning_item_emitted && !stream_error {
+            emitter
+                .emit_reasoning_completed(
+                    ctx,
+                    &reasoning_item_id,
+                    &reasoning_buffer,
+                    response_items_repository,
+                )
+                .await?;
+            ctx.add_reasoning_tokens(
+                crate::responses::service_helpers::ResponseStreamContext::estimate_tokens(
+                    &reasoning_buffer,
+                ),
+            );
+            ctx.next_output_index();
         }
 
         // If we have message content, close it with done events and retain it
@@ -493,7 +515,7 @@ impl ResponseServiceImpl {
         // that parser can repair and reserialize JSON for server-executed
         // search tools, which would corrupt a client replay.
         let tool_calls_detected =
-            Self::convert_client_function_calls(tool_call_accumulator, &process_context.request)?;
+            Self::convert_client_function_calls(tool_call_accumulator, request)?;
 
         Ok(crate::responses::service_helpers::ProcessStreamResult {
             text: current_text,
@@ -702,7 +724,7 @@ impl ResponseServiceImpl {
         // layer over exactly one Chat Completions request. Client-defined
         // functions are returned to the caller; Cloud never executes them or
         // starts another completion.
-        let one_shot_result: Result<(String, bool), errors::ResponseError> = async {
+        let one_shot_result: Result<String, errors::ResponseError> = async {
             let stream_result = Self::run_completion_once(
                 &mut ctx,
                 &mut emitter,
@@ -725,7 +747,7 @@ impl ResponseServiceImpl {
                 ctx.next_output_index();
             }
 
-            let function_calls_required = Self::emit_client_function_calls(
+            Self::emit_client_function_calls(
                 &mut ctx,
                 &mut emitter,
                 &context.response_items_repository,
@@ -733,26 +755,21 @@ impl ResponseServiceImpl {
             )
             .await?;
 
-            Ok((stream_result.text, function_calls_required))
+            Ok(stream_result.text)
         }
         .await;
 
-        let (final_response_text, final_status, incomplete_details) = match &one_shot_result {
-            Ok((text, true)) => (
-                text.clone(),
-                models::ResponseStatus::Incomplete,
-                Some(models::ResponseIncompleteDetails {
-                    reason: "function_call_required".to_string(),
-                }),
-            ),
-            Ok((text, false)) => (text.clone(), models::ResponseStatus::Completed, None),
-            Err(_) => (String::new(), models::ResponseStatus::Failed, None),
+        let (final_response_text, final_status) = match &one_shot_result {
+            // Producing a function call completes this model turn. The client
+            // executes it and submits the result in a separate request.
+            Ok(text) => (text.clone(), models::ResponseStatus::Completed),
+            Err(_) => (String::new(), models::ResponseStatus::Failed),
         };
 
         // Build final response
         let mut final_response = initial_response;
         final_response.status = final_status;
-        final_response.incomplete_details = incomplete_details;
+        final_response.incomplete_details = None;
 
         // Load all response items from the database for this response
         let response_items = context
@@ -1000,7 +1017,8 @@ impl ResponseServiceImpl {
             emitter,
             ctx,
             &process_context.response_items_repository,
-            process_context,
+            &process_context.request,
+            process_context.organization_id,
         )
         .await
     }
@@ -1012,37 +1030,34 @@ impl ResponseServiceImpl {
         emitter: &mut crate::responses::service_helpers::EventEmitter,
         response_items_repository: &Arc<dyn ports::ResponseItemRepositoryTrait>,
         tool_calls: Vec<crate::responses::service_helpers::ClientManagedFunctionCall>,
-    ) -> Result<bool, errors::ResponseError> {
-        if tool_calls.is_empty() {
-            return Ok(false);
-        }
-
+    ) -> Result<(), errors::ResponseError> {
         for tool_call in tool_calls {
-            let call_id = tool_call.id;
+            let item_id = format!(
+                "{}{}",
+                crate::id_prefixes::PREFIX_FC,
+                Uuid::new_v4().simple()
+            );
+            let arguments = tool_call.arguments;
             let function_call = models::ResponseOutputItem::FunctionCall {
-                id: format!(
-                    "{}{}",
-                    crate::id_prefixes::PREFIX_FC,
-                    Uuid::new_v4().simple()
-                ),
+                id: item_id.clone(),
                 response_id: ctx.response_id_str.clone(),
                 previous_response_id: ctx.previous_response_id.clone(),
                 next_response_ids: vec![],
                 created_at: ctx.created_at,
-                call_id: call_id.clone(),
+                call_id: tool_call.id,
                 name: tool_call.name,
-                arguments: tool_call.arguments,
+                arguments: arguments.clone(),
                 thought_signature: tool_call.thought_signature,
-                status: "in_progress".to_string(),
+                status: "completed".to_string(),
                 model: ctx.model.clone(),
             };
 
-            response_items_repository
+            let function_call = response_items_repository
                 .create(
                     ctx.response_id.clone(),
                     ctx.api_key_id,
                     ctx.conversation_id,
-                    function_call.clone(),
+                    function_call,
                 )
                 .await
                 .map_err(|e| {
@@ -1051,13 +1066,28 @@ impl ResponseServiceImpl {
                     ))
                 })?;
 
-            // Keep the event shape compatible with the prior function
-            // executor: `item_id` is the model call ID used by clients to
-            // correlate the later function_call_output.
-            emitter.emit_item_added(ctx, function_call, call_id).await?;
+            let mut pending_call = function_call.clone();
+            if let models::ResponseOutputItem::FunctionCall {
+                arguments, status, ..
+            } = &mut pending_call
+            {
+                arguments.clear();
+                *status = "in_progress".to_string();
+            }
+            emitter
+                .emit_item_added(ctx, pending_call, item_id.clone())
+                .await?;
+            // Provider chunks have already been accumulated and validated.
+            // Emit their exact bytes as one delta, then close the arguments
+            // and item so clients can execute the function from item.done.
+            emitter
+                .emit_function_call_arguments(ctx, item_id.clone(), arguments)
+                .await?;
+            emitter.emit_item_done(ctx, function_call, item_id).await?;
+            ctx.next_output_index();
         }
 
-        Ok(true)
+        Ok(())
     }
 
     /// Convert accumulated provider tool-call chunks into client-managed
@@ -1900,6 +1930,178 @@ impl ResponseServiceImpl {
 mod tests {
     use super::*;
     use crate::responses::tools::WEB_SEARCH_TOOL_NAME;
+
+    #[tokio::test]
+    async fn reasoning_before_parallel_functions_finishes_with_distinct_output_slots() {
+        use crate::responses::service_helpers::{
+            EventEmitter, ResponseStreamContext, UsageTracker,
+        };
+        use futures::StreamExt;
+
+        for preamble in ["", "I will check both cities."] {
+            let request: models::CreateResponseRequest =
+                serde_json::from_value(serde_json::json!({
+                    "model": "test", "store": false,
+                    "tools": [{"type": "function", "name": "lookup"}]
+                }))
+                .unwrap();
+            let (responses, items) = transient::repositories();
+            let api_key_id = Uuid::new_v4();
+            let response = responses
+                .create(
+                    crate::workspace::WorkspaceId(Uuid::new_v4()),
+                    api_key_id,
+                    request.clone(),
+                )
+                .await
+                .unwrap();
+            let response_id = ResponseServiceImpl::extract_response_uuid(&response).unwrap();
+            let mut ctx = ResponseStreamContext::new(
+                response_id.clone(),
+                api_key_id,
+                None,
+                response.id,
+                None,
+                0,
+                "test".to_string(),
+                UsageTracker::new(),
+            );
+            let chunk = |delta| {
+                Ok(inference_providers::SSEEvent {
+                    raw_bytes: Default::default(),
+                    raw_passthrough: false,
+                    chunk: Some(inference_providers::StreamChunk::Chat(
+                        serde_json::from_value(serde_json::json!({
+                            "id": "chat_test", "object": "chat.completion.chunk",
+                            "created": 0, "model": "test",
+                            "choices": [{"index": 0, "delta": delta}]
+                        }))
+                        .unwrap(),
+                    )),
+                })
+            };
+            let chunks = vec![
+                chunk(serde_json::json!({"reasoning_content": "Compare both cities."})),
+                chunk(serde_json::json!({"content": preamble})),
+                chunk(serde_json::json!({"tool_calls": [
+                    {"index": 1, "id": "call_1", "function": {"name": "lookup", "arguments": "{un"}},
+                    {"index": 0, "id": "call_0", "function": {"name": "lookup", "arguments": "{ \"city\":"}, "thought_signature": "signature"}
+                ]})),
+                chunk(serde_json::json!({"tool_calls": [
+                    {"index": 0, "function": {"arguments": " \"上海\" }"}},
+                    {"index": 1, "function": {"arguments": "finished"}}
+                ]})),
+            ];
+            let mut stream: Pin<
+                Box<
+                    dyn Stream<
+                            Item = Result<
+                                inference_providers::SSEEvent,
+                                inference_providers::CompletionError,
+                            >,
+                        > + Send,
+                >,
+            > = Box::pin(futures::stream::iter(chunks));
+            let (tx, rx) = futures::channel::mpsc::unbounded();
+            let mut emitter = EventEmitter::new(tx);
+            let result = ResponseServiceImpl::process_completion_stream(
+                &mut stream,
+                &mut emitter,
+                &mut ctx,
+                &items,
+                &request,
+                Uuid::new_v4(),
+            )
+            .await
+            .unwrap();
+            assert!(!result.stream_error);
+            assert_eq!(result.text, preamble);
+            assert_eq!(ctx.output_item_index, 1, "reasoning must reserve its slot");
+            if !result.text.is_empty() {
+                ctx.next_output_index();
+            }
+            ResponseServiceImpl::emit_client_function_calls(
+                &mut ctx,
+                &mut emitter,
+                &items,
+                result.tool_calls,
+            )
+            .await
+            .unwrap();
+            drop(emitter);
+            let events: Vec<_> = rx.collect().await;
+            let stored = items.list_by_response(response_id).await.unwrap();
+            let function_start = if preamble.is_empty() { 1 } else { 2 };
+            assert_eq!(stored.len(), function_start + 2);
+            assert_eq!(ctx.output_item_index, stored.len());
+            assert!(matches!(&stored[0], models::ResponseOutputItem::Reasoning {
+                status: models::ResponseItemStatus::Completed, content, ..
+            } if content == "Compare both cities."));
+            assert!(ctx.reasoning_tokens > 0);
+            for (output_index, item) in stored.iter().enumerate() {
+                let lifecycle: Vec<_> = events
+                    .iter()
+                    .filter(|event| event.item_id.as_deref() == Some(item.id()))
+                    .collect();
+                assert_eq!(
+                    lifecycle.first().unwrap().event_type,
+                    "response.output_item.added"
+                );
+                assert_eq!(
+                    lifecycle.last().unwrap().event_type,
+                    "response.output_item.done"
+                );
+                assert!(lifecycle
+                    .iter()
+                    .all(|event| event.output_index == Some(output_index)));
+                assert!(matches!(
+                    item.status(),
+                    models::ResponseItemStatus::Completed
+                ));
+            }
+            for (index, arguments) in ["{ \"city\": \"上海\" }", "{unfinished"].iter().enumerate()
+            {
+                let item = &stored[function_start + index];
+                let json = serde_json::to_value(item).unwrap();
+                assert_eq!(json["arguments"], *arguments);
+                assert_eq!(json["call_id"], format!("call_{index}"));
+                assert_ne!(json["id"], json["call_id"]);
+                let related: Vec<_> = events
+                    .iter()
+                    .filter(|event| event.item_id.as_deref() == Some(item.id()))
+                    .collect();
+                let added = related.first().unwrap().item.as_ref().unwrap();
+                assert!(matches!(
+                    added.status(),
+                    models::ResponseItemStatus::InProgress
+                ));
+                assert_eq!(serde_json::to_value(added).unwrap()["arguments"], "");
+                let deltas: String = related
+                    .iter()
+                    .filter(|event| event.event_type == "response.function_call_arguments.delta")
+                    .map(|event| event.delta.as_deref().unwrap())
+                    .collect();
+                assert_eq!(deltas, *arguments);
+                let arguments_done = related
+                    .iter()
+                    .find(|event| event.event_type == "response.function_call_arguments.done")
+                    .unwrap();
+                assert_eq!(arguments_done.arguments.as_deref(), Some(*arguments));
+                assert_eq!(arguments_done.item_id.as_deref(), Some(item.id()));
+                assert_eq!(
+                    serde_json::to_value(&related.last().unwrap().item).unwrap(),
+                    json
+                );
+            }
+            assert_eq!(
+                serde_json::to_value(&stored[function_start]).unwrap()["thought_signature"],
+                "signature"
+            );
+            for (sequence, event) in events.iter().enumerate() {
+                assert_eq!(event.sequence_number, Some(sequence as u64));
+            }
+        }
+    }
 
     #[tokio::test]
     async fn historical_assistant_input_is_not_returned_as_response_output() {

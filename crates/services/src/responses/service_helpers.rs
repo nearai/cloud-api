@@ -169,6 +169,7 @@ impl EventEmitter {
             item: None,
             item_id: None,
             part: None,
+            arguments: None,
             delta: None,
             text: None,
             error: None,
@@ -198,6 +199,7 @@ impl EventEmitter {
             item: None,
             item_id: None,
             part: None,
+            arguments: None,
             delta: None,
             text: None,
             error: None,
@@ -228,6 +230,7 @@ impl EventEmitter {
             item: None,
             item_id: None,
             part: None,
+            arguments: None,
             delta: None,
             text: None,
             error: None,
@@ -258,6 +261,7 @@ impl EventEmitter {
             item: Some(item),
             item_id: Some(item_id),
             part: None,
+            arguments: None,
             delta: None,
             text: None,
             error: None,
@@ -288,6 +292,7 @@ impl EventEmitter {
             item: Some(item),
             item_id: Some(item_id),
             part: None,
+            arguments: None,
             delta: None,
             text: None,
             error: None,
@@ -299,6 +304,41 @@ impl EventEmitter {
             conversation_title: None,
             usage: None,
         };
+        self.send(event).await
+    }
+
+    /// Emit already-accumulated function arguments without rewriting their bytes.
+    pub async fn emit_function_call_arguments(
+        &mut self,
+        ctx: &mut ResponseStreamContext,
+        item_id: String,
+        arguments: String,
+    ) -> Result<(), errors::ResponseError> {
+        let mut event = models::ResponseStreamEvent {
+            event_type: "response.function_call_arguments.delta".to_string(),
+            sequence_number: Some(ctx.next_sequence()),
+            response: None,
+            output_index: Some(ctx.output_item_index),
+            content_index: None,
+            item: None,
+            item_id: Some(item_id),
+            part: None,
+            delta: Some(arguments),
+            arguments: None,
+            text: None,
+            error: None,
+            status_code: None,
+            logprobs: None,
+            obfuscation: None,
+            annotation_index: None,
+            annotation: None,
+            conversation_title: None,
+            usage: None,
+        };
+        self.send(event.clone()).await?;
+        event.event_type = "response.function_call_arguments.done".to_string();
+        event.sequence_number = Some(ctx.next_sequence());
+        event.arguments = event.delta.take();
         self.send(event).await
     }
 
@@ -318,6 +358,7 @@ impl EventEmitter {
             item: None,
             item_id: Some(item_id),
             part: Some(part),
+            arguments: None,
             delta: None,
             text: None,
             error: None,
@@ -348,6 +389,7 @@ impl EventEmitter {
             item: None,
             item_id: Some(item_id),
             part: Some(part),
+            arguments: None,
             delta: None,
             text: None,
             error: None,
@@ -378,6 +420,7 @@ impl EventEmitter {
             item: None,
             item_id: Some(item_id),
             part: None,
+            arguments: None,
             delta: Some(delta),
             text: None,
             error: None,
@@ -408,6 +451,7 @@ impl EventEmitter {
             item: None,
             item_id: Some(item_id),
             part: None,
+            arguments: None,
             delta: None,
             text: Some(text),
             error: None,
@@ -459,6 +503,7 @@ impl EventEmitter {
             item: None,
             item_id: Some(reasoning_id),
             part: None,
+            arguments: None,
             delta: Some(delta),
             text: None,
             error: None,

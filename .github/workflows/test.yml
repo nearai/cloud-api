@@ -231,6 +231,25 @@ jobs:
       env:
         GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+    - name: TEMP diagnose migrator connectivity
+      continue-on-error: true
+      env:
+        NET: ${{ job.services.postgres.network }}
+      run: |
+        set -x
+        hostname; cat /etc/docker/daemon.json || true
+        docker info --format '{{.DefaultRuntime}} {{json .Runtimes}} {{.SecurityOptions}} rootless={{.Name}}' || true
+        getent ahosts localhost || true
+        pg_isready -h 127.0.0.1 -p 5432 || true
+        docker run --rm --network host postgres:15 pg_isready -h 127.0.0.1 -p 5432 || true
+        docker run --rm --network host postgres:15 pg_isready -h localhost -p 5432 || true
+        docker run --rm --network "$NET" postgres:15 pg_isready -h postgres -p 5432 || true
+        docker run --rm --network "$NET" -e PGPASSWORD=postgres postgres:15 psql -h postgres -U postgres -d platform_api -c 'select version()' || true
+        source scripts/cloud-platform-schema.env
+        docker image inspect "$CLOUD_PLATFORM_IMAGE" --format '{{.Architecture}} {{.Os}} {{json .Config.Entrypoint}} {{json .Config.User}}' || true
+        printf '{"host":"postgres","port":5432,"dbname":"platform_api","username":"postgres","password":"postgres"}' | \
+          docker run --rm -i --network "$NET" -e RUST_LOG=trace -e DB_SECRET_FILE=/dev/stdin -e CLOUD_PLATFORM_ALLOW_PLAINTEXT_DB=1 "$CLOUD_PLATFORM_IMAGE" migrate 2>&1 | tail -n 60 || true
+
     - name: Run typed-query, credit-allocation, credit-transfer, session, and binding regressions
       run: |
         cargo test --locked -p database --test hot_path_typed_queries --test billing_typed_queries --test credit_allocation --test session_rotation --test staking_wallet_binding -- --test-threads=4

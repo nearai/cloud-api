@@ -12,6 +12,9 @@ on:
   # Include stacked PRs targeting another feature branch.
   pull_request:
 
+permissions:
+  contents: read
+
 # A new push to a PR supersedes the previous run, so cancel it instead of letting
 # it hold self-hosted runners. Non-PR runs get a unique group (run_id): a shared
 # group would serialize main/develop pushes and GitHub would cancel the pending
@@ -93,7 +96,10 @@ jobs:
     name: Lint
     needs: changes
     if: ${{ needs.changes.outputs.rust == 'true' }}
-    runs-on: [self-hosted, infra]
+    # Same-repo pushes/PRs run on the dedicated CI host (ci-build-1, no deploy
+    # credentials). Fork PRs fall back to GitHub-hosted so untrusted code never
+    # reaches a self-hosted machine.
+    runs-on: ${{ (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","ci-cloud-api"]') || 'ubuntu-latest' }}
 
     steps:
     - uses: actions/checkout@v7
@@ -121,7 +127,10 @@ jobs:
     name: Unit tests
     needs: changes
     if: ${{ needs.changes.outputs.rust == 'true' }}
-    runs-on: [self-hosted, infra]
+    # Same-repo pushes/PRs run on the dedicated CI host (ci-build-1, no deploy
+    # credentials). Fork PRs fall back to GitHub-hosted so untrusted code never
+    # reaches a self-hosted machine.
+    runs-on: ${{ (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","ci-cloud-api"]') || 'ubuntu-latest' }}
 
     steps:
     - uses: actions/checkout@v7
@@ -134,7 +143,10 @@ jobs:
     - name: Run unit tests
       run: cargo nextest run --lib --bins
       env:
-        POSTGRES_PRIMARY_APP_ID: ${{ secrets.POSTGRES_PRIMARY_APP_ID }}
+        # This job has no `environment:`, so the "Cloud API test env" secrets
+        # were never available here; keep the variables set (some config
+        # loaders panic when unset) but empty, without referencing secrets.
+        POSTGRES_PRIMARY_APP_ID: ""
         DATABASE_HOST: localhost
         DATABASE_PORT: 5432
         DATABASE_NAME: platform_api
@@ -142,11 +154,11 @@ jobs:
         DATABASE_PASSWORD: postgres
         DATABASE_MAX_CONNECTIONS: 5
         DATABASE_TLS_ENABLED: "false"
-        MODEL_DISCOVERY_SERVER_URL: ${{ secrets.MODEL_DISCOVERY_SERVER_URL }}
-        MODEL_DISCOVERY_API_KEY: ${{ secrets.MODEL_DISCOVERY_API_KEY }}
-        AUTH_ADMIN_DOMAINS: ${{ secrets.AUTH_ADMIN_DOMAINS }}
-        AUTH_ENCODING_KEY: ${{ secrets.AUTH_ENCODING_KEY }}
-        BRAVE_SEARCH_PRO_API_KEY: ${{ secrets.BRAVE_SEARCH_PRO_API_KEY }}
+        MODEL_DISCOVERY_SERVER_URL: ""
+        MODEL_DISCOVERY_API_KEY: ""
+        AUTH_ADMIN_DOMAINS: ""
+        AUTH_ENCODING_KEY: ""
+        BRAVE_SEARCH_PRO_API_KEY: ""
         DEV: "true"
 
   # vLLM provider integration tests. Uses MockProvider by default
@@ -157,7 +169,10 @@ jobs:
     name: Integration tests
     needs: changes
     if: ${{ needs.changes.outputs.rust == 'true' }}
-    runs-on: [self-hosted, infra]
+    # Same-repo pushes/PRs run on the dedicated CI host (ci-build-1, no deploy
+    # credentials). Fork PRs fall back to GitHub-hosted so untrusted code never
+    # reaches a self-hosted machine.
+    runs-on: ${{ (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","ci-cloud-api"]') || 'ubuntu-latest' }}
 
     steps:
     - uses: actions/checkout@v7
@@ -168,10 +183,8 @@ jobs:
         cache-key: integration
 
     - name: Run integration tests
+      # MockProvider unless USE_REAL_VLLM is set; the real-vLLM test is #[ignore].
       run: cargo nextest run --test integration_tests
-      env:
-        VLLM_BASE_URL: ${{ secrets.VLLM_BASE_URL }}
-        VLLM_API_KEY: ${{ secrets.VLLM_API_KEY }}
 
   # End-to-end tests. All e2e tests are compiled into a single binary
   # (tests/e2e_all/) for faster linking. Isolation comes from UUID-scoped

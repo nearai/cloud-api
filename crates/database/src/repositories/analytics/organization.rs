@@ -43,8 +43,7 @@ const CREDIT_TYPE_USAGE_CTE: &str = r#"
     )
 "#;
 
-/// The four statements of an organization metrics report. Both sources return the same
-/// columns in the same order, so one mapping serves both.
+/// The four statements of an unfiltered organization metrics report.
 struct MetricsSql {
     summary: String,
     by_workspace: String,

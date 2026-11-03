@@ -344,24 +344,22 @@ interactively and inspect request/response schemas.
 
 ### Stateless Responses and attestation retention
 
-`POST /v1/responses` is stateless. The default typed adapter treats an omitted
-`store` as `false` and rejects `store: true`; the native allowlisted route is
-selected only when `store: false` is explicitly supplied. Cloud API does not
-retain raw request or response content, response items, or response history;
-clients must supply any needed prior context with each request.
+`POST /v1/responses` is stateless. Both transports treat omitted or null
+`store` as `false` and reject `store: true`. Cloud API does not retain raw
+request or response content, response items, or response history; clients
+must supply any needed prior context with each request.
 
-The default typed adapter makes one Chat Completions inference. A canonical
-model explicitly listed in `NATIVE_RESPONSES_MODELS`, with an explicit
-`store: false` request, instead makes one native provider Responses inference.
-That narrow exception remains stateless, writes no response/item history, and
-does not run an agent loop or execute built-in or remote MCP tools.
+After alias resolution, canonical `openai/` models make one native provider
+Responses inference. Other models use the typed adapter for one Chat
+Completions inference. Both paths keep tools under client control and do
+not run an agent loop or execute built-in or remote MCP tools.
 
 Tools are executed by the client. Both paths accept `function` and `custom`
 tools, either at the top level or inside a `namespace` containing those tool
 types. Codex's leading developer `additional_tools` declarations are accepted
 as a tool catalog. Keep these declarations before conversation items.
 
-| Custom tool format | Default typed adapter | Native Responses |
+| Custom tool format | Non-OpenAI typed adapter | OpenAI native Responses |
 | --- | --- | --- |
 | Omitted format or `{"type":"text"}` | Supported | Forwarded to the provider |
 | Codex 0.166 `exec` Lark source grammar | Supported, including its nonempty input requirement | Forwarded to the provider |
@@ -415,10 +413,10 @@ legacy disconnect fallback.
 Server-executed tools are rejected locally: `web_search`,
 `web_context_search`, `file_search`, `code_interpreter`, `computer`, and
 remote `mcp` tools. Image-generation and image-editing models are rejected on
-both paths. The default typed adapter's successful requests make exactly one
+both paths. The typed adapter's successful requests make exactly one
 Chat Completions call. This does not affect the separate `POST /mcp` MCP
 server, which continues to expose its independent `web_search` tool, or the
-`/v1/images/*` endpoints. Native allowlisted requests may preserve validated
+`/v1/images/*` endpoints. Native OpenAI requests preserve validated
 provider-native fields such as encrypted reasoning and grammar definitions.
 
 Responses itself rejects conversation linkage, response history, and file

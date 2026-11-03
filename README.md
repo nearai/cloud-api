@@ -203,16 +203,14 @@ These endpoints require an API key and retain their own resource lifecycle.
 ### Stateless Responses
 
 `POST /v1/responses` remains stateless and does not accept a Conversation
-reference, response history, or File input. The default typed adapter treats
-an omitted `store` as `false` and rejects `store: true`; native routing is
-selected only for an explicitly supplied `store: false`. Clients must send any
-inference history needed for a request themselves. The default typed adapter
-uses one Chat Completions inference; a canonical model explicitly configured
-through `NATIVE_RESPONSES_MODELS`, with an explicit `store: false` request,
-uses one native provider Responses inference instead. Both paths keep no
-response/item history and do not run an agent loop. Clients execute `function`
-and `custom` tools, including tools grouped in a `namespace`, then replay the
-calls and results in their next request. See the [Responses compatibility and
+reference, response history, or File input. Both transports normalize omitted
+or null `store` to `false` and reject `store: true`. Clients must send any
+inference history needed for a request themselves. After alias resolution,
+canonical `openai/` models use one native provider Responses inference; other
+models use the typed adapter for one Chat Completions inference. Both paths
+keep no response/item history and do not run an agent loop. Clients execute
+`function` and `custom` tools, including tools grouped in a `namespace`, then
+replay the calls and results in their next request. See the [Responses compatibility and
 replay guide](docs/local-development.md#stateless-responses-and-attestation-retention)
 for streaming, reasoning, Codex tool declarations, and grammar support.
 

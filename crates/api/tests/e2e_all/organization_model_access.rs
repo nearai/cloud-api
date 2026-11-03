@@ -37,7 +37,7 @@ enum ModelKind {
     Decisions,
     /// A model the native Anthropic Messages routes accept.
     Anthropic,
-    /// A model on the native Responses allowlist.
+    /// An OpenAI model routed through native Responses.
     NativeResponses,
 }
 
@@ -112,15 +112,13 @@ async fn setup() -> Fixture {
     let text_alias = format!("access-text-alias-{suffix}");
     let decisions = format!("access-decisions/model-{suffix}");
     let anthropic = format!("anthropic/access-model-{suffix}");
-    let native = format!("access-native/model-{suffix}");
+    let native = format!("openai/access-native-model-{suffix}");
     let successor = format!("access-successor/model-{suffix}");
 
-    let native_allowlist = vec![native.clone()];
     let (server, pool, _shared_mock, database) =
         setup_test_server_with_pool_and_config(move |config| {
             config.internal_usage_token = Some(INTERNAL_TOKEN.to_string());
             config.external_providers.enable_anthropic_messages = true;
-            config.native_responses_models = native_allowlist;
         })
         .await;
 

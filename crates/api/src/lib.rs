@@ -1718,7 +1718,6 @@ pub fn build_response_routes(
     };
     let route_state = responses::ResponseRouteState {
         native_service: services::responses::native::NativeResponsesService {
-            models: native_app_state.config.native_responses_models.clone(),
             models_service: native_app_state.models_service,
             completion_service: native_app_state.completion_service,
             inference_provider_pool: native_app_state.inference_provider_pool,
@@ -2883,8 +2882,8 @@ mod tests {
             .expect("Responses request body must explain its polymorphic contract");
         assert!(
             request_description.contains("StatelessCreateResponseRequestSchema")
-                && request_description.contains("NATIVE_RESPONSES_MODELS"),
-            "Responses request body must distinguish the typed schema from the native exception"
+                && request_description.contains("canonical openai/ models"),
+            "Responses request body must distinguish the typed schema from native OpenAI routing"
         );
         let request_schema = &request_body["content"]["application/json"]["schema"];
         assert_ne!(
@@ -3152,13 +3151,11 @@ mod tests {
         let description = responses_tag["description"]
             .as_str()
             .expect("Responses tag must document its contract");
-        assert!(description.contains("accepts an omitted `store` as `false`"));
-        assert!(
-            description.contains("native routing requires an explicitly supplied `store: false`")
-        );
+        assert!(description.contains("Both paths normalize omitted or null `store` to `false`"));
         assert!(description
-            .contains("default typed adapter sends exactly one Chat Completions inference"));
-        assert!(description.contains("NATIVE_RESPONSES_MODELS"));
+            .contains("Canonical `openai/` models use one native provider Responses inference"));
+        assert!(description
+            .contains("Other models use the typed adapter for one Chat Completions inference"));
         assert!(description.contains("client-managed `function` and `custom` tools"));
         assert!(description.contains("tools grouped in a `namespace`"));
         assert!(description.contains("plaintext `reasoning` items"));
@@ -3344,7 +3341,6 @@ mod tests {
             inference_api_key: Some("test-key".to_string()),
             internal_usage_token: None,
             internal_usage_max_discount: config::DEFAULT_INTERNAL_USAGE_MAX_DISCOUNT,
-            native_responses_models: Vec::new(),
             logging: config::LoggingConfig {
                 level: "info".to_string(),
                 format: "compact".to_string(),
@@ -3468,7 +3464,6 @@ mod tests {
             inference_api_key: Some("test-key".to_string()),
             internal_usage_token: None,
             internal_usage_max_discount: config::DEFAULT_INTERNAL_USAGE_MAX_DISCOUNT,
-            native_responses_models: Vec::new(),
             logging: config::LoggingConfig {
                 level: "info".to_string(),
                 format: "compact".to_string(),

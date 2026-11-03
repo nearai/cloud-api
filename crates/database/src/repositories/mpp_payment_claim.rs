@@ -10,6 +10,7 @@ use crate::repositories::utils::map_db_error;
 use crate::retry_db;
 use anyhow::Context;
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use services::common::RepositoryError;
 use services::mpp::{ClaimOutcome, PaymentClaimRepository, ServeOutcome};
 
@@ -27,6 +28,18 @@ RETURNING payment_key";
 const FINISH_SQL: &str = "\
 UPDATE mpp_payment_claims SET state = $2, updated_at = NOW() \
 WHERE payment_key = $1 AND state = 'serving'";
+
+/// Rows deleted per statement: small enough that no statement holds its locks for long.
+const PURGE_BATCH: i64 = 5000;
+/// Statements per call. 200 batches is a million rows; anything left goes at the next call.
+const PURGE_MAX_BATCHES: u32 = 200;
+
+/// Oldest rows first, through `idx_mpp_payment_claims_created_at`. `SKIP LOCKED` lets two
+/// instances purge at once without waiting on each other.
+const PURGE_SQL: &str = "\
+DELETE FROM mpp_payment_claims WHERE payment_key IN ( \
+SELECT payment_key FROM mpp_payment_claims WHERE created_at < $1 \
+ORDER BY created_at LIMIT $2 FOR UPDATE SKIP LOCKED)";
 
 pub struct MppPaymentClaimRepository {
     pool: DbPool,
@@ -85,6 +98,27 @@ impl PaymentClaimRepository for MppPaymentClaimRepository {
                 .map(|_| ())
         })
     }
+
+    async fn purge_older_than(&self, cutoff: DateTime<Utc>) -> Result<u64, RepositoryError> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .context("Failed to get database connection")
+            .map_err(RepositoryError::PoolError)?;
+        let mut purged = 0u64;
+        for _ in 0..PURGE_MAX_BATCHES {
+            let deleted = client
+                .execute(PURGE_SQL, &[&cutoff, &PURGE_BATCH])
+                .await
+                .map_err(map_db_error)?;
+            purged += deleted;
+            if deleted < PURGE_BATCH as u64 {
+                break;
+            }
+        }
+        Ok(purged)
+    }
 }
 
 #[cfg(test)]
@@ -108,10 +142,21 @@ mod tests {
     /// Every statement is parameterized: no value is formatted into SQL.
     #[test]
     fn statements_bind_every_input() {
-        for sql in [CLAIM_SQL, FINISH_SQL] {
+        for sql in [CLAIM_SQL, FINISH_SQL, PURGE_SQL] {
             assert!(sql.contains("$1"));
             assert!(!sql.contains("tempo:"));
         }
         assert!(CLAIM_SQL.contains("$2"));
+        assert!(PURGE_SQL.contains("$2"));
+    }
+
+    /// The purge deletes by age through the `created_at` index, oldest first and bounded, and
+    /// never touches a row another instance is already purging.
+    #[test]
+    fn purge_is_bounded_ordered_by_age_and_non_blocking() {
+        assert!(PURGE_SQL.contains("WHERE created_at < $1"));
+        assert!(PURGE_SQL.contains("ORDER BY created_at LIMIT $2"));
+        assert!(PURGE_SQL.contains("SKIP LOCKED"));
+        const _: () = assert!(PURGE_BATCH > 0 && PURGE_MAX_BATCHES > 0);
     }
 }

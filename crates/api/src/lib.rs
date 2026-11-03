@@ -3173,7 +3173,12 @@ mod tests {
             .expect("Responses tag must document its contract");
         assert!(description.contains("Both paths normalize omitted or null `store` to `false`"));
         assert!(description
-            .contains("Canonical `openai/` models use one native provider Responses inference"));
+            .contains("Canonical `openai/` models use one upstream native Responses request"));
+        assert!(description.contains("Native Responses also accepts top-level `web_search`"));
+        assert!(description.contains("without a Cloud search loop"));
+        assert!(description.contains(
+            "Complete native `web_search_call` replay items, search configuration, and `include` are forwarded unchanged"
+        ));
         assert!(description.contains(
             "Other models use the typed adapter, with bounded request-scoped inference rounds"
         ));

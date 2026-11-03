@@ -620,6 +620,12 @@ pub struct RecordUsageServiceRequest {
     /// Provider-side discount applied after catalog pricing (see
     /// [`UsageDiscount`]). `None` records the row at list price.
     pub discount: Option<UsageDiscount>,
+    /// How a write whose `(organization_id, inference_id)` already exists is
+    /// handled. `true` (the default, for reporters that may retry) treats it as
+    /// a retry and returns the stored row. `false` (the inference pipeline, which
+    /// writes once per request it served) records it under a new
+    /// `inference_id`, so a provider id seen before is not taken for a retry.
+    pub dedupe_on_conflict: bool,
 }
 
 /// Who a usage row bills and for which catalog model. Named fields keep the
@@ -675,6 +681,7 @@ impl RecordUsageServiceRequest {
             image_count: None,
             provider_attribution: ProviderAttribution::default(),
             discount: None,
+            dedupe_on_conflict: true,
         }
     }
 }
@@ -872,6 +879,8 @@ pub struct RecordUsageDbRequest {
     /// Number of images generated (for image generation requests)
     pub image_count: Option<i32>,
     pub provider_attribution: ProviderAttribution,
+    /// See [`RecordUsageServiceRequest::dedupe_on_conflict`].
+    pub dedupe_on_conflict: bool,
 }
 
 /// Model pricing information

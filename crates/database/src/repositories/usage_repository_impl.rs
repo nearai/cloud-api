@@ -41,6 +41,7 @@ impl services::usage::ports::UsageRepository for OrganizationUsageRepository {
             served_provider_tier: request.provider_attribution.served_provider_tier,
             served_provider_type: request.provider_attribution.served_provider_type,
             served_via_fallback: request.provider_attribution.served_via_fallback,
+            dedupe_on_conflict: request.dedupe_on_conflict,
         };
 
         let log = self.record_usage(db_request).await?;

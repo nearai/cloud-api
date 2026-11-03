@@ -477,6 +477,9 @@ where
                         stop_reason,
                         response_id,
                         provider_attribution,
+                        // Written once per served stream: a provider id seen
+                        // before is not a retry.
+                        dedupe_on_conflict: false,
                         ..RecordUsageServiceRequest::base(
                             crate::usage::BillingIdentity {
                                 organization_id,
@@ -2277,6 +2280,9 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
                 stop_reason: Some(stop_reason),
                 response_id,
                 provider_attribution,
+                // Written once per served request: a provider id seen
+                // before is not a retry.
+                dedupe_on_conflict: false,
                 ..RecordUsageServiceRequest::base(
                     crate::usage::BillingIdentity {
                         organization_id,

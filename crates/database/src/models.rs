@@ -853,6 +853,11 @@ pub struct RecordUsageRequest {
     pub served_provider_tier: Option<ServedProviderTier>,
     pub served_provider_type: Option<ServedProviderType>,
     pub served_via_fallback: bool,
+    /// How a write whose `(organization_id, inference_id)` already exists is
+    /// handled. `true` (the default, for reporters that retry) returns the
+    /// stored row. `false` (the inference pipeline, which writes once per request
+    /// it served) records it under a new `inference_id`.
+    pub dedupe_on_conflict: bool,
 }
 
 // ============================================

@@ -52,6 +52,7 @@ fn usage(
         served_provider_tier: None,
         served_provider_type: None,
         served_via_fallback: false,
+        dedupe_on_conflict: true,
     }
 }
 
@@ -352,6 +353,53 @@ async fn retry_keeps_original_split_and_conflicting_retry_is_rejected() -> anyho
         .get(0);
     assert_eq!(allocation_total, 12);
     cleanup_usage_fixtures(&pool, &[org.org_id], &[model.id, other_model.id]).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn write_without_dedupe_is_recorded_when_its_key_is_taken() -> anyhow::Result<()> {
+    // With dedupe_on_conflict off, a different write whose inference_id is already
+    // taken is recorded under a new inference_id and allocated; the first row stays.
+    let pool = test_pool().await?;
+    let limits = OrganizationLimitsRepository::new(pool.clone());
+    let repository = OrganizationUsageRepository::new(pool.clone());
+    let org = insert_org_fixture(&pool).await?;
+    let model = insert_model(&pool, "allocation-no-dedupe").await?;
+    set_limit(&limits, org.org_id, "grant", 100).await?;
+    let inference_id = Uuid::new_v4();
+
+    let mut request = usage(&org, &model, inference_id, 12);
+    request.dedupe_on_conflict = false;
+
+    let first = repository.record_usage(request.clone()).await?;
+    assert!(first.was_inserted);
+    assert_eq!(first.inference_id, Some(inference_id));
+
+    let second = repository.record_usage(request.clone()).await?;
+    assert!(second.was_inserted, "the second write is recorded");
+    assert_ne!(second.id, first.id, "the second write is its own row");
+    assert_ne!(
+        second.inference_id,
+        Some(inference_id),
+        "the second row has a new inference_id"
+    );
+    assert_eq!(
+        second.provider_request_id, first.provider_request_id,
+        "the provider id is kept for correlation"
+    );
+
+    let balance = pool
+        .get()
+        .await?
+        .query_one(
+            "SELECT total_spent, total_requests FROM organization_balance WHERE organization_id = $1",
+            &[&org.org_id],
+        )
+        .await?;
+    assert_eq!(balance.get::<_, i64>("total_spent"), 24);
+    assert_eq!(balance.get::<_, i64>("total_requests"), 2);
+
+    cleanup_usage_fixtures(&pool, &[org.org_id], &[model.id]).await?;
     Ok(())
 }
 
@@ -1208,14 +1256,16 @@ async fn inference_function_matches_service_allocation_for_credit_boundaries() -
 {
     let pool = test_pool().await?;
     let client = pool.get().await?;
-    let functions: i64 = client
-        .query_one(
-            "SELECT COUNT(*) FROM pg_proc WHERE proname = 'record_organization_usage'",
+    let arities: Vec<i16> = client
+        .query(
+            "SELECT pronargs FROM pg_proc WHERE proname = 'record_organization_usage' ORDER BY pronargs",
             &[],
         )
         .await?
-        .get(0);
-    assert_eq!(functions, 1);
+        .iter()
+        .map(|row| row.get(0))
+        .collect();
+    assert_eq!(arities, vec![29, 30]);
     drop(client);
 
     let limits = OrganizationLimitsRepository::new(pool.clone());

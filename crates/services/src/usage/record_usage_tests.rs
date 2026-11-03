@@ -209,6 +209,7 @@ fn request(inference_type: InferenceType) -> RecordUsageServiceRequest {
         image_count: Some(4),
         provider_attribution: ProviderAttribution::default(),
         discount: None,
+        dedupe_on_conflict: false,
     }
 }
 
@@ -447,6 +448,7 @@ async fn passthrough_fields_reach_the_repository_unchanged() {
     assert_eq!(db.avg_itl_ms, Some(1.5));
     assert_eq!(db.inference_id, expected.inference_id);
     assert_eq!(db.provider_request_id.as_deref(), Some("provider-id"));
+    assert!(!db.dedupe_on_conflict);
     assert_eq!(db.stop_reason, Some(StopReason::Completed));
     assert_eq!(db.image_count, Some(4));
     assert_eq!(db.provider_attribution, expected.provider_attribution);

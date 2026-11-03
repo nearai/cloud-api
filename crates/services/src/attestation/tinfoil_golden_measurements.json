@@ -132,6 +132,15 @@
     "doc-upload": [
       {
         "registers": [
+          "13e197811f4bf209f9cc3b3679edd2aa6fb152fea119e82d4c1aed49ede8b53e7aa8600bbb97f338b60e418bec6af08f",
+          "482d0a481acfdf35c0e90b17faf98d313b3d26e948ab34cb349e5cc7b49f9dee85b56c0e20db740832d122285fac8e4f",
+          "88978a302d9e307cd3d7b0c01a63d80ab62c8fe8dbed4b532879df69e66231e4bb31e20b17c82f2dcb000e512bd3b584"
+        ],
+        "repo": "tinfoilsh/confidential-doc-upload",
+        "tag": "v0.0.40"
+      },
+      {
+        "registers": [
           "2d0417d46044c94ed72cb74e9f9a6bf7afac3f94ea9e2f2457b7ffc03bd7365b089895a12bf992d007efee9defa90c85",
           "a787299fe2e84295a406dde367abac5b40128c1e13aa81dfde4a5c2e39682e45cde7bb84cefc7f33f25ac645fc265030",
           "8645c6410d812f81679c5970333bef4e35892350f7762177cca4f949596cd81321fb35038ce03e5f319a337c6b1d7efd"
@@ -454,6 +463,15 @@
         ],
         "repo": "tinfoilsh/confidential-websearch",
         "tag": "v0.5.16"
+      },
+      {
+        "registers": [
+          "3152e2d5b81a04c62040634186c247bc9f8021c440bd64f5ac08759b0757bc998422cdda4351350728a787e376fe5499",
+          "482d0a481acfdf35c0e90b17faf98d313b3d26e948ab34cb349e5cc7b49f9dee85b56c0e20db740832d122285fac8e4f",
+          "e5ef583f70f7504b44a0bbf4c023a4df43cf4eea08c393eeff98c54c59f593f4513e2f3b5925f7150ba8208a4688232a"
+        ],
+        "repo": "tinfoilsh/confidential-websearch",
+        "tag": "v0.5.17"
       },
       {
         "registers": [

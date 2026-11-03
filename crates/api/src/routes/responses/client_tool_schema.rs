@@ -1,4 +1,4 @@
-//! Public request schemas for tools executed by the Responses caller.
+//! Public request schemas for client-managed tools and request-local Cloud search.
 
 use serde::Deserialize;
 use utoipa::ToSchema;
@@ -18,6 +18,17 @@ pub enum StatelessResponseToolSchema {
         description: Option<String>,
         format: Option<StatelessCustomToolFormatSchema>,
     },
+    #[serde(rename = "web_search")]
+    WebSearch {
+        /// Maximum results per search (0–20); zero skips the search provider. Overrides the model's count when set.
+        #[schema(minimum = 0, maximum = 20)]
+        count: Option<u32>,
+        filters: Option<serde_json::Value>,
+        search_context_size: Option<String>,
+        user_location: Option<services::responses::models::UserLocation>,
+    },
+    #[serde(rename = "web_context_search")]
+    WebContextSearch {},
     #[serde(rename = "namespace")]
     Namespace {
         name: String,
@@ -98,4 +109,34 @@ pub enum StatelessFunctionToolTypeSchema {
 pub enum StatelessCustomToolTypeSchema {
     #[serde(rename = "custom")]
     Custom,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use utoipa::PartialSchema;
+
+    #[test]
+    fn typed_search_schema_exposes_count_bounds_and_client_only_namespaces() {
+        let schema = serde_json::to_value(StatelessResponseToolSchema::schema()).unwrap();
+        let variants = schema["oneOf"].as_array().unwrap();
+        let search = variants
+            .iter()
+            .find(|variant| variant["properties"]["type"]["enum"] == json!(["web_search"]))
+            .unwrap();
+        assert_eq!(search["properties"]["count"]["minimum"], 0);
+        assert_eq!(search["properties"]["count"]["maximum"], 20);
+        assert!(variants.iter().any(|variant| {
+            variant["properties"]["type"]["enum"] == json!(["web_context_search"])
+        }));
+        let namespace = serde_json::to_value(StatelessNamespacedToolSchema::schema()).unwrap();
+        let names: Vec<_> = namespace["oneOf"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|variant| variant["properties"]["type"]["enum"].clone())
+            .collect();
+        assert_eq!(names, vec![json!(["function"]), json!(["custom"])]);
+    }
 }

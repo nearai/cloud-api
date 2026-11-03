@@ -100,9 +100,8 @@ fn initial_response(request: models::CreateResponseRequest) -> (Uuid, models::Re
                 }
                 None => models::ResponseToolChoiceOutput::Auto("auto".to_string()),
             },
-            // Stateless Responses only supports caller-defined functions.
-            // Never advertise the formerly implicit server-side web_search
-            // builtin when the caller did not configure any tools.
+            // Advertise only explicitly configured client or Cloud search tools;
+            // a no-tools request does not implicitly enable search.
             tools: request.tools.unwrap_or_default(),
             top_logprobs: 0,
             top_p: request.top_p.unwrap_or(1.0),
@@ -534,7 +533,7 @@ mod tests {
         assert!(response.conversation.is_none());
         assert!(
             response.tools.is_empty(),
-            "a no-tools request must not advertise the retired web_search builtin"
+            "a no-tools request must not implicitly enable web_search"
         );
 
         let response_id = models::ResponseId(

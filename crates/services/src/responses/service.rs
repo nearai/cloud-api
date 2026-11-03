@@ -13,6 +13,9 @@ use crate::inference_provider_pool::InferenceProviderPool;
 use crate::responses::tools;
 use crate::responses::{citation_tracker, errors, models, ports, transient};
 
+#[path = "search_loop.rs"]
+mod search_loop;
+
 #[cfg(test)]
 #[path = "failure_tests.rs"]
 mod failure_tests;
@@ -41,6 +44,7 @@ struct ProcessStreamContext {
     file_service: Arc<dyn FileServiceTrait>,
     organization_service: Arc<dyn crate::organization::OrganizationServiceTrait>,
     source_registry: Option<models::SourceRegistry>,
+    search_tools: tools::ToolRegistry,
 }
 
 pub struct ResponseServiceImpl {
@@ -51,6 +55,8 @@ pub struct ResponseServiceImpl {
     pub completion_service: Arc<dyn CompletionServiceTrait>,
     pub file_service: Arc<dyn FileServiceTrait>,
     pub organization_service: Arc<dyn crate::organization::OrganizationServiceTrait>,
+    pub web_search_provider: Option<Arc<dyn tools::WebSearchProviderTrait>>,
+    pub web_context_search_provider: Option<Arc<dyn tools::WebContextSearchProviderTrait>>,
 }
 
 /// Tag transition states for reasoning content
@@ -62,6 +68,7 @@ enum TagTransition {
 }
 
 impl ResponseServiceImpl {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         response_repository: Arc<dyn ports::ResponseRepositoryTrait>,
         response_items_repository: Arc<dyn ports::ResponseItemRepositoryTrait>,
@@ -70,6 +77,8 @@ impl ResponseServiceImpl {
         completion_service: Arc<dyn CompletionServiceTrait>,
         file_service: Arc<dyn FileServiceTrait>,
         organization_service: Arc<dyn crate::organization::OrganizationServiceTrait>,
+        web_search_provider: Option<Arc<dyn tools::WebSearchProviderTrait>>,
+        web_context_search_provider: Option<Arc<dyn tools::WebContextSearchProviderTrait>>,
     ) -> Self {
         Self {
             response_repository,
@@ -79,6 +88,8 @@ impl ResponseServiceImpl {
             completion_service,
             file_service,
             organization_service,
+            web_search_provider,
+            web_context_search_provider,
         }
     }
 }
@@ -135,7 +146,7 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
                 .map_err(|message| errors::ResponseError::InvalidParams(message.into()))?;
             if Self::has_image_generation_capability(&model.output_modalities) {
                 return Err(errors::ResponseError::InvalidParams(
-                    "The stateless Responses API only supports a single /chat/completions request; image generation and image editing are not supported. Use /v1/images/generations or /v1/images/edits.".to_string(),
+                    "The stateless Responses API does not support image generation or image editing. Use /v1/images/generations or /v1/images/edits.".to_string(),
                 ));
             }
         }
@@ -171,6 +182,8 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
         let conversation_service = self.conversation_service.clone();
         let file_service = self.file_service.clone();
         let organization_service = self.organization_service.clone();
+        let web_search_provider = self.web_search_provider.clone();
+        let web_context_search_provider = self.web_context_search_provider.clone();
         let signing_algo_clone = signing_algo.clone();
         let client_pub_key_clone = client_pub_key.clone();
         let model_pub_key_clone = model_pub_key.clone();
@@ -180,6 +193,13 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
         // need the caller's key (cloud-platform model access).
         crate::caller_credential::spawn_with_caller_credential(async move {
             let usage_tracker = crate::responses::service_helpers::UsageTracker::new();
+            let mut search_tools = tools::ToolRegistry::new();
+            if let Some(provider) = web_search_provider {
+                search_tools.register(Arc::new(tools::WebSearchToolExecutor::new(provider)));
+            }
+            if let Some(provider) = web_context_search_provider {
+                search_tools.register(Arc::new(tools::WebContextSearchToolExecutor::new(provider)));
+            }
 
             let context = ProcessStreamContext {
                 request,
@@ -203,6 +223,7 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
                 file_service,
                 organization_service,
                 source_registry: None,
+                search_tools,
             };
 
             if Self::process_response_stream(
@@ -450,6 +471,7 @@ impl ResponseServiceImpl {
         use futures::StreamExt;
 
         let mut current_text = String::new();
+        let mut current_reasoning = String::new();
         let mut tool_call_accumulator: ToolCallAccumulator = std::collections::HashMap::new();
         let mut message_item_emitted = false;
         let message_item_id = format!("msg_{}", uuid::Uuid::new_v4().simple());
@@ -496,6 +518,7 @@ impl ResponseServiceImpl {
                                 {
                                     tracing::debug!("emit_reasoning_delta failed: {}", e);
                                 }
+                                current_reasoning.push_str(&reasoning);
                                 reasoning_buffer.push_str(&reasoning);
                             }
                         }
@@ -507,6 +530,9 @@ impl ResponseServiceImpl {
                                 &mut reasoning_buffer,
                                 &mut inside_reasoning,
                             );
+                        if let Some(reasoning) = &reasoning_delta {
+                            current_reasoning.push_str(reasoning);
+                        }
 
                         // Handle transition from explicit reasoning to content
                         // If we have content, and we were reasoning (but not inside a tag block), close reasoning
@@ -753,22 +779,21 @@ impl ResponseServiceImpl {
             .await?;
         }
 
-        // Stateless Responses only returns client-managed custom functions.
-        // Do not route their raw arguments through the legacy builtin parser:
-        // that parser can repair and reserialize JSON for server-executed
-        // search tools, which would corrupt a client replay.
-        // Interrupted function/custom arguments can be incomplete JSON. Do
-        // not validate or expose them as calls, or mask a provider error with
-        // an argument-conversion error.
-        let tool_calls_detected = if stream_error {
-            Vec::new()
+        // Parse only declared hosted search calls through the legacy search
+        // parser. Client arguments retain their exact bytes for replay.
+        // An interrupted stream may contain incomplete tool arguments; preserve
+        // its original failure rather than attempting tool conversion.
+        let (tool_calls_detected, search_calls) = if stream_error {
+            (Vec::new(), Vec::new())
         } else {
-            Self::convert_client_function_calls(tool_call_accumulator, request)?
+            search_loop::split_tool_calls(tool_call_accumulator, request)?
         };
 
         Ok(crate::responses::service_helpers::ProcessStreamResult {
             text: current_text,
+            reasoning: (!current_reasoning.is_empty()).then_some(current_reasoning),
             tool_calls: tool_calls_detected,
+            search_calls,
             stream_error,
             stream_error_cause,
         })
@@ -909,7 +934,7 @@ impl ResponseServiceImpl {
     /// Process the response stream - main logic
     async fn process_response_stream(
         tx: futures::channel::mpsc::UnboundedSender<models::ResponseStreamEvent>,
-        context: ProcessStreamContext,
+        mut context: ProcessStreamContext,
         initial_response: models::ResponseObject,
         api_key_uuid: Uuid,
         usage_tracker: Arc<crate::responses::service_helpers::UsageTracker>,
@@ -951,7 +976,7 @@ impl ResponseServiceImpl {
                 .emit_created(&mut ctx, initial_response.clone())
                 .await?;
 
-            let messages = Self::load_conversation_context(
+            let mut messages = Self::load_conversation_context(
                 &context.request,
                 &context.conversation_service,
                 &context.response_items_repository,
@@ -990,43 +1015,14 @@ impl ResponseServiceImpl {
             let tools = tools::prepare_tools(&context.request);
             let tool_choice = tools::prepare_tool_choice(&context.request);
 
-            // The default typed Responses adapter is a stateless compatibility
-            // layer over exactly one Chat Completions request. Client-defined
-            // functions are returned to the caller; Cloud never executes them or
-            // starts another completion.
-            let final_response_text: String = async {
-                let stream_result = Self::run_completion_once(
-                    &mut ctx,
-                    &mut emitter,
-                    &messages,
-                    &context,
-                    &tools,
-                    &tool_choice,
-                )
-                .await?;
-
-                if stream_result.stream_error {
-                    return Err(stream_result
-                        .stream_error_cause
-                        .unwrap_or(errors::ResponseError::StreamInterrupted));
-                }
-
-                // `process_completion_stream` emits any text item. Preserve the
-                // previous output-index transition before adding function calls.
-                if !stream_result.text.is_empty() {
-                    ctx.next_output_index();
-                }
-
-                Self::emit_client_function_calls(
-                    &mut ctx,
-                    &mut emitter,
-                    &context.response_items_repository,
-                    stream_result.tool_calls,
-                )
-                .await?;
-
-                Ok::<_, errors::ResponseError>(stream_result.text)
-            }
+            let final_response_text = search_loop::run(
+                &mut ctx,
+                &mut emitter,
+                &mut messages,
+                &mut context,
+                &tools,
+                &tool_choice,
+            )
             .await?;
 
             // Build final response
@@ -1260,6 +1256,7 @@ impl ResponseServiceImpl {
             extra,
         };
 
+        ctx.begin_completion();
         let mut completion_stream = process_context
             .completion_service
             .create_chat_completion_stream(completion_request)

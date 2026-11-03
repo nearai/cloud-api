@@ -63,10 +63,13 @@ pub struct ResponseStreamContext {
     pub conversation_id: Option<ConversationId>,
     pub sequence_number: u64,
     pub output_item_index: usize,
-    /// Token usage (overwritten per chunk; last chunk wins per stream; for multi-turn agent, last turn only)
+    /// Cumulative usage across completed and current inference rounds.
     pub total_input_tokens: i32,
     pub total_output_tokens: i32,
     pub total_cached_tokens: i32,
+    completed_input_tokens: i32,
+    completed_output_tokens: i32,
+    completed_cached_tokens: i32,
     /// Accumulated reasoning tokens from reasoning content
     pub reasoning_tokens: i32,
     /// Response metadata for enriching output items
@@ -100,6 +103,9 @@ impl ResponseStreamContext {
             total_input_tokens: 0,
             total_output_tokens: 0,
             total_cached_tokens: 0,
+            completed_input_tokens: 0,
+            completed_output_tokens: 0,
+            completed_cached_tokens: 0,
             reasoning_tokens: 0,
             response_id_str,
             previous_response_id,
@@ -121,13 +127,24 @@ impl ResponseStreamContext {
         self.output_item_index += 1;
     }
 
-    /// Update usage from current completion stream (overwrite each chunk; last chunk wins).
+    /// Start a new inference while retaining usage from earlier rounds. Usage
+    /// chunks are cumulative within one provider stream, not across rounds.
+    pub fn begin_completion(&mut self) {
+        self.completed_input_tokens = self.total_input_tokens;
+        self.completed_output_tokens = self.total_output_tokens;
+        self.completed_cached_tokens = self.total_cached_tokens;
+    }
+
+    /// Replace the current round's usage without counting repeated chunks twice.
     pub fn update_usage(&mut self, input_tokens: i32, output_tokens: i32, cached_tokens: i32) {
-        self.total_input_tokens = input_tokens;
-        self.total_output_tokens = output_tokens;
-        self.total_cached_tokens = cached_tokens;
-        self.usage_tracker
-            .set_chunk_usage(input_tokens, output_tokens, cached_tokens);
+        self.total_input_tokens = self.completed_input_tokens.saturating_add(input_tokens);
+        self.total_output_tokens = self.completed_output_tokens.saturating_add(output_tokens);
+        self.total_cached_tokens = self.completed_cached_tokens.saturating_add(cached_tokens);
+        self.usage_tracker.set_chunk_usage(
+            self.total_input_tokens,
+            self.total_output_tokens,
+            self.total_cached_tokens,
+        );
     }
 
     /// Add reasoning tokens from detected reasoning content
@@ -713,6 +730,15 @@ pub struct ClientManagedFunctionCall {
     pub thought_signature: Option<String>,
 }
 
+/// A declared hosted search call plus the parsed model arguments used in the
+/// in-memory Chat transcript. Client-managed tool arguments never enter this parser.
+#[derive(Debug, Clone)]
+pub struct HostedSearchCall {
+    pub call: ToolCallInfo,
+    pub name: String,
+    pub arguments: String,
+}
+
 /// Result of processing a completion stream
 ///
 /// Contains the accumulated text, detected tool calls, and stream status.
@@ -720,8 +746,12 @@ pub struct ClientManagedFunctionCall {
 pub struct ProcessStreamResult {
     /// The accumulated text content from the stream
     pub text: String,
+    /// Model reasoning required when continuing this inference with tool results.
+    pub reasoning: Option<String>,
     /// Tool calls detected in the stream
     pub tool_calls: Vec<ClientManagedFunctionCall>,
+    /// Cloud-managed search calls, kept separate from client-executed functions.
+    pub search_calls: Vec<HostedSearchCall>,
     /// Whether the stream terminated with an error (client disconnect, network error, etc.)
     /// When true, the response may be incomplete and the agent loop should stop.
     pub stream_error: bool,
@@ -810,6 +840,28 @@ mod tests {
         let snap = tracker.snapshot();
         assert_eq!(snap.input_tokens, 50);
         assert_eq!(snap.output_tokens, 100);
+    }
+
+    #[test]
+    fn usage_accumulates_rounds_without_counting_repeated_chunks_twice() {
+        let tracker = UsageTracker::new();
+        let mut ctx = make_ctx(tracker.clone());
+        ctx.begin_completion();
+        ctx.update_usage(5, 2, 1);
+        ctx.update_usage(10, 4, 2);
+        ctx.begin_completion();
+        ctx.update_usage(20, 3, 5);
+        ctx.update_usage(20, 8, 5);
+        assert_eq!(ctx.total_input_tokens, 30);
+        assert_eq!(ctx.total_output_tokens, 12);
+        assert_eq!(ctx.total_cached_tokens, 7);
+        let snapshot = tracker.snapshot();
+        assert_eq!(snapshot.input_tokens, 30);
+        assert_eq!(snapshot.output_tokens, 12);
+        // A later provider failure before its first usage chunk must not erase
+        // any usage already captured from successful or partial rounds.
+        ctx.begin_completion();
+        assert_eq!(tracker.snapshot().total_tokens, 42);
     }
 
     #[test]

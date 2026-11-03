@@ -101,8 +101,8 @@ async fn stateless_responses_reject_persistent_fields() {
 }
 
 #[tokio::test]
-async fn stateless_responses_reject_hosted_tools_before_provider_work() {
-    // Request normalization must reject builtin types before the handler reaches
+async fn stateless_responses_reject_unsupported_tools_before_provider_work() {
+    // Request normalization must reject unsupported builtin types before the handler reaches
     // service validation or provider work. A mock makes that boundary
     // observable. The MCP URL uses the reserved `.invalid` TLD so it cannot
     // point to a real third party if this behavior ever regresses.
@@ -115,11 +115,6 @@ async fn stateless_responses_reject_hosted_tools_before_provider_work() {
     let api_key = get_api_key_for_org(&server, org.id).await;
 
     let rejected_tools = [
-        ("web_search", serde_json::json!({"type": "web_search"})),
-        (
-            "web_context_search",
-            serde_json::json!({"type": "web_context_search"}),
-        ),
         ("file_search", serde_json::json!({"type": "file_search"})),
         (
             "code_interpreter",
@@ -180,7 +175,7 @@ async fn stateless_responses_reject_hosted_tools_before_provider_work() {
     assert_eq!(
         web_search_call_count.load(Ordering::SeqCst),
         0,
-        "Responses must not invoke the retained Web Search provider"
+        "Rejected tools must not invoke the Web Search provider"
     );
 }
 

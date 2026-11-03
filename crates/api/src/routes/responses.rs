@@ -38,7 +38,8 @@ const RESPONSE_ATTESTATION_STORE_TIMEOUT: Duration = Duration::from_secs(5);
 /// `invalid_request_error` for them. Both transports normalize omitted or null
 /// `store` to `false`. Canonical `openai/` models use the provider's native
 /// Responses transport, which preserves validated provider-native fields
-/// outside this typed schema. Both paths permit only client-managed tools.
+/// outside this typed schema. The typed adapter also executes hosted web search
+/// using request-scoped context; the native path accepts client-managed tools.
 #[derive(serde::Deserialize, utoipa::ToSchema)]
 pub struct StatelessCreateResponseRequestSchema {
     pub model: String,
@@ -125,6 +126,17 @@ pub enum StatelessResponseInputItemSchema {
         #[serde(skip_serializing_if = "Option::is_none")]
         encrypted_content: Option<String>,
     },
+    /// Completed search markers may accompany replayed assistant text.
+    /// They are informational and do not trigger another search.
+    WebSearchCall {
+        #[serde(rename = "type")]
+        type_: CompletedWebSearchCallType,
+        status: CompletedWebSearchCallStatus,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        action: Option<serde_json::Value>,
+    },
     FunctionCall {
         #[serde(rename = "type")]
         type_: FunctionCallType,
@@ -185,6 +197,18 @@ pub enum StatelessResponseContentPartSchema {
         #[serde(skip_serializing_if = "Option::is_none")]
         detail: Option<String>,
     },
+}
+
+#[derive(serde::Deserialize, utoipa::ToSchema)]
+pub enum CompletedWebSearchCallType {
+    #[serde(rename = "web_search_call")]
+    WebSearchCall,
+}
+
+#[derive(serde::Deserialize, utoipa::ToSchema)]
+pub enum CompletedWebSearchCallStatus {
+    #[serde(rename = "completed")]
+    Completed,
 }
 
 #[derive(serde::Deserialize, utoipa::ToSchema)]
@@ -616,22 +640,22 @@ pub async fn response_history_gone() -> axum::response::Response {
 /// Generate a single-turn, stateless AI response with optional streaming.
 ///
 /// Canonical `openai/` models use one native provider Responses inference.
-/// Other models use the typed adapter for one Chat Completions inference.
-/// Both paths normalize omitted or null `store` to `false`, keep no
-/// response/item history, and never execute built-in, remote MCP, or
-/// agent-loop tools.
+/// Other models use the typed adapter, which can execute `web_search` and
+/// `web_context_search` in a bounded, request-scoped inference loop. Both paths
+/// normalize omitted or null `store` to `false` and keep no response/item history.
+/// Client-managed tools are returned to the caller; remote MCP tools remain unsupported.
 #[utoipa::path(
     post,
     path = "/v1/responses",
     tag = "Responses",
     request_body(
         content = serde_json::Value,
-        description = "Polymorphic stateless JSON request. After alias resolution, canonical openai/ models accept validated provider-native Responses fields. Other models use the typed StatelessCreateResponseRequestSchema component. Both paths normalize omitted or null store to false, reject store: true, and reject built-in and remote MCP tools."
+        description = "Polymorphic stateless JSON request. After alias resolution, canonical openai/ models accept validated provider-native Responses fields. Other models use the typed StatelessCreateResponseRequestSchema component. Both paths normalize omitted or null store to false and reject store: true. The typed adapter supports hosted web_search and web_context_search with request-scoped context; native Responses accepts client-managed tools. File tools and remote MCP tools are unsupported."
     ),
     responses(
         (
             status = 200,
-            description = "Polymorphic success response. For non-OpenAI models, the typed adapter returns ResponseObject metadata with client-managed function/custom call items and optional namespaces as JSON for non-streaming requests. Canonical openai/ models forward the provider-native response shape, which can include native reasoning fields outside ResponseObject. Streaming requests use text/event-stream on either path.",
+            description = "Polymorphic success response. For non-OpenAI models, the typed adapter returns ResponseObject metadata with hosted search events/citations, client-managed function/custom call items, and optional namespaces as JSON for non-streaming requests. Canonical openai/ models forward the provider-native response shape, which can include native reasoning fields outside ResponseObject. Streaming requests use text/event-stream on either path.",
             content(
                 (serde_json::Value = "application/json"),
                 ("text/event-stream")

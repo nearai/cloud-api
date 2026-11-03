@@ -915,7 +915,7 @@ async fn worker_claims_recover_after_crash_and_fence_stale_workers() {
     );
 
     // Verification has an independent lock: even an expired live process cannot
-    // overlap the replacement's expensive full-history scan.
+    // overlap the replacement's verification scan.
     let mut client = f.db.pool().get().await.unwrap();
     let tx = client.transaction().await.unwrap();
     tx.query_one(
@@ -946,18 +946,18 @@ async fn worker_claims_recover_after_crash_and_fence_stale_workers() {
 #[tokio::test]
 async fn worker_failures_back_off_show_safe_diagnostics_and_clear_after_repair() {
     let f = fixture().await;
-    // Synthetic pre-existing drift, outside the selected history.
+    save(&f, Some(Utc::now() - Duration::days(1))).await;
+    // Synthetic drift in the correction's own records: a batch counted with no adjustments.
     f.db.pool()
         .get()
         .await
         .unwrap()
         .execute(
-            "UPDATE organization_balance SET total_spent=1 WHERE organization_id=$1",
+            "UPDATE organization_usage_discounts SET processed_count=1 WHERE organization_id=$1",
             &[&f.org],
         )
         .await
         .unwrap();
-    save(&f, Some(Utc::now() - Duration::days(1))).await;
     let repo = OrganizationUsageDiscountRepository::new(f.db.pool().clone());
     for (attempts, expected_delay) in [(0_i32, 30_i64), (1, 60), (16, 1800)] {
         let client = f.db.pool().get().await.unwrap();
@@ -986,12 +986,11 @@ async fn worker_failures_back_off_show_safe_diagnostics_and_clear_after_repair()
         );
         assert!(
             repo.claim_next().await.unwrap().is_none(),
-            "backoff must prevent another full scan"
+            "backoff must prevent another verification"
         );
     }
     let client = f.db.pool().get().await.unwrap();
-    client.execute("UPDATE organization_balance SET total_spent=0,legacy_unattributed_amount=0 WHERE organization_id=$1", &[&f.org]).await.unwrap();
-    client.execute("UPDATE organization_usage_discounts SET next_attempt_at=clock_timestamp() WHERE organization_id=$1", &[&f.org]).await.unwrap();
+    client.execute("UPDATE organization_usage_discounts SET processed_count=0,next_attempt_at=clock_timestamp() WHERE organization_id=$1", &[&f.org]).await.unwrap();
     drop(client);
     assert!(repo
         .run_claimed(repo.claim_next().await.unwrap().unwrap())
@@ -1008,21 +1007,105 @@ async fn worker_failures_back_off_show_safe_diagnostics_and_clear_after_repair()
 }
 
 #[tokio::test]
+async fn ledger_drift_outside_the_correction_does_not_block_activation() {
+    let f = fixture().await;
+    // Pre-existing drift the correction did not cause: the balance disagrees with usage.
+    let drifted = f
+        .db
+        .pool()
+        .get()
+        .await
+        .unwrap()
+        .execute(
+            "INSERT INTO organization_balance (organization_id,total_spent,total_requests,total_tokens,
+               legacy_unattributed_amount,updated_at) VALUES ($1,1,0,0,0,NOW())
+             ON CONFLICT (organization_id) DO UPDATE SET total_spent=organization_balance.total_spent+1",
+            &[&f.org],
+        )
+        .await
+        .unwrap();
+    assert_eq!(drifted, 1);
+    save(&f, Some(Utc::now() - Duration::days(1))).await;
+    let repo = OrganizationUsageDiscountRepository::new(f.db.pool().clone());
+    let claim = repo.claim_next().await.unwrap().unwrap();
+    assert_eq!(claim.organization_id, f.org);
+    let result = repo.run_claimed(claim).await;
+    let rule = repo.get(f.org).await.unwrap().unwrap();
+    // Delete before asserting, so a regression cannot leave due work in the global queue.
+    f.db.pool()
+        .get()
+        .await
+        .unwrap()
+        .execute(
+            "DELETE FROM organization_usage_discounts WHERE organization_id=$1",
+            &[&f.org],
+        )
+        .await
+        .unwrap();
+    assert!(matches!(result, Ok(true)), "{result:?}");
+    assert_eq!(
+        (rule.status.as_str(), rule.last_error),
+        ("active", None),
+        "drift outside the correction must not hold the rule in applying"
+    );
+}
+
+#[tokio::test]
+async fn verification_fails_when_credit_notes_miss_part_of_the_funded_reduction() {
+    let f = fixture().await;
+    credits(&f, "postpay", 900_000_000).await;
+    let hour = crate::usage_hourly::random_past_hour();
+    let paid_id = legacy(&f, hour, &request(&f, 200_000_000)).await;
+    let client = f.db.pool().get().await.unwrap();
+    client.execute("INSERT INTO usage_credit_allocations (organization_id,inference_usage_id,credit_type,amount,organization_limit_id,policy_version,priority_position)
+     SELECT $1,$2,'postpay',200000000,id,'synthetic',0 FROM organization_limits_history WHERE organization_id=$1 AND credit_type='postpay' AND effective_until IS NULL", &[&f.org,&paid_id]).await.unwrap();
+    client.execute("UPDATE organization_usage_log SET funded_amount=total_cost,unfunded_amount=0,allocation_policy_version='synthetic' WHERE id=$1",&[&paid_id]).await.unwrap();
+    client.execute("INSERT INTO organization_credit_consumption (organization_id,credit_type,amount) VALUES ($1,'postpay',200000000)",&[&f.org]).await.unwrap();
+    drop(client);
+    seed_balance(&f, 0).await;
+    crate::usage_hourly::recompute_usage_hours(hour, hour + Duration::hours(1)).await;
+    save(&f, Some(hour)).await;
+    let repo = OrganizationUsageDiscountRepository::new(f.db.pool().clone());
+    assert!(repo.apply_batch(f.org).await.unwrap(), "corrects the row");
+    // The credit note now covers one nano-dollar less than the row's reduction.
+    let changed = f.db.pool().get().await.unwrap().execute(
+        "UPDATE usage_credit_allocation_reversals r SET amount=r.amount-1 FROM usage_credit_allocations a
+         WHERE a.id=r.allocation_id AND a.inference_usage_id=$1", &[&paid_id]).await.unwrap();
+    assert_eq!(changed, 1);
+    let error = repo
+        .apply_batch(f.org)
+        .await
+        .err()
+        .map(|error| error.to_string());
+    let status = repo.get(f.org).await.unwrap().unwrap().status;
+    // Delete before asserting, so neither outcome leaves due work in the global queue.
+    f.db.pool()
+        .get()
+        .await
+        .unwrap()
+        .execute(
+            "DELETE FROM organization_usage_discounts WHERE organization_id=$1",
+            &[&f.org],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        error.as_deref(),
+        Some("Accounting verification failed. Reconcile organization balances before retry.")
+    );
+    assert_eq!(status, "applying");
+}
+
+#[tokio::test]
 async fn worker_queue_reaches_newer_orgs_behind_more_than_32_failures() {
     let f = fixture().await;
     let client = f.db.pool().get().await.unwrap();
     let user = Uuid::parse_str(MOCK_USER_ID).unwrap();
+    // processed_count=1 with no adjustments makes each rule fail verification.
     let rows = client.query("WITH org AS (INSERT INTO organizations (name) SELECT 'synthetic-discount-queue-'||uuid_generate_v4() FROM generate_series(1,34) RETURNING id)
-        INSERT INTO organization_usage_discounts (organization_id,discount_basis_points,apply_since,saved_at,created_by,status,next_attempt_at)
-        SELECT id,2500,clock_timestamp()-INTERVAL '2 days',clock_timestamp()-INTERVAL '1 day',$1,'applying',clock_timestamp()-INTERVAL '1 day' FROM org RETURNING organization_id", &[&user]).await.unwrap();
+        INSERT INTO organization_usage_discounts (organization_id,discount_basis_points,apply_since,saved_at,created_by,status,processed_count,next_attempt_at)
+        SELECT id,2500,clock_timestamp()-INTERVAL '2 days',clock_timestamp()-INTERVAL '1 day',$1,'applying',1,clock_timestamp()-INTERVAL '1 day' FROM org RETURNING organization_id", &[&user]).await.unwrap();
     let ids: Vec<Uuid> = rows.iter().map(|row| row.get(0)).collect();
-    client
-        .execute(
-            "UPDATE organization_balance SET total_spent=1 WHERE organization_id=ANY($1)",
-            &[&ids],
-        )
-        .await
-        .unwrap();
     drop(client);
     let repo = OrganizationUsageDiscountRepository::new(f.db.pool().clone());
     let mut seen = std::collections::HashSet::new();

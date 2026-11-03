@@ -559,20 +559,16 @@ fn check_admin_access(state: &AuthState, user: &DbUser) -> bool {
 }
 
 fn is_admin_user(admin_domains: &[String], user: &DbUser) -> bool {
-    if admin_domains.is_empty() {
-        return false;
-    }
-
-    if user.auth_provider == crate::routes::auth_vpc::VPC_AUTH_PROVIDER {
+    if user.auth_provider == crate::routes::auth_vpc::VPC_AUTH_PROVIDER
+        || user
+            .provider_user_id
+            .starts_with(crate::routes::auth_vpc::VPC_PROVIDER_USER_ID_PREFIX)
+    {
         tracing::warn!(user_id = %user.id, "VPC-provisioned user attempted admin action");
         return false;
     }
 
-    config::admin_email_domain(&user.email).is_some_and(|domain| {
-        admin_domains
-            .iter()
-            .any(|admin_domain| domain.eq_ignore_ascii_case(admin_domain))
-    })
+    config::email_matches_admin_domain(admin_domains, &user.email)
 }
 
 /// Authenticate admin access token
@@ -1030,7 +1026,14 @@ mod tests {
             &admin_domains,
             &admin_test_user("vpc", "admin@near.ai")
         ));
-        for email in ["x@near.ai@vpc.internal.near.ai", "x@evil.com@near.ai"] {
+        let mut google_vpc_user = admin_test_user("google", "admin@near.ai");
+        google_vpc_user.provider_user_id = "vpc:legacy".to_string();
+        assert!(!is_admin_user(&admin_domains, &google_vpc_user));
+        for email in [
+            "x@near.ai@vpc.internal.near.ai",
+            "x@evil.com@near.ai",
+            "x@near.ai.",
+        ] {
             assert!(
                 !is_admin_user(&admin_domains, &admin_test_user("google", email)),
                 "{email:?} must not be admin"

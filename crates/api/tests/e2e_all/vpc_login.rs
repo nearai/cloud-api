@@ -420,7 +420,13 @@ async fn test_vpc_login_rejects_client_id_with_invalid_characters() {
     let timestamp = chrono::Utc::now().timestamp();
     let signature = generate_vpc_signature(timestamp, "test_vpc_secret_123");
 
-    for client_id in ["bad client", "bad/client", "bad\nclient", &"a".repeat(65)] {
+    for client_id in [
+        "bad client",
+        "bad/client",
+        "bad\nclient",
+        "...",
+        &"a".repeat(65),
+    ] {
         let request = serde_json::json!({
             "timestamp": timestamp,
             "signature": signature,
@@ -438,6 +444,14 @@ async fn test_vpc_login_rejects_client_id_with_invalid_characters() {
         "timestamp": timestamp,
         "signature": signature,
         "client_id": "chat-api-client"
+    });
+    let response = server.post("/v1/auth/vpc/login").json(&request).await;
+    assert_eq!(response.status_code(), StatusCode::OK);
+
+    let request = serde_json::json!({
+        "timestamp": timestamp,
+        "signature": signature,
+        "client_id": "a".repeat(64)
     });
     let response = server.post("/v1/auth/vpc/login").json(&request).await;
     assert_eq!(response.status_code(), StatusCode::OK);

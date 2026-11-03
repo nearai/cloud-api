@@ -18,7 +18,9 @@ use services::{
 };
 
 pub const VPC_AUTH_PROVIDER: &str = "vpc";
+pub const VPC_PROVIDER_USER_ID_PREFIX: &str = "vpc:";
 pub const MAX_VPC_CLIENT_ID_LENGTH: usize = 64;
+pub(crate) const VPC_CLIENT_ID_ERROR: &str = "client_id must be 1-64 characters of ASCII letters, digits, '.', '_' or '-' and contain at least one letter or digit";
 
 fn validate_vpc_client_id(client_id: &str) -> Result<(), String> {
     if client_id.is_empty()
@@ -26,11 +28,9 @@ fn validate_vpc_client_id(client_id: &str) -> Result<(), String> {
         || !client_id
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        || !client_id.bytes().any(|byte| byte.is_ascii_alphanumeric())
     {
-        return Err(
-            "client_id must be 1-64 characters of ASCII letters, digits, '.', '_' or '-'"
-                .to_string(),
-        );
+        return Err(VPC_CLIENT_ID_ERROR.to_string());
     }
     Ok(())
 }
@@ -93,7 +93,7 @@ pub async fn vpc_login(
     }
 
     // Get or create Chat API user with deterministic mapping
-    let provider_user_id = format!("vpc:{}", payload.client_id);
+    let provider_user_id = format!("{VPC_PROVIDER_USER_ID_PREFIX}{}", payload.client_id);
     let email = format!("{}@vpc.internal.near.ai", payload.client_id);
     let username = payload.client_id.clone();
 
@@ -244,11 +244,18 @@ mod tests {
 
         for client_id in [
             "",
+            ".",
+            "...",
+            "-_.",
             "probe-i161413@near.ai",
             "a b",
             "a/b",
             "a\nb",
             "ä",
+            "café",
+            "x\u{FF20}near.ai",
+            "a\u{2024}b",
+            "\u{0661}\u{0662}",
             &"a".repeat(65),
         ] {
             let request = VpcLoginRequest {
@@ -258,10 +265,7 @@ mod tests {
             };
             assert_eq!(
                 request.validate(),
-                Err(
-                    "client_id must be 1-64 characters of ASCII letters, digits, '.', '_' or '-'"
-                        .to_string()
-                ),
+                Err(VPC_CLIENT_ID_ERROR.to_string()),
                 "{client_id:?} must be rejected"
             );
         }

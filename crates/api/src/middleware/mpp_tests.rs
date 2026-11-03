@@ -22,7 +22,8 @@ use config::{MppModelPrice, MppSettings, MppTempoSettings};
 use serde_json::{json, Value};
 use services::common::RepositoryError;
 use services::mpp::testing::{
-    bound_payment_receipt, credential_header, hash_payload, payment_receipt, FakeTempo, SendMode,
+    bound_payment_receipt, credential_header, hash_payload, payment_receipt, payment_transaction,
+    transaction_payload, FakeTempo, PaymentTx, SendMode,
 };
 use services::mpp::{
     protocol, ClaimState, InMemoryClaimRepository, MppService, RpcError, CHAT_COMPLETIONS_ROUTE,
@@ -57,231 +58,9 @@ const TX: [u8; 32] = [0x11; 32];
 
 // ----- fakes for the authentication state -----
 
-struct Keys;
-
-fn api_key(key: &str) -> ApiKey {
-    ApiKey {
-        id: ApiKeyId(Uuid::from_u128(5).to_string()),
-        key: None,
-        key_prefix: key.chars().take(12).collect(),
-        name: "k".to_string(),
-        workspace_id: WorkspaceId(Uuid::from_u128(8)),
-        created_by_user_id: services::auth::UserId(Uuid::nil()),
-        created_at: Utc::now(),
-        expires_at: None,
-        last_used_at: None,
-        is_active: true,
-        deleted_at: None,
-        spend_limit: None,
-        usage: None,
-    }
-}
-
-#[async_trait]
-impl ApiKeyRepository for Keys {
-    async fn validate(&self, key: String) -> Result<Option<ApiKey>, RepositoryError> {
-        Ok((key == SERVICE_KEY || key == BEARER_KEY).then(|| api_key(&key)))
-    }
-    async fn create(&self, _: CreateApiKeyRequest) -> Result<ApiKey, RepositoryError> {
-        unimplemented!()
-    }
-    async fn get_by_id(&self, _: ApiKeyId) -> Result<Option<ApiKey>, RepositoryError> {
-        unimplemented!()
-    }
-    async fn list_by_workspace_paginated(
-        &self,
-        _: WorkspaceId,
-        _: i64,
-        _: i64,
-        _: Option<ApiKeyOrderBy>,
-        _: Option<ApiKeyOrderDirection>,
-    ) -> Result<Vec<ApiKey>, RepositoryError> {
-        unimplemented!()
-    }
-    async fn delete(&self, _: ApiKeyId) -> Result<bool, RepositoryError> {
-        unimplemented!()
-    }
-    async fn update_last_used(&self, _: ApiKeyId) -> Result<(), RepositoryError> {
-        Ok(())
-    }
-    async fn update_spend_limit(
-        &self,
-        _: ApiKeyId,
-        _: Option<i64>,
-    ) -> Result<ApiKey, RepositoryError> {
-        unimplemented!()
-    }
-    async fn update(
-        &self,
-        _: ApiKeyId,
-        _: Option<String>,
-        _: Option<Option<DateTime<Utc>>>,
-        _: Option<Option<i64>>,
-        _: Option<bool>,
-    ) -> Result<ApiKey, RepositoryError> {
-        unimplemented!()
-    }
-    async fn count_by_workspace(&self, _: WorkspaceId) -> Result<i64, RepositoryError> {
-        unimplemented!()
-    }
-    async fn check_name_duplication(
-        &self,
-        _: WorkspaceId,
-        _: &str,
-    ) -> Result<bool, RepositoryError> {
-        unimplemented!()
-    }
-    async fn revoke(&self, _: ApiKeyId) -> Result<bool, RepositoryError> {
-        unimplemented!()
-    }
-    async fn get_all_active_key_hashes(&self) -> Result<Vec<String>, RepositoryError> {
-        Ok(vec![])
-    }
-    async fn get_active_key_hashes_created_after(
-        &self,
-        _: DateTime<Utc>,
-    ) -> Result<Vec<String>, RepositoryError> {
-        Ok(vec![])
-    }
-}
-
-struct Workspaces;
-
-#[async_trait]
-impl WorkspaceRepository for Workspaces {
-    async fn get_by_id(&self, _: WorkspaceId) -> Result<Option<Workspace>, RepositoryError> {
-        unimplemented!()
-    }
-    async fn get_by_name(&self, _: Uuid, _: &str) -> Result<Option<Workspace>, RepositoryError> {
-        unimplemented!()
-    }
-    async fn get_workspace_with_organization(
-        &self,
-        id: WorkspaceId,
-    ) -> Result<Option<(Workspace, Organization)>, RepositoryError> {
-        let owner = services::auth::UserId(Uuid::nil());
-        Ok(Some((
-            Workspace {
-                id,
-                name: "w".to_string(),
-                description: None,
-                organization_id: OrganizationId(Uuid::from_u128(9)),
-                created_by_user_id: owner.clone(),
-                created_at: Utc::now(),
-                updated_at: Utc::now(),
-                is_active: true,
-                settings: None,
-            },
-            Organization {
-                request_priority: 0,
-                id: OrganizationId(Uuid::from_u128(9)),
-                name: "o".to_string(),
-                description: None,
-                owner_id: owner,
-                settings: json!({}),
-                is_active: true,
-                created_at: Utc::now(),
-                updated_at: Utc::now(),
-            },
-        )))
-    }
-    async fn list_by_organization(
-        &self,
-        _: OrganizationId,
-    ) -> Result<Vec<Workspace>, RepositoryError> {
-        unimplemented!()
-    }
-    async fn list_by_organization_paginated(
-        &self,
-        _: OrganizationId,
-        _: i64,
-        _: i64,
-        _: Option<WorkspaceOrderBy>,
-        _: Option<WorkspaceOrderDirection>,
-    ) -> Result<Vec<Workspace>, RepositoryError> {
-        unimplemented!()
-    }
-    async fn create(
-        &self,
-        _: String,
-        _: Option<String>,
-        _: OrganizationId,
-        _: services::auth::UserId,
-    ) -> Result<Workspace, RepositoryError> {
-        unimplemented!()
-    }
-    async fn update(
-        &self,
-        _: WorkspaceId,
-        _: Option<String>,
-        _: Option<String>,
-        _: Option<Value>,
-    ) -> Result<Option<Workspace>, RepositoryError> {
-        unimplemented!()
-    }
-    async fn delete(&self, _: WorkspaceId) -> Result<bool, RepositoryError> {
-        unimplemented!()
-    }
-    async fn count_by_organization(&self, _: OrganizationId) -> Result<i64, RepositoryError> {
-        unimplemented!()
-    }
-    async fn list_by_user(
-        &self,
-        _: services::auth::UserId,
-        _: i64,
-    ) -> Result<Vec<Workspace>, RepositoryError> {
-        unimplemented!()
-    }
-}
-
-struct NoReportingTokens;
-
-#[async_trait]
-impl OrganizationReportingTokenService for NoReportingTokens {
-    async fn create(
-        &self,
-        _: CreateOrganizationReportingTokenRequest,
-    ) -> Result<CreatedOrganizationReportingToken, RepositoryError> {
-        unimplemented!()
-    }
-    async fn validate(
-        &self,
-        _: &str,
-    ) -> Result<Option<ValidatedOrganizationReportingToken>, RepositoryError> {
-        Ok(None)
-    }
-    async fn get_by_id(
-        &self,
-        _: Uuid,
-    ) -> Result<Option<OrganizationReportingToken>, RepositoryError> {
-        unimplemented!()
-    }
-    async fn list_active_by_organization(
-        &self,
-        _: Uuid,
-    ) -> Result<Vec<OrganizationReportingToken>, RepositoryError> {
-        unimplemented!()
-    }
-    async fn revoke(&self, _: Uuid, _: Uuid) -> Result<bool, RepositoryError> {
-        unimplemented!()
-    }
-}
-
-fn auth_state() -> AuthState {
-    AuthState::new(
-        Arc::new(services::auth::OAuthManager::new(None, None).unwrap()),
-        Arc::new(services::auth::MockAuthService {
-            apikey_repository: Arc::new(Keys),
-        }),
-        Arc::new(Workspaces),
-        Arc::new(NoReportingTokens),
-        Arc::new(database::repositories::AdminAccessTokenRepository::new(
-            database::DbPool::uninitialized(),
-        )),
-        Vec::new(),
-        String::new(),
-    )
-}
+#[path = "mpp_tests/fakes.rs"]
+mod fakes;
+use fakes::*;
 
 // ----- the app under test -----
 
@@ -325,6 +104,8 @@ enum Handler {
     Ok,
     Fail,
     Stream,
+    /// Never answers: the client gives up and the request future is dropped.
+    Hang,
 }
 
 #[derive(Clone)]
@@ -348,6 +129,7 @@ async fn handler(
                 .into_response()
         }
         Handler::Fail => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        Handler::Hang => std::future::pending().await,
         Handler::Stream => {
             let chunks = futures::stream::iter(vec![
                 Ok::<_, std::convert::Infallible>(bytes::Bytes::from("data: one\n\n")),
@@ -410,10 +192,11 @@ fn app_with(enabled: bool, service_key: &str) -> App {
         calls: calls.clone(),
         mode: mode.clone(),
     };
-    let group = Router::new()
+    // As in `build_completion_routes`: chat completions has its own router with the MPP
+    // layers; the other inference routes keep the plain API-key stack.
+    let chat = Router::new()
         .route("/chat/completions", post(handler))
-        .route("/embeddings", post(handler))
-        .with_state(state)
+        .with_state(state.clone())
         .layer(from_fn_with_state(
             MppSettleState {
                 mpp: service.clone(),
@@ -432,8 +215,19 @@ fn app_with(enabled: bool, service_key: &str) -> App {
             BodyHashLimit(1 << 20),
             body_hash_middleware,
         ));
+    let others = Router::new()
+        .route("/embeddings", post(handler))
+        .with_state(state)
+        .layer(from_fn_with_state(
+            auth_state(),
+            crate::middleware::auth::auth_middleware_with_workspace_context,
+        ))
+        .layer(from_fn_with_state(
+            BodyHashLimit(1 << 20),
+            body_hash_middleware,
+        ));
     App {
-        router: Router::new().nest("/v1", group),
+        router: Router::new().nest("/v1", chat.merge(others)),
         repo,
         chain,
         service,
@@ -538,6 +332,21 @@ impl App {
         ));
         credential_header(&challenge, hash_payload(tx), None)
     }
+}
+
+/// A `transaction` payload that pays `challenge` (one bound `transferWithMemo`), and its raw
+/// bytes. `seed` varies the transaction, hence its hash.
+fn paying_transaction(challenge: &services::mpp::Challenge, seed: u64) -> (Value, Vec<u8>) {
+    let raw = payment_transaction(&PaymentTx {
+        chain_id: 42431,
+        currency: CURRENCY,
+        recipient: RECIPIENT,
+        amount: AMOUNT,
+        realm: REALM,
+        challenge_id: &challenge.id,
+        seed,
+    });
+    (transaction_payload(&raw), raw)
 }
 
 /// The ledger key of a payment: a keyed digest, never the transaction hash itself.
@@ -796,7 +605,7 @@ async fn a_paid_transaction_credential_works_end_to_end() {
     let challenge = service
         .challenge_for_body(CHAT_COMPLETIONS_ROUTE, &body())
         .unwrap();
-    let (payload, raw) = services::mpp::testing::transaction_payload(3);
+    let (payload, raw) = paying_transaction(&challenge, 3);
     let hash = services::mpp::tempo::transaction_hash(&raw);
     app.chain.mine(bound_payment_receipt(
         hash, PAYER, CURRENCY, RECIPIENT, AMOUNT, REALM, &challenge,
@@ -851,6 +660,38 @@ async fn a_payment_without_this_challenges_memo_is_403_and_never_claimed() {
 }
 
 #[tokio::test]
+async fn a_client_that_disconnects_mid_inference_has_used_its_payment() {
+    let app = app(true);
+    *app.mode.lock().unwrap() = Handler::Hang;
+    let credential = app.pay(&body(), TX).await;
+    // The client gives up while the handler runs: the request future is dropped.
+    let gone = tokio::time::timeout(
+        Duration::from_millis(50),
+        app.router
+            .clone()
+            .oneshot(request("/v1/chat/completions", &body(), Some(&credential))),
+    )
+    .await;
+    assert!(gone.is_err(), "the handler never answered");
+    assert_eq!(app.calls.load(Ordering::SeqCst), 1);
+    // The guard records the outcome from a spawned task; wait for it with a deadline.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while app.repo.state_of(&key(TX)) != Some(ClaimState::Served) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "claim never marked served"
+        );
+        tokio::task::yield_now().await;
+    }
+
+    // Presenting the same credential again buys nothing.
+    *app.mode.lock().unwrap() = Handler::Ok;
+    let replay = app.post(&body(), Some(&credential)).await;
+    assert_eq!(replay.status, StatusCode::FORBIDDEN);
+    assert_eq!(app.calls.load(Ordering::SeqCst), 1, "no second inference");
+}
+
+#[tokio::test]
 async fn a_failed_inference_releases_the_payment_for_a_retry_of_the_same_credential() {
     let app = app(true);
     *app.mode.lock().unwrap() = Handler::Fail;
@@ -859,8 +700,8 @@ async fn a_failed_inference_releases_the_payment_for_a_retry_of_the_same_credent
     assert_eq!(first.status, StatusCode::INTERNAL_SERVER_ERROR);
     assert_eq!(app.repo.state_of(&key(TX)), Some(ClaimState::Unserved));
     assert!(
-        first.header("payment-receipt").is_some(),
-        "the payment itself succeeded"
+        first.header("payment-receipt").is_none(),
+        "no receipt certifies a payment whose claim was released for a retry"
     );
 
     *app.mode.lock().unwrap() = Handler::Ok;
@@ -933,7 +774,7 @@ async fn bad_credentials_get_a_402_with_a_fresh_challenge() {
 }
 
 #[tokio::test]
-async fn an_unmined_payment_is_a_retryable_402_and_a_proof_is_a_400() {
+async fn an_unmined_payment_is_a_503_retry_of_the_same_credential_and_a_proof_is_a_400() {
     let app = app(true);
     let service = app.service.as_ref().unwrap();
     let challenge = service
@@ -941,13 +782,21 @@ async fn an_unmined_payment_is_a_retryable_402_and_a_proof_is_a_400() {
         .unwrap();
     let credential = credential_header(&challenge, hash_payload([0x77; 32]), None);
     let reply = app.post(&body(), Some(&credential)).await;
-    assert_eq!(reply.status, StatusCode::PAYMENT_REQUIRED);
-    assert!(reply.header("www-authenticate").is_some());
-    assert_eq!(
-        reply.json()["type"],
-        "https://paymentauth.org/problems/verification-failed"
-    );
+    // Not yet mined is not "pay again": a fresh challenge here would make the client pay
+    // twice. It is a 503 to retry the same credential.
+    assert_eq!(reply.status, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(reply.header("www-authenticate").is_none());
+    assert!(reply.header("retry-after").is_some());
     assert_eq!(app.calls.load(Ordering::SeqCst), 0);
+
+    // Once mined, the same credential is served.
+    app.chain.mine(bound_payment_receipt(
+        [0x77; 32], PAYER, CURRENCY, RECIPIENT, AMOUNT, REALM, &challenge,
+    ));
+    assert_eq!(
+        app.post(&body(), Some(&credential)).await.status,
+        StatusCode::OK
+    );
 
     let proof = credential_header(
         &challenge,
@@ -1013,7 +862,7 @@ async fn an_unreachable_node_is_a_503_not_a_payment_request() {
     let challenge = service
         .challenge_for_body(CHAT_COMPLETIONS_ROUTE, &body())
         .unwrap();
-    let (payload, _) = services::mpp::testing::transaction_payload(4);
+    let (payload, _) = paying_transaction(&challenge, 4);
     let credential = credential_header(&challenge, payload, None);
     assert_eq!(
         app2.post(&body(), Some(&credential)).await.status,
@@ -1075,10 +924,14 @@ async fn pending_payment_debug_prints_nothing_sensitive() {
     let challenge = service
         .challenge_for_body(CHAT_COMPLETIONS_ROUTE, &body())
         .unwrap();
+    app.chain.mine(bound_payment_receipt(
+        TX, PAYER, CURRENCY, RECIPIENT, AMOUNT, REALM, &challenge,
+    ));
     let credential = credential_header(&challenge, hash_payload(TX), None);
     let verified = service
         .verify(&credential, CHAT_COMPLETIONS_ROUTE, &body())
         .unwrap();
-    let printed = format!("{:?}", PendingMppPayment::new(verified));
+    let paid = service.verify_payment(&verified).await.unwrap();
+    let printed = format!("{:?}", PendingMppPayment(paid));
     assert_eq!(printed, "PendingMppPayment { .. }");
 }

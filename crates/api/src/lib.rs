@@ -187,6 +187,37 @@ pub async fn init_database(db_config: &config::DatabaseConfig) -> Arc<Database> 
     database
 }
 
+/// Build the Machine Payments Protocol service when `MPP_ENABLED=true`, and start the hourly
+/// purge of its claim table. A construction failure leaves MPP off (the safe state: no
+/// payment is accepted) and is logged; the settings were validated at startup, so it is not
+/// expected.
+fn init_mpp_service(
+    pool: database::DbPool,
+    config: &ApiConfig,
+) -> Option<Arc<services::mpp::MppService>> {
+    let settings = config.mpp.settings()?;
+    let claims = Arc::new(database::repositories::MppPaymentClaimRepository::new(pool));
+    match services::mpp::MppService::from_settings(settings, claims.clone()) {
+        Ok(service) => {
+            services::mpp::retention::spawn_purge_task(claims);
+            tracing::info!(
+                realm = %settings.realm,
+                chain_id = settings.tempo.chain_id,
+                priced_models = settings.model_prices.len(),
+                "MPP payments enabled"
+            );
+            Some(Arc::new(service))
+        }
+        Err(error) => {
+            tracing::error!(
+                outcome = error.kind(),
+                "MPP enabled but the service could not be built; MPP is off"
+            );
+            None
+        }
+    }
+}
+
 /// Initialize authentication services and middleware
 pub fn init_auth_services(database: Arc<Database>, config: &ApiConfig) -> AuthComponents {
     // Create organization-related repositories first (needed for organization_service)
@@ -1181,7 +1212,7 @@ pub fn build_app_with_config_and_options(
         ohttp_gateway,
         ohttp_attestation,
         http_client: reqwest::Client::new(),
-        mpp_service: middleware::mpp::build_mpp_service(database.pool().clone(), &config),
+        mpp_service: init_mpp_service(database.pool().clone(), &config),
     };
 
     // Create usage state for middleware
@@ -1603,19 +1634,50 @@ pub fn build_completion_routes(
         Router::new()
     };
 
-    // Machine Payments Protocol: off (both hold `None`) unless MPP_ENABLED=true.
-    let mpp_auth_state = middleware::MppAuthState {
-        auth: auth_state_middleware.clone(),
-        mpp: app_state.mpp_service.clone(),
-    };
-    let mpp_settle_state = middleware::MppSettleState {
-        mpp: app_state.mpp_service.clone(),
-    };
+    // POST /chat/completions has its own router so Machine Payments Protocol (HTTP 402) can
+    // sit in front of it without touching the other inference routes. The layers are the text
+    // group's, with the MPP auth wrapper in place of the API-key middleware and the MPP
+    // settlement layer innermost. With MPP off (the default) both hold `None` and behave
+    // exactly like the API-key middleware and a pass-through.
+    let chat_completions_routes = Router::new()
+        .route("/chat/completions", post(chat_completions))
+        .with_state(app_state.clone())
+        .layer(from_fn_with_state(
+            middleware::MppSettleState {
+                mpp: app_state.mpp_service.clone(),
+            },
+            middleware::mpp_settle_middleware,
+        ))
+        .layer(from_fn_with_state(
+            model_deprecation_state.clone(),
+            middleware::model_deprecation_middleware,
+        ))
+        .layer(from_fn_with_state(
+            usage_state.clone(),
+            middleware::usage_check_middleware,
+        ))
+        .layer(from_fn_with_state(
+            rate_limit_state.clone(),
+            middleware::api_key_rate_limit_middleware,
+        ))
+        .layer(from_fn_with_state(
+            middleware::MppAuthState {
+                auth: auth_state_middleware.clone(),
+                mpp: app_state.mpp_service.clone(),
+            },
+            middleware::mpp_auth_middleware,
+        ))
+        .layer(from_fn_with_state(
+            middleware::BodyHashLimit(AUDIO_TRANSCRIPTION_MAX_BODY_SIZE),
+            middleware::body_hash_middleware,
+        ))
+        // Outermost, so the MPP pre-flight (which parses the buffered body as the handler
+        // will) sees the same limit the handler's extractor does.
+        .layer(DefaultBodyLimit::max(AUDIO_TRANSCRIPTION_MAX_BODY_SIZE));
 
-    // Text-based inference routes (chat/completions, image generation, audio transcription, rerank, score).
+    // Text-based inference routes (image generation, audio transcription, rerank, score, ...).
     // The shared 25 MiB cap accommodates inline multimodal JSON payloads.
     let text_inference_routes = Router::new()
-        .route("/chat/completions", post(chat_completions))
         .route("/completions", post(completions))
         .route("/images/generations", post(image_generations))
         .route("/audio/transcriptions", post(audio_transcriptions))
@@ -1637,11 +1699,6 @@ pub fn build_completion_routes(
         )
         .layer(DefaultBodyLimit::max(AUDIO_TRANSCRIPTION_MAX_BODY_SIZE))
         .with_state(app_state.clone())
-        // Innermost: verifies and claims an MPP payment after the usage check passed.
-        .layer(from_fn_with_state(
-            mpp_settle_state,
-            middleware::mpp_settle_middleware,
-        ))
         .layer(from_fn_with_state(
             model_deprecation_state.clone(),
             middleware::model_deprecation_middleware,
@@ -1655,8 +1712,8 @@ pub fn build_completion_routes(
             middleware::api_key_rate_limit_middleware,
         ))
         .layer(from_fn_with_state(
-            mpp_auth_state,
-            middleware::mpp_auth_middleware,
+            auth_state_middleware.clone(),
+            middleware::auth::auth_middleware_with_workspace_context,
         ))
         // body_hash buffers before auth runs, so cap it at the largest route
         // limit in this group. Smaller per-route limits (privacy) still apply
@@ -1704,6 +1761,7 @@ pub fn build_completion_routes(
         ));
 
     Router::new()
+        .merge(chat_completions_routes)
         .merge(text_inference_routes)
         .merge(file_inference_routes)
         .merge(metadata_routes)

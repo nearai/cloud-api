@@ -25,9 +25,7 @@ pub use auth::{
 pub use body_hash::{body_hash_middleware, BodyHashLimit, RequestBodyHash};
 pub use metrics::{http_metrics_middleware, MetricsState};
 pub use model_deprecation::{model_deprecation_middleware, ModelDeprecationState, RequestedModel};
-pub use mpp::{
-    mpp_auth_middleware, mpp_settle_middleware, MppAuthState, MppSettleState, PendingMppPayment,
-};
+pub use mpp::{mpp_auth_middleware, mpp_settle_middleware, MppAuthState, MppSettleState};
 pub use rate_limit::{api_key_rate_limit_middleware, RateLimitState};
 pub use reporting_guard::{
     reporting_global_guard_middleware, reporting_token_guard_middleware, ReportingGuardState,

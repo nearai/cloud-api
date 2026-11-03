@@ -34,11 +34,27 @@ impl ClaimState {
     }
 }
 
+/// The generation of one claim attempt: the row's `updated_at` as the claim wrote it.
+/// [`PaymentClaimRepository::finish`] only moves the row that still carries it, so a late or
+/// retried `finish` of an earlier attempt can never touch a newer attempt's claim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClaimLease(DateTime<Utc>);
+
+impl ClaimLease {
+    pub fn new(at: DateTime<Utc>) -> Self {
+        Self(at)
+    }
+
+    pub fn at(self) -> DateTime<Utc> {
+        self.0
+    }
+}
+
 /// Result of [`PaymentClaimRepository::claim`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClaimOutcome {
-    /// This caller now holds the payment and may serve the request.
-    Claimed,
+    /// This caller now holds the payment and may serve the request, under this lease.
+    Claimed(ClaimLease),
     /// The payment was already claimed (being served, served, or bound to another challenge).
     AlreadyUsed,
 }
@@ -74,9 +90,14 @@ pub trait PaymentClaimRepository: Send + Sync {
         challenge_id: &str,
     ) -> Result<ClaimOutcome, RepositoryError>;
 
-    /// Record how a claimed payment ended. Only a `serving` row changes.
-    async fn finish(&self, payment_key: &str, outcome: ServeOutcome)
-        -> Result<(), RepositoryError>;
+    /// Record how a claimed payment ended. Only the `serving` row still holding `lease`
+    /// changes; anything else (a stale attempt's finish) is a no-op.
+    async fn finish(
+        &self,
+        payment_key: &str,
+        lease: ClaimLease,
+        outcome: ServeOutcome,
+    ) -> Result<(), RepositoryError>;
 
     /// Delete claims created before `cutoff`, in bounded batches; returns how many went. A
     /// claim only has to outlive its challenge (at most an hour), so callers pass a cutoff

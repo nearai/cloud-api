@@ -10,8 +10,8 @@ use config::{MppConfig, MppModelPrice, MppSettings, MppTempoSettings};
 use serde_json::{json, Value};
 use services::mpp::testing::{credential_header, hash_payload, payment_receipt};
 use services::mpp::{
-    protocol, tempo, Challenge, ClaimOutcome, ClaimState, PaymentClaimRepository, RpcReceipt,
-    ServeOutcome,
+    protocol, tempo, Challenge, ClaimLease, ClaimOutcome, ClaimState, PaymentClaimRepository,
+    RpcReceipt, ServeOutcome,
 };
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -52,6 +52,17 @@ fn repository(
     database::repositories::MppPaymentClaimRepository::new(database.pool().clone())
 }
 
+async fn claimed(
+    repo: &database::repositories::MppPaymentClaimRepository,
+    key: &str,
+    challenge: &str,
+) -> ClaimLease {
+    match repo.claim(key, challenge).await.unwrap() {
+        ClaimOutcome::Claimed(lease) => lease,
+        ClaimOutcome::AlreadyUsed => panic!("expected a claim"),
+    }
+}
+
 // ----- the Postgres claim repository -----
 
 #[tokio::test]
@@ -60,10 +71,7 @@ async fn claim_is_single_use_and_unserved_is_retryable_by_the_same_challenge_onl
     let repo = repository(&database);
     let key = unique_key();
 
-    assert_eq!(
-        repo.claim(&key, "challenge-a").await.unwrap(),
-        ClaimOutcome::Claimed
-    );
+    let first = claimed(&repo, &key, "challenge-a").await;
     assert_eq!(state_of(&database, &key).await.as_deref(), Some("serving"));
 
     // A replay while serving, by the same and by another challenge.
@@ -76,7 +84,9 @@ async fn claim_is_single_use_and_unserved_is_retryable_by_the_same_challenge_onl
         ClaimOutcome::AlreadyUsed
     );
 
-    repo.finish(&key, ServeOutcome::Unserved).await.unwrap();
+    repo.finish(&key, first, ServeOutcome::Unserved)
+        .await
+        .unwrap();
     assert_eq!(state_of(&database, &key).await.as_deref(), Some("unserved"));
 
     // Another challenge cannot take an unserved payment; the same one can.
@@ -85,20 +95,29 @@ async fn claim_is_single_use_and_unserved_is_retryable_by_the_same_challenge_onl
         ClaimOutcome::AlreadyUsed
     );
     assert_eq!(state_of(&database, &key).await.as_deref(), Some("unserved"));
-    assert_eq!(
-        repo.claim(&key, "challenge-a").await.unwrap(),
-        ClaimOutcome::Claimed
-    );
+    let second = claimed(&repo, &key, "challenge-a").await;
+    assert_ne!(second, first, "every attempt gets its own lease");
+    assert_eq!(state_of(&database, &key).await.as_deref(), Some("serving"));
+
+    // A stale finish of the first attempt (a retried statement whose reply was lost) must
+    // not release the second attempt's claim.
+    repo.finish(&key, first, ServeOutcome::Unserved)
+        .await
+        .unwrap();
     assert_eq!(state_of(&database, &key).await.as_deref(), Some("serving"));
 
     // Served is terminal: it cannot be reclaimed, and a late finish cannot reopen it.
-    repo.finish(&key, ServeOutcome::Served).await.unwrap();
+    repo.finish(&key, second, ServeOutcome::Served)
+        .await
+        .unwrap();
     assert_eq!(state_of(&database, &key).await.as_deref(), Some("served"));
     assert_eq!(
         repo.claim(&key, "challenge-a").await.unwrap(),
         ClaimOutcome::AlreadyUsed
     );
-    repo.finish(&key, ServeOutcome::Unserved).await.unwrap();
+    repo.finish(&key, second, ServeOutcome::Unserved)
+        .await
+        .unwrap();
     assert_eq!(state_of(&database, &key).await.as_deref(), Some("served"));
 }
 
@@ -118,7 +137,7 @@ async fn concurrent_claims_of_one_payment_have_exactly_one_winner() {
     }
     let mut claimed = 0;
     for task in tasks {
-        if task.await.unwrap() == ClaimOutcome::Claimed {
+        if matches!(task.await.unwrap(), ClaimOutcome::Claimed(_)) {
             claimed += 1;
         }
     }
@@ -131,7 +150,13 @@ async fn finish_ignores_unknown_keys_and_the_table_rejects_unknown_states() {
     let (_server, database) = setup_test_server_with_database().await;
     let repo = repository(&database);
     let unknown = unique_key();
-    repo.finish(&unknown, ServeOutcome::Served).await.unwrap();
+    repo.finish(
+        &unknown,
+        ClaimLease::new(chrono::Utc::now()),
+        ServeOutcome::Served,
+    )
+    .await
+    .unwrap();
     assert_eq!(state_of(&database, &unknown).await, None);
 
     // The CHECK constraint is the closed state set.

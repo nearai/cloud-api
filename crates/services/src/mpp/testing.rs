@@ -10,7 +10,8 @@ use serde_json::Value;
 
 use super::memory::InMemoryClaimRepository;
 use super::ports::{
-    ClaimOutcome, PaymentClaimRepository, RpcError, RpcLog, RpcReceipt, ServeOutcome, TempoRpc,
+    ClaimLease, ClaimOutcome, PaymentClaimRepository, RpcError, RpcLog, RpcReceipt, ServeOutcome,
+    TempoRpc,
 };
 use super::protocol::{b64url_encode, Challenge};
 use super::tempo::{attribution_memo, transaction_hash, TRANSFER_TOPIC, TRANSFER_WITH_MEMO_TOPIC};
@@ -189,12 +190,13 @@ impl PaymentClaimRepository for FlakyClaimRepository {
     async fn finish(
         &self,
         payment_key: &str,
+        lease: ClaimLease,
         outcome: ServeOutcome,
     ) -> Result<(), RepositoryError> {
         if self.fail_finishes.load(Ordering::SeqCst) {
             return Err(store_down());
         }
-        self.inner.finish(payment_key, outcome).await
+        self.inner.finish(payment_key, lease, outcome).await
     }
 
     async fn purge_older_than(

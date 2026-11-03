@@ -31,8 +31,8 @@ pub use error::{
 #[cfg(any(test, feature = "test-mocks"))]
 pub use memory::InMemoryClaimRepository;
 pub use ports::{
-    ClaimOutcome, ClaimState, PaymentClaimRepository, RpcError, RpcLog, RpcReceipt, ServeOutcome,
-    TempoRpc,
+    ClaimLease, ClaimOutcome, ClaimState, PaymentClaimRepository, RpcError, RpcLog, RpcReceipt,
+    ServeOutcome, TempoRpc,
 };
 pub use pricing::{LimitViolation, Param, Price, Pricing, RequestShape};
 pub use protocol::{Challenge, ProblemCode};

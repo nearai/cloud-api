@@ -16,7 +16,7 @@ use super::{MppService, VerifiedCredential};
 use crate::mpp::error::{
     repository_error_kind, ConsumedReason, MppError, UnavailableReason, VerifyFailure,
 };
-use crate::mpp::ports::{ClaimOutcome, RpcError, RpcReceipt, ServeOutcome};
+use crate::mpp::ports::{ClaimLease, ClaimOutcome, RpcError, RpcReceipt, ServeOutcome};
 use crate::mpp::protocol::{self, PaymentPayload};
 use crate::mpp::tempo::{self, Expected, ReceiptVerdict};
 use crate::mpp::transaction::{self, PaymentTerms};
@@ -51,6 +51,8 @@ impl fmt::Debug for PaidCredential {
 #[derive(Clone, PartialEq, Eq)]
 pub struct SettledPayment {
     paid: PaidCredential,
+    /// This attempt's claim: only it may be finished.
+    lease: ClaimLease,
 }
 
 impl SettledPayment {
@@ -212,7 +214,10 @@ impl MppService {
     /// the same credential may be presented again.
     pub async fn claim(&self, paid: &PaidCredential) -> Result<SettledPayment, MppError> {
         match self.repo.claim(&paid.payment_key, &paid.challenge_id).await {
-            Ok(ClaimOutcome::Claimed) => Ok(SettledPayment { paid: paid.clone() }),
+            Ok(ClaimOutcome::Claimed(lease)) => Ok(SettledPayment {
+                paid: paid.clone(),
+                lease,
+            }),
             Ok(ClaimOutcome::AlreadyUsed) => {
                 Err(MppError::Consumed(ConsumedReason::AlreadyClaimed))
             }
@@ -235,7 +240,7 @@ impl MppService {
         outcome: ServeOutcome,
     ) -> Result<(), MppError> {
         self.repo
-            .finish(&payment.paid.payment_key, outcome)
+            .finish(&payment.paid.payment_key, payment.lease, outcome)
             .await
             .map_err(|error| {
                 tracing::error!(

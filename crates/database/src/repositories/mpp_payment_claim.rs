@@ -12,22 +12,24 @@ use anyhow::Context;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use services::common::RepositoryError;
-use services::mpp::{ClaimOutcome, PaymentClaimRepository, ServeOutcome};
+use services::mpp::{ClaimLease, ClaimOutcome, PaymentClaimRepository, ServeOutcome};
 
 /// One atomic step: insert a new claim, or take over a row that an earlier attempt of the
 /// *same challenge* left `unserved`. Any other existing row returns no row: already used.
+/// The returned `updated_at` is the attempt's lease: every write sets it anew.
 const CLAIM_SQL: &str = "\
 INSERT INTO mpp_payment_claims (payment_key, challenge_id, state) VALUES ($1, $2, 'serving') \
 ON CONFLICT (payment_key) DO UPDATE SET state = 'serving', updated_at = NOW() \
 WHERE mpp_payment_claims.state = 'unserved' \
 AND mpp_payment_claims.challenge_id = EXCLUDED.challenge_id \
-RETURNING payment_key";
+RETURNING updated_at";
 
-/// Only a `serving` row moves, so a late or repeated `finish` can never reopen a served
-/// payment. Idempotent, so it is safe to retry.
+/// Only the `serving` row of this attempt (its lease) moves. A late or retried `finish` of
+/// an earlier attempt matches nothing, so it can neither reopen a served payment nor release
+/// a newer attempt's claim. Idempotent, so it is safe to retry.
 const FINISH_SQL: &str = "\
 UPDATE mpp_payment_claims SET state = $2, updated_at = NOW() \
-WHERE payment_key = $1 AND state = 'serving'";
+WHERE payment_key = $1 AND state = 'serving' AND updated_at = $3";
 
 /// Rows deleted per statement: small enough that no statement holds its locks for long.
 const PURGE_BATCH: i64 = 5000;
@@ -71,19 +73,22 @@ impl PaymentClaimRepository for MppPaymentClaimRepository {
             .query_opt(CLAIM_SQL, &[&payment_key, &challenge_id])
             .await
             .map_err(map_db_error)?;
-        Ok(if row.is_some() {
-            ClaimOutcome::Claimed
-        } else {
-            ClaimOutcome::AlreadyUsed
+        Ok(match row {
+            Some(row) => ClaimOutcome::Claimed(ClaimLease::new(
+                row.try_get::<_, DateTime<Utc>>(0).map_err(map_db_error)?,
+            )),
+            None => ClaimOutcome::AlreadyUsed,
         })
     }
 
     async fn finish(
         &self,
         payment_key: &str,
+        lease: ClaimLease,
         outcome: ServeOutcome,
     ) -> Result<(), RepositoryError> {
         let state = outcome.state().as_str();
+        let lease = lease.at();
         retry_db!("finish_mpp_payment_claim", {
             let client = self
                 .pool
@@ -92,7 +97,7 @@ impl PaymentClaimRepository for MppPaymentClaimRepository {
                 .context("Failed to get database connection")
                 .map_err(RepositoryError::PoolError)?;
             client
-                .execute(FINISH_SQL, &[&payment_key, &state])
+                .execute(FINISH_SQL, &[&payment_key, &state, &lease])
                 .await
                 .map_err(map_db_error)
                 .map(|_| ())

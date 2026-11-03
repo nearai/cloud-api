@@ -2863,6 +2863,10 @@ mod tests {
         let operation = &spec["paths"]["/v1/responses"]["post"];
         let request_body = &operation["requestBody"];
         let request_schema = &request_body["content"]["application/json"]["schema"];
+        assert!(
+            request_schema.is_object(),
+            "Responses must document JSON input"
+        );
         assert_ne!(
             request_schema["$ref"], "#/components/schemas/StatelessCreateResponseRequestSchema",
             "the endpoint request schema must not falsely present the typed adapter as universal"
@@ -2870,6 +2874,10 @@ mod tests {
 
         let response = &operation["responses"]["200"];
         let json_response_schema = &response["content"]["application/json"]["schema"];
+        assert!(
+            json_response_schema.is_object(),
+            "Responses must document JSON output"
+        );
         assert_ne!(
             json_response_schema["$ref"], "#/components/schemas/ResponseObject",
             "the endpoint response schema must not falsely present typed output as universal"

@@ -162,8 +162,11 @@ async fn stateless_responses_reject_unsupported_tools_before_provider_work() {
             error.error.message
         );
         assert!(
-            error.error.message.contains("function"),
-            "the client-managed tool adapter should reject {tool_type}: {}",
+            error
+                .error
+                .message
+                .contains("Unsupported Responses tool type"),
+            "the stateless tool adapter should reject {tool_type}: {}",
             error.error.message
         );
         assert!(

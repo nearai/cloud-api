@@ -14,16 +14,20 @@ pub const REQUEST_ID_HEADER: &str = "x-request-id";
 
 #[derive(Debug, Clone, Copy)]
 pub struct RequestCorrelation {
+    /// Chosen by the server for every request: the id in our logs and the one
+    /// sent to providers and cloud-platform.
     pub request_id: Uuid,
 }
 
 pub async fn request_correlation_middleware(mut request: Request<Body>, next: Next) -> Response {
-    let request_id = request
+    // A valid inbound id is echoed in the response and logged next to ours as
+    // `client_request_id`; look a customer-reported id up by that field.
+    let client_request_id = request
         .headers()
         .get(REQUEST_ID_HEADER)
         .and_then(|value| value.to_str().ok())
-        .and_then(|value| Uuid::parse_str(value).ok())
-        .unwrap_or_else(Uuid::new_v4);
+        .and_then(|value| Uuid::parse_str(value).ok());
+    let request_id = Uuid::new_v4();
 
     request
         .extensions_mut()
@@ -34,6 +38,7 @@ pub async fn request_correlation_middleware(mut request: Request<Body>, next: Ne
     let span = tracing::info_span!(
         "http_request",
         request_id = %request_id,
+        client_request_id = client_request_id.map(tracing::field::display),
         method = %method,
         path = %path,
     );
@@ -49,12 +54,14 @@ pub async fn request_correlation_middleware(mut request: Request<Body>, next: Ne
     } else {
         run.instrument(span).await
     };
-    if let Ok(value) = HeaderValue::from_str(&request_id.to_string()) {
+    let response_request_id = client_request_id.unwrap_or(request_id);
+    if let Ok(value) = HeaderValue::from_str(&response_request_id.to_string()) {
         response.headers_mut().insert(REQUEST_ID_HEADER, value);
         prevent_request_id_caching(response.headers_mut());
     }
     tracing::debug!(
         request_id = %request_id,
+        client_request_id = client_request_id.map(tracing::field::display),
         method = %method,
         path = %path,
         status = response.status().as_u16(),
@@ -137,6 +144,59 @@ mod tests {
                 .expect("captured logs mutex should not poison");
             String::from_utf8_lossy(&logs).into_owned()
         }
+    }
+
+    async fn served_ids(inbound: Option<&str>) -> (String, Uuid) {
+        let app = Router::new()
+            .route(
+                "/id",
+                post(
+                    |axum::Extension(correlation): axum::Extension<RequestCorrelation>| async move {
+                        correlation.request_id.to_string()
+                    },
+                ),
+            )
+            .layer(from_fn(request_correlation_middleware));
+        let mut builder = Request::builder().method("POST").uri("/id");
+        if let Some(inbound) = inbound {
+            builder = builder.header(REQUEST_ID_HEADER, inbound);
+        }
+        let response = app
+            .oneshot(
+                builder
+                    .body(Body::empty())
+                    .expect("test request should build"),
+            )
+            .await
+            .expect("test request should complete");
+        let echoed = response
+            .headers()
+            .get(REQUEST_ID_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .expect("response carries x-request-id")
+            .to_string();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body should read");
+        let internal = std::str::from_utf8(&body)
+            .ok()
+            .and_then(|id| Uuid::parse_str(id).ok())
+            .expect("handler returns its request id");
+        (echoed, internal)
+    }
+
+    #[tokio::test]
+    async fn inbound_request_id_is_echoed_and_the_server_id_is_used_inside() {
+        let inbound = Uuid::new_v4().to_string();
+        let (echoed, internal) = served_ids(Some(&inbound)).await;
+        assert_eq!(echoed, inbound);
+        assert_ne!(internal.to_string(), inbound);
+
+        let (echoed, internal) = served_ids(None).await;
+        assert_eq!(echoed, internal.to_string());
+
+        let (echoed, internal) = served_ids(Some("not-a-uuid")).await;
+        assert_eq!(echoed, internal.to_string());
     }
 
     #[tokio::test]

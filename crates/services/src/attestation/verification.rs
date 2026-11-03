@@ -1433,6 +1433,23 @@ mod tests {
     }
 
     #[test]
+    fn identical_duplicate_boot_measurements_are_rejected() {
+        // Strict at-most-once: even byte-identical payloads are rejected.
+        for name in ["os-image-hash", "compose-hash"] {
+            let err = extract_err(&[
+                runtime_event(name, &hexb(b"same")),
+                runtime_event(name, &hexb(b"same")),
+                ready(),
+            ]);
+            assert!(
+                matches!(&err, AttestationVerificationError::InvalidFormat(m)
+                if m.contains(&format!("duplicate {name}"))),
+                "{name}: {err:?}"
+            );
+        }
+    }
+
+    #[test]
     fn missing_system_ready_is_rejected() {
         let err = extract_err(&[runtime_event("os-image-hash", &hexb(b"a"))]);
         assert!(

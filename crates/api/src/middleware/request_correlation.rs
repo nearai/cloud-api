@@ -20,7 +20,8 @@ pub struct RequestCorrelation {
 }
 
 pub async fn request_correlation_middleware(mut request: Request<Body>, next: Next) -> Response {
-    // A valid inbound id is echoed in the response and logged next to ours.
+    // A valid inbound id is echoed in the response and logged next to ours as
+    // `client_request_id`; look a customer-reported id up by that field.
     let client_request_id = request
         .headers()
         .get(REQUEST_ID_HEADER)

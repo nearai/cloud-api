@@ -110,6 +110,21 @@ fn privacy_error_response(
         .into_response()
 }
 
+/// The engine assigns its own request id: drop a client `rid` (SGLang) or
+/// `request_id` (vLLM) from a classify body. Any other body is forwarded byte
+/// for byte.
+fn strip_client_request_ids(body: Bytes) -> Bytes {
+    let Ok(serde_json::Value::Object(mut fields)) = serde_json::from_slice(&body) else {
+        return body;
+    };
+    let removed_rid = fields.remove("rid").is_some();
+    let removed_request_id = fields.remove("request_id").is_some();
+    if !removed_rid && !removed_request_id {
+        return body;
+    }
+    serde_json::to_vec(&fields).map_or(body, Bytes::from)
+}
+
 /// Upper bound on input tokens billed for one privacy call; larger provider
 /// reports are treated as anomalies and capped.
 const MAX_REASONABLE_PRIVACY_TOKENS: i32 = 1_000_000;
@@ -370,7 +385,13 @@ pub async fn privacy_classify(
 
     match app_state
         .completion_service
-        .try_privacy_classify(organization_id, model_id, &model_name, body, extra)
+        .try_privacy_classify(
+            organization_id,
+            model_id,
+            &model_name,
+            strip_client_request_ids(body),
+            extra,
+        )
         .await
     {
         Ok(response_bytes) => {
@@ -761,6 +782,21 @@ pub async fn privacy_redact(
 mod tests {
     use super::*;
     use services::completions::ports::CompletionError;
+
+    #[test]
+    fn classify_body_drops_client_request_ids_only() {
+        let stripped = strip_client_request_ids(Bytes::from_static(
+            br#"{"model":"m","input":["a"],"rid":"x","request_id":"y","threshold":0.5}"#,
+        ));
+        let value: serde_json::Value = serde_json::from_slice(&stripped).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({"model": "m", "input": ["a"], "threshold": 0.5})
+        );
+
+        let untouched = Bytes::from_static(br#"{"model":"m",  "input":"a"}"#);
+        assert_eq!(strip_client_request_ids(untouched.clone()), untouched);
+    }
 
     fn parts(endpoint: PrivacyEndpoint, e: CompletionError) -> (u16, &'static str, String) {
         let (status, ty, msg) = privacy_error_parts(endpoint, e);

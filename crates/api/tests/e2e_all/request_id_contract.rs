@@ -293,3 +293,49 @@ async fn test_request_id_contract_for_cors_and_streaming_surfaces() {
     );
     println!("request_id_contract tenant spoof rejection: public tenant headers ignored");
 }
+
+#[tokio::test]
+async fn test_request_id_contract_for_non_streaming_chat() {
+    // Given
+    let (server, mock_provider) = setup_request_id_server().await;
+    let org = setup_org_with_credits(&server, 10_000_000_000).await;
+    let api_key = get_api_key_for_org(&server, org.id.clone()).await;
+    let model = setup_qwen_model(&server).await;
+    let inbound_request_id = Uuid::new_v4();
+
+    // When
+    let response = server
+        .post("/v1/chat/completions")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .add_header(REQUEST_ID_HEADER, inbound_request_id.to_string())
+        .json(&serde_json::json!({
+            "model": model,
+            "stream": false,
+            "rid": "client-rid",
+            "request_id": "client-request-id",
+            "messages": [{"role": "user", "content": "sentinel-non-stream"}]
+        }))
+        .await;
+
+    // Then
+    assert_eq!(response.status_code(), 200);
+    assert_eq!(
+        assert_uuid_response_id("non-streaming success", &response),
+        inbound_request_id
+    );
+    let params = mock_provider
+        .last_chat_params()
+        .await
+        .expect("non-streaming request should reach mock provider");
+    let forwarded_id = params
+        .extra
+        .get("x_request_id")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|id| Uuid::parse_str(id).ok())
+        .expect("provider propagation should carry a UUID request ID");
+    assert_ne!(forwarded_id, inbound_request_id);
+    assert!(
+        !params.extra.contains_key("rid") && !params.extra.contains_key("request_id"),
+        "client engine request ids must not reach the provider"
+    );
+}

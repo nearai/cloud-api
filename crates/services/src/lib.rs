@@ -18,6 +18,7 @@ pub mod lifecycle;
 pub mod mcp;
 pub mod metrics;
 pub mod models;
+pub mod mpp;
 pub mod organization;
 pub mod reporting_tokens;
 pub mod reporting_usage;

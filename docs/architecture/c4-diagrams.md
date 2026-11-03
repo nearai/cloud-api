@@ -494,11 +494,12 @@ sequenceDiagram
 
 `POST /v1/responses` is a stateless compatibility API. After alias resolution,
 canonical `openai/` models make one native provider Responses request; other
-models use the typed adapter for one Chat Completions request. Both transports
-normalize omitted or null `store` to `false`, reject `store: true`, and keep no
-conversation linkage or response/item history. Tools run in the client;
-neither path runs a server-side agent loop or executes built-in/remote MCP
-tools. Image-generation and image-editing models are rejected on both paths.
+models use the typed adapter, including bounded request-scoped inference rounds
+for `web_search` and `web_context_search`. Both transports normalize omitted or
+null `store` to `false`, reject `store: true`, and keep no conversation linkage or
+response/item history. Custom tools run in the client. Native Responses retains
+its client-managed-tool boundary; remote MCP tools and image-generation/editing
+models are unsupported by both paths.
 The diagram below describes the typed adapter for non-OpenAI models.
 
 ```mermaid
@@ -537,14 +538,14 @@ sequenceDiagram
     
     ResponseService-->>Client: SSE: response.completed<br/>{ status: "completed", usage: {...} }
     
-    Note over Client,AttestationService: No responses/response_items row, response history,<br/>server tool execution, or agent loop is used
+    Note over Client,AttestationService: No responses/response_items row or response history is stored.<br/>Hosted search uses request-scoped context and bounded inference rounds.
 ```
 
 ### 5. Default Typed Client-Managed Function Call Flow (Tool Use)
 
 Multi-turn flow where the model requests a function and the client executes
 it. Responses also accepts client-managed `custom` tools and namespaces of
-function/custom tools; server-executed/builtin tools are rejected. The
+function/custom tools. Hosted web search is executed by the typed adapter. The
 [compatibility guide](../local-development.md#stateless-responses-and-attestation-retention)
 describes custom formats, Codex tool declarations, and reasoning replay.
 
@@ -585,7 +586,7 @@ sequenceDiagram
     ResponseService-->>Client: SSE: response.output_text.delta
     ResponseService-->>Client: SSE: response.completed
 
-    Note over Client,vLLM: Cloud never executes the function, looks up history,<br/>or starts an agent loop; arguments are replayed unchanged
+    Note over Client,vLLM: Cloud never executes client functions or looks up history;<br/>arguments are replayed unchanged
 ```
 
 ### 6. Model Discovery Flow
@@ -785,12 +786,12 @@ stateDiagram-v2
     failed --> [*]: Error delivered
 
     note right of in_progress
-        Default typed adapter: one Chat Completions inference
+        Typed adapter: bounded inference rounds with hosted search
         Streaming tokens and tracking usage
     end note
 
     note right of completed
-        Client executes any requested tools
+        Client executes requested function/custom tools
         A later request replays calls and outputs
         No response/item history is written
         Best-effort digest signature may be stored
@@ -1408,15 +1409,16 @@ erDiagram
 > after the migration/export window and account-deletion lifecycle.
 
 **Responses (Platform-specific):**
-- `POST /v1/responses` - Stateless inference; canonical `openai/` models use one native Responses call, other models use one typed Chat Completions call, and omitted or null `store` defaults to `false`
+- `POST /v1/responses` - Stateless inference; canonical `openai/` models use one native Responses call, other models use the typed adapter with request-scoped hosted search, and omitted or null `store` defaults to `false`
 - `GET`/`DELETE /v1/responses/{id}` - Authenticated `410 Gone` (history retired)
 - `POST /v1/responses/{id}/cancel` - Authenticated `410 Gone` (history retired)
 - `GET /v1/responses/{id}/input_items` - Authenticated `410 Gone` (history retired)
 
 > Responses accepts client-managed `function` and `custom` tools, including
 > namespaced tools. Clients keep history and replay the returned call and its
-> matching output in a fresh request; Cloud neither executes tools nor runs an
-> agent loop. Responses, including retired-history responses, use
+> matching output in a fresh request. The typed adapter executes hosted web
+> search within the request and returns source citations. Responses, including
+> retired-history responses, use
 > `Cache-Control: no-store`.
 
 **Attestation:**

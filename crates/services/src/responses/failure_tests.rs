@@ -100,6 +100,7 @@ async fn interrupted_reasoning_and_custom_arguments_keep_the_original_failure() 
         &items,
         &request,
         Uuid::new_v4(),
+        None,
     )
     .await
     .expect("partial custom arguments must not replace the provider failure");

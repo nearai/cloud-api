@@ -524,7 +524,10 @@ pub async fn init_domain_services_with_pool(
     let brave_search_provider =
         Arc::new(services::responses::tools::brave::BraveWebSearchProvider::new());
     let web_search_provider: Arc<dyn services::responses::tools::WebSearchProviderTrait> =
-        brave_search_provider;
+        brave_search_provider.clone();
+    let web_context_search_provider: Arc<
+        dyn services::responses::tools::WebContextSearchProviderTrait,
+    > = brave_search_provider;
 
     // Create session repository for user service
     let session_repo = Arc::new(database::SessionRepository::new(database.pool().clone()))
@@ -583,6 +586,8 @@ pub async fn init_domain_services_with_pool(
     let response_service = Arc::new(services::ResponseService::new(
         completion_service.clone(),
         organization_service.clone(),
+        Some(web_search_provider.clone()),
+        Some(web_context_search_provider),
     ));
 
     let service_repo = Arc::new(database::repositories::ServiceRepository::new(
@@ -709,7 +714,6 @@ pub async fn init_domain_services_with_mcp_factory(
     metrics_service: Arc<dyn services::metrics::MetricsServiceTrait>,
     _mcp_client_factory: Arc<dyn services::responses::tools::McpClientFactory>,
 ) -> DomainServices {
-    // Get the base domain services
     init_domain_services_with_pool(
         database,
         config,
@@ -721,8 +725,7 @@ pub async fn init_domain_services_with_mcp_factory(
     .await
 }
 
-/// Like `init_domain_services_with_pool` but use the given web search provider
-/// for the standalone MCP route in tests.
+/// Inject a web search provider into the standalone MCP route and hosted Responses search.
 pub async fn init_domain_services_with_pool_and_web_search_provider(
     database: Arc<Database>,
     config: &ApiConfig,
@@ -743,9 +746,7 @@ pub async fn init_domain_services_with_pool_and_web_search_provider(
     .await
 }
 
-/// Like `init_domain_services_with_pool_and_web_search_provider`, but keeps a
-/// compatibility argument for tests that previously injected a Responses-only
-/// context-search provider. Responses no longer accepts that built-in tool.
+/// Inject both hosted search providers into the request-scoped Responses service.
 pub async fn init_domain_services_with_pool_and_search_providers(
     database: Arc<Database>,
     config: &ApiConfig,
@@ -753,21 +754,29 @@ pub async fn init_domain_services_with_pool_and_search_providers(
     inference_provider_pool: Arc<services::inference_provider_pool::InferenceProviderPool>,
     metrics_service: Arc<dyn services::metrics::MetricsServiceTrait>,
     web_search_provider: Arc<dyn services::responses::tools::WebSearchProviderTrait>,
-    _web_context_search_provider: Option<
+    web_context_search_provider: Option<
         Arc<dyn services::responses::tools::WebContextSearchProviderTrait>,
     >,
 ) -> DomainServices {
     let mut domain_services = init_domain_services_with_pool(
-        database.clone(),
+        database,
         config,
         organization_service.clone(),
-        inference_provider_pool.clone(),
+        inference_provider_pool,
         metrics_service,
         None,
     )
     .await;
 
+    let response_service = Arc::new(services::ResponseService::new(
+        domain_services.completion_service.clone(),
+        organization_service,
+        Some(web_search_provider.clone()),
+        web_context_search_provider,
+    ));
+
     domain_services.web_search_provider = web_search_provider;
+    domain_services.response_service = response_service;
     domain_services
 }
 
@@ -2956,14 +2965,7 @@ mod tests {
 
         let tools = serde_json::to_string(&schemas["StatelessResponseToolSchema"])
             .expect("tool schema should serialize");
-        for rejected_tool in [
-            "web_search",
-            "web_context_search",
-            "file_search",
-            "code_interpreter",
-            "computer",
-            "mcp",
-        ] {
+        for rejected_tool in ["file_search", "code_interpreter", "computer", "mcp"] {
             assert!(
                 !tools.contains(rejected_tool),
                 "stateless Responses schema must not advertise {rejected_tool}"
@@ -3109,7 +3111,7 @@ mod tests {
     }
 
     #[test]
-    fn test_openapi_responses_only_advertises_client_managed_tools() {
+    fn test_openapi_responses_advertises_client_tools_and_hosted_search() {
         let spec = serde_json::to_value(ApiDoc::openapi()).unwrap();
         let request_tools_schema = &spec["components"]["schemas"]
             ["StatelessCreateResponseRequestSchema"]["properties"]["tools"];
@@ -3117,7 +3119,7 @@ mod tests {
             serde_json::to_string(request_tools_schema)
                 .unwrap()
                 .contains("StatelessResponseToolSchema"),
-            "Responses create-request schema must reference only the client-managed tool schema"
+            "Responses create-request schema must reference its supported tool schema"
         );
 
         let response_tool_schema = &spec["components"]["schemas"]["StatelessResponseToolSchema"];
@@ -3127,7 +3129,13 @@ mod tests {
         );
 
         let serialized_tool_schema = serde_json::to_string(response_tool_schema).unwrap();
-        for supported_tool in ["function", "custom", "namespace"] {
+        for supported_tool in [
+            "function",
+            "custom",
+            "namespace",
+            "web_search",
+            "web_context_search",
+        ] {
             assert!(
                 serialized_tool_schema.contains(supported_tool),
                 "typed Responses OpenAPI schema must advertise {supported_tool}"
@@ -3142,20 +3150,14 @@ mod tests {
             "CustomToolCallType",
             "CustomToolCallOutputType",
             "ReasoningType",
+            "CompletedWebSearchCallType",
         ] {
             assert!(
                 input_schema.contains(supported_item),
                 "typed Responses input schema must advertise {supported_item}"
             );
         }
-        for server_executed_tool in [
-            "web_search",
-            "web_context_search",
-            "file_search",
-            "code_interpreter",
-            "computer",
-            "mcp",
-        ] {
+        for server_executed_tool in ["file_search", "code_interpreter", "computer", "mcp"] {
             assert!(
                 !serialized_tool_schema.contains(server_executed_tool),
                 "typed Responses OpenAPI schema must not advertise the rejected {server_executed_tool} tool"
@@ -3172,8 +3174,9 @@ mod tests {
         assert!(description.contains("Both paths normalize omitted or null `store` to `false`"));
         assert!(description
             .contains("Canonical `openai/` models use one native provider Responses inference"));
-        assert!(description
-            .contains("Other models use the typed adapter for one Chat Completions inference"));
+        assert!(description.contains(
+            "Other models use the typed adapter, with bounded request-scoped inference rounds"
+        ));
         assert!(description.contains("client-managed `function` and `custom` tools"));
         assert!(description.contains("tools grouped in a `namespace`"));
         assert!(description.contains("plaintext `reasoning` items"));

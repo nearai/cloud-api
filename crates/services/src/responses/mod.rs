@@ -1,3 +1,4 @@
+pub mod citation_tracker;
 pub mod client_tools;
 pub mod errors;
 mod message_normalization;

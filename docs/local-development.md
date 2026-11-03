@@ -351,11 +351,12 @@ request or response content, response items, or response history; clients
 must supply any needed prior context with each request.
 
 After alias resolution, canonical `openai/` models make one native provider
-Responses inference. Other models use the typed adapter for one Chat
-Completions inference. Both paths keep tools under client control and do
-not run an agent loop or execute built-in or remote MCP tools.
+Responses request. Other models use the typed adapter, which executes
+`web_search` and `web_context_search` in a bounded, request-scoped loop.
+Search results are passed back to the model within the same request; messages,
+results, and source citations remain in memory until that request ends.
 
-Tools are executed by the client. Both paths accept `function` and `custom`
+Custom tools are executed by the client. Both paths accept `function` and `custom`
 tools, either at the top level or inside a `namespace` containing those tool
 types. Codex's leading developer `additional_tools` declarations are accepted
 as a tool catalog. Keep these declarations before conversation items.
@@ -411,14 +412,23 @@ the signature material contains no raw request or response content. A stream
 that disconnects before completion creates no `resp_*` attestation record or
 legacy disconnect fallback.
 
-Server-executed tools are rejected locally: `web_search`,
-`web_context_search`, `file_search`, `code_interpreter`, `computer`, and
-remote `mcp` tools. Image-generation and image-editing models are rejected on
-both paths. The typed adapter's successful requests make exactly one
-Chat Completions call. This does not affect the separate `POST /mcp` MCP
-server, which continues to expose its independent `web_search` tool, or the
-`/v1/images/*` endpoints. Native OpenAI requests preserve validated
-provider-native fields such as encrypted reasoning and grammar definitions.
+Hosted search on the typed adapter emits `web_search_call` items, search
+lifecycle events, and URL citations. Optional `web_search.count` accepts 0–20
+and overrides the count selected by the model. A count of zero returns empty
+search results without calling the search provider. Streaming and non-streaming
+responses use the same search execution and cumulative inference usage.
+If a model emits hosted search and client tool calls in the same round, the
+response returns the client tool calls without executing that round's searches.
+After the client supplies its tool results, the model can request search again.
+Completed `web_search_call` output markers may accompany replayed assistant
+messages; the typed adapter ignores those markers and uses the supplied text
+as context instead of repeating the historical search.
+
+Native OpenAI requests preserve validated provider-native fields such as
+encrypted reasoning and grammar definitions, and retain their client-managed
+tool boundary. File search, code interpreter, computer use, remote MCP tools,
+and image-generation/editing models remain unsupported by Responses. The
+separate `POST /mcp` search tool and `/v1/images/*` endpoints remain available.
 
 Responses itself rejects conversation linkage, response history, and file
 input. During the temporary migration/export window, the authenticated,

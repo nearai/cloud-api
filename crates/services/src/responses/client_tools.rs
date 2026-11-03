@@ -235,8 +235,16 @@ fn tool_name(tool: &Value) -> Result<String, String> {
         .ok_or("Client-managed tools require a nonempty name".into())
 }
 
+fn is_cloud_search(tool: &Value) -> bool {
+    matches!(
+        tool["type"].as_str(),
+        Some("web_search" | "web_context_search")
+    )
+}
+
 fn visit_tools<'a>(
     tools: &'a [Value],
+    allow_cloud_search: bool,
     mut visitor: impl FnMut(&'a Value, Option<&'a str>) -> Result<(), String>,
 ) -> Result<(), String> {
     for tool in tools {
@@ -258,8 +266,13 @@ fn visit_tools<'a>(
                 visitor(child, Some(name))?;
             }
         } else {
-            if !matches!(tool["type"].as_str(), Some("function" | "custom")) {
-                return Err(format!("Unsupported Responses tool type '{}': only client-managed function, custom, and namespace tools are supported", tool["type"].as_str().unwrap_or("unknown")));
+            if !(matches!(tool["type"].as_str(), Some("function" | "custom"))
+                || allow_cloud_search && is_cloud_search(tool))
+            {
+                return Err(format!(
+                    "Unsupported Responses tool type '{}'",
+                    tool["type"].as_str().unwrap_or("unknown")
+                ));
             }
             visitor(tool, None)?;
         }
@@ -271,6 +284,7 @@ pub fn validate_native_tools(body: &Value) -> Result<(), String> {
     if let Some(tools) = body.get("tools").filter(|value| !value.is_null()) {
         visit_tools(
             tools.as_array().ok_or("tools must be an array")?,
+            false,
             |tool, _| tool_name(tool).map(|_| ()),
         )?;
     }
@@ -351,7 +365,12 @@ pub fn normalize_request(mut body: Value) -> Result<(Value, ClientToolAdapter), 
     if let Some(tools) = body.get("tools").filter(|value| !value.is_null()) {
         visit_tools(
             tools.as_array().ok_or("tools must be an array")?,
+            true,
             |tool, namespace| {
+                if is_cloud_search(tool) {
+                    normalized.push(tool.clone());
+                    return Ok(());
+                }
                 let custom = tool["type"] == "custom";
                 let spec = Tool {
                     name: tool_name(tool)?,
@@ -390,10 +409,34 @@ pub fn normalize_request(mut body: Value) -> Result<(Value, ClientToolAdapter), 
                 Ok(())
             },
         )?;
+        if normalized
+            .iter()
+            .filter(|tool| is_cloud_search(tool))
+            .any(|search| {
+                normalized
+                    .iter()
+                    .any(|tool| tool["type"] == "function" && tool["name"] == search["type"])
+            })
+        {
+            return Err(
+                "A client function conflicts with a configured Cloud search tool of the same name"
+                    .into(),
+            );
+        }
         body["tools"] = json!(normalized);
     }
 
     if let Some(input) = body.get_mut("input").and_then(Value::as_array_mut) {
+        // Completed searches are informational output markers, not client tool
+        // calls. The replayed assistant text supplies context; do not execute
+        // searches again or create an unmatched tool-result message.
+        if input
+            .iter()
+            .any(|item| item["type"] == "web_search_call" && item["status"] != "completed")
+        {
+            return Err("Only completed web_search_call items can be replayed".into());
+        }
+        input.retain(|item| item["type"] != "web_search_call");
         for item in input {
             match item["type"].as_str() {
                 Some("function_call" | "custom_tool_call") => {
@@ -487,8 +530,13 @@ pub fn normalize_request(mut body: Value) -> Result<(Value, ClientToolAdapter), 
                 custom: (kind == "custom").then_some(CustomFormat::Text),
             };
             let alias = spec.provider_name();
-            if !normalized.iter().any(|tool| tool["name"] == alias) {
-                return Err("tool_choice must name a declared client tool".into());
+            let declared_search = kind == "function"
+                && spec.namespace.is_none()
+                && normalized
+                    .iter()
+                    .any(|tool| is_cloud_search(tool) && tool["type"] == alias);
+            if !declared_search && !normalized.iter().any(|tool| tool["name"] == alias) {
+                return Err("tool_choice must name a declared tool".into());
             }
             *choice = json!({"type":"function", "function":{"name":alias}});
         } else {

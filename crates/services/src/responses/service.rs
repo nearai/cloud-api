@@ -7,7 +7,10 @@ use uuid::Uuid;
 use crate::common::encryption_headers;
 use crate::completions::ports::CompletionServiceTrait;
 use crate::responses::tools;
-use crate::responses::{errors, models, ports, transient};
+use crate::responses::{citation_tracker, errors, models, ports, transient};
+
+#[path = "search_loop.rs"]
+mod search_loop;
 
 #[cfg(test)]
 #[path = "failure_tests.rs"]
@@ -34,11 +37,15 @@ struct ProcessStreamContext {
     response_items_repository: Arc<dyn ports::ResponseItemRepositoryTrait>,
     completion_service: Arc<dyn CompletionServiceTrait>,
     organization_service: Arc<dyn crate::organization::OrganizationServiceTrait>,
+    source_registry: Option<models::SourceRegistry>,
+    search_tools: tools::ToolRegistry,
 }
 
 pub struct ResponseServiceImpl {
     pub completion_service: Arc<dyn CompletionServiceTrait>,
     pub organization_service: Arc<dyn crate::organization::OrganizationServiceTrait>,
+    pub web_search_provider: Option<Arc<dyn tools::WebSearchProviderTrait>>,
+    pub web_context_search_provider: Option<Arc<dyn tools::WebContextSearchProviderTrait>>,
 }
 
 /// Tag transition states for reasoning content
@@ -53,10 +60,14 @@ impl ResponseServiceImpl {
     pub fn new(
         completion_service: Arc<dyn CompletionServiceTrait>,
         organization_service: Arc<dyn crate::organization::OrganizationServiceTrait>,
+        web_search_provider: Option<Arc<dyn tools::WebSearchProviderTrait>>,
+        web_context_search_provider: Option<Arc<dyn tools::WebContextSearchProviderTrait>>,
     ) -> Self {
         Self {
             completion_service,
             organization_service,
+            web_search_provider,
+            web_context_search_provider,
         }
     }
 }
@@ -112,7 +123,7 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
                 .map_err(|message| errors::ResponseError::InvalidParams(message.into()))?;
             if Self::has_image_generation_capability(&model.output_modalities) {
                 return Err(errors::ResponseError::InvalidParams(
-                    "The stateless Responses API only supports a single /chat/completions request; image generation and image editing are not supported. Use /v1/images/generations or /v1/images/edits.".to_string(),
+                    "The stateless Responses API does not support image generation or image editing. Use /v1/images/generations or /v1/images/edits.".to_string(),
                 ));
             }
         }
@@ -146,6 +157,8 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
         // Clone necessary references for the async task
         let completion_service = self.completion_service.clone();
         let organization_service = self.organization_service.clone();
+        let web_search_provider = self.web_search_provider.clone();
+        let web_context_search_provider = self.web_context_search_provider.clone();
         let signing_algo_clone = signing_algo.clone();
         let client_pub_key_clone = client_pub_key.clone();
         let model_pub_key_clone = model_pub_key.clone();
@@ -155,6 +168,13 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
         // need the caller's key (cloud-platform model access).
         crate::caller_credential::spawn_with_caller_credential(async move {
             let usage_tracker = crate::responses::service_helpers::UsageTracker::new();
+            let mut search_tools = tools::ToolRegistry::new();
+            if let Some(provider) = web_search_provider {
+                search_tools.register(Arc::new(tools::WebSearchToolExecutor::new(provider)));
+            }
+            if let Some(provider) = web_context_search_provider {
+                search_tools.register(Arc::new(tools::WebContextSearchToolExecutor::new(provider)));
+            }
 
             let context = ProcessStreamContext {
                 request,
@@ -175,6 +195,8 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
                 response_items_repository,
                 completion_service,
                 organization_service,
+                source_registry: None,
+                search_tools,
             };
 
             if Self::process_response_stream(
@@ -233,14 +255,17 @@ impl ResponseServiceImpl {
         response_items_repository: &Arc<dyn ports::ResponseItemRepositoryTrait>,
         request: &models::CreateResponseRequest,
         organization_id: Uuid,
+        source_registry: Option<&models::SourceRegistry>,
     ) -> Result<crate::responses::service_helpers::ProcessStreamResult, errors::ResponseError> {
         use crate::responses::service_helpers::ToolCallAccumulator;
         use futures::StreamExt;
 
         let mut current_text = String::new();
+        let mut current_reasoning = String::new();
         let mut tool_call_accumulator: ToolCallAccumulator = std::collections::HashMap::new();
         let mut message_item_emitted = false;
         let message_item_id = format!("msg_{}", uuid::Uuid::new_v4().simple());
+        let mut tracker = citation_tracker::CitationTracker::new();
 
         // Reasoning tracking state
         let mut reasoning_buffer = String::new();
@@ -283,6 +308,7 @@ impl ResponseServiceImpl {
                                 {
                                     tracing::debug!("emit_reasoning_delta failed: {}", e);
                                 }
+                                current_reasoning.push_str(&reasoning);
                                 reasoning_buffer.push_str(&reasoning);
                             }
                         }
@@ -294,6 +320,9 @@ impl ResponseServiceImpl {
                                 &mut reasoning_buffer,
                                 &mut inside_reasoning,
                             );
+                        if let Some(reasoning) = &reasoning_delta {
+                            current_reasoning.push_str(reasoning);
+                        }
 
                         // Handle transition from explicit reasoning to content
                         // If we have content, and we were reasoning (but not inside a tag block), close reasoning
@@ -324,7 +353,10 @@ impl ResponseServiceImpl {
                             reasoning_item_emitted = false;
                         }
 
-                        let clean_text = text_without_reasoning;
+                        // Feed text (without reasoning tags) to citation tracker for real-time processing
+                        // Returns clean text with citation tags also removed, plus any completed citations
+                        let token_result = tracker.add_token(&text_without_reasoning);
+                        let clean_text = token_result.clean_text;
 
                         // Handle reasoning tag transitions
                         match tag_transition {
@@ -424,6 +456,32 @@ impl ResponseServiceImpl {
                         if stream_error {
                             break;
                         }
+
+                        // If a citation just closed, emit annotation event immediately
+                        if let Some(completed_citation) = token_result.completed_citation {
+                            if let Some(registry) = source_registry {
+                                if let Some(source) =
+                                    registry.web_sources.get(completed_citation.source_id)
+                                {
+                                    let annotation = models::TextAnnotation::UrlCitation {
+                                        start_index: completed_citation.start_index,
+                                        end_index: completed_citation.end_index,
+                                        title: source.title.clone(),
+                                        url: source.url.clone(),
+                                    };
+                                    if let Err(e) = emitter
+                                        .emit_citation_annotation(
+                                            ctx,
+                                            message_item_id.clone(),
+                                            annotation,
+                                        )
+                                        .await
+                                    {
+                                        tracing::debug!("emit_citation_annotation failed: {}", e);
+                                    }
+                                }
+                            }
+                        }
                     }
 
                     // Update usage from chunk (overwrite; commit at end of stream)
@@ -497,35 +555,35 @@ impl ResponseServiceImpl {
             }
         }
 
-        // If we have message content, close it with done events and retain it
-        // in this request's transient response store.
+        // If we have message content, close it with done events and save to DB
+        // Only save if we successfully emitted the message start AND have content
         if message_item_emitted && !current_text.is_empty() {
             Self::emit_message_completed(
                 emitter,
                 ctx,
                 &message_item_id,
                 response_items_repository,
-                current_text.clone(),
+                source_registry,
+                tracker,
             )
             .await?;
         }
 
-        // Stateless Responses only returns client-managed custom functions.
-        // Do not route their raw arguments through the legacy builtin parser:
-        // that parser can repair and reserialize JSON for server-executed
-        // search tools, which would corrupt a client replay.
-        // Interrupted function/custom arguments can be incomplete JSON. Do
-        // not validate or expose them as calls, or mask a provider error with
-        // an argument-conversion error.
-        let tool_calls_detected = if stream_error {
-            Vec::new()
+        // Parse only declared hosted search calls through the legacy search
+        // parser. Client arguments retain their exact bytes for replay.
+        // An interrupted stream may contain incomplete tool arguments; preserve
+        // its original failure rather than attempting tool conversion.
+        let (tool_calls_detected, search_calls) = if stream_error {
+            (Vec::new(), Vec::new())
         } else {
-            Self::convert_client_function_calls(tool_call_accumulator, request)?
+            search_loop::split_tool_calls(tool_call_accumulator, request)?
         };
 
         Ok(crate::responses::service_helpers::ProcessStreamResult {
             text: current_text,
+            reasoning: (!current_reasoning.is_empty()).then_some(current_reasoning),
             tool_calls: tool_calls_detected,
+            search_calls,
             stream_error,
             stream_error_cause,
         })
@@ -573,11 +631,32 @@ impl ResponseServiceImpl {
         ctx: &mut crate::responses::service_helpers::ResponseStreamContext,
         message_item_id: &str,
         response_items_repository: &Arc<dyn ports::ResponseItemRepositoryTrait>,
-        text: String,
+        source_registry: Option<&models::SourceRegistry>,
+        citation_tracker: citation_tracker::CitationTracker,
     ) -> Result<(), errors::ResponseError> {
-        let annotations = vec![];
+        // Finalize citation tracker to get clean text and citations
+        let (clean_text, citations) = citation_tracker.finalize();
 
-        // Build the message item to retain for the current response.
+        // Convert citations to TextAnnotation::UrlCitation by looking up web sources
+        let annotations = if let Some(registry) = source_registry {
+            citations
+                .into_iter()
+                .filter_map(|citation| {
+                    registry.web_sources.get(citation.source_id).map(|source| {
+                        models::TextAnnotation::UrlCitation {
+                            start_index: citation.start_index,
+                            end_index: citation.end_index,
+                            title: source.title.clone(),
+                            url: source.url.clone(),
+                        }
+                    })
+                })
+                .collect()
+        } else {
+            vec![]
+        };
+
+        // Build the message item to save
         let item = models::ResponseOutputItem::Message {
             id: message_item_id.to_string(),
             response_id: ctx.response_id_str.clone(),
@@ -587,7 +666,7 @@ impl ResponseServiceImpl {
             status: models::ResponseItemStatus::Completed,
             role: "assistant".to_string(),
             content: vec![models::ResponseContentItem::OutputText {
-                text: text.clone(),
+                text: clean_text.clone(),
                 annotations: annotations.clone(),
                 logprobs: vec![],
             }],
@@ -595,8 +674,8 @@ impl ResponseServiceImpl {
             metadata: None,
         };
 
-        // Retain the final item before emitting its done events so the
-        // request-scoped response can still be assembled after a disconnect.
+        // CRITICAL: Store to database FIRST before emitting events
+        // This ensures the message is persisted even if client disconnected and emit calls fail
         if let Err(e) = response_items_repository
             .create(
                 ctx.response_id.clone(),
@@ -609,10 +688,10 @@ impl ResponseServiceImpl {
             tracing::warn!("Failed to store message item: {}", e);
         }
 
-        // Try to emit events; the request-scoped item is already retained.
+        // Try to emit events (may fail if client disconnected, but data is already saved)
         // Event: response.output_text.done
         if let Err(e) = emitter
-            .emit_text_done(ctx, message_item_id.to_string(), text.clone())
+            .emit_text_done(ctx, message_item_id.to_string(), clean_text.clone())
             .await
         {
             tracing::debug!("Failed to emit text_done event: {}", e);
@@ -620,7 +699,7 @@ impl ResponseServiceImpl {
 
         // Event: response.content_part.done
         let part = models::ResponseOutputContent::OutputText {
-            text,
+            text: clean_text,
             annotations: annotations.clone(),
             logprobs: vec![],
         };
@@ -645,7 +724,7 @@ impl ResponseServiceImpl {
     /// Process the response stream - main logic
     async fn process_response_stream(
         tx: futures::channel::mpsc::UnboundedSender<models::ResponseStreamEvent>,
-        context: ProcessStreamContext,
+        mut context: ProcessStreamContext,
         initial_response: models::ResponseObject,
         api_key_uuid: Uuid,
         usage_tracker: Arc<crate::responses::service_helpers::UsageTracker>,
@@ -681,7 +760,7 @@ impl ResponseServiceImpl {
                 .emit_created(&mut ctx, initial_response.clone())
                 .await?;
 
-            let messages = Self::build_stateless_messages(
+            let mut messages = Self::build_stateless_messages(
                 &context.request,
                 context.organization_id,
                 context.user_id.clone(),
@@ -715,43 +794,14 @@ impl ResponseServiceImpl {
             let tools = tools::prepare_tools(&context.request);
             let tool_choice = tools::prepare_tool_choice(&context.request);
 
-            // The default typed Responses adapter is a stateless compatibility
-            // layer over exactly one Chat Completions request. Client-defined
-            // functions are returned to the caller; Cloud never executes them or
-            // starts another completion.
-            let final_response_text: String = async {
-                let stream_result = Self::run_completion_once(
-                    &mut ctx,
-                    &mut emitter,
-                    &messages,
-                    &context,
-                    &tools,
-                    &tool_choice,
-                )
-                .await?;
-
-                if stream_result.stream_error {
-                    return Err(stream_result
-                        .stream_error_cause
-                        .unwrap_or(errors::ResponseError::StreamInterrupted));
-                }
-
-                // `process_completion_stream` emits any text item. Preserve the
-                // previous output-index transition before adding function calls.
-                if !stream_result.text.is_empty() {
-                    ctx.next_output_index();
-                }
-
-                Self::emit_client_function_calls(
-                    &mut ctx,
-                    &mut emitter,
-                    &context.response_items_repository,
-                    stream_result.tool_calls,
-                )
-                .await?;
-
-                Ok::<_, errors::ResponseError>(stream_result.text)
-            }
+            let final_response_text = search_loop::run(
+                &mut ctx,
+                &mut emitter,
+                &mut messages,
+                &mut context,
+                &tools,
+                &tool_choice,
+            )
             .await?;
 
             // Build final response
@@ -985,6 +1035,7 @@ impl ResponseServiceImpl {
             extra,
         };
 
+        ctx.begin_completion();
         let mut completion_stream = process_context
             .completion_service
             .create_chat_completion_stream(completion_request)
@@ -998,6 +1049,7 @@ impl ResponseServiceImpl {
             &process_context.response_items_repository,
             &process_context.request,
             process_context.organization_id,
+            process_context.source_registry.as_ref(),
         )
         .await
     }
@@ -2048,6 +2100,7 @@ mod tests {
                 &items,
                 &request,
                 Uuid::new_v4(),
+                None,
             )
             .await
             .unwrap();
@@ -3136,6 +3189,107 @@ mod tests {
         assert!(reasoning.is_some());
         assert_eq!(reasoning_buffer, "content");
         assert!(!inside_reasoning);
+    }
+
+    #[test]
+    fn test_multiple_web_search_registry_accumulation() {
+        use crate::responses::models::SourceRegistry;
+        use crate::responses::tools::WebSearchResult;
+
+        // Simulate first web search with 3 results
+        let first_search_results = vec![
+            WebSearchResult {
+                title: "First Result".to_string(),
+                url: "https://example.com/1".to_string(),
+                snippet: "First snippet".to_string(),
+            },
+            WebSearchResult {
+                title: "Second Result".to_string(),
+                url: "https://example.com/2".to_string(),
+                snippet: "Second snippet".to_string(),
+            },
+            WebSearchResult {
+                title: "Third Result".to_string(),
+                url: "https://example.com/3".to_string(),
+                snippet: "Third snippet".to_string(),
+            },
+        ];
+
+        // Simulate second web search with 2 results
+        let second_search_results = vec![
+            WebSearchResult {
+                title: "Fourth Result".to_string(),
+                url: "https://example.com/4".to_string(),
+                snippet: "Fourth snippet".to_string(),
+            },
+            WebSearchResult {
+                title: "Fifth Result".to_string(),
+                url: "https://example.com/5".to_string(),
+                snippet: "Fifth snippet".to_string(),
+            },
+        ];
+
+        // First search: registry starts None, should create new registry
+        let mut registry: Option<SourceRegistry> = None;
+        let first_offset = registry.as_ref().map(|r| r.web_sources.len()).unwrap_or(0);
+        assert_eq!(first_offset, 0, "First search should have offset 0");
+
+        // Create registry with first search results
+        if let Some(ref mut reg) = registry {
+            reg.web_sources.extend(first_search_results.clone());
+        } else {
+            registry = Some(SourceRegistry::with_results(first_search_results.clone()));
+        }
+        assert_eq!(
+            registry.as_ref().unwrap().web_sources.len(),
+            3,
+            "Registry should have 3 results after first search"
+        );
+
+        // Second search: registry exists, should accumulate
+        let second_offset = registry.as_ref().map(|r| r.web_sources.len()).unwrap_or(0);
+        assert_eq!(second_offset, 3, "Second search should have offset 3");
+
+        // Accumulate second search results
+        if let Some(ref mut reg) = registry {
+            reg.web_sources.extend(second_search_results.clone());
+        }
+        assert_eq!(
+            registry.as_ref().unwrap().web_sources.len(),
+            5,
+            "Registry should have 5 results after second search"
+        );
+
+        // Verify correct indices
+        let final_registry = registry.unwrap();
+        assert_eq!(
+            final_registry.web_sources[0].title, "First Result",
+            "Index 0 should be first result"
+        );
+        assert_eq!(
+            final_registry.web_sources[1].title, "Second Result",
+            "Index 1 should be second result"
+        );
+        assert_eq!(
+            final_registry.web_sources[2].title, "Third Result",
+            "Index 2 should be third result"
+        );
+        assert_eq!(
+            final_registry.web_sources[3].title, "Fourth Result",
+            "Index 3 should be fourth result"
+        );
+        assert_eq!(
+            final_registry.web_sources[4].title, "Fifth Result",
+            "Index 4 should be fifth result"
+        );
+
+        // Verify that searching for index 0 gets first result
+        assert_eq!(
+            final_registry.web_sources.first().unwrap().url,
+            "https://example.com/1"
+        );
+        // Verify that searching for index 3 gets fourth result
+        assert_eq!(final_registry.web_sources[3].url, "https://example.com/4");
     }
 
     #[test]

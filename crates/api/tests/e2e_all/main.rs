@@ -105,6 +105,7 @@ mod rerank;
 mod responses_client_tools;
 mod responses_contract;
 mod responses_failed;
+mod responses_hosted_search;
 mod responses_native;
 mod responses_stateless;
 mod score;
@@ -124,6 +125,8 @@ mod usage_responses;
 mod user_erasure;
 mod user_erasure_lookup;
 mod vpc_login;
+mod web_context_search;
+mod web_search_citations;
 /// Run by nextest's setup script after this E2E binary has already been built.
 /// Keeping bootstrap in the same binary avoids a second cold compile/link in CI.
 #[tokio::test]

@@ -361,9 +361,8 @@ fn native_keeps_custom_constraints_and_reasoning_while_promoting_lite_tools() {
 }
 
 #[test]
-fn native_and_chat_validation_reject_hosted_tools_even_inside_namespaces() {
+fn unsupported_hosted_tools_remain_rejected_on_both_transports() {
     for kind in [
-        "web_search",
         "file_search",
         "mcp",
         "code_interpreter",
@@ -382,5 +381,120 @@ fn native_and_chat_validation_reject_hosted_tools_even_inside_namespaces() {
             ]}))
             .is_err());
         }
+    }
+}
+
+#[test]
+fn typed_search_preserves_configuration_alongside_namespaced_client_tools() {
+    for count in [None, Some(0), Some(5), Some(20)] {
+        let mut search = json!({
+            "type": "web_search", "filters": {"allowed_domains": ["example.com"]},
+            "search_context_size": "small", "user_location": {"type": "approximate", "country": "US"}
+        });
+        if let Some(count) = count {
+            search["count"] = json!(count);
+        }
+        let tools = vec![
+            search.clone(),
+            namespace("client", vec![custom("exec")]),
+            json!({"type": "web_context_search"}),
+        ];
+        let (normalized, adapter) = normalize_request(request(tools.clone())).unwrap();
+        assert_eq!(normalized["tools"][0], search);
+        assert_eq!(
+            normalized["tools"][2],
+            json!({"type": "web_context_search"})
+        );
+        assert_eq!(normalized["tools"][1]["type"], "function");
+        let typed: crate::responses::models::CreateResponseRequest =
+            serde_json::from_value(normalized.clone()).unwrap();
+        assert!(typed.validate().is_ok());
+        assert!(typed.validate_stateless().is_ok());
+        let restored = adapter
+            .response(json!({"output": [], "tools": normalized["tools"]}))
+            .unwrap();
+        assert_eq!(restored["tools"], json!(tools));
+        assert!(normalize_native_request(request(tools)).is_err());
+    }
+}
+
+#[test]
+fn search_is_not_allowed_inside_client_namespaces_or_on_native_transport() {
+    for kind in ["web_search", "web_context_search"] {
+        let search = json!({"type": kind});
+        assert!(normalize_request(request(vec![search.clone()])).is_ok());
+        assert!(validate_native_tools(&request(vec![search.clone()])).is_err());
+        assert!(normalize_native_request(request(vec![search.clone()])).is_err());
+        assert!(
+            normalize_request(request(vec![namespace("client", vec![search.clone()])])).is_err()
+        );
+        assert!(normalize_native_request(json!({"model": "test", "input": [
+            {"type": "additional_tools", "role": "developer", "tools": [search]}
+        ]}))
+        .is_err());
+    }
+}
+
+#[test]
+fn search_name_collisions_are_rejected_without_reserving_client_names() {
+    for kind in ["web_search", "web_context_search"] {
+        let search = json!({"type": kind});
+        for tools in [
+            vec![search.clone(), function(kind)],
+            vec![function(kind), search.clone()],
+        ] {
+            assert!(normalize_request(request(tools))
+                .unwrap_err()
+                .contains("conflicts"));
+        }
+        let (client_only, _) = normalize_request(request(vec![function(kind)])).unwrap();
+        assert_eq!(client_only["tools"][0], function(kind));
+        let (namespaced, _) = normalize_request(request(vec![
+            search.clone(),
+            namespace("client", vec![function(kind)]),
+        ]))
+        .unwrap();
+        assert_ne!(namespaced["tools"][1]["name"], kind);
+        let (custom_tool, _) =
+            normalize_request(request(vec![search.clone(), custom(kind)])).unwrap();
+        assert_ne!(custom_tool["tools"][1]["name"], kind);
+    }
+}
+
+#[test]
+fn named_function_choice_can_select_a_declared_cloud_search() {
+    for kind in ["web_search", "web_context_search"] {
+        for choice in [
+            json!({"type": "function", "name": kind}),
+            json!({"type": "function", "function": {"name": kind}}),
+        ] {
+            let mut body = request(vec![json!({"type": kind})]);
+            body["tool_choice"] = choice;
+            let (normalized, _) = normalize_request(body).unwrap();
+            assert_eq!(
+                normalized["tool_choice"],
+                json!({"type": "function", "function": {"name": kind}})
+            );
+        }
+    }
+}
+
+#[test]
+fn completed_search_replay_keeps_assistant_context_without_tool_history() {
+    let answer = json!({"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "An answer with sources.", "annotations": []}]});
+    let next = json!({"role": "user", "content": "A follow-up."});
+    let marker = json!({"type": "web_search_call", "id": "ws_old", "status": "completed", "action": {"type": "search", "query": "Synthetic query"}});
+    let (normalized, _) =
+        normalize_request(json!({"model": "test", "input": [marker, answer, next]})).unwrap();
+    assert_eq!(normalized["input"], json!([answer, next]));
+    let typed: crate::responses::models::CreateResponseRequest =
+        serde_json::from_value(normalized).unwrap();
+    assert!(typed.validate().is_ok());
+    assert!(typed.validate_stateless().is_ok());
+    for status in ["in_progress", "failed", "searching"] {
+        assert!(normalize_request(json!({"model": "test", "input": [
+            {"type": "web_search_call", "id": "ws_old", "status": status}
+        ]}))
+        .is_err());
     }
 }

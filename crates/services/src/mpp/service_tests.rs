@@ -396,7 +396,8 @@ fn tampered_challenge_fields_are_invalid_challenge() {
     .to_b64()
     .unwrap();
     let later = (challenge.expires + ChronoDuration::hours(5)).to_rfc3339();
-    let edits: Vec<(&str, Box<dyn Fn(&mut serde_json::Value)>)> = vec![
+    type Edit = Box<dyn Fn(&mut serde_json::Value)>;
+    let edits: Vec<(&str, Edit)> = vec![
         (
             "request",
             Box::new(move |c| c["challenge"]["request"] = json!(other_request.clone())),

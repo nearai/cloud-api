@@ -222,7 +222,8 @@ mod tests {
 
     #[test]
     fn rejects_malformed_receipts_instead_of_defaulting() {
-        let cases: Vec<(&str, Box<dyn Fn(&mut Value)>)> = vec![
+        type Edit = Box<dyn Fn(&mut Value)>;
+        let cases: Vec<(&str, Edit)> = vec![
             (
                 "status missing",
                 Box::new(|v| {

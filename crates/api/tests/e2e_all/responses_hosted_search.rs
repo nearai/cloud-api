@@ -425,7 +425,7 @@ async fn failed_search_emits_failure_with_usage_and_does_not_start_another_infer
                 let failed = events.last().unwrap();
                 assert_eq!(failed["type"], "response.failed");
                 assert_eq!(failed["response"]["status"], "failed");
-                assert_eq!(failed["response"]["error"]["type"], "server_error");
+                assert_eq!(failed["response"]["error"]["type"], "internal_server_error");
                 assert_eq!(failed["response"]["usage"]["output_tokens"], 2);
                 assert!(events
                     .iter()
@@ -437,7 +437,10 @@ async fn failed_search_emits_failure_with_usage_and_does_not_start_another_infer
                 assert_no_history(&database, &failed["response"]).await;
             } else {
                 assert_eq!(result.status_code(), 500);
-                assert_eq!(result.json::<Value>()["error"]["type"], "server_error");
+                assert_eq!(
+                    result.json::<Value>()["error"]["type"],
+                    "internal_server_error"
+                );
             }
         }
         assert_eq!(mock.chat_completion_call_count(), 2);
@@ -470,7 +473,7 @@ async fn repeated_searches_stop_at_the_request_round_limit() {
     let events = events(&result.text());
     let failed = events.last().unwrap();
     assert_eq!(failed["type"], "response.failed");
-    assert_eq!(failed["response"]["error"]["type"], "server_error");
+    assert_eq!(failed["response"]["error"]["type"], "internal_server_error");
     assert_eq!(mock.chat_completion_call_count(), 10);
     assert_eq!(provider.web_params.lock().unwrap().len(), 10);
     assert_eq!(failed["response"]["usage"]["output_tokens"], 20);

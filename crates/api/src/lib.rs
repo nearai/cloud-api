@@ -555,14 +555,15 @@ pub async fn init_domain_services_with_pool(
     let user_service = Arc::new(services::user::UserService::new(user_repo, session_repo))
         as Arc<dyn services::user::UserServiceTrait + Send + Sync>;
 
-    // Create S3 storage and file service (must be created before response service)
+    // Create S3 storage and FileService for temporary authenticated read views
+    // and retained per-file delete operations.
     let s3_storage: Arc<dyn services::files::storage::StorageTrait> = if config.s3.mock {
-        tracing::info!("Using mock S3 storage for file uploads");
+        tracing::info!("Using mock S3 storage for temporary file views and deletes");
         Arc::new(services::files::storage::MockStorage::new(
             config.s3.encryption_key.clone(),
         ))
     } else {
-        tracing::info!("Using real S3 storage for file uploads");
+        tracing::info!("Using real S3 storage for temporary file views and deletes");
         let s3_config = aws_config::load_from_env().await;
         let s3_client = aws_sdk_s3::Client::new(&s3_config);
 
@@ -583,12 +584,7 @@ pub async fn init_domain_services_with_pool(
     )) as Arc<dyn services::files::FileServiceTrait + Send + Sync>;
 
     let response_service = Arc::new(services::ResponseService::new(
-        response_repo,
-        response_items_repo.clone(),
-        inference_provider_pool.clone(),
-        conversation_service.clone(),
         completion_service.clone(),
-        files_service.clone(), // file_service
         organization_service.clone(),
         Some(web_search_provider.clone()),
         Some(web_context_search_provider),
@@ -729,9 +725,7 @@ pub async fn init_domain_services_with_mcp_factory(
     .await
 }
 
-/// Like `init_domain_services_with_pool` but use the given web search provider (for tests with mock).
-/// Rebuilds response_service so both the standalone web search route and Response API (web search
-/// tool) use the mock; otherwise response_service would still hold the original Brave provider.
+/// Inject a web search provider into the standalone MCP route and hosted Responses search.
 pub async fn init_domain_services_with_pool_and_web_search_provider(
     database: Arc<Database>,
     config: &ApiConfig,
@@ -765,28 +759,17 @@ pub async fn init_domain_services_with_pool_and_search_providers(
     >,
 ) -> DomainServices {
     let mut domain_services = init_domain_services_with_pool(
-        database.clone(),
+        database,
         config,
         organization_service.clone(),
-        inference_provider_pool.clone(),
+        inference_provider_pool,
         metrics_service,
         None,
     )
     .await;
 
-    let response_repo = Arc::new(database::PgResponseRepository::new(database.pool().clone()));
-    let response_items_repo = Arc::new(database::PgResponseItemsRepository::new(
-        database.pool().clone(),
-    ))
-        as Arc<dyn services::responses::ports::ResponseItemRepositoryTrait>;
-
     let response_service = Arc::new(services::ResponseService::new(
-        response_repo,
-        response_items_repo,
-        inference_provider_pool,
-        domain_services.conversation_service.clone(),
         domain_services.completion_service.clone(),
-        domain_services.files_service.clone(),
         organization_service,
         Some(web_search_provider.clone()),
         web_context_search_provider,

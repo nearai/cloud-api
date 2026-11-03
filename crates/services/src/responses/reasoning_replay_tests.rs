@@ -106,7 +106,6 @@ async fn replayed_reasoning_is_context_only_and_never_new_output() {
         &items,
         response_id.clone(),
         key,
-        None,
         &input,
         "test",
         None,

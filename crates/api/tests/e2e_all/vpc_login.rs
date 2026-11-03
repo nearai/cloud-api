@@ -1,5 +1,6 @@
 use crate::common::*;
 use api::routes::auth_vpc::VpcLoginResponse;
+use axum::http::StatusCode;
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 use std::fs;
@@ -394,4 +395,89 @@ async fn test_vpc_login_missing_fields() {
     );
 
     println!("✅ Correctly rejected requests with missing fields");
+}
+
+#[tokio::test]
+async fn test_vpc_login_rejects_client_id_with_at_sign() {
+    let _guard = setup_vpc_shared_secret("test_vpc_secret_123");
+    let server = setup_test_server().await;
+    let timestamp = chrono::Utc::now().timestamp();
+    let request = serde_json::json!({
+        "timestamp": timestamp,
+        "signature": generate_vpc_signature(timestamp, "test_vpc_secret_123"),
+        "client_id": "attacker@test.com"
+    });
+
+    let response = server.post("/v1/auth/vpc/login").json(&request).await;
+    assert_eq!(response.status_code(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn test_vpc_login_rejects_client_id_with_invalid_characters() {
+    let _guard = setup_vpc_shared_secret("test_vpc_secret_123");
+    let server = setup_test_server().await;
+    create_org(&server).await;
+    let timestamp = chrono::Utc::now().timestamp();
+    let signature = generate_vpc_signature(timestamp, "test_vpc_secret_123");
+
+    for client_id in [
+        "bad client",
+        "bad/client",
+        "bad\nclient",
+        "...",
+        &"a".repeat(65),
+    ] {
+        let request = serde_json::json!({
+            "timestamp": timestamp,
+            "signature": signature,
+            "client_id": client_id
+        });
+        let response = server.post("/v1/auth/vpc/login").json(&request).await;
+        assert_eq!(
+            response.status_code(),
+            StatusCode::BAD_REQUEST,
+            "{client_id:?}"
+        );
+    }
+
+    let request = serde_json::json!({
+        "timestamp": timestamp,
+        "signature": signature,
+        "client_id": "chat-api-client"
+    });
+    let response = server.post("/v1/auth/vpc/login").json(&request).await;
+    assert_eq!(response.status_code(), StatusCode::OK);
+
+    let request = serde_json::json!({
+        "timestamp": timestamp,
+        "signature": signature,
+        "client_id": "a".repeat(64)
+    });
+    let response = server.post("/v1/auth/vpc/login").json(&request).await;
+    assert_eq!(response.status_code(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_vpc_session_is_never_admin() {
+    let _guard = setup_vpc_shared_secret("test_vpc_secret_123");
+    let server = setup_test_server_with_config(|config| {
+        config.auth.mock = false;
+        config.auth.admin_domains = vec!["vpc.internal.near.ai".to_string()];
+    })
+    .await;
+    let timestamp = chrono::Utc::now().timestamp();
+    let request = serde_json::json!({
+        "timestamp": timestamp,
+        "signature": generate_vpc_signature(timestamp, "test_vpc_secret_123"),
+        "client_id": "admin-probe"
+    });
+    let login_response = server.post("/v1/auth/vpc/login").json(&request).await;
+    assert_eq!(login_response.status_code(), StatusCode::OK);
+    let login = login_response.json::<VpcLoginResponse>();
+
+    let admin_response = server
+        .get("/v1/admin/models")
+        .add_header("Authorization", format!("Bearer {}", login.access_token))
+        .await;
+    assert_eq!(admin_response.status_code(), StatusCode::FORBIDDEN);
 }

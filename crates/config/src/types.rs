@@ -1129,19 +1129,35 @@ impl AuthConfig {
 
     /// Check if an email address belongs to an admin domain
     pub fn is_admin_email(&self, email: &str) -> bool {
-        if self.admin_domains.is_empty() {
-            return false;
-        }
-
-        // Extract domain from email (everything after @)
-        if let Some(domain) = email.split('@').nth(1) {
-            self.admin_domains
-                .iter()
-                .any(|admin_domain| domain.eq_ignore_ascii_case(admin_domain))
-        } else {
-            false
-        }
+        email_matches_admin_domain(&self.admin_domains, email)
     }
+}
+
+pub fn email_matches_admin_domain(admin_domains: &[String], email: &str) -> bool {
+    if admin_domains.is_empty() {
+        return false;
+    }
+
+    admin_email_domain(email).is_some_and(|domain| {
+        admin_domains
+            .iter()
+            .any(|admin_domain| domain.eq_ignore_ascii_case(admin_domain))
+    })
+}
+
+/// The domain of a well-formed email: exactly one `@`, a non-empty local part and a non-empty
+/// domain with no whitespace or control characters. Anything else is `None`, so an email such
+/// as `x@near.ai@vpc.internal.near.ai` can never match an admin domain.
+pub fn admin_email_domain(email: &str) -> Option<&str> {
+    let (local_part, domain) = email.split_once('@')?;
+    if local_part.is_empty()
+        || domain.is_empty()
+        || domain.contains('@')
+        || email.chars().any(|c| c.is_whitespace() || c.is_control())
+    {
+        return None;
+    }
+    Some(domain)
 }
 
 #[derive(Debug, Clone)]
@@ -1936,8 +1952,74 @@ mod tests {
         // Test non-admin domains
         assert!(!config.is_admin_email("user@example.com"));
         assert!(!config.is_admin_email("attacker@near.ai.evil.com"));
+        for email in [
+            "x@near.ai@vpc.internal.near.ai",
+            "x@evil.com@near.ai",
+            "x@near.ai@",
+            "x@near.ai.",
+            "x@nеar.ai",
+            "x@near.ai ",
+            "@near.ai",
+            "x@",
+            "near.ai",
+            "x y@near.ai",
+            "x@near.ai\n",
+        ] {
+            assert!(!config.is_admin_email(email), "{email:?} must not be admin");
+        }
+        assert!(config.is_admin_email("x@NEAR.AI"));
+        assert!(config.is_admin_email("x@near.ai"));
         assert!(!config.is_admin_email("invalid-email"));
         assert!(!config.is_admin_email(""));
+    }
+
+    #[test]
+    fn test_admin_email_domain() {
+        assert_eq!(admin_email_domain("x@near.ai"), Some("near.ai"));
+        assert_eq!(admin_email_domain("x@NEAR.AI"), Some("NEAR.AI"));
+        assert_eq!(admin_email_domain("x@near.ai."), Some("near.ai."));
+        assert_eq!(admin_email_domain("x@nеar.ai"), Some("nеar.ai"));
+        for email in [
+            "x@near.ai@vpc.internal.near.ai",
+            "x@evil.com@near.ai",
+            "x@near.ai@",
+            "@near.ai",
+            "x@",
+            "near.ai",
+            "x y@near.ai",
+            "x@near.ai\n",
+            "x@near.ai ",
+        ] {
+            assert_eq!(admin_email_domain(email), None, "{email:?}");
+        }
+    }
+
+    #[test]
+    fn test_email_matches_admin_domain() {
+        let admin_domains = vec!["near.ai".to_string(), "near.org".to_string()];
+        for email in ["alice@near.ai", "bob@near.org", "admin@NEAR.AI"] {
+            assert!(
+                email_matches_admin_domain(&admin_domains, email),
+                "{email:?}"
+            );
+        }
+        for email in [
+            "user@example.com",
+            "attacker@near.ai.evil.com",
+            "x@near.ai@vpc.internal.near.ai",
+            "x@evil.com@near.ai",
+            "x@near.ai.",
+            "x@nеar.ai",
+            "x@near.ai ",
+            "invalid-email",
+            "",
+        ] {
+            assert!(
+                !email_matches_admin_domain(&admin_domains, email),
+                "{email:?}"
+            );
+        }
+        assert!(!email_matches_admin_domain(&[], "admin@near.ai"));
     }
 
     #[test]

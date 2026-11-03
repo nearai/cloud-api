@@ -32,15 +32,13 @@ pub use client_tool_schema::{StatelessResponseToolSchema, StatelessToolChoiceSch
 /// prevents a completed inference response from being delivered.
 const RESPONSE_ATTESTATION_STORE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// OpenAPI view of the default typed stateless Responses adapter.
+/// OpenAPI view of the typed stateless Responses adapter for non-OpenAI models.
 ///
 /// The runtime request type keeps legacy variants so it can return a precise
-/// `invalid_request_error` for them. The typed adapter normalizes an omitted
-/// `store` to `false`. A canonical model explicitly listed in
-/// `NATIVE_RESPONSES_MODELS` uses the provider's native Responses transport
-/// only when `store: false` is explicitly supplied. That exception remains
-/// stateless and permits only client-managed tools, but can preserve
-/// validated provider-native fields that this typed schema does not model.
+/// `invalid_request_error` for them. Both transports normalize omitted or null
+/// `store` to `false`. Canonical `openai/` models use the provider's native
+/// Responses transport, which preserves validated provider-native fields
+/// outside this typed schema. Both paths permit only client-managed tools.
 #[derive(serde::Deserialize, utoipa::ToSchema)]
 pub struct StatelessCreateResponseRequestSchema {
     pub model: String,
@@ -617,24 +615,23 @@ pub async fn response_history_gone() -> axum::response::Response {
 ///
 /// Generate a single-turn, stateless AI response with optional streaming.
 ///
-/// The default typed adapter normalizes an omitted `store` to `false` and
-/// performs one Chat Completions inference. A canonical model explicitly
-/// allowlisted through `NATIVE_RESPONSES_MODELS` uses one native provider
-/// Responses inference only when `store: false` is explicitly supplied.
-/// Both paths keep no response/item history and never execute built-in,
-/// remote MCP, or agent-loop tools.
+/// Canonical `openai/` models use one native provider Responses inference.
+/// Other models use the typed adapter for one Chat Completions inference.
+/// Both paths normalize omitted or null `store` to `false`, keep no
+/// response/item history, and never execute built-in, remote MCP, or
+/// agent-loop tools.
 #[utoipa::path(
     post,
     path = "/v1/responses",
     tag = "Responses",
     request_body(
         content = serde_json::Value,
-        description = "Polymorphic stateless JSON request. The default typed adapter accepts the StatelessCreateResponseRequestSchema component and normalizes an omitted store to false. A canonical model allowlisted through NATIVE_RESPONSES_MODELS with explicit store: false instead accepts validated provider-native Responses fields. Both paths remain stateless and reject built-in and remote MCP tools."
+        description = "Polymorphic stateless JSON request. After alias resolution, canonical openai/ models accept validated provider-native Responses fields. Other models use the typed StatelessCreateResponseRequestSchema component. Both paths normalize omitted or null store to false, reject store: true, and reject built-in and remote MCP tools."
     ),
     responses(
         (
             status = 200,
-            description = "Polymorphic success response. The default typed adapter returns ResponseObject metadata with client-managed function/custom call items and optional namespaces as JSON for non-streaming requests. An allowlisted native request forwards its provider-native response shape, which can include native reasoning fields outside ResponseObject. Streaming requests use text/event-stream on either path.",
+            description = "Polymorphic success response. For non-OpenAI models, the typed adapter returns ResponseObject metadata with client-managed function/custom call items and optional namespaces as JSON for non-streaming requests. Canonical openai/ models forward the provider-native response shape, which can include native reasoning fields outside ResponseObject. Streaming requests use text/event-stream on either path.",
             content(
                 (serde_json::Value = "application/json"),
                 ("text/event-stream")
@@ -665,13 +662,26 @@ pub async fn create_response(
     if let Some(model) = body.get("model").and_then(|model| model.as_str()) {
         requested_model.set(model);
     }
-    let native = state
+    let native = match state
         .native_service
         .selected_model(
             &body,
             services::models::ModelCaller::Organization(api_key.organization.id.0),
         )
-        .await;
+        .await
+    {
+        Ok(model) => model,
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ResponseJson(ErrorResponse::new(
+                    "Failed to resolve model".to_string(),
+                    "api_error".to_string(),
+                )),
+            )
+                .into_response();
+        }
+    };
     if let Some(model) = native {
         return super::responses_native::handle(
             state.native_service,

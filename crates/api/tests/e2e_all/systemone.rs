@@ -522,12 +522,7 @@ async fn systemone_public_key_restricts_provider_fallback() {
 
 #[tokio::test]
 async fn systemone_rejects_invalid_requests_before_inference() {
-    let (server, pool, mock, _) = setup_test_server_with_pool_and_config(|config| {
-        // This regression covers the ordinary typed route, not the explicit
-        // native Responses allowlist exception.
-        config.native_responses_models.clear();
-    })
-    .await;
+    let (server, pool, mock, _) = setup_test_server_with_pool().await;
     let key = auth(&server).await;
     let (model, alias) = catalog(&server, None, true).await;
     let calls = Arc::new(AtomicUsize::new(0));
@@ -635,10 +630,7 @@ async fn systemone_rejects_invalid_requests_before_inference() {
 async fn typed_responses_prioritizes_systemone_for_dual_capability_models() {
     let model = format!("dual-capability-{}", uuid::Uuid::new_v4());
     let alias = format!("dual-capability-alias-{}", uuid::Uuid::new_v4());
-    let (server, _pool, mock, _) = setup_test_server_with_pool_and_config(|config| {
-        config.native_responses_models.clear();
-    })
-    .await;
+    let (server, _pool, mock, _) = setup_test_server_with_pool().await;
     catalog_with_names_and_output_modalities(
         &server,
         None,
@@ -943,13 +935,10 @@ async fn systemone_invalid_success_and_timeout_never_invoke_a_second_provider() 
 }
 
 #[tokio::test]
-async fn systemone_is_rejected_by_native_responses_even_when_allowlisted() {
-    let model = format!("native-decision-{}", uuid::Uuid::new_v4());
+async fn openai_systemone_is_rejected_by_native_responses() {
+    let model = format!("openai/native-decision-{}", uuid::Uuid::new_v4());
     let alias = format!("native-decision-alias-{}", uuid::Uuid::new_v4());
-    let (server, pool, _, _) = setup_test_server_with_pool_and_config(|config| {
-        config.native_responses_models = vec![model.clone()];
-    })
-    .await;
+    let (server, pool, _, _) = setup_test_server_with_pool().await;
     catalog_with_names(&server, None, true, model.clone(), alias.clone()).await;
     pool.register_provider(
         model.clone(),

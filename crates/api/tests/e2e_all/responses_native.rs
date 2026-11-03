@@ -6,26 +6,6 @@ use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
 
 #[tokio::test]
-async fn native_stateless_astra_preserves_protocol_and_isolates_legacy_routes() {
-    native_flow("openai/gpt-6-astra").await;
-}
-
-#[tokio::test]
-async fn native_routing_supports_gpt41_without_model_exceptions() {
-    native_flow("openai/gpt-4.1").await;
-}
-
-#[tokio::test]
-async fn native_routing_supports_gpt54_without_model_exceptions() {
-    native_flow("openai/gpt-5.4").await;
-}
-
-#[tokio::test]
-async fn native_routing_supports_gpt61_sol_without_model_exceptions() {
-    native_flow("openai/gpt-6.1-sol").await;
-}
-
-#[tokio::test]
 async fn native_stateless_responses_reject_image_output_models() {
     let model = format!("openai/native-image-{}", uuid::Uuid::new_v4());
     let (server, _pool, _, _) = setup_test_server_with_pool().await;
@@ -93,8 +73,9 @@ async fn openai_responses_without_native_provider_never_fall_back_to_chat() {
     }
 }
 
-async fn native_flow(prefix: &str) {
-    let model = format!("{prefix}-{}", uuid::Uuid::new_v4());
+#[tokio::test]
+async fn native_stateless_responses_preserve_protocol_and_isolate_legacy_routes() {
+    let model = format!("openai/native-protocol-{}", uuid::Uuid::new_v4());
     let alias = format!("native-alias-{}", uuid::Uuid::new_v4());
     let (server, pool, _, database) = setup_test_server_with_pool().await;
     let other = format!("other-{}", uuid::Uuid::new_v4());

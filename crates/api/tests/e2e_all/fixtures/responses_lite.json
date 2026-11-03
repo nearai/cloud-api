@@ -27,31 +27,6 @@
               }
             }
           ]
-        },
-        {
-          "type": "namespace",
-          "name": "clock",
-          "description": "Synthetic clock tools.",
-          "tools": [
-            {
-              "type": "function",
-              "name": "sleep",
-              "description": "Wait for a test duration.",
-              "strict": false,
-              "parameters": {
-                "type": "object",
-                "properties": {
-                  "duration_ms": {
-                    "type": "number"
-                  }
-                },
-                "required": [
-                  "duration_ms"
-                ],
-                "additionalProperties": false
-              }
-            }
-          ]
         }
       ]
     },

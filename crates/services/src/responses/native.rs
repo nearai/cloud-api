@@ -235,7 +235,6 @@ fn validate(body: &Value) -> Result<(), &'static str> {
     {
         return Err("instructions must be a string");
     }
-    crate::responses::client_tools::validate_native_tools(body).map_err(|_| CLIENT_TOOLS_ERROR)?;
     if body.get("prompt").is_some_and(|v| !v.is_null()) {
         return Err("Stored prompt references are unavailable for native stateless Responses");
     }

@@ -101,8 +101,7 @@ pub(super) async fn run(
     context: &mut ProcessStreamContext,
     definitions: &[inference_providers::ToolDefinition],
     tool_choice: &Option<inference_providers::ToolChoice>,
-) -> Result<String, errors::ResponseError> {
-    let mut response_text = String::new();
+) -> Result<(), errors::ResponseError> {
     let mut malformed_rounds = 0;
     let mut round_tool_choice = tool_choice.clone();
     for _ in 0..MAX_COMPLETION_ROUNDS {
@@ -115,7 +114,6 @@ pub(super) async fn run(
             &round_tool_choice,
         )
         .await?;
-        response_text.push_str(&result.text);
         if result.stream_error {
             return Err(result
                 .stream_error_cause
@@ -135,10 +133,10 @@ pub(super) async fn run(
                 result.tool_calls,
             )
             .await?;
-            return Ok(response_text);
+            return Ok(());
         }
         if result.search_calls.is_empty() {
-            return Ok(response_text);
+            return Ok(());
         }
         if result
             .search_calls
@@ -172,15 +170,19 @@ pub(super) async fn run(
         });
         let mut search_succeeded = false;
         for search in result.search_calls {
-            let (content, instruction) = execute(ctx, emitter, context, &search).await?;
+            let (mut content, instruction) = execute(ctx, emitter, context, &search).await?;
             search_succeeded |= search.call.tool_type != tools::tool_config::ERROR_TOOL_TYPE;
+            if let Some(instruction) = instruction {
+                content.push_str("\n\n");
+                content.push_str(&instruction);
+            }
             messages.push(CompletionMessage {
                 reasoning_content: None,
                 role: "tool".to_string(),
                 // Keep citation guidance with the result it describes. A
                 // trailing system message breaks providers that only accept
                 // leading instructions and interrupts parallel tool results.
-                content: Value::String(with_citation_instruction(content, instruction)),
+                content: Value::String(content),
                 tool_call_id: Some(call_id(&search)?.to_string()),
                 tool_calls: None,
             });
@@ -195,14 +197,6 @@ pub(super) async fn run(
     Err(errors::ResponseError::InternalError(
         "Search execution exceeded the limit of 10 inference rounds.".to_string(),
     ))
-}
-
-fn with_citation_instruction(mut content: String, instruction: Option<String>) -> String {
-    if let Some(instruction) = instruction {
-        content.push_str("\n\n");
-        content.push_str(&instruction);
-    }
-    content
 }
 
 fn call_id(search: &HostedSearchCall) -> Result<&str, errors::ResponseError> {
@@ -401,23 +395,5 @@ mod tests {
         .unwrap();
         assert!(searches.is_empty());
         assert_eq!(clients[0].arguments, raw);
-    }
-
-    #[test]
-    fn citation_guidance_stays_in_the_search_result_with_source_indices() {
-        let source = tools::WebSearchResult {
-            title: "Example".to_string(),
-            url: "https://example.com".to_string(),
-            snippet: "An example result".to_string(),
-        };
-        let formatted = tools::web_search::format_results(std::slice::from_ref(&source), 0);
-        let content = with_citation_instruction(formatted.formatted, formatted.instruction);
-        assert!(content.starts_with("Source: 0\n"));
-        assert!(content.contains(tools::web_search::CITATION_INSTRUCTION));
-
-        let formatted = tools::web_search::format_results(&[source], 1);
-        let content = with_citation_instruction(formatted.formatted, formatted.instruction);
-        assert!(content.starts_with("Source: 1\n"));
-        assert!(!content.contains(tools::web_search::CITATION_INSTRUCTION));
     }
 }

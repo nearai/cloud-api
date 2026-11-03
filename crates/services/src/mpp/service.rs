@@ -1,13 +1,18 @@
-//! `MppService`: price a request, issue a challenge, verify a credential without state, settle
-//! it against the chain and the single-use ledger.
+//! `MppService`: price a request, issue a challenge, verify a credential without state, check
+//! its payment on chain, and claim it against the single-use ledger.
 //!
-//! The flow around one request:
+//! The flow around one request, each step a separate call so the API layer can place the
+//! expensive and the irreversible ones where they belong:
 //!
 //! 1. [`MppService::price_body`]: is the model priced, and are the request limits respected?
 //! 2. [`MppService::challenge`]: a fresh HMAC-bound challenge for this body.
 //! 3. [`MppService::verify`]: stateless checks of the echoed challenge and the payload shape.
-//! 4. [`MppService::settle`]: chain verification, then the atomic claim.
-//! 5. [`MppService::finish`]: record whether the paid request was served.
+//! 4. [`MppService::verify_payment`]: the chain work (receipt lookup, or the pre-checked
+//!    broadcast) and the receipt verification. It claims nothing, so it can be repeated for
+//!    the same credential and runs before the service key is used.
+//! 5. [`MppService::claim`]: the atomic single-use claim, taken only once the request is
+//!    certain to reach the handler.
+//! 6. [`MppService::finish`]: record whether the paid request was served.
 //!
 //! Logs carry closed outcome codes only. No credential, header, transaction hash, payer
 //! address, `source` DID, request body or secret is ever logged or put in an error.
@@ -20,17 +25,18 @@ use std::time::Duration;
 use chrono::{DateTime, TimeZone, Utc};
 use config::{MppModelPrice, MppSettings};
 
-use super::ports::{
-    ClaimOutcome, PaymentClaimRepository, RpcError, RpcReceipt, ServeOutcome, TempoRpc,
-};
+use super::error::{MppError, VerifyFailure};
+use super::ports::{PaymentClaimRepository, TempoRpc};
 use super::pricing::{LimitViolation, Param, Price, Pricing, RequestShape};
 use super::protocol::{
     self, body_digest, opaque_for, opaque_route, parse_authorization, parse_source_did,
-    BoundFields, Challenge, ChargeRequest, PaymentPayload, ProblemCode, ProtocolError,
-    INTENT_CHARGE, METHOD,
+    BoundFields, Challenge, ChargeRequest, PaymentPayload, INTENT_CHARGE, METHOD,
 };
 use super::rpc::HttpTempoRpc;
-use super::tempo::{self, Expected, ReceiptVerdict};
+
+mod settlement;
+
+pub use settlement::{PaidCredential, ServingGuard, SettledPayment};
 
 /// The only route MPP serves.
 pub const CHAT_COMPLETIONS_ROUTE: &str = "/v1/chat/completions";
@@ -41,147 +47,11 @@ const DEFAULT_RECOVER_ATTEMPTS: u32 = 3;
 const DEFAULT_RECOVER_INTERVAL: Duration = Duration::from_millis(400);
 
 // ---------------------------------------------------------------------------------------
-// Errors
+// Verified credentials
 // ---------------------------------------------------------------------------------------
 
-/// Why chain verification failed in a way another payment (or a retry) can fix.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum VerifyFailure {
-    Reverted,
-    NoMatchingTransfer,
-    ReceiptNotFound,
-    ReceiptMismatch,
-    SourceChain,
-}
-
-/// Why a verified payment can not be used.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ConsumedReason {
-    AlreadyClaimed,
-    /// The funds moved but not for this challenge: paying again would not help.
-    MemoNotBound,
-}
-
-/// Which dependency was unreachable.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UnavailableReason {
-    Rpc,
-    Store,
-}
-
-/// Every way MPP processing can end other than success. Variants carry closed reasons only.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub enum MppError {
-    #[error("malformed credential")]
-    Malformed(&'static str),
-    #[error("method unsupported")]
-    MethodUnsupported,
-    #[error("invalid challenge")]
-    InvalidChallenge(&'static str),
-    #[error("challenge expired")]
-    Expired,
-    #[error("payment verification failed")]
-    VerificationFailed(VerifyFailure),
-    #[error("payment already used")]
-    Consumed(ConsumedReason),
-    #[error("payment backend unavailable")]
-    Unavailable(UnavailableReason),
-    #[error("request limit violated")]
-    Limit(LimitViolation),
-    #[error("invalid MPP configuration")]
-    Config,
-}
-
-impl MppError {
-    /// Closed code for logs and metrics.
-    pub fn kind(&self) -> &'static str {
-        match self {
-            Self::Malformed(_) => "malformed_credential",
-            Self::MethodUnsupported => "method_unsupported",
-            Self::InvalidChallenge(_) => "invalid_challenge",
-            Self::Expired => "payment_expired",
-            Self::VerificationFailed(VerifyFailure::Reverted) => "tx_reverted",
-            Self::VerificationFailed(VerifyFailure::NoMatchingTransfer) => "no_matching_transfer",
-            Self::VerificationFailed(VerifyFailure::ReceiptNotFound) => "receipt_not_found",
-            Self::VerificationFailed(VerifyFailure::ReceiptMismatch) => "receipt_mismatch",
-            Self::VerificationFailed(VerifyFailure::SourceChain) => "source_chain_mismatch",
-            Self::Consumed(ConsumedReason::AlreadyClaimed) => "already_claimed",
-            Self::Consumed(ConsumedReason::MemoNotBound) => "memo_not_bound",
-            Self::Unavailable(UnavailableReason::Rpc) => "rpc_unavailable",
-            Self::Unavailable(UnavailableReason::Store) => "store_unavailable",
-            Self::Limit(limit) => limit.code(),
-            Self::Config => "config",
-        }
-    }
-
-    /// The HTTP status to answer with.
-    pub fn status(&self) -> u16 {
-        match self {
-            Self::MethodUnsupported | Self::Limit(_) => 400,
-            Self::Malformed(_)
-            | Self::InvalidChallenge(_)
-            | Self::Expired
-            | Self::VerificationFailed(_) => 402,
-            Self::Consumed(_) => 403,
-            Self::Unavailable(_) | Self::Config => 503,
-        }
-    }
-
-    /// The RFC 9457 problem type, when the error is answered with one.
-    pub fn problem(&self) -> Option<ProblemCode> {
-        match self {
-            Self::Malformed(_) => Some(ProblemCode::MalformedCredential),
-            Self::MethodUnsupported => Some(ProblemCode::MethodUnsupported),
-            Self::InvalidChallenge(_) => Some(ProblemCode::InvalidChallenge),
-            Self::Expired => Some(ProblemCode::PaymentExpired),
-            Self::VerificationFailed(_) | Self::Consumed(_) => {
-                Some(ProblemCode::VerificationFailed)
-            }
-            Self::Unavailable(_) | Self::Limit(_) | Self::Config => None,
-        }
-    }
-
-    /// Whether the response carries a fresh challenge (every 402).
-    pub fn carries_challenge(&self) -> bool {
-        self.status() == 402
-    }
-
-    /// A fixed, input-free sentence for the problem `detail`.
-    pub fn detail(&self) -> &'static str {
-        match self {
-            Self::Malformed(_) => "The Payment credential could not be read.",
-            Self::MethodUnsupported => "This payment method is not supported.",
-            Self::InvalidChallenge(_) => {
-                "The challenge in the credential is not valid for this request."
-            }
-            Self::Expired => "The challenge has expired.",
-            Self::VerificationFailed(VerifyFailure::ReceiptNotFound) => {
-                "The transaction was not found or is not yet mined."
-            }
-            Self::VerificationFailed(_) => "Payment verification failed.",
-            Self::Consumed(_) => "This payment has already been used.",
-            Self::Unavailable(_) | Self::Config => {
-                "Payment verification is temporarily unavailable."
-            }
-            Self::Limit(_) => "The request is not eligible for payment.",
-        }
-    }
-}
-
-impl From<ProtocolError> for MppError {
-    fn from(error: ProtocolError) -> Self {
-        match error {
-            ProtocolError::Malformed(reason) => Self::Malformed(reason),
-            ProtocolError::MethodUnsupported => Self::MethodUnsupported,
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------------------
-// Verified and settled payments
-// ---------------------------------------------------------------------------------------
-
-/// A credential that passed the stateless checks. Not yet paid: see [`MppService::settle`].
+/// A credential that passed the stateless checks. Not yet shown to be paid: see
+/// [`MppService::verify_payment`].
 #[derive(Clone)]
 pub struct VerifiedCredential {
     challenge_id: String,
@@ -191,12 +61,13 @@ pub struct VerifiedCredential {
     source: Option<[u8; 20]>,
 }
 
+#[cfg(test)]
 impl VerifiedCredential {
-    pub fn challenge_id(&self) -> &str {
+    fn challenge_id(&self) -> &str {
         &self.challenge_id
     }
 
-    pub fn amount(&self) -> u128 {
+    fn amount(&self) -> u128 {
         self.amount
     }
 }
@@ -204,31 +75,6 @@ impl VerifiedCredential {
 impl fmt::Debug for VerifiedCredential {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("VerifiedCredential { .. }")
-    }
-}
-
-/// A payment that is claimed: the request may be served.
-#[derive(Clone, PartialEq, Eq)]
-pub struct SettledPayment {
-    payment_key: String,
-    reference: String,
-}
-
-impl SettledPayment {
-    /// `Payment-Receipt` header value for this payment.
-    pub fn receipt_header(&self, at: DateTime<Utc>) -> Result<String, MppError> {
-        protocol::format_receipt(&self.reference, at).map_err(|_| MppError::Config)
-    }
-
-    /// The claim key, `tempo:` and a 64-hex keyed digest. For the claim store only.
-    pub fn payment_key(&self) -> &str {
-        &self.payment_key
-    }
-}
-
-impl fmt::Debug for SettledPayment {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("SettledPayment { .. }")
     }
 }
 
@@ -254,6 +100,8 @@ pub struct MppService {
     rpc: Arc<dyn TempoRpc>,
     recover_attempts: u32,
     recover_interval: Duration,
+    /// The whole receipt phase of `verify_payment` (broadcast, lookups, polls) ends here.
+    receipt_deadline: Duration,
 }
 
 impl fmt::Debug for MppService {
@@ -306,6 +154,10 @@ impl MppService {
             rpc,
             recover_attempts: DEFAULT_RECOVER_ATTEMPTS,
             recover_interval: DEFAULT_RECOVER_INTERVAL,
+            // One call per RPC timeout, and a lookup phase after a failed broadcast: two
+            // timeouts bound the phase however the node behaves.
+            receipt_deadline: Duration::from_secs(settings.tempo.rpc_timeout_secs)
+                .saturating_mul(2),
         })
     }
 
@@ -329,8 +181,10 @@ impl MppService {
         self
     }
 
-    pub fn realm(&self) -> &str {
-        &self.realm
+    /// Change the deadline of the whole receipt phase of [`Self::verify_payment`].
+    pub fn with_receipt_deadline(mut self, deadline: Duration) -> Self {
+        self.receipt_deadline = deadline;
+        self
     }
 
     /// The `sk-` key MPP traffic is authenticated and metered under.
@@ -443,8 +297,8 @@ impl MppService {
         })
     }
 
-    /// Price `body` and issue its challenge: [`MppError::NotPriced`] / [`MppError::Limit`]
-    /// when it cannot be paid for this way.
+    /// Price `body` and issue its challenge: [`MppError::Limit`] when it cannot be paid for
+    /// this way (an unpriced model is [`LimitViolation::ModelNotPriced`]).
     pub fn challenge_for_body(&self, route: &str, body: &[u8]) -> Result<Challenge, MppError> {
         match self.price_body(body) {
             Pricing::Priced(price) => self.challenge(route, body, &price),
@@ -532,175 +386,6 @@ impl MppService {
             payload: credential.payload,
             source,
         })
-    }
-
-    // ----- settle -----
-
-    /// Verify the payment on chain, then claim it. [`MppError::VerificationFailed`] is
-    /// retryable with a new payment, [`MppError::Consumed`] is final, and
-    /// [`MppError::Unavailable`] means the RPC or the store could not answer.
-    pub async fn settle(&self, verified: &VerifiedCredential) -> Result<SettledPayment, MppError> {
-        let receipt = self.receipt_for(verified).await?;
-        let expected = Expected {
-            currency: self.currency,
-            recipient: self.recipient,
-            amount: verified.amount,
-            source: verified.source,
-            realm: &self.realm,
-            challenge_id: &verified.challenge_id,
-        };
-        tempo::verify_receipt(&receipt, &expected).map_err(|verdict| match verdict {
-            ReceiptVerdict::Reverted => MppError::VerificationFailed(VerifyFailure::Reverted),
-            ReceiptVerdict::NoMatchingTransfer => {
-                MppError::VerificationFailed(VerifyFailure::NoMatchingTransfer)
-            }
-            ReceiptVerdict::MemoNotBound => MppError::Consumed(ConsumedReason::MemoNotBound),
-        })?;
-
-        let reference = format!("0x{}", hex::encode(receipt.tx_hash));
-        let payment_key = protocol::payment_key(&self.secret_key, &receipt.tx_hash)
-            .map_err(|_| MppError::Config)?;
-        match self.repo.claim(&payment_key, &verified.challenge_id).await {
-            Ok(ClaimOutcome::Claimed) => Ok(SettledPayment {
-                payment_key,
-                reference,
-            }),
-            Ok(ClaimOutcome::AlreadyUsed) => {
-                Err(MppError::Consumed(ConsumedReason::AlreadyClaimed))
-            }
-            Err(_) => {
-                tracing::error!(outcome = "store_unavailable", "MPP claim failed");
-                Err(MppError::Unavailable(UnavailableReason::Store))
-            }
-        }
-    }
-
-    async fn receipt_for(&self, verified: &VerifiedCredential) -> Result<RpcReceipt, MppError> {
-        match &verified.payload {
-            PaymentPayload::Hash(hash) => match self.rpc.get_transaction_receipt(*hash).await {
-                Ok(Some(receipt)) if receipt.tx_hash == *hash => Ok(receipt),
-                Ok(Some(_)) => Err(MppError::VerificationFailed(VerifyFailure::ReceiptMismatch)),
-                Ok(None) => Err(MppError::VerificationFailed(VerifyFailure::ReceiptNotFound)),
-                Err(error) => Err(rpc_unavailable(error)),
-            },
-            PaymentPayload::Transaction(raw) => {
-                // The window to broadcast is the challenge's lifetime.
-                if verified.expires_at <= Utc::now() {
-                    return Err(MppError::Expired);
-                }
-                match self.rpc.send_raw_transaction_sync(raw).await {
-                    Ok(receipt) => Ok(receipt),
-                    Err(send_error) => {
-                        self.recover_receipt(tempo::transaction_hash(raw), send_error)
-                            .await
-                    }
-                }
-            }
-        }
-    }
-
-    /// The broadcast failed: the node may still hold the transaction (already known, or mined
-    /// before its reply failed). Look the receipt up by `keccak256(raw)` a few times. With no
-    /// receipt, a node that refused the transaction means a retryable 402; an unreachable one
-    /// means unavailable.
-    async fn recover_receipt(
-        &self,
-        hash: [u8; 32],
-        send_error: RpcError,
-    ) -> Result<RpcReceipt, MppError> {
-        let mut lookup_failed = false;
-        for attempt in 0..self.recover_attempts {
-            if attempt > 0 {
-                tokio::time::sleep(self.recover_interval).await;
-            }
-            match self.rpc.get_transaction_receipt(hash).await {
-                Ok(Some(receipt)) if receipt.tx_hash == hash => return Ok(receipt),
-                Ok(Some(_)) => {
-                    return Err(MppError::VerificationFailed(VerifyFailure::ReceiptMismatch))
-                }
-                Ok(None) => lookup_failed = false,
-                Err(_) => lookup_failed = true,
-            }
-        }
-        if lookup_failed || send_error != RpcError::Rejected {
-            tracing::warn!(outcome = "rpc_unavailable", "MPP broadcast failed");
-            return Err(MppError::Unavailable(UnavailableReason::Rpc));
-        }
-        Err(MppError::VerificationFailed(VerifyFailure::ReceiptNotFound))
-    }
-
-    // ----- finish -----
-
-    /// Record how the paid request ended. An error leaves the claim `serving`; callers log it.
-    pub async fn finish(
-        &self,
-        payment: &SettledPayment,
-        outcome: ServeOutcome,
-    ) -> Result<(), MppError> {
-        self.repo
-            .finish(&payment.payment_key, outcome)
-            .await
-            .map_err(|_| MppError::Unavailable(UnavailableReason::Store))
-    }
-
-    /// A guard that marks `payment` served if it is dropped before [`ServingGuard::finish`]
-    /// (the client disconnected and the handler future was cancelled).
-    pub fn serving(self: &Arc<Self>, payment: SettledPayment) -> ServingGuard {
-        ServingGuard {
-            service: self.clone(),
-            payment: Some(payment),
-        }
-    }
-}
-
-fn rpc_unavailable(_error: RpcError) -> MppError {
-    tracing::warn!(outcome = "rpc_unavailable", "MPP receipt lookup failed");
-    MppError::Unavailable(UnavailableReason::Rpc)
-}
-
-/// Holds a claimed payment while its request is served.
-pub struct ServingGuard {
-    service: Arc<MppService>,
-    payment: Option<SettledPayment>,
-}
-
-impl ServingGuard {
-    pub fn payment(&self) -> Option<&SettledPayment> {
-        self.payment.as_ref()
-    }
-
-    /// Record the outcome. Logs a closed code if the store fails.
-    pub async fn finish(mut self, outcome: ServeOutcome) {
-        if let Some(payment) = self.payment.take() {
-            if self.service.finish(&payment, outcome).await.is_err() {
-                tracing::error!(outcome = "finish_failed", "MPP claim finish failed");
-            }
-        }
-    }
-}
-
-impl Drop for ServingGuard {
-    fn drop(&mut self) {
-        let Some(payment) = self.payment.take() else {
-            return;
-        };
-        let service = self.service.clone();
-        // Dropped means the client went away while its paid request ran (the work may already
-        // be done). That counts as served: marking it unserved would let one payment buy a new
-        // inference on every disconnect until the challenge expires. Only an error response
-        // releases the claim. No runtime (process shutdown) leaves the row `serving`, which also
-        // refuses reuse.
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            handle.spawn(async move {
-                if service
-                    .finish(&payment, ServeOutcome::Served)
-                    .await
-                    .is_err()
-                {
-                    tracing::error!(outcome = "finish_failed", "MPP claim finish failed");
-                }
-            });
-        }
     }
 }
 

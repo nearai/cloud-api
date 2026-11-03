@@ -4,11 +4,12 @@
 //! fakes (see `service.rs` tests) and implemented in `crates/database` and `rpc.rs`.
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 
 use crate::common::RepositoryError;
 
-/// Lifecycle of one claimed payment. A closed set with a strict parser: a value outside it
-/// is an error, never a default.
+/// Lifecycle of one claimed payment. A closed set; the claim store is the only writer of
+/// these values (`as_str` is their text form), so nothing parses them back.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClaimState {
     /// The payment is claimed and its request is being served.
@@ -31,21 +32,7 @@ impl ClaimState {
             Self::Unserved => Self::UNSERVED,
         }
     }
-
-    pub fn parse(raw: &str) -> Result<Self, UnknownClaimState> {
-        match raw {
-            Self::SERVING => Ok(Self::Serving),
-            Self::SERVED => Ok(Self::Served),
-            Self::UNSERVED => Ok(Self::Unserved),
-            _ => Err(UnknownClaimState),
-        }
-    }
 }
-
-/// A stored claim state outside the closed set. Carries no value: it never reaches a log.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-#[error("unknown MPP claim state")]
-pub struct UnknownClaimState;
 
 /// Result of [`PaymentClaimRepository::claim`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,6 +77,11 @@ pub trait PaymentClaimRepository: Send + Sync {
     /// Record how a claimed payment ended. Only a `serving` row changes.
     async fn finish(&self, payment_key: &str, outcome: ServeOutcome)
         -> Result<(), RepositoryError>;
+
+    /// Delete claims created before `cutoff`, in bounded batches; returns how many went. A
+    /// claim only has to outlive its challenge (at most an hour), so callers pass a cutoff
+    /// well past that.
+    async fn purge_older_than(&self, cutoff: DateTime<Utc>) -> Result<u64, RepositoryError>;
 }
 
 /// A TIP-20 / EVM log of a Tempo transaction receipt.
@@ -126,6 +118,17 @@ pub enum RpcError {
     InvalidResponse,
 }
 
+impl RpcError {
+    /// Closed name for logs.
+    pub fn kind(self) -> &'static str {
+        match self {
+            Self::Unavailable => "unavailable",
+            Self::Rejected => "rejected",
+            Self::InvalidResponse => "invalid_response",
+        }
+    }
+}
+
 /// The Tempo JSON-RPC calls the verification needs.
 #[async_trait]
 pub trait TempoRpc: Send + Sync {
@@ -140,20 +143,6 @@ pub trait TempoRpc: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn claim_state_round_trips_and_rejects_unknown_values() {
-        for state in [
-            ClaimState::Serving,
-            ClaimState::Served,
-            ClaimState::Unserved,
-        ] {
-            assert_eq!(ClaimState::parse(state.as_str()), Ok(state));
-        }
-        for bad in ["", "Serving", "SERVED", "done", "serving ", "unserved\n"] {
-            assert_eq!(ClaimState::parse(bad), Err(UnknownClaimState), "{bad:?}");
-        }
-    }
 
     #[test]
     fn serve_outcome_only_maps_to_terminal_states() {

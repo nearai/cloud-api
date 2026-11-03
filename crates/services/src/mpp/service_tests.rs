@@ -5,12 +5,16 @@ use config::{MppModelPrice, MppSettings, MppTempoSettings};
 use serde_json::json;
 
 use super::*;
+use crate::mpp::error::{
+    ConsumedReason, MppError, MppResponse, ProblemStatus, UnavailableReason, VerifyFailure,
+};
 use crate::mpp::memory::InMemoryClaimRepository;
-use crate::mpp::ports::ClaimState;
+use crate::mpp::ports::{ClaimOutcome, ClaimState, RpcError, RpcReceipt, ServeOutcome};
+use crate::mpp::protocol::ProblemCode;
 use crate::mpp::protocol::{b64url_decode, b64url_encode, compute_challenge_id, opaque_for};
+use crate::mpp::tempo;
 use crate::mpp::testing::{
-    bound_payment_receipt, credential_header, hash_payload, payment_receipt, transaction_payload,
-    FakeTempo, SendMode,
+    bound_payment_receipt, credential_header, hash_payload, payment_receipt, FakeTempo, SendMode,
 };
 
 const REALM: &str = "cloud-api.near.ai";
@@ -25,6 +29,13 @@ const RECIPIENT: [u8; 20] = [0xaa; 20];
 const PAYER: [u8; 20] = [0x40; 20];
 const AMOUNT: u128 = 20_000;
 const CHAIN: u64 = 42431;
+const TX: [u8; 32] = [0x11; 32];
+const TX_B: [u8; 32] = [0x12; 32];
+
+/// The ledger key of a payment: a keyed digest, never the transaction hash itself.
+fn key(hash: [u8; 32]) -> String {
+    protocol::payment_key(SECRET.as_bytes(), &hash).unwrap()
+}
 
 fn address(a: [u8; 20]) -> String {
     format!("0x{}", hex::encode(a))
@@ -793,536 +804,89 @@ fn proof_payloads_and_oversized_or_wrong_type_transactions_are_refused() {
     ));
 }
 
-// ----- settle -----
-
-const TX: [u8; 32] = [0x11; 32];
-const TX_B: [u8; 32] = [0x12; 32];
-
-/// The ledger key of a payment: a keyed digest, never the transaction hash itself.
-fn key(hash: [u8; 32]) -> String {
-    protocol::payment_key(SECRET.as_bytes(), &hash).unwrap()
-}
-
-#[tokio::test]
-async fn a_paid_hash_credential_settles_and_is_claimed_serving() {
-    let f = fixture();
-    let (challenge, header) = f.paid_hash_credential(&body(), TX);
-    let verified = f.verify(&header, &body()).unwrap();
-    let settled = f.service.settle(&verified).await.unwrap();
-    assert_eq!(settled.payment_key(), key(TX));
-    assert_eq!(f.repo.state_of(&key(TX)), Some(ClaimState::Serving));
-    let receipt = settled.receipt_header(Utc::now()).unwrap();
-    let decoded: serde_json::Value =
-        serde_json::from_slice(&b64url_decode(&receipt).unwrap()).unwrap();
-    assert_eq!(decoded["method"], "tempo");
-    assert_eq!(decoded["status"], "success");
-    assert_eq!(decoded["reference"], format!("0x{}", hex::encode(TX)));
-    let _ = challenge;
-}
-
-#[tokio::test]
-async fn a_paid_transaction_credential_broadcasts_and_settles() {
-    let f = fixture();
-    let challenge = f.challenge(&body());
-    let (payload, raw) = transaction_payload(7);
-    let hash = tempo::transaction_hash(&raw);
-    f.chain.mine(bound_payment_receipt(
-        hash, PAYER, CURRENCY, RECIPIENT, AMOUNT, REALM, &challenge,
-    ));
-    let header = credential_header(&challenge, payload, None);
-    let settled = f
-        .service
-        .settle(&f.verify(&header, &body()).unwrap())
-        .await
-        .unwrap();
-    assert_eq!(settled.payment_key(), key(hash));
-    assert_eq!(f.chain.send_calls(), 1);
-    assert_eq!(f.chain.lookup_calls(), 0);
-}
-
-#[tokio::test]
-async fn a_known_transaction_is_recovered_by_hash_after_a_broadcast_error() {
-    let f = fixture();
-    f.chain.set_send_mode(SendMode::Reject);
-    let challenge = f.challenge(&body());
-    let (payload, raw) = transaction_payload(8);
-    let hash = tempo::transaction_hash(&raw);
-    f.chain.mine(bound_payment_receipt(
-        hash, PAYER, CURRENCY, RECIPIENT, AMOUNT, REALM, &challenge,
-    ));
-    let header = credential_header(&challenge, payload, None);
-    let settled = f
-        .service
-        .settle(&f.verify(&header, &body()).unwrap())
-        .await
-        .unwrap();
-    assert_eq!(settled.payment_key(), key(hash));
-    assert_eq!(f.chain.send_calls(), 1);
-    assert_eq!(f.chain.lookup_calls(), 1);
-}
-
-#[tokio::test]
-async fn an_unknown_transaction_the_node_refused_is_a_retryable_402() {
-    let f = fixture();
-    let challenge = f.challenge(&body());
-    let (payload, _) = transaction_payload(9);
-    let header = credential_header(&challenge, payload, None);
-    let error = f
-        .service
-        .settle(&f.verify(&header, &body()).unwrap())
-        .await
-        .unwrap_err();
-    assert_eq!(
-        error,
-        MppError::VerificationFailed(VerifyFailure::ReceiptNotFound)
-    );
-    assert_eq!(error.status(), 402);
-    // The lookup is bounded: exactly the configured number of attempts.
-    assert_eq!(f.chain.lookup_calls(), 3);
-    assert_eq!(f.chain.send_calls(), 1);
-}
-
-#[tokio::test]
-async fn an_unreachable_node_is_unavailable_not_a_missing_payment() {
-    let f = fixture();
-    // Hash payload, RPC down.
-    f.chain.set_lookup_error(Some(RpcError::Unavailable));
-    let (_, header) = f.paid_hash_credential(&body(), TX);
-    let error = f
-        .service
-        .settle(&f.verify(&header, &body()).unwrap())
-        .await
-        .unwrap_err();
-    assert_eq!(error, MppError::Unavailable(UnavailableReason::Rpc));
-    assert_eq!(error.status(), 503);
-    assert_eq!(
-        f.repo.state_of(&key(TX)),
-        None,
-        "nothing is claimed when verification could not run"
-    );
-
-    // Transaction payload, transport failure on the broadcast and nothing found afterwards.
-    let f = fixture();
-    f.chain.set_send_mode(SendMode::Unavailable);
-    let challenge = f.challenge(&body());
-    let (payload, _) = transaction_payload(3);
-    let header = credential_header(&challenge, payload, None);
-    assert_eq!(
-        f.service
-            .settle(&f.verify(&header, &body()).unwrap())
-            .await
-            .unwrap_err(),
-        MppError::Unavailable(UnavailableReason::Rpc)
-    );
-    // The broadcast error is transport, but the tx is already mined: the lookup rescues it.
-    let (payload, raw) = transaction_payload(4);
-    f.chain.mine(bound_payment_receipt(
-        tempo::transaction_hash(&raw),
-        PAYER,
-        CURRENCY,
-        RECIPIENT,
-        AMOUNT,
-        REALM,
-        &challenge,
-    ));
-    let header = credential_header(&challenge, payload, None);
-    assert!(f
-        .service
-        .settle(&f.verify(&header, &body()).unwrap())
-        .await
-        .is_ok());
-}
-
-#[tokio::test]
-async fn hash_not_found_is_a_retryable_402() {
-    let f = fixture();
-    let challenge = f.challenge(&body());
-    let header = credential_header(&challenge, hash_payload([0x99; 32]), None);
-    let error = f
-        .service
-        .settle(&f.verify(&header, &body()).unwrap())
-        .await
-        .unwrap_err();
-    assert_eq!(
-        error,
-        MppError::VerificationFailed(VerifyFailure::ReceiptNotFound)
-    );
-}
-
-#[tokio::test]
-async fn a_node_answering_with_another_transactions_receipt_is_refused() {
-    let f = fixture();
-    let challenge = f.challenge(&body());
-    // Mined under hash [0x99] but claiming to be [0x98].
-    let mut wrong = bound_payment_receipt(
-        [0x98; 32], PAYER, CURRENCY, RECIPIENT, AMOUNT, REALM, &challenge,
-    );
-    wrong.tx_hash = [0x98; 32];
-    f.chain.mine(wrong.clone());
-    f.chain.mined_alias([0x99; 32], wrong);
-    let header = credential_header(&challenge, hash_payload([0x99; 32]), None);
-    assert_eq!(
-        f.service
-            .settle(&f.verify(&header, &body()).unwrap())
-            .await
-            .unwrap_err(),
-        MppError::VerificationFailed(VerifyFailure::ReceiptMismatch)
-    );
-}
-
-#[tokio::test]
-async fn verification_negatives_map_to_the_documented_errors() {
-    let f = fixture();
-    let challenge = f.challenge(&body());
-    let settle = |tx: [u8; 32], receipt: RpcReceipt| {
-        let f = &f;
-        let challenge = challenge.clone();
-        async move {
-            f.chain.mine(RpcReceipt {
-                tx_hash: tx,
-                ..receipt
-            });
-            let header = credential_header(&challenge, hash_payload(tx), None);
-            f.service.settle(&f.verify(&header, &body()).unwrap()).await
-        }
-    };
-    let memo = Some(tempo::attribution_memo(REALM, &challenge.id));
-    let ok = |hash| payment_receipt(hash, PAYER, CURRENCY, RECIPIENT, AMOUNT, memo);
-
-    let mut reverted = ok([1; 32]);
-    reverted.success = false;
-    assert_eq!(
-        settle([1; 32], reverted).await.unwrap_err(),
-        MppError::VerificationFailed(VerifyFailure::Reverted)
-    );
-    assert_eq!(
-        settle(
-            [2; 32],
-            payment_receipt([2; 32], PAYER, CURRENCY, [0xbb; 20], AMOUNT, memo)
-        )
-        .await
-        .unwrap_err(),
-        MppError::VerificationFailed(VerifyFailure::NoMatchingTransfer)
-    );
-    assert_eq!(
-        settle(
-            [3; 32],
-            payment_receipt([3; 32], PAYER, CURRENCY, RECIPIENT, AMOUNT - 1, memo)
-        )
-        .await
-        .unwrap_err(),
-        MppError::VerificationFailed(VerifyFailure::NoMatchingTransfer)
-    );
-    assert_eq!(
-        settle(
-            [4; 32],
-            payment_receipt([4; 32], PAYER, [0x21; 20], RECIPIENT, AMOUNT, memo)
-        )
-        .await
-        .unwrap_err(),
-        MppError::VerificationFailed(VerifyFailure::NoMatchingTransfer)
-    );
-    // Sent by someone other than the transaction sender.
-    let mut other_sender = payment_receipt([5; 32], [0x77; 20], CURRENCY, RECIPIENT, AMOUNT, memo);
-    other_sender.from = PAYER;
-    assert_eq!(
-        settle([5; 32], other_sender).await.unwrap_err(),
-        MppError::VerificationFailed(VerifyFailure::NoMatchingTransfer)
-    );
-    // Funds moved without this challenge's memo: final, 403, no new challenge.
-    for (hash, memo) in [
-        ([6; 32], None),
-        (
-            [7; 32],
-            Some(tempo::attribution_memo(REALM, "another-challenge-id")),
-        ),
-        (
-            [8; 32],
-            Some(tempo::attribution_memo("evil.example", &challenge.id)),
-        ),
-    ] {
-        let error = settle(
-            hash,
-            payment_receipt(hash, PAYER, CURRENCY, RECIPIENT, AMOUNT, memo),
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(error, MppError::Consumed(ConsumedReason::MemoNotBound));
-        assert_eq!(error.status(), 403);
-        assert!(!error.carries_challenge());
-        assert_eq!(
-            f.repo.state_of(&key(hash)),
-            None,
-            "an unbound payment is never claimed"
-        );
-    }
-    // None of the failures claimed anything.
-    for n in 1..=8u8 {
-        assert_eq!(f.repo.state_of(&key([n; 32])), None);
-    }
-}
-
-#[tokio::test]
-async fn the_source_did_decides_who_must_have_paid() {
-    let f = fixture();
-    let challenge = f.challenge(&body());
-    // A relayer sent the transaction; PAYER's funds moved.
-    let mut receipt =
-        bound_payment_receipt(TX, PAYER, CURRENCY, RECIPIENT, AMOUNT, REALM, &challenge);
-    receipt.from = [0x55; 20];
-    f.chain.mine(receipt);
-    let did = |a: [u8; 20]| format!("did:pkh:eip155:{CHAIN}:{}", address(a));
-    let without = credential_header(&challenge, hash_payload(TX), None);
-    assert_eq!(
-        f.service
-            .settle(&f.verify(&without, &body()).unwrap())
-            .await
-            .unwrap_err(),
-        MppError::VerificationFailed(VerifyFailure::NoMatchingTransfer)
-    );
-    let wrong = credential_header(&challenge, hash_payload(TX), Some(&did([0x66; 20])));
-    assert_eq!(
-        f.service
-            .settle(&f.verify(&wrong, &body()).unwrap())
-            .await
-            .unwrap_err(),
-        MppError::VerificationFailed(VerifyFailure::NoMatchingTransfer)
-    );
-    let right = credential_header(&challenge, hash_payload(TX), Some(&did(PAYER)));
-    assert!(f
-        .service
-        .settle(&f.verify(&right, &body()).unwrap())
-        .await
-        .is_ok());
-}
-
-// ----- claim state machine through the service -----
-
-#[tokio::test]
-async fn a_replayed_credential_is_consumed() {
-    let f = fixture();
-    let (_, header) = f.paid_hash_credential(&body(), TX);
-    let verified = f.verify(&header, &body()).unwrap();
-    f.service.settle(&verified).await.unwrap();
-    let replay = f.service.settle(&verified).await.unwrap_err();
-    assert_eq!(replay, MppError::Consumed(ConsumedReason::AlreadyClaimed));
-    assert_eq!(replay.status(), 403);
-    assert!(!replay.carries_challenge());
-}
-
-#[tokio::test]
-async fn an_unserved_payment_is_retried_without_a_second_payment() {
-    let f = fixture();
-    let (_, header) = f.paid_hash_credential(&body(), TX);
-    let verified = f.verify(&header, &body()).unwrap();
-    let first = f.service.settle(&verified).await.unwrap();
-    f.service
-        .finish(&first, ServeOutcome::Unserved)
-        .await
-        .unwrap();
-    assert_eq!(f.repo.state_of(&key(TX)), Some(ClaimState::Unserved));
-    let retry = f.service.settle(&verified).await.unwrap();
-    assert_eq!(retry.payment_key(), first.payment_key());
-    assert_eq!(f.repo.state_of(&key(TX)), Some(ClaimState::Serving));
-    // Served is final.
-    f.service
-        .finish(&retry, ServeOutcome::Served)
-        .await
-        .unwrap();
-    assert_eq!(
-        f.service.settle(&verified).await.unwrap_err(),
-        MppError::Consumed(ConsumedReason::AlreadyClaimed)
-    );
-}
-
-#[tokio::test]
-async fn a_second_challenge_cannot_reuse_a_claimed_payment_even_when_unserved() {
-    let f = fixture();
-    let (_, header) = f.paid_hash_credential(&body(), TX);
-    let first = f
-        .service
-        .settle(&f.verify(&header, &body()).unwrap())
-        .await
-        .unwrap();
-    f.service
-        .finish(&first, ServeOutcome::Unserved)
-        .await
-        .unwrap();
-    // Same transaction, presented under a different challenge (different body). The memo is
-    // bound to the first challenge, so chain verification refuses it before the claim; the
-    // claim store would refuse it too.
-    let mut other_body = body();
-    other_body.extend_from_slice(b"\n");
-    let other_challenge = f.challenge(&other_body);
-    let other_header = credential_header(&other_challenge, hash_payload(TX), None);
-    assert_eq!(
-        f.service
-            .settle(&f.verify(&other_header, &other_body).unwrap())
-            .await
-            .unwrap_err(),
-        MppError::Consumed(ConsumedReason::MemoNotBound)
-    );
-    assert_eq!(
-        f.repo.claim(&key(TX), &other_challenge.id).await.unwrap(),
-        ClaimOutcome::AlreadyUsed
-    );
-    assert_eq!(f.repo.state_of(&key(TX)), Some(ClaimState::Unserved));
-}
-
-#[tokio::test]
-async fn a_transaction_credential_cannot_broadcast_after_the_challenge_expired() {
-    let f = fixture();
-    let issued = Utc::now() - ChronoDuration::seconds(599);
-    let challenge = f
-        .service
-        .challenge_at(
-            issued,
-            CHAT_COMPLETIONS_ROUTE,
-            &body(),
-            &Price { amount: AMOUNT },
-        )
-        .unwrap();
-    let (payload, raw) = transaction_payload(5);
-    f.chain.mine(bound_payment_receipt(
-        tempo::transaction_hash(&raw),
-        PAYER,
-        CURRENCY,
-        RECIPIENT,
-        AMOUNT,
-        REALM,
-        &challenge,
-    ));
-    let header = credential_header(&challenge, payload, None);
-    let verified = f.verify(&header, &body()).unwrap();
-    tokio::time::sleep(std::time::Duration::from_millis(2200)).await;
-    assert_eq!(
-        f.service.settle(&verified).await.unwrap_err(),
-        MppError::Expired
-    );
-    assert_eq!(
-        f.chain.send_calls(),
-        0,
-        "an expired challenge must not reach the node"
-    );
-}
-
-// ----- serving guard -----
-
-#[tokio::test]
-async fn the_guard_marks_served_when_dropped_and_respects_finish() {
-    let f = fixture();
-    let (_, header) = f.paid_hash_credential(&body(), TX);
-    let settled = f
-        .service
-        .settle(&f.verify(&header, &body()).unwrap())
-        .await
-        .unwrap();
-
-    let guard = f.service.serving(settled.clone());
-    assert_eq!(
-        guard.payment().map(|p| p.payment_key().to_string()),
-        Some(key(TX))
-    );
-    drop(guard);
-    // The spawned finish runs on the same runtime; wait for it deterministically.
-    for _ in 0..100 {
-        if f.repo.state_of(&key(TX)) == Some(ClaimState::Served) {
-            break;
-        }
-        tokio::task::yield_now().await;
-    }
-    assert_eq!(f.repo.state_of(&key(TX)), Some(ClaimState::Served));
-
-    // A client that disconnected cannot present the payment again.
-    let replay = f.service.settle(&f.verify(&header, &body()).unwrap()).await;
-    assert!(matches!(replay, Err(MppError::Consumed(_))), "{replay:?}");
-
-    // An explicit unserved finish releases the claim for a retry under the same challenge.
-    let (_, header) = f.paid_hash_credential(&body(), TX_B);
-    let settled = f
-        .service
-        .settle(&f.verify(&header, &body()).unwrap())
-        .await
-        .unwrap();
-    f.service
-        .serving(settled)
-        .finish(ServeOutcome::Unserved)
-        .await;
-    assert_eq!(f.repo.state_of(&key(TX_B)), Some(ClaimState::Unserved));
-    let retried = f.service.settle(&f.verify(&header, &body()).unwrap()).await;
-    assert!(retried.is_ok(), "{retried:?}");
-}
+#[path = "service_tests/payment.rs"]
+mod payment;
 
 // ----- errors and redaction -----
 
 #[test]
-fn error_statuses_and_problem_types() {
+fn every_error_has_exactly_one_response() {
+    use std::time::Duration;
+    let challenge = |code| MppResponse::Challenge(code);
     let cases = [
         (
             MppError::Malformed("x"),
-            402,
-            Some("malformed-credential"),
-            true,
-        ),
-        (
-            MppError::MethodUnsupported,
-            400,
-            Some("method-unsupported"),
-            false,
+            challenge(ProblemCode::MalformedCredential),
         ),
         (
             MppError::InvalidChallenge("id"),
-            402,
-            Some("invalid-challenge"),
-            true,
+            challenge(ProblemCode::InvalidChallenge),
         ),
-        (MppError::Expired, 402, Some("payment-expired"), true),
+        (MppError::Expired, challenge(ProblemCode::PaymentExpired)),
         (
             MppError::VerificationFailed(VerifyFailure::Reverted),
-            402,
-            Some("verification-failed"),
-            true,
+            challenge(ProblemCode::VerificationFailed),
+        ),
+        (
+            MppError::VerificationFailed(VerifyFailure::NoMatchingTransfer),
+            challenge(ProblemCode::VerificationFailed),
+        ),
+        (
+            MppError::VerificationFailed(VerifyFailure::ReceiptMismatch),
+            challenge(ProblemCode::VerificationFailed),
+        ),
+        (
+            MppError::VerificationFailed(VerifyFailure::SourceChain),
+            challenge(ProblemCode::VerificationFailed),
+        ),
+        (
+            MppError::VerificationFailed(VerifyFailure::Transaction(
+                crate::mpp::transaction::TransactionMismatch::NoPaymentCall,
+            )),
+            challenge(ProblemCode::VerificationFailed),
+        ),
+        (
+            MppError::MethodUnsupported,
+            MppResponse::Problem(ProblemStatus::BadRequest, ProblemCode::MethodUnsupported),
         ),
         (
             MppError::Consumed(ConsumedReason::AlreadyClaimed),
-            403,
-            Some("verification-failed"),
-            false,
+            MppResponse::Problem(ProblemStatus::Forbidden, ProblemCode::VerificationFailed),
         ),
         (
             MppError::Consumed(ConsumedReason::MemoNotBound),
-            403,
-            Some("verification-failed"),
-            false,
+            MppResponse::Problem(ProblemStatus::Forbidden, ProblemCode::VerificationFailed),
+        ),
+        // A payment that is not found yet is retried with the same credential: no challenge.
+        (
+            MppError::ReceiptNotFound,
+            MppResponse::Retry(Duration::from_secs(2)),
         ),
         (
             MppError::Unavailable(UnavailableReason::Rpc),
-            503,
-            None,
-            false,
+            MppResponse::Retry(Duration::from_secs(5)),
         ),
         (
             MppError::Unavailable(UnavailableReason::Store),
-            503,
-            None,
-            false,
+            MppResponse::Retry(Duration::from_secs(5)),
+        ),
+        (MppError::Config, MppResponse::Retry(Duration::from_secs(5))),
+        (
+            MppError::Limit(LimitViolation::MultipleChoices),
+            MppResponse::Limit(LimitViolation::MultipleChoices),
         ),
     ];
-    for (error, status, problem, challenge) in cases {
-        assert_eq!(error.status(), status, "{error:?}");
-        assert_eq!(
-            error.problem().map(ProblemCode::as_str),
-            problem,
-            "{error:?}"
-        );
-        assert_eq!(error.carries_challenge(), challenge, "{error:?}");
+    for (error, expected) in cases {
+        assert_eq!(error.response(), expected, "{error:?}");
         assert!(!error.kind().is_empty());
         assert!(!error.detail().is_empty());
     }
+    assert_eq!(ProblemStatus::BadRequest.code(), 400);
+    assert_eq!(ProblemStatus::Forbidden.code(), 403);
 }
 
-#[test]
-fn debug_output_never_prints_secrets_or_payment_data() {
+#[tokio::test]
+async fn debug_output_never_prints_secrets_or_payment_data() {
     let f = fixture();
     let printed = format!("{:?}", f.service);
     assert!(printed.contains(REALM));
@@ -1343,6 +907,18 @@ fn debug_output_never_prints_secrets_or_payment_data() {
     let verified = f.verify(&header, &body()).unwrap();
     let printed = format!("{verified:?}");
     assert!(!printed.contains(&challenge.id));
+    // Neither the proof of payment nor the claimed payment prints a key or a hash.
+    let (_, header) = f.paid_hash_credential(&body(), [0x42; 32]);
+    let paid = f
+        .service
+        .verify_payment(&f.verify(&header, &body()).unwrap())
+        .await
+        .unwrap();
+    let settled = f.service.claim(&paid).await.unwrap();
+    assert_eq!(
+        format!("{paid:?} {settled:?}"),
+        "PaidCredential { .. } SettledPayment { .. }"
+    );
     let credential = protocol::parse_authorization(&header).unwrap();
     let printed = format!("{credential:?} {:?}", credential.payload);
     assert!(!printed.contains(&hex::encode(TX)));

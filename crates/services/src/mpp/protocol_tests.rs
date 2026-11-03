@@ -702,27 +702,27 @@ fn rlp_list_hex(payload_len: usize) -> String {
 fn rlp_check_requires_one_exact_list() {
     for len in [0usize, 1, 55, 56, 255, 256, 1000] {
         let bytes = hex::decode(rlp_list_hex(len)).unwrap();
-        assert!(rlp_list_spans_exactly(&bytes), "len {len}");
+        assert!(rlp::list_spans_exactly(&bytes), "len {len}");
         let mut trailing = bytes.clone();
         trailing.push(0);
-        assert!(!rlp_list_spans_exactly(&trailing), "trailing {len}");
+        assert!(!rlp::list_spans_exactly(&trailing), "trailing {len}");
         if len > 0 {
             let mut short = bytes.clone();
             short.pop();
-            assert!(!rlp_list_spans_exactly(&short), "short {len}");
+            assert!(!rlp::list_spans_exactly(&short), "short {len}");
         }
     }
-    assert!(!rlp_list_spans_exactly(&[]));
-    assert!(!rlp_list_spans_exactly(&[0x80]), "a string is not a list");
-    assert!(!rlp_list_spans_exactly(&[0x05]));
-    assert!(!rlp_list_spans_exactly(&[0xf8]));
+    assert!(!rlp::list_spans_exactly(&[]));
+    assert!(!rlp::list_spans_exactly(&[0x80]), "a string is not a list");
+    assert!(!rlp::list_spans_exactly(&[0x05]));
+    assert!(!rlp::list_spans_exactly(&[0xf8]));
     // Long form used for a short payload, and a leading zero in the length.
-    assert!(!rlp_list_spans_exactly(&[0xf8, 0x01, 0x00]));
-    assert!(!rlp_list_spans_exactly(&[0xf9, 0x00, 0x38]));
+    assert!(!rlp::list_spans_exactly(&[0xf8, 0x01, 0x00]));
+    assert!(!rlp::list_spans_exactly(&[0xf9, 0x00, 0x38]));
     // A declared length near usize::MAX must not overflow.
     let mut huge = vec![0xff];
     huge.extend([0xff; 8]);
-    assert!(!rlp_list_spans_exactly(&huge));
+    assert!(!rlp::list_spans_exactly(&huge));
 }
 
 #[test]

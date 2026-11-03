@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 
 use super::ports::{ClaimOutcome, ClaimState, PaymentClaimRepository, ServeOutcome};
 use crate::common::RepositoryError;
@@ -14,6 +15,7 @@ use crate::common::RepositoryError;
 struct Claim {
     challenge_id: String,
     state: ClaimState,
+    created_at: DateTime<Utc>,
 }
 
 /// Claims keyed by payment key.
@@ -29,6 +31,26 @@ impl InMemoryClaimRepository {
             .lock()
             .ok()
             .and_then(|claims| claims.get(payment_key).map(|claim| claim.state))
+    }
+}
+
+impl InMemoryClaimRepository {
+    /// Pretend `payment_key` was claimed `by` earlier. For purge tests.
+    pub fn age(&self, payment_key: &str, by: chrono::Duration) {
+        if let Ok(mut claims) = self.claims.lock() {
+            if let Some(claim) = claims.get_mut(payment_key) {
+                claim.created_at -= by;
+            }
+        }
+    }
+
+    /// Number of stored claims. For assertions.
+    pub fn len(&self) -> usize {
+        self.claims.lock().map(|claims| claims.len()).unwrap_or(0)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 }
 
@@ -51,6 +73,7 @@ impl PaymentClaimRepository for InMemoryClaimRepository {
                     Claim {
                         challenge_id: challenge_id.to_string(),
                         state: ClaimState::Serving,
+                        created_at: Utc::now(),
                     },
                 );
                 Ok(ClaimOutcome::Claimed)
@@ -78,6 +101,13 @@ impl PaymentClaimRepository for InMemoryClaimRepository {
             }
         }
         Ok(())
+    }
+
+    async fn purge_older_than(&self, cutoff: DateTime<Utc>) -> Result<u64, RepositoryError> {
+        let mut claims = self.claims.lock().map_err(|_| poisoned())?;
+        let before = claims.len();
+        claims.retain(|_, claim| claim.created_at >= cutoff);
+        Ok((before - claims.len()) as u64)
     }
 }
 
@@ -144,6 +174,23 @@ mod tests {
         repo.finish(KEY, ServeOutcome::Unserved).await.unwrap();
         repo.finish(KEY, ServeOutcome::Served).await.unwrap();
         assert_eq!(repo.state_of(KEY), Some(ClaimState::Unserved));
+    }
+
+    #[tokio::test]
+    async fn purge_removes_only_claims_older_than_the_cutoff() {
+        let repo = InMemoryClaimRepository::default();
+        let old = "tempo:old";
+        repo.claim(old, "c1").await.unwrap();
+        repo.claim(KEY, "c2").await.unwrap();
+        repo.age(old, chrono::Duration::hours(25));
+        let cutoff = Utc::now() - chrono::Duration::hours(24);
+        assert_eq!(repo.purge_older_than(cutoff).await.unwrap(), 1);
+        assert_eq!(repo.state_of(old), None);
+        assert_eq!(repo.state_of(KEY), Some(ClaimState::Serving));
+        assert_eq!(repo.purge_older_than(cutoff).await.unwrap(), 0);
+        // A purged payment key could be claimed again: the table remembers a payment only as
+        // long as its challenge can still be presented.
+        assert_eq!(repo.claim(old, "c3").await.unwrap(), ClaimOutcome::Claimed);
     }
 
     #[tokio::test]

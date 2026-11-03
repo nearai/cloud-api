@@ -10,17 +10,24 @@
 //! - [`ports`]: the claim store and RPC traits. `memory` (tests and the `test-mocks`
 //!   feature only) is an in-memory claim store; deployments use the Postgres repository.
 
+pub mod error;
 #[cfg(any(test, feature = "test-mocks"))]
 pub mod memory;
 pub mod ports;
 pub mod pricing;
 pub mod protocol;
+pub mod retention;
+pub mod rlp;
 pub mod rpc;
 pub mod service;
 pub mod tempo;
 #[cfg(any(test, feature = "test-mocks"))]
 pub mod testing;
+pub mod transaction;
 
+pub use error::{
+    ConsumedReason, MppError, MppResponse, ProblemStatus, UnavailableReason, VerifyFailure,
+};
 #[cfg(any(test, feature = "test-mocks"))]
 pub use memory::InMemoryClaimRepository;
 pub use ports::{
@@ -31,6 +38,6 @@ pub use pricing::{LimitViolation, Param, Price, Pricing, RequestShape};
 pub use protocol::{Challenge, ProblemCode};
 pub use rpc::HttpTempoRpc;
 pub use service::{
-    ConsumedReason, MppError, MppService, ServingGuard, SettledPayment, UnavailableReason,
-    VerifiedCredential, VerifyFailure, CHAT_COMPLETIONS_ROUTE,
+    MppService, PaidCredential, ServingGuard, SettledPayment, VerifiedCredential,
+    CHAT_COMPLETIONS_ROUTE,
 };

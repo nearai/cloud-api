@@ -23,6 +23,8 @@ use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+use super::rlp;
+
 /// The authentication scheme name.
 pub const SCHEME: &str = "Payment";
 /// The only payment method this server speaks.
@@ -576,7 +578,7 @@ fn parse_payload(payload: &Value) -> Result<PaymentPayload, ProtocolError> {
             if raw.first() != Some(&TEMPO_TX_TYPE_ID) {
                 return Err(ProtocolError::Malformed("not a Tempo transaction"));
             }
-            if !raw.get(1..).is_some_and(rlp_list_spans_exactly) {
+            if !raw.get(1..).is_some_and(rlp::list_spans_exactly) {
                 return Err(ProtocolError::Malformed("invalid transaction encoding"));
             }
             Ok(PaymentPayload::Transaction(raw))
@@ -591,44 +593,6 @@ fn parse_payload(payload: &Value) -> Result<PaymentPayload, ProtocolError> {
         Some("proof") => Err(ProtocolError::MethodUnsupported),
         _ => Err(ProtocolError::Malformed("unknown payload type")),
     }
-}
-
-/// Whether `bytes` is exactly one RLP list: a list header whose declared payload length
-/// accounts for every remaining byte. A Tempo transaction is `0x76 || rlp([fields…, sig])`,
-/// so this is the cheapest structural check before the bytes are sent to a node.
-pub fn rlp_list_spans_exactly(bytes: &[u8]) -> bool {
-    let Some(&first) = bytes.first() else {
-        return false;
-    };
-    let (header_len, payload_len) = match first {
-        0xc0..=0xf7 => (1usize, usize::from(first - 0xc0)),
-        0xf8..=0xff => {
-            let length_of_length = usize::from(first - 0xf7);
-            let Some(length_bytes) = bytes.get(1..1 + length_of_length) else {
-                return false;
-            };
-            // Canonical RLP: no leading zero, and a long form only above 55 bytes.
-            if length_bytes.first() == Some(&0) {
-                return false;
-            }
-            let mut payload_len = 0usize;
-            for &byte in length_bytes {
-                let Some(next) = payload_len
-                    .checked_mul(256)
-                    .and_then(|v| v.checked_add(usize::from(byte)))
-                else {
-                    return false;
-                };
-                payload_len = next;
-            }
-            if payload_len <= 55 {
-                return false;
-            }
-            (1 + length_of_length, payload_len)
-        }
-        _ => return false,
-    };
-    header_len.checked_add(payload_len) == Some(bytes.len())
 }
 
 /// `0x` + hex, at most `max_bytes` decoded. The length is checked before decoding.

@@ -2,15 +2,20 @@
 //! crate's tests and, through the `test-mocks` feature, for the API crate's tests.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use async_trait::async_trait;
 use serde_json::Value;
 
-use super::ports::{RpcError, RpcLog, RpcReceipt, TempoRpc};
+use super::memory::InMemoryClaimRepository;
+use super::ports::{
+    ClaimOutcome, PaymentClaimRepository, RpcError, RpcLog, RpcReceipt, ServeOutcome, TempoRpc,
+};
 use super::protocol::{b64url_encode, Challenge};
 use super::tempo::{attribution_memo, transaction_hash, TRANSFER_TOPIC, TRANSFER_WITH_MEMO_TOPIC};
+use super::transaction::TRANSFER_WITH_MEMO_SELECTOR;
+use crate::common::RepositoryError;
 
 /// How `eth_sendRawTransactionSync` behaves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -22,6 +27,8 @@ pub enum SendMode {
     Reject,
     /// Transport failure.
     Unavailable,
+    /// Never answers (a node that accepts the connection and goes silent).
+    Hang,
 }
 
 /// A scripted Tempo node: a table of mined receipts and a failure mode.
@@ -29,6 +36,8 @@ pub struct FakeTempo {
     mined: Mutex<HashMap<[u8; 32], RpcReceipt>>,
     send_mode: Mutex<SendMode>,
     lookup_error: Mutex<Option<RpcError>>,
+    /// Returned by every successful broadcast instead of the transaction's own receipt.
+    send_receipt: Mutex<Option<RpcReceipt>>,
     sends: AtomicUsize,
     lookups: AtomicUsize,
 }
@@ -39,6 +48,7 @@ impl Default for FakeTempo {
             mined: Mutex::new(HashMap::new()),
             send_mode: Mutex::new(SendMode::Normal),
             lookup_error: Mutex::new(None),
+            send_receipt: Mutex::new(None),
             sends: AtomicUsize::new(0),
             lookups: AtomicUsize::new(0),
         }
@@ -72,6 +82,14 @@ impl FakeTempo {
         }
     }
 
+    /// Make every broadcast answer with `receipt`, whatever transaction was sent (a node that
+    /// returns the wrong receipt).
+    pub fn set_send_receipt(&self, receipt: Option<RpcReceipt>) {
+        if let Ok(mut current) = self.send_receipt.lock() {
+            *current = receipt;
+        }
+    }
+
     pub fn send_calls(&self) -> usize {
         self.sends.load(Ordering::SeqCst)
     }
@@ -93,12 +111,17 @@ impl TempoRpc for FakeTempo {
         match mode {
             SendMode::Unavailable => Err(RpcError::Unavailable),
             SendMode::Reject => Err(RpcError::Rejected),
-            SendMode::Normal => self
-                .mined
-                .lock()
-                .ok()
-                .and_then(|mined| mined.get(&transaction_hash(raw)).cloned())
-                .ok_or(RpcError::Rejected),
+            SendMode::Hang => std::future::pending().await,
+            SendMode::Normal => {
+                if let Some(receipt) = self.send_receipt.lock().ok().and_then(|r| r.clone()) {
+                    return Ok(receipt);
+                }
+                self.mined
+                    .lock()
+                    .ok()
+                    .and_then(|mined| mined.get(&transaction_hash(raw)).cloned())
+                    .ok_or(RpcError::Rejected)
+            }
         }
     }
 
@@ -115,6 +138,73 @@ impl TempoRpc for FakeTempo {
             .lock()
             .ok()
             .and_then(|mined| mined.get(&hash).cloned()))
+    }
+}
+
+/// A claim store that can be told to fail, over a real in-memory one.
+#[derive(Default)]
+pub struct FlakyClaimRepository {
+    inner: std::sync::Arc<InMemoryClaimRepository>,
+    fail_claims: AtomicBool,
+    fail_finishes: AtomicBool,
+    fail_purges: AtomicBool,
+}
+
+impl FlakyClaimRepository {
+    /// The store underneath, for assertions.
+    pub fn store(&self) -> &InMemoryClaimRepository {
+        &self.inner
+    }
+
+    pub fn set_fail_claims(&self, fail: bool) {
+        self.fail_claims.store(fail, Ordering::SeqCst);
+    }
+
+    pub fn set_fail_finishes(&self, fail: bool) {
+        self.fail_finishes.store(fail, Ordering::SeqCst);
+    }
+
+    pub fn set_fail_purges(&self, fail: bool) {
+        self.fail_purges.store(fail, Ordering::SeqCst);
+    }
+}
+
+fn store_down() -> RepositoryError {
+    RepositoryError::ConnectionFailed("claim store down".to_string())
+}
+
+#[async_trait]
+impl PaymentClaimRepository for FlakyClaimRepository {
+    async fn claim(
+        &self,
+        payment_key: &str,
+        challenge_id: &str,
+    ) -> Result<ClaimOutcome, RepositoryError> {
+        if self.fail_claims.load(Ordering::SeqCst) {
+            return Err(store_down());
+        }
+        self.inner.claim(payment_key, challenge_id).await
+    }
+
+    async fn finish(
+        &self,
+        payment_key: &str,
+        outcome: ServeOutcome,
+    ) -> Result<(), RepositoryError> {
+        if self.fail_finishes.load(Ordering::SeqCst) {
+            return Err(store_down());
+        }
+        self.inner.finish(payment_key, outcome).await
+    }
+
+    async fn purge_older_than(
+        &self,
+        cutoff: chrono::DateTime<chrono::Utc>,
+    ) -> Result<u64, RepositoryError> {
+        if self.fail_purges.load(Ordering::SeqCst) {
+            return Err(store_down());
+        }
+        self.inner.purge_older_than(cutoff).await
     }
 }
 
@@ -219,12 +309,133 @@ pub fn hash_payload(tx_hash: [u8; 32]) -> Value {
     serde_json::json!({"type": "hash", "hash": format!("0x{}", hex::encode(tx_hash))})
 }
 
-/// A well-formed (`0x76` + one RLP list) `transaction` payload whose bytes depend on `seed`.
-pub fn transaction_payload(seed: u8) -> (Value, Vec<u8>) {
+/// A framing-valid (`0x76` + one RLP list) `transaction` payload that is not a payment: the
+/// bytes depend on `seed`. The service refuses it before any broadcast.
+pub fn framed_transaction_payload(seed: u8) -> (Value, Vec<u8>) {
     let mut raw = vec![0x76, 0xc0 + 20];
     raw.extend([seed; 20]);
-    (
-        serde_json::json!({"type": "transaction", "signature": format!("0x{}", hex::encode(&raw))}),
-        raw,
+    (transaction_payload(&raw), raw)
+}
+
+/// A `transaction` payload carrying `raw`.
+pub fn transaction_payload(raw: &[u8]) -> Value {
+    serde_json::json!({"type": "transaction", "signature": format!("0x{}", hex::encode(raw))})
+}
+
+// ----- RLP encoding and Tempo transactions, for building what a client sends -----
+
+/// RLP of a byte string.
+pub fn rlp_string(content: &[u8]) -> Vec<u8> {
+    match content {
+        [byte] if *byte < 0x80 => vec![*byte],
+        content if content.len() <= 55 => {
+            let mut out = vec![0x80 + content.len() as u8];
+            out.extend(content);
+            out
+        }
+        content => {
+            let mut out = rlp_long_header(0xb7, content.len());
+            out.extend(content);
+            out
+        }
+    }
+}
+
+/// RLP of a list of already-encoded items.
+pub fn rlp_list(items: &[Vec<u8>]) -> Vec<u8> {
+    let payload: Vec<u8> = items.concat();
+    let mut out = if payload.len() <= 55 {
+        vec![0xc0 + payload.len() as u8]
+    } else {
+        rlp_long_header(0xf7, payload.len())
+    };
+    out.extend(payload);
+    out
+}
+
+/// RLP of an unsigned integer (zero is the empty string).
+pub fn rlp_uint(value: u128) -> Vec<u8> {
+    let bytes = value.to_be_bytes();
+    let first = bytes.iter().position(|b| *b != 0).unwrap_or(bytes.len());
+    rlp_string(bytes.get(first..).unwrap_or_default())
+}
+
+fn rlp_long_header(base: u8, len: usize) -> Vec<u8> {
+    let length: Vec<u8> = len
+        .to_be_bytes()
+        .into_iter()
+        .skip_while(|b| *b == 0)
+        .collect();
+    let mut out = vec![base + length.len() as u8];
+    out.extend(length);
+    out
+}
+
+/// `transferWithMemo(address,uint256,bytes32)` calldata.
+pub fn transfer_with_memo_input(recipient: [u8; 20], amount: u128, memo: [u8; 32]) -> Vec<u8> {
+    let mut input = TRANSFER_WITH_MEMO_SELECTOR.to_vec();
+    input.extend([0u8; 12]);
+    input.extend(recipient);
+    input.extend(amount_word(amount));
+    input.extend(memo);
+    input
+}
+
+/// One call of a Tempo transaction: `(to, value, input)`.
+pub type TxCall = ([u8; 20], u128, Vec<u8>);
+
+/// A signed Tempo transaction (`0x76 || rlp([...])`) shaped as `mppx` builds one for a charge:
+/// an expiring nonce key, a fee token, no fee payer, no authorization list, and a 65-byte
+/// secp256k1 signature last. `seed` varies the bytes (the expiry), hence the hash.
+pub fn tempo_transaction(chain_id: u64, calls: &[TxCall], seed: u64) -> Vec<u8> {
+    let calls: Vec<Vec<u8>> = calls
+        .iter()
+        .map(|(to, value, input)| rlp_list(&[rlp_string(to), rlp_uint(*value), rlp_string(input)]))
+        .collect();
+    let fields = [
+        rlp_uint(u128::from(chain_id)),
+        rlp_uint(1_000_000_000),  // max_priority_fee_per_gas
+        rlp_uint(20_000_000_000), // max_fee_per_gas
+        rlp_uint(150_000),        // gas_limit
+        rlp_list(&calls),
+        rlp_list(&[]),                              // access_list
+        rlp_string(&[0xff; 32]),                    // nonce_key: the expiring nonce key (U256::MAX)
+        rlp_uint(0),                                // nonce
+        rlp_uint(1_900_000_000 + u128::from(seed)), // valid_before
+        rlp_uint(0),                                // valid_after
+        rlp_string(&[0x20; 20]),                    // fee_token
+        rlp_uint(0),                                // fee_payer_signature: none
+        rlp_list(&[]),                              // tempo_authorization_list
+        rlp_string(&[0x5a; 65]),                    // signature
+    ];
+    let mut raw = vec![0x76];
+    raw.extend(rlp_list(&fields));
+    raw
+}
+
+/// What a charge transaction must pay.
+#[derive(Debug, Clone, Copy)]
+pub struct PaymentTx<'a> {
+    pub chain_id: u64,
+    pub currency: [u8; 20],
+    pub recipient: [u8; 20],
+    pub amount: u128,
+    pub realm: &'a str,
+    pub challenge_id: &'a str,
+    pub seed: u64,
+}
+
+/// A transaction paying `tx`: one `transferWithMemo` of `amount` to `recipient` in
+/// `currency`, with the attribution memo for the challenge.
+pub fn payment_transaction(tx: &PaymentTx<'_>) -> Vec<u8> {
+    let memo = attribution_memo(tx.realm, tx.challenge_id);
+    tempo_transaction(
+        tx.chain_id,
+        &[(
+            tx.currency,
+            0,
+            transfer_with_memo_input(tx.recipient, tx.amount, memo),
+        )],
+        tx.seed,
     )
 }

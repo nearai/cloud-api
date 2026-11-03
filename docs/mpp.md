@@ -27,7 +27,8 @@ client                                         cloud-api                        
   |<---------------------------------------------|                                 |
 ```
 
-1. A request with no `Authorization` header for a **priced** model gets
+1. A request with no `Authorization` header for a **priced** model, whose body passes the
+   handler's own checks (JSON content type, request shape, `validate_request`), gets
    `402 Payment Required` with `WWW-Authenticate: Payment id, realm, method="tempo",
    intent="charge", request, expires, digest, opaque`, `Cache-Control: no-store`, and an
    `application/problem+json` body (`https://paymentauth.org/problems/payment-required`).
@@ -35,13 +36,15 @@ client                                         cloud-api                        
    configured recipient with `transferWithMemo`. The memo is the MPP attribution memo
    bound to this server's realm and this challenge id (mppx does this by default).
 3. The client retries the **same body** with `Authorization: Payment <base64url(JSON)>`
-   carrying a `transaction` payload (a signed `0x76` Tempo transaction the server
-   broadcasts with `eth_sendRawTransactionSync`) or a `hash` payload (a transaction the
+   carrying a `transaction` payload (a signed `0x76` Tempo transaction the server checks and
+   then broadcasts with `eth_sendRawTransactionSync`) or a `hash` payload (a transaction the
    client already sent). An optional `source` is a `did:pkh:eip155:<chainId>:0x<address>`.
-4. The server verifies the credential, verifies the payment on chain, claims the payment
-   once, runs the request as the configured service key, and answers with the completion
-   and a `Payment-Receipt` (`base64url` of
-   `{"method":"tempo","reference":"0x<tx hash>","status":"success","timestamp":…}`).
+4. The server verifies the credential and the payment on chain, and only then runs the
+   request as the configured service key (an unpaid credential never touches that key's rate
+   limit). The payment is claimed once, just before the handler, and a successful response
+   carries a `Payment-Receipt` (`base64url` of
+   `{"method":"tempo","reference":"0x<tx hash>","status":"success","timestamp":…}`). An error
+   response carries no receipt.
 
 Streaming responses are supported: the receipt headers are on the response head. The MPP
 layer marks the response `Cache-Control: private`; the app-wide request-correlation layer
@@ -51,11 +54,11 @@ then sets `no-store` on every response, which is stricter, so a receipt is never
 
 | Status | When |
 |---|---|
-| `402` + fresh challenge | no credential, or a retryable failure: malformed credential, invalid or expired challenge, transaction not found or not mined, reverted, no matching transfer |
+| `402` + fresh challenge | no credential; a malformed credential; an invalid or expired challenge; a reverted transaction or no matching transfer; a `transaction` payload that does not pay this challenge (refused before any broadcast) |
 | `403`, no challenge | the payment was already used, or funds moved without a memo bound to this challenge. Paying again would not help |
-| `400` `validation_error` | a priced model whose request breaks a limit (below) |
+| `400` | a priced model whose request breaks a limit (below), or a body the handler would refuse anyway (its own error, no challenge) |
 | `400` `method-unsupported` | a `proof` payload, or a method other than `tempo` |
-| `503` + `Retry-After` | the Tempo RPC or the claim store did not answer, or the service workspace cannot pay for inference |
+| `503` + `Retry-After`, no challenge | the transaction is not found or not yet mined, or a broadcast could not be confirmed: **retry the same credential**, do not pay again. Also when the Tempo RPC or the claim store did not answer, or the service workspace cannot pay for inference |
 | `401` | unpriced or unparseable request without a valid key: today's behavior |
 
 A `Bearer` key request is never touched by MPP, and a request without `Authorization` for
@@ -117,9 +120,11 @@ fields, a duplicate model name, an empty table, and zero limits.
 3. **Schema.** The single-use ledger is the table `mpp_payment_claims`
    (`V0098__mpp_payment_claims.sql` in `nearai/cloud-platform`). cloud-api does not migrate:
    deploy the cloud-platform migration, then the pin in `scripts/cloud-platform-schema.env`,
-   before enabling MPP. The table holds `payment_key`, `challenge_id`, `state`
+   before enabling MPP. The table holds `payment_key` (`tempo:` + hex of
+   `HMAC-SHA256(MPP_SECRET_KEY, tx hash)`, never the hash itself), `challenge_id`, `state`
    (`serving`, `served`, `unserved`) and two timestamps. It has no organization, workspace,
-   request or payer column.
+   request or payer column. cloud-api purges rows older than 24 hours every hour (a claim
+   outlives its challenge, at most one hour, many times over).
 4. **Reconciliation.** Payments are on-chain transfers to the recipient carrying an MPP
    attribution memo (`keccak256("mpp")[0..4] ‖ 0x01 ‖ keccak256(realm)[0..10] ‖ client ‖
    keccak256(challenge id)[0..7]`). Reconcile the treasury's `TransferWithMemo` events with
@@ -130,19 +135,26 @@ fields, a duplicate model name, an empty table, and zero limits.
 
 - The challenge id is `HMAC-SHA256(secret, realm|method|intent|request|expires|digest|opaque)`,
   verified in constant time, so a challenge needs no storage. The digest binds the exact
-  request body and the opaque value binds the route; any change is `invalid-challenge`.
+  request body; the opaque value binds the route and a random per-challenge nonce, so two
+  identical requests never share a challenge (and a payment cannot be claimed under someone
+  else's copy of it). Any change is `invalid-challenge`.
 - A payment is accepted only if the receipt has `status == 0x1` and a TIP-20 transfer from the
   configured token to the configured recipient for **exactly** the requested amount, sent by
   the expected sender (the `source` address when the client sends one, else the transaction
   sender), carrying an MPP memo bound to this realm and this challenge id.
-- The payment key is `tempo:0x<tx hash>`. Claiming is one atomic statement, so concurrent
+- The payment key is a keyed digest of the transaction hash. Claiming is one atomic statement, so concurrent
   presentations of one credential serve it once. If the paid request ends in an error
   response, the claim is released to `unserved` and the same credential (same challenge) can
   be presented again until the challenge expires, without a second payment. A client that
   disconnects while its request runs has used the payment: the claim is marked `served`.
+- A `transaction` payload is decoded before it is broadcast: its chain id must be the
+  configured one, and one of its calls must be `transferWithMemo` on the configured token, to
+  the recipient, for the amount, with a memo bound to this challenge. Anything else is refused
+  without reaching the node, so the server neither relays arbitrary transactions nor lets a
+  client lose funds to a transaction that cannot pay.
 - If `eth_sendRawTransactionSync` fails, the receipt is looked up by `keccak256(raw tx)` a
-  few times (the node may already have the transaction). No receipt after the node refused it
-  is a retryable `402`; an unreachable node is `503`.
+  few times (the node may already have the transaction), all under one deadline. No receipt
+  is a `503` to retry the same credential.
 
 ## Privacy
 
@@ -152,7 +164,8 @@ The service runs in a TEE and MPP adds no customer data to its storage or logs.
   transaction hashes, payer addresses, `source` DIDs, request bodies, the service API key,
   the HMAC secret and the RPC URL. Logs carry closed outcome codes (for example
   `rpc_unavailable`, `memo_not_bound`).
-- The claim table stores a transaction hash and a challenge id only.
+- The claim table stores a keyed digest of the transaction hash (not linkable to the payer
+  without `MPP_SECRET_KEY`) and a challenge id only, for 24 hours.
 - Problem details use fixed sentences; no request content is echoed.
 - Requests run as the service workspace, so usage is recorded against that workspace and not
   against the payer. There is no link between a payer address and a conversation.
@@ -164,9 +177,10 @@ The service runs in a TEE and MPP adds no customer data to its storage or logs.
   credentials, no `session` intent.
 - `POST /v1/chat/completions` only.
 - Retry window for a failed paid request: the challenge lifetime.
-- Transaction payloads are checked for type (`0x76`), size (16 KiB) and RLP framing, then
-  broadcast and judged by their receipt. The server does not decode or simulate the
-  transaction, so edge rate limiting should protect a metered RPC.
+- Transaction payloads are decoded and checked (above) but not simulated, and the signer is
+  not recovered before broadcast; the receipt's sender is checked afterwards.
+- A `hash` payload costs one receipt lookup before any rate limit applies: protect a metered
+  RPC with edge rate limiting.
 - The `Authorization` header is capped at 16 KiB.
 
 ## Client example

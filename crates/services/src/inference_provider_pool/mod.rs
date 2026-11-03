@@ -25,6 +25,7 @@ use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, info, warn};
 
 mod context_routing;
+pub(crate) use context_routing::estimate_input;
 pub use context_routing::expand_inference_endpoints;
 
 #[cfg(test)]

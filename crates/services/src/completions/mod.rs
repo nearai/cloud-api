@@ -352,10 +352,18 @@ where
                     }
                     return;
                 }
+                if self.last_error.is_some() {
+                    tracing::warn!(%chat_id, %organization_id, %model_id, model = %self.model_name,
+                        "Stream ended with provider error before usage stats received");
+                    return;
+                }
                 let input_tokens = i32::try_from(self.estimated_input_tokens).unwrap_or(i32::MAX);
-                let output_tokens =
+                let output_tokens = if self.streamed_output_bytes == 0 {
+                    0
+                } else {
                     i32::try_from(estimate_tokens_from_bytes(self.streamed_output_bytes))
-                        .unwrap_or(i32::MAX);
+                        .unwrap_or(i32::MAX)
+                };
                 tracing::info!(
                     estimated_input_tokens = input_tokens,
                     estimated_output_tokens = output_tokens,
@@ -482,7 +490,7 @@ where
 
             handle_clone.block_on(
                 async move {
-                    let stop_reason = Some(if estimated_usage {
+                    let stop_reason = Some(if estimated_usage && stream_completed {
                         crate::usage::StopReason::Incomplete
                     } else {
                         crate::usage::StopReason::for_stream_outcome(
@@ -549,10 +557,10 @@ where
                             1,
                             &[model_tag.as_str()],
                         );
-                        return;
                     }
 
-                    if let Some(first_token_instant) = first_token_time {
+                    if let Some(first_token_instant) = first_token_time.filter(|_| !estimated_usage)
+                    {
                         let decoding_duration = first_token_instant.elapsed();
                         metrics_service.record_latency(
                             METRIC_LATENCY_DECODING_TIME,
@@ -577,7 +585,9 @@ where
                         cache_read_tokens as i64,
                         &tags,
                     );
-                    if let Some(rate) = cache_hit_rate_percent(cache_read_tokens, input_tokens) {
+                    if let Some(rate) = cache_hit_rate_percent(cache_read_tokens, input_tokens)
+                        .filter(|_| !estimated_usage)
+                    {
                         metrics_service.record_histogram(METRIC_CACHE_HIT_RATE, rate, &tags);
                     }
                 }
@@ -660,6 +670,24 @@ where
 
                             for choice in &chat_chunk.choices {
                                 if let Some(delta) = &choice.delta {
+                                    let tool_call_bytes = delta
+                                        .tool_calls
+                                        .as_ref()
+                                        .into_iter()
+                                        .flatten()
+                                        .filter_map(|call| call.function.as_ref())
+                                        .fold(0usize, |total, function| {
+                                            total
+                                                .saturating_add(
+                                                    function.name.as_ref().map_or(0, String::len),
+                                                )
+                                                .saturating_add(
+                                                    function
+                                                        .arguments
+                                                        .as_ref()
+                                                        .map_or(0, String::len),
+                                                )
+                                        });
                                     self.streamed_output_bytes =
                                         self.streamed_output_bytes.saturating_add(
                                             delta.content.as_ref().map_or(0, String::len)
@@ -667,7 +695,8 @@ where
                                                     .reasoning_content
                                                     .as_ref()
                                                     .or(delta.reasoning.as_ref())
-                                                    .map_or(0, String::len),
+                                                    .map_or(0, String::len)
+                                                + tool_call_bytes,
                                         );
                                 }
                             }
@@ -903,24 +932,34 @@ fn estimate_tokens_from_bytes(bytes: usize) -> u32 {
     (bytes / 4).max(1) as u32
 }
 
-/// Rough token count estimate for context-length routing.
-fn estimate_input_tokens(messages: &[inference_providers::ChatMessage]) -> u32 {
-    let chars: usize = messages
+fn estimate_text_input_tokens(params: &inference_providers::ChatCompletionParams) -> u32 {
+    let chars: usize = params
+        .messages
         .iter()
-        .map(|m| {
-            let content = match &m.content {
-                Some(serde_json::Value::String(s)) => s.len(),
+        .map(|message| {
+            let content = match &message.content {
+                Some(serde_json::Value::String(text)) => text.len(),
                 Some(serde_json::Value::Array(parts)) => parts
                     .iter()
-                    .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
-                    .map(|s| s.len())
+                    .filter_map(|part| part.get("text").and_then(|text| text.as_str()))
+                    .map(str::len)
                     .sum(),
                 _ => 0,
             };
-            content + m.reasoning_content.as_ref().map_or(0, |r| r.len())
+            content + message.reasoning_content.as_ref().map_or(0, String::len)
         })
         .sum();
     estimate_tokens_from_bytes(chars)
+}
+
+fn estimate_input_tokens(params: &inference_providers::ChatCompletionParams) -> u32 {
+    let estimate = super::inference_provider_pool::estimate_input(params);
+    u32::try_from(
+        estimate
+            .countable_tokens
+            .saturating_add(estimate.uncounted_tokens),
+    )
+    .unwrap_or(u32::MAX)
 }
 
 impl CompletionServiceImpl {
@@ -1981,10 +2020,10 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         let provider_start_time = Instant::now();
 
         // Compute routing hints from the request messages for adaptive load balancing.
-        let estimated_input_tokens = estimate_input_tokens(&chat_params.messages);
+        let estimated_input_tokens = estimate_input_tokens(&chat_params);
         let routing_hints = super::inference_provider_pool::ChatRoutingHints {
             prefix_hash: Some(compute_prefix_hash(&chat_params.messages)),
-            estimated_tokens: Some(estimated_input_tokens),
+            estimated_tokens: Some(estimate_text_input_tokens(&chat_params)),
             fallback_disabled: !request.fallback_enabled,
             request_priority: chat_params.request_priority,
         };
@@ -2868,7 +2907,7 @@ mod tests {
         );
         assert_eq!(
             requests[0].stop_reason,
-            Some(crate::usage::StopReason::Incomplete)
+            Some(crate::usage::StopReason::ClientDisconnect)
         );
         let metrics = metrics_service.get_metrics();
         let estimate_metrics: Vec<_> = metrics
@@ -2883,6 +2922,25 @@ mod tests {
         assert!(!metrics
             .iter()
             .any(|metric| metric.name == METRIC_LATENCY_STREAMING_TTFT_BY_INPUT));
+        for (name, count) in [
+            (METRIC_TOKENS_INPUT, 7),
+            (METRIC_TOKENS_OUTPUT, 3),
+            (METRIC_TOKENS_CACHED, 0),
+        ] {
+            assert!(metrics.iter().any(|metric| {
+                metric.name == name && matches!(metric.value, MetricValue::Count(v) if v == count)
+            }));
+        }
+        assert!(!metrics
+            .iter()
+            .any(|metric| metric.name == METRIC_CACHE_HIT_RATE));
+        assert!(metrics
+            .iter()
+            .any(|metric| metric.name == METRIC_LATENCY_TOTAL));
+        assert!(!metrics
+            .iter()
+            .any(|metric| metric.name == METRIC_LATENCY_DECODING_TIME));
+        assert!(requests[0].avg_itl_ms.is_none());
     }
 
     #[tokio::test]
@@ -2913,6 +2971,12 @@ mod tests {
             requests[0].stop_reason,
             Some(crate::usage::StopReason::Stop)
         );
+        assert!(metrics_service.get_metrics().iter().any(|metric| {
+            metric.name == METRIC_TOKENS_INPUT && matches!(metric.value, MetricValue::Count(37))
+        }));
+        assert!(metrics_service.get_metrics().iter().any(|metric| {
+            metric.name == METRIC_TOKENS_OUTPUT && matches!(metric.value, MetricValue::Count(11))
+        }));
         assert!(!metrics_service
             .get_metrics()
             .iter()
@@ -2932,6 +2996,165 @@ mod tests {
         drop(stream);
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(usage_service.get_requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn stream_provider_error_after_role_only_chunk_records_no_usage() {
+        use crate::test_utils::CapturingUsageService;
+
+        let usage_service = Arc::new(CapturingUsageService::new());
+        let mut stream = terminal_test_stream(vec![
+            Ok(usage_test_chunk(None, None, None, None)),
+            Err(inference_providers::CompletionError::CompletionError(
+                "provider failed".to_string(),
+            )),
+        ]);
+        stream.usage_service = usage_service.clone();
+        assert!(stream.next().await.is_some());
+        assert!(stream.next().await.unwrap().is_err());
+        drop(stream);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        assert!(usage_service.get_requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn incomplete_stream_role_only_chunk_records_zero_output() {
+        use crate::test_utils::CapturingUsageService;
+
+        let usage_service = Arc::new(CapturingUsageService::new());
+        let mut stream = terminal_test_stream(vec![Ok(usage_test_chunk(None, None, None, None))]);
+        stream.usage_service = usage_service.clone();
+        assert!(stream.next().await.is_some());
+        drop(stream);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let requests = usage_service.get_requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].input_tokens, 7);
+        assert_eq!(requests[0].output_tokens, 0);
+        assert_eq!(
+            requests[0].stop_reason,
+            Some(crate::usage::StopReason::ClientDisconnect)
+        );
+    }
+
+    #[tokio::test]
+    async fn incomplete_stream_estimate_emits_token_volume_metrics() {
+        let metrics_service = Arc::new(CapturingMetricsService::new());
+        let mut stream =
+            terminal_test_stream(vec![Ok(usage_test_chunk(Some("hello"), None, None, None))]);
+        stream.metrics_service = metrics_service.clone();
+        assert!(stream.next().await.is_some());
+        drop(stream);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let metrics = metrics_service.get_metrics();
+        assert!(metrics.iter().any(|metric| {
+            metric.name == METRIC_TOKENS_INPUT && matches!(metric.value, MetricValue::Count(7))
+        }));
+        assert!(metrics.iter().any(|metric| {
+            metric.name == METRIC_TOKENS_OUTPUT && matches!(metric.value, MetricValue::Count(1))
+        }));
+        assert!(metrics
+            .iter()
+            .any(|metric| metric.name == METRIC_TOKENS_CACHED));
+        assert!(!metrics
+            .iter()
+            .any(|metric| metric.name == METRIC_CACHE_HIT_RATE));
+        assert!(metrics
+            .iter()
+            .any(|metric| metric.name == METRIC_LATENCY_TOTAL));
+        assert!(!metrics
+            .iter()
+            .any(|metric| metric.name == METRIC_TOKENS_PER_SECOND));
+        assert!(!metrics
+            .iter()
+            .any(|metric| metric.name == METRIC_LATENCY_DECODING_TIME));
+        assert!(!metrics
+            .iter()
+            .any(|metric| metric.name == METRIC_LATENCY_STREAMING_TTFT_BY_INPUT));
+    }
+
+    #[tokio::test]
+    async fn incomplete_stream_completed_without_usage_records_incomplete() {
+        use crate::test_utils::CapturingUsageService;
+
+        let usage_service = Arc::new(CapturingUsageService::new());
+        let mut stream =
+            terminal_test_stream(vec![Ok(usage_test_chunk(Some("hello"), None, None, None))]);
+        stream.usage_service = usage_service.clone();
+        let _ = stream.collect::<Vec<_>>().await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let requests = usage_service.get_requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].input_tokens, 7);
+        assert_eq!(requests[0].output_tokens, 1);
+        assert_eq!(
+            requests[0].stop_reason,
+            Some(crate::usage::StopReason::Incomplete)
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_tool_call_only_chunk_counts_output() {
+        use crate::test_utils::CapturingUsageService;
+
+        let usage_service = Arc::new(CapturingUsageService::new());
+        let mut event = usage_test_chunk(None, None, None, None);
+        if let Some(StreamChunk::Chat(chunk)) = &mut event.chunk {
+            chunk.choices[0].delta.as_mut().unwrap().tool_calls =
+                Some(vec![inference_providers::models::ToolCallDelta {
+                    id: None,
+                    type_: None,
+                    index: Some(0),
+                    function: Some(inference_providers::models::FunctionCallDelta {
+                        name: Some("lookup".to_string()),
+                        arguments: Some("{\"city\":\"Paris\"}".to_string()),
+                    }),
+                    thought_signature: None,
+                }]);
+        }
+        let mut stream = terminal_test_stream(vec![Ok(event)]);
+        stream.usage_service = usage_service.clone();
+        assert!(stream.next().await.is_some());
+        drop(stream);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let requests = usage_service.get_requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].input_tokens, 7);
+        assert_eq!(requests[0].output_tokens, 5);
+        assert_eq!(
+            requests[0].stop_reason,
+            Some(crate::usage::StopReason::ClientDisconnect)
+        );
+    }
+
+    #[test]
+    fn estimate_text_input_tokens_ignores_tools() {
+        let base: inference_providers::ChatCompletionParams =
+            serde_json::from_value(serde_json::json!({
+                "model": "m",
+                "messages": [{"role": "user", "content": "hello"}]
+            }))
+            .unwrap();
+        let mut with_tools = base.clone();
+        with_tools.tools = Some(vec![inference_providers::models::ToolDefinition {
+            type_: "function".to_string(),
+            function: inference_providers::models::FunctionDefinition {
+                name: "lookup".to_string(),
+                description: Some("Find a place".to_string()),
+                parameters: serde_json::json!({"type": "object", "properties": {"city": {"type": "string"}}}),
+            },
+        }]);
+        assert_eq!(estimate_text_input_tokens(&base), 1);
+        assert_eq!(
+            estimate_text_input_tokens(&with_tools),
+            estimate_text_input_tokens(&base)
+        );
+        assert!(estimate_input_tokens(&with_tools) > estimate_input_tokens(&base));
     }
 
     #[tokio::test]

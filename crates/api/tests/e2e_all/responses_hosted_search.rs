@@ -8,8 +8,8 @@ use inference_providers::{
 };
 use serde_json::{json, Value};
 use services::responses::tools::{
-    WebContextSearchParams, WebContextSearchProviderTrait, WebSearchError, WebSearchParams,
-    WebSearchProviderTrait, WebSearchResult,
+    web_search::CITATION_INSTRUCTION, WebContextSearchParams, WebContextSearchProviderTrait,
+    WebSearchError, WebSearchParams, WebSearchProviderTrait, WebSearchResult,
 };
 use std::sync::{Arc, Mutex};
 
@@ -318,22 +318,32 @@ async fn multiple_search_rounds_accumulate_sources_usage_and_unique_output_ids()
             2,
             "both search results must reach the final inference"
         );
-        assert!(results[0]
-            .content
-            .as_ref()
-            .unwrap()
-            .as_str()
-            .unwrap()
-            .contains("https://example.com/first"));
-        assert!(results[1]
-            .content
-            .as_ref()
-            .unwrap()
-            .as_str()
-            .unwrap()
-            .contains("https://example.com/second"));
+        for (index, query) in ["first", "second"].into_iter().enumerate() {
+            assert_eq!(annotations[index]["title"], format!("Source for {query}"));
+            let content = results[index].content.as_ref().unwrap().as_str().unwrap();
+            assert!(content.starts_with(&format!("Source: {index}\n")));
+            assert!(content.contains(&format!("https://example.com/{query}")));
+            assert!(content.contains(&format!("Grounded context about {query}.")));
+            assert_eq!(
+                content.matches(CITATION_INSTRUCTION).count(),
+                usize::from(index == 0)
+            );
+        }
         if stream {
-            assert_search_lifecycle(&events(&result.text()), &response);
+            let events = events(&result.text());
+            assert_search_lifecycle(&events, &response);
+            let deltas: String = events
+                .iter()
+                .filter(|event| event["type"] == "response.output_text.delta")
+                .filter_map(|event| event["delta"].as_str())
+                .collect();
+            assert_eq!(deltas, text["text"].as_str().unwrap());
+            let added: Vec<_> = events
+                .iter()
+                .filter(|event| event["type"] == "response.output_text.annotation.added")
+                .map(|event| &event["annotation"])
+                .collect();
+            assert_eq!(added, annotations.iter().collect::<Vec<_>>());
         }
         assert_no_history(&database, &response).await;
     }

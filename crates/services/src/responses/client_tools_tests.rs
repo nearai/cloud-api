@@ -352,12 +352,14 @@ fn native_keeps_custom_constraints_and_reasoning_while_promoting_lite_tools() {
     let tools = vec![namespace("client", vec![tool])];
     let reasoning = json!({"type": "reasoning", "id": "rs_old", "summary": [], "encrypted_content": "opaque_fixture"});
     let call = json!({"type": "custom_tool_call", "name": "run", "namespace": "client", "call_id": "call_old", "input": "hello"});
+    let output =
+        json!({"type": "custom_tool_call_output", "call_id": "call_old", "output": "Done"});
     let normalized = normalize_native_request(json!({"model": "test", "store": false, "input": [
-        {"type": "additional_tools", "role": "developer", "tools": tools}, reasoning, call
+        {"type": "additional_tools", "role": "developer", "tools": tools}, reasoning, call, output
     ]}))
     .unwrap();
     assert_eq!(normalized["tools"], json!(tools));
-    assert_eq!(normalized["input"], json!([reasoning, call]));
+    assert_eq!(normalized["input"], json!([reasoning, call, output]));
 }
 
 #[test]
@@ -425,7 +427,6 @@ fn search_is_not_allowed_inside_client_namespaces() {
         assert!(normalize_request(request(vec![search.clone()])).is_ok());
         let tools = vec![namespace("client", vec![search])];
         assert!(normalize_request(request(tools.clone())).is_err());
-        assert!(validate_native_tools(&request(tools.clone())).is_err());
         assert!(normalize_native_request(request(tools.clone())).is_err());
         assert!(normalize_native_request(json!({"model": "test", "input": [
             {"type": "additional_tools", "role": "developer", "tools": tools}
@@ -455,9 +456,15 @@ fn native_search_accepts_only_web_search_without_relaxing_client_tool_validation
         json!({"type":"function"}),
         json!({"type":"custom", "name":" "}),
         namespace("client", vec![json!({"type":"function"})]),
+        namespace(
+            "outer",
+            vec![namespace(
+                "inner",
+                vec![json!({"type":"mcp", "server_label":"remote"})],
+            )],
+        ),
     ] {
         let tools = vec![search.clone(), invalid];
-        assert!(validate_native_tools(&request(tools.clone())).is_err());
         assert!(normalize_native_request(request(tools.clone())).is_err());
         assert!(normalize_native_request(json!({"model":"test", "input":[
             {"type":"additional_tools", "role":"developer", "tools":tools}

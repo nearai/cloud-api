@@ -280,7 +280,7 @@ fn visit_tools<'a>(
     Ok(())
 }
 
-pub fn validate_native_tools(body: &Value) -> Result<(), String> {
+fn validate_native_tools(body: &Value) -> Result<(), String> {
     if let Some(tools) = body.get("tools").filter(|value| !value.is_null()) {
         for tool in tools.as_array().ok_or("tools must be an array")? {
             // Native web search is executed by the upstream Responses provider.

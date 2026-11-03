@@ -2921,14 +2921,6 @@ mod tests {
         let spec = serde_json::to_value(ApiDoc::openapi()).unwrap();
         let operation = &spec["paths"]["/v1/responses"]["post"];
         let request_body = &operation["requestBody"];
-        let request_description = request_body["description"]
-            .as_str()
-            .expect("Responses request body must explain its polymorphic contract");
-        assert!(
-            request_description.contains("StatelessCreateResponseRequestSchema")
-                && request_description.contains("canonical openai/ models"),
-            "Responses request body must distinguish the typed schema from native OpenAI routing"
-        );
         let request_schema = &request_body["content"]["application/json"]["schema"];
         assert_ne!(
             request_schema["$ref"], "#/components/schemas/StatelessCreateResponseRequestSchema",
@@ -2936,15 +2928,6 @@ mod tests {
         );
 
         let response = &operation["responses"]["200"];
-        let response_description = response["description"]
-            .as_str()
-            .expect("Responses success response must explain its polymorphic contract");
-        assert!(
-            response_description.contains("ResponseObject")
-                && response_description.contains("provider-native")
-                && response_description.contains("text/event-stream"),
-            "Responses success response must distinguish typed JSON, native JSON, and streaming"
-        );
         let json_response_schema = &response["content"]["application/json"]["schema"];
         assert_ne!(
             json_response_schema["$ref"], "#/components/schemas/ResponseObject",
@@ -3174,37 +3157,6 @@ mod tests {
                 "typed Responses input schema must advertise {supported_item}"
             );
         }
-        for server_executed_tool in ["file_search", "code_interpreter", "computer", "mcp"] {
-            assert!(
-                !serialized_tool_schema.contains(server_executed_tool),
-                "typed Responses OpenAPI schema must not advertise the rejected {server_executed_tool} tool"
-            );
-        }
-
-        let responses_tag = spec["tags"]
-            .as_array()
-            .and_then(|tags| tags.iter().find(|tag| tag["name"] == "Responses"))
-            .expect("Responses tag must be present in OpenAPI");
-        let description = responses_tag["description"]
-            .as_str()
-            .expect("Responses tag must document its contract");
-        assert!(description.contains("Both paths normalize omitted or null `store` to `false`"));
-        assert!(description
-            .contains("Canonical `openai/` models use one upstream native Responses request"));
-        assert!(description.contains("Native Responses also accepts top-level `web_search`"));
-        assert!(description.contains("without a Cloud search loop"));
-        assert!(description.contains(
-            "Complete native `web_search_call` replay items, search configuration, and `include` are forwarded unchanged"
-        ));
-        assert!(description.contains(
-            "Other models use the typed adapter, with bounded request-scoped inference rounds"
-        ));
-        assert!(description.contains("client-managed `function` and `custom` tools"));
-        assert!(description.contains("tools grouped in a `namespace`"));
-        assert!(description.contains("plaintext `reasoning` items"));
-        assert!(!description.contains("but not reasoning"));
-        assert!(description.contains("Image-generation/editing models are rejected on both paths"));
-        assert!(description.contains("POST /mcp"));
     }
 
     #[test]

@@ -1952,12 +1952,7 @@ impl InferenceProvider for Fleet {
         // serialization — vLLM may 400 on an unknown `cache_control` content-part
         // field (the breakpoint only matters on the Anthropic upstream).
         crate::strip_cache_control(&mut streaming_params.messages);
-        streaming_params.stream = Some(true);
-        streaming_params.stream_options = Some(StreamOptions {
-            include_usage: Some(true),
-            continuous_usage_stats: Some(true),
-            extra: Default::default(),
-        });
+        streaming_params.set_stream_fields(Some(true));
 
         let mut headers = self
             .build_headers()

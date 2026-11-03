@@ -127,7 +127,9 @@ fn decorate_response_item(
 ) {
     let response_id = response.id.clone();
     let previous_response_id = response.previous_response_id.clone();
-    let created_at = chrono::Utc::now().timestamp();
+    // Stream events and the final output share the request's creation time,
+    // even when search execution crosses a wall-clock second boundary.
+    let created_at = response.created_at;
 
     match item {
         models::ResponseOutputItem::Message {
@@ -473,6 +475,7 @@ impl ports::ResponseItemRepositoryTrait for TransientResponseItemsRepository {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ports::ResponseItemRepositoryTrait;
 
     #[test]
     fn initial_response_preserves_the_requested_tool_choice() {
@@ -514,6 +517,54 @@ mod tests {
             prompt_cache_key: None,
             service_tier: None,
         }
+    }
+
+    #[tokio::test]
+    async fn search_items_keep_the_response_timestamp_and_match_stream_items() {
+        let store = Arc::new(TransientResponseStore::default());
+        let (response_id, mut response) = initial_response(request());
+        response.created_at = 1_700_000_000;
+        let stream_item = models::ResponseOutputItem::WebSearchCall {
+            id: format!("ws_{}", Uuid::new_v4().simple()),
+            response_id: response.id.clone(),
+            previous_response_id: None,
+            next_response_ids: vec![],
+            created_at: response.created_at,
+            status: models::ResponseItemStatus::Completed,
+            action: models::WebSearchAction::Search {
+                query: "example".to_string(),
+            },
+            model: response.model.clone(),
+        };
+        store
+            .responses
+            .lock()
+            .unwrap()
+            .insert(response_id, response);
+        let items = TransientResponseItemsRepository { store };
+
+        let returned = items
+            .create(
+                models::ResponseId(response_id),
+                Uuid::new_v4(),
+                None,
+                stream_item.clone(),
+            )
+            .await
+            .unwrap();
+        let stored = items
+            .list_by_response(models::ResponseId(response_id))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            serde_json::to_value(returned).unwrap(),
+            serde_json::to_value(&stream_item).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(stored).unwrap(),
+            serde_json::to_value(vec![stream_item]).unwrap()
+        );
     }
 
     #[tokio::test]

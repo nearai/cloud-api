@@ -3553,6 +3553,7 @@ mod tests {
             credit_allocation: config::CreditAllocationConfig::default(),
             ita: config::ItaAttestationConfig::default(),
             placement: config::PlacementConfig::default(),
+            mpp: config::MppConfig::default(),
         };
 
         // Initialize services
@@ -3676,6 +3677,7 @@ mod tests {
             credit_allocation: config::CreditAllocationConfig::default(),
             ita: config::ItaAttestationConfig::default(),
             placement: config::PlacementConfig::default(),
+            mpp: config::MppConfig::default(),
         };
 
         let auth_components = init_auth_services(database.clone(), &config);

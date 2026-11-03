@@ -162,6 +162,7 @@ pub fn test_config() -> ApiConfig {
         credit_allocation: config::CreditAllocationConfig::default(),
         ita: config::ItaAttestationConfig::default(),
         placement: config::PlacementConfig::default(),
+        mpp: config::MppConfig::default(),
     }
 }
 

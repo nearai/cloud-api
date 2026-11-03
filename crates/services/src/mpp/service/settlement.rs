@@ -129,6 +129,9 @@ impl MppService {
             }
             ReceiptVerdict::MemoNotBound => MppError::Consumed(ConsumedReason::MemoNotBound),
         })?;
+        if verified.expires_at <= now {
+            self.mined_by_expiry(&receipt, verified.expires_at).await?;
+        }
 
         Ok(PaidCredential {
             challenge_id: verified.challenge_id.clone(),
@@ -143,18 +146,10 @@ impl MppService {
         now: DateTime<Utc>,
         verified: &VerifiedCredential,
     ) -> Result<RpcReceipt, MppError> {
+        let expired = verified.expires_at <= now;
         match &verified.payload {
-            PaymentPayload::Hash(hash) => match self.rpc.get_transaction_receipt(*hash).await {
-                Ok(Some(receipt)) if receipt.tx_hash == *hash => Ok(receipt),
-                Ok(Some(_)) => Err(MppError::VerificationFailed(VerifyFailure::ReceiptMismatch)),
-                Ok(None) => Err(MppError::ReceiptNotFound),
-                Err(error) => Err(rpc_unavailable(error, "lookup")),
-            },
+            PaymentPayload::Hash(hash) => self.look_up(*hash, expired).await,
             PaymentPayload::Transaction(raw) => {
-                // The window to broadcast is the challenge's lifetime.
-                if verified.expires_at <= now {
-                    return Err(MppError::Expired);
-                }
                 // Nothing leaves this server unless it pays this challenge.
                 let terms = PaymentTerms {
                     chain_id: self.chain_id,
@@ -168,12 +163,48 @@ impl MppService {
                     MppError::VerificationFailed(VerifyFailure::Transaction(mismatch))
                 })?;
                 let hash = tempo::transaction_hash(raw);
+                // The window to broadcast is the challenge's lifetime. After it, a transaction
+                // that was already mined can still be redeemed, by lookup only.
+                if expired {
+                    return self.look_up(hash, expired).await;
+                }
                 match self.rpc.send_raw_transaction_sync(raw).await {
                     Ok(receipt) if receipt.tx_hash == hash => Ok(receipt),
                     Ok(_) => Err(MppError::VerificationFailed(VerifyFailure::ReceiptMismatch)),
                     Err(send_error) => self.recover_receipt(hash, send_error).await,
                 }
             }
+        }
+    }
+
+    /// Look a payment up by its transaction hash. Not mined yet is a retry of the same
+    /// credential while the challenge is live, and an expired challenge once it is not.
+    async fn look_up(&self, hash: [u8; 32], expired: bool) -> Result<RpcReceipt, MppError> {
+        match self.rpc.get_transaction_receipt(hash).await {
+            Ok(Some(receipt)) if receipt.tx_hash == hash => Ok(receipt),
+            Ok(Some(_)) => Err(MppError::VerificationFailed(VerifyFailure::ReceiptMismatch)),
+            Ok(None) if expired => Err(MppError::Expired),
+            Ok(None) => Err(MppError::ReceiptNotFound),
+            Err(error) => Err(rpc_unavailable(error, "lookup")),
+        }
+    }
+
+    /// A late redemption counts only for a payment mined by the challenge's expiry.
+    async fn mined_by_expiry(
+        &self,
+        receipt: &RpcReceipt,
+        expires_at: DateTime<Utc>,
+    ) -> Result<(), MppError> {
+        let mined_at = match self.rpc.get_block_timestamp(receipt.block_number).await {
+            Ok(Some(mined_at)) => mined_at,
+            Ok(None) => return Err(MppError::Unavailable(UnavailableReason::Rpc)),
+            Err(error) => return Err(rpc_unavailable(error, "block")),
+        };
+        let deadline = u64::try_from(expires_at.timestamp()).map_err(|_| MppError::Config)?;
+        if mined_at <= deadline {
+            Ok(())
+        } else {
+            Err(MppError::Expired)
         }
     }
 

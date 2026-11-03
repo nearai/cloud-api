@@ -43,6 +43,14 @@ pub const CHAT_COMPLETIONS_ROUTE: &str = "/v1/chat/completions";
 
 /// After a failed `eth_sendRawTransactionSync`, how often and how far apart the receipt is
 /// looked up by hash (the node may have included the transaction before its reply failed).
+/// How long after its challenge expired a credential may still redeem a payment that was
+/// mined before the expiry. The expiry bounds when a client must *pay*; a payment already made
+/// must not be stranded because the request was refused (rate limit, credits, an outage) until
+/// the challenge ran out. After expiry nothing is broadcast: the payment is only looked up.
+/// It must stay inside the claim retention (`retention.rs`), so a purged claim can never be
+/// redeemed again.
+pub const LATE_REDEMPTION: Duration = Duration::from_secs(12 * 60 * 60);
+
 const DEFAULT_RECOVER_ATTEMPTS: u32 = 3;
 const DEFAULT_RECOVER_INTERVAL: Duration = Duration::from_millis(400);
 
@@ -349,7 +357,9 @@ impl MppService {
             .and_then(|expires| DateTime::parse_from_rfc3339(expires).ok())
             .map(|expires| expires.with_timezone(&Utc))
             .ok_or(MppError::InvalidChallenge("expires"))?;
-        if expires_at <= now {
+        let late_redemption =
+            chrono::Duration::from_std(LATE_REDEMPTION).map_err(|_| MppError::Config)?;
+        if now >= expires_at + late_redemption {
             return Err(MppError::Expired);
         }
         let request = ChargeRequest::from_b64(&echo.request)

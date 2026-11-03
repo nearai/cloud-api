@@ -107,6 +107,34 @@ impl TempoRpc for HttpTempoRpc {
         }
         parse_receipt(&result).map(Some)
     }
+
+    async fn get_block_timestamp(&self, number: u64) -> Result<Option<u64>, RpcError> {
+        let result = self
+            .call(
+                "eth_getBlockByNumber",
+                json!([format!("0x{number:x}"), false]),
+            )
+            .await
+            .map_err(|error| match error {
+                RpcError::Rejected => RpcError::Unavailable,
+                other => other,
+            })?;
+        if result.is_null() {
+            return Ok(None);
+        }
+        let block = result.as_object().ok_or(RpcError::InvalidResponse)?;
+        hex_u64(block.get("timestamp").ok_or(RpcError::InvalidResponse)?).map(Some)
+    }
+}
+
+/// A JSON-RPC quantity (`0x`-prefixed hex, at most 64 bits).
+fn hex_u64(value: &Value) -> Result<u64, RpcError> {
+    let digits = value
+        .as_str()
+        .and_then(|s| s.strip_prefix("0x"))
+        .filter(|digits| !digits.is_empty() && digits.len() <= 16)
+        .ok_or(RpcError::InvalidResponse)?;
+    u64::from_str_radix(digits, 16).map_err(|_| RpcError::InvalidResponse)
 }
 
 fn hex_bytes(value: &Value, max_bytes: usize) -> Result<Vec<u8>, RpcError> {
@@ -166,6 +194,7 @@ pub fn parse_receipt(value: &Value) -> Result<RpcReceipt, RpcError> {
     }
     Ok(RpcReceipt {
         tx_hash: hex_array::<32>(field("transactionHash")?)?,
+        block_number: hex_u64(field("blockNumber")?)?,
         success,
         from: hex_array::<20>(field("from")?)?,
         logs,
@@ -350,6 +379,49 @@ mod tests {
             .await
             .unwrap();
         assert!(receipt.success);
+    }
+
+    #[tokio::test]
+    async fn block_timestamp_reads_the_quantity_and_an_unknown_block_is_none() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({
+                "method": "eth_getBlockByNumber",
+                "params": ["0x287d957", false],
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                json!({"jsonrpc": "2.0", "id": 1, "result": {"timestamp": "0x6aea4b4f"}}),
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"params": ["0x1", false]})))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"jsonrpc": "2.0", "id": 1, "result": null})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"params": ["0x2", false]})))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(
+                    json!({"jsonrpc": "2.0", "id": 1, "result": {"timestamp": "soon"}}),
+                ),
+            )
+            .mount(&server)
+            .await;
+        let client = rpc(&server, Duration::from_secs(5));
+        // The live Moderato block of an interop payment: 2026-11-03T20:59:59Z.
+        assert_eq!(
+            client.get_block_timestamp(0x287d957).await.unwrap(),
+            Some(0x6aea4b4f)
+        );
+        assert_eq!(client.get_block_timestamp(1).await.unwrap(), None);
+        assert_eq!(
+            client.get_block_timestamp(2).await.unwrap_err(),
+            RpcError::InvalidResponse
+        );
     }
 
     #[tokio::test]

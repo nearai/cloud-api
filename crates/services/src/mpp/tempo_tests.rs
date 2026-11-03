@@ -54,6 +54,7 @@ fn memo_pair(memo: [u8; 32]) -> Vec<RpcLog> {
 fn receipt(logs: Vec<RpcLog>) -> RpcReceipt {
     RpcReceipt {
         tx_hash: [0x77; 32],
+        block_number: 1,
         success: true,
         from: PAYER,
         logs,

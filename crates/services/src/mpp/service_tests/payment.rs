@@ -590,6 +590,9 @@ async fn a_transaction_credential_cannot_broadcast_after_the_challenge_expired()
         REALM,
         &challenge,
     ));
+    // Mined, but only after the challenge expired: too late to count.
+    f.chain
+        .set_block_time(1, challenge.expires.timestamp() as u64 + 1);
     let header = credential_header(&challenge, transaction_payload(&raw), None);
     let verified = f
         .service
@@ -665,4 +668,137 @@ async fn the_guard_marks_served_when_dropped_and_respects_finish() {
         .claim(&f.verify_payment(&header).await.unwrap())
         .await;
     assert!(retried.is_ok(), "{retried:?}");
+}
+
+// ----- late redemption (a paid credential refused until its challenge expired) -----
+
+/// A challenge issued `ago` before `now`, at the fixture's price for `body()`.
+fn challenge_issued(f: &Fixture, now: DateTime<Utc>, ago: ChronoDuration) -> Challenge {
+    let Pricing::Priced(price) = f.service.price_body(&body()) else {
+        panic!("body() prices");
+    };
+    f.service
+        .challenge_at(now - ago, CHAT_COMPLETIONS_ROUTE, &body(), &price)
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_payment_mined_before_expiry_is_redeemable_after_it() {
+    let f = fixture();
+    let now = Utc::now();
+    // TTL 600s, issued 2h ago: expired 1h50m ago, inside the late-redemption window.
+    let challenge = challenge_issued(&f, now, ChronoDuration::hours(2));
+    let mut receipt =
+        bound_payment_receipt(TX, PAYER, CURRENCY, RECIPIENT, AMOUNT, REALM, &challenge);
+    receipt.block_number = 7;
+    f.chain.mine(receipt);
+    let expires = challenge.expires.timestamp() as u64;
+    f.chain.set_block_time(7, expires - 30);
+    let header = credential_header(&challenge, hash_payload(TX), None);
+
+    let verified = f
+        .service
+        .verify_at(now, &header, CHAT_COMPLETIONS_ROUTE, &body())
+        .unwrap();
+    let paid = f.service.verify_payment_at(now, &verified).await.unwrap();
+    assert!(
+        f.service.claim(&paid).await.is_ok(),
+        "a stranded payment is redeemed"
+    );
+    // Still single use.
+    let again = f.service.verify_payment_at(now, &verified).await.unwrap();
+    assert!(matches!(
+        f.service.claim(&again).await,
+        Err(MppError::Consumed(_))
+    ));
+}
+
+#[tokio::test]
+async fn a_payment_mined_after_expiry_is_not_redeemable() {
+    let f = fixture();
+    let now = Utc::now();
+    let challenge = challenge_issued(&f, now, ChronoDuration::hours(2));
+    let mut receipt =
+        bound_payment_receipt(TX, PAYER, CURRENCY, RECIPIENT, AMOUNT, REALM, &challenge);
+    receipt.block_number = 9;
+    f.chain.mine(receipt);
+    f.chain
+        .set_block_time(9, challenge.expires.timestamp() as u64 + 1);
+    let header = credential_header(&challenge, hash_payload(TX), None);
+    let verified = f
+        .service
+        .verify_at(now, &header, CHAT_COMPLETIONS_ROUTE, &body())
+        .unwrap();
+    assert_eq!(
+        f.service
+            .verify_payment_at(now, &verified)
+            .await
+            .unwrap_err(),
+        MppError::Expired
+    );
+}
+
+#[tokio::test]
+async fn an_expired_unpaid_credential_is_expired_and_past_the_window_nothing_is_read() {
+    let f = fixture();
+    let now = Utc::now();
+    // Expired but inside the window, never paid: expired, not "retry".
+    let challenge = challenge_issued(&f, now, ChronoDuration::hours(2));
+    let header = credential_header(&challenge, hash_payload(TX), None);
+    let verified = f
+        .service
+        .verify_at(now, &header, CHAT_COMPLETIONS_ROUTE, &body())
+        .unwrap();
+    assert_eq!(
+        f.service
+            .verify_payment_at(now, &verified)
+            .await
+            .unwrap_err(),
+        MppError::Expired
+    );
+    // Past the late-redemption window the credential is refused before any lookup.
+    let stale = challenge_issued(&f, now, ChronoDuration::hours(13));
+    let header = credential_header(&stale, hash_payload(TX), None);
+    let lookups = f.chain.lookup_calls();
+    assert_eq!(
+        f.service
+            .verify_at(now, &header, CHAT_COMPLETIONS_ROUTE, &body())
+            .unwrap_err(),
+        MppError::Expired
+    );
+    assert_eq!(f.chain.lookup_calls(), lookups);
+}
+
+#[tokio::test]
+async fn an_expired_transaction_credential_is_looked_up_never_broadcast() {
+    let f = fixture();
+    let now = Utc::now();
+    let challenge = challenge_issued(&f, now, ChronoDuration::hours(2));
+    let raw = payment_transaction(&paying(&challenge, 11));
+    let hash = tempo::transaction_hash(&raw);
+    let header = credential_header(&challenge, transaction_payload(&raw), None);
+    let verified = f
+        .service
+        .verify_at(now, &header, CHAT_COMPLETIONS_ROUTE, &body())
+        .unwrap();
+
+    // Not mined: expired, and nothing was sent to the node.
+    assert_eq!(
+        f.service
+            .verify_payment_at(now, &verified)
+            .await
+            .unwrap_err(),
+        MppError::Expired
+    );
+    assert_eq!(f.chain.send_calls(), 0);
+
+    // Mined before expiry (the client or an earlier attempt broadcast it): redeemed by lookup.
+    let mut receipt =
+        bound_payment_receipt(hash, PAYER, CURRENCY, RECIPIENT, AMOUNT, REALM, &challenge);
+    receipt.block_number = 3;
+    f.chain.mine(receipt);
+    f.chain
+        .set_block_time(3, challenge.expires.timestamp() as u64 - 1);
+    assert!(f.service.verify_payment_at(now, &verified).await.is_ok());
+    assert_eq!(f.chain.send_calls(), 0, "never broadcast after expiry");
 }

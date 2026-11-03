@@ -17,6 +17,13 @@ use super::ports::PaymentClaimRepository;
 
 /// Claims older than this are purged: a day, against a one-hour maximum challenge lifetime.
 pub const CLAIM_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
+
+// A claim must outlive every credential that could still redeem its payment: the longest
+// challenge plus the late-redemption window. Otherwise a purged claim could be spent again.
+const _: () = assert!(
+    config::MAX_MPP_CHALLENGE_TTL_SECS + super::service::LATE_REDEMPTION.as_secs()
+        < CLAIM_RETENTION.as_secs()
+);
 /// How often the purge runs.
 pub const PURGE_INTERVAL: Duration = Duration::from_secs(60 * 60);
 /// One purge (many batches) ends here whatever the database does.

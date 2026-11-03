@@ -152,6 +152,18 @@ fields, a duplicate model name, an empty table, and zero limits.
   the recipient, for the amount, with a memo bound to this challenge. Anything else is refused
   without reaching the node, so the server neither relays arbitrary transactions nor lets a
   client lose funds to a transaction that cannot pay.
+- **Expiry bounds when a client must pay, not when a payment can be redeemed.** A request
+  refused after the payment was made (rate limit, the service workspace's credits, an outage)
+  must not strand that payment when its challenge runs out. For 12 hours after expiry
+  (`LATE_REDEMPTION`) the same credential still verifies; the server then only looks the
+  payment up (it never broadcasts after expiry) and accepts it only if its block was produced
+  at or before the challenge's expiry. A payment mined later, or a credential presented after
+  the window, is `payment-expired`. The window plus the longest challenge stays inside the
+  24-hour claim retention (checked at compile time), so a purged claim can never be spent
+  again.
+- Each claim attempt carries a lease (the row's `updated_at`); `finish` only moves the row
+  still holding it, so a retried or late `finish` of an earlier attempt cannot release a newer
+  attempt's claim.
 - If `eth_sendRawTransactionSync` fails, the receipt is looked up by `keccak256(raw tx)` a
   few times (the node may already have the transaction), all under one deadline. No receipt
   is a `503` to retry the same credential.
@@ -176,7 +188,8 @@ The service runs in a TEE and MPP adds no customer data to its storage or logs.
 - No fee sponsorship (`feePayer`), no splits, no machine token, no zero-amount `proof`
   credentials, no `session` intent.
 - `POST /v1/chat/completions` only.
-- Retry window for a failed paid request: the challenge lifetime.
+- Retry window for a paid request that failed or was refused: the challenge lifetime plus
+  12 hours, for a payment mined before the challenge expired.
 - Transaction payloads are decoded and checked (above) but not simulated, and the signer is
   not recovered before broadcast; the receipt's sender is checked afterwards.
 - A `hash` payload costs one receipt lookup before any rate limit applies: protect a metered

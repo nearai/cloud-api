@@ -117,6 +117,8 @@ pub struct RpcLog {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RpcReceipt {
     pub tx_hash: [u8; 32],
+    /// The block the transaction was mined in.
+    pub block_number: u64,
     /// `status == 0x1`.
     pub success: bool,
     pub from: [u8; 20],
@@ -159,6 +161,9 @@ pub trait TempoRpc: Send + Sync {
     /// `eth_getTransactionReceipt`: `None` while the transaction is unknown or not mined.
     async fn get_transaction_receipt(&self, hash: [u8; 32])
         -> Result<Option<RpcReceipt>, RpcError>;
+
+    /// `eth_getBlockByNumber`: the block's timestamp (Unix seconds), `None` if unknown.
+    async fn get_block_timestamp(&self, number: u64) -> Result<Option<u64>, RpcError>;
 }
 
 #[cfg(test)]

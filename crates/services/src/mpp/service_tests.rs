@@ -698,7 +698,10 @@ fn a_challenge_is_bound_to_its_body_and_route() {
 }
 
 #[test]
-fn expired_challenges_are_payment_expired_not_invalid() {
+fn a_credential_verifies_until_the_late_redemption_window_closes() {
+    // Expiry bounds when the client must pay. The credential itself verifies until
+    // LATE_REDEMPTION after expiry (settlement then only accepts a payment mined by the
+    // expiry, and never broadcasts); after that it is payment-expired, never "invalid".
     let f = fixture();
     let issued = Utc::now() - ChronoDuration::seconds(601);
     let challenge = f
@@ -711,24 +714,16 @@ fn expired_challenges_are_payment_expired_not_invalid() {
         )
         .unwrap();
     let header = credential_header(&challenge, hash_payload([1; 32]), None);
-    assert_eq!(f.verify(&header, &body()).unwrap_err(), MppError::Expired);
-    // One second before expiry still verifies; at expiry it does not.
     let expires = challenge.expires;
-    assert!(f
-        .service
-        .verify_at(
-            expires - ChronoDuration::seconds(1),
-            &header,
-            CHAT_COMPLETIONS_ROUTE,
-            &body()
-        )
-        .is_ok());
-    assert_eq!(
+    let window = ChronoDuration::from_std(LATE_REDEMPTION).unwrap();
+    let at = |now| {
         f.service
-            .verify_at(expires, &header, CHAT_COMPLETIONS_ROUTE, &body())
-            .unwrap_err(),
-        MppError::Expired
-    );
+            .verify_at(now, &header, CHAT_COMPLETIONS_ROUTE, &body())
+    };
+    assert!(at(expires - ChronoDuration::seconds(1)).is_ok());
+    assert!(at(expires).is_ok(), "expired, but inside the window");
+    assert!(at(expires + window - ChronoDuration::seconds(1)).is_ok());
+    assert_eq!(at(expires + window).unwrap_err(), MppError::Expired);
 }
 
 #[test]

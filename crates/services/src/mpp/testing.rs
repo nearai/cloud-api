@@ -39,6 +39,8 @@ pub struct FakeTempo {
     lookup_error: Mutex<Option<RpcError>>,
     /// Returned by every successful broadcast instead of the transaction's own receipt.
     send_receipt: Mutex<Option<RpcReceipt>>,
+    /// Block timestamps (Unix seconds) by number; unknown blocks are `None`.
+    block_times: Mutex<HashMap<u64, u64>>,
     sends: AtomicUsize,
     lookups: AtomicUsize,
 }
@@ -50,6 +52,7 @@ impl Default for FakeTempo {
             send_mode: Mutex::new(SendMode::Normal),
             lookup_error: Mutex::new(None),
             send_receipt: Mutex::new(None),
+            block_times: Mutex::new(HashMap::new()),
             sends: AtomicUsize::new(0),
             lookups: AtomicUsize::new(0),
         }
@@ -88,6 +91,13 @@ impl FakeTempo {
     pub fn set_send_receipt(&self, receipt: Option<RpcReceipt>) {
         if let Ok(mut current) = self.send_receipt.lock() {
             *current = receipt;
+        }
+    }
+
+    /// Record when block `number` was produced.
+    pub fn set_block_time(&self, number: u64, timestamp: u64) {
+        if let Ok(mut times) = self.block_times.lock() {
+            times.insert(number, timestamp);
         }
     }
 
@@ -139,6 +149,17 @@ impl TempoRpc for FakeTempo {
             .lock()
             .ok()
             .and_then(|mined| mined.get(&hash).cloned()))
+    }
+
+    async fn get_block_timestamp(&self, number: u64) -> Result<Option<u64>, RpcError> {
+        if let Some(error) = self.lookup_error.lock().ok().and_then(|e| *e) {
+            return Err(error);
+        }
+        Ok(self
+            .block_times
+            .lock()
+            .ok()
+            .and_then(|times| times.get(&number).copied()))
     }
 }
 
@@ -256,6 +277,7 @@ pub fn payment_receipt(
     }
     RpcReceipt {
         tx_hash,
+        block_number: 1,
         success: true,
         from,
         logs,

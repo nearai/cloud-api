@@ -264,6 +264,9 @@ pub async fn image_generations(
 ///
 /// **Request Body (multipart/form-data):**
 /// All fields should be provided as text values or files as indicated in the schema.
+///
+/// **Size limit:** the whole multipart body is capped at 50 MiB, so the image itself
+/// must be somewhat smaller to leave room for the form fields. Larger requests get 413.
 #[utoipa::path(
     post,
     path = "/v1/images/edits",
@@ -304,7 +307,7 @@ pub async fn image_edits(
                 match field.name().unwrap_or("") {
                     "image" => {
                         // Use streaming validation to detect oversized payloads before buffering entirely in memory.
-                        // This prevents memory exhaustion DoS attacks where attackers send payloads larger than MAX_FILE_SIZE.
+                        // This prevents memory exhaustion DoS attacks where attackers send payloads larger than MAX_IMAGE_EDIT_BODY_SIZE.
                         let mut bytes = Vec::new();
                         let mut size = 0usize;
 
@@ -312,12 +315,17 @@ pub async fn image_edits(
                             match field.chunk().await {
                                 Ok(Some(chunk)) => {
                                     size += chunk.len();
-                                    // Reject early if size exceeds limit, before allocating memory
-                                    if size > MAX_FILE_SIZE {
+                                    // Reject early if size exceeds limit, before allocating memory.
+                                    // Backstop only: the outer body limit already caps the whole
+                                    // request at this value, so this should not trigger today.
+                                    if size > crate::MAX_IMAGE_EDIT_BODY_SIZE {
                                         return (
                                             StatusCode::PAYLOAD_TOO_LARGE,
                                             ResponseJson(ErrorResponse::new(
-                                                "Image size exceeds maximum of 512 MB".to_string(),
+                                                format!(
+                                                    "Image size exceeds maximum of {} MB",
+                                                    crate::MAX_IMAGE_EDIT_BODY_SIZE / (1024 * 1024)
+                                                ),
                                                 "invalid_request_error".to_string(),
                                             )),
                                         )

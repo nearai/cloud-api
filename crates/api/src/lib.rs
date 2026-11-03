@@ -87,6 +87,15 @@ const OHTTP_MAX_BODY_SIZE: usize = 32 * 1024 * 1024; // 32 MB
 // is its effective limit. body_hash_middleware needs it as an explicit cap.
 const RESPONSES_MAX_BODY_SIZE: usize = 2 * 1024 * 1024; // 2 MB
 
+/// POST /v1/images/edits accepts a single `image` multipart part plus small text
+/// fields. body_hash_middleware buffers the body before auth, so this is the
+/// pre-auth memory bound per request. 50 MiB is a chosen bound for that buffering,
+/// not a verified upstream limit. It applies to the whole multipart body, so the image
+/// itself must be somewhat smaller. It is independent of `MAX_FILE_SIZE`, which
+/// only bounds the file-upload handler (writes return 410 and that router has no
+/// body-limit layer).
+pub const MAX_IMAGE_EDIT_BODY_SIZE: usize = 50 * 1024 * 1024; // 50 MiB
+
 /// Service initialization components
 #[derive(Clone)]
 pub struct AuthComponents {
@@ -1514,8 +1523,6 @@ pub fn build_completion_routes(
     usage_state: middleware::UsageState,
     rate_limit_state: middleware::RateLimitState,
 ) -> Router {
-    use crate::routes::files::MAX_FILE_SIZE;
-
     // Announces a planned model deprecation in response headers. Innermost
     // layer: it only sees requests that passed auth, rate and usage checks.
     let model_deprecation_state = middleware::ModelDeprecationState {
@@ -1629,7 +1636,7 @@ pub fn build_completion_routes(
         ));
 
     // File-based inference routes (image edits)
-    // Apply 512 MB limit only to endpoints that accept file uploads.
+    // Apply MAX_IMAGE_EDIT_BODY_SIZE only to endpoints that accept file uploads.
     // body_hash_middleware buffers before auth, so it is capped at the same limit.
     let file_inference_routes = Router::new()
         .route("/images/edits", post(image_edits))
@@ -1651,10 +1658,10 @@ pub fn build_completion_routes(
             middleware::auth::auth_middleware_with_workspace_context,
         ))
         .layer(from_fn_with_state(
-            middleware::BodyHashLimit(MAX_FILE_SIZE),
+            middleware::BodyHashLimit(MAX_IMAGE_EDIT_BODY_SIZE),
             middleware::body_hash_middleware,
         ))
-        .layer(DefaultBodyLimit::max(MAX_FILE_SIZE));
+        .layer(DefaultBodyLimit::max(MAX_IMAGE_EDIT_BODY_SIZE));
 
     let metadata_routes = Router::new()
         .route("/models", get(models))

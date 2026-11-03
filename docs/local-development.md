@@ -352,9 +352,12 @@ must supply any needed prior context with each request.
 
 After alias resolution, canonical `openai/` models make one native provider
 Responses request, with native `web_search` executed by the upstream provider.
-Cloud does not run a tool loop for that transport. Other models use the typed
-adapter, which executes `web_search` and `web_context_search` in a bounded,
-request-scoped loop.
+The `openai_compatible` backend sends `/responses` to its configured base URL,
+including compatible gateways such as OpenRouter. The upstream validates endpoint
+and feature support; its errors are returned without falling back to Chat
+Completions. Cloud does not run a tool loop for that transport. Other models use
+the typed adapter, which executes `web_search` and `web_context_search` in a
+bounded, request-scoped loop.
 Search results are passed back to the model within the same request; messages,
 results, and source citations remain in memory until that request ends.
 

@@ -87,17 +87,12 @@ impl From<ChatCompletionRequest> for ChatCompletionParams {
             serde_json::from_value::<Vec<inference_providers::ToolDefinition>>(v.clone()).ok()
         });
 
-        let stream_options = req
-            .extra
-            .get("stream_options")
-            .and_then(|v| serde_json::from_value::<StreamOptions>(v.clone()).ok());
-
         let mut extra = req.extra;
         extra.remove("modalities");
         extra.remove("tools");
-        if stream_options.is_some() {
-            extra.remove("stream_options");
-        }
+        let stream_options = extra
+            .remove("stream_options")
+            .and_then(|v| serde_json::from_value::<StreamOptions>(v).ok());
 
         Self {
             placement: Default::default(),
@@ -1089,7 +1084,7 @@ mod tests {
     }
 
     #[test]
-    fn malformed_stream_options_remain_in_extra() {
+    fn stream_options_that_do_not_parse_leave_extra() {
         let mut extra = HashMap::new();
         extra.insert("stream_options".to_string(), serde_json::json!("bad"));
 
@@ -1121,10 +1116,7 @@ mod tests {
 
         let domain_params: ChatCompletionParams = http_req.into();
         assert!(domain_params.stream_options.is_none());
-        assert_eq!(
-            domain_params.extra.get("stream_options"),
-            Some(&serde_json::json!("bad"))
-        );
+        assert!(!domain_params.extra.contains_key("stream_options"));
     }
 
     #[test]

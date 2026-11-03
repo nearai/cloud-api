@@ -9,15 +9,10 @@ use wiremock::{
 async fn backend() -> (MockServer, OpenAiCompatibleBackend, BackendConfig) {
     let server = MockServer::start().await;
     let backend = OpenAiCompatibleBackend {
-        client: Client::builder()
-            .no_proxy()
-            .resolve("api.openai.com", *server.address())
-            .resolve("example.openai.azure.com", *server.address())
-            .build()
-            .unwrap(),
+        client: Client::builder().no_proxy().build().unwrap(),
     };
     let config = BackendConfig {
-        base_url: format!("http://api.openai.com:{}/v1", server.address().port()),
+        base_url: format!("{}/v1", server.uri()),
         api_key: "test".into(),
         ..Default::default()
     };
@@ -26,10 +21,7 @@ async fn backend() -> (MockServer, OpenAiCompatibleBackend, BackendConfig) {
 
 #[tokio::test]
 async fn native_responses_preserves_request_fields_and_response_bytes() {
-    let (server, backend, mut config) = backend().await;
-    config.base_url = config
-        .base_url
-        .replace("api.openai.com", "example.openai.azure.com");
+    let (server, backend, config) = backend().await;
     let body = json!({"model":"openai/gpt-6-astra", "store":false,
         "input":[{"type":"reasoning","id":"rs_1","encrypted_content":"opaque","summary":[]},
             {"type":"function_call","call_id":"call_1","name":"weather","arguments":"{}"},
@@ -57,7 +49,7 @@ async fn native_responses_preserves_request_fields_and_response_bytes() {
 }
 
 #[tokio::test]
-async fn native_transport_rejects_stateful_requests_and_other_hosts() {
+async fn native_transport_rejects_stateful_requests_before_sending() {
     let (server, backend, config) = backend().await;
     for body in [
         json!({}),
@@ -71,14 +63,6 @@ async fn native_transport_rejects_stateful_requests_and_other_hosts() {
             .await
             .is_err());
     }
-    let other = BackendConfig {
-        base_url: server.uri(),
-        ..config
-    };
-    assert!(backend
-        .responses_raw(&other, "gpt-6-astra", json!({"store":false}))
-        .await
-        .is_err());
     assert!(server.received_requests().await.unwrap().is_empty());
 }
 
@@ -119,8 +103,13 @@ async fn native_transport_preserves_sse_and_http_errors() {
             true,
         ),
         (429, "{\"error\":{\"message\":\"Rate limited\"}}", false),
+        (
+            404,
+            "{\"error\":{\"message\":\"Responses unsupported\"}}",
+            false,
+        ),
     ] {
-        Mock::given(method("POST"))
+        let _mock = Mock::given(method("POST"))
             .and(path("/v1/responses"))
             .and(body_json(
                 json!({"model":"gpt-6-astra","store":false,"stream":stream}),
@@ -138,7 +127,7 @@ async fn native_transport_preserves_sse_and_http_errors() {
                     ),
             )
             .expect(1)
-            .mount(&server)
+            .mount_as_scoped(&server)
             .await;
         let response = backend
             .responses_raw(

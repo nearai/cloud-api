@@ -11,11 +11,10 @@
 
 use super::backend::{BackendConfig, ExternalBackend};
 use crate::{
-    models::StreamOptions, sse_parser::new_external_sse_parser, AudioTranscriptionError,
-    AudioTranscriptionParams, AudioTranscriptionResponse, ChatCompletionParams,
-    ChatCompletionResponse, ChatCompletionResponseWithBytes, CompletionError, ImageGenerationError,
-    ImageGenerationParams, ImageGenerationResponse, ImageGenerationResponseWithBytes,
-    StreamingResult,
+    sse_parser::new_external_sse_parser, AudioTranscriptionError, AudioTranscriptionParams,
+    AudioTranscriptionResponse, ChatCompletionParams, ChatCompletionResponse,
+    ChatCompletionResponseWithBytes, CompletionError, ImageGenerationError, ImageGenerationParams,
+    ImageGenerationResponse, ImageGenerationResponseWithBytes, StreamingResult,
 };
 use async_trait::async_trait;
 use reqwest::{header::HeaderValue, Client};
@@ -130,7 +129,7 @@ fn normalize_reasoning_effort_for_openai_tools(
 /// (Together, Groq, Fireworks, OpenRouter, …) are intentionally excluded
 /// because they tend to accept (or apply) the extra sampling knobs below, and
 /// stripping them there would silently change behaviour.
-pub(super) fn is_openai_source(base_url: &str) -> bool {
+fn is_openai_source(base_url: &str) -> bool {
     // Match on the parsed URL *host* (lower-cased), not a substring of the whole
     // URL. A substring check would both miss mixed-case hosts (`API.OPENAI.COM`)
     // and misclassify look-alikes such as `api.openai.com.evil.example` as
@@ -202,9 +201,9 @@ impl ExternalBackend for OpenAiCompatibleBackend {
         mut body: serde_json::Value,
     ) -> Result<crate::responses_raw::ResponsesRawResponse, CompletionError> {
         use futures_util::TryStreamExt;
-        if !is_openai_source(&config.base_url) || !crate::responses_raw::is_stateless(&body) {
+        if !crate::responses_raw::is_stateless(&body) {
             return Err(CompletionError::CompletionError(
-                "Native Responses requires stateless requests on an OpenAI upstream".into(),
+                "Native Responses requires stateless requests".into(),
             ));
         }
         body["model"] = serde_json::json!(model);
@@ -252,12 +251,8 @@ impl ExternalBackend for OpenAiCompatibleBackend {
         crate::strip_cache_control(&mut streaming_params.messages);
         crate::strip_reasoning_content(&mut streaming_params.messages);
         streaming_params.model = model.to_string();
-        streaming_params.stream = Some(true);
-        streaming_params.stream_options = Some(StreamOptions {
-            include_usage: Some(true),
-            continuous_usage_stats: None, // Not all providers support this
-            extra: Default::default(),
-        });
+        // `continuous_usage_stats` stays unset: not all providers support it.
+        streaming_params.set_stream_fields(None);
 
         // Convert max_tokens to max_completion_tokens for newer OpenAI models
         // Some models (e.g., gpt-5.2) require max_completion_tokens instead of max_tokens
@@ -553,6 +548,7 @@ impl ExternalBackend for OpenAiCompatibleBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::StreamOptions;
     use std::collections::HashMap;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};

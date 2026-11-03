@@ -1025,21 +1025,15 @@ impl CompletionServiceImpl {
     }
 
     /// Extract typed OpenAI stream options from flattened request extras.
-    /// Removing the parsed key avoids serializing duplicate `stream_options`
-    /// fields once `ChatCompletionParams.stream_options` is populated.
+    /// The key always leaves `extra`, so `ChatCompletionParams.stream_options`
+    /// is the only copy that serializes. A value that does not parse counts as
+    /// unset.
     fn extract_stream_options_from_extra(
         extra: &mut std::collections::HashMap<String, serde_json::Value>,
     ) -> Option<inference_providers::StreamOptions> {
-        match extra.get("stream_options").cloned() {
-            Some(raw) => match serde_json::from_value::<inference_providers::StreamOptions>(raw) {
-                Ok(parsed) => {
-                    extra.remove("stream_options");
-                    Some(parsed)
-                }
-                Err(_) => None,
-            },
-            None => None,
-        }
+        extra
+            .remove("stream_options")
+            .and_then(|raw| serde_json::from_value(raw).ok())
     }
 
     fn is_json_object_response_format(
@@ -4439,20 +4433,23 @@ mod tests {
     }
 
     #[test]
-    fn extract_stream_options_passes_through_malformed_options() {
-        let mut extra = std::collections::HashMap::new();
-        extra.insert(
-            "stream_options".to_string(),
+    fn extract_stream_options_drops_values_that_do_not_parse() {
+        for value in [
+            serde_json::Value::Null,
             serde_json::json!("not-an-object"),
-        );
+            serde_json::json!([]),
+            serde_json::json!(true),
+            serde_json::json!(0),
+        ] {
+            let mut extra = std::collections::HashMap::new();
+            extra.insert("stream_options".to_string(), value);
 
-        let stream_options = CompletionServiceImpl::extract_stream_options_from_extra(&mut extra);
+            let stream_options =
+                CompletionServiceImpl::extract_stream_options_from_extra(&mut extra);
 
-        assert!(stream_options.is_none());
-        assert!(
-            extra.contains_key("stream_options"),
-            "malformed stream_options should be left for upstream handling"
-        );
+            assert!(stream_options.is_none());
+            assert!(!extra.contains_key("stream_options"));
+        }
     }
 
     // ── reject_n_gt_1_if_unsupported ──────────────────────────────────────

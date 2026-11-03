@@ -282,11 +282,16 @@ fn visit_tools<'a>(
 
 pub fn validate_native_tools(body: &Value) -> Result<(), String> {
     if let Some(tools) = body.get("tools").filter(|value| !value.is_null()) {
-        visit_tools(
-            tools.as_array().ok_or("tools must be an array")?,
-            false,
-            |tool, _| tool_name(tool).map(|_| ()),
-        )?;
+        for tool in tools.as_array().ok_or("tools must be an array")? {
+            // Native web search is executed by the upstream Responses provider.
+            // Its configuration has no client-tool name and stays unmodified.
+            if tool["type"] == "web_search" {
+                continue;
+            }
+            visit_tools(std::slice::from_ref(tool), false, |tool, _| {
+                tool_name(tool).map(|_| ())
+            })?;
+        }
     }
     Ok(())
 }

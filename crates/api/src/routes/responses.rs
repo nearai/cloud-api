@@ -39,7 +39,9 @@ const RESPONSE_ATTESTATION_STORE_TIMEOUT: Duration = Duration::from_secs(5);
 /// `store` to `false`. Canonical `openai/` models use the provider's native
 /// Responses transport, which preserves validated provider-native fields
 /// outside this typed schema. The typed adapter also executes hosted web search
-/// using request-scoped context; the native path accepts client-managed tools.
+/// using request-scoped context. Native Responses accepts client-managed tools
+/// and top-level `web_search`, executed upstream, and preserves complete
+/// `web_search_call` replay items and `include` unchanged.
 #[derive(serde::Deserialize, utoipa::ToSchema)]
 pub struct StatelessCreateResponseRequestSchema {
     pub model: String,
@@ -639,7 +641,9 @@ pub async fn response_history_gone() -> axum::response::Response {
 ///
 /// Generate a single-turn, stateless AI response with optional streaming.
 ///
-/// Canonical `openai/` models use one native provider Responses inference.
+/// Canonical `openai/` models use one upstream native Responses request, with
+/// top-level `web_search` executed by the provider. Complete `web_search_call`
+/// replay items and `include` are forwarded unchanged.
 /// Other models use the typed adapter, which can execute `web_search` and
 /// `web_context_search` in a bounded, request-scoped inference loop. Both paths
 /// normalize omitted or null `store` to `false` and keep no response/item history.
@@ -650,12 +654,12 @@ pub async fn response_history_gone() -> axum::response::Response {
     tag = "Responses",
     request_body(
         content = serde_json::Value,
-        description = "Polymorphic stateless JSON request. After alias resolution, canonical openai/ models accept validated provider-native Responses fields. Other models use the typed StatelessCreateResponseRequestSchema component. Both paths normalize omitted or null store to false and reject store: true. The typed adapter supports hosted web_search and web_context_search with request-scoped context; native Responses accepts client-managed tools. File tools and remote MCP tools are unsupported."
+        description = "Polymorphic stateless JSON request. After alias resolution, canonical openai/ models accept validated provider-native Responses fields. Other models use the typed StatelessCreateResponseRequestSchema component. Both paths normalize omitted or null store to false and reject store: true. The typed adapter supports hosted web_search and web_context_search with request-scoped context. Native Responses accepts client-managed tools and top-level web_search, executed upstream in one provider request; complete web_search_call replay items and include are forwarded unchanged. File tools and remote MCP tools are unsupported."
     ),
     responses(
         (
             status = 200,
-            description = "Polymorphic success response. For non-OpenAI models, the typed adapter returns ResponseObject metadata with hosted search events/citations, client-managed function/custom call items, and optional namespaces as JSON for non-streaming requests. Canonical openai/ models forward the provider-native response shape, which can include native reasoning fields outside ResponseObject. Streaming requests use text/event-stream on either path.",
+            description = "Polymorphic success response. For non-OpenAI models, the typed adapter returns ResponseObject metadata with hosted search events/citations, client-managed function/custom call items, and optional namespaces as JSON for non-streaming requests. Canonical openai/ models forward the provider-native response shape, including native reasoning, web_search_call items, and search citations or sources returned by the provider. Streaming requests use text/event-stream on either path.",
             content(
                 (serde_json::Value = "application/json"),
                 ("text/event-stream")

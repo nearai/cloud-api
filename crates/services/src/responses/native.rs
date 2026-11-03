@@ -26,7 +26,7 @@ use std::{
 };
 use uuid::Uuid;
 
-const CLIENT_TOOLS_ERROR: &str = "Native stateless Responses supports only valid client-managed function, custom, and namespace tools; hosted tools are unavailable";
+const CLIENT_TOOLS_ERROR: &str = "Native stateless Responses supports valid client-managed function, custom, and namespace tools, plus top-level web_search";
 
 #[derive(Clone)]
 pub struct NativeResponsesService {
@@ -239,7 +239,8 @@ fn validate(body: &Value) -> Result<(), &'static str> {
     if body.get("prompt").is_some_and(|v| !v.is_null()) {
         return Err("Stored prompt references are unavailable for native stateless Responses");
     }
-    // Cloud file IDs and built-in/MCP continuation items are not OpenAI IDs.
+    // Replay supported native output inline; Cloud file IDs and unsupported
+    // tool continuation items cannot be resolved by this stateless transport.
     if let Some(input) = body.get("input") {
         if !input.is_string() && !input.is_array() {
             return Err("input must be a string or array");
@@ -253,6 +254,7 @@ fn validate(body: &Value) -> Result<(), &'static str> {
                         | "function_call_output"
                         | "custom_tool_call"
                         | "custom_tool_call_output"
+                        | "web_search_call"
                         | "reasoning"
                 )
             ) {

@@ -350,8 +350,10 @@ request or response content, response items, or response history; clients
 must supply any needed prior context with each request.
 
 After alias resolution, canonical `openai/` models make one native provider
-Responses request. Other models use the typed adapter, which executes
-`web_search` and `web_context_search` in a bounded, request-scoped loop.
+Responses request, with native `web_search` executed by the upstream provider.
+Cloud does not run a tool loop for that transport. Other models use the typed
+adapter, which executes `web_search` and `web_context_search` in a bounded,
+request-scoped loop.
 Search results are passed back to the model within the same request; messages,
 results, and source citations remain in memory until that request ends.
 
@@ -423,9 +425,17 @@ Completed `web_search_call` output markers may accompany replayed assistant
 messages; the typed adapter ignores those markers and uses the supplied text
 as context instead of repeating the historical search.
 
-Native OpenAI requests preserve validated provider-native fields such as
-encrypted reasoning and grammar definitions, and retain their client-managed
-tool boundary. File search, code interpreter, computer use, remote MCP tools,
+Native requests for canonical `openai/` models accept top-level `web_search`
+alongside client-managed tools and preserve provider-native fields such as encrypted
+reasoning and grammar definitions. Replay the complete returned `web_search_call`
+item with the rest of the native output; Cloud forwards it unchanged, including
+provider-specific action and source fields. The native request's `include` is
+also forwarded unchanged. Supported include values and returned fields depend
+on the upstream provider; Cloud preserves source/citation fields rather than
+stripping them to make different providers return the same shape.
+
+Native hosted tools are limited to `web_search`; `web_context_search` uses the
+typed adapter. File search, code interpreter, computer use, remote MCP tools,
 and image-generation/editing models remain unsupported by Responses. The
 separate `POST /mcp` search tool and `/v1/images/*` endpoints remain available.
 

@@ -419,17 +419,48 @@ fn typed_search_preserves_configuration_alongside_namespaced_client_tools() {
 }
 
 #[test]
-fn search_is_not_allowed_inside_client_namespaces_or_on_native_transport() {
+fn search_is_not_allowed_inside_client_namespaces() {
     for kind in ["web_search", "web_context_search"] {
         let search = json!({"type": kind});
         assert!(normalize_request(request(vec![search.clone()])).is_ok());
-        assert!(validate_native_tools(&request(vec![search.clone()])).is_err());
-        assert!(normalize_native_request(request(vec![search.clone()])).is_err());
-        assert!(
-            normalize_request(request(vec![namespace("client", vec![search.clone()])])).is_err()
-        );
+        let tools = vec![namespace("client", vec![search])];
+        assert!(normalize_request(request(tools.clone())).is_err());
+        assert!(validate_native_tools(&request(tools.clone())).is_err());
+        assert!(normalize_native_request(request(tools.clone())).is_err());
         assert!(normalize_native_request(json!({"model": "test", "input": [
-            {"type": "additional_tools", "role": "developer", "tools": [search]}
+            {"type": "additional_tools", "role": "developer", "tools": tools}
+        ]}))
+        .is_err());
+    }
+}
+
+#[test]
+fn native_search_accepts_only_web_search_without_relaxing_client_tool_validation() {
+    let search = json!({"type":"web_search", "external_web_access":false});
+    let body = request(vec![search.clone(), function("lookup")]);
+    assert_eq!(normalize_native_request(body.clone()).unwrap(), body);
+    let promoted = normalize_native_request(json!({"model":"test", "input":[
+        {"type":"additional_tools", "role":"developer", "tools":[search]},
+        {"role":"user", "content":"Search the web."}
+    ]}))
+    .unwrap();
+    assert_eq!(promoted["tools"], json!([search]));
+    assert_eq!(
+        promoted["input"],
+        json!([{"role":"user", "content":"Search the web."}])
+    );
+    for invalid in [
+        json!({"type":"web_context_search"}),
+        json!({"type":"web_search_preview"}),
+        json!({"type":"function"}),
+        json!({"type":"custom", "name":" "}),
+        namespace("client", vec![json!({"type":"function"})]),
+    ] {
+        let tools = vec![search.clone(), invalid];
+        assert!(validate_native_tools(&request(tools.clone())).is_err());
+        assert!(normalize_native_request(request(tools.clone())).is_err());
+        assert!(normalize_native_request(json!({"model":"test", "input":[
+            {"type":"additional_tools", "role":"developer", "tools":tools}
         ]}))
         .is_err());
     }

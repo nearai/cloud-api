@@ -137,7 +137,7 @@ graph TB
                 UserRoutes["<b>User Routes</b><br/>Profile, invitations,<br/>sessions"]
                 CompletionRoutes["<b>Completion Routes</b><br/>Chat & text<br/>completions"]
                 ConvRoutes["<b>Conversation Routes</b><br/>Create & manage<br/>conversations"]
-                ResponseRoutes["<b>Response Routes</b><br/>Stateless one-shot<br/>AI responses"]
+                ResponseRoutes["<b>Response Routes</b><br/>Stateless request-scoped<br/>AI responses"]
                 ModelRoutes["<b>Model Routes</b><br/>List available<br/>models"]
                 UsageRoutes["<b>Usage Routes</b><br/>Tracking & billing<br/>data"]
                 AttestationRoutes["<b>Attestation Routes</b><br/>TEE verification<br/>& signatures"]
@@ -153,7 +153,7 @@ graph TB
                 OrgService["<b>Organization Service</b><br/>Multi-tenant<br/>management"]
                 UserService["<b>User Service</b><br/>User & session<br/>management"]
                 ConvService["<b>Conversation Service</b><br/>Conversation<br/>lifecycle"]
-                ResponseService["<b>Response Service</b><br/>Stateless one-shot<br/>Responses compatibility"]
+                ResponseService["<b>Response Service</b><br/>Stateless request-scoped<br/>Responses compatibility"]
                 CompletionService["<b>Completion Service</b><br/>Model inference<br/>coordination"]
                 ModelService["<b>Model Service</b><br/>Model catalog<br/>& pricing"]
                 UsageService["<b>Usage Service</b><br/>Usage tracking<br/>& limits"]
@@ -311,7 +311,7 @@ graph TB
 | **User Routes** | User profile, invitations, sessions | Session (OAuth) |
 | **Completion Routes** | Chat & text completions (OpenAI-compatible) | API Key |
 | **Conversation Routes** | Conversation lifecycle management | API Key |
-| **Response Routes** | Stateless one-shot inference; response history returns `410` | API Key |
+| **Response Routes** | Stateless request-scoped inference; response history returns `410` | API Key |
 | **Model Routes** | List available models | API Key |
 | **Usage Routes** | Usage tracking, billing, limits | Session (OAuth) |
 | **Attestation Routes** | TEE attestation reports, chat signatures | API Key |
@@ -323,7 +323,7 @@ graph TB
 | **Organization Service** | Multi-tenant organization & workspace management | Organization Repo, Workspace Repo |
 | **User Service** | User management, profile updates | User Repo, Session Repo |
 | **Conversation Service** | Conversation creation, retrieval, updates, and deletion | Conversation Repo |
-| **Response Service** | Stateless inference: native Responses for canonical `openai/` models; one typed Chat Completions request for other models | Completion Service, Usage Service |
+| **Response Service** | Stateless inference: native Responses with upstream web search for canonical `openai/` models; typed Chat Completions with bounded Cloud-managed search rounds for other models | Completion Service, search providers, Usage Service |
 | **Completion Service** | Coordinates with inference providers | Provider Pool, Model Service |
 | **Model Service** | Manages model catalog & pricing | Model Repo |
 | **Usage Service** | Tracks token usage, enforces limits | Usage Repo, Organization Repo |
@@ -493,13 +493,16 @@ sequenceDiagram
 ### 4. Typed Stateless Response Creation Flow (Platform-specific API)
 
 `POST /v1/responses` is a stateless compatibility API. After alias resolution,
-canonical `openai/` models make one native provider Responses request; other
-models use the typed adapter, including bounded request-scoped inference rounds
-for `web_search` and `web_context_search`. Both transports normalize omitted or
+canonical `openai/` models make one native provider Responses request, with
+`web_search` executed upstream and no Cloud tool loop. Other models use the
+typed adapter, including bounded request-scoped inference rounds for Cloud-managed
+`web_search` and `web_context_search`. Both transports normalize omitted or
 null `store` to `false`, reject `store: true`, and keep no conversation linkage or
-response/item history. Custom tools run in the client. Native Responses retains
-its client-managed-tool boundary; remote MCP tools and image-generation/editing
-models are unsupported by both paths.
+response/item history. Custom tools run in the client. Native replay forwards
+complete `web_search_call` items and `include` unchanged, preserving the
+upstream provider's source/citation fields. Native hosted tools are limited to
+`web_search`; file search, code interpreter, computer use, remote MCP tools, and
+image-generation/editing models are unsupported by both paths.
 The diagram below describes the typed adapter for non-OpenAI models.
 
 ```mermaid
@@ -786,7 +789,8 @@ stateDiagram-v2
     failed --> [*]: Error delivered
 
     note right of in_progress
-        Typed adapter: bounded inference rounds with hosted search
+        Native transport: one upstream request, including native web search
+        Typed adapter: bounded inference rounds with Cloud-managed search
         Streaming tokens and tracking usage
     end note
 
@@ -1069,7 +1073,7 @@ POST /v1/completions
 ```
 POST /v1/responses
 ```
-- Stateless compatibility layer over Chat Completions for the default model path
+- Native Responses with upstream web search for canonical `openai/` models; typed Chat Completions with Cloud-managed search for other models
 - Client-managed context; no response or conversation-history persistence
 - Responses event shape and richer metadata support
 - **Event Types**:
@@ -1409,7 +1413,7 @@ erDiagram
 These resource APIs require an API key and use its workspace scope.
 
 **Responses (Platform-specific):**
-- `POST /v1/responses` - Stateless inference; canonical `openai/` models use one native Responses call, other models use the typed adapter with request-scoped hosted search, and omitted or null `store` defaults to `false`
+- `POST /v1/responses` - Stateless inference; canonical `openai/` models use one native Responses call with upstream web search, other models use the typed adapter with request-scoped Cloud-managed search, and omitted or null `store` defaults to `false`
 - `GET`/`DELETE /v1/responses/{id}` - Authenticated `410 Gone` (history retired)
 - `POST /v1/responses/{id}/cancel` - Authenticated `410 Gone` (history retired)
 - `GET /v1/responses/{id}/input_items` - Authenticated `410 Gone` (history retired)
@@ -1417,7 +1421,9 @@ These resource APIs require an API key and use its workspace scope.
 > Responses accepts client-managed `function` and `custom` tools, including
 > namespaced tools. Clients keep history and replay the returned call and its
 > matching output in a fresh request. The typed adapter executes hosted web
-> search within the request and returns source citations. Responses, including
+> search within the request and returns source citations. Native Responses
+> forwards full `web_search_call` replay items and `include`, preserving the
+> provider's returned source/citation fields. Responses, including
 > retired-history responses, use
 > `Cache-Control: no-store`.
 

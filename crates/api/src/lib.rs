@@ -48,7 +48,7 @@ use axum::{
     extract::DefaultBodyLimit,
     middleware::{from_fn, from_fn_with_state, map_response, Next},
     response::Html,
-    routing::{any, get, post},
+    routing::{any, get, post, MethodRouter},
     Router,
 };
 use config::ApiConfig;
@@ -1816,57 +1816,72 @@ pub fn build_mcp_routes(
         ))
 }
 
-/// Build conversation routes with auth
+/// Build the temporary Conversation API migration surface.
+///
+/// Existing conversation data remains available through its original view
+/// routes so chat-api can export it. The existing per-conversation DELETE
+/// route remains available for account deletion; all other mutations and
+/// unsupported legacy paths stay authenticated and return 410 until the
+/// data-retention migration is complete.
 pub fn build_conversation_routes(
     conversation_service: Arc<services::ConversationService>,
     auth_state_middleware: &AuthState,
 ) -> Router {
+    build_stage_one_conversation_route_layout(
+        post(conversations::batch_get_conversations)
+            .fallback(conversations::conversation_write_disabled),
+        get(conversations::get_conversation)
+            .delete(conversations::delete_conversation)
+            .fallback(conversations::conversation_write_disabled),
+        get(conversations::list_conversation_items)
+            .fallback(conversations::conversation_write_disabled),
+        conversations::conversation_write_disabled,
+    )
+    .with_state(
+        conversation_service as Arc<dyn services::conversations::ports::ConversationServiceTrait>,
+    )
+    .layer(from_fn_with_state(
+        auth_state_middleware.clone(),
+        auth_middleware_with_api_key,
+    ))
+    // Conversation records can contain confidential prompt and completion
+    // data. Apply this outside auth so rejects are no-store as well.
+    .layer(map_response(no_store_response))
+}
+
+/// Install the exact Stage I Conversation API route layout.
+///
+/// Kept separate from service wiring so route precedence can be tested without
+/// a database; production uses this helper directly. It preserves the
+/// existing workspace-scoped DELETE route needed by account deletion, while
+/// per-route fallbacks make every other unsupported method 410.
+fn build_stage_one_conversation_route_layout<S, H, T>(
+    batch: MethodRouter<S>,
+    conversation: MethodRouter<S>,
+    items: MethodRouter<S>,
+    write_disabled: H,
+) -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+    H: axum::handler::Handler<T, S>,
+    T: 'static,
+{
+    // Catch-all parameters never match an empty segment, so the trailing-slash
+    // form (which also covers `/batch/`) needs its own 410 route.
+    let descendants = Router::new()
+        .route("/", any(write_disabled.clone()))
+        .route("/batch", batch)
+        .route("/{conversation_id}", conversation)
+        .route("/{conversation_id}/", any(write_disabled.clone()))
+        .route("/{conversation_id}/items", items)
+        .route(
+            "/{conversation_id}/{*legacy_path}",
+            any(write_disabled.clone()),
+        );
+
     Router::new()
-        .route("/conversations", post(conversations::create_conversation))
-        .route(
-            "/conversations/batch",
-            post(conversations::batch_get_conversations),
-        )
-        .route(
-            "/conversations/{conversation_id}",
-            get(conversations::get_conversation),
-        )
-        .route(
-            "/conversations/{conversation_id}",
-            post(conversations::update_conversation),
-        )
-        .route(
-            "/conversations/{conversation_id}",
-            axum::routing::delete(conversations::delete_conversation),
-        )
-        .route(
-            "/conversations/{conversation_id}/pin",
-            post(conversations::pin_conversation).delete(conversations::unpin_conversation),
-        )
-        .route(
-            "/conversations/{conversation_id}/archive",
-            post(conversations::archive_conversation).delete(conversations::unarchive_conversation),
-        )
-        .route(
-            "/conversations/{conversation_id}/clone",
-            post(conversations::clone_conversation),
-        )
-        .route(
-            "/conversations/{conversation_id}/items",
-            get(conversations::list_conversation_items),
-        )
-        .route(
-            "/conversations/{conversation_id}/items",
-            post(conversations::create_conversation_items),
-        )
-        .with_state(
-            conversation_service
-                as Arc<dyn services::conversations::ports::ConversationServiceTrait>,
-        )
-        .layer(from_fn_with_state(
-            auth_state_middleware.clone(),
-            auth_middleware_with_api_key,
-        ))
+        .route("/conversations", any(write_disabled))
+        .nest("/conversations/", descendants)
 }
 
 /// Build attestation routes with auth.
@@ -1961,20 +1976,64 @@ pub fn build_workspace_routes(app_state: AppState, auth_state_middleware: &AuthS
         ))
 }
 
-/// Build file upload routes
+/// Build the temporary Files API migration surface.
+///
+/// Existing metadata and content stay available through the original GET
+/// routes so chat-api can export data. The existing per-file DELETE route
+/// remains available for account deletion; uploads and all other unsupported
+/// legacy paths remain authenticated 410 responses and never reach storage.
 pub fn build_files_routes(app_state: AppState, auth_state_middleware: &AuthState) -> Router {
-    use crate::routes::files::MAX_FILE_SIZE;
-    use crate::routes::files::*;
+    use crate::routes::files::{
+        delete_file, files_write_disabled, get_file, get_file_content, list_files,
+    };
+
+    build_stage_one_file_route_layout(
+        get(list_files).fallback(files_write_disabled),
+        get(get_file)
+            .delete(delete_file)
+            .fallback(files_write_disabled),
+        get(get_file_content).fallback(files_write_disabled),
+        files_write_disabled,
+    )
+    .with_state(app_state)
+    .layer(from_fn_with_state(
+        auth_state_middleware.clone(),
+        auth_middleware_with_api_key,
+    ))
+    // File metadata and content are confidential. Keep both the temporary
+    // view routes and their 410 responses out of shared/browser caches.
+    .layer(map_response(no_store_response))
+}
+
+/// Install the exact Stage I Files API route layout.
+///
+/// Like Conversations, this is shared by production and route-precedence
+/// tests. The original GET views and per-file DELETE receive service handlers;
+/// other methods and descendants land on the authenticated 410 router through
+/// ordinary routes that survive the outer `/v1` nest.
+fn build_stage_one_file_route_layout<S, H, T>(
+    list: MethodRouter<S>,
+    file: MethodRouter<S>,
+    content: MethodRouter<S>,
+    write_disabled: H,
+) -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+    H: axum::handler::Handler<T, S>,
+    T: 'static,
+{
+    // Catch-all parameters never match an empty segment, so the trailing-slash
+    // form needs its own 410 route.
+    let descendants = Router::new()
+        .route("/", any(write_disabled.clone()))
+        .route("/{file_id}/content", content)
+        .route("/{file_id}", file)
+        .route("/{file_id}/", any(write_disabled.clone()))
+        .route("/{file_id}/{*legacy_path}", any(write_disabled));
+
     Router::new()
-        .route("/files", post(upload_file).get(list_files))
-        .route("/files/{file_id}", get(get_file).delete(delete_file))
-        .route("/files/{file_id}/content", get(get_file_content))
-        .layer(DefaultBodyLimit::max(MAX_FILE_SIZE))
-        .with_state(app_state)
-        .layer(from_fn_with_state(
-            auth_state_middleware.clone(),
-            auth_middleware_with_api_key,
-        ))
+        .route("/files", list)
+        .nest("/files/", descendants)
 }
 
 /// Build feature request routes for user submissions and admin aggregation.
@@ -3126,32 +3185,6 @@ mod tests {
     }
 
     #[test]
-    fn test_openapi_conversation_action_paths_use_v1_prefix() {
-        let spec = serde_json::to_value(ApiDoc::openapi()).unwrap();
-        let paths = spec["paths"].as_object().unwrap();
-
-        // Pin/unpin and archive/unarchive share path keys with different methods.
-        for path in [
-            "/v1/conversations/{conversation_id}/archive",
-            "/v1/conversations/{conversation_id}/clone",
-            "/v1/conversations/{conversation_id}/pin",
-        ] {
-            assert!(paths.contains_key(path), "missing OpenAPI path: {path}");
-        }
-
-        for path in [
-            "/conversations/{conversation_id}/archive",
-            "/conversations/{conversation_id}/clone",
-            "/conversations/{conversation_id}/pin",
-        ] {
-            assert!(
-                !paths.contains_key(path),
-                "OpenAPI path is missing /v1 prefix: {path}"
-            );
-        }
-    }
-
-    #[test]
     fn test_openapi_admin_aml_paths_require_admin_security() {
         let spec = serde_json::to_value(ApiDoc::openapi()).unwrap();
         let paths = spec["paths"].as_object().unwrap();
@@ -3185,6 +3218,174 @@ mod tests {
 
         assert!(!properties.contains_key("result_json"));
         assert!(!properties.contains_key("resultJson"));
+    }
+
+    #[test]
+    fn stage_one_openapi_exposes_only_allowed_resource_deletes() {
+        let spec = serde_json::to_value(ApiDoc::openapi()).unwrap();
+        let paths = spec["paths"]
+            .as_object()
+            .expect("OpenAPI paths must be an object");
+
+        for path in ["/v1/conversations/{conversation_id}", "/v1/files/{file_id}"] {
+            let delete = paths
+                .get(path)
+                .and_then(|path_item| path_item.get("delete"));
+            assert!(
+                delete.is_some_and(serde_json::Value::is_object),
+                "OpenAPI must expose the existing DELETE route: {path}"
+            );
+            assert_eq!(
+                delete.unwrap()["security"],
+                serde_json::json!([{ "api_key": [] }]),
+                "{path} DELETE must require an API key"
+            );
+            assert!(
+                delete.unwrap()["responses"]["200"]["headers"]["Cache-Control"].is_object(),
+                "{path} DELETE must document Cache-Control: no-store"
+            );
+        }
+
+        let conversation = paths
+            .get("/v1/conversations/{conversation_id}")
+            .expect("Conversation path must be present");
+        assert!(conversation.get("post").is_none());
+
+        let files = paths.get("/v1/files").expect("Files path must be present");
+        assert!(files.get("post").is_none());
+    }
+
+    #[tokio::test]
+    async fn stage_one_data_route_layout_preserves_views_and_only_allowed_deletions() {
+        async fn view() -> StatusCode {
+            StatusCode::OK
+        }
+
+        async fn write_disabled() -> StatusCode {
+            StatusCode::GONE
+        }
+
+        async fn unrelated_route() -> StatusCode {
+            StatusCode::NOT_FOUND
+        }
+
+        // These are the production route-layout helpers. Using lightweight
+        // handlers here isolates Axum's static/parameter/catch-all matching
+        // from database state while proving the exact public layout builds.
+        let conversation_routes = build_stage_one_conversation_route_layout(
+            axum::routing::post(view).fallback(write_disabled),
+            axum::routing::get(view)
+                .delete(view)
+                .fallback(write_disabled),
+            axum::routing::get(view).fallback(write_disabled),
+            write_disabled,
+        )
+        .layer(map_response(no_store_response));
+        let file_routes = build_stage_one_file_route_layout(
+            axum::routing::get(view).fallback(write_disabled),
+            axum::routing::get(view)
+                .delete(view)
+                .fallback(write_disabled),
+            axum::routing::get(view).fallback(write_disabled),
+            write_disabled,
+        )
+        .layer(map_response(no_store_response));
+        let app = Router::new()
+            .nest(
+                "/v1",
+                Router::new().merge(conversation_routes).merge(file_routes),
+            )
+            .fallback(unrelated_route);
+
+        for (method, path) in [
+            ("POST", "/v1/conversations/batch"),
+            ("GET", "/v1/conversations/conv_example"),
+            ("DELETE", "/v1/conversations/conv_example"),
+            ("GET", "/v1/conversations/conv_example/items"),
+            ("GET", "/v1/files"),
+            ("GET", "/v1/files/file_example"),
+            ("DELETE", "/v1/files/file_example"),
+            ("GET", "/v1/files/file_example/content"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    HttpRequest::builder()
+                        .method(method)
+                        .uri(path)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{method} {path}");
+            assert_eq!(
+                response
+                    .headers()
+                    .get(CACHE_CONTROL)
+                    .and_then(|value| value.to_str().ok()),
+                Some("no-store"),
+                "{method} {path}"
+            );
+        }
+
+        for (method, path) in [
+            ("POST", "/v1/conversations"),
+            ("GET", "/v1/conversations/"),
+            ("GET", "/v1/conversations/batch"),
+            ("DELETE", "/v1/conversations/batch"),
+            ("POST", "/v1/conversations/batch/"),
+            ("GET", "/v1/conversations/batch/"),
+            ("POST", "/v1/conversations/conv_example"),
+            ("GET", "/v1/conversations/conv_example/"),
+            ("DELETE", "/v1/conversations/conv_example/"),
+            ("POST", "/v1/conversations/conv_example/items"),
+            ("POST", "/v1/conversations/conv_example/pin"),
+            ("DELETE", "/v1/conversations/conv_example/pin"),
+            ("DELETE", "/v1/conversations/conv_example/unknown"),
+            ("PATCH", "/v1/conversations/conv_example/unknown"),
+            ("POST", "/v1/files"),
+            ("DELETE", "/v1/files"),
+            ("GET", "/v1/files/"),
+            ("GET", "/v1/files/file_example/"),
+            ("DELETE", "/v1/files/file_example/"),
+            ("DELETE", "/v1/files/file_example/content"),
+            ("PUT", "/v1/files/legacy/nested/path"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    HttpRequest::builder()
+                        .method(method)
+                        .uri(path)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::GONE, "{method} {path}");
+            assert_eq!(
+                response
+                    .headers()
+                    .get(CACHE_CONTROL)
+                    .and_then(|value| value.to_str().ok()),
+                Some("no-store"),
+                "{method} {path}"
+            );
+        }
+
+        let unrelated = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method("GET")
+                    .uri("/unrelated")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unrelated.status(), StatusCode::NOT_FOUND);
+        assert!(unrelated.headers().get(CACHE_CONTROL).is_none());
     }
 
     #[test]

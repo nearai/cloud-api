@@ -1,24 +1,25 @@
-use super::*;
+use crate::common::*;
+use api::models::ConversationItem;
+use uuid::Uuid;
 
 #[tokio::test]
 async fn test_conversation_items_pagination() {
     let (server, database) = setup_test_server_with_database().await;
     let model_id = setup_qwen_model(&server).await;
     let org = setup_org_with_credits(&server, 10000000000i64).await;
-    let api_key = get_api_key_for_org(&server, org.id).await;
+    let api_key = get_api_key_for_org(&server, org.id.clone()).await;
 
-    // Create a conversation
-    let conversation = create_conversation(&server, api_key.clone()).await;
+    // Seed retained data directly: Stage I rejects public conversation creation.
+    let (conversation, _) = seed_conversation_history(&database, org.id.parse().unwrap(), 0).await;
 
     // Retained responses are fixtures: new Responses requests no longer persist history.
     for i in 0..5 {
         seed_response(
             &database,
-            &conversation.id,
+            &conversation,
             &model_id,
             &format!("Test message {}", i + 1),
             None,
-            false,
         )
         .await;
     }
@@ -164,27 +165,19 @@ async fn test_conversation_items_include_response_metadata() {
     let (server, database) = setup_test_server_with_database().await;
     let model_name = setup_qwen_model(&server).await;
     let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD
-    let api_key = get_api_key_for_org(&server, org.id).await;
+    let api_key = get_api_key_for_org(&server, org.id.clone()).await;
 
-    // Create a conversation
-    let conversation = create_conversation(&server, api_key.clone()).await;
+    // Seed retained data directly: Stage I rejects public conversation creation.
+    let (conversation, _) = seed_conversation_history(&database, org.id.parse().unwrap(), 0).await;
 
-    let parent_response = seed_response(
-        &database,
-        &conversation.id,
-        &model_name,
-        "What is Rust?",
-        None,
-        false,
-    )
-    .await;
+    let parent_response =
+        seed_response(&database, &conversation, &model_name, "What is Rust?", None).await;
     let follow_up_response = seed_response(
         &database,
-        &conversation.id,
+        &conversation,
         &model_name,
         "Tell me more about that.",
         Some(&parent_response.id),
-        false,
     )
     .await;
 
@@ -273,20 +266,12 @@ async fn test_conversation_items_include_model() {
     let (server, database) = setup_test_server_with_database().await;
     let model_name = setup_qwen_model(&server).await;
     let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD
-    let api_key = get_api_key_for_org(&server, org.id).await;
+    let api_key = get_api_key_for_org(&server, org.id.clone()).await;
 
-    // Create a conversation
-    let conversation = create_conversation(&server, api_key.clone()).await;
+    // Seed retained data directly: Stage I rejects public conversation creation.
+    let (conversation, _) = seed_conversation_history(&database, org.id.parse().unwrap(), 0).await;
 
-    seed_response(
-        &database,
-        &conversation.id,
-        &model_name,
-        "What is Rust?",
-        None,
-        false,
-    )
-    .await;
+    seed_response(&database, &conversation, &model_name, "What is Rust?", None).await;
 
     // List conversation items
     let items_response = server
@@ -384,88 +369,87 @@ async fn test_conversation_items_include_model() {
     println!("✅ Model field matches the model used for the response: {model_name}");
 }
 
-#[tokio::test]
-async fn test_backfilled_items_include_model() {
-    let (server, database) = setup_test_server_with_database().await;
-    let model_name = setup_qwen_model(&server).await;
-    let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD
-    let api_key = get_api_key_for_org(&server, org.id).await;
+/// Seed retained turns with real response metadata, model fields, and parent links.
+async fn seed_response(
+    database: &std::sync::Arc<database::Database>,
+    conversation: &services::conversations::models::Conversation,
+    model: &str,
+    input: &str,
+    previous_response_id: Option<&str>,
+) -> services::responses::models::ResponseObject {
+    use services::responses::{
+        models,
+        ports::{ResponseItemRepositoryTrait, ResponseRepositoryTrait},
+    };
 
-    // Create a conversation
-    let conversation = create_conversation(&server, api_key.clone()).await;
-
-    // Backfill some conversation items (this creates items directly without a response)
-    let create_items_response = server
-        .post(format!("/v1/conversations/{}/items", conversation.id).as_str())
-        .add_header("Authorization", format!("Bearer {api_key}"))
-        .json(&serde_json::json!({
-            "items": [
-                {
-                    "type": "message",
-                    "role": "user",
-                    "content": [{"type": "input_text", "text": "Hello!"}]
+    let workspace = conversation.workspace_id.clone();
+    let key = conversation.api_key_id;
+    let request = serde_json::json!({
+        "model": model,
+        "input": input,
+        "conversation": conversation.id.to_string(),
+        "previous_response_id": previous_response_id,
+        "store": true,
+    });
+    let response = database
+        .responses
+        .create(
+            workspace.clone(),
+            key,
+            serde_json::from_value(request).unwrap(),
+        )
+        .await
+        .unwrap();
+    let response_id =
+        models::ResponseId(response.id.strip_prefix("resp_").unwrap().parse().unwrap());
+    for (role, content) in [
+        (
+            "user",
+            vec![models::ResponseContentItem::InputText {
+                text: input.to_string(),
+            }],
+        ),
+        (
+            "assistant",
+            vec![models::ResponseContentItem::OutputText {
+                text: format!("Retained answer to {input}"),
+                annotations: vec![],
+                logprobs: vec![],
+            }],
+        ),
+    ] {
+        database
+            .response_items
+            .create(
+                response_id.clone(),
+                key,
+                Some(conversation.id),
+                models::ResponseOutputItem::Message {
+                    id: format!("msg_{}", Uuid::new_v4().simple()),
+                    response_id: response.id.clone(),
+                    previous_response_id: response.previous_response_id.clone(),
+                    next_response_ids: vec![],
+                    created_at: response.created_at,
+                    status: models::ResponseItemStatus::Completed,
+                    role: role.to_string(),
+                    content,
+                    model: model.to_string(),
+                    metadata: None,
                 },
-                {
-                    "type": "message",
-                    "role": "assistant",
-                    "content": [{"type": "input_text", "text": "Hi there!"}]
-                }
-            ]
-        }))
-        .await;
-
-    assert_eq!(create_items_response.status_code(), 200);
-    let items_response = create_items_response.json::<api::models::ConversationItemList>();
-    assert_eq!(items_response.data.len(), 2);
-
-    // Existing response history and freshly backfilled items remain readable together.
-    seed_response(
-        &database,
-        &conversation.id,
-        &model_name,
-        "What is Rust?",
-        None,
-        false,
-    )
-    .await;
-
-    // List all conversation items
-    let items_list_response = server
-        .get(format!("/v1/conversations/{}/items", conversation.id).as_str())
-        .add_header("Authorization", format!("Bearer {api_key}"))
-        .await;
-
-    assert_eq!(items_list_response.status_code(), 200);
-    let items_list = items_list_response.json::<api::models::ConversationItemList>();
-
-    println!(
-        "Retrieved {} total conversation items (backfilled + response)",
-        items_list.data.len()
-    );
-
-    assert_eq!(
-        items_list.data.len(),
-        4,
-        "backfilled and retained messages must be visible"
-    );
-
-    // Verify all items have the model field populated
-    for item in &items_list.data {
-        if let api::models::ConversationItem::Message {
-            id, model, role, ..
-        } = item
-        {
-            println!("  Message item {id}: role={role}, model={model}");
-
-            // Verify model field is populated
-            // Note: Backfilled items get their model from the response they're associated with
-            // All items in this test should have the same model since they're all in the same response chain
-            assert!(
-                !model.is_empty(),
-                "Model field should not be empty for item {id}"
-            );
-        }
+            )
+            .await
+            .unwrap();
     }
-
-    println!("✅ All conversation items (including backfilled) include the model field");
+    database
+        .responses
+        .update(
+            response_id,
+            workspace,
+            Some(format!("Retained answer to {input}")),
+            models::ResponseStatus::Completed,
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap()
 }

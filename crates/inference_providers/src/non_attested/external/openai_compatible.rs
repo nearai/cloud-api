@@ -11,11 +11,10 @@
 
 use super::backend::{BackendConfig, ExternalBackend};
 use crate::{
-    models::StreamOptions, sse_parser::new_external_sse_parser, AudioTranscriptionError,
-    AudioTranscriptionParams, AudioTranscriptionResponse, ChatCompletionParams,
-    ChatCompletionResponse, ChatCompletionResponseWithBytes, CompletionError, ImageGenerationError,
-    ImageGenerationParams, ImageGenerationResponse, ImageGenerationResponseWithBytes,
-    StreamingResult,
+    sse_parser::new_external_sse_parser, AudioTranscriptionError, AudioTranscriptionParams,
+    AudioTranscriptionResponse, ChatCompletionParams, ChatCompletionResponse,
+    ChatCompletionResponseWithBytes, CompletionError, ImageGenerationError, ImageGenerationParams,
+    ImageGenerationResponse, ImageGenerationResponseWithBytes, StreamingResult,
 };
 use async_trait::async_trait;
 use reqwest::{header::HeaderValue, Client};
@@ -252,12 +251,8 @@ impl ExternalBackend for OpenAiCompatibleBackend {
         crate::strip_cache_control(&mut streaming_params.messages);
         crate::strip_reasoning_content(&mut streaming_params.messages);
         streaming_params.model = model.to_string();
-        streaming_params.stream = Some(true);
-        streaming_params.stream_options = Some(StreamOptions {
-            include_usage: Some(true),
-            continuous_usage_stats: None, // Not all providers support this
-            extra: Default::default(),
-        });
+        // `continuous_usage_stats` stays unset: not all providers support it.
+        streaming_params.set_stream_fields(None);
 
         // Convert max_tokens to max_completion_tokens for newer OpenAI models
         // Some models (e.g., gpt-5.2) require max_completion_tokens instead of max_tokens
@@ -553,6 +548,7 @@ impl ExternalBackend for OpenAiCompatibleBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::StreamOptions;
     use std::collections::HashMap;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};

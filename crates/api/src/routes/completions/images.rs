@@ -317,7 +317,10 @@ pub async fn image_edits(
                                         return (
                                             StatusCode::PAYLOAD_TOO_LARGE,
                                             ResponseJson(ErrorResponse::new(
-                                                "Image size exceeds maximum of 50 MB".to_string(),
+                                                format!(
+                                                    "Image size exceeds maximum of {} MB",
+                                                    crate::MAX_IMAGE_EDIT_BODY_SIZE / (1024 * 1024)
+                                                ),
                                                 "invalid_request_error".to_string(),
                                             )),
                                         )

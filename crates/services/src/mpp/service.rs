@@ -25,8 +25,9 @@ use super::ports::{
 };
 use super::pricing::{LimitViolation, Param, Price, Pricing, RequestShape};
 use super::protocol::{
-    self, body_digest, opaque_for_route, parse_authorization, parse_source_did, BoundFields,
-    Challenge, ChargeRequest, PaymentPayload, ProblemCode, ProtocolError, INTENT_CHARGE, METHOD,
+    self, body_digest, opaque_for, opaque_route, parse_authorization, parse_source_did,
+    BoundFields, Challenge, ChargeRequest, PaymentPayload, ProblemCode, ProtocolError,
+    INTENT_CHARGE, METHOD,
 };
 use super::rpc::HttpTempoRpc;
 use super::tempo::{self, Expected, ReceiptVerdict};
@@ -219,7 +220,7 @@ impl SettledPayment {
         protocol::format_receipt(&self.reference, at).map_err(|_| MppError::Config)
     }
 
-    /// The claim key, `tempo:0x<64 hex>`. Sensitive: for the claim store only.
+    /// The claim key, `tempo:` and a 64-hex keyed digest. For the claim store only.
     pub fn payment_key(&self) -> &str {
         &self.payment_key
     }
@@ -411,7 +412,8 @@ impl MppService {
             recipient: self.recipient_hex.clone(),
         }
         .to_b64()?;
-        let opaque = opaque_for_route(route)?;
+        let nonce: [u8; protocol::OPAQUE_NONCE_BYTES] = rand::random();
+        let opaque = opaque_for(route, &nonce)?;
         let digest = body_digest(body);
         // Seconds precision on the wire: truncate so the id binds the string the client sees.
         let expires = Utc
@@ -508,8 +510,9 @@ impl MppService {
         if echo.digest.as_deref() != Some(body_digest(body).as_str()) {
             return Err(MppError::InvalidChallenge("digest"));
         }
-        let expected_opaque = opaque_for_route(route)?;
-        if echo.opaque.as_deref() != Some(expected_opaque.as_str()) {
+        // The opaque value is ours (HMAC-checked above) and carries a nonce; only the route
+        // it was issued for matters here.
+        if echo.opaque.as_deref().and_then(opaque_route).as_deref() != Some(route) {
             return Err(MppError::InvalidChallenge("opaque"));
         }
         let source = match credential.source.as_deref() {
@@ -555,7 +558,8 @@ impl MppService {
         })?;
 
         let reference = format!("0x{}", hex::encode(receipt.tx_hash));
-        let payment_key = format!("{METHOD}:{reference}");
+        let payment_key = protocol::payment_key(&self.secret_key, &receipt.tx_hash)
+            .map_err(|_| MppError::Config)?;
         match self.repo.claim(&payment_key, &verified.challenge_id).await {
             Ok(ClaimOutcome::Claimed) => Ok(SettledPayment {
                 payment_key,

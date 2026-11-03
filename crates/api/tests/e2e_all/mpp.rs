@@ -298,7 +298,7 @@ async fn paid_chat_completion_end_to_end() {
     assert_eq!(decoded["reference"], format!("0x{}", hex::encode(tx_hash)));
     let completion: api::models::ChatCompletionResponse = paid.json();
     assert!(completion.usage.completion_tokens > 0);
-    let key = format!("tempo:0x{}", hex::encode(tx_hash));
+    let key = protocol::payment_key(SECRET.as_bytes(), &tx_hash).unwrap();
     assert_eq!(state_of(&database, &key).await.as_deref(), Some("served"));
 
     // 4. Replaying the credential is a 403 with no new challenge.

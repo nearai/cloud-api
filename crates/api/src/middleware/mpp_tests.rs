@@ -540,8 +540,9 @@ impl App {
     }
 }
 
+/// The ledger key of a payment: a keyed digest, never the transaction hash itself.
 fn key(hash: [u8; 32]) -> String {
-    format!("tempo:0x{}", hex::encode(hash))
+    protocol::payment_key(SECRET.as_bytes(), &hash).unwrap()
 }
 
 fn no_secrets(reply: &Reply) {

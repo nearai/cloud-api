@@ -332,7 +332,7 @@ fn sample_challenge() -> Challenge {
     }
     .to_b64()
     .unwrap();
-    let opaque = opaque_for_route("/v1/chat/completions").unwrap();
+    let opaque = opaque_for("/v1/chat/completions", &[7; OPAQUE_NONCE_BYTES]).unwrap();
     let digest = body_digest(b"{\"model\":\"m\"}");
     let expires = DateTime::parse_from_rfc3339("2030-05-06T07:08:09Z")
         .unwrap()
@@ -359,6 +359,57 @@ fn sample_challenge() -> Challenge {
         digest,
         opaque,
     }
+}
+
+#[test]
+fn opaque_carries_a_nonce_and_names_its_route() {
+    let a = opaque_for("/v1/chat/completions", &[1; OPAQUE_NONCE_BYTES]).unwrap();
+    let b = opaque_for("/v1/chat/completions", &[2; OPAQUE_NONCE_BYTES]).unwrap();
+    assert_ne!(a, b);
+    assert_eq!(opaque_route(&a).as_deref(), Some("/v1/chat/completions"));
+    assert_eq!(opaque_route(&b).as_deref(), Some("/v1/chat/completions"));
+    // The legacy route-only object still names its route.
+    let legacy = b64url_encode(br#"{"route":"/v1/chat/completions"}"#);
+    assert_eq!(
+        opaque_route(&legacy).as_deref(),
+        Some("/v1/chat/completions")
+    );
+    // Not a flat string map with a route: nothing.
+    for bad in [
+        "",
+        "!!!",
+        &b64url_encode(b"[]"),
+        &b64url_encode(br#"{"nonce":"x"}"#),
+        &b64url_encode(br#"{"route":5}"#),
+        &b64url_encode(br#"{"route":{"a":"b"}}"#),
+    ] {
+        assert_eq!(opaque_route(bad), None, "{bad}");
+    }
+}
+
+#[test]
+fn payment_key_is_a_keyed_digest_of_the_transaction_hash() {
+    let tx = [0x11u8; 32];
+    let key = payment_key(SECRET, &tx).unwrap();
+    assert_eq!(key.len(), "tempo:".len() + 64);
+    assert!(key.starts_with("tempo:"));
+    assert!(
+        !key.contains(&hex::encode(tx)),
+        "the raw hash is not stored"
+    );
+    assert_eq!(key, payment_key(SECRET, &tx).unwrap(), "deterministic");
+    assert_ne!(
+        key,
+        payment_key(b"another-secret-0123456789abcdefgh", &tx).unwrap()
+    );
+    assert_ne!(key, payment_key(SECRET, &[0x12u8; 32]).unwrap());
+    // Pinned against the MAC, so a change of construction is a deliberate act.
+    let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(SECRET).unwrap();
+    mac.update(&tx);
+    assert_eq!(
+        key,
+        format!("tempo:{}", hex::encode(mac.finalize().into_bytes()))
+    );
 }
 
 /// Parse `Payment k="v", …` back into pairs, honouring `\` escapes (test-only inverse of
@@ -440,10 +491,14 @@ fn www_authenticate_has_the_exact_parameter_order_and_round_trips() {
             opaque: Some(get("opaque")),
         }
     ));
-    // The opaque value is base64url(JCS {"route": …}).
+    // The opaque value is base64url(JCS {"nonce": …, "route": …}).
     assert_eq!(
         b64url_decode(get("opaque")).unwrap(),
-        br#"{"route":"/v1/chat/completions"}"#
+        format!(
+            r#"{{"nonce":"{}","route":"/v1/chat/completions"}}"#,
+            b64url_encode(&[7; OPAQUE_NONCE_BYTES])
+        )
+        .into_bytes()
     );
 }
 
@@ -624,7 +679,7 @@ fn legacy_object_opaque_is_normalised_to_the_base64url_string() {
     let parsed = parse_authorization(&header).unwrap();
     assert_eq!(
         parsed.challenge.opaque.as_deref(),
-        Some(opaque_for_route("/v1/chat/completions").unwrap().as_str())
+        Some(b64url_encode(br#"{"route":"/v1/chat/completions"}"#).as_str())
     );
 }
 

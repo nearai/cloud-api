@@ -7,7 +7,7 @@ use serde_json::json;
 use super::*;
 use crate::mpp::memory::InMemoryClaimRepository;
 use crate::mpp::ports::ClaimState;
-use crate::mpp::protocol::{b64url_decode, b64url_encode, compute_challenge_id};
+use crate::mpp::protocol::{b64url_decode, b64url_encode, compute_challenge_id, opaque_for};
 use crate::mpp::testing::{
     bound_payment_receipt, credential_header, hash_payload, payment_receipt, transaction_payload,
     FakeTempo, SendMode,
@@ -337,12 +337,31 @@ fn challenge_is_hmac_bound_and_expires_after_the_ttl() {
         )
         .into_bytes()
     );
-    // Deterministic for equal inputs, different for a different body.
+    // The same body in the same second is still a different challenge (a random nonce is
+    // bound into the opaque value), so a payment made for one cannot be front-run onto the
+    // other.
     let again = f
         .service
         .challenge_at(now, CHAT_COMPLETIONS_ROUTE, &body(), &price)
         .unwrap();
-    assert_eq!(challenge.id, again.id);
+    assert_ne!(challenge.id, again.id);
+    assert_ne!(challenge.opaque, again.opaque);
+    assert_eq!(
+        protocol::opaque_route(&challenge.opaque).as_deref(),
+        Some(CHAT_COMPLETIONS_ROUTE)
+    );
+    assert_eq!(
+        protocol::opaque_route(&again.opaque).as_deref(),
+        Some(CHAT_COMPLETIONS_ROUTE)
+    );
+    // Both still verify for the body they were issued for.
+    for issued in [&challenge, &again] {
+        let header = credential_header(issued, hash_payload(TX), None);
+        assert!(f
+            .service
+            .verify_at(now, &header, CHAT_COMPLETIONS_ROUTE, &body())
+            .is_ok());
+    }
     let other = f
         .service
         .challenge_at(now, CHAT_COMPLETIONS_ROUTE, b"{\"model\":\"x\"}", &price)
@@ -449,7 +468,9 @@ fn tampered_challenge_fields_are_invalid_challenge() {
         ),
         (
             "opaque",
-            Box::new(|c| c["challenge"]["opaque"] = json!(opaque_for_route("/v1/other").unwrap())),
+            Box::new(|c| {
+                c["challenge"]["opaque"] = json!(opaque_for("/v1/other", &[9; 16]).unwrap())
+            }),
         ),
         ("id", Box::new(|c| c["challenge"]["id"] = json!("AAAA"))),
         (
@@ -562,6 +583,34 @@ fn a_validly_signed_but_wrong_challenge_is_still_refused() {
                 Err(MppError::InvalidChallenge(_))
             ),
             "{field}"
+        );
+    }
+    // The opaque value decides only the route: a signed legacy route-only value is accepted,
+    // a signed value for another route, or one that is not a string map with a route, is not.
+    let legacy = b64url_encode(br#"{"route":"/v1/chat/completions"}"#);
+    let header = credential_with(
+        &f,
+        &challenge,
+        |c| c["challenge"]["opaque"] = json!(legacy),
+        true,
+    );
+    assert!(f.verify(&header, &body()).is_ok());
+    for (label, opaque) in [
+        ("other route", opaque_for("/v1/other", &[1; 16]).unwrap()),
+        ("no route", b64url_encode(br#"{"nonce":"abc"}"#)),
+        ("not a map", b64url_encode(b"[\"/v1/chat/completions\"]")),
+        ("non-string route", b64url_encode(br#"{"route":5}"#)),
+    ] {
+        let header = credential_with(
+            &f,
+            &challenge,
+            |c| c["challenge"]["opaque"] = json!(opaque),
+            true,
+        );
+        assert_eq!(
+            f.verify(&header, &body()).err(),
+            Some(MppError::InvalidChallenge("opaque")),
+            "{label}"
         );
     }
     // Signed with another secret.
@@ -749,8 +798,9 @@ fn proof_payloads_and_oversized_or_wrong_type_transactions_are_refused() {
 const TX: [u8; 32] = [0x11; 32];
 const TX_B: [u8; 32] = [0x12; 32];
 
+/// The ledger key of a payment: a keyed digest, never the transaction hash itself.
 fn key(hash: [u8; 32]) -> String {
-    format!("tempo:0x{}", hex::encode(hash))
+    protocol::payment_key(SECRET.as_bytes(), &hash).unwrap()
 }
 
 #[tokio::test]

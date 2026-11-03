@@ -210,12 +210,43 @@ pub fn body_digest(body: &[u8]) -> String {
     format!("sha-256=:{}:", b64_standard(&Sha256::digest(body)))
 }
 
-/// The `opaque` value of a challenge: `base64url(JCS({"route": <route>}))`.
-pub fn opaque_for_route(route: &str) -> Result<String, ProtocolError> {
+/// Bytes of the random nonce inside every challenge's opaque value.
+pub const OPAQUE_NONCE_BYTES: usize = 16;
+
+/// The `opaque` value of a challenge: `base64url(JCS({"nonce": <b64url nonce>, "route":
+/// <route>}))`. The nonce makes the challenge id unique per issue: two requests with the
+/// same body in the same second would otherwise be given the same id, and with it the same
+/// memo, so a push-mode payment made for one could be front-run onto the other.
+pub fn opaque_for(route: &str, nonce: &[u8; OPAQUE_NONCE_BYTES]) -> Result<String, ProtocolError> {
     let mut object = serde_json::Map::new();
+    object.insert("nonce".to_string(), Value::String(b64url_encode(nonce)));
     object.insert("route".to_string(), Value::String(route.to_string()));
     Ok(b64url_encode(
         canonical_json(&Value::Object(object))?.as_bytes(),
+    ))
+}
+
+/// The `route` an (already HMAC-checked) opaque value names. `None` when the value is not
+/// a flat map of strings with a `route`.
+pub fn opaque_route(opaque: &str) -> Option<String> {
+    let bytes = b64url_decode(opaque).ok()?;
+    let mut fields: BTreeMap<String, String> = serde_json::from_slice(&bytes).ok()?;
+    fields.remove("route")
+}
+
+/// The claim-store key of a payment: `tempo:` and the hex of `HMAC-SHA256(secret, tx hash)`.
+/// The transaction hash is public on chain, so storing it would link a ledger row to the
+/// payer; the keyed digest cannot be linked without the server secret. Challenge ids are
+/// MACs of a `|`-joined text of at least six separators, never of a bare 32-byte hash, so the
+/// two uses of the secret do not overlap. A secret rotation also retires every challenge, so
+/// no credential can be replayed against a re-keyed ledger.
+pub fn payment_key(secret: &[u8], tx_hash: &[u8; 32]) -> Result<String, ProtocolError> {
+    let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(secret)
+        .map_err(|_| ProtocolError::Malformed("invalid HMAC key"))?;
+    mac.update(tx_hash);
+    Ok(format!(
+        "{METHOD}:{}",
+        hex::encode(mac.finalize().into_bytes())
     ))
 }
 

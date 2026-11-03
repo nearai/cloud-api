@@ -182,6 +182,8 @@ async fn test_request_id_contract_for_cors_and_streaming_surfaces() {
         .json(&serde_json::json!({
             "model": model,
             "stream": true,
+            "rid": "client-rid",
+            "request_id": "client-request-id",
             "messages": [{"role": "user", "content": "sentinel-stream"}]
         }))
         .await;
@@ -243,13 +245,19 @@ async fn test_request_id_contract_for_cors_and_streaming_surfaces() {
         .last_chat_params()
         .await
         .expect("streaming request should reach mock provider");
-    assert_eq!(
-        params
-            .extra
-            .get("x_request_id")
-            .and_then(serde_json::Value::as_str),
-        Some(selected_id.to_string().as_str()),
-        "provider propagation should use selected middleware request ID"
+    let forwarded_id = params
+        .extra
+        .get("x_request_id")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|id| Uuid::parse_str(id).ok())
+        .expect("provider propagation should carry a UUID request ID");
+    assert_ne!(
+        forwarded_id, inbound_request_id,
+        "provider propagation should use the server's request ID, not the inbound one"
+    );
+    assert!(
+        !params.extra.contains_key("rid") && !params.extra.contains_key("request_id"),
+        "client engine request ids must not reach the provider"
     );
     assert_eq!(
         params

@@ -1832,6 +1832,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             extra,
         };
         chat_params.strip_client_priority();
+        chat_params.strip_client_request_ids();
         // Routing-only context is set in process below (affinity) and by the
         // pool (size, class); never trust a value from anywhere else.
         chat_params.placement = Default::default();
@@ -2049,6 +2050,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             extra,
         };
         chat_params.strip_client_priority();
+        chat_params.strip_client_request_ids();
         // Routing-only context is set in process below (affinity) and by the
         // pool (size, class); never trust a value from anywhere else.
         chat_params.placement = Default::default();

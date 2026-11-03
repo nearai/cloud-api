@@ -395,6 +395,22 @@ impl ChatCompletionParams {
         }
     }
 
+    /// The engine assigns its own request id: customer JSON cannot set `rid`
+    /// (SGLang) or `request_id` (vLLM), including in the original request
+    /// sidecar.
+    pub fn strip_client_request_ids(&mut self) {
+        self.extra.remove("rid");
+        self.extra.remove("request_id");
+        if let Some(original) = self
+            .original_request
+            .as_mut()
+            .and_then(|value| value.as_object_mut())
+        {
+            original.remove("rid");
+            original.remove("request_id");
+        }
+    }
+
     /// Third-party providers get neither our internal user id nor a request to
     /// keep the exchange: `store` retains it in our provider account, and
     /// `metadata` is only accepted alongside `store`. A client's own `user`
@@ -1594,6 +1610,34 @@ mod tests {
             assert_eq!(parsed["stream_options"]["include_usage"], true);
             assert_eq!(parsed["stream_options"]["continuous_usage_stats"], true);
         }
+    }
+
+    #[test]
+    fn strip_client_request_ids_leaves_other_fields() {
+        let mut params: ChatCompletionParams = serde_json::from_value(serde_json::json!({
+            "model": "m",
+            "messages": [],
+            "rid": "client-rid",
+            "request_id": "client-request-id",
+            "top_k": 5,
+        }))
+        .unwrap();
+        params.original_request = Some(serde_json::json!({
+            "rid": "client-rid",
+            "request_id": "client-request-id",
+            "top_k": 5,
+        }));
+
+        params.strip_client_request_ids();
+
+        let wire: serde_json::Value = serde_json::to_value(&params).unwrap();
+        assert!(wire.get("rid").is_none());
+        assert!(wire.get("request_id").is_none());
+        assert_eq!(wire["top_k"], 5);
+        let original = params.original_request.unwrap();
+        assert!(original.get("rid").is_none());
+        assert!(original.get("request_id").is_none());
+        assert_eq!(original["top_k"], 5);
     }
 
     #[test]

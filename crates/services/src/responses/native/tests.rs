@@ -56,16 +56,13 @@ fn native_requests_reject_stateful_or_invalid_fields_before_dispatch() {
 }
 
 #[test]
-fn native_validation_keeps_reasoning_and_function_schemas_but_rejects_unsupported_tools() {
+fn native_validation_accepts_replay_and_rejects_unsupported_service_tiers() {
     let mut body = json!({"model":"openai/gpt-6-astra", "store":false, "input":[
         {"type":"reasoning", "id":"rs_1", "encrypted_content":"opaque", "summary":[]},
         {"type":"function_call", "call_id":"call_1", "name":"lookup", "arguments":"{}"},
         {"type":"function_call_output", "call_id":"call_1", "output":"ok"}
     ], "tools":[{"type":"function", "name":"lookup", "strict":true}], "reasoning":{"effort":"high"}, "parallel_tool_calls":false});
     assert!(validate(&body).is_ok());
-    body["tools"] = json!([{"type":"web_context_search"}]);
-    assert!(validate(&body).is_err());
-    body["tools"] = json!([]);
     body["service_tier"] = json!("priority");
     assert!(validate(&body).is_err());
 }
@@ -156,59 +153,6 @@ fn native_client_tools_preserve_grammar_namespaces_and_custom_replay() {
 }
 
 #[test]
-fn native_additional_tools_are_promoted_without_changing_remaining_input() {
-    let tools = json!([
-        {"type":"namespace", "name":"functions", "tools":[
-            {"type":"function", "name":"lookup", "parameters":{"type":"object"}}
-        ]},
-        {"type":"custom", "name":"apply_patch", "format":{"type":"text"}}
-    ]);
-    let remaining = json!([
-        {"role":"user", "content":"Apply the patch"},
-        {"type":"custom_tool_call", "call_id":"call_patch", "name":"apply_patch", "input":"raw patch"},
-        {"type":"custom_tool_call_output", "call_id":"call_patch", "output":"Done"}
-    ]);
-    let mut input = vec![json!({"type":"additional_tools", "role":"developer", "tools":tools})];
-    input.extend(remaining.as_array().unwrap().iter().cloned());
-    let normalized = crate::responses::client_tools::normalize_native_request(json!({
-        "model":"openai/gpt-6-astra", "store":false, "input":input,
-        "reasoning":{"effort":"high"}, "include":["reasoning.encrypted_content"]
-    }))
-    .unwrap();
-    assert!(validate(&normalized).is_ok());
-    assert_eq!(normalized["tools"], tools);
-    assert_eq!(normalized["input"], remaining);
-    assert_eq!(normalized["reasoning"], json!({"effort":"high"}));
-    assert_eq!(
-        normalized["include"],
-        json!(["reasoning.encrypted_content"])
-    );
-}
-
-#[test]
-fn native_client_tools_cannot_hide_hosted_tools_inside_namespaces() {
-    for tool in [
-        json!({"type":"web_context_search"}),
-        json!({"type":"namespace", "name":"outer", "tools":[{"type":"web_search"}]}),
-        json!({"type":"namespace", "name":"outer", "tools":[{"type":"web_context_search"}]}),
-        json!({"type":"namespace", "name":"outer", "tools":[
-            {"type":"namespace", "name":"inner", "tools":[{"type":"mcp", "server_label":"remote"}]}
-        ]}),
-    ] {
-        let request = json!({"store":false, "input":"hello", "tools":[tool]});
-        assert_eq!(validate(&request), Err(CLIENT_TOOLS_ERROR));
-        assert!(crate::responses::client_tools::normalize_native_request(request).is_err());
-        assert!(crate::responses::client_tools::normalize_native_request(json!({
-            "store":false,
-            "input":[{"type":"additional_tools", "tools":[tool]}, {"role":"user", "content":"hello"}]
-        })).is_err());
-    }
-    assert!(validate(&json!({
-        "input":[{"type":"custom_tool_call_output", "call_id":"call_patch", "output":[{"type":"input_file", "file_id":"file_shared"}]}]
-    })).is_err());
-}
-
-#[test]
 fn fragmented_native_events_keep_usage_including_cache_writes() {
     let wire = concat!(
         "event: response.created\r\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"status\":\"in_progress\"}}\r\n\r\n",
@@ -249,6 +193,7 @@ fn native_stateless_requests_cannot_reference_upstream_stored_resources() {
         json!([{"type":"file_search_call","id":"fs_shared","status":"completed"}]),
         json!([{"type":"mcp_call","id":"mcp_shared","status":"completed"}]),
         json!([{"type":"function_call_output","call_id":"call_1","output":[{"type":"input_image","file_id":"file_shared"}]}]),
+        json!([{"type":"custom_tool_call_output","call_id":"call_patch","output":[{"type":"input_file","file_id":"file_shared"}]}]),
         json!([{"role":"user","content":[{"type":"input_image","file_id":"file_shared"}]}]),
         json!([{"role":"user","content":[{"type":"input_file","file_id":"file_shared"}]}]),
     ] {

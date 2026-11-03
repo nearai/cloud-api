@@ -1015,7 +1015,7 @@ impl ResponseServiceImpl {
             let tools = tools::prepare_tools(&context.request);
             let tool_choice = tools::prepare_tool_choice(&context.request);
 
-            let final_response_text = search_loop::run(
+            search_loop::run(
                 &mut ctx,
                 &mut emitter,
                 &mut messages,
@@ -1030,7 +1030,7 @@ impl ResponseServiceImpl {
             final_response.status = models::ResponseStatus::Completed;
             final_response.incomplete_details = None;
 
-            // Load all response items from the database for this response
+            // Load this request's items from the request-local repository.
             let response_items = context
                 .response_items_repository
                 .list_by_response(ctx.response_id.clone())
@@ -1058,7 +1058,7 @@ impl ResponseServiceImpl {
                 ctx.total_input_tokens + ctx.total_output_tokens
             );
 
-            // Serialize usage to JSON for database storage
+            // Serialize usage for the request-local repository.
             let usage_json = serde_json::to_value(&final_response.usage).map_err(|e| {
                 errors::ResponseError::InternalError(format!("Failed to serialize usage: {e}"))
             })?;
@@ -1068,7 +1068,7 @@ impl ResponseServiceImpl {
                 .update(
                     ctx.response_id.clone(),
                     workspace_id_domain.clone(),
-                    Some(final_response_text),
+                    None,
                     final_response.status.clone(),
                     Some(usage_json),
                 )

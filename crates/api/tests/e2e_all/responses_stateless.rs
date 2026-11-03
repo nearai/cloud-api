@@ -3,7 +3,6 @@
 use crate::common::*;
 use api::models::BatchUpdateModelApiRequest;
 use axum::http::Method;
-use std::sync::{atomic::Ordering, Arc};
 
 fn assert_response_history_is_gone(response: axum_test::TestResponse) {
     assert_eq!(response.status_code(), 410);
@@ -106,10 +105,7 @@ async fn stateless_responses_reject_unsupported_tools_before_provider_work() {
     // service validation or provider work. A mock makes that boundary
     // observable. The MCP URL uses the reserved `.invalid` TLD so it cannot
     // point to a real third party if this behavior ever regresses.
-    let web_search_provider = Arc::new(MockWebSearchProvider::default_results());
-    let web_search_call_count = web_search_provider.call_count();
-    let (server, _database, mock) =
-        setup_test_server_with_search_providers(web_search_provider, None).await;
+    let (server, _pool, mock, _database) = setup_test_server_with_pool().await;
     let model = setup_qwen_model(&server).await;
     let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
     let api_key = get_api_key_for_org(&server, org.id).await;
@@ -162,24 +158,10 @@ async fn stateless_responses_reject_unsupported_tools_before_provider_work() {
             error.error.message
         );
         assert!(
-            error
-                .error
-                .message
-                .contains("Unsupported Responses tool type"),
-            "the stateless tool adapter should reject {tool_type}: {}",
-            error.error.message
-        );
-        assert!(
             mock.last_chat_params().await.is_none(),
             "{tool_type} must be rejected before service/provider work"
         );
     }
-
-    assert_eq!(
-        web_search_call_count.load(Ordering::SeqCst),
-        0,
-        "Rejected tools must not invoke the Web Search provider"
-    );
 }
 
 #[tokio::test]

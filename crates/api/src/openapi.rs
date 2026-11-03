@@ -32,11 +32,11 @@ Operations marked deprecated (account, organization, workspace, invitation, API 
         (name = "Privacy", description = "Privacy classification (PII span detection) endpoints"),
         (name = "Models", description = "Public model catalog and information"),
         (name = "Conversations", description = "Conversation management"),
-        (name = "Responses", description = "Response handling and streaming"),
+        (name = "Files", description = "File upload and management"),
+        (name = "Responses", description = "Stateless response inference. Both paths normalize omitted or null `store` to `false` and reject `store: true`. Raw request/response content, response items, and history are not persisted. Clients must include any prior context in each request. Canonical `openai/` models use one upstream native Responses request after alias resolution. Other models use the typed adapter, with bounded request-scoped inference rounds when hosted search is requested.\n\nBoth paths accept client-managed `function` and `custom` tools, including tools grouped in a `namespace`, and leading developer `additional_tools` declarations. Cloud returns calls without executing them; clients replay each `function_call` or `custom_tool_call` with its matching output and caller-managed history. Preserve `call_id`, names, namespaces, raw arguments or custom input, and provider metadata such as `thought_signature`. The typed replay path accepts assistant `output_text` parts and plaintext `reasoning` items, using reasoning content or its summary as prior assistant context. Encrypted-only reasoning requires a native Responses backend. The typed adapter supports text custom tools and the Codex `exec` Lark source grammar; other grammars require a native backend.\n\nEach generated item has its own `output_index`. Tool calls finish with `response.output_item.done`; a successful model turn ends with `response.completed`, including when tools await client execution. Reasoning uses `response.reasoning_text.delta`; failures expose `response.error` in `response.failed` and preserve partial usage.\n\nThe typed adapter executes `web_search` and `web_context_search` using a bounded request-scoped loop, emits search lifecycle events and URL citations, and accumulates usage across inference rounds without storing history. Optional `web_search.count` (0–20) overrides model-selected counts; 0 skips the search provider. If a model emits client tool calls and searches in the same round, client calls are returned without executing that round's searches. On the typed path, completed search output markers may accompany replayed assistant text, but raw search results are not restored across requests. Native Responses also accepts top-level `web_search`, executed by the upstream provider without a Cloud search loop. Complete native `web_search_call` replay items, search configuration, and `include` are forwarded unchanged; provider-returned search citations and sources retain their native shape. `file_search`, `code_interpreter`, `computer`, and remote `mcp` are unsupported. Image-generation/editing models are rejected on both paths. The separate `POST /mcp` endpoint exposes its `web_search` tool independently of Responses; use `/v1/images/*` for image generation/editing. Existing completed-response gateway attestation is preserved best-effort: when the signature write succeeds, `GET /v1/signature/resp_*` retrieves signatures over SHA-256 request/response digests, never raw content. Interrupted streams create no `resp_*` attestation record or legacy disconnect fallback. Responses rejects conversation linkage, response history, and file input; the separate Conversation and File endpoints are not part of Responses inference."),
         (name = "Organizations", description = "Organization management"),
         (name = "Organization Members", description = "Organization member and invitation management"),
         (name = "Workspaces", description = "Workspace and API key management"),
-        (name = "Files", description = "File upload and management"),
         (name = "Users", description = "User profile and token management"),
         (name = "Invitations", description = "Token-based invitation handling"),
         (name = "Usage", description = "Usage tracking and billing information"),
@@ -67,6 +67,7 @@ Operations marked deprecated (account, organization, workspace, invitation, API 
         crate::routes::models::get_model_by_name,
         // Conversation endpoints
         crate::routes::conversations::create_conversation,
+        crate::routes::conversations::batch_get_conversations,
         crate::routes::conversations::get_conversation,
         crate::routes::conversations::update_conversation,
         crate::routes::conversations::delete_conversation,
@@ -77,12 +78,14 @@ Operations marked deprecated (account, organization, workspace, invitation, API 
         crate::routes::conversations::clone_conversation,
         crate::routes::conversations::list_conversation_items,
         crate::routes::conversations::create_conversation_items,
+        // Files endpoints
+        crate::routes::files::upload_file,
+        crate::routes::files::list_files,
+        crate::routes::files::get_file,
+        crate::routes::files::delete_file,
+        crate::routes::files::get_file_content,
         // Response endpoints
         crate::routes::responses::create_response,
-        crate::routes::responses::get_response,
-        crate::routes::responses::delete_response,
-        crate::routes::responses::cancel_response,
-        crate::routes::responses::list_input_items,
         // Organization endpoints
         crate::routes::organizations::list_organizations,
         crate::routes::organizations::create_organization,
@@ -111,12 +114,6 @@ Operations marked deprecated (account, organization, workspace, invitation, API 
         crate::routes::workspaces::revoke_workspace_api_key,
         crate::routes::workspaces::update_api_key_spend_limit,
         crate::routes::workspaces::update_workspace_api_key,
-        // Files endpoints
-        crate::routes::files::upload_file,
-        crate::routes::files::list_files,
-        crate::routes::files::get_file,
-        crate::routes::files::delete_file,
-        crate::routes::files::get_file_content,
         // Users endpoints
         crate::routes::users::get_current_user,
         crate::routes::users::get_user_status,
@@ -328,10 +325,13 @@ Operations marked deprecated (account, organization, workspace, invitation, API 
             crate::routes::users::VerifyContactEmailRequest,
             crate::routes::users::ContactEmailStatusResponse,
             // Conversation models
-            CreateConversationRequest, ConversationObject,
-            UpdateConversationRequest, ConversationDeleteResult, ConversationItemList,
+            CreateConversationRequest, UpdateConversationRequest,
+            BatchConversationsRequest, ConversationBatchResponse, ConversationObject,
+            ConversationItemList, ConversationDeleteResult,
+            // File models
+            FileUploadResponse, ExpiresAfter, FileListResponse, FileDeleteResponse,
             // Response models
-            CreateResponseRequest, ResponseObject,
+            crate::routes::responses::StatelessCreateResponseRequestSchema, ResponseObject,
             // Attestation models
             crate::routes::attestation::SignatureResponse,
             crate::routes::attestation::AttestationResponse,
@@ -437,8 +437,6 @@ Operations marked deprecated (account, organization, workspace, invitation, API 
             crate::routes::billing::BillingCostsRequest,
             crate::routes::billing::BillingCostsResponse,
             crate::routes::billing::RequestCost,
-            // File models
-            FileUploadResponse, ExpiresAfter, FileListResponse, FileDeleteResponse,
             // Organization metrics (admin)
             services::admin::OrganizationMetrics,
             services::admin::MetricsSummary,

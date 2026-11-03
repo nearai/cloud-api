@@ -108,6 +108,8 @@ struct SignatureHashes {
 pub enum RequestMatcher {
     /// Match any request
     Any,
+    /// Match a tool-loop round by the number of tool results in its transcript.
+    ToolResultCount(usize),
     /// Match requests with exact prompt text (checks all text content in messages)
     /// Timestamps are automatically normalized to [TIME] for matching across test runs
     ExactPrompt(String),
@@ -124,6 +126,14 @@ impl RequestMatcher {
     pub fn matches(&self, params: &ChatCompletionParams) -> bool {
         match self {
             Self::Any => true,
+            Self::ToolResultCount(expected) => {
+                params
+                    .messages
+                    .iter()
+                    .filter(|message| message.role == MessageRole::Tool)
+                    .count()
+                    == *expected
+            }
             Self::ExactPrompt(prompt) => {
                 // Extract all text from messages and check if it equals the prompt
                 let all_text = Self::extract_text_from_messages(&params.messages);
@@ -205,6 +215,9 @@ pub struct ToolCall {
     pub name: String,
     /// JSON arguments for the tool
     pub arguments: String,
+    /// Provider metadata required when replaying the call (for example
+    /// Gemini's thought signature).
+    pub thought_signature: Option<String>,
 }
 
 impl ToolCall {
@@ -213,7 +226,14 @@ impl ToolCall {
         Self {
             name: name.into(),
             arguments: arguments.into(),
+            thought_signature: None,
         }
+    }
+
+    /// Attach provider metadata that must survive a tool-call round trip.
+    pub fn with_thought_signature(mut self, thought_signature: impl Into<String>) -> Self {
+        self.thought_signature = Some(thought_signature.into());
+        self
     }
 }
 
@@ -375,7 +395,7 @@ impl ResponseTemplate {
                         name: Some(tc.name.clone()),
                         arguments: Some(tc.arguments.clone()),
                     },
-                    thought_signature: None,
+                    thought_signature: tc.thought_signature.clone(),
                 })
                 .collect()
         });
@@ -574,7 +594,7 @@ impl ResponseTemplate {
                                     name: Some(tc.name.clone()),
                                     arguments: None,
                                 }),
-                                thought_signature: None,
+                                thought_signature: tc.thought_signature.clone(),
                             }]),
                             reasoning_content: None,
                             reasoning: None,
@@ -761,6 +781,9 @@ pub struct MockProvider {
     last_chat_params: Arc<Mutex<Option<ChatCompletionParams>>>,
     /// Numeric policy metadata only, for multi-request propagation assertions.
     chat_request_priorities: Arc<Mutex<Vec<i32>>>,
+    /// Number of chat-completion requests received, across streaming and
+    /// non-streaming calls. Useful for asserting one-shot API behavior.
+    chat_completion_call_count: Arc<std::sync::atomic::AtomicUsize>,
     /// When true, get_attestation_report returns an error (simulates blocked/broken backend)
     fail_attestation: Arc<std::sync::atomic::AtomicBool>,
     /// Trust tier reported by [`InferenceProvider::tier`]; defaults to
@@ -867,6 +890,7 @@ impl MockProvider {
             })),
             last_chat_params: Arc::new(Mutex::new(None)),
             chat_request_priorities: Arc::new(Mutex::new(Vec::new())),
+            chat_completion_call_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             fail_attestation: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tier: crate::ProviderTier::NonAttested,
             provider_source: None,
@@ -901,6 +925,7 @@ impl MockProvider {
             })),
             last_chat_params: Arc::new(Mutex::new(None)),
             chat_request_priorities: Arc::new(Mutex::new(Vec::new())),
+            chat_completion_call_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             fail_attestation: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tier: crate::ProviderTier::NonAttested,
             provider_source: None,
@@ -933,6 +958,7 @@ impl MockProvider {
             })),
             last_chat_params: Arc::new(Mutex::new(None)),
             chat_request_priorities: Arc::new(Mutex::new(Vec::new())),
+            chat_completion_call_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             fail_attestation: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tier: crate::ProviderTier::NonAttested,
             provider_source: None,
@@ -1005,6 +1031,12 @@ impl MockProvider {
     /// Get the last chat completion params received by the mock provider.
     pub async fn last_chat_params(&self) -> Option<ChatCompletionParams> {
         self.last_chat_params.lock().await.clone()
+    }
+
+    /// Number of calls made to `chat_completion` or `chat_completion_stream`.
+    pub fn chat_completion_call_count(&self) -> usize {
+        self.chat_completion_call_count
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Chat ids for which [`crate::InferenceProvider::unpin_chat_connection`]
@@ -1302,6 +1334,8 @@ impl crate::InferenceProvider for MockProvider {
             .lock()
             .await
             .push(params.request_priority);
+        self.chat_completion_call_count
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         *self.last_chat_params.lock().await = Some(params.clone());
 
         // Check for invalid model
@@ -1446,6 +1480,8 @@ impl crate::InferenceProvider for MockProvider {
             .lock()
             .await
             .push(params.request_priority);
+        self.chat_completion_call_count
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         *self.last_chat_params.lock().await = Some(params.clone());
 
         // Check for invalid model

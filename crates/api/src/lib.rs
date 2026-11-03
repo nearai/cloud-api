@@ -48,7 +48,7 @@ use axum::{
     extract::DefaultBodyLimit,
     middleware::{from_fn, from_fn_with_state, map_response, Next},
     response::Html,
-    routing::{get, post},
+    routing::{any, get, post},
     Router,
 };
 use config::ApiConfig;
@@ -588,11 +588,10 @@ pub async fn init_domain_services_with_pool(
         inference_provider_pool.clone(),
         conversation_service.clone(),
         completion_service.clone(),
-        Some(web_search_provider.clone()), // web_search_provider
-        Some(web_context_search_provider), // web_context_search_provider
-        None,                              // file_search_provider
-        files_service.clone(),             // file_service
+        files_service.clone(), // file_service
         organization_service.clone(),
+        Some(web_search_provider.clone()),
+        Some(web_context_search_provider),
     ));
 
     let service_repo = Arc::new(database::repositories::ServiceRepository::new(
@@ -705,8 +704,11 @@ pub async fn init_domain_services_with_pool(
     }
 }
 
-/// Initialize domain services with a custom MCP client factory (for testing)
-/// This is a thin wrapper that creates the response service with an injected factory
+/// Initialize domain services for legacy MCP tests.
+///
+/// Remote MCP tools are no longer supported by Responses. Keep this helper's
+/// signature temporarily so downstream test setup still compiles, but do not
+/// inject or construct an MCP client for the Responses service.
 #[allow(clippy::too_many_arguments)]
 pub async fn init_domain_services_with_mcp_factory(
     database: Arc<Database>,
@@ -714,50 +716,17 @@ pub async fn init_domain_services_with_mcp_factory(
     organization_service: Arc<dyn services::organization::OrganizationServiceTrait + Send + Sync>,
     inference_provider_pool: Arc<services::inference_provider_pool::InferenceProviderPool>,
     metrics_service: Arc<dyn services::metrics::MetricsServiceTrait>,
-    mcp_client_factory: Arc<dyn services::responses::tools::McpClientFactory>,
+    _mcp_client_factory: Arc<dyn services::responses::tools::McpClientFactory>,
 ) -> DomainServices {
-    // Get the base domain services
-    let mut domain_services = init_domain_services_with_pool(
-        database.clone(),
+    init_domain_services_with_pool(
+        database,
         config,
-        organization_service.clone(),
-        inference_provider_pool.clone(),
-        metrics_service.clone(),
+        organization_service,
+        inference_provider_pool,
+        metrics_service,
         None,
     )
-    .await;
-
-    // Replace the response service with one that has the MCP factory injected
-    let response_repo = Arc::new(database::PgResponseRepository::new(database.pool().clone()));
-    let response_items_repo = Arc::new(database::PgResponseItemsRepository::new(
-        database.pool().clone(),
-    ))
-        as Arc<dyn services::responses::ports::ResponseItemRepositoryTrait>;
-
-    let brave_search_provider =
-        Arc::new(services::responses::tools::brave::BraveWebSearchProvider::new());
-    let web_search_provider: Arc<dyn services::responses::tools::WebSearchProviderTrait> =
-        brave_search_provider.clone();
-    let web_context_search_provider: Arc<
-        dyn services::responses::tools::WebContextSearchProviderTrait,
-    > = brave_search_provider;
-
-    let response_service = Arc::new(services::ResponseService::with_mcp_client_factory(
-        response_repo,
-        response_items_repo,
-        inference_provider_pool,
-        domain_services.conversation_service.clone(),
-        domain_services.completion_service.clone(),
-        Some(web_search_provider),
-        Some(web_context_search_provider),
-        None,
-        domain_services.files_service.clone(), // Reuse files_service from base
-        organization_service,
-        mcp_client_factory,
-    ));
-
-    domain_services.response_service = response_service;
-    domain_services
+    .await
 }
 
 /// Like `init_domain_services_with_pool` but use the given web search provider (for tests with mock).
@@ -783,8 +752,7 @@ pub async fn init_domain_services_with_pool_and_web_search_provider(
     .await
 }
 
-/// Like `init_domain_services_with_pool_and_web_search_provider`, but also lets tests
-/// inject a Responses-only context-search provider.
+/// Inject both hosted search providers into the request-scoped Responses service.
 pub async fn init_domain_services_with_pool_and_search_providers(
     database: Arc<Database>,
     config: &ApiConfig,
@@ -818,11 +786,10 @@ pub async fn init_domain_services_with_pool_and_search_providers(
         inference_provider_pool,
         domain_services.conversation_service.clone(),
         domain_services.completion_service.clone(),
-        Some(web_search_provider.clone()),
-        web_context_search_provider,
-        None,
         domain_services.files_service.clone(),
         organization_service,
+        Some(web_search_provider.clone()),
+        web_context_search_provider,
     ));
 
     domain_services.web_search_provider = web_search_provider;
@@ -1288,7 +1255,7 @@ pub fn build_app_with_config_and_options(
     );
 
     let conversation_routes = build_conversation_routes(
-        domain_services.conversation_service,
+        domain_services.conversation_service.clone(),
         &auth_components.auth_state_middleware,
     );
 
@@ -1736,7 +1703,6 @@ pub fn build_response_routes(
     };
     let route_state = responses::ResponseRouteState {
         native_service: services::responses::native::NativeResponsesService {
-            models: native_app_state.config.native_responses_models.clone(),
             models_service: native_app_state.models_service,
             completion_service: native_app_state.completion_service,
             inference_provider_pool: native_app_state.inference_provider_pool,
@@ -1744,7 +1710,7 @@ pub fn build_response_routes(
             attestation_service: native_app_state.attestation_service,
         },
         response_service: response_service.clone(),
-        attestation_service: attestation_service.clone(),
+        attestation_service,
     };
 
     let inference_routes = Router::new()
@@ -1771,19 +1737,20 @@ pub fn build_response_routes(
             middleware::body_hash_middleware,
         ));
 
-    let other_routes = Router::new()
-        .route("/responses/{response_id}", get(responses::get_response))
+    let retired_history_routes = Router::new()
+        // Keep retired response-history paths explicit so authenticated clients
+        // receive a useful migration signal instead of an ambiguous 404/405.
         .route(
             "/responses/{response_id}",
-            axum::routing::delete(responses::delete_response),
+            any(responses::response_history_gone),
         )
         .route(
             "/responses/{response_id}/cancel",
-            post(responses::cancel_response),
+            any(responses::response_history_gone),
         )
         .route(
             "/responses/{response_id}/input_items",
-            get(responses::list_input_items),
+            any(responses::response_history_gone),
         )
         .with_state(route_state)
         .layer(from_fn_with_state(
@@ -1795,7 +1762,13 @@ pub fn build_response_routes(
             middleware::auth::auth_middleware_with_workspace_context,
         ));
 
-    Router::new().merge(inference_routes).merge(other_routes)
+    Router::new()
+        .merge(inference_routes)
+        .merge(retired_history_routes)
+        // Responses can contain user-provided prompts and model output. Apply
+        // this outside the route groups so extractor, authentication, and
+        // rate-limit rejections are no-store too.
+        .layer(map_response(no_store_response))
 }
 
 /// Build explicit not-implemented handlers for recognized OpenAI-compatible
@@ -2221,6 +2194,16 @@ async fn cache_control_on_success(
         res.headers_mut().insert(CACHE_CONTROL, value);
     }
     res
+}
+
+/// Force every response for a confidential-data route to bypass shared and
+/// browser caches. Unlike public catalog routes, even error responses may
+/// include request-specific details from validation or authentication.
+async fn no_store_response(mut response: Response) -> Response {
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
 }
 
 // Type aliases for `cache_control_layer`'s return type. They name the
@@ -2875,6 +2858,71 @@ mod tests {
     }
 
     #[test]
+    fn test_openapi_stateless_responses_request_excludes_rejected_inputs() {
+        let spec = serde_json::to_value(ApiDoc::openapi()).unwrap();
+        let operation = &spec["paths"]["/v1/responses"]["post"];
+        let request_body = &operation["requestBody"];
+        let request_schema = &request_body["content"]["application/json"]["schema"];
+        assert!(
+            request_schema.is_object(),
+            "Responses must document JSON input"
+        );
+        assert_ne!(
+            request_schema["$ref"], "#/components/schemas/StatelessCreateResponseRequestSchema",
+            "the endpoint request schema must not falsely present the typed adapter as universal"
+        );
+
+        let response = &operation["responses"]["200"];
+        let json_response_schema = &response["content"]["application/json"]["schema"];
+        assert!(
+            json_response_schema.is_object(),
+            "Responses must document JSON output"
+        );
+        assert_ne!(
+            json_response_schema["$ref"], "#/components/schemas/ResponseObject",
+            "the endpoint response schema must not falsely present typed output as universal"
+        );
+        assert!(
+            response["content"].get("text/event-stream").is_some(),
+            "Responses OpenAPI must advertise its streaming media type"
+        );
+
+        let schemas = &spec["components"]["schemas"];
+        let request = &schemas["StatelessCreateResponseRequestSchema"];
+        for rejected_field in ["conversation", "previous_response_id", "background"] {
+            assert!(
+                request["properties"].get(rejected_field).is_none(),
+                "stateless Responses schema must not advertise {rejected_field}"
+            );
+        }
+        assert_eq!(request["properties"]["store"]["default"], false);
+
+        let input_items = serde_json::to_string(&schemas["StatelessResponseInputItemSchema"])
+            .expect("input item schema should serialize");
+        assert!(
+            !input_items.contains("mcp_approval_response")
+                && !input_items.contains("mcp_list_tools"),
+            "stateless Responses schema must not advertise MCP input items"
+        );
+
+        let content_parts = serde_json::to_string(&schemas["StatelessResponseContentPartSchema"])
+            .expect("content part schema should serialize");
+        assert!(
+            !content_parts.contains("input_file"),
+            "stateless Responses schema must not advertise input_file"
+        );
+
+        let tools = serde_json::to_string(&schemas["StatelessResponseToolSchema"])
+            .expect("tool schema should serialize");
+        for rejected_tool in ["file_search", "code_interpreter", "computer", "mcp"] {
+            assert!(
+                !tools.contains(rejected_tool),
+                "stateless Responses schema must not advertise {rejected_tool}"
+            );
+        }
+    }
+
+    #[test]
     fn test_openapi_chat_completion_details_are_optional() {
         // Chat-completion usage details are independently optional (a provider
         // may report only `audio_tokens`), while the Responses API usage keeps
@@ -2993,6 +3041,71 @@ mod tests {
             serde_json::json!([{}, { "api_key": [] }]),
             "/v1/attestation/report must declare api_key security as optional"
         );
+    }
+
+    #[test]
+    fn test_openapi_omits_retired_response_history_paths() {
+        let spec = serde_json::to_value(ApiDoc::openapi()).unwrap();
+
+        for path in [
+            "/v1/responses/{response_id}",
+            "/v1/responses/{response_id}/cancel",
+            "/v1/responses/{response_id}/input_items",
+        ] {
+            assert!(
+                spec["paths"].get(path).is_none(),
+                "retired response-history path {path} must not be in OpenAPI"
+            );
+        }
+    }
+
+    #[test]
+    fn test_openapi_responses_advertises_client_tools_and_hosted_search() {
+        let spec = serde_json::to_value(ApiDoc::openapi()).unwrap();
+        let request_tools_schema = &spec["components"]["schemas"]
+            ["StatelessCreateResponseRequestSchema"]["properties"]["tools"];
+        assert!(
+            serde_json::to_string(request_tools_schema)
+                .unwrap()
+                .contains("StatelessResponseToolSchema"),
+            "Responses create-request schema must reference its supported tool schema"
+        );
+
+        let response_tool_schema = &spec["components"]["schemas"]["StatelessResponseToolSchema"];
+        assert!(
+            response_tool_schema.is_object(),
+            "typed Responses OpenAPI schema must describe its supported tool type"
+        );
+
+        let serialized_tool_schema = serde_json::to_string(response_tool_schema).unwrap();
+        for supported_tool in [
+            "function",
+            "custom",
+            "namespace",
+            "web_search",
+            "web_context_search",
+        ] {
+            assert!(
+                serialized_tool_schema.contains(supported_tool),
+                "typed Responses OpenAPI schema must advertise {supported_tool}"
+            );
+        }
+        let input_schema = serde_json::to_string(
+            &spec["components"]["schemas"]["StatelessResponseInputItemSchema"],
+        )
+        .unwrap();
+        for supported_item in [
+            "AdditionalToolsType",
+            "CustomToolCallType",
+            "CustomToolCallOutputType",
+            "ReasoningType",
+            "CompletedWebSearchCallType",
+        ] {
+            assert!(
+                input_schema.contains(supported_item),
+                "typed Responses input schema must advertise {supported_item}"
+            );
+        }
     }
 
     #[test]
@@ -3172,7 +3285,6 @@ mod tests {
             inference_api_key: Some("test-key".to_string()),
             internal_usage_token: None,
             internal_usage_max_discount: config::DEFAULT_INTERNAL_USAGE_MAX_DISCOUNT,
-            native_responses_models: Vec::new(),
             logging: config::LoggingConfig {
                 level: "info".to_string(),
                 format: "compact".to_string(),
@@ -3296,7 +3408,6 @@ mod tests {
             inference_api_key: Some("test-key".to_string()),
             internal_usage_token: None,
             internal_usage_max_discount: config::DEFAULT_INTERNAL_USAGE_MAX_DISCOUNT,
-            native_responses_models: Vec::new(),
             logging: config::LoggingConfig {
                 level: "info".to_string(),
                 format: "compact".to_string(),
@@ -3597,6 +3708,47 @@ mod tests {
     use axum::response::IntoResponse;
     use axum::routing::get;
     use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn no_store_response_layer_covers_extractor_rejections() {
+        #[derive(serde::Deserialize)]
+        struct RequestPayload {
+            #[allow(dead_code)]
+            model: String,
+        }
+
+        async fn handler(
+            crate::routes::extractors::OpenAiJson(_): crate::routes::extractors::OpenAiJson<
+                RequestPayload,
+            >,
+        ) -> StatusCode {
+            StatusCode::OK
+        }
+
+        let app = Router::new()
+            .route("/responses", axum::routing::post(handler))
+            .layer(map_response(no_store_response));
+        let response = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri("/responses")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{not json"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response
+                .headers()
+                .get(CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some("no-store"),
+        );
+    }
 
     fn cache_test_app() -> Router {
         async fn ok_handler() -> impl IntoResponse {

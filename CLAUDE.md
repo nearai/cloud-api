@@ -29,7 +29,7 @@ cargo fmt --all -- --check              # CI format check
 cargo clippy --all-targets --all-features -- -D warnings   # CI lint
 bash scripts/check_dep_guards.sh        # CI dependency guards
 cargo nextest run --lib --bins          # unit tests
-cargo nextest run test_create_conversation                  # tests matching a name
+cargo nextest run --test e2e_all -E 'test(responses_stateless)'   # stateless Responses coverage
 cargo nextest run --test e2e_all        # database-backed e2e (needs PostgreSQL)
 cargo nextest run --test e2e_all -E 'test(/^module_name::test_name$/)'   # one e2e test
 TEST_DATABASE_NAME=platform_api_e2e_local cargo nextest run --test e2e_all   # per-checkout e2e DB
@@ -79,7 +79,14 @@ The separation is deliberate: interactive users manage resources, programs run i
 ### Inference
 
 - **Chat Completions** (`POST /v1/chat/completions`, `/v1/completions`): drop-in OpenAI-compatible API, SSE streaming with a `[DONE]` terminator, plus non-streaming.
-- **Responses** (`POST /v1/responses`): linked to conversation history, with events `response.created`, `response.output_text.delta`, `response.completed`, `response.failed`. Supports client-executed tools (function calls, code_interpreter, computer) and server-executed web_search, file_search, and MCP. On a function call the response pauses as `incomplete`; the client resumes with `previous_response_id` plus `FunctionCallOutput`. Resumption verifies workspace ownership of `previous_response_id` and that each `call_id` maps to exactly one stored function call.
+- **Responses** (`POST /v1/responses`): stateless, with events `response.created`, `response.output_text.delta`, `response.completed`, and `response.failed`. Omitted or null `store` is normalized to `false`; `store: true`, `conversation`, `previous_response_id`, and `background: true` are rejected. Clients provide all prior context in each request.
+  - After alias resolution, canonical `openai/` models use one provider-native Responses request. The upstream provider executes native `web_search`; Cloud does not run a tool loop for this transport. Other models use the typed adapter, which can execute Cloud-managed `web_search` / `web_context_search` and feed results back through a bounded request-scoped inference loop. Neither path writes raw response/item history.
+  - Client-managed `function` and `custom` tools are supported, including tools grouped in a `namespace` and Codex's leading developer `additional_tools` declarations. Clients execute returned calls and replay each call with its matching output and prior context in a new request. Preserve `call_id`, names, raw arguments or custom input, and provider metadata such as `thought_signature`.
+  - Typed replay accepts assistant `output_text` and plaintext `reasoning` items, using reasoning content or its summary as prior assistant context. Encrypted-only reasoning requires a native Responses backend. The typed adapter supports text custom tools and the Codex `exec` Lark source grammar; other grammars require a native backend.
+  - Native requests forward complete replayed `web_search_call` items and `include` unchanged. Provider support determines the returned fields; Cloud preserves source/citation fields instead of stripping them to make providers match. Typed replay accepts completed search markers alongside assistant text and ignores the markers without repeating the search.
+  - Generated tool calls finish with `response.output_item.done`; a successful model turn ends with `response.completed`, including when tools await client execution. Reasoning uses `response.reasoning_text.delta`; failures expose `response.error` in `response.failed` and preserve partial usage. Typed hosted search retains search lifecycle events, source citations, and cumulative multi-round usage. Its `web_search.count` (0–20) overrides the model count; zero skips the search provider. Native hosted tools are limited to `web_search`; other builtin/remote tools, file input, and image-generation/editing output models are rejected. The independent root `POST /mcp` web-search endpoint is retained.
+  - Completed-response gateway attestation remains best-effort: when persistence succeeds, `GET /v1/signature/resp_*` returns signatures over request/response digests, not raw content. Interrupted streams create no partial `resp_*` attestation record.
+  - Named response-history routes (`/v1/responses/{id}`, its `/cancel` and `/input_items` paths) return authenticated `410 Gone`.
 
 Streaming flow:
 
@@ -89,6 +96,12 @@ Client → CompletionService → Provider Pool → provider → inference server
 ```
 
 The engine is streaming-first: tokens reach users in real time, usage is tracked during the stream rather than after, and non-streaming clients get the collected stream.
+
+### Conversations and Files
+
+Conversations and Files remain authenticated, workspace-scoped resource APIs. Conversation creation, retrieval, updates, pinning, archiving, cloning, item creation, and deletion are available. Files support upload, listing, metadata/content retrieval, and deletion.
+
+These resources have their own storage lifecycle. Stateless Responses accepts caller-provided context instead of linking to stored Conversations or Files.
 
 ### Model discovery
 

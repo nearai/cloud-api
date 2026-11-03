@@ -40,6 +40,9 @@ impl From<Uuid> for ResponseItemId {
 /// Request to create a response
 #[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct CreateResponseRequest {
+    #[serde(skip)]
+    #[schema(ignore)]
+    pub client_tool_adapter: super::client_tools::ClientToolAdapter,
     pub model: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub input: Option<ResponseInput>,
@@ -64,6 +67,8 @@ pub struct CreateResponseRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub background: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<Vec<StatelessResponseTool>>)]
+    #[serde(default, deserialize_with = "deserialize_stateless_response_tools")]
     pub tools: Option<Vec<ResponseTool>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<ResponseToolChoice>,
@@ -98,6 +103,24 @@ pub enum ResponseInput {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(untagged)]
 pub enum ResponseInputItem {
+    /// Plaintext reasoning replayed with the assistant's function calls.
+    Reasoning {
+        #[serde(rename = "type")]
+        type_: ReasoningType,
+        #[serde(default, with = "super::reasoning_wire::summary")]
+        #[schema(value_type = Vec<ReasoningSummaryPart>)]
+        summary: String,
+        #[serde(
+            default,
+            with = "super::reasoning_wire::content",
+            skip_serializing_if = "String::is_empty"
+        )]
+        #[schema(value_type = Option<Vec<ReasoningTextPart>>)]
+        content: String,
+        /// Opaque reasoning is only supported by the native Responses path.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        encrypted_content: Option<String>,
+    },
     McpApprovalResponse {
         #[serde(rename = "type")]
         type_: McpApprovalResponseType,
@@ -110,6 +133,22 @@ pub enum ResponseInputItem {
         id: String,
         server_label: String,
         tools: Vec<McpDiscoveredTool>,
+    },
+    /// A function call returned by a prior stateless response and replayed by
+    /// the client with its output. The platform never executes this function.
+    FunctionCall {
+        #[serde(rename = "type")]
+        type_: FunctionCallType,
+        /// The call ID used to correlate this request with its output.
+        call_id: String,
+        /// The client-defined function name requested by the model.
+        name: String,
+        /// JSON-encoded arguments returned by the model.
+        arguments: String,
+        /// Provider-specific metadata (for example Gemini's thought signature)
+        /// that must be echoed unchanged when this call is replayed.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        thought_signature: Option<String>,
     },
     /// Output from a client-executed function call
     FunctionCallOutput {
@@ -135,12 +174,22 @@ pub enum McpListToolsType {
     McpListTools,
 }
 
+pub use super::reasoning_wire::{ReasoningSummaryPart, ReasoningTextPart};
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq)]
+pub enum ReasoningType {
+    #[serde(rename = "reasoning")]
+    Reasoning,
+}
+
 impl ResponseInputItem {
     pub fn role(&self) -> Option<&str> {
         match self {
             ResponseInputItem::Message { role, .. } => Some(role),
+            ResponseInputItem::Reasoning { .. } => None,
             ResponseInputItem::McpApprovalResponse { .. } => None,
             ResponseInputItem::McpListTools { .. } => None,
+            ResponseInputItem::FunctionCall { .. } => None,
             ResponseInputItem::FunctionCallOutput { .. } => None,
         }
     }
@@ -148,8 +197,10 @@ impl ResponseInputItem {
     pub fn content(&self) -> Option<&ResponseContent> {
         match self {
             ResponseInputItem::Message { content, .. } => Some(content),
+            ResponseInputItem::Reasoning { .. } => None,
             ResponseInputItem::McpApprovalResponse { .. } => None,
             ResponseInputItem::McpListTools { .. } => None,
+            ResponseInputItem::FunctionCall { .. } => None,
             ResponseInputItem::FunctionCallOutput { .. } => None,
         }
     }
@@ -157,8 +208,10 @@ impl ResponseInputItem {
     pub fn metadata(&self) -> Option<&serde_json::Value> {
         match self {
             ResponseInputItem::Message { metadata, .. } => metadata.as_ref(),
+            ResponseInputItem::Reasoning { .. } => None,
             ResponseInputItem::McpApprovalResponse { .. } => None,
             ResponseInputItem::McpListTools { .. } => None,
+            ResponseInputItem::FunctionCall { .. } => None,
             ResponseInputItem::FunctionCallOutput { .. } => None,
         }
     }
@@ -175,7 +228,9 @@ impl ResponseInputItem {
                 ..
             } => Some((approval_request_id, *approve)),
             ResponseInputItem::Message { .. } => None,
+            ResponseInputItem::Reasoning { .. } => None,
             ResponseInputItem::McpListTools { .. } => None,
+            ResponseInputItem::FunctionCall { .. } => None,
             ResponseInputItem::FunctionCallOutput { .. } => None,
         }
     }
@@ -192,6 +247,13 @@ impl ResponseInputItem {
             _ => None,
         }
     }
+}
+
+/// Type marker for a client-replayed function call input item.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq)]
+pub enum FunctionCallType {
+    #[serde(rename = "function_call")]
+    FunctionCall,
 }
 
 /// Type marker for MCP approval response input
@@ -220,7 +282,7 @@ pub enum ResponseContent {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(tag = "type")]
 pub enum ResponseContentPart {
-    #[serde(rename = "input_text")]
+    #[serde(rename = "input_text", alias = "output_text")]
     InputText { text: String },
     #[serde(rename = "input_image")]
     InputImage {
@@ -305,6 +367,77 @@ pub enum ResponseTool {
         #[serde(skip_serializing_if = "Option::is_none")]
         allowed_tools: Option<Vec<String>>,
     },
+}
+
+/// Tool shapes accepted by the typed stateless Responses adapter.
+///
+/// Client custom/namespace tools are normalized to functions before parsing.
+/// Cloud search executes within the request; other legacy tool variants remain
+/// unavailable even though internal code still uses `ResponseTool`.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "type")]
+pub enum StatelessResponseTool {
+    #[serde(rename = "function")]
+    Function {
+        name: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        description: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        parameters: Option<serde_json::Value>,
+    },
+    #[serde(rename = "web_search")]
+    WebSearch {
+        /// Maximum results per search (0–20); zero skips the search provider. Overrides the model's count when set.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[schema(minimum = 0, maximum = 20)]
+        count: Option<u32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        filters: Option<serde_json::Value>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        search_context_size: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        user_location: Option<UserLocation>,
+    },
+    #[serde(rename = "web_context_search")]
+    WebContextSearch {},
+}
+
+impl From<StatelessResponseTool> for ResponseTool {
+    fn from(tool: StatelessResponseTool) -> Self {
+        match tool {
+            StatelessResponseTool::Function {
+                name,
+                description,
+                parameters,
+            } => Self::Function {
+                name,
+                description,
+                parameters,
+            },
+            StatelessResponseTool::WebSearch {
+                count,
+                filters,
+                search_context_size,
+                user_location,
+            } => Self::WebSearch {
+                count,
+                filters,
+                search_context_size,
+                user_location,
+            },
+            StatelessResponseTool::WebContextSearch {} => Self::WebContextSearch {},
+        }
+    }
+}
+
+fn deserialize_stateless_response_tools<'de, D>(
+    deserializer: D,
+) -> Result<Option<Vec<ResponseTool>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<Vec<StatelessResponseTool>>::deserialize(deserializer)
+        .map(|tools| tools.map(|tools| tools.into_iter().map(ResponseTool::from).collect()))
 }
 
 /// User location for web search
@@ -478,6 +611,7 @@ pub struct ResponseObject {
     pub store: bool,
     pub temperature: f32,
     pub tool_choice: ResponseToolChoiceOutput,
+    #[schema(value_type = Vec<StatelessResponseTool>)]
     pub tools: Vec<ResponseTool>,
     #[serde(default)]
     pub top_logprobs: i32,
@@ -598,7 +732,15 @@ pub enum ResponseOutputItem {
         #[serde(default)]
         created_at: i64,
         status: ResponseItemStatus,
+        #[serde(default, with = "super::reasoning_wire::summary")]
+        #[schema(value_type = Vec<ReasoningSummaryPart>)]
         summary: String,
+        #[serde(
+            default,
+            with = "super::reasoning_wire::content",
+            skip_serializing_if = "String::is_empty"
+        )]
+        #[schema(value_type = Option<Vec<ReasoningTextPart>>)]
         content: String,
         model: String,
     },
@@ -676,7 +818,11 @@ pub enum ResponseOutputItem {
         name: String,
         /// JSON-encoded arguments
         arguments: String,
-        /// Status: "in_progress" when pending client execution
+        /// Provider-specific metadata that clients must echo unchanged when
+        /// replaying the function call (for example Gemini's thought signature).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        thought_signature: Option<String>,
+        /// Generation status; "completed" means the client can execute the call.
         status: String,
         model: String,
     },
@@ -726,7 +872,12 @@ impl ResponseOutputItem {
             ResponseOutputItem::McpListTools { .. } => ResponseItemStatus::Completed,
             ResponseOutputItem::McpCall { .. } => ResponseItemStatus::Completed,
             ResponseOutputItem::McpApprovalRequest { .. } => ResponseItemStatus::InProgress,
-            ResponseOutputItem::FunctionCall { .. } => ResponseItemStatus::InProgress,
+            ResponseOutputItem::FunctionCall { status, .. } => match status.as_str() {
+                "completed" => ResponseItemStatus::Completed,
+                "failed" => ResponseItemStatus::Failed,
+                "cancelled" => ResponseItemStatus::Cancelled,
+                _ => ResponseItemStatus::InProgress,
+            },
             ResponseOutputItem::FunctionCallOutput { .. } => ResponseItemStatus::Completed,
         }
     }
@@ -1033,6 +1184,8 @@ pub struct ResponseStreamEvent {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub delta: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub arguments: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<ResponseError>,
@@ -1280,6 +1433,170 @@ impl CreateResponseRequest {
 
         Ok(())
     }
+
+    /// Validate that a request can be handled without platform-side response
+    /// or conversation persistence.
+    ///
+    /// The Responses API does not retain conversation state. Clients that need
+    /// a multi-turn flow must include the full context in a new request instead
+    /// of referring to stored server state. This includes replaying a custom
+    /// function call and its client-produced output in the same request.
+    pub fn validate_stateless(&self) -> Result<(), String> {
+        if self.store == Some(true) {
+            return Err("The Responses API only supports store: false.".to_string());
+        }
+
+        if self.conversation.is_some() {
+            return Err("The stateless Responses API does not support conversation.".to_string());
+        }
+
+        if self.previous_response_id.is_some() {
+            return Err(
+                "The stateless Responses API does not support previous_response_id.".to_string(),
+            );
+        }
+
+        if self.background == Some(true) {
+            return Err("The stateless Responses API does not support background.".to_string());
+        }
+
+        if let Some(ResponseInput::Items(items)) = &self.input {
+            let mut replayed_function_call_ids = HashSet::new();
+            let mut completed_function_call_ids = HashSet::new();
+            let mut pending_function_call_ids = HashSet::new();
+
+            for item in items {
+                match item {
+                    ResponseInputItem::Reasoning {
+                        content,
+                        summary,
+                        encrypted_content,
+                        ..
+                    } if content.is_empty()
+                        && summary.is_empty()
+                        && encrypted_content
+                            .as_ref()
+                            .is_some_and(|text| !text.is_empty()) =>
+                    {
+                        return Err("Encrypted-only reasoning replay requires a model using native Responses; the typed adapter requires plaintext reasoning content or summary.".to_string());
+                    }
+                    ResponseInputItem::McpApprovalResponse { .. }
+                    | ResponseInputItem::McpListTools { .. } => {
+                        return Err(
+                            "The stateless Responses API does not support mcp input items."
+                                .to_string(),
+                        );
+                    }
+                    ResponseInputItem::FunctionCall { call_id, name, .. } => {
+                        if call_id.trim().is_empty() {
+                            return Err(
+                                "A replayed function_call must include call_id.".to_string()
+                            );
+                        }
+                        if name.trim().is_empty() {
+                            return Err("A replayed function_call must include name.".to_string());
+                        }
+                        if !replayed_function_call_ids.insert(call_id.clone()) {
+                            return Err(format!(
+                                "duplicate call_id '{call_id}' in replayed function_call items"
+                            ));
+                        }
+                        pending_function_call_ids.insert(call_id.clone());
+                    }
+                    ResponseInputItem::FunctionCallOutput { call_id, .. } => {
+                        if call_id.trim().is_empty() {
+                            return Err("A function_call_output must include call_id.".to_string());
+                        }
+                        if !completed_function_call_ids.insert(call_id.clone()) {
+                            return Err(format!(
+                                "duplicate call_id '{call_id}' in function_call_output items"
+                            ));
+                        }
+                        if !pending_function_call_ids.remove(call_id) {
+                            return Err(format!(
+                                "function_call_output for call_id '{call_id}' must follow a matching function_call in the same stateless request"
+                            ));
+                        }
+                    }
+                    ResponseInputItem::Message {
+                        content: ResponseContent::Parts(parts),
+                        ..
+                    } => {
+                        if parts
+                            .iter()
+                            .any(|part| matches!(part, ResponseContentPart::InputFile { .. }))
+                        {
+                            return Err("The stateless Responses API does not support input_file."
+                                .to_string());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            if !pending_function_call_ids.is_empty() {
+                return Err(
+                    "Each replayed function_call must have a matching function_call_output in the same stateless request."
+                        .to_string(),
+                );
+            }
+        }
+
+        // The HTTP parser only admits `StatelessResponseTool`, but retain
+        // this defense for programmatic callers that construct the legacy
+        // internal `ResponseTool` enum directly.
+        if let Some(tools) = &self.tools {
+            let mut function_names = HashSet::new();
+            let mut search_names = HashSet::new();
+            for tool in tools {
+                match tool {
+                    ResponseTool::Function { name, .. } => {
+                        function_names.insert(name.as_str());
+                    }
+                    ResponseTool::WebSearch { .. } => {
+                        search_names.insert(crate::responses::tools::WEB_SEARCH_TOOL_NAME);
+                    }
+                    ResponseTool::WebContextSearch {} => {
+                        search_names.insert(crate::responses::tools::WEB_CONTEXT_SEARCH_TOOL_NAME);
+                    }
+                    ResponseTool::FileSearch { .. } => {
+                        return Err(
+                            "The stateless Responses API does not support file_search.".to_string()
+                        );
+                    }
+                    ResponseTool::CodeInterpreter {} => {
+                        return Err(
+                            "The stateless Responses API does not support code_interpreter because it requires continuation."
+                                .to_string(),
+                        );
+                    }
+                    ResponseTool::Computer {} => {
+                        return Err(
+                            "The stateless Responses API does not support computer because it requires continuation."
+                                .to_string(),
+                        );
+                    }
+                    ResponseTool::Mcp { .. } => {
+                        return Err(
+                            "The stateless Responses API does not support remote mcp tools."
+                                .to_string(),
+                        );
+                    }
+                }
+            }
+            if function_names
+                .iter()
+                .any(|name| search_names.contains(name))
+            {
+                return Err(
+                    "A client function conflicts with a configured Cloud search tool of the same name."
+                        .to_string(),
+                );
+            }
+        }
+
+        Ok(())
+    }
 }
 
 impl CreateConversationRequest {
@@ -1339,6 +1656,57 @@ mod tests {
     use crate::responses::models::*;
     use serde_json::json;
 
+    fn stateless_request() -> CreateResponseRequest {
+        CreateResponseRequest {
+            client_tool_adapter: Default::default(),
+            model: "gpt-4".to_string(),
+            input: Some(ResponseInput::Text("Hello".to_string())),
+            instructions: None,
+            conversation: None,
+            previous_response_id: None,
+            max_output_tokens: None,
+            max_tool_calls: None,
+            temperature: None,
+            top_p: None,
+            stream: None,
+            store: None,
+            background: None,
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+            reasoning: None,
+            include: None,
+            metadata: None,
+            safety_identifier: None,
+            prompt_cache_key: None,
+            service_tier: None,
+        }
+    }
+
+    fn replayed_function_call(call_id: &str) -> ResponseInputItem {
+        ResponseInputItem::FunctionCall {
+            type_: FunctionCallType::FunctionCall,
+            call_id: call_id.to_string(),
+            name: "lookup".to_string(),
+            arguments: "{}".to_string(),
+            thought_signature: None,
+        }
+    }
+
+    fn function_call_output(call_id: &str) -> ResponseInputItem {
+        ResponseInputItem::FunctionCallOutput {
+            type_: FunctionCallOutputType::FunctionCallOutput,
+            call_id: call_id.to_string(),
+            output: "{}".to_string(),
+        }
+    }
+
+    fn stateless_request_with_items(items: Vec<ResponseInputItem>) -> CreateResponseRequest {
+        let mut request = stateless_request();
+        request.input = Some(ResponseInput::Items(items));
+        request
+    }
+
     #[test]
     fn test_web_search_count_validation_and_round_trip() {
         for count in [None, Some(1), Some(5), Some(20), Some(0), Some(21)] {
@@ -1346,7 +1714,7 @@ mod tests {
             if let Some(count) = count {
                 tool["count"] = serde_json::json!(count);
             }
-            let request: CreateResponseRequest = serde_json::from_value(serde_json::json!({
+            let request: CreateResponseRequest = serde_json::from_value(json!({
                 "model": "test", "input": "Search the web", "tools": [tool.clone()]
             }))
             .unwrap();
@@ -1363,12 +1731,10 @@ mod tests {
             serde_json::json!("5"),
             serde_json::json!(4294967296u64),
         ] {
-            assert!(
-                serde_json::from_value::<CreateResponseRequest>(serde_json::json!({
-                    "model": "test", "tools": [{"type": "web_search", "count": count}]
-                }))
-                .is_err()
-            );
+            assert!(serde_json::from_value::<CreateResponseRequest>(json!({
+                "model": "test", "tools": [{"type": "web_search", "count": count}]
+            }))
+            .is_err());
         }
     }
 
@@ -1665,6 +2031,7 @@ mod tests {
     #[test]
     fn test_create_response_request_rejects_non_positive_max_output_tokens() {
         let base_request = CreateResponseRequest {
+            client_tool_adapter: Default::default(),
             model: "gpt-4".to_string(),
             input: None,
             instructions: None,
@@ -1736,6 +2103,7 @@ mod tests {
 
         // Test that valid metadata passes validation
         let request_with_small_metadata = CreateResponseRequest {
+            client_tool_adapter: Default::default(),
             model: "gpt-4".to_string(),
             input: None,
             instructions: None,
@@ -1767,6 +2135,7 @@ mod tests {
         // Test that metadata exceeding the limit fails validation
         let large_string = "x".repeat(MAX_METADATA_SIZE_BYTES + 1);
         let request_with_large_metadata = CreateResponseRequest {
+            client_tool_adapter: Default::default(),
             model: "gpt-4".to_string(),
             input: None,
             instructions: None,
@@ -1802,6 +2171,7 @@ mod tests {
     fn test_create_response_request_validates_without_metadata() {
         // Test that request without metadata passes validation
         let request_without_metadata = CreateResponseRequest {
+            client_tool_adapter: Default::default(),
             model: "gpt-4".to_string(),
             input: None,
             instructions: None,
@@ -1911,6 +2281,7 @@ mod tests {
 
         // Test that valid input message metadata passes validation
         let request_with_small_input_metadata = CreateResponseRequest {
+            client_tool_adapter: Default::default(),
             model: "gpt-4".to_string(),
             input: Some(ResponseInput::Items(vec![ResponseInputItem::Message {
                 role: "user".to_string(),
@@ -1946,6 +2317,7 @@ mod tests {
         // Test that input message metadata exceeding the limit fails validation
         let large_string = "x".repeat(MAX_METADATA_SIZE_BYTES + 1);
         let request_with_large_input_metadata = CreateResponseRequest {
+            client_tool_adapter: Default::default(),
             model: "gpt-4".to_string(),
             input: Some(ResponseInput::Items(vec![ResponseInputItem::Message {
                 role: "user".to_string(),
@@ -2014,5 +2386,315 @@ mod tests {
         };
 
         assert!(mcp_item.metadata().is_none());
+    }
+
+    #[test]
+    fn stateless_requests_accept_omitted_or_false_store() {
+        let request = stateless_request();
+        assert!(request.validate_stateless().is_ok());
+
+        let mut explicit_no_store = request;
+        explicit_no_store.store = Some(false);
+        assert!(explicit_no_store.validate_stateless().is_ok());
+    }
+
+    #[test]
+    fn stateless_function_call_replay_accepts_returned_output_without_server_state() {
+        // This is the second request in a client-managed two-turn loop. The
+        // `function_call` object is shaped like the first response's output
+        // item, including fields the input parser intentionally ignores.
+        let request: CreateResponseRequest = serde_json::from_value(json!({
+            "model": "gpt-4",
+            "store": false,
+            "input": [
+                {"role": "user", "content": "What is the weather?"},
+                {
+                    "type": "message",
+                    "id": "msg_first_turn",
+                    "status": "completed",
+                    "role": "assistant",
+                    "content": [{
+                        "type": "output_text",
+                        "text": "I will look that up.",
+                        "annotations": [],
+                        "logprobs": []
+                    }]
+                },
+                {
+                    "type": "function_call",
+                    "id": "fc_first_turn",
+                    "response_id": "resp_first_turn",
+                    "created_at": 0,
+                    "status": "in_progress",
+                    "model": "gpt-4",
+                    "call_id": "call_weather",
+                    "name": "get_weather",
+                    "arguments": "{\"location\":\"Shanghai\"}"
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_weather",
+                    "output": "{\"temperature_c\":22}"
+                }
+            ],
+            "tools": [{
+                "type": "function",
+                "name": "get_weather",
+                "parameters": {"type": "object"}
+            }]
+        }))
+        .expect("client replay request should deserialize");
+
+        assert!(request.previous_response_id.is_none());
+        assert!(request.conversation.is_none());
+        assert!(request.validate_stateless().is_ok());
+        assert!(matches!(
+            request.input,
+            Some(ResponseInput::Items(ref items))
+                if matches!(items[1], ResponseInputItem::Message {
+                    content: ResponseContent::Parts(ref parts),
+                    ..
+                } if matches!(parts[0], ResponseContentPart::InputText { .. }))
+                    && matches!(items[2], ResponseInputItem::FunctionCall { .. })
+                    && matches!(items[3], ResponseInputItem::FunctionCallOutput { .. })
+        ));
+    }
+
+    #[test]
+    fn stateless_function_replay_validates_call_output_correlations() {
+        let duplicate_call = stateless_request_with_items(vec![
+            replayed_function_call("call_one"),
+            replayed_function_call("call_one"),
+            function_call_output("call_one"),
+        ]);
+        assert!(duplicate_call
+            .validate_stateless()
+            .unwrap_err()
+            .contains("duplicate call_id 'call_one' in replayed function_call"));
+
+        let duplicate_output = stateless_request_with_items(vec![
+            replayed_function_call("call_one"),
+            function_call_output("call_one"),
+            function_call_output("call_one"),
+        ]);
+        assert!(duplicate_output
+            .validate_stateless()
+            .unwrap_err()
+            .contains("duplicate call_id 'call_one' in function_call_output"));
+
+        let orphan_output = stateless_request_with_items(vec![
+            replayed_function_call("call_one"),
+            function_call_output("call_two"),
+        ]);
+        assert!(orphan_output
+            .validate_stateless()
+            .unwrap_err()
+            .contains("matching function_call"));
+
+        let missing_output = stateless_request_with_items(vec![replayed_function_call("call_one")]);
+        assert!(missing_output
+            .validate_stateless()
+            .unwrap_err()
+            .contains("Each replayed function_call must have a matching"));
+
+        let parallel_calls = stateless_request_with_items(vec![
+            replayed_function_call("call_one"),
+            replayed_function_call("call_two"),
+            function_call_output("call_one"),
+            function_call_output("call_two"),
+        ]);
+        assert!(parallel_calls.validate_stateless().is_ok());
+
+        let interleaved_calls_and_outputs = stateless_request_with_items(vec![
+            replayed_function_call("call_one"),
+            replayed_function_call("call_two"),
+            function_call_output("call_one"),
+            replayed_function_call("call_three"),
+            function_call_output("call_two"),
+            function_call_output("call_three"),
+        ]);
+        assert!(interleaved_calls_and_outputs.validate_stateless().is_ok());
+
+        let message_between_call_and_output = stateless_request_with_items(vec![
+            replayed_function_call("call_one"),
+            ResponseInputItem::Message {
+                role: "user".to_string(),
+                content: ResponseContent::Text("continue".to_string()),
+                metadata: None,
+            },
+            function_call_output("call_one"),
+        ]);
+        assert!(message_between_call_and_output.validate_stateless().is_ok());
+    }
+
+    #[test]
+    fn stateless_requests_reject_persistent_response_fields() {
+        let mut store = stateless_request();
+        store.store = Some(true);
+        assert!(store
+            .validate_stateless()
+            .unwrap_err()
+            .contains("store: false"));
+
+        let mut conversation = stateless_request();
+        conversation.conversation = Some(ConversationReference::Id("conv_test".to_string()));
+        assert!(conversation
+            .validate_stateless()
+            .unwrap_err()
+            .contains("conversation"));
+
+        let mut previous_response = stateless_request();
+        previous_response.previous_response_id = Some("resp_test".to_string());
+        assert!(previous_response
+            .validate_stateless()
+            .unwrap_err()
+            .contains("previous_response_id"));
+
+        let mut background = stateless_request();
+        background.background = Some(true);
+        assert!(background
+            .validate_stateless()
+            .unwrap_err()
+            .contains("background"));
+    }
+
+    #[test]
+    fn stateless_requests_reject_stateful_inputs_and_tools() {
+        let mut input_file = stateless_request();
+        input_file.input = Some(ResponseInput::Items(vec![ResponseInputItem::Message {
+            role: "user".to_string(),
+            content: ResponseContent::Parts(vec![ResponseContentPart::InputFile {
+                file_id: "file_test".to_string(),
+                detail: None,
+            }]),
+            metadata: None,
+        }]));
+        assert!(input_file
+            .validate_stateless()
+            .unwrap_err()
+            .contains("input_file"));
+
+        let mut missing_function_call = stateless_request();
+        missing_function_call.input = Some(ResponseInput::Items(vec![
+            ResponseInputItem::FunctionCallOutput {
+                type_: FunctionCallOutputType::FunctionCallOutput,
+                call_id: "call_test".to_string(),
+                output: "{}".to_string(),
+            },
+        ]));
+        assert!(missing_function_call
+            .validate_stateless()
+            .unwrap_err()
+            .contains("matching function_call"));
+
+        let mut mcp_approval = stateless_request();
+        mcp_approval.input = Some(ResponseInput::Items(vec![
+            ResponseInputItem::McpApprovalResponse {
+                type_: McpApprovalResponseType::McpApprovalResponse,
+                approval_request_id: "apr_test".to_string(),
+                approve: true,
+            },
+        ]));
+        assert!(mcp_approval
+            .validate_stateless()
+            .unwrap_err()
+            .contains("mcp input items"));
+
+        let mut file_search = stateless_request();
+        file_search.tools = Some(vec![ResponseTool::FileSearch {}]);
+        assert!(file_search
+            .validate_stateless()
+            .unwrap_err()
+            .contains("file_search"));
+
+        let mut code_interpreter = stateless_request();
+        code_interpreter.tools = Some(vec![ResponseTool::CodeInterpreter {}]);
+        assert!(code_interpreter
+            .validate_stateless()
+            .unwrap_err()
+            .contains("code_interpreter"));
+
+        let mut computer = stateless_request();
+        computer.tools = Some(vec![ResponseTool::Computer {}]);
+        assert!(computer
+            .validate_stateless()
+            .unwrap_err()
+            .contains("computer"));
+
+        let mut mcp_tool = stateless_request();
+        mcp_tool.tools = Some(vec![ResponseTool::Mcp {
+            server_label: "test".to_string(),
+            server_url: "https://example.com/mcp".to_string(),
+            server_description: None,
+            authorization: None,
+            require_approval: McpApprovalRequirement::Simple(McpApprovalMode::Always),
+            allowed_tools: None,
+        }]);
+        assert!(mcp_tool
+            .validate_stateless()
+            .unwrap_err()
+            .contains("does not support remote mcp"));
+    }
+
+    #[test]
+    fn stateless_requests_reject_client_function_names_colliding_with_search() {
+        let mut request = stateless_request();
+        request.tools = Some(vec![
+            ResponseTool::Function {
+                name: "web_search".to_string(),
+                description: None,
+                parameters: None,
+            },
+            ResponseTool::WebSearch {
+                filters: None,
+                search_context_size: None,
+                user_location: None,
+                count: None,
+            },
+        ]);
+
+        assert!(request
+            .validate_stateless()
+            .unwrap_err()
+            .contains("conflicts with a configured Cloud search tool"));
+    }
+
+    #[test]
+    fn response_request_deserialization_accepts_functions_and_cloud_search() {
+        let request: CreateResponseRequest = serde_json::from_value(json!({
+            "model": "gpt-4",
+            "tools": [{
+                "type": "function",
+                "name": "web_search",
+                "parameters": {"type": "object"}
+            }]
+        }))
+        .expect("custom functions must deserialize");
+        assert!(matches!(
+            request.tools.as_deref(),
+            Some([ResponseTool::Function { name, .. }]) if name == "web_search"
+        ));
+
+        for search_type in ["web_search", "web_context_search"] {
+            let request: CreateResponseRequest = serde_json::from_value(json!({
+                "model": "test", "tools": [{"type": search_type}]
+            }))
+            .unwrap();
+            assert!(request.validate().is_ok());
+            assert!(request.validate_stateless().is_ok());
+        }
+
+        for unsupported_type in ["file_search", "code_interpreter", "computer", "mcp"] {
+            let error = serde_json::from_value::<CreateResponseRequest>(json!({
+                "model": "gpt-4",
+                "tools": [{"type": unsupported_type}]
+            }))
+            .expect_err("{unsupported_type} must fail request deserialization");
+
+            assert!(
+                error.to_string().contains(unsupported_type),
+                "deserialization error should identify {unsupported_type}: {error}"
+            );
+        }
     }
 }

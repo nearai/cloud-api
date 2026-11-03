@@ -5,7 +5,7 @@ use crate::{
         hash_inference_id_to_uuid, ports::ConcurrentRequestGuard, CompletionServiceTrait,
     },
     inference_provider_pool::InferenceProviderPool,
-    models::{ModelWithPricing, ModelsServiceTrait},
+    models::{ModelWithPricing, ModelsError, ModelsServiceTrait},
     usage::{
         InferenceType, ProviderAttribution, RecordUsageServiceRequest, StopReason, TextServiceTier,
         UsageServiceTrait,
@@ -26,9 +26,10 @@ use std::{
 };
 use uuid::Uuid;
 
+const CLIENT_TOOLS_ERROR: &str = "Native stateless Responses supports valid client-managed function, custom, and namespace tools, plus top-level web_search";
+
 #[derive(Clone)]
 pub struct NativeResponsesService {
-    pub models: Vec<String>,
     pub models_service: Arc<dyn ModelsServiceTrait>,
     pub completion_service: Arc<dyn CompletionServiceTrait>,
     pub inference_provider_pool: Arc<InferenceProviderPool>,
@@ -58,30 +59,35 @@ pub struct NativeResponse {
     pub provider_response_id: Option<String>,
 }
 
-pub fn selected(models: &[String], canonical_model: &str, body: &Value) -> bool {
-    models.iter().any(|model| model == canonical_model)
-        && inference_providers::responses_raw::is_stateless(body)
+pub fn selected(canonical_model: &str) -> bool {
+    canonical_model.starts_with("openai/")
 }
 
 impl NativeResponsesService {
-    /// Resolve aliases before checking the canonical allowlist. Non-selected
-    /// requests retain legacy validation and error handling. A model the
+    /// Resolve aliases before choosing the OpenAI-native transport. Other
+    /// models retain typed validation and error handling. A model the
     /// caller may not use is never selected: the request takes the legacy
     /// path and gets its unknown-model answer.
     pub async fn selected_model(
         &self,
         body: &Value,
         caller: crate::models::ModelCaller,
-    ) -> Option<ModelWithPricing> {
-        if self.models.is_empty() || !inference_providers::responses_raw::is_stateless(body) {
-            return None;
-        }
-        let model = self
+    ) -> Result<Option<ModelWithPricing>, ModelsError> {
+        let Some(identifier) = body["model"].as_str() else {
+            return Ok(None);
+        };
+        let model = match self
             .models_service
-            .resolve_and_get_model(body["model"].as_str()?, caller)
+            .resolve_and_get_model(identifier, caller)
             .await
-            .ok()?;
-        selected(&self.models, &model.model_name, body).then_some(model)
+        {
+            Ok(model) => model,
+            Err(ModelsError::NotFound(_)) => return Ok(None),
+            // A failed lookup cannot safely choose a transport. Let the
+            // route report the failure instead of retrying through Chat.
+            Err(error) => return Err(error),
+        };
+        Ok(selected(&model.model_name).then_some(model))
     }
 
     pub async fn execute(
@@ -93,12 +99,25 @@ impl NativeResponsesService {
         model
             .validate_endpoint(crate::models::InferenceEndpoint::Responses)
             .map_err(NativeResponsesError::InvalidRequest)?;
-        // Recheck the allowlist at the service boundary, independent of HTTP routing.
-        if !selected(&self.models, &model.model_name, &body) {
+        // Keep transport selection independent of request state: an invalid
+        // OpenAI request must never fall back to Chat Completions.
+        if !selected(&model.model_name) {
             return Err(NativeResponsesError::InvalidRequest(
-                "Native Responses is not enabled for this stateless request",
+                "Native Responses requires an OpenAI model",
             ));
         }
+        normalize_stateless_request(&mut body)?;
+        if model
+            .output_modalities
+            .as_ref()
+            .is_some_and(|modalities| modalities.iter().any(|modality| modality == "image"))
+        {
+            return Err(NativeResponsesError::InvalidRequest(
+                "Image generation and image editing are not supported by /v1/responses. Use /v1/images/generations or /v1/images/edits.",
+            ));
+        }
+        body = crate::responses::client_tools::normalize_native_request(body)
+            .map_err(|_| NativeResponsesError::InvalidRequest(CLIENT_TOOLS_ERROR))?;
         validate(&body).map_err(NativeResponsesError::InvalidRequest)?;
         let guard = self
             .completion_service
@@ -158,6 +177,26 @@ impl NativeResponsesService {
     }
 }
 
+/// Match the typed Responses default, while always sending explicit no-store
+/// semantics to the native provider. The provider boundary still checks the
+/// fully normalized request independently.
+fn normalize_stateless_request(body: &mut Value) -> Result<(), NativeResponsesError> {
+    let fields = body
+        .as_object_mut()
+        .ok_or(NativeResponsesError::InvalidRequest(
+            "Request must be an object",
+        ))?;
+    if fields.get("store").is_none_or(Value::is_null) {
+        fields.insert("store".into(), json!(false));
+    }
+    if !inference_providers::responses_raw::is_stateless(body) {
+        return Err(NativeResponsesError::InvalidRequest(
+            "Responses requires store: false and does not support conversation, previous_response_id, or background execution",
+        ));
+    }
+    Ok(())
+}
+
 struct Billing {
     service: NativeResponsesService,
     request_hash: String,
@@ -196,16 +235,11 @@ fn validate(body: &Value) -> Result<(), &'static str> {
     {
         return Err("instructions must be a string");
     }
-    if let Some(tools) = body.get("tools").filter(|v| !v.is_null()) {
-        let tools = tools.as_array().ok_or("tools must be an array")?;
-        if tools.iter().any(|t| t["type"] != "function") {
-            return Err("Native stateless Responses supports client-managed function tools only");
-        }
-    }
     if body.get("prompt").is_some_and(|v| !v.is_null()) {
         return Err("Stored prompt references are unavailable for native stateless Responses");
     }
-    // Cloud file IDs and built-in/MCP continuation items are not OpenAI IDs.
+    // Replay supported native output inline; Cloud file IDs and unsupported
+    // tool continuation items cannot be resolved by this stateless transport.
     if let Some(input) = body.get("input") {
         if !input.is_string() && !input.is_array() {
             return Err("input must be a string or array");
@@ -213,7 +247,15 @@ fn validate(body: &Value) -> Result<(), &'static str> {
         for item in input.as_array().into_iter().flatten() {
             if !matches!(
                 item["type"].as_str(),
-                None | Some("message" | "function_call" | "function_call_output" | "reasoning")
+                None | Some(
+                    "message"
+                        | "function_call"
+                        | "function_call_output"
+                        | "custom_tool_call"
+                        | "custom_tool_call_output"
+                        | "web_search_call"
+                        | "reasoning"
+                )
             ) {
                 return Err("Unsupported input item for native stateless Responses");
             }

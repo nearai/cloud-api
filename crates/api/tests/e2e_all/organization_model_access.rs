@@ -37,7 +37,7 @@ enum ModelKind {
     Decisions,
     /// A model the native Anthropic Messages routes accept.
     Anthropic,
-    /// A model on the native Responses allowlist.
+    /// An OpenAI model routed through native Responses.
     NativeResponses,
 }
 
@@ -112,15 +112,13 @@ async fn setup() -> Fixture {
     let text_alias = format!("access-text-alias-{suffix}");
     let decisions = format!("access-decisions/model-{suffix}");
     let anthropic = format!("anthropic/access-model-{suffix}");
-    let native = format!("access-native/model-{suffix}");
+    let native = format!("openai/access-native-model-{suffix}");
     let successor = format!("access-successor/model-{suffix}");
 
-    let native_allowlist = vec![native.clone()];
     let (server, pool, _shared_mock, database) =
         setup_test_server_with_pool_and_config(move |config| {
             config.internal_usage_token = Some(INTERNAL_TOKEN.to_string());
             config.external_providers.enable_anthropic_messages = true;
-            config.native_responses_models = native_allowlist;
         })
         .await;
 
@@ -653,8 +651,60 @@ fn blank_generated_ids(body: &str) -> String {
     out
 }
 
+/// The enclosing router builder, for resolving a named MethodRouter or a
+/// locally nested router. This scanner intentionally supports the source
+/// forms used here, not arbitrary Rust; unrecognized route handlers still fail.
+fn enclosing_router_builder(code: &str, at: usize) -> (usize, &str) {
+    let boundaries = ["\nfn ", "\npub fn "];
+    let start = boundaries
+        .iter()
+        .filter_map(|boundary| code[..at].rfind(boundary))
+        .max()
+        .unwrap_or(0);
+    let end = boundaries
+        .iter()
+        .filter_map(|boundary| code[at..].find(boundary).map(|end| at + end))
+        .min()
+        .unwrap_or(code.len());
+    (start, &code[start..end])
+}
+
+/// Resolve a local `let name = Router::new() ...;` mounted by
+/// `.nest("/prefix/", name)` in the same builder. Top-level mounts such as
+/// `/v1` stay outside the per-builder inventory, as before.
+fn nested_route_path(builder: &str, route_at: usize, path: &str) -> String {
+    if let Some(local_at) = builder[..route_at].rfind("let ") {
+        let declaration = &builder[local_at + "let ".len()..];
+        if let Some((name, expression)) = declaration.split_once('=') {
+            let statement_end = declaration.find(';').unwrap_or(declaration.len());
+            if local_at + "let ".len() + statement_end > route_at
+                && expression.trim_start().starts_with("Router::new()")
+            {
+                for mount in builder.split(".nest(").skip(1) {
+                    let Some((prefix, router)) = mount
+                        .trim_start()
+                        .strip_prefix('"')
+                        .and_then(|mount| mount.split_once('"'))
+                    else {
+                        continue;
+                    };
+                    if router.split_once(')').is_some_and(|(router, _)| {
+                        router.trim().trim_start_matches(',').trim() == name.trim()
+                    }) {
+                        return format!("{}{path}", prefix.trim_end_matches('/'));
+                    }
+                }
+            }
+        }
+    }
+    path.to_string()
+}
+
 /// Every `.route("<path>", <method>(..))` call in a router source file, as
-/// (method, path) pairs. Comment lines and the unit-test module are left out.
+/// (method, path) pairs. MethodRouter parameters require an `ANY` decision:
+/// the model-access inventory covers all methods passed to that path. The
+/// Route-layout tests separately check the exact supported methods.
+/// Comment lines and the unit-test module are left out.
 fn registered_routes(source: &str) -> Vec<(String, String)> {
     const METHODS: &[&str] = &[
         "get", "post", "put", "patch", "delete", "head", "options", "trace", "any",
@@ -672,6 +722,8 @@ fn registered_routes(source: &str) -> Vec<(String, String)> {
     let mut routes = Vec::new();
     let mut rest = code.as_str();
     while let Some(at) = rest.find(".route(") {
+        let route_at = code.len() - rest.len() + at;
+        let (builder_at, builder) = enclosing_router_builder(&code, route_at);
         rest = &rest[at + ".route(".len()..];
         // The arguments of the call: up to the parenthesis that closes it.
         let mut depth = 1usize;
@@ -713,11 +765,24 @@ fn registered_routes(source: &str) -> Vec<(String, String)> {
                 from = at + token.len();
             }
         }
-        assert!(
-            !methods.is_empty(),
-            "no method found for route {path}: {handlers}"
-        );
-        routes.extend(methods.into_iter().map(|method| (method, path.to_string())));
+        if methods.is_empty() {
+            let name = handlers
+                .trim()
+                .trim_start_matches(',')
+                .trim()
+                .trim_end_matches(',');
+            let signature = builder.split('{').next().unwrap_or(builder);
+            let parameter = format!("{name}: MethodRouter<");
+            assert!(
+                signature
+                    .lines()
+                    .any(|line| line.trim_start().starts_with(&parameter)),
+                "no method found for route {path}: {handlers}"
+            );
+            methods.push("ANY".to_string());
+        }
+        let path = nested_route_path(builder, route_at - builder_at, path);
+        routes.extend(methods.into_iter().map(|method| (method, path.clone())));
         rest = &rest[end..];
     }
     routes
@@ -771,11 +836,10 @@ fn every_registered_route_has_a_model_access_decision() {
         ("POST", "/logout"),
         ("GET", "/{token}"),
         ("POST", "/{token}/accept"),
-        // Stored responses, by id.
-        ("GET", "/responses/{response_id}"),
-        ("DELETE", "/responses/{response_id}"),
-        ("POST", "/responses/{response_id}/cancel"),
-        ("GET", "/responses/{response_id}/input_items"),
+        // Retired response history always returns authenticated 410.
+        ("ANY", "/responses/{response_id}"),
+        ("ANY", "/responses/{response_id}/cancel"),
+        ("ANY", "/responses/{response_id}/input_items"),
         // The MCP endpoint serves web search only.
         ("POST", "/mcp"),
         ("POST", "/conversations"),
@@ -923,6 +987,51 @@ mod tests {
             ("POST", "/b/{id}"),
             ("PATCH", "/c"),
         ]
+    );
+}
+
+#[test]
+fn registered_routes_reads_nested_method_router_parameters() {
+    let source = r#"
+fn layout<S>(
+    item: MethodRouter<S>,
+) -> Router<S> {
+    let descendants = Router::new()
+        .route("/", any(gone))
+        .route("/{id}", item);
+    Router::new()
+        .route("/items", get(list))
+        .nest("/items/", descendants)
+}
+fn other_layout<S>(
+    item: MethodRouter<S>,
+) -> Router<S> {
+    let descendants = Router::new().route("/{id}", item);
+    Router::new().nest("/other/", descendants)
+}
+"#;
+    assert_eq!(
+        registered_routes(source),
+        vec![
+            ("ANY".to_string(), "/items/".to_string()),
+            ("ANY".to_string(), "/items/{id}".to_string()),
+            ("GET".to_string(), "/items".to_string()),
+            ("ANY".to_string(), "/other/{id}".to_string()),
+        ]
+    );
+}
+
+#[test]
+#[should_panic(expected = "no method found for route /unknown")]
+fn registered_routes_rejects_unknown_named_handlers() {
+    registered_routes(
+        r#"
+fn layout<S>(
+    known: MethodRouter<S>,
+) -> Router<S> {
+    Router::new().route("/unknown", unknown)
+}
+"#,
     );
 }
 

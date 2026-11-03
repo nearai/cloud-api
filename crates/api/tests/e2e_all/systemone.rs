@@ -46,13 +46,25 @@ async fn catalog_with_names(
     model: String,
     alias: String,
 ) -> (String, String) {
+    catalog_with_names_and_output_modalities(server, provider, active, model, alias, &["decisions"])
+        .await
+}
+
+async fn catalog_with_names_and_output_modalities(
+    server: &axum_test::TestServer,
+    provider: Option<Value>,
+    active: bool,
+    model: String,
+    alias: String,
+    output_modalities: &[&str],
+) -> (String, String) {
     let mut config = json!({
         "inputCostPerToken":{"amount":3,"currency":"USD"},
         "outputCostPerToken":{"amount":2,"currency":"USD"},
         "modelDisplayName":"Jev decision fixture","modelDescription":"System One integration fixture",
         "contextLength":32768,"maxOutputLength":512,"verifiable":true,
         "isActive":active,"attestationSupported":true,
-        "inputModalities":["text"],"outputModalities":["decisions"],"aliases":[alias],
+        "inputModalities":["text"],"outputModalities":output_modalities,"aliases":[alias],
         "providerType":"vllm"
     });
     if let Some(provider) = provider {
@@ -510,7 +522,7 @@ async fn systemone_public_key_restricts_provider_fallback() {
 
 #[tokio::test]
 async fn systemone_rejects_invalid_requests_before_inference() {
-    let (server, pool, _, _) = setup_test_server_with_pool().await;
+    let (server, pool, mock, _) = setup_test_server_with_pool().await;
     let key = auth(&server).await;
     let (model, alias) = catalog(&server, None, true).await;
     let calls = Arc::new(AtomicUsize::new(0));
@@ -587,6 +599,11 @@ async fn systemone_rejects_invalid_requests_before_inference() {
             assert!(response.text().contains("/v1/systemone"));
         }
     }
+    assert_eq!(
+        mock.chat_completion_call_count(),
+        0,
+        "non-native decision models must be rejected as HTTP 400 before either Responses variant starts Chat Completions inference"
+    );
     server
         .post("/v1/systemone")
         .json(&request(&model))
@@ -607,6 +624,40 @@ async fn systemone_rejects_invalid_requests_before_inference() {
         .await
         .assert_status_bad_request();
     assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn typed_responses_prioritizes_systemone_for_dual_capability_models() {
+    let model = format!("dual-capability-{}", uuid::Uuid::new_v4());
+    let alias = format!("dual-capability-alias-{}", uuid::Uuid::new_v4());
+    let (server, _pool, mock, _) = setup_test_server_with_pool().await;
+    catalog_with_names_and_output_modalities(
+        &server,
+        None,
+        true,
+        model.clone(),
+        alias.clone(),
+        &["decisions", "image"],
+    )
+    .await;
+    let key = auth(&server).await;
+
+    for identifier in [&model, &alias] {
+        for stream in [false, true] {
+            let response = server
+                .post("/v1/responses")
+                .add_header("Authorization", format!("Bearer {key}"))
+                .json(&json!({"model":identifier,"input":"decision","stream":stream}))
+                .await;
+            assert_eq!(response.status_code(), 400, "{}", response.text());
+            assert!(response.text().contains("/v1/systemone"));
+        }
+    }
+    assert_eq!(
+        mock.chat_completion_call_count(),
+        0,
+        "dual-capability decision models must fail before a typed Chat Completions inference"
+    );
 }
 
 #[tokio::test]
@@ -884,13 +935,10 @@ async fn systemone_invalid_success_and_timeout_never_invoke_a_second_provider() 
 }
 
 #[tokio::test]
-async fn systemone_is_rejected_by_native_responses_even_when_allowlisted() {
-    let model = format!("native-decision-{}", uuid::Uuid::new_v4());
+async fn openai_systemone_is_rejected_by_native_responses() {
+    let model = format!("openai/native-decision-{}", uuid::Uuid::new_v4());
     let alias = format!("native-decision-alias-{}", uuid::Uuid::new_v4());
-    let (server, pool, _, _) = setup_test_server_with_pool_and_config(|config| {
-        config.native_responses_models = vec![model.clone()];
-    })
-    .await;
+    let (server, pool, _, _) = setup_test_server_with_pool().await;
     catalog_with_names(&server, None, true, model.clone(), alias.clone()).await;
     pool.register_provider(
         model.clone(),

@@ -32,6 +32,7 @@ impl<'a> ToolEventContext<'a> {
             item: None,
             item_id: Some(self.tool_call_id.to_string()),
             part: None,
+            arguments: None,
             delta: None,
             text: None,
             error: None,
@@ -402,6 +403,7 @@ mod tests {
 
     fn create_test_request() -> CreateResponseRequest {
         CreateResponseRequest {
+            client_tool_adapter: Default::default(),
             model: "test".to_string(),
             input: None,
             instructions: None,

@@ -12,10 +12,8 @@ use uuid::Uuid;
 
 /// Atomically-updated mirror of `ResponseStreamContext`'s token counters.
 ///
-/// `process_response_stream` owns `ctx` and drops it when it returns. The outer
-/// `tokio::spawn` task that emits `response.failed` on error needs visibility
-/// into accumulated usage after `ctx` is gone, so `ctx` writes through this
-/// shared handle on every update; the outer scope reads it via `snapshot`.
+/// Both completed and failed terminal events use the accumulated usage, even
+/// when an upstream stream ends after producing only part of its output.
 #[derive(Default)]
 pub struct UsageTracker {
     input_tokens: AtomicI32,
@@ -65,10 +63,13 @@ pub struct ResponseStreamContext {
     pub conversation_id: Option<ConversationId>,
     pub sequence_number: u64,
     pub output_item_index: usize,
-    /// Token usage (overwritten per chunk; last chunk wins per stream; for multi-turn agent, last turn only)
+    /// Cumulative usage across completed and current inference rounds.
     pub total_input_tokens: i32,
     pub total_output_tokens: i32,
     pub total_cached_tokens: i32,
+    completed_input_tokens: i32,
+    completed_output_tokens: i32,
+    completed_cached_tokens: i32,
     /// Accumulated reasoning tokens from reasoning content
     pub reasoning_tokens: i32,
     /// Response metadata for enriching output items
@@ -102,6 +103,9 @@ impl ResponseStreamContext {
             total_input_tokens: 0,
             total_output_tokens: 0,
             total_cached_tokens: 0,
+            completed_input_tokens: 0,
+            completed_output_tokens: 0,
+            completed_cached_tokens: 0,
             reasoning_tokens: 0,
             response_id_str,
             previous_response_id,
@@ -123,13 +127,24 @@ impl ResponseStreamContext {
         self.output_item_index += 1;
     }
 
-    /// Update usage from current completion stream (overwrite each chunk; last chunk wins).
+    /// Start a new inference while retaining usage from earlier rounds. Usage
+    /// chunks are cumulative within one provider stream, not across rounds.
+    pub fn begin_completion(&mut self) {
+        self.completed_input_tokens = self.total_input_tokens;
+        self.completed_output_tokens = self.total_output_tokens;
+        self.completed_cached_tokens = self.total_cached_tokens;
+    }
+
+    /// Replace the current round's usage without counting repeated chunks twice.
     pub fn update_usage(&mut self, input_tokens: i32, output_tokens: i32, cached_tokens: i32) {
-        self.total_input_tokens = input_tokens;
-        self.total_output_tokens = output_tokens;
-        self.total_cached_tokens = cached_tokens;
-        self.usage_tracker
-            .set_chunk_usage(input_tokens, output_tokens, cached_tokens);
+        self.total_input_tokens = self.completed_input_tokens.saturating_add(input_tokens);
+        self.total_output_tokens = self.completed_output_tokens.saturating_add(output_tokens);
+        self.total_cached_tokens = self.completed_cached_tokens.saturating_add(cached_tokens);
+        self.usage_tracker.set_chunk_usage(
+            self.total_input_tokens,
+            self.total_output_tokens,
+            self.total_cached_tokens,
+        );
     }
 
     /// Add reasoning tokens from detected reasoning content
@@ -169,6 +184,7 @@ impl EventEmitter {
             item: None,
             item_id: None,
             part: None,
+            arguments: None,
             delta: None,
             text: None,
             error: None,
@@ -198,6 +214,7 @@ impl EventEmitter {
             item: None,
             item_id: None,
             part: None,
+            arguments: None,
             delta: None,
             text: None,
             error: None,
@@ -228,6 +245,7 @@ impl EventEmitter {
             item: None,
             item_id: None,
             part: None,
+            arguments: None,
             delta: None,
             text: None,
             error: None,
@@ -240,6 +258,57 @@ impl EventEmitter {
             usage: Some(usage),
         };
         self.send(event).await
+    }
+
+    /// Emit the failed Response object clients expect, retaining legacy
+    /// top-level error/status/usage for consumers of the existing adapter.
+    pub async fn emit_failed(
+        &mut self,
+        ctx: &mut ResponseStreamContext,
+        mut response: models::ResponseObject,
+        error: &errors::ResponseError,
+    ) -> Result<(), errors::ResponseError> {
+        let status_code = error.http_status_code();
+        let legacy_error = error.response_error();
+        let mut response_error = legacy_error.clone();
+        if response_error.code.is_none() {
+            response_error.code = Some(
+                match status_code {
+                    429 => "rate_limit_exceeded",
+                    400..=499 => "invalid_prompt",
+                    _ => "server_error",
+                }
+                .to_string(),
+            );
+        }
+        response.status = models::ResponseStatus::Failed;
+        response.error = Some(response_error);
+        response.incomplete_details = None;
+        response.usage = ctx.usage_tracker.snapshot();
+        let usage = ctx.usage_tracker.has_data().then(|| response.usage.clone());
+
+        self.send(models::ResponseStreamEvent {
+            event_type: "response.failed".to_string(),
+            sequence_number: Some(ctx.next_sequence()),
+            response: Some(response),
+            output_index: None,
+            content_index: None,
+            item: None,
+            item_id: None,
+            part: None,
+            arguments: None,
+            delta: None,
+            text: None,
+            error: Some(legacy_error),
+            status_code: Some(status_code),
+            logprobs: None,
+            obfuscation: None,
+            annotation_index: None,
+            annotation: None,
+            conversation_title: None,
+            usage,
+        })
+        .await
     }
 
     /// Emit output_item.added event
@@ -258,6 +327,7 @@ impl EventEmitter {
             item: Some(item),
             item_id: Some(item_id),
             part: None,
+            arguments: None,
             delta: None,
             text: None,
             error: None,
@@ -288,6 +358,7 @@ impl EventEmitter {
             item: Some(item),
             item_id: Some(item_id),
             part: None,
+            arguments: None,
             delta: None,
             text: None,
             error: None,
@@ -299,6 +370,41 @@ impl EventEmitter {
             conversation_title: None,
             usage: None,
         };
+        self.send(event).await
+    }
+
+    /// Emit already-accumulated function arguments without rewriting their bytes.
+    pub async fn emit_function_call_arguments(
+        &mut self,
+        ctx: &mut ResponseStreamContext,
+        item_id: String,
+        arguments: String,
+    ) -> Result<(), errors::ResponseError> {
+        let mut event = models::ResponseStreamEvent {
+            event_type: "response.function_call_arguments.delta".to_string(),
+            sequence_number: Some(ctx.next_sequence()),
+            response: None,
+            output_index: Some(ctx.output_item_index),
+            content_index: None,
+            item: None,
+            item_id: Some(item_id),
+            part: None,
+            delta: Some(arguments),
+            arguments: None,
+            text: None,
+            error: None,
+            status_code: None,
+            logprobs: None,
+            obfuscation: None,
+            annotation_index: None,
+            annotation: None,
+            conversation_title: None,
+            usage: None,
+        };
+        self.send(event.clone()).await?;
+        event.event_type = "response.function_call_arguments.done".to_string();
+        event.sequence_number = Some(ctx.next_sequence());
+        event.arguments = event.delta.take();
         self.send(event).await
     }
 
@@ -318,6 +424,7 @@ impl EventEmitter {
             item: None,
             item_id: Some(item_id),
             part: Some(part),
+            arguments: None,
             delta: None,
             text: None,
             error: None,
@@ -348,6 +455,7 @@ impl EventEmitter {
             item: None,
             item_id: Some(item_id),
             part: Some(part),
+            arguments: None,
             delta: None,
             text: None,
             error: None,
@@ -378,6 +486,7 @@ impl EventEmitter {
             item: None,
             item_id: Some(item_id),
             part: None,
+            arguments: None,
             delta: Some(delta),
             text: None,
             error: None,
@@ -408,6 +517,7 @@ impl EventEmitter {
             item: None,
             item_id: Some(item_id),
             part: None,
+            arguments: None,
             delta: None,
             text: Some(text),
             error: None,
@@ -438,6 +548,7 @@ impl EventEmitter {
             item: None,
             item_id: Some(item_id),
             part: None,
+            arguments: None,
             delta: None,
             text: None,
             error: None,
@@ -481,14 +592,15 @@ impl EventEmitter {
         delta: String,
     ) -> Result<(), errors::ResponseError> {
         let event = models::ResponseStreamEvent {
-            event_type: "response.reasoning.delta".to_string(),
+            event_type: "response.reasoning_text.delta".to_string(),
             sequence_number: Some(ctx.next_sequence()),
             response: None,
             output_index: Some(ctx.output_item_index),
-            content_index: None,
+            content_index: Some(0),
             item: None,
             item_id: Some(reasoning_id),
             part: None,
+            arguments: None,
             delta: Some(delta),
             text: None,
             error: None,
@@ -525,12 +637,8 @@ impl EventEmitter {
             model: ctx.model.clone(),
         };
 
-        // Emit done event
-        self.emit_item_done(ctx, item.clone(), reasoning_id.to_string())
-            .await?;
-
-        // Store the reasoning item in the database
-        if let Err(e) = response_items_repository
+        // Use the decorated item in both the stream and final response.
+        let item = match response_items_repository
             .create(
                 ctx.response_id.clone(),
                 ctx.api_key_id,
@@ -539,8 +647,37 @@ impl EventEmitter {
             )
             .await
         {
-            tracing::error!("Failed to store reasoning item in database: {}", e);
-        }
+            Ok(stored) => stored,
+            Err(e) => {
+                tracing::error!("Failed to store reasoning item in database: {}", e);
+                item
+            }
+        };
+
+        self.send(models::ResponseStreamEvent {
+            event_type: "response.reasoning_text.done".to_string(),
+            sequence_number: Some(ctx.next_sequence()),
+            response: None,
+            output_index: Some(ctx.output_item_index),
+            content_index: Some(0),
+            item: None,
+            item_id: Some(reasoning_id.to_string()),
+            part: None,
+            arguments: None,
+            delta: None,
+            text: Some(content.to_string()),
+            error: None,
+            status_code: None,
+            logprobs: None,
+            obfuscation: None,
+            annotation_index: None,
+            annotation: None,
+            conversation_title: None,
+            usage: None,
+        })
+        .await?;
+        self.emit_item_done(ctx, item, reasoning_id.to_string())
+            .await?;
 
         Ok(())
     }
@@ -580,6 +717,28 @@ pub struct ToolCallInfo {
     pub thought_signature: Option<String>,
 }
 
+/// A custom function call that Cloud returns verbatim for the client to run.
+///
+/// Unlike the legacy server-executed tool representation, `arguments` is not
+/// parsed, repaired, or reserialized. A client may replay it exactly alongside
+/// its `function_call_output` in a subsequent stateless request.
+#[derive(Debug, Clone)]
+pub struct ClientManagedFunctionCall {
+    pub id: String,
+    pub name: String,
+    pub arguments: String,
+    pub thought_signature: Option<String>,
+}
+
+/// A declared hosted search call plus the parsed model arguments used in the
+/// in-memory Chat transcript. Client-managed tool arguments never enter this parser.
+#[derive(Debug, Clone)]
+pub struct HostedSearchCall {
+    pub call: ToolCallInfo,
+    pub name: String,
+    pub arguments: String,
+}
+
 /// Result of processing a completion stream
 ///
 /// Contains the accumulated text, detected tool calls, and stream status.
@@ -587,8 +746,12 @@ pub struct ToolCallInfo {
 pub struct ProcessStreamResult {
     /// The accumulated text content from the stream
     pub text: String,
+    /// Model reasoning required when continuing this inference with tool results.
+    pub reasoning: Option<String>,
     /// Tool calls detected in the stream
-    pub tool_calls: Vec<ToolCallInfo>,
+    pub tool_calls: Vec<ClientManagedFunctionCall>,
+    /// Cloud-managed search calls, kept separate from client-executed functions.
+    pub search_calls: Vec<HostedSearchCall>,
     /// Whether the stream terminated with an error (client disconnect, network error, etc.)
     /// When true, the response may be incomplete and the agent loop should stop.
     pub stream_error: bool,
@@ -677,6 +840,28 @@ mod tests {
         let snap = tracker.snapshot();
         assert_eq!(snap.input_tokens, 50);
         assert_eq!(snap.output_tokens, 100);
+    }
+
+    #[test]
+    fn usage_accumulates_rounds_without_counting_repeated_chunks_twice() {
+        let tracker = UsageTracker::new();
+        let mut ctx = make_ctx(tracker.clone());
+        ctx.begin_completion();
+        ctx.update_usage(5, 2, 1);
+        ctx.update_usage(10, 4, 2);
+        ctx.begin_completion();
+        ctx.update_usage(20, 3, 5);
+        ctx.update_usage(20, 8, 5);
+        assert_eq!(ctx.total_input_tokens, 30);
+        assert_eq!(ctx.total_output_tokens, 12);
+        assert_eq!(ctx.total_cached_tokens, 7);
+        let snapshot = tracker.snapshot();
+        assert_eq!(snapshot.input_tokens, 30);
+        assert_eq!(snapshot.output_tokens, 12);
+        // A later provider failure before its first usage chunk must not erase
+        // any usage already captured from successful or partial rounds.
+        ctx.begin_completion();
+        assert_eq!(tracker.snapshot().total_tokens, 42);
     }
 
     #[test]

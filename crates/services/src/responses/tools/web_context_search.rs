@@ -414,6 +414,7 @@ mod tests {
 
     fn create_test_request() -> CreateResponseRequest {
         CreateResponseRequest {
+            client_tool_adapter: Default::default(),
             model: "test".to_string(),
             input: None,
             instructions: None,

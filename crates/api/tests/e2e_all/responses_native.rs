@@ -1,4 +1,4 @@
-//! Native Astra routing must remain an explicit stateless opt-in.
+//! Canonical OpenAI models always use native stateless Responses.
 use crate::common::*;
 use bytes::Bytes;
 use inference_providers::{mock::MockProvider, responses_raw::ResponsesRawResponse};
@@ -6,28 +6,80 @@ use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
 
 #[tokio::test]
-async fn native_stateless_astra_preserves_protocol_and_isolates_legacy_routes() {
-    native_flow("openai/gpt-6-astra", true).await;
+async fn native_stateless_responses_reject_image_output_models() {
+    let model = format!("openai/native-image-{}", uuid::Uuid::new_v4());
+    let (server, _pool, _, _) = setup_test_server_with_pool().await;
+
+    let mut batch = api::models::BatchUpdateModelApiRequest::new();
+    batch.insert(
+        model.clone(),
+        serde_json::from_value(json!({
+            "inputCostPerToken":{"amount":1000,"currency":"USD"},
+            "outputCostPerToken":{"amount":2000,"currency":"USD"},
+            "modelDisplayName":"Native image fixture",
+            "modelDescription":"Must be rejected by Responses",
+            "contextLength":10000,"maxOutputLength":1000,"isActive":true,"ownedBy":"openai",
+            "verifiable":false,"inputModalities":["text"],"outputModalities":["image"]
+        }))
+        .unwrap(),
+    );
+    admin_batch_upsert_models(&server, batch, get_session_id()).await;
+
+    let org = setup_org_with_credits(&server, 10_000_000_000).await;
+    let key = get_api_key_for_org(&server, org.id).await;
+    let response = server
+        .post("/v1/responses")
+        .add_header("Authorization", format!("Bearer {key}"))
+        .json(&json!({"model":model,"store":false,"input":"draw a cat"}))
+        .await;
+
+    assert_eq!(response.status_code(), 400, "{}", response.text());
+    assert!(response
+        .text()
+        .contains("Image generation and image editing"));
 }
 
 #[tokio::test]
-async fn native_routing_supports_explicitly_configured_non_astra_models() {
-    native_flow("configured/custom-model", true).await;
+async fn openai_responses_without_native_provider_never_fall_back_to_chat() {
+    let model = format!("openai/chat-only-fixture-{}", uuid::Uuid::new_v4());
+    let (server, pool, _, _) = setup_test_server_with_pool().await;
+    let mut batch = api::models::BatchUpdateModelApiRequest::new();
+    batch.insert(
+        model.clone(),
+        serde_json::from_value(json!({
+            "inputCostPerToken":{"amount":1000,"currency":"USD"},
+            "outputCostPerToken":{"amount":2000,"currency":"USD"},
+            "modelDisplayName":"Chat-only provider fixture",
+            "modelDescription":"Native routing cannot silently use Chat",
+            "contextLength":10000,"maxOutputLength":1000,"isActive":true,"ownedBy":"openai",
+            "verifiable":false,"inputModalities":["text"],"outputModalities":["text"]
+        }))
+        .unwrap(),
+    );
+    admin_batch_upsert_models(&server, batch, get_session_id()).await;
+    let provider = Arc::new(MockProvider::new_accept_all());
+    pool.register_provider(model.clone(), provider.clone())
+        .await;
+    let org = setup_org_with_credits(&server, 10_000_000_000).await;
+    let key = get_api_key_for_org(&server, org.id).await;
+    for stream in [false, true] {
+        let response = server
+            .post("/v1/responses")
+            .add_header("Authorization", format!("Bearer {key}"))
+            .json(&json!({"model":model,"input":"hello","stream":stream}))
+            .await;
+        assert_eq!(response.status_code(), 502, "{}", response.text());
+        assert!(provider.last_chat_params().await.is_none());
+    }
 }
 
 #[tokio::test]
-async fn native_routing_is_disabled_when_allowlist_is_empty() {
-    native_flow("openai/gpt-6-astra", false).await;
-}
-
-async fn native_flow(prefix: &str, enabled: bool) {
-    let model = format!("{prefix}-{}", uuid::Uuid::new_v4());
+async fn native_stateless_responses_preserve_protocol_and_isolate_legacy_routes() {
+    let model = format!("openai/native-protocol-{}", uuid::Uuid::new_v4());
     let alias = format!("native-alias-{}", uuid::Uuid::new_v4());
-    let (server, pool, _, database) = setup_test_server_with_pool_and_config(|config| {
-        config.native_responses_models = if enabled { vec![model.clone()] } else { vec![] };
-    })
-    .await;
+    let (server, pool, _, database) = setup_test_server_with_pool().await;
     let other = format!("other-{}", uuid::Uuid::new_v4());
+    let other_alias = format!("openai/other-alias-{}", uuid::Uuid::new_v4());
     let captured = Arc::new(Mutex::new(Vec::<Value>::new()));
     let calls = captured.clone();
     let provider = Arc::new(MockProvider::new_accept_all().with_responses_handler(move |body: Value| {
@@ -54,7 +106,7 @@ async fn native_flow(prefix: &str, enabled: bool) {
                 "inputCostPerToken":{"amount":1000,"currency":"USD"},"outputCostPerToken":{"amount":2000,"currency":"USD"},
                 "modelDisplayName":"Routing fixture","modelDescription":"Native Responses test",
                 "contextLength":10000,"maxOutputLength":1000,"isActive":true,"ownedBy":"openai",
-                "aliases":if name == &model {vec![alias.clone()]} else {vec![]},
+                "aliases":if name == &model {vec![alias.clone()]} else {vec![other_alias.clone()]},
                 "verifiable":false,"inputModalities":["text"],"outputModalities":["text"]
             }))
             .unwrap(),
@@ -68,17 +120,6 @@ async fn native_flow(prefix: &str, enabled: bool) {
     let org = setup_org_with_credits(&server, 10_000_000_000).await;
     let key = get_api_key_for_org(&server, org.id.clone()).await;
     let auth = format!("Bearer {key}");
-    if !enabled {
-        let response = server
-            .post("/v1/responses")
-            .add_header("Authorization", &auth)
-            .json(&json!({"model":model,"store":false,"input":"hello"}))
-            .await;
-        assert_eq!(response.status_code(), 200, "{}", response.text());
-        assert!(captured.lock().unwrap().is_empty());
-        assert!(provider.last_chat_params().await.is_some());
-        return;
-    }
     let mut request = json!({"model":alias,"store":false,"input":[
         {"type":"reasoning","id":"rs_prior","summary":[],"encrypted_content":"prior-opaque"},
         {"type":"function_call","call_id":"call_prior","name":"weather","arguments":"{}"},
@@ -132,40 +173,101 @@ async fn native_flow(prefix: &str, enabled: bool) {
     ];
     assert_eq!(captured.lock().unwrap().len(), 2);
 
-    // Both explicit and default storage must still persist local response records.
-    for store in [Some(true), None] {
-        let mut legacy = json!({"model":model,"input":"hello"});
-        if let Some(store) = store {
-            legacy["store"] = json!(store);
+    // Invalid or stateful OpenAI requests must never switch to Chat.
+    for rejected in [
+        json!({"store":true}),
+        json!({"store":"false"}),
+        json!({"store":false,"previous_response_id":"resp_stale"}),
+        json!({"store":false,"conversation":"conv_stale"}),
+        json!({"store":false,"background":true}),
+    ] {
+        let mut body = json!({"model":model,"input":"hello"});
+        body.as_object_mut()
+            .unwrap()
+            .extend(rejected.as_object().unwrap().clone());
+        server
+            .post("/v1/responses")
+            .add_header("Authorization", &auth)
+            .json(&body)
+            .await
+            .assert_status_bad_request();
+    }
+    assert_eq!(captured.lock().unwrap().len(), 2);
+    assert!(provider.last_chat_params().await.is_none());
+
+    // Both forms use native Responses and explicitly disable upstream storage.
+    for null_store in [false, true] {
+        let mut body = json!({"model":model,"input":"hello"});
+        if null_store {
+            body["store"] = Value::Null;
         }
         let response = server
             .post("/v1/responses")
             .add_header("Authorization", &auth)
-            .json(&legacy)
+            .json(&body)
             .await;
         assert_eq!(response.status_code(), 200, "{}", response.text());
-        let value: Value = response.json();
-        assert!(stored_response(&database, value["id"].as_str().unwrap()).await);
-        let followup = server.post("/v1/responses")
-            .add_header("Authorization", &auth)
-            .json(&json!({"model":model,"store":false,"previous_response_id":value["id"],"input":"follow up"}))
-            .await;
-        assert_eq!(followup.status_code(), 200, "{}", followup.text());
-        assert_eq!(captured.lock().unwrap().len(), 2);
+        let response: Value = response.json();
+        assert_eq!(response["output"][0]["encrypted_content"], "opaque");
+        assert_eq!(captured.lock().unwrap().last().unwrap()["store"], false);
+        assert!(
+            !stored_response(&database, response["id"].as_str().unwrap()).await,
+            "Native stateless output must not be stored"
+        );
     }
+    assert_eq!(captured.lock().unwrap().len(), 4);
+    assert!(provider.last_chat_params().await.is_none());
+
+    // Codex Lite declarations are promoted while native grammars, custom
+    // replay and opaque reasoning remain intact instead of becoming Chat tools.
+    let tools = json!([
+        {"type":"namespace","name":"functions","tools":[
+            {"type":"function","name":"weather","parameters":{"type":"object"}}
+        ]},
+        {"type":"custom","name":"apply_patch","format":{
+            "type":"grammar","syntax":"lark","definition":"start: /.+/s"
+        }}
+    ]);
+    let history = json!([
+        {"role":"user","content":"Apply the patch"},
+        {"type":"reasoning","id":"rs_prior","summary":[],"encrypted_content":"prior-opaque"},
+        {"type":"custom_tool_call","call_id":"call_patch","name":"apply_patch","input":"raw patch"},
+        {"type":"custom_tool_call_output","call_id":"call_patch","output":"Done"}
+    ]);
+    let mut input = vec![json!({"type":"additional_tools","role":"developer","tools":tools})];
+    input.extend(history.as_array().unwrap().iter().cloned());
+    let lite = server
+        .post("/v1/responses")
+        .add_header("Authorization", &auth)
+        .json(&json!({"model":alias,"input":input,"reasoning":{"effort":"high"},"include":["reasoning.encrypted_content"]}))
+        .await;
+    assert_eq!(lite.status_code(), 200, "{}", lite.text());
+    let forwarded = captured.lock().unwrap().last().unwrap().clone();
+    assert_eq!(forwarded["model"], model);
+    assert_eq!(forwarded["store"], false);
+    assert_eq!(forwarded["tools"], tools);
+    assert_eq!(forwarded["input"], history);
+    assert_eq!(forwarded["reasoning"], json!({"effort":"high"}));
+    assert_eq!(forwarded["include"], json!(["reasoning.encrypted_content"]));
+    assert_eq!(captured.lock().unwrap().len(), 5);
+    assert!(provider.last_chat_params().await.is_none());
+
+    // Routing uses the resolved canonical name, not ownedBy or alias spelling.
     let response = server
         .post("/v1/responses")
         .add_header("Authorization", &auth)
-        .json(&json!({"model":other,"store":false,"input":"hello"}))
+        .json(&json!({"model":other_alias,"store":false,"input":"hello"}))
         .await;
     assert_eq!(response.status_code(), 200, "{}", response.text());
+    assert_eq!(captured.lock().unwrap().len(), 5);
+    assert!(provider.last_chat_params().await.is_some());
     let response = server
         .post("/v1/chat/completions")
         .add_header("Authorization", &auth)
         .json(&json!({"model":model,"messages":[{"role":"user","content":"hello"}]}))
         .await;
     assert_eq!(response.status_code(), 200, "{}", response.text());
-    assert_eq!(captured.lock().unwrap().len(), 2);
+    assert_eq!(captured.lock().unwrap().len(), 5);
     assert!(provider.last_chat_params().await.is_some());
 
     // Poll async streaming usage; native records must not point at stored response rows.

@@ -2,8 +2,11 @@
 //!
 //! Uses mock inference and mock context-search providers so CI does not need Brave credentials.
 
+use super::responses_hosted_search::{
+    assert_citation, assert_no_history, assert_search_lifecycle, completed_response, events,
+};
 use crate::common::{
-    get_api_key_for_org, mock_prompts, setup_org_with_credits, setup_qwen_model,
+    get_api_key_for_org, setup_org_with_credits, setup_qwen_model,
     setup_test_server_with_search_providers, MockWebContextSearchProvider, MockWebSearchProvider,
 };
 use inference_providers::mock::{RequestMatcher, ResponseTemplate, ToolCall};
@@ -11,8 +14,7 @@ use serde_json::json;
 use services::responses::tools::WebSearchResult;
 use std::sync::Arc;
 
-#[tokio::test]
-async fn test_non_streaming_web_context_search_with_mock_provider() {
+async fn check_web_context_search(stream: bool) {
     let context_provider = Arc::new(MockWebContextSearchProvider::new(vec![WebSearchResult {
         title: "NEAR Context Source".to_string(),
         url: "https://example.com/near-context".to_string(),
@@ -20,7 +22,7 @@ async fn test_non_streaming_web_context_search_with_mock_provider() {
     }]));
     let captured_context_params = context_provider.last_params();
 
-    let (server, _database, mock) = setup_test_server_with_search_providers(
+    let (server, database, mock) = setup_test_server_with_search_providers(
         Arc::new(MockWebSearchProvider::default_results()),
         Some(context_provider),
     )
@@ -30,33 +32,28 @@ async fn test_non_streaming_web_context_search_with_mock_provider() {
     let api_key = get_api_key_for_org(&server, org.id).await;
 
     let user_prompt = "Use context search to ground a short answer about NEAR Protocol.";
-    let expected_prompt = mock_prompts::build_prompt(user_prompt);
-
-    mock.when(RequestMatcher::PromptWithTools {
-        prompt: expected_prompt,
-        tool_names: vec!["web_context_search".to_string()],
-    })
-    .respond_with(
-        ResponseTemplate::new("").with_tool_calls(vec![ToolCall::new(
-            "web_context_search",
-            json!({
-                "query": "NEAR Protocol",
-                "country": "US",
-                "search_lang": "en",
-                "freshness": "pw",
-                "spellcheck": false,
-                "count": 5,
-                "maximum_number_of_urls": 2,
-                "maximum_number_of_tokens": 2048,
-                "maximum_number_of_snippets": 4,
-                "maximum_number_of_tokens_per_url": 1024,
-                "maximum_number_of_snippets_per_url": 2,
-                "context_threshold_mode": "strict"
-            })
-            .to_string(),
-        )]),
-    )
-    .await;
+    mock.when(RequestMatcher::ToolResultCount(0))
+        .respond_with(
+            ResponseTemplate::new("").with_tool_calls(vec![ToolCall::new(
+                "web_context_search",
+                json!({
+                    "query": "NEAR Protocol",
+                    "country": "US",
+                    "search_lang": "en",
+                    "freshness": "pw",
+                    "spellcheck": false,
+                    "count": 5,
+                    "maximum_number_of_urls": 2,
+                    "maximum_number_of_tokens": 2048,
+                    "maximum_number_of_snippets": 4,
+                    "maximum_number_of_tokens_per_url": 1024,
+                    "maximum_number_of_snippets_per_url": 2,
+                    "context_threshold_mode": "strict"
+                })
+                .to_string(),
+            )]),
+        )
+        .await;
 
     mock.set_default_response(ResponseTemplate::new(
         "NEAR Protocol is a sharded layer-one blockchain with source-backed context [s:0]from Brave Context[/s:0].",
@@ -69,7 +66,8 @@ async fn test_non_streaming_web_context_search_with_mock_provider() {
         .json(&json!({
             "model": model,
             "input": user_prompt,
-            "stream": false,
+            "stream": stream,
+            "store": false,
             "tools": [
                 {
                     "type": "web_context_search"
@@ -85,7 +83,7 @@ async fn test_non_streaming_web_context_search_with_mock_provider() {
         response.text()
     );
 
-    let response_body = response.json::<serde_json::Value>();
+    let response_body = completed_response(&response, stream);
     assert_eq!(response_body["status"], "completed");
 
     let output = response_body["output"]
@@ -142,4 +140,25 @@ async fn test_non_streaming_web_context_search_with_mock_provider() {
     assert_eq!(params.maximum_number_of_tokens_per_url, Some(1024));
     assert_eq!(params.maximum_number_of_snippets_per_url, Some(2));
     assert_eq!(params.context_threshold_mode.as_deref(), Some("strict"));
+    assert_eq!(mock.chat_completion_call_count(), 2);
+    assert_citation(
+        &annotations[0],
+        text,
+        "from Brave Context",
+        "https://example.com/near-context",
+    );
+    if stream {
+        assert_search_lifecycle(&events(&response.text()), &response_body);
+    }
+    assert_no_history(&database, &response_body).await;
+}
+
+#[tokio::test]
+async fn test_non_streaming_web_context_search_with_mock_provider() {
+    check_web_context_search(false).await;
+}
+
+#[tokio::test]
+async fn test_streaming_web_context_search_with_mock_provider() {
+    check_web_context_search(true).await;
 }

@@ -133,53 +133,20 @@ mod response_item_workspace_scoping {
         item_ids: Vec<String>,
     }
 
-    fn parse_conv_uuid(conversation_id: &str) -> Uuid {
-        let raw = conversation_id
-            .strip_prefix("conv_")
-            .unwrap_or(conversation_id);
-        Uuid::parse_str(raw).expect("conversation id should contain a UUID")
-    }
-
-    /// Creates an org + API key, a conversation, and `item_count` backfilled
-    /// items via the public API; returns the raw IDs for repository-level use.
-    async fn seed_workspace(server: &axum_test::TestServer, item_count: usize) -> WorkspaceFixture {
+    /// Seed retained history directly so repository coverage does not depend on
+    /// the public conversation write routes.
+    async fn seed_workspace(
+        server: &axum_test::TestServer,
+        database: &std::sync::Arc<database::Database>,
+        item_count: usize,
+    ) -> WorkspaceFixture {
         let org = create_org(server).await;
-        let workspaces = list_workspaces(server, org.id.clone()).await;
-        let workspace = workspaces.first().expect("org should have a workspace");
-        let workspace_id =
-            WorkspaceId(Uuid::parse_str(&workspace.id).expect("workspace id should be a UUID"));
-        let api_key = get_api_key_for_org(server, org.id.clone()).await;
-
-        let create_response = server
-            .post("/v1/conversations")
-            .add_header("Authorization", format!("Bearer {api_key}"))
-            .json(&serde_json::json!({}))
-            .await;
-        assert_eq!(create_response.status_code(), 201);
-        let conversation = create_response.json::<api::models::ConversationObject>();
-        let conversation_id = ConversationId(parse_conv_uuid(&conversation.id));
-
-        let mut item_ids = Vec::new();
-        for i in 0..item_count {
-            let response = server
-                .post(format!("/v1/conversations/{}/items", conversation.id).as_str())
-                .add_header("Authorization", format!("Bearer {api_key}"))
-                .json(&serde_json::json!({
-                    "items": [{
-                        "type": "message",
-                        "role": "user",
-                        "content": [{"type": "input_text", "text": format!("item {i}")}]
-                    }]
-                }))
-                .await;
-            assert_eq!(response.status_code(), 200);
-            let created = response.json::<api::models::ConversationItemList>();
-            item_ids.push(created.first_id.clone());
-        }
-
+        get_api_key_for_org(server, org.id.clone()).await;
+        let (conversation, item_ids) =
+            seed_conversation_history(database, org.id.parse().unwrap(), item_count).await;
         WorkspaceFixture {
-            workspace_id,
-            conversation_id,
+            workspace_id: conversation.workspace_id,
+            conversation_id: conversation.id,
             item_ids,
         }
     }
@@ -196,8 +163,8 @@ mod response_item_workspace_scoping {
         let (server, database) = setup_test_server_with_database().await;
         let repo = PgResponseItemsRepository::new(database.pool().clone());
 
-        let ws_a = seed_workspace(&server, 3).await;
-        let ws_b = seed_workspace(&server, 1).await;
+        let ws_a = seed_workspace(&server, &database, 3).await;
+        let ws_b = seed_workspace(&server, &database, 1).await;
 
         // Owner sees its own items.
         let own_items = repo
@@ -234,8 +201,8 @@ mod response_item_workspace_scoping {
         let (server, database) = setup_test_server_with_database().await;
         let repo = PgResponseItemsRepository::new(database.pool().clone());
 
-        let ws_a = seed_workspace(&server, 3).await;
-        let ws_b = seed_workspace(&server, 1).await;
+        let ws_a = seed_workspace(&server, &database, 3).await;
+        let ws_b = seed_workspace(&server, &database, 1).await;
 
         // A cursor from the same conversation works.
         let page = repo
@@ -297,8 +264,8 @@ mod response_item_workspace_scoping {
         let (server, database) = setup_test_server_with_database().await;
         let repo = PgResponseItemsRepository::new(database.pool().clone());
 
-        let ws_a = seed_workspace(&server, 1).await;
-        let ws_b = seed_workspace(&server, 1).await;
+        let ws_a = seed_workspace(&server, &database, 1).await;
+        let ws_b = seed_workspace(&server, &database, 1).await;
 
         let raw_item_id = ws_a.item_ids[0]
             .rsplit('_')

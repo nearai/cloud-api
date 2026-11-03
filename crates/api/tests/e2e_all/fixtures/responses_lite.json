@@ -1,0 +1,54 @@
+{
+  "model": "test-model",
+  "store": false,
+  "stream": true,
+  "parallel_tool_calls": false,
+  "tool_choice": "auto",
+  "instructions": "Use only the synthetic tools provided for this test.",
+  "input": [
+    {
+      "type": "additional_tools",
+      "id": "at_fixture",
+      "role": "developer",
+      "tools": [
+        {
+          "type": "namespace",
+          "name": "functions",
+          "description": "Synthetic client tools.",
+          "tools": [
+            {
+              "type": "custom",
+              "name": "exec",
+              "description": "Run the supplied JavaScript in the client test environment.",
+              "format": {
+                "type": "grammar",
+                "syntax": "lark",
+                "definition": "\nstart: pragma_source | plain_source\npragma_source: PRAGMA_LINE NEWLINE SOURCE\nplain_source: SOURCE\n\nPRAGMA_LINE: /[ \\t]*\\/\\/ @exec:[^\\r\\n]*/\nNEWLINE: /\\r?\\n/\nSOURCE: /[\\s\\S]+/\n"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "type": "message",
+      "role": "developer",
+      "content": [
+        {
+          "type": "input_text",
+          "text": "Print the synthetic marker with the client exec tool."
+        }
+      ]
+    },
+    {
+      "type": "message",
+      "role": "user",
+      "content": [
+        {
+          "type": "input_text",
+          "text": "Produce the marker NEAR_TOOL_OK and report the result."
+        }
+      ]
+    }
+  ]
+}

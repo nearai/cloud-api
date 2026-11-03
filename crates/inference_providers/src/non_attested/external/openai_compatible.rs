@@ -129,7 +129,7 @@ fn normalize_reasoning_effort_for_openai_tools(
 /// (Together, Groq, Fireworks, OpenRouter, …) are intentionally excluded
 /// because they tend to accept (or apply) the extra sampling knobs below, and
 /// stripping them there would silently change behaviour.
-pub(super) fn is_openai_source(base_url: &str) -> bool {
+fn is_openai_source(base_url: &str) -> bool {
     // Match on the parsed URL *host* (lower-cased), not a substring of the whole
     // URL. A substring check would both miss mixed-case hosts (`API.OPENAI.COM`)
     // and misclassify look-alikes such as `api.openai.com.evil.example` as
@@ -201,9 +201,9 @@ impl ExternalBackend for OpenAiCompatibleBackend {
         mut body: serde_json::Value,
     ) -> Result<crate::responses_raw::ResponsesRawResponse, CompletionError> {
         use futures_util::TryStreamExt;
-        if !is_openai_source(&config.base_url) || !crate::responses_raw::is_stateless(&body) {
+        if !crate::responses_raw::is_stateless(&body) {
             return Err(CompletionError::CompletionError(
-                "Native Responses requires stateless requests on an OpenAI upstream".into(),
+                "Native Responses requires stateless requests".into(),
             ));
         }
         body["model"] = serde_json::json!(model);

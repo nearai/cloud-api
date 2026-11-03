@@ -91,7 +91,7 @@ The API has two mutually-exclusive auth methods:
 - **Session auth** (cookies / `Authorization: Bearer rt_…`) for the
   management plane: organizations, workspaces, users, API keys.
 - **API key auth** (`Authorization: Bearer sk-…`) for the data plane:
-  chat completions, responses, conversations, attestation.
+  chat completions, responses, conversations, files, and attestation.
 
 ### Mock session auth (no real OAuth)
 
@@ -331,14 +331,122 @@ Provider refresh runs every 300s by default
 | `POST /v1/workspaces/{id}/api-keys`         | session  | Returns plaintext `key` — store it, it isn't shown again    |
 | `GET  /v1/models`                           | public   | OpenAI-compatible model catalog with pricing metadata       |
 | `POST /v1/chat/completions`                 | API key  | OpenAI-compatible. Add `"stream": true` for SSE             |
-| `POST /v1/responses`                        | API key  | Platform-specific event-streamed responses                  |
-| `POST /v1/conversations`                    | API key  | Conversation lifecycle                                      |
+| `POST /v1/responses`                        | API key  | Stateless `store: false` inference; client-managed function/custom tools and namespaces |
+| `/v1/conversations`, `/v1/conversations/{id}` and item routes | API key | Workspace-scoped Conversation creation, retrieval, updates, item management, and deletion |
+| `/v1/files`, `/v1/files/{id}`, `/v1/files/{id}/content` | API key | Workspace-scoped File upload, listing, metadata/content retrieval, and deletion |
+| `POST /mcp`                                 | API key  | Independent MCP server exposing the `web_search` tool       |
 | `GET  /v1/attestation/report`               | API key  | TEE attestation (503 outside a CVM unless `DEV=true` in debug builds) |
 | `GET  /v1/attestation/ita-token`            | public   | Intel Trust Authority JWT wrapper (requires ITA env vars)   |
-| `GET  /v1/signature/{chat_id}`              | API key  | Per-completion signature lookup                             |
+| `GET  /v1/signature/{chat_id}`              | API key  | Per-completion and `resp_*` signature lookup                |
 
 The Scalar UI at `http://localhost:3000/docs` lets you fire each of these
 interactively and inspect request/response schemas.
+
+### Stateless Responses and attestation retention
+
+`POST /v1/responses` is stateless. Both transports treat omitted or null
+`store` as `false` and reject `store: true`. Cloud API does not retain raw
+request or response content, response items, or response history; clients
+must supply any needed prior context with each request.
+
+After alias resolution, canonical `openai/` models make one native provider
+Responses request, with native `web_search` executed by the upstream provider.
+The `openai_compatible` backend sends `/responses` to its configured base URL,
+including compatible gateways such as OpenRouter. The upstream validates endpoint
+and feature support; its errors are returned without falling back to Chat
+Completions. Cloud does not run a tool loop for that transport. Other models use
+the typed adapter, which executes `web_search` and `web_context_search` in a
+bounded, request-scoped loop.
+Search results are passed back to the model within the same request; messages,
+results, and source citations remain in memory until that request ends.
+
+Custom tools are executed by the client. Both paths accept `function` and `custom`
+tools, either at the top level or inside a `namespace` containing those tool
+types. Codex's leading developer `additional_tools` declarations are accepted
+as a tool catalog. Keep these declarations before conversation items.
+
+| Custom tool format | Non-OpenAI typed adapter | OpenAI native Responses |
+| --- | --- | --- |
+| Omitted format or `{"type":"text"}` | Supported | Forwarded to the provider |
+| Codex 0.166 `exec` Lark source grammar | Supported, including its nonempty input requirement | Forwarded to the provider |
+| Other grammars | Rejected with a request to use a native backend | Forwarded for provider validation |
+
+`tool_choice` accepts `auto`, `none`, `required`, or a named choice such as
+`{"type":"function","name":"lookup"}`. Named choices can include a
+`namespace`; use `"type":"custom"` for a custom tool.
+
+To continue after executing a tool, send a new `store: false` request with
+the transcript and tool definitions. Retain the returned items, identifiers,
+and metadata such as `thought_signature` when present:
+
+- Replay a `function_call` with its matching `function_call_output`, preserving
+  its `name`, optional `namespace`, `call_id`, and unchanged `arguments`.
+- Replay a `custom_tool_call` with its matching `custom_tool_call_output`,
+  preserving `name`, optional `namespace`, `call_id`, and `input`.
+- Include assistant messages with `output_text` parts and any returned
+  plaintext `reasoning` items. The typed adapter uses reasoning `content`
+  when available, otherwise its `summary`, as prior assistant context.
+  Encrypted-only reasoning requires a native Responses model; it is not
+  decoded by the Chat Completions adapter.
+
+Tool outputs may be strings or text-part arrays on the typed path. Use
+`call_id` to match a result to its call; the separate item `id` identifies
+stream events. Each generated item, including parallel calls and preceding
+text or reasoning, has its own `output_index`.
+
+With `stream: true`, generated calls progress from `response.output_item.added`
+through argument/input delta and done events to `response.output_item.done`.
+A successful model turn ends with `response.completed` and status `completed`,
+including when the client must execute tools next. Reasoning uses
+`response.reasoning_text.delta` with a `content_index`. Completed reasoning
+items have a `summary` array of `summary_text` parts and an optional `content`
+array of `reasoning_text` parts. A failure
+after streaming starts is delivered as `response.failed`, with
+`response.status: "failed"` and details in `response.error`.
+
+Place system/developer instructions before conversation history. The typed
+adapter combines the leading instruction messages in order, including the
+organization policy and request `instructions`, for models requiring one
+initial system message. User, assistant, and tool history retains its order.
+
+Existing completed-response gateway attestation is preserved on a best-effort
+basis. When its signature write succeeds, `GET /v1/signature/resp_*` can
+retrieve the response ID and signatures over SHA-256 request/response digests;
+the signature material contains no raw request or response content. A stream
+that disconnects before completion creates no `resp_*` attestation record or
+legacy disconnect fallback.
+
+Hosted search on the typed adapter emits `web_search_call` items, search
+lifecycle events, and URL citations. Optional `web_search.count` accepts 0–20
+and overrides the count selected by the model. A count of zero returns empty
+search results without calling the search provider. Streaming and non-streaming
+responses use the same search execution and cumulative inference usage.
+If a model emits hosted search and client tool calls in the same round, the
+response returns the client tool calls without executing that round's searches.
+After the client supplies its tool results, the model can request search again.
+Completed `web_search_call` output markers may accompany replayed assistant
+messages; the typed adapter ignores those markers and uses the supplied text
+as context instead of repeating the historical search.
+
+Native requests for canonical `openai/` models accept top-level `web_search`
+alongside client-managed tools and preserve provider-native fields such as encrypted
+reasoning and grammar definitions. Replay the complete returned `web_search_call`
+item with the rest of the native output; Cloud forwards it unchanged, including
+provider-specific action and source fields. The native request's `include` is
+also forwarded unchanged. Supported include values and returned fields depend
+on the upstream provider; Cloud preserves source/citation fields rather than
+stripping them to make different providers return the same shape.
+
+Native hosted tools are limited to `web_search`; `web_context_search` uses the
+typed adapter. File search, code interpreter, computer use, remote MCP tools,
+and image-generation/editing models remain unsupported by Responses. The
+separate `POST /mcp` search tool and `/v1/images/*` endpoints remain available.
+
+Responses itself rejects conversation linkage, response history, and file
+input. The separate Conversation and File APIs retain their normal resource
+operations: creating and updating conversations and their items, uploading
+files, retrieving resources, and deleting them. These workspace-scoped APIs
+require an API key; stored resources are independent of Responses inference.
 
 ## 7. Troubleshooting
 

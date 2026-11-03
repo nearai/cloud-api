@@ -649,10 +649,9 @@ impl InferenceProvider for ExternalProvider {
     }
 
     fn supports_responses_raw(&self) -> bool {
-        // Capability depends on the protocol/host, not the deployment name.
-        // The service authorizes canonical model IDs through its allowlist.
+        // The backend supplies the transport; the configured upstream validates
+        // Responses support. The service selects authorized OpenAI model IDs.
         self.backend.backend_type() == "openai_compatible"
-            && openai_compatible::is_openai_source(&self.config.base_url)
     }
 
     async fn anthropic_raw(
@@ -675,15 +674,22 @@ mod tests {
     use std::collections::HashMap;
 
     #[test]
-    fn native_responses_capability_accepts_deployment_overrides() {
-        let config = ExternalProviderConfig {
-            model_name: "openai/gpt-6-astra".into(),
-            provider_config: serde_json::from_value(serde_json::json!({
-                "backend":"openai_compatible", "base_url":"https://example.openai.azure.com/openai/v1", "model_name":"astra-prod"
-            })).unwrap(),
-            api_key: "test".into(), timeout_seconds: 30,
-        };
-        assert!(ExternalProvider::new(config).supports_responses_raw());
+    fn native_responses_capability_accepts_compatible_hosts_and_deployment_overrides() {
+        for base_url in [
+            "https://example.openai.azure.com/openai/v1",
+            "https://openrouter.ai/api/v1",
+        ] {
+            let config = ExternalProviderConfig {
+                model_name: "openai/gpt-6-astra".into(),
+                provider_config: serde_json::from_value(serde_json::json!({
+                    "backend":"openai_compatible", "base_url":base_url, "model_name":"astra-prod"
+                }))
+                .unwrap(),
+                api_key: "test".into(),
+                timeout_seconds: 30,
+            };
+            assert!(ExternalProvider::new(config).supports_responses_raw());
+        }
     }
 
     #[test]

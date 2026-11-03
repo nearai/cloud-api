@@ -304,7 +304,7 @@ pub async fn image_edits(
                 match field.name().unwrap_or("") {
                     "image" => {
                         // Use streaming validation to detect oversized payloads before buffering entirely in memory.
-                        // This prevents memory exhaustion DoS attacks where attackers send payloads larger than MAX_FILE_SIZE.
+                        // This prevents memory exhaustion DoS attacks where attackers send payloads larger than MAX_IMAGE_EDIT_BODY_SIZE.
                         let mut bytes = Vec::new();
                         let mut size = 0usize;
 
@@ -313,11 +313,11 @@ pub async fn image_edits(
                                 Ok(Some(chunk)) => {
                                     size += chunk.len();
                                     // Reject early if size exceeds limit, before allocating memory
-                                    if size > MAX_FILE_SIZE {
+                                    if size > crate::MAX_IMAGE_EDIT_BODY_SIZE {
                                         return (
                                             StatusCode::PAYLOAD_TOO_LARGE,
                                             ResponseJson(ErrorResponse::new(
-                                                "Image size exceeds maximum of 512 MB".to_string(),
+                                                "Image size exceeds maximum of 50 MB".to_string(),
                                                 "invalid_request_error".to_string(),
                                             )),
                                         )

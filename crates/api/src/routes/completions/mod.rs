@@ -9,7 +9,6 @@ use crate::{
             HEADER_NO_ALIASING, SIGNATURE_STORE_TIMEOUT,
         },
         extractors::OpenAiJson,
-        files::MAX_FILE_SIZE,
     },
 };
 use axum::{

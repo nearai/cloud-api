@@ -126,10 +126,10 @@ async fn under_limit_unauthenticated_request_still_reaches_auth() {
 }
 
 #[tokio::test]
-async fn image_edits_declared_length_over_file_limit_is_rejected_without_reading() {
+async fn image_edits_declared_length_over_limit_is_rejected_without_reading() {
     let (_server, router) = setup_test_server_and_router().await;
 
-    // Declares one byte over the 512 MiB image-edits limit; the actual body
+    // Declares one byte over the image-edits limit; the actual body
     // is small, so a missing cap would read it and fall through to auth (401).
     let (body, consumed) = counting_body(MIB);
     let request = axum::http::Request::builder()
@@ -138,7 +138,7 @@ async fn image_edits_declared_length_over_file_limit_is_rejected_without_reading
         .header("Content-Type", "multipart/form-data; boundary=x")
         .header(
             "Content-Length",
-            (api::routes::files::MAX_FILE_SIZE + 1).to_string(),
+            (api::MAX_IMAGE_EDIT_BODY_SIZE + 1).to_string(),
         )
         .header("User-Agent", MOCK_USER_AGENT)
         .body(body)
@@ -162,4 +162,20 @@ async fn image_edits_body_above_text_limit_still_reaches_auth() {
 
     assert_eq!(status, 401);
     assert_eq!(consumed, 30 * MIB);
+}
+
+#[tokio::test]
+async fn unauthenticated_oversize_image_edit_is_not_fully_buffered() {
+    let (_server, router) = setup_test_server_and_router().await;
+
+    // 80 MiB streamed (no Content-Length) against the 50 MiB image-edits cap.
+    let total = 80 * MIB;
+    let (status, json, consumed) = send_unauthenticated(router, "/v1/images/edits", total).await;
+
+    assert!(
+        consumed <= api::MAX_IMAGE_EDIT_BODY_SIZE + CHUNK,
+        "body_hash buffered {consumed} of {total} bytes before rejecting"
+    );
+    assert_eq!(status, 413);
+    assert_too_large_envelope(&json);
 }

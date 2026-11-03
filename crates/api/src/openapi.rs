@@ -1,4 +1,5 @@
 use crate::models::*;
+use crate::openapi_deprecation::DeprecatedRoutesAddon;
 use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme};
 use utoipa::{Modify, OpenApi};
 
@@ -7,7 +8,11 @@ use utoipa::{Modify, OpenApi};
 #[openapi(
     info(
         title = "NEAR AI Cloud API",
-        description = "A comprehensive cloud API for AI model inference, temporary confidential-data migration views, and organization administration.\n\n## Authentication\n\nThis API supports five authentication methods:\n\n1. **Access Token (JWT)**: Use `Authorization: Bearer <jwt_token>` with a short-lived JWT access token for most API endpoints. Obtain this by calling POST /users/me/access_tokens with a refresh token.\n2. **Refresh Token**: Use `Authorization: Bearer <refresh_token>` (prefix: `rt_`) only with POST /users/me/access_tokens to create new JWT access tokens. Obtained from OAuth login.\n3. **API Key (Programmatic Access)**: Use `Authorization: Bearer sk-<api_key>` with an API key (prefix: `sk-`).\n4. **Reporting Token (Read-only Usage Reporting)**: Use `Authorization: Bearer rpt-<reporting_token>` only with usage reporting endpoints.\n5. **Admin Access Token**: Use `Authorization: Bearer adm_<token>` with approved admin operations. `read_only` permits explicitly approved reads across organizations; `read_write` preserves admin-token write access. Token management always requires an admin session.\n\nClick the **Authorize** button above to configure authentication.",
+        description = "A comprehensive cloud API for AI model inference, temporary confidential-data migration views, and organization administration.\n\n## Authentication\n\nThis API supports five authentication methods:\n\n1. **Access Token (JWT)**: Use `Authorization: Bearer <jwt_token>` with a short-lived JWT access token for most API endpoints. Obtain this by calling POST /users/me/access_tokens with a refresh token.\n2. **Refresh Token**: Use `Authorization: Bearer <refresh_token>` (prefix: `rt_`) only with POST /users/me/access_tokens to create new JWT access tokens. Obtained from OAuth login.\n3. **API Key (Programmatic Access)**: Use `Authorization: Bearer sk-<api_key>` with an API key (prefix: `sk-`).\n4. **Reporting Token (Read-only Usage Reporting)**: Use `Authorization: Bearer rpt-<reporting_token>` only with usage reporting endpoints.\n5. **Admin Access Token**: Use `Authorization: Bearer adm_<token>` with approved admin operations. `read_only` permits explicitly approved reads across organizations; `read_write` preserves admin-token write access. Token management always requires an admin session.\n\nClick the **Authorize** button above to configure authentication.
+
+## Deprecations
+
+Operations marked deprecated (account, organization, workspace, invitation, API key, usage, billing, service pricing, staking, feature request, admin and catalog-administration endpoints) are moving to cloud-platform at the same path. The cloud-platform base URL has not been published yet, and behaviour may differ in edge cases. Inference and content endpoints (chat completions, responses, conversations, embeddings, images, audio, files, attestation) are unaffected.",
         version = "1.0.0",
         contact(
             name = "NEAR AI Team",
@@ -28,7 +33,7 @@ use utoipa::{Modify, OpenApi};
         (name = "Models", description = "Public model catalog and information"),
         (name = "Conversations", description = "Temporary authenticated, workspace-scoped migration access for export and account deletion. Only `POST /v1/conversations/batch`, `GET /v1/conversations/{conversation_id}`, `GET /v1/conversations/{conversation_id}/items`, and `DELETE /v1/conversations/{conversation_id}` are available. Conversation creation and every other mutation return `410 Gone`; this surface will be removed after data migration. Migration responses use `Cache-Control: no-store`."),
         (name = "Files", description = "Temporary authenticated, workspace-scoped migration access for export and account deletion. Only `GET /v1/files`, `GET /v1/files/{file_id}`, `GET /v1/files/{file_id}/content`, and `DELETE /v1/files/{file_id}` are available. Upload and every other mutation return `410 Gone`; this surface will be removed after data migration. Migration responses use `Cache-Control: no-store`."),
-        (name = "Responses", description = "Stateless response inference. The default typed adapter accepts an omitted `store` as `false` and rejects `store: true`; native routing requires an explicitly supplied `store: false`. Raw request/response content, response items, and history are not persisted. Clients must include any prior context in each request. The default typed adapter sends exactly one Chat Completions inference. A canonical model explicitly configured through `NATIVE_RESPONSES_MODELS`, with an explicit `store: false` request, instead sends one native provider Responses inference.\n\nBoth paths accept client-managed `function` and `custom` tools, including tools grouped in a `namespace`, and leading developer `additional_tools` declarations. Cloud returns calls without executing them; clients replay each `function_call` or `custom_tool_call` with its matching output and caller-managed history. Preserve `call_id`, names, namespaces, raw arguments or custom input, and provider metadata such as `thought_signature`. The typed replay path accepts assistant `output_text` parts and plaintext `reasoning` items, using reasoning content or its summary as prior assistant context. Encrypted-only reasoning requires a native Responses backend. The typed adapter supports text custom tools and the Codex `exec` Lark source grammar; other grammars require a native backend.\n\nEach generated item has its own `output_index`. Tool calls finish with `response.output_item.done`; a successful model turn ends with `response.completed`, including when tools await client execution. Reasoning uses `response.reasoning_text.delta`; failures expose `response.error` in `response.failed` and preserve partial usage.\n\nBuilt-in/server-executed tools (`web_search`, `web_context_search`, `file_search`, `code_interpreter`, `computer`, and remote `mcp`) are rejected and neither path runs an agent loop. Image-generation/editing models are rejected on both paths. The separate `POST /mcp` endpoint exposes its `web_search` tool independently of Responses; use `/v1/images/*` for image generation/editing. Existing completed-response gateway attestation is preserved best-effort: when the signature write succeeds, `GET /v1/signature/resp_*` retrieves signatures over SHA-256 request/response digests, never raw content. Interrupted streams create no `resp_*` attestation record or legacy disconnect fallback. Responses rejects conversation linkage, response history, and file input; the separate Conversation and File endpoints are not part of Responses inference."),
+        (name = "Responses", description = "Stateless response inference. Both paths normalize omitted or null `store` to `false` and reject `store: true`. Raw request/response content, response items, and history are not persisted. Clients must include any prior context in each request. Canonical `openai/` models use one native provider Responses inference after alias resolution. Other models use the typed adapter for one Chat Completions inference.\n\nBoth paths accept client-managed `function` and `custom` tools, including tools grouped in a `namespace`, and leading developer `additional_tools` declarations. Cloud returns calls without executing them; clients replay each `function_call` or `custom_tool_call` with its matching output and caller-managed history. Preserve `call_id`, names, namespaces, raw arguments or custom input, and provider metadata such as `thought_signature`. The typed replay path accepts assistant `output_text` parts and plaintext `reasoning` items, using reasoning content or its summary as prior assistant context. Encrypted-only reasoning requires a native Responses backend. The typed adapter supports text custom tools and the Codex `exec` Lark source grammar; other grammars require a native backend.\n\nEach generated item has its own `output_index`. Tool calls finish with `response.output_item.done`; a successful model turn ends with `response.completed`, including when tools await client execution. Reasoning uses `response.reasoning_text.delta`; failures expose `response.error` in `response.failed` and preserve partial usage.\n\nBuilt-in/server-executed tools (`web_search`, `web_context_search`, `file_search`, `code_interpreter`, `computer`, and remote `mcp`) are rejected and neither path runs an agent loop. Image-generation/editing models are rejected on both paths. The separate `POST /mcp` endpoint exposes its `web_search` tool independently of Responses; use `/v1/images/*` for image generation/editing. Existing completed-response gateway attestation is preserved best-effort: when the signature write succeeds, `GET /v1/signature/resp_*` retrieves signatures over SHA-256 request/response digests, never raw content. Interrupted streams create no `resp_*` attestation record or legacy disconnect fallback. Responses rejects conversation linkage, response history, and file input; the separate Conversation and File endpoints are not part of Responses inference."),
         (name = "Organizations", description = "Organization management"),
         (name = "Organization Members", description = "Organization member and invitation management"),
         (name = "Workspaces", description = "Workspace and API key management"),
@@ -78,6 +83,8 @@ use utoipa::{Modify, OpenApi};
         crate::routes::organizations::get_organization,
         crate::routes::organizations::update_organization,
         crate::routes::organizations::delete_organization,
+        crate::routes::organizations::get_organization_settings,
+        crate::routes::organizations::patch_organization_settings,
         // Organization Members endpoints
         crate::routes::organization_members::add_organization_member,
         crate::routes::organization_members::invite_organization_member_by_email,
@@ -120,6 +127,7 @@ use utoipa::{Modify, OpenApi};
         crate::routes::usage::get_organization_usage_history,
         crate::routes::usage::get_organization_usage_by_model,
         crate::routes::usage::get_api_key_usage_history,
+        crate::routes::usage::get_service_usage_history,
         crate::routes::usage::get_user_organization_metrics,
         crate::routes::usage::get_user_organization_timeseries,
         // Staking farm endpoints
@@ -179,6 +187,9 @@ use utoipa::{Modify, OpenApi};
         crate::routes::admin::get_platform_metrics,
         crate::routes::admin::get_organization_timeseries,
         crate::routes::admin::get_platform_timeseries,
+        crate::routes::admin::list_organizations,
+        crate::routes::admin::get_model_consumption_timeseries,
+        crate::routes::admin::get_performance_timeseries,
         crate::routes::admin::get_billing_summary,
         crate::routes::admin::get_model_revenue,
         crate::routes::admin::get_revenue_density,
@@ -229,6 +240,13 @@ use utoipa::{Modify, OpenApi};
         schemas(
             // Health check models
             crate::routes::health::HealthResponse,
+            // List query parameter enums: utoipa does not collect types used only in `params`
+            crate::routes::organizations::OrganizationOrderBy,
+            crate::routes::organizations::OrganizationOrderDirection,
+            crate::routes::workspaces::WorkspaceOrderBy,
+            crate::routes::workspaces::WorkspaceOrderDirection,
+            crate::routes::workspaces::ApiKeyOrderBy,
+            crate::routes::workspaces::ApiKeyOrderDirection,
             // Core API models
             ChatCompletionRequest, ChatCompletionResponse, Message, CompletionUsage,
             CompletionRequest, CompletionPrompt, StopSequences, CompletionResponse,
@@ -436,7 +454,11 @@ use utoipa::{Modify, OpenApi};
             services::admin::ModelGpuAllocation,
         ),
     ),
-    modifiers(&SecurityAddon, &AdminPermissionsAddon)
+    modifiers(
+        &SecurityAddon,
+        &AdminPermissionsAddon,
+        &DeprecatedRoutesAddon
+    )
     // No servers - let client determine the URL dynamically
 )]
 pub struct ApiDoc;

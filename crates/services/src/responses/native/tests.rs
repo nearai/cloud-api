@@ -1,24 +1,57 @@
 use super::*;
 
 #[test]
-fn selection_changes_only_explicit_stateless_allowlisted_models() {
-    let models = vec!["openai/gpt-6-astra".into(), "custom/model".into()];
-    let native = json!({"store":false});
-    assert!(selected(&models, "openai/gpt-6-astra", &native));
-    assert!(selected(&models, "custom/model", &native));
-    assert!(!selected(&[], "openai/gpt-6-astra", &native));
-    assert!(!selected(&models, "openai/gpt-6-astra-2026-09-03", &native));
-    assert!(!selected(&models, "another/model", &native));
-    for body in [
+fn selection_routes_every_canonical_openai_model_natively() {
+    for model in [
+        "openai/gpt-4.1",
+        "openai/gpt-5.4",
+        "openai/gpt-6.1-sol",
+        "openai/gpt-6-astra",
+        "openai/gpt-6-astra-2026-09-03",
+        "openai/future-model",
+    ] {
+        assert!(selected(model), "{model}");
+    }
+    for model in [
+        "custom/model",
+        "anthropic/claude",
+        "Qwen/model",
+        "openai-compatible/model",
+    ] {
+        assert!(!selected(model), "{model}");
+    }
+}
+
+#[test]
+fn native_requests_default_to_explicit_no_store_and_preserve_provider_fields() {
+    for mut body in [
         json!({}),
-        json!({"store":true}),
         json!({"store":null}),
+        json!({"store":false}),
+        json!({"store":false,"conversation":null,"previous_response_id":null,"background":null}),
+    ] {
+        body["reasoning"] = json!({"effort":"high"});
+        body["include"] = json!(["reasoning.encrypted_content"]);
+        let mut expected = body.clone();
+        expected["store"] = json!(false);
+        normalize_stateless_request(&mut body).unwrap();
+        assert_eq!(body, expected);
+        assert!(inference_providers::responses_raw::is_stateless(&body));
+    }
+}
+
+#[test]
+fn native_requests_reject_stateful_or_invalid_fields_before_dispatch() {
+    for mut body in [
+        json!(null),
+        json!([]),
+        json!({"store":true}),
         json!({"store":"false"}),
         json!({"store":false,"conversation":"conv_1"}),
         json!({"store":false,"previous_response_id":"resp_1"}),
         json!({"store":false,"background":true}),
     ] {
-        assert!(!selected(&models, "openai/gpt-6-astra", &body));
+        assert!(normalize_stateless_request(&mut body).is_err(), "{body}");
     }
 }
 

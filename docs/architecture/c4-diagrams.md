@@ -323,7 +323,7 @@ graph TB
 | **Organization Service** | Multi-tenant organization & workspace management | Organization Repo, Workspace Repo |
 | **User Service** | User management, profile updates | User Repo, Session Repo |
 | **Conversation Service** | Temporary workspace-scoped views and per-resource deletion | Conversation Repo |
-| **Response Service** | Default typed stateless adapter: one Chat Completions request; explicit native allowlist bypasses it | Completion Service, Usage Service |
+| **Response Service** | Stateless inference: native Responses for canonical `openai/` models; one typed Chat Completions request for other models | Completion Service, Usage Service |
 | **Completion Service** | Coordinates with inference providers | Provider Pool, Model Service |
 | **Model Service** | Manages model catalog & pricing | Model Repo |
 | **Usage Service** | Tracks token usage, enforces limits | Usage Repo, Organization Repo |
@@ -490,18 +490,16 @@ sequenceDiagram
     Note over Client,Database: Streaming provides real-time response<br/>while tracking usage
 ```
 
-### 4. Default Typed Stateless Response Creation Flow (Platform-specific API)
+### 4. Typed Stateless Response Creation Flow (Platform-specific API)
 
-`POST /v1/responses` is a stateless compatibility API. The default typed
-adapter normalizes an omitted `store` to `false`, then creates one Chat
-Completions inference request; it does not link to a Conversation or persist
-response/item history. A canonical model explicitly listed in
-`NATIVE_RESPONSES_MODELS`, with an explicitly supplied `store: false` request,
-is a narrow exception: it makes one native provider Responses request instead.
-That path remains stateless, writes no response/item history, and never runs a
-server-side agent loop or executes built-in/remote MCP tools. Image-generation
-and image-editing models are rejected on both paths. The diagram below
-describes the default typed adapter.
+`POST /v1/responses` is a stateless compatibility API. After alias resolution,
+canonical `openai/` models make one native provider Responses request; other
+models use the typed adapter for one Chat Completions request. Both transports
+normalize omitted or null `store` to `false`, reject `store: true`, and keep no
+conversation linkage or response/item history. Tools run in the client;
+neither path runs a server-side agent loop or executes built-in/remote MCP
+tools. Image-generation and image-editing models are rejected on both paths.
+The diagram below describes the typed adapter for non-OpenAI models.
 
 ```mermaid
 sequenceDiagram
@@ -1410,7 +1408,7 @@ erDiagram
 > after the migration/export window and account-deletion lifecycle.
 
 **Responses (Platform-specific):**
-- `POST /v1/responses` - Stateless `store: false` inference; default typed adapter makes one Chat Completions call, while an explicit `NATIVE_RESPONSES_MODELS` allowlist uses one native provider Responses call
+- `POST /v1/responses` - Stateless inference; canonical `openai/` models use one native Responses call, other models use one typed Chat Completions call, and omitted or null `store` defaults to `false`
 - `GET`/`DELETE /v1/responses/{id}` - Authenticated `410 Gone` (history retired)
 - `POST /v1/responses/{id}/cancel` - Authenticated `410 Gone` (history retired)
 - `GET /v1/responses/{id}/input_items` - Authenticated `410 Gone` (history retired)

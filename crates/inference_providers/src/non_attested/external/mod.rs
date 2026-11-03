@@ -650,7 +650,7 @@ impl InferenceProvider for ExternalProvider {
 
     fn supports_responses_raw(&self) -> bool {
         // Capability depends on the protocol/host, not the deployment name.
-        // The service authorizes canonical model IDs through its allowlist.
+        // The service selects authorized canonical OpenAI model IDs.
         self.backend.backend_type() == "openai_compatible"
             && openai_compatible::is_openai_source(&self.config.base_url)
     }

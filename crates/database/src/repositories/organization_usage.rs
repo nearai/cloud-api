@@ -73,9 +73,10 @@ impl OrganizationUsageRepository {
 
     /// Record usage and update balance atomically.
     ///
-    /// When `inference_id` is set, this is idempotent: duplicate inserts for the
-    /// same `(organization_id, inference_id)` skip the INSERT and balance update,
-    /// returning the existing record instead.
+    /// When `inference_id` is set and `dedupe_on_conflict` is true, this is idempotent:
+    /// duplicate inserts for the same `(organization_id, inference_id)` skip the INSERT
+    /// and balance update, returning the existing record instead. When it is false, a
+    /// different write holding the key does not stop this one.
     pub async fn record_usage(&self, request: RecordUsageRequest) -> Result<OrganizationUsageLog> {
         if request.total_cost < 0 {
             return Err(RepositoryError::ValidationFailed(
@@ -83,6 +84,9 @@ impl OrganizationUsageRepository {
             )
             .into());
         }
+        // One id for every attempt: with `dedupe_on_conflict` off, the function tells a retry
+        // of this write from a different write by it.
+        let id = Uuid::new_v4();
         let row = retry_db!("record_organization_usage", {
             let client = self
                 .pool
@@ -90,7 +94,6 @@ impl OrganizationUsageRepository {
                 .await
                 .context("Failed to get database connection")
                 .map_err(RepositoryError::PoolError)?;
-            let id = Uuid::new_v4();
             let stop_reason = request.stop_reason.as_ref().map(|reason| reason.as_str());
             let response_id = request.response_id.as_ref().map(|id| id.as_uuid());
             let served_provider_tier = request.served_provider_tier.map(|tier| tier.as_str());
@@ -104,7 +107,7 @@ impl OrganizationUsageRepository {
                     FROM record_organization_usage(
                         $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
                         $11, $12, $13, $14, $15, $16, $17, $18, $19, $20,
-                        $21, $22, $23, $24, $25, $26, $27, $28, $29
+                        $21, $22, $23, $24, $25, $26, $27, $28, $29, $30
                     ) AS result
                     "#,
                     &[
@@ -137,6 +140,7 @@ impl OrganizationUsageRepository {
                         (&request.context_band, Type::TEXT),
                         (&self.allocation_policy.priority, Type::TEXT_ARRAY),
                         (&self.allocation_policy.version, Type::VARCHAR),
+                        (&request.dedupe_on_conflict, Type::BOOL),
                     ],
                 )
                 .await

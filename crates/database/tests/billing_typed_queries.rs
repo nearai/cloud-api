@@ -37,6 +37,7 @@ fn request(org: &support::OrgFixture, model: &support::ModelFixture) -> RecordUs
         served_provider_tier: None,
         served_provider_type: None,
         served_via_fallback: false,
+        dedupe_on_conflict: true,
     }
 }
 

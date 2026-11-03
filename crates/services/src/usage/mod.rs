@@ -36,6 +36,18 @@ use uuid::Uuid;
 /// and embedded as a constant so the value never drifts.
 const EXTERNAL_USAGE_ID_NAMESPACE: Uuid = Uuid::from_u128(0x1966acaf_9f95_5dab_b8f0_03a51c091314);
 
+/// Width of `organization_usage_log.provider_request_id` (VARCHAR(255)).
+const PROVIDER_REQUEST_ID_MAX_CHARS: usize = 255;
+
+/// Cut a request id to the stored column width on a char boundary, keeping the
+/// leading part.
+fn truncate_provider_request_id(id: &str) -> String {
+    match id.char_indices().nth(PROVIDER_REQUEST_ID_MAX_CHARS) {
+        Some((byte_idx, _)) => id[..byte_idx].to_string(),
+        None => id.to_string(),
+    }
+}
+
 /// Compute token-based cost with cache-aware input pricing for token-based chat-style models.
 ///
 /// Important: This helper is intended for chat/LLM-style models where cache-read pricing
@@ -256,11 +268,17 @@ impl UsageServiceTrait for UsageServiceImpl {
             ttft_ms: request.ttft_ms,
             avg_itl_ms: request.avg_itl_ms,
             inference_id: request.inference_id,
-            provider_request_id: request.provider_request_id,
+            // A longer id would fail the insert. It is only kept for
+            // correlation, and `inference_id` is hashed from the full id
+            // before this.
+            provider_request_id: request
+                .provider_request_id
+                .map(|id| truncate_provider_request_id(&id)),
             stop_reason: request.stop_reason,
             response_id: request.response_id,
             image_count: request.image_count,
             provider_attribution: request.provider_attribution,
+            dedupe_on_conflict: request.dedupe_on_conflict,
         };
 
         // Record in database
@@ -1230,5 +1248,24 @@ mod tests {
             b"chatcmpl-9e51f8ac5b4f4a01",
         );
         assert_eq!(dup_a, dup_b);
+    }
+
+    #[test]
+    fn provider_request_id_is_cut_to_the_column_width() {
+        use super::{truncate_provider_request_id, PROVIDER_REQUEST_ID_MAX_CHARS};
+
+        // A short id is untouched.
+        assert_eq!(truncate_provider_request_id("chatcmpl-abc"), "chatcmpl-abc");
+
+        // A longer id is cut to the column width.
+        let long = "x".repeat(PROVIDER_REQUEST_ID_MAX_CHARS + 50);
+        let clamped = truncate_provider_request_id(&long);
+        assert_eq!(clamped.chars().count(), PROVIDER_REQUEST_ID_MAX_CHARS);
+
+        // Cut on a char boundary, never inside a code point.
+        let multibyte = "é".repeat(PROVIDER_REQUEST_ID_MAX_CHARS + 10);
+        let clamped = truncate_provider_request_id(&multibyte);
+        assert_eq!(clamped.chars().count(), PROVIDER_REQUEST_ID_MAX_CHARS);
+        assert!(clamped.chars().all(|c| c == 'é'));
     }
 }

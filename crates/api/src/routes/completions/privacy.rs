@@ -242,6 +242,7 @@ async fn settle_privacy_usage(
         image_count: None,
         discount: None,
         provider_attribution: services::usage::ProviderAttribution::default(),
+        dedupe_on_conflict: true,
     };
 
     record_usage_with_sync_fallback(

@@ -57,7 +57,7 @@ services:
   # checks that. The DB secret is a file mounted read-only (dev credentials, the same values as
   # POSTGRES_PASSWORD above); the password is not passed in the environment or on argv.
   schema:
-    image: ${CLOUD_PLATFORM_IMAGE:-ghcr.io/nearai/cloud-platform:sha-5519b11c6d53ac145cf33cc19fa99a9fd60d7968@sha256:745c3cb40e5b62c0b109e54a0a0da1486fc80fd52928aba008360e557ad8b41d}
+    image: ${CLOUD_PLATFORM_IMAGE:-ghcr.io/nearai/cloud-platform:sha-ce42c2b225d9b2ea8f05a47a3b28f0560b123b33@sha256:bf66440ab290969f5bbd1be76564166712a5b344db3f60c19a360050c260bd15}
     command: ["migrate"]
     restart: "no"
     environment:

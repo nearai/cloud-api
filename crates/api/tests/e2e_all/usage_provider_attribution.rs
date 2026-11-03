@@ -102,6 +102,7 @@ fn attributed_usage_request(
         served_provider_tier: Some(ServedProviderTier::Attested3p),
         served_provider_type: Some(ServedProviderType::Chutes),
         served_via_fallback: true,
+        dedupe_on_conflict: true,
     }
 }
 

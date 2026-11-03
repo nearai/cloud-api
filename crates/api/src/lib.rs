@@ -1565,6 +1565,32 @@ pub fn build_auth_routes(
 }
 
 /// Build completion routes with auth and usage tracking
+/// The API-key admission layers of the text inference routes, between authentication and the
+/// handler. `/chat/completions` and the text group both apply them through
+/// [`with_inference_admission`], so their stacks cannot drift apart.
+struct InferenceAdmission {
+    model_deprecation: middleware::ModelDeprecationState,
+    usage: middleware::UsageState,
+    rate_limit: middleware::RateLimitState,
+}
+
+/// Rate limit, then usage check, then model deprecation (outermost first), around `router`.
+fn with_inference_admission(router: Router, admission: &InferenceAdmission) -> Router {
+    router
+        .layer(from_fn_with_state(
+            admission.model_deprecation.clone(),
+            middleware::model_deprecation_middleware,
+        ))
+        .layer(from_fn_with_state(
+            admission.usage.clone(),
+            middleware::usage_check_middleware,
+        ))
+        .layer(from_fn_with_state(
+            admission.rate_limit.clone(),
+            middleware::api_key_rate_limit_middleware,
+        ))
+}
+
 pub fn build_completion_routes(
     app_state: AppState,
     auth_state_middleware: &AuthState,
@@ -1634,46 +1660,43 @@ pub fn build_completion_routes(
         Router::new()
     };
 
+    let admission = InferenceAdmission {
+        model_deprecation: model_deprecation_state.clone(),
+        usage: usage_state.clone(),
+        rate_limit: rate_limit_state.clone(),
+    };
+
     // POST /chat/completions has its own router so Machine Payments Protocol (HTTP 402) can
     // sit in front of it without touching the other inference routes. The layers are the text
     // group's, with the MPP auth wrapper in place of the API-key middleware and the MPP
     // settlement layer innermost. With MPP off (the default) both hold `None` and behave
     // exactly like the API-key middleware and a pass-through.
-    let chat_completions_routes = Router::new()
-        .route("/chat/completions", post(chat_completions))
-        .with_state(app_state.clone())
-        .layer(from_fn_with_state(
-            middleware::MppSettleState {
-                mpp: app_state.mpp_service.clone(),
-            },
-            middleware::mpp_settle_middleware,
-        ))
-        .layer(from_fn_with_state(
-            model_deprecation_state.clone(),
-            middleware::model_deprecation_middleware,
-        ))
-        .layer(from_fn_with_state(
-            usage_state.clone(),
-            middleware::usage_check_middleware,
-        ))
-        .layer(from_fn_with_state(
-            rate_limit_state.clone(),
-            middleware::api_key_rate_limit_middleware,
-        ))
-        .layer(from_fn_with_state(
-            middleware::MppAuthState {
-                auth: auth_state_middleware.clone(),
-                mpp: app_state.mpp_service.clone(),
-            },
-            middleware::mpp_auth_middleware,
-        ))
-        .layer(from_fn_with_state(
-            middleware::BodyHashLimit(AUDIO_TRANSCRIPTION_MAX_BODY_SIZE),
-            middleware::body_hash_middleware,
-        ))
-        // Outermost, so the MPP pre-flight (which parses the buffered body as the handler
-        // will) sees the same limit the handler's extractor does.
-        .layer(DefaultBodyLimit::max(AUDIO_TRANSCRIPTION_MAX_BODY_SIZE));
+    let chat_completions_routes = with_inference_admission(
+        Router::new()
+            .route("/chat/completions", post(chat_completions))
+            .with_state(app_state.clone())
+            .layer(from_fn_with_state(
+                middleware::MppSettleState {
+                    mpp: app_state.mpp_service.clone(),
+                },
+                middleware::mpp_settle_middleware,
+            )),
+        &admission,
+    )
+    .layer(from_fn_with_state(
+        middleware::MppAuthState {
+            auth: auth_state_middleware.clone(),
+            mpp: app_state.mpp_service.clone(),
+        },
+        middleware::mpp_auth_middleware,
+    ))
+    .layer(from_fn_with_state(
+        middleware::BodyHashLimit(AUDIO_TRANSCRIPTION_MAX_BODY_SIZE),
+        middleware::body_hash_middleware,
+    ))
+    // Outermost, so the MPP pre-flight (which parses the buffered body as the handler
+    // will) sees the same limit the handler's extractor does.
+    .layer(DefaultBodyLimit::max(AUDIO_TRANSCRIPTION_MAX_BODY_SIZE));
 
     // Text-based inference routes (image generation, audio transcription, rerank, score, ...).
     // The shared 25 MiB cap accommodates inline multimodal JSON payloads.
@@ -1698,19 +1721,8 @@ pub fn build_completion_routes(
             post(privacy_redact).layer(DefaultBodyLimit::max(PRIVACY_CLASSIFY_MAX_BODY_SIZE)),
         )
         .layer(DefaultBodyLimit::max(AUDIO_TRANSCRIPTION_MAX_BODY_SIZE))
-        .with_state(app_state.clone())
-        .layer(from_fn_with_state(
-            model_deprecation_state.clone(),
-            middleware::model_deprecation_middleware,
-        ))
-        .layer(from_fn_with_state(
-            usage_state.clone(),
-            middleware::usage_check_middleware,
-        ))
-        .layer(from_fn_with_state(
-            rate_limit_state.clone(),
-            middleware::api_key_rate_limit_middleware,
-        ))
+        .with_state(app_state.clone());
+    let text_inference_routes = with_inference_admission(text_inference_routes, &admission)
         .layer(from_fn_with_state(
             auth_state_middleware.clone(),
             middleware::auth::auth_middleware_with_workspace_context,

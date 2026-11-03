@@ -41,6 +41,8 @@ pub struct FakeTempo {
     send_receipt: Mutex<Option<RpcReceipt>>,
     /// Block timestamps (Unix seconds) by number; unknown blocks are `None`.
     block_times: Mutex<HashMap<u64, u64>>,
+    /// A node that never answers block lookups.
+    block_lookup_hangs: std::sync::atomic::AtomicBool,
     sends: AtomicUsize,
     lookups: AtomicUsize,
 }
@@ -53,6 +55,7 @@ impl Default for FakeTempo {
             lookup_error: Mutex::new(None),
             send_receipt: Mutex::new(None),
             block_times: Mutex::new(HashMap::new()),
+            block_lookup_hangs: std::sync::atomic::AtomicBool::new(false),
             sends: AtomicUsize::new(0),
             lookups: AtomicUsize::new(0),
         }
@@ -99,6 +102,10 @@ impl FakeTempo {
         if let Ok(mut times) = self.block_times.lock() {
             times.insert(number, timestamp);
         }
+    }
+
+    pub fn set_block_lookup_hangs(&self, hangs: bool) {
+        self.block_lookup_hangs.store(hangs, Ordering::SeqCst);
     }
 
     pub fn send_calls(&self) -> usize {
@@ -152,6 +159,9 @@ impl TempoRpc for FakeTempo {
     }
 
     async fn get_block_timestamp(&self, number: u64) -> Result<Option<u64>, RpcError> {
+        if self.block_lookup_hangs.load(Ordering::SeqCst) {
+            return std::future::pending().await;
+        }
         if let Some(error) = self.lookup_error.lock().ok().and_then(|e| *e) {
             return Err(error);
         }

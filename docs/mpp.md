@@ -114,7 +114,11 @@ fields, a duplicate model name, an empty table, and zero limits.
 1. **Service workspace.** Create an organization and workspace for MPP traffic and an API key
    in it. Its credits and limits bound all MPP traffic: when they run out, paying clients get
    `503` with `Retry-After: 30` instead of a payment request (a payment is never taken
-   for a request that cannot be served). All MPP requests share that key's rate limit.
+   for a request that cannot be served). All MPP requests share that key's rate limit and
+   credits, so one payer's burst can make the others wait (a request refused there leaves its
+   payment unclaimed and redeemable). Alert on that key's rate-limit rejections and on its
+   organization's remaining credits; usage records attribute all MPP traffic to it, not to
+   individual payers.
 2. **Recipient treasury.** Use an address you control and monitor. The server never signs or
    sends anything; it only reads Tempo.
 3. **Schema.** The single-use ledger is the table `mpp_payment_claims`

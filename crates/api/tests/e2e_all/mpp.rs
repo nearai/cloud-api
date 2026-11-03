@@ -146,6 +146,42 @@ async fn concurrent_claims_of_one_payment_have_exactly_one_winner() {
 }
 
 #[tokio::test]
+async fn purge_deletes_only_claims_older_than_the_cutoff() {
+    let (_server, database) = setup_test_server_with_database().await;
+    let repo = repository(&database);
+    let (old_a, old_b, fresh) = (unique_key(), unique_key(), unique_key());
+    for key in [&old_a, &old_b, &fresh] {
+        claimed(&repo, key, "challenge-a").await;
+    }
+    let client = database.pool().get().await.expect("connection");
+    client
+        .execute(
+            "UPDATE mpp_payment_claims SET created_at = NOW() - INTERVAL '25 hours' \
+             WHERE payment_key = ANY($1)",
+            &[&vec![old_a.clone(), old_b.clone()]],
+        )
+        .await
+        .expect("age two claims");
+
+    let cutoff = chrono::Utc::now() - chrono::Duration::hours(24);
+    // Other tests share the table; only this test ages rows, so at least its two go.
+    let purged = repo.purge_older_than(cutoff).await.unwrap();
+    assert!(purged >= 2, "purged {purged}");
+    assert_eq!(state_of(&database, &old_a).await, None);
+    assert_eq!(state_of(&database, &old_b).await, None);
+    assert_eq!(
+        state_of(&database, &fresh).await.as_deref(),
+        Some("serving")
+    );
+    // Nothing old is left for a second run to find among this test's rows.
+    repo.purge_older_than(cutoff).await.unwrap();
+    assert_eq!(
+        state_of(&database, &fresh).await.as_deref(),
+        Some("serving")
+    );
+}
+
+#[tokio::test]
 async fn finish_ignores_unknown_keys_and_the_table_rejects_unknown_states() {
     let (_server, database) = setup_test_server_with_database().await;
     let repo = repository(&database);
@@ -196,6 +232,7 @@ fn receipt_json(receipt: &RpcReceipt) -> Value {
         "transactionHash": hex(&receipt.tx_hash),
         "status": if receipt.success { "0x1" } else { "0x0" },
         "from": hex(&receipt.from),
+        "blockNumber": format!("0x{:x}", receipt.block_number),
         "logs": receipt.logs.iter().map(|log| json!({
             "address": hex(&log.address),
             "topics": log.topics.iter().map(|t| hex(t)).collect::<Vec<_>>(),

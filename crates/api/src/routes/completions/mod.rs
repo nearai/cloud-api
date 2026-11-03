@@ -35,6 +35,7 @@ use utoipa;
 use uuid::Uuid;
 
 mod chat;
+pub(crate) use chat::{reject_invalid_chat_request, ChatRequestBody};
 mod chat_auto_redact;
 mod chat_stream;
 mod models;

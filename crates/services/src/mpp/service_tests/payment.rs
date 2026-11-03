@@ -865,3 +865,42 @@ async fn a_failing_spent_check_is_unavailable_and_reads_no_chain() {
     );
     assert_eq!(chain.lookup_calls(), 0);
 }
+
+#[tokio::test]
+async fn a_late_redemption_block_lookup_is_bounded_by_the_receipt_deadline() {
+    let repo = Arc::new(InMemoryClaimRepository::default());
+    let chain = Arc::new(FakeTempo::default());
+    let service = MppService::new(&settings(), repo, chain.clone())
+        .unwrap()
+        .with_receipt_deadline(StdDuration::from_millis(50));
+    let now = Utc::now();
+    let Pricing::Priced(price) = service.price_body(&body()) else {
+        panic!("body() prices");
+    };
+    let challenge = service
+        .challenge_at(
+            now - ChronoDuration::hours(2),
+            CHAT_COMPLETIONS_ROUTE,
+            &body(),
+            &price,
+        )
+        .unwrap();
+    chain.mine(bound_payment_receipt(
+        TX, PAYER, CURRENCY, RECIPIENT, AMOUNT, REALM, &challenge,
+    ));
+    chain.set_block_lookup_hangs(true);
+    let header = credential_header(&challenge, hash_payload(TX), None);
+    let verified = service
+        .verify_at(now, &header, CHAT_COMPLETIONS_ROUTE, &body())
+        .unwrap();
+    let outcome = tokio::time::timeout(
+        StdDuration::from_secs(5),
+        service.verify_payment_at(now, &verified),
+    )
+    .await
+    .expect("the receipt deadline bounds the block lookup too");
+    assert_eq!(
+        outcome.unwrap_err(),
+        MppError::Unavailable(UnavailableReason::Rpc)
+    );
+}

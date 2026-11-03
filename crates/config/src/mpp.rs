@@ -202,7 +202,8 @@ pub fn parse_realm(raw: &str) -> Result<String, String> {
 
 /// `https`, or `http` only for a loopback host (local tests).
 pub fn parse_rpc_url(raw: &str) -> Result<String, String> {
-    let invalid = || "MPP_TEMPO_RPC_URL must be an https URL".to_string();
+    let invalid =
+        || "MPP_TEMPO_RPC_URL must be an https URL, or http on a loopback host".to_string();
     let url = url::Url::parse(raw.trim()).map_err(|_| invalid())?;
     let host_ok = match url.host() {
         Some(url::Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),

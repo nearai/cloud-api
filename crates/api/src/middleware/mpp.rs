@@ -46,7 +46,8 @@ use super::auth::{
     with_caller_key, AuthState,
 };
 use super::body_hash::RequestBodyHash;
-use crate::models::{ChatCompletionRequest, ErrorResponse};
+use crate::models::ErrorResponse;
+use crate::routes::completions::{reject_invalid_chat_request, ChatRequestBody};
 use crate::routes::extractors::OpenAiJson;
 
 const PAYMENT_RECEIPT: HeaderName = HeaderName::from_static("payment-receipt");
@@ -226,17 +227,18 @@ fn preflight_probe(request: &Request, body: &Bytes) -> Request {
     probe
 }
 
-/// The handler's own pre-flight on the buffered body: the `OpenAiJson` extractor (JSON
-/// content type, `ChatCompletionRequest`) and `validate_request`, exactly as
-/// `chat_completions` runs them. On failure: the handler's own error response, so a request
-/// that could never be served gets neither a challenge nor a payment.
+/// The handler's own pre-flight on the buffered body, through the handler's own extractor
+/// type and validation function (`ChatRequestBody`, `reject_invalid_chat_request`), so the
+/// two cannot drift. On failure: the handler's own error response, so a request that could
+/// never be served gets neither a challenge nor a payment.
 async fn handler_preflight(probe: Request) -> Result<(), Response> {
-    let OpenAiJson(parsed) = OpenAiJson::<ChatCompletionRequest>::from_request(probe, &())
+    let OpenAiJson(parsed) = ChatRequestBody::from_request(probe, &())
         .await
         .map_err(IntoResponse::into_response)?;
-    parsed
-        .validate_request()
-        .map_err(|error| (StatusCode::BAD_REQUEST, axum::Json(error)).into_response())
+    match reject_invalid_chat_request(&parsed) {
+        Some(response) => Err(response),
+        None => Ok(()),
+    }
 }
 
 /// Replaces `auth_middleware_with_workspace_context` on `POST /chat/completions`.

@@ -16,7 +16,10 @@ use services::mpp::{ClaimLease, ClaimOutcome, PaymentClaimRepository, ServeOutco
 
 /// One atomic step: insert a new claim, or take over a row that an earlier attempt of the
 /// *same challenge* left `unserved`. Any other existing row returns no row: already used.
-/// The returned `updated_at` is the attempt's lease: every write sets it anew.
+/// The returned `updated_at` is the attempt's lease: every write sets it anew. The fence in
+/// `FINISH_SQL` compares it for equality, so it relies on `updated_at` being a `timestamptz`
+/// (microsecond precision, round-tripped exactly as `DateTime<Utc>`) that only these
+/// statements write; V0098 in cloud-platform defines it that way.
 const CLAIM_SQL: &str = "\
 INSERT INTO mpp_payment_claims (payment_key, challenge_id, state) VALUES ($1, $2, 'serving') \
 ON CONFLICT (payment_key) DO UPDATE SET state = 'serving', updated_at = NOW() \
@@ -122,11 +125,20 @@ impl PaymentClaimRepository for MppPaymentClaimRepository {
                 .await
                 .context("Failed to get database connection")
                 .map_err(RepositoryError::PoolError)?;
-            client
+            let updated = client
                 .execute(FINISH_SQL, &[&payment_key, &state, &lease])
                 .await
-                .map_err(map_db_error)
-                .map(|_| ())
+                .map_err(map_db_error)?;
+            // Zero rows is a stale finish (an earlier attempt), which is rare by design. Log
+            // it so that a lease that stopped matching (schema drift) is visible rather than
+            // silently leaving claims `serving`.
+            if updated == 0 {
+                tracing::warn!(
+                    outcome = "finish_matched_nothing",
+                    "MPP claim finish matched no serving row"
+                );
+            }
+            Ok(())
         })
     }
 

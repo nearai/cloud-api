@@ -132,7 +132,12 @@ fn hex_u64(value: &Value) -> Result<u64, RpcError> {
     let digits = value
         .as_str()
         .and_then(|s| s.strip_prefix("0x"))
-        .filter(|digits| !digits.is_empty() && digits.len() <= 16)
+        .filter(|digits| {
+            // `from_str_radix` would also take a leading `+`: hex digits only.
+            !digits.is_empty()
+                && digits.len() <= 16
+                && digits.bytes().all(|b| b.is_ascii_hexdigit())
+        })
         .ok_or(RpcError::InvalidResponse)?;
     u64::from_str_radix(digits, 16).map_err(|_| RpcError::InvalidResponse)
 }
@@ -411,7 +416,19 @@ mod tests {
             )
             .mount(&server)
             .await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"params": ["0x3", false]})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                json!({"jsonrpc": "2.0", "id": 1, "result": {"timestamp": "0x+ff"}}),
+            ))
+            .mount(&server)
+            .await;
         let client = rpc(&server, Duration::from_secs(5));
+        // A sign is not a hex digit, although `from_str_radix` would accept it.
+        assert_eq!(
+            client.get_block_timestamp(3).await.unwrap_err(),
+            RpcError::InvalidResponse
+        );
         // The live Moderato block of an interop payment: 2026-11-03T20:59:59Z.
         assert_eq!(
             client.get_block_timestamp(0x287d957).await.unwrap(),

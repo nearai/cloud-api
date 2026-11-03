@@ -113,6 +113,20 @@ pub(super) fn convert_chat_request_to_service(
 ///
 /// Generate AI model responses for chat conversations. Supports both streaming and non-streaming modes.
 /// OpenAI-compatible endpoint.
+/// The body extractor of [`chat_completions`]. The MPP pre-flight
+/// (`middleware::mpp`) extracts through this same type, so a body the handler would refuse
+/// is refused before any payment is taken.
+pub(crate) type ChatRequestBody = OpenAiJson<ChatCompletionRequest>;
+
+/// The request checks [`chat_completions`] runs before any work, as a response. The MPP
+/// pre-flight calls this same function, so the two cannot drift.
+pub(crate) fn reject_invalid_chat_request(request: &ChatCompletionRequest) -> Option<Response> {
+    request
+        .validate_request()
+        .err()
+        .map(|error| (StatusCode::BAD_REQUEST, ResponseJson(error)).into_response())
+}
+
 #[utoipa::path(
     post,
     path = "/v1/chat/completions",
@@ -137,7 +151,7 @@ pub async fn chat_completions(
     Extension(correlation): Extension<RequestCorrelation>,
     headers: header::HeaderMap,
     requested_model: RequestedModel,
-    OpenAiJson(request): OpenAiJson<ChatCompletionRequest>,
+    OpenAiJson(request): ChatRequestBody,
 ) -> axum::response::Response {
     requested_model.set(&request.model);
     debug!(
@@ -149,8 +163,8 @@ pub async fn chat_completions(
         request.model, request.stream, api_key.organization.id, api_key.workspace.id.0
     );
     // Validate the request
-    if let Err(error) = request.validate_request() {
-        return (StatusCode::BAD_REQUEST, ResponseJson(error)).into_response();
+    if let Some(response) = reject_invalid_chat_request(&request) {
+        return response;
     }
 
     let request_id = correlation.request_id;

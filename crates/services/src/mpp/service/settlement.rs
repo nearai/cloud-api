@@ -127,13 +127,16 @@ impl MppService {
         }
 
         // One deadline for the whole phase: the broadcast, its recovery lookups and their
-        // spacing, however the node behaves.
-        let receipt = match tokio::time::timeout(
-            self.receipt_deadline,
-            self.receipt_for(now, verified),
-        )
-        .await
-        {
+        // spacing, and for a late redemption the block-time lookup, however the node behaves.
+        let late = verified.expires_at <= now;
+        let chain_phase = async {
+            let receipt = self.receipt_for(now, verified).await?;
+            if late {
+                self.mined_by_expiry(&receipt, verified.expires_at).await?;
+            }
+            Ok::<RpcReceipt, MppError>(receipt)
+        };
+        let receipt = match tokio::time::timeout(self.receipt_deadline, chain_phase).await {
             Ok(receipt) => receipt?,
             Err(_) => {
                 tracing::warn!(outcome = "rpc_deadline", "MPP receipt phase timed out");
@@ -155,9 +158,6 @@ impl MppService {
             }
             ReceiptVerdict::MemoNotBound => MppError::Consumed(ConsumedReason::MemoNotBound),
         })?;
-        if verified.expires_at <= now {
-            self.mined_by_expiry(&receipt, verified.expires_at).await?;
-        }
 
         Ok(PaidCredential {
             challenge_id: verified.challenge_id.clone(),

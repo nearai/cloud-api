@@ -461,30 +461,26 @@ impl OrganizationUsageDiscountRepository {
         if !owned {
             return Ok(false);
         }
+        // Verify the correction, not the organization's lifetime ledger: the window is
+        // frozen at save, so this costs the same on every retry however much usage
+        // follows. Each batch already checked its rows' funding against their
+        // allocations and moved the balance and counters by its own deltas. Drift the
+        // correction did not cause is outside this check: it must not hold the rule in
+        // 'applying' behind a scan that grows until it times out.
+        // Validated history is fully funded or legacy, so the credit notes must equal
+        // the funded part of the reduction.
         let consistent: bool = tx.query_one(r#"
-            WITH costs AS (
-                SELECT COALESCE(SUM(total_cost),0)::BIGINT AS total,
-                       COALESCE(SUM(total_cost) FILTER (WHERE funded_amount IS NULL),0)::BIGINT AS legacy
-                FROM (
-                    SELECT total_cost, funded_amount FROM organization_usage_log WHERE organization_id=$1
-                    UNION ALL
-                    SELECT total_cost, funded_amount FROM organization_service_usage_log WHERE organization_id=$1
-                ) usage
-            ), credits AS (
-                SELECT credit_type, SUM(amount)::BIGINT AS amount FROM effective_usage_credit_allocations
-                WHERE organization_id=$1 GROUP BY credit_type
-            ), counter_mismatch AS (
-                SELECT 1 FROM credits a FULL JOIN
-                    (SELECT credit_type, amount FROM organization_credit_consumption WHERE organization_id=$1) c
-                    USING (credit_type) WHERE COALESCE(a.amount,0) <> COALESCE(c.amount,0)
+            WITH adjusted AS (
+                SELECT COUNT(*) AS processed,
+                       COALESCE(SUM(original_total_cost - net_input_cost - net_output_cost)
+                           FILTER (WHERE original_funded_amount IS NOT NULL),0)::BIGINT AS funded_delta
+                FROM usage_discount_adjustments WHERE rule_id=$1
             ) SELECT
-                COALESCE((SELECT b.total_spent = costs.total AND b.legacy_unattributed_amount = costs.legacy
-                    FROM organization_balance b CROSS JOIN costs WHERE b.organization_id=$1),
-                    (SELECT total=0 AND legacy=0 FROM costs))
-                AND NOT EXISTS (SELECT 1 FROM counter_mismatch)
-                AND (SELECT COUNT(*) FROM usage_discount_adjustments WHERE rule_id=$2) =
-                    (SELECT processed_count FROM organization_usage_discounts WHERE id=$2)
-            "#, &[&organization_id, &rule_id]).await?
+                adjusted.processed = (SELECT processed_count FROM organization_usage_discounts WHERE id=$1)
+                AND adjusted.funded_delta = (SELECT COALESCE(SUM(amount),0)::BIGINT
+                    FROM usage_credit_allocation_reversals WHERE rule_id=$1)
+            FROM adjusted
+            "#, &[&rule_id]).await?
 .get(0);
         if !consistent {
             return Err(WorkerError::Accounting.into());

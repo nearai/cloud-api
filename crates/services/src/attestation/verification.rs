@@ -69,6 +69,15 @@ struct EventLogData {
 /// dstack runtime event type constant (0x08000001).
 const DSTACK_RUNTIME_EVENT_TYPE: u32 = 0x08000001;
 
+/// An RTMR3 event whose name and payload are cryptographically bound by the
+/// replay (a runtime event whose digest was recomputed from them). Only
+/// `verify_rtmr3_and_extract`'s replay constructs these, so anything that
+/// consumes `BoundEvent`s cannot read unbound (relabellable) log fields.
+struct BoundEvent {
+    name: String,
+    payload_hex: String,
+}
+
 /// An entry from the TDX event log.
 #[derive(Debug, Clone, serde::Deserialize)]
 struct EventLogEntry {
@@ -240,18 +249,7 @@ impl AttestationVerifier {
         //    allowlist. For NEAR an empty allowlist skips the check (historical
         //    behavior); for an attested third party the empty case was already
         //    rejected by `assert_enforceable()` above, so the check is enforced.
-        if let Some(ref hash) = event_log_data.os_image_hash {
-            if self.policy.enforces_image_hash() && !self.policy.allows_image_hash(hash) {
-                return Err(AttestationVerificationError::ImageHashMismatch(format!(
-                    "os_image_hash '{}' from RTMR3-verified event log not in allowed list",
-                    hash
-                )));
-            }
-        } else if self.policy.enforces_image_hash() {
-            return Err(AttestationVerificationError::ImageHashMismatch(
-                "ALLOWED_IMAGE_HASHES configured but no os-image-hash in event log".to_string(),
-            ));
-        }
+        self.check_os_image_hash(event_log_data.os_image_hash.as_deref())?;
 
         // 5. Verify GPU evidence (best-effort — skip if not present)
         let gpu_verdict = self
@@ -378,6 +376,7 @@ impl AttestationVerifier {
         use sha2::Sha384;
         let mut rtmr3 = [0u8; 48];
         let mut rtmr3_event_count = 0u32;
+        let mut bound_events: Vec<BoundEvent> = Vec::new();
         for event in &events {
             if event.imr != 3 {
                 continue;
@@ -417,6 +416,10 @@ impl AttestationVerifier {
                         )));
                     }
                 }
+                bound_events.push(BoundEvent {
+                    name: event.event.clone(),
+                    payload_hex: event.event_payload.clone(),
+                });
                 computed.to_vec()
             } else {
                 // Non-runtime events: use stored digest directly
@@ -451,41 +454,42 @@ impl AttestationVerifier {
             )));
         }
 
-        // Event log is verified — extract os-image-hash, compose-hash, and
-        // the replica report signing key. Iterated in log order; a later
-        // valid replica-report-key event overwrites an earlier one, but an
-        // invalid later event is ignored and does NOT clear a valid earlier
-        // one (last VALID event wins).
+        // Event log is verified. Extract from `bound_events` only: the
+        // runtime events whose name and payload the replay bound into RTMR3.
+        // A non-runtime event's stored digest is chained as-is, so its
+        // name/payload can be relabelled freely and must never be read here.
+        //
+        // os-image-hash and compose-hash must appear at most once: any
+        // workload with dstack.sock access can emit further runtime events,
+        // so a duplicate is rejected rather than resolved. The replica
+        // report key is the exception (last VALID event wins; an invalid
+        // later event does not clear an earlier valid one), because only the
+        // inference-proxy container mounts dstack.sock; revisit if that
+        // changes.
+        //
+        // Note: the extracted os-image-hash only gates verification when
+        // ALLOWED_IMAGE_HASHES is set (see `check_os_image_hash`).
         let mut os_image_hash = None;
         let mut compose_hash = None;
         let mut replica_report_key = None;
-        for event in &events {
-            if event.imr != 3 {
-                continue;
-            }
-            match event.event.as_str() {
+        for event in &bound_events {
+            match event.name.as_str() {
                 "os-image-hash" => {
-                    os_image_hash = Some(event.event_payload.clone());
+                    if os_image_hash.replace(event.payload_hex.clone()).is_some() {
+                        return Err(AttestationVerificationError::InvalidFormat(
+                            "duplicate os-image-hash runtime event in RTMR3".to_string(),
+                        ));
+                    }
                 }
                 "compose-hash" => {
-                    compose_hash = Some(event.event_payload.clone());
+                    if compose_hash.replace(event.payload_hex.clone()).is_some() {
+                        return Err(AttestationVerificationError::InvalidFormat(
+                            "duplicate compose-hash runtime event in RTMR3".to_string(),
+                        ));
+                    }
                 }
                 placement::consts::KEY_EVENT => {
-                    // Only a runtime event's name and payload are bound into
-                    // RTMR3 by the replay above (the digest-validation branch
-                    // keyed on `DSTACK_RUNTIME_EVENT_TYPE`); a non-runtime
-                    // event's stored digest is chained as-is, with no check
-                    // that it actually corresponds to this name/payload. So
-                    // without this gate, an attacker could keep a genuine
-                    // non-runtime event's digest, relabel it as `KEY_EVENT`,
-                    // and supply an arbitrary key that would still pass
-                    // replay and self-validate via `key_id == hash(pk)`.
-                    if event.event_type != DSTACK_RUNTIME_EVENT_TYPE {
-                        tracing::debug!("replica report key event: not a runtime event");
-                    } else if let Some(key) = parse_replica_report_key(&event.event_payload) {
-                        // Last valid event wins. Safe because only the inference-proxy
-                        // container mounts dstack.sock, so no other workload on the CVM
-                        // can emit a competing runtime event; revisit if that changes.
+                    if let Some(key) = parse_replica_report_key(&event.payload_hex) {
                         replica_report_key = Some(key);
                     }
                 }
@@ -498,6 +502,28 @@ impl AttestationVerifier {
             compose_hash,
             replica_report_key,
         })
+    }
+
+    /// Check the RTMR3-verified `os-image-hash` against the policy allowlist.
+    /// Only takes effect when an allowlist is configured (ALLOWED_IMAGE_HASHES
+    /// for NEAR); with an empty allowlist this check is skipped.
+    fn check_os_image_hash(
+        &self,
+        os_image_hash: Option<&str>,
+    ) -> Result<(), AttestationVerificationError> {
+        if let Some(hash) = os_image_hash {
+            if self.policy.enforces_image_hash() && !self.policy.allows_image_hash(hash) {
+                return Err(AttestationVerificationError::ImageHashMismatch(format!(
+                    "os_image_hash '{}' from RTMR3-verified event log not in allowed list",
+                    hash
+                )));
+            }
+        } else if self.policy.enforces_image_hash() {
+            return Err(AttestationVerificationError::ImageHashMismatch(
+                "ALLOWED_IMAGE_HASHES configured but no os-image-hash in event log".to_string(),
+            ));
+        }
+        Ok(())
     }
 
     /// Verify GPU evidence via NVIDIA NRAS.
@@ -1299,6 +1325,196 @@ mod tests {
             .verify_rtmr3_and_extract(&report, &rtmr3)
             .unwrap();
         assert_eq!(result.replica_report_key, None);
+    }
+
+    #[test]
+    fn non_runtime_os_image_hash_event_is_ignored() {
+        // A relabelled non-runtime event must not yield an os-image-hash, so
+        // an allowlist configured on the policy cannot be satisfied by it
+        // (extraction returns None -> "no os-image-hash in event log").
+        let digest_hex = hex::encode(b"some-genuine-non-runtime-digest");
+        let events = vec![non_runtime_event(
+            "os-image-hash",
+            &hex::encode(b"allowlisted-image-hash"),
+            &digest_hex,
+        )];
+        let rtmr3 = replay_rtmr3(&events);
+        let report = event_log_report(&events);
+
+        let result = verifier()
+            .verify_rtmr3_and_extract(&report, &rtmr3)
+            .unwrap();
+        assert_eq!(result.os_image_hash, None);
+    }
+
+    #[test]
+    fn non_runtime_compose_hash_event_is_ignored() {
+        let digest_hex = hex::encode(b"some-genuine-non-runtime-digest");
+        let events = vec![non_runtime_event(
+            "compose-hash",
+            &hex::encode(b"relabelled-compose-hash"),
+            &digest_hex,
+        )];
+        let rtmr3 = replay_rtmr3(&events);
+        let report = event_log_report(&events);
+
+        let result = verifier()
+            .verify_rtmr3_and_extract(&report, &rtmr3)
+            .unwrap();
+        assert_eq!(result.compose_hash, None);
+    }
+
+    #[test]
+    fn non_runtime_event_does_not_override_runtime_hashes() {
+        let events = vec![
+            runtime_event("os-image-hash", &hex::encode(b"image-hash-value")),
+            runtime_event("compose-hash", &hex::encode(b"compose-hash-value")),
+            non_runtime_event(
+                "os-image-hash",
+                &hex::encode(b"attacker-image"),
+                &hex::encode(b"digest-a"),
+            ),
+            non_runtime_event(
+                "compose-hash",
+                &hex::encode(b"attacker-compose"),
+                &hex::encode(b"digest-b"),
+            ),
+        ];
+        let rtmr3 = replay_rtmr3(&events);
+        let report = event_log_report(&events);
+
+        let result = verifier()
+            .verify_rtmr3_and_extract(&report, &rtmr3)
+            .unwrap();
+        assert_eq!(
+            result.os_image_hash.as_deref(),
+            Some(hex::encode(b"image-hash-value")).as_deref()
+        );
+        assert_eq!(
+            result.compose_hash.as_deref(),
+            Some(hex::encode(b"compose-hash-value")).as_deref()
+        );
+    }
+
+    #[test]
+    fn relabelled_non_runtime_os_image_hash_fails_enforced_allowlist() {
+        let allowed = hex::encode(b"allowlisted-image-hash");
+        let verifier = AttestationVerifier::new(HashSet::from([allowed.clone()]), None, false);
+
+        // Relabelled non-runtime event carrying an allowlisted payload.
+        let events = vec![non_runtime_event(
+            "os-image-hash",
+            &allowed,
+            &hex::encode(b"some-genuine-non-runtime-digest"),
+        )];
+        let rtmr3 = replay_rtmr3(&events);
+        let data = verifier
+            .verify_rtmr3_and_extract(&event_log_report(&events), &rtmr3)
+            .unwrap();
+        let err = verifier
+            .check_os_image_hash(data.os_image_hash.as_deref())
+            .unwrap_err();
+        assert!(
+            matches!(&err, AttestationVerificationError::ImageHashMismatch(m)
+                if m.contains("no os-image-hash in event log")),
+            "unexpected error: {err:?}"
+        );
+
+        // A genuine runtime event with the same payload still passes.
+        let events = vec![runtime_event("os-image-hash", &allowed)];
+        let rtmr3 = replay_rtmr3(&events);
+        let data = verifier
+            .verify_rtmr3_and_extract(&event_log_report(&events), &rtmr3)
+            .unwrap();
+        verifier
+            .check_os_image_hash(data.os_image_hash.as_deref())
+            .unwrap();
+    }
+
+    #[test]
+    fn non_runtime_event_before_runtime_event_is_skipped() {
+        let events = vec![
+            non_runtime_event(
+                "os-image-hash",
+                &hex::encode(b"attacker-image"),
+                &hex::encode(b"digest-a"),
+            ),
+            non_runtime_event(
+                "compose-hash",
+                &hex::encode(b"attacker-compose"),
+                &hex::encode(b"digest-b"),
+            ),
+            runtime_event("os-image-hash", &hex::encode(b"image-hash-value")),
+            runtime_event("compose-hash", &hex::encode(b"compose-hash-value")),
+        ];
+        let rtmr3 = replay_rtmr3(&events);
+        let result = verifier()
+            .verify_rtmr3_and_extract(&event_log_report(&events), &rtmr3)
+            .unwrap();
+        assert_eq!(
+            result.os_image_hash.as_deref(),
+            Some(hex::encode(b"image-hash-value")).as_deref()
+        );
+        assert_eq!(
+            result.compose_hash.as_deref(),
+            Some(hex::encode(b"compose-hash-value")).as_deref()
+        );
+    }
+
+    #[test]
+    fn duplicate_os_image_hash_runtime_event_is_rejected() {
+        let events = vec![
+            runtime_event("os-image-hash", &hex::encode(b"image-hash-value")),
+            runtime_event("os-image-hash", &hex::encode(b"second-image")),
+        ];
+        let rtmr3 = replay_rtmr3(&events);
+        let err = verifier()
+            .verify_rtmr3_and_extract(&event_log_report(&events), &rtmr3)
+            .err()
+            .expect("duplicate must be rejected");
+        assert!(
+            matches!(&err, AttestationVerificationError::InvalidFormat(m)
+            if m.contains("duplicate os-image-hash")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn duplicate_compose_hash_runtime_event_is_rejected() {
+        let events = vec![
+            runtime_event("compose-hash", &hex::encode(b"compose-hash-value")),
+            runtime_event("compose-hash", &hex::encode(b"second-compose")),
+        ];
+        let rtmr3 = replay_rtmr3(&events);
+        let err = verifier()
+            .verify_rtmr3_and_extract(&event_log_report(&events), &rtmr3)
+            .err()
+            .expect("duplicate must be rejected");
+        assert!(
+            matches!(&err, AttestationVerificationError::InvalidFormat(m)
+            if m.contains("duplicate compose-hash")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn non_runtime_duplicate_does_not_trigger_duplicate_rejection() {
+        let events = vec![
+            runtime_event("os-image-hash", &hex::encode(b"image-hash-value")),
+            non_runtime_event(
+                "os-image-hash",
+                &hex::encode(b"attacker-image"),
+                &hex::encode(b"digest-a"),
+            ),
+        ];
+        let rtmr3 = replay_rtmr3(&events);
+        let result = verifier()
+            .verify_rtmr3_and_extract(&event_log_report(&events), &rtmr3)
+            .unwrap();
+        assert_eq!(
+            result.os_image_hash.as_deref(),
+            Some(hex::encode(b"image-hash-value")).as_deref()
+        );
     }
 
     #[test]

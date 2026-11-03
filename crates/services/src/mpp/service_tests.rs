@@ -17,6 +17,9 @@ const REALM: &str = "cloud-api.near.ai";
 const SECRET: &str = "0123456789abcdef0123456789abcdef-hmac";
 const SERVICE_KEY: &str = "sk-live-service-key-0001";
 const MODEL: &str = "zai-org/GLM-5";
+/// A second priced model with a larger body cap, so a body past MODEL's cap is still parsed.
+const BIG_MODEL: &str = "zai-org/GLM-5-long";
+const BIG_BODY_CAP: usize = 65_536;
 const CURRENCY: [u8; 20] = [0x20; 20];
 const RECIPIENT: [u8; 20] = [0xaa; 20];
 const PAYER: [u8; 20] = [0x40; 20];
@@ -35,6 +38,14 @@ fn settings() -> MppSettings {
             amount: AMOUNT,
             max_tokens: 2048,
             max_request_bytes: 4096,
+        },
+    );
+    prices.insert(
+        BIG_MODEL.to_string(),
+        MppModelPrice {
+            amount: AMOUNT * 2,
+            max_tokens: 4096,
+            max_request_bytes: BIG_BODY_CAP as u32,
         },
     );
     MppSettings {
@@ -258,6 +269,32 @@ fn limit_violations_name_the_limit() {
 }
 
 #[test]
+fn a_body_past_every_priced_cap_is_not_priced_and_not_parsed() {
+    let f = fixture();
+    // Under the largest cap it is a priced model's limit violation; over it, not a request
+    // MPP takes at all (the body is never parsed).
+    let at_cap = |len: usize| {
+        let mut request = json!({"model": MODEL, "max_tokens": 10, "pad": ""});
+        let base = request.to_string().len();
+        request["pad"] = json!("x".repeat(len - base));
+        request
+    };
+    assert_eq!(
+        priced(&f.service, at_cap(BIG_BODY_CAP)),
+        Pricing::Violation(LimitViolation::BodyTooLarge { cap: 4096 })
+    );
+    assert_eq!(
+        priced(&f.service, at_cap(BIG_BODY_CAP + 1)),
+        Pricing::Unpriced
+    );
+    // Not even valid JSON: past the cap it is Unpriced before any parse could fail or succeed.
+    assert_eq!(
+        f.service.price_body(&vec![b'['; BIG_BODY_CAP + 1]),
+        Pricing::Unpriced
+    );
+}
+
+#[test]
 fn body_cap_is_inclusive() {
     let f = fixture();
     let mut request = json!({"model": MODEL, "max_tokens": 10, "pad": ""});
@@ -321,7 +358,7 @@ fn challenge_for_body_rejects_what_cannot_be_paid_for() {
     assert_eq!(
         f.service
             .challenge_for_body(CHAT_COMPLETIONS_ROUTE, b"{\"model\":\"nope\"}"),
-        Err(MppError::NotPriced)
+        Err(MppError::Limit(LimitViolation::ModelNotPriced))
     );
     assert!(matches!(
         f.service

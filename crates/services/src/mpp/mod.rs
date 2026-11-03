@@ -13,6 +13,7 @@
 #[cfg(any(test, feature = "test-mocks"))]
 pub mod memory;
 pub mod ports;
+pub mod pricing;
 pub mod protocol;
 pub mod rpc;
 pub mod service;
@@ -26,10 +27,10 @@ pub use ports::{
     ClaimOutcome, ClaimState, PaymentClaimRepository, RpcError, RpcLog, RpcReceipt, ServeOutcome,
     TempoRpc,
 };
+pub use pricing::{LimitViolation, Param, Price, Pricing, RequestShape};
 pub use protocol::{Challenge, ProblemCode};
 pub use rpc::HttpTempoRpc;
 pub use service::{
-    ConsumedReason, LimitViolation, MppError, MppService, Price, Pricing, RequestShape,
-    ServingGuard, SettledPayment, UnavailableReason, VerifiedCredential, VerifyFailure,
-    CHAT_COMPLETIONS_ROUTE,
+    ConsumedReason, MppError, MppService, ServingGuard, SettledPayment, UnavailableReason,
+    VerifiedCredential, VerifyFailure, CHAT_COMPLETIONS_ROUTE,
 };

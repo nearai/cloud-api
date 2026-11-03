@@ -19,12 +19,11 @@ use std::time::Duration;
 
 use chrono::{DateTime, TimeZone, Utc};
 use config::{MppModelPrice, MppSettings};
-use serde::Deserialize;
-use serde_json::Value;
 
 use super::ports::{
     ClaimOutcome, PaymentClaimRepository, RpcError, RpcReceipt, ServeOutcome, TempoRpc,
 };
+use super::pricing::{LimitViolation, Param, Price, Pricing, RequestShape};
 use super::protocol::{
     self, body_digest, opaque_for_route, parse_authorization, parse_source_did, BoundFields,
     Challenge, ChargeRequest, PaymentPayload, ProblemCode, ProtocolError, INTENT_CHARGE, METHOD,
@@ -43,50 +42,6 @@ const DEFAULT_RECOVER_INTERVAL: Duration = Duration::from_millis(400);
 // ---------------------------------------------------------------------------------------
 // Errors
 // ---------------------------------------------------------------------------------------
-
-/// Why a request is not priced even though its model is.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LimitViolation {
-    BodyTooLarge { cap: u32 },
-    MaxTokensRequired { cap: u32 },
-    MaxTokensInvalid,
-    MaxTokensTooLarge { cap: u32 },
-    MultipleChoices,
-}
-
-impl LimitViolation {
-    /// Closed code for logs.
-    pub fn code(&self) -> &'static str {
-        match self {
-            Self::BodyTooLarge { .. } => "body_too_large",
-            Self::MaxTokensRequired { .. } => "max_tokens_required",
-            Self::MaxTokensInvalid => "max_tokens_invalid",
-            Self::MaxTokensTooLarge { .. } => "max_tokens_too_large",
-            Self::MultipleChoices => "multiple_choices",
-        }
-    }
-
-    /// A message naming the limit. Built from configured numbers only, never from the body.
-    pub fn message(&self) -> String {
-        match self {
-            Self::BodyTooLarge { cap } => format!(
-                "Request body exceeds the {cap}-byte limit for pay-per-request (MPP) on this model."
-            ),
-            Self::MaxTokensRequired { cap } => format!(
-                "max_tokens (or max_completion_tokens) is required for pay-per-request (MPP) and must be at most {cap}."
-            ),
-            Self::MaxTokensInvalid => {
-                "max_tokens and max_completion_tokens must be positive integers.".to_string()
-            }
-            Self::MaxTokensTooLarge { cap } => format!(
-                "max_tokens (or max_completion_tokens) exceeds the pay-per-request (MPP) limit of {cap} for this model."
-            ),
-            Self::MultipleChoices => {
-                "n must be 1 (or omitted) for pay-per-request (MPP).".to_string()
-            }
-        }
-    }
-}
 
 /// Why chain verification failed in a way another payment (or a retry) can fix.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -130,8 +85,6 @@ pub enum MppError {
     Consumed(ConsumedReason),
     #[error("payment backend unavailable")]
     Unavailable(UnavailableReason),
-    #[error("request is not priced")]
-    NotPriced,
     #[error("request limit violated")]
     Limit(LimitViolation),
     #[error("invalid MPP configuration")]
@@ -155,7 +108,6 @@ impl MppError {
             Self::Consumed(ConsumedReason::MemoNotBound) => "memo_not_bound",
             Self::Unavailable(UnavailableReason::Rpc) => "rpc_unavailable",
             Self::Unavailable(UnavailableReason::Store) => "store_unavailable",
-            Self::NotPriced => "not_priced",
             Self::Limit(limit) => limit.code(),
             Self::Config => "config",
         }
@@ -164,7 +116,7 @@ impl MppError {
     /// The HTTP status to answer with.
     pub fn status(&self) -> u16 {
         match self {
-            Self::MethodUnsupported | Self::Limit(_) | Self::NotPriced => 400,
+            Self::MethodUnsupported | Self::Limit(_) => 400,
             Self::Malformed(_)
             | Self::InvalidChallenge(_)
             | Self::Expired
@@ -184,7 +136,7 @@ impl MppError {
             Self::VerificationFailed(_) | Self::Consumed(_) => {
                 Some(ProblemCode::VerificationFailed)
             }
-            Self::Unavailable(_) | Self::NotPriced | Self::Limit(_) | Self::Config => None,
+            Self::Unavailable(_) | Self::Limit(_) | Self::Config => None,
         }
     }
 
@@ -210,7 +162,7 @@ impl MppError {
             Self::Unavailable(_) | Self::Config => {
                 "Payment verification is temporarily unavailable."
             }
-            Self::NotPriced | Self::Limit(_) => "The request is not eligible for payment.",
+            Self::Limit(_) => "The request is not eligible for payment.",
         }
     }
 }
@@ -222,93 +174,6 @@ impl From<ProtocolError> for MppError {
             ProtocolError::MethodUnsupported => Self::MethodUnsupported,
         }
     }
-}
-
-// ---------------------------------------------------------------------------------------
-// Pricing
-// ---------------------------------------------------------------------------------------
-
-/// A numeric request parameter as the pricing sees it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Param {
-    Absent,
-    /// A positive JSON integer.
-    Value(u64),
-    /// Present but not a positive integer.
-    Invalid,
-}
-
-impl Param {
-    fn from_json(value: Option<&Value>) -> Self {
-        match value {
-            None | Some(Value::Null) => Self::Absent,
-            Some(value) => match value.as_u64() {
-                Some(n) if n > 0 => Self::Value(n),
-                _ => Self::Invalid,
-            },
-        }
-    }
-}
-
-/// The few request fields pricing reads.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RequestShape {
-    pub model: String,
-    pub max_tokens: Param,
-    pub max_completion_tokens: Param,
-    pub n: Param,
-}
-
-impl RequestShape {
-    /// `None` when the body is not a JSON object with a string `model`: such a request is not
-    /// priced and falls through to ordinary authentication. Only the four fields are
-    /// materialised; the rest of the body is skipped.
-    pub fn from_body(body: &[u8]) -> Option<Self> {
-        #[derive(Deserialize)]
-        struct Raw {
-            model: String,
-            #[serde(default)]
-            max_tokens: Option<Value>,
-            #[serde(default)]
-            max_completion_tokens: Option<Value>,
-            #[serde(default)]
-            n: Option<Value>,
-        }
-        let raw: Raw = serde_json::from_slice(body).ok()?;
-        Some(Self {
-            model: raw.model,
-            max_tokens: Param::from_json(raw.max_tokens.as_ref()),
-            max_completion_tokens: Param::from_json(raw.max_completion_tokens.as_ref()),
-            n: Param::from_json(raw.n.as_ref()),
-        })
-    }
-
-    /// The larger of `max_tokens` / `max_completion_tokens` when present.
-    fn requested_tokens(&self) -> Param {
-        match (self.max_tokens, self.max_completion_tokens) {
-            (Param::Invalid, _) | (_, Param::Invalid) => Param::Invalid,
-            (Param::Absent, Param::Absent) => Param::Absent,
-            (Param::Value(a), Param::Value(b)) => Param::Value(a.max(b)),
-            (Param::Value(a), Param::Absent) | (Param::Absent, Param::Value(a)) => Param::Value(a),
-        }
-    }
-}
-
-/// The price of a request that passed its limits.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Price {
-    /// Token base units.
-    pub amount: u128,
-}
-
-/// Result of pricing one request body.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Pricing {
-    /// Not an MPP request: unparseable, or the model has no price. Ordinary auth applies.
-    Unpriced,
-    Priced(Price),
-    /// The model is priced but the request breaks a limit.
-    Violation(LimitViolation),
 }
 
 // ---------------------------------------------------------------------------------------
@@ -382,6 +247,8 @@ pub struct MppService {
     recipient: [u8; 20],
     recipient_hex: String,
     prices: BTreeMap<String, MppModelPrice>,
+    /// The largest `max_request_bytes` of any priced model: a longer body is never parsed.
+    largest_priced_body: usize,
     repo: Arc<dyn PaymentClaimRepository>,
     rpc: Arc<dyn TempoRpc>,
     recover_attempts: u32,
@@ -428,6 +295,12 @@ impl MppService {
             recipient,
             recipient_hex,
             prices: settings.model_prices.clone(),
+            largest_priced_body: settings
+                .model_prices
+                .values()
+                .map(|price| usize::try_from(price.max_request_bytes).unwrap_or(usize::MAX))
+                .max()
+                .unwrap_or(0),
             repo,
             rpc,
             recover_attempts: DEFAULT_RECOVER_ATTEMPTS,
@@ -499,8 +372,13 @@ impl MppService {
         }
     }
 
-    /// Price a raw request body. An unparseable body is [`Pricing::Unpriced`].
+    /// Price a raw request body. An unparseable body is [`Pricing::Unpriced`], and so is one
+    /// longer than any priced model accepts: it is not parsed at all, so a large body on the
+    /// unauthenticated path costs nothing here.
     pub fn price_body(&self, body: &[u8]) -> Pricing {
+        if body.len() > self.largest_priced_body {
+            return Pricing::Unpriced;
+        }
         match RequestShape::from_body(body) {
             Some(shape) => self.price_for(&shape, body.len()),
             None => Pricing::Unpriced,
@@ -569,7 +447,7 @@ impl MppService {
         match self.price_body(body) {
             Pricing::Priced(price) => self.challenge(route, body, &price),
             Pricing::Violation(violation) => Err(MppError::Limit(violation)),
-            Pricing::Unpriced => Err(MppError::NotPriced),
+            Pricing::Unpriced => Err(MppError::Limit(LimitViolation::ModelNotPriced)),
         }
     }
 

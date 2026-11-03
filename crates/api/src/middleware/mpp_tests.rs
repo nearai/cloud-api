@@ -295,6 +295,15 @@ fn settings(service_key: &str) -> MppSettings {
             max_request_bytes: 4096,
         },
     );
+    // A second model with a larger body cap: a body past every cap is not an MPP request.
+    prices.insert(
+        "zai-org/GLM-5-long".to_string(),
+        MppModelPrice {
+            amount: AMOUNT,
+            max_tokens: 2048,
+            max_request_bytes: 65_536,
+        },
+    );
     MppSettings {
         realm: REALM.to_string(),
         secret_key: SECRET.to_string(),

@@ -128,10 +128,10 @@ Two ways to mint a token:
 
 #### Admin endpoints under mock auth
 
-The seeded mock user is `admin@test.com`. Admin access is granted by
-email domain via `AUTH_ADMIN_DOMAINS` (default: `near.ai,near.org`),
-so `admin@test.com` is **not** an admin out of the box. To exercise
-`/v1/admin/*` locally with mock auth, add `test.com`:
+The seeded mock user is `admin@test.com`. Admin access requires a well-formed
+email in `AUTH_ADMIN_DOMAINS` (default: `near.ai,near.org`), and VPC-provisioned
+users are never admins. Thus `admin@test.com` is **not** an admin out of the box.
+To exercise `/v1/admin/*` locally with mock auth, add `test.com`:
 
 ```env
 AUTH_ADMIN_DOMAINS=near.ai,near.org,test.com

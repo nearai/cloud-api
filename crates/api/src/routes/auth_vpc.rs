@@ -1,5 +1,5 @@
 use crate::{
-    consts::{MAX_NAME_LENGTH, MAX_SIGNATURE_LENGTH},
+    consts::MAX_SIGNATURE_LENGTH,
     routes::{
         api::AppState,
         common::{validate_max_length, validate_non_empty_field},
@@ -17,6 +17,24 @@ use services::{
     workspace::ports::Workspace,
 };
 
+pub const VPC_AUTH_PROVIDER: &str = "vpc";
+pub const MAX_VPC_CLIENT_ID_LENGTH: usize = 64;
+
+fn validate_vpc_client_id(client_id: &str) -> Result<(), String> {
+    if client_id.is_empty()
+        || client_id.len() > MAX_VPC_CLIENT_ID_LENGTH
+        || !client_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        return Err(
+            "client_id must be 1-64 characters of ASCII letters, digits, '.', '_' or '-'"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 #[derive(Debug, Deserialize)]
 pub struct VpcLoginRequest {
     pub timestamp: i64,
@@ -27,8 +45,7 @@ pub struct VpcLoginRequest {
 impl VpcLoginRequest {
     pub fn validate(&self) -> Result<(), String> {
         // Basic sanity checks to avoid extremely large inputs
-        validate_non_empty_field(&self.client_id, "client_id")?;
-        validate_max_length(&self.client_id, "client_id", MAX_NAME_LENGTH)?;
+        validate_vpc_client_id(&self.client_id)?;
 
         validate_non_empty_field(&self.signature, "signature")?;
         validate_max_length(&self.signature, "signature", MAX_SIGNATURE_LENGTH)?;
@@ -83,7 +100,7 @@ pub async fn vpc_login(
     let user_info = OAuthUserInfo {
         email_verified: false,
         email_authoritative: false,
-        provider: "vpc".to_string(),
+        provider: VPC_AUTH_PROVIDER.to_string(),
         provider_user_id,
         email,
         username,
@@ -208,4 +225,45 @@ pub async fn vpc_login(
         organization: org.clone(),
         workspace: workspace.clone(),
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_vpc_client_id_validation() {
+        for client_id in ["chat-api-client", "a.z_9", &"a".repeat(64)] {
+            let request = VpcLoginRequest {
+                timestamp: 0,
+                signature: "signature".to_string(),
+                client_id: client_id.to_string(),
+            };
+            assert_eq!(request.validate(), Ok(()), "{client_id:?}");
+        }
+
+        for client_id in [
+            "",
+            "probe-i161413@near.ai",
+            "a b",
+            "a/b",
+            "a\nb",
+            "ä",
+            &"a".repeat(65),
+        ] {
+            let request = VpcLoginRequest {
+                timestamp: 0,
+                signature: "signature".to_string(),
+                client_id: client_id.to_string(),
+            };
+            assert_eq!(
+                request.validate(),
+                Err(
+                    "client_id must be 1-64 characters of ASCII letters, digits, '.', '_' or '-'"
+                        .to_string()
+                ),
+                "{client_id:?} must be rejected"
+            );
+        }
+    }
 }

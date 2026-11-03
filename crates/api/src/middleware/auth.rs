@@ -555,19 +555,24 @@ pub async fn admin_middleware(
 
 /// Check if a user has admin access based on their email domain
 fn check_admin_access(state: &AuthState, user: &DbUser) -> bool {
-    if state.admin_domains.is_empty() {
+    is_admin_user(&state.admin_domains, user)
+}
+
+fn is_admin_user(admin_domains: &[String], user: &DbUser) -> bool {
+    if admin_domains.is_empty() {
         return false;
     }
 
-    // Extract domain from email (everything after @)
-    if let Some(domain) = user.email.split('@').nth(1) {
-        state
-            .admin_domains
+    if user.auth_provider == crate::routes::auth_vpc::VPC_AUTH_PROVIDER {
+        tracing::warn!(user_id = %user.id, "VPC-provisioned user attempted admin action");
+        return false;
+    }
+
+    config::admin_email_domain(&user.email).is_some_and(|domain| {
+        admin_domains
             .iter()
             .any(|admin_domain| domain.eq_ignore_ascii_case(admin_domain))
-    } else {
-        false
-    }
+    })
 }
 
 /// Authenticate admin access token
@@ -993,6 +998,49 @@ fn convert_user_to_db_user(user: services::auth::User) -> DbUser {
 mod tests {
     use super::*;
     use axum::http::{HeaderMap, HeaderValue};
+
+    fn admin_test_user(auth_provider: &str, email: &str) -> DbUser {
+        DbUser {
+            id: uuid::Uuid::nil(),
+            email: email.to_string(),
+            username: "admin-probe".to_string(),
+            display_name: None,
+            avatar_url: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            last_login_at: None,
+            is_active: true,
+            auth_provider: auth_provider.to_string(),
+            provider_user_id: "probe".to_string(),
+            tokens_revoked_at: None,
+            contact_email: None,
+            contact_email_verified_at: None,
+            email_opt_in_at: None,
+        }
+    }
+
+    #[test]
+    fn vpc_and_malformed_email_never_grant_admin_access() {
+        let admin_domains = vec!["near.ai".to_string()];
+        assert!(is_admin_user(
+            &admin_domains,
+            &admin_test_user("google", "admin@near.ai")
+        ));
+        assert!(!is_admin_user(
+            &admin_domains,
+            &admin_test_user("vpc", "admin@near.ai")
+        ));
+        for email in ["x@near.ai@vpc.internal.near.ai", "x@evil.com@near.ai"] {
+            assert!(
+                !is_admin_user(&admin_domains, &admin_test_user("google", email)),
+                "{email:?} must not be admin"
+            );
+        }
+        assert!(!is_admin_user(
+            &[],
+            &admin_test_user("google", "admin@near.ai")
+        ));
+    }
 
     #[test]
     fn missing_route_metadata_never_grants_read_permission() {

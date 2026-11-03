@@ -207,8 +207,8 @@ reference, response history, or File input. Both transports normalize omitted
 or null `store` to `false` and reject `store: true`. Clients must send any
 inference history needed for a request themselves. After alias resolution,
 canonical `openai/` models use one native provider Responses inference; other
-models use the typed adapter for one Chat Completions inference. Both paths
-keep no response/item history and do not run an agent loop. Clients execute
+models use the typed adapter, with a bounded inference loop for hosted web
+search. Both paths keep no response/item history. Clients execute
 `function` and `custom` tools, including tools grouped in a `namespace`, then
 replay the calls and results in their next request. See the [Responses compatibility and
 replay guide](docs/local-development.md#stateless-responses-and-attestation-retention)

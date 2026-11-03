@@ -100,6 +100,32 @@ impl MppService {
         now: DateTime<Utc>,
         verified: &VerifiedCredential,
     ) -> Result<PaidCredential, MppError> {
+        // A credential whose payment is already spent is refused here, before any RPC call
+        // and before the service key's rate limit, so replaying it costs nothing. The payment
+        // key is known up front: the hash of a `hash` payload, `keccak256` of a transaction.
+        let tx_hash = match &verified.payload {
+            PaymentPayload::Hash(hash) => *hash,
+            PaymentPayload::Transaction(raw) => tempo::transaction_hash(raw),
+        };
+        let payment_key =
+            protocol::payment_key(&self.secret_key, &tx_hash).map_err(|_| MppError::Config)?;
+        match self
+            .repo
+            .is_spent(&payment_key, &verified.challenge_id)
+            .await
+        {
+            Ok(false) => {}
+            Ok(true) => return Err(MppError::Consumed(ConsumedReason::AlreadyClaimed)),
+            Err(error) => {
+                tracing::error!(
+                    outcome = "store_unavailable",
+                    repository_error = repository_error_kind(&error),
+                    "MPP spent-payment check failed"
+                );
+                return Err(MppError::Unavailable(UnavailableReason::Store));
+            }
+        }
+
         // One deadline for the whole phase: the broadcast, its recovery lookups and their
         // spacing, however the node behaves.
         let receipt = match tokio::time::timeout(

@@ -208,6 +208,17 @@ impl PaymentClaimRepository for FlakyClaimRepository {
         self.inner.claim(payment_key, challenge_id).await
     }
 
+    async fn is_spent(
+        &self,
+        payment_key: &str,
+        challenge_id: &str,
+    ) -> Result<bool, RepositoryError> {
+        if self.fail_claims.load(Ordering::SeqCst) {
+            return Err(store_down());
+        }
+        self.inner.is_spent(payment_key, challenge_id).await
+    }
+
     async fn finish(
         &self,
         payment_key: &str,

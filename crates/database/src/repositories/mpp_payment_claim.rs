@@ -31,6 +31,12 @@ const FINISH_SQL: &str = "\
 UPDATE mpp_payment_claims SET state = $2, updated_at = NOW() \
 WHERE payment_key = $1 AND state = 'serving' AND updated_at = $3";
 
+/// A payment that can no longer be claimed under this challenge (see `CLAIM_SQL`): any row
+/// except an `unserved` claim of the same challenge.
+const SPENT_SQL: &str = "\
+SELECT 1 FROM mpp_payment_claims WHERE payment_key = $1 \
+AND NOT (state = 'unserved' AND challenge_id = $2)";
+
 /// Rows deleted per statement: small enough that no statement holds its locks for long.
 const PURGE_BATCH: i64 = 5000;
 /// Statements per call. 200 batches is a million rows; anything left goes at the next call.
@@ -78,6 +84,26 @@ impl PaymentClaimRepository for MppPaymentClaimRepository {
                 row.try_get::<_, DateTime<Utc>>(0).map_err(map_db_error)?,
             )),
             None => ClaimOutcome::AlreadyUsed,
+        })
+    }
+
+    async fn is_spent(
+        &self,
+        payment_key: &str,
+        challenge_id: &str,
+    ) -> Result<bool, RepositoryError> {
+        retry_db!("is_mpp_payment_spent", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
+            client
+                .query_opt(SPENT_SQL, &[&payment_key, &challenge_id])
+                .await
+                .map_err(map_db_error)
+                .map(|row| row.is_some())
         })
     }
 

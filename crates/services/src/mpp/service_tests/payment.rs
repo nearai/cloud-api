@@ -460,9 +460,9 @@ async fn a_second_challenge_cannot_reuse_a_claimed_payment_even_when_unserved() 
         .finish(&first, ServeOutcome::Unserved)
         .await
         .unwrap();
-    // Same transaction, presented under a different challenge (different body). The memo is
-    // bound to the first challenge, so chain verification refuses it before the claim; the
-    // claim store would refuse it too.
+    // Same transaction, presented under a different challenge (different body). The spent
+    // check refuses it before the chain is read (memo binding and the claim store would
+    // refuse it too).
     let mut other_body = body();
     other_body.extend_from_slice(b"\n");
     let other_challenge = f.challenge(&other_body);
@@ -472,7 +472,7 @@ async fn a_second_challenge_cannot_reuse_a_claimed_payment_even_when_unserved() 
             .verify_payment(&f.verify(&other_header, &other_body).unwrap())
             .await
             .unwrap_err(),
-        MppError::Consumed(ConsumedReason::MemoNotBound)
+        MppError::Consumed(ConsumedReason::AlreadyClaimed)
     );
     assert_eq!(
         f.repo.claim(&key(TX), &other_challenge.id).await.unwrap(),
@@ -542,10 +542,7 @@ async fn a_failing_finish_is_reported_and_leaves_the_claim_serving() {
     service.serving(settled).finish(ServeOutcome::Served).await;
     assert_eq!(repo.store().state_of(&key(TX)), Some(ClaimState::Serving));
     assert_eq!(
-        service
-            .claim(&service.verify_payment(&verified).await.unwrap())
-            .await
-            .unwrap_err(),
+        service.verify_payment(&verified).await.unwrap_err(),
         MppError::Consumed(ConsumedReason::AlreadyClaimed)
     );
 }
@@ -647,8 +644,7 @@ async fn the_guard_marks_served_when_dropped_and_respects_finish() {
     assert_eq!(f.repo.state_of(&key(TX)), Some(ClaimState::Served));
 
     // A client that disconnected cannot present the payment again.
-    let paid = f.verify_payment(&header).await.unwrap();
-    let replay = f.service.claim(&paid).await;
+    let replay = f.verify_payment(&header).await;
     assert!(matches!(replay, Err(MppError::Consumed(_))), "{replay:?}");
 
     // An explicit unserved finish releases the claim for a retry under the same challenge.
@@ -705,10 +701,16 @@ async fn a_payment_mined_before_expiry_is_redeemable_after_it() {
         f.service.claim(&paid).await.is_ok(),
         "a stranded payment is redeemed"
     );
-    // Still single use.
-    let again = f.service.verify_payment_at(now, &verified).await.unwrap();
+    // Still single use: refused by the spent check, and by the atomic claim itself.
+    assert_eq!(
+        f.service
+            .verify_payment_at(now, &verified)
+            .await
+            .unwrap_err(),
+        MppError::Consumed(ConsumedReason::AlreadyClaimed)
+    );
     assert!(matches!(
-        f.service.claim(&again).await,
+        f.service.claim(&paid).await,
         Err(MppError::Consumed(_))
     ));
 }
@@ -801,4 +803,65 @@ async fn an_expired_transaction_credential_is_looked_up_never_broadcast() {
         .set_block_time(3, challenge.expires.timestamp() as u64 - 1);
     assert!(f.service.verify_payment_at(now, &verified).await.is_ok());
     assert_eq!(f.chain.send_calls(), 0, "never broadcast after expiry");
+}
+
+#[tokio::test]
+async fn a_spent_payment_is_refused_before_any_rpc_call() {
+    let f = fixture();
+    let (_, header) = f.paid_hash_credential(&body(), TX);
+    let verified = f.verify(&header, &body()).unwrap();
+    let paid = f.service.verify_payment(&verified).await.unwrap();
+    let settled = f.service.claim(&paid).await.unwrap();
+    f.service
+        .finish(&settled, ServeOutcome::Served)
+        .await
+        .unwrap();
+
+    let lookups = f.chain.lookup_calls();
+    assert_eq!(
+        f.service.verify_payment(&verified).await.unwrap_err(),
+        MppError::Consumed(ConsumedReason::AlreadyClaimed)
+    );
+    assert_eq!(
+        f.chain.lookup_calls(),
+        lookups,
+        "no RPC call for a spent payment"
+    );
+}
+
+#[tokio::test]
+async fn an_unserved_payment_of_the_same_challenge_is_not_spent() {
+    // The retry path stays open: a payment released by an error response is not "spent" for
+    // the challenge it was bound to.
+    let f = fixture();
+    let (_, header) = f.paid_hash_credential(&body(), TX);
+    let verified = f.verify(&header, &body()).unwrap();
+    let paid = f.service.verify_payment(&verified).await.unwrap();
+    let settled = f.service.claim(&paid).await.unwrap();
+    f.service
+        .finish(&settled, ServeOutcome::Unserved)
+        .await
+        .unwrap();
+    let again = f.service.verify_payment(&verified).await.unwrap();
+    assert!(f.service.claim(&again).await.is_ok());
+}
+
+#[tokio::test]
+async fn a_failing_spent_check_is_unavailable_and_reads_no_chain() {
+    let repo = Arc::new(FlakyClaimRepository::default());
+    let chain = Arc::new(FakeTempo::default());
+    let service = MppService::new(&settings(), repo.clone(), chain.clone()).unwrap();
+    let challenge = service
+        .challenge_for_body(CHAT_COMPLETIONS_ROUTE, &body())
+        .unwrap();
+    let header = credential_header(&challenge, hash_payload(TX), None);
+    let verified = service
+        .verify(&header, CHAT_COMPLETIONS_ROUTE, &body())
+        .unwrap();
+    repo.set_fail_claims(true);
+    assert_eq!(
+        service.verify_payment(&verified).await.unwrap_err(),
+        MppError::Unavailable(UnavailableReason::Store)
+    );
+    assert_eq!(chain.lookup_calls(), 0);
 }

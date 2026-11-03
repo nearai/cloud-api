@@ -105,6 +105,17 @@ impl PaymentClaimRepository for InMemoryClaimRepository {
         }
     }
 
+    async fn is_spent(
+        &self,
+        payment_key: &str,
+        challenge_id: &str,
+    ) -> Result<bool, RepositoryError> {
+        let claims = self.claims.lock().map_err(|_| poisoned())?;
+        Ok(claims.get(payment_key).is_some_and(|claim| {
+            !(claim.state == ClaimState::Unserved && claim.challenge_id == challenge_id)
+        }))
+    }
+
     async fn finish(
         &self,
         payment_key: &str,

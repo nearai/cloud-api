@@ -642,6 +642,31 @@ async fn a_replayed_credential_is_403_without_a_challenge() {
 }
 
 #[tokio::test]
+async fn a_spent_credential_is_refused_before_the_service_key_layers_and_the_node() {
+    // The service key's rate limit and usage check sit between the auth wrapper and the
+    // claim. Block that layer: a replay that reached it would come back 503, not 403. A
+    // replay must also cost no RPC call.
+    let app = app(true);
+    let credential = app.pay(&body(), TX).await;
+    assert_eq!(
+        app.post(&body(), Some(&credential)).await.status,
+        StatusCode::OK
+    );
+    app.blocked.store(true, Ordering::SeqCst);
+    let lookups = app.chain.lookup_calls();
+    for _ in 0..5 {
+        let replay = app.post(&body(), Some(&credential)).await;
+        assert_eq!(replay.status, StatusCode::FORBIDDEN);
+    }
+    assert_eq!(
+        app.chain.lookup_calls(),
+        lookups,
+        "a replay never reaches the node"
+    );
+    assert_eq!(app.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
 async fn a_payment_without_this_challenges_memo_is_403_and_never_claimed() {
     let app = app(true);
     let service = app.service.as_ref().unwrap();

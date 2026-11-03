@@ -90,6 +90,16 @@ pub trait PaymentClaimRepository: Send + Sync {
         challenge_id: &str,
     ) -> Result<ClaimOutcome, RepositoryError>;
 
+    /// Whether `payment_key` can no longer be claimed under `challenge_id`: a row exists
+    /// that is not an `unserved` claim of that same challenge. Read-only and advisory: it
+    /// refuses a spent credential before any RPC call or the service key's rate limit, while
+    /// the atomic [`Self::claim`] still decides races.
+    async fn is_spent(
+        &self,
+        payment_key: &str,
+        challenge_id: &str,
+    ) -> Result<bool, RepositoryError>;
+
     /// Record how a claimed payment ended. Only the `serving` row still holding `lease`
     /// changes; anything else (a stale attempt's finish) is a no-op.
     async fn finish(

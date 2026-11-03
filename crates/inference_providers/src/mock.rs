@@ -108,6 +108,8 @@ struct SignatureHashes {
 pub enum RequestMatcher {
     /// Match any request
     Any,
+    /// Match a tool-loop round by the number of tool results in its transcript.
+    ToolResultCount(usize),
     /// Match requests with exact prompt text (checks all text content in messages)
     /// Timestamps are automatically normalized to [TIME] for matching across test runs
     ExactPrompt(String),
@@ -124,6 +126,14 @@ impl RequestMatcher {
     pub fn matches(&self, params: &ChatCompletionParams) -> bool {
         match self {
             Self::Any => true,
+            Self::ToolResultCount(expected) => {
+                params
+                    .messages
+                    .iter()
+                    .filter(|message| message.role == MessageRole::Tool)
+                    .count()
+                    == *expected
+            }
             Self::ExactPrompt(prompt) => {
                 // Extract all text from messages and check if it equals the prompt
                 let all_text = Self::extract_text_from_messages(&params.messages);

@@ -459,8 +459,8 @@ mod tests {
                 .unwrap(),
         });
         let executor = WebSearchToolExecutor::new(provider);
-        // Exercise the retained internal executor directly; stateless Responses
-        // deliberately rejects builtin web_search in public request JSON.
+        // Exercise the executor directly; public typed request parsing is covered
+        // by the Responses schema and hosted-search API tests.
         let mut request = create_test_request();
         request.tools = Some(vec![ResponseTool::WebSearch {
             count: Some(0),

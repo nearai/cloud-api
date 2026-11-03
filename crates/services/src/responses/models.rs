@@ -67,11 +67,8 @@ pub struct CreateResponseRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub background: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[schema(value_type = Option<Vec<ClientManagedResponseTool>>)]
-    #[serde(
-        default,
-        deserialize_with = "deserialize_client_managed_response_tools"
-    )]
+    #[schema(value_type = Option<Vec<StatelessResponseTool>>)]
+    #[serde(default, deserialize_with = "deserialize_stateless_response_tools")]
     pub tools: Option<Vec<ResponseTool>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<ResponseToolChoice>,
@@ -372,15 +369,14 @@ pub enum ResponseTool {
     },
 }
 
-/// The only tool shape accepted from a public Responses request.
+/// Tool shapes accepted by the typed stateless Responses adapter.
 ///
-/// `ResponseTool` retains legacy variants for dormant/internal code paths, but
-/// the `CreateResponseRequest::tools` deserializer first parses this enum. That
-/// makes unsupported builtin types ordinary request-deserialization failures,
-/// before the route or a provider can do any work.
+/// Client custom/namespace tools are normalized to functions before parsing.
+/// Cloud search executes within the request; other legacy tool variants remain
+/// unavailable even though internal code still uses `ResponseTool`.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(tag = "type")]
-pub enum ClientManagedResponseTool {
+pub enum StatelessResponseTool {
     #[serde(rename = "function")]
     Function {
         name: String,
@@ -389,12 +385,27 @@ pub enum ClientManagedResponseTool {
         #[serde(skip_serializing_if = "Option::is_none")]
         parameters: Option<serde_json::Value>,
     },
+    #[serde(rename = "web_search")]
+    WebSearch {
+        /// Maximum results per search (0–20); zero skips the search provider. Overrides the model's count when set.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[schema(minimum = 0, maximum = 20)]
+        count: Option<u32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        filters: Option<serde_json::Value>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        search_context_size: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        user_location: Option<UserLocation>,
+    },
+    #[serde(rename = "web_context_search")]
+    WebContextSearch {},
 }
 
-impl From<ClientManagedResponseTool> for ResponseTool {
-    fn from(tool: ClientManagedResponseTool) -> Self {
+impl From<StatelessResponseTool> for ResponseTool {
+    fn from(tool: StatelessResponseTool) -> Self {
         match tool {
-            ClientManagedResponseTool::Function {
+            StatelessResponseTool::Function {
                 name,
                 description,
                 parameters,
@@ -403,17 +414,29 @@ impl From<ClientManagedResponseTool> for ResponseTool {
                 description,
                 parameters,
             },
+            StatelessResponseTool::WebSearch {
+                count,
+                filters,
+                search_context_size,
+                user_location,
+            } => Self::WebSearch {
+                count,
+                filters,
+                search_context_size,
+                user_location,
+            },
+            StatelessResponseTool::WebContextSearch {} => Self::WebContextSearch {},
         }
     }
 }
 
-fn deserialize_client_managed_response_tools<'de, D>(
+fn deserialize_stateless_response_tools<'de, D>(
     deserializer: D,
 ) -> Result<Option<Vec<ResponseTool>>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    Option::<Vec<ClientManagedResponseTool>>::deserialize(deserializer)
+    Option::<Vec<StatelessResponseTool>>::deserialize(deserializer)
         .map(|tools| tools.map(|tools| tools.into_iter().map(ResponseTool::from).collect()))
 }
 
@@ -588,7 +611,7 @@ pub struct ResponseObject {
     pub store: bool,
     pub temperature: f32,
     pub tool_choice: ResponseToolChoiceOutput,
-    #[schema(value_type = Vec<ClientManagedResponseTool>)]
+    #[schema(value_type = Vec<StatelessResponseTool>)]
     pub tools: Vec<ResponseTool>,
     #[serde(default)]
     pub top_logprobs: i32,
@@ -1519,24 +1542,22 @@ impl CreateResponseRequest {
             }
         }
 
-        // The HTTP parser only admits `ClientManagedResponseTool`, but retain
+        // The HTTP parser only admits `StatelessResponseTool`, but retain
         // this defense for programmatic callers that construct the legacy
         // internal `ResponseTool` enum directly.
         if let Some(tools) = &self.tools {
+            let mut function_names = HashSet::new();
+            let mut search_names = HashSet::new();
             for tool in tools {
                 match tool {
-                    ResponseTool::Function { .. } => {}
+                    ResponseTool::Function { name, .. } => {
+                        function_names.insert(name.as_str());
+                    }
                     ResponseTool::WebSearch { .. } => {
-                        return Err(
-                            "The stateless Responses API only supports custom function tools; web_search is not supported."
-                                .to_string(),
-                        );
+                        search_names.insert(crate::responses::tools::WEB_SEARCH_TOOL_NAME);
                     }
                     ResponseTool::WebContextSearch {} => {
-                        return Err(
-                            "The stateless Responses API only supports custom function tools; web_context_search is not supported."
-                                .to_string(),
-                        );
+                        search_names.insert(crate::responses::tools::WEB_CONTEXT_SEARCH_TOOL_NAME);
                     }
                     ResponseTool::FileSearch { .. } => {
                         return Err(
@@ -1557,11 +1578,20 @@ impl CreateResponseRequest {
                     }
                     ResponseTool::Mcp { .. } => {
                         return Err(
-                            "The stateless Responses API only supports custom function tools; mcp is not supported."
+                            "The stateless Responses API does not support remote mcp tools."
                                 .to_string(),
                         );
                     }
                 }
+            }
+            if function_names
+                .iter()
+                .any(|name| search_names.contains(name))
+            {
+                return Err(
+                    "A client function conflicts with a configured Cloud search tool of the same name."
+                        .to_string(),
+                );
             }
         }
 
@@ -1678,18 +1708,16 @@ mod tests {
     }
 
     #[test]
-    fn test_internal_web_search_count_validation_and_round_trip() {
+    fn test_web_search_count_validation_and_round_trip() {
         for count in [None, Some(1), Some(5), Some(20), Some(0), Some(21)] {
             let mut tool = serde_json::json!({"type": "web_search"});
             if let Some(count) = count {
                 tool["count"] = serde_json::json!(count);
             }
-            // Builtin tools are no longer accepted by the public request
-            // deserializer, but retained internal tools still validate count.
-            let mut request = stateless_request();
-            request.tools = Some(vec![
-                serde_json::from_value::<ResponseTool>(tool.clone()).unwrap()
-            ]);
+            let request: CreateResponseRequest = serde_json::from_value(json!({
+                "model": "test", "input": "Search the web", "tools": [tool.clone()]
+            }))
+            .unwrap();
             assert_eq!(
                 request.validate().is_ok(),
                 count.is_none_or(|n| (0..=20).contains(&n))
@@ -1703,8 +1731,8 @@ mod tests {
             serde_json::json!("5"),
             serde_json::json!(4294967296u64),
         ] {
-            assert!(serde_json::from_value::<ResponseTool>(serde_json::json!({
-                "type": "web_search", "count": count
+            assert!(serde_json::from_value::<CreateResponseRequest>(json!({
+                "model": "test", "tools": [{"type": "web_search", "count": count}]
             }))
             .is_err());
         }
@@ -2572,25 +2600,6 @@ mod tests {
             .unwrap_err()
             .contains("mcp input items"));
 
-        let mut web_search = stateless_request();
-        web_search.tools = Some(vec![ResponseTool::WebSearch {
-            filters: None,
-            search_context_size: None,
-            user_location: None,
-            count: None,
-        }]);
-        assert!(web_search
-            .validate_stateless()
-            .unwrap_err()
-            .contains("web_search is not supported"));
-
-        let mut web_context_search = stateless_request();
-        web_context_search.tools = Some(vec![ResponseTool::WebContextSearch {}]);
-        assert!(web_context_search
-            .validate_stateless()
-            .unwrap_err()
-            .contains("web_context_search is not supported"));
-
         let mut file_search = stateless_request();
         file_search.tools = Some(vec![ResponseTool::FileSearch {}]);
         assert!(file_search
@@ -2624,11 +2633,11 @@ mod tests {
         assert!(mcp_tool
             .validate_stateless()
             .unwrap_err()
-            .contains("mcp is not supported"));
+            .contains("does not support remote mcp"));
     }
 
     #[test]
-    fn stateless_requests_reject_builtin_tools_even_when_a_function_has_the_same_name() {
+    fn stateless_requests_reject_client_function_names_colliding_with_search() {
         let mut request = stateless_request();
         request.tools = Some(vec![
             ResponseTool::Function {
@@ -2647,11 +2656,11 @@ mod tests {
         assert!(request
             .validate_stateless()
             .unwrap_err()
-            .contains("web_search is not supported"));
+            .contains("conflicts with a configured Cloud search tool"));
     }
 
     #[test]
-    fn response_request_deserialization_accepts_only_function_tools() {
+    fn response_request_deserialization_accepts_functions_and_cloud_search() {
         let request: CreateResponseRequest = serde_json::from_value(json!({
             "model": "gpt-4",
             "tools": [{
@@ -2666,14 +2675,16 @@ mod tests {
             Some([ResponseTool::Function { name, .. }]) if name == "web_search"
         ));
 
-        for unsupported_type in [
-            "web_search",
-            "web_context_search",
-            "file_search",
-            "code_interpreter",
-            "computer",
-            "mcp",
-        ] {
+        for search_type in ["web_search", "web_context_search"] {
+            let request: CreateResponseRequest = serde_json::from_value(json!({
+                "model": "test", "tools": [{"type": search_type}]
+            }))
+            .unwrap();
+            assert!(request.validate().is_ok());
+            assert!(request.validate_stateless().is_ok());
+        }
+
+        for unsupported_type in ["file_search", "code_interpreter", "computer", "mcp"] {
             let error = serde_json::from_value::<CreateResponseRequest>(json!({
                 "model": "gpt-4",
                 "tools": [{"type": unsupported_type}]

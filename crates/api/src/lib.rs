@@ -1181,6 +1181,7 @@ pub fn build_app_with_config_and_options(
         ohttp_gateway,
         ohttp_attestation,
         http_client: reqwest::Client::new(),
+        mpp_service: middleware::mpp::build_mpp_service(database.pool().clone(), &config),
     };
 
     // Create usage state for middleware
@@ -1602,6 +1603,15 @@ pub fn build_completion_routes(
         Router::new()
     };
 
+    // Machine Payments Protocol: off (both hold `None`) unless MPP_ENABLED=true.
+    let mpp_auth_state = middleware::MppAuthState {
+        auth: auth_state_middleware.clone(),
+        mpp: app_state.mpp_service.clone(),
+    };
+    let mpp_settle_state = middleware::MppSettleState {
+        mpp: app_state.mpp_service.clone(),
+    };
+
     // Text-based inference routes (chat/completions, image generation, audio transcription, rerank, score).
     // The shared 25 MiB cap accommodates inline multimodal JSON payloads.
     let text_inference_routes = Router::new()
@@ -1627,6 +1637,11 @@ pub fn build_completion_routes(
         )
         .layer(DefaultBodyLimit::max(AUDIO_TRANSCRIPTION_MAX_BODY_SIZE))
         .with_state(app_state.clone())
+        // Innermost: verifies and claims an MPP payment after the usage check passed.
+        .layer(from_fn_with_state(
+            mpp_settle_state,
+            middleware::mpp_settle_middleware,
+        ))
         .layer(from_fn_with_state(
             model_deprecation_state.clone(),
             middleware::model_deprecation_middleware,
@@ -1640,8 +1655,8 @@ pub fn build_completion_routes(
             middleware::api_key_rate_limit_middleware,
         ))
         .layer(from_fn_with_state(
-            auth_state_middleware.clone(),
-            middleware::auth::auth_middleware_with_workspace_context,
+            mpp_auth_state,
+            middleware::mpp_auth_middleware,
         ))
         // body_hash buffers before auth runs, so cap it at the largest route
         // limit in this group. Smaller per-route limits (privacy) still apply

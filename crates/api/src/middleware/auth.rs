@@ -148,7 +148,7 @@ pub struct AuthenticatedReportingToken {
 
 /// The caller's API key to carry into cloud-platform reads. Copied only for a
 /// successful key, and only when some cloud-platform area is on.
-fn caller_key(token: Option<&str>) -> Option<String> {
+pub(crate) fn caller_key(token: Option<&str>) -> Option<String> {
     if !database::cp_client::client::configured() {
         return None;
     }
@@ -161,7 +161,7 @@ fn bearer(auth_header: Option<&str>) -> Option<&str> {
 
 /// Runs the rest of an API-key request with the caller's key in scope, for the
 /// cloud-platform reads that answer only for that key (model access).
-async fn with_caller_key(
+pub(crate) async fn with_caller_key(
     token: Option<String>,
     request: impl std::future::Future<Output = Response>,
 ) -> Response {
@@ -897,7 +897,7 @@ fn reporting_token_extension(
 }
 
 /// Authenticate using API key and resolve workspace/organization context
-async fn authenticate_api_key_with_context(
+pub(crate) async fn authenticate_api_key_with_context(
     state: &AuthState,
     api_key: &str,
 ) -> Result<AuthenticatedApiKey, (StatusCode, axum::Json<crate::models::ErrorResponse>)> {

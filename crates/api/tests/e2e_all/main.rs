@@ -107,6 +107,7 @@ mod responses_contract;
 mod responses_failed;
 mod responses_hosted_search;
 mod responses_native;
+mod responses_native_search;
 mod responses_stateless;
 mod score;
 mod serving_provider;

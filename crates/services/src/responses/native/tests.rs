@@ -56,18 +56,69 @@ fn native_requests_reject_stateful_or_invalid_fields_before_dispatch() {
 }
 
 #[test]
-fn native_validation_keeps_reasoning_and_function_schemas_but_rejects_builtins() {
+fn native_validation_keeps_reasoning_and_function_schemas_but_rejects_unsupported_tools() {
     let mut body = json!({"model":"openai/gpt-6-astra", "store":false, "input":[
         {"type":"reasoning", "id":"rs_1", "encrypted_content":"opaque", "summary":[]},
         {"type":"function_call", "call_id":"call_1", "name":"lookup", "arguments":"{}"},
         {"type":"function_call_output", "call_id":"call_1", "output":"ok"}
     ], "tools":[{"type":"function", "name":"lookup", "strict":true}], "reasoning":{"effort":"high"}, "parallel_tool_calls":false});
     assert!(validate(&body).is_ok());
-    body["tools"] = json!([{"type":"web_search"}]);
+    body["tools"] = json!([{"type":"web_context_search"}]);
     assert!(validate(&body).is_err());
     body["tools"] = json!([]);
     body["service_tier"] = json!("priority");
     assert!(validate(&body).is_err());
+}
+
+#[test]
+fn native_web_search_preserves_configuration_choice_and_include() {
+    for choice in [json!("required"), json!({"type":"web_search"})] {
+        let body = json!({
+            "model":"openai/gpt-6-astra", "store":false, "input":"Find current sources.",
+            "tools":[
+                {"type":"web_search", "search_context_size":"high", "external_web_access":false,
+                    "filters":{"allowed_domains":["example.com"]},
+                    "user_location":{"type":"approximate", "country":"US", "city":"Boston"}},
+                {"type":"function", "name":"lookup", "strict":true},
+                {"type":"namespace", "name":"client", "tools":[
+                    {"type":"custom", "name":"apply_patch", "format":{"type":"text"}}
+                ]}
+            ],
+            "tool_choice":choice,
+            "include":["web_search_call.action.sources", "reasoning.encrypted_content", "web_search_call.results"],
+            "provider_extension":{"preserve":"exactly"}
+        });
+        let normalized =
+            crate::responses::client_tools::normalize_native_request(body.clone()).unwrap();
+        assert!(validate(&normalized).is_ok());
+        assert_eq!(normalized, body);
+    }
+}
+
+#[test]
+fn native_web_search_replays_complete_output_without_transforming_it() {
+    let body = json!({
+        "model":"openai/gpt-6-astra", "store":false,
+        "tools":[{"type":"web_search"}], "tool_choice":"none",
+        "include":["web_search_call.action.sources", "reasoning.encrypted_content"],
+        "input":[
+            {"role":"user", "content":"Find a source."},
+            {"type":"reasoning", "id":"rs_old", "summary":[], "encrypted_content":"opaque_fixture"},
+            {"type":"web_search_call", "id":"ws_old", "status":"completed", "action":{
+                "type":"search", "query":"Synthetic query", "queries":["Synthetic query"],
+                "sources":[{"type":"url", "url":"https://example.com/source"}]
+            }},
+            {"type":"message", "id":"msg_old", "role":"assistant", "status":"completed", "phase":"final_answer",
+                "content":[{"type":"output_text", "text":"A sourced answer.", "annotations":[{
+                    "type":"url_citation", "url":"https://example.com/source", "title":"Synthetic source", "start_index":2, "end_index":9
+                }]}]},
+            {"role":"user", "content":"Summarize that answer without another search."}
+        ]
+    });
+    let normalized =
+        crate::responses::client_tools::normalize_native_request(body.clone()).unwrap();
+    assert!(validate(&normalized).is_ok());
+    assert_eq!(normalized, body);
 }
 
 #[test]
@@ -137,8 +188,9 @@ fn native_additional_tools_are_promoted_without_changing_remaining_input() {
 #[test]
 fn native_client_tools_cannot_hide_hosted_tools_inside_namespaces() {
     for tool in [
-        json!({"type":"web_search"}),
+        json!({"type":"web_context_search"}),
         json!({"type":"namespace", "name":"outer", "tools":[{"type":"web_search"}]}),
+        json!({"type":"namespace", "name":"outer", "tools":[{"type":"web_context_search"}]}),
         json!({"type":"namespace", "name":"outer", "tools":[
             {"type":"namespace", "name":"inner", "tools":[{"type":"mcp", "server_label":"remote"}]}
         ]}),
@@ -194,6 +246,8 @@ fn incomplete_unknown_reason_keeps_billable_usage() {
 fn native_stateless_requests_cannot_reference_upstream_stored_resources() {
     for input in [
         json!([{"type":"item_reference","id":"msg_shared"}]),
+        json!([{"type":"file_search_call","id":"fs_shared","status":"completed"}]),
+        json!([{"type":"mcp_call","id":"mcp_shared","status":"completed"}]),
         json!([{"type":"function_call_output","call_id":"call_1","output":[{"type":"input_image","file_id":"file_shared"}]}]),
         json!([{"role":"user","content":[{"type":"input_image","file_id":"file_shared"}]}]),
         json!([{"role":"user","content":[{"type":"input_file","file_id":"file_shared"}]}]),

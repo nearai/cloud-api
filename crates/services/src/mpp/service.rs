@@ -761,7 +761,7 @@ impl MppService {
             .map_err(|_| MppError::Unavailable(UnavailableReason::Store))
     }
 
-    /// A guard that marks `payment` unserved if it is dropped before [`ServingGuard::finish`]
+    /// A guard that marks `payment` served if it is dropped before [`ServingGuard::finish`]
     /// (the client disconnected and the handler future was cancelled).
     pub fn serving(self: &Arc<Self>, payment: SettledPayment) -> ServingGuard {
         ServingGuard {
@@ -803,11 +803,15 @@ impl Drop for ServingGuard {
             return;
         };
         let service = self.service.clone();
-        // No runtime (process shutdown) leaves the row `serving`, which is the safe state.
+        // Dropped means the client went away while its paid request ran (the work may already
+        // be done). That counts as served: marking it unserved would let one payment buy a new
+        // inference on every disconnect until the challenge expires. Only an error response
+        // releases the claim. No runtime (process shutdown) leaves the row `serving`, which also
+        // refuses reuse.
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
                 if service
-                    .finish(&payment, ServeOutcome::Unserved)
+                    .finish(&payment, ServeOutcome::Served)
                     .await
                     .is_err()
                 {

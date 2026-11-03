@@ -710,6 +710,7 @@ fn proof_payloads_and_oversized_or_wrong_type_transactions_are_refused() {
 // ----- settle -----
 
 const TX: [u8; 32] = [0x11; 32];
+const TX_B: [u8; 32] = [0x12; 32];
 
 fn key(hash: [u8; 32]) -> String {
     format!("tempo:0x{}", hex::encode(hash))
@@ -1121,7 +1122,7 @@ async fn a_transaction_credential_cannot_broadcast_after_the_challenge_expired()
 // ----- serving guard -----
 
 #[tokio::test]
-async fn the_guard_marks_unserved_when_dropped_and_respects_finish() {
+async fn the_guard_marks_served_when_dropped_and_respects_finish() {
     let f = fixture();
     let (_, header) = f.paid_hash_credential(&body(), TX);
     let settled = f
@@ -1138,14 +1139,19 @@ async fn the_guard_marks_unserved_when_dropped_and_respects_finish() {
     drop(guard);
     // The spawned finish runs on the same runtime; wait for it deterministically.
     for _ in 0..100 {
-        if f.repo.state_of(&key(TX)) == Some(ClaimState::Unserved) {
+        if f.repo.state_of(&key(TX)) == Some(ClaimState::Served) {
             break;
         }
         tokio::task::yield_now().await;
     }
-    assert_eq!(f.repo.state_of(&key(TX)), Some(ClaimState::Unserved));
+    assert_eq!(f.repo.state_of(&key(TX)), Some(ClaimState::Served));
 
-    // Re-claim, finish served through the guard, then nothing changes on drop.
+    // A client that disconnected cannot present the payment again.
+    let replay = f.service.settle(&f.verify(&header, &body()).unwrap()).await;
+    assert!(matches!(replay, Err(MppError::Consumed(_))), "{replay:?}");
+
+    // An explicit unserved finish releases the claim for a retry under the same challenge.
+    let (_, header) = f.paid_hash_credential(&body(), TX_B);
     let settled = f
         .service
         .settle(&f.verify(&header, &body()).unwrap())
@@ -1153,9 +1159,11 @@ async fn the_guard_marks_unserved_when_dropped_and_respects_finish() {
         .unwrap();
     f.service
         .serving(settled)
-        .finish(ServeOutcome::Served)
+        .finish(ServeOutcome::Unserved)
         .await;
-    assert_eq!(f.repo.state_of(&key(TX)), Some(ClaimState::Served));
+    assert_eq!(f.repo.state_of(&key(TX_B)), Some(ClaimState::Unserved));
+    let retried = f.service.settle(&f.verify(&header, &body()).unwrap()).await;
+    assert!(retried.is_ok(), "{retried:?}");
 }
 
 // ----- errors and redaction -----

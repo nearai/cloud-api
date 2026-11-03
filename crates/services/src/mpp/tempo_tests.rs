@@ -153,6 +153,22 @@ fn a_bound_memo_transfer_pays_the_challenge() {
 }
 
 #[test]
+fn an_identical_transfer_with_a_foreign_memo_does_not_hide_the_bound_one() {
+    // Same token, sender, recipient and amount; the first carries a non-MPP memo.
+    let mut logs = memo_pair([0xab; 32]);
+    logs.extend(memo_pair(good_memo()));
+    assert_eq!(verify_receipt(&receipt(logs), &expected()), Ok(()));
+
+    // Neither bound: still refused.
+    let mut logs = memo_pair([0xab; 32]);
+    logs.extend(memo_pair(attribution_memo(REALM, "another-challenge")));
+    assert_eq!(
+        verify_receipt(&receipt(logs), &expected()),
+        Err(ReceiptVerdict::MemoNotBound)
+    );
+}
+
+#[test]
 fn unrelated_logs_around_the_payment_are_ignored() {
     let mut logs = vec![
         transfer(OTHER, PAYER, OTHER, 5),

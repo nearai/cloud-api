@@ -99,7 +99,7 @@ error. Secrets also accept a `*_FILE` variant (the file wins), and are redacted 
 | `MPP_MODEL_PRICES` | JSON, see below |
 
 ```json
-{"zai-org/GLM-5": {"amount": "20000", "max_tokens": 2048, "max_request_bytes": 65536}}
+{"zai-org/GLM-5.1-FP8": {"amount": "20000", "max_tokens": 2048, "max_request_bytes": 65536}}
 ```
 
 `amount` is a decimal string of token base units, greater than zero and at most `u128`.
@@ -136,9 +136,10 @@ fields, a duplicate model name, an empty table, and zero limits.
   the expected sender (the `source` address when the client sends one, else the transaction
   sender), carrying an MPP memo bound to this realm and this challenge id.
 - The payment key is `tempo:0x<tx hash>`. Claiming is one atomic statement, so concurrent
-  presentations of one credential serve it once. If serving fails, the claim is released to
-  `unserved` and the same credential (same challenge) can be presented again until the
-  challenge expires, without a second payment.
+  presentations of one credential serve it once. If the paid request ends in an error
+  response, the claim is released to `unserved` and the same credential (same challenge) can
+  be presented again until the challenge expires, without a second payment. A client that
+  disconnects while its request runs has used the payment: the claim is marked `served`.
 - If `eth_sendRawTransactionSync` fails, the receipt is looked up by `keccak256(raw tx)` a
   few times (the node may already have the transaction). No receipt after the node refused it
   is a retryable `402`; an unreachable node is `503`.
@@ -181,7 +182,7 @@ const response = await fetch('https://cloud-api.near.ai/v1/chat/completions', {
   method: 'POST',
   headers: { 'content-type': 'application/json' },
   body: JSON.stringify({
-    model: 'zai-org/GLM-5',
+    model: 'zai-org/GLM-5.1-FP8',
     max_tokens: 256,
     messages: [{ role: 'user', content: 'Hello' }],
   }),
@@ -191,4 +192,4 @@ console.log(response.headers.get('payment-receipt'), await response.json())
 
 From a shell, with an `mppx` account funded on the same network:
 `npx mppx account create`, then
-`npx mppx --network testnet https://cloud-api.near.ai/v1/chat/completions -J '{"model":"zai-org/GLM-5","max_tokens":256,"messages":[{"role":"user","content":"Hi"}]}'`.
+`npx mppx --network testnet https://cloud-api.near.ai/v1/chat/completions -J '{"model":"zai-org/GLM-5.1-FP8","max_tokens":256,"messages":[{"role":"user","content":"Hi"}]}'`.

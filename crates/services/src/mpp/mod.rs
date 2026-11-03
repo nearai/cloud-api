@@ -7,8 +7,10 @@
 //! - [`tempo`]: verification of a transaction receipt against a challenge.
 //! - [`rpc`]: the Tempo JSON-RPC client behind the [`ports::TempoRpc`] port.
 //! - [`service`]: [`MppService`], the only entry point the API layer uses.
-//! - [`ports`]: the claim store and RPC traits; [`memory`] is the in-memory claim store.
+//! - [`ports`]: the claim store and RPC traits. `memory` (tests and the `test-mocks`
+//!   feature only) is an in-memory claim store; deployments use the Postgres repository.
 
+#[cfg(any(test, feature = "test-mocks"))]
 pub mod memory;
 pub mod ports;
 pub mod protocol;
@@ -18,6 +20,7 @@ pub mod tempo;
 #[cfg(any(test, feature = "test-mocks"))]
 pub mod testing;
 
+#[cfg(any(test, feature = "test-mocks"))]
 pub use memory::InMemoryClaimRepository;
 pub use ports::{
     ClaimOutcome, ClaimState, PaymentClaimRepository, RpcError, RpcLog, RpcReceipt, ServeOutcome,

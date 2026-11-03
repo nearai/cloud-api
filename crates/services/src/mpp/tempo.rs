@@ -190,22 +190,21 @@ pub fn verify_receipt(receipt: &RpcReceipt, expected: &Expected<'_>) -> Result<(
             && effect.amount == amount
             && effect.from == sender
     };
-    // A memo transfer is preferred over a plain one, as in the reference.
-    let matched = effects
-        .iter()
-        .filter(matches)
-        .find(|effect| effect.memo.is_some())
-        .or_else(|| {
-            effects
-                .iter()
-                .filter(matches)
-                .find(|effect| effect.memo.is_none())
-        })
-        .ok_or(ReceiptVerdict::NoMatchingTransfer)?;
-
-    match matched.memo {
-        Some(memo) if is_bound_memo(&memo, expected.realm, expected.challenge_id) => Ok(()),
-        _ => Err(ReceiptVerdict::MemoNotBound),
+    let mut candidates = effects.iter().filter(matches).peekable();
+    if candidates.peek().is_none() {
+        return Err(ReceiptVerdict::NoMatchingTransfer);
+    }
+    // Any matching transfer bound to this challenge pays it, so an unrelated memo on an
+    // identical transfer earlier in the same transaction cannot hide it. A transaction that
+    // pays several challenges is still claimed once (the claim key is its hash).
+    if candidates.any(|effect| {
+        effect
+            .memo
+            .is_some_and(|memo| is_bound_memo(&memo, expected.realm, expected.challenge_id))
+    }) {
+        Ok(())
+    } else {
+        Err(ReceiptVerdict::MemoNotBound)
     }
 }
 

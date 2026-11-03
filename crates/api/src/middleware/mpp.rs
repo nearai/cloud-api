@@ -383,8 +383,8 @@ pub async fn mpp_settle_middleware(
         .ok()
         .as_deref()
         .and_then(header_value);
-    // Dropped (client gone before the handler finished) means unserved: the guard releases the
-    // claim so the same credential can be presented again within the challenge lifetime.
+    // Dropped (client gone before the handler finished) counts as served, so a payment cannot
+    // be replayed by disconnecting. Only an error response below releases the claim.
     let guard = mpp.serving(settled);
 
     let mut response = next.run(request).await;

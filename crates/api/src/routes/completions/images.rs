@@ -264,6 +264,9 @@ pub async fn image_generations(
 ///
 /// **Request Body (multipart/form-data):**
 /// All fields should be provided as text values or files as indicated in the schema.
+///
+/// **Size limit:** the whole multipart body is capped at 50 MiB, so the image itself
+/// must be somewhat smaller to leave room for the form fields. Larger requests get 413.
 #[utoipa::path(
     post,
     path = "/v1/images/edits",
@@ -312,7 +315,9 @@ pub async fn image_edits(
                             match field.chunk().await {
                                 Ok(Some(chunk)) => {
                                     size += chunk.len();
-                                    // Reject early if size exceeds limit, before allocating memory
+                                    // Reject early if size exceeds limit, before allocating memory.
+                                    // Backstop only: the outer body limit already caps the whole
+                                    // request at this value, so this should not trigger today.
                                     if size > crate::MAX_IMAGE_EDIT_BODY_SIZE {
                                         return (
                                             StatusCode::PAYLOAD_TOO_LARGE,

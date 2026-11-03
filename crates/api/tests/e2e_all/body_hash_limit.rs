@@ -179,3 +179,32 @@ async fn unauthenticated_oversize_image_edit_is_not_fully_buffered() {
     assert_eq!(status, 413);
     assert_too_large_envelope(&json);
 }
+
+#[tokio::test]
+async fn image_edits_body_exactly_at_limit_reaches_auth() {
+    let (_server, router) = setup_test_server_and_router().await;
+
+    // Exactly the cap: body_hash lets it through and auth rejects.
+    let (status, _json, consumed) =
+        send_unauthenticated(router, "/v1/images/edits", api::MAX_IMAGE_EDIT_BODY_SIZE).await;
+
+    assert_eq!(status, 401);
+    assert_eq!(consumed, api::MAX_IMAGE_EDIT_BODY_SIZE);
+}
+
+#[tokio::test]
+async fn image_edits_body_one_byte_over_limit_is_rejected() {
+    let (_server, router) = setup_test_server_and_router().await;
+
+    // counting_body emits whole chunks, so stream the cap plus one chunk. The
+    // exact limit + 1 case is the declared-length test above.
+    let (status, json, _consumed) = send_unauthenticated(
+        router,
+        "/v1/images/edits",
+        api::MAX_IMAGE_EDIT_BODY_SIZE + CHUNK,
+    )
+    .await;
+
+    assert_eq!(status, 413);
+    assert_too_large_envelope(&json);
+}

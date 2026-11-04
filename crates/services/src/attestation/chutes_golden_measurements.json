@@ -216,6 +216,51 @@
           "rtmr0": "a5488b5f4cf1484da23001e013a5ad3ff177836bf2cfdbde55dacded21b3eece5de43d4c4a2d5279f8ed8d24b9e072d6"
         }
       ]
+    },
+    {
+      "version": "1.5.0",
+      "mrtd": "261ce538b435e2d0e85fc97e254bc99154c507b7a8e13d59b69f8532384f1d0bfaadfddf3fccc6e0a411203840bbee8d",
+      "rtmr1": "d3a862ff47357f374fc72c7f02a480a13790d1805e24aaa8de1f03994256625ce0f593ae35ea8f0c24d09f7df36cb0ed",
+      "rtmr2": "e1de99043052f3e1ab5a4463d3310b5680e851631adf10e071b15cbd8b4d664ea435b0ec33e7f18e908dda60734056f7",
+      "rtmr3": "9617be835beac8c62093a9db424f015f3e12651235d0101c112729e7225b7a70836a184dee0b45f28cd190f1871afe6e",
+      "hardware_rows": [
+        {
+          "name": "8xb200 [10.2.1, flat-208c-1536g]",
+          "rtmr0": "0e990b232dc6df68c5208dac9eb23f777950b7b9ce638b8299dd44ba97902cbcc035c97b704cb28a23643771f8438cbc"
+        },
+        {
+          "name": "8xb200 [10.2.1, numa-240c-1536g]",
+          "rtmr0": "7f95b8e70d1ade7473dcaf3344abe6ffdb303a1156a69b80ab5af7cac4804709a31e1803f858449b36676150f40b79ff"
+        },
+        {
+          "name": "8xb300 [10.2.1, flat-252c-1944g]",
+          "rtmr0": "fc71a5a8edcb1f6d307d59e62ce257365df0f233ae2334691f99d2136832d911f8be975b92f88036db8a4906574519c4"
+        },
+        {
+          "name": "8xh200 [10.2.1, numa-124c-1128g-nvsw-node1]",
+          "rtmr0": "5b509103a3bf3c10dbf27a7da030a3d7ba93a81c0c8844de20e5dfee77611644a39cc7236313e9d0a99a8a8a703bbfc9"
+        },
+        {
+          "name": "8xh200 [10.2.1, numa-188c-1128g-nvsw-node0]",
+          "rtmr0": "052183ad6cca5ad4aef7e31dc3f6c47be2ba90c288a55420bf432301374f1bd9932ea7d6b5da999c4fecf578c4b0a21a"
+        },
+        {
+          "name": "8xh200 [10.2.1, numa-188c-1128g-nvsw-node1]",
+          "rtmr0": "ba81dbf034d968fd4be0975c031cbe6451295d63cb509cd857372fc915dada1b24fc4e1b0486db4a276a9efb49d415e6"
+        },
+        {
+          "name": "8xh200 [10.2.1, numa-236c-1128g-nvsw-node1]",
+          "rtmr0": "a9cac743d296a96c7a0d6348f03be1e1a407f18ec215f0039e3dc1ea4c132eb1e4a5fe3783022ff3d252d4b30f1dbf9f"
+        },
+        {
+          "name": "8xpro_6000 [10.2.1, numa-124c-768g] (58443435b208)",
+          "rtmr0": "bacb4abf7b19aba4a8307ebc7244706745de4fa627e669e7f06fd35c3303eea1903f58dc143d27b557da1a986e0e95f6"
+        },
+        {
+          "name": "8xpro_6000 [10.2.1, numa-204c-768g]",
+          "rtmr0": "a5488b5f4cf1484da23001e013a5ad3ff177836bf2cfdbde55dacded21b3eece5de43d4c4a2d5279f8ed8d24b9e072d6"
+        }
+      ]
     }
   ]
 }

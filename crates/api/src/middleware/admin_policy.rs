@@ -72,6 +72,7 @@ pub(crate) fn admin_operation(method: &Method, matched_path: &str) -> AdminOpera
                 | "/admin/organizations/{org_id}/members"
                 | "/admin/feature-requests"
                 | "/admin/database-encryption/jobs/{id}"
+                | "/admin/database-encryption/keys"
         )
     {
         return AdminOperation::Read;
@@ -98,6 +99,25 @@ pub(crate) fn admin_operation(method: &Method, matched_path: &str) -> AdminOpera
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn database_encryption_keys_are_read_only_and_jobs_require_write() {
+        for prefix in ["/v1", ""] {
+            for method in [Method::GET, Method::HEAD] {
+                assert_eq!(
+                    admin_operation(&method, &format!("{prefix}/admin/database-encryption/keys")),
+                    AdminOperation::Read
+                );
+            }
+            assert_eq!(
+                admin_operation(
+                    &Method::POST,
+                    &format!("{prefix}/admin/database-encryption/jobs")
+                ),
+                AdminOperation::Write
+            );
+        }
+    }
 
     #[test]
     fn user_erasure_preview_is_read_and_execute_is_session_only() {

@@ -38,6 +38,8 @@ async fn create_job_rejects_invalid_request_parameters() {
         serde_json::json!({"mode":"dry_run","scope":{"fields":[{"table":"files","column":"filename"}]},"batch_size":1,"actions":["verify_only"]}),
         serde_json::json!({"mode":"dry_run","scope":{"fields":[{"table":"files","column":"filename"}]},"batch_size":1,"actions":["encrypt","encrypt"]}),
         serde_json::json!({"mode":"dry_run","scope":{"fields":[{"table":"files","column":"filename"}]},"batch_size":1,"max_rows":0,"actions":["encrypt"]}),
+        serde_json::json!({"mode":"dry_run","scope":{"fields":[{"table":"files","column":"filename"}]},"actions":["rewrap"],"batch_delay_ms":-1}),
+        serde_json::json!({"mode":"dry_run","scope":{"fields":[{"table":"files","column":"filename"}]},"actions":["rewrap"],"batch_delay_ms":10001}),
     ];
 
     for request in cases {
@@ -873,3 +875,5 @@ async fn recovery_resumes_the_cursor_and_duplicate_workers_do_not_double_process
         wait_for_database_encryption_job(&server, &periodically_recovered_id.to_string()).await;
     assert_eq!(periodic["status"], "completed");
 }
+
+mod key_rotation;

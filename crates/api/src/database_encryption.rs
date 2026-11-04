@@ -11,6 +11,11 @@ use std::sync::{
 use tokio::sync::Semaphore;
 use uuid::Uuid;
 
+mod key_rotation;
+use key_rotation::{
+    classify, job_action, rewrap_envelope, validate_delay, Action, Classification, KeyCounts,
+};
+
 const MARKER: &str = "__near_db_encrypted";
 const MAX_BATCH_PLAINTEXT_BYTES: i64 = 8 * 1024 * 1024;
 
@@ -303,6 +308,19 @@ pub struct Scope {
     tables: Vec<String>,
     #[serde(default)]
     fields: Vec<FieldName>,
+    #[serde(default, skip_serializing_if = "JobOptions::is_empty")]
+    options: JobOptions,
+}
+
+#[derive(Debug, Deserialize, Serialize, Default)]
+struct JobOptions {
+    batch_delay_ms: Option<i64>,
+}
+
+impl JobOptions {
+    fn is_empty(&self) -> bool {
+        self.batch_delay_ms.is_none()
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -338,6 +356,8 @@ pub struct CreateJobRequest {
     max_rows: Option<i64>,
     #[serde(default = "actions_default")]
     actions: Vec<String>,
+    #[serde(default)]
+    batch_delay_ms: Option<i64>,
 }
 
 fn batch_default() -> i64 {
@@ -357,6 +377,8 @@ pub struct FieldCount {
     encrypted: i64,
     empty: i64,
     invalid_envelope: i64,
+    stale: i64,
+    by_key_id: std::collections::BTreeMap<String, i64>,
     scanned: i64,
     complete: bool,
 }
@@ -548,6 +570,8 @@ async fn counts(
             encrypted: 0,
             plaintext: 0,
             invalid_envelope: 0,
+            stale: 0,
+            by_key_id: Default::default(),
             scanned: 0,
             complete: true,
         };
@@ -591,10 +615,15 @@ async fn counts(
                 };
                 match serde_json::from_str::<Value>(&raw) {
                     Ok(value) if value[MARKER] == true => {
-                        if decrypt_ring_envelope(&ring, f, id, &raw).is_ok() {
-                            count.encrypted += 1;
-                        } else {
-                            count.invalid_envelope += 1;
+                        if let Some(key_id) = database::field_encryption::envelope_key_id(&value) {
+                            *count.by_key_id.entry(key_id.to_string()).or_default() += 1;
+                        }
+                        match classify(&ring, f, id, &raw) {
+                            Classification::Current => count.encrypted += 1,
+                            Classification::Stale(_) => count.stale += 1,
+                            Classification::Invalid | Classification::Plaintext => {
+                                count.invalid_envelope += 1
+                            }
                         }
                     }
                     _ => count.plaintext += 1,
@@ -611,7 +640,13 @@ async fn counts(
 }
 
 fn totals(c: &[FieldCount]) -> Value {
-    json!({"plaintext":c.iter().map(|x|x.plaintext).sum::<i64>(),"encrypted":c.iter().map(|x|x.encrypted).sum::<i64>(),"empty":c.iter().map(|x|x.empty).sum::<i64>(),"invalid_envelope":c.iter().map(|x|x.invalid_envelope).sum::<i64>(),"scanned":c.iter().map(|x|x.scanned).sum::<i64>(),"complete":c.iter().all(|x|x.complete)})
+    let mut by_key_id = std::collections::BTreeMap::<String, i64>::new();
+    for count in c {
+        for (key_id, count) in &count.by_key_id {
+            *by_key_id.entry(key_id.clone()).or_default() += count;
+        }
+    }
+    json!({"plaintext":c.iter().map(|x|x.plaintext).sum::<i64>(),"encrypted":c.iter().map(|x|x.encrypted).sum::<i64>(),"stale":c.iter().map(|x|x.stale).sum::<i64>(),"by_key_id":by_key_id,"empty":c.iter().map(|x|x.empty).sum::<i64>(),"invalid_envelope":c.iter().map(|x|x.invalid_envelope).sum::<i64>(),"scanned":c.iter().map(|x|x.scanned).sum::<i64>(),"complete":c.iter().all(|x|x.complete)})
 }
 
 // Admin scan and verification endpoints.
@@ -726,18 +761,15 @@ pub async fn create_job(
     if !(1..=1000).contains(&req.batch_size) {
         return Err(bad("batch_size must be between 1 and 1000"));
     }
-    let expected_action = if matches!(req.mode, Mode::Verify) {
-        "verify"
-    } else {
-        "encrypt"
-    };
-    if req.actions.as_slice() != [expected_action] {
-        return Err(bad("actions do not match the requested job mode"));
-    }
+    job_action(req.mode, &req.actions)?;
+    validate_delay(req.batch_delay_ms)?;
+    validate_delay(req.scope.options.batch_delay_ms)?;
     if req.max_rows.is_some_and(|max_rows| max_rows <= 0) {
         return Err(bad("max_rows must be greater than zero"));
     }
     let mut scope_request = req.scope;
+    scope_request.options.batch_delay_ms =
+        req.batch_delay_ms.or(scope_request.options.batch_delay_ms);
     normalize_scope(&mut scope_request);
     selected(&scope_request)?;
     let id = Uuid::new_v4();
@@ -811,6 +843,8 @@ fn classify_job_error(error: &anyhow::Error) -> &'static str {
         "db_timeout"
     } else if error.to_string().contains("Pool") || error.to_string().contains("pool") {
         "pool_unavailable"
+    } else if error.to_string().contains("rewrap failed") {
+        "rewrap_failed"
     } else if error.to_string().contains("encryption failed") {
         "encrypt_failed"
     } else if error.to_string().contains("invalid encrypted envelope") {
@@ -844,7 +878,7 @@ async fn run_locked_job(
         .ok_or_else(|| anyhow::anyhow!("database encryption ring is not configured"))?;
     let job = client
         .query_opt(
-            "UPDATE database_encryption_jobs SET status='running',started_at=COALESCE(started_at,NOW()) WHERE id=$1 AND status IN ('queued','running') RETURNING mode,scope,batch_size,max_rows,cursor,progress",
+            "UPDATE database_encryption_jobs SET status='running',started_at=COALESCE(started_at,NOW()) WHERE id=$1 AND status IN ('queued','running') RETURNING mode,scope,batch_size,max_rows,cursor,progress,actions",
             &[&id],
         )
         .await?;
@@ -852,10 +886,16 @@ async fn run_locked_job(
         return Ok(());
     };
     let mode: String = job.get("mode");
+    let persisted_mode: Mode = serde_json::from_value(json!(&mode))?;
+    let actions: Vec<String> = serde_json::from_value(job.get("actions"))?;
+    let action = job_action(persisted_mode, &actions)
+        .map_err(|_| anyhow::anyhow!("invalid persisted actions"))?;
     if mode == "execute" && !state.pool.encryption_write_enabled() {
         anyhow::bail!("execute jobs require DB_ENCRYPTION_WRITE_ENABLED=true");
     }
     let scope: Scope = serde_json::from_value(job.get("scope"))?;
+    validate_delay(scope.options.batch_delay_ms)
+        .map_err(|_| anyhow::anyhow!("invalid persisted batch delay"))?;
     let fields = selected(&scope).map_err(|_| anyhow::anyhow!("invalid persisted scope"))?;
     let batch: i64 = job.get("batch_size");
     let max: Option<i64> = job.get("max_rows");
@@ -871,6 +911,13 @@ async fn run_locked_job(
     let mut plaintext = progress["plaintext"].as_i64().unwrap_or(0);
     let mut verified = progress["verified"].as_i64().unwrap_or(0);
     let mut invalid_envelopes = progress["invalid_envelopes"].as_i64().unwrap_or(0);
+    let mut rewrapped = progress["rewrapped"].as_i64().unwrap_or(0);
+    let mut already_current = progress["already_current"].as_i64().unwrap_or(0);
+    let mut stale = progress["stale"].as_i64().unwrap_or(0);
+    let mut by_key_id: KeyCounts = match progress.get("by_key_id") {
+        Some(value) => serde_json::from_value(value.clone())?,
+        None => KeyCounts::default(),
+    };
     let mut invalid_envelope_rows = progress["invalid_envelope_rows"]
         .as_array()
         .cloned()
@@ -945,33 +992,38 @@ async fn run_locked_job(
             for row in &rows {
                 let row_id: Uuid = row.get(0);
                 after_id = row_id;
-                if mode == "verify" {
+                if matches!(action, Action::Verify | Action::Rewrap) {
                     let raw: String = row.get(1);
-                    match serde_json::from_str::<Value>(&raw) {
-                        Ok(value) if value[MARKER] == true => {
-                            if database::field_encryption::is_envelope(&value)
-                                && decrypt_ring_envelope(&ring, field, row_id, &raw).is_ok()
-                            {
-                                verified += 1;
-                                continue;
-                            }
-                            invalid_envelopes += 1;
-                            if invalid_envelope_rows.len() < 100 {
-                                invalid_envelope_rows.push(json!({
-                                    "table": field.table,
-                                    "column": field.column,
-                                    "id": row_id,
-                                }));
+                    by_key_id.record(field, &raw);
+                    match classify(&ring, field, row_id, &raw) {
+                        Classification::Plaintext => {
+                            plaintext += 1;
+                            if action == Action::Verify && plaintext_rows.len() < 100 {
+                                plaintext_rows.push(
+                                    json!({"table":field.table,"column":field.column,"id":row_id}),
+                                );
                             }
                         }
-                        _ => {
-                            plaintext += 1;
-                            if plaintext_rows.len() < 100 {
-                                plaintext_rows.push(json!({
-                                    "table": field.table,
-                                    "column": field.column,
-                                    "id": row_id,
-                                }));
+                        Classification::Current => {
+                            if action == Action::Verify {
+                                verified += 1;
+                            } else {
+                                already_current += 1;
+                            }
+                        }
+                        Classification::Stale(_) => {
+                            stale += 1;
+                            if action == Action::Rewrap && mode == "execute" {
+                                row_ids.push(row_id);
+                                encrypted_values.push(rewrap_envelope(&ring, field, row_id, &raw)?);
+                            }
+                        }
+                        Classification::Invalid => {
+                            invalid_envelopes += 1;
+                            if invalid_envelope_rows.len() < 100 {
+                                invalid_envelope_rows.push(
+                                    json!({"table":field.table,"column":field.column,"id":row_id}),
+                                );
                             }
                         }
                     }
@@ -1005,7 +1057,10 @@ async fn run_locked_job(
                 }
             }
             if mode == "execute" && !row_ids.is_empty() {
-                if field.table == "responses" && field.column == "metadata" {
+                if action == Action::Encrypt
+                    && field.table == "responses"
+                    && field.column == "metadata"
+                {
                     transaction
                         .execute(
                             "UPDATE responses SET is_root_response=TRUE WHERE id=ANY($1) AND metadata->>'root_response'='true'",
@@ -1024,9 +1079,14 @@ async fn run_locked_job(
                     table = field.table,
                     column = field.column,
                 );
-                encrypted += transaction
+                let updated = transaction
                     .execute(&update, &[&row_ids, &encrypted_values])
                     .await? as i64;
+                match action {
+                    Action::Encrypt => encrypted += updated,
+                    Action::Rewrap => rewrapped += updated,
+                    Action::Verify => {}
+                }
             }
             processed += rows.len() as i64;
         }
@@ -1039,6 +1099,10 @@ async fn run_locked_job(
                     &json!({
                         "processed": processed,
                         "encrypted": encrypted,
+                        "rewrapped": rewrapped,
+                        "already_current": already_current,
+                        "stale": stale,
+                        "by_key_id": by_key_id,
                         "verified": verified,
                         "plaintext": plaintext,
                         "invalid_envelopes": invalid_envelopes,
@@ -1055,11 +1119,15 @@ async fn run_locked_job(
             )
             .await?;
         transaction.commit().await?;
+        if let Some(delay) = scope.options.batch_delay_ms {
+            tokio::time::sleep(std::time::Duration::from_millis(u64::try_from(delay)?)).await;
+        }
     }
 
     if mode == "verify" {
         let (approved, excluded, unclassified) = classify_schema(client).await?;
-        let pass = plaintext == 0 && invalid_envelopes == 0 && unclassified.is_empty();
+        let pass =
+            plaintext == 0 && invalid_envelopes == 0 && stale == 0 && unclassified.is_empty();
         client
             .execute(
                 "UPDATE database_encryption_jobs SET status='completed',completed_at=NOW(),progress=progress || $2 WHERE id=$1",
@@ -1129,6 +1197,8 @@ pub struct VerifyRequest {
     #[serde(default = "yes")]
     fail_on_approved_plaintext_without_reason: bool,
     batch_size: Option<i64>,
+    #[serde(default)]
+    batch_delay_ms: Option<i64>,
 }
 
 fn yes() -> bool {
@@ -1154,6 +1224,7 @@ pub async fn verify(
             batch_size: req.batch_size.unwrap_or_else(batch_default),
             max_rows: None,
             actions: vec!["verify".to_string()],
+            batch_delay_ms: req.batch_delay_ms,
         }),
     )
     .await

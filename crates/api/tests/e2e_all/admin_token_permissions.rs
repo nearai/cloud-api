@@ -400,6 +400,25 @@ async fn database_encryption_reads_cannot_create_or_cancel_jobs() {
         )
         .await
         .unwrap();
+    for method in [Method::GET, Method::HEAD] {
+        assert_eq!(
+            call(
+                &server,
+                method,
+                "/v1/admin/database-encryption/keys",
+                &token,
+                json!({})
+            )
+            .await
+            .status_code(),
+            StatusCode::OK
+        );
+    }
+    assert_forbidden(
+        &call(&server, Method::POST, "/v1/admin/database-encryption/jobs", &token,
+            json!({"mode":"execute","scope":{"fields":[{"table":"files","column":"filename"}]},"actions":["rewrap"]})).await,
+        "insufficient_permissions",
+    );
     let scope = json!({"fields": [{"table": "files", "column": "filename"}]});
     let scan = call(
         &server,

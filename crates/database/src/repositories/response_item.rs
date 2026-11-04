@@ -63,10 +63,9 @@ impl PgResponseItemsRepository {
     fn row_to_item(&self, row: tokio_postgres::Row) -> Result<ResponseOutputItem> {
         let id: Uuid = row.try_get("id")?;
         let mut item_json: serde_json::Value = row.try_get("item")?;
-        if let Some((key, key_id)) = self.pool.encryption_context() {
-            item_json = field_encryption::decrypt_json_if_encrypted_with_key_id(
-                &key,
-                &key_id,
+        if let Some(ring) = self.pool.decryption_context() {
+            item_json = field_encryption::decrypt_json_if_encrypted_with_ring(
+                &ring,
                 "response_items",
                 "item",
                 id,

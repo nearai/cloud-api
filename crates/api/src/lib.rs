@@ -2840,6 +2840,11 @@ mod tests {
     /// previews that moved to cloud-platform must not be registered there.
     /// axum cannot enumerate registered routes, so this scans the source.
     #[test]
+    fn retired_admin_routes_are_off_by_default() {
+        assert!(!AppBuildOptions::default().mount_retired_admin_routes);
+    }
+
+    #[test]
     fn retained_admin_routes_are_reads_only() {
         use crate::middleware::admin_policy::{admin_operation, AdminOperation};
 

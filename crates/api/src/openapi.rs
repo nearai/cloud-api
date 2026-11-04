@@ -50,6 +50,9 @@ Operations marked deprecated (account, organization, workspace, invitation, API 
         (name = "Services", description = "Public platform services (e.g. web_search pricing)"),
     ),
     paths(
+        crate::database_encryption::get_keys,
+        crate::database_encryption::create_job,
+        crate::database_encryption::verify,
         // Chat completion endpoints (most important for users)
         crate::routes::completions::chat_completions,
         crate::routes::completions::image_generations,
@@ -637,6 +640,38 @@ impl Modify for SecurityAddon {
 mod admin_token_permission_tests {
     use super::*;
     use serde_json::{json, Value};
+
+    #[test]
+    fn database_encryption_schema_describes_rotation_and_permissions() {
+        let doc = serde_json::to_value(ApiDoc::openapi()).unwrap();
+        for (path, method, phrase) in [
+            (
+                "/v1/admin/database-encryption/keys",
+                "get",
+                "read_only token",
+            ),
+            (
+                "/v1/admin/database-encryption/jobs",
+                "post",
+                "insufficient_permissions",
+            ),
+            (
+                "/v1/admin/database-encryption/verify",
+                "post",
+                "insufficient_permissions",
+            ),
+        ] {
+            assert!(doc["paths"][path][method]["description"]
+                .as_str()
+                .unwrap()
+                .contains(phrase));
+        }
+        for schema in ["CreateJobRequest", "VerifyRequest", "JobOptions"] {
+            let delay = &doc["components"]["schemas"][schema]["properties"]["batch_delay_ms"];
+            assert_eq!(delay["minimum"].as_f64(), Some(0.0));
+            assert_eq!(delay["maximum"].as_f64(), Some(10000.0));
+        }
+    }
 
     #[test]
     fn permission_request_defaults_only_when_omitted() {

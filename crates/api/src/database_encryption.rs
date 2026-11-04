@@ -302,7 +302,7 @@ impl DatabaseEncryptionState {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize, Default)]
+#[derive(Debug, Deserialize, Serialize, Default, utoipa::ToSchema)]
 pub struct Scope {
     #[serde(default)]
     tables: Vec<String>,
@@ -312,8 +312,9 @@ pub struct Scope {
     options: JobOptions,
 }
 
-#[derive(Debug, Deserialize, Serialize, Default)]
+#[derive(Debug, Deserialize, Serialize, Default, utoipa::ToSchema)]
 struct JobOptions {
+    #[schema(minimum = 0, maximum = 10000)]
     batch_delay_ms: Option<i64>,
 }
 
@@ -323,7 +324,7 @@ impl JobOptions {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, utoipa::ToSchema)]
 struct FieldName {
     table: String,
     column: String,
@@ -338,7 +339,7 @@ pub struct ScanRequest {
     include_approved_plaintext: bool,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize)]
+#[derive(Clone, Copy, Debug, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 enum Mode {
     DryRun,
@@ -346,7 +347,7 @@ enum Mode {
     Verify,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct CreateJobRequest {
     mode: Mode,
     #[serde(default)]
@@ -354,9 +355,11 @@ pub struct CreateJobRequest {
     #[serde(default = "batch_default")]
     batch_size: i64,
     max_rows: Option<i64>,
+    /// Exactly ["encrypt"] or ["rewrap"] for dry_run/execute; ["verify"] for verify.
     #[serde(default = "actions_default")]
     actions: Vec<String>,
     #[serde(default)]
+    #[schema(minimum = 0, maximum = 10000)]
     batch_delay_ms: Option<i64>,
 }
 
@@ -394,7 +397,7 @@ pub struct ScanResponse {
     unclassified: Vec<Value>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct JobResponse {
     job_id: Uuid,
     status: String,
@@ -713,9 +716,16 @@ fn decrypt_ring_envelope(
     )
 }
 
+#[utoipa::path(
+    get,
+    path = "/v1/admin/database-encryption/keys",
+    tag = "Admin",
+    responses((status = 200, description = "Configured write/read key IDs, 16-character SHA-256 fingerprints, and write status", body = Value)),
+    security(("admin_token" = []))
+)]
 pub async fn get_keys(
     Extension(state): Extension<DatabaseEncryptionState>,
-    Extension(_): Extension<AdminUser>,
+    Extension(_admin): Extension<AdminUser>,
 ) -> ApiResult<Value> {
     let ring = state
         .pool
@@ -733,6 +743,14 @@ pub async fn get_keys(
     })))
 }
 
+#[utoipa::path(
+    post,
+    path = "/v1/admin/database-encryption/jobs",
+    tag = "Admin",
+    request_body = CreateJobRequest,
+    responses((status = 202, description = "Resumable database encryption job accepted", body = JobResponse)),
+    security(("admin_token" = []))
+)]
 pub async fn create_job(
     Extension(state): Extension<DatabaseEncryptionState>,
     Extension(admin): Extension<AdminUser>,
@@ -1190,7 +1208,7 @@ pub async fn cancel_job(
     get_inner(&state, id).await
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize, Default, utoipa::ToSchema)]
 pub struct VerifyRequest {
     #[serde(default)]
     scope: Scope,
@@ -1198,6 +1216,7 @@ pub struct VerifyRequest {
     fail_on_approved_plaintext_without_reason: bool,
     batch_size: Option<i64>,
     #[serde(default)]
+    #[schema(minimum = 0, maximum = 10000)]
     batch_delay_ms: Option<i64>,
 }
 
@@ -1205,6 +1224,14 @@ fn yes() -> bool {
     true
 }
 
+#[utoipa::path(
+    post,
+    path = "/v1/admin/database-encryption/verify",
+    tag = "Admin",
+    request_body = VerifyRequest,
+    responses((status = 202, description = "Resumable database encryption job accepted", body = JobResponse)),
+    security(("admin_token" = []))
+)]
 pub async fn verify(
     Extension(state): Extension<DatabaseEncryptionState>,
     Extension(admin): Extension<AdminUser>,

@@ -190,6 +190,15 @@ pub trait UserRepository: Send + Sync {
     ) -> anyhow::Result<()> {
         Ok(())
     }
+    /// Records the campaign a new user signed up with. Called once, right after the user is
+    /// created; never on a later sign-in.
+    async fn record_signup_attribution(
+        &self,
+        _user_id: UserId,
+        _attribution: &super::attribution::SignupAttribution,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
     async fn create(
         &self,
         email: String,
@@ -371,6 +380,14 @@ pub trait AuthServiceTrait: Send + Sync {
 
     /// Get or create user from OAuth data
     async fn get_or_create_oauth_user(&self, oauth_info: OAuthUserInfo) -> Result<User, AuthError>;
+
+    /// [`Self::get_or_create_oauth_user`], recording `attribution` on the user only when this
+    /// call creates it.
+    async fn get_or_create_oauth_user_with_attribution(
+        &self,
+        oauth_info: OAuthUserInfo,
+        attribution: &super::attribution::SignupAttribution,
+    ) -> Result<User, AuthError>;
 
     /// Clean up expired sessions
     async fn cleanup_expired_sessions(&self) -> Result<usize, AuthError>;
@@ -677,6 +694,14 @@ impl AuthServiceTrait for MockAuthService {
     async fn get_or_create_oauth_user(
         &self,
         _oauth_info: OAuthUserInfo,
+    ) -> Result<User, AuthError> {
+        Ok(Self::create_mock_user())
+    }
+
+    async fn get_or_create_oauth_user_with_attribution(
+        &self,
+        _oauth_info: OAuthUserInfo,
+        _attribution: &super::attribution::SignupAttribution,
     ) -> Result<User, AuthError> {
         Ok(Self::create_mock_user())
     }

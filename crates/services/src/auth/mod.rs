@@ -1,3 +1,4 @@
+pub mod attribution;
 pub mod near;
 pub mod oauth;
 pub mod ports;
@@ -296,6 +297,18 @@ impl AuthServiceTrait for AuthService {
     }
 
     async fn get_or_create_oauth_user(&self, oauth_info: OAuthUserInfo) -> Result<User, AuthError> {
+        self.get_or_create_oauth_user_with_attribution(
+            oauth_info,
+            &attribution::SignupAttribution::default(),
+        )
+        .await
+    }
+
+    async fn get_or_create_oauth_user_with_attribution(
+        &self,
+        oauth_info: OAuthUserInfo,
+        attribution: &attribution::SignupAttribution,
+    ) -> Result<User, AuthError> {
         use crate::organization::OrganizationId;
         // Look up by provider identity — the stable, unique identifier from the OAuth provider
         let existing_user = self
@@ -355,6 +368,18 @@ impl AuthServiceTrait for AuthService {
                 )));
             }
         };
+
+        // Signup attribution belongs to the new user only. Recording it is best effort: a
+        // failure is logged and the sign-in continues.
+        if !attribution.is_empty()
+            && self
+                .user_repository
+                .record_signup_attribution(new_user.id.clone(), attribution)
+                .await
+                .is_err()
+        {
+            tracing::warn!(user_id = %new_user.id.0, "Failed to record signup attribution");
+        }
 
         // NEAR identities are provisioned with their personal organization and
         // workspace atomically by the repository, shared with wallet binding.
@@ -821,6 +846,7 @@ mod tests {
         email_update_calls: Mutex<usize>,
         email_update_race: bool,
         email_update_unavailable: bool,
+        signup_attributions: Mutex<usize>,
     }
 
     impl MockUserRepo {
@@ -842,6 +868,7 @@ mod tests {
                 email_update_calls: Mutex::new(0),
                 email_update_race: false,
                 email_update_unavailable: false,
+                signup_attributions: Mutex::new(0),
             }
         }
     }
@@ -875,6 +902,14 @@ mod tests {
                 return Ok(Some(user));
             }
             Ok(None)
+        }
+        async fn record_signup_attribution(
+            &self,
+            _: UserId,
+            _: &attribution::SignupAttribution,
+        ) -> anyhow::Result<()> {
+            *self.signup_attributions.lock().unwrap() += 1;
+            Ok(())
         }
         async fn create(
             &self,
@@ -1572,6 +1607,42 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(user.id, existing.id);
+    }
+
+    /// Attribution belongs to the signup: a sign-in that resolves to an existing user, directly
+    /// or after losing a creation race, never records it.
+    #[tokio::test]
+    async fn signup_attribution_is_not_recorded_for_an_existing_user() {
+        let attribution =
+            attribution::SignupAttribution::from_request(Some("partner-app"), None, None);
+        let info = oauth_info("github");
+        let mut existing = make_user(&info.email, "github");
+        existing.provider_user_id = info.provider_user_id.clone();
+
+        let repo = Arc::new(MockUserRepo::with_user(existing.clone()));
+        let user = build_auth_service(repo.clone())
+            .get_or_create_oauth_user_with_attribution(info.clone(), &attribution)
+            .await
+            .unwrap();
+        assert_eq!(user.id, existing.id, "existing identity");
+        assert_eq!(
+            *repo.signup_attributions.lock().unwrap(),
+            0,
+            "existing identity"
+        );
+
+        let repo = Arc::new(MockUserRepo::creation_failure(Some(existing.clone())));
+        let user = build_auth_service(repo.clone())
+            .get_or_create_oauth_user_with_attribution(info, &attribution)
+            .await
+            .unwrap();
+        assert_eq!(user.id, existing.id, "creation race");
+        assert_eq!(*repo.creation_calls.lock().unwrap(), 1, "creation race");
+        assert_eq!(
+            *repo.signup_attributions.lock().unwrap(),
+            0,
+            "creation race"
+        );
     }
 
     #[tokio::test]

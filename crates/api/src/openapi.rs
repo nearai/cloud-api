@@ -143,7 +143,6 @@ Operations marked deprecated (account, organization, workspace, invitation, API 
         crate::routes::reporting_usage::summary::summary_usage,
         // Feature request endpoints
         crate::routes::feature_requests::submit_feature_request,
-        crate::routes::feature_requests::list_admin_feature_requests,
         // Gateway endpoints (model gateway integration)
         crate::routes::gateway::check_api_key,
         // Billing endpoints (HuggingFace integration)
@@ -152,13 +151,6 @@ Operations marked deprecated (account, organization, workspace, invitation, API 
         crate::routes::admin::list_models,
         crate::routes::admin::list_model_pricing_changes,
         crate::routes::admin::get_model_history,
-        crate::routes::admin_model_access::get_model_access,
-        crate::routes::admin_model_access::list_organization_model_access,
-        crate::routes::admin::get_admin_organization_balance,
-        crate::routes::admin::get_organization_limits_history,
-        crate::routes::staking_farm::get_admin_organization_staking_farm,
-        crate::routes::admin::list_aml_reports,
-        crate::routes::admin::list_aml_allowlist,
         crate::routes::admin::get_organization_concurrent_limit,
         crate::routes::admin::get_organization_fallback,
         crate::routes::admin::get_organization_priority,
@@ -166,33 +158,24 @@ Operations marked deprecated (account, organization, workspace, invitation, API 
         crate::routes::admin::get_platform_metrics,
         crate::routes::admin::get_organization_timeseries,
         crate::routes::admin::get_platform_timeseries,
-        crate::routes::admin::list_organizations,
         crate::routes::admin::get_model_consumption_timeseries,
         crate::routes::admin::get_performance_timeseries,
         crate::routes::admin::get_billing_summary,
         crate::routes::admin::get_model_revenue,
         crate::routes::admin::get_revenue_density,
-        crate::routes::admin_usage_discount::get_usage_discount,
         crate::routes::credit_transfers::create,
         crate::routes::credit_transfers::history,
         crate::routes::credit_transfers::detail,
         crate::routes::credit_transfers::capacity,
-        crate::routes::organization_policy::get_policy,
         crate::routes::organization_credentials::create_credential,
         crate::routes::organization_credentials::revoke_credential,
         crate::routes::organization_credentials::list_credentials,
         crate::routes::organization_credentials::update_credential,
         crate::routes::organization_credentials::rotate_credential,
-        crate::routes::credit_transfers::reconciliation,
         crate::routes::admin::get_org_revenue,
         crate::routes::admin::get_infra_summary,
         crate::routes::admin::list_admin_settings,
         crate::routes::admin::get_admin_setting,
-        crate::routes::admin::list_invitation_email_deliveries,
-        crate::routes::admin::list_users,
-        crate::routes::admin::list_api_keys,
-        crate::routes::admin::get_organization,
-        crate::routes::admin::list_organization_members,
         crate::routes::services::list_services,
         crate::routes::services::get_service_by_name,
         // Health check endpoint
@@ -651,7 +634,7 @@ mod admin_token_permission_tests {
         }
         for (path, method, phrase, tokens_allowed) in [
             ("/v1/admin/models", "get", "read_only token", true),
-            ("/v1/admin/feature-requests", "get", "read_only token", true),
+            ("/v1/admin/settings", "get", "read_only token", true),
         ] {
             let operation = &doc["paths"][path][method];
             assert!(
@@ -668,11 +651,31 @@ mod admin_token_permission_tests {
                 tokens_allowed
             );
         }
-        // Write and session-only admin operations are no longer served, so the
+        // Retired admin operations (writes, session-only and moved reads) are no longer served, so the
         // spec must not advertise them.
         for (path, method) in [
             ("/v1/admin/models", "patch"),
             ("/v1/admin/models/pricing-changes/preview", "post"),
+            ("/v1/admin/users", "get"),
+            ("/v1/admin/api-keys", "get"),
+            ("/v1/admin/organizations", "get"),
+            ("/v1/admin/organizations/{org_id}", "get"),
+            ("/v1/admin/organizations/{org_id}/members", "get"),
+            ("/v1/admin/invitation-email-deliveries", "get"),
+            ("/v1/admin/aml/reports", "get"),
+            ("/v1/admin/aml/allowlist", "get"),
+            ("/v1/admin/feature-requests", "get"),
+            ("/v1/admin/models/{model_name}/access", "get"),
+            ("/v1/admin/organizations/{org_id}/model-access", "get"),
+            ("/v1/admin/organizations/{org_id}/usage/balance", "get"),
+            ("/v1/admin/organizations/{org_id}/staking/farm", "get"),
+            (
+                "/v1/admin/organizations/{org_id}/credit/transfer/reconciliation",
+                "get",
+            ),
+            ("/v1/admin/organizations/{org_id}/limits/history", "get"),
+            ("/v1/admin/organizations/{org_id}/policy", "get"),
+            ("/v1/admin/organizations/{org_id}/usage-discount", "get"),
             ("/v1/admin/access-tokens", "get"),
             ("/v1/admin/access-tokens", "post"),
             ("/v1/admin/access-tokens/{token_id}", "delete"),

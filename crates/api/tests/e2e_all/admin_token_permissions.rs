@@ -475,7 +475,7 @@ async fn unclassified_routes_deny_reads_and_preserve_authentication_context() {
         count.fetch_add(1, Ordering::SeqCst);
         async move {
             axum::Json(match context {
-                AdminAuthContext::Session => json!({"source": "session"}),
+                AdminAuthContext::Session { .. } => json!({"source": "session"}),
                 AdminAuthContext::AccessToken {
                     token_id,
                     permission,

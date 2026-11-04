@@ -1,3 +1,4 @@
+use super::admin_audit::{AdminAudit, AdminCredentialKind};
 use axum::{
     extract::{MatchedPath, Request, State},
     http::StatusCode,
@@ -63,7 +64,10 @@ pub struct AdminUser(pub DbUser);
 /// AdminUser. Session access and opaque admin tokens have different privileges.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AdminAuthContext {
-    Session,
+    Session {
+        /// The token's `sid` claim; `None` for legacy tokens without one.
+        session_id: Option<uuid::Uuid>,
+    },
     AccessToken {
         token_id: uuid::Uuid,
         permission: AdminAccessTokenPermission,
@@ -358,7 +362,7 @@ pub async fn auth_middleware(
     };
 
     match auth_result {
-        Ok(user) => {
+        Ok((user, _session_id)) => {
             // Clone request to add extension
             let mut request = request;
             request.extensions_mut().insert(AuthenticatedUser(user));
@@ -440,6 +444,7 @@ pub async fn admin_middleware(
         authorization_present = auth_header.is_some(),
         "Admin auth middleware"
     );
+    let audit = AdminAudit::from_extensions(request.extensions());
 
     let auth_result = if let Some(auth_value) = auth_header {
         debug!("Found Authorization header");
@@ -449,12 +454,17 @@ pub async fn admin_middleware(
             // Check if this looks like an admin access token (starts with "adm_")
             // Admin access tokens should ONLY be validated as admin tokens, no fallback
             if token.starts_with("adm_") {
+                audit.record_credential(AdminCredentialKind::AdminAccessToken, None);
                 match authenticate_admin_access_token(&state, token, user_agent.as_deref()).await {
                     Ok(admin_token) => {
                         debug!(
                             admin_access_token_id = %admin_token.id,
                             authenticated = true,
                             "Authenticated via admin access token"
+                        );
+                        audit.record_credential(
+                            AdminCredentialKind::AdminAccessToken,
+                            Some(admin_token.id),
                         );
 
                         // Query the actual admin user from database
@@ -496,9 +506,10 @@ pub async fn admin_middleware(
             } else {
                 // Not an admin access token, try as session token
                 debug!("Token does not appear to be an admin access token, trying session token");
+                audit.record_credential(AdminCredentialKind::Session, None);
                 authenticate_session_access(&state, token.to_string())
                     .await
-                    .map(|user| (user, AdminAuthContext::Session))
+                    .map(|(user, session_id)| (user, AdminAuthContext::Session { session_id }))
             }
         } else {
             debug!("Authorization header uses unsupported scheme");
@@ -522,11 +533,13 @@ pub async fn admin_middleware(
 
     match auth_result {
         Ok((user, context)) => {
+            audit.record_authenticated(user.id, context);
             // Check if user has admin access based on email domain
             let is_admin = check_admin_access(&state, &user);
 
             if !is_admin {
                 tracing::warn!("User attempted admin action without admin privileges");
+                audit.record_denied();
                 return Err((
                     StatusCode::FORBIDDEN,
                     axum::Json(crate::models::ErrorResponse::new(
@@ -536,9 +549,10 @@ pub async fn admin_middleware(
                 ));
             }
 
-            authorize_admin_operation(context, &request)?;
+            authorize_admin_operation(context, &request).inspect_err(|_| audit.record_denied())?;
 
             debug!(admin_user_id = %user.id, authenticated = true, "Admin access granted");
+            audit.record_allowed();
 
             // Add both AuthenticatedUser and AdminUser extensions
             let mut request = request;
@@ -549,7 +563,10 @@ pub async fn admin_middleware(
             request.extensions_mut().insert(context);
             Ok(next.run(request).await)
         }
-        Err(status) => Err(status),
+        Err(status) => {
+            audit.record_denied();
+            Err(status)
+        }
     }
 }
 
@@ -618,10 +635,11 @@ async fn authenticate_admin_access_token(
     }
 }
 
+/// The authenticated user and the session (`sid` claim) the token is bound to.
 async fn authenticate_session_access(
     state: &AuthState,
     token: String, // jwt
-) -> Result<DbUser, (StatusCode, axum::Json<crate::models::ErrorResponse>)> {
+) -> Result<(DbUser, Option<uuid::Uuid>), (StatusCode, axum::Json<crate::models::ErrorResponse>)> {
     if token.starts_with(REPORTING_TOKEN_PREFIX) {
         debug!("Reporting token rejected by session middleware");
         return Err((
@@ -643,9 +661,12 @@ async fn authenticate_session_access(
             .validate_session_access(token, state.encoding_key.clone())
             .await
         {
-            Ok(user) => {
-                debug!(user_id = %user.id.0, authenticated = true, "Authenticated user via session");
-                return Ok(convert_user_to_db_user(user));
+            Ok(session) => {
+                debug!(user_id = %session.user.id.0, authenticated = true, "Authenticated user via session");
+                return Ok((
+                    convert_user_to_db_user(session.user),
+                    session.session_id.map(|session_id| session_id.0),
+                ));
             }
             Err(AuthError::SessionNotFound) | Err(AuthError::UserNotFound) => {
                 debug!("Session not found in auth service, trying OAuth manager");

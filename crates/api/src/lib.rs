@@ -1320,6 +1320,7 @@ pub fn build_app_with_config_and_options(
     let feature_request_routes = build_feature_request_routes(
         database.pool().clone(),
         &auth_components.auth_state_middleware,
+        build_options.mount_retired_admin_routes,
     );
 
     let billing_routes = build_billing_routes(
@@ -2031,10 +2032,13 @@ where
         .nest("/files/", descendants)
 }
 
-/// Build feature request routes for user submissions and admin aggregation.
+/// Build feature request routes. The admin aggregation read moved to
+/// nearai/cloud-platform and is only mounted when `mount_retired_admin_routes`
+/// is set (see [`AppBuildOptions`]); user submissions are always mounted.
 pub fn build_feature_request_routes(
     pool: database::DbPool,
     auth_state_middleware: &AuthState,
+    mount_retired_admin_routes: bool,
 ) -> Router {
     use crate::middleware::{admin_middleware, auth_middleware};
 
@@ -2050,7 +2054,10 @@ pub fn build_feature_request_routes(
             auth_middleware,
         ));
 
-    // Classify read operations in middleware::admin_policy when adding admin routes.
+    if !mount_retired_admin_routes {
+        return user_routes;
+    }
+
     let admin_routes = Router::new()
         .route("/admin/feature-requests", get(list_admin_feature_requests))
         .with_state(state)
@@ -2436,31 +2443,6 @@ fn build_admin_routes_with_options(
             axum::routing::get(get_model_history),
         )
         .route(
-            "/admin/models/{model_name}/access",
-            axum::routing::get(crate::routes::admin_model_access::get_model_access),
-        )
-        .route(
-            "/admin/organizations/{org_id}/model-access",
-            axum::routing::get(crate::routes::admin_model_access::list_organization_model_access),
-        )
-        .route(
-            "/admin/organizations/{org_id}/limits/history",
-            axum::routing::get(get_organization_limits_history),
-        )
-        .route(
-            "/admin/organizations/{org_id}/usage/balance",
-            axum::routing::get(get_admin_organization_balance),
-        )
-        .route(
-            "/admin/organizations/{org_id}/staking/farm",
-            axum::routing::get(get_admin_organization_staking_farm),
-        )
-        .route("/admin/aml/reports", axum::routing::get(list_aml_reports))
-        .route(
-            "/admin/aml/allowlist",
-            axum::routing::get(list_aml_allowlist),
-        )
-        .route(
             "/admin/organizations/{org_id}/concurrent-limit",
             axum::routing::get(get_organization_concurrent_limit),
         )
@@ -2521,6 +2503,31 @@ fn build_admin_routes_with_options(
             "/admin/platform/revenue-density",
             axum::routing::get(get_revenue_density),
         )
+        .with_state(admin_app_state.clone());
+
+    let retired = Router::new()
+        .route("/admin/models", axum::routing::patch(batch_upsert_models))
+        .route(
+            "/admin/models/{model_name}/access",
+            axum::routing::get(crate::routes::admin_model_access::get_model_access),
+        )
+        .route(
+            "/admin/organizations/{org_id}/model-access",
+            axum::routing::get(crate::routes::admin_model_access::list_organization_model_access),
+        )
+        .route(
+            "/admin/organizations/{org_id}/limits/history",
+            axum::routing::get(get_organization_limits_history),
+        )
+        .route(
+            "/admin/organizations/{org_id}/usage/balance",
+            axum::routing::get(get_admin_organization_balance),
+        )
+        .route(
+            "/admin/organizations/{org_id}/staking/farm",
+            axum::routing::get(get_admin_organization_staking_farm),
+        )
+        .route("/admin/aml/reports", axum::routing::get(list_aml_reports))
         .route(
             "/admin/invitation-email-deliveries",
             axum::routing::get(list_invitation_email_deliveries),
@@ -2539,27 +2546,6 @@ fn build_admin_routes_with_options(
             "/admin/organizations/{org_id}/members",
             axum::routing::get(list_organization_members),
         )
-        .with_state(admin_app_state.clone())
-        .merge(
-            Router::new()
-                .route(
-                    "/admin/organizations/{org_id}/policy",
-                    get(crate::routes::organization_policy::get_policy),
-                )
-                .route("/admin/organizations/{org_id}/credit/transfer/reconciliation", get(crate::routes::credit_transfers::reconciliation))
-                .layer(axum::Extension(
-                    build_organization_credit_service(&database, &config),
-                ))
-        )
-        .merge(
-            Router::new()
-                .route("/admin/organizations/{org_id}/usage-discount",
-                    axum::routing::get(crate::routes::admin_usage_discount::get_usage_discount))
-                .layer(axum::Extension(database::repositories::organization_usage_discount::OrganizationUsageDiscountRepository::new(database.pool().clone())))
-        );
-
-    let retired = Router::new()
-        .route("/admin/models", axum::routing::patch(batch_upsert_models))
         .route(
             "/admin/models/deprecate",
             axum::routing::post(deprecate_model),
@@ -2609,7 +2595,7 @@ fn build_admin_routes_with_options(
         )
         .route(
             "/admin/aml/allowlist",
-            axum::routing::post(upsert_aml_allowlist_entry),
+            axum::routing::get(list_aml_allowlist).post(upsert_aml_allowlist_entry),
         )
         .route(
             "/admin/aml/allowlist/{account_id}",
@@ -2664,7 +2650,12 @@ fn build_admin_routes_with_options(
             Router::new()
                 .route(
                     "/admin/organizations/{org_id}/policy",
-                    axum::routing::put(crate::routes::organization_policy::put_policy),
+                    axum::routing::get(crate::routes::organization_policy::get_policy)
+                        .put(crate::routes::organization_policy::put_policy),
+                )
+                .route(
+                    "/admin/organizations/{org_id}/credit/transfer/reconciliation",
+                    axum::routing::get(crate::routes::credit_transfers::reconciliation),
                 )
                 .layer(axum::Extension(
                     build_organization_credit_service(&database, &config),
@@ -2687,7 +2678,8 @@ fn build_admin_routes_with_options(
         .merge(
             Router::new()
                 .route("/admin/organizations/{org_id}/usage-discount",
-                    axum::routing::put(crate::routes::admin_usage_discount::put_usage_discount))
+                    axum::routing::get(crate::routes::admin_usage_discount::get_usage_discount)
+                        .put(crate::routes::admin_usage_discount::put_usage_discount))
                 .layer(axum::Extension(database::repositories::organization_usage_discount::OrganizationUsageDiscountRepository::new(database.pool().clone())))
         )
         .merge(
@@ -2717,30 +2709,34 @@ fn build_admin_routes_with_options(
         if build_options.start_database_encryption_recovery {
             database_encryption_state.recover_jobs();
         }
-        admin_routes.merge(
-            Router::new()
-                .route(
-                    "/admin/database-encryption/scan",
-                    axum::routing::post(crate::database_encryption::scan),
-                )
-                .route(
-                    "/admin/database-encryption/jobs",
-                    axum::routing::post(crate::database_encryption::create_job),
-                )
-                .route(
-                    "/admin/database-encryption/jobs/{id}",
-                    axum::routing::get(crate::database_encryption::get_job),
-                )
-                .route(
-                    "/admin/database-encryption/jobs/{id}/cancel",
-                    axum::routing::post(crate::database_encryption::cancel_job),
-                )
-                .route(
-                    "/admin/database-encryption/verify",
-                    axum::routing::post(crate::database_encryption::verify),
-                )
-                .layer(axum::Extension(database_encryption_state)),
-        )
+        if build_options.mount_retired_admin_routes {
+            admin_routes.merge(
+                Router::new()
+                    .route(
+                        "/admin/database-encryption/scan",
+                        axum::routing::post(crate::database_encryption::scan),
+                    )
+                    .route(
+                        "/admin/database-encryption/jobs",
+                        axum::routing::post(crate::database_encryption::create_job),
+                    )
+                    .route(
+                        "/admin/database-encryption/jobs/{id}",
+                        axum::routing::get(crate::database_encryption::get_job),
+                    )
+                    .route(
+                        "/admin/database-encryption/jobs/{id}/cancel",
+                        axum::routing::post(crate::database_encryption::cancel_job),
+                    )
+                    .route(
+                        "/admin/database-encryption/verify",
+                        axum::routing::post(crate::database_encryption::verify),
+                    )
+                    .layer(axum::Extension(database_encryption_state)),
+            )
+        } else {
+            admin_routes
+        }
     } else {
         admin_routes
     };
@@ -2847,6 +2843,32 @@ mod tests {
     fn retained_admin_routes_are_reads_only() {
         use crate::middleware::admin_policy::{admin_operation, AdminOperation};
 
+        // Reads that moved to cloud-platform; they must not come back to `retained`.
+        const RETIRED_READS: [&str; 22] = [
+            "/admin/users",
+            "/admin/api-keys",
+            "/admin/organizations",
+            "/admin/organizations/{org_id}",
+            "/admin/organizations/{org_id}/members",
+            "/admin/invitation-email-deliveries",
+            "/admin/aml/reports",
+            "/admin/aml/allowlist",
+            "/admin/feature-requests",
+            "/admin/models/{model_name}/access",
+            "/admin/organizations/{org_id}/model-access",
+            "/admin/organizations/{org_id}/usage/balance",
+            "/admin/organizations/{org_id}/staking/farm",
+            "/admin/organizations/{org_id}/credit/transfer/reconciliation",
+            "/admin/organizations/{org_id}/limits/history",
+            "/admin/organizations/{org_id}/policy",
+            "/admin/organizations/{org_id}/usage-discount",
+            "/admin/access-tokens",
+            "/admin/database-encryption/scan",
+            "/admin/database-encryption/jobs",
+            "/admin/database-encryption/jobs/{id}",
+            "/admin/database-encryption/verify",
+        ];
+
         const PREVIEWS: [&str; 3] = [
             "/admin/models/pricing-changes/preview",
             "/admin/models/{model_name}/deprecation/preview",
@@ -2866,7 +2888,9 @@ mod tests {
             let chunk = chunk.split(".with_state(").next().unwrap();
             let path = chunk.split('"').nth(1).expect("route path");
             assert!(
-                !PREVIEWS.contains(&path),
+                !PREVIEWS.contains(&path)
+                    && !RETIRED_READS.contains(&path)
+                    && !path.starts_with("/admin/database-encryption"),
                 "{path} must be registered in the retired router"
             );
             for method in ["get", "post", "put", "patch", "delete"] {
@@ -2887,7 +2911,34 @@ mod tests {
                 }
             }
         }
-        assert!(checked > 30, "route scan found only {checked} routes");
+        assert!(checked > 15, "route scan found only {checked} routes");
+
+        // The feature-request builder is outside the retained slice: its admin
+        // read must sit behind the option.
+        let builder = source
+            .find("pub fn build_feature_request_routes(")
+            .expect("feature request builder");
+        let admin_read = builder
+            + source[builder..]
+                .find("\"/admin/feature-requests\"")
+                .expect("feature request admin route");
+        let gate = builder
+            + source[builder..]
+                .find("if !mount_retired_admin_routes {")
+                .expect("feature request gate");
+        assert!(gate < admin_read, "/admin/feature-requests must be gated");
+
+        // Database-encryption routes are only registered behind the option.
+        let first_encryption = source
+            .find("\"/admin/database-encryption/")
+            .expect("database encryption routes");
+        let encryption_gate = source
+            .find("if build_options.mount_retired_admin_routes {\n            admin_routes.merge(")
+            .expect("database encryption gate");
+        assert!(
+            encryption_gate < first_encryption,
+            "database-encryption routes must be gated"
+        );
     }
 
     /// Regression for issue #781 (M1): the Chutes catalog seed must advertise a
@@ -3273,23 +3324,14 @@ mod tests {
     }
 
     #[test]
-    fn test_openapi_admin_aml_paths_require_admin_security() {
+    fn test_openapi_omits_retired_admin_aml_paths() {
         let spec = serde_json::to_value(ApiDoc::openapi()).unwrap();
         let paths = spec["paths"].as_object().unwrap();
 
-        for (path, method) in [
-            ("/v1/admin/aml/reports", "get"),
-            ("/v1/admin/aml/allowlist", "get"),
-        ] {
-            let operation = &paths[path][method];
+        for path in ["/v1/admin/aml/reports", "/v1/admin/aml/allowlist"] {
             assert!(
-                operation.is_object(),
-                "missing OpenAPI operation: {method} {path}"
-            );
-            assert_eq!(
-                operation["security"],
-                serde_json::json!([{ "session_token": [] }, { "admin_token": [] }]),
-                "{method} {path} must require session_token or admin_token security"
+                !paths.contains_key(path),
+                "retired admin path {path} must not be in OpenAPI"
             );
         }
     }

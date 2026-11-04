@@ -1,7 +1,8 @@
 // E2E tests for the production-shaped admin router: the routes that moved to
-// nearai/cloud-platform are not served, while reads and database-encryption
-// routes still are. Uses default `AppBuildOptions` apart from disabling
-// background encryption recovery.
+// nearai/cloud-platform (including the database-encryption routes and the
+// admin list/detail reads) are not served, while the remaining admin reads
+// still are. Uses default `AppBuildOptions` apart from disabling background
+// encryption recovery.
 
 use crate::common::*;
 use axum::http::{Method, StatusCode};
@@ -100,6 +101,57 @@ fn retired_routes() -> Vec<(Method, String)> {
             format!("/v1/admin/organizations/{ORG}/usage-discount"),
         ),
         (Method::POST, "/v1/admin/usage-hourly/recompute".into()),
+        // Database encryption.
+        (Method::POST, "/v1/admin/database-encryption/scan".into()),
+        (Method::POST, "/v1/admin/database-encryption/jobs".into()),
+        (
+            Method::GET,
+            format!("/v1/admin/database-encryption/jobs/{ORG}"),
+        ),
+        (
+            Method::POST,
+            format!("/v1/admin/database-encryption/jobs/{ORG}/cancel"),
+        ),
+        (Method::POST, "/v1/admin/database-encryption/verify".into()),
+        // Reads that moved to cloud-platform.
+        (Method::GET, "/v1/admin/users".into()),
+        (Method::GET, "/v1/admin/api-keys".into()),
+        (Method::GET, "/v1/admin/organizations".into()),
+        (Method::GET, format!("/v1/admin/organizations/{ORG}")),
+        (
+            Method::GET,
+            format!("/v1/admin/organizations/{ORG}/members"),
+        ),
+        (Method::GET, "/v1/admin/invitation-email-deliveries".into()),
+        (Method::GET, "/v1/admin/aml/reports".into()),
+        (Method::GET, "/v1/admin/aml/allowlist".into()),
+        (Method::GET, "/v1/admin/feature-requests".into()),
+        (Method::GET, "/v1/admin/models/some-model/access".into()),
+        (
+            Method::GET,
+            format!("/v1/admin/organizations/{ORG}/model-access"),
+        ),
+        (
+            Method::GET,
+            format!("/v1/admin/organizations/{ORG}/usage/balance"),
+        ),
+        (
+            Method::GET,
+            format!("/v1/admin/organizations/{ORG}/staking/farm"),
+        ),
+        (
+            Method::GET,
+            format!("/v1/admin/organizations/{ORG}/credit/transfer/reconciliation"),
+        ),
+        (
+            Method::GET,
+            format!("/v1/admin/organizations/{ORG}/limits/history"),
+        ),
+        (Method::GET, format!("/v1/admin/organizations/{ORG}/policy")),
+        (
+            Method::GET,
+            format!("/v1/admin/organizations/{ORG}/usage-discount"),
+        ),
     ];
     routes
 }
@@ -140,9 +192,7 @@ async fn test_retained_admin_routes_are_served_in_production_shape() {
 
     for path in [
         "/v1/admin/models?limit=1",
-        "/v1/admin/users?limit=1",
-        "/v1/admin/organizations?limit=1",
-        "/v1/admin/api-keys?limit=1",
+        "/v1/admin/models/pricing-changes",
         "/v1/admin/settings",
     ] {
         let response = call(&server, &Method::GET, path).await;
@@ -152,8 +202,14 @@ async fn test_retained_admin_routes_are_served_in_production_shape() {
     // Environment-dependent reads: only require that the route is mounted.
     for path in [
         "/v1/admin/platform/infra-summary",
-        "/v1/admin/feature-requests",
-        "/v1/admin/aml/allowlist",
+        "/v1/admin/platform/metrics",
+        "/v1/admin/platform/metrics/timeseries",
+        "/v1/admin/platform/billing-summary",
+        "/v1/admin/platform/model-revenue",
+        "/v1/admin/platform/org-revenue",
+        "/v1/admin/platform/model-consumption-timeseries",
+        "/v1/admin/platform/performance-timeseries",
+        "/v1/admin/platform/revenue-density",
     ] {
         let response = call(&server, &Method::GET, path).await;
         assert!(
@@ -166,19 +222,26 @@ async fn test_retained_admin_routes_are_served_in_production_shape() {
         );
     }
 
+    // Reads whose handler can answer 404 for an unknown id: a method the path
+    // does not register answers 405 only when the path itself is mounted.
+    for path in [
+        "/v1/admin/models/some-model/history".to_string(),
+        "/v1/admin/settings/some-key".to_string(),
+        format!("/v1/admin/organizations/{ORG}/concurrent-limit"),
+        format!("/v1/admin/organizations/{ORG}/priority"),
+        format!("/v1/admin/organizations/{ORG}/fallback"),
+        format!("/v1/admin/organizations/{ORG}/metrics"),
+        format!("/v1/admin/organizations/{ORG}/metrics/timeseries"),
+    ] {
+        let response = call(&server, &Method::POST, &path).await;
+        assert_eq!(
+            response.status_code(),
+            StatusCode::METHOD_NOT_ALLOWED,
+            "POST {path}"
+        );
+    }
+
     // Paths that keep their read also reject the retired method.
     let response = call(&server, &Method::PATCH, "/v1/admin/models").await;
     assert_eq!(response.status_code(), StatusCode::METHOD_NOT_ALLOWED);
-
-    // Database-encryption routes stay mounted.
-    let response = server
-        .post("/v1/admin/database-encryption/scan")
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
-        .add_header("User-Agent", MOCK_USER_AGENT)
-        .json(&serde_json::json!({
-            "scope": {"fields": [{"table": "files", "column": "filename"}]},
-            "batch_size": 1
-        }))
-        .await;
-    assert_eq!(response.status_code(), StatusCode::OK);
 }

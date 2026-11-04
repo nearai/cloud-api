@@ -144,12 +144,17 @@ pub struct DomainServices {
 #[derive(Clone, Copy, Debug)]
 pub struct AppBuildOptions {
     pub start_database_encryption_recovery: bool,
+    /// Mounts the admin routes that moved to nearai/cloud-platform. Off by
+    /// default and intentionally not configurable from the environment; only
+    /// the test harness enables it while the handlers still exist.
+    pub mount_retired_admin_routes: bool,
 }
 
 impl Default for AppBuildOptions {
     fn default() -> Self {
         Self {
             start_database_encryption_recovery: true,
+            mount_retired_admin_routes: false,
         }
     }
 }
@@ -2414,65 +2419,29 @@ fn build_admin_routes_with_options(
     .ok();
 
     // Classify read operations in middleware::admin_policy when adding admin routes.
-    let admin_routes = Router::new()
-        .route(
-            "/admin/models",
-            axum::routing::get(admin_list_models).patch(batch_upsert_models),
-        )
-        .route(
-            "/admin/models/deprecate",
-            axum::routing::post(deprecate_model),
-        )
+    //
+    // Routes are registered into two routers. `retained` is always served.
+    // `retired` holds every operation that moved to nearai/cloud-platform (all
+    // Write and SessionOnly operations plus read-only previews) and is mounted
+    // only when `AppBuildOptions::mount_retired_admin_routes` is set, which only
+    // the test harness does. Database-encryption routes stay in `retained`.
+    let retained = Router::new()
+        .route("/admin/models", axum::routing::get(admin_list_models))
         .route(
             "/admin/models/pricing-changes",
             axum::routing::get(list_model_pricing_changes),
-        )
-        .route(
-            "/admin/models/pricing-changes/preview",
-            axum::routing::post(preview_model_pricing_changes),
-        )
-        .route(
-            "/admin/models/pricing-changes/confirm",
-            axum::routing::post(confirm_model_pricing_changes),
-        )
-        .route(
-            "/admin/models/pricing-changes/{id}",
-            axum::routing::delete(cancel_model_pricing_change),
-        )
-        .route(
-            "/admin/models/{model_name}",
-            axum::routing::delete(delete_model),
         )
         .route(
             "/admin/models/{model_name}/history",
             axum::routing::get(get_model_history),
         )
         .route(
-            "/admin/models/{model_name}/deprecation/preview",
-            axum::routing::post(preview_model_deprecation),
-        )
-        .route(
-            "/admin/models/{model_name}/deprecation/confirm",
-            axum::routing::post(confirm_model_deprecation),
-        )
-        .route(
             "/admin/models/{model_name}/access",
             axum::routing::get(crate::routes::admin_model_access::get_model_access),
         )
         .route(
-            "/admin/models/{model_name}/access/{org_id}",
-            axum::routing::put(crate::routes::admin_model_access::grant_model_access)
-                .delete(crate::routes::admin_model_access::revoke_model_access),
-        )
-        .route(
             "/admin/organizations/{org_id}/model-access",
             axum::routing::get(crate::routes::admin_model_access::list_organization_model_access),
-        )
-        .route("/admin/services", axum::routing::post(create_service))
-        .route("/admin/services/{id}", axum::routing::patch(update_service))
-        .route(
-            "/admin/organizations/{org_id}/limits",
-            axum::routing::patch(update_organization_limits),
         )
         .route(
             "/admin/organizations/{org_id}/limits/history",
@@ -2486,35 +2455,22 @@ fn build_admin_routes_with_options(
             "/admin/organizations/{org_id}/staking/farm",
             axum::routing::get(get_admin_organization_staking_farm),
         )
-        .route(
-            "/admin/organizations/{org_id}/staking/farm/sync",
-            axum::routing::post(sync_admin_organization_staking_farm),
-        )
         .route("/admin/aml/reports", axum::routing::get(list_aml_reports))
         .route(
-            "/admin/aml/reports/{report_id}/status",
-            axum::routing::patch(update_aml_report_status),
-        )
-        .route(
             "/admin/aml/allowlist",
-            axum::routing::get(list_aml_allowlist).post(upsert_aml_allowlist_entry),
-        )
-        .route(
-            "/admin/aml/allowlist/{account_id}",
-            axum::routing::delete(delete_aml_allowlist_entry),
+            axum::routing::get(list_aml_allowlist),
         )
         .route(
             "/admin/organizations/{org_id}/concurrent-limit",
-            axum::routing::patch(update_organization_concurrent_limit)
-                .get(get_organization_concurrent_limit),
+            axum::routing::get(get_organization_concurrent_limit),
         )
         .route(
             "/admin/organizations/{org_id}/priority",
-            axum::routing::get(get_organization_priority).patch(update_organization_priority),
+            axum::routing::get(get_organization_priority),
         )
         .route(
             "/admin/organizations/{org_id}/fallback",
-            axum::routing::get(get_organization_fallback).patch(update_organization_fallback),
+            axum::routing::get(get_organization_fallback),
         )
         .route(
             "/admin/organizations/{org_id}/metrics",
@@ -2551,7 +2507,7 @@ fn build_admin_routes_with_options(
         .route("/admin/settings", axum::routing::get(list_admin_settings))
         .route(
             "/admin/settings/{key}",
-            axum::routing::get(get_admin_setting).patch(update_admin_setting),
+            axum::routing::get(get_admin_setting),
         )
         .route(
             "/admin/platform/model-consumption-timeseries",
@@ -2569,23 +2525,7 @@ fn build_admin_routes_with_options(
             "/admin/invitation-email-deliveries",
             axum::routing::get(list_invitation_email_deliveries),
         )
-        .route(
-            "/admin/invitation-email-deliveries/{invitation_id}/resend",
-            axum::routing::post(resend_invitation_email),
-        )
         .route("/admin/users", axum::routing::get(list_users))
-        .route(
-            "/admin/users/{user_id}/erasure/preview",
-            axum::routing::post(preview_user_erasure),
-        )
-        .route(
-            "/admin/users/{user_id}/erasure",
-            axum::routing::post(erase_user),
-        )
-        .route(
-            "/admin/user-erasures/lookup",
-            axum::routing::post(lookup_user_erasures),
-        )
         .route(
             "/admin/organizations",
             axum::routing::get(list_organizations),
@@ -2599,17 +2539,121 @@ fn build_admin_routes_with_options(
             "/admin/organizations/{org_id}/members",
             axum::routing::get(list_organization_members),
         )
+        .with_state(admin_app_state.clone())
+        .merge(
+            Router::new()
+                .route(
+                    "/admin/organizations/{org_id}/policy",
+                    get(crate::routes::organization_policy::get_policy),
+                )
+                .route("/admin/organizations/{org_id}/credit/transfer/reconciliation", get(crate::routes::credit_transfers::reconciliation))
+                .layer(axum::Extension(
+                    build_organization_credit_service(&database, &config),
+                ))
+        )
+        .merge(
+            Router::new()
+                .route("/admin/organizations/{org_id}/usage-discount",
+                    axum::routing::get(crate::routes::admin_usage_discount::get_usage_discount))
+                .layer(axum::Extension(database::repositories::organization_usage_discount::OrganizationUsageDiscountRepository::new(database.pool().clone())))
+        );
+
+    let retired = Router::new()
+        .route("/admin/models", axum::routing::patch(batch_upsert_models))
+        .route(
+            "/admin/models/deprecate",
+            axum::routing::post(deprecate_model),
+        )
+        .route(
+            "/admin/models/pricing-changes/preview",
+            axum::routing::post(preview_model_pricing_changes),
+        )
+        .route(
+            "/admin/models/pricing-changes/confirm",
+            axum::routing::post(confirm_model_pricing_changes),
+        )
+        .route(
+            "/admin/models/pricing-changes/{id}",
+            axum::routing::delete(cancel_model_pricing_change),
+        )
+        .route(
+            "/admin/models/{model_name}",
+            axum::routing::delete(delete_model),
+        )
+        .route(
+            "/admin/models/{model_name}/deprecation/preview",
+            axum::routing::post(preview_model_deprecation),
+        )
+        .route(
+            "/admin/models/{model_name}/deprecation/confirm",
+            axum::routing::post(confirm_model_deprecation),
+        )
+        .route(
+            "/admin/models/{model_name}/access/{org_id}",
+            axum::routing::put(crate::routes::admin_model_access::grant_model_access)
+                .delete(crate::routes::admin_model_access::revoke_model_access),
+        )
+        .route("/admin/services", axum::routing::post(create_service))
+        .route("/admin/services/{id}", axum::routing::patch(update_service))
+        .route(
+            "/admin/organizations/{org_id}/limits",
+            axum::routing::patch(update_organization_limits),
+        )
+        .route(
+            "/admin/organizations/{org_id}/staking/farm/sync",
+            axum::routing::post(sync_admin_organization_staking_farm),
+        )
+        .route(
+            "/admin/aml/reports/{report_id}/status",
+            axum::routing::patch(update_aml_report_status),
+        )
+        .route(
+            "/admin/aml/allowlist",
+            axum::routing::post(upsert_aml_allowlist_entry),
+        )
+        .route(
+            "/admin/aml/allowlist/{account_id}",
+            axum::routing::delete(delete_aml_allowlist_entry),
+        )
+        .route(
+            "/admin/organizations/{org_id}/concurrent-limit",
+            axum::routing::patch(update_organization_concurrent_limit),
+        )
+        .route(
+            "/admin/organizations/{org_id}/priority",
+            axum::routing::patch(update_organization_priority),
+        )
+        .route(
+            "/admin/organizations/{org_id}/fallback",
+            axum::routing::patch(update_organization_fallback),
+        )
+        .route(
+            "/admin/settings/{key}",
+            axum::routing::patch(update_admin_setting),
+        )
+        .route(
+            "/admin/invitation-email-deliveries/{invitation_id}/resend",
+            axum::routing::post(resend_invitation_email),
+        )
+        .route(
+            "/admin/users/{user_id}/erasure/preview",
+            axum::routing::post(preview_user_erasure),
+        )
+        .route(
+            "/admin/users/{user_id}/erasure",
+            axum::routing::post(erase_user),
+        )
+        .route(
+            "/admin/user-erasures/lookup",
+            axum::routing::post(lookup_user_erasures),
+        )
         .route(
             "/admin/organizations/{org_id}/members/{user_id}",
             axum::routing::put(update_organization_member_role),
         )
         .route(
             "/admin/access-tokens",
-            axum::routing::post(create_admin_access_token),
-        )
-        .route(
-            "/admin/access-tokens",
-            axum::routing::get(list_admin_access_tokens),
+            axum::routing::post(create_admin_access_token).get(list_admin_access_tokens),
         )
         .route(
             "/admin/access-tokens/{token_id}",
@@ -2620,10 +2664,8 @@ fn build_admin_routes_with_options(
             Router::new()
                 .route(
                     "/admin/organizations/{org_id}/policy",
-                    get(crate::routes::organization_policy::get_policy)
-                        .put(crate::routes::organization_policy::put_policy),
+                    axum::routing::put(crate::routes::organization_policy::put_policy),
                 )
-                .route("/admin/organizations/{org_id}/credit/transfer/reconciliation", get(crate::routes::credit_transfers::reconciliation))
                 .layer(axum::Extension(
                     build_organization_credit_service(&database, &config),
                 ))
@@ -2645,8 +2687,7 @@ fn build_admin_routes_with_options(
         .merge(
             Router::new()
                 .route("/admin/organizations/{org_id}/usage-discount",
-                    axum::routing::get(crate::routes::admin_usage_discount::get_usage_discount)
-                        .put(crate::routes::admin_usage_discount::put_usage_discount))
+                    axum::routing::put(crate::routes::admin_usage_discount::put_usage_discount))
                 .layer(axum::Extension(database::repositories::organization_usage_discount::OrganizationUsageDiscountRepository::new(database.pool().clone())))
         )
         .merge(
@@ -2665,6 +2706,12 @@ fn build_admin_routes_with_options(
                     },
                 )),
         );
+
+    let admin_routes = if build_options.mount_retired_admin_routes {
+        retained.merge(retired)
+    } else {
+        retained
+    };
 
     let admin_routes = if let Some(database_encryption_state) = database_encryption_state {
         if build_options.start_database_encryption_recovery {

@@ -49,6 +49,8 @@ pub(super) const E2E_APP_BUILD_OPTIONS: AppBuildOptions = AppBuildOptions {
     // startup recovery is disabled so unrelated tests do not all scan and race
     // over the same global job queue.
     start_database_encryption_recovery: false,
+    // Existing admin e2e tests still exercise the retired handlers.
+    mount_retired_admin_routes: true,
 };
 
 /// Shared pricing constants for E2E tests that use the Qwen bootstrap fixtures.

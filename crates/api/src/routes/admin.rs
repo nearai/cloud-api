@@ -3,7 +3,7 @@ use crate::conversions::{
     api_role_to_services_role, services_invitation_email_delivery_to_api,
     services_invitation_resend_result_to_api, services_member_to_api_member,
 };
-use crate::middleware::AdminUser;
+use crate::middleware::{AdminAudit, AdminUser};
 use crate::models::{
     AdminAccessTokenPermission, AdminAccessTokenResponse, AdminAmlAllowlistEntryResponse,
     AdminAmlReportResponse, AdminApiKeyResponse, AdminInvitationEmailResendResultResponse,
@@ -252,6 +252,7 @@ pub struct AdminAmlAllowlistQuery {
 pub async fn list_aml_reports(
     State(app_state): State<AdminAppState>,
     Extension(_admin_user): Extension<AdminUser>,
+    audit: AdminAudit,
     Query(params): Query<AdminAmlReportsQuery>,
 ) -> Result<ResponseJson<ListAdminAmlReportsResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
     crate::routes::common::validate_limit_offset(params.limit, params.offset)?;
@@ -261,6 +262,7 @@ pub async fn list_aml_reports(
         .list_reports(params.limit, params.offset)
         .await
         .map_err(aml_service_error)?;
+    audit.record_page(params.limit, params.offset, page.reports.len());
 
     Ok(ResponseJson(ListAdminAmlReportsResponse {
         reports: page.reports.into_iter().map(aml_report_response).collect(),
@@ -335,6 +337,7 @@ pub async fn update_aml_report_status(
 pub async fn list_aml_allowlist(
     State(app_state): State<AdminAppState>,
     Extension(_admin_user): Extension<AdminUser>,
+    audit: AdminAudit,
     Query(params): Query<AdminAmlAllowlistQuery>,
 ) -> Result<ResponseJson<ListAdminAmlAllowlistResponse>, (StatusCode, ResponseJson<ErrorResponse>)>
 {
@@ -345,6 +348,7 @@ pub async fn list_aml_allowlist(
         .list_allowlist_entries(params.limit, params.offset)
         .await
         .map_err(aml_service_error)?;
+    audit.record_page(params.limit, params.offset, page.entries.len());
 
     let accounts = page
         .entries
@@ -1180,6 +1184,7 @@ pub async fn batch_upsert_models(
 pub async fn list_models(
     State(app_state): State<AdminAppState>,
     Extension(_admin_user): Extension<AdminUser>,
+    audit: AdminAudit,
     axum::extract::Query(params): axum::extract::Query<ListModelsQueryParams>,
 ) -> Result<ResponseJson<AdminModelListResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
     crate::routes::common::validate_limit_offset(params.limit, params.offset)?;
@@ -1262,6 +1267,7 @@ pub async fn list_models(
             updated_at: model.updated_at,
         })
         .collect();
+    audit.record_page(params.limit, params.offset, api_models.len());
 
     let response = AdminModelListResponse {
         models: api_models,
@@ -1303,6 +1309,7 @@ pub async fn get_model_history(
     State(app_state): State<AdminAppState>,
     Path(model_name): Path<String>,
     Extension(_admin_user): Extension<AdminUser>, // Require admin auth
+    audit: AdminAudit,
     axum::extract::Query(params): axum::extract::Query<ModelHistoryQueryParams>,
 ) -> Result<ResponseJson<ModelHistoryResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
     crate::routes::common::validate_limit_offset(params.limit, params.offset)?;
@@ -1399,6 +1406,7 @@ pub async fn get_model_history(
             is_listed: h.is_listed,
         })
         .collect();
+    audit.record_page(params.limit, params.offset, history_entries.len());
 
     let response = ModelHistoryResponse {
         model_name,
@@ -1575,6 +1583,7 @@ pub async fn get_organization_limits_history(
     State(app_state): State<AdminAppState>,
     Path(org_id): Path<String>,
     Extension(_admin_user): Extension<AdminUser>, // Require admin auth
+    audit: AdminAudit,
     axum::extract::Query(params): axum::extract::Query<OrgLimitsHistoryQueryParams>,
 ) -> Result<ResponseJson<OrgLimitsHistoryResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
     crate::routes::common::validate_limit_offset(params.limit, params.offset)?;
@@ -1658,6 +1667,7 @@ pub async fn get_organization_limits_history(
             })
         })
         .collect::<Result<Vec<_>, (StatusCode, ResponseJson<ErrorResponse>)>>()?;
+    audit.record_page(params.limit, params.offset, entries.len());
 
     let response = OrgLimitsHistoryResponse {
         history: entries,
@@ -2363,6 +2373,7 @@ fn default_pricing_changes_limit() -> i64 {
 pub async fn list_model_pricing_changes(
     State(app_state): State<AdminAppState>,
     Extension(_admin_user): Extension<AdminUser>,
+    audit: AdminAudit,
     Query(params): Query<ListPricingChangesQueryParams>,
 ) -> Result<ResponseJson<ListPricingChangesResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
     let status = params
@@ -2388,6 +2399,7 @@ pub async fn list_model_pricing_changes(
         .list_pricing_changes(status, params.limit, params.offset)
         .await
         .map_err(admin_error_to_response)?;
+    audit.record_page(params.limit, params.offset, changes.len());
 
     Ok(ResponseJson(ListPricingChangesResponse {
         changes: changes
@@ -2497,6 +2509,7 @@ fn admin_error_to_response(
 pub async fn list_users(
     State(app_state): State<AdminAppState>,
     Extension(_admin_user): Extension<AdminUser>, // Require admin auth
+    audit: AdminAudit,
     axum::extract::Query(params): axum::extract::Query<ListUsersQueryParams>,
 ) -> Result<ResponseJson<ListUsersResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
     crate::routes::common::validate_limit_offset(params.limit, params.offset)?;
@@ -2658,6 +2671,7 @@ pub async fn list_users(
 
         (responses, total)
     };
+    audit.record_page(params.limit, params.offset, user_responses.len());
 
     let response = ListUsersResponse {
         users: user_responses,
@@ -2694,6 +2708,7 @@ pub async fn list_users(
 pub async fn list_organizations(
     State(app_state): State<AdminAppState>,
     Extension(_admin_user): Extension<AdminUser>, // Require admin auth
+    audit: AdminAudit,
     axum::extract::Query(params): axum::extract::Query<ListOrganizationsQueryParams>,
 ) -> Result<ResponseJson<ListOrganizationsAdminResponse>, (StatusCode, ResponseJson<ErrorResponse>)>
 {
@@ -2729,6 +2744,7 @@ pub async fn list_organizations(
         .into_iter()
         .map(admin_org_info_to_response)
         .collect();
+    audit.record_page(params.limit, params.offset, org_responses.len());
 
     let response = ListOrganizationsAdminResponse {
         organizations: org_responses,
@@ -2768,6 +2784,7 @@ pub async fn list_organizations(
 pub async fn list_api_keys(
     State(app_state): State<AdminAppState>,
     Extension(_admin_user): Extension<AdminUser>,
+    audit: AdminAudit,
     axum::extract::Query(params): axum::extract::Query<ListAdminApiKeysQueryParams>,
 ) -> Result<ResponseJson<ListAdminApiKeysResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
     crate::routes::common::validate_limit_offset(params.limit, params.offset)?;
@@ -2776,6 +2793,9 @@ pub async fn list_api_keys(
         "List API keys request with limit={}, offset={}",
         params.limit, params.offset
     );
+    if let Some(organization_id) = params.organization_id {
+        audit.record_organization(organization_id);
+    }
 
     let filters = services::admin::AdminApiKeyFilters {
         organization_id: params.organization_id,
@@ -2807,6 +2827,7 @@ pub async fn list_api_keys(
                 )
             }
         })?;
+    audit.record_page(params.limit, params.offset, api_keys.len());
 
     let response = ListAdminApiKeysResponse {
         api_keys: api_keys
@@ -3123,6 +3144,7 @@ fn member_role_from_db_str(role: &str, member_id: Uuid) -> MemberRole {
 pub async fn list_organization_members(
     State(app_state): State<AdminAppState>,
     Extension(_admin_user): Extension<AdminUser>, // Require admin auth
+    audit: AdminAudit,
     Path(org_id): Path<Uuid>,
     Query(params): Query<ListOrganizationMembersQueryParams>,
 ) -> Result<
@@ -3206,6 +3228,7 @@ pub async fn list_organization_members(
             },
         })
         .collect();
+    audit.record_page(params.limit, params.offset, member_responses.len());
 
     Ok(ResponseJson(ListAdminOrganizationMembersResponse {
         members: member_responses,
@@ -3325,6 +3348,7 @@ pub async fn update_organization_member_role(
 pub async fn list_invitation_email_deliveries(
     State(app_state): State<AdminAppState>,
     Extension(_admin_user): Extension<AdminUser>,
+    audit: AdminAudit,
     axum::extract::Query(params): axum::extract::Query<ListInvitationEmailDeliveriesQueryParams>,
 ) -> Result<
     ResponseJson<ListAdminInvitationEmailDeliveriesResponse>,
@@ -3336,6 +3360,9 @@ pub async fn list_invitation_email_deliveries(
         "List invitation email deliveries request with limit={}, offset={}",
         params.limit, params.offset
     );
+    if let Some(organization_id) = params.organization_id {
+        audit.record_organization(organization_id);
+    }
 
     let filters = services::organization::InvitationEmailDeliveryFilters {
         organization_id: params
@@ -3372,6 +3399,7 @@ pub async fn list_invitation_email_deliveries(
                 )
             }
         })?;
+    audit.record_page(params.limit, params.offset, deliveries.len());
 
     let response = ListAdminInvitationEmailDeliveriesResponse {
         deliveries: deliveries
@@ -3688,6 +3716,7 @@ pub async fn create_admin_access_token(
 pub async fn list_admin_access_tokens(
     State(app_state): State<AdminAppState>,
     Extension(admin_user): Extension<AdminUser>, // Require admin auth
+    audit: AdminAudit,
     axum::extract::Query(params): axum::extract::Query<ListUsersQueryParams>,
 ) -> Result<ResponseJson<ListAdminAccessTokensResponse>, (StatusCode, ResponseJson<ErrorResponse>)>
 {
@@ -3706,6 +3735,7 @@ pub async fn list_admin_access_tokens(
         .await
     {
         Ok(tokens) => {
+            audit.record_page(params.limit, params.offset, tokens.len());
             let total = app_state
                 .admin_access_token_repository
                 .count()
@@ -4238,6 +4268,7 @@ pub async fn get_model_revenue(
     State(app_state): State<AdminAppState>,
     Query(params): Query<ModelRevenueQueryParams>,
     Extension(_admin_user): Extension<AdminUser>,
+    audit: AdminAudit,
 ) -> Result<
     ResponseJson<services::admin::ModelRevenueReport>,
     (StatusCode, ResponseJson<ErrorResponse>),
@@ -4279,6 +4310,7 @@ pub async fn get_model_revenue(
         })
         .await
         .map_err(|e| analytics_error_response(e, "Failed to retrieve model revenue", true))?;
+    audit.record_page(params.limit, params.offset, report.data.len());
 
     Ok(ResponseJson(report))
 }
@@ -4333,6 +4365,7 @@ pub async fn get_org_revenue(
     State(app_state): State<AdminAppState>,
     Query(params): Query<OrgRevenueQueryParams>,
     Extension(_admin_user): Extension<AdminUser>,
+    audit: AdminAudit,
 ) -> Result<
     ResponseJson<services::admin::OrgRevenueReport>,
     (StatusCode, ResponseJson<ErrorResponse>),
@@ -4365,6 +4398,7 @@ pub async fn get_org_revenue(
         })
         .await
         .map_err(|e| analytics_error_response(e, "Failed to retrieve org revenue", true))?;
+    audit.record_page(params.limit, params.offset, report.data.len());
 
     Ok(ResponseJson(report))
 }

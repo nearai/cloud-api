@@ -1,4 +1,4 @@
-use crate::middleware::{AdminUser, AuthenticatedUser};
+use crate::middleware::{AdminAudit, AdminUser, AuthenticatedUser};
 use crate::models::ErrorResponse;
 use crate::routes::common::{validate_limit_offset, validate_max_length, validate_non_empty_field};
 use axum::{
@@ -220,6 +220,7 @@ pub async fn submit_feature_request(
 pub async fn list_admin_feature_requests(
     State(state): State<FeatureRequestsRouteState>,
     Extension(_admin_user): Extension<AdminUser>,
+    audit: AdminAudit,
     Query(params): Query<AdminFeatureRequestListQuery>,
 ) -> Result<ResponseJson<AdminFeatureRequestListResponse>, (StatusCode, ResponseJson<ErrorResponse>)>
 {
@@ -252,6 +253,7 @@ pub async fn list_admin_feature_requests(
         .list_admin(kind.as_deref(), params.limit, params.offset)
         .await
         .map_err(internal_error)?;
+    audit.record_page(params.limit, params.offset, requests.len());
 
     Ok(ResponseJson(AdminFeatureRequestListResponse {
         requests: requests.into_iter().map(summary_to_response).collect(),

@@ -363,18 +363,38 @@ pub async fn init_domain_services_with_pool(
     metrics_service: Arc<dyn services::metrics::MetricsServiceTrait>,
     admin_settings: Option<Arc<services::admin_settings::AdminSettingsService>>,
 ) -> DomainServices {
-    let database_encryption_key = database::field_encryption::parse_key(
-        &config.database_encryption_key,
-    )
-    .unwrap_or_else(|_| {
-        panic!("configured database encryption key is invalid");
-    });
-    database::field_encryption::validate_key_id(&config.database_encryption_key_id)
-        .unwrap_or_else(|_| panic!("configured database encryption key id is invalid"));
-    database.pool().set_encryption_key(database_encryption_key);
-    database
-        .pool()
-        .set_encryption_key_id(config.database_encryption_key_id.clone());
+    if let Some(specs) = &config.database_encryption_keys {
+        let keys = services::encryption_keys::resolve_key_ring(specs, None)
+            .await
+            .unwrap_or_else(|class| {
+                panic!("configured database encryption keys are invalid: {class}")
+            });
+        let mut keys = keys.into_iter();
+        let (write_id, write_key) = keys
+            .next()
+            .unwrap_or_else(|| panic!("configured database encryption keys are invalid: empty"));
+        let ring = database::field_encryption::KeyRing::new(write_id, write_key, keys.collect())
+            .unwrap_or_else(|class| {
+                panic!("configured database encryption keys are invalid: {class}")
+            });
+        database.pool().set_encryption_ring(ring);
+    } else {
+        let database_encryption_key = database::field_encryption::parse_key(
+            &config.database_encryption_key,
+        )
+        .unwrap_or_else(|_| {
+            panic!("configured database encryption key is invalid");
+        });
+        database::field_encryption::validate_key_id(&config.database_encryption_key_id)
+            .unwrap_or_else(|_| panic!("configured database encryption key id is invalid"));
+        database.pool().set_encryption_key(database_encryption_key);
+        database
+            .pool()
+            .set_encryption_key_id(config.database_encryption_key_id.clone());
+    }
+    if let Some(ring) = database.pool().encryption_ring() {
+        tracing::info!(write_key_id = ring.write_id(), read_key_ids = ?ring.read_ids(), "database encryption keys configured");
+    }
     database
         .pool()
         .set_encryption_write_enabled(config.database_encryption_write_enabled);
@@ -2400,18 +2420,15 @@ fn build_admin_routes_with_options(
         user_erasure_service: services.user_erasure_service,
     };
 
-    let database_encryption_state = crate::database_encryption::DatabaseEncryptionState::new(
-        database.pool().clone(),
-        &config.database_encryption_key,
-        &config.database_encryption_key_id,
-    )
-    .map_err(|_| {
-        tracing::error!(
-            error_class = "invalid_database_encryption_key",
-            "Database encryption admin routes are disabled"
-        );
-    })
-    .ok();
+    let database_encryption_state =
+        crate::database_encryption::DatabaseEncryptionState::new(database.pool().clone())
+            .map_err(|_| {
+                tracing::error!(
+                    error_class = "missing_database_encryption_ring",
+                    "Database encryption admin routes are disabled"
+                );
+            })
+            .ok();
 
     // Classify read operations in middleware::admin_policy when adding admin routes.
     let admin_routes = Router::new()
@@ -2672,6 +2689,10 @@ fn build_admin_routes_with_options(
         }
         admin_routes.merge(
             Router::new()
+                .route(
+                    "/admin/database-encryption/keys",
+                    axum::routing::get(crate::database_encryption::get_keys),
+                )
                 .route(
                     "/admin/database-encryption/scan",
                     axum::routing::post(crate::database_encryption::scan),

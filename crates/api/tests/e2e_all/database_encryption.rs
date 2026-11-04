@@ -831,24 +831,14 @@ async fn recovery_resumes_the_cursor_and_duplicate_workers_do_not_double_process
         )
         .await
         .expect("locked resumed row");
-    let key = database
-        .pool()
-        .encryption_key()
-        .expect("database encryption key");
-    let first_recovery_state = api::database_encryption::DatabaseEncryptionState::new(
-        database.pool().clone(),
-        &hex::encode(key),
-        &database.pool().encryption_key_id(),
-    )
-    .expect("database encryption state")
-    .with_recovery_interval(std::time::Duration::from_millis(20));
-    let second_recovery_state = api::database_encryption::DatabaseEncryptionState::new(
-        database.pool().clone(),
-        &hex::encode(key),
-        &database.pool().encryption_key_id(),
-    )
-    .expect("second database encryption state")
-    .with_recovery_interval(std::time::Duration::from_millis(20));
+    let first_recovery_state =
+        api::database_encryption::DatabaseEncryptionState::new(database.pool().clone())
+            .expect("database encryption state")
+            .with_recovery_interval(std::time::Duration::from_millis(20));
+    let second_recovery_state =
+        api::database_encryption::DatabaseEncryptionState::new(database.pool().clone())
+            .expect("second database encryption state")
+            .with_recovery_interval(std::time::Duration::from_millis(20));
     first_recovery_state.recover_jobs();
     wait_for_database_encryption_job_status(&server, &job_id.to_string(), "running").await;
     // Model two application instances recovering the same persisted job. A

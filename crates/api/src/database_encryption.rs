@@ -1,7 +1,7 @@
 use crate::middleware::AdminUser;
 use axum::{extract::Path, http::StatusCode, Extension, Json};
 use chrono::{DateTime, Utc};
-use database::DbPool;
+use database::{field_encryption::KeyRing, DbPool};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::{
@@ -233,8 +233,6 @@ fn is_encrypted_field(table: &str, column: &str) -> bool {
 #[derive(Clone)]
 pub struct DatabaseEncryptionState {
     pub pool: DbPool,
-    key: [u8; 32],
-    key_id: String,
     /// Database migrations are serialized so a backfill cannot consume the
     /// application's connection pool.
     worker_permit: Arc<Semaphore>,
@@ -244,17 +242,13 @@ pub struct DatabaseEncryptionState {
 }
 
 impl DatabaseEncryptionState {
-    pub fn new(pool: DbPool, hex_key: &str, key_id: &str) -> anyhow::Result<Self> {
-        let bytes = hex::decode(hex_key)?;
-        let len = bytes.len();
-        let key = bytes
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("database encryption key must be 32 bytes, got {len}"))?;
-        database::field_encryption::validate_key_id(key_id)?;
+    pub fn new(pool: DbPool) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            pool.encryption_ring().is_some(),
+            "database encryption ring is not configured"
+        );
         Ok(Self {
             pool,
-            key,
-            key_id: key_id.to_string(),
             worker_permit: Arc::new(Semaphore::new(1)),
             recovery_started: Arc::new(AtomicBool::new(false)),
             active_jobs: Arc::new(Mutex::new(std::collections::HashSet::new())),
@@ -533,6 +527,10 @@ async fn counts(
     fields: &[&Field],
     limit: Option<i64>,
 ) -> anyhow::Result<Vec<FieldCount>> {
+    let ring = state
+        .pool
+        .encryption_ring()
+        .ok_or_else(|| anyhow::anyhow!("database encryption ring is not configured"))?;
     let mut client = state.pool.get().await?;
     let mut out = vec![];
     for f in fields {
@@ -593,7 +591,7 @@ async fn counts(
                 };
                 match serde_json::from_str::<Value>(&raw) {
                     Ok(value) if value[MARKER] == true => {
-                        if decrypt_envelope(&state.key, &state.key_id, f, id, &raw).is_ok() {
+                        if decrypt_ring_envelope(&ring, f, id, &raw).is_ok() {
                             count.encrypted += 1;
                         } else {
                             count.invalid_envelope += 1;
@@ -654,6 +652,7 @@ fn envelope(
 
 // Job lifecycle and authenticated envelope helpers.
 
+#[cfg(test)]
 fn decrypt_envelope(
     key: &[u8; 32],
     key_id: &str,
@@ -662,6 +661,41 @@ fn decrypt_envelope(
     encoded: &str,
 ) -> anyhow::Result<String> {
     database::field_encryption::decrypt_with_key_id(key, key_id, f.table, f.column, id, encoded)
+}
+
+fn decrypt_ring_envelope(
+    ring: &KeyRing,
+    field: &Field,
+    id: Uuid,
+    encoded: &str,
+) -> anyhow::Result<String> {
+    database::field_encryption::decrypt_with_ring(
+        &serde_json::from_str(encoded)?,
+        ring,
+        field.table,
+        field.column,
+        id,
+    )
+}
+
+pub async fn get_keys(
+    Extension(state): Extension<DatabaseEncryptionState>,
+    Extension(_): Extension<AdminUser>,
+) -> ApiResult<Value> {
+    let ring = state
+        .pool
+        .encryption_ring()
+        .ok_or_else(|| internal("database encryption ring is not configured"))?;
+    let fingerprints = ring
+        .fingerprints()
+        .into_iter()
+        .collect::<std::collections::BTreeMap<_, _>>();
+    Ok(Json(json!({
+        "write_key_id": ring.write_id(),
+        "read_key_ids": ring.read_ids(),
+        "fingerprints": fingerprints,
+        "write_enabled": state.pool.encryption_write_enabled(),
+    })))
 }
 
 pub async fn create_job(
@@ -804,6 +838,10 @@ async fn run_locked_job(
     id: Uuid,
     client: &mut tokio_postgres::Client,
 ) -> anyhow::Result<()> {
+    let ring = state
+        .pool
+        .encryption_ring()
+        .ok_or_else(|| anyhow::anyhow!("database encryption ring is not configured"))?;
     let job = client
         .query_opt(
             "UPDATE database_encryption_jobs SET status='running',started_at=COALESCE(started_at,NOW()) WHERE id=$1 AND status IN ('queued','running') RETURNING mode,scope,batch_size,max_rows,cursor,progress",
@@ -912,8 +950,7 @@ async fn run_locked_job(
                     match serde_json::from_str::<Value>(&raw) {
                         Ok(value) if value[MARKER] == true => {
                             if database::field_encryption::is_envelope(&value)
-                                && decrypt_envelope(&state.key, &state.key_id, field, row_id, &raw)
-                                    .is_ok()
+                                && decrypt_ring_envelope(&ring, field, row_id, &raw).is_ok()
                             {
                                 verified += 1;
                                 continue;
@@ -944,15 +981,7 @@ async fn run_locked_job(
                     let plaintext: String = row.get(1);
                     if let Ok(value) = serde_json::from_str::<Value>(&plaintext) {
                         if database::field_encryption::is_envelope(&value) {
-                            if decrypt_envelope(
-                                &state.key,
-                                &state.key_id,
-                                field,
-                                row_id,
-                                &plaintext,
-                            )
-                            .is_err()
-                            {
+                            if decrypt_ring_envelope(&ring, field, row_id, &plaintext).is_err() {
                                 invalid_envelopes += 1;
                                 if invalid_envelope_rows.len() < 100 {
                                     invalid_envelope_rows.push(json!({
@@ -967,8 +996,8 @@ async fn run_locked_job(
                     }
                     row_ids.push(row_id);
                     encrypted_values.push(envelope(
-                        &state.key,
-                        &state.key_id,
+                        ring.write_key(),
+                        ring.write_id(),
                         field,
                         row_id,
                         &plaintext,
@@ -1133,6 +1162,16 @@ pub async fn verify(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn state_requires_a_configured_pool_ring() {
+        let pool = DbPool::uninitialized();
+        assert!(DatabaseEncryptionState::new(pool.clone()).is_err());
+        pool.set_encryption_ring(KeyRing::new("db-v2".into(), [9; 32], vec![]).unwrap());
+        let state = DatabaseEncryptionState::new(pool.clone()).unwrap();
+        pool.set_encryption_ring(KeyRing::new("db-v3".into(), [8; 32], vec![]).unwrap());
+        assert_eq!(state.pool.encryption_ring().unwrap().write_id(), "db-v3");
+    }
+
     #[test]
     fn envelope_hides_plaintext() {
         let v = envelope(&[7; 32], "test-v1", &FIELDS[0], Uuid::nil(), "secret").unwrap();

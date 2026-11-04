@@ -12,9 +12,9 @@ const APPLY_SECTION: &str = "\n## Apply without a deploy\n\n\
 for the model releases above that this run saw live, each carrying its Sigstore bundle (cloud-api \
 verifies every bundle at PATCH).\n\n\
 **The PATCH replaces the whole `model_pins` list.** Merge these rows with the \
-current value from `GET /v1/admin/settings/tinfoil_trust` first.\n\n\
+current value from `GET $CLOUD_PLATFORM/v1/admin/settings/tinfoil_trust` first.\n\n\
 ```\n\
-curl -X PATCH \"$CLOUD_API/v1/admin/settings/tinfoil_trust\" -H \"Authorization: Bearer $ADMIN_TOKEN\" -H 'Content-Type: application/json' --data @tinfoil-admin-pins.json\n\
+curl -X PATCH \"$CLOUD_PLATFORM/v1/admin/settings/tinfoil_trust\" -H \"Authorization: Bearer $ADMIN_TOKEN\" -H 'Content-Type: application/json' --data @tinfoil-admin-pins.json\n\
 ```\n";
 
 /// Keep only characters that can appear in slugs, repos, tags and hex, so
@@ -200,9 +200,9 @@ mod tests {
         assert!(md.contains("## Apply without a deploy"));
         assert!(md.contains("tinfoil-admin-pins.json"));
         assert!(md.contains("replaces the whole `model_pins` list"));
-        assert!(md.contains("GET /v1/admin/settings/tinfoil_trust"));
+        assert!(md.contains("GET $CLOUD_PLATFORM/v1/admin/settings/tinfoil_trust"));
         assert!(md.contains(
-            "curl -X PATCH \"$CLOUD_API/v1/admin/settings/tinfoil_trust\" -H \"Authorization: Bearer $ADMIN_TOKEN\" -H 'Content-Type: application/json' --data @tinfoil-admin-pins.json"
+            "curl -X PATCH \"$CLOUD_PLATFORM/v1/admin/settings/tinfoil_trust\" -H \"Authorization: Bearer $ADMIN_TOKEN\" -H 'Content-Type: application/json' --data @tinfoil-admin-pins.json"
         ));
         let none = render_markdown(&[added(Some("m"), "v2")], &[], "2026-10-07", false);
         assert!(!none.contains("Apply without a deploy"));

@@ -64,10 +64,7 @@ pub struct AdminUser(pub DbUser);
 /// AdminUser. Session access and opaque admin tokens have different privileges.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AdminAuthContext {
-    Session {
-        /// The token's `sid` claim; `None` for legacy tokens without one.
-        session_id: Option<uuid::Uuid>,
-    },
+    Session,
     AccessToken {
         token_id: uuid::Uuid,
         permission: AdminAccessTokenPermission,
@@ -509,7 +506,10 @@ pub async fn admin_middleware(
                 audit.record_credential(AdminCredentialKind::Session, None);
                 authenticate_session_access(&state, token.to_string())
                     .await
-                    .map(|(user, session_id)| (user, AdminAuthContext::Session { session_id }))
+                    .map(|(user, session_id)| {
+                        audit.record_credential(AdminCredentialKind::Session, session_id);
+                        (user, AdminAuthContext::Session)
+                    })
             }
         } else {
             debug!("Authorization header uses unsupported scheme");
@@ -533,7 +533,7 @@ pub async fn admin_middleware(
 
     match auth_result {
         Ok((user, context)) => {
-            audit.record_authenticated(user.id, context);
+            audit.record_authenticated(user.id);
             // Check if user has admin access based on email domain
             let is_admin = check_admin_access(&state, &user);
 

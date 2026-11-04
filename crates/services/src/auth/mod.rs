@@ -1765,6 +1765,37 @@ mod tests {
         assert_eq!(validated.session_id.map(|s| s.0), Some(session.id.0));
     }
 
+    #[test]
+    fn validated_session_access_debug_prints_ids_but_no_profile_fields() {
+        let mut user = make_user("debug-email@example.com", "google");
+        user.username = "debug-username".to_string();
+        user.display_name = Some("Debug Display Name".to_string());
+        user.avatar_url = Some("https://avatars.example.com/debug-avatar".to_string());
+        user.contact_email = Some("debug-contact@example.net".to_string());
+        let session_id = Uuid::new_v4();
+        let access = ValidatedSessionAccess {
+            user: user.clone(),
+            session_id: Some(SessionId(session_id)),
+        };
+
+        let debug = format!("{access:?}");
+
+        assert!(debug.contains(&user.id.0.to_string()), "{debug}");
+        assert!(debug.contains(&session_id.to_string()), "{debug}");
+        for profile_value in [
+            "debug-email",
+            "debug-username",
+            "Debug Display Name",
+            "debug-avatar",
+            "debug-contact",
+        ] {
+            assert!(
+                !debug.contains(profile_value),
+                "Debug output contains {profile_value}: {debug}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn test_logout_revokes_session_and_invalidates_access_token() {
         let user = make_user("alice@example.com", "google");

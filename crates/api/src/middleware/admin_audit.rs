@@ -32,7 +32,7 @@
 //! dropped before a response (client disconnect) is still logged once,
 //! without `admin_status`.
 
-use crate::middleware::{auth::AdminAuthContext, metrics::bounded_method, RequestCorrelation};
+use crate::middleware::{metrics::bounded_method, RequestCorrelation};
 use axum::{
     body::Body,
     extract::{FromRequestParts, MatchedPath, RawPathParams},
@@ -120,19 +120,9 @@ impl AdminAudit {
         });
     }
 
-    /// The credential authenticated `user_id`.
-    pub(crate) fn record_authenticated(&self, user_id: Uuid, context: AdminAuthContext) {
-        let (kind, credential_id) = match context {
-            AdminAuthContext::Session { session_id } => (AdminCredentialKind::Session, session_id),
-            AdminAuthContext::AccessToken { token_id, .. } => {
-                (AdminCredentialKind::AdminAccessToken, Some(token_id))
-            }
-        };
-        self.update(|record| {
-            record.credential_kind = Some(kind);
-            record.credential_id = credential_id;
-            record.user_id = Some(user_id);
-        });
+    /// The validated credential authenticated `user_id`.
+    pub(crate) fn record_authenticated(&self, user_id: Uuid) {
+        self.update(|record| record.user_id = Some(user_id));
     }
 
     pub(crate) fn record_allowed(&self) {

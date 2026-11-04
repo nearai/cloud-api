@@ -63,12 +63,24 @@ request; the inner response's `x-admin-audit-request-id` returns inside the
 encrypted OHTTP response, so these events have no ingress log entry to join.
 The OHTTP handler's own INFO line logs the inner request target, query included.
 
+## cloud-platform
+
+These events cover the admin requests that cloud-api serves. cloud-platform
+serves its own copy of the admin routes that moved there under the database
+freeze (`.claude/rules/database.md`) and writes its own audit records; a request
+that cloud-platform answers produces none of the events on this page. Matching
+coverage for those routes is a paired cloud-platform change, not described here.
+
 ## How it works
 
 `admin_audit_middleware` (`crates/api/src/middleware/admin_audit.rs`) runs once
 on the root router, after routing, inside request correlation and outside CORS.
 `admin_middleware` records the authentication facts; list handlers record their
-validated page through the `AdminAudit` extractor. Nothing reads bodies.
+validated page through the `AdminAudit` extractor. Nothing reads bodies. The
+list handlers are in frozen route modules (`routes/admin.rs`,
+`routes/feature_requests.rs`), where the audit adds only the extractor and its
+`record_*` calls; a new call there is paired with cloud-platform like any other
+change to those modules.
 
 New routes under `/v1/admin` are audited automatically. The e2e suite in
 `crates/api/tests/e2e_all/admin_audit.rs` checks that:

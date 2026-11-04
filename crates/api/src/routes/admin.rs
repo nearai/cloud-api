@@ -2399,7 +2399,6 @@ pub async fn list_model_pricing_changes(
         .list_pricing_changes(status, params.limit, params.offset)
         .await
         .map_err(admin_error_to_response)?;
-    // The service rejects a limit outside 1..=1000 or a negative offset.
     audit.record_page(params.limit, params.offset, changes.len());
 
     Ok(ResponseJson(ListPricingChangesResponse {

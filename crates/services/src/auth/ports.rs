@@ -93,12 +93,22 @@ pub struct User {
 }
 
 /// A session access token that passed validation.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ValidatedSessionAccess {
     pub user: User,
     /// The `sid` claim: the refresh-token session the token is bound to.
     /// `None` for legacy tokens issued before session binding.
     pub session_id: Option<SessionId>,
+}
+
+impl std::fmt::Debug for ValidatedSessionAccess {
+    // Manual: `User`'s derived `Debug` prints its email and names; print ids only.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ValidatedSessionAccess")
+            .field("user_id", &self.user.id)
+            .field("session_id", &self.session_id)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

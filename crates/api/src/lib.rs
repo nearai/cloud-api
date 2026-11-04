@@ -3512,6 +3512,7 @@ mod tests {
             },
             database_encryption_key:
                 "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789".to_string(),
+            database_encryption_keys: None,
             database_encryption_key_id: "test-db-v1".to_string(),
             database_encryption_write_enabled: false,
             s3: config::S3Config {
@@ -3635,6 +3636,7 @@ mod tests {
             },
             database_encryption_key:
                 "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789".to_string(),
+            database_encryption_keys: None,
             database_encryption_key_id: "test-db-v1".to_string(),
             database_encryption_write_enabled: false,
             s3: config::S3Config {

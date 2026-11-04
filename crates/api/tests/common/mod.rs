@@ -132,6 +132,7 @@ pub fn test_config() -> ApiConfig {
         // mock-storage and database-encryption behavior across processes.
         database_encryption_key: "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
             .to_string(),
+        database_encryption_keys: None,
         database_encryption_key_id: "e2e-db-v1".to_string(),
         // Preserve encrypted-write coverage in E2E tests; production defaults off.
         database_encryption_write_enabled: true,

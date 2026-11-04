@@ -2,6 +2,76 @@ use crate::ita::ItaAttestationConfig;
 use rustls_pki_types::{pem::PemObject, CertificateDer};
 use std::{collections::HashMap, env};
 
+/// Source of one database encryption key. Inline key material is redacted.
+#[derive(Clone)]
+pub enum KeySource {
+    File(std::path::PathBuf),
+    Dstack(String),
+    Hex(String),
+}
+
+impl std::fmt::Debug for KeySource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::File(path) => f.debug_tuple("File").field(path).finish(),
+            Self::Dstack(path) => f.debug_tuple("Dstack").field(path).finish(),
+            Self::Hex(_) => f.debug_tuple("Hex").field(&"<redacted>").finish(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct KeySourceSpec {
+    pub key_id: String,
+    pub source: KeySource,
+}
+
+/// Parse ordered `<key_id>=file:...|dstack:...|hex:...` entries.
+pub fn parse_key_source_specs(raw: &str) -> Result<Vec<KeySourceSpec>, String> {
+    let mut ids = std::collections::HashSet::new();
+    raw.split(',')
+        .enumerate()
+        .map(|(index, entry)| {
+            let error = |reason: &str| format!("DB_ENCRYPTION_KEYS entry {index}: {reason}");
+            let (key_id, source) = entry
+                .trim()
+                .split_once('=')
+                .ok_or_else(|| error("expected key_id=source"))?;
+            if key_id.is_empty()
+                || key_id.len() > 64
+                || !key_id
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+            {
+                return Err(error("invalid key id"));
+            }
+            if !ids.insert(key_id.to_string()) {
+                return Err(error("duplicate key id"));
+            }
+            let source =
+                if let Some(path) = source.strip_prefix("file:").filter(|path| !path.is_empty()) {
+                    KeySource::File(path.into())
+                } else if let Some(path) = source
+                    .strip_prefix("dstack:")
+                    .filter(|path| !path.is_empty())
+                {
+                    KeySource::Dstack(path.into())
+                } else if let Some(key) = source.strip_prefix("hex:") {
+                    if key.len() != 64 || !key.bytes().all(|b| b.is_ascii_hexdigit()) {
+                        return Err(error("hex key must contain 64 hexadecimal characters"));
+                    }
+                    KeySource::Hex(key.into())
+                } else {
+                    return Err(error("expected nonempty file:, dstack: or hex: source"));
+                };
+            Ok(KeySourceSpec {
+                key_id: key_id.into(),
+                source,
+            })
+        })
+        .collect()
+}
+
 #[derive(Debug, Clone)]
 pub struct ApiConfig {
     pub server: ServerConfig,
@@ -27,6 +97,8 @@ pub struct ApiConfig {
     /// Dedicated AES-256 key for confidential database fields. This must not
     /// reuse the object-storage encryption key.
     pub database_encryption_key: String,
+    /// Ordered key sources; first writes and all entries read.
+    pub database_encryption_keys: Option<Vec<KeySourceSpec>>,
     /// Identifier embedded in and validated against every database envelope.
     pub database_encryption_key_id: String,
     /// Enables encryption for newly written confidential database fields.
@@ -53,6 +125,15 @@ impl ApiConfig {
     /// Load configuration from environment variables
     pub fn from_env() -> Result<Self, String> {
         let auth = AuthConfig::from_env()?;
+        let database_encryption_keys = non_empty_env("DB_ENCRYPTION_KEYS")
+            .map(|raw| parse_key_source_specs(&raw))
+            .transpose()?;
+        let database_encryption_key = if database_encryption_keys.is_some() {
+            read_optional_secret_env("DB_ENCRYPTION_KEY_FILE", "DB_ENCRYPTION_KEY")?
+                .unwrap_or_default()
+        } else {
+            read_required_secret_env("DB_ENCRYPTION_KEY_FILE", "DB_ENCRYPTION_KEY")?
+        };
         Ok(Self {
             server: ServerConfig::from_env()?,
             inference_api_key: env::var("INFERENCE_API_KEY")
@@ -73,10 +154,8 @@ impl ApiConfig {
             staking_farm: StakingFarmConfig::from_env(&auth.near),
             auth,
             database: DatabaseConfig::from_env()?,
-            database_encryption_key: read_required_secret_env(
-                "DB_ENCRYPTION_KEY_FILE",
-                "DB_ENCRYPTION_KEY",
-            )?,
+            database_encryption_key,
+            database_encryption_keys,
             database_encryption_key_id: non_empty_env("DB_ENCRYPTION_KEY_ID")
                 .unwrap_or_else(|| "db-v1".to_string()),
             database_encryption_write_enabled: parse_bool_env(
@@ -1606,6 +1685,53 @@ mod tests {
     use super::*;
     use serial_test::serial;
     use std::ffi::OsString;
+
+    #[test]
+    fn key_source_specs_preserve_order_and_redact_hex() {
+        let raw = format!(
+            " db-v2=dstack:/keys/v2, db-v1=file:/config/v1,db-v0=hex:{} ",
+            "AB".repeat(32)
+        );
+        let specs = parse_key_source_specs(&raw).unwrap();
+        assert_eq!(
+            specs
+                .iter()
+                .map(|spec| spec.key_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["db-v2", "db-v1", "db-v0"]
+        );
+        assert!(matches!(&specs[0].source, KeySource::Dstack(path) if path == "/keys/v2"));
+        assert!(
+            matches!(&specs[1].source, KeySource::File(path) if path == std::path::Path::new("/config/v1"))
+        );
+        assert_eq!(format!("{:?}", specs[2].source), "Hex(\"<redacted>\")");
+        assert!(!format!("{specs:?}").contains(&"AB".repeat(32)));
+    }
+
+    #[test]
+    fn key_source_specs_reject_malformed_entries_without_key_values() {
+        for raw in [
+            "",
+            " ",
+            "db-v1",
+            "=file:/key",
+            "bad id=file:/key",
+            "db-v1=unknown:/key",
+            "db-v1=file:",
+            "db-v1=dstack:",
+            "db-v1=hex:1234",
+            "db-v1=hex:zzzz",
+            "db-v1=file:/key,",
+            "db-v1=file:/one,db-v1=file:/two",
+        ] {
+            let error = parse_key_source_specs(raw).unwrap_err();
+            assert!(error.contains("entry "), "{error}");
+            assert!(!error.contains("1234") && !error.contains("zzzz"));
+        }
+        assert!(parse_key_source_specs(&format!("{}=file:/key", "a".repeat(65))).is_err());
+        let error = parse_key_source_specs("db-v2=file:/one,db-v1=hex:1234").unwrap_err();
+        assert!(error.contains("entry 1"));
+    }
 
     #[test]
     fn database_connection_mode_requires_exact_values() {

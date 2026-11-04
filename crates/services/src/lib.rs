@@ -10,6 +10,7 @@ pub mod completions;
 pub mod contact_email;
 pub mod conversations;
 pub mod email;
+pub mod encryption_keys;
 pub mod files;
 pub mod github_dispatch;
 pub mod id_prefixes;

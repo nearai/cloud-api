@@ -2839,6 +2839,57 @@ mod tests {
     use crate::attested_3p_startup::{CHUTES_SUPPORTED_FEATURES, CHUTES_SUPPORTED_SAMPLING_PARAMS};
     use crate::openapi::ApiDoc;
 
+    /// Guards the split in `build_admin_routes_with_options`: everything in the
+    /// always-mounted `retained` router must be a read, and the read-only
+    /// previews that moved to cloud-platform must not be registered there.
+    /// axum cannot enumerate registered routes, so this scans the source.
+    #[test]
+    fn retained_admin_routes_are_reads_only() {
+        use crate::middleware::admin_policy::{admin_operation, AdminOperation};
+
+        const PREVIEWS: [&str; 3] = [
+            "/admin/models/pricing-changes/preview",
+            "/admin/models/{model_name}/deprecation/preview",
+            "/admin/users/{user_id}/erasure/preview",
+        ];
+
+        let source = include_str!("lib.rs");
+        let start = source
+            .find("let retained = Router::new()")
+            .expect("retained router");
+        let end = source
+            .find("let retired = Router::new()")
+            .expect("retired router");
+
+        let mut checked = 0;
+        for chunk in source[start..end].split(".route(").skip(1) {
+            let chunk = chunk.split(".with_state(").next().unwrap();
+            let path = chunk.split('"').nth(1).expect("route path");
+            assert!(
+                !PREVIEWS.contains(&path),
+                "{path} must be registered in the retired router"
+            );
+            for method in ["get", "post", "put", "patch", "delete"] {
+                let registered = chunk.match_indices(&format!("{method}(")).any(|(i, _)| {
+                    !chunk[..i]
+                        .chars()
+                        .next_back()
+                        .is_some_and(|c| c.is_alphanumeric() || c == '_')
+                });
+                if registered {
+                    let http: axum::http::Method = method.to_uppercase().parse().unwrap();
+                    assert_eq!(
+                        admin_operation(&http, path),
+                        AdminOperation::Read,
+                        "{method} {path} is not a read; register it in the retired router"
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 30, "route scan found only {checked} routes");
+    }
+
     /// Regression for issue #781 (M1): the Chutes catalog seed must advertise a
     /// NON-EMPTY `supported_features` / `supported_sampling_parameters` so
     /// OpenRouter-style routers don't silently treat the model as supporting

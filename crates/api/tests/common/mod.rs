@@ -206,6 +206,19 @@ async fn build_test_server_components(
     Arc<inference_providers::mock::MockProvider>,
     axum::Router,
 ) {
+    build_test_server_components_with_options(database, config, E2E_APP_BUILD_OPTIONS).await
+}
+
+async fn build_test_server_components_with_options(
+    database: Arc<Database>,
+    config: ApiConfig,
+    build_options: AppBuildOptions,
+) -> (
+    axum_test::TestServer,
+    Arc<services::inference_provider_pool::InferenceProviderPool>,
+    Arc<inference_providers::mock::MockProvider>,
+    axum::Router,
+) {
     // Create mock user in database for foreign key constraints
     assert_mock_user_in_db(&database).await;
 
@@ -230,7 +243,7 @@ async fn build_test_server_components(
         auth_components,
         domain_services,
         Arc::new(config),
-        E2E_APP_BUILD_OPTIONS,
+        build_options,
     );
     let server = axum_test::TestServer::new(app.clone());
 
@@ -446,6 +459,23 @@ pub async fn setup_test_server_with_search_providers(
     )
     .await;
     (server, infra.database, mock_provider)
+}
+
+/// Builds the app with the production `AppBuildOptions` (retired admin routes
+/// not mounted) so tests can assert what production actually serves. Only the
+/// background encryption recovery is disabled, as in every other e2e server.
+pub async fn setup_production_shape_test_server() -> axum_test::TestServer {
+    let infra = setup_test_infrastructure().await;
+    let (server, _pool, _mock, _router) = build_test_server_components_with_options(
+        infra.database.clone(),
+        infra.config,
+        AppBuildOptions {
+            start_database_encryption_recovery: false,
+            ..AppBuildOptions::default()
+        },
+    )
+    .await;
+    server
 }
 
 pub async fn setup_test_server() -> axum_test::TestServer {

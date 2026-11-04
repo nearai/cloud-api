@@ -150,39 +150,18 @@ Operations marked deprecated (account, organization, workspace, invitation, API 
         crate::routes::billing::get_billing_costs,
         // Admin endpoints (less frequently used)
         crate::routes::admin::list_models,
-        crate::routes::admin::batch_upsert_models,
-        crate::routes::admin::delete_model,
-        crate::routes::admin::deprecate_model,
-        crate::routes::admin::preview_model_deprecation,
-        crate::routes::admin::confirm_model_deprecation,
-        crate::routes::admin::preview_model_pricing_changes,
-        crate::routes::admin::preview_user_erasure,
-        crate::routes::admin::erase_user,
-        crate::routes::admin::lookup_user_erasures,
-        crate::routes::admin::confirm_model_pricing_changes,
         crate::routes::admin::list_model_pricing_changes,
-        crate::routes::admin::cancel_model_pricing_change,
         crate::routes::admin::get_model_history,
         crate::routes::admin_model_access::get_model_access,
-        crate::routes::admin_model_access::grant_model_access,
-        crate::routes::admin_model_access::revoke_model_access,
         crate::routes::admin_model_access::list_organization_model_access,
         crate::routes::admin::get_admin_organization_balance,
-        crate::routes::admin::update_organization_limits,
         crate::routes::admin::get_organization_limits_history,
         crate::routes::staking_farm::get_admin_organization_staking_farm,
-        crate::routes::staking_farm::sync_admin_organization_staking_farm,
         crate::routes::admin::list_aml_reports,
-        crate::routes::admin::update_aml_report_status,
         crate::routes::admin::list_aml_allowlist,
-        crate::routes::admin::upsert_aml_allowlist_entry,
-        crate::routes::admin::delete_aml_allowlist_entry,
-        crate::routes::admin::update_organization_concurrent_limit,
         crate::routes::admin::get_organization_concurrent_limit,
         crate::routes::admin::get_organization_fallback,
         crate::routes::admin::get_organization_priority,
-        crate::routes::admin::update_organization_priority,
-        crate::routes::admin::update_organization_fallback,
         crate::routes::admin::get_organization_metrics,
         crate::routes::admin::get_platform_metrics,
         crate::routes::admin::get_organization_timeseries,
@@ -193,41 +172,29 @@ Operations marked deprecated (account, organization, workspace, invitation, API 
         crate::routes::admin::get_billing_summary,
         crate::routes::admin::get_model_revenue,
         crate::routes::admin::get_revenue_density,
-        crate::routes::admin_usage_hourly::recompute_usage_hourly,
         crate::routes::admin_usage_discount::get_usage_discount,
-        crate::routes::admin_credit_reconciliation::reconcile_organization_credits,
         crate::routes::credit_transfers::create,
         crate::routes::credit_transfers::history,
         crate::routes::credit_transfers::detail,
         crate::routes::credit_transfers::capacity,
         crate::routes::organization_policy::get_policy,
-        crate::routes::organization_policy::put_policy,
         crate::routes::organization_credentials::create_credential,
         crate::routes::organization_credentials::revoke_credential,
         crate::routes::organization_credentials::list_credentials,
         crate::routes::organization_credentials::update_credential,
         crate::routes::organization_credentials::rotate_credential,
         crate::routes::credit_transfers::reconciliation,
-        crate::routes::admin_usage_discount::put_usage_discount,
         crate::routes::admin::get_org_revenue,
         crate::routes::admin::get_infra_summary,
         crate::routes::admin::list_admin_settings,
         crate::routes::admin::get_admin_setting,
-        crate::routes::admin::update_admin_setting,
         crate::routes::admin::list_invitation_email_deliveries,
-        crate::routes::admin::resend_invitation_email,
         crate::routes::admin::list_users,
         crate::routes::admin::list_api_keys,
         crate::routes::admin::get_organization,
         crate::routes::admin::list_organization_members,
-        crate::routes::admin::update_organization_member_role,
-        crate::routes::admin::create_admin_access_token,
-        crate::routes::admin::list_admin_access_tokens,
-        crate::routes::admin::delete_admin_access_token,
         crate::routes::services::list_services,
         crate::routes::services::get_service_by_name,
-        crate::routes::admin::create_service,
-        crate::routes::admin::update_service,
         // Health check endpoint
         crate::routes::health::health_check,
         // Attestation endpoints
@@ -684,27 +651,7 @@ mod admin_token_permission_tests {
         }
         for (path, method, phrase, tokens_allowed) in [
             ("/v1/admin/models", "get", "read_only token", true),
-            (
-                "/v1/admin/models",
-                "patch",
-                "insufficient_permissions",
-                true,
-            ),
-            (
-                "/v1/admin/models/pricing-changes/preview",
-                "post",
-                "read_only token",
-                true,
-            ),
             ("/v1/admin/feature-requests", "get", "read_only token", true),
-            ("/v1/admin/access-tokens", "get", "session only", false),
-            ("/v1/admin/access-tokens", "post", "session only", false),
-            (
-                "/v1/admin/access-tokens/{token_id}",
-                "delete",
-                "session only",
-                false,
-            ),
         ] {
             let operation = &doc["paths"][path][method];
             assert!(
@@ -721,14 +668,19 @@ mod admin_token_permission_tests {
                 tokens_allowed
             );
         }
-        assert!(doc["paths"]["/v1/admin/access-tokens"]["post"]["responses"]
-            .get("503")
-            .is_some());
-        assert!(
-            doc["paths"]["/v1/admin/access-tokens"]["get"]["responses"]["200"]["content"]
-                ["application/json"]["schema"]
-                .to_string()
-                .contains("ListAdminAccessTokensResponse")
-        );
+        // Write and session-only admin operations are no longer served, so the
+        // spec must not advertise them.
+        for (path, method) in [
+            ("/v1/admin/models", "patch"),
+            ("/v1/admin/models/pricing-changes/preview", "post"),
+            ("/v1/admin/access-tokens", "get"),
+            ("/v1/admin/access-tokens", "post"),
+            ("/v1/admin/access-tokens/{token_id}", "delete"),
+        ] {
+            assert!(
+                doc["paths"][path].get(method).is_none(),
+                "{method} {path} must not be documented"
+            );
+        }
     }
 }

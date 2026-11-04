@@ -3228,10 +3228,7 @@ mod tests {
 
         for (path, method) in [
             ("/v1/admin/aml/reports", "get"),
-            ("/v1/admin/aml/reports/{report_id}/status", "patch"),
             ("/v1/admin/aml/allowlist", "get"),
-            ("/v1/admin/aml/allowlist", "post"),
-            ("/v1/admin/aml/allowlist/{account_id}", "delete"),
         ] {
             let operation = &paths[path][method];
             assert!(

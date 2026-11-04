@@ -1867,6 +1867,13 @@ mod tests {
         assert!(parse_bool_env(key, true).unwrap());
         std::env::set_var(key, "false");
         assert!(!parse_bool_env(key, true).unwrap());
+        std::env::set_var(key, "0");
+        assert!(!parse_bool_env(key, true).unwrap());
+        std::env::set_var(key, "garbage");
+        assert_eq!(
+            parse_bool_env(key, true),
+            Err(format!("{key} must be true or false"))
+        );
         match original {
             Some(value) => std::env::set_var(key, value),
             None => std::env::remove_var(key),

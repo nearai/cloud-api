@@ -219,10 +219,10 @@ async fn test_chat_completions_stream_records_usage_in_history() {
 async fn test_chat_completions_stream_without_provider_usage_records_estimate() {
     ensure_usage_chat_completions_env();
     let (server, _pool, mock_provider, _db) = setup_test_server_with_pool().await;
+    const OUTPUT: &str = "hello world from mock";
     mock_provider
         .set_default_response(
-            inference_providers::mock::ResponseTemplate::new("hello world from mock")
-                .with_usage_omitted(),
+            inference_providers::mock::ResponseTemplate::new(OUTPUT).with_usage_omitted(),
         )
         .await;
 
@@ -244,22 +244,85 @@ async fn test_chat_completions_stream_without_provider_usage_records_estimate() 
     assert!(body.contains("hello"));
     assert!(body.contains("[DONE]"));
 
-    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-    let history_resp = server
-        .get(&format!(
-            "/v1/organizations/{}/usage/history?limit=1&offset=0",
-            org.id
-        ))
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
-        .add_header("User-Agent", MOCK_USER_AGENT)
-        .await;
-    assert_eq!(history_resp.status_code(), 200);
-    let history: api::routes::usage::UsageHistoryResponse = history_resp.json();
-    assert_eq!(history.data.len(), 1);
-    let entry = &history.data[0];
-    assert!(entry.input_tokens > 0);
-    assert!(entry.output_tokens > 0);
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+    let entry = loop {
+        let history_resp = server
+            .get(&format!(
+                "/v1/organizations/{}/usage/history?limit=1&offset=0",
+                org.id
+            ))
+            .add_header("Authorization", format!("Bearer {}", get_session_id()))
+            .add_header("User-Agent", MOCK_USER_AGENT)
+            .await;
+        assert_eq!(history_resp.status_code(), 200);
+        let history: api::routes::usage::UsageHistoryResponse = history_resp.json();
+        if let Some(entry) = history.data.into_iter().next() {
+            break entry;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "usage row not recorded within 5s"
+        );
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+    };
+    assert_eq!(
+        entry.input_tokens, 5,
+        "5 prompt bytes / 4 + 4 message tokens"
+    );
+    assert_eq!(entry.output_tokens, 5, "21 streamed UTF-8 bytes / 4");
     assert_eq!(entry.stop_reason.as_deref(), Some("incomplete"));
+}
+
+#[tokio::test]
+async fn test_chat_completions_stream_without_provider_usage_respects_flag_off() {
+    ensure_usage_chat_completions_env();
+    let (server, _pool, mock_provider, _db) = setup_test_server_with_pool_and_config(|config| {
+        config.usage_estimate_incomplete_streams = false;
+    })
+    .await;
+    mock_provider
+        .set_default_response(
+            inference_providers::mock::ResponseTemplate::new("hello world from mock")
+                .with_usage_omitted(),
+        )
+        .await;
+
+    setup_qwen_model(&server).await;
+    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id.clone()).await;
+    let stream_resp = server
+        .post("/v1/chat/completions")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&json!({
+            "model": E2E_QWEN_MODEL_NAME,
+            "messages": [{ "role": "user", "content": "hello" }],
+            "stream": true
+        }))
+        .await;
+    assert_eq!(stream_resp.status_code(), 200);
+    assert!(stream_resp.text().contains("[DONE]"));
+
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(1);
+    loop {
+        let history_resp = server
+            .get(&format!(
+                "/v1/organizations/{}/usage/history?limit=1&offset=0",
+                org.id
+            ))
+            .add_header("Authorization", format!("Bearer {}", get_session_id()))
+            .add_header("User-Agent", MOCK_USER_AGENT)
+            .await;
+        assert_eq!(history_resp.status_code(), 200);
+        let history: api::routes::usage::UsageHistoryResponse = history_resp.json();
+        assert!(
+            history.data.is_empty(),
+            "flag-off stream must not record usage"
+        );
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+    }
 }
 
 /// Register a non-attested (external) chat model in both the provider pool and the DB.

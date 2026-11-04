@@ -139,6 +139,8 @@ where
     ttft_ms: Option<i32>,
     /// Token count for ITL calculation
     token_count: i32,
+    /// Number of parsed stream chunks, including usage-only chunks.
+    observed_chunk_count: u32,
     /// Last token time for ITL calculation
     last_token_time: Option<Instant>,
     /// Accumulated inter-token latency for average calculation
@@ -367,7 +369,7 @@ where
                 tracing::info!(
                     estimated_input_tokens = input_tokens,
                     estimated_output_tokens = output_tokens,
-                    chunks = self.token_count.saturating_add(1),
+                    observed_chunks = self.observed_chunk_count,
                     "Recording estimated usage for stream without provider usage"
                 );
                 (input_tokens, output_tokens, 0, 0, 0, chat_id.clone(), true)
@@ -549,7 +551,9 @@ where
 
                     // Record metrics
                     let tags: Vec<&str> = metric_tags.iter().map(|s| s.as_str()).collect();
-                    metrics_service.record_latency(METRIC_LATENCY_TOTAL, e2e_duration, &tags);
+                    if !estimated_usage {
+                        metrics_service.record_latency(METRIC_LATENCY_TOTAL, e2e_duration, &tags);
+                    }
 
                     if let Some(model_tag) = estimated_metric_tag {
                         metrics_service.record_count(
@@ -634,6 +638,7 @@ where
                         if event.chunk.is_none() {
                             return Poll::Ready(Some(Ok(event)));
                         }
+                        self.observed_chunk_count = self.observed_chunk_count.saturating_add(1);
 
                         let now = Instant::now();
 
@@ -1834,6 +1839,7 @@ impl CompletionServiceImpl {
             first_token_time: None,
             ttft_ms: None,
             token_count: 0,
+            observed_chunk_count: 0,
             last_token_time: None,
             total_itl_ms: 0.0,
             metric_tags,
@@ -2797,6 +2803,7 @@ mod tests {
             first_token_time: None,
             ttft_ms: None,
             token_count: 0,
+            observed_chunk_count: 0,
             last_token_time: None,
             total_itl_ms: 0.0,
             metric_tags: CompletionServiceImpl::create_metric_tags("test-model"),
@@ -2934,7 +2941,7 @@ mod tests {
         assert!(!metrics
             .iter()
             .any(|metric| metric.name == METRIC_CACHE_HIT_RATE));
-        assert!(metrics
+        assert!(!metrics
             .iter()
             .any(|metric| metric.name == METRIC_LATENCY_TOTAL));
         assert!(!metrics
@@ -2960,7 +2967,9 @@ mod tests {
         ]);
         stream.usage_service = usage_service.clone();
         stream.metrics_service = metrics_service.clone();
-        let _ = stream.collect::<Vec<_>>().await;
+        let _ = stream.by_ref().collect::<Vec<_>>().await;
+        assert_eq!(stream.observed_chunk_count, 2);
+        drop(stream);
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         let requests = usage_service.get_requests();
@@ -2981,6 +2990,89 @@ mod tests {
             .get_metrics()
             .iter()
             .any(|metric| metric.name == "cloud_api.usage.estimated_stream"));
+        assert!(metrics_service
+            .get_metrics()
+            .iter()
+            .any(|metric| metric.name == METRIC_LATENCY_TOTAL));
+    }
+
+    #[tokio::test]
+    async fn stream_usage_after_terminal_choice_records_exact_usage() {
+        use crate::test_utils::CapturingUsageService;
+
+        let usage_service = Arc::new(CapturingUsageService::new());
+        let mut stream = terminal_test_stream(vec![
+            Ok(usage_test_chunk(
+                Some("done"),
+                None,
+                None,
+                Some(FinishReason::Stop),
+            )),
+            Ok(usage_test_chunk(
+                None,
+                None,
+                Some(TokenUsage::new(37, 11)),
+                None,
+            )),
+        ]);
+        stream.usage_service = usage_service.clone();
+        let _ = stream.collect::<Vec<_>>().await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let requests = usage_service.get_requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].input_tokens, 37);
+        assert_eq!(requests[0].output_tokens, 11);
+        assert_eq!(
+            requests[0].stop_reason,
+            Some(crate::usage::StopReason::Stop)
+        );
+    }
+
+    #[tokio::test]
+    async fn incomplete_stream_multibyte_output_uses_utf8_bytes() {
+        use crate::test_utils::CapturingUsageService;
+
+        let usage_service = Arc::new(CapturingUsageService::new());
+        let content = "你好世界";
+        let mut stream =
+            terminal_test_stream(vec![Ok(usage_test_chunk(Some(content), None, None, None))]);
+        stream.usage_service = usage_service.clone();
+        assert!(stream.next().await.is_some());
+        drop(stream);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let requests = usage_service.get_requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].input_tokens, 7);
+        assert_eq!(
+            requests[0].output_tokens,
+            estimate_tokens_from_bytes(content.len()) as i32
+        );
+        assert_eq!(
+            requests[0].stop_reason,
+            Some(crate::usage::StopReason::ClientDisconnect)
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_provider_error_after_content_records_no_usage() {
+        use crate::test_utils::CapturingUsageService;
+
+        let usage_service = Arc::new(CapturingUsageService::new());
+        let mut stream = terminal_test_stream(vec![
+            Ok(usage_test_chunk(Some("partial output"), None, None, None)),
+            Err(inference_providers::CompletionError::CompletionError(
+                "provider failed".to_string(),
+            )),
+        ]);
+        stream.usage_service = usage_service.clone();
+        assert!(stream.next().await.is_some());
+        assert!(stream.next().await.unwrap().is_err());
+        drop(stream);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        assert!(usage_service.get_requests().is_empty());
     }
 
     #[tokio::test]
@@ -3062,7 +3154,7 @@ mod tests {
         assert!(!metrics
             .iter()
             .any(|metric| metric.name == METRIC_CACHE_HIT_RATE));
-        assert!(metrics
+        assert!(!metrics
             .iter()
             .any(|metric| metric.name == METRIC_LATENCY_TOTAL));
         assert!(!metrics
@@ -3364,6 +3456,7 @@ mod tests {
             first_token_time: None,
             ttft_ms: None,
             token_count: 0,
+            observed_chunk_count: 0,
             last_token_time: None,
             total_itl_ms: 0.0,
             metric_tags,
@@ -3541,6 +3634,7 @@ mod tests {
             first_token_time: None,
             ttft_ms: None,
             token_count: 0,
+            observed_chunk_count: 0,
             last_token_time: None,
             total_itl_ms: 0.0,
             metric_tags: CompletionServiceImpl::create_metric_tags("test-model"),
@@ -3699,6 +3793,7 @@ mod tests {
             first_token_time: None,
             ttft_ms: None,
             token_count: 0,
+            observed_chunk_count: 0,
             last_token_time: None,
             total_itl_ms: 0.0,
             metric_tags,
@@ -3831,6 +3926,7 @@ mod tests {
             first_token_time: None,
             ttft_ms: None,
             token_count: 0,
+            observed_chunk_count: 0,
             last_token_time: None,
             total_itl_ms: 0.0,
             metric_tags,
@@ -4045,6 +4141,7 @@ mod tests {
                 first_token_time: None,
                 ttft_ms: None,
                 token_count: 0,
+                observed_chunk_count: 0,
                 last_token_time: None,
                 total_itl_ms: 0.0,
                 metric_tags: vec![],

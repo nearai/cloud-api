@@ -1242,14 +1242,6 @@ mod tests {
         ) -> Result<ItaTokenResponse, AttestationError> {
             Err(AttestationError::InternalError("unused".to_string()))
         }
-
-        async fn verify_vpc_signature(
-            &self,
-            _timestamp: i64,
-            _signature: String,
-        ) -> Result<bool, AttestationError> {
-            Ok(false)
-        }
     }
 
     fn sample_response(response_id: &str) -> ResponseObject {

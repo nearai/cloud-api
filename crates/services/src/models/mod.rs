@@ -4,7 +4,7 @@ mod pricing;
 pub use capabilities::InferenceEndpoint;
 pub use pricing::{ModelPricingChange, UpcomingModelPricing};
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
@@ -19,6 +19,7 @@ use tracing::warn;
 use uuid::Uuid;
 
 use crate::inference_provider_pool::{BackendModelMetadata, InferenceProviderPool};
+use crate::organization_model_filter::OrganizationModelFilterSource;
 
 /// TTL for the cached `/v1/model/list` response.
 ///
@@ -51,6 +52,10 @@ const MODEL_RESOLVE_CACHE_CAPACITY: u64 = 1_000;
 /// model) pair that was asked for within the TTL.
 const MODEL_ACCESS_CACHE_CAPACITY: u64 = 10_000;
 
+/// Capacity of the organization filter cache: one entry per organization that
+/// asked for a model within the TTL.
+const MODEL_FILTER_CACHE_CAPACITY: u64 = 10_000;
+
 /// The caches behind `resolve_model_cached`. Cloning shares them. Owned by
 /// `ModelsServiceImpl` (which clears them on invalidation) and handed to the
 /// other services that resolve a model for a request.
@@ -62,13 +67,18 @@ const MODEL_ACCESS_CACHE_CAPACITY: u64 = 10_000;
 ///   keyed by (organization id, model id). It holds both answers, so an
 ///   organization that keeps asking for a model it may not use does not reach
 ///   the database every time. Only unlisted models are ever looked up here.
+/// - `filters`: cache of each organization's `allowed_models` setting (see
+///   [`crate::organization_model_filter`]), keyed by organization id, read
+///   through `filter_source`. Without a source no organization has a filter.
 ///
-/// Both share one TTL, so a grant or a revocation made through another
-/// instance takes effect here within that time.
+/// The caches share one TTL, so a grant, a revocation or a filter change made
+/// through another instance takes effect here within that time.
 #[derive(Clone)]
 pub struct ModelResolveCache {
     models: Cache<String, ModelWithPricing>,
     access: Cache<(Uuid, Uuid), bool>,
+    filters: Cache<Uuid, Option<Arc<HashSet<String>>>>,
+    filter_source: Option<Arc<dyn OrganizationModelFilterSource>>,
 }
 
 impl ModelResolveCache {
@@ -76,12 +86,35 @@ impl ModelResolveCache {
     pub fn invalidate_all(&self) {
         self.models.invalidate_all();
         self.access.invalidate_all();
+        self.filters.invalidate_all();
     }
 
     /// Drop the cached access decision for one organization and one model.
     /// The cached models are kept: a grant does not change a model.
     pub async fn invalidate_access(&self, organization_id: Uuid, model_id: Uuid) {
         self.access.invalidate(&(organization_id, model_id)).await;
+    }
+
+    /// Drop the cached filter of one organization, after its settings changed.
+    pub async fn invalidate_organization_filter(&self, organization_id: Uuid) {
+        self.filters.invalidate(&organization_id).await;
+    }
+
+    /// The canonical names `organization_id` allows, `None` for every model.
+    /// Cached, both answers. A failed read is an error, never "no filter".
+    async fn organization_filter(
+        &self,
+        organization_id: Uuid,
+    ) -> Result<Option<Arc<HashSet<String>>>, anyhow::Error> {
+        let Some(source) = &self.filter_source else {
+            return Ok(None);
+        };
+        self.filters
+            .try_get_with(organization_id, async {
+                source.allowed_models(organization_id).await
+            })
+            .await
+            .map_err(|e: Arc<anyhow::Error>| anyhow::anyhow!("{e:#}"))
     }
 }
 
@@ -99,6 +132,11 @@ pub fn model_resolve_cache_with_ttl(ttl: Duration) -> ModelResolveCache {
             .max_capacity(MODEL_ACCESS_CACHE_CAPACITY)
             .time_to_live(ttl)
             .build(),
+        filters: Cache::builder()
+            .max_capacity(MODEL_FILTER_CACHE_CAPACITY)
+            .time_to_live(ttl)
+            .build(),
+        filter_source: None,
     }
 }
 
@@ -157,18 +195,27 @@ pub async fn resolve_model_cached(
     }
 }
 
-/// The access rule. A listed model is open to every caller and returns before
-/// any lookup, so it costs nothing here. An unlisted model is open to a
-/// trusted caller, closed to an anonymous one, and open to an organization
-/// only if it holds a grant (cached, both answers).
+/// The access rule. An organization's own filter (`allowed_models`) comes
+/// first: a model it does not list is closed to it. Then a listed model is
+/// open to every caller. An unlisted model is open to a trusted caller,
+/// closed to an anonymous one, and open to an organization only if it holds
+/// a grant (cached, both answers). The filter and the grant lookups are both
+/// cached for the TTL.
 ///
-/// A failed grant lookup is an error, never an allow.
+/// A failed filter or grant lookup is an error, never an allow.
 async fn caller_can_use_model(
     cache: &ModelResolveCache,
     repository: &dyn ModelsRepository,
     caller: ModelCaller,
     model: &ModelWithPricing,
 ) -> Result<bool, anyhow::Error> {
+    if let ModelCaller::Organization(organization_id) = caller {
+        if let Some(allowed) = cache.organization_filter(organization_id).await? {
+            if !allowed.contains(&model.model_name) {
+                return Ok(false);
+            }
+        }
+    }
     if model.is_listed {
         return Ok(true);
     }
@@ -246,6 +293,17 @@ impl ModelsServiceImpl {
             models_list_cache,
             model_resolve_cache: new_model_resolve_cache(),
         }
+    }
+
+    /// Apply each organization's `allowed_models` setting, read from
+    /// `source`. Call before [`Self::model_resolve_cache`] hands the cache to
+    /// another service: a clone taken earlier has no filters.
+    pub fn with_organization_model_filter(
+        mut self,
+        source: Arc<dyn OrganizationModelFilterSource>,
+    ) -> Self {
+        self.model_resolve_cache.filter_source = Some(source);
+        self
     }
 
     /// Handle to the resolve cache for the other services that resolve a
@@ -424,6 +482,12 @@ impl ModelsServiceTrait for ModelsServiceImpl {
     async fn invalidate_models_cache(&self) {
         self.models_list_cache.invalidate_all();
         self.model_resolve_cache.invalidate_all();
+    }
+
+    async fn invalidate_organization_model_filter(&self, organization_id: Uuid) {
+        self.model_resolve_cache
+            .invalidate_organization_filter(organization_id)
+            .await;
     }
 
     async fn invalidate_model_access(&self, organization_id: Uuid, model_id: Uuid) {
@@ -1489,5 +1553,251 @@ mod tests {
         assert!(matches!(by_alias, Err(ModelsError::NotFound(_))));
         assert_eq!(resolved_alias.context_length, 4096);
         assert_eq!(resolved_alias.max_output_length, Some(1024));
+    }
+
+    /// A filter source over a fixed map, counting its reads.
+    #[derive(Default)]
+    struct StaticFilters {
+        filters: Mutex<HashMap<Uuid, HashSet<String>>>,
+        fail: AtomicBool,
+        reads: AtomicUsize,
+    }
+
+    impl StaticFilters {
+        fn set(&self, organization_id: Uuid, names: &[&str]) {
+            self.filters.lock().unwrap().insert(
+                organization_id,
+                names.iter().map(|name| name.to_string()).collect(),
+            );
+        }
+
+        fn clear(&self, organization_id: Uuid) {
+            self.filters.lock().unwrap().remove(&organization_id);
+        }
+
+        fn reads(&self) -> usize {
+            self.reads.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl OrganizationModelFilterSource for StaticFilters {
+        async fn allowed_models(
+            &self,
+            organization_id: Uuid,
+        ) -> anyhow::Result<Option<Arc<HashSet<String>>>> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            if self.fail.load(Ordering::SeqCst) {
+                anyhow::bail!("db down");
+            }
+            Ok(self
+                .filters
+                .lock()
+                .unwrap()
+                .get(&organization_id)
+                .cloned()
+                .map(Arc::new))
+        }
+    }
+
+    /// The access fixture with a filter source.
+    fn filtered_fixture() -> (
+        Arc<StaticModelsRepository>,
+        ModelsServiceImpl,
+        Uuid,
+        Arc<StaticFilters>,
+    ) {
+        let (repository, service, unlisted_id) = access_fixture();
+        let filters = Arc::new(StaticFilters::default());
+        let service = service.with_organization_model_filter(filters.clone());
+        (repository, service, unlisted_id, filters)
+    }
+
+    fn not_found<T>(result: Result<T, ModelsError>) -> bool {
+        matches!(result, Err(ModelsError::NotFound(_)))
+    }
+
+    #[tokio::test]
+    async fn an_organization_filter_closes_every_model_it_does_not_list() {
+        let organization = Uuid::new_v4();
+        let (repository, service, unlisted_id, filters) = filtered_fixture();
+        let caller = ModelCaller::Organization(organization);
+        filters.set(organization, &[UNLISTED]);
+        repository.grant(organization, unlisted_id);
+
+        // The listed model is not on the list: unknown, by every lookup.
+        assert!(not_found(
+            service.resolve_and_get_model(LISTED, caller).await
+        ));
+        assert!(not_found(service.get_model_by_name(LISTED, caller).await));
+        let listed = repository.models_by_name[LISTED].clone();
+        assert!(!service.caller_can_use_model(caller, &listed).await.unwrap());
+        assert_eq!(
+            service.resolve_alias_cached(UNLISTED_ALIAS, caller).await,
+            Some(UNLISTED.to_string())
+        );
+
+        // The granted unlisted model is on the list: open, alias included.
+        for identifier in [UNLISTED, UNLISTED_ALIAS] {
+            assert_eq!(
+                service
+                    .resolve_and_get_model(identifier, caller)
+                    .await
+                    .unwrap()
+                    .model_name,
+                UNLISTED,
+                "{identifier}"
+            );
+        }
+
+        // The filter only narrows: without the grant the unlisted model
+        // stays closed even though it is listed in the filter.
+        repository.revoke(organization, unlisted_id);
+        service
+            .invalidate_model_access(organization, unlisted_id)
+            .await;
+        assert!(not_found(
+            service.resolve_and_get_model(UNLISTED, caller).await
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_filter_changes_nothing_for_other_callers() {
+        let filtered = Uuid::new_v4();
+        let (repository, service, unlisted_id, filters) = filtered_fixture();
+        filters.set(filtered, &[UNLISTED]);
+        let other = Uuid::new_v4();
+        repository.grant(other, unlisted_id);
+
+        for caller in [
+            ModelCaller::Anonymous,
+            ModelCaller::Organization(other),
+            ModelCaller::Trusted,
+        ] {
+            assert_eq!(
+                service
+                    .resolve_and_get_model(LISTED, caller)
+                    .await
+                    .unwrap()
+                    .model_name,
+                LISTED
+            );
+        }
+        // Listed models still cost no grant lookup.
+        assert_eq!(repository.access_lookups(), 0);
+        assert!(service
+            .resolve_and_get_model(UNLISTED, ModelCaller::Organization(other))
+            .await
+            .is_ok());
+        // Platform work for the filtered organization (`Trusted`) ignores it.
+        assert!(service
+            .resolve_and_get_model(LISTED, ModelCaller::Trusted)
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_filter_is_cached_and_its_invalidation_reaches_shared_caches() {
+        let organization = Uuid::new_v4();
+        let (repository, service, _, filters) = filtered_fixture();
+        let caller = ModelCaller::Organization(organization);
+        let shared = service.model_resolve_cache();
+        filters.set(organization, &[UNLISTED]);
+
+        for _ in 0..3 {
+            assert!(not_found(
+                service.resolve_and_get_model(LISTED, caller).await
+            ));
+        }
+        assert!(
+            resolve_model_cached(&shared, repository.as_ref(), LISTED, caller)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(filters.reads(), 1, "one read, then the cached answer");
+
+        // Lifted in the store: the cached filter holds until invalidated.
+        filters.clear(organization);
+        assert!(not_found(
+            service.resolve_and_get_model(LISTED, caller).await
+        ));
+        service
+            .invalidate_organization_model_filter(organization)
+            .await;
+        assert!(service.resolve_and_get_model(LISTED, caller).await.is_ok());
+        assert!(
+            resolve_model_cached(&shared, repository.as_ref(), LISTED, caller)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_filter_read_is_an_error() {
+        let organization = Uuid::new_v4();
+        let (_, service, _, filters) = filtered_fixture();
+        filters.fail.store(true, Ordering::SeqCst);
+        assert!(matches!(
+            service
+                .resolve_and_get_model(LISTED, ModelCaller::Organization(organization))
+                .await,
+            Err(ModelsError::InternalError(_))
+        ));
+        // Nothing is cached from a failed read.
+        filters.fail.store(false, Ordering::SeqCst);
+        assert!(service
+            .resolve_and_get_model(LISTED, ModelCaller::Organization(organization))
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn allowed_models_are_checked_against_what_the_organization_could_use() {
+        use crate::organization_model_filter::{
+            canonical_allowed_models, AllowedModelsError, MAX_ALLOWED_MODELS,
+        };
+        let organization = Uuid::new_v4();
+        let (repository, service, unlisted_id, filters) = filtered_fixture();
+        let names = |list: &[&str]| list.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let check = |list: Vec<String>| {
+            let service = &service;
+            async move { canonical_allowed_models(service, organization, &list).await }
+        };
+
+        // Listed names are accepted, duplicates dropped, sorted.
+        assert_eq!(
+            check(names(&[LISTED, LISTED])).await.unwrap(),
+            names(&[LISTED])
+        );
+        // An unlisted model without a grant looks unknown, by name and alias.
+        for name in [UNLISTED, UNLISTED_ALIAS, "test/does-not-exist"] {
+            assert!(
+                matches!(
+                    check(names(&[name])).await,
+                    Err(AllowedModelsError::UnknownModel(n)) if n == name
+                ),
+                "{name}"
+            );
+        }
+        // With a grant it is accepted, and an alias is stored canonical.
+        repository.grant(organization, unlisted_id);
+        assert_eq!(
+            check(names(&[UNLISTED_ALIAS, LISTED])).await.unwrap(),
+            names(&[LISTED, UNLISTED])
+        );
+        // The current filter does not apply, so a PATCH can widen it.
+        filters.set(organization, &[LISTED]);
+        assert_eq!(check(names(&[UNLISTED])).await.unwrap(), names(&[UNLISTED]));
+
+        assert!(matches!(
+            check(Vec::new()).await,
+            Err(AllowedModelsError::Empty)
+        ));
+        assert!(matches!(
+            check(vec![LISTED.to_string(); MAX_ALLOWED_MODELS + 1]).await,
+            Err(AllowedModelsError::TooMany)
+        ));
     }
 }

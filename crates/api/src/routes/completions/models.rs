@@ -3,6 +3,11 @@ use super::*;
 /// List available models
 ///
 /// Returns all AI models available for completions. OpenAI-compatible endpoint.
+///
+/// No authentication is needed, and the answer is the same public catalog for
+/// every caller, with one exception: an organization that limited itself to a
+/// set of models (`allowed_models` in its settings) gets the models it may use,
+/// when it calls with one of its API keys. That answer must not be cached.
 #[utoipa::path(
     get,
     path = "/v1/models",
@@ -12,33 +17,89 @@ use super::*;
         (status = 500, description = "Server error", body = ErrorResponse)
     ),
     security(
-        ()
+        (),
+        ("api_key" = [])
     )
 )]
 pub async fn models(
     State(app_state): State<AppState>,
-) -> Result<ResponseJson<ModelsResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
+    api_key: Option<Extension<AuthenticatedApiKey>>,
+) -> Result<Response, (StatusCode, ResponseJson<ErrorResponse>)> {
     debug!("Models list request");
 
-    let models = app_state
-        .models_service
-        .get_public_models_with_pricing()
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                ResponseJson(ErrorResponse::new(
-                    e.to_string(),
-                    "internal_server_error".to_string(),
-                )),
-            )
-        })?;
+    let internal_error = |e: services::models::ModelsError| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            ResponseJson(ErrorResponse::new(
+                e.to_string(),
+                "internal_server_error".to_string(),
+            )),
+        )
+    };
 
+    // `filtered_catalog_middleware` sets the key only for an organization with
+    // a filter. Checked again here, so any other caller keeps the public
+    // catalog whatever authenticated the request.
+    let filtered_organization = api_key
+        .filter(|Extension(key)| key.organization.allowed_models().is_some())
+        .map(|Extension(key)| key.organization.id.0);
+
+    let Some(organization_id) = filtered_organization else {
+        let models = app_state
+            .models_service
+            .get_public_models_with_pricing()
+            .await
+            .map_err(internal_error)?;
+        let response = ModelsResponse {
+            object: "list".to_string(),
+            data: models.into_iter().map(model_with_pricing_to_info).collect(),
+        };
+        return Ok(([(header::VARY, "Authorization")], ResponseJson(response)).into_response());
+    };
+
+    // The models this organization may use: the access rule of every
+    // inference route, on every active model, listed or not.
+    let caller = ModelCaller::Organization(organization_id);
+    let mut models = Vec::new();
+    for model in app_state
+        .models_service
+        .get_models_with_pricing()
+        .await
+        .map_err(internal_error)?
+    {
+        if app_state
+            .models_service
+            .caller_can_use_model(caller, &model)
+            .await
+            .map_err(internal_error)?
+        {
+            models.push(model);
+        }
+    }
+    // Name a successor only if the organization may use it.
+    let usable: std::collections::HashSet<String> =
+        models.iter().map(|m| m.model_name.clone()).collect();
+    for model in &mut models {
+        if model
+            .successor_model_name
+            .as_ref()
+            .is_some_and(|successor| !usable.contains(successor))
+        {
+            model.successor_model_name = None;
+        }
+    }
     let response = ModelsResponse {
         object: "list".to_string(),
         data: models.into_iter().map(model_with_pricing_to_info).collect(),
     };
-    Ok(ResponseJson(response))
+    Ok((
+        [
+            (header::CACHE_CONTROL, "private, no-store"),
+            (header::VARY, "Authorization"),
+        ],
+        ResponseJson(response),
+    )
+        .into_response())
 }
 
 /// List every active model for trusted services, unlisted models included.

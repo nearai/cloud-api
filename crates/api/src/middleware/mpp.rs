@@ -171,6 +171,7 @@ fn error_response(
             let http = match status {
                 ProblemStatus::BadRequest => StatusCode::BAD_REQUEST,
                 ProblemStatus::Forbidden => StatusCode::FORBIDDEN,
+                ProblemStatus::Gone => StatusCode::GONE,
             };
             problem_response(http, problem.body(status.code(), error.detail()))
         }

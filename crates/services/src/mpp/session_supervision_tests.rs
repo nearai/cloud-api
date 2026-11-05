@@ -50,9 +50,17 @@ async fn open(repo: &InMemoryChannelRepository, id: [u8; 32]) {
     .await
     .unwrap();
     for cumulative in [100, 200] {
-        repo.accept_voucher(&id, cumulative, v.fixed("voucher.signature"))
-            .await
-            .unwrap();
+        repo.accept_voucher(
+            &id,
+            cumulative,
+            v.fixed("voucher.signature"),
+            crate::mpp::ports::VoucherRules {
+                min_delta: 0,
+                settled_floor_from_chain: true,
+            },
+        )
+        .await
+        .unwrap();
     }
 }
 
@@ -117,7 +125,9 @@ async fn pending_close_recovery_handles_receipts_expiry_and_hash_mismatch() {
             capture: 80,
             valid_before: u64::try_from(now().timestamp()).unwrap(),
         };
-        repo.mark_closing(&[1; 32], pending).await.unwrap();
+        repo.mark_closing(&[1; 32], pending, Utc::now())
+            .await
+            .unwrap();
         let rpc = FakeTempo::default();
         answer(&rpc, requested());
         if let Some(success) = receipt {
@@ -186,7 +196,9 @@ async fn pending_close_recovery_handles_receipts_expiry_and_hash_mismatch() {
         capture: 80,
         valid_before: 0,
     };
-    repo.mark_closing(&[1; 32], pending).await.unwrap();
+    repo.mark_closing(&[1; 32], pending, Utc::now())
+        .await
+        .unwrap();
     let rpc = FakeTempo::default();
     answer(&rpc, requested());
     rpc.mined_alias(
@@ -226,7 +238,9 @@ async fn receipt_read_error_preserves_even_an_expired_pending_close() {
         capture: 80,
         valid_before: 0,
     };
-    repo.mark_closing(&[1; 32], pending).await.unwrap();
+    repo.mark_closing(&[1; 32], pending, Utc::now())
+        .await
+        .unwrap();
     let rpc = FakeTempo::default();
     rpc.set_lookup_error(Some(RpcError::Unavailable));
     let summary = run_supervision_pass(

@@ -97,19 +97,14 @@ fn every_statement_binds_its_inputs_and_uses_the_closed_state_values() {
         INSERT_RESERVATION_SQL,
         TAKE_RESERVATION_SQL,
         FINALIZE_SQL,
-        CLEAR_CLOSING_SQL,
-        CLAIM_LEASE_SQL,
-        RELEASE_LEASE_SQL,
+        LEASE_SQL,
+        SET_LEASE_SQL,
         PURGE_SQL,
     ] {
         assert!(sql.contains("$1"));
     }
     assert!(INSERT_SQL.contains(&format!("'{}'", ChannelLifecycle::Open.as_str())));
     assert!(FINALIZE_SQL.contains(&format!("'{}'", ChannelLifecycle::Finalized.as_str())));
-    assert!(CLEAR_CLOSING_SQL.contains(&format!("'{}'", ChannelLifecycle::Open.as_str())));
-    assert!(
-        CLEAR_CLOSING_SQL.contains(&format!("state = '{}'", ChannelLifecycle::Closing.as_str()))
-    );
     assert!(LIST_FIRST_SQL.contains(&format!("<> '{}'", ChannelLifecycle::Finalized.as_str())));
     assert!(LIST_AFTER_SQL.contains(&format!("<> '{}'", ChannelLifecycle::Finalized.as_str())));
     assert!(FINALIZED_PAGE_SQL.contains(&format!("= '{}'", ChannelLifecycle::Finalized.as_str())));
@@ -132,7 +127,6 @@ fn the_read_columns_match_the_row_reader() {
     for sql in [
         GET_SQL,
         LOCK_SQL,
-        CLAIM_LEASE_SQL,
         LIST_FIRST_SQL,
         LIST_AFTER_SQL,
         RELEASE_STALE_LOCK_SQL,
@@ -148,10 +142,6 @@ fn locks_and_batches_are_bounded_and_non_blocking_where_instances_overlap() {
     assert!(RELEASE_STALE_LOCK_SQL.ends_with("SKIP LOCKED"));
     assert!(PURGE_SQL.contains("SKIP LOCKED"));
     assert!(FINALIZED_PAGE_SQL.contains("LIMIT $2") && STALE_CHANNELS_SQL.contains("LIMIT $3"));
-    // The settlement lease is claimed in one statement, not read then written.
-    assert!(
-        CLAIM_LEASE_SQL.contains("settlement_lease_until IS NULL OR settlement_lease_until < $2")
-    );
     const _: () = assert!(SCAN_BATCH > 0 && MAX_BATCHES > 0 && MAX_LIST_LIMIT > 0);
     assert!(!batch_is_full(0) && batch_is_full(usize::try_from(SCAN_BATCH).unwrap()));
 }

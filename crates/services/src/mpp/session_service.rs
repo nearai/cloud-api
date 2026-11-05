@@ -20,7 +20,7 @@ use crate::mpp::error::{
 use crate::mpp::open_check::{verify_open_transaction, OpenTerms};
 use crate::mpp::ports::{
     ChannelLifecycle, ChannelRecord, ChannelRepository, ChargeOutcome, NewChannel, ReserveOutcome,
-    TempoRpc, TempoSigner, VoucherOutcome,
+    TempoRpc, TempoSigner, VoucherOutcome, VoucherRules,
 };
 use crate::mpp::pricing::{LimitViolation, Price};
 use crate::mpp::protocol::{self, Challenge, INTENT_SESSION, METHOD};
@@ -354,11 +354,19 @@ impl SessionService {
 
     async fn refresh(&self, record: ChannelRecord) -> Result<ChannelRecord, MppError> {
         Self::accepting(&record)?;
-        if record
-            .last_chain_read_at
-            .is_some_and(|at| Utc::now().signed_duration_since(at) < chrono::Duration::seconds(60))
+        if !self
+            .repo
+            .claim_chain_read(
+                &record.channel_id,
+                Utc::now(),
+                chrono::Duration::seconds(60),
+            )
+            .await
+            .map_err(store_error)?
         {
-            return Ok(record);
+            let current = self.get(&record.channel_id).await?;
+            Self::accepting(&current)?;
+            return Ok(current);
         }
         let chain = self.read_chain(&record.channel_id).await?;
         self.record_chain(&record.channel_id, chain).await
@@ -420,13 +428,22 @@ impl SessionService {
         record: ChannelRecord,
         cumulative: u128,
         signature: [u8; SIGNATURE_LEN],
+        min_delta: u128,
     ) -> Result<ChannelRecord, MppError> {
         if cumulative == record.highest_cumulative && signature == record.highest_signature {
             return Ok(record);
         }
         match self
             .repo
-            .accept_voucher(&record.channel_id, cumulative, signature)
+            .accept_voucher(
+                &record.channel_id,
+                cumulative,
+                signature,
+                VoucherRules {
+                    min_delta,
+                    settled_floor_from_chain: true,
+                },
+            )
             .await
             .map_err(store_error)?
         {
@@ -441,6 +458,15 @@ impl SessionService {
                 } else {
                     Err(MppError::VoucherRejected(VoucherReason::NotHigher))
                 }
+            }
+            VoucherOutcome::DeltaTooSmall => {
+                Err(MppError::VoucherRejected(VoucherReason::DeltaTooSmall))
+            }
+            VoucherOutcome::BelowSettled => {
+                Err(MppError::VoucherRejected(VoucherReason::BelowSettled))
+            }
+            VoucherOutcome::AboveDeposit => {
+                Err(MppError::VoucherRejected(VoucherReason::AboveDeposit))
             }
             VoucherOutcome::NotAccepting => Err(MppError::ChannelClosing),
             VoucherOutcome::Missing => Err(MppError::ChannelNotFound),
@@ -539,6 +565,17 @@ impl SessionService {
             .map_err(store_error)?;
         Self::accepting(&record)?;
         let record = self.record_chain(id, chain).await?;
+        let record = if *cumulative_amount > record.highest_cumulative {
+            self.accept(
+                record,
+                *cumulative_amount,
+                *signature,
+                credential.min_voucher_delta,
+            )
+            .await?
+        } else {
+            record
+        };
         Ok(ManagementReceipt {
             receipt: receipt(credential, &record, Some(tx.tx_hash)),
         })
@@ -681,7 +718,33 @@ impl SessionService {
             }
             return Err(error);
         }
-        self.accept(record, *cumulative_amount, *signature).await?;
+        if let Err(error) = self
+            .accept(
+                record,
+                *cumulative_amount,
+                *signature,
+                credential.min_voucher_delta,
+            )
+            .await
+        {
+            if error == MppError::VoucherRejected(VoucherReason::DeltaTooSmall) {
+                let current = self.get(id).await?;
+                let required = current
+                    .spent
+                    .checked_add(cost_cap)
+                    .zip(
+                        current
+                            .highest_cumulative
+                            .checked_add(credential.min_voucher_delta),
+                    )
+                    .map(|(cost, delta)| cost.max(delta))
+                    .ok_or(MppError::Malformed("cost_overflow"))?;
+                return Err(MppError::VoucherDeltaTooSmall(Box::new(snapshot(
+                    &current, required,
+                ))));
+            }
+            return Err(error);
+        }
         match self
             .repo
             .reserve(id, request_id, cost_cap)

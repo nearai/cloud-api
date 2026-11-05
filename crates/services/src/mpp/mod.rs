@@ -64,8 +64,8 @@ pub use memory::InMemoryClaimRepository;
 pub use ports::{
     ChannelLifecycle, ChannelRecord, ChannelRepository, ChargeOutcome, ClaimLease, ClaimOutcome,
     ClaimState, CloseTransition, NewChannel, PaymentClaimRepository, PendingClose, ReserveOutcome,
-    RetainedVoucher, RpcError, RpcLog, RpcReceipt, ServeOutcome, TempoRpc, TempoSigner,
-    VoucherOutcome, MAX_RETAINED_VOUCHERS,
+    RetainedVoucher, RpcError, RpcLog, RpcReceipt, ServeOutcome, SettlementLease, TempoRpc,
+    TempoSigner, VoucherOutcome, VoucherRules, MAX_RETAINED_VOUCHERS,
 };
 pub use pricing::{LimitViolation, Param, Price, Pricing, RequestShape};
 pub use protocol::{Challenge, ProblemCode};

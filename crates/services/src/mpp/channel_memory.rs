@@ -22,7 +22,8 @@ use uuid::Uuid;
 use super::abi::ChannelState;
 use super::ports::{
     ChannelLifecycle, ChannelRecord, ChannelRepository, ChargeOutcome, CloseTransition, NewChannel,
-    PendingClose, ReserveOutcome, RetainedVoucher, VoucherOutcome, MAX_RETAINED_VOUCHERS,
+    PendingClose, ReserveOutcome, RetainedVoucher, SettlementLease, VoucherOutcome, VoucherRules,
+    MAX_RETAINED_VOUCHERS,
 };
 use super::secp256k1::SIGNATURE_LEN;
 use crate::common::RepositoryError;
@@ -151,6 +152,15 @@ impl InMemoryChannelRepository {
         }
     }
 
+    /// Age the last refresh claim, for cache-expiry tests.
+    pub fn age_chain_read(&self, channel_id: &[u8; 32], by: Duration) {
+        if let Ok(mut state) = self.state.lock() {
+            if let Some(row) = state.channels.get_mut(channel_id) {
+                row.record.last_chain_read_at = row.record.last_chain_read_at.map(|at| at - by);
+            }
+        }
+    }
+
     /// Whether a settlement lease is held on the channel (whatever its expiry). For
     /// assertions.
     pub fn lease_until(&self, channel_id: &[u8; 32]) -> Option<DateTime<Utc>> {
@@ -194,13 +204,6 @@ impl ChannelRepository for InMemoryChannelRepository {
             let record = &mut row.record;
             record.deposit = record.deposit.max(channel.deposit);
             record.settled_on_chain = record.settled_on_chain.max(channel.settled_on_chain);
-            if channel.highest_cumulative > record.highest_cumulative {
-                promote_voucher(
-                    record,
-                    channel.highest_cumulative,
-                    channel.highest_signature,
-                );
-            }
             record.updated_at = stamp;
             return Ok(record.clone());
         }
@@ -245,6 +248,7 @@ impl ChannelRepository for InMemoryChannelRepository {
         channel_id: &[u8; 32],
         cumulative: u128,
         signature: [u8; SIGNATURE_LEN],
+        rules: VoucherRules,
     ) -> Result<VoucherOutcome, RepositoryError> {
         let mut state = self.state.lock().map_err(|_| poisoned())?;
         let stamp = state.tick();
@@ -256,6 +260,15 @@ impl ChannelRepository for InMemoryChannelRepository {
         }
         if cumulative <= row.record.highest_cumulative {
             return Ok(VoucherOutcome::NotHigher);
+        }
+        if cumulative - row.record.highest_cumulative < rules.min_delta {
+            return Ok(VoucherOutcome::DeltaTooSmall);
+        }
+        if rules.settled_floor_from_chain && cumulative < row.record.settled_on_chain {
+            return Ok(VoucherOutcome::BelowSettled);
+        }
+        if cumulative > row.record.deposit {
+            return Ok(VoucherOutcome::AboveDeposit);
         }
         promote_voucher(&mut row.record, cumulative, signature);
         row.record.updated_at = stamp;
@@ -359,7 +372,11 @@ impl ChannelRepository for InMemoryChannelRepository {
         if chain.close_requested_at != 0 {
             record.close_requested_at = chain.close_requested_at;
         }
-        record.last_chain_read_at = Some(read_at);
+        record.last_chain_read_at = Some(
+            record
+                .last_chain_read_at
+                .map_or(read_at, |at| at.max(read_at)),
+        );
         record.updated_at = stamp;
         Ok(Some(record.clone()))
     }
@@ -368,6 +385,7 @@ impl ChannelRepository for InMemoryChannelRepository {
         &self,
         channel_id: &[u8; 32],
         pending: PendingClose,
+        now: DateTime<Utc>,
     ) -> Result<CloseTransition, RepositoryError> {
         let mut state = self.state.lock().map_err(|_| poisoned())?;
         let stamp = state.tick();
@@ -376,6 +394,9 @@ impl ChannelRepository for InMemoryChannelRepository {
         };
         if row.record.state != ChannelLifecycle::Open {
             return Ok(CloseTransition::NotOpen);
+        }
+        if row.lease_until.is_some_and(|until| until > now) {
+            return Ok(CloseTransition::SettlementInFlight);
         }
         row.record.state = ChannelLifecycle::Closing;
         row.record.pending_close = Some(pending);
@@ -399,17 +420,77 @@ impl ChannelRepository for InMemoryChannelRepository {
         Ok(())
     }
 
-    async fn clear_closing(&self, channel_id: &[u8; 32]) -> Result<(), RepositoryError> {
+    async fn clear_closing(
+        &self,
+        channel_id: &[u8; 32],
+        expected_tx_hash: &[u8; 32],
+    ) -> Result<bool, RepositoryError> {
         let mut state = self.state.lock().map_err(|_| poisoned())?;
         let stamp = state.tick();
-        if let Some(row) = state.channels.get_mut(channel_id) {
-            if row.record.state == ChannelLifecycle::Closing {
-                row.record.state = ChannelLifecycle::Open;
-                row.record.pending_close = None;
-                row.record.updated_at = stamp;
-            }
+        let Some(row) = state.channels.get_mut(channel_id) else {
+            return Ok(false);
+        };
+        if row.record.state != ChannelLifecycle::Closing
+            || row
+                .record
+                .pending_close
+                .is_none_or(|pending| pending.tx_hash != *expected_tx_hash)
+        {
+            return Ok(false);
         }
-        Ok(())
+        row.record.state = ChannelLifecycle::Open;
+        row.record.pending_close = None;
+        row.record.updated_at = stamp;
+        Ok(true)
+    }
+
+    async fn finalize_pending_close(
+        &self,
+        channel_id: &[u8; 32],
+        expected_tx_hash: &[u8; 32],
+        settled_on_chain: u128,
+    ) -> Result<bool, RepositoryError> {
+        let mut state = self.state.lock().map_err(|_| poisoned())?;
+        let stamp = state.tick();
+        let Some(row) = state.channels.get_mut(channel_id) else {
+            return Ok(false);
+        };
+        if row.record.state != ChannelLifecycle::Closing
+            || row
+                .record
+                .pending_close
+                .is_none_or(|pending| pending.tx_hash != *expected_tx_hash)
+        {
+            return Ok(false);
+        }
+        row.record.state = ChannelLifecycle::Finalized;
+        row.record.settled_on_chain = row.record.settled_on_chain.max(settled_on_chain);
+        row.record.pending_close = None;
+        row.record.updated_at = stamp;
+        Ok(true)
+    }
+
+    async fn claim_chain_read(
+        &self,
+        channel_id: &[u8; 32],
+        now: DateTime<Utc>,
+        min_interval: Duration,
+    ) -> Result<bool, RepositoryError> {
+        let mut state = self.state.lock().map_err(|_| poisoned())?;
+        let stamp = state.tick();
+        let Some(row) = state.channels.get_mut(channel_id) else {
+            return Ok(false);
+        };
+        if row
+            .record
+            .last_chain_read_at
+            .is_some_and(|at| now.signed_duration_since(at) < min_interval)
+        {
+            return Ok(false);
+        }
+        row.record.last_chain_read_at = Some(now);
+        row.record.updated_at = stamp;
+        Ok(true)
     }
 
     async fn claim_settlement_lease(
@@ -417,50 +498,69 @@ impl ChannelRepository for InMemoryChannelRepository {
         channel_id: &[u8; 32],
         now: DateTime<Utc>,
         until: DateTime<Utc>,
-    ) -> Result<Option<ChannelRecord>, RepositoryError> {
+    ) -> Result<Option<(ChannelRecord, SettlementLease)>, RepositoryError> {
         let mut state = self.state.lock().map_err(|_| poisoned())?;
         let stamp = state.tick();
         let Some(row) = state.channels.get_mut(channel_id) else {
             return Ok(None);
         };
-        if row.lease_until.is_some_and(|held| held >= now) {
+        // Match PostgreSQL's timestamp encoding, including sub-microsecond callers.
+        let until = DateTime::from_timestamp_micros(until.timestamp_micros())
+            .ok_or_else(|| RepositoryError::ValidationFailed("lease deadline".to_string()))?;
+        if until <= now
+            || row.record.state != ChannelLifecycle::Open
+            || row.lease_until.is_some_and(|held| held >= now)
+        {
             return Ok(None);
         }
         row.lease_until = Some(until);
         row.record.updated_at = stamp;
-        Ok(Some(row.record.clone()))
+        Ok(Some((row.record.clone(), SettlementLease::new(until))))
     }
 
     async fn record_settlement(
         &self,
         channel_id: &[u8; 32],
+        lease: SettlementLease,
         cumulative: u128,
         at: DateTime<Utc>,
-    ) -> Result<(), RepositoryError> {
+    ) -> Result<bool, RepositoryError> {
         let mut state = self.state.lock().map_err(|_| poisoned())?;
         let stamp = state.tick();
-        if let Some(row) = state.channels.get_mut(channel_id) {
-            let record = &mut row.record;
-            record.settled_on_chain = record.settled_on_chain.max(cumulative);
-            record.last_settlement_at = Some(at);
-            record.last_settlement_spent = record.spent;
-            record
-                .retained_vouchers
-                .retain(|voucher| voucher.cumulative > cumulative);
-            record.updated_at = stamp;
-            row.lease_until = None;
+        let Some(row) = state.channels.get_mut(channel_id) else {
+            return Ok(false);
+        };
+        if row.lease_until != Some(lease.until()) || row.record.state != ChannelLifecycle::Open {
+            return Ok(false);
         }
-        Ok(())
+        let record = &mut row.record;
+        record.settled_on_chain = record.settled_on_chain.max(cumulative);
+        record.last_settlement_at = Some(at);
+        record.last_settlement_spent = record.spent;
+        record
+            .retained_vouchers
+            .retain(|voucher| voucher.cumulative > cumulative);
+        record.updated_at = stamp;
+        row.lease_until = None;
+        Ok(true)
     }
 
-    async fn release_settlement_lease(&self, channel_id: &[u8; 32]) -> Result<(), RepositoryError> {
+    async fn release_settlement_lease(
+        &self,
+        channel_id: &[u8; 32],
+        lease: SettlementLease,
+    ) -> Result<bool, RepositoryError> {
         let mut state = self.state.lock().map_err(|_| poisoned())?;
         let stamp = state.tick();
-        if let Some(row) = state.channels.get_mut(channel_id) {
-            row.lease_until = None;
-            row.record.updated_at = stamp;
+        let Some(row) = state.channels.get_mut(channel_id) else {
+            return Ok(false);
+        };
+        if row.lease_until != Some(lease.until()) {
+            return Ok(false);
         }
-        Ok(())
+        row.lease_until = None;
+        row.record.updated_at = stamp;
+        Ok(true)
     }
 
     async fn list_active(

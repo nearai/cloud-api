@@ -106,7 +106,7 @@ async fn pending_close_stays_fenced_before_expiry_margin_and_reopens_only_after_
             valid_before: if expired { now - 31 } else { now - 5 },
         };
         f.repo
-            .mark_closing(&Vectors::load().fixed("channelId"), pending)
+            .mark_closing(&Vectors::load().fixed("channelId"), pending, Utc::now())
             .await
             .unwrap();
         f.rpc.set_gas_price(Err(RpcError::Unavailable));
@@ -141,7 +141,7 @@ async fn definitive_failed_pending_close_receipt_clears_fence_without_spending()
         valid_before: u64::try_from(Utc::now().timestamp()).unwrap() + 3600,
     };
     f.repo
-        .mark_closing(&Vectors::load().fixed("channelId"), pending)
+        .mark_closing(&Vectors::load().fixed("channelId"), pending, Utc::now())
         .await
         .unwrap();
     f.rpc.mine(pending_receipt(pending, false));
@@ -276,7 +276,12 @@ async fn stale_chain_failures_refuse_even_exact_replay_without_money_changes() {
             Some(MppError::Unavailable(UnavailableReason::Rpc)),
             "case {case}"
         );
-        let after = f.record().await;
+        let mut after = f.record().await;
+        assert!(after.last_chain_read_at.is_some());
+        assert!(after.updated_at > before.updated_at);
+        // A failed read retains its throttle claim; every money field stays exact.
+        after.last_chain_read_at = before.last_chain_read_at;
+        after.updated_at = before.updated_at;
         assert_eq!(after, before);
         assert_eq!(f.repo.reservation_count(), 0);
         assert_eq!(f.rpc.eth_calls(), 1);

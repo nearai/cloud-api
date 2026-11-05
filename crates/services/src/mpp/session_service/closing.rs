@@ -80,11 +80,14 @@ impl SessionService {
         };
         let marked = match self
             .repo
-            .mark_closing(id, pending)
+            .mark_closing(id, pending, Utc::now())
             .await
             .map_err(store_error)?
         {
             CloseTransition::Marked(record) => record,
+            CloseTransition::SettlementInFlight => {
+                return Err(MppError::CloseRejected(CloseReason::Busy))
+            }
             CloseTransition::NotOpen => return Err(MppError::ChannelClosing),
             CloseTransition::Missing => return Err(MppError::ChannelNotFound),
         };
@@ -94,18 +97,31 @@ impl SessionService {
             || marked.spent.max(marked.settled_on_chain) != capture
             || marked.close_requested_at != 0
         {
-            self.repo.clear_closing(id).await.map_err(store_error)?;
+            self.repo
+                .clear_closing(id, &pending.tx_hash)
+                .await
+                .map_err(store_error)?;
             return Err(MppError::CloseRejected(CloseReason::StateChanged));
         }
         if let Err(error) = broadcast(self.rpc.as_ref(), &tx).await {
             if error == BroadcastError::Reverted {
-                self.repo.clear_closing(id).await.map_err(store_error)?;
+                self.repo
+                    .clear_closing(id, &pending.tx_hash)
+                    .await
+                    .map_err(store_error)?;
             } else if let Some(receipt) = self.reconcile_close(credential, &marked).await? {
                 return Ok(receipt);
             }
             return Err(MppError::ChainTxFailed);
         }
-        self.repo.finalize(id, capture).await.map_err(store_error)?;
+        if !self
+            .repo
+            .finalize_pending_close(id, &pending.tx_hash, capture)
+            .await
+            .map_err(store_error)?
+        {
+            return Err(MppError::CloseRejected(CloseReason::StateChanged));
+        }
         let record = self.get(id).await?;
         let mut receipt = receipt(credential, &record, Some(tx.tx_hash));
         receipt.accepted_cumulative = receipt.accepted_cumulative.max(*cumulative_amount);
@@ -148,17 +164,21 @@ impl SessionService {
                 return Err(MppError::ChainTxFailed);
             }
             if mined.success {
-                self.repo
-                    .finalize(&record.channel_id, pending.capture)
+                if !self
+                    .repo
+                    .finalize_pending_close(&record.channel_id, &pending.tx_hash, pending.capture)
                     .await
-                    .map_err(store_error)?;
+                    .map_err(store_error)?
+                {
+                    return Err(MppError::ChannelClosing);
+                }
                 let current = self.get(&record.channel_id).await?;
                 let mut receipt = receipt(credential, &current, Some(pending.tx_hash));
                 receipt.accepted_cumulative = receipt.accepted_cumulative.max(pending.cumulative);
                 return Ok(Some(ManagementReceipt { receipt }));
             }
             self.repo
-                .clear_closing(&record.channel_id)
+                .clear_closing(&record.channel_id, &pending.tx_hash)
                 .await
                 .map_err(store_error)?;
             return Ok(None);
@@ -186,7 +206,7 @@ impl SessionService {
             .await
             .map_err(store_error)?;
         self.repo
-            .clear_closing(&record.channel_id)
+            .clear_closing(&record.channel_id, &pending.tx_hash)
             .await
             .map_err(store_error)?;
         Ok(None)

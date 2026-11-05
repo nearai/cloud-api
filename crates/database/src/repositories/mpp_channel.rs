@@ -30,7 +30,8 @@ use services::common::RepositoryError;
 use services::mpp::session::{ChannelDescriptor, ChannelState, SIGNATURE_LEN};
 use services::mpp::{
     ChannelLifecycle, ChannelRecord, ChannelRepository, ChargeOutcome, CloseTransition, NewChannel,
-    PendingClose, ReserveOutcome, RetainedVoucher, VoucherOutcome, MAX_RETAINED_VOUCHERS,
+    PendingClose, ReserveOutcome, RetainedVoucher, SettlementLease, VoucherOutcome, VoucherRules,
+    MAX_RETAINED_VOUCHERS,
 };
 use tokio_postgres::Row;
 use uuid::Uuid;
@@ -91,20 +92,9 @@ settled_on_chain = GREATEST(settled_on_chain, $2::TEXT::NUMERIC), \
 updated_at = clock_timestamp() \
 WHERE channel_id = $1";
 
-const CLEAR_CLOSING_SQL: &str = "\
-UPDATE mpp_channels SET state = 'open', pending_close = NULL, updated_at = clock_timestamp() \
-WHERE channel_id = $1 AND state = 'closing'";
-
-/// One atomic statement: the lease is taken only by the instance whose update still sees it
-/// free (a concurrent claimant re-evaluates the condition after the first commits).
-const CLAIM_LEASE_SQL: &str = "\
-UPDATE mpp_channels SET settlement_lease_until = $3, updated_at = clock_timestamp() \
-WHERE channel_id = $1 AND (settlement_lease_until IS NULL OR settlement_lease_until < $2) \
-RETURNING {COLUMNS}";
-
-const RELEASE_LEASE_SQL: &str = "\
-UPDATE mpp_channels SET settlement_lease_until = NULL, updated_at = clock_timestamp() \
-WHERE channel_id = $1";
+const LEASE_SQL: &str = "SELECT settlement_lease_until FROM mpp_channels WHERE channel_id = $1";
+const SET_LEASE_SQL: &str = "UPDATE mpp_channels SET settlement_lease_until = $2, \
+updated_at = clock_timestamp() WHERE channel_id = $1";
 
 /// Through `idx_mpp_channels_open`.
 const LIST_FIRST_SQL: &str = "\
@@ -431,13 +421,6 @@ impl ChannelRepository for MppChannelRepository {
                         record.deposit = record.deposit.max(channel.deposit);
                         record.settled_on_chain =
                             record.settled_on_chain.max(channel.settled_on_chain);
-                        if channel.highest_cumulative > record.highest_cumulative {
-                            promote_voucher(
-                                &mut record,
-                                channel.highest_cumulative,
-                                channel.highest_signature,
-                            );
-                        }
                         store(&tx, &mut record, false).await?;
                         Some(record)
                     }
@@ -466,6 +449,7 @@ impl ChannelRepository for MppChannelRepository {
         channel_id: &[u8; 32],
         cumulative: u128,
         signature: [u8; SIGNATURE_LEN],
+        rules: VoucherRules,
     ) -> Result<VoucherOutcome, RepositoryError> {
         let mut client = self.client().await?;
         let tx = client.transaction().await.map_err(map_db_error)?;
@@ -477,6 +461,15 @@ impl ChannelRepository for MppChannelRepository {
         }
         if cumulative <= record.highest_cumulative {
             return Ok(VoucherOutcome::NotHigher);
+        }
+        if cumulative - record.highest_cumulative < rules.min_delta {
+            return Ok(VoucherOutcome::DeltaTooSmall);
+        }
+        if rules.settled_floor_from_chain && cumulative < record.settled_on_chain {
+            return Ok(VoucherOutcome::BelowSettled);
+        }
+        if cumulative > record.deposit {
+            return Ok(VoucherOutcome::AboveDeposit);
         }
         promote_voucher(&mut record, cumulative, signature);
         store(&tx, &mut record, false).await?;
@@ -582,7 +575,11 @@ impl ChannelRepository for MppChannelRepository {
             if chain.close_requested_at != 0 {
                 record.close_requested_at = chain.close_requested_at;
             }
-            record.last_chain_read_at = Some(read_at);
+            record.last_chain_read_at = Some(
+                record
+                    .last_chain_read_at
+                    .map_or(read_at, |at| at.max(read_at)),
+            );
             store(&tx, &mut record, false).await?;
             commit(tx).await?;
             Ok(Some(record))
@@ -593,6 +590,7 @@ impl ChannelRepository for MppChannelRepository {
         &self,
         channel_id: &[u8; 32],
         pending: PendingClose,
+        now: DateTime<Utc>,
     ) -> Result<CloseTransition, RepositoryError> {
         let mut client = self.client().await?;
         let tx = client.transaction().await.map_err(map_db_error)?;
@@ -601,6 +599,12 @@ impl ChannelRepository for MppChannelRepository {
         };
         if record.state != ChannelLifecycle::Open {
             return Ok(CloseTransition::NotOpen);
+        }
+        if lease_until(&tx, channel_id)
+            .await?
+            .is_some_and(|until| until > now)
+        {
+            return Ok(CloseTransition::SettlementInFlight);
         }
         record.state = ChannelLifecycle::Closing;
         record.pending_close = Some(pending);
@@ -628,73 +632,119 @@ impl ChannelRepository for MppChannelRepository {
         })
     }
 
-    /// One statement, idempotent.
-    async fn clear_closing(&self, channel_id: &[u8; 32]) -> Result<(), RepositoryError> {
-        retry_db!("clear_mpp_channel_closing", {
-            let client = self.client().await?;
-            client
-                .execute(CLEAR_CLOSING_SQL, &[&channel_id.as_slice()])
-                .await
-                .map_err(map_db_error)?;
-            Ok(())
-        })
+    async fn clear_closing(
+        &self,
+        channel_id: &[u8; 32],
+        expected_tx_hash: &[u8; 32],
+    ) -> Result<bool, RepositoryError> {
+        close_transition(self, channel_id, expected_tx_hash, None).await
     }
 
-    /// Not retried: after a lost reply the retry would find the lease held by this caller
-    /// and report that someone else has it.
+    async fn finalize_pending_close(
+        &self,
+        channel_id: &[u8; 32],
+        expected_tx_hash: &[u8; 32],
+        settled_on_chain: u128,
+    ) -> Result<bool, RepositoryError> {
+        close_transition(self, channel_id, expected_tx_hash, Some(settled_on_chain)).await
+    }
+
+    async fn claim_chain_read(
+        &self,
+        channel_id: &[u8; 32],
+        now: DateTime<Utc>,
+        min_interval: chrono::Duration,
+    ) -> Result<bool, RepositoryError> {
+        let mut client = self.client().await?;
+        let tx = client.transaction().await.map_err(map_db_error)?;
+        let Some(mut record) = lock_channel(&tx, channel_id).await? else {
+            return Ok(false);
+        };
+        if record
+            .last_chain_read_at
+            .is_some_and(|at| now.signed_duration_since(at) < min_interval)
+        {
+            return Ok(false);
+        }
+        record.last_chain_read_at = Some(now);
+        store(&tx, &mut record, false).await?;
+        commit(tx).await?;
+        Ok(true)
+    }
+
     async fn claim_settlement_lease(
         &self,
         channel_id: &[u8; 32],
         now: DateTime<Utc>,
         until: DateTime<Utc>,
-    ) -> Result<Option<ChannelRecord>, RepositoryError> {
-        let client = self.client().await?;
-        client
-            .query_opt(
-                &with_columns(CLAIM_LEASE_SQL),
-                &[&channel_id.as_slice(), &now, &until],
-            )
+    ) -> Result<Option<(ChannelRecord, SettlementLease)>, RepositoryError> {
+        let mut client = self.client().await?;
+        let tx = client.transaction().await.map_err(map_db_error)?;
+        let Some(mut record) = lock_channel(&tx, channel_id).await? else {
+            return Ok(None);
+        };
+        let until = DateTime::from_timestamp_micros(until.timestamp_micros())
+            .ok_or_else(|| RepositoryError::ValidationFailed("lease deadline".to_string()))?;
+        if until <= now
+            || record.state != ChannelLifecycle::Open
+            || lease_until(&tx, channel_id)
+                .await?
+                .is_some_and(|held| held >= now)
+        {
+            return Ok(None);
+        }
+        tx.execute(SET_LEASE_SQL, &[&channel_id.as_slice(), &until])
             .await
-            .map_err(map_db_error)?
-            .as_ref()
-            .map(record_from_row)
-            .transpose()
+            .map_err(map_db_error)?;
+        store(&tx, &mut record, false).await?;
+        commit(tx).await?;
+        Ok(Some((record, SettlementLease::new(until))))
     }
 
-    /// Idempotent: the greater settled amount, the same retained-voucher filter.
     async fn record_settlement(
         &self,
         channel_id: &[u8; 32],
+        lease: SettlementLease,
         cumulative: u128,
         at: DateTime<Utc>,
-    ) -> Result<(), RepositoryError> {
-        retry_db!("record_mpp_channel_settlement", {
-            let mut client = self.client().await?;
-            let tx = client.transaction().await.map_err(map_db_error)?;
-            let Some(mut record) = lock_channel(&tx, channel_id).await? else {
-                return Ok(());
-            };
-            record.settled_on_chain = record.settled_on_chain.max(cumulative);
-            record.last_settlement_at = Some(at);
-            record.last_settlement_spent = record.spent;
-            record
-                .retained_vouchers
-                .retain(|voucher| voucher.cumulative > cumulative);
-            store(&tx, &mut record, true).await?;
-            commit(tx).await
-        })
+    ) -> Result<bool, RepositoryError> {
+        let mut client = self.client().await?;
+        let tx = client.transaction().await.map_err(map_db_error)?;
+        let Some(mut record) = lock_channel(&tx, channel_id).await? else {
+            return Ok(false);
+        };
+        if lease_until(&tx, channel_id).await? != Some(lease.until())
+            || record.state != ChannelLifecycle::Open
+        {
+            return Ok(false);
+        }
+        record.settled_on_chain = record.settled_on_chain.max(cumulative);
+        record.last_settlement_at = Some(at);
+        record.last_settlement_spent = record.spent;
+        record
+            .retained_vouchers
+            .retain(|voucher| voucher.cumulative > cumulative);
+        store(&tx, &mut record, true).await?;
+        commit(tx).await?;
+        Ok(true)
     }
 
-    /// One statement, idempotent.
-    async fn release_settlement_lease(&self, channel_id: &[u8; 32]) -> Result<(), RepositoryError> {
-        retry_db!("release_mpp_channel_lease", {
-            let client = self.client().await?;
-            client
-                .execute(RELEASE_LEASE_SQL, &[&channel_id.as_slice()])
-                .await
-                .map_err(map_db_error)?;
-            Ok(())
-        })
+    async fn release_settlement_lease(
+        &self,
+        channel_id: &[u8; 32],
+        lease: SettlementLease,
+    ) -> Result<bool, RepositoryError> {
+        let mut client = self.client().await?;
+        let tx = client.transaction().await.map_err(map_db_error)?;
+        let Some(mut record) = lock_channel(&tx, channel_id).await? else {
+            return Ok(false);
+        };
+        if lease_until(&tx, channel_id).await? != Some(lease.until()) {
+            return Ok(false);
+        }
+        store(&tx, &mut record, true).await?;
+        commit(tx).await?;
+        Ok(true)
     }
 
     async fn list_active(
@@ -795,6 +845,50 @@ impl ChannelRepository for MppChannelRepository {
         }
         Ok(purged)
     }
+}
+
+/// The caller already holds this channel's row lock.
+async fn lease_until(
+    tx: &Transaction<'_>,
+    id: &[u8; 32],
+) -> Result<Option<DateTime<Utc>>, RepositoryError> {
+    tx.query_one(LEASE_SQL, &[&id.as_slice()])
+        .await
+        .map_err(map_db_error)?
+        .try_get(0)
+        .map_err(map_db_error)
+}
+
+async fn close_transition(
+    repo: &MppChannelRepository,
+    id: &[u8; 32],
+    expected: &[u8; 32],
+    settled: Option<u128>,
+) -> Result<bool, RepositoryError> {
+    let mut client = repo.client().await?;
+    let tx = client.transaction().await.map_err(map_db_error)?;
+    let Some(mut record) = lock_channel(&tx, id).await? else {
+        return Ok(false);
+    };
+    if record.state != ChannelLifecycle::Closing
+        || record
+            .pending_close
+            .is_none_or(|pending| pending.tx_hash != *expected)
+    {
+        return Ok(false);
+    }
+    record.state = if settled.is_some() {
+        ChannelLifecycle::Finalized
+    } else {
+        ChannelLifecycle::Open
+    };
+    if let Some(settled) = settled {
+        record.settled_on_chain = record.settled_on_chain.max(settled);
+    }
+    record.pending_close = None;
+    store(&tx, &mut record, false).await?;
+    commit(tx).await?;
+    Ok(true)
 }
 
 /// Commit, then hand back the record the transaction produced.

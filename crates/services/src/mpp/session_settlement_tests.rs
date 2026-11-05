@@ -3,7 +3,9 @@ use crate::mpp::channel_memory::InMemoryChannelRepository;
 use crate::mpp::ports::{
     ChannelLifecycle, ChannelRecord, ChannelRepository, RetainedVoucher, TempoRpc, TempoSigner,
 };
-use crate::mpp::ports::{NewChannel, PendingClose, ReserveOutcome, RpcError, RpcReceipt};
+use crate::mpp::ports::{
+    NewChannel, PendingClose, ReserveOutcome, RpcError, RpcReceipt, SettlementLease, VoucherRules,
+};
 use crate::mpp::session_chain::{build_payee_tx, PayeeChain};
 use crate::mpp::session_settlement::*;
 use crate::mpp::session_vectors::Vectors;
@@ -170,9 +172,17 @@ impl Harness {
         .await
         .unwrap();
         for cumulative in [100, 200] {
-            repo.accept_voucher(&id, cumulative, v.fixed("voucher.signature"))
-                .await
-                .unwrap();
+            repo.accept_voucher(
+                &id,
+                cumulative,
+                v.fixed("voucher.signature"),
+                crate::mpp::ports::VoucherRules {
+                    min_delta: 0,
+                    settled_floor_from_chain: true,
+                },
+            )
+            .await
+            .unwrap();
         }
         let rpc = FakeTempo::default();
         chain_answer(&rpc, id, 0);
@@ -228,6 +238,21 @@ impl Harness {
             from: self.signer.address(),
             logs: vec![],
         });
+    }
+
+    async fn seed_settlement(
+        &self,
+        cumulative: u128,
+        at: DateTime<Utc>,
+    ) -> Result<bool, crate::common::RepositoryError> {
+        let (_, lease) = self
+            .repo
+            .claim_settlement_lease(&self.id, self.now, self.now + chrono::Duration::seconds(30))
+            .await?
+            .unwrap();
+        self.repo
+            .record_settlement(&self.id, lease, cumulative, at)
+            .await
     }
 
     async fn run(&self, cfg: &SettlementConfig) -> SettlementSummary {
@@ -286,18 +311,19 @@ impl TempoRpc for CloseDuringBuild<'_> {
                         cumulative: 100,
                         capture: 100,
                         valid_before: 1_800_000_025,
-                    }
+                    },
+                    Utc::now()
                 )
                 .await
                 .unwrap(),
-            crate::mpp::ports::CloseTransition::Marked(_)
+            crate::mpp::ports::CloseTransition::SettlementInFlight
         ));
         self.h.rpc.gas_price().await
     }
 }
 
 #[tokio::test]
-async fn close_during_build_aborts_settlement_before_broadcast() {
+async fn close_during_build_is_refused_while_settlement_completes() {
     let h = Harness::new().await;
     h.spend(100).await;
     h.mine(100, true).await;
@@ -310,9 +336,9 @@ async fn close_during_build_aborts_settlement_before_broadcast() {
         h.now,
     )
     .await;
-    assert_eq!((summary.settled, summary.failed), (0, 0));
-    assert_eq!(h.record().await.state, ChannelLifecycle::Closing);
-    assert_eq!(h.rpc.send_calls(), 0);
+    assert_eq!((summary.settled, summary.failed), (1, 0));
+    assert_eq!(h.record().await.state, ChannelLifecycle::Open);
+    assert_eq!(h.rpc.send_calls(), 1);
     assert_eq!(h.repo.lease_until(&h.id), None);
 }
 
@@ -363,9 +389,10 @@ impl ChannelRepository for TestRepo<'_> {
         channel_id: &[u8; 32],
         cumulative: u128,
         signature: [u8; 65],
+        rules: VoucherRules,
     ) -> Result<crate::mpp::ports::VoucherOutcome, crate::common::RepositoryError> {
         self.inner
-            .accept_voucher(channel_id, cumulative, signature)
+            .accept_voucher(channel_id, cumulative, signature, rules)
             .await
     }
     async fn reserve(
@@ -401,8 +428,9 @@ impl ChannelRepository for TestRepo<'_> {
         &self,
         channel_id: &[u8; 32],
         pending: PendingClose,
+        now: DateTime<Utc>,
     ) -> Result<crate::mpp::ports::CloseTransition, crate::common::RepositoryError> {
-        self.inner.mark_closing(channel_id, pending).await
+        self.inner.mark_closing(channel_id, pending, now).await
     }
     async fn finalize(
         &self,
@@ -418,29 +446,56 @@ impl ChannelRepository for TestRepo<'_> {
     async fn clear_closing(
         &self,
         channel_id: &[u8; 32],
-    ) -> Result<(), crate::common::RepositoryError> {
-        self.inner.clear_closing(channel_id).await
+        expected_tx_hash: &[u8; 32],
+    ) -> Result<bool, crate::common::RepositoryError> {
+        self.inner.clear_closing(channel_id, expected_tx_hash).await
+    }
+    async fn finalize_pending_close(
+        &self,
+        channel_id: &[u8; 32],
+        expected_tx_hash: &[u8; 32],
+        settled: u128,
+    ) -> Result<bool, crate::common::RepositoryError> {
+        self.finalize_calls.fetch_add(1, Ordering::SeqCst);
+        if self.fail_finalize.swap(false, Ordering::SeqCst) {
+            return Err(crate::common::RepositoryError::QueryTimeout);
+        }
+        self.inner
+            .finalize_pending_close(channel_id, expected_tx_hash, settled)
+            .await
+    }
+    async fn claim_chain_read(
+        &self,
+        channel_id: &[u8; 32],
+        now: DateTime<Utc>,
+        min_interval: chrono::Duration,
+    ) -> Result<bool, crate::common::RepositoryError> {
+        self.inner
+            .claim_chain_read(channel_id, now, min_interval)
+            .await
     }
     async fn record_settlement(
         &self,
         channel_id: &[u8; 32],
+        lease: SettlementLease,
         cumulative: u128,
         at: DateTime<Utc>,
-    ) -> Result<(), crate::common::RepositoryError> {
+    ) -> Result<bool, crate::common::RepositoryError> {
         self.settlement_calls.fetch_add(1, Ordering::SeqCst);
         if self.fail_settlement.swap(false, Ordering::SeqCst) {
             return Err(crate::common::RepositoryError::QueryTimeout);
         }
         self.inner
-            .record_settlement(channel_id, cumulative, at)
+            .record_settlement(channel_id, lease, cumulative, at)
             .await
     }
     async fn release_settlement_lease(
         &self,
         channel_id: &[u8; 32],
-    ) -> Result<(), crate::common::RepositoryError> {
+        lease: SettlementLease,
+    ) -> Result<bool, crate::common::RepositoryError> {
         self.release_calls.fetch_add(1, Ordering::SeqCst);
-        self.inner.release_settlement_lease(channel_id).await
+        self.inner.release_settlement_lease(channel_id, lease).await
     }
     async fn list_active(
         &self,
@@ -466,38 +521,28 @@ impl ChannelRepository for TestRepo<'_> {
         channel_id: &[u8; 32],
         now: DateTime<Utc>,
         until: DateTime<Utc>,
-    ) -> Result<Option<ChannelRecord>, crate::common::RepositoryError> {
+    ) -> Result<Option<(ChannelRecord, SettlementLease)>, crate::common::RepositoryError> {
         self.claim_calls.fetch_add(1, Ordering::SeqCst);
         let claimed = self
             .inner
             .claim_settlement_lease(channel_id, now, until)
             .await?;
-        if claimed.is_none() {
+        let Some((mut snapshot, lease)) = claimed else {
             return Ok(None);
-        }
+        };
         match self.claim_action {
             ClaimAction::None => {}
             ClaimAction::Charge(request) => {
                 self.inner.charge(request, 60, 1).await?;
             }
+            // Return adversarial snapshots to exercise defensive consumer checks.
+            // The real ledger now refuses a close while this lease is held.
             ClaimAction::Closing => {
-                self.inner
-                    .mark_closing(
-                        channel_id,
-                        PendingClose {
-                            tx_hash: [1; 32],
-                            cumulative: 100,
-                            capture: 100,
-                            valid_before: 1_800_000_025,
-                        },
-                    )
-                    .await?;
+                snapshot.state = ChannelLifecycle::Closing;
             }
             ClaimAction::NotDue => {
-                self.inner.record_settlement(channel_id, 0, now).await?;
-                self.inner
-                    .claim_settlement_lease(channel_id, now, until)
-                    .await?;
+                snapshot.last_settlement_at = Some(now);
+                snapshot.last_settlement_spent = snapshot.spent;
             }
             ClaimAction::NoVoucher => {
                 self.inner
@@ -513,8 +558,14 @@ impl ChannelRepository for TestRepo<'_> {
                     .await?;
             }
         }
-        assert_eq!(self.inner.lease_until(channel_id), Some(until));
-        self.inner.get(channel_id).await
+        assert_eq!(self.inner.lease_until(channel_id), Some(lease.until()));
+        if !matches!(
+            self.claim_action,
+            ClaimAction::Closing | ClaimAction::NotDue
+        ) {
+            snapshot = self.inner.get(channel_id).await?.unwrap();
+        }
+        Ok(Some((snapshot, lease)))
     }
 }
 
@@ -548,7 +599,7 @@ async fn voucher_is_selected_again_from_the_leased_record() {
 #[tokio::test]
 async fn due_by_amount_at_the_exact_threshold() {
     let h = Harness::new().await;
-    h.repo.record_settlement(&h.id, 0, h.now).await.unwrap();
+    h.seed_settlement(0, h.now).await.unwrap();
     h.spend(100).await;
     h.mine(100, true).await;
     let summary = h
@@ -572,8 +623,7 @@ async fn due_by_amount_at_the_exact_threshold() {
 async fn due_by_interval_at_the_exact_boundary() {
     let h = Harness::new().await;
     h.spend(100).await;
-    h.repo
-        .record_settlement(&h.id, 0, h.now - chrono::Duration::hours(1))
+    h.seed_settlement(0, h.now - chrono::Duration::hours(1))
         .await
         .unwrap();
     h.mine(100, true).await;
@@ -592,8 +642,7 @@ async fn no_previous_settlement_is_immediately_due() {
 #[tokio::test]
 async fn recent_below_threshold_channel_is_not_due() {
     let h = Harness::new().await;
-    h.repo
-        .record_settlement(&h.id, 0, h.now - chrono::Duration::seconds(3599))
+    h.seed_settlement(0, h.now - chrono::Duration::seconds(3599))
         .await
         .unwrap();
     h.spend(100).await;
@@ -624,6 +673,7 @@ async fn closing_and_finalized_channels_are_skipped() {
                 capture: 100,
                 valid_before: 1_800_000_025,
             },
+            Utc::now(),
         )
         .await
         .unwrap();

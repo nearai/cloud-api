@@ -546,6 +546,7 @@ async fn vouchers_refuse_missing_closing_finalized_and_chain_closed_channels() {
                             capture: 0,
                             valid_before: 1,
                         },
+                        Utc::now(),
                     )
                     .await
                     .unwrap();
@@ -616,10 +617,7 @@ async fn chain_cache_reuses_fresh_read_and_refreshes_after_sixty_seconds() {
     let reserved = f.service.voucher(&first, 10, Uuid::new_v4()).await.unwrap();
     assert_eq!(f.rpc.eth_calls(), 0);
     f.service.release(&reserved).await.unwrap();
-    f.repo
-        .record_chain_state(&id, state(), Utc::now() - chrono::Duration::seconds(61))
-        .await
-        .unwrap();
+    f.repo.age_chain_read(&id, chrono::Duration::seconds(61));
     set_chain(
         &f.rpc,
         ChannelState {

@@ -6,15 +6,25 @@
 //! Every test uses channels with random ids, so tests share the database without touching
 //! each other's rows.
 
+const RULES: services::mpp::VoucherRules = services::mpp::VoucherRules {
+    min_delta: 0,
+    settled_floor_from_chain: true,
+};
+
 use crate::common::db_setup::create_test_pool;
-use chrono::{Duration, Utc};
+use chrono::{DateTime, Duration, Utc};
+use services::mpp::SettlementLease;
+
+fn test_now() -> DateTime<Utc> {
+    DateTime::from_timestamp_micros(Utc::now().timestamp_micros()).unwrap()
+}
 use database::repositories::MppChannelRepository;
 use database::DbPool;
 use services::common::RepositoryError;
 use services::mpp::session::{ChannelDescriptor, ChannelState};
 use services::mpp::{
     ChannelLifecycle, ChannelRecord, ChannelRepository, ChargeOutcome, CloseTransition, NewChannel,
-    PendingClose, ReserveOutcome, RetainedVoucher, VoucherOutcome, MAX_RETAINED_VOUCHERS,
+    PendingClose, ReserveOutcome, VoucherOutcome, MAX_RETAINED_VOUCHERS,
 };
 use std::sync::Arc;
 use uuid::Uuid;
@@ -108,6 +118,38 @@ impl Fixture {
             .get(0)
     }
 
+    async fn settle(
+        &self,
+        id: &[u8; 32],
+        cumulative: u128,
+        at: DateTime<Utc>,
+    ) -> Result<bool, RepositoryError> {
+        let client = self.pool.get().await.unwrap();
+        let until = client
+            .query_opt(
+                "SELECT settlement_lease_until FROM mpp_channels WHERE channel_id = $1",
+                &[&id.as_slice()],
+            )
+            .await
+            .unwrap()
+            .and_then(|row| row.get::<_, Option<DateTime<Utc>>>(0));
+        let lease = match until {
+            Some(until) => SettlementLease::new(until),
+            None => {
+                let now = test_now();
+                let Some((_, lease)) = self
+                    .repo
+                    .claim_settlement_lease(id, now, now + Duration::seconds(30))
+                    .await?
+                else {
+                    return Ok(false);
+                };
+                lease
+            }
+        };
+        self.repo.record_settlement(id, lease, cumulative, at).await
+    }
+
     /// Run one statement against the channel row, for setting up aged rows.
     async fn sql(&self, statement: &str, id: &[u8; 32]) {
         let client = self.pool.get().await.unwrap();
@@ -149,21 +191,18 @@ async fn open_inserts_an_open_channel_and_refresh_merges_without_touching_state(
     assert!(f.repo.get(&random_id()).await.unwrap().is_none());
 
     let (_request, _) = f.reserve(&id, 30).await;
-    f.repo.mark_closing(&id, pending()).await.unwrap();
+    f.repo
+        .mark_closing(&id, pending(), Utc::now())
+        .await
+        .unwrap();
     let mut refresh = new_channel(id, 250);
     refresh.deposit = 500;
     refresh.settled_on_chain = 40;
     let refreshed = f.repo.open_or_refresh(refresh).await.unwrap();
     assert_eq!(refreshed.deposit, DEPOSIT, "the deposit never decreases");
     assert_eq!(refreshed.settled_on_chain, 40);
-    assert_eq!(refreshed.highest_cumulative, 250);
-    assert_eq!(
-        refreshed.retained_vouchers,
-        vec![RetainedVoucher {
-            cumulative: 100,
-            signature: sig(100)
-        }]
-    );
+    assert_eq!(refreshed.highest_cumulative, 100);
+    assert!(refreshed.retained_vouchers.is_empty());
     assert_eq!(refreshed.state, ChannelLifecycle::Closing);
     assert_eq!((refreshed.spent, refreshed.reserved), (30, 30));
     assert_eq!(f.reservations(&id).await, 1);
@@ -174,9 +213,9 @@ async fn open_inserts_an_open_channel_and_refresh_merges_without_touching_state(
     let again = f.repo.open_or_refresh(lower).await.unwrap();
     assert_eq!(
         (again.highest_cumulative, again.deposit),
-        (250, 2 * DEPOSIT)
+        (100, 2 * DEPOSIT)
     );
-    assert_eq!(again.retained_vouchers.len(), 1);
+    assert!(again.retained_vouchers.is_empty());
 }
 
 #[tokio::test]
@@ -188,6 +227,9 @@ async fn concurrent_opens_of_one_channel_leave_one_row() {
         let repo = f.repo.clone();
         tasks.push(tokio::spawn(async move {
             repo.open_or_refresh(new_channel(id, u128::from(n) * 10))
+                .await
+                .unwrap();
+            repo.accept_voucher(&id, u128::from(n) * 10, sig(n), RULES)
                 .await
                 .unwrap()
         }));
@@ -205,7 +247,7 @@ async fn vouchers_are_accepted_only_above_the_highest_and_retained_in_order() {
     let f = fixture().await;
     assert_eq!(
         f.repo
-            .accept_voucher(&random_id(), 5, sig(5))
+            .accept_voucher(&random_id(), 5, sig(5), RULES)
             .await
             .unwrap(),
         VoucherOutcome::Missing
@@ -214,7 +256,7 @@ async fn vouchers_are_accepted_only_above_the_highest_and_retained_in_order() {
     for not_higher in [1, 0] {
         assert_eq!(
             f.repo
-                .accept_voucher(&id, not_higher, sig(9))
+                .accept_voucher(&id, not_higher, sig(9), RULES)
                 .await
                 .unwrap(),
             VoucherOutcome::NotHigher
@@ -224,7 +266,15 @@ async fn vouchers_are_accepted_only_above_the_highest_and_retained_in_order() {
     for cumulative in 2..=top {
         let VoucherOutcome::Accepted(record) = f
             .repo
-            .accept_voucher(&id, cumulative, sig(cumulative as u8))
+            .accept_voucher(
+                &id,
+                cumulative,
+                sig(cumulative as u8),
+                services::mpp::VoucherRules {
+                    min_delta: 0,
+                    settled_floor_from_chain: true,
+                },
+            )
             .await
             .unwrap()
         else {
@@ -270,7 +320,10 @@ async fn vouchers_are_accepted_only_above_the_highest_and_retained_in_order() {
 async fn a_channel_that_is_not_accepting_refuses_vouchers_and_reservations() {
     let f = fixture().await;
     let (closing, _) = f.open(100).await;
-    f.repo.mark_closing(&closing, pending()).await.unwrap();
+    f.repo
+        .mark_closing(&closing, pending(), Utc::now())
+        .await
+        .unwrap();
     let (finalized, _) = f.open(100).await;
     f.repo.finalize(&finalized, 0).await.unwrap();
     let (requested, _) = f.open(100).await;
@@ -288,7 +341,10 @@ async fn a_channel_that_is_not_accepting_refuses_vouchers_and_reservations() {
         .unwrap();
     for id in [closing, finalized, requested] {
         assert_eq!(
-            f.repo.accept_voucher(&id, 200, sig(2)).await.unwrap(),
+            f.repo
+                .accept_voucher(&id, 200, sig(2), RULES)
+                .await
+                .unwrap(),
             VoucherOutcome::NotAccepting
         );
         assert_eq!(
@@ -477,7 +533,15 @@ async fn settleable_voucher_never_exceeds_what_was_delivered() {
     let (id, _) = f.open(100).await;
     for cumulative in [250, 400, 900] {
         f.repo
-            .accept_voucher(&id, cumulative, sig(cumulative as u8))
+            .accept_voucher(
+                &id,
+                cumulative,
+                sig(cumulative as u8),
+                services::mpp::VoucherRules {
+                    min_delta: 0,
+                    settled_floor_from_chain: true,
+                },
+            )
             .await
             .unwrap();
     }
@@ -508,7 +572,7 @@ async fn chain_state_takes_the_greater_values_and_a_close_request_sticks() {
         .unwrap()
         .is_none());
     let (id, _) = f.open(100).await;
-    let read_at = Utc::now();
+    let read_at = test_now();
     let record = f
         .repo
         .record_chain_state(
@@ -569,38 +633,55 @@ async fn chain_state_takes_the_greater_values_and_a_close_request_sticks() {
 async fn closing_finalize_and_clear_transitions() {
     let f = fixture().await;
     assert_eq!(
-        f.repo.mark_closing(&random_id(), pending()).await.unwrap(),
+        f.repo
+            .mark_closing(&random_id(), pending(), Utc::now())
+            .await
+            .unwrap(),
         CloseTransition::Missing
     );
     let (id, _) = f.open(100).await;
-    let CloseTransition::Marked(record) = f.repo.mark_closing(&id, pending()).await.unwrap() else {
+    let CloseTransition::Marked(record) = f
+        .repo
+        .mark_closing(&id, pending(), Utc::now())
+        .await
+        .unwrap()
+    else {
         panic!("expected Marked");
     };
     assert_eq!(record.state, ChannelLifecycle::Closing);
     assert_eq!(record.pending_close, Some(pending()));
     assert_eq!(f.stored(&id).await.pending_close, Some(pending()));
     assert_eq!(
-        f.repo.mark_closing(&id, pending()).await.unwrap(),
+        f.repo
+            .mark_closing(&id, pending(), Utc::now())
+            .await
+            .unwrap(),
         CloseTransition::NotOpen
     );
 
-    f.repo.clear_closing(&id).await.unwrap();
+    f.repo.clear_closing(&id, &pending().tx_hash).await.unwrap();
     let record = f.stored(&id).await;
     assert_eq!(record.state, ChannelLifecycle::Open);
     assert!(record.pending_close.is_none());
     // Clearing an open channel changes nothing.
-    f.repo.clear_closing(&id).await.unwrap();
+    f.repo.clear_closing(&id, &pending().tx_hash).await.unwrap();
     assert_eq!(f.stored(&id).await, record);
 
-    f.repo.mark_closing(&id, pending()).await.unwrap();
+    f.repo
+        .mark_closing(&id, pending(), Utc::now())
+        .await
+        .unwrap();
     f.repo.finalize(&id, 650).await.unwrap();
     let record = f.stored(&id).await;
     assert_eq!(record.state, ChannelLifecycle::Finalized);
     assert_eq!(record.settled_on_chain, 650);
     assert!(record.pending_close.is_none());
-    f.repo.clear_closing(&id).await.unwrap();
+    f.repo.clear_closing(&id, &pending().tx_hash).await.unwrap();
     assert_eq!(
-        f.repo.mark_closing(&id, pending()).await.unwrap(),
+        f.repo
+            .mark_closing(&id, pending(), Utc::now())
+            .await
+            .unwrap(),
         CloseTransition::NotOpen
     );
     f.repo.finalize(&id, 10).await.unwrap();
@@ -614,7 +695,7 @@ async fn the_settlement_lease_goes_to_exactly_one_of_two_contenders() {
     let f = fixture().await;
     for _ in 0..10 {
         let (id, _) = f.open(100).await;
-        let now = Utc::now();
+        let now = test_now();
         let until = now + Duration::seconds(30);
         let (repo_a, repo_b) = (f.repo.clone(), f.repo.clone());
         let a = tokio::spawn(async move { repo_a.claim_settlement_lease(&id, now, until).await });
@@ -631,7 +712,7 @@ async fn the_settlement_lease_goes_to_exactly_one_of_two_contenders() {
 async fn many_contenders_for_one_lease_have_one_winner_and_it_lapses_and_releases() {
     let f = fixture().await;
     let (id, _) = f.open(100).await;
-    let now = Utc::now();
+    let now = test_now();
     let until = now + Duration::seconds(30);
     let mut tasks = Vec::new();
     for _ in 0..16 {
@@ -666,7 +747,10 @@ async fn many_contenders_for_one_lease_have_one_winner_and_it_lapses_and_release
         .await
         .unwrap()
         .is_some());
-    f.repo.release_settlement_lease(&id).await.unwrap();
+    f.repo
+        .release_settlement_lease(&id, SettlementLease::new(lease_end))
+        .await
+        .unwrap();
     assert!(f
         .repo
         .claim_settlement_lease(&id, later, lease_end)
@@ -680,7 +764,10 @@ async fn many_contenders_for_one_lease_have_one_winner_and_it_lapses_and_release
         .await
         .unwrap()
         .is_none());
-    f.repo.release_settlement_lease(&random_id()).await.unwrap();
+    f.repo
+        .release_settlement_lease(&random_id(), SettlementLease::new(lease_end))
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -689,19 +776,27 @@ async fn record_settlement_drops_covered_vouchers_and_releases_the_lease() {
     let (id, _) = f.open(100).await;
     for cumulative in [200, 300, 400] {
         f.repo
-            .accept_voucher(&id, cumulative, sig(cumulative as u8))
+            .accept_voucher(
+                &id,
+                cumulative,
+                sig(cumulative as u8),
+                services::mpp::VoucherRules {
+                    min_delta: 0,
+                    settled_floor_from_chain: true,
+                },
+            )
             .await
             .unwrap();
     }
     let (request, _) = f.reserve(&id, 150).await;
     charged(f.repo.charge(request, 150, 15).await.unwrap());
-    let now = Utc::now();
+    let now = test_now();
     f.repo
         .claim_settlement_lease(&id, now, now + Duration::seconds(30))
         .await
         .unwrap();
-    let at = Utc::now();
-    f.repo.record_settlement(&id, 200, at).await.unwrap();
+    let at = test_now();
+    f.settle(&id, 200, at).await.unwrap();
 
     let record = f.stored(&id).await;
     assert_eq!(record.settled_on_chain, 200);
@@ -724,9 +819,9 @@ async fn record_settlement_drops_covered_vouchers_and_releases_the_lease() {
         .is_some());
 
     // A lower amount lowers nothing.
-    f.repo.record_settlement(&id, 50, at).await.unwrap();
+    f.settle(&id, 50, at).await.unwrap();
     assert_eq!(f.stored(&id).await.settled_on_chain, 200);
-    f.repo.record_settlement(&random_id(), 1, at).await.unwrap();
+    f.settle(&random_id(), 1, at).await.unwrap();
 }
 
 #[tokio::test]
@@ -752,7 +847,10 @@ async fn list_active_pages_by_channel_id_and_skips_finalized() {
             .unwrap();
     }
     f.repo.finalize(&id(4), 0).await.unwrap();
-    f.repo.mark_closing(&id(5), pending()).await.unwrap();
+    f.repo
+        .mark_closing(&id(5), pending(), Utc::now())
+        .await
+        .unwrap();
 
     let ids = |page: &[ChannelRecord]| page.iter().map(|r| r.channel_id).collect::<Vec<_>>();
     let page = f.repo.list_active(Some(before), 2).await.unwrap();
@@ -795,7 +893,7 @@ async fn stale_reservations_are_released_like_release() {
             .await
             .unwrap();
     }
-    let cutoff = Utc::now() - Duration::hours(1);
+    let cutoff = test_now() - Duration::hours(1);
     assert!(f.repo.release_stale_reservations(cutoff).await.unwrap() >= 3);
 
     let a = f.stored(&one).await;
@@ -832,7 +930,7 @@ async fn purge_removes_old_finalized_channels_and_their_reservations() {
         )
         .await;
     }
-    let cutoff = Utc::now() - Duration::days(30);
+    let cutoff = test_now() - Duration::days(30);
     assert!(f.repo.purge_finalized(cutoff).await.unwrap() >= 2);
     assert!(f.repo.get(&old_a).await.unwrap().is_none());
     assert!(f.repo.get(&old_b).await.unwrap().is_none());
@@ -873,3 +971,5 @@ async fn amounts_up_to_the_numeric_range_round_trip_exactly() {
     let (record, paid) = charged(f.repo.charge(request, big, 1).await.unwrap());
     assert_eq!((paid, record.spent), (big, big));
 }
+
+mod hardening;

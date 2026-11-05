@@ -147,7 +147,9 @@ pub enum RpcError {
     #[error("Tempo RPC unavailable")]
     Unavailable,
     /// The node answered with a JSON-RPC error object (for a send: the transaction was
-    /// refused or is already known).
+    /// refused or is already known). A rejection without a matching receipt is
+    /// ambiguous: keep a pending close until its expiring nonce passes
+    /// `valid_before + 30` seconds.
     #[error("Tempo RPC rejected the call")]
     Rejected,
     /// The node answered with something that is not a valid receipt.
@@ -353,6 +355,12 @@ pub enum VoucherOutcome {
     Accepted(Box<ChannelRecord>),
     /// Not above the stored highest voucher: nothing changed.
     NotHigher,
+    /// The increase above the stored highest is below the required minimum.
+    DeltaTooSmall,
+    /// Below the settled chain floor when that rule is enabled.
+    BelowSettled,
+    /// Above the stored deposit.
+    AboveDeposit,
     /// The channel is closing, finalized, or has a close requested on chain.
     NotAccepting,
     /// No such channel.
@@ -392,8 +400,33 @@ pub enum CloseTransition {
     Marked(Box<ChannelRecord>),
     /// The channel was not `open`.
     NotOpen,
+    /// A settlement lease is still live; no close was stored.
+    SettlementInFlight,
     /// No such channel.
     Missing,
+}
+
+/// Atomic amount checks applied to an authenticated voucher under the channel lock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VoucherRules {
+    pub min_delta: u128,
+    pub settled_floor_from_chain: bool,
+}
+
+/// The exact stored deadline of a settlement claim. Earlier holders cannot write or
+/// release a replacement lease. PostgreSQL timestamps have microsecond precision;
+/// both adapters return the deadline after that same normalization.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SettlementLease(DateTime<Utc>);
+
+impl SettlementLease {
+    pub fn new(until: DateTime<Utc>) -> Self {
+        Self(until)
+    }
+
+    pub fn until(self) -> DateTime<Utc> {
+        self.0
+    }
 }
 
 /// The channel ledger of the `session` intent: one row per channel the server is payee
@@ -407,8 +440,8 @@ pub enum CloseTransition {
 #[async_trait]
 pub trait ChannelRepository: Send + Sync {
     /// Insert the channel, or refresh an existing row with the same id: `deposit` and
-    /// `settled_on_chain` take the greater value, and the voucher replaces the stored
-    /// highest only when it is higher (the old highest is then retained). The state of an
+    /// `settled_on_chain` take the greater value, while the existing voucher remains
+    /// unchanged. Use `accept_voucher` to promote it with atomic rules. The state of an
     /// existing row is left as it is. Returns the row after the write.
     async fn open_or_refresh(&self, channel: NewChannel) -> Result<ChannelRecord, RepositoryError>;
 
@@ -417,12 +450,14 @@ pub trait ChannelRepository: Send + Sync {
     /// Make `cumulative` the channel's highest voucher. Only an accepting channel takes a
     /// voucher, and only one above the stored highest; the old highest joins the retained
     /// vouchers (highest first, the lowest dropped past [`MAX_RETAINED_VOUCHERS`]). The
-    /// caller has verified the signature and the amount against the chain state.
+    /// caller has verified the signature. Under the same lock, enforce `rules`, the
+    /// stored deposit ceiling and (when enabled) the settled chain floor.
     async fn accept_voucher(
         &self,
         channel_id: &[u8; 32],
         cumulative: u128,
         signature: [u8; SIGNATURE_LEN],
+        rules: VoucherRules,
     ) -> Result<VoucherOutcome, RepositoryError>;
 
     /// Hold `amount` for `request_id` before inference runs: `spent += amount`,
@@ -454,7 +489,8 @@ pub trait ChannelRepository: Send + Sync {
     /// Record a chain read: `deposit` takes the greater of the stored and the on-chain
     /// value unless the on-chain deposit is zero (a withdrawn channel; the caller
     /// finalizes it), `settled_on_chain` takes the greater value, a non-zero
-    /// `close_requested_at` is stored, and `last_chain_read_at = read_at`. Returns the
+    /// `close_requested_at` is stored, and `last_chain_read_at` takes the greater of its
+    /// stored value and `read_at`, preserving newer refresh claims. Returns the
     /// row after the write, `None` for an unknown channel.
     async fn record_chain_state(
         &self,
@@ -464,10 +500,12 @@ pub trait ChannelRepository: Send + Sync {
     ) -> Result<Option<ChannelRecord>, RepositoryError>;
 
     /// `open` to `closing`, storing `pending` before its transaction is broadcast.
+    /// Refuse while a settlement lease deadline is strictly greater than `now`.
     async fn mark_closing(
         &self,
         channel_id: &[u8; 32],
         pending: PendingClose,
+        now: DateTime<Utc>,
     ) -> Result<CloseTransition, RepositoryError>;
 
     /// The channel is closed or withdrawn on chain: state `finalized`,
@@ -480,30 +518,60 @@ pub trait ChannelRepository: Send + Sync {
     ) -> Result<(), RepositoryError>;
 
     /// A close that did not land: `closing` back to `open`, `pending_close` cleared. A
-    /// no-op for any other state.
-    async fn clear_closing(&self, channel_id: &[u8; 32]) -> Result<(), RepositoryError>;
+    /// no-op returning false for any other state or a different pending hash.
+    async fn clear_closing(
+        &self,
+        channel_id: &[u8; 32],
+        expected_tx_hash: &[u8; 32],
+    ) -> Result<bool, RepositoryError>;
+
+    /// Finalize only the closing row whose pending transaction still matches.
+    /// A stale reconciler is a no-op returning false.
+    async fn finalize_pending_close(
+        &self,
+        channel_id: &[u8; 32],
+        expected_tx_hash: &[u8; 32],
+        settled_on_chain: u128,
+    ) -> Result<bool, RepositoryError>;
+
+    /// Claim a chain refresh under the row lock, writing `now` only if no read was
+    /// claimed within `min_interval`. Equality at the interval boundary is eligible.
+    async fn claim_chain_read(
+        &self,
+        channel_id: &[u8; 32],
+        now: DateTime<Utc>,
+        min_interval: chrono::Duration,
+    ) -> Result<bool, RepositoryError>;
 
     /// Take the settlement lease of a channel until `until`, if no instance holds one
-    /// past `now`. Returns the row when this caller now holds the lease.
+    /// at or past `now`, and only while Open. Returns the row and the exact stored
+    /// deadline fence. An invalid deadline (`until <= now`) is refused.
     async fn claim_settlement_lease(
         &self,
         channel_id: &[u8; 32],
         now: DateTime<Utc>,
         until: DateTime<Utc>,
-    ) -> Result<Option<ChannelRecord>, RepositoryError>;
+    ) -> Result<Option<(ChannelRecord, SettlementLease)>, RepositoryError>;
 
     /// A settlement of `cumulative` landed: `settled_on_chain = max(stored, cumulative)`,
     /// `last_settlement_at = at`, `last_settlement_spent = spent`, retained vouchers at or
-    /// below `cumulative` dropped, and the lease released.
+    /// below `cumulative` dropped, and the lease released. Only the Open row still
+    /// holding `lease` changes; a stale holder returns false without writing.
     async fn record_settlement(
         &self,
         channel_id: &[u8; 32],
+        lease: SettlementLease,
         cumulative: u128,
         at: DateTime<Utc>,
-    ) -> Result<(), RepositoryError>;
+    ) -> Result<bool, RepositoryError>;
 
-    /// Give the settlement lease back without a settlement.
-    async fn release_settlement_lease(&self, channel_id: &[u8; 32]) -> Result<(), RepositoryError>;
+    /// Give the settlement lease back without a settlement. A stale holder returns
+    /// false without writing.
+    async fn release_settlement_lease(
+        &self,
+        channel_id: &[u8; 32],
+        lease: SettlementLease,
+    ) -> Result<bool, RepositoryError>;
 
     /// Channels that are not finalized, ordered by channel id, those after `after` first,
     /// at most `limit`. Pages the close supervision and settlement tasks.

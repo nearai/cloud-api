@@ -91,14 +91,22 @@ async fn reconcile_close(
                     return Err("close_receipt_mismatch");
                 }
                 if receipt.success {
-                    repo.finalize(&record.channel_id, pending.capture)
+                    if repo
+                        .finalize_pending_close(
+                            &record.channel_id,
+                            &pending.tx_hash,
+                            pending.capture,
+                        )
                         .await
-                        .map_err(|_| "close_finalize_failed")?;
-                    summary.reconciled_finalized += 1;
-                } else {
-                    repo.clear_closing(&record.channel_id)
-                        .await
-                        .map_err(|_| "clear_closing_failed")?;
+                        .map_err(|_| "close_finalize_failed")?
+                    {
+                        summary.reconciled_finalized += 1;
+                    }
+                } else if repo
+                    .clear_closing(&record.channel_id, &pending.tx_hash)
+                    .await
+                    .map_err(|_| "clear_closing_failed")?
+                {
                     summary.reconciled_reverted += 1;
                 }
             }
@@ -109,10 +117,13 @@ async fn reconcile_close(
                     .checked_add(30)
                     .is_some_and(|expiry| now_unix > expiry)
                 {
-                    repo.clear_closing(&record.channel_id)
+                    if repo
+                        .clear_closing(&record.channel_id, &pending.tx_hash)
                         .await
-                        .map_err(|_| "clear_closing_failed")?;
-                    summary.reconciled_expired += 1;
+                        .map_err(|_| "clear_closing_failed")?
+                    {
+                        summary.reconciled_expired += 1;
+                    }
                 } else {
                     summary.reconciliation_pending += 1;
                 }
@@ -220,7 +231,7 @@ async fn supervise_channel(
             return;
         }
     };
-    match repo.mark_closing(&id, pending).await {
+    match repo.mark_closing(&id, pending, now).await {
         Ok(CloseTransition::Marked(marked)) => {
             // An in-flight inference can finish while gas price/signing is awaited.
             // Never close at the old capture if delivered spend changed meanwhile.
@@ -230,7 +241,7 @@ async fn supervise_channel(
                     outcome = "close_capture_changed",
                     "MPP supervised close deferred"
                 );
-                if repo.clear_closing(&id).await.is_err() {
+                if repo.clear_closing(&id, &pending.tx_hash).await.is_err() {
                     tracing::warn!(
                         outcome = "clear_closing_failed",
                         "MPP supervised close cleanup failed"
@@ -239,7 +250,11 @@ async fn supervise_channel(
                 return;
             }
         }
-        Ok(CloseTransition::NotOpen | CloseTransition::Missing) => return,
+        Ok(
+            CloseTransition::NotOpen
+            | CloseTransition::Missing
+            | CloseTransition::SettlementInFlight,
+        ) => return,
         Err(_) => {
             summary.closes_failed += 1;
             tracing::warn!(
@@ -252,7 +267,11 @@ async fn supervise_channel(
     summary.closes_submitted += 1;
     match broadcast(rpc, &tx).await {
         Ok(_) => {
-            if repo.finalize(&id, capture).await.is_err() {
+            if repo
+                .finalize_pending_close(&id, &pending.tx_hash, capture)
+                .await
+                .is_err()
+            {
                 // Keep the pending hash: the transaction landed but persistence failed.
                 summary.closes_failed += 1;
                 tracing::warn!(
@@ -267,7 +286,9 @@ async fn supervise_channel(
                 outcome = error.code(),
                 "MPP supervised close broadcast failed"
             );
-            if error.definitively_failed() && repo.clear_closing(&id).await.is_err() {
+            if error.definitively_failed()
+                && repo.clear_closing(&id, &pending.tx_hash).await.is_err()
+            {
                 tracing::warn!(
                     outcome = "clear_closing_failed",
                     "MPP supervised close cleanup failed"

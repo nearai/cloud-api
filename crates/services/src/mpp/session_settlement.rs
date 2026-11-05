@@ -8,7 +8,7 @@ use tokio::task::JoinHandle;
 
 use crate::mpp::abi::{decode_channel_state, get_channel_state_calldata, settle_calldata};
 use crate::mpp::ports::{
-    ChannelLifecycle, ChannelRecord, ChannelRepository, TempoRpc, TempoSigner,
+    ChannelLifecycle, ChannelRecord, ChannelRepository, SettlementLease, TempoRpc, TempoSigner,
 };
 use crate::mpp::session_chain::{broadcast, build_payee_tx, PayeeChain};
 
@@ -62,8 +62,13 @@ fn is_due(record: &ChannelRecord, cfg: &SettlementConfig, now: DateTime<Utc>) ->
         })
 }
 
-async fn release(repo: &dyn ChannelRepository, id: &[u8; 32], summary: &mut SettlementSummary) {
-    if repo.release_settlement_lease(id).await.is_err() {
+async fn release(
+    repo: &dyn ChannelRepository,
+    id: &[u8; 32],
+    lease: SettlementLease,
+    summary: &mut SettlementSummary,
+) {
+    if repo.release_settlement_lease(id, lease).await.is_err() {
         summary.failed += 1;
         tracing::warn!(
             outcome = "settlement_release_failed",
@@ -155,7 +160,7 @@ pub async fn run_settlement_pass(
                 continue;
             }
             let id = record.channel_id;
-            let current = match repo.claim_settlement_lease(&id, now, until).await {
+            let (current, lease) = match repo.claim_settlement_lease(&id, now, until).await {
                 Ok(Some(current)) => current,
                 Ok(None) => {
                     summary.lease_busy += 1;
@@ -167,12 +172,12 @@ pub async fn run_settlement_pass(
                 }
             };
             if current.state != ChannelLifecycle::Open || !is_due(&current, cfg, now) {
-                release(repo, &id, &mut summary).await;
+                release(repo, &id, lease, &mut summary).await;
                 continue;
             }
             if current.settleable_voucher().is_none() {
                 summary.no_settleable_voucher += 1;
-                release(repo, &id, &mut summary).await;
+                release(repo, &id, lease, &mut summary).await;
                 continue;
             }
             let attempt = async {
@@ -202,9 +207,8 @@ pub async fn run_settlement_pass(
                 let tx = build_payee_tx(chain, signer, rpc, calldata, now_unix)
                     .await
                     .map_err(|error| error.code())?;
-                // A close may have started while gas pricing/signing was awaited.
-                // This narrows the race; an atomic lease/close fence requires a
-                // repository contract that prevents mark_closing under our lease.
+                // Recheck independently observed finalization before broadcast; a live
+                // settlement lease atomically excludes the close transition.
                 let latest = repo
                     .get(&id)
                     .await
@@ -216,13 +220,17 @@ pub async fn run_settlement_pass(
                     return Ok(SettlementAttempt::Deferred);
                 }
                 broadcast(rpc, &tx).await.map_err(|error| error.code())?;
-                repo.record_settlement(&id, voucher.cumulative, now)
+                if !repo
+                    .record_settlement(&id, lease, voucher.cumulative, now)
                     .await
-                    .map_err(|_| "settlement_record_failed")?;
+                    .map_err(|_| "settlement_record_failed")?
+                {
+                    return Ok(SettlementAttempt::Deferred);
+                }
                 Ok(SettlementAttempt::Settled)
             };
-            // The port has no lease owner token or renewal. Bound work below the
-            // lease lifetime so a stalled RPC cannot keep acting after reassignment.
+            // Bound broadcast work below the lease lifetime; persistence and release
+            // also compare the lease fence after any reassignment.
             let result = tokio::time::timeout(cfg.lease / 2, attempt)
                 .await
                 .unwrap_or(Err("settlement_timeout"));
@@ -232,12 +240,12 @@ pub async fn run_settlement_pass(
                     if matches!(outcome, SettlementAttempt::NoVoucher) {
                         summary.no_settleable_voucher += 1;
                     }
-                    release(repo, &id, &mut summary).await;
+                    release(repo, &id, lease, &mut summary).await;
                 }
                 Err(outcome) => {
                     summary.failed += 1;
                     tracing::warn!(outcome, "MPP settlement failed");
-                    release(repo, &id, &mut summary).await;
+                    release(repo, &id, lease, &mut summary).await;
                 }
             }
         }

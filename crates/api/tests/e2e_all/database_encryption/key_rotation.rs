@@ -335,7 +335,8 @@ async fn key_rotation_rewraps_previous_envelopes_before_key_removal() {
     let keys = keys.json::<Value>();
     assert_eq!(keys["write_key_id"], "db-v2");
     assert_eq!(keys["read_key_ids"][0], "db-v2");
-    assert_eq!(keys["fingerprints"]["db-v1"].as_str().unwrap().len(), 16);
+    assert_eq!(keys["fingerprints"]["db-v1"], "820ed242bff6e2d9");
+    assert_eq!(keys["fingerprints"]["db-v2"], "825674e6c3e8ca73");
     assert!(!keys.to_string().contains(&hex::encode(DB_V1_KEY)));
 
     let before = seeded_envelopes(database.pool(), &ids, (response_id, item_id.0)).await;

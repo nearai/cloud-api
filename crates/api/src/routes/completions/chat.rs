@@ -460,6 +460,13 @@ pub(super) async fn chat_completions_inner(
                             }
                             true
                         }
+                        Some(Err(error)) => {
+                            return initial_stream_error_response(
+                                &request.model,
+                                error,
+                                api_key.organization.id.0,
+                            );
+                        }
                         _ => break None,
                     };
                     if is_control {
@@ -922,6 +929,7 @@ pub(super) async fn chat_completions_inner(
                                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                     if count == 0 {
                                         tracing::error!(
+                                            %request_id,
                                             %organization_id,
                                             model = %model_for_err,
                                             error_type = %completion_stream_error_category(&e),
@@ -950,7 +958,7 @@ pub(super) async fn chat_completions_inner(
                                 let mut combined: Vec<u8> = Vec::new();
                                 let error_count_final =
                                     stream_error_count.load(std::sync::atomic::Ordering::Relaxed);
-                                if auto_redact_enabled {
+                                if auto_redact_enabled && error_count_final == 0 {
                                     let mut states = unredact_states_for_chain.lock().await;
                                     let template = chunk_template_for_chain.lock().await.clone();
                                     for bytes in build_flush_chunks(&mut states, &template) {
@@ -1011,10 +1019,11 @@ pub(super) async fn chat_completions_inner(
                                     );
                                 }
 
-                                let synthesized_done = !upstream_done_for_chain
-                                    .load(std::sync::atomic::Ordering::Relaxed);
+                                let synthesized_done = error_count_final == 0
+                                    && !upstream_done_for_chain
+                                        .load(std::sync::atomic::Ordering::Relaxed);
                                 if synthesized_done {
-                                    combined.extend_from_slice(b"data: [DONE]\n\n");
+                                    combined.extend_from_slice(SYNTHESIZED_DONE_FRAME);
                                 } else if error_count_final == 0
                                     && defer_upstream_terminal
                                     && holding_provider_terminal_suffix_for_chain

@@ -1,5 +1,27 @@
 use super::*;
 
+// Raw providers may end after a complete data line but before its blank
+// separator. A synthesized terminal must start its own SSE event.
+pub(super) const SYNTHESIZED_DONE_FRAME: &[u8] = b"\n\ndata: [DONE]\n\n";
+
+pub(super) fn initial_stream_error_response(
+    model: &str,
+    error: &inference_providers::CompletionError,
+    organization_id: Uuid,
+) -> Response {
+    let error = services::completions::CompletionServiceImpl::map_provider_error(
+        model,
+        error,
+        "completion stream",
+        organization_id,
+    );
+    (
+        map_domain_error_to_status(&error),
+        ResponseJson::<ErrorResponse>(error.into()),
+    )
+        .into_response()
+}
+
 /// Returns a safe-to-log category string for a stream-level completion error.
 pub(super) fn completion_stream_error_category(
     e: &inference_providers::CompletionError,
@@ -44,7 +66,9 @@ pub(super) fn completion_stream_error_openai_type(
 
 /// Build an OpenAI-compatible SSE error frame.
 ///
-/// Format: `data: {"error":{"message":"...","type":"..."}}\n\n`. Replaces the
+/// Format: `\n\ndata: {"error":{"message":"...","type":"..."}}\n\n`. The leading
+/// separator completes any raw upstream event whose data line was forwarded
+/// before a disconnect, so the error is always a separate SSE event. Replaces the
 /// historical `data: error: <msg>\n\n` shape that was not valid JSON and broke
 /// clients (opencode, vercel/ai-sdk) parsing the `data:` payload as JSON.
 pub(super) fn sse_error_frame(e: &inference_providers::CompletionError) -> Bytes {
@@ -54,7 +78,7 @@ pub(super) fn sse_error_frame(e: &inference_providers::CompletionError) -> Bytes
             "type": completion_stream_error_openai_type(e),
         }
     });
-    Bytes::from(format!("data: {payload}\n\n"))
+    Bytes::from(format!("\n\ndata: {payload}\n\n"))
 }
 
 pub(super) fn chat_stream_options(

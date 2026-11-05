@@ -170,7 +170,8 @@ async fn verification_checks_metadata_and_write_key_independently() {
         stale,
         ObjectVerification {
             is_current: false,
-            is_decryptable: true,
+            decrypts_under_write_key: true,
+            decrypts_under_previous_key: false,
             unknown_key_id: false,
         }
     );
@@ -178,7 +179,8 @@ async fn verification_checks_metadata_and_write_key_independently() {
         wrong,
         ObjectVerification {
             is_current: true,
-            is_decryptable: false,
+            decrypts_under_write_key: false,
+            decrypts_under_previous_key: false,
             unknown_key_id: false,
         }
     );
@@ -186,7 +188,8 @@ async fn verification_checks_metadata_and_write_key_independently() {
         both,
         ObjectVerification {
             is_current: false,
-            is_decryptable: false,
+            decrypts_under_write_key: false,
+            decrypts_under_previous_key: true,
             unknown_key_id: false,
         }
     );

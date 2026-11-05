@@ -43,15 +43,18 @@ async fn oversized_objects_report_whether_metadata_is_current_without_rewriting(
             .unwrap();
     }
     // When rewrap and verify use a limit below their encrypted size.
-    for (key, is_current) in [("current", true), ("old", false)] {
+    for (key, key_state) in [
+        ("current", ObjectKeyState::Current),
+        ("old", ObjectKeyState::StaleOrAbsent),
+    ] {
         let rewrap = storage.rewrap_object(key, 34).await;
         let verify = storage.verify_object(key, 34).await;
         // Then both report the limit and preserve the original metadata.
         assert!(
-            matches!(rewrap, Err(FileServiceError::ObjectTooLarge { is_current: value, unknown_key_id: false }) if value == is_current)
+            matches!(rewrap, Err(FileServiceError::ObjectTooLarge { key_state: value }) if value == key_state)
         );
         assert!(
-            matches!(verify, Err(FileServiceError::ObjectTooLarge { is_current: value, unknown_key_id: false }) if value == is_current)
+            matches!(verify, Err(FileServiceError::ObjectTooLarge { key_state: value }) if value == key_state)
         );
         assert_eq!(
             storage.object_key_id(key).await.unwrap().as_deref(),
@@ -89,8 +92,7 @@ async fn verify_retains_unknown_id_when_object_grows_after_preflight() {
     assert!(matches!(
         result,
         Err(FileServiceError::ObjectTooLarge {
-            is_current: false,
-            unknown_key_id: true
+            key_state: ObjectKeyState::UnknownKeyId
         })
     ));
 }
@@ -124,8 +126,7 @@ async fn execute_retains_unknown_id_when_object_grows_after_preflight() {
     assert!(matches!(
         result,
         Err(FileServiceError::ObjectTooLarge {
-            is_current: false,
-            unknown_key_id: true
+            key_state: ObjectKeyState::UnknownKeyId
         })
     ));
 }
@@ -149,7 +150,8 @@ async fn unknown_metadata_is_undecryptable_during_verify_even_with_write_ciphert
         result,
         ObjectVerification {
             is_current: false,
-            is_decryptable: false,
+            decrypts_under_write_key: false,
+            decrypts_under_previous_key: false,
             unknown_key_id: true,
         }
     );
@@ -201,7 +203,8 @@ async fn verify_reports_unknown_metadata_replaced_after_preflight() {
         result,
         ObjectVerification {
             is_current: false,
-            is_decryptable: false,
+            decrypts_under_write_key: false,
+            decrypts_under_previous_key: false,
             unknown_key_id: true
         }
     );
@@ -249,4 +252,40 @@ async fn execute_distinguishes_unknown_metadata_when_no_ring_key_decrypts() {
     let outcome = storage.rewrap_object("file", 35).await.unwrap();
     // Then the unknown-id class is retained even though recovery failed.
     assert_eq!(outcome, RewrapOutcome::UndecryptableUnknownKeyId);
+}
+
+#[tokio::test]
+async fn readable_legacy_and_previous_objects_are_not_undecryptable() {
+    let storage = storage();
+    for hint in [None, Some("old")] {
+        storage
+            .seed_raw(
+                "file",
+                encrypt_with_key(b"content", &[2; 32]).unwrap(),
+                hint.map(str::to_owned),
+                "text/plain",
+            )
+            .unwrap();
+        let result = storage.verify_object("file", 35).await.unwrap();
+        assert!(
+            result.decrypts_under_previous_key,
+            "previous-key ciphertext remains readable"
+        );
+        assert!(!result.decrypts_under_write_key);
+    }
+}
+
+#[tokio::test]
+async fn execute_trusts_current_metadata_but_verify_authenticates_ciphertext() {
+    let storage = storage();
+    storage
+        .seed_raw("file", vec![0; 35], Some("current".into()), "text/plain")
+        .unwrap();
+    assert_eq!(
+        storage.rewrap_object("file", 35).await.unwrap(),
+        RewrapOutcome::AlreadyCurrent
+    );
+    let verification = storage.verify_object("file", 35).await.unwrap();
+    assert!(verification.is_current);
+    assert!(!verification.decrypts_under_write_key);
 }

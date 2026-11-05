@@ -161,7 +161,7 @@ fn object_rewrap_limit_rejects_nonpositive_or_malformed_values() {
 fn object_rewrap_write_gate_rejects_non_boolean_values() {
     let _env = Environment::new();
     env::set_var("S3_ENCRYPTION_KEYS", "s3-v1=file:/keys/current");
-    for value in ["", "1", "0", "TRUE", "false ", "disabled"] {
+    for value in ["", "2", "truefalse", "disabled"] {
         env::set_var("OBJECT_ENCRYPTION_WRITE_ENABLED", value);
         let error = S3Config::from_env().unwrap_err();
         assert!(error.contains("OBJECT_ENCRYPTION_WRITE_ENABLED"));
@@ -188,4 +188,35 @@ fn object_rewrap_settings_accept_explicit_limit_and_disabled_gate() {
     let config = S3Config::from_env().unwrap();
     assert_eq!(config.object_rewrap_max_bytes, 1);
     assert!(!config.object_encryption_write_enabled);
+}
+
+#[test]
+#[serial]
+fn object_rewrap_limit_accepts_surrounding_whitespace() {
+    let _env = Environment::new();
+    env::set_var("S3_ENCRYPTION_KEYS", "s3-v1=file:/keys/current");
+    env::set_var("OBJECT_REWRAP_MAX_BYTES", " \t42\n");
+    assert_eq!(S3Config::from_env().unwrap().object_rewrap_max_bytes, 42);
+}
+
+#[test]
+#[serial]
+fn object_rewrap_gate_accepts_the_shared_boolean_syntax() {
+    let _env = Environment::new();
+    env::set_var("S3_ENCRYPTION_KEYS", "s3-v1=file:/keys/current");
+    for (value, expected) in [
+        ("1", true),
+        ("0", false),
+        (" TRUE ", true),
+        ("\tFaLsE\n", false),
+    ] {
+        env::set_var("OBJECT_ENCRYPTION_WRITE_ENABLED", value);
+        assert_eq!(
+            S3Config::from_env()
+                .unwrap()
+                .object_encryption_write_enabled,
+            expected,
+            "value={value:?}"
+        );
+    }
 }

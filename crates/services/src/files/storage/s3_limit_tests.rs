@@ -20,8 +20,7 @@ async fn oversized_current_head_skips_get_during_rewrap() {
     assert!(matches!(
         result,
         Err(FileServiceError::ObjectTooLarge {
-            is_current: true,
-            unknown_key_id: false
+            key_state: ObjectKeyState::Current
         })
     ));
     assert_eq!(server.received_requests().await.unwrap().len(), 1);
@@ -47,8 +46,7 @@ async fn oversized_old_head_skips_get_during_verify() {
     assert!(matches!(
         result,
         Err(FileServiceError::ObjectTooLarge {
-            is_current: false,
-            unknown_key_id: false
+            key_state: ObjectKeyState::StaleOrAbsent
         })
     ));
     assert_eq!(server.received_requests().await.unwrap().len(), 1);
@@ -84,8 +82,7 @@ async fn execute_retains_unknown_id_when_get_grows_after_known_small_head() {
     assert!(matches!(
         result,
         Err(FileServiceError::ObjectTooLarge {
-            is_current: false,
-            unknown_key_id: true
+            key_state: ObjectKeyState::UnknownKeyId
         })
     ));
     assert_eq!(server.received_requests().await.unwrap().len(), 2);
@@ -114,7 +111,8 @@ async fn unknown_key_id_skips_get_during_verify() {
         result,
         ObjectVerification {
             is_current: false,
-            is_decryptable: false,
+            decrypts_under_write_key: false,
+            decrypts_under_previous_key: false,
             unknown_key_id: true,
         }
     );
@@ -154,7 +152,8 @@ async fn verify_retains_unknown_key_id_discovered_in_get_after_known_head() {
         result,
         ObjectVerification {
             is_current: false,
-            is_decryptable: false,
+            decrypts_under_write_key: false,
+            decrypts_under_previous_key: false,
             unknown_key_id: true
         }
     );

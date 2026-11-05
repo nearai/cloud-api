@@ -1,8 +1,8 @@
 use super::{
-    page_size, FileServiceError, ObjectMetadata, ObjectVerification, RewrapOutcome, StorageTrait,
-    KEY_ID_METADATA,
+    page_size, FileServiceError, ObjectKeyState, ObjectMetadata, ObjectVerification, RewrapOutcome,
+    StorageTrait, KEY_ID_METADATA,
 };
-use crate::files::encryption::{self, EncryptionError, ObjectKeyRing};
+use crate::files::encryption::{self, ObjectKeyRing};
 use async_trait::async_trait;
 use aws_sdk_s3::{
     operation::get_object::GetObjectOutput, primitives::ByteStream, Client as S3Client,
@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 #[path = "s3_io.rs"]
 mod io;
-use io::{body, bounded_body, content_length, object_error, storage_error};
+use io::{body, bounded_body, content_length, exists_result, object_error};
 
 #[derive(Clone)]
 pub struct S3Storage {
@@ -21,18 +21,6 @@ pub struct S3Storage {
 }
 
 impl S3Storage {
-    pub fn new(
-        client: S3Client,
-        bucket: String,
-        encryption_key: String,
-    ) -> Result<Self, EncryptionError> {
-        Ok(Self::new_with_ring(
-            client,
-            bucket,
-            Arc::new(ObjectKeyRing::from_hex(&encryption_key)?),
-        ))
-    }
-
     pub const fn new_with_ring(
         client: S3Client,
         bucket: String,
@@ -102,24 +90,14 @@ impl StorageTrait for S3Storage {
     }
 
     async fn exists(&self, key: &str) -> Result<bool, FileServiceError> {
-        match self
-            .client
-            .head_object()
-            .bucket(&self.bucket)
-            .key(key)
-            .send()
-            .await
-        {
-            Ok(_) => Ok(true),
-            Err(error)
-                if error
-                    .as_service_error()
-                    .is_some_and(|service| service.is_not_found()) =>
-            {
-                Ok(false)
-            }
-            Err(error) => Err(storage_error("existence check", error)),
-        }
+        exists_result(
+            self.client
+                .head_object()
+                .bucket(&self.bucket)
+                .key(key)
+                .send()
+                .await,
+        )
     }
 
     async fn list_keys(
@@ -177,13 +155,19 @@ impl StorageTrait for S3Storage {
         let mut metadata = response.metadata().cloned().unwrap_or_default();
         let content_type = response.content_type().map(str::to_owned);
         let etag = response.e_tag().map(str::to_owned);
-        let is_current =
-            metadata.get(KEY_ID_METADATA).map(String::as_str) == Some(self.key_ring.write_id());
         let unknown_key_id = metadata
             .get(KEY_ID_METADATA)
             .is_some_and(|id| self.key_ring.lookup(id).is_none());
         let (plaintext, from) = match encryption::decrypt_with_ring(
-            &bounded_body(response, max_bytes, is_current, unknown_key_id).await?,
+            &bounded_body(
+                response,
+                max_bytes,
+                ObjectKeyState::for_key_id(
+                    metadata.get(KEY_ID_METADATA).map(String::as_str),
+                    &self.key_ring,
+                ),
+            )
+            .await?,
             &self.key_ring,
             metadata.get(KEY_ID_METADATA).map(String::as_str),
         ) {
@@ -225,40 +209,34 @@ impl StorageTrait for S3Storage {
     ) -> Result<ObjectVerification, FileServiceError> {
         let head = self.object_metadata(key).await?;
         head.enforce_limit(max_bytes, &self.key_ring)?;
-        if head
-            .key_id
-            .as_deref()
-            .is_some_and(|id| self.key_ring.lookup(id).is_none())
+        if ObjectKeyState::for_key_id(head.key_id.as_deref(), &self.key_ring)
+            == ObjectKeyState::UnknownKeyId
         {
-            return Ok(ObjectVerification {
-                is_current: false,
-                is_decryptable: false,
-                unknown_key_id: true,
-            });
+            return Ok(ObjectVerification::authenticate(
+                &[],
+                &self.key_ring,
+                head.key_id.as_deref(),
+            ));
         }
         let response = self.get_object(key).await?;
         let key_id = response
             .metadata()
             .and_then(|metadata| metadata.get(KEY_ID_METADATA))
-            .map(String::as_str);
-        let is_current = key_id == Some(self.key_ring.write_id());
-        if key_id.is_some_and(|id| self.key_ring.lookup(id).is_none()) {
-            return Ok(ObjectVerification {
-                is_current,
-                is_decryptable: false,
-                unknown_key_id: true,
-            });
+            .cloned();
+        let key_state = ObjectKeyState::for_key_id(key_id.as_deref(), &self.key_ring);
+        if key_state == ObjectKeyState::UnknownKeyId {
+            return Ok(ObjectVerification::authenticate(
+                &[],
+                &self.key_ring,
+                key_id.as_deref(),
+            ));
         }
-        let encrypted_data = bounded_body(response, max_bytes, is_current, false).await?;
-        Ok(ObjectVerification {
-            is_current,
-            unknown_key_id: false,
-            is_decryptable: encryption::decrypt_with_key(
-                &encrypted_data,
-                self.key_ring.write_key(),
-            )
-            .is_ok(),
-        })
+        let encrypted_data = bounded_body(response, max_bytes, key_state).await?;
+        Ok(ObjectVerification::authenticate(
+            &encrypted_data,
+            &self.key_ring,
+            key_id.as_deref(),
+        ))
     }
 }
 

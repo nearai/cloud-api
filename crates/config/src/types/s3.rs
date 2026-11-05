@@ -1,4 +1,7 @@
-use super::{non_empty_env, parse_key_source_specs_for, KeySource, KeySourceSpec};
+use super::{
+    non_empty_env, parse_bool_env, parse_key_source_specs_for, parse_u64_env, KeySource,
+    KeySourceSpec,
+};
 use std::env;
 
 /// S3 configuration for file storage
@@ -33,26 +36,12 @@ impl std::fmt::Debug for S3Config {
 impl S3Config {
     /// Load from environment variables
     pub fn from_env() -> Result<Self, String> {
-        let object_rewrap_max_bytes = match env::var("OBJECT_REWRAP_MAX_BYTES") {
-            Ok(raw) => raw
-                .parse::<u64>()
-                .ok()
-                .filter(|value| *value > 0)
-                .ok_or("OBJECT_REWRAP_MAX_BYTES must be a positive integer")?,
-            Err(env::VarError::NotPresent) => 268_435_456,
-            Err(env::VarError::NotUnicode(_)) => {
-                return Err("OBJECT_REWRAP_MAX_BYTES must be a positive integer".into());
-            }
-        };
-        let object_encryption_write_enabled = match env::var("OBJECT_ENCRYPTION_WRITE_ENABLED") {
-            Ok(raw) => raw
-                .parse::<bool>()
-                .map_err(|_| "OBJECT_ENCRYPTION_WRITE_ENABLED must be true or false")?,
-            Err(env::VarError::NotPresent) => true,
-            Err(env::VarError::NotUnicode(_)) => {
-                return Err("OBJECT_ENCRYPTION_WRITE_ENABLED must be true or false".into());
-            }
-        };
+        let object_rewrap_max_bytes = parse_u64_env("OBJECT_REWRAP_MAX_BYTES", 268_435_456)?;
+        if object_rewrap_max_bytes == 0 {
+            return Err("OBJECT_REWRAP_MAX_BYTES must be a positive integer".into());
+        }
+        let object_encryption_write_enabled =
+            parse_bool_env("OBJECT_ENCRYPTION_WRITE_ENABLED", true)?;
         // Check if mock mode is enabled
         let mock = env::var("S3_MOCK")
             .ok()

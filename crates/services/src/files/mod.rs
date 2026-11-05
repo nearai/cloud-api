@@ -3,6 +3,7 @@ pub mod ports;
 pub mod storage;
 
 pub use ports::{CreateFileParams, File, FileRepositoryTrait};
+pub use storage::ObjectKeyState;
 
 use crate::common::RepositoryError;
 use async_trait::async_trait;
@@ -29,10 +30,7 @@ pub enum FileServiceError {
     #[error("Transient storage error: {0}")]
     TransientStorageError(String),
     #[error("Object exceeds the configured rewrap byte limit")]
-    ObjectTooLarge {
-        is_current: bool,
-        unknown_key_id: bool,
-    },
+    ObjectTooLarge { key_state: ObjectKeyState },
     #[error("Repository error: {0}")]
     RepositoryError(#[from] RepositoryError),
     #[error("Invalid encoding for text file. Expected UTF-8, UTF-16, or ASCII")]

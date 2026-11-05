@@ -1,4 +1,4 @@
-use crate::files::FileServiceError;
+use crate::files::{FileServiceError, ObjectKeyState};
 use aws_sdk_s3::{
     error::{ProvideErrorMetadata, SdkError},
     operation::get_object::GetObjectOutput,
@@ -60,14 +60,10 @@ pub(super) async fn body(response: GetObjectOutput) -> Result<Vec<u8>, FileServi
 pub(super) async fn bounded_body(
     mut response: GetObjectOutput,
     max_bytes: u64,
-    is_current: bool,
-    unknown_key_id: bool,
+    key_state: ObjectKeyState,
 ) -> Result<Vec<u8>, FileServiceError> {
     if content_length(response.content_length())? > max_bytes {
-        return Err(FileServiceError::ObjectTooLarge {
-            is_current,
-            unknown_key_id,
-        });
+        return Err(FileServiceError::ObjectTooLarge { key_state });
     }
     let limit = usize::try_from(max_bytes).unwrap_or(usize::MAX);
     let mut data = Vec::new();
@@ -76,10 +72,7 @@ pub(super) async fn bounded_body(
             FileServiceError::TransientStorageError(format!("Object body read failed: {error}"))
         })?;
         if chunk.len() > limit.saturating_sub(data.len()) {
-            return Err(FileServiceError::ObjectTooLarge {
-                is_current,
-                unknown_key_id,
-            });
+            return Err(FileServiceError::ObjectTooLarge { key_state });
         }
         if data.capacity() - data.len() < chunk.len() {
             let capacity = data
@@ -98,3 +91,16 @@ pub(super) async fn bounded_body(
 #[cfg(test)]
 #[path = "s3_io_tests.rs"]
 mod tests;
+
+pub(super) fn exists_result(
+    result: Result<
+        aws_sdk_s3::operation::head_object::HeadObjectOutput,
+        aws_sdk_s3::error::SdkError<aws_sdk_s3::operation::head_object::HeadObjectError>,
+    >,
+) -> Result<bool, FileServiceError> {
+    match result.map_err(|error| object_error("existence check", error)) {
+        Ok(_) => Ok(true),
+        Err(FileServiceError::NotFound) => Ok(false),
+        Err(error) => Err(error),
+    }
+}

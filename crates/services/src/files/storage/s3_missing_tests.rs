@@ -114,3 +114,26 @@ fn transport_failures_are_not_missing_objects() {
     // Then the storage failure is retained.
     assert!(matches!(error, FileServiceError::StorageError(_)));
 }
+
+#[test]
+fn exists_classifies_codeless_404_as_absent() {
+    let error = SdkError::service_error(
+        HeadObjectError::generic(ErrorMetadata::builder().build()),
+        response(404),
+    );
+    assert!(matches!(exists_result(Err(error)), Ok(false)));
+}
+
+#[test]
+fn exists_preserves_permission_and_bucket_errors() {
+    for (status, code) in [(403, "AccessDenied"), (404, "NoSuchBucket")] {
+        let error = SdkError::service_error(
+            HeadObjectError::generic(ErrorMetadata::builder().code(code).build()),
+            response(status),
+        );
+        assert!(matches!(
+            exists_result(Err(error)),
+            Err(FileServiceError::StorageError(_))
+        ));
+    }
+}

@@ -98,7 +98,9 @@ pub fn decrypt_with_key(encrypted_data: &[u8], key: &[u8; 32]) -> Result<Vec<u8>
     Ok(plaintext)
 }
 
-/// A known metadata id selects its key; other objects try keys in write-first order.
+/// A known metadata id selects only its key; a mismatch intentionally fails rather
+/// than being masked by another ring key. Missing or unknown ids try write-first.
+/// Rewrap adapters turn authentication failures into counted outcomes.
 pub fn decrypt_with_ring(
     data: &[u8],
     ring: &ObjectKeyRing,

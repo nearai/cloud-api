@@ -15,6 +15,16 @@ struct StoredObject {
     content_type: String,
 }
 
+impl StoredObject {
+    fn metadata(&self) -> ObjectMetadata {
+        ObjectMetadata {
+            key_id: self.key_id.clone(),
+            // Rust's supported targets have at most 64-bit usize, so this is lossless.
+            content_length: self.encrypted_data.len() as u64,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct MockStorage {
     files: Arc<RwLock<BTreeMap<String, StoredObject>>>,
@@ -123,11 +133,7 @@ impl StorageTrait for MockStorage {
     async fn object_metadata(&self, key: &str) -> Result<ObjectMetadata, FileServiceError> {
         let files = self.files.read().map_err(lock_error)?;
         let object = files.get(key).ok_or(FileServiceError::NotFound)?;
-        Ok(ObjectMetadata {
-            key_id: object.key_id.clone(),
-            content_length: u64::try_from(object.encrypted_data.len())
-                .map_err(|error| FileServiceError::StorageError(error.to_string()))?,
-        })
+        Ok(object.metadata())
     }
 
     async fn rewrap_object(
@@ -137,12 +143,8 @@ impl StorageTrait for MockStorage {
     ) -> Result<RewrapOutcome, FileServiceError> {
         let mut files = self.files.write().map_err(lock_error)?;
         let object = files.get_mut(key).ok_or(FileServiceError::NotFound)?;
-        ObjectMetadata {
-            key_id: object.key_id.clone(),
-            content_length: u64::try_from(object.encrypted_data.len())
-                .map_err(|error| FileServiceError::StorageError(error.to_string()))?,
-        }
-        .enforce_limit(max_bytes, &self.key_ring)?;
+        // This test double holds its lock during crypto; it is not for production load.
+        object.metadata().enforce_limit(max_bytes, &self.key_ring)?;
         if object.key_id.as_deref() == Some(self.key_ring.write_id()) {
             return Ok(RewrapOutcome::AlreadyCurrent);
         }
@@ -178,22 +180,11 @@ impl StorageTrait for MockStorage {
     ) -> Result<ObjectVerification, FileServiceError> {
         let files = self.files.read().map_err(lock_error)?;
         let object = files.get(key).ok_or(FileServiceError::NotFound)?;
-        ObjectMetadata {
-            key_id: object.key_id.clone(),
-            content_length: u64::try_from(object.encrypted_data.len())
-                .map_err(|error| FileServiceError::StorageError(error.to_string()))?,
-        }
-        .enforce_limit(max_bytes, &self.key_ring)?;
-        let unknown_id = object
-            .key_id
-            .as_deref()
-            .is_some_and(|id| self.key_ring.lookup(id).is_none());
-        Ok(ObjectVerification {
-            unknown_key_id: unknown_id,
-            is_current: object.key_id.as_deref() == Some(self.key_ring.write_id()),
-            is_decryptable: !unknown_id
-                && encryption::decrypt_with_key(&object.encrypted_data, self.key_ring.write_key())
-                    .is_ok(),
-        })
+        object.metadata().enforce_limit(max_bytes, &self.key_ring)?;
+        Ok(ObjectVerification::authenticate(
+            &object.encrypted_data,
+            &self.key_ring,
+            object.key_id.as_deref(),
+        ))
     }
 }

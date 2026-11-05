@@ -13,14 +13,13 @@ async fn bounded_body_rejects_announced_growth_before_polling_the_stream() {
         .body(ByteStream::from_body_1_x(StreamBody::new(pending)))
         .build();
     // When a bounded body read starts.
-    let read = std::pin::pin!(bounded_body(response, 35, true, false));
+    let read = std::pin::pin!(bounded_body(response, 35, ObjectKeyState::Current));
     let result = futures::poll!(read);
     // Then Content-Length alone rejects it without polling that body.
     assert!(matches!(
         result,
         std::task::Poll::Ready(Err(FileServiceError::ObjectTooLarge {
-            is_current: true,
-            unknown_key_id: false
+            key_state: ObjectKeyState::Current
         }))
     ));
 }
@@ -38,13 +37,12 @@ async fn bounded_body_rejects_streamed_growth_even_when_length_is_small() {
         .body(ByteStream::from_body_1_x(StreamBody::new(frames)))
         .build();
     // When the body crosses the configured byte limit.
-    let result = bounded_body(response, 5, false, true).await;
+    let result = bounded_body(response, 5, ObjectKeyState::UnknownKeyId).await;
     // Then size classification wins before the trailing body is consumed.
     assert!(matches!(
         result,
         Err(FileServiceError::ObjectTooLarge {
-            is_current: false,
-            unknown_key_id: true
+            key_state: ObjectKeyState::UnknownKeyId
         })
     ));
 }
@@ -56,7 +54,9 @@ async fn bounded_body_accepts_exact_limit_without_a_content_length() {
         .body(ByteStream::from_static(b"12345"))
         .build();
     // When it is read with that exact byte limit.
-    let data = bounded_body(response, 5, false, false).await.unwrap();
+    let data = bounded_body(response, 5, ObjectKeyState::StaleOrAbsent)
+        .await
+        .unwrap();
     // Then all bytes are retained.
     assert_eq!(data, b"12345");
 }
@@ -71,7 +71,7 @@ async fn interrupted_body_is_retryable() {
         .body(ByteStream::from_body_1_x(StreamBody::new(frames)))
         .build();
     // When the bounded reader polls the failed body.
-    let result = bounded_body(response, 5, false, false).await;
+    let result = bounded_body(response, 5, ObjectKeyState::StaleOrAbsent).await;
     // Then the caller can retry the object.
     assert!(matches!(
         result,

@@ -112,3 +112,9 @@ fn invalid_hex_and_lengths_fail_without_key_material() {
         assert!(!error.contains(&raw));
     }
 }
+
+#[test]
+fn known_previous_hint_does_not_mask_a_mismatched_previous_key() {
+    let encrypted = encrypt_with_key(b"content", &[1; 32]).unwrap();
+    assert!(decrypt_with_ring(&encrypted, &ring(), Some("s3-v2")).is_err());
+}

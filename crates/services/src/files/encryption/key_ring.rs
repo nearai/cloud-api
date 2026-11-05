@@ -1,5 +1,4 @@
 use super::{parse_key, EncryptionError};
-use ring::hmac;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// One write key and ordered previous keys for object reads.
@@ -53,6 +52,8 @@ impl ObjectKeyRing {
         &self.write.0
     }
 
+    /// Borrows key material for cryptographic operations; callers must not copy it out.
+    /// No accessor returns an owned key.
     pub const fn write_key(&self) -> &[u8; 32] {
         &self.write.1
     }
@@ -63,18 +64,11 @@ impl ObjectKeyRing {
 
     pub fn fingerprints(&self) -> Vec<(String, String)> {
         self.entries()
-            .map(|(id, key)| {
-                let key = hmac::Key::new(hmac::HMAC_SHA256, key);
-                let digest = hmac::sign(&key, b"near-key-fingerprint/v1");
-                (
-                    id.to_string(),
-                    hex::encode(digest.as_ref().iter().take(8).copied().collect::<Vec<_>>()),
-                )
-            })
+            .map(|(id, key)| (id.to_string(), crate::key_fingerprint(key)))
             .collect()
     }
 
-    pub(super) fn entries(&self) -> impl Iterator<Item = (&str, &[u8; 32])> {
+    pub(in crate::files) fn entries(&self) -> impl Iterator<Item = (&str, &[u8; 32])> {
         std::iter::once(&self.write)
             .chain(&self.previous)
             .map(|(id, key)| (id.as_str(), key))

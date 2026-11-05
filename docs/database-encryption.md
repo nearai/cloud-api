@@ -43,3 +43,13 @@ slices of at most 500 ms. The process worker permit remains held so only one
 job runs per process at a time.
 
 See [env.example](../env.example) for configuration and request examples.
+
+Key fingerprints use `HMAC-SHA256(key, "near-key-fingerprint/v1")`, truncated
+to the first 16 lowercase hexadecimal characters (8 bytes). The shared
+implementation in `services::key_fingerprint` is used by the database key ring.
+
+Database job scopes must omit `kind`; requests containing that key, including
+null or an empty string, return 400. Persisted jobs with a non-empty `scope.kind`
+belong to other workers and are excluded from database recovery, claims,
+updates and cancellation. The database job GET endpoint returns 404 for those
+IDs; cancellation responds as it does for an unknown ID.

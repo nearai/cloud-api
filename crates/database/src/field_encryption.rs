@@ -5,7 +5,6 @@ use aes_gcm::{
 use anyhow::{anyhow, ensure, Context, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 use uuid::Uuid;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
@@ -83,10 +82,7 @@ impl KeyRing {
     pub fn fingerprints(&self) -> Vec<(String, String)> {
         std::iter::once(&self.write)
             .chain(&self.read)
-            .map(|(id, key)| {
-                let digest = Sha256::digest(key);
-                (id.clone(), hex::encode(&digest[..8]))
-            })
+            .map(|(id, key)| (id.clone(), services::key_fingerprint(key)))
             .collect()
     }
 }
@@ -394,6 +390,8 @@ mod tests {
     fn key_ring_fingerprints_and_debug_expose_identifiers_only() {
         let ring = KeyRing::new("db-v2".into(), [9; 32], vec![("db-v1".into(), [7; 32])]).unwrap();
         let fingerprints = ring.fingerprints();
+        assert_eq!(fingerprints[0].1, "825674e6c3e8ca73");
+        assert_eq!(fingerprints[1].1, "820ed242bff6e2d9");
         assert_eq!(
             fingerprints
                 .iter()

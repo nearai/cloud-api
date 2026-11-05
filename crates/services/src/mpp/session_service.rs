@@ -871,3 +871,7 @@ mod validation_tests;
 #[cfg(test)]
 #[path = "session_service/regression_tests.rs"]
 mod regression_tests;
+
+#[cfg(test)]
+#[path = "session_service/port_tests.rs"]
+mod port_tests;

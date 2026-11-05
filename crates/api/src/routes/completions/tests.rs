@@ -1,4 +1,5 @@
 use super::*;
+use services::completions::usage_observer::UsageObserverExt;
 
 #[test]
 fn chat_token_limits_are_normalized_before_dispatch() {
@@ -1602,4 +1603,44 @@ fn prompt_array_shapes_deserialize_without_422() {
 
     let token_batches = parse_completion_request(r#"{"model":"m","prompt":[[1,2],[3,4]]}"#);
     assert!(token_batches.prompt.single_text().is_err());
+}
+
+#[derive(Debug)]
+struct NoopUsageObserver;
+
+impl services::completions::usage_observer::UsageObserver for NoopUsageObserver {
+    fn on_finished(&self, _report: services::completions::usage_observer::UsageReport) {}
+}
+
+#[test]
+fn usage_observer_extension_is_copied_into_the_service_request() {
+    let body = serde_json::json!({
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "hi"}],
+    });
+    let request: ChatCompletionRequest = serde_json::from_value(body.clone()).unwrap();
+    let mut service = convert_chat_request_to_service(
+        &request,
+        Uuid::nil(),
+        Uuid::nil().to_string(),
+        Uuid::nil(),
+        Uuid::nil(),
+        false,
+        0,
+        RequestBodyHash {
+            hash: "h".to_string(),
+            body_bytes: serde_json::to_vec(&body).unwrap().into(),
+        },
+        Uuid::nil(),
+    );
+    assert!(service.usage_observer.is_none());
+
+    apply_usage_observer(&mut service, None);
+    assert!(service.usage_observer.is_none());
+
+    let observer: std::sync::Arc<dyn services::completions::usage_observer::UsageObserver> =
+        std::sync::Arc::new(NoopUsageObserver);
+    apply_usage_observer(&mut service, Some(UsageObserverExt(observer.clone())));
+    let copied = service.usage_observer.as_ref().unwrap();
+    assert!(std::sync::Arc::ptr_eq(copied, &observer));
 }

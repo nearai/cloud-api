@@ -62,6 +62,7 @@ pub(super) fn convert_text_request_to_service(
         body_hash: body_hash.hash.clone(),
         response_id: None, // Direct text completions API calls don't have a response_id
         skip_provider_chat_signature: false,
+        usage_observer: None,
         original_request: None,
         extra,
     }

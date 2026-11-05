@@ -1,4 +1,5 @@
 use super::*;
+use services::completions::usage_observer::UsageObserverExt;
 
 // Convert MessageContent to serde_json::Value, preserving multimodal parts (images, audio, etc.)
 pub(super) fn message_content_to_value(content: &Option<MessageContent>) -> serde_json::Value {
@@ -15,6 +16,14 @@ pub(super) fn message_content_to_value(content: &Option<MessageContent>) -> serd
 /// a placement affinity key (`services::completions::affinity::derive`).
 /// Never logged, never forwarded to a provider.
 pub(super) const SESSION_ID_HEADER: &str = "x-session-id";
+
+/// Hand a request-scoped usage observer, if the request carried one, to the service request.
+pub(super) fn apply_usage_observer(
+    service_request: &mut ServiceCompletionRequest,
+    usage_observer: Option<UsageObserverExt>,
+) {
+    service_request.usage_observer = usage_observer.map(|observer| observer.0);
+}
 
 /// Read the `x-session-id` header, if present and valid UTF-8.
 pub(super) fn session_hint_from_headers(headers: &header::HeaderMap) -> Option<String> {
@@ -104,6 +113,7 @@ pub(super) fn convert_chat_request_to_service(
         body_hash: body_hash.hash.clone(),
         response_id: None, // Direct chat completions API calls don't have a response_id
         skip_provider_chat_signature: false,
+        usage_observer: None,
         original_request,
         extra,
     }
@@ -144,11 +154,13 @@ pub(crate) fn reject_invalid_chat_request(request: &ChatCompletionRequest) -> Op
         ("api_key" = [])
     )
 )]
+#[allow(clippy::too_many_arguments)]
 pub async fn chat_completions(
     State(app_state): State<AppState>,
     Extension(api_key): Extension<AuthenticatedApiKey>,
     Extension(body_hash): Extension<RequestBodyHash>,
     Extension(correlation): Extension<RequestCorrelation>,
+    usage_observer: Option<Extension<UsageObserverExt>>,
     headers: header::HeaderMap,
     requested_model: RequestedModel,
     OpenAiJson(request): ChatRequestBody,
@@ -185,9 +197,17 @@ pub async fn chat_completions(
         model = %request.model,
     );
 
-    chat_completions_inner(app_state, api_key, body_hash, headers, request, request_id)
-        .instrument(span)
-        .await
+    chat_completions_inner(
+        app_state,
+        api_key,
+        body_hash,
+        headers,
+        request,
+        request_id,
+        usage_observer.map(|Extension(observer)| observer),
+    )
+    .instrument(span)
+    .await
 }
 
 // Inner async fn so .instrument(span) wraps all awaits in the handler.
@@ -202,6 +222,7 @@ pub(super) async fn chat_completions_inner(
     headers: header::HeaderMap,
     request: ChatCompletionRequest,
     request_id: Uuid,
+    usage_observer: Option<UsageObserverExt>,
 ) -> axum::response::Response {
     let request_hash = body_hash.hash.clone();
 
@@ -219,6 +240,7 @@ pub(super) async fn chat_completions_inner(
         request_id,
     );
     service_request.session_hint = session_hint_from_headers(&headers);
+    apply_usage_observer(&mut service_request, usage_observer);
 
     // Extract and validate encryption headers if present
     let encryption_headers = match crate::routes::common::validate_encryption_headers(&headers) {

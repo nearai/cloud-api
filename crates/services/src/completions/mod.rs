@@ -1,5 +1,6 @@
 pub mod affinity;
 pub mod ports;
+pub mod usage_observer;
 
 use crate::attestation::ports::AttestationServiceTrait;
 use crate::attestation::STREAM_SIGNATURE_STORE_TIMEOUT;
@@ -14,6 +15,7 @@ use inference_providers::{ChatMessage, MessageRole, SSEEvent, StreamChunk, Strea
 use moka::future::Cache;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use usage_observer::{UsageFireOnce, UsageObserver, UsageReport, UsageReportGuard};
 use uuid::Uuid;
 
 // Create a new stream that intercepts messages, but passes the original ones through
@@ -178,6 +180,8 @@ where
     /// Callback to report observed TTFT back to the provider pool for latency-aware
     /// routing. Called once with the backend TTFT (ms) from record_usage_and_metrics.
     latency_reporter: Option<super::inference_provider_pool::ProviderLatencyReporter>,
+    /// Told the final usage exactly once from `record_usage_and_metrics`.
+    usage_observer: UsageFireOnce,
 }
 
 impl<S> InterceptStream<S>
@@ -295,6 +299,21 @@ where
             %inference_type
         )
         .entered();
+
+        // Tell the observer first: every exit below (including the early
+        // returns for interrupted streams) has already settled its counts.
+        let usage_complete = self.last_usage_stats.is_some() && self.last_chat_id.is_some();
+        let (observed_prompt, observed_completion) = self
+            .last_usage_stats
+            .as_ref()
+            .map(|usage| (usage.prompt_tokens, usage.completion_tokens))
+            .unwrap_or((0, 0));
+        self.usage_observer.fire(UsageReport {
+            request_id,
+            prompt_tokens: observed_prompt,
+            completion_tokens: observed_completion,
+            completed: usage_complete,
+        });
 
         let (
             input_tokens,
@@ -1701,6 +1720,7 @@ impl CompletionServiceImpl {
         cache_write_cost_per_token: Option<i64>,
         requested_service_tier: Option<TextServiceTier>,
         latency_reporter: Option<super::inference_provider_pool::ProviderLatencyReporter>,
+        usage_observer: Option<Arc<dyn UsageObserver>>,
     ) -> StreamingResult {
         // Create low-cardinality metric tags (no org/workspace/key - those go to database)
         let metric_tags = Self::create_metric_tags(&model_name);
@@ -1750,6 +1770,7 @@ impl CompletionServiceImpl {
             requested_service_tier,
             provider_service_tier: None,
             latency_reporter,
+            usage_observer: UsageFireOnce::new(usage_observer),
         };
         Box::pin(intercepted_stream)
     }
@@ -1778,6 +1799,9 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         let organization_id = request.organization_id;
         let workspace_id = request.workspace_id;
         let request_id = request.request_id;
+        // Reports `completed: false` on any early return; handed to the
+        // InterceptStream on success, which then owns reporting.
+        let usage_guard = UsageReportGuard::new(request.usage_observer.clone(), request_id);
         let api_key_id = match uuid::Uuid::parse_str(&request.api_key_id) {
             Ok(id) => id,
             Err(e) => {
@@ -1979,6 +2003,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
                 cache_write_cost_per_token,
                 requested_service_tier,
                 Some(latency_reporter),
+                usage_guard.disarm(),
             )
             .await;
 
@@ -2006,6 +2031,8 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         let organization_id = request.organization_id;
         let workspace_id = request.workspace_id;
         let request_id = request.request_id;
+        // Reports `completed: false` on any early return before usage exists.
+        let usage_guard = UsageReportGuard::new(request.usage_observer.clone(), request_id);
         let chat_messages = Self::prepare_chat_messages(&request.messages);
 
         // Extract tools from extra if present (Responses API puts them there)
@@ -2259,6 +2286,8 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             .and_then(|c| c.finish_reason.as_ref())
             .map(|reason| crate::usage::StopReason::from_finish_reason(reason))
             .unwrap_or(crate::usage::StopReason::Incomplete);
+
+        usage_guard.finish(input_tokens, output_tokens);
 
         usage_service
             .record_usage(RecordUsageServiceRequest {
@@ -2604,6 +2633,8 @@ pub use ports::*;
 
 #[cfg(test)]
 mod provider_attribution_tests;
+#[cfg(test)]
+mod usage_observer_tests;
 
 #[cfg(test)]
 mod tests {
@@ -2706,6 +2737,7 @@ mod tests {
             requested_service_tier: None,
             provider_service_tier: None,
             latency_reporter: None,
+            usage_observer: UsageFireOnce::new(None),
         }
     }
 
@@ -2924,6 +2956,7 @@ mod tests {
             requested_service_tier: None,
             provider_service_tier: None,
             latency_reporter: None,
+            usage_observer: UsageFireOnce::new(None),
         };
 
         // Consume both provider chunks, then verify the usage dimensions captured
@@ -3098,6 +3131,7 @@ mod tests {
             requested_service_tier: None,
             provider_service_tier: None,
             latency_reporter: None,
+            usage_observer: UsageFireOnce::new(None),
         };
         let _ = intercept_stream.collect::<Vec<_>>().await;
         // Wait for the fire-and-forget usage/metrics task spawned in Drop to finish.
@@ -3253,6 +3287,7 @@ mod tests {
             requested_service_tier: None,
             provider_service_tier: None,
             latency_reporter: None,
+            usage_observer: UsageFireOnce::new(None),
         };
 
         // Consume the stream
@@ -3382,6 +3417,7 @@ mod tests {
             requested_service_tier: None,
             provider_service_tier: None,
             latency_reporter: None,
+            usage_observer: UsageFireOnce::new(None),
         };
 
         let _ = intercept_stream.collect::<Vec<_>>().await;
@@ -3593,6 +3629,7 @@ mod tests {
                 requested_service_tier: None,
                 provider_service_tier: None,
                 latency_reporter: None,
+                usage_observer: UsageFireOnce::new(None),
             };
             // InterceptStream goes out of scope here and Drop is called
         }

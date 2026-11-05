@@ -113,6 +113,7 @@ pub(super) fn completion_request(model: &str) -> ports::CompletionRequest {
         body_hash: "test-body-hash".to_string(),
         response_id: None,
         skip_provider_chat_signature: true,
+        usage_observer: None,
         original_request: None,
         extra: std::collections::HashMap::new(),
     }
@@ -138,7 +139,7 @@ async fn wait_for_usage_requests(
     })
 }
 
-async fn completion_service_with_mock_providers(
+pub(super) async fn completion_service_with_mock_providers(
     model_name: &str,
     near_fails: bool,
     chutes_fails: bool,

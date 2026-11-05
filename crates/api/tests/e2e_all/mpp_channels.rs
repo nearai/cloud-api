@@ -656,7 +656,7 @@ async fn closing_finalize_and_clear_transitions() {
             .unwrap(),
         CloseTransition::Missing
     );
-    let (id, _) = f.open(100).await;
+    let (id, _) = f.open(700).await;
     let CloseTransition::Marked(record) = f
         .repo
         .mark_closing(&id, pending(), Utc::now())
@@ -692,6 +692,7 @@ async fn closing_finalize_and_clear_transitions() {
     let record = f.stored(&id).await;
     assert_eq!(record.state, ChannelLifecycle::Finalized);
     assert_eq!(record.settled_on_chain, 650);
+    assert_eq!(record.spent, 650);
     assert!(record.pending_close.is_none());
     f.repo.clear_closing(&id, &pending().tx_hash).await.unwrap();
     assert_eq!(

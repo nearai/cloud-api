@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use crate::auth::ports::UserId;
 use crate::common::RepositoryError;
-use crate::organization::{OrganizationId, OrganizationServiceTrait};
+use crate::organization::{MemberRole, OrganizationId, OrganizationServiceTrait};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 
@@ -77,6 +77,18 @@ impl WorkspaceServiceImpl {
         workspace_id: WorkspaceId,
         user_id: UserId,
     ) -> Result<(Workspace, crate::organization::Organization), WorkspaceError> {
+        let (workspace, organization, _) =
+            self.workspace_member_role(workspace_id, user_id).await?;
+        Ok((workspace, organization))
+    }
+
+    /// The workspace, its organization and the requester's role in that organization.
+    /// `Unauthorized` when the requester is not a member.
+    async fn workspace_member_role(
+        &self,
+        workspace_id: WorkspaceId,
+        user_id: UserId,
+    ) -> Result<(Workspace, crate::organization::Organization, MemberRole), WorkspaceError> {
         // Get workspace with organization
         let (workspace, organization) = self
             .workspace_repository
@@ -96,15 +108,55 @@ impl WorkspaceServiceImpl {
                 ))
             })?;
 
-        if member.is_none() {
+        let Some(role) = member else {
             return Err(WorkspaceError::Unauthorized(
                 "User is not a member of this organization".to_string(),
             ));
-        }
+        };
 
-        Ok((workspace, organization))
+        Ok((workspace, organization, role))
+    }
+
+    /// A workspace is renamed, reconfigured or deleted only by its creator or an organization
+    /// owner or admin. Every member can still read it and create keys in it.
+    async fn check_workspace_change_permission(
+        &self,
+        workspace_id: WorkspaceId,
+        user_id: UserId,
+    ) -> Result<(), WorkspaceError> {
+        let (workspace, _, role) = self
+            .workspace_member_role(workspace_id, user_id.clone())
+            .await?;
+        if workspace.created_by_user_id == user_id || role.can_manage_organization() {
+            return Ok(());
+        }
+        Err(WorkspaceError::Unauthorized(
+            WORKSPACE_CHANGE_FORBIDDEN.to_string(),
+        ))
+    }
+
+    /// A key is revoked, deleted or updated only by its creator or an organization owner or admin.
+    fn check_api_key_change_permission(
+        api_key: &ApiKey,
+        requester_id: &UserId,
+        role: &MemberRole,
+    ) -> Result<(), WorkspaceError> {
+        if &api_key.created_by_user_id == requester_id || role.can_manage_organization() {
+            return Ok(());
+        }
+        Err(WorkspaceError::Unauthorized(
+            API_KEY_CHANGE_FORBIDDEN.to_string(),
+        ))
     }
 }
+
+/// Refusal when a member who did not create the workspace tries to change it.
+const WORKSPACE_CHANGE_FORBIDDEN: &str =
+    "Only the workspace creator or an organization owner or admin can change this workspace";
+
+/// Refusal when a member who did not create the key tries to change it.
+const API_KEY_CHANGE_FORBIDDEN: &str =
+    "Only the key creator or an organization owner or admin can change this API key";
 
 #[async_trait]
 impl WorkspaceServiceTrait for WorkspaceServiceImpl {
@@ -320,7 +372,8 @@ impl WorkspaceServiceTrait for WorkspaceServiceImpl {
         requester_id: UserId,
     ) -> Result<bool, WorkspaceError> {
         // Check permissions
-        self.check_workspace_permission(workspace_id.clone(), requester_id)
+        let (_, _, role) = self
+            .workspace_member_role(workspace_id.clone(), requester_id.clone())
             .await?;
 
         // Verify the API key belongs to this workspace
@@ -334,6 +387,7 @@ impl WorkspaceServiceTrait for WorkspaceServiceImpl {
         if api_key.workspace_id.0 != workspace_id.0 {
             return Err(WorkspaceError::ApiKeyNotFound);
         }
+        Self::check_api_key_change_permission(&api_key, &requester_id, &role)?;
 
         // Delete the API key
         self.api_key_repository
@@ -350,7 +404,8 @@ impl WorkspaceServiceTrait for WorkspaceServiceImpl {
         spend_limit: Option<i64>,
     ) -> Result<ApiKey, WorkspaceError> {
         // Check permissions
-        self.check_workspace_permission(workspace_id.clone(), requester_id)
+        let (_, _, role) = self
+            .workspace_member_role(workspace_id.clone(), requester_id.clone())
             .await?;
 
         // Verify the API key belongs to this workspace
@@ -364,6 +419,7 @@ impl WorkspaceServiceTrait for WorkspaceServiceImpl {
         if api_key.workspace_id.0 != workspace_id.0 {
             return Err(WorkspaceError::ApiKeyNotFound);
         }
+        Self::check_api_key_change_permission(&api_key, &requester_id, &role)?;
 
         // Update the spend limit
         self.api_key_repository
@@ -385,7 +441,8 @@ impl WorkspaceServiceTrait for WorkspaceServiceImpl {
         is_active: Option<bool>,
     ) -> Result<ApiKey, WorkspaceError> {
         // Check permissions
-        self.check_workspace_permission(workspace_id.clone(), requester_id)
+        let (_, _, role) = self
+            .workspace_member_role(workspace_id.clone(), requester_id.clone())
             .await?;
 
         // Verify the API key belongs to this workspace
@@ -399,6 +456,7 @@ impl WorkspaceServiceTrait for WorkspaceServiceImpl {
         if api_key.workspace_id.0 != workspace_id.0 {
             return Err(WorkspaceError::ApiKeyNotFound);
         }
+        Self::check_api_key_change_permission(&api_key, &requester_id, &role)?;
 
         // If updating the name, check for duplicates
         if let Some(ref new_name) = name {
@@ -446,7 +504,7 @@ impl WorkspaceServiceTrait for WorkspaceServiceImpl {
         settings: Option<serde_json::Value>,
     ) -> Result<Workspace, WorkspaceError> {
         // Check permissions
-        self.check_workspace_permission(workspace_id.clone(), requester_id)
+        self.check_workspace_change_permission(workspace_id.clone(), requester_id)
             .await?;
 
         // If name is being updated, check for duplicates in the same organization
@@ -484,7 +542,7 @@ impl WorkspaceServiceTrait for WorkspaceServiceImpl {
         requester_id: UserId,
     ) -> Result<bool, WorkspaceError> {
         // Check permissions
-        self.check_workspace_permission(workspace_id.clone(), requester_id)
+        self.check_workspace_change_permission(workspace_id.clone(), requester_id)
             .await?;
 
         // Delete the workspace
@@ -578,7 +636,8 @@ impl WorkspaceServiceTrait for WorkspaceServiceImpl {
         requester_id: UserId,
     ) -> Result<bool, WorkspaceError> {
         // Check permissions
-        self.check_workspace_permission(workspace_id.clone(), requester_id)
+        let (_, _, role) = self
+            .workspace_member_role(workspace_id.clone(), requester_id.clone())
             .await?;
 
         // Verify the API key belongs to this workspace
@@ -592,6 +651,7 @@ impl WorkspaceServiceTrait for WorkspaceServiceImpl {
         if api_key.workspace_id.0 != workspace_id.0 {
             return Err(WorkspaceError::ApiKeyNotFound);
         }
+        Self::check_api_key_change_permission(&api_key, &requester_id, &role)?;
 
         // Revoke the API key
         self.api_key_repository

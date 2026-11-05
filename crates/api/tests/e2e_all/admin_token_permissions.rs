@@ -382,12 +382,15 @@ async fn post_previews_are_reads_but_confirmation_is_forbidden() {
 
 #[tokio::test]
 async fn database_encryption_reads_cannot_create_or_cancel_jobs() {
+    let user = Uuid::new_v4();
+    let creator_email = format!("test-{user}@test.com");
     let (server, db) = setup_test_server_with_config_and_database(|config| {
         config.auth.mock = false;
+        config.auth.admin_emails = vec![creator_email.clone()];
     })
     .await;
-    let (session, _) = setup_unique_test_session(&db).await;
-    let user = Uuid::parse_str(session.strip_prefix("rt_").unwrap()).unwrap();
+    setup_unique_test_session_with_user_id(&db, user).await;
+
     let repo = database::repositories::AdminAccessTokenRepository::new(db.pool().clone());
     let (_, token) = repo
         .create(
@@ -545,12 +548,15 @@ async fn unclassified_routes_deny_reads_and_preserve_authentication_context() {
 async fn permissions_preserve_expiration_revocation_user_agent_and_admin_eligibility() {
     // Use the real auth service so creator eligibility is loaded from the DB,
     // rather than the mock auth service's fixed admin user.
+    let user = Uuid::new_v4();
+    let creator_email = format!("test-{user}@test.com");
     let (server, db) = setup_test_server_with_config_and_database(|config| {
         config.auth.mock = false;
+        config.auth.admin_emails = vec![creator_email.clone()];
     })
     .await;
-    let (session, _) = setup_unique_test_session(&db).await;
-    let user = Uuid::parse_str(session.strip_prefix("rt_").unwrap()).unwrap();
+    setup_unique_test_session_with_user_id(&db, user).await;
+
     let repo = database::repositories::AdminAccessTokenRepository::new(db.pool().clone());
     for permission in [
         database::models::AdminAccessTokenPermission::ReadOnly,
@@ -597,7 +603,7 @@ async fn permissions_preserve_expiration_revocation_user_agent_and_admin_eligibi
         client
             .execute(
                 "UPDATE users SET email = $1 WHERE id = $2",
-                &[&format!("{user}@test.com"), &user],
+                &[&creator_email, &user],
             )
             .await
             .unwrap();
@@ -647,7 +653,7 @@ async fn permissions_preserve_expiration_revocation_user_agent_and_admin_eligibi
 #[tokio::test]
 async fn existing_service_tokens_follow_the_creator_email_allowlist() {
     let (allowed_server, db) = setup_test_server_with_config_and_database(|config| {
-        config.auth.admin_emails = vec!["ADMIN@TEST.COM".to_string()];
+        config.auth.admin_emails = vec![ADMIN_ALLOWLIST_EMAIL.to_ascii_uppercase()];
     })
     .await;
     let repo = database::repositories::AdminAccessTokenRepository::new(db.pool().clone());
@@ -675,7 +681,7 @@ async fn existing_service_tokens_follow_the_creator_email_allowlist() {
     assert_eq!(response.status_code(), StatusCode::OK);
 
     // The shared database retains the same token; only the server allowlist changes.
-    for emails in [vec!["other@test.com".to_string()], Vec::new()] {
+    for emails in [vec![NON_ADMIN_ALLOWLIST_EMAIL.to_string()], Vec::new()] {
         let denied_server = setup_test_server_with_config(|config| {
             config.auth.admin_emails = emails;
         })

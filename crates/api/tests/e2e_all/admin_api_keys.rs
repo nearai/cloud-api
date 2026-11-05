@@ -211,7 +211,7 @@ async fn test_admin_list_api_keys_requires_admin_auth() {
 #[tokio::test]
 async fn test_admin_list_api_keys_rejects_non_admin_users() {
     let server = setup_test_server_with_config(|config| {
-        config.auth.admin_emails = vec!["other@test.com".to_string()];
+        config.auth.admin_emails = vec![NON_ADMIN_ALLOWLIST_EMAIL.to_string()];
     })
     .await;
     let response = list_admin_api_keys(&server, "limit=1").await;

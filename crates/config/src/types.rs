@@ -1092,7 +1092,14 @@ impl AuthConfig {
             None
         };
 
-        let admin_emails = env::var("AUTH_ADMIN_EMAILS")
+        if env::var_os("AUTH_ADMIN_DOMAINS").is_some() {
+            return Err(
+                "AUTH_ADMIN_DOMAINS is retired; remove it and configure AUTH_ADMIN_EMAILS with complete email addresses"
+                    .to_string(),
+            );
+        }
+
+        let admin_emails: Vec<String> = env::var("AUTH_ADMIN_EMAILS")
             .ok()
             .map(|emails| {
                 emails
@@ -1102,6 +1109,15 @@ impl AuthConfig {
                     .collect()
             })
             .unwrap_or_default();
+
+        for (index, entry) in admin_emails.iter().enumerate() {
+            if admin_email_domain(entry).is_none() || entry.contains('*') {
+                return Err(format!(
+                    "AUTH_ADMIN_EMAILS entry {} is invalid; configure complete email addresses without wildcards",
+                    index + 1,
+                ));
+            }
+        }
 
         let near = NearConfig::from_env();
 
@@ -1954,6 +1970,21 @@ mod tests {
         env::set_var("AUTH_ADMIN_DOMAINS", "near.ai");
         env::remove_var("AUTH_ADMIN_EMAILS");
 
+        let error = AuthConfig::from_env().unwrap_err();
+
+        assert!(error.contains("AUTH_ADMIN_DOMAINS is retired"));
+        assert!(error.contains("AUTH_ADMIN_EMAILS"));
+
+        // Even a populated replacement requires removal of the retired setting.
+        env::set_var("AUTH_ADMIN_EMAILS", "alice@near.ai");
+        assert!(AuthConfig::from_env().is_err());
+
+        env::set_var("AUTH_ADMIN_DOMAINS", "");
+        assert!(AuthConfig::from_env().is_err());
+
+        env::remove_var("AUTH_ADMIN_DOMAINS");
+        env::remove_var("AUTH_ADMIN_EMAILS");
+
         let config = AuthConfig::from_env().unwrap();
 
         assert!(config.admin_emails.is_empty());
@@ -1973,6 +2004,16 @@ mod tests {
 
         assert!(config.admin_emails.is_empty());
         assert!(!config.is_admin_email("alice@near.ai"));
+
+        for invalid in ["near.ai", "*@near.ai", "x y@near.ai", "x@evil.com@near.ai"] {
+            env::set_var("AUTH_ADMIN_EMAILS", format!("alice@near.ai,{invalid}"));
+
+            let error = AuthConfig::from_env().unwrap_err();
+
+            assert!(error.contains("AUTH_ADMIN_EMAILS entry 2 is invalid"));
+            assert!(!error.contains(invalid));
+            assert!(!error.contains("alice@near.ai"));
+        }
     }
 
     #[test]

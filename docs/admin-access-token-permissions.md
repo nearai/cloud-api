@@ -59,7 +59,11 @@ and audit logging are permitted; business mutations are not.
 Platform admin eligibility is controlled by `AUTH_ADMIN_EMAILS`, a comma-separated
 list of complete email addresses matched case-insensitively against the stored
 account email (not the editable contact email). There is no domain wildcard or
-fallback to the retired `AUTH_ADMIN_DOMAINS`. Empty or unset means no admin access.
+fallback to the retired `AUTH_ADMIN_DOMAINS`. Remove the retired variable before
+startup, even if it is empty or `AUTH_ADMIN_EMAILS` is also configured; its presence
+is a configuration error. Invalid email entries and wildcards also fail startup
+with an entry index, without logging the configured address. Empty or unset
+`AUTH_ADMIN_EMAILS` means no admin access.
 Ordinary user login remains available. VPC-provisioned users remain ineligible.
 
 Before deploying, inventory active service tokens and their creators. Configure

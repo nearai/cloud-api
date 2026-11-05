@@ -35,7 +35,6 @@ async fn main() {
     // Load configuration and initialize logging
     let config = load_configuration();
     init_tracing(&config.logging);
-    tracing::debug!("Config: {:?}", config);
 
     // Initialize core services
     let database = init_database(&config.database).await;

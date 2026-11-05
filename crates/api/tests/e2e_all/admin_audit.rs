@@ -23,8 +23,9 @@ const AUDIT_HEADER: &str = "x-admin-audit-request-id";
 const REQUEST_ID_HEADER: &str = "x-request-id";
 
 /// Every admin route the app mounts: `build_admin_routes`, the admin
-/// feature-request route, and the database-encryption routes (mounted because
-/// the e2e configuration has a valid encryption key).
+/// feature-request route, the database-encryption routes (mounted because
+/// the e2e configuration has a valid encryption key), and the object-encryption
+/// router (using mock storage).
 const MOUNTED_ADMIN_ROUTES: &[(&str, &str)] = &[
     ("GET", "/admin/models"),
     ("PATCH", "/admin/models"),
@@ -106,8 +107,15 @@ const MOUNTED_ADMIN_ROUTES: &[(&str, &str)] = &[
     ("POST", "/admin/database-encryption/scan"),
     ("POST", "/admin/database-encryption/jobs"),
     ("GET", "/admin/database-encryption/jobs/{id}"),
+    ("GET", "/admin/database-encryption/keys"),
     ("POST", "/admin/database-encryption/jobs/{id}/cancel"),
     ("POST", "/admin/database-encryption/verify"),
+    ("GET", "/admin/object-encryption/keys"),
+    ("POST", "/admin/object-encryption/scan"),
+    ("POST", "/admin/object-encryption/jobs"),
+    ("GET", "/admin/object-encryption/jobs/{id}"),
+    ("POST", "/admin/object-encryption/jobs/{id}/cancel"),
+    ("POST", "/admin/object-encryption/verify"),
     ("GET", "/admin/feature-requests"),
 ];
 
@@ -325,9 +333,15 @@ fn audited_route_table_lists_every_mounted_admin_route() {
         .iter()
         .map(|(_, route)| *route)
         .collect();
+    let mounted: BTreeSet<&str> = [
+        include_str!("../../src/lib.rs"),
+        include_str!("../../src/object_encryption.rs"),
+    ]
+    .into_iter()
+    .flat_map(admin_route_literals)
+    .collect();
     assert_eq!(
-        listed,
-        admin_route_literals(include_str!("../../src/lib.rs")),
+        listed, mounted,
         "list new admin routes in MOUNTED_ADMIN_ROUTES so their audit events are tested"
     );
 

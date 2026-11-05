@@ -45,18 +45,58 @@ impl Organization {
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(true)
     }
+
+    /// The models this organization's owners and admins allow it to use
+    /// (`allowed_models`, canonical names). `None`: every model.
+    ///
+    /// The validated write path is `PATCH /v1/organizations/{org_id}/settings`.
+    /// A stored value that is not a list of strings, which only a full
+    /// settings `PUT` can write, allows no model: the filter fails closed.
+    pub fn allowed_models(&self) -> Option<std::collections::HashSet<String>> {
+        match self.settings.get(ALLOWED_MODELS_SETTING) {
+            None | Some(serde_json::Value::Null) => None,
+            Some(serde_json::Value::Array(entries)) => {
+                let names: Option<std::collections::HashSet<String>> = entries
+                    .iter()
+                    .map(|entry| entry.as_str().map(str::to_string))
+                    .collect();
+                Some(names.unwrap_or_else(|| {
+                    tracing::warn!(
+                        organization_id = %self.id,
+                        "allowed_models setting has entries that are not model names; allowing no model"
+                    );
+                    std::collections::HashSet::new()
+                }))
+            }
+            Some(_) => {
+                tracing::warn!(
+                    organization_id = %self.id,
+                    "allowed_models setting is not a list; allowing no model"
+                );
+                Some(std::collections::HashSet::new())
+            }
+        }
+    }
 }
+
+/// The organization setting that lists the models it may use.
+pub const ALLOWED_MODELS_SETTING: &str = "allowed_models";
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct OrganizationSettings {
     pub system_prompt: Option<String>,
     pub fallback_enabled: bool,
+    /// Canonical names, sorted. `None`: every model.
+    pub allowed_models: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct PatchOrganizationSettings {
     /// None = omitted, Some(None) = clear, Some(Some(value)) = set.
     pub system_prompt: Option<Option<String>>,
+    /// None = omitted, Some(None) = allow every model, Some(Some(names)) = allow
+    /// only these canonical names (validated by the caller, never empty).
+    pub allowed_models: Option<Option<Vec<String>>>,
     /// None = omitted, Some(None) = restore the default, Some(Some(value)) = set.
     pub fallback_enabled: Option<Option<bool>>,
 }

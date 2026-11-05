@@ -382,12 +382,15 @@ async fn post_previews_are_reads_but_confirmation_is_forbidden() {
 
 #[tokio::test]
 async fn database_encryption_reads_cannot_create_or_cancel_jobs() {
+    let user = Uuid::new_v4();
+    let creator_email = format!("test-{user}@test.com");
     let (server, db) = setup_test_server_with_config_and_database(|config| {
         config.auth.mock = false;
+        config.auth.admin_emails = vec![creator_email.clone()];
     })
     .await;
-    let (session, _) = setup_unique_test_session(&db).await;
-    let user = Uuid::parse_str(session.strip_prefix("rt_").unwrap()).unwrap();
+    setup_unique_test_session_with_user_id(&db, user).await;
+
     let repo = database::repositories::AdminAccessTokenRepository::new(db.pool().clone());
     let (_, token) = repo
         .create(
@@ -400,6 +403,27 @@ async fn database_encryption_reads_cannot_create_or_cancel_jobs() {
         )
         .await
         .unwrap();
+    for method in [Method::GET, Method::HEAD] {
+        assert_eq!(
+            call(
+                &server,
+                method,
+                "/v1/admin/database-encryption/keys",
+                &token,
+                json!({})
+            )
+            .await
+            .status_code(),
+            StatusCode::OK
+        );
+    }
+    for mode in ["execute", "dry_run"] {
+        assert_forbidden(
+            &call(&server, Method::POST, "/v1/admin/database-encryption/jobs", &token,
+                json!({"mode":mode,"scope":{"fields":[{"table":"files","column":"filename"}]},"actions":["rewrap"]})).await,
+            "insufficient_permissions",
+        );
+    }
     let scope = json!({"fields": [{"table": "files", "column": "filename"}]});
     let scan = call(
         &server,
@@ -545,12 +569,15 @@ async fn unclassified_routes_deny_reads_and_preserve_authentication_context() {
 async fn permissions_preserve_expiration_revocation_user_agent_and_admin_eligibility() {
     // Use the real auth service so creator eligibility is loaded from the DB,
     // rather than the mock auth service's fixed admin user.
+    let user = Uuid::new_v4();
+    let creator_email = format!("test-{user}@test.com");
     let (server, db) = setup_test_server_with_config_and_database(|config| {
         config.auth.mock = false;
+        config.auth.admin_emails = vec![creator_email.clone()];
     })
     .await;
-    let (session, _) = setup_unique_test_session(&db).await;
-    let user = Uuid::parse_str(session.strip_prefix("rt_").unwrap()).unwrap();
+    setup_unique_test_session_with_user_id(&db, user).await;
+
     let repo = database::repositories::AdminAccessTokenRepository::new(db.pool().clone());
     for permission in [
         database::models::AdminAccessTokenPermission::ReadOnly,
@@ -597,7 +624,7 @@ async fn permissions_preserve_expiration_revocation_user_agent_and_admin_eligibi
         client
             .execute(
                 "UPDATE users SET email = $1 WHERE id = $2",
-                &[&format!("{user}@test.com"), &user],
+                &[&creator_email, &user],
             )
             .await
             .unwrap();
@@ -642,4 +669,79 @@ async fn permissions_preserve_expiration_revocation_user_agent_and_admin_eligibi
         .status_code(),
         StatusCode::UNAUTHORIZED
     );
+}
+
+#[tokio::test]
+async fn existing_service_tokens_follow_the_creator_email_allowlist() {
+    let (allowed_server, db) = setup_test_server_with_config_and_database(|config| {
+        config.auth.admin_emails = vec![ADMIN_ALLOWLIST_EMAIL.to_ascii_uppercase()];
+    })
+    .await;
+    let repo = database::repositories::AdminAccessTokenRepository::new(db.pool().clone());
+    let (_, token) = repo
+        .create(
+            Uuid::parse_str(MOCK_USER_ID).unwrap(),
+            format!("allowlist-{}", Uuid::new_v4()),
+            "Existing service credential".to_string(),
+            chrono::Utc::now() + chrono::Duration::hours(1),
+            Some(MOCK_USER_AGENT.to_string()),
+            database::models::AdminAccessTokenPermission::ReadWrite,
+        )
+        .await
+        .unwrap();
+
+    let response = call(
+        &allowed_server,
+        Method::GET,
+        "/v1/admin/users",
+        &token,
+        json!({}),
+    )
+    .await;
+
+    assert_eq!(response.status_code(), StatusCode::OK);
+
+    // The shared database retains the same token; only the server allowlist changes.
+    for emails in [vec![NON_ADMIN_ALLOWLIST_EMAIL.to_string()], Vec::new()] {
+        let denied_server = setup_test_server_with_config(|config| {
+            config.auth.admin_emails = emails;
+        })
+        .await;
+
+        for credential in [&token, &get_session_id()] {
+            let response = call(
+                &denied_server,
+                Method::GET,
+                "/v1/admin/users",
+                credential,
+                json!({}),
+            )
+            .await;
+
+            assert_forbidden(&response, "forbidden");
+        }
+
+        // Ordinary authenticated user endpoints remain available.
+        let response = call(
+            &denied_server,
+            Method::GET,
+            "/v1/users/me",
+            &get_session_id(),
+            json!({}),
+        )
+        .await;
+
+        assert_eq!(response.status_code(), StatusCode::OK);
+    }
+
+    let response = call(
+        &allowed_server,
+        Method::GET,
+        "/v1/admin/users",
+        &token,
+        json!({}),
+    )
+    .await;
+
+    assert_eq!(response.status_code(), StatusCode::OK);
 }

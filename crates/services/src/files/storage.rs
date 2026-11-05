@@ -1,278 +1,175 @@
-use super::{encryption, FileServiceError};
+use super::encryption::{self, ObjectKeyRing};
+use super::FileServiceError;
 use async_trait::async_trait;
-use aws_sdk_s3::{primitives::ByteStream, Client as S3Client};
-use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
-use tracing::{debug, error};
 
-/// Trait for file storage operations
+mod mock;
+mod s3;
+
+pub use mock::MockStorage;
+pub use s3::S3Storage;
+
+const KEY_ID_METADATA: &str = "near-enc-key-id";
+
+/// Metadata classification retained when an encrypted envelope exceeds its byte limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObjectKeyState {
+    /// The stored id names the configured write key; ciphertext is not authenticated.
+    Current,
+    /// The id names a previous key, or the legacy object has no id.
+    StaleOrAbsent,
+    /// The stored id is not configured in this ring.
+    UnknownKeyId,
+}
+
+impl ObjectKeyState {
+    fn for_key_id(key_id: Option<&str>, ring: &ObjectKeyRing) -> Self {
+        match key_id {
+            Some(id) if id == ring.write_id() => Self::Current,
+            Some(id) if ring.lookup(id).is_none() => Self::UnknownKeyId,
+            Some(_) | None => Self::StaleOrAbsent,
+        }
+    }
+}
+
+/// Result of a metadata-trusting execute operation, distinct from ciphertext verification.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RewrapOutcome {
+    /// Metadata already names the write key; execute did not authenticate ciphertext.
+    AlreadyCurrent,
+    /// Ciphertext was authenticated with `from` and rewritten with the write key.
+    Rewrapped { from: String },
+    /// No permitted ring key authenticated the ciphertext.
+    Undecryptable,
+    /// An unconfigured metadata id was recovered by trial decryption and replaced.
+    RewrappedUnknownKeyId,
+    /// An unconfigured metadata id was present and no ring key authenticated ciphertext.
+    UndecryptableUnknownKeyId,
+}
+
+/// Independent metadata and permitted authentication results for key retirement checks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ObjectVerification {
+    /// Metadata names the configured write key.
+    pub is_current: bool,
+    /// The write key authenticates ciphertext and is permitted by the stored key id.
+    pub decrypts_under_write_key: bool,
+    /// A previous key authenticates ciphertext and is permitted by the stored key id.
+    pub decrypts_under_previous_key: bool,
+    /// Metadata names an unconfigured id; verification never trials that ciphertext.
+    pub unknown_key_id: bool,
+}
+
+impl ObjectVerification {
+    fn authenticate(data: &[u8], ring: &ObjectKeyRing, key_id: Option<&str>) -> Self {
+        let mut result = Self {
+            is_current: key_id == Some(ring.write_id()),
+            decrypts_under_write_key: false,
+            decrypts_under_previous_key: false,
+            unknown_key_id: matches!(
+                ObjectKeyState::for_key_id(key_id, ring),
+                ObjectKeyState::UnknownKeyId
+            ),
+        };
+        if result.unknown_key_id {
+            return result;
+        }
+        // Authenticate write-first, but never hide a mismatch with a known metadata id.
+        if encryption::decrypt_with_key(data, ring.write_key()).is_ok() {
+            result.decrypts_under_write_key = key_id.is_none() || result.is_current;
+            return result;
+        }
+        result.decrypts_under_previous_key = ring.entries().skip(1).any(|(id, key)| {
+            key_id.is_none_or(|hint| hint == id) && encryption::decrypt_with_key(data, key).is_ok()
+        });
+        result
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectMetadata {
+    /// Stored key id, absent for legacy envelopes.
+    pub key_id: Option<String>,
+    /// Stored envelope bytes: nonce + ciphertext + authentication tag, not plaintext.
+    pub content_length: u64,
+}
+
+impl ObjectMetadata {
+    fn enforce_limit(&self, max_bytes: u64, ring: &ObjectKeyRing) -> Result<(), FileServiceError> {
+        if self.content_length > max_bytes {
+            return Err(FileServiceError::ObjectTooLarge {
+                key_state: ObjectKeyState::for_key_id(self.key_id.as_deref(), ring),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Encrypted storage contract shared by the S3 adapter and in-memory test double.
+/// Both adapters preserve envelope format, strict known-id reads, write-first legacy
+/// trials, byte-limit classification, and metadata-versus-authentication outcomes.
 #[async_trait]
 pub trait StorageTrait: Send + Sync {
+    /// Encrypts plaintext with the write key and stores its id and content type.
     async fn upload(
         &self,
         key: &str,
         data: Vec<u8>,
         content_type: &str,
     ) -> Result<(), FileServiceError>;
-
+    /// Authenticates and decrypts; a known metadata id permits only its named key.
     async fn download(&self, key: &str) -> Result<Vec<u8>, FileServiceError>;
-
+    /// Removes an object; deleting an absent object succeeds.
     async fn delete(&self, key: &str) -> Result<(), FileServiceError>;
-
+    /// Reports object absence as false, preserving storage and permission failures.
     async fn exists(&self, key: &str) -> Result<bool, FileServiceError>;
-}
-
-#[derive(Clone)]
-pub struct S3Storage {
-    client: S3Client,
-    bucket: String,
-    encryption_key: String,
-}
-
-impl S3Storage {
-    pub fn new(client: S3Client, bucket: String, encryption_key: String) -> Self {
-        Self {
-            client,
-            bucket,
-            encryption_key,
-        }
+    /// Lists up to 1–1000 keys with an opaque continuation token for the next page.
+    async fn list_keys(
+        &self,
+        continuation: Option<String>,
+        max: i32,
+    ) -> Result<(Vec<String>, Option<String>), FileServiceError>;
+    /// Reads the key id and stored envelope length without downloading ciphertext.
+    async fn object_metadata(&self, key: &str) -> Result<ObjectMetadata, FileServiceError>;
+    /// Reads the stored id; absent objects fail, while legacy objects return None.
+    async fn object_key_id(&self, key: &str) -> Result<Option<String>, FileServiceError> {
+        Ok(self.object_metadata(key).await?.key_id)
     }
-}
-
-#[async_trait]
-impl StorageTrait for S3Storage {
-    /// Upload a file to S3 (with encryption)
-    async fn upload(
+    /// Re-encrypts with the write key within `max_bytes` stored envelope bytes.
+    /// Execute trusts current metadata and skips its ciphertext: run execute → verify
+    /// and retire keys only after verify passes. Rewrites preserve content type and
+    /// metadata. S3 uses If-Match when GET supplies an ETag, so concurrent changes or
+    /// deletion fail rather than overwrite/recreate; without an ETag its PUT is
+    /// unconditional. The mock holds a write lock for its atomic replacement.
+    async fn rewrap_object(
         &self,
         key: &str,
-        data: Vec<u8>,
-        content_type: &str,
-    ) -> Result<(), FileServiceError> {
-        debug!(
-            "Encrypting and uploading file to S3: bucket={}, key={}",
-            self.bucket, key
-        );
-
-        // Encrypt the data before uploading
-        let encrypted_data = encryption::encrypt(&data, &self.encryption_key)?;
-        debug!(
-            "File encrypted: original_size={}, encrypted_size={}",
-            data.len(),
-            encrypted_data.len()
-        );
-
-        let byte_stream = ByteStream::from(encrypted_data);
-
-        self.client
-            .put_object()
-            .bucket(&self.bucket)
-            .key(key)
-            .body(byte_stream)
-            .content_type(content_type)
-            .send()
-            .await
-            .map_err(|e| {
-                error!("Failed to upload file to S3: {}", e);
-                FileServiceError::StorageError(format!("Failed to upload file: {e}"))
-            })?;
-
-        debug!("Successfully uploaded encrypted file to S3: {}", key);
-        Ok(())
-    }
-
-    /// Download a file from S3 (with decryption)
-    async fn download(&self, key: &str) -> Result<Vec<u8>, FileServiceError> {
-        debug!(
-            "Downloading file from S3: bucket={}, key={}",
-            self.bucket, key
-        );
-
-        let response = self
-            .client
-            .get_object()
-            .bucket(&self.bucket)
-            .key(key)
-            .send()
-            .await
-            .map_err(|e| {
-                error!("Failed to download file from S3: {}", e);
-                FileServiceError::StorageError(format!("Failed to download file: {e:?}"))
-            })?;
-
-        let encrypted_data = response
-            .body
-            .collect()
-            .await
-            .map_err(|e| {
-                error!("Failed to read file data from S3: {}", e);
-                FileServiceError::StorageError(format!("Failed to read file data: {e}"))
-            })?
-            .into_bytes()
-            .to_vec();
-
-        debug!(
-            "Downloaded encrypted file from S3: {} bytes",
-            encrypted_data.len()
-        );
-
-        // Decrypt the data after downloading
-        let decrypted_data = encryption::decrypt(&encrypted_data, &self.encryption_key)?;
-        debug!(
-            "File decrypted: encrypted_size={}, decrypted_size={}",
-            encrypted_data.len(),
-            decrypted_data.len()
-        );
-
-        Ok(decrypted_data)
-    }
-
-    /// Delete a file from S3
-    async fn delete(&self, key: &str) -> Result<(), FileServiceError> {
-        debug!("Deleting file from S3: bucket={}, key={}", self.bucket, key);
-
-        self.client
-            .delete_object()
-            .bucket(&self.bucket)
-            .key(key)
-            .send()
-            .await
-            .map_err(|e| {
-                error!("Failed to delete file from S3: {}", e);
-                FileServiceError::StorageError(format!("Failed to delete file: {e}"))
-            })?;
-
-        debug!("Successfully deleted file from S3: {}", key);
-        Ok(())
-    }
-
-    /// Check if a file exists in S3
-    async fn exists(&self, key: &str) -> Result<bool, FileServiceError> {
-        match self
-            .client
-            .head_object()
-            .bucket(&self.bucket)
-            .key(key)
-            .send()
-            .await
-        {
-            Ok(_) => Ok(true),
-            Err(e) => {
-                let error_str = e.to_string();
-                if error_str.contains("Not Found") || error_str.contains("404") {
-                    Ok(false)
-                } else {
-                    error!("Failed to check file existence in S3: {}", e);
-                    Err(FileServiceError::StorageError(format!(
-                        "Failed to check file existence: {e}"
-                    )))
-                }
-            }
-        }
-    }
-}
-
-/// Mock storage for testing (stores files in memory)
-#[derive(Clone)]
-pub struct MockStorage {
-    files: Arc<RwLock<HashMap<String, Vec<u8>>>>,
-    encryption_key: String,
-}
-
-impl MockStorage {
-    pub fn new(encryption_key: String) -> Self {
-        Self {
-            files: Arc::new(RwLock::new(HashMap::new())),
-            encryption_key,
-        }
-    }
-}
-
-#[async_trait]
-impl StorageTrait for MockStorage {
-    async fn upload(
+        max_bytes: u64,
+    ) -> Result<RewrapOutcome, FileServiceError>;
+    /// Authenticates within `max_bytes` stored envelope bytes without rewriting.
+    /// Write-key authentication is checked first, then permitted previous keys.
+    /// Unknown metadata ids are reported without trial decryption. Known ids never
+    /// permit another key to mask a mismatch; absent ids permit the full ring.
+    async fn verify_object(
         &self,
         key: &str,
-        data: Vec<u8>,
-        _content_type: &str,
-    ) -> Result<(), FileServiceError> {
-        debug!("Mock storage: uploading file with key: {}", key);
+        max_bytes: u64,
+    ) -> Result<ObjectVerification, FileServiceError>;
+}
 
-        // Encrypt the data (same as S3)
-        let encrypted_data = encryption::encrypt(&data, &self.encryption_key)?;
-
-        let mut files = self.files.write().unwrap();
-        files.insert(key.to_string(), encrypted_data);
-
-        debug!("Mock storage: file uploaded successfully");
-        Ok(())
-    }
-
-    async fn download(&self, key: &str) -> Result<Vec<u8>, FileServiceError> {
-        debug!("Mock storage: downloading file with key: {}", key);
-
-        let files = self.files.read().unwrap();
-        let encrypted_data = files.get(key).ok_or(FileServiceError::NotFound)?.clone();
-
-        // Decrypt the data (same as S3)
-        let decrypted_data = encryption::decrypt(&encrypted_data, &self.encryption_key)?;
-
-        debug!("Mock storage: file downloaded successfully");
-        Ok(decrypted_data)
-    }
-
-    async fn delete(&self, key: &str) -> Result<(), FileServiceError> {
-        debug!("Mock storage: deleting file with key: {}", key);
-
-        let mut files = self.files.write().unwrap();
-        files.remove(key);
-
-        debug!("Mock storage: file deleted successfully");
-        Ok(())
-    }
-
-    async fn exists(&self, key: &str) -> Result<bool, FileServiceError> {
-        let files = self.files.read().unwrap();
-        Ok(files.contains_key(key))
+fn page_size(max: i32) -> Result<usize, FileServiceError> {
+    match usize::try_from(max) {
+        Ok(size @ 1..=1000) => Ok(size),
+        Ok(_) | Err(_) => Err(FileServiceError::StorageError(
+            "Object page size must be between 1 and 1000".into(),
+        )),
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use std::time::Duration;
-
-    use aws_sdk_s3::{
-        config::{BehaviorVersion, Credentials, Region},
-        presigning::PresigningConfig,
-    };
-
-    use super::*;
-
-    #[tokio::test]
-    async fn regional_s3_requests_use_sigv4_without_sigv4a() {
-        let config = aws_sdk_s3::Config::builder()
-            .behavior_version(BehaviorVersion::latest())
-            .region(Region::new("us-east-1"))
-            .credentials_provider(Credentials::new(
-                "test-access-key",
-                "test-secret-key",
-                None,
-                None,
-                "test",
-            ))
-            .build();
-        let client = S3Client::from_conf(config);
-
-        // Presigning exercises endpoint resolution and signing without AWS I/O.
-        let request = client
-            .get_object()
-            .bucket("regional-test-bucket")
-            .key("test-object")
-            .presigned(PresigningConfig::expires_in(Duration::from_secs(60)).unwrap())
-            .await
-            .unwrap();
-
-        assert!(request.uri().contains("X-Amz-Algorithm=AWS4-HMAC-SHA256"));
-        assert!(request.uri().contains("us-east-1%2Fs3%2Faws4_request"));
-        assert!(request.uri().contains("X-Amz-Signature="));
-    }
-}
+mod mock_tests;
+#[cfg(test)]
+mod review_tests;
+#[cfg(test)]
+mod s3_tests;
+#[cfg(test)]
+mod verification_tests;

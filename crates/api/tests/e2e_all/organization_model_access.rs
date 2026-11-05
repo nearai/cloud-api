@@ -43,6 +43,8 @@ enum ModelKind {
 
 struct Fixture {
     server: axum_test::TestServer,
+    /// The router behind `server`, for a test that serves it on a real port.
+    router: axum::Router,
     database: Arc<database::Database>,
     pool: Arc<services::inference_provider_pool::InferenceProviderPool>,
     /// Serves every fixture model and records the chat requests it receives.
@@ -107,6 +109,11 @@ async fn upsert_models(server: &axum_test::TestServer, models: Vec<(&str, Value)
 /// A server with one unlisted model of each kind, all served by one mock
 /// provider. Each has a planned deprecation and names a listed successor.
 async fn setup() -> Fixture {
+    setup_with(|_| {}).await
+}
+
+/// [`setup`] with further configuration.
+async fn setup_with(configure: impl FnOnce(&mut config::ApiConfig)) -> Fixture {
     let suffix = Uuid::new_v4();
     let text = format!("access-text/model-{suffix}");
     let text_alias = format!("access-text-alias-{suffix}");
@@ -115,10 +122,11 @@ async fn setup() -> Fixture {
     let native = format!("openai/access-native-model-{suffix}");
     let successor = format!("access-successor/model-{suffix}");
 
-    let (server, pool, _shared_mock, database) =
-        setup_test_server_with_pool_and_config(move |config| {
+    let (server, router, pool, _shared_mock, database) =
+        setup_test_server_with_pool_config_and_router(move |config| {
             config.internal_usage_token = Some(INTERNAL_TOKEN.to_string());
             config.external_providers.enable_anthropic_messages = true;
+            configure(config);
         })
         .await;
 
@@ -201,6 +209,7 @@ async fn setup() -> Fixture {
 
     Fixture {
         server,
+        router,
         database,
         pool,
         provider,
@@ -826,7 +835,6 @@ fn every_registered_route_has_a_model_access_decision() {
         ("GET", "/docs"),
         ("GET", "/api-docs/openapi.json"),
         // Sign-in and invitations.
-        ("POST", "/auth/vpc/login"),
         ("POST", "/near"),
         ("GET", "/login"),
         ("GET", "/github"),
@@ -2183,4 +2191,593 @@ async fn usage_is_recorded_for_an_organization_without_a_grant() {
     assert_eq!(body["model"], fixture.text.as_str());
     assert_eq!(body["input_cost"], 1_000_000_000i64);
     assert_eq!(body["output_cost"], 400_000_000i64);
+}
+
+fn settings_path(organization_id: &str) -> String {
+    format!("/v1/organizations/{organization_id}/settings")
+}
+
+/// `PATCH /v1/organizations/{org_id}/settings` with `access_token`.
+async fn patch_settings(
+    server: &axum_test::TestServer,
+    access_token: &str,
+    organization_id: &str,
+    body: Value,
+) -> axum_test::TestResponse {
+    server
+        .patch(&settings_path(organization_id))
+        .add_header("Authorization", format!("Bearer {access_token}"))
+        .json(&body)
+        .await
+}
+
+/// The owner's access token (the mock session user owns every test
+/// organization).
+async fn owner_token(server: &axum_test::TestServer) -> String {
+    get_access_token_from_refresh_token(server, get_session_id()).await
+}
+
+/// Limit `organization` to `models` as its owner; returns what was stored.
+async fn allow_models(
+    server: &axum_test::TestServer,
+    organization_id: &str,
+    models: &[&str],
+) -> Vec<String> {
+    let response = patch_settings(
+        server,
+        &owner_token(server).await,
+        organization_id,
+        json!({ "allowed_models": models }),
+    )
+    .await;
+    assert_eq!(response.status_code(), 200, "{}", response.text());
+    response
+        .json::<api::models::OrganizationSettingsResponse>()
+        .settings
+        .allowed_models
+        .expect("a filter is set")
+}
+
+/// Allow every model again, as the owner.
+async fn allow_every_model(server: &axum_test::TestServer, organization_id: &str) {
+    let response = patch_settings(
+        server,
+        &owner_token(server).await,
+        organization_id,
+        json!({ "allowed_models": null }),
+    )
+    .await;
+    assert_eq!(response.status_code(), 200, "{}", response.text());
+    assert_eq!(
+        response
+            .json::<api::models::OrganizationSettingsResponse>()
+            .settings
+            .allowed_models,
+        None
+    );
+}
+
+/// An organization that set `allowed_models` gets, for any model it did not
+/// list, exactly the answer an unknown model gets, on every route that takes
+/// a model name, by name and by alias. Listing the model opens it; other
+/// organizations keep every listed model.
+#[tokio::test]
+async fn an_organization_filter_closes_unlisted_models_on_every_route() {
+    let fixture = setup().await;
+    let server = &fixture.server;
+    let kinds = [
+        ModelKind::Text,
+        ModelKind::Decisions,
+        ModelKind::Anthropic,
+        ModelKind::NativeResponses,
+    ];
+    for kind in kinds {
+        set_listed(server, fixture.model(kind), true).await;
+    }
+    let filtered = organization(server).await;
+    let other = organization(server).await;
+    allow_models(server, &filtered.id, &[&fixture.successor]).await;
+
+    for &route in ROUTES {
+        let model = fixture.model(route.model_kind());
+        let unknown = unknown_twin(model);
+        let missing = observe(
+            &send(server, route, &filtered.api_key, &unknown).await,
+            &unknown,
+        );
+        let refused = observe(&send(server, route, &filtered.api_key, model).await, model);
+        assert!(
+            (400..500).contains(&missing.status) || missing.body.contains("event: response.failed"),
+            "{route:?}: an unknown model must be an error: {missing:?}"
+        );
+        assert_eq!(
+            refused, missing,
+            "{route:?}: a model the organization did not allow must look unknown"
+        );
+        if route.mock_serves_it() {
+            let served = send(server, route, &other.api_key, model).await;
+            assert_eq!(
+                served.status_code(),
+                200,
+                "{route:?}: an organization without a filter keeps every listed model: {}",
+                served.text()
+            );
+        }
+        if route.model_kind() == ModelKind::Text {
+            let alias = &fixture.text_alias;
+            let unknown_alias = unknown_twin(alias);
+            let missing = observe(
+                &send(server, route, &filtered.api_key, &unknown_alias).await,
+                &unknown_alias,
+            );
+            let refused = observe(&send(server, route, &filtered.api_key, alias).await, alias);
+            assert_eq!(refused, missing, "{route:?}: by alias");
+        }
+    }
+
+    // Allowing the models opens them, at once, on every route.
+    let all: Vec<&str> = kinds.iter().map(|&kind| fixture.model(kind)).collect();
+    allow_models(server, &filtered.id, &all).await;
+    for &route in ROUTES {
+        let model = fixture.model(route.model_kind());
+        let unknown = unknown_twin(model);
+        let missing = observe(
+            &send(server, route, &filtered.api_key, &unknown).await,
+            &unknown,
+        );
+        let allowed = send(server, route, &filtered.api_key, model).await;
+        if route.mock_serves_it() {
+            assert_eq!(
+                allowed.status_code(),
+                200,
+                "{route:?}: an allowed model must be served: {}",
+                allowed.text()
+            );
+        }
+        assert_ne!(
+            observe(&allowed, model),
+            missing,
+            "{route:?}: an allowed model must move past the unknown-model answer"
+        );
+    }
+
+    // The successor is no longer on the list: closed. Null opens it again.
+    fixture
+        .pool
+        .register_provider(fixture.successor.clone(), fixture.provider.clone())
+        .await;
+    let successor = &fixture.successor;
+    let unknown = unknown_twin(successor);
+    let key = &filtered.api_key;
+    assert_eq!(
+        observe(
+            &send(server, Route::ChatCompletions, key, successor).await,
+            successor
+        ),
+        observe(
+            &send(server, Route::ChatCompletions, key, &unknown).await,
+            &unknown
+        )
+    );
+    allow_every_model(server, &filtered.id).await;
+    let served = send(server, Route::ChatCompletions, key, successor).await;
+    assert_eq!(served.status_code(), 200, "{}", served.text());
+}
+
+/// The filter only narrows: an unlisted model on the list still needs a
+/// grant, and naming one without a grant is refused like an unknown model,
+/// so the setting discloses nothing. Names are stored canonical.
+#[tokio::test]
+async fn allowed_models_are_validated_and_stored_canonical() {
+    let fixture = setup().await;
+    let server = &fixture.server;
+    set_listed(server, &fixture.text, true).await;
+    let org = organization(server).await;
+    let token = owner_token(server).await;
+    let unknown = unknown_twin(&fixture.decisions);
+
+    for (body, expected) in [
+        (
+            json!({ "allowed_models": [] }),
+            "send null to allow every model",
+        ),
+        (json!({ "allowed_models": [unknown] }), "not found"),
+        // Unlisted, no grant: the same answer as an unknown name.
+        (
+            json!({ "allowed_models": [fixture.decisions] }),
+            "not found",
+        ),
+    ] {
+        let response = patch_settings(server, &token, &org.id, body.clone()).await;
+        assert_eq!(response.status_code(), 400, "{body}: {}", response.text());
+        assert!(
+            response.text().contains(expected),
+            "{body}: {}",
+            response.text()
+        );
+    }
+    let refused_unlisted = patch_settings(
+        server,
+        &token,
+        &org.id,
+        json!({ "allowed_models": [fixture.decisions] }),
+    )
+    .await
+    .text()
+    .replace(&fixture.decisions, "<model>");
+    let refused_unknown = patch_settings(
+        server,
+        &token,
+        &org.id,
+        json!({ "allowed_models": [unknown] }),
+    )
+    .await
+    .text()
+    .replace(&unknown, "<model>");
+    assert_eq!(refused_unlisted, refused_unknown);
+
+    // An alias is stored as the canonical name, duplicates once.
+    let alias = fixture.text_alias.as_str();
+    assert_eq!(
+        allow_models(server, &org.id, &[alias, &fixture.text]).await,
+        vec![fixture.text.clone()]
+    );
+    let settings = server
+        .get(&settings_path(&org.id))
+        .add_header("Authorization", format!("Bearer {token}"))
+        .await
+        .json::<api::models::OrganizationSettingsResponse>();
+    assert_eq!(
+        settings.settings.allowed_models,
+        Some(vec![fixture.text.clone()])
+    );
+
+    // With a grant the unlisted model can be listed, and is served.
+    grant(server, &fixture.decisions, &org.id).await;
+    let mut both = vec![fixture.text.clone(), fixture.decisions.clone()];
+    both.sort();
+    assert_eq!(
+        allow_models(server, &org.id, &[&fixture.decisions, &fixture.text]).await,
+        both
+    );
+    let served = send(server, Route::SystemOne, &org.api_key, &fixture.decisions).await;
+    assert_eq!(served.status_code(), 200, "{}", served.text());
+}
+
+/// Owners and admins manage the filter; members cannot. (The settings routes
+/// take a signed-in session, never an API key; the e2e mock auth accepts any
+/// token as a session, so that half is not observable here.)
+#[tokio::test]
+async fn owners_and_admins_manage_allowed_models() {
+    let fixture = setup().await;
+    let server = &fixture.server;
+    set_listed(server, &fixture.text, true).await;
+    let org = organization(server).await;
+    let (admin_session, _) = setup_unique_test_session(&fixture.database).await;
+    let (member_session, _) = setup_unique_test_session(&fixture.database).await;
+    let admin_id = Uuid::parse_str(admin_session.trim_start_matches("rt_")).unwrap();
+    let member_id = Uuid::parse_str(member_session.trim_start_matches("rt_")).unwrap();
+    let org_id = Uuid::parse_str(&org.id).unwrap();
+    fixture
+        .database
+        .pool()
+        .get()
+        .await
+        .expect("database connection")
+        .execute(
+            "INSERT INTO organization_members (organization_id, user_id, role) VALUES ($1, $2, 'admin'), ($1, $3, 'member')",
+            &[&org_id, &admin_id, &member_id],
+        )
+        .await
+        .expect("insert organization roles");
+    let body = json!({ "allowed_models": [fixture.text] });
+
+    let member = patch_settings(server, &member_session, &org.id, body.clone()).await;
+    assert_eq!(member.status_code(), 403, "{}", member.text());
+    // The same refusal whatever the names: a member learns nothing from
+    // validation either.
+    for names in [
+        json!([]),
+        json!([unknown_twin(&fixture.text)]),
+        json!([fixture.decisions]),
+    ] {
+        let refused = patch_settings(
+            server,
+            &member_session,
+            &org.id,
+            json!({ "allowed_models": names }),
+        )
+        .await;
+        assert_eq!(
+            (refused.status_code(), refused.text()),
+            (member.status_code(), member.text()),
+            "{names}"
+        );
+    }
+
+    // A non-member gets the same refusal whatever the names, so it cannot
+    // learn which unlisted models the organization holds a grant for.
+    grant(server, &fixture.decisions, &org.id).await;
+    let (outsider_session, _) = setup_unique_test_session(&fixture.database).await;
+    for names in [
+        json!([fixture.decisions]),
+        json!([unknown_twin(&fixture.decisions)]),
+    ] {
+        let outsider = patch_settings(
+            server,
+            &outsider_session,
+            &org.id,
+            json!({ "allowed_models": names }),
+        )
+        .await;
+        assert_eq!(outsider.status_code(), 403, "{names}: {}", outsider.text());
+    }
+    // Nothing was stored.
+    let settings = server
+        .get(&settings_path(&org.id))
+        .add_header(
+            "Authorization",
+            format!("Bearer {}", owner_token(server).await),
+        )
+        .await
+        .json::<api::models::OrganizationSettingsResponse>();
+    assert_eq!(settings.settings.allowed_models, None);
+
+    let admin = patch_settings(server, &admin_session, &org.id, body).await;
+    assert_eq!(admin.status_code(), 200, "{}", admin.text());
+}
+
+async fn catalog(
+    server: &axum_test::TestServer,
+    api_key: Option<&str>,
+) -> (Vec<String>, Option<String>) {
+    let mut request = server.get("/v1/models");
+    if let Some(api_key) = api_key {
+        request = request.add_header("Authorization", format!("Bearer {api_key}"));
+    }
+    let response = request.await;
+    assert_eq!(response.status_code(), 200, "{}", response.text());
+    assert_eq!(
+        response.headers().get("vary").and_then(|v| v.to_str().ok()),
+        Some("Authorization")
+    );
+    let cache_control = response
+        .headers()
+        .get("cache-control")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    let mut ids: Vec<String> = response
+        .json::<api::models::ModelsResponse>()
+        .data
+        .into_iter()
+        .map(|model| model.id)
+        .collect();
+    ids.sort();
+    (ids, cache_control)
+}
+
+/// `GET /v1/models` answers the API key of an organization with a filter
+/// with the models it may use. Everyone else gets the public catalog,
+/// including a request whose key does not authenticate.
+#[tokio::test]
+async fn models_catalog_lists_only_the_allowed_models_of_a_filtered_organization() {
+    let fixture = setup().await;
+    let server = &fixture.server;
+    set_listed(server, &fixture.text, true).await;
+    let filtered = organization(server).await;
+    let other = organization(server).await;
+
+    let (public, _) = catalog(server, None).await;
+    assert!(public.contains(&fixture.text));
+    assert!(public.contains(&fixture.successor));
+    assert!(!public.contains(&fixture.decisions), "unlisted stays out");
+
+    grant(server, &fixture.decisions, &filtered.id).await;
+    allow_models(server, &filtered.id, &[&fixture.text, &fixture.decisions]).await;
+
+    let (own, own_cache) = catalog(server, Some(&filtered.api_key)).await;
+    let mut expected = vec![fixture.text.clone(), fixture.decisions.clone()];
+    expected.sort();
+    assert_eq!(own, expected);
+    // The same with the key as `x-api-key`, as an Anthropic SDK sends it.
+    let by_x_api_key = server
+        .get("/v1/models")
+        .add_header("x-api-key", filtered.api_key.clone())
+        .await;
+    let mut ids: Vec<String> = by_x_api_key
+        .json::<api::models::ModelsResponse>()
+        .data
+        .into_iter()
+        .map(|model| model.id)
+        .collect();
+    ids.sort();
+    assert_eq!(ids, expected);
+    assert!(
+        own_cache.as_deref().is_some_and(|v| v.contains("no-store")),
+        "{own_cache:?}"
+    );
+
+    for api_key in [
+        None,
+        Some(other.api_key.as_str()),
+        Some("sk-not-a-real-key"),
+    ] {
+        let (ids, _) = catalog(server, api_key).await;
+        assert_eq!(ids, public, "{api_key:?}");
+    }
+
+    allow_every_model(server, &filtered.id).await;
+    let (ids, _) = catalog(server, Some(&filtered.api_key)).await;
+    assert_eq!(ids, public);
+}
+
+/// A fixture whose router is also served on a real port, with the OHTTP
+/// gateway on. The gateway sends the request it decrypts to
+/// `127.0.0.1:{config.server.port}`, so the port must be bound first.
+async fn setup_with_ohttp() -> Fixture {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind a loopback port");
+    let port = listener.local_addr().expect("bound address").port();
+    let fixture = setup_with(move |config| {
+        config.server.ohttp_enabled = true;
+        config.server.port = port;
+    })
+    .await;
+    let router = fixture.router.clone();
+    tokio::spawn(async move {
+        axum::serve(listener, router)
+            .await
+            .expect("loopback server");
+    });
+    fixture
+}
+
+/// The inner answer of an OHTTP request: (status, body).
+struct OhttpAnswer {
+    status: u16,
+    body: String,
+}
+
+/// Encrypt `POST {path}` with `body` (and the inner `headers`) to the
+/// gateway's key, post it to `/ohttp` with `Authorization: Bearer
+/// {outer_api_key}` as a relay does, and decrypt the answer.
+async fn ohttp_post(
+    server: &axum_test::TestServer,
+    outer_api_key: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: &Value,
+) -> OhttpAnswer {
+    let key_config = server.get("/.well-known/ohttp-gateway").await;
+    assert_eq!(key_config.status_code(), 200, "{}", key_config.text());
+    let mut key_config =
+        ohttp::KeyConfig::decode(key_config.as_bytes()).expect("a valid key configuration");
+    let client = ohttp::ClientRequest::from_config(&mut key_config).expect("an OHTTP client");
+
+    let mut inner = bhttp::Message::request(
+        b"POST".to_vec(),
+        b"https".to_vec(),
+        b"api.invalid".to_vec(),
+        path.as_bytes().to_vec(),
+    );
+    inner.put_header("content-type", "application/json");
+    for (name, value) in headers {
+        inner.put_header(*name, *value);
+    }
+    inner.write_content(serde_json::to_vec(body).expect("a JSON body"));
+    let mut encoded = Vec::new();
+    inner
+        .write_bhttp(bhttp::Mode::KnownLength, &mut encoded)
+        .expect("a BHTTP request");
+    let (encapsulated, client_response) = client.encapsulate(&encoded).expect("encapsulated");
+
+    let response = server
+        .post("/ohttp")
+        .add_header("Authorization", format!("Bearer {outer_api_key}"))
+        .add_header("Content-Type", "message/ohttp-req")
+        .bytes(Bytes::from(encapsulated))
+        .await;
+    assert_eq!(response.status_code(), 200, "{}", response.text());
+    let decrypted = client_response
+        .decapsulate(response.as_bytes())
+        .expect("a response for this request");
+    let inner =
+        bhttp::Message::read_bhttp(&mut std::io::Cursor::new(decrypted)).expect("a BHTTP response");
+    OhttpAnswer {
+        status: inner.control().status().expect("a response status").code(),
+        body: String::from_utf8_lossy(inner.content()).into_owned(),
+    }
+}
+
+/// A relay forwards an encrypted request to `POST /ohttp` with the caller's
+/// key as the outer `Authorization`, and cannot see which model or route the
+/// request names. The gateway sends the decrypted request through the same
+/// routes over a loopback connection, so the organization's filter holds on
+/// that path too, whatever the encrypted request says, including its own
+/// `Authorization`.
+#[tokio::test]
+async fn an_organization_filter_holds_for_requests_relayed_through_ohttp() {
+    let fixture = setup_with_ohttp().await;
+    let server = &fixture.server;
+    let allowed = &fixture.text;
+    let refused = &fixture.successor;
+    set_listed(server, allowed, true).await;
+    fixture
+        .pool
+        .register_provider(refused.clone(), fixture.provider.clone())
+        .await;
+    let filtered = organization(server).await;
+    let other = organization(server).await;
+    allow_models(server, &filtered.id, &[allowed]).await;
+
+    let chat = |model: &str| {
+        json!({
+            "model": model,
+            "messages": [{ "role": "user", "content": "Hello" }],
+            "max_tokens": 16
+        })
+    };
+    let embedding = |model: &str| json!({ "model": model, "input": "Hello" });
+    let unknown = unknown_twin(refused);
+
+    for (path, body, unknown_body) in [
+        ("/v1/chat/completions", chat(refused), chat(&unknown)),
+        ("/v1/embeddings", embedding(refused), embedding(&unknown)),
+    ] {
+        let missing = ohttp_post(server, &filtered.api_key, path, &[], &unknown_body).await;
+        assert!(
+            (400..500).contains(&missing.status),
+            "{path}: {}",
+            missing.body
+        );
+        let blank = |answer: &OhttpAnswer, model: &str| {
+            (answer.status, answer.body.replace(model, "<model>"))
+        };
+        let expected = blank(&missing, &unknown);
+
+        let answer = ohttp_post(server, &filtered.api_key, path, &[], &body).await;
+        assert_eq!(
+            blank(&answer, refused),
+            expected,
+            "{path}: a model the organization did not allow must look unknown through OHTTP"
+        );
+
+        // The outer key wins over an inner one of an organization without a
+        // filter, so the encrypted request cannot switch keys.
+        let inner_key = format!("Bearer {}", other.api_key);
+        let answer = ohttp_post(
+            server,
+            &filtered.api_key,
+            path,
+            &[("authorization", inner_key.as_str())],
+            &body,
+        )
+        .await;
+        assert_eq!(blank(&answer, refused), expected, "{path}: inner key");
+    }
+
+    // The allowed model is served through OHTTP.
+    let served = ohttp_post(
+        server,
+        &filtered.api_key,
+        "/v1/chat/completions",
+        &[],
+        &chat(allowed),
+    )
+    .await;
+    assert_eq!(served.status, 200, "{}", served.body);
+
+    // The refusal above came from the filter: without it, the same request
+    // is served.
+    allow_every_model(server, &filtered.id).await;
+    let served = ohttp_post(
+        server,
+        &filtered.api_key,
+        "/v1/chat/completions",
+        &[],
+        &chat(refused),
+    )
+    .await;
+    assert_eq!(served.status, 200, "{}", served.body);
 }

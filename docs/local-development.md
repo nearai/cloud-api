@@ -129,13 +129,13 @@ Two ways to mint a token:
 #### Admin endpoints under mock auth
 
 The seeded mock user is `admin@test.com`. Admin access requires a well-formed
-email in a domain explicitly set in `AUTH_ADMIN_DOMAINS` (no default; empty means
+email address explicitly listed in `AUTH_ADMIN_EMAILS` (no default; empty means
 nobody is an admin), and VPC-provisioned users are never admins. Thus
 `admin@test.com` is **not** an admin out of the box.
-To exercise `/v1/admin/*` locally with mock auth, add `test.com`:
+To exercise `/v1/admin/*` locally with mock auth, add `admin@test.com`:
 
 ```env
-AUTH_ADMIN_DOMAINS=near.ai,near.org,test.com
+AUTH_ADMIN_EMAILS=admin@test.com
 ```
 
 #### Headers used below
@@ -297,12 +297,12 @@ If you want to populate models the same way prod does, use
 `HashMap<model_id, UpdateModelApiRequest>` — note that `inferenceUrl`
 is **camelCase**; the snake_case form is silently ignored.
 
-Admin endpoints are gated by `AUTH_ADMIN_DOMAINS`, which has no default (empty
+Admin endpoints are gated by `AUTH_ADMIN_EMAILS`, which has no default (empty
 means nobody is an admin). Set it explicitly for local testing, including
-`test.com` for the seeded mock user `admin@test.com`:
+`admin@test.com` for the seeded mock user `admin@test.com`:
 
 ```env
-AUTH_ADMIN_DOMAINS=near.ai,near.org,test.com
+AUTH_ADMIN_EMAILS=admin@test.com
 ```
 
 Then:
@@ -471,8 +471,8 @@ starts with `rt_`. The `User-Agent: Mock User Agent` header is only
 required for refresh-token endpoints (e.g. `POST /v1/users/me/access_tokens`).
 
 **403 on `/v1/admin/*` with mock auth**
-The seeded mock user is `admin@test.com`. `AUTH_ADMIN_DOMAINS` has no default
-(empty means nobody is an admin); set it explicitly with `test.com` in the
+The seeded mock user is `admin@test.com`. `AUTH_ADMIN_EMAILS` has no default
+(empty means nobody is an admin); set it explicitly with `admin@test.com` in the
 list (see §5 Option C) and restart the server.
 
 **401 on API-key endpoints right after creating the key**

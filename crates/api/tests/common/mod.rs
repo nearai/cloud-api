@@ -6,11 +6,13 @@
 //! orgs/workspaces/keys, not separate databases.
 
 pub mod db_setup;
+mod encryption_jobs;
 pub mod fake_ita;
 pub mod ita_evidence;
 pub mod ita_server;
 
 pub use db_setup::MOCK_USER_ID;
+pub use encryption_jobs::EncryptionJobsCleanup;
 pub use ita_evidence::setup_test_server_with_config_and_ita_model_evidence;
 pub use ita_server::{setup_ita_server, setup_ita_server_with_env_policy, ItaServerMode};
 
@@ -43,6 +45,9 @@ use ed25519_dalek::{Signature as Ed25519Signature, VerifyingKey as Ed25519Verify
 use k256::ecdsa::{RecoveryId, Signature as EcdsaSignature, VerifyingKey};
 #[cfg(test)]
 use sha3::Keccak256;
+
+pub const ADMIN_ALLOWLIST_EMAIL: &str = "admin@test.com";
+pub const NON_ADMIN_ALLOWLIST_EMAIL: &str = "other@test.com";
 
 pub(super) const E2E_APP_BUILD_OPTIONS: AppBuildOptions = AppBuildOptions {
     // Individual encryption jobs still start from their request handler. Only
@@ -105,7 +110,7 @@ pub fn test_config() -> ApiConfig {
             github: None,
             google: None,
             near: config::NearConfig::default(),
-            admin_domains: vec!["test.com".to_string()],
+            admin_emails: vec![ADMIN_ALLOWLIST_EMAIL.to_string()],
             admin_read_only_tokens_enabled: false,
             require_session_bound_access_tokens: false,
         },
@@ -132,10 +137,14 @@ pub fn test_config() -> ApiConfig {
         // mock-storage and database-encryption behavior across processes.
         database_encryption_key: "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
             .to_string(),
+        database_encryption_keys: None,
         database_encryption_key_id: "e2e-db-v1".to_string(),
         // Preserve encrypted-write coverage in E2E tests; production defaults off.
         database_encryption_write_enabled: true,
         s3: config::S3Config {
+            object_rewrap_max_bytes: 268_435_456,
+            object_encryption_write_enabled: true,
+            encryption_keys: None,
             mock: true,
             bucket: "test-bucket".to_string(),
             region: "us-east-1".to_string(),
@@ -569,6 +578,35 @@ where
     )
 }
 
+/// Like [`setup_test_server_with_pool_and_config`], with the underlying
+/// router, for a test that also serves it on a real listener: the OHTTP
+/// gateway sends the request it decrypts to this API over a loopback
+/// connection on `config.server.port`.
+pub async fn setup_test_server_with_pool_config_and_router<F>(
+    mutate: F,
+) -> (
+    axum_test::TestServer,
+    axum::Router,
+    std::sync::Arc<services::inference_provider_pool::InferenceProviderPool>,
+    std::sync::Arc<inference_providers::mock::MockProvider>,
+    Arc<Database>,
+)
+where
+    F: FnOnce(&mut config::ApiConfig),
+{
+    let mut infra = setup_test_infrastructure().await;
+    mutate(&mut infra.config);
+    let (server, inference_provider_pool, mock_provider, router) =
+        build_test_server_components(infra.database.clone(), infra.config).await;
+    (
+        server,
+        router,
+        inference_provider_pool,
+        mock_provider,
+        infra.database,
+    )
+}
+
 /// Like `setup_test_server`, but also returns the underlying `axum::Router`,
 /// so a test can drive it in-process (`tower::ServiceExt::oneshot`) and poll
 /// the response body frame-by-frame. `axum_test` buffers whole response
@@ -690,7 +728,14 @@ pub async fn setup_test_server_with_mcp_factory(
 }
 
 pub async fn setup_unique_test_session(database: &Arc<Database>) -> (String, String) {
-    let user_id = uuid::Uuid::new_v4();
+    setup_unique_test_session_with_user_id(database, uuid::Uuid::new_v4()).await
+}
+
+/// Preselect an identity so real-auth admin tests can allowlist it before building the server.
+pub async fn setup_unique_test_session_with_user_id(
+    database: &Arc<Database>,
+    user_id: uuid::Uuid,
+) -> (String, String) {
     let user_id_str = user_id.to_string();
     // Session ID format: rt_{uuid} (with dashes so it can be parsed by MockAuthService)
     let session_id = format!("rt_{user_id_str}");

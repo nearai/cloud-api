@@ -167,7 +167,7 @@ impl Harness {
             deposit: 1000,
             settled_on_chain: 0,
             highest_cumulative: 60,
-            highest_signature: v.fixed("voucher.signature"),
+            highest_signature: [60; 65],
         })
         .await
         .unwrap();
@@ -175,7 +175,7 @@ impl Harness {
             repo.accept_voucher(
                 &id,
                 cumulative,
-                v.fixed("voucher.signature"),
+                [u8::try_from(cumulative).unwrap(); 65],
                 crate::mpp::ports::VoucherRules {
                     min_delta: 0,
                     settled_floor_from_chain: true,
@@ -220,8 +220,12 @@ impl Harness {
 
     async fn mine(&self, cumulative: u128, success: bool) {
         let record = self.record().await;
-        let data =
-            settle_calldata(&record.descriptor, cumulative, &record.highest_signature).unwrap();
+        let data = settle_calldata(
+            &record.descriptor,
+            cumulative,
+            &[u8::try_from(cumulative).unwrap(); 65],
+        )
+        .unwrap();
         let tx = build_payee_tx(
             self.chain,
             &self.signer,
@@ -472,6 +476,15 @@ impl ChannelRepository for TestRepo<'_> {
     ) -> Result<bool, crate::common::RepositoryError> {
         self.inner
             .claim_chain_read(channel_id, now, min_interval)
+            .await
+    }
+    async fn clear_chain_read_claim(
+        &self,
+        channel_id: &[u8; 32],
+        claimed_at: DateTime<Utc>,
+    ) -> Result<bool, crate::common::RepositoryError> {
+        self.inner
+            .clear_chain_read_claim(channel_id, claimed_at)
             .await
     }
     async fn record_settlement(

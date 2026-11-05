@@ -295,7 +295,7 @@ async fn chain_read_claim_is_once_per_interval_and_old_results_do_not_rewind_it(
     .unwrap();
     assert_eq!(
         repo.get(&id).await.unwrap().unwrap().last_chain_read_at,
-        Some(now + interval)
+        crate::mpp::ports::chain_read_claim_at(now + interval, interval)
     );
     assert!(!repo
         .claim_chain_read(&id, now + Duration::seconds(61), interval)

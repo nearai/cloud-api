@@ -6,6 +6,8 @@ pub mod conversions;
 pub mod database_encryption;
 pub mod middleware;
 pub mod models;
+#[cfg(test)]
+mod mpp_startup_tests;
 pub mod ohttp_gateway;
 pub mod openapi;
 pub mod openapi_deprecation;
@@ -222,8 +224,8 @@ fn init_mpp_service(
 /// the service; background tasks retain the same ledger, RPC and signer.
 fn init_mpp_session(
     pool: database::DbPool,
-    config: &ApiConfig,
-) -> Option<Arc<services::mpp::SessionService>> {
+    config: &config::MppConfig,
+) -> Result<Option<Arc<services::mpp::SessionService>>, services::mpp::MppError> {
     use services::mpp::{
         session_chain::PayeeChain,
         session_settlement::{spawn_settlement_task, SettlementConfig},
@@ -231,8 +233,12 @@ fn init_mpp_session(
         HttpTempoRpc, LocalSigner, MppError, SessionService, SessionServiceConfig,
     };
     use std::time::Duration;
-    let settings = config.mpp.settings()?;
-    let session = settings.session.as_ref()?;
+    let Some(settings) = config.settings() else {
+        return Ok(None);
+    };
+    let Some(session) = settings.session.as_ref() else {
+        return Ok(None);
+    };
     let build = || -> Result<_, MppError> {
         let signer = Arc::new(
             LocalSigner::from_hex(session.signer_key.as_deref().ok_or(MppError::Config)?)
@@ -298,11 +304,11 @@ fn init_mpp_session(
                 },
             );
             services::mpp::retention::spawn_channel_purge_task(repo);
-            Some(Arc::new(service))
+            Ok(Some(Arc::new(service)))
         }
         Err(error) => {
             tracing::error!(outcome = error.kind(), "MPP session initialization failed");
-            None
+            Err(error)
         }
     }
 }
@@ -1213,7 +1219,7 @@ pub fn build_app_with_config(
     auth_components: AuthComponents,
     domain_services: DomainServices,
     config: Arc<ApiConfig>,
-) -> Router {
+) -> Result<Router, services::mpp::MppError> {
     build_app_with_config_and_options(
         database,
         auth_components,
@@ -1230,7 +1236,10 @@ pub fn build_app_with_config_and_options(
     domain_services: DomainServices,
     config: Arc<ApiConfig>,
     build_options: AppBuildOptions,
-) -> Router {
+) -> Result<Router, services::mpp::MppError> {
+    // Validate configured session ports before constructing a router. A broken session
+    // configuration must fail startup even if another MPP component is disabled.
+    let mpp_session = init_mpp_session(database.pool().clone(), &config.mpp)?;
     // Create analytics service (shared between user and admin routes)
     let analytics_repository = Arc::new(database::repositories::PgAnalyticsRepository::new(
         database.pool().clone(),
@@ -1333,10 +1342,7 @@ pub fn build_app_with_config_and_options(
         &auth_components.auth_state_middleware,
         usage_state.clone(),
         rate_limit_state.clone(),
-        app_state
-            .mpp_service
-            .as_ref()
-            .and_then(|_| init_mpp_session(database.pool().clone(), &config)),
+        mpp_session,
     );
 
     let gateway_routes = build_gateway_routes(
@@ -1531,7 +1537,7 @@ pub fn build_app_with_config_and_options(
         .merge(mcp_routes)
         .merge(ohttp_root_routes);
 
-    with_app_fallbacks_and_layers(router, metrics_state, cors)
+    Ok(with_app_fallbacks_and_layers(router, metrics_state, cors))
 }
 
 /// Wrap the assembled routes in the app-wide fallbacks and middleware.

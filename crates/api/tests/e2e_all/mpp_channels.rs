@@ -555,7 +555,7 @@ async fn settleable_voucher_never_exceeds_what_was_delivered() {
 }
 
 #[tokio::test]
-async fn chain_state_takes_the_greater_values_and_a_close_request_sticks() {
+async fn chain_state_takes_greater_amounts_and_clears_a_zero_close_request() {
     let f = fixture().await;
     assert!(f
         .repo
@@ -591,7 +591,7 @@ async fn chain_state_takes_the_greater_values_and_a_close_request_sticks() {
     assert_eq!(record.close_requested_at, 0);
     assert_eq!(record.last_chain_read_at, Some(read_at));
 
-    // Lower values, a zero deposit and a zero close request lower or erase nothing.
+    // Amounts stay monotone; the close request follows the latest chain value.
     let record = f
         .repo
         .record_chain_state(
@@ -623,9 +623,26 @@ async fn chain_state_takes_the_greater_values_and_a_close_request_sticks() {
         .await
         .unwrap()
         .unwrap();
+    assert_eq!((record.deposit, record.close_requested_at), (3_000_000, 0));
+    assert!(record.accepts_vouchers());
+    let same = f
+        .repo
+        .record_chain_state(
+            &id,
+            ChannelState {
+                settled: 10,
+                deposit: 2_000_000,
+                close_requested_at: 0,
+            },
+            read_at + Duration::seconds(1),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(same.updated_at, record.updated_at);
     assert_eq!(
-        (record.deposit, record.close_requested_at),
-        (3_000_000, 1_800_000_000)
+        same.last_chain_read_at,
+        Some(read_at + Duration::seconds(1))
     );
 }
 

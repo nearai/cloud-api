@@ -16,6 +16,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use uuid::Uuid;
 
+#[path = "session_supervision_regression_tests.rs"]
+mod regressions;
+
 fn now() -> DateTime<Utc> {
     DateTime::from_timestamp(1_800_000_000, 0).unwrap()
 }
@@ -45,7 +48,7 @@ async fn open(repo: &InMemoryChannelRepository, id: [u8; 32]) {
         deposit: 1000,
         settled_on_chain: 0,
         highest_cumulative: 60,
-        highest_signature: v.fixed("voucher.signature"),
+        highest_signature: [60; 65],
     })
     .await
     .unwrap();
@@ -53,7 +56,7 @@ async fn open(repo: &InMemoryChannelRepository, id: [u8; 32]) {
         repo.accept_voucher(
             &id,
             cumulative,
-            v.fixed("voucher.signature"),
+            [u8::try_from(cumulative).unwrap(); 65],
             crate::mpp::ports::VoucherRules {
                 min_delta: 0,
                 settled_floor_from_chain: true,
@@ -92,6 +95,12 @@ fn encode_states(states: &[ChannelState]) -> Vec<u8> {
 fn answer(rpc: &FakeTempo, state: ChannelState) {
     rpc.set_call_handler(Box::new(move |to, data| {
         assert_eq!(to, chain().escrow);
+        if data.starts_with(&crate::mpp::abi::GET_CHANNEL_STATE_SELECTOR) {
+            let mut bytes = uint_word(state.settled).to_vec();
+            bytes.extend(uint_word(state.deposit));
+            bytes.extend(uint_word(u128::from(state.close_requested_at)));
+            return Ok(bytes);
+        }
         assert_eq!(data[..4], GET_CHANNEL_STATES_BATCH_SELECTOR);
         let count = (data.len() - 68) / 32;
         assert!(count <= MAX_BATCH_CHANNELS);
@@ -186,7 +195,7 @@ async fn pending_close_recovery_handles_receipts_expiry_and_hash_mismatch() {
             u64::from(receipt.is_none() && age <= 30)
         );
         assert_eq!(summary.reconciliation_failed, 0);
-        assert_eq!(rpc.eth_calls(), 0);
+        assert_eq!(rpc.eth_calls(), usize::from(receipt.is_none() && age > 30));
     }
     let repo = InMemoryChannelRepository::with_clock(now());
     open(&repo, [1; 32]).await;
@@ -375,7 +384,7 @@ async fn revert_clears_pending_but_rejected_without_receipt_stays_pending() {
                 chain(),
                 &signer(),
                 &rpc,
-                close_calldata(&record.descriptor, 100, 80, &record.highest_signature).unwrap(),
+                close_calldata(&record.descriptor, 100, 80, &[100; 65]).unwrap(),
                 u64::try_from(now().timestamp()).unwrap(),
             )
             .await
@@ -445,7 +454,7 @@ impl TempoRpc for OrderedRpc {
                 &record.descriptor,
                 self.cumulative,
                 self.capture,
-                &record.highest_signature
+                &[u8::try_from(self.cumulative).unwrap(); 65]
             )
             .unwrap()
         );
@@ -592,11 +601,10 @@ async fn a_large_ledger_page_is_split_at_the_abi_batch_limit() {
 }
 
 #[tokio::test]
-async fn mark_closing_precedes_send_and_capture_excludes_reservations() {
+async fn mark_closing_precedes_send_and_capture_uses_drained_spend() {
     let repo = Arc::new(InMemoryChannelRepository::with_clock(now()));
     open(&repo, [1; 32]).await;
     spend(&repo, &[1; 32], 80).await;
-    reserve(&repo, &[1; 32], 90).await;
     let rpc = OrderedRpc {
         fake: FakeTempo::default(),
         repo: repo.clone(),
@@ -693,7 +701,6 @@ async fn requested_close_with_no_new_delivered_spend_sends_nothing() {
     let repo = InMemoryChannelRepository::with_clock(now());
     open(&repo, [1; 32]).await;
     spend(&repo, &[1; 32], 60).await;
-    reserve(&repo, &[1; 32], 100).await;
     let rpc = FakeTempo::default();
     answer(
         &rpc,
@@ -731,7 +738,7 @@ async fn stale_reservations_are_released_once_and_recent_ones_remain() {
     open(&repo, [1; 32]).await;
     let stale = reserve(&repo, &[1; 32], 60).await;
     reserve(&repo, &[1; 32], 30).await;
-    repo.age_reservation(stale, chrono::Duration::minutes(16));
+    repo.age_reservation(stale, chrono::Duration::minutes(121));
     let rpc = FakeTempo::default();
     answer(
         &rpc,
@@ -864,8 +871,8 @@ async fn changed_capture_during_build_is_not_broadcast() {
         id: [1; 32],
         observed_closing: AtomicUsize::new(0),
         cumulative: 100,
-        capture: 80,
-        charge_during_build: Some((request, 20)),
+        capture: 100,
+        charge_during_build: Some((request, 10)),
         settled_during_build: None,
     };
     answer(&rpc.fake, requested());
@@ -875,7 +882,7 @@ async fn changed_capture_during_build_is_not_broadcast() {
         &signer(),
         chain(),
         &SupervisionConfig::default(),
-        now(),
+        now() + chrono::Duration::seconds(600),
     )
     .await;
     assert_eq!((summary.closes_submitted, summary.closes_failed), (0, 1));
@@ -883,7 +890,7 @@ async fn changed_capture_during_build_is_not_broadcast() {
     let record = repo.get(&[1; 32]).await.unwrap().unwrap();
     assert_eq!(
         (record.state, record.spent, record.reserved),
-        (ChannelLifecycle::Open, 100, 0)
+        (ChannelLifecycle::Open, 90, 0)
     );
     assert_eq!(record.pending_close, None);
 }

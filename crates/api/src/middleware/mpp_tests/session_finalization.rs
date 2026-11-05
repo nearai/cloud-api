@@ -15,13 +15,28 @@ struct Gate {
     entered: Notify,
     resume: Notify,
     calls: AtomicUsize,
+    failures: AtomicUsize,
+    skip_pause: AtomicBool,
+    missing_reservation: AtomicBool,
 }
 
 impl Gate {
-    async fn pause(&self) {
+    async fn pause(&self) -> Result<(), RepositoryError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.entered.notify_one();
-        self.resume.notified().await;
+        if self
+            .failures
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok()
+        {
+            return Err(RepositoryError::DatabaseError(anyhow::anyhow!(
+                "injected charge failure"
+            )));
+        }
+        if !self.skip_pause.load(Ordering::SeqCst) {
+            self.resume.notified().await;
+        }
+        Ok(())
     }
 }
 
@@ -68,12 +83,15 @@ impl ChannelRepository for DelayedLedger {
         actual: u128,
         units: u64,
     ) -> Result<ChargeOutcome, RepositoryError> {
-        self.charge.pause().await;
+        self.charge.pause().await?;
+        if self.charge.missing_reservation.load(Ordering::SeqCst) {
+            return Ok(ChargeOutcome::NoReservation);
+        }
         self.inner.charge(request_id, actual, units).await
     }
 
     async fn release(&self, request_id: Uuid) -> Result<bool, RepositoryError> {
-        self.release.pause().await;
+        self.release.pause().await?;
         self.inner.release(request_id).await
     }
 
@@ -143,6 +161,16 @@ impl ChannelRepository for DelayedLedger {
     ) -> Result<Option<(ChannelRecord, SettlementLease)>, RepositoryError> {
         self.inner
             .claim_settlement_lease(channel_id, now, until)
+            .await
+    }
+
+    async fn clear_chain_read_claim(
+        &self,
+        channel_id: &[u8; 32],
+        claimed_at: DateTime<Utc>,
+    ) -> Result<bool, RepositoryError> {
+        self.inner
+            .clear_chain_read_claim(channel_id, claimed_at)
             .await
     }
 
@@ -253,4 +281,53 @@ async fn cancellation_during_release_does_not_leave_a_reservation() {
     assert_eq!((row(&app).await.spent, row(&app).await.units), (0, 0));
     assert_eq!(charge.calls.load(Ordering::SeqCst), 0);
     assert_eq!(release.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn charge_retries_two_store_failures_and_records_once() {
+    let (app, charge, release) = app_with_delayed_ledger();
+    seed(&app).await;
+    charge.failures.store(2, Ordering::SeqCst);
+    charge.skip_pause.store(true, Ordering::SeqCst);
+    let credential = session_credential(&app, voucher(INITIAL)).await;
+    let response = post_session(&app, Some(&credential)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(response.headers().contains_key("payment-receipt"));
+    assert_eq!(charge.calls.load(Ordering::SeqCst), 3);
+    assert_eq!(release.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        (
+            row(&app).await.spent,
+            row(&app).await.units,
+            row(&app).await.reserved
+        ),
+        (24, 12, 0)
+    );
+}
+
+#[tokio::test]
+async fn permanent_charge_failure_preserves_success_and_provisional_receipt() {
+    let (app, charge, release) = app_with_delayed_ledger();
+    seed(&app).await;
+    charge.failures.store(usize::MAX, Ordering::SeqCst);
+    let credential = session_credential(&app, voucher(INITIAL)).await;
+    let response = post_session(&app, Some(&credential)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(response.headers().contains_key("payment-receipt"));
+    assert_eq!(charge.calls.load(Ordering::SeqCst), 3);
+    assert_eq!(release.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(app.ledger.reservation_count(), 1);
+}
+
+#[tokio::test]
+async fn missing_reservation_after_success_preserves_completion_and_provisional_receipt() {
+    let (app, charge, _) = app_with_delayed_ledger();
+    seed(&app).await;
+    charge.skip_pause.store(true, Ordering::SeqCst);
+    charge.missing_reservation.store(true, Ordering::SeqCst);
+    let credential = session_credential(&app, voucher(INITIAL)).await;
+    let response = post_session(&app, Some(&credential)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(response.headers().contains_key("payment-receipt"));
+    assert!(response.headers().get(header::WWW_AUTHENTICATE).is_none());
 }

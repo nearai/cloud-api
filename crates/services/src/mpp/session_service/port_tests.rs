@@ -7,7 +7,7 @@ use tokio::sync::Notify;
 use uuid::Uuid;
 
 use super::tests::{close, config, service, voucher, Fixture};
-use crate::mpp::error::{CloseReason, MppError, VoucherReason};
+use crate::mpp::error::{CloseReason, MppError, UnavailableReason, VoucherReason};
 use crate::mpp::ports::{
     ChannelLifecycle, ChannelRepository, PendingClose, RpcError, RpcReceipt, TempoRpc, VoucherRules,
 };
@@ -141,8 +141,11 @@ async fn separate_service_instances_share_one_chain_refresh_claim() {
         b.voucher(&credential, 10, Uuid::new_v4()),
     )
     .await
-    .unwrap()
     .unwrap();
+    assert_eq!(
+        second.err(),
+        Some(MppError::Unavailable(UnavailableReason::Rpc))
+    );
     assert_eq!(rpc.reads.load(Ordering::SeqCst), 1);
     rpc.resume.notify_one();
     let first = attempt.await.unwrap().unwrap();
@@ -151,10 +154,9 @@ async fn separate_service_instances_share_one_chain_refresh_claim() {
     let row = f.record().await;
     assert_eq!(
         (row.spent, row.reserved, row.units, row.settled_on_chain),
-        (20, 20, 0, 0)
+        (10, 10, 0, 0)
     );
     f.service.release(&first).await.unwrap();
-    f.service.release(&second).await.unwrap();
     let row = f.record().await;
     assert_eq!((row.spent, row.reserved, row.units), (0, 0, 0));
 }

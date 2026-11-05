@@ -927,11 +927,10 @@ async fn reopen_cannot_bypass_delta_or_revive_a_finalized_channel() {
 }
 
 #[tokio::test]
-async fn exact_stored_replay_does_not_reverify_signature() {
+async fn exact_stored_replay_rejects_invalid_signature_before_storage_or_rpc() {
     let f = Fixture::new();
     let v = Vectors::load();
-    // The repository is trusted to have verified its stored bytes. Deliberately invalid
-    // bytes distinguish the fast replay path from redundant cryptographic verification.
+    // Descriptor preflight authenticates even a replay before touching the ledger.
     f.repo
         .open_or_refresh(NewChannel {
             channel_id: v.fixed("channelId"),
@@ -949,13 +948,19 @@ async fn exact_stored_replay_does_not_reverify_signature() {
     let mut payload = voucher(INITIAL);
     payload["signature"] = json!(hex_prefixed(&[0; 65]));
     let credential = f.verified(payload).await;
-    let reserved = f
+    let before = f.repo.get(&v.fixed("channelId")).await.unwrap();
+    let error = f
         .service
         .voucher(&credential, 10, Uuid::new_v4())
         .await
-        .unwrap();
-    assert_eq!(reserved.reserved, 10);
-    assert_eq!(f.repo.reservation_count(), 1);
+        .unwrap_err();
+    assert_eq!(
+        error,
+        MppError::VoucherRejected(VoucherReason::InvalidSignature)
+    );
+    assert_eq!(f.repo.reservation_count(), 0);
+    assert_eq!(f.rpc.eth_calls(), 0);
+    assert_eq!(f.repo.get(&v.fixed("channelId")).await.unwrap(), before);
 }
 
 #[tokio::test]

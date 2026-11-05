@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
+use futures::{stream, StreamExt};
 use tokio::task::JoinHandle;
 
 use crate::mpp::abi::{
@@ -12,10 +13,14 @@ use crate::mpp::abi::{
     MAX_BATCH_CHANNELS,
 };
 use crate::mpp::ports::{
-    ChannelLifecycle, ChannelRecord, ChannelRepository, CloseTransition, PendingClose,
-    RetainedVoucher, TempoRpc, TempoSigner,
+    chain_read_claim_at, chain_read_is_fresh, ChannelLifecycle, ChannelRecord, ChannelRepository,
+    CloseTransition, PendingClose, RetainedVoucher, TempoRpc, TempoSigner,
 };
 use crate::mpp::session_chain::{broadcast, build_payee_tx, PayeeChain};
+use crate::mpp::session_close_reconciliation::{reconcile_pending_close, CloseRecovery};
+
+const MAX_IN_FLIGHT: usize = 8;
+pub const PAYEE_CLOSE_DEADLINE_SECS: u64 = 600;
 
 /// Cadence, batching and stale-reservation policy for close supervision.
 #[derive(Clone)]
@@ -26,7 +31,7 @@ pub struct SupervisionConfig {
     pub page: usize,
     /// Warn when a pass takes longer than this; defaults to 120 seconds.
     pub warn_after: Duration,
-    /// Release reservations older than this; defaults to 15 minutes.
+    /// Release reservations older than this; defaults to two hours.
     pub stale_reservation_after: Duration,
 }
 
@@ -36,7 +41,7 @@ impl Default for SupervisionConfig {
             every: Duration::from_secs(60),
             page: 100,
             warn_after: Duration::from_secs(120),
-            stale_reservation_after: Duration::from_secs(15 * 60),
+            stale_reservation_after: Duration::from_secs(2 * 60 * 60),
         }
     }
 }
@@ -56,6 +61,8 @@ pub struct SupervisionSummary {
     pub closes_submitted: u64,
     /// Close attempts that failed during build, transition, broadcast or finalization.
     pub closes_failed: u64,
+    /// Close requests deferred while live reservations can still drain.
+    pub reservation_deferrals: u64,
     /// Requested closes with no delivered spend above the settled amount.
     pub nothing_to_capture: u64,
     /// Expired reservations released during this pass.
@@ -79,62 +86,17 @@ async fn reconcile_close(
     now: DateTime<Utc>,
     summary: &mut SupervisionSummary,
 ) {
-    let result = async {
-        let pending = record.pending_close.ok_or("close_pending_missing")?;
-        let receipt = rpc
-            .get_transaction_receipt(pending.tx_hash)
-            .await
-            .map_err(|_| "close_receipt_failed")?;
-        match receipt {
-            Some(receipt) => {
-                if receipt.tx_hash != pending.tx_hash {
-                    return Err("close_receipt_mismatch");
-                }
-                if receipt.success {
-                    if repo
-                        .finalize_pending_close(
-                            &record.channel_id,
-                            &pending.tx_hash,
-                            pending.capture,
-                        )
-                        .await
-                        .map_err(|_| "close_finalize_failed")?
-                    {
-                        summary.reconciled_finalized += 1;
-                    }
-                } else if repo
-                    .clear_closing(&record.channel_id, &pending.tx_hash)
-                    .await
-                    .map_err(|_| "clear_closing_failed")?
-                {
-                    summary.reconciled_reverted += 1;
-                }
-            }
-            None => {
-                let now_unix = u64::try_from(now.timestamp()).map_err(|_| "close_time_invalid")?;
-                if pending
-                    .valid_before
-                    .checked_add(30)
-                    .is_some_and(|expiry| now_unix > expiry)
-                {
-                    if repo
-                        .clear_closing(&record.channel_id, &pending.tx_hash)
-                        .await
-                        .map_err(|_| "clear_closing_failed")?
-                    {
-                        summary.reconciled_expired += 1;
-                    }
-                } else {
-                    summary.reconciliation_pending += 1;
-                }
-            }
+    match reconcile_pending_close(repo, rpc, record, now).await {
+        Ok(CloseRecovery::Finalized | CloseRecovery::Withdrawn) => {
+            summary.reconciled_finalized += 1
         }
-        Ok::<_, &'static str>(())
-    }
-    .await;
-    if let Err(outcome) = result {
-        summary.reconciliation_failed += 1;
-        tracing::warn!(outcome, "MPP close reconciliation failed");
+        Ok(CloseRecovery::Reverted) => summary.reconciled_reverted += 1,
+        Ok(CloseRecovery::Expired) => summary.reconciled_expired += 1,
+        Ok(CloseRecovery::Pending) => summary.reconciliation_pending += 1,
+        Err(outcome) => {
+            summary.reconciliation_failed += 1;
+            tracing::warn!(outcome, "MPP close reconciliation failed");
+        }
     }
 }
 
@@ -142,6 +104,33 @@ fn pass_time(now: DateTime<Utc>, started: Instant) -> Option<DateTime<Utc>> {
     i64::try_from(started.elapsed().as_secs())
         .ok()
         .and_then(|seconds| now.checked_add_signed(chrono::Duration::seconds(seconds)))
+}
+
+fn capture_at(record: &ChannelRecord, now: DateTime<Utc>) -> Option<u128> {
+    if record.reserved == 0 {
+        return Some(record.delivered());
+    }
+    let now = u64::try_from(now.timestamp()).ok()?;
+    let deadline = record
+        .close_requested_at
+        .checked_add(PAYEE_CLOSE_DEADLINE_SECS)?;
+    (now >= deadline).then_some(record.spent)
+}
+
+impl SupervisionSummary {
+    fn add(&mut self, other: Self) {
+        self.finalized_withdrawn += other.finalized_withdrawn;
+        self.close_requested += other.close_requested;
+        self.closes_submitted += other.closes_submitted;
+        self.closes_failed += other.closes_failed;
+        self.nothing_to_capture += other.nothing_to_capture;
+        self.reservation_deferrals += other.reservation_deferrals;
+        self.reconciled_finalized += other.reconciled_finalized;
+        self.reconciled_reverted += other.reconciled_reverted;
+        self.reconciled_expired += other.reconciled_expired;
+        self.reconciliation_pending += other.reconciliation_pending;
+        self.reconciliation_failed += other.reconciliation_failed;
+    }
 }
 
 async fn supervise_channel(
@@ -188,7 +177,10 @@ async fn supervise_channel(
         return;
     }
     summary.close_requested += 1;
-    let capture = current.delivered();
+    let Some(capture) = capture_at(&current, now) else {
+        summary.reservation_deferrals += 1;
+        return;
+    };
     if capture <= current.settled_on_chain {
         summary.nothing_to_capture += 1;
         return;
@@ -235,7 +227,7 @@ async fn supervise_channel(
         Ok(CloseTransition::Marked(marked)) => {
             // An in-flight inference can finish while gas price/signing is awaited.
             // Never close at the old capture if delivered spend changed meanwhile.
-            if marked.delivered() != capture || marked.settled_on_chain >= capture {
+            if capture_at(&marked, now) != Some(capture) || marked.settled_on_chain >= capture {
                 summary.closes_failed += 1;
                 tracing::warn!(
                     outcome = "close_capture_changed",
@@ -311,6 +303,14 @@ pub async fn run_supervision_pass(
 ) -> SupervisionSummary {
     let started = Instant::now();
     let mut summary = SupervisionSummary::default();
+    let Ok(chain_freshness) = chrono::Duration::from_std(cfg.every.max(Duration::from_secs(1)))
+    else {
+        tracing::warn!(
+            outcome = "supervision_interval_invalid",
+            "MPP supervision interval invalid"
+        );
+        return summary;
+    };
     let cutoff = chrono::Duration::from_std(cfg.stale_reservation_after)
         .ok()
         .and_then(|age| now.checked_sub_signed(age));
@@ -377,47 +377,100 @@ pub async fn run_supervision_pass(
                 matches
             })
             .collect();
-        // Receipt recovery does not depend on a successful batch eth_call. A close
-        // may already be mined even when channel-state reads are unavailable.
-        let mut open_records = Vec::with_capacity(records.len());
-        for record in records {
-            if record.state == ChannelLifecycle::Closing {
+        // Recovery runs independently from channel-state batches, with a fixed
+        // in-flight bound so one slow receipt does not stall the entire page.
+        let (closing, open): (Vec<_>, Vec<_>) = records
+            .into_iter()
+            .partition(|record| record.state == ChannelLifecycle::Closing);
+        let mut recoveries = stream::iter(closing)
+            .map(|record| async move {
+                let mut summary = SupervisionSummary::default();
                 if let Some(at) = pass_time(now, started) {
                     reconcile_close(repo, rpc, &record, at, &mut summary).await;
                 } else {
                     summary.reconciliation_failed += 1;
                 }
-            } else {
-                open_records.push(record);
+                summary
+            })
+            .buffer_unordered(MAX_IN_FLIGHT);
+        while let Some(result) = recoveries.next().await {
+            summary.add(result);
+        }
+        let mut claimed = Vec::with_capacity(open.len());
+        let Some(claimed_at) = pass_time(now, started) else {
+            break;
+        };
+        let Some(claim_deadline) = chain_read_claim_at(claimed_at, chain_freshness) else {
+            break;
+        };
+        for record in open {
+            // A fresh observation needs neither another row write nor an RPC.
+            if chain_read_is_fresh(record.last_chain_read_at, claimed_at, chain_freshness) {
+                continue;
+            }
+            match repo
+                .claim_chain_read(&record.channel_id, claimed_at, chain_freshness)
+                .await
+            {
+                Ok(true) => claimed.push(record),
+                Ok(false) => {}
+                Err(_) => tracing::warn!(
+                    outcome = "chain_read_claim_failed",
+                    "MPP supervision claim failed"
+                ),
             }
         }
-        for batch in open_records.chunks(MAX_BATCH_CHANNELS) {
+        for batch in claimed.chunks(MAX_BATCH_CHANNELS) {
             let ids: Vec<_> = batch.iter().map(|record| record.channel_id).collect();
-            let Ok(data) = get_channel_states_batch_calldata(&ids) else {
-                continue;
-            };
-            summary.chain_reads += 1;
-            let states = match rpc.call(chain.escrow, &data).await {
-                Ok(bytes) => decode_channel_states_batch(&bytes).ok(),
-                Err(_) => None,
+            let states = if let Ok(data) = get_channel_states_batch_calldata(&ids) {
+                summary.chain_reads += 1;
+                match rpc.call(chain.escrow, &data).await {
+                    Ok(bytes) => decode_channel_states_batch(&bytes).ok(),
+                    Err(_) => None,
+                }
+            } else {
+                None
             };
             let Some(states) = states.filter(|states| states.len() == batch.len()) else {
                 tracing::warn!(
                     outcome = "supervision_chain_read_failed",
                     "MPP supervision batch skipped"
                 );
+                for record in batch {
+                    if repo
+                        .clear_chain_read_claim(&record.channel_id, claim_deadline)
+                        .await
+                        .is_err()
+                    {
+                        tracing::warn!(
+                            outcome = "chain_read_claim_clear_failed",
+                            "MPP supervision claim cleanup failed"
+                        );
+                    }
+                }
                 continue;
             };
-            for (record, state) in batch.iter().zip(states) {
-                let Some(at) = pass_time(now, started) else {
-                    tracing::warn!(
-                        outcome = "supervision_time_invalid",
-                        "MPP supervision channel skipped"
-                    );
-                    continue;
-                };
-                supervise_channel(repo, rpc, signer, chain, (record, state), at, &mut summary)
-                    .await;
+            let observations: Vec<_> = batch.iter().cloned().zip(states).collect();
+            let mut operations = stream::iter(observations)
+                .map(|(record, state)| async move {
+                    let mut summary = SupervisionSummary::default();
+                    if let Some(at) = pass_time(now, started) {
+                        supervise_channel(
+                            repo,
+                            rpc,
+                            signer,
+                            chain,
+                            (&record, state),
+                            at,
+                            &mut summary,
+                        )
+                        .await;
+                    }
+                    summary
+                })
+                .buffer_unordered(MAX_IN_FLIGHT);
+            while let Some(result) = operations.next().await {
+                summary.add(result);
             }
         }
     }
@@ -469,6 +522,7 @@ pub fn spawn_supervision_task(
                 close_requested = summary.close_requested,
                 closes_submitted = summary.closes_submitted,
                 closes_failed = summary.closes_failed,
+                reservation_deferrals = summary.reservation_deferrals,
                 nothing_to_capture = summary.nothing_to_capture,
                 stale_reservations_released = summary.stale_reservations_released,
                 reconciled_finalized = summary.reconciled_finalized,

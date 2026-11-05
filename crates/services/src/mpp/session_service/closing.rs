@@ -9,6 +9,7 @@ use crate::mpp::error::{CloseReason, MppError, SessionMismatch, VoucherReason};
 use crate::mpp::ports::{ChannelLifecycle, ChannelRecord, CloseTransition, PendingClose};
 use crate::mpp::secp256k1::recover_address;
 use crate::mpp::session_chain::{broadcast, build_payee_tx, BroadcastError, PayeeChain};
+use crate::mpp::session_close_reconciliation::{reconcile_pending_close, CloseRecovery};
 use crate::mpp::session_service::{
     receipt, store_error, ManagementReceipt, SessionCredential, SessionService,
 };
@@ -29,10 +30,11 @@ impl SessionService {
         else {
             return Err(MppError::SessionMismatch(SessionMismatch::Action));
         };
-        let _gate = self.gate(id).await?;
+        self.verify_signature(id, descriptor, *cumulative_amount, signature)?;
+        self.check_close_authorization(id, descriptor, *cumulative_amount, close_signature)?;
+        let _permit = self.management_permit()?;
         let mut record = self.get(id).await?;
         self.bind(&record, descriptor)?;
-        self.check_close_authorization(id, descriptor, *cumulative_amount, close_signature)?;
         if record.state == ChannelLifecycle::Closing {
             if let Some(receipt) = self.reconcile_close(credential, &record).await? {
                 return Ok(receipt);
@@ -164,62 +166,25 @@ impl SessionService {
         record: &ChannelRecord,
     ) -> Result<Option<ManagementReceipt>, MppError> {
         let pending = record.pending_close.ok_or(MppError::ChannelClosing)?;
-        let mined = self
-            .rpc
-            .get_transaction_receipt(pending.tx_hash)
+        match reconcile_pending_close(self.repo.as_ref(), self.rpc.as_ref(), record, Utc::now())
             .await
-            .map_err(|_| MppError::ChainTxFailed)?;
-        if let Some(mined) = mined {
-            if mined.tx_hash != pending.tx_hash {
-                return Err(MppError::ChainTxFailed);
-            }
-            if mined.success {
-                if !self
-                    .repo
-                    .finalize_pending_close(&record.channel_id, &pending.tx_hash, pending.capture)
-                    .await
-                    .map_err(store_error)?
-                {
-                    return Err(MppError::ChannelClosing);
+            .map_err(|code| {
+                if code == "close_state_changed" {
+                    MppError::ChannelClosing
+                } else {
+                    MppError::ChainTxFailed
                 }
+            })? {
+            CloseRecovery::Finalized => {
                 let current = self.get(&record.channel_id).await?;
                 let mut receipt = receipt(credential, &current, Some(pending.tx_hash));
                 receipt.accepted_cumulative = pending.cumulative;
-                return Ok(Some(ManagementReceipt { receipt }));
+                Ok(Some(ManagementReceipt { receipt }))
             }
-            self.repo
-                .clear_closing(&record.channel_id, &pending.tx_hash)
-                .await
-                .map_err(store_error)?;
-            return Ok(None);
+            CloseRecovery::Withdrawn => Err(MppError::ChannelClosed),
+            CloseRecovery::Pending => Err(MppError::ChainTxFailed),
+            CloseRecovery::Reverted | CloseRecovery::Expired => Ok(None),
         }
-        let now = u64::try_from(Utc::now().timestamp()).map_err(|_| MppError::Config)?;
-        let deadline = pending
-            .valid_before
-            .checked_add(30)
-            .ok_or(MppError::Config)?;
-        if now <= deadline {
-            return Err(MppError::ChainTxFailed);
-        }
-        // A read after expiry detects a successful close whose receipt was unavailable,
-        // or a payer withdrawal. Never revive a zero-deposit channel.
-        let state = self.read_chain(&record.channel_id).await?;
-        if state.deposit == 0 {
-            self.repo
-                .finalize(&record.channel_id, state.settled)
-                .await
-                .map_err(store_error)?;
-            return Err(MppError::ChannelClosed);
-        }
-        self.repo
-            .record_chain_state(&record.channel_id, state, Utc::now())
-            .await
-            .map_err(store_error)?;
-        self.repo
-            .clear_closing(&record.channel_id, &pending.tx_hash)
-            .await
-            .map_err(store_error)?;
-        Ok(None)
     }
 }
 
@@ -228,6 +193,28 @@ mod tests {
     use crate::mpp::ports::ChannelLifecycle;
     use crate::mpp::session_service::tests::{close, Fixture};
     use crate::mpp::testing::SendMode;
+
+    #[tokio::test]
+    async fn invalid_close_signatures_fail_before_missing_channel_lookup() {
+        use crate::mpp::error::{CloseReason, MppError, VoucherReason};
+        for field in ["signature", "closeSignature"] {
+            let f = Fixture::new();
+            let mut payload = close(1_250_000);
+            payload[field] = serde_json::json!(crate::mpp::session_wire::hex_prefixed(&[0; 65]));
+            let credential = f.credential(payload).await;
+            let error = f.service.close(&credential).await.err();
+            assert_eq!(
+                error,
+                Some(if field == "signature" {
+                    MppError::VoucherRejected(VoucherReason::InvalidSignature)
+                } else {
+                    MppError::CloseRejected(CloseReason::InvalidSignature)
+                })
+            );
+            assert_eq!(f.rpc.eth_calls(), 0);
+            assert_eq!(f.rpc.send_calls(), 0);
+        }
+    }
 
     #[tokio::test]
     async fn lost_close_reply_keeps_the_channel_fenced() {

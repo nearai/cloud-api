@@ -13,7 +13,10 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::ops::Bound;
-use std::sync::Mutex;
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Mutex,
+};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
@@ -21,8 +24,9 @@ use uuid::Uuid;
 
 use super::abi::ChannelState;
 use super::ports::{
-    ChannelLifecycle, ChannelRecord, ChannelRepository, ChargeOutcome, CloseTransition, NewChannel,
-    PendingClose, ReserveOutcome, RetainedVoucher, SettlementLease, VoucherOutcome, VoucherRules,
+    chain_read_claim_at, chain_read_may_claim, chain_read_observed_at, ChannelLifecycle,
+    ChannelRecord, ChannelRepository, ChargeOutcome, CloseTransition, NewChannel, PendingClose,
+    ReserveOutcome, RetainedVoucher, SettlementLease, VoucherOutcome, VoucherRules,
     MAX_RETAINED_VOUCHERS,
 };
 use super::secp256k1::SIGNATURE_LEN;
@@ -60,6 +64,9 @@ impl State {
         let stamp = self.tick();
         if let Some(row) = self.channels.get_mut(&reservation.channel_id) {
             row.record.spent = row.record.spent.saturating_sub(reservation.amount);
+            if row.record.state == ChannelLifecycle::Finalized {
+                row.record.spent = row.record.spent.max(row.record.settled_on_chain);
+            }
             row.record.reserved = row.record.reserved.saturating_sub(reservation.amount);
             row.record.updated_at = stamp;
         }
@@ -70,6 +77,8 @@ impl State {
 #[derive(Debug)]
 pub struct InMemoryChannelRepository {
     state: Mutex<State>,
+    chain_read_claims: AtomicUsize,
+    chain_state_writes: AtomicUsize,
 }
 
 impl Default for InMemoryChannelRepository {
@@ -87,12 +96,24 @@ impl InMemoryChannelRepository {
     /// An empty ledger whose clock starts at `now`.
     pub fn with_clock(now: DateTime<Utc>) -> Self {
         Self {
+            chain_read_claims: AtomicUsize::new(0),
+            chain_state_writes: AtomicUsize::new(0),
             state: Mutex::new(State {
                 channels: BTreeMap::new(),
                 reservations: HashMap::new(),
                 clock: now,
             }),
         }
+    }
+
+    /// Count refresh claims, including rejected claims, for boundary assertions.
+    pub fn chain_read_claim_count(&self) -> usize {
+        self.chain_read_claims.load(Ordering::Relaxed)
+    }
+
+    /// Count changes to chain-state data, excluding read-timestamp-only refreshes.
+    pub fn chain_state_write_count(&self) -> usize {
+        self.chain_state_writes.load(Ordering::Relaxed)
     }
 
     /// Set the fake clock; later writes are stamped just after it. For tests.
@@ -181,7 +202,21 @@ fn retain_voucher(record: &mut ChannelRecord, old: RetainedVoucher) {
     record
         .retained_vouchers
         .sort_by(|a, b| b.cumulative.cmp(&a.cumulative));
+    let settleable = record
+        .retained_vouchers
+        .iter()
+        .copied()
+        .filter(|voucher| {
+            voucher.cumulative <= record.delivered() && voucher.cumulative > record.settled_on_chain
+        })
+        .max_by_key(|voucher| voucher.cumulative);
     record.retained_vouchers.truncate(MAX_RETAINED_VOUCHERS);
+    if let Some(settleable) = settleable {
+        if !record.retained_vouchers.contains(&settleable) {
+            record.retained_vouchers.pop();
+            record.retained_vouchers.push(settleable);
+        }
+    }
 }
 
 /// Make `(cumulative, signature)` the highest voucher, retaining the one it replaces.
@@ -335,6 +370,9 @@ impl ChannelRepository for InMemoryChannelRepository {
         let cap = record.highest_cumulative.saturating_sub(before);
         let charged = actual.min(cap);
         record.spent = before.saturating_add(charged);
+        if record.state == ChannelLifecycle::Finalized {
+            record.spent = record.spent.max(record.settled_on_chain);
+        }
         record.reserved = record.reserved.saturating_sub(reservation.amount);
         record.units = record.units.saturating_add(units);
         record.updated_at = stamp;
@@ -365,19 +403,30 @@ impl ChannelRepository for InMemoryChannelRepository {
             return Ok(None);
         };
         let record = &mut row.record;
+        let before = (
+            record.deposit,
+            record.settled_on_chain,
+            record.close_requested_at,
+        );
         if chain.deposit != 0 {
             record.deposit = record.deposit.max(chain.deposit);
         }
         record.settled_on_chain = record.settled_on_chain.max(chain.settled);
-        if chain.close_requested_at != 0 {
+        let observed_at = chain_read_observed_at(record.last_chain_read_at, read_at);
+        if observed_at == read_at {
             record.close_requested_at = chain.close_requested_at;
         }
-        record.last_chain_read_at = Some(
-            record
-                .last_chain_read_at
-                .map_or(read_at, |at| at.max(read_at)),
-        );
-        record.updated_at = stamp;
+        record.last_chain_read_at = Some(observed_at);
+        if before
+            != (
+                record.deposit,
+                record.settled_on_chain,
+                record.close_requested_at,
+            )
+        {
+            self.chain_state_writes.fetch_add(1, Ordering::Relaxed);
+            record.updated_at = stamp;
+        }
         Ok(Some(record.clone()))
     }
 
@@ -476,20 +525,34 @@ impl ChannelRepository for InMemoryChannelRepository {
         now: DateTime<Utc>,
         min_interval: Duration,
     ) -> Result<bool, RepositoryError> {
+        self.chain_read_claims.fetch_add(1, Ordering::Relaxed);
         let mut state = self.state.lock().map_err(|_| poisoned())?;
-        let stamp = state.tick();
         let Some(row) = state.channels.get_mut(channel_id) else {
             return Ok(false);
         };
-        if row
-            .record
-            .last_chain_read_at
-            .is_some_and(|at| now.signed_duration_since(at) < min_interval)
-        {
+        if !chain_read_may_claim(row.record.last_chain_read_at, now, min_interval) {
             return Ok(false);
         }
-        row.record.last_chain_read_at = Some(now);
-        row.record.updated_at = stamp;
+        row.record.last_chain_read_at =
+            Some(chain_read_claim_at(now, min_interval).ok_or_else(|| {
+                RepositoryError::ValidationFailed("chain read interval".to_string())
+            })?);
+        Ok(true)
+    }
+
+    async fn clear_chain_read_claim(
+        &self,
+        channel_id: &[u8; 32],
+        claimed_at: DateTime<Utc>,
+    ) -> Result<bool, RepositoryError> {
+        let mut state = self.state.lock().map_err(|_| poisoned())?;
+        let Some(row) = state.channels.get_mut(channel_id) else {
+            return Ok(false);
+        };
+        if row.record.last_chain_read_at != Some(claimed_at) {
+            return Ok(false);
+        }
+        row.record.last_chain_read_at = None;
         Ok(true)
     }
 

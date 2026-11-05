@@ -4,11 +4,13 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
+use futures::{stream, StreamExt};
 use tokio::task::JoinHandle;
 
 use crate::mpp::abi::{decode_channel_state, get_channel_state_calldata, settle_calldata};
 use crate::mpp::ports::{
-    ChannelLifecycle, ChannelRecord, ChannelRepository, SettlementLease, TempoRpc, TempoSigner,
+    chain_read_is_fresh, ChannelLifecycle, ChannelRecord, ChannelRepository, SettlementLease,
+    TempoRpc, TempoSigner,
 };
 use crate::mpp::session_chain::{broadcast, build_payee_tx, PayeeChain};
 
@@ -85,8 +87,8 @@ enum SettlementAttempt {
 
 /// Settle due open channels in channel-id order. The lease result is authoritative:
 /// lifecycle, schedule and voucher are checked again after acquisition. A failed
-/// attempt releases its lease. Every attempt refreshes chain state under the lease,
-/// so a landed settlement whose ledger write failed is not blindly resubmitted.
+/// attempt releases its lease. Fresh chain observations avoid duplicate reads, and
+/// broadcasting invalidates them so a failed ledger write requires reconciliation.
 pub async fn run_settlement_pass(
     repo: &dyn ChannelRepository,
     rpc: &dyn TempoRpc,
@@ -123,131 +125,173 @@ pub async fn run_settlement_pass(
             break;
         }
         after = Some(next);
-        for record in records {
-            if record.state != ChannelLifecycle::Open {
-                continue;
-            }
-            summary.considered += 1;
-            if record.chain_id != chain.chain_id
-                || record.escrow != chain.escrow
-                || record.descriptor.payee != signer.address()
-            {
-                summary.failed += 1;
-                continue;
-            }
-            // A long page scan must not reuse the pass start as a transaction expiry
-            // or claim a lease whose deadline has already passed.
-            let Some(now) = i64::try_from(started.elapsed().as_secs())
-                .ok()
-                .and_then(|seconds| now.checked_add_signed(chrono::Duration::seconds(seconds)))
-            else {
-                summary.failed += 1;
-                continue;
-            };
-            let (Some(until), Ok(now_unix)) = (
-                now.checked_add_signed(lease),
-                u64::try_from(now.timestamp()),
-            ) else {
-                summary.failed += 1;
-                continue;
-            };
-            if !is_due(&record, cfg, now) {
-                continue;
-            }
-            summary.due += 1;
-            if record.settleable_voucher().is_none() {
-                summary.no_settleable_voucher += 1;
-                continue;
-            }
-            let id = record.channel_id;
-            let (current, lease) = match repo.claim_settlement_lease(&id, now, until).await {
-                Ok(Some(current)) => current,
-                Ok(None) => {
-                    summary.lease_busy += 1;
-                    continue;
+        let mut operations = stream::iter(records)
+            .map(|record| async move {
+                let mut summary = SettlementSummary::default();
+                if record.state != ChannelLifecycle::Open {
+                    return summary;
                 }
-                Err(_) => {
-                    summary.failed += 1;
-                    continue;
-                }
-            };
-            if current.state != ChannelLifecycle::Open || !is_due(&current, cfg, now) {
-                release(repo, &id, lease, &mut summary).await;
-                continue;
-            }
-            if current.settleable_voucher().is_none() {
-                summary.no_settleable_voucher += 1;
-                release(repo, &id, lease, &mut summary).await;
-                continue;
-            }
-            let attempt = async {
-                let bytes = rpc
-                    .call(chain.escrow, &get_channel_state_calldata(&id))
-                    .await
-                    .map_err(|_| "settlement_chain_read_failed")?;
-                let state =
-                    decode_channel_state(&bytes).map_err(|_| "settlement_chain_decode_failed")?;
-                let current = repo
-                    .record_chain_state(&id, state, now)
-                    .await
-                    .map_err(|_| "settlement_chain_record_failed")?
-                    .ok_or("settlement_channel_missing")?;
-                if state.deposit == 0
-                    || current.state != ChannelLifecycle::Open
-                    || !is_due(&current, cfg, now)
+                summary.considered += 1;
+                if record.chain_id != chain.chain_id
+                    || record.escrow != chain.escrow
+                    || record.descriptor.payee != signer.address()
                 {
-                    return Ok(SettlementAttempt::Deferred);
+                    summary.failed += 1;
+                    return summary;
                 }
-                let Some(voucher) = current.settleable_voucher() else {
-                    return Ok(SettlementAttempt::NoVoucher);
+                // A long page scan must not reuse the pass start as a transaction expiry
+                // or claim a lease whose deadline has already passed.
+                let Some(now) = i64::try_from(started.elapsed().as_secs())
+                    .ok()
+                    .and_then(|seconds| now.checked_add_signed(chrono::Duration::seconds(seconds)))
+                else {
+                    summary.failed += 1;
+                    return summary;
                 };
-                let calldata =
-                    settle_calldata(&current.descriptor, voucher.cumulative, &voucher.signature)
-                        .map_err(|_| "settlement_calldata_failed")?;
-                let tx = build_payee_tx(chain, signer, rpc, calldata, now_unix)
-                    .await
-                    .map_err(|error| error.code())?;
-                // Recheck independently observed finalization before broadcast; a live
-                // settlement lease atomically excludes the close transition.
-                let latest = repo
-                    .get(&id)
-                    .await
-                    .map_err(|_| "settlement_reread_failed")?
-                    .ok_or("settlement_channel_missing")?;
-                if latest.state != ChannelLifecycle::Open
-                    || latest.settled_on_chain >= voucher.cumulative
-                {
-                    return Ok(SettlementAttempt::Deferred);
-                }
-                broadcast(rpc, &tx).await.map_err(|error| error.code())?;
-                if !repo
-                    .record_settlement(&id, lease, voucher.cumulative, now)
-                    .await
-                    .map_err(|_| "settlement_record_failed")?
-                {
-                    return Ok(SettlementAttempt::Deferred);
-                }
-                Ok(SettlementAttempt::Settled)
-            };
-            // Bound broadcast work below the lease lifetime; persistence and release
-            // also compare the lease fence after any reassignment.
-            let result = tokio::time::timeout(cfg.lease / 2, attempt)
-                .await
-                .unwrap_or(Err("settlement_timeout"));
-            match result {
-                Ok(SettlementAttempt::Settled) => summary.settled += 1,
-                Ok(outcome) => {
-                    if matches!(outcome, SettlementAttempt::NoVoucher) {
-                        summary.no_settleable_voucher += 1;
-                    }
-                    release(repo, &id, lease, &mut summary).await;
-                }
-                Err(outcome) => {
+                let (Some(until), Ok(now_unix)) = (
+                    now.checked_add_signed(lease),
+                    u64::try_from(now.timestamp()),
+                ) else {
                     summary.failed += 1;
-                    tracing::warn!(outcome, "MPP settlement failed");
-                    release(repo, &id, lease, &mut summary).await;
+                    return summary;
+                };
+                if !is_due(&record, cfg, now) {
+                    return summary;
                 }
-            }
+                summary.due += 1;
+                if record.settleable_voucher().is_none() {
+                    summary.no_settleable_voucher += 1;
+                    return summary;
+                }
+                let id = record.channel_id;
+                let (current, lease) = match repo.claim_settlement_lease(&id, now, until).await {
+                    Ok(Some(current)) => current,
+                    Ok(None) => {
+                        summary.lease_busy += 1;
+                        return summary;
+                    }
+                    Err(_) => {
+                        summary.failed += 1;
+                        return summary;
+                    }
+                };
+                if current.state != ChannelLifecycle::Open || !is_due(&current, cfg, now) {
+                    release(repo, &id, lease, &mut summary).await;
+                    return summary;
+                }
+                if current.settleable_voucher().is_none() {
+                    summary.no_settleable_voucher += 1;
+                    release(repo, &id, lease, &mut summary).await;
+                    return summary;
+                }
+                let attempt = async {
+                    let current = if chain_read_is_fresh(
+                        current.last_chain_read_at,
+                        now,
+                        chrono::Duration::seconds(60),
+                    ) {
+                        current
+                    } else {
+                        if current
+                            .last_chain_read_at
+                            .is_some_and(|at| at.timestamp_micros() < 0)
+                        {
+                            return Ok(SettlementAttempt::Deferred);
+                        }
+                        let bytes = rpc
+                            .call(chain.escrow, &get_channel_state_calldata(&id))
+                            .await
+                            .map_err(|_| "settlement_chain_read_failed")?;
+                        let state = decode_channel_state(&bytes)
+                            .map_err(|_| "settlement_chain_decode_failed")?;
+                        let observed = repo
+                            .record_chain_state(&id, state, now)
+                            .await
+                            .map_err(|_| "settlement_chain_record_failed")?
+                            .ok_or("settlement_channel_missing")?;
+                        if state.deposit == 0 {
+                            return Ok(SettlementAttempt::Deferred);
+                        }
+                        observed
+                    };
+                    if current.state != ChannelLifecycle::Open || !is_due(&current, cfg, now) {
+                        return Ok(SettlementAttempt::Deferred);
+                    }
+                    let Some(voucher) = current.settleable_voucher() else {
+                        return Ok(SettlementAttempt::NoVoucher);
+                    };
+                    let calldata = settle_calldata(
+                        &current.descriptor,
+                        voucher.cumulative,
+                        &voucher.signature,
+                    )
+                    .map_err(|_| "settlement_calldata_failed")?;
+                    let tx = build_payee_tx(chain, signer, rpc, calldata, now_unix)
+                        .await
+                        .map_err(|error| error.code())?;
+                    // Recheck independently observed finalization before broadcast; a live
+                    // settlement lease atomically excludes the close transition.
+                    let latest = repo
+                        .get(&id)
+                        .await
+                        .map_err(|_| "settlement_reread_failed")?
+                        .ok_or("settlement_channel_missing")?;
+                    if latest.state != ChannelLifecycle::Open
+                        || latest.settled_on_chain >= voucher.cumulative
+                    {
+                        return Ok(SettlementAttempt::Deferred);
+                    }
+                    // A pre-broadcast observation cannot establish whether this
+                    // transaction landed. Invalidate it before sending so a failed
+                    // ledger write forces an authoritative read on the next retry.
+                    if let Some(at) = latest.last_chain_read_at {
+                        if !repo
+                            .clear_chain_read_claim(&id, at)
+                            .await
+                            .map_err(|_| "settlement_chain_invalidate_failed")?
+                        {
+                            return Ok(SettlementAttempt::Deferred);
+                        }
+                    }
+                    broadcast(rpc, &tx).await.map_err(|error| error.code())?;
+                    if !repo
+                        .record_settlement(&id, lease, voucher.cumulative, now)
+                        .await
+                        .map_err(|_| "settlement_record_failed")?
+                    {
+                        return Ok(SettlementAttempt::Deferred);
+                    }
+                    Ok(SettlementAttempt::Settled)
+                };
+                // Bound broadcast work below the lease lifetime; persistence and release
+                // also compare the lease fence after any reassignment.
+                let result = tokio::time::timeout(cfg.lease / 2, attempt)
+                    .await
+                    .unwrap_or(Err("settlement_timeout"));
+                match result {
+                    Ok(SettlementAttempt::Settled) => summary.settled += 1,
+                    Ok(outcome) => {
+                        if matches!(outcome, SettlementAttempt::NoVoucher) {
+                            summary.no_settleable_voucher += 1;
+                        }
+                        release(repo, &id, lease, &mut summary).await;
+                    }
+                    Err(outcome) => {
+                        summary.failed += 1;
+                        tracing::warn!(outcome, "MPP settlement failed");
+                        release(repo, &id, lease, &mut summary).await;
+                    }
+                }
+                summary
+            })
+            .buffer_unordered(8);
+        while let Some(result) = operations.next().await {
+            summary.considered += result.considered;
+            summary.due += result.due;
+            summary.settled += result.settled;
+            summary.no_settleable_voucher += result.no_settleable_voucher;
+            summary.lease_busy += result.lease_busy;
+            summary.failed += result.failed;
         }
     }
     summary

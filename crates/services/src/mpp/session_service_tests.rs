@@ -138,7 +138,7 @@ pub(super) async fn verified(service: &SessionService, payload: Value) -> Sessio
         .unwrap()
 }
 
-fn state() -> ChannelState {
+pub(super) fn state() -> ChannelState {
     ChannelState {
         deposit: Vectors::load().int("deposit"),
         settled: 0,
@@ -439,7 +439,7 @@ async fn exact_voucher_replay_reserves_again_but_changed_signature_does_not() {
     let changed = f.credential(changed).await;
     assert_eq!(
         f.service.voucher(&changed, 10, Uuid::new_v4()).await.err(),
-        Some(MppError::VoucherRejected(VoucherReason::NotHigher))
+        Some(MppError::VoucherRejected(VoucherReason::SignerMismatch))
     );
     assert_eq!(f.record().await.reserved, 20);
 }
@@ -658,8 +658,8 @@ async fn shortfall_snapshot_has_exact_required_cumulative_and_no_reservation() {
     };
     assert_eq!(snapshot.required_cumulative, 1_300_000);
     assert_eq!(snapshot.spent, 1_000_000);
-    assert_eq!(snapshot.accepted_cumulative, amount);
-    assert_eq!(snapshot.highest_voucher.cumulative_amount, amount);
+    assert_eq!(snapshot.accepted_cumulative, INITIAL);
+    assert_eq!(snapshot.highest_voucher.cumulative_amount, INITIAL);
     assert_eq!(f.record().await.reserved, 1_000_000);
 }
 
@@ -892,99 +892,5 @@ async fn close_marks_pending_before_send_and_failure_clears_closing() {
     }
 }
 
-fn top_up_input(descriptor: &ChannelDescriptor, amount: u128) -> Vec<u8> {
-    let mut input = vec![0xdc, 0x48, 0x47, 0x1e];
-    for address in [
-        descriptor.payer,
-        descriptor.payee,
-        descriptor.operator,
-        descriptor.token,
-    ] {
-        input.extend(abi::address_word(&address));
-    }
-    input.extend(descriptor.salt);
-    input.extend(abi::address_word(&descriptor.authorized_signer));
-    input.extend(descriptor.expiring_nonce_hash);
-    input.extend(abi::uint_word(amount));
-    input
-}
-
-fn top_up(raw: &[u8], additional: u128) -> Value {
-    let v = Vectors::load();
-    json!({"action":"topUp","type":"transaction", "channelId":v.text("channelId"),
-        "descriptor":descriptor_json(&v.descriptor()), "additionalDeposit":additional.to_string(), "transaction":hex_prefixed(raw)})
-}
-
-#[tokio::test]
-async fn top_up_validates_call_descriptor_sender_amount_and_chain_before_send() {
-    for (case, expected) in [
-        (0, TopUpReason::Selector),
-        (1, TopUpReason::Descriptor),
-        (2, TopUpReason::Sender),
-        (3, TopUpReason::Amount),
-        (4, TopUpReason::ChainId),
-        (5, TopUpReason::CallCount),
-        (6, TopUpReason::Target),
-        (7, TopUpReason::Value),
-        (8, TopUpReason::Calldata),
-        (9, TopUpReason::ExpiringNonce),
-    ] {
-        let f = Fixture::new();
-        f.seed().await;
-        let raw = resigned(
-            |tx| {
-                let mut d = Vectors::load().descriptor();
-                if case == 1 {
-                    d.salt[0] ^= 1;
-                }
-                tx.calls[0].input = top_up_input(&d, if case == 3 { 201 } else { 200 });
-                match case {
-                    0 => tx.calls[0].input[0] ^= 1,
-                    4 => tx.chain_id += 1,
-                    5 => tx.calls.push(tx.calls[0].clone()),
-                    6 => tx.calls[0].to[0] ^= 1,
-                    7 => tx.calls[0].value = 1,
-                    8 => {
-                        tx.calls[0].input.pop();
-                    }
-                    9 => tx.nonce_key = [0; 32],
-                    _ => {}
-                }
-            },
-            case != 2,
-        );
-        let credential = f.credential(top_up(&raw, 200)).await;
-        assert_eq!(
-            f.service.top_up(&credential).await.err(),
-            Some(MppError::TopUpRejected(expected)),
-            "case {case}"
-        );
-        assert_eq!(f.rpc.send_calls(), 0);
-        assert_eq!(f.record().await.deposit, Vectors::load().int("deposit"));
-    }
-}
-
-#[tokio::test]
-async fn valid_top_up_broadcasts_and_refreshes_deposit_without_spending() {
-    let f = Fixture::new();
-    f.seed().await;
-    let raw = resigned(
-        |tx| tx.calls[0].input = top_up_input(&Vectors::load().descriptor(), 200),
-        true,
-    );
-    f.rpc.mine(receipt(&raw));
-    set_chain(
-        &f.rpc,
-        ChannelState {
-            deposit: Vectors::load().int("deposit") + 200,
-            ..state()
-        },
-    );
-    let credential = f.credential(top_up(&raw, 200)).await;
-    let receipt = f.service.top_up(&credential).await.unwrap().receipt;
-    assert_eq!(receipt.tx_hash, Some(tx_hash(&raw)));
-    assert_eq!(receipt.accepted_cumulative, INITIAL);
-    let row = f.record().await;
-    assert_eq!((row.deposit, row.spent, row.reserved), (5_000_200, 0, 0));
-    assert_eq!(f.rpc.send_calls(), 1);
-}
+#[path = "session_service/topup_tests.rs"]
+mod topup_tests;

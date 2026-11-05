@@ -178,6 +178,7 @@ impl Stream for SessionBody {
             prompt_tokens: 7,
             completion_tokens: 5,
             completed: true,
+            output_started: true,
         });
         std::task::Poll::Ready(None)
     }
@@ -188,9 +189,10 @@ impl Drop for SessionBody {
         if !self.finished {
             self.observer.on_finished(UsageReport {
                 request_id: self.request_id,
-                prompt_tokens: 0,
-                completion_tokens: 0,
+                prompt_tokens: if self.emitted { 7 } else { 0 },
+                completion_tokens: if self.emitted { 2 } else { 0 },
                 completed: false,
+                output_started: self.emitted,
             });
         }
     }
@@ -217,6 +219,7 @@ async fn session_handler(State(state): State<SessionHandlerState>, request: Requ
                 prompt_tokens: 7,
                 completion_tokens: 5,
                 completed: true,
+                output_started: true,
             };
             observer.on_finished(report);
             observer.on_finished(report); // A duplicate callback must not double charge.
@@ -755,7 +758,7 @@ async fn stored_voucher_with_insufficient_balance_returns_required_snapshot() {
         .next()
         .unwrap();
     let terms: Value = serde_json::from_slice(&protocol::b64url_decode(request).unwrap()).unwrap();
-    let expected = INITIAL - 1 + SESSION_PRICE * (body().len().div_ceil(4) as u128 + 8);
+    let expected = INITIAL - 1 + SESSION_PRICE * (body().len() as u128 + 8);
     assert_eq!(
         terms["methodDetails"]["sessionSnapshot"]["requiredCumulative"],
         expected.to_string()
@@ -787,7 +790,7 @@ async fn closed_channel_returns_gone_without_reservation() {
 }
 
 #[tokio::test]
-async fn absent_usage_releases_and_stream_uses_provisional_receipt() {
+async fn absent_usage_charges_cap_and_stream_uses_provisional_receipt() {
     let app = session_app(SERVICE_KEY, AMOUNT, Some(SESSION_PRICE));
     seed(&app).await;
     *app.state.mode.lock().unwrap() = SessionHandlerMode::Missing;
@@ -797,8 +800,10 @@ async fn absent_usage_releases_and_stream_uses_provisional_receipt() {
     )
     .await;
     assert_eq!(response.status(), StatusCode::OK);
-    assert!(response.headers().get("payment-receipt").is_none());
+    assert!(response.headers().get("payment-receipt").is_some());
     assert_eq!(app.ledger.reservation_count(), 0);
+    let cap = SESSION_PRICE * (body().len() as u128 + 8);
+    assert_eq!(row(&app).await.spent, cap);
 
     *app.state.mode.lock().unwrap() = SessionHandlerMode::Stream;
     let response = post_session(
@@ -832,7 +837,38 @@ async fn absent_usage_releases_and_stream_uses_provisional_receipt() {
     })
     .await
     .unwrap();
-    assert_eq!((row(&app).await.spent, row(&app).await.units), (24, 12));
+    assert_eq!(
+        (row(&app).await.spent, row(&app).await.units),
+        (cap + 24, 12)
+    );
+}
+
+#[tokio::test]
+async fn dropped_stream_after_first_chunk_charges_full_cap() {
+    use futures::StreamExt;
+    let app = session_app(SERVICE_KEY, AMOUNT, Some(SESSION_PRICE));
+    seed(&app).await;
+    *app.state.mode.lock().unwrap() = SessionHandlerMode::Stream;
+    let response = post_session(
+        &app,
+        Some(&session_credential(&app, voucher(INITIAL)).await),
+    )
+    .await;
+    let cap = SESSION_PRICE * (body().len() as u128 + 8);
+    let mut stream = response.into_body().into_data_stream();
+    assert_eq!(
+        stream.next().await.unwrap().unwrap().as_ref(),
+        b"data: one\n\n"
+    );
+    drop(stream);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while app.ledger.reservation_count() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!((row(&app).await.spent, row(&app).await.units), (cap, 0));
 }
 
 #[tokio::test]

@@ -46,6 +46,7 @@ pub enum ConsumedReason {
 pub enum UnavailableReason {
     Rpc,
     Store,
+    ManagementBusy,
 }
 
 /// Every way MPP processing can end other than success. Variants carry closed reasons only.
@@ -192,6 +193,7 @@ impl MppError {
             Self::Consumed(ConsumedReason::MemoNotBound) => "memo_not_bound",
             Self::Unavailable(UnavailableReason::Rpc) => "rpc_unavailable",
             Self::Unavailable(UnavailableReason::Store) => "store_unavailable",
+            Self::Unavailable(UnavailableReason::ManagementBusy) => "management_busy",
             Self::Limit(limit) => limit.code(),
             Self::Config => "config",
             Self::VoucherTooLow(_) => "insufficient_balance",

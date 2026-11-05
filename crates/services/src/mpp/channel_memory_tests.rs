@@ -5,6 +5,9 @@ const RULES: crate::mpp::ports::VoucherRules = crate::mpp::ports::VoucherRules {
     settled_floor_from_chain: true,
 };
 
+#[path = "channel_memory_tests/ledger_regressions.rs"]
+mod ledger_regressions;
+
 use super::ports::SettlementLease;
 use chrono::{DateTime, Duration, Utc};
 
@@ -596,7 +599,7 @@ async fn chain_state_with_a_zero_deposit_leaves_the_deposit() {
 }
 
 #[tokio::test]
-async fn a_close_request_is_stored_and_a_zero_never_erases_it() {
+async fn a_close_request_is_stored_and_a_zero_clears_it() {
     let repo = InMemoryChannelRepository::new();
     open(&repo, 1, 100).await;
     let chain = |close_requested_at| ChannelState {
@@ -616,7 +619,8 @@ async fn a_close_request_is_stored_and_a_zero_never_erases_it() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(record.close_requested_at, 1_800_000_000);
+    assert_eq!(record.close_requested_at, 0);
+    assert!(record.accepts_vouchers());
 }
 
 // ---- closing / finalize ----------------------------------------------------------
@@ -814,7 +818,7 @@ async fn purge_removes_old_finalized_channels_and_their_reservations() {
 // ---- clock, concurrency ----------------------------------------------------------
 
 #[tokio::test]
-async fn every_write_moves_updated_at_forward() {
+async fn money_writes_advance_updated_at_and_unchanged_chain_observations_preserve_it() {
     let repo = InMemoryChannelRepository::new();
     let mut last = open(&repo, 1, 100).await.updated_at;
     let mut check = |record: ChannelRecord| {
@@ -841,6 +845,8 @@ async fn every_write_moves_updated_at_forward() {
         panic!("expected Accepted");
     };
     check(*record);
+    let before = repo.get(&id(1)).await.unwrap().unwrap().updated_at;
+    let read_at = Utc::now();
     let record = repo
         .record_chain_state(
             &id(1),
@@ -849,12 +855,13 @@ async fn every_write_moves_updated_at_forward() {
                 deposit: 1,
                 close_requested_at: 0,
             },
-            Utc::now(),
+            read_at,
         )
         .await
         .unwrap()
         .unwrap();
-    check(record);
+    assert_eq!(record.updated_at, before);
+    assert_eq!(record.last_chain_read_at, Some(read_at));
 
     // set_now steers later stamps.
     let target = test_now() + Duration::days(1);

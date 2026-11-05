@@ -16,9 +16,11 @@ pub struct UsageReport {
     pub request_id: Uuid,
     pub prompt_tokens: i32,
     pub completion_tokens: i32,
+    /// At least one provider chunk was forwarded, or the non-streaming body was produced.
+    pub output_started: bool,
     /// `true` when the completion ended with usage; `false` when it ended
-    /// without usage (dropped stream, provider error, early failure), in
-    /// which case the counts are zero.
+    /// without final usage (dropped stream, provider error, early failure).
+    /// Incomplete reports may contain partial counts.
     pub completed: bool,
 }
 
@@ -44,6 +46,7 @@ pub struct UsageObserverExt(pub Arc<dyn UsageObserver>);
 pub(crate) struct UsageFireOnce {
     observer: Option<Arc<dyn UsageObserver>>,
     fired: AtomicBool,
+    output_started: AtomicBool,
 }
 
 impl UsageFireOnce {
@@ -51,18 +54,20 @@ impl UsageFireOnce {
         Self {
             observer,
             fired: AtomicBool::new(false),
+            output_started: AtomicBool::new(false),
         }
     }
 
     /// Fire the observer unless it already fired. Returns whether this call fired.
     /// A panicking observer is contained so it cannot unwind through `Drop`.
-    pub(crate) fn fire(&self, report: UsageReport) -> bool {
+    pub(crate) fn fire(&self, mut report: UsageReport) -> bool {
         let Some(observer) = &self.observer else {
             return false;
         };
         if self.fired.swap(true, Ordering::AcqRel) {
             return false;
         }
+        report.output_started |= self.output_started.load(Ordering::Acquire);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             observer.on_finished(report);
         }));
@@ -70,6 +75,10 @@ impl UsageFireOnce {
             tracing::error!(request_id = %report.request_id, "Usage observer panicked");
         }
         true
+    }
+
+    pub(crate) fn output_started(&self) {
+        self.output_started.store(true, Ordering::Release);
     }
 }
 
@@ -96,6 +105,7 @@ impl UsageReportGuard {
             prompt_tokens,
             completion_tokens,
             completed: true,
+            output_started: true,
         });
     }
 
@@ -114,6 +124,7 @@ impl Drop for UsageReportGuard {
             prompt_tokens: 0,
             completion_tokens: 0,
             completed: false,
+            output_started: false,
         });
     }
 }

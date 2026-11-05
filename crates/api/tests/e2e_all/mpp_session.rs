@@ -16,6 +16,9 @@ use uuid::Uuid;
 use wiremock::matchers::{body_partial_json, method};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
+#[path = "mpp_session/regressions.rs"]
+mod regressions;
+
 const VECTORS: &str = include_str!("../../../services/src/mpp/testdata/session_vectors.json");
 const TOKEN_PRICE: u128 = 2;
 const DEPOSIT: u128 = 5_000_000;
@@ -214,7 +217,7 @@ async fn session_open_short_voucher_charge_and_close() {
     .unwrap();
     let snapshot = &terms["methodDetails"]["sessionSnapshot"];
     assert_eq!(snapshot["channelId"], id_hex);
-    let cap = TOKEN_PRICE * (body.len().div_ceil(4) as u128 + 64);
+    let cap = TOKEN_PRICE * (u128::try_from(body.len()).unwrap() + 64);
     assert_eq!(snapshot["requiredCumulative"], cap.to_string());
     let row = repo.get(&id).await.unwrap().unwrap();
     assert_eq!((row.spent, row.reserved), (0, 0));

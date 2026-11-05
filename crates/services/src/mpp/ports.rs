@@ -434,6 +434,62 @@ impl SettlementLease {
     }
 }
 
+/// Encode a refresh lease distinctly from successful observation timestamps. Negative
+/// Unix microseconds contain the negated claim time, so an expired claim can never
+/// be mistaken for a successful recent read. PostgreSQL stores microsecond precision.
+pub fn chain_read_claim_at(
+    now: DateTime<Utc>,
+    interval: chrono::Duration,
+) -> Option<DateTime<Utc>> {
+    let started = now.timestamp_micros();
+    if interval <= chrono::Duration::zero() || started <= 0 {
+        return None;
+    }
+    DateTime::from_timestamp_micros(started.checked_neg()?)
+}
+
+pub fn chain_read_is_fresh(
+    at: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+    interval: chrono::Duration,
+) -> bool {
+    at.is_some_and(|at| {
+        at.timestamp_micros() >= 0 && at <= now && now.signed_duration_since(at) < interval
+    })
+}
+
+pub fn chain_read_may_claim(
+    at: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+    interval: chrono::Duration,
+) -> bool {
+    match at {
+        Some(at) if at.timestamp_micros() < 0 => at
+            .timestamp_micros()
+            .checked_neg()
+            .and_then(DateTime::from_timestamp_micros)
+            .is_some_and(|started| now.signed_duration_since(started) >= interval),
+        Some(at) => now.signed_duration_since(at) >= interval,
+        None => true,
+    }
+}
+
+/// Record an observation, replacing a pending claim and preserving newer observations.
+pub fn chain_read_observed_at(previous: Option<DateTime<Utc>>, at: DateTime<Utc>) -> DateTime<Utc> {
+    if let Some(pending) = previous.filter(|old| old.timestamp_micros() < 0) {
+        if pending
+            .timestamp_micros()
+            .checked_neg()
+            .is_some_and(|started| started > at.timestamp_micros())
+        {
+            return pending;
+        }
+    }
+    previous
+        .filter(|old| old.timestamp_micros() >= 0)
+        .map_or(at, |old| old.max(at))
+}
+
 /// The channel ledger of the `session` intent: one row per channel the server is payee
 /// of, plus one row per in-flight reservation. It stores no organization, workspace,
 /// request content or API key.
@@ -493,9 +549,9 @@ pub trait ChannelRepository: Send + Sync {
 
     /// Record a chain read: `deposit` takes the greater of the stored and the on-chain
     /// value unless the on-chain deposit is zero (a withdrawn channel; the caller
-    /// finalizes it), `settled_on_chain` takes the greater value, a non-zero
-    /// `close_requested_at` is stored, and `last_chain_read_at` takes the greater of its
-    /// stored value and `read_at`, preserving newer refresh claims. Returns the
+    /// finalizes it), `settled_on_chain` takes the greater value and
+    /// `close_requested_at` is replaced, including zero. `last_chain_read_at` records the
+    /// observation; unchanged chain data preserves `updated_at`. Returns the
     /// row after the write, `None` for an unknown channel.
     async fn record_chain_state(
         &self,
@@ -539,13 +595,22 @@ pub trait ChannelRepository: Send + Sync {
         settled_on_chain: u128,
     ) -> Result<bool, RepositoryError>;
 
-    /// Claim a chain refresh under the row lock, writing `now` only if no read was
-    /// claimed within `min_interval`. Equality at the interval boundary is eligible.
+    /// Claim a chain refresh under the row lock with [`chain_read_claim_at`], only
+    /// when no successful read or unexpired claim covers `min_interval`.
     async fn claim_chain_read(
         &self,
         channel_id: &[u8; 32],
         now: DateTime<Utc>,
         min_interval: chrono::Duration,
+    ) -> Result<bool, RepositoryError>;
+
+    /// Clear only the exact failed refresh claim. A stale claimant cannot clear a
+    /// replacement claim. Also invalidates an exact observed timestamp before a chain
+    /// mutation, so retry requires an authoritative read. Does not change `updated_at`.
+    async fn clear_chain_read_claim(
+        &self,
+        channel_id: &[u8; 32],
+        claimed_at: DateTime<Utc>,
     ) -> Result<bool, RepositoryError>;
 
     /// Take the settlement lease of a channel until `until`, if no instance holds one

@@ -311,12 +311,7 @@ async fn stale_chain_failures_refuse_even_exact_replay_without_money_changes() {
             Some(MppError::Unavailable(UnavailableReason::Rpc)),
             "case {case}"
         );
-        let mut after = f.record().await;
-        assert!(after.last_chain_read_at.is_some());
-        assert!(after.updated_at > before.updated_at);
-        // A failed read retains its throttle claim; every money field stays exact.
-        after.last_chain_read_at = before.last_chain_read_at;
-        after.updated_at = before.updated_at;
+        let after = f.record().await;
         assert_eq!(after, before);
         assert_eq!(f.repo.reservation_count(), 0);
         assert_eq!(f.rpc.eth_calls(), 1);

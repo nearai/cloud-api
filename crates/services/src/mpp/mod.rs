@@ -39,6 +39,7 @@ pub mod service;
 pub mod session_chain;
 #[cfg(test)]
 mod session_chain_tests;
+mod session_close_reconciliation;
 pub mod session_service;
 pub mod session_settlement;
 #[cfg(test)]

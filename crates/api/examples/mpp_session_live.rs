@@ -55,6 +55,7 @@ async fn completion(request: Request) -> Json<Value> {
             prompt_tokens: 7,
             completion_tokens: 5,
             completed: true,
+            output_started: true,
         });
     }
     Json(json!({

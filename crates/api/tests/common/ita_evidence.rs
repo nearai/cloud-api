@@ -57,7 +57,8 @@ where
         domain_services,
         Arc::new(infra.config),
         E2E_APP_BUILD_OPTIONS,
-    );
+    )
+    .expect("test application configuration");
     axum_test::TestServer::new(app)
 }
 

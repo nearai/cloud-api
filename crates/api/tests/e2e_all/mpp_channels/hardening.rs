@@ -295,7 +295,7 @@ async fn chain_read_claim_is_once_per_interval_and_old_results_do_not_rewind_it(
     .unwrap();
     assert_eq!(
         repo.get(&id).await.unwrap().unwrap().last_chain_read_at,
-        Some(now + interval)
+        services::mpp::ports::chain_read_claim_at(now + interval, interval)
     );
     assert!(!repo
         .claim_chain_read(&id, now + Duration::seconds(61), interval)
@@ -304,4 +304,35 @@ async fn chain_read_claim_is_once_per_interval_and_old_results_do_not_rewind_it(
     let before = repo.get(&id).await.unwrap().unwrap();
     assert!(!repo.claim_chain_read(&id, now, interval).await.unwrap());
     assert_eq!(repo.get(&id).await.unwrap().unwrap(), before);
+}
+
+#[tokio::test]
+async fn finalized_capture_survives_late_charge_release_and_reaper() {
+    for case in 0..3 {
+        let f = fixture().await;
+        let (id, _) = f.open(300).await;
+        let (request, _) = f.reserve(&id, 100).await;
+        f.repo.finalize(&id, 100).await.unwrap();
+        match case {
+            0 => {
+                f.repo.charge(request, 10, 5).await.unwrap();
+            }
+            1 => {
+                assert!(f.repo.release(request).await.unwrap());
+            }
+            _ => {
+                f.pool.get().await.unwrap().execute("UPDATE mpp_channel_reservations SET created_at = NOW() - INTERVAL '3 hours' WHERE request_id = $1", &[&request]).await.unwrap();
+                f.repo
+                    .release_stale_reservations(Utc::now() - Duration::hours(2))
+                    .await
+                    .unwrap();
+            }
+        }
+        let row = f.stored(&id).await;
+        assert_eq!(
+            (row.spent, row.reserved, row.settled_on_chain),
+            (100, 0, 100)
+        );
+        assert_eq!(row.units, if case == 0 { 5 } else { 0 });
+    }
 }

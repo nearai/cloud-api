@@ -139,6 +139,7 @@ async fn streaming_with_usage_reports_counts_once() {
             prompt_tokens: 11,
             completion_tokens: 23,
             completed: true,
+            output_started: true,
         }]
     );
 }
@@ -163,7 +164,67 @@ async fn dropped_stream_before_usage_reports_incomplete() {
             prompt_tokens: 0,
             completion_tokens: 0,
             completed: false,
+            output_started: true,
         }]
+    );
+}
+
+#[tokio::test]
+async fn dropped_stream_after_partial_usage_is_incomplete() {
+    let observer = Arc::new(RecordingObserver::default());
+    let mut stream = observed_stream(
+        vec![Ok(chunk(Some(usage(11, 2))))],
+        observer.clone(),
+        Uuid::new_v4(),
+    );
+    assert!(stream.next().await.is_some());
+    drop(stream);
+    let reports = observer.reports();
+    assert_eq!(reports.len(), 1);
+    assert!(!reports[0].completed);
+    assert_eq!(
+        (reports[0].prompt_tokens, reports[0].completion_tokens),
+        (11, 2)
+    );
+}
+
+#[tokio::test]
+async fn streaming_service_propagates_observer_and_final_counts() {
+    let model_name = "z-ai/glm-5.1";
+    let (service, usage_service) =
+        completion_service_with_mock_providers(model_name, false, false).await;
+    let observer = Arc::new(RecordingObserver::default());
+    let mut request = completion_request(model_name);
+    let request_id = request.request_id;
+    request.stream = Some(true);
+    request.usage_observer = Some(observer.clone());
+    let mut stream = service
+        .create_chat_completion_stream(request)
+        .await
+        .unwrap();
+    while let Some(event) = stream.next().await {
+        event.unwrap();
+    }
+    drop(stream);
+    let reports = observer.reports();
+    assert_eq!(reports.len(), 1);
+    assert_eq!(reports[0].request_id, request_id);
+    assert!(reports[0].completed);
+    let usage = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let usage = usage_service.get_requests();
+            if !usage.is_empty() {
+                break usage;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(usage.len(), 1);
+    assert_eq!(
+        (reports[0].prompt_tokens, reports[0].completion_tokens),
+        (usage[0].input_tokens, usage[0].output_tokens)
     );
 }
 
@@ -214,6 +275,7 @@ async fn non_streaming_reports_the_recorded_usage_once() {
             prompt_tokens: recorded[0].input_tokens,
             completion_tokens: recorded[0].output_tokens,
             completed: true,
+            output_started: true,
         }]
     );
 }
@@ -237,6 +299,7 @@ async fn non_streaming_failure_reports_incomplete_once() {
             prompt_tokens: 0,
             completion_tokens: 0,
             completed: false,
+            output_started: false,
         }]
     );
 }

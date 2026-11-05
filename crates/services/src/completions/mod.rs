@@ -302,7 +302,10 @@ where
 
         // Tell the observer first: every exit below (including the early
         // returns for interrupted streams) has already settled its counts.
-        let usage_complete = self.last_usage_stats.is_some() && self.last_chat_id.is_some();
+        let usage_complete = self.stream_completed
+            && self.last_error.is_none()
+            && self.last_usage_stats.is_some()
+            && self.last_chat_id.is_some();
         let (observed_prompt, observed_completion) = self
             .last_usage_stats
             .as_ref()
@@ -313,6 +316,7 @@ where
             prompt_tokens: observed_prompt,
             completion_tokens: observed_completion,
             completed: usage_complete,
+            output_started: false, // UsageFireOnce carries the forwarded-chunk observation.
         });
 
         let (
@@ -579,6 +583,9 @@ where
             if matches!(&self.state, StreamState::Streaming) {
                 match Pin::new(&mut self.inner).poll_next(cx) {
                     Poll::Ready(Some(Ok(event))) => {
+                        if !event.raw_bytes.is_empty() {
+                            self.usage_observer.output_started();
+                        }
                         if event.is_done_marker() {
                             if event.raw_bytes.len() > MAX_PROVIDER_DONE_EVENT_BYTES {
                                 let error = inference_providers::CompletionError::CompletionError(

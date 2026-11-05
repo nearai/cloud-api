@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, TimeZone, Utc};
 use config::{MppModelPrice, MppSessionSettings};
-use tokio::sync::{Mutex, MutexGuard};
+use tokio::sync::{Semaphore, SemaphorePermit};
 use uuid::Uuid;
 
 use crate::mpp::abi::{self, ChannelDescriptor, ChannelState, TOP_UP_SELECTOR};
@@ -19,8 +19,8 @@ use crate::mpp::error::{
 };
 use crate::mpp::open_check::{verify_open_transaction, OpenTerms};
 use crate::mpp::ports::{
-    ChannelLifecycle, ChannelRecord, ChannelRepository, ChargeOutcome, NewChannel, ReserveOutcome,
-    TempoRpc, TempoSigner, VoucherOutcome, VoucherRules,
+    chain_read_claim_at, chain_read_is_fresh, ChannelLifecycle, ChannelRecord, ChannelRepository,
+    ChargeOutcome, NewChannel, ReserveOutcome, TempoRpc, TempoSigner, VoucherOutcome, VoucherRules,
 };
 use crate::mpp::pricing::{LimitViolation, Price};
 use crate::mpp::protocol::{self, Challenge, INTENT_SESSION, METHOD};
@@ -33,6 +33,9 @@ use crate::mpp::session_wire::{
 use crate::mpp::tempo_tx::{decode_signed, tx_hash};
 
 mod closing;
+
+pub(crate) const CHAIN_READ_FRESHNESS_SECONDS: i64 = 60;
+static MANAGEMENT: Semaphore = Semaphore::const_new(8);
 
 /// Immutable offer configuration. Secrets are never included in Debug output.
 #[derive(Clone)]
@@ -107,9 +110,6 @@ pub struct SessionService {
     repo: Arc<dyn ChannelRepository>,
     rpc: Arc<dyn TempoRpc>,
     signer: Arc<dyn TempoSigner>,
-    // Bounded stripes coalesce stale reads in this instance without an unbounded map of
-    // attacker-selected ids. The ledger still arbitrates cross-instance money writes.
-    gates: [Mutex<()>; 64],
 }
 
 impl SessionService {
@@ -131,7 +131,6 @@ impl SessionService {
             repo,
             rpc,
             signer,
-            gates: std::array::from_fn(|_| Mutex::new(())),
         };
         for price in service.config.model_prices.values() {
             if price.token_price.is_some() {
@@ -307,9 +306,10 @@ impl SessionService {
         })
     }
 
-    async fn gate(&self, id: &[u8; 32]) -> Result<MutexGuard<'_, ()>, MppError> {
-        let index = usize::from(id.first().copied().unwrap_or(0)) % self.gates.len();
-        Ok(self.gates.get(index).ok_or(MppError::Config)?.lock().await)
+    fn management_permit(&self) -> Result<SemaphorePermit<'static>, MppError> {
+        MANAGEMENT
+            .try_acquire()
+            .map_err(|_| MppError::Unavailable(UnavailableReason::ManagementBusy))
     }
 
     async fn get(&self, id: &[u8; 32]) -> Result<ChannelRecord, MppError> {
@@ -384,22 +384,37 @@ impl SessionService {
 
     async fn refresh(&self, record: ChannelRecord) -> Result<ChannelRecord, MppError> {
         Self::accepting(&record)?;
+        let now = Utc::now();
+        let interval = chrono::Duration::seconds(CHAIN_READ_FRESHNESS_SECONDS);
+        if chain_read_is_fresh(record.last_chain_read_at, now, interval) {
+            return Ok(record);
+        }
+        let claimed_at = chain_read_claim_at(now, interval).ok_or(MppError::Config)?;
         if !self
             .repo
-            .claim_chain_read(
-                &record.channel_id,
-                Utc::now(),
-                chrono::Duration::seconds(60),
-            )
+            .claim_chain_read(&record.channel_id, now, interval)
             .await
             .map_err(store_error)?
         {
             let current = self.get(&record.channel_id).await?;
             Self::accepting(&current)?;
-            return Ok(current);
+            return if chain_read_is_fresh(current.last_chain_read_at, Utc::now(), interval) {
+                Ok(current)
+            } else {
+                Err(MppError::Unavailable(UnavailableReason::Rpc))
+            };
         }
-        let chain = self.read_chain(&record.channel_id).await?;
-        self.record_chain(&record.channel_id, chain).await
+        let result = match self.read_chain(&record.channel_id).await {
+            Ok(chain) => self.record_chain(&record.channel_id, chain).await,
+            Err(error) => Err(error),
+        };
+        if result.is_err() {
+            self.repo
+                .clear_chain_read_claim(&record.channel_id, claimed_at)
+                .await
+                .map_err(store_error)?;
+        }
+        result
     }
 
     fn verify_signature(
@@ -517,7 +532,6 @@ impl SessionService {
         else {
             return Err(MppError::SessionMismatch(SessionMismatch::Action));
         };
-        let _gate = self.gate(id).await?;
         let verified = verify_open_transaction(
             transaction,
             &OpenTerms {
@@ -538,6 +552,7 @@ impl SessionService {
             return Err(MppError::VoucherRejected(VoucherReason::AboveDeposit));
         }
         self.verify_signature(id, descriptor, *cumulative_amount, signature)?;
+        let _permit = self.management_permit()?;
         if let Some(existing) = self.repo.get(id).await.map_err(store_error)? {
             Self::accepting(&existing)?;
             self.bind(&existing, descriptor)?;
@@ -624,11 +639,11 @@ impl SessionService {
         else {
             return Err(MppError::SessionMismatch(SessionMismatch::Action));
         };
-        let _gate = self.gate(id).await?;
+        self.verify_top_up(transaction, descriptor, *additional_deposit)?;
+        let _permit = self.management_permit()?;
         let record = self.get(id).await?;
         Self::accepting(&record)?;
         self.bind(&record, descriptor)?;
-        self.verify_top_up(transaction, &record, *additional_deposit)?;
         let tx = client_tx(transaction);
         broadcast(self.rpc.as_ref(), &tx)
             .await
@@ -643,7 +658,7 @@ impl SessionService {
     fn verify_top_up(
         &self,
         raw: &[u8],
-        record: &ChannelRecord,
+        descriptor: &ChannelDescriptor,
         additional: u128,
     ) -> Result<(), MppError> {
         let rejected = MppError::TopUpRejected;
@@ -672,7 +687,7 @@ impl SessionService {
         // Static ABI: comparing the complete canonical encoding also checks address padding,
         // uint96 width, descriptor identity, length and the absence of trailing calldata.
         let mut expected = TOP_UP_SELECTOR.to_vec();
-        let d = &record.descriptor;
+        let d = descriptor;
         for address in [&d.payer, &d.payee, &d.operator, &d.token] {
             expected.extend_from_slice(&abi::address_word(address));
         }
@@ -716,7 +731,7 @@ impl SessionService {
         if cost_cap == 0 {
             return Err(MppError::Malformed("zero_cost_cap"));
         }
-        let _gate = self.gate(id).await?;
+        self.verify_signature(id, descriptor, *cumulative_amount, signature)?;
         let record = self.get(id).await?;
         Self::accepting(&record)?;
         self.bind(&record, descriptor)?;
@@ -747,6 +762,15 @@ impl SessionService {
                 ))));
             }
             return Err(error);
+        }
+        let required = record
+            .spent
+            .checked_add(cost_cap)
+            .ok_or(MppError::Malformed("cost_overflow"))?;
+        if *cumulative_amount < required {
+            return Err(MppError::VoucherTooLow(Box::new(snapshot(
+                &record, required,
+            ))));
         }
         if let Err(error) = self
             .accept(
@@ -816,20 +840,47 @@ impl SessionService {
             .token_price
             .checked_mul(u128::from(units))
             .ok_or(MppError::Malformed("cost_overflow"))?;
+        self.charge_amount(reserved, actual, units).await
+    }
+
+    /// Charge the full reserved cap when output was delivered without complete usage.
+    /// Unknown usage contributes no invented units.
+    pub async fn charge_reserved(
+        &self,
+        reserved: &ReservedRequest,
+    ) -> Result<SessionReceipt, MppError> {
+        self.charge_amount(reserved, reserved.reserved, 0).await
+    }
+
+    async fn charge_amount(
+        &self,
+        reserved: &ReservedRequest,
+        actual: u128,
+        units: u64,
+    ) -> Result<SessionReceipt, MppError> {
         match self
             .repo
             .charge(reserved.request_id, actual, units)
             .await
             .map_err(store_error)?
         {
-            ChargeOutcome::Charged { record, .. } => Ok(SessionReceipt {
-                challenge_id: reserved.receipt_preview.challenge_id.clone(),
-                channel_id: record.channel_id,
-                accepted_cumulative: record.highest_cumulative,
-                spent: record.spent,
-                units: record.units,
-                tx_hash: None,
-            }),
+            ChargeOutcome::Charged { record, charged } => {
+                if charged < actual {
+                    tracing::warn!(
+                        error_code = "session_charge_clamped",
+                        count = 1u64,
+                        "MPP charge clamped"
+                    );
+                }
+                Ok(SessionReceipt {
+                    challenge_id: reserved.receipt_preview.challenge_id.clone(),
+                    channel_id: record.channel_id,
+                    accepted_cumulative: record.highest_cumulative,
+                    spent: record.spent,
+                    units: record.units,
+                    tx_hash: None,
+                })
+            }
             ChargeOutcome::NoReservation => Err(MppError::ReservationMissing),
         }
     }
@@ -905,3 +956,8 @@ mod regression_tests;
 #[cfg(test)]
 #[path = "session_service/port_tests.rs"]
 mod port_tests;
+
+#[cfg(test)]
+#[path = "session_service/ledger_regression_tests.rs"]
+mod ledger_regression_tests;
+// Focused ledger regression coverage remains separate from the service implementation.

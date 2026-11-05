@@ -137,6 +137,7 @@ enum SessionHandlerMode {
     Missing,
     Stream,
     Hang,
+    Custom(fn(Arc<dyn UsageObserver>) -> Response),
 }
 
 struct SessionBody {
@@ -175,10 +176,10 @@ impl Stream for SessionBody {
         body.finished = true;
         body.observer.on_finished(UsageReport {
             request_id: body.request_id,
-            prompt_tokens: 7,
-            completion_tokens: 5,
+            prompt_tokens: Some(7),
+            completion_tokens: Some(5),
             completed: true,
-            output_started: true,
+            partial: false,
         });
         std::task::Poll::Ready(None)
     }
@@ -189,10 +190,10 @@ impl Drop for SessionBody {
         if !self.finished {
             self.observer.on_finished(UsageReport {
                 request_id: self.request_id,
-                prompt_tokens: if self.emitted { 7 } else { 0 },
-                completion_tokens: if self.emitted { 2 } else { 0 },
+                prompt_tokens: Some(if self.emitted { 7 } else { 0 }),
+                completion_tokens: Some(if self.emitted { 2 } else { 0 }),
                 completed: false,
-                output_started: self.emitted,
+                partial: false,
             });
         }
     }
@@ -216,10 +217,10 @@ async fn session_handler(State(state): State<SessionHandlerState>, request: Requ
             let observer = observer.expect("voucher carries usage observer");
             let report = UsageReport {
                 request_id: Uuid::new_v4(),
-                prompt_tokens: 7,
-                completion_tokens: 5,
+                prompt_tokens: Some(7),
+                completion_tokens: Some(5),
                 completed: true,
-                output_started: true,
+                partial: false,
             };
             observer.on_finished(report);
             observer.on_finished(report); // A duplicate callback must not double charge.
@@ -235,6 +236,7 @@ async fn session_handler(State(state): State<SessionHandlerState>, request: Requ
             )))
             .unwrap(),
         SessionHandlerMode::Hang => std::future::pending().await,
+        SessionHandlerMode::Custom(handler) => handler(observer.unwrap()),
     }
 }
 
@@ -844,7 +846,7 @@ async fn absent_usage_charges_cap_and_stream_uses_provisional_receipt() {
 }
 
 #[tokio::test]
-async fn dropped_stream_after_first_chunk_charges_full_cap() {
+async fn dropped_stream_after_first_chunk_charges_partial_counts() {
     use futures::StreamExt;
     let app = session_app(SERVICE_KEY, AMOUNT, Some(SESSION_PRICE));
     seed(&app).await;
@@ -854,7 +856,6 @@ async fn dropped_stream_after_first_chunk_charges_full_cap() {
         Some(&session_credential(&app, voucher(INITIAL)).await),
     )
     .await;
-    let cap = SESSION_PRICE * (body().len() as u128 + 8);
     let mut stream = response.into_body().into_data_stream();
     assert_eq!(
         stream.next().await.unwrap().unwrap().as_ref(),
@@ -868,7 +869,7 @@ async fn dropped_stream_after_first_chunk_charges_full_cap() {
     })
     .await
     .unwrap();
-    assert_eq!((row(&app).await.spent, row(&app).await.units), (cap, 0));
+    assert_eq!((row(&app).await.spent, row(&app).await.units), (18, 9));
 }
 
 #[tokio::test]
@@ -966,3 +967,6 @@ mod finalization;
 
 #[path = "mpp_tests/session_management.rs"]
 mod management;
+
+#[path = "mpp_tests/session_partial.rs"]
+mod partial;

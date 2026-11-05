@@ -228,7 +228,7 @@ fn app_with_delayed_ledger() -> (Arc<SessionApp>, Arc<Gate>, Arc<Gate>) {
     (Arc::new(app), charge, release)
 }
 
-async fn await_finalized(app: &SessionApp) {
+pub(super) async fn await_finalized(app: &SessionApp) {
     tokio::time::timeout(Duration::from_secs(2), async {
         while app.ledger.reservation_count() != 0 {
             tokio::task::yield_now().await;
@@ -306,21 +306,28 @@ async fn charge_retries_two_store_failures_and_records_once() {
 }
 
 #[tokio::test]
-async fn permanent_charge_failure_preserves_success_and_provisional_receipt() {
+async fn permanent_charge_failure_preserves_success_without_receipt() {
     let (app, charge, release) = app_with_delayed_ledger();
     seed(&app).await;
     charge.failures.store(usize::MAX, Ordering::SeqCst);
     let credential = session_credential(&app, voucher(INITIAL)).await;
     let response = post_session(&app, Some(&credential)).await;
     assert_eq!(response.status(), StatusCode::OK);
-    assert!(response.headers().contains_key("payment-receipt"));
+    assert!(!response.headers().contains_key("payment-receipt"));
     assert_eq!(charge.calls.load(Ordering::SeqCst), 3);
     assert_eq!(release.calls.load(Ordering::SeqCst), 0);
     assert_eq!(app.ledger.reservation_count(), 1);
+    assert_eq!(
+        axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap()
+            .as_ref(),
+        b"{\"status\":\"ok\"}"
+    );
 }
 
 #[tokio::test]
-async fn missing_reservation_after_success_preserves_completion_and_provisional_receipt() {
+async fn missing_reservation_after_success_preserves_completion_without_receipt() {
     let (app, charge, _) = app_with_delayed_ledger();
     seed(&app).await;
     charge.skip_pause.store(true, Ordering::SeqCst);
@@ -328,6 +335,13 @@ async fn missing_reservation_after_success_preserves_completion_and_provisional_
     let credential = session_credential(&app, voucher(INITIAL)).await;
     let response = post_session(&app, Some(&credential)).await;
     assert_eq!(response.status(), StatusCode::OK);
-    assert!(response.headers().contains_key("payment-receipt"));
+    assert!(!response.headers().contains_key("payment-receipt"));
     assert!(response.headers().get(header::WWW_AUTHENTICATE).is_none());
+    assert_eq!(
+        axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap()
+            .as_ref(),
+        b"{\"status\":\"ok\"}"
+    );
 }

@@ -169,9 +169,21 @@ struct Reservation {
     service: Arc<SessionService>,
     reserved: Option<ReservedRequest>,
     output_started: Arc<AtomicBool>,
+    prompt_bound: u64,
+    usage_receiver: Option<oneshot::Receiver<UsageReport>>,
 }
 
 impl Reservation {
+    async fn wait_for_usage(&mut self, wait: Duration) -> Option<UsageReport> {
+        let receiver = self.usage_receiver.as_mut()?;
+        let report = tokio::time::timeout(wait, receiver)
+            .await
+            .ok()
+            .and_then(Result::ok);
+        self.usage_receiver.take();
+        report
+    }
+
     async fn finish(
         mut self,
         report: Option<UsageReport>,
@@ -181,10 +193,15 @@ impl Reservation {
         let Some(reserved) = self.reserved.take() else {
             return Ok(None);
         };
-        let usage = report.filter(|report| report.completed).and_then(|report| {
-            u64::try_from(report.prompt_tokens)
-                .ok()
-                .zip(u64::try_from(report.completion_tokens).ok())
+        let usage = report.and_then(|report| {
+            let prompt = report
+                .prompt_tokens
+                .and_then(|value| u64::try_from(value).ok());
+            let completion = report
+                .completion_tokens
+                .and_then(|value| u64::try_from(value).ok());
+            (prompt.is_some() || completion.is_some())
+                .then_some((prompt.unwrap_or(self.prompt_bound), completion.unwrap_or(0)))
         });
         let service = self.service.clone();
         let delivered = self.output_started.load(Ordering::Acquire);
@@ -243,14 +260,19 @@ impl Drop for Reservation {
         };
         let service = self.service.clone();
         let delivered = self.output_started.load(Ordering::Acquire);
+        let prompt_bound = self.prompt_bound;
+        let usage_receiver = self.usage_receiver.take();
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             runtime.spawn(async move {
-                let guard = Reservation {
+                let mut guard = Reservation {
                     service,
                     reserved: Some(reserved),
                     output_started: Arc::new(AtomicBool::new(delivered)),
+                    prompt_bound,
+                    usage_receiver,
                 };
-                if let Err(error) = guard.finish(None).await {
+                let report = guard.wait_for_usage(USAGE_WAIT).await;
+                if let Err(error) = guard.finish(report).await {
                     tracing::warn!(
                         outcome = error.kind(),
                         "MPP session cancellation release failed"
@@ -296,10 +318,13 @@ pub(super) async fn serve(
         Err(error) => return error_response(&service, &price, error).await,
     };
     let preview = reserved.receipt_preview.clone();
-    let guard = Reservation {
+    let (sender, receiver) = oneshot::channel();
+    let mut guard = Reservation {
         service: service.clone(),
         reserved: Some(reserved.clone()),
         output_started: Arc::new(AtomicBool::new(false)),
+        prompt_bound: u64::try_from(body.len()).unwrap_or(u64::MAX),
+        usage_receiver: Some(receiver),
     };
     let authenticated = match authenticate_api_key_with_context(auth, mpp.service_api_key()).await {
         Ok(authenticated) => authenticated,
@@ -310,7 +335,6 @@ pub(super) async fn serve(
             return retry_response("service_key_rejected", 30);
         }
     };
-    let (sender, receiver) = oneshot::channel();
     // Keep a sender alive until response classification, even if the handler ignores it.
     let observer = Arc::new(Observer(Mutex::new(Some(sender))));
     request.extensions_mut().insert(authenticated);
@@ -346,10 +370,10 @@ pub(super) async fn serve(
         let (body, finished) = delivery::track(body, guard.output_started.clone());
         let response = Response::from_parts(parts, body);
         tokio::spawn(async move {
-            let report = tokio::time::timeout(STREAM_WAIT, async move {
+            let report = tokio::time::timeout(STREAM_WAIT, async {
                 let _ = finished.await;
                 // The body drops its service observer before signalling completion.
-                receiver.await.ok()
+                guard.wait_for_usage(STREAM_WAIT).await
             })
             .await
             .ok()
@@ -369,19 +393,19 @@ pub(super) async fn serve(
         });
         receipt_response(response, &preview)
     } else {
-        // A non-streaming successful handler has already produced its response body.
-        guard.output_started.store(true, Ordering::Release);
-        let report = tokio::time::timeout(USAGE_WAIT, receiver)
-            .await
-            .ok()
-            .and_then(Result::ok);
+        let response = delivery::non_streaming(response, &guard.output_started).await;
+        let report = guard.wait_for_usage(USAGE_WAIT).await;
         if report.is_none() {
             tracing::warn!(outcome = "usage_missing", "MPP session usage missing");
         }
         match guard.finish(report).await {
             Ok(Some(receipt)) => receipt_response(response, &receipt),
             Ok(None) => response,
-            Err(_) => receipt_response(response, &preview),
+            Err(_) => {
+                let mut response = response;
+                response.headers_mut().remove(PAYMENT_RECEIPT);
+                response
+            }
         }
     }
 }

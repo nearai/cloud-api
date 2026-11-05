@@ -52,10 +52,10 @@ async fn completion(request: Request) -> Json<Value> {
     if let Some(observer) = request.extensions().get::<UsageObserverExt>() {
         observer.0.on_finished(UsageReport {
             request_id: Uuid::new_v4(),
-            prompt_tokens: 7,
-            completion_tokens: 5,
+            prompt_tokens: Some(7),
+            completion_tokens: Some(5),
             completed: true,
-            output_started: true,
+            partial: false,
         });
     }
     Json(json!({

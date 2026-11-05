@@ -843,7 +843,7 @@ impl SessionService {
         self.charge_amount(reserved, actual, units).await
     }
 
-    /// Charge the full reserved cap when output was delivered without complete usage.
+    /// Charge the full reserved cap when output was delivered without any known counts.
     /// Unknown usage contributes no invented units.
     pub async fn charge_reserved(
         &self,
@@ -860,7 +860,7 @@ impl SessionService {
     ) -> Result<SessionReceipt, MppError> {
         match self
             .repo
-            .charge(reserved.request_id, actual, units)
+            .charge(reserved.request_id, actual.min(reserved.reserved), units)
             .await
             .map_err(store_error)?
         {

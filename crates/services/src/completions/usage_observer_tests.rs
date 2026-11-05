@@ -67,6 +67,69 @@ fn usage(prompt: i32, completion: i32) -> TokenUsage {
     }
 }
 
+fn content_chunk(usage: Option<TokenUsage>) -> SSEEvent {
+    let mut event = chunk(usage);
+    if let Some(StreamChunk::Chat(chat)) = event.chunk.as_mut() {
+        chat.choices = vec![ChatChoice {
+            index: 0,
+            delta: Some(inference_providers::models::ChatDelta {
+                content: Some("one".into()),
+                ..Default::default()
+            }),
+            logprobs: None,
+            finish_reason: None,
+            token_ids: None,
+        }];
+    }
+    event
+}
+
+#[tokio::test]
+async fn interrupted_content_chunks_without_provider_usage_report_lower_bound() {
+    let observer = Arc::new(RecordingObserver::default());
+    let mut stream = observed_stream(
+        vec![
+            Ok(content_chunk(None)),
+            Ok(content_chunk(None)),
+            Ok(content_chunk(None)),
+        ],
+        observer.clone(),
+        Uuid::new_v4(),
+    );
+    for _ in 0..3 {
+        stream.next().await.unwrap().unwrap();
+    }
+    drop(stream);
+    let reports = observer.reports();
+    assert_eq!(reports.len(), 1);
+    assert_eq!(reports[0].completion_tokens, Some(3));
+    assert!(reports[0].partial);
+    assert_eq!(reports[0].prompt_tokens, None);
+    assert!(!reports[0].completed);
+}
+
+#[tokio::test]
+async fn interrupted_content_chunks_use_provider_counts_then_extend_lower_bound() {
+    let observer = Arc::new(RecordingObserver::default());
+    let mut stream = observed_stream(
+        vec![
+            Ok(content_chunk(Some(usage(7, 5)))),
+            Ok(content_chunk(None)),
+        ],
+        observer.clone(),
+        Uuid::new_v4(),
+    );
+    for _ in 0..2 {
+        stream.next().await.unwrap().unwrap();
+    }
+    drop(stream);
+    let reports = observer.reports();
+    assert_eq!(reports.len(), 1);
+    assert_eq!(reports[0].completion_tokens, Some(6));
+    assert!(reports[0].partial);
+    assert!(!reports[0].completed);
+}
+
 fn observed_stream(
     events: Vec<Result<SSEEvent, inference_providers::CompletionError>>,
     observer: Arc<RecordingObserver>,
@@ -113,6 +176,7 @@ fn observed_stream(
         provider_service_tier: None,
         latency_reporter: None,
         usage_observer: UsageFireOnce::new(Some(observer)),
+        usage_progress: Default::default(),
     }
 }
 
@@ -136,10 +200,10 @@ async fn streaming_with_usage_reports_counts_once() {
         observer.reports(),
         vec![UsageReport {
             request_id,
-            prompt_tokens: 11,
-            completion_tokens: 23,
+            prompt_tokens: Some(11),
+            completion_tokens: Some(23),
             completed: true,
-            output_started: true,
+            partial: false,
         }]
     );
 }
@@ -161,10 +225,10 @@ async fn dropped_stream_before_usage_reports_incomplete() {
         observer.reports(),
         vec![UsageReport {
             request_id,
-            prompt_tokens: 0,
-            completion_tokens: 0,
+            prompt_tokens: None,
+            completion_tokens: None,
             completed: false,
-            output_started: true,
+            partial: false,
         }]
     );
 }
@@ -184,7 +248,7 @@ async fn dropped_stream_after_partial_usage_is_incomplete() {
     assert!(!reports[0].completed);
     assert_eq!(
         (reports[0].prompt_tokens, reports[0].completion_tokens),
-        (11, 2)
+        (Some(11), Some(2))
     );
 }
 
@@ -265,7 +329,7 @@ async fn streaming_service_propagates_observer_and_final_counts() {
     assert_eq!(usage.len(), 1);
     assert_eq!(
         (reports[0].prompt_tokens, reports[0].completion_tokens),
-        (usage[0].input_tokens, usage[0].output_tokens)
+        (Some(usage[0].input_tokens), Some(usage[0].output_tokens))
     );
 }
 
@@ -287,7 +351,7 @@ async fn reaching_record_usage_twice_fires_once() {
     assert_eq!(reports.len(), 1);
     assert_eq!(
         (reports[0].prompt_tokens, reports[0].completion_tokens),
-        (5, 7)
+        (Some(5), Some(7))
     );
     assert!(reports[0].completed);
 }
@@ -313,10 +377,10 @@ async fn non_streaming_reports_the_recorded_usage_once() {
         observer.reports(),
         vec![UsageReport {
             request_id,
-            prompt_tokens: recorded[0].input_tokens,
-            completion_tokens: recorded[0].output_tokens,
+            prompt_tokens: Some(recorded[0].input_tokens),
+            completion_tokens: Some(recorded[0].output_tokens),
             completed: true,
-            output_started: true,
+            partial: false,
         }]
     );
 }
@@ -337,10 +401,10 @@ async fn non_streaming_failure_reports_incomplete_once() {
         observer.reports(),
         vec![UsageReport {
             request_id,
-            prompt_tokens: 0,
-            completion_tokens: 0,
+            prompt_tokens: None,
+            completion_tokens: None,
             completed: false,
-            output_started: false,
+            partial: false,
         }]
     );
 }

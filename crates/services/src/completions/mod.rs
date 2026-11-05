@@ -1,6 +1,7 @@
 pub mod affinity;
 pub mod ports;
 pub mod usage_observer;
+pub mod usage_progress;
 
 use crate::attestation::ports::AttestationServiceTrait;
 use crate::attestation::STREAM_SIGNATURE_STORE_TIMEOUT;
@@ -182,6 +183,7 @@ where
     latency_reporter: Option<super::inference_provider_pool::ProviderLatencyReporter>,
     /// Told the final usage exactly once from `record_usage_and_metrics`.
     usage_observer: UsageFireOnce,
+    usage_progress: usage_progress::UsageProgress,
 }
 
 impl<S> InterceptStream<S>
@@ -307,17 +309,12 @@ where
             && self.usage_observer.has_final_usage()
             && self.last_usage_stats.is_some()
             && self.last_chat_id.is_some();
-        let (observed_prompt, observed_completion) = self
-            .last_usage_stats
-            .as_ref()
-            .map(|usage| (usage.prompt_tokens, usage.completion_tokens))
-            .unwrap_or((0, 0));
         self.usage_observer.fire(UsageReport {
             request_id,
-            prompt_tokens: observed_prompt,
-            completion_tokens: observed_completion,
+            prompt_tokens: self.usage_progress.prompt_tokens,
+            completion_tokens: self.usage_progress.completion_tokens,
             completed: usage_complete,
-            output_started: false, // UsageFireOnce carries the forwarded-chunk observation.
+            partial: self.usage_progress.partial,
         });
 
         let (
@@ -584,8 +581,8 @@ where
             if matches!(&self.state, StreamState::Streaming) {
                 match Pin::new(&mut self.inner).poll_next(cx) {
                     Poll::Ready(Some(Ok(event))) => {
-                        if !event.raw_bytes.is_empty() {
-                            self.usage_observer.output_started();
+                        if let Some(chunk) = &event.chunk {
+                            self.usage_progress.observe(chunk);
                         }
                         if event.is_done_marker() {
                             if event.raw_bytes.len() > MAX_PROVIDER_DONE_EVENT_BYTES {
@@ -1789,6 +1786,7 @@ impl CompletionServiceImpl {
             provider_service_tier: None,
             latency_reporter,
             usage_observer: UsageFireOnce::new(usage_observer),
+            usage_progress: Default::default(),
         };
         Box::pin(intercepted_stream)
     }
@@ -2756,6 +2754,7 @@ mod tests {
             provider_service_tier: None,
             latency_reporter: None,
             usage_observer: UsageFireOnce::new(None),
+            usage_progress: Default::default(),
         }
     }
 
@@ -2975,6 +2974,7 @@ mod tests {
             provider_service_tier: None,
             latency_reporter: None,
             usage_observer: UsageFireOnce::new(None),
+            usage_progress: Default::default(),
         };
 
         // Consume both provider chunks, then verify the usage dimensions captured
@@ -3150,6 +3150,7 @@ mod tests {
             provider_service_tier: None,
             latency_reporter: None,
             usage_observer: UsageFireOnce::new(None),
+            usage_progress: Default::default(),
         };
         let _ = intercept_stream.collect::<Vec<_>>().await;
         // Wait for the fire-and-forget usage/metrics task spawned in Drop to finish.
@@ -3306,6 +3307,7 @@ mod tests {
             provider_service_tier: None,
             latency_reporter: None,
             usage_observer: UsageFireOnce::new(None),
+            usage_progress: Default::default(),
         };
 
         // Consume the stream
@@ -3436,6 +3438,7 @@ mod tests {
             provider_service_tier: None,
             latency_reporter: None,
             usage_observer: UsageFireOnce::new(None),
+            usage_progress: Default::default(),
         };
 
         let _ = intercept_stream.collect::<Vec<_>>().await;
@@ -3648,6 +3651,7 @@ mod tests {
                 provider_service_tier: None,
                 latency_reporter: None,
                 usage_observer: UsageFireOnce::new(None),
+                usage_progress: Default::default(),
             };
             // InterceptStream goes out of scope here and Drop is called
         }

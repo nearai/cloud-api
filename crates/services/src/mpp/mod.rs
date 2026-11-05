@@ -20,6 +20,7 @@ pub mod eip712;
 pub mod error;
 #[cfg(any(test, feature = "test-mocks"))]
 pub mod memory;
+pub mod open_check;
 pub mod ports;
 pub mod pricing;
 pub mod protocol;
@@ -31,6 +32,7 @@ pub mod service;
 #[cfg(test)]
 mod session_vectors;
 pub mod tempo;
+pub mod tempo_tx;
 #[cfg(any(test, feature = "test-mocks"))]
 pub mod testing;
 pub mod transaction;
@@ -68,5 +70,10 @@ pub mod session {
     pub use super::eip712::{
         close_authorization_digest, domain_separator, voucher_digest, AmountOutOfRange, MAX_UINT96,
     };
+    pub use super::open_check::{verify_open_transaction, OpenMismatch, OpenTerms, VerifiedOpen};
     pub use super::secp256k1::{address_of, recover_address, sign_digest, SigError, SIGNATURE_LEN};
+    pub use super::tempo_tx::{
+        decode_signed, expiring_nonce_hash, tx_hash, Call, TempoTx, TxError, EXPIRING_NONCE_KEY,
+        EXPIRING_NONCE_VALIDITY_SECS, MAX_CALLS, MAX_TX_BYTES,
+    };
 }

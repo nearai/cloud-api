@@ -144,6 +144,74 @@ pub fn uint_u64(bytes: &[u8]) -> Result<u64, RlpError> {
         .fold(0u64, |value, byte| (value << 8) | u64::from(*byte)))
 }
 
+/// A canonical RLP unsigned integer of at most 16 bytes: no leading zero, empty for zero.
+pub fn uint_u128(bytes: &[u8]) -> Result<u128, RlpError> {
+    if bytes.len() > 16 || bytes.first() == Some(&0) {
+        return Err(RlpError);
+    }
+    Ok(bytes
+        .iter()
+        .fold(0u128, |value, byte| (value << 8) | u128::from(*byte)))
+}
+
+// ---------------------------------------------------------------------------------------
+// Encoding. The writer side of the same canonical form the reader enforces.
+// ---------------------------------------------------------------------------------------
+
+/// Append the header of a string (`short_base` 0x80) or list (`short_base` 0xc0) whose
+/// payload is `payload_len` bytes.
+fn put_header(out: &mut Vec<u8>, short_base: u8, payload_len: usize) {
+    if payload_len <= 55 {
+        // `payload_len <= 55` fits a u8; the fallback is unreachable.
+        out.push(short_base.saturating_add(u8::try_from(payload_len).unwrap_or(55)));
+        return;
+    }
+    let length: Vec<u8> = payload_len
+        .to_be_bytes()
+        .into_iter()
+        .skip_while(|byte| *byte == 0)
+        .collect();
+    // A usize has at most 8 length bytes.
+    out.push(
+        short_base
+            .saturating_add(55)
+            .saturating_add(u8::try_from(length.len()).unwrap_or(8)),
+    );
+    out.extend(length);
+}
+
+/// Append `content` as an RLP byte string.
+pub fn put_string(out: &mut Vec<u8>, content: &[u8]) {
+    match content {
+        [byte] if *byte < 0x80 => out.push(*byte),
+        content => {
+            put_header(out, 0x80, content.len());
+            out.extend_from_slice(content);
+        }
+    }
+}
+
+/// Append `payload` (already-encoded items) wrapped as an RLP list.
+pub fn put_list(out: &mut Vec<u8>, payload: &[u8]) {
+    put_header(out, 0xc0, payload.len());
+    out.extend_from_slice(payload);
+}
+
+/// Append an unsigned integer given as big-endian bytes (leading zeros are dropped; zero is
+/// the empty string).
+pub fn put_uint_be(out: &mut Vec<u8>, big_endian: &[u8]) {
+    let first_significant = big_endian
+        .iter()
+        .position(|byte| *byte != 0)
+        .unwrap_or(big_endian.len());
+    put_string(out, big_endian.get(first_significant..).unwrap_or(&[]));
+}
+
+/// Append an unsigned integer.
+pub fn put_uint(out: &mut Vec<u8>, value: u128) {
+    put_uint_be(out, &value.to_be_bytes());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -302,5 +370,49 @@ mod tests {
         assert_eq!(uint_u64(&[0x00]), Err(RlpError), "zero is the empty string");
         assert_eq!(uint_u64(&[0x00, 0x01]), Err(RlpError), "leading zero");
         assert_eq!(uint_u64(&[1; 9]), Err(RlpError), "wider than u64");
+    }
+    #[test]
+    fn the_writer_produces_the_canonical_form_the_reader_accepts() {
+        for content in [
+            vec![],
+            vec![0x05],
+            vec![0x80],
+            vec![7u8; 55],
+            vec![7u8; 56],
+            vec![7u8; 300],
+        ] {
+            let mut out = Vec::new();
+            put_string(&mut out, &content);
+            assert_eq!(out, string(&content));
+            assert_eq!(read_item(&out), Ok((Item::String(&content), &[][..])));
+        }
+        for len in [0usize, 1, 55, 56, 300] {
+            let payload = vec![0x01u8; len];
+            let mut out = Vec::new();
+            put_list(&mut out, &payload);
+            assert_eq!(out, list(std::slice::from_ref(&payload)));
+            assert!(list_spans_exactly(&out));
+        }
+        let mut out = Vec::new();
+        put_uint(&mut out, 0);
+        put_uint(&mut out, 1);
+        put_uint(&mut out, 42431);
+        put_uint_be(&mut out, &[0, 0, 0xa5, 0xbf]);
+        assert_eq!(out, [0x80, 0x01, 0x82, 0xa5, 0xbf, 0x82, 0xa5, 0xbf]);
+        let mut out = Vec::new();
+        put_uint_be(&mut out, &[0xff; 32]);
+        assert_eq!(out.len(), 33);
+        assert_eq!(out.first(), Some(&0xa0));
+        let mut out = Vec::new();
+        put_uint_be(&mut out, &[0; 32]);
+        assert_eq!(out, [0x80]);
+    }
+
+    #[test]
+    fn wide_integers_are_canonical_and_bounded() {
+        assert_eq!(uint_u128(&[]), Ok(0));
+        assert_eq!(uint_u128(&[0xff; 16]), Ok(u128::MAX));
+        assert_eq!(uint_u128(&[0x00, 0x01]), Err(RlpError));
+        assert_eq!(uint_u128(&[1; 17]), Err(RlpError));
     }
 }

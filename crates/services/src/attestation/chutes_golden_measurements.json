@@ -237,6 +237,10 @@
           "rtmr0": "fc71a5a8edcb1f6d307d59e62ce257365df0f233ae2334691f99d2136832d911f8be975b92f88036db8a4906574519c4"
         },
         {
+          "name": "8xb300 [10.2.1, flat-252c-2304g]",
+          "rtmr0": "e7bfc6f65f062f9aeaa6882c8a78cc7b134ac633992ad5cd1f66a5e2f543b4dc331e3d254bbcc9a29a61a9f971c27807"
+        },
+        {
           "name": "8xh200 [10.2.1, numa-124c-1128g-nvsw-node1]",
           "rtmr0": "5b509103a3bf3c10dbf27a7da030a3d7ba93a81c0c8844de20e5dfee77611644a39cc7236313e9d0a99a8a8a703bbfc9"
         },

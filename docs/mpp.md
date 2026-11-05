@@ -62,7 +62,10 @@ then sets `no-store` on every response, which is stricter, so a receipt is never
 | `401` | unpriced or unparseable request without a valid key: today's behavior |
 
 A `Bearer` key request is never touched by MPP, and a request without `Authorization` for
-a model that is not priced still gets today's `401`.
+a model that is not priced still gets today's `401`. With `session: None`, non-session
+Payment credentials also retain `401` for unpriced or unparseable bodies and when body
+hashing has no buffered body.
+`charge_only_unpriced_payment_inputs_retain_baseline_401_authentication` pins this behavior.
 
 ## Pricing
 
@@ -86,6 +89,8 @@ model may advertise both `charge` and `session` (two `WWW-Authenticate` headers)
 
 All variables are read only when `MPP_ENABLED=true`. Invalid configuration is a startup
 error. Secrets also accept a `*_FILE` variant (the file wins), and are redacted in `Debug`.
+The session signer is the exception: set exactly one of `MPP_TEMPO_SIGNER_KEY` and
+`MPP_TEMPO_SIGNER_KEY_FILE`; setting both is a startup error.
 
 | Variable | Meaning |
 |---|---|
@@ -128,12 +133,18 @@ fields, a duplicate model name, an empty table, and zero limits.
    `HMAC-SHA256(MPP_SECRET_KEY, tx hash)`, never the hash itself), `challenge_id`, `state`
    (`serving`, `served`, `unserved`) and two timestamps. It has no organization, workspace,
    request or payer column. cloud-api purges rows older than 24 hours every hour (a claim
-   outlives its challenge, at most one hour, many times over).
+   outlives its challenge, at most one hour, many times over). The same hourly task reclaims
+   `serving` rows whose last update is older than 15 minutes as `unserved`, in bounded batches
+   with `SKIP LOCKED`. Only the original challenge can retry them; leases fence late finishes.
+   Reclaimed credentials remain subject to their original challenge expiry. The default
+   ten-minute challenge expires before the fifteen-minute reclaim threshold; reclamation
+   does not extend its lifetime or authorize a replacement challenge.
 4. **Reconciliation.** Payments are on-chain transfers to the recipient carrying an MPP
    attribution memo (`keccak256("mpp")[0..4] ‖ 0x01 ‖ keccak256(realm)[0..10] ‖ client ‖
    keccak256(challenge id)[0..7]`). Reconcile the treasury's `TransferWithMemo` events with
    that tag against inference usage of the service key. A row stuck in `serving` means the
-   process died mid-request; the payer was charged and not served.
+   process may have died mid-request. Reclamation permits a retry with the same credential;
+   a store error during finalization is retried once before the hourly recovery applies.
 
 ## Verification
 
@@ -232,9 +243,10 @@ on-chain deposit into the channel reserve precompile
 `0x4D50500000000000000000000000000000000000`, one signed voucher per request, server-side
 metering by tokens, periodic on-chain settlement, and cooperative close with refund. Unlike
 `charge`, nothing is transferred per request; the payer escrows funds once, authorizes spend
-with EIP-712 vouchers, and gets the remainder back on close. Errors and disconnects release
-the reservation without charging delivered work; a successful `charge` payment is already on
-chain before inference runs.
+with EIP-712 vouchers, and gets the remainder back on close. A successful response that starts
+delivering output consumes its full reservation if final usage is missing or incomplete.
+A complete usage report charges the actual tokens. A successful `charge` payment is already
+on chain before inference runs.
 
 A priced model with `token_price` in `MPP_MODEL_PRICES` is offered `intent="session"` alongside
 or instead of `charge`. The session challenge's `recipient` is the server's settlement signer
@@ -303,8 +315,8 @@ greater than zero). The session challenge sets `amount` to that price and `unitT
 For each voucher request on a channel:
 
 1. `cost_cap = token_price × (prompt_estimate + max_tokens)` where
-   `prompt_estimate = ceil(body_bytes / 4)` (an approximation; billing uses real usage after
-   the response). Use the larger of the request's `max_tokens` and `max_completion_tokens`
+   `prompt_estimate = body_bytes` (one token per input byte as an upper bound; complete
+   reports use real usage). Use the larger of the request's `max_tokens` and `max_completion_tokens`
    when both are present. Arithmetic overflow returns `400` before a reservation.
 2. Require `accepted_cumulative - spent >= cost_cap`. Otherwise return `402` with
    `sessionSnapshot.requiredCumulative = spent + cost_cap` and run no inference (nothing
@@ -313,8 +325,10 @@ For each voucher request on a channel:
    keyed by request id) so concurrent requests cannot spend the same balance. After the
    response: `actual = token_price × (prompt_tokens + completion_tokens)` from completion
    usage, capped at what the voucher still covers; then adjust `spent` and `units`, and delete
-   the reservation. On an error response or client disconnect, release the full reservation
-   (`spent -= cost_cap`): nothing delivered, nothing charged.
+   the reservation. Release the full reservation (`spent -= cost_cap`) for a non-2xx inner
+   response or a stream cancelled before any response bytes were forwarded. After any bytes
+   are forwarded, missing or incomplete usage, including nonzero partial counts, charges
+   the full cap. A successful non-streaming response counts as a produced body.
 
 Reservations precede service-key authentication, rate limiting and usage checks. A short
 voucher consumes none of the shared service key's rate limit. Management actions (`open`,
@@ -322,15 +336,19 @@ voucher consumes none of the shared service key's rate limit. Management actions
 they bypass body pricing, handler pre-flight, service-key authentication and inference.
 Their price comes from a configured token price matching the HMAC-verified echoed session
 terms. Credential verification still checks the full offer and route. A Payment credential
-with a missing or unpriceable inference body receives an MPP problem document, as does a
-malformed credential; neither falls through to API-key authentication. Without a price for
+with a parsed `intent=session` and missing or unpriceable inference body receives an MPP
+problem document. Other credentials preserve the normal authentication fallback. Without a price for
 a fresh challenge, challenge-class errors answer `400 application/problem+json`.
 
 The chat completion's usage observer reports final counts once. Non-streaming completions
 normally report before the handler returns; if no report arrives within one second after a
-successful response, the wrapper releases the reservation and records `usage_missing`.
-Streaming completions charge asynchronously on the final report, or release on an incomplete
-report (including a dropped stream). A missing stream report is bounded at fifteen minutes.
+successful response, the wrapper charges the full cap and records `usage_missing`.
+Streaming completions finalize after body completion or disconnect. A missing stream report
+is bounded at 30 minutes, below supervision's two-hour stale reservation cutoff.
+Charge finalization retries store errors three times with short backoff. If every attempt
+fails, the successful response retains its provisional receipt and the reservation remains
+held. The reaper eventually releases that hold, favouring the payer; delivered work can
+remain uncharged after a persistent store failure. Finalization failures log closed codes.
 An inner error, including a rate-limit `429`, releases the reservation. Missing or closed
 channels return `410 application/problem+json`; voucher and minimum-delta refusals return
 `402` with a fresh challenge carrying the authenticated session snapshot.
@@ -380,17 +398,20 @@ settlement run holds the channel at a time (60 second lease on the row).
 
 Every `MPP_CLOSE_SUPERVISION_SECS` (default 60), for channels not yet finalized, the server
 reads escrow state in batch. If `closeRequestedAt` is set on chain, it records that, stops
-new vouchers, and, when `spent - reserved` exceeds `settled_on_chain`, submits a payee close
-with capture equal to delivered spend, using a voucher at least that high, inside the 900 second
-grace period. Channels whose on-chain deposit is zero are marked finalized (withdrawn). Stale
-reservations with no finish are released after fifteen minutes. Finalized channel rows are purged
+new vouchers and reservations. While `reserved > 0`, it defers payee close and counts the
+deferral. Once reservations drain, it captures delivered spend. At
+`closeRequestedAt + 600 seconds`, it captures `spent`, including in-flight reservations as
+consumed, using a voucher at least that high. Channels whose on-chain deposit is zero are
+marked finalized (withdrawn). Stale reservations with no finish are released after two hours.
+Finalized channel rows are purged
 after thirty days.
 
 ### Session configuration
 
 When any model has `token_price`, `MPP_TEMPO_SIGNER_KEY` / `_FILE` is required: a 32-byte
 hex secp256k1 key whose address is the session `recipient` and signs settlement and payee-close
-transactions. Fund that address with the fee token (`MPP_TEMPO_CURRENCY`) for gas on settle and
+transactions. Exactly one signer source may be configured; startup rejects both sources,
+invalid signer scalars, and invalid RPC URLs. Fund that address with the fee token (`MPP_TEMPO_CURRENCY`) for gas on settle and
 close, in addition to whatever treasury policy you use for `charge`.
 
 | Variable | Meaning |
@@ -437,6 +458,10 @@ Example model entry with both intents:
 
 Session storage follows the same privacy rules as `charge`: no credentials, signatures, channel
 ids, or payer addresses in logs or metrics; problem details stay generic.
+Management verifies offer HMACs and signatures before ledger locks or RPC calls and admits
+at most eight concurrent management actions per process. Busy responses return `503` with
+`Retry-After`. Follow-up: add per-IP and per-payer rate limits for session management and
+charge-intent requests before the shared service-key limiter.
 
 ### Session limits
 

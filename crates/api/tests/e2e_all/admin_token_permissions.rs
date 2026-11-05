@@ -643,3 +643,78 @@ async fn permissions_preserve_expiration_revocation_user_agent_and_admin_eligibi
         StatusCode::UNAUTHORIZED
     );
 }
+
+#[tokio::test]
+async fn existing_service_tokens_follow_the_creator_email_allowlist() {
+    let (allowed_server, db) = setup_test_server_with_config_and_database(|config| {
+        config.auth.admin_emails = vec!["ADMIN@TEST.COM".to_string()];
+    })
+    .await;
+    let repo = database::repositories::AdminAccessTokenRepository::new(db.pool().clone());
+    let (_, token) = repo
+        .create(
+            Uuid::parse_str(MOCK_USER_ID).unwrap(),
+            format!("allowlist-{}", Uuid::new_v4()),
+            "Existing service credential".to_string(),
+            chrono::Utc::now() + chrono::Duration::hours(1),
+            Some(MOCK_USER_AGENT.to_string()),
+            database::models::AdminAccessTokenPermission::ReadWrite,
+        )
+        .await
+        .unwrap();
+
+    let response = call(
+        &allowed_server,
+        Method::GET,
+        "/v1/admin/users",
+        &token,
+        json!({}),
+    )
+    .await;
+
+    assert_eq!(response.status_code(), StatusCode::OK);
+
+    // The shared database retains the same token; only the server allowlist changes.
+    for emails in [vec!["other@test.com".to_string()], Vec::new()] {
+        let denied_server = setup_test_server_with_config(|config| {
+            config.auth.admin_emails = emails;
+        })
+        .await;
+
+        for credential in [&token, &get_session_id()] {
+            let response = call(
+                &denied_server,
+                Method::GET,
+                "/v1/admin/users",
+                credential,
+                json!({}),
+            )
+            .await;
+
+            assert_forbidden(&response, "forbidden");
+        }
+
+        // Ordinary authenticated user endpoints remain available.
+        let response = call(
+            &denied_server,
+            Method::GET,
+            "/v1/users/me",
+            &get_session_id(),
+            json!({}),
+        )
+        .await;
+
+        assert_eq!(response.status_code(), StatusCode::OK);
+    }
+
+    let response = call(
+        &allowed_server,
+        Method::GET,
+        "/v1/admin/users",
+        &token,
+        json!({}),
+    )
+    .await;
+
+    assert_eq!(response.status_code(), StatusCode::OK);
+}

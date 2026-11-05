@@ -105,7 +105,7 @@ pub fn test_config() -> ApiConfig {
             github: None,
             google: None,
             near: config::NearConfig::default(),
-            admin_domains: vec!["test.com".to_string()],
+            admin_emails: vec!["admin@test.com".to_string()],
             admin_read_only_tokens_enabled: false,
             require_session_bound_access_tokens: false,
         },

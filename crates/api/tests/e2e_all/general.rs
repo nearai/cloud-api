@@ -1264,7 +1264,7 @@ async fn test_admin_get_organization_balance_accepts_admin_access_token() {
 #[tokio::test]
 async fn test_admin_get_organization_balance_rejects_non_admin() {
     let server = setup_test_server_with_config(|config| {
-        config.auth.admin_domains = vec!["near.ai".to_string()];
+        config.auth.admin_emails = vec!["other@test.com".to_string()];
     })
     .await;
     let org = create_org(&server).await;

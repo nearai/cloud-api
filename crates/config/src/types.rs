@@ -1041,9 +1041,9 @@ pub struct AuthConfig {
     pub github: Option<GitHubOAuthConfig>,
     pub google: Option<GoogleOAuthConfig>,
     pub near: NearConfig,
-    /// Email domains that are granted platform admin access
-    /// Users with emails from these domains will have admin privileges
-    pub admin_domains: Vec<String>,
+    /// Explicit email addresses that are granted platform admin access
+    /// An empty list denies admin access; domain-wide grants are not supported.
+    pub admin_emails: Vec<String>,
     /// Enable only after all API instances enforce admin token permissions.
     /// Disabling issuance does not disable enforcement for existing tokens.
     pub admin_read_only_tokens_enabled: bool,
@@ -1092,10 +1092,10 @@ impl AuthConfig {
             None
         };
 
-        let admin_domains = env::var("AUTH_ADMIN_DOMAINS")
+        let admin_emails = env::var("AUTH_ADMIN_EMAILS")
             .ok()
-            .map(|domains| {
-                domains
+            .map(|emails| {
+                emails
                     .split(',')
                     .map(|s| s.trim().to_string())
                     .filter(|s| !s.is_empty())
@@ -1115,7 +1115,7 @@ impl AuthConfig {
             github,
             google,
             near,
-            admin_domains,
+            admin_emails,
             admin_read_only_tokens_enabled: parse_bool_env(
                 "AUTH_ADMIN_READ_ONLY_TOKENS_ENABLED",
                 false,
@@ -1127,27 +1127,22 @@ impl AuthConfig {
         })
     }
 
-    /// Check if an email address belongs to an admin domain
+    /// Check if a complete email address is explicitly allowed admin access
     pub fn is_admin_email(&self, email: &str) -> bool {
-        email_matches_admin_domain(&self.admin_domains, email)
+        email_matches_admin_allowlist(&self.admin_emails, email)
     }
 }
 
-pub fn email_matches_admin_domain(admin_domains: &[String], email: &str) -> bool {
-    if admin_domains.is_empty() {
-        return false;
-    }
-
-    admin_email_domain(email).is_some_and(|domain| {
-        admin_domains
+pub fn email_matches_admin_allowlist(admin_emails: &[String], email: &str) -> bool {
+    admin_email_domain(email).is_some()
+        && admin_emails
             .iter()
-            .any(|admin_domain| domain.eq_ignore_ascii_case(admin_domain))
-    })
+            .any(|admin_email| email.eq_ignore_ascii_case(admin_email))
 }
 
 /// The domain of a well-formed email: exactly one `@`, a non-empty local part and a non-empty
 /// domain with no whitespace or control characters. Anything else is `None`, so an email such
-/// as `x@near.ai@vpc.internal.near.ai` can never match an admin domain.
+/// as `x@near.ai@vpc.internal.near.ai` can never pass the admin email allowlist.
 pub fn admin_email_domain(email: &str) -> Option<&str> {
     let (local_part, domain) = email.split_once('@')?;
     if local_part.is_empty()
@@ -1932,6 +1927,55 @@ mod tests {
     }
 
     #[test]
+    #[serial]
+    fn admin_email_environment_has_no_domain_fallback() {
+        let keys = [
+            "AUTH_ADMIN_EMAILS",
+            "AUTH_ADMIN_DOMAINS",
+            "AUTH_ENCODING_KEY",
+        ];
+        let previous = keys.map(|key| (key, env::var_os(key)));
+
+        struct RestoreEnv([(&'static str, Option<std::ffi::OsString>); 3]);
+
+        impl Drop for RestoreEnv {
+            fn drop(&mut self) {
+                for (key, value) in &self.0 {
+                    match value {
+                        Some(value) => env::set_var(key, value),
+                        None => env::remove_var(key),
+                    }
+                }
+            }
+        }
+
+        let _restore = RestoreEnv(previous);
+        env::set_var("AUTH_ENCODING_KEY", "test-encoding-key");
+        env::set_var("AUTH_ADMIN_DOMAINS", "near.ai");
+        env::remove_var("AUTH_ADMIN_EMAILS");
+
+        let config = AuthConfig::from_env().unwrap();
+
+        assert!(config.admin_emails.is_empty());
+        assert!(!config.is_admin_email("alice@near.ai"));
+
+        env::set_var("AUTH_ADMIN_EMAILS", " , Alice@near.ai, bob@near.org, , ");
+
+        let config = AuthConfig::from_env().unwrap();
+
+        assert_eq!(config.admin_emails, ["Alice@near.ai", "bob@near.org"]);
+        assert!(config.is_admin_email("ALICE@NEAR.AI"));
+        assert!(!config.is_admin_email("other@near.ai"));
+
+        env::set_var("AUTH_ADMIN_EMAILS", " , , ");
+
+        let config = AuthConfig::from_env().unwrap();
+
+        assert!(config.admin_emails.is_empty());
+        assert!(!config.is_admin_email("alice@near.ai"));
+    }
+
+    #[test]
     fn test_is_admin_email() {
         let config = AuthConfig {
             mock: false,
@@ -1939,17 +1983,17 @@ mod tests {
             github: None,
             google: None,
             near: NearConfig::default(),
-            admin_domains: vec!["near.ai".to_string(), "near.org".to_string()],
+            admin_emails: vec!["alice@near.ai".to_string(), "bob@near.org".to_string()],
             admin_read_only_tokens_enabled: false,
             require_session_bound_access_tokens: false,
         };
 
-        // Test admin domains
+        // Explicitly allowed addresses
         assert!(config.is_admin_email("alice@near.ai"));
         assert!(config.is_admin_email("bob@near.org"));
-        assert!(config.is_admin_email("admin@NEAR.AI")); // Case insensitive
+        assert!(config.is_admin_email("ALICE@NEAR.AI")); // Case insensitive
 
-        // Test non-admin domains
+        // Other addresses, including users in an allowed user's domain
         assert!(!config.is_admin_email("user@example.com"));
         assert!(!config.is_admin_email("attacker@near.ai.evil.com"));
         for email in [
@@ -1967,8 +2011,8 @@ mod tests {
         ] {
             assert!(!config.is_admin_email(email), "{email:?} must not be admin");
         }
-        assert!(config.is_admin_email("x@NEAR.AI"));
-        assert!(config.is_admin_email("x@near.ai"));
+        assert!(!config.is_admin_email("x@NEAR.AI"));
+        assert!(!config.is_admin_email("x@near.ai"));
         assert!(!config.is_admin_email("invalid-email"));
         assert!(!config.is_admin_email(""));
     }
@@ -1995,15 +2039,18 @@ mod tests {
     }
 
     #[test]
-    fn test_email_matches_admin_domain() {
-        let admin_domains = vec!["near.ai".to_string(), "near.org".to_string()];
-        for email in ["alice@near.ai", "bob@near.org", "admin@NEAR.AI"] {
+    fn test_email_matches_admin_allowlist() {
+        let admin_emails = vec!["alice@near.ai".to_string(), "bob@near.org".to_string()];
+
+        for email in ["alice@near.ai", "bob@near.org", "ALICE@NEAR.AI"] {
             assert!(
-                email_matches_admin_domain(&admin_domains, email),
+                email_matches_admin_allowlist(&admin_emails, email),
                 "{email:?}"
             );
         }
         for email in [
+            "other@near.ai",
+            "alice+other@near.ai",
             "user@example.com",
             "attacker@near.ai.evil.com",
             "x@near.ai@vpc.internal.near.ai",
@@ -2015,11 +2062,23 @@ mod tests {
             "",
         ] {
             assert!(
-                !email_matches_admin_domain(&admin_domains, email),
+                !email_matches_admin_allowlist(&admin_emails, email),
                 "{email:?}"
             );
         }
-        assert!(!email_matches_admin_domain(&[], "admin@near.ai"));
+
+        assert!(!email_matches_admin_allowlist(&[], "admin@near.ai"));
+        assert!(!email_matches_admin_allowlist(
+            &["*@near.ai".to_string()],
+            "admin@near.ai"
+        ));
+
+        for entry in ["near.ai", "x@evil.com@near.ai", "x y@near.ai"] {
+            let allowlist = vec![entry.to_string()];
+
+            assert!(!email_matches_admin_allowlist(&allowlist, "admin@near.ai"));
+            assert!(!email_matches_admin_allowlist(&allowlist, entry));
+        }
     }
 
     #[test]
@@ -2030,12 +2089,12 @@ mod tests {
             github: None,
             google: None,
             near: NearConfig::default(),
-            admin_domains: vec![],
+            admin_emails: vec![],
             admin_read_only_tokens_enabled: false,
             require_session_bound_access_tokens: false,
         };
 
-        // Should return false when no admin domains configured
+        // Should return false when no admin emails configured
         assert!(!config.is_admin_email("admin@near.ai"));
     }
 

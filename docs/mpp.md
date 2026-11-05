@@ -79,8 +79,8 @@ A priced request that breaks a limit gets `400` naming the limit and no challeng
 only if it is listed itself, so list each name you want payable, and give an alias the price
 of the model it resolves to.
 
-Metered per-token billing is the MPP `session` intent. It is a follow-up, not part of this
-change.
+Metered per-token billing is the MPP `session` intent; see [Sessions](#sessions) below. A
+model may advertise both `charge` and `session` (two `WWW-Authenticate` headers).
 
 ## Configuration
 
@@ -190,7 +190,7 @@ The service runs in a TEE and MPP adds no customer data to its storage or logs.
 
 - One currency (`MPP_TEMPO_CURRENCY`) on one chain, one recipient.
 - No fee sponsorship (`feePayer`), no splits, no machine token, no zero-amount `proof`
-  credentials, no `session` intent.
+  credentials. The `session` intent has its own limits in [Sessions](#sessions).
 - `POST /v1/chat/completions` only.
 - Retry window for a paid request that failed or was refused: the challenge lifetime plus
   12 hours, for a payment mined before the challenge expired.
@@ -224,3 +224,206 @@ console.log(response.headers.get('payment-receipt'), await response.json())
 From a shell, with an `mppx` account funded on the same network:
 `npx mppx account create`, then
 `npx mppx --network testnet https://cloud-api.near.ai/v1/chat/completions -J '{"model":"zai-org/GLM-5.1-FP8","max_tokens":256,"messages":[{"role":"user","content":"Hi"}]}'`.
+
+## Sessions
+
+The `session` intent pays for inference through a TIP-1034 payment channel on Tempo: one
+on-chain deposit into the channel reserve precompile
+`0x4D50500000000000000000000000000000000000`, one signed voucher per request, server-side
+metering by tokens, periodic on-chain settlement, and cooperative close with refund. Unlike
+`charge`, nothing is transferred per request; the payer escrows funds once, authorizes spend
+with EIP-712 vouchers, and gets the remainder back on close. Errors and disconnects release
+the reservation without charging delivered work; a successful `charge` payment is already on
+chain before inference runs.
+
+A priced model with `token_price` in `MPP_MODEL_PRICES` is offered `intent="session"` alongside
+or instead of `charge`. The session challenge's `recipient` is the server's settlement signer
+(`MPP_TEMPO_SIGNER_KEY`), not `MPP_TEMPO_RECIPIENT`; only that payee can settle and close.
+
+### Flow
+
+```
+client                                         cloud-api                        Tempo
+  | POST /v1/chat/completions (no Authorization) |                                 |
+  |--------------------------------------------->|                                 |
+  | 402 + WWW-Authenticate: Payment … session    |                                 |
+  |<---------------------------------------------|                                 |
+  | open / topUp (signed 0x76 tx to escrow)      |                                 |
+  |--------------------------------------------->| eth_sendRawTransactionSync      |
+  |                                              |-------------------------------->|
+  | 200 ok + Payment-Receipt (management)        |                                 |
+  |<---------------------------------------------|                                 |
+  | POST … Authorization: Payment voucher        |                                 |
+  |--------------------------------------------->| reserve → inference → charge    |
+  | 200 + Payment-Receipt (reference=channel)    | settle / close (background)     |
+  |<---------------------------------------------|-------------------------------->|
+```
+
+1. A request with no `Authorization` for a model with `token_price`, whose body passes the
+   same handler checks as `charge`, gets `402 Payment Required` with `WWW-Authenticate: Payment
+   id, realm, method="tempo", intent="session", request, expires, opaque` (no `digest`: the
+   challenge is bound to the route and a nonce only, and may be reused across requests).
+   `request` is base64url(JCS):
+   `{"amount":"<price per token>","currency":"0x<token>","recipient":"0x<settlement signer>",
+   "suggestedDeposit":"<base units>","unitType":"llm_token","methodDetails":{…}}`.
+   `methodDetails` includes `chainId`, `escrowContract":"0x4D50500000000000000000000000000000000000`,
+   `minVoucherDelta`, `sessionProtocol":"v2"`, and optionally `sessionSnapshot` when the client's
+   voucher is too low (see below).
+2. The client opens a channel (`action":"open"`) or tops it up (`action":"topUp"`) with a signed
+   Tempo transaction calling the escrow precompile. The server answers `200 {"status":"ok"}` with
+   a `Payment-Receipt` and does not run inference.
+3. For each completion the client retries with `Authorization: Payment` carrying
+   `{"action":"voucher",…}` (same challenge echo, channel id, descriptor, `cumulativeAmount`,
+   voucher signature). The server reserves spend, runs the request as the service key, charges
+   actual usage when the response completes, and returns a receipt. Cooperative close
+   (`action":"close"`) is another management action: `200 ok` and a receipt, no inference.
+4. When the highest voucher no longer covers the next request's cost cap, the server responds
+   with `402` and a fresh session challenge whose `methodDetails.sessionSnapshot` includes
+   `requiredCumulative`; the client signs a voucher for that amount (or tops up if it exceeds
+   `deposit`) and retries. Nothing is charged on that refusal.
+
+Management actions (`open`, `topUp`, `close`) always answer `200 {"status":"ok"}` with a
+`Payment-Receipt` and never touch inference. Only `voucher` runs the chat handler.
+
+Receipt (`Payment-Receipt`, base64url JSON) for session:
+`{"method":"tempo","intent":"session","reference":"0x<channelId>","status":"success",
+"timestamp":…,"acceptedCumulative":"…","spent":"…","units":<u64>,…}`. The reference is the
+channel id, not a transaction hash. `txHash` is present on `open`, `topUp`, and `close` only.
+On a streaming completion the receipt headers are on the response head with pre-charge
+`spent` and `acceptedCumulative`; the final charge happens when the stream ends, so that head
+receipt is provisional.
+
+### Pricing and metering
+
+Add an optional `"token_price": "<base units per token>"` to each model entry (integer string,
+greater than zero). The session challenge sets `amount` to that price and `unitType` to
+`llm_token`. The same caps as `charge` apply (`max_tokens`, `n`, `max_request_bytes`).
+
+For each voucher request on a channel:
+
+1. `cost_cap = token_price × (prompt_estimate + max_tokens)` where
+   `prompt_estimate = ceil(body_bytes / 4)` (an approximation; billing uses real usage after
+   the response).
+2. Require `accepted_cumulative - spent >= cost_cap`. Otherwise return `402` with
+   `sessionSnapshot.requiredCumulative = spent + cost_cap` and run no inference (nothing
+   charged).
+3. Reserve `cost_cap` before inference (`spent` and `reserved` increase; a reservation row
+   keyed by request id) so concurrent requests cannot spend the same balance. After the
+   response: `actual = token_price × (prompt_tokens + completion_tokens)` from completion
+   usage, capped at what the voucher still covers; then adjust `spent` and `units`, and delete
+   the reservation. On an error response or client disconnect, release the full reservation
+   (`spent -= cost_cap`): nothing delivered, nothing charged.
+
+### Channel checks
+
+`open`: decode the signed `0x76` transaction; exactly one call to the escrow with selector
+`open`, `operator` zero, `payee` equal to our signer, `token` equal to `MPP_TEMPO_CURRENCY`,
+deposit positive; recover the payer from the signing hash; descriptor and channel id must match
+the credential; the opening voucher must be `<= deposit` and verify for the channel's voucher
+signer; broadcast, require receipt status success, read chain state (`deposit > 0`, no close
+requested), insert or refresh the channel row.
+
+`topUp`: same decoding rules with `topUp`; descriptor must match the stored channel;
+`additionalDeposit` must match; refresh `deposit` from chain (never decrease stored deposit or
+settled).
+
+`voucher`: channel must exist and accept vouchers (`open`, no close requested on chain);
+descriptor must match; cumulative `>= settled_on_chain`, `<= deposit`, strictly above the
+stored highest (or an exact replay of the same highest amount and signature bytes); signature
+verifies (secp256k1, 65 bytes); delta from the previous highest must be at least
+`min_voucher_delta`. On-chain state is read at most once every 60 seconds per channel to
+refresh `deposit`, `settled`, and `closeRequestedAt`; zero deposit means closed—refuse.
+Once the payer has requested close on chain, no further vouchers or reservations are accepted.
+
+`close`: voucher checks as for inference (amount may equal the highest accepted); payer or
+voucher signer must supply `closeSignature` over `CloseAuthorization`; capture is
+`max(spent, settled_on_chain)` with `cumulativeAmount >= capture`; channel moves to `closing`,
+then the payee broadcasts `close` on chain.
+
+### Settlement
+
+The ledger keeps the highest voucher and up to sixteen earlier vouchers. A voucher is
+settleable only when `settled_on_chain < cumulative <= spent - reserved` (never settle above
+what was delivered). When `spent - last_settlement_spent >= MPP_SETTLE_AMOUNT` or
+`now - last_settlement_at >= MPP_SETTLE_INTERVAL_SECS` and a settleable voucher exists, one
+instance signs and broadcasts `settle` for that voucher; on success it updates
+`settled_on_chain` and drops retained vouchers at or below the settled amount. At most one
+settlement run holds the channel at a time (60 second lease on the row).
+
+### Close supervision
+
+Every `MPP_CLOSE_SUPERVISION_SECS` (default 60), for channels not yet finalized, the server
+reads escrow state in batch. If `closeRequestedAt` is set on chain, it records that, stops
+new vouchers, and—when `spent - reserved` exceeds `settled_on_chain`—submits a payee close
+with capture equal to delivered spend, using a voucher at least that high, inside the 900 second
+grace period. Channels whose on-chain deposit is zero are marked finalized (withdrawn). Stale
+reservations with no finish are released after fifteen minutes. Finalized channel rows are purged
+after thirty days.
+
+### Session configuration
+
+When any model has `token_price`, `MPP_TEMPO_SIGNER_KEY` / `_FILE` is required: a 32-byte
+hex secp256k1 key whose address is the session `recipient` and signs settlement and payee-close
+transactions. Fund that address with the fee token (`MPP_TEMPO_CURRENCY`) for gas on settle and
+close, in addition to whatever treasury policy you use for `charge`.
+
+| Variable | Meaning |
+|---|---|
+| `MPP_TEMPO_SIGNER_KEY` / `_FILE` | Payee settlement signer (required if any `token_price`) |
+| `MPP_SESSION_MIN_VOUCHER_DELTA` | Minimum voucher step in base units (default `token_price × 64`) |
+| `MPP_SESSION_SUGGESTED_DEPOSIT` | Suggested opening deposit (default `1000000`) |
+| `MPP_SETTLE_INTERVAL_SECS` | Max time between settlements (default `3600`) |
+| `MPP_SETTLE_AMOUNT` | Settle when delivered spend since last settlement reaches this (default `5000000`) |
+| `MPP_CLOSE_SUPERVISION_SECS` | Close-supervision poll interval (default `60`) |
+
+Example model entry with both intents:
+
+```json
+{"zai-org/GLM-5.1-FP8": {"amount": "20000", "token_price": "8", "max_tokens": 2048, "max_request_bytes": 65536}}
+```
+
+### Session operator setup
+
+1. **Signer and escrow.** Generate and protect `MPP_TEMPO_SIGNER_KEY`; its address is every
+   session challenge's `recipient`. Keep enough of `MPP_TEMPO_CURRENCY` on that address to pay
+   Tempo fees for periodic `settle` and payee `close` transactions.
+2. **Schema.** Channel state lives in `mpp_channels` and in-flight holds in
+   `mpp_channel_reservations` (`V0100__mpp_channels.sql` in `nearai/cloud-platform`). Deploy
+   that migration and bump `scripts/cloud-platform-schema.env` before enabling session pricing.
+   `mpp_channels` holds the channel descriptor, on-chain deposit and settled amounts, highest
+   and retained vouchers, `spent`, `reserved`, token `units`, lifecycle state, settlement and
+   close metadata, and timestamps. `mpp_channel_reservations` holds `request_id`, `channel_id`,
+   reserved `amount`, and `created_at`. Neither table stores organization, workspace, request
+   content, or API key.
+3. **Reconciliation.** On-chain `settle` and payee `close` move value to the payee (your
+   signer) and refund the payer's remainder. Compare escrow events and the signer's balance
+   with `units` and settlement timestamps on the channel rows, alongside the service workspace
+   usage you already watch for `charge`.
+
+Session storage follows the same privacy rules as `charge`: no credentials, signatures, channel
+ids, or payer addresses in logs or metrics; problem details stay generic.
+
+### Session limits
+
+- Signatures are secp256k1 only (65-byte `r||s||v`); P-256 and WebAuthn (TIP-1020) are refused.
+- No fee sponsorship (`feePayer`), no machine token, no auto-swap transaction prefix, no
+  mid-stream voucher updates (one voucher per request before inference).
+- One currency, one chain, one session recipient (the signer), `POST /v1/chat/completions` only.
+- NEAR Intents is offered on `charge` only, not on `session`.
+
+### Testing against Tempo Moderato with mppx
+
+On chain id `42431`, use mppx's session manager so the client opens the channel, signs
+vouchers, and handles `sessionSnapshot` top-ups:
+
+```ts
+import { Mppx, tempo } from 'mppx/client'
+import { privateKeyToAccount } from 'viem/accounts'
+
+const account = privateKeyToAccount(process.env.TEMPO_PRIVATE_KEY as `0x${string}`)
+Mppx.create({
+  methods: [tempo.session.manager({ account, maxDeposit: 1_000_000n })],
+})
+```
+
+Point `MPP_TEMPO_RPC_URL` at Moderato and list `token_price` on the models you test.

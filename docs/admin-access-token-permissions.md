@@ -56,6 +56,11 @@ and audit logging are permitted; business mutations are not.
    to the old version. Preserve the permission column during rollback. Revocation
    must complete while permission enforcement is still deployed.
 
+Object encryption uses the same separation: `GET /v1/admin/object-encryption/keys`,
+`GET /v1/admin/object-encryption/jobs/{id}`, and `POST /v1/admin/object-encryption/scan`
+require Read permission. Creating, cancelling, or verifying object encryption jobs
+requires Write permission. See [object encryption key rotation](object-encryption.md).
+
 ## Admin email allowlist migration
 
 Platform admin eligibility is controlled by `AUTH_ADMIN_EMAILS`, a comma-separated

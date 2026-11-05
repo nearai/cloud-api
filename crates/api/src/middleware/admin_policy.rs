@@ -73,6 +73,8 @@ pub(crate) fn admin_operation(method: &Method, matched_path: &str) -> AdminOpera
                 | "/admin/feature-requests"
                 | "/admin/database-encryption/jobs/{id}"
                 | "/admin/database-encryption/keys"
+                | "/admin/object-encryption/jobs/{id}"
+                | "/admin/object-encryption/keys"
         )
     {
         return AdminOperation::Read;
@@ -87,6 +89,7 @@ pub(crate) fn admin_operation(method: &Method, matched_path: &str) -> AdminOpera
             "/admin/models/pricing-changes/preview"
                 | "/admin/models/{model_name}/deprecation/preview"
                 | "/admin/database-encryption/scan"
+                | "/admin/object-encryption/scan"
                 | "/admin/users/{user_id}/erasure/preview"
         )
     {
@@ -116,6 +119,31 @@ mod tests {
                 ),
                 AdminOperation::Write
             );
+        }
+    }
+
+    #[test]
+    fn object_encryption_reads_and_mutations_have_separate_permissions() {
+        for prefix in ["/v1", ""] {
+            for (method, suffix, expected) in [
+                (Method::GET, "keys", AdminOperation::Read),
+                (Method::HEAD, "keys", AdminOperation::Read),
+                (Method::GET, "jobs/{id}", AdminOperation::Read),
+                (Method::POST, "scan", AdminOperation::Read),
+                (Method::POST, "jobs", AdminOperation::Write),
+                (Method::POST, "jobs/{id}/cancel", AdminOperation::Write),
+                (Method::POST, "verify", AdminOperation::Write),
+                (Method::GET, "unknown", AdminOperation::Write),
+            ] {
+                assert_eq!(
+                    admin_operation(
+                        &method,
+                        &format!("{prefix}/admin/object-encryption/{suffix}")
+                    ),
+                    expected,
+                    "{method} {suffix}"
+                );
+            }
         }
     }
 

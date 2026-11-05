@@ -1,6 +1,8 @@
 use crate::common::*;
 use uuid::Uuid;
 
+mod conflicts;
+
 #[tokio::test]
 async fn execute_job_is_rejected_until_encrypted_writes_are_enabled() {
     let (server, _) = setup_test_server_with_config_and_database(|config| {
@@ -877,6 +879,9 @@ async fn recovery_resumes_the_cursor_and_duplicate_workers_do_not_double_process
 
 mod key_rotation;
 
+// Object jobs share the serialized encryption-job test group.
+#[path = "object_encryption.rs"]
+mod object_encryption;
 struct AdvisoryLockJobCleanup {
     connection: Option<deadpool_postgres::Object>,
     job_id: Option<Uuid>,

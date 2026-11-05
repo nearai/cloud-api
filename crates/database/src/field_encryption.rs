@@ -387,6 +387,18 @@ mod tests {
     }
 
     #[test]
+    fn key_ring_fingerprints_match_domain_separated_hmac_vectors() {
+        let ring = KeyRing::new("db-v2".into(), [9; 32], vec![("db-v1".into(), [7; 32])]).unwrap();
+        assert_eq!(
+            ring.fingerprints(),
+            vec![
+                ("db-v2".into(), "825674e6c3e8ca73".into()),
+                ("db-v1".into(), "820ed242bff6e2d9".into()),
+            ]
+        );
+    }
+
+    #[test]
     fn key_ring_fingerprints_and_debug_expose_identifiers_only() {
         let ring = KeyRing::new("db-v2".into(), [9; 32], vec![("db-v1".into(), [7; 32])]).unwrap();
         let fingerprints = ring.fingerprints();

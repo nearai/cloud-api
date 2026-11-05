@@ -6,11 +6,13 @@
 //! orgs/workspaces/keys, not separate databases.
 
 pub mod db_setup;
+mod encryption_jobs;
 pub mod fake_ita;
 pub mod ita_evidence;
 pub mod ita_server;
 
 pub use db_setup::MOCK_USER_ID;
+pub use encryption_jobs::EncryptionJobsCleanup;
 pub use ita_evidence::setup_test_server_with_config_and_ita_model_evidence;
 pub use ita_server::{setup_ita_server, setup_ita_server_with_env_policy, ItaServerMode};
 
@@ -140,6 +142,9 @@ pub fn test_config() -> ApiConfig {
         // Preserve encrypted-write coverage in E2E tests; production defaults off.
         database_encryption_write_enabled: true,
         s3: config::S3Config {
+            object_rewrap_max_bytes: 268_435_456,
+            object_encryption_write_enabled: true,
+            encryption_keys: None,
             mock: true,
             bucket: "test-bucket".to_string(),
             region: "us-east-1".to_string(),

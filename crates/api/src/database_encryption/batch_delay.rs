@@ -1,7 +1,7 @@
 use super::DATABASE_JOB_KIND_FILTER;
 use std::{future::Future, time::Duration};
 
-pub(super) async fn wait_between_batches<F, Fut>(
+pub(crate) async fn wait_between_batches<F, Fut>(
     delay: Duration,
     mut cancel: F,
 ) -> anyhow::Result<bool>
@@ -24,7 +24,7 @@ where
 
 /// Mark cancellation with a short-lived pooled connection; no connection or
 /// transaction survives into a delay slice.
-pub(super) async fn cancel_if_requested(
+pub(crate) async fn cancel_if_requested(
     pool: &database::DbPool,
     id: uuid::Uuid,
 ) -> anyhow::Result<bool> {

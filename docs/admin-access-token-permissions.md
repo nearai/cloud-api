@@ -36,8 +36,8 @@ approved for reads. OpenAPI uses the same registry for documented admin routes.
 
 Read-only access spans organizations; organization and resource scopes are not
 supported. Token hashes, expiration, revocation, User-Agent binding and the
-creator's admin-domain eligibility are checked as before. Usage timestamps and
-audit logging are permitted; business mutations are not.
+creator's email allowlist eligibility are checked as before. Usage timestamps
+and audit logging are permitted; business mutations are not.
 
 ## Rollout and rollback
 
@@ -55,3 +55,27 @@ audit logging are permitted; business mutations are not.
    every issuer and revoke all active read-only tokens before routing any traffic
    to the old version. Preserve the permission column during rollback. Revocation
    must complete while permission enforcement is still deployed.
+
+## Admin email allowlist migration
+
+Platform admin eligibility is controlled by `AUTH_ADMIN_EMAILS`, a comma-separated
+list of complete email addresses matched case-insensitively against the stored
+account email (not the editable contact email). There is no domain wildcard or
+fallback to the retired `AUTH_ADMIN_DOMAINS`. Remove the retired variable before
+startup, even if it is empty or `AUTH_ADMIN_EMAILS` is also configured; its presence
+is a configuration error. Invalid email entries and wildcards also fail startup
+with an entry index, without logging the configured address. Empty or unset
+`AUTH_ADMIN_EMAILS` means no admin access.
+Ordinary user login remains available. VPC-provisioned users remain ineligible.
+
+Before deploying, inventory active service tokens and their creators. Configure
+`AUTH_ADMIN_EMAILS` with the approved human admins and the creators of service
+tokens that must remain usable. Deploy/restart every API instance with the new
+configuration; instances running older code still use the domain-wide policy.
+
+Existing `adm_` tokens require no migration or reissuance. Their permissions,
+expiration, revocation and User-Agent binding remain unchanged, and token
+management still requires an admin session. Every token request rechecks the
+creator against the allowlist. Removing a creator therefore also disables their
+service tokens once all instances have loaded the updated configuration; replace
+needed service credentials under an approved identity before removing that user.

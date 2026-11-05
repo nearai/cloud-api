@@ -44,6 +44,9 @@ use k256::ecdsa::{RecoveryId, Signature as EcdsaSignature, VerifyingKey};
 #[cfg(test)]
 use sha3::Keccak256;
 
+pub const ADMIN_ALLOWLIST_EMAIL: &str = "admin@test.com";
+pub const NON_ADMIN_ALLOWLIST_EMAIL: &str = "other@test.com";
+
 pub(super) const E2E_APP_BUILD_OPTIONS: AppBuildOptions = AppBuildOptions {
     // Individual encryption jobs still start from their request handler. Only
     // startup recovery is disabled so unrelated tests do not all scan and race
@@ -105,7 +108,7 @@ pub fn test_config() -> ApiConfig {
             github: None,
             google: None,
             near: config::NearConfig::default(),
-            admin_domains: vec!["test.com".to_string()],
+            admin_emails: vec![ADMIN_ALLOWLIST_EMAIL.to_string()],
             admin_read_only_tokens_enabled: false,
             require_session_bound_access_tokens: false,
         },
@@ -685,7 +688,14 @@ pub async fn setup_test_server_with_mcp_factory(
 }
 
 pub async fn setup_unique_test_session(database: &Arc<Database>) -> (String, String) {
-    let user_id = uuid::Uuid::new_v4();
+    setup_unique_test_session_with_user_id(database, uuid::Uuid::new_v4()).await
+}
+
+/// Preselect an identity so real-auth admin tests can allowlist it before building the server.
+pub async fn setup_unique_test_session_with_user_id(
+    database: &Arc<Database>,
+    user_id: uuid::Uuid,
+) -> (String, String) {
     let user_id_str = user_id.to_string();
     // Session ID format: rt_{uuid} (with dashes so it can be parsed by MockAuthService)
     let session_id = format!("rt_{user_id_str}");

@@ -1264,7 +1264,7 @@ async fn test_admin_get_organization_balance_accepts_admin_access_token() {
 #[tokio::test]
 async fn test_admin_get_organization_balance_rejects_non_admin() {
     let server = setup_test_server_with_config(|config| {
-        config.auth.admin_domains = vec!["near.ai".to_string()];
+        config.auth.admin_emails = vec![NON_ADMIN_ALLOWLIST_EMAIL.to_string()];
     })
     .await;
     let org = create_org(&server).await;
@@ -3072,7 +3072,7 @@ async fn test_admin_list_users_with_organizations_no_spend_limit() {
     let (unique_session, test_user_email) = setup_unique_test_session(&database).await;
 
     // Get access token from refresh token
-    let access_token = get_access_token_from_refresh_token(&server, unique_session.clone()).await;
+    let access_token = get_access_token_from_refresh_token(&server, get_session_id()).await;
 
     // Create an organization WITHOUT setting spend limit for a user owned by
     // this test. The shared admin user can already own organizations from
@@ -3178,7 +3178,7 @@ async fn test_admin_list_users_with_organization_usage() {
         loop {
             let response = server
                 .get(&users_path)
-                .add_header("Authorization", format!("Bearer {}", &unique_session))
+                .add_header("Authorization", format!("Bearer {}", get_session_id()))
                 .await;
             assert_eq!(response.status_code(), 200);
             let users = response.json::<api::models::ListUsersResponse>();

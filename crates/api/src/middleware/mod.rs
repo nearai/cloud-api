@@ -3,6 +3,7 @@
 // This module contains custom middleware for the API layer,
 // including authentication, authorization, and request processing.
 
+pub mod admin_audit;
 pub(crate) mod admin_policy;
 pub mod auth;
 pub mod body_hash;
@@ -15,6 +16,7 @@ pub mod retry_after;
 pub mod usage;
 
 // Re-export commonly used items
+pub use admin_audit::{admin_audit_middleware, AdminAudit, ADMIN_AUDIT_REQUEST_ID_HEADER};
 pub use auth::{
     admin_middleware, auth_middleware, AdminUser, AuthState, AuthenticatedReportingToken,
     AuthenticatedUser,

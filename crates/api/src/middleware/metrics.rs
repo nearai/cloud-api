@@ -30,7 +30,7 @@ pub struct MetricsState {
     pub metrics_service: Arc<dyn MetricsServiceTrait>,
 }
 
-fn bounded_method(method: &Method) -> &'static str {
+pub(crate) fn bounded_method(method: &Method) -> &'static str {
     match method.as_str() {
         "GET" => "GET",
         "POST" => "POST",

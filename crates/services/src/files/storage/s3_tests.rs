@@ -190,12 +190,27 @@ async fn s3_current_metadata_skips_the_body_download() {
 async fn s3_listing_forwards_the_continuation_and_limit() {
     // Given a bucket listing with a continuation token.
     let server = MockServer::start().await;
-    Mock::given(method("GET")).and(path("/bucket"))
-        .and(query_param("list-type", "2")).and(query_param("max-keys", "2"))
+    Mock::given(method("GET"))
+        .and(path("/bucket/"))
+        .and(query_param("list-type", "2"))
+        .and(query_param("max-keys", "2"))
         .and(query_param("continuation-token", "previous-page"))
-        .respond_with(ResponseTemplate::new(200).set_body_string(
-            "<ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><IsTruncated>true</IsTruncated><Contents><Key>a</Key></Contents><Contents><Key>b</Key></Contents><NextContinuationToken>next-page</NextContinuationToken></ListBucketResult>"))
-        .expect(1).mount(&server).await;
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+    <Name>bucket</Name>
+    <KeyCount>2</KeyCount>
+    <MaxKeys>2</MaxKeys>
+    <IsTruncated>true</IsTruncated>
+    <Contents><Key>a</Key></Contents>
+    <Contents><Key>b</Key></Contents>
+    <NextContinuationToken>next-page</NextContinuationToken>
+</ListBucketResult>"#,
+            "application/xml",
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
     // When the next page is requested.
     let page = storage(&server)
         .await

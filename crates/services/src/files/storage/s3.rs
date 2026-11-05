@@ -4,7 +4,8 @@ use super::{
 use crate::files::encryption::{self, EncryptionError, ObjectKeyRing};
 use async_trait::async_trait;
 use aws_sdk_s3::{
-    operation::get_object::GetObjectOutput, primitives::ByteStream, Client as S3Client,
+    error::ProvideErrorMetadata, operation::get_object::GetObjectOutput, primitives::ByteStream,
+    Client as S3Client,
 };
 use std::{fmt::Display, sync::Arc};
 
@@ -154,7 +155,14 @@ impl StorageTrait for S3Storage {
             .max_keys(max)
             .send()
             .await
-            .map_err(|error| storage_error("listing", error))?;
+            .map_err(|error| match error.as_service_error() {
+                Some(service) => FileServiceError::StorageError(format!(
+                    "Object listing failed: {}: {}",
+                    service.code().unwrap_or("Unknown"),
+                    service.message().unwrap_or("No message provided")
+                )),
+                None => storage_error("listing", error),
+            })?;
         let keys = response
             .contents()
             .iter()

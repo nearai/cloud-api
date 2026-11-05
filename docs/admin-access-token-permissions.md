@@ -27,8 +27,10 @@ The method and matched route template are classified centrally in
 GET (and its HEAD fallback) is approved only on the listed routes. POST pricing
 and deprecation previews read models and notification recipients without storing
 changes or sending notifications. POST database-encryption scans read counts and
-schema classification; GET job status reads an existing job. POST verification
-creates a job and requires write permission. Newly added routes require write
+schema classification; GET job status reads an existing job. GET (and HEAD)
+`/v1/admin/database-encryption/keys` reads key IDs, fingerprints and write status.
+POST verification and jobs with `actions: ["rewrap"]` create work and require
+write permission. Newly added routes require write
 permission until their handler and service calls are reviewed and explicitly
 approved for reads. OpenAPI uses the same registry for documented admin routes.
 

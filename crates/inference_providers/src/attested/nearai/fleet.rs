@@ -19,7 +19,7 @@ use crate::placement_io::{
     PlacementHandles, RoutedAck, Write, METRIC_DURATION_MS, METRIC_ITL_MS, METRIC_TTFT_MS,
 };
 use crate::rotation;
-use crate::spki_verifier::FingerprintState;
+use crate::spki_verifier::{FingerprintState, SharedTlsRoots};
 use crate::BackendHosts;
 use crate::BackendVerifier;
 use arc_swap::{ArcSwap, ArcSwapOption};
@@ -300,6 +300,8 @@ pub(super) struct Fleet {
     pub(super) config: Config,
     /// General-purpose client for non-completion requests (attestation, models).
     pub(super) client: Client,
+    /// Reuse the native roots when building a fresh report-collection client.
+    pub(super) tls_roots: SharedTlsRoots,
     /// Completion-timeout, non-pinned client used for the canonical fallback
     /// (cold-start / non-rotation) and when inline index verification exhausts
     /// retries (graceful degradation).
@@ -321,6 +323,7 @@ impl Fleet {
         index_clients: Vec<Mutex<Option<Client>>>,
         config: Config,
         client: Client,
+        tls_roots: SharedTlsRoots,
         fallback_client: Client,
         verification_semaphore: Arc<Semaphore>,
         fingerprint_state: Arc<RwLock<FingerprintState>>,
@@ -348,6 +351,7 @@ impl Fleet {
             last_unknown_key_warn_ms: AtomicU64::new(0),
             config,
             client,
+            tls_roots,
             fallback_client,
             verification_semaphore,
             fingerprint_state,

@@ -755,6 +755,17 @@ impl MockExpectationBuilder {
 
 type ResponsesHandler =
     Arc<dyn Fn(serde_json::Value) -> crate::responses_raw::ResponsesRawResponse + Send + Sync>;
+type AttestationReportsHandler = Arc<
+    dyn Fn(
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            bool,
+        ) -> Result<Vec<serde_json::Map<String, serde_json::Value>>, AttestationError>
+        + Send
+        + Sync,
+>;
 type PrivacyClassifyHandler =
     Arc<dyn Fn(bytes::Bytes) -> Result<bytes::Bytes, PrivacyClassifyError> + Send + Sync>;
 type SystemOneHandler = Arc<
@@ -769,6 +780,7 @@ type SystemOneHandler = Arc<
 /// Mock provider that implements InferenceProvider for testing
 pub struct MockProvider {
     responses_handler: Option<ResponsesHandler>,
+    attestation_reports_handler: Option<AttestationReportsHandler>,
     systemone_handler: Option<SystemOneHandler>,
     privacy_classify_handler: Option<PrivacyClassifyHandler>,
     /// List of available mock models
@@ -864,6 +876,25 @@ impl MockProvider {
         self
     }
 
+    /// Supply a fleet report collection for provider-pool tests.
+    pub fn with_attestation_reports_handler(
+        mut self,
+        handler: impl Fn(
+                String,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+                bool,
+            )
+                -> Result<Vec<serde_json::Map<String, serde_json::Value>>, AttestationError>
+            + Send
+            + Sync
+            + 'static,
+    ) -> Self {
+        self.attestation_reports_handler = Some(Arc::new(handler));
+        self
+    }
+
     /// Create a new mock provider with default models
     pub fn new() -> Self {
         let models = vec![ModelInfo {
@@ -902,6 +933,7 @@ impl MockProvider {
             unpinned_chat_ids: Arc::new(std::sync::Mutex::new(Vec::new())),
             attestation_signing_algos: Arc::new(std::sync::Mutex::new(Vec::new())),
             responses_handler: None,
+            attestation_reports_handler: None,
             systemone_handler: None,
             privacy_classify_handler: None,
         }
@@ -937,6 +969,7 @@ impl MockProvider {
             unpinned_chat_ids: Arc::new(std::sync::Mutex::new(Vec::new())),
             attestation_signing_algos: Arc::new(std::sync::Mutex::new(Vec::new())),
             responses_handler: None,
+            attestation_reports_handler: None,
             systemone_handler: None,
             privacy_classify_handler: None,
         }
@@ -970,6 +1003,7 @@ impl MockProvider {
             unpinned_chat_ids: Arc::new(std::sync::Mutex::new(Vec::new())),
             attestation_signing_algos: Arc::new(std::sync::Mutex::new(Vec::new())),
             responses_handler: None,
+            attestation_reports_handler: None,
             systemone_handler: None,
             privacy_classify_handler: None,
         }
@@ -1911,6 +1945,34 @@ impl crate::InferenceProvider for MockProvider {
         );
 
         Ok(report)
+    }
+
+    async fn get_attestation_reports(
+        &self,
+        model: String,
+        signing_algo: Option<String>,
+        nonce: Option<String>,
+        signing_address: Option<String>,
+        include_tls_fingerprint: bool,
+    ) -> Result<Vec<serde_json::Map<String, serde_json::Value>>, AttestationError> {
+        if let Some(handler) = &self.attestation_reports_handler {
+            return handler(
+                model,
+                signing_algo,
+                nonce,
+                signing_address,
+                include_tls_fingerprint,
+            );
+        }
+        self.get_attestation_report(
+            model,
+            signing_algo,
+            nonce,
+            signing_address,
+            include_tls_fingerprint,
+        )
+        .await
+        .map(|report| vec![report])
     }
 
     async fn audio_transcription(

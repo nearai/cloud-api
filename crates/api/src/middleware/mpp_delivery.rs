@@ -27,7 +27,9 @@ impl<S> Delivery<S> {
         for byte in bytes {
             if *byte == b'\n' {
                 if !self.comment && line_has_content(&self.line) {
+                    self.line.clear();
                     self.started.store(true, Ordering::Release);
+                    return Ok(());
                 }
                 self.line.clear();
                 self.comment = false;
@@ -160,6 +162,27 @@ pub(super) async fn non_streaming(response: Response, started: &AtomicBool) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn content_before_an_oversized_following_frame_is_forwarded_without_reclassification() {
+        let started = Arc::new(AtomicBool::new(false));
+        let mut bytes =
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"one\"}}]}\n\ndata: ".to_vec();
+        bytes.extend(std::iter::repeat_n(b'x', 1024 * 1024 + 1));
+        let expected = Bytes::from(bytes);
+        let original = expected.clone();
+        let (body, finished) = track(
+            Body::from_stream(futures::stream::once(async move {
+                Ok::<_, std::convert::Infallible>(original)
+            })),
+            started.clone(),
+        );
+        let mut stream = body.into_data_stream();
+        assert_eq!(stream.next().await.unwrap().unwrap(), expected);
+        assert!(started.load(Ordering::Acquire));
+        drop(stream);
+        finished.await.unwrap();
+    }
 
     #[tokio::test]
     async fn fragmented_comments_and_role_delta_do_not_start_delivery() {

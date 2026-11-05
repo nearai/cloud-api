@@ -1059,6 +1059,10 @@ pub struct AuthConfig {
     /// outstanding legacy tokens have expired to reject any token that cannot
     /// be tied to a live session.
     pub require_session_bound_access_tokens: bool,
+    /// `VPC_LOGIN_ALLOWED_CLIENT_IDS` (comma-separated). Empty means any client_id.
+    pub vpc_login_allowed_client_ids: Vec<String>,
+    /// `VPC_LOGIN_API_KEY_TTL_DAYS`. `None` keeps API keys issued by VPC login non-expiring.
+    pub vpc_login_api_key_ttl_days: Option<u32>,
 }
 
 impl AuthConfig {
@@ -1124,6 +1128,26 @@ impl AuthConfig {
                 "AUTH_REQUIRE_SESSION_BOUND_ACCESS_TOKENS",
                 false,
             )?,
+            vpc_login_allowed_client_ids: env::var("VPC_LOGIN_ALLOWED_CLIENT_IDS")
+                .ok()
+                .map(|ids| {
+                    ids.split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default(),
+            vpc_login_api_key_ttl_days: match env::var("VPC_LOGIN_API_KEY_TTL_DAYS") {
+                Ok(v) if !v.trim().is_empty() => match v.trim().parse::<u32>() {
+                    Ok(days) if (1..=36500).contains(&days) => Some(days),
+                    _ => {
+                        return Err(format!(
+                        "VPC_LOGIN_API_KEY_TTL_DAYS must be an integer from 1 to 36500, got {v:?}"
+                    ))
+                    }
+                },
+                _ => None,
+            },
         })
     }
 
@@ -1942,6 +1966,8 @@ mod tests {
             admin_domains: vec!["near.ai".to_string(), "near.org".to_string()],
             admin_read_only_tokens_enabled: false,
             require_session_bound_access_tokens: false,
+            vpc_login_allowed_client_ids: Vec::new(),
+            vpc_login_api_key_ttl_days: None,
         };
 
         // Test admin domains
@@ -2033,6 +2059,8 @@ mod tests {
             admin_domains: vec![],
             admin_read_only_tokens_enabled: false,
             require_session_bound_access_tokens: false,
+            vpc_login_allowed_client_ids: Vec::new(),
+            vpc_login_api_key_ttl_days: None,
         };
 
         // Should return false when no admin domains configured

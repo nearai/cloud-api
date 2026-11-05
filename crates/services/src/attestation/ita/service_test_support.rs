@@ -87,6 +87,8 @@ fn service_with_collectors(
         usage_repository: Arc::new(NoopUsageRepository),
         vpc_info: None,
         vpc_shared_secret: None,
+        service_login_secret: None,
+        vpc_login_allow_shared_secret: true,
         tls_cert_fingerprint: None,
         ed25519_signing_key: Arc::new(ed25519_signing_key),
         ed25519_verifying_key: Arc::new(ed25519_verifying_key),

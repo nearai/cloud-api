@@ -57,6 +57,7 @@ impl Tool {
 
 #[derive(Debug, Default)]
 struct Registry {
+    // Only current declarations may validate or restore newly generated calls.
     tools: HashMap<String, Tool>,
     original_tools: Option<Value>,
 }
@@ -332,9 +333,9 @@ fn describe(tool: &Value, namespace: Option<&str>, custom: bool) -> String {
     }
 }
 
-fn register(registry: &mut Registry, tool: Tool) -> Result<String, String> {
+fn register(tools: &mut HashMap<String, Tool>, tool: Tool) -> Result<String, String> {
     let alias = tool.provider_name();
-    if let Some(existing) = registry.tools.get(&alias) {
+    if let Some(existing) = tools.get(&alias) {
         if existing.name != tool.name
             || existing.namespace != tool.namespace
             || existing.custom.is_some() != tool.custom.is_some()
@@ -342,7 +343,7 @@ fn register(registry: &mut Registry, tool: Tool) -> Result<String, String> {
             return Err("Client tool names collide with an internal namespace alias".into());
         }
     } else {
-        registry.tools.insert(alias.clone(), tool);
+        tools.insert(alias.clone(), tool);
     }
     Ok(alias)
 }
@@ -386,7 +387,7 @@ pub fn normalize_request(mut body: Value) -> Result<(Value, ClientToolAdapter), 
                         None
                     },
                 };
-                let alias = register(&mut registry, spec.clone())?;
+                let alias = register(&mut registry.tools, spec.clone())?;
                 if normalized.iter().any(|tool: &Value| tool["name"] == alias) {
                     return Err("Duplicate client-managed tool name within a namespace".into());
                 }
@@ -442,6 +443,8 @@ pub fn normalize_request(mut body: Value) -> Result<(Value, ClientToolAdapter), 
             return Err("Only completed web_search_call items can be replayed".into());
         }
         input.retain(|item| item["type"] != "web_search_call");
+        // History needs stable aliases without enabling removed tools for new output.
+        let mut replay_tools = registry.tools.clone();
         for item in input {
             match item["type"].as_str() {
                 Some("function_call" | "custom_tool_call") => {
@@ -459,7 +462,13 @@ pub fn normalize_request(mut body: Value) -> Result<(Value, ClientToolAdapter), 
                             .transpose()?,
                         custom: custom.then_some(CustomFormat::Text),
                     };
-                    let alias = register(&mut registry, spec)?;
+                    let alias = if !custom && spec.namespace.is_none() {
+                        // Unknown calls can contain a raw alias from an earlier response.
+                        // Preserve it without registering a second identity for that alias.
+                        spec.name
+                    } else {
+                        register(&mut replay_tools, spec)?
+                    };
                     if custom {
                         let input = item["input"]
                             .as_str()

@@ -1125,10 +1125,10 @@ impl ResponseServiceImpl {
     /// function calls without touching their argument bytes.
     ///
     /// Unlike `tools::convert_tool_calls`, this deliberately does not infer a
-    /// missing name, parse JSON, repair malformed JSON, or apply builtin
-    /// search-specific handling. The only checks are that the provider named a
-    /// declared custom function and supplied a usable call ID (or omitted one,
-    /// in which case Cloud creates the correlation ID once).
+    /// missing name, repair argument JSON, or apply builtin search handling.
+    /// Unknown names reach the client so it can return a tool error and continue
+    /// its loop. Name/call-ID structure and registered custom-tool input wrappers
+    /// are still validated.
     fn convert_client_function_calls(
         tool_call_accumulator: crate::responses::service_helpers::ToolCallAccumulator,
         request: &models::CreateResponseRequest,
@@ -1136,17 +1136,6 @@ impl ResponseServiceImpl {
         Vec<crate::responses::service_helpers::ClientManagedFunctionCall>,
         errors::ResponseError,
     > {
-        let declared_function_names: HashSet<&str> = request
-            .tools
-            .as_deref()
-            .unwrap_or_default()
-            .iter()
-            .filter_map(|tool| match tool {
-                models::ResponseTool::Function { name, .. } => Some(name.as_str()),
-                _ => None,
-            })
-            .collect();
-
         let mut entries: Vec<_> = tool_call_accumulator.into_iter().collect();
         entries.sort_by_key(|(index, _)| *index);
 
@@ -1163,12 +1152,6 @@ impl ResponseServiceImpl {
                         "Model returned an invalid custom function call at index {index}: missing function name."
                     )));
                 }
-                if !declared_function_names.contains(name.as_str()) {
-                    return Err(errors::ResponseError::InvalidParams(format!(
-                        "Model called unsupported custom function '{name}'."
-                    )));
-                }
-
                 request.client_tool_adapter.validate_arguments(&name, &entry.arguments)
                     .map_err(errors::ResponseError::InvalidParams)?;
 

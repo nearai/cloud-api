@@ -68,6 +68,9 @@ pub use service::{
     MppService, PaidCredential, ServingGuard, SettledPayment, VerifiedCredential,
     CHAT_COMPLETIONS_ROUTE,
 };
+pub use session_service::{
+    ManagementReceipt, ReservedRequest, SessionCredential, SessionService, SessionServiceConfig,
+};
 pub use signer::{LocalSigner, SignerKeyError};
 
 /// The chain-level core of the MPP `session` intent. No I/O and no state: digests,

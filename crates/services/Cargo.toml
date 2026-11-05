@@ -63,7 +63,7 @@ aws-sdk-s3 = { version = "1.134", default-features = false, features = [
 ] }
 # Encryption for file storage
 aes-gcm = "0.10"
-# HMAC for VPC signature verification
+# HMAC for session token signing and affinity keys
 hmac = "0.13"
 # HKDF for deriving the placement affinity/pin secrets
 hkdf = "0.13"

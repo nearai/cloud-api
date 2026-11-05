@@ -644,6 +644,32 @@ impl services::auth::UserRepository for UserRepository {
         Ok(())
     }
 
+    async fn record_signup_attribution(
+        &self,
+        user_id: UserId,
+        attribution: &services::auth::attribution::SignupAttribution,
+    ) -> anyhow::Result<()> {
+        let client = self.pool.get().await?;
+        // Written once, right after the user is created; the IS NULL guard keeps a repeated
+        // call from overwriting the first value.
+        client
+            .execute(
+                "UPDATE users SET signup_utm_source = $2, signup_utm_medium = $3,
+                 signup_utm_campaign = $4
+                 WHERE id = $1 AND signup_utm_source IS NULL AND signup_utm_medium IS NULL
+                 AND signup_utm_campaign IS NULL",
+                &[
+                    &user_id.0,
+                    &attribution.utm_source,
+                    &attribution.utm_medium,
+                    &attribution.utm_campaign,
+                ],
+            )
+            .await
+            .map_err(map_db_error)?;
+        Ok(())
+    }
+
     async fn create(
         &self,
         email: String,

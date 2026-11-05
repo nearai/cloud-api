@@ -159,6 +159,7 @@ async fn oauth_non_authoritative_google_email_returns_conflict_without_identity_
                 incoming.into(),
                 Some("local-verifier".into()),
                 None,
+                &Default::default(),
             )
             .await
             .unwrap();
@@ -212,6 +213,7 @@ async fn oauth_verified_email_callback_auto_links_and_signs_into_original_accoun
                     incoming.into(),
                     Some("local-verifier".into()),
                     None,
+                    &Default::default(),
                 )
                 .await
                 .unwrap();
@@ -266,6 +268,7 @@ async fn oauth_google_gmail_callback_auto_links_without_hosted_domain() {
             "google".into(),
             Some("local-verifier".into()),
             None,
+            &Default::default(),
         )
         .await
         .unwrap();
@@ -292,4 +295,154 @@ async fn oauth_google_gmail_callback_auto_links_without_hosted_domain() {
     ).await.unwrap();
     assert!(row.get::<_, bool>("email_verified"));
     assert!(row.get::<_, bool>("email_authoritative"));
+}
+
+type Attribution = (Option<String>, Option<String>, Option<String>);
+
+async fn signup_attribution(db: &database::Database, user_id: uuid::Uuid) -> Attribution {
+    let row = db
+        .pool()
+        .get()
+        .await
+        .unwrap()
+        .query_one(
+            "SELECT signup_utm_source, signup_utm_medium, signup_utm_campaign FROM users WHERE id=$1",
+            &[&user_id],
+        )
+        .await
+        .unwrap();
+    (row.get(0), row.get(1), row.get(2))
+}
+
+async fn user_id_by_email(db: &database::Database, email: &str) -> uuid::Uuid {
+    db.pool()
+        .get()
+        .await
+        .unwrap()
+        .query_one("SELECT id FROM users WHERE email=$1", &[&email])
+        .await
+        .unwrap()
+        .get(0)
+}
+
+fn attribution(source: Option<&str>, medium: Option<&str>, campaign: Option<&str>) -> Attribution {
+    (
+        source.map(str::to_string),
+        medium.map(str::to_string),
+        campaign.map(str::to_string),
+    )
+}
+
+/// The login redirect's utm parameters ride the OAuth state across the provider bounce and land
+/// on the user the callback creates; invalid values are dropped. A later sign-in never changes
+/// them, and a NEAR signup records them the same way.
+#[tokio::test]
+async fn oauth_signup_attribution_is_recorded_only_when_the_user_is_created() {
+    use services::auth::attribution::SignupAttribution;
+
+    let (server, db, auth, store, provider) = fixture().await;
+    let identity = info(
+        "github",
+        &format!("signup-{}@example.test", uuid::Uuid::new_v4()),
+    );
+    mock_identity(&provider, &identity).await;
+
+    // The redirect keeps the accepted values with the state and out of the provider URL.
+    let redirect = server
+        .get("/v1/auth/github?utm_source=partner-app&utm_medium=%3Cscript%3E&utm_campaign=launch")
+        .await;
+    assert_eq!(redirect.status_code(), 303);
+    let location = redirect.header("location");
+    let location = location.to_str().unwrap();
+    assert!(!location.contains("partner-app"), "provider URL");
+    let state = url::Url::parse(location)
+        .unwrap()
+        .query_pairs()
+        .find(|(key, _)| key == "state")
+        .map(|(_, value)| value.into_owned())
+        .expect("state");
+    let stored: Attribution = db
+        .pool()
+        .get()
+        .await
+        .unwrap()
+        .query_one(
+            "SELECT utm_source, utm_medium, utm_campaign FROM oauth_states WHERE state=$1",
+            &[&state],
+        )
+        .await
+        .map(|row| (row.get(0), row.get(1), row.get(2)))
+        .unwrap();
+    assert_eq!(
+        stored,
+        attribution(Some("partner-app"), None, Some("launch"))
+    );
+
+    // The callback creates the user with them.
+    let response = server
+        .get(&format!("/v1/auth/callback?state={state}&code=local-code"))
+        .add_header("User-Agent", UA)
+        .await;
+    assert_eq!(response.status_code(), 200, "first sign-in");
+    let user_id = user_id_by_email(&db, &identity.email).await;
+    assert_eq!(
+        signup_attribution(&db, user_id).await,
+        attribution(Some("partner-app"), None, Some("launch")),
+        "created user"
+    );
+
+    // Signing in again with other values leaves them as they were.
+    let state = uuid::Uuid::new_v4().to_string();
+    store
+        .create(
+            state.clone(),
+            "github".into(),
+            None,
+            None,
+            &SignupAttribution::from_request(Some("other"), Some("web"), None),
+        )
+        .await
+        .unwrap();
+    let response = server
+        .get(&format!("/v1/auth/callback?state={state}&code=local-code"))
+        .add_header("User-Agent", UA)
+        .await;
+    assert_eq!(response.status_code(), 200, "second sign-in");
+    assert_eq!(
+        signup_attribution(&db, user_id).await,
+        attribution(Some("partner-app"), None, Some("launch")),
+        "existing user"
+    );
+
+    // A signup without attribution stores none.
+    let (plain, _) = account(&auth, "google").await;
+    assert_eq!(
+        signup_attribution(&db, plain.id.0).await,
+        attribution(None, None, None),
+        "no attribution"
+    );
+
+    // NEAR identities are created by the same service call.
+    let account_id = format!("n{}.near", uuid::Uuid::new_v4().simple());
+    let near = auth
+        .get_or_create_oauth_user_with_attribution(
+            OAuthUserInfo {
+                provider: "near".into(),
+                provider_user_id: account_id.clone(),
+                email: services::email::near_placeholder_email(&account_id),
+                email_verified: false,
+                email_authoritative: false,
+                username: account_id.clone(),
+                display_name: Some(account_id.clone()),
+                avatar_url: None,
+            },
+            &SignupAttribution::from_request(Some("partner-app"), Some("desktop"), None),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        signup_attribution(&db, near.id.0).await,
+        attribution(Some("partner-app"), Some("desktop"), None),
+        "NEAR user"
+    );
 }

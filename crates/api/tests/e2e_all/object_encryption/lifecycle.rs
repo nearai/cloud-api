@@ -67,7 +67,8 @@ async fn read_only_tokens_scan_but_cannot_mutate_and_job_kinds_are_isolated() {
             "insufficient_permissions"
         );
     }
-    for (domain, foreign_id) in [("object", database_id), ("database", id)] {
+    for (domain, foreign_id, cancel_status) in [("object", database_id, 404), ("database", id, 400)]
+    {
         let response = server
             .get(&format!("/v1/admin/{domain}-encryption/jobs/{foreign_id}"))
             .add_header("Authorization", format!("Bearer {}", get_session_id()))
@@ -81,7 +82,7 @@ async fn read_only_tokens_scan_but_cannot_mutate_and_job_kinds_are_isolated() {
             .add_header("Authorization", format!("Bearer {}", get_session_id()))
             .add_header("User-Agent", MOCK_USER_AGENT)
             .await;
-        assert!(matches!(response.status_code().as_u16(), 400 | 404));
+        assert_eq!(response.status_code(), cancel_status, "domain={domain}");
     }
     for job_id in [id, database_id] {
         let status: String = client

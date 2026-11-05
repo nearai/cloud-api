@@ -80,6 +80,7 @@ pub(super) struct ScanCursor {
 }
 
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ObjectCreateJobRequest {
     pub(super) mode: Mode,
     #[serde(default)]
@@ -139,6 +140,7 @@ impl ObjectCreateJobRequest {
 }
 
 #[derive(Debug, Deserialize, Default, utoipa::ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ObjectVerifyRequest {
     #[serde(default)]
     pub(super) scope: Scope,

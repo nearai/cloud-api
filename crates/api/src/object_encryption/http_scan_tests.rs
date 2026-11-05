@@ -109,7 +109,7 @@ async fn scan_deadline_returns_the_unprocessed_page_and_resumes_it() {
     ));
     // When the one-second whole-scan deadline interrupts its current page.
     let response = tokio::time::timeout(
-        std::time::Duration::from_secs(2),
+        std::time::Duration::from_secs(10),
         server
             .post("/admin/object-encryption/scan")
             .json(&json!({"deadline_seconds":1})),

@@ -1,4 +1,5 @@
 use super::{
+    job_error::{transient, JobError},
     lease::{self, Claim, Job},
     types::Mode,
     ObjectEncryptionState,
@@ -7,6 +8,8 @@ use std::{future::Future, time::Duration};
 use uuid::Uuid;
 
 pub(super) use super::object_processing::{process_key, storage_call};
+pub(super) const CLAIM_RETRY_ATTEMPTS: u32 = 20;
+pub(super) const LISTING_MAX_CONSECUTIVE_ATTEMPTS: u32 = 5;
 
 pub(super) trait JobControl: Sync {
     fn check(&self) -> impl Future<Output = anyhow::Result<bool>> + Send;
@@ -37,7 +40,7 @@ where
     F: FnMut() -> Fut,
     Fut: Future<Output = anyhow::Result<Claim>>,
 {
-    for _ in 0..20 {
+    for _ in 0..CLAIM_RETRY_ATTEMPTS {
         match claim().await? {
             Claim::Busy => tokio::time::sleep(interval).await,
             outcome => return Ok(outcome),
@@ -48,26 +51,22 @@ where
 
 pub(super) async fn run_job(state: &ObjectEncryptionState, id: Uuid) -> anyhow::Result<()> {
     let _permit = state.worker_permit.clone().acquire_owned().await?;
-    let Claim::Owned(mut job) =
-        retry_busy(state.lease_retry_interval, || lease::claim(state, id)).await?
-    else {
-        return Ok(());
-    };
-    let token = job
-        .cursor
-        .lease
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("missing object job lease"))?
-        .token;
-    let control = DatabaseControl { state, id, token };
-    let result = run_owned(state, &mut job, &control).await;
-    if result.is_err() {
-        let warn = mark_unknown(&mut job);
-        if lease::fail(state, &job).await? && warn {
-            emit_unknown(&job);
+    match retry_busy(state.lease_retry_interval, || lease::claim(state, id)).await? {
+        Claim::Owned(mut job) => {
+            let token = job
+                .cursor
+                .lease
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("missing object job lease"))?
+                .token;
+            run_owned(state, &mut job, &DatabaseControl { state, id, token }).await
         }
+        Claim::Busy => {
+            tracing::warn!(job_id=%id, attempts=CLAIM_RETRY_ATTEMPTS + 1, "Object job claim retry budget exhausted");
+            lease::record_busy(state, id).await
+        }
+        Claim::Stopped => Ok(()),
     }
-    result
 }
 
 async fn heartbeat<T>(
@@ -93,14 +92,30 @@ async fn run_owned(
     job: &mut Job,
     control: &impl JobControl,
 ) -> anyhow::Result<()> {
+    let result = process_owned(state, job, control).await;
+    if let Err(error) = &result {
+        job.cursor.last_error = Some(JobError::from_error(error));
+        // Preserve the original cause even if writing terminal status also fails.
+        tracing::error!(job_id=%job.id, error=%error, "Object encryption worker failed");
+        if let Err(failure_error) = finish(control, job, "failed").await {
+            tracing::error!(job_id=%job.id, error=%failure_error, "Failed to record object worker failure");
+        }
+    }
+    result
+}
+
+async fn process_owned(
+    state: &ObjectEncryptionState,
+    job: &mut Job,
+    control: &impl JobControl,
+) -> anyhow::Result<()> {
     loop {
         if control.check().await? {
             return finish(control, job, "cancelled").await;
         }
-        anyhow::ensure!(
-            !matches!(job.request.mode, Mode::Execute) || state.write_enabled,
-            "object rewrap write gate is disabled"
-        );
+        if matches!(job.request.mode, Mode::Execute) && !state.write_enabled {
+            return Err(JobError::WriteDisabled.into());
+        }
         if job.cursor.pending_keys.is_empty() && !finished(job) {
             let cap = job
                 .request
@@ -122,22 +137,27 @@ async fn run_owned(
                     if error.is::<services::files::FileServiceError>()
                         || error.is::<tokio::time::error::Elapsed>() =>
                 {
-                    tracing::warn!(
-                        error_class = "object_listing_unavailable",
-                        "Object encryption listing will retry during recovery"
-                    );
-                    return control.persist(job, "queued").await;
+                    job.cursor.listing_attempts = job.cursor.listing_attempts.saturating_add(1);
+                    let (failure, status) = if !transient(&error) {
+                        (JobError::ListingFailed, "failed")
+                    } else if job.cursor.listing_attempts >= LISTING_MAX_CONSECUTIVE_ATTEMPTS {
+                        (JobError::ListingAttemptsExhausted, "failed")
+                    } else {
+                        (JobError::ListingUnavailable, "queued")
+                    };
+                    job.cursor.last_error = Some(failure);
+                    tracing::warn!(job_id=%job.id, error_class=failure.class(), attempts=job.cursor.listing_attempts, "Object encryption listing failed");
+                    return finish(control, job, status).await;
                 }
                 Err(error) => return Err(error),
             };
-            anyhow::ensure!(
-                i64::try_from(keys.len())? <= cap,
-                "invalid object page size"
-            );
-            anyhow::ensure!(
-                next.is_none() || next != job.cursor.continuation,
-                "object pagination did not advance"
-            );
+            if i64::try_from(keys.len())? > cap
+                || (next.is_some() && next == job.cursor.continuation)
+            {
+                return Err(JobError::InvalidPage.into());
+            }
+            job.cursor.listing_attempts = 0;
+            job.cursor.last_error = None;
             job.cursor.pending_keys = keys;
             job.cursor.pending_next = next;
             if job.cursor.pending_keys.is_empty() {
@@ -234,3 +254,7 @@ fn emit_unknown(job: &Job) {
         "Object encryption job encountered unknown metadata key IDs"
     );
 }
+
+#[cfg(test)]
+#[path = "worker_listing_tests.rs"]
+mod listing_tests;

@@ -1,6 +1,6 @@
 use super::*;
 use crate::middleware::AdminUser;
-use axum::Extension;
+use axum::{http::StatusCode, Extension};
 use axum_test::TestServer;
 use serde_json::{json, Value};
 use services::files::{encryption::encrypt_with_key, storage::MockStorage};
@@ -215,3 +215,27 @@ async fn scan_rejects_invalid_object_and_wall_clock_bounds() {
 
 #[path = "http_scan_tests.rs"]
 mod scan_tests;
+
+#[tokio::test]
+async fn request_field_misspellings_are_rejected_by_the_json_extractor() {
+    // Given the real router with no initialized database connections.
+    let (server, _) = fixture();
+    let mut statuses = Vec::new();
+    for (route, body) in [
+        ("jobs", json!({"mode":"execute","batch_szie":1})),
+        ("verify", json!({"batch_szie":1})),
+        ("scan", json!({"deadline_secods":1})),
+    ] {
+        // When a caller misspells an optional field at the request boundary.
+        let response = server
+            .post(&format!("/admin/object-encryption/{route}"))
+            .json(&body)
+            .await;
+        statuses.push((route, response.status_code()));
+    }
+    // Then every request fails extraction before handler side effects.
+    assert_eq!(
+        statuses,
+        ["jobs", "verify", "scan"].map(|route| (route, StatusCode::UNPROCESSABLE_ENTITY))
+    );
+}

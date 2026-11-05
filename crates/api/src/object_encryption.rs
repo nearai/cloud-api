@@ -16,6 +16,9 @@ use tokio::sync::Semaphore;
 use uuid::Uuid;
 
 mod endpoints;
+mod job_error;
+
+const OBJECT_JOB_KIND_FILTER: &str = "scope->>'kind'='objects'";
 // Exposed for integration tests to exercise the real lease SQL with opaque jobs.
 #[doc(hidden)]
 pub mod lease;
@@ -115,7 +118,7 @@ impl ObjectEncryptionState {
                 let result = async {
                     let client = state.pool.get().await?;
                     let rows = client.query(
-                        "SELECT id FROM database_encryption_jobs WHERE scope->>'kind'='objects' AND status IN ('queued','running') ORDER BY created_at", &[]
+                        &format!("SELECT id FROM database_encryption_jobs WHERE {OBJECT_JOB_KIND_FILTER} AND status IN ('queued','running') ORDER BY created_at"), &[]
                     ).await?;
                     drop(client);
                     for row in rows {
@@ -123,9 +126,10 @@ impl ObjectEncryptionState {
                     }
                     anyhow::Ok(())
                 }.await;
-                if result.is_err() {
+                if let Err(error) = result {
                     tracing::error!(
                         error_class = "object_encryption_job_recovery_failed",
+                        error = %error,
                         "Failed to recover object encryption jobs"
                     );
                 }

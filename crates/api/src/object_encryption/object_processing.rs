@@ -1,9 +1,13 @@
 use super::{progress::Progress, types::Mode, ObjectEncryptionState};
 use services::files::{
     storage::{ObjectMetadata, RewrapOutcome},
-    FileServiceError,
+    FileServiceError, ObjectKeyState,
 };
 use std::{future::Future, time::Duration};
+
+use super::job_error::transient;
+
+pub(super) const STORAGE_RETRY_ATTEMPTS: u32 = 3;
 
 const STORAGE_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -25,21 +29,13 @@ where
             .map_err(anyhow::Error::from)
             .and_then(|result| result.map_err(anyhow::Error::from));
         match result {
-            Err(error) if attempt < 3 && transient(&error) => {
+            Err(error) if attempt < STORAGE_RETRY_ATTEMPTS && transient(&error) => {
                 attempt += 1;
                 tokio::time::sleep(state.storage_retry_interval).await;
             }
             outcome => return outcome,
         }
     }
-}
-
-fn transient(error: &anyhow::Error) -> bool {
-    error.is::<tokio::time::error::Elapsed>()
-        || matches!(
-            error.downcast_ref::<FileServiceError>(),
-            Some(FileServiceError::TransientStorageError(_))
-        )
 }
 
 pub(super) async fn process_key(
@@ -61,21 +57,23 @@ pub(super) async fn process_key(
         Err(error) => match error.downcast_ref::<FileServiceError>() {
             Some(FileServiceError::NotFound) => progress.record_missing(key),
             Some(FileServiceError::PreconditionFailed) => progress.record_changed(key),
-            Some(FileServiceError::ObjectTooLarge {
-                is_current,
-                unknown_key_id,
-            }) => {
-                if *unknown_key_id {
-                    if progress.unknown_key_ids == unknown_before {
-                        progress.unknown_key_ids += 1;
+            Some(FileServiceError::ObjectTooLarge { key_state }) => {
+                let stale = match key_state {
+                    ObjectKeyState::Current => false,
+                    ObjectKeyState::StaleOrAbsent => true,
+                    ObjectKeyState::UnknownKeyId => {
+                        if progress.unknown_key_ids == unknown_before {
+                            progress.unknown_key_ids += 1;
+                        }
+                        if !matches!(mode, Mode::Execute)
+                            && progress.undecryptable == undecryptable_before
+                        {
+                            progress.record_undecryptable(key, "unknown_key_id");
+                        }
+                        true
                     }
-                    if !matches!(mode, Mode::Execute)
-                        && progress.undecryptable == undecryptable_before
-                    {
-                        progress.record_undecryptable(key, "unknown_key_id");
-                    }
-                }
-                progress.record_oversized(key, matches!(mode, Mode::Verify) && !is_current)
+                };
+                progress.record_oversized(key, matches!(mode, Mode::Verify) && stale)
             }
             _ => progress.record_error(key, error_class(&error)),
         },

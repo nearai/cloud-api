@@ -1,3 +1,4 @@
+use super::OBJECT_JOB_KIND_FILTER;
 use super::{spawn_job, types::*, ObjectEncryptionState};
 use crate::middleware::AdminUser;
 use axum::{extract::Path, http::StatusCode, Extension, Json};
@@ -52,19 +53,7 @@ pub async fn create_job(
     client.execute(
         "INSERT INTO database_encryption_jobs(id,mode,status,scope,actions,batch_size,max_rows,admin_actor) VALUES($1,$2,'queued',$3,$4,$5,$6,$7)",
         &[&id, &mode, &scope, &actions, &req.batch_size, &req.max_rows, &admin.0.id]
-    ).await.map_err(|error| {
-        if error.as_db_error().is_some_and(|error| {
-            error.code() == &tokio_postgres::error::SqlState::UNIQUE_VIOLATION
-                && error.constraint() == Some("idx_database_encryption_jobs_active_scope")
-        }) {
-            (StatusCode::CONFLICT, Json(json!({"error": {
-                "code": "conflict",
-                "message": "an object encryption job is already queued or running"
-            }})))
-        } else {
-            internal(error)
-        }
-    })?;
+    ).await.map_err(job_insert_error)?;
     drop(client);
     spawn_job(state.clone(), id);
     Ok((StatusCode::ACCEPTED, get_inner(&state, id).await?))
@@ -84,7 +73,7 @@ pub async fn get_job(
 async fn get_inner(state: &ObjectEncryptionState, id: Uuid) -> ApiResult<ObjectJobResponse> {
     let client = state.pool.get().await.map_err(internal)?;
     let row = client.query_opt(
-        "SELECT id,status,mode,scope,actions,progress,cursor,created_at,completed_at,last_error_class,last_error_message FROM database_encryption_jobs WHERE id=$1 AND scope->>'kind'='objects'",
+        &format!("SELECT id,status,mode,scope,actions,progress,cursor,created_at,completed_at,last_error_class,last_error_message FROM database_encryption_jobs WHERE id=$1 AND {OBJECT_JOB_KIND_FILTER}"),
         &[&id]
     ).await.map_err(internal)?.ok_or_else(not_found)?;
     Ok(Json(ObjectJobResponse {
@@ -112,7 +101,7 @@ pub async fn cancel_job(
 ) -> ApiResult<ObjectJobResponse> {
     let client = state.pool.get().await.map_err(internal)?;
     let row = client.query_opt(
-        "UPDATE database_encryption_jobs SET cancel_requested_at=NOW(),status=CASE WHEN status='queued' THEN 'cancelled' ELSE status END,completed_at=CASE WHEN status='queued' THEN NOW() ELSE completed_at END WHERE id=$1 AND scope->>'kind'='objects' AND status IN ('queued','running') RETURNING id",
+        &format!("UPDATE database_encryption_jobs SET cancel_requested_at=NOW(),status=CASE WHEN status='queued' THEN 'cancelled' ELSE status END,completed_at=CASE WHEN status='queued' THEN NOW() ELSE completed_at END WHERE id=$1 AND {OBJECT_JOB_KIND_FILTER} AND status IN ('queued','running') RETURNING id"),
         &[&id]
     ).await.map_err(internal)?;
     drop(client);
@@ -171,4 +160,56 @@ pub(super) fn public_cursor(mut cursor: Value) -> Value {
         }
     }
     cursor
+}
+
+// The schema is owned by cloud-platform: any SQLSTATE 23505 on this INSERT
+// means a queued/running job already occupies the same scope; index names are not a contract.
+fn job_insert_error(error: tokio_postgres::Error) -> (StatusCode, Json<Value>) {
+    if error
+        .as_db_error()
+        .is_some_and(|error| error.code() == &tokio_postgres::error::SqlState::UNIQUE_VIOLATION)
+    {
+        (
+            StatusCode::CONFLICT,
+            Json(json!({"error": {
+                "code": "conflict",
+                "message": "an object encryption job is already queued or running"
+            }})),
+        )
+    } else {
+        internal(error)
+    }
+}
+
+#[cfg(test)]
+mod insert_error_tests {
+    use super::*;
+    #[tokio::test]
+    async fn any_unique_violation_on_job_insert_is_a_conflict() {
+        for constraint in [
+            None,
+            Some("idx_database_encryption_jobs_active_scope"),
+            Some("renamed_active_scope"),
+        ] {
+            let error = crate::database_encryption::postgres_error_tests::database_error(
+                "23505", constraint,
+            )
+            .await;
+            let (status, body) = job_insert_error(error);
+            assert_eq!(status, StatusCode::CONFLICT);
+            assert_eq!(
+                body["error"]["message"],
+                "an object encryption job is already queued or running"
+            );
+        }
+    }
+    #[tokio::test]
+    async fn other_job_insert_errors_remain_internal() {
+        let error = crate::database_encryption::postgres_error_tests::database_error(
+            "23503",
+            Some("admin_actor_fkey"),
+        )
+        .await;
+        assert_eq!(job_insert_error(error).0, StatusCode::INTERNAL_SERVER_ERROR);
+    }
 }

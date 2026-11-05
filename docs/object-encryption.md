@@ -16,7 +16,7 @@ When `S3_ENCRYPTION_KEYS` is unset, `S3_ENCRYPTION_KEY_FILE` or `S3_ENCRYPTION_K
 
 `OBJECT_REWRAP_MAX_BYTES` is a positive integer byte limit, default `268435456` (256 MiB). Objects whose HEAD `Content-Length` exceeds it are counted as `oversized` without downloading their bodies. This bounds rewrap and verification memory; uploads are unaffected.
 
-`OBJECT_ENCRYPTION_WRITE_ENABLED` is the object rewrap kill switch, default `true`. It accepts only `true` or `false`. Setting it to `false` refuses new execute jobs with HTTP 400 and stops existing execute jobs when the worker next checks the gate. Dry runs, scans, verification, and uploads remain available; uploads continue using the configured write key. `/keys` reports the actual gate value as `write_enabled`.
+`OBJECT_ENCRYPTION_WRITE_ENABLED` is the object rewrap kill switch, default `true`. It accepts the same trimmed boolean syntax as other configuration switches (`true`/`false` case-insensitively, or `1`/`0`). Setting it to `false` refuses new execute jobs with HTTP 400 and stops existing execute jobs when the worker next checks the gate. Dry runs, scans, verification, and uploads remain available; uploads continue using the configured write key. `/keys` reports the actual gate value as `write_enabled`.
 
 A known metadata ID selects only that key. Normal object reads try the ring for missing or unknown metadata. Scan and verify classify an unconfigured metadata ID as `undecryptable` with class `unknown_key_id`, without trial decryption. Execute tries the ring to recover such objects and emits at most one warning per job with the unknown-ID count. Missing metadata can be resolved by authentication against the ring. Keep previous keys available until all objects have been rewrapped and verified.
 
@@ -80,13 +80,13 @@ Content-Type: application/json
 {"batch_size":100,"batch_delay_ms":100}
 ```
 
-Verification requires write-key metadata and successful authentication under the write key alone. It passes only when `stale == 0`, `undecryptable == 0`, and `errors == 0`, and no oversized object remains outside the write key ID. `oversized` is reported separately: a current metadata ID passes the size check without downloading that body, so its ciphertext is not authenticated during that run. `missing` and `changed` do not fail verification.
+Verification requires write-key metadata and successful authentication under the write key. It passes only when the complete inventory has `stale == 0`, `undecryptable == 0`, `errors == 0`, and `oversized == 0`. Objects readable under previous keys are stale, rather than undecryptable. `missing` and `changed` do not fail verification.
 
 ## Rotation sequence
 
 1. Deploy ring-aware code to every replica, then configure old and new keys with the old key first.
 2. Put the new key first on every replica and compare `/keys` write IDs and fingerprints.
-3. Run dry-run and execute jobs for the whole bucket. A replica or an in-flight job still using the old configuration during a rolling deployment can leave stale objects. After the rollout completes and old writers finish, run execute again, then verify. Repeat execute for `changed` objects and resolve errors, stale objects, undecryptable objects, and oversized objects outside the write key ID before retiring a key.
+3. Run dry-run and execute jobs for the whole bucket. A replica or an in-flight job still using the old configuration during a rolling deployment can leave stale objects. After the rollout completes and old writers finish, run execute again, then verify. Repeat execute for `changed` objects and resolve errors, stale objects, undecryptable objects, and oversized objects before retiring a key.
 4. After passing verification with previous keys present, deploy the write-only ring to every replica and verify again before discarding old key material.
 
 ## Concurrent deletion during rewrap
@@ -96,3 +96,44 @@ Rewrap uses the GET response's ETag for a conditional `If-Match` PUT when availa
 ## Versioned buckets
 
 Rewrap replaces the current version only. Deleting superseded versions in a versioned bucket, setting lifecycle rules, and removing old versions from replica buckets are operator steps outside this application. Retain access to previous keys for any object versions and backups that must remain readable.
+
+## Deployment prerequisite and job errors
+
+Before creating the first object job, every replica must run a build that includes
+object jobs and the database worker's job-kind ownership filter. During a rolling
+deploy, hold object-job creation until this is true everywhere. Call
+`GET /v1/admin/object-encryption/keys` on each replica directly; an older build
+returns 404. A successful request to a load-balanced address proves only the
+replica that answered, so check each replica individually.
+
+Object and database endpoints use the same shared fingerprint implementation and
+format. Matching key IDs alone do not prove matching key bytes; compare their
+fingerprints too.
+
+Execute trusts the stored key ID: `already_current` means metadata names the
+write key and the body was not downloaded or authenticated. Verification
+independently authenticates ciphertext under the write key. Always use
+execute → verify; retire a previous key only after complete verification passes.
+A corrupt object labelled with the write ID is still `already_current` during
+execute and fails verification. An oversized object cannot pass verification
+because its ciphertext was not authenticated; adjust the byte limit or resolve
+that object before retiring keys. The byte limit measures the stored envelope,
+including the nonce and authentication tag, rather than plaintext length.
+
+For missing metadata or a configured previous key ID, ciphertext readable under
+a previous key counts as `stale`, without also counting as `undecryptable`.
+Verification tries the write key first, then permitted previous keys; a known
+metadata ID remains strict and cannot be masked by a different ring key.
+Unknown metadata IDs retain the `unknown_key_id` failure classification.
+
+Listing failures use a separate consecutive retry budget persisted in the job
+cursor. Transient listing errors requeue the job with a sanitized
+`last_error_class` and message; a successful page resets the budget. The fifth
+consecutive transient failure marks the job `failed` with
+`object_listing_attempts_exhausted`. Permanent listing errors (including access
+denied, a missing bucket, or invalid configuration) fail immediately with
+`object_listing_failed`. Terminal failure releases the active-scope slot. Claim
+contention leaves the job queued with `object_job_busy` after the bounded claim
+retry budget; recovery may try it again later. Internal worker failures persist
+an error class and sanitized message without bucket names, object keys or key
+material.

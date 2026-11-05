@@ -8,6 +8,9 @@ use std::collections::BTreeMap;
 #[derive(Default, Deserialize, Serialize)]
 #[serde(default)]
 pub(super) struct Cursor {
+    pub listing_attempts: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<super::job_error::JobError>,
     pub continuation: Option<String>,
     pub last_key: Option<String>,
     pub complete: bool,
@@ -106,9 +109,9 @@ impl Progress {
         if !result.is_current {
             self.stale += 1;
         }
-        if result.is_decryptable {
+        if result.decrypts_under_write_key {
             self.verified += 1;
-        } else {
+        } else if !result.decrypts_under_previous_key {
             self.record_undecryptable(
                 key,
                 if result.unknown_key_id {
@@ -158,7 +161,11 @@ impl Progress {
     }
 
     pub const fn verification_passes(&self) -> bool {
-        self.complete && self.stale == 0 && self.undecryptable == 0 && self.errors == 0
+        self.complete
+            && self.stale == 0
+            && self.undecryptable == 0
+            && self.errors == 0
+            && self.oversized == 0
     }
 }
 

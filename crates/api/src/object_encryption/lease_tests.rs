@@ -62,3 +62,22 @@ fn malformed_lease_token_or_expiry_is_rejected() {
         assert!(serde_json::from_value::<Cursor>(json!({"lease":lease})).is_err());
     }
 }
+
+#[test]
+fn every_object_lifecycle_statement_has_the_shared_kind_predicate() {
+    for source in [
+        include_str!("../object_encryption.rs"),
+        include_str!("lease.rs"),
+        include_str!("endpoints.rs"),
+    ] {
+        for line in source.lines().filter(|line| {
+            line.contains("FROM database_encryption_jobs")
+                || line.contains("UPDATE database_encryption_jobs")
+        }) {
+            assert!(
+                line.contains("{OBJECT_JOB_KIND_FILTER}"),
+                "missing shared object kind guard: {line}"
+            );
+        }
+    }
+}

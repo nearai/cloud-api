@@ -86,5 +86,8 @@ async fn busy_lease_retry_is_bounded() {
     .await
     .unwrap();
     assert!(matches!(outcome, Claim::Busy));
-    assert_eq!(calls.load(Ordering::SeqCst), 21);
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        worker::CLAIM_RETRY_ATTEMPTS as usize + 1
+    );
 }

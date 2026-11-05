@@ -1,3 +1,4 @@
+use super::OBJECT_JOB_KIND_FILTER;
 use super::{
     progress::{Cursor, Progress},
     types::{Mode, ObjectCreateJobRequest},
@@ -45,17 +46,17 @@ pub async fn claim(state: &ObjectEncryptionState, id: Uuid) -> anyhow::Result<Cl
         return Ok(Claim::Busy);
     }
     let busy: bool = tx.query_one(
-        "SELECT EXISTS(SELECT 1 FROM database_encryption_jobs WHERE scope->>'kind'='objects' AND status='running' AND ($1::boolean = false OR id=$2::uuid) AND (cursor->'lease'->>'expires_at')::bigint > EXTRACT(EPOCH FROM clock_timestamp())::bigint)", &[&state.job_scoped_leases, &id]
+        &format!("SELECT EXISTS(SELECT 1 FROM database_encryption_jobs WHERE {OBJECT_JOB_KIND_FILTER} AND status='running' AND ($1::boolean = false OR id=$2::uuid) AND (cursor->'lease'->>'expires_at')::bigint > EXTRACT(EPOCH FROM clock_timestamp())::bigint)"), &[&state.job_scoped_leases, &id]
     ).await?.get(0);
     if busy {
         return Ok(Claim::Busy);
     }
     let Some(row) = tx.query_opt(
-        "SELECT mode,scope,batch_size,max_rows,cursor,progress,actions,cancel_requested_at IS NOT NULL AS cancelled FROM database_encryption_jobs WHERE id=$1::uuid AND scope->>'kind'='objects' AND status IN ('queued','running') FOR UPDATE", &[&id]
+        &format!("SELECT mode,scope,batch_size,max_rows,cursor,progress,actions,cancel_requested_at IS NOT NULL AS cancelled FROM database_encryption_jobs WHERE id=$1::uuid AND {OBJECT_JOB_KIND_FILTER} AND status IN ('queued','running') FOR UPDATE"), &[&id]
     ).await? else { return Ok(Claim::Stopped) };
     if row.get::<_, bool>("cancelled") {
         tx.execute(
-            "UPDATE database_encryption_jobs SET status='cancelled',completed_at=NOW() WHERE id=$1::uuid",
+            &format!("UPDATE database_encryption_jobs SET status='cancelled',completed_at=NOW() WHERE {OBJECT_JOB_KIND_FILTER} AND id=$1::uuid"),
             &[&id],
         )
         .await?;
@@ -92,7 +93,7 @@ pub async fn claim(state: &ObjectEncryptionState, id: Uuid) -> anyhow::Result<Cl
     let mut job = match parsed {
         Ok(job) => job,
         Err(_) => {
-            tx.execute("UPDATE database_encryption_jobs SET status='failed',cursor=cursor-'lease',last_error_class='invalid_object_job',last_error_message='invalid_object_job',completed_at=NOW() WHERE id=$1::uuid", &[&id]).await?;
+            tx.execute(&format!("UPDATE database_encryption_jobs SET status='failed',cursor=cursor-'lease',last_error_class='invalid_object_job',last_error_message='invalid_object_job',completed_at=NOW() WHERE {OBJECT_JOB_KIND_FILTER} AND id=$1::uuid"), &[&id]).await?;
             tx.commit().await?;
             return Ok(Claim::Stopped);
         }
@@ -108,7 +109,7 @@ pub async fn claim(state: &ObjectEncryptionState, id: Uuid) -> anyhow::Result<Cl
         token: Uuid::new_v4(),
         expires_at,
     });
-    tx.execute("UPDATE database_encryption_jobs SET status='running',started_at=COALESCE(started_at,NOW()),cursor=$2::jsonb WHERE id=$1::uuid", &[&id, &serde_json::to_value(&job.cursor)?]).await?;
+    tx.execute(&format!("UPDATE database_encryption_jobs SET status='running',started_at=COALESCE(started_at,NOW()),cursor=$2::jsonb WHERE {OBJECT_JOB_KIND_FILTER} AND id=$1::uuid"), &[&id, &serde_json::to_value(&job.cursor)?]).await?;
     tx.commit().await?;
     Ok(Claim::Owned(Box::new(job)))
 }
@@ -116,7 +117,7 @@ pub async fn claim(state: &ObjectEncryptionState, id: Uuid) -> anyhow::Result<Cl
 pub async fn check(state: &ObjectEncryptionState, id: Uuid, token: Uuid) -> anyhow::Result<bool> {
     let client = state.pool.get().await?;
     let row = client.query_opt(
-        "UPDATE database_encryption_jobs SET cursor=jsonb_set(cursor,'{lease,expires_at}',to_jsonb(EXTRACT(EPOCH FROM clock_timestamp())::bigint + $3::bigint)) WHERE id=$1::uuid AND scope->>'kind'='objects' AND status='running' AND cursor->'lease'->>'token'=$2::text AND (cursor->'lease'->>'expires_at')::bigint > EXTRACT(EPOCH FROM clock_timestamp())::bigint RETURNING cancel_requested_at IS NOT NULL", &[&id, &token.to_string(), &LEASE_SECONDS]
+        &format!("UPDATE database_encryption_jobs SET cursor=jsonb_set(cursor,'{{lease,expires_at}}',to_jsonb(EXTRACT(EPOCH FROM clock_timestamp())::bigint + $3::bigint)) WHERE id=$1::uuid AND {OBJECT_JOB_KIND_FILTER} AND status='running' AND cursor->'lease'->>'token'=$2::text AND (cursor->'lease'->>'expires_at')::bigint > EXTRACT(EPOCH FROM clock_timestamp())::bigint RETURNING cancel_requested_at IS NOT NULL"), &[&id, &token.to_string(), &LEASE_SECONDS]
     ).await?;
     let row = row.ok_or_else(|| anyhow::anyhow!("object job lease lost"))?;
     Ok(row.get(0))
@@ -136,7 +137,7 @@ pub async fn persist(
     let token = lease.token;
     let client = state.pool.get().await?;
     let updated = client.execute(
-        "UPDATE database_encryption_jobs SET status=$3::text,progress=$4::jsonb,cursor=CASE WHEN $3::text='running' THEN jsonb_set($5::jsonb,'{lease,expires_at}',to_jsonb(EXTRACT(EPOCH FROM clock_timestamp())::bigint + $6::bigint)) ELSE $5::jsonb-'lease' END,completed_at=CASE WHEN $3::text IN ('completed','cancelled') THEN NOW() ELSE completed_at END WHERE id=$1::uuid AND scope->>'kind'='objects' AND status='running' AND cursor->'lease'->>'token'=$2::text AND (cursor->'lease'->>'expires_at')::bigint > EXTRACT(EPOCH FROM clock_timestamp())::bigint", &[&id, &token.to_string(), &status, &serde_json::to_value(&job.progress)?, &serde_json::to_value(&job.cursor)?, &LEASE_SECONDS]
+        &format!("UPDATE database_encryption_jobs SET status=$3::text,progress=$4::jsonb,cursor=CASE WHEN $3::text='running' THEN jsonb_set($5::jsonb,'{{lease,expires_at}}',to_jsonb(EXTRACT(EPOCH FROM clock_timestamp())::bigint + $6::bigint)) ELSE $5::jsonb-'lease' END,last_error_class=$7::text,last_error_message=$8::text,completed_at=CASE WHEN $3::text IN ('completed','cancelled','failed') THEN NOW() ELSE completed_at END WHERE id=$1::uuid AND {OBJECT_JOB_KIND_FILTER} AND status='running' AND cursor->'lease'->>'token'=$2::text AND (cursor->'lease'->>'expires_at')::bigint > EXTRACT(EPOCH FROM clock_timestamp())::bigint"), &[&id, &token.to_string(), &status, &serde_json::to_value(&job.progress)?, &serde_json::to_value(&job.cursor)?, &LEASE_SECONDS, &job.cursor.last_error.map(|error| error.class()), &job.cursor.last_error.map(|error| error.to_string())]
     ).await?;
     anyhow::ensure!(updated == 1, "object job lease lost");
     Ok(())
@@ -151,7 +152,17 @@ pub async fn fail(state: &ObjectEncryptionState, job: &Job) -> anyhow::Result<bo
         .token;
     let client = state.pool.get().await?;
     let updated = client.execute(
-        "UPDATE database_encryption_jobs SET status='failed',cursor=$4::jsonb-'lease',progress=$3::jsonb,last_error_class='object_worker_failed',last_error_message='object_worker_failed',completed_at=NOW() WHERE id=$1::uuid AND scope->>'kind'='objects' AND status='running' AND cursor->'lease'->>'token'=$2::text AND (cursor->'lease'->>'expires_at')::bigint > EXTRACT(EPOCH FROM clock_timestamp())::bigint", &[&job.id, &token.to_string(), &serde_json::to_value(&job.progress)?, &serde_json::to_value(&job.cursor)?]
+        &format!("UPDATE database_encryption_jobs SET status='failed',cursor=$4::jsonb-'lease',progress=$3::jsonb,last_error_class=$5::text,last_error_message=$6::text,completed_at=NOW() WHERE id=$1::uuid AND {OBJECT_JOB_KIND_FILTER} AND status='running' AND cursor->'lease'->>'token'=$2::text AND (cursor->'lease'->>'expires_at')::bigint > EXTRACT(EPOCH FROM clock_timestamp())::bigint"), &[&job.id, &token.to_string(), &serde_json::to_value(&job.progress)?, &serde_json::to_value(&job.cursor)?, &job.cursor.last_error.unwrap_or(super::job_error::JobError::WorkerFailed).class(), &job.cursor.last_error.unwrap_or(super::job_error::JobError::WorkerFailed).to_string()]
     ).await?;
     Ok(updated == 1)
+}
+
+/// Record contention only on queued rows, never on another worker's live lease.
+pub(super) async fn record_busy(state: &ObjectEncryptionState, id: Uuid) -> anyhow::Result<()> {
+    let client = state.pool.get().await?;
+    client.execute(
+        &format!("UPDATE database_encryption_jobs SET last_error_class='object_job_busy',last_error_message='object job claim retry budget exhausted' WHERE {OBJECT_JOB_KIND_FILTER} AND id=$1::uuid AND status='queued'"),
+        &[&id],
+    ).await?;
+    Ok(())
 }

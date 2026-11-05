@@ -1,4 +1,5 @@
 use super::{
+    object_processing::STORAGE_RETRY_ATTEMPTS,
     progress::Progress,
     types::Mode,
     worker,
@@ -33,7 +34,10 @@ async fn transient_errors_retry_then_process_the_object() {
         .await
         .unwrap();
     assert_eq!((progress.errors, progress.already_current), (0, 1));
-    assert_eq!(attempts.load(Ordering::SeqCst), 4);
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        STORAGE_RETRY_ATTEMPTS as usize + 1
+    );
 }
 
 #[tokio::test]
@@ -43,7 +47,10 @@ async fn exhausted_retries_record_a_sanitized_error() {
     worker::process_key(&state, Mode::Execute, "object", &mut progress)
         .await
         .unwrap();
-    assert_eq!(attempts.load(Ordering::SeqCst), 4);
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        STORAGE_RETRY_ATTEMPTS as usize + 1
+    );
     assert_eq!(progress.errors, 1);
     assert_eq!(progress.error_samples[0].class, "transient_storage_error");
     assert!(!serde_json::to_string(&progress)
@@ -70,7 +77,10 @@ async fn timeouts_retry_three_times_and_continue() {
     worker::process_key(&state, Mode::Execute, "object", &mut progress)
         .await
         .unwrap();
-    assert_eq!(attempts.load(Ordering::SeqCst), 4);
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        STORAGE_RETRY_ATTEMPTS as usize + 1
+    );
     assert_eq!(progress.error_samples[0].class, "timeout");
 }
 
@@ -87,7 +97,7 @@ async fn oversized_objects_never_reach_rewrap() {
 }
 
 #[tokio::test]
-async fn oversized_verification_fails_only_for_stale_metadata() {
+async fn oversized_verification_never_passes_without_authentication() {
     for (key_id, stale) in [("current", 0), ("previous", 1)] {
         let storage = mock().await;
         storage
@@ -103,7 +113,10 @@ async fn oversized_verification_fails_only_for_stale_metadata() {
             .await
             .unwrap();
         assert_eq!((progress.oversized, progress.stale), (1, stale));
-        assert_eq!(progress.verification_passes(), stale == 0);
+        assert!(
+            !progress.verification_passes(),
+            "an unauthenticated oversized object cannot pass verification"
+        );
     }
 }
 
@@ -213,5 +226,29 @@ async fn unknown_oversized_metadata_race_keeps_both_outcomes() {
             Mode::Execute => assert_eq!(progress.undecryptable, 0),
             Mode::DryRun => unreachable!(),
         }
+    }
+}
+
+#[tokio::test]
+async fn readable_previous_key_objects_are_stale_not_undecryptable() {
+    for hint in [None, Some("previous".into())] {
+        let storage = mock().await;
+        storage
+            .seed_raw(
+                "object",
+                encryption::encrypt_with_key(b"payload", &[7; 32]).unwrap(),
+                hint,
+                "text/plain",
+            )
+            .unwrap();
+        let state = ObjectEncryptionState::new(DbPool::uninitialized(), Arc::new(storage), ring());
+        let mut progress = Progress::default();
+        worker::process_key(&state, Mode::Verify, "object", &mut progress)
+            .await
+            .unwrap();
+        assert_eq!(
+            (progress.stale, progress.undecryptable, progress.verified),
+            (1, 0, 0)
+        );
     }
 }

@@ -11,10 +11,12 @@ use std::sync::{
 use tokio::sync::Semaphore;
 use uuid::Uuid;
 
-mod batch_delay;
+pub(crate) mod batch_delay;
 #[cfg(test)]
 mod job_kind_tests;
 mod key_rotation;
+#[cfg(test)]
+pub(crate) mod postgres_error_tests;
 use key_rotation::{
     classify, job_action, rewrap_envelope, validate_delay, Action, Classification, KeyCounts,
 };
@@ -832,23 +834,29 @@ pub async fn create_job(
     let scope = serde_json::to_value(&scope_request).map_err(internal)?;
     let actions = json!(req.actions);
     let client = state.pool.get().await.map_err(internal)?;
-    client.execute("INSERT INTO database_encryption_jobs(id,mode,status,scope,actions,batch_size,max_rows,admin_actor) VALUES($1,$2,'queued',$3,$4,$5,$6,$7)",&[&id,&mode,&scope,&actions,&req.batch_size,&req.max_rows,&admin.0.id]).await.map_err(|error| {
-        if error.as_db_error().is_some_and(|error| {
-            error.code() == &tokio_postgres::error::SqlState::UNIQUE_VIOLATION
-                && error.constraint() == Some("idx_database_encryption_jobs_active_scope")
-        }) {
-            (StatusCode::CONFLICT, Json(json!({"error": {
-                "code": "conflict",
-                "message": "a database encryption job with this scope is already queued or running"
-            }})))
-        } else {
-            internal(error)
-        }
-    })?;
+    client.execute("INSERT INTO database_encryption_jobs(id,mode,status,scope,actions,batch_size,max_rows,admin_actor) VALUES($1,$2,'queued',$3,$4,$5,$6,$7)",&[&id,&mode,&scope,&actions,&req.batch_size,&req.max_rows,&admin.0.id]).await.map_err(job_insert_error)?;
     drop(client);
     spawn_job(state.clone(), id);
     let response = get_inner(&state, id).await?;
     Ok((StatusCode::ACCEPTED, response))
+}
+
+fn job_insert_error(error: tokio_postgres::Error) -> (StatusCode, Json<Value>) {
+    // The cloud-platform-owned schema enforces one active job per scope on this INSERT.
+    if error
+        .as_db_error()
+        .is_some_and(|error| error.code() == &tokio_postgres::error::SqlState::UNIQUE_VIOLATION)
+    {
+        (
+            StatusCode::CONFLICT,
+            Json(json!({"error": {
+                "code": "conflict",
+                "message": "a database encryption job with this scope is already queued or running"
+            }})),
+        )
+    } else {
+        internal(error)
+    }
 }
 
 fn spawn_job(state: DatabaseEncryptionState, id: Uuid) {

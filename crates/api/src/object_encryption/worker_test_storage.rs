@@ -20,6 +20,8 @@ pub(super) enum Failure {
     Timeout,
     MetadataRace,
     MetadataOversizedRace,
+    ListingTransient(usize),
+    ListingPermanent,
 }
 struct FaultStorage {
     inner: MockStorage,
@@ -50,7 +52,22 @@ impl StorageTrait for FaultStorage {
         continuation: Option<String>,
         max: i32,
     ) -> Result<(Vec<String>, Option<String>), FileServiceError> {
-        self.inner.list_keys(continuation, max).await
+        match self.failure {
+            Failure::ListingTransient(count)
+                if self.attempts.fetch_add(1, Ordering::SeqCst) < count =>
+            {
+                Err(FileServiceError::TransientStorageError(
+                    "private bucket details".into(),
+                ))
+            }
+            Failure::ListingPermanent => {
+                self.attempts.fetch_add(1, Ordering::SeqCst);
+                Err(FileServiceError::StorageError(
+                    "AccessDenied private bucket details".into(),
+                ))
+            }
+            _ => self.inner.list_keys(continuation, max).await,
+        }
     }
     async fn object_metadata(&self, key: &str) -> Result<ObjectMetadata, FileServiceError> {
         self.inner.object_metadata(key).await
@@ -62,6 +79,9 @@ impl StorageTrait for FaultStorage {
     ) -> Result<RewrapOutcome, FileServiceError> {
         let attempt = self.attempts.fetch_add(1, Ordering::SeqCst);
         match self.failure {
+            Failure::ListingTransient(_) | Failure::ListingPermanent => {
+                self.inner.rewrap_object(key, max_bytes).await
+            }
             Failure::Changed => Err(FileServiceError::PreconditionFailed),
             Failure::Transient(count) if attempt < count => Err(
                 FileServiceError::TransientStorageError("private details".into()),

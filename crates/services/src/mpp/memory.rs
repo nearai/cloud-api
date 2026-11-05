@@ -16,6 +16,7 @@ struct Claim {
     challenge_id: String,
     state: ClaimState,
     created_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
     /// Stands in for the row's `updated_at`: a new value on every write.
     lease: ClaimLease,
 }
@@ -48,11 +49,12 @@ impl InMemoryClaimRepository {
 }
 
 impl InMemoryClaimRepository {
-    /// Pretend `payment_key` was claimed `by` earlier. For purge tests.
+    /// Pretend `payment_key` was created and last updated `by` earlier. For retention tests.
     pub fn age(&self, payment_key: &str, by: chrono::Duration) {
         if let Ok(mut claims) = self.claims.lock() {
             if let Some(claim) = claims.get_mut(payment_key) {
                 claim.created_at -= by;
+                claim.updated_at -= by;
             }
         }
     }
@@ -88,6 +90,7 @@ impl PaymentClaimRepository for InMemoryClaimRepository {
                         challenge_id: challenge_id.to_string(),
                         state: ClaimState::Serving,
                         created_at: Utc::now(),
+                        updated_at: Utc::now(),
                         lease,
                     },
                 );
@@ -99,6 +102,7 @@ impl PaymentClaimRepository for InMemoryClaimRepository {
             {
                 claim.state = ClaimState::Serving;
                 claim.lease = lease;
+                claim.updated_at = Utc::now();
                 Ok(ClaimOutcome::Claimed(lease))
             }
             Some(_) => Ok(ClaimOutcome::AlreadyUsed),
@@ -128,16 +132,33 @@ impl PaymentClaimRepository for InMemoryClaimRepository {
             if claim.state == ClaimState::Serving && claim.lease == lease {
                 claim.state = outcome.state();
                 claim.lease = next;
+                claim.updated_at = Utc::now();
             }
         }
         Ok(())
+    }
+
+    async fn reclaim_stale_serving(&self, cutoff: DateTime<Utc>) -> Result<u64, RepositoryError> {
+        let mut claims = self.claims.lock().map_err(|_| poisoned())?;
+        let mut reclaimed = 0;
+        for claim in claims
+            .values_mut()
+            .filter(|claim| claim.state == ClaimState::Serving && claim.updated_at < cutoff)
+            .take(1_000_000)
+        {
+            claim.state = ClaimState::Unserved;
+            claim.lease = self.next_lease();
+            claim.updated_at = Utc::now();
+            reclaimed += 1;
+        }
+        Ok(reclaimed)
     }
 
     async fn purge_older_than(&self, cutoff: DateTime<Utc>) -> Result<u64, RepositoryError> {
         let mut claims = self.claims.lock().map_err(|_| poisoned())?;
         let before = claims.len();
         claims.retain(|_, claim| claim.created_at >= cutoff);
-        Ok((before - claims.len()) as u64)
+        u64::try_from(before - claims.len()).map_err(|_| poisoned())
     }
 }
 
@@ -155,10 +176,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reclaim_releases_only_stale_serving_and_fences_the_abandoned_attempt() {
+        let repo = InMemoryClaimRepository::default();
+        let stale = claimed(&repo, KEY, "c1").await;
+        let served = claimed(&repo, "served", "c1").await;
+        repo.finish("served", served, ServeOutcome::Served)
+            .await
+            .unwrap();
+        let unserved = claimed(&repo, "unserved", "c1").await;
+        repo.finish("unserved", unserved, ServeOutcome::Unserved)
+            .await
+            .unwrap();
+        claimed(&repo, "fresh", "c1").await;
+        for key in [KEY, "served", "unserved"] {
+            repo.age(key, chrono::Duration::minutes(16));
+        }
+        assert_eq!(
+            repo.reclaim_stale_serving(Utc::now() - chrono::Duration::minutes(15))
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(repo.state_of(KEY), Some(ClaimState::Unserved));
+        assert!(!repo.is_spent(KEY, "c1").await.unwrap());
+        assert!(repo.is_spent(KEY, "c2").await.unwrap());
+        assert_eq!(repo.state_of("served"), Some(ClaimState::Served));
+        assert_eq!(repo.state_of("unserved"), Some(ClaimState::Unserved));
+        assert_eq!(repo.state_of("fresh"), Some(ClaimState::Serving));
+        let retry = claimed(&repo, KEY, "c1").await;
+        repo.finish(KEY, stale, ServeOutcome::Served).await.unwrap();
+        assert_eq!(repo.state_of(KEY), Some(ClaimState::Serving));
+        repo.finish(KEY, retry, ServeOutcome::Served).await.unwrap();
+        assert_eq!(repo.state_of(KEY), Some(ClaimState::Served));
+    }
+
+    #[tokio::test]
     async fn first_claim_wins_and_a_replay_is_already_used() {
         let repo = InMemoryClaimRepository::default();
+        assert!(!repo.is_spent(KEY, "c1").await.unwrap());
         claimed(&repo, KEY, "c1").await;
         assert_eq!(repo.state_of(KEY), Some(ClaimState::Serving));
+        assert!(repo.is_spent(KEY, "c1").await.unwrap());
+        assert!(repo.is_spent(KEY, "c2").await.unwrap());
         // Replay while serving, by the same and by another challenge.
         assert_eq!(
             repo.claim(KEY, "c1").await.unwrap(),
@@ -178,6 +237,8 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(repo.state_of(KEY), Some(ClaimState::Unserved));
+        assert!(!repo.is_spent(KEY, "c1").await.unwrap());
+        assert!(repo.is_spent(KEY, "c2").await.unwrap());
         assert_eq!(
             repo.claim(KEY, "c2").await.unwrap(),
             ClaimOutcome::AlreadyUsed
@@ -194,6 +255,8 @@ mod tests {
         let lease = claimed(&repo, KEY, "c1").await;
         repo.finish(KEY, lease, ServeOutcome::Served).await.unwrap();
         assert_eq!(repo.state_of(KEY), Some(ClaimState::Served));
+        assert!(repo.is_spent(KEY, "c1").await.unwrap());
+        assert!(repo.is_spent(KEY, "c2").await.unwrap());
         assert_eq!(
             repo.claim(KEY, "c1").await.unwrap(),
             ClaimOutcome::AlreadyUsed

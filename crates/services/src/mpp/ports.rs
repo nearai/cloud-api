@@ -113,6 +113,11 @@ pub trait PaymentClaimRepository: Send + Sync {
         outcome: ServeOutcome,
     ) -> Result<(), RepositoryError>;
 
+    /// Release abandoned `serving` attempts last updated before `cutoff`, in bounded
+    /// batches. Renew each released row's lease so a stale finish cannot affect a retry.
+    /// Served and already unserved claims retain their state and challenge binding.
+    async fn reclaim_stale_serving(&self, cutoff: DateTime<Utc>) -> Result<u64, RepositoryError>;
+
     /// Delete claims created before `cutoff`, in bounded batches; returns how many went. A
     /// claim only has to outlive its challenge (at most an hour), so callers pass a cutoff
     /// well past that.

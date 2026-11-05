@@ -22,7 +22,8 @@ use services::mpp::{ClaimLease, ClaimOutcome, PaymentClaimRepository, ServeOutco
 /// statements write; V0098 in cloud-platform defines it that way.
 const CLAIM_SQL: &str = "\
 INSERT INTO mpp_payment_claims (payment_key, challenge_id, state) VALUES ($1, $2, 'serving') \
-ON CONFLICT (payment_key) DO UPDATE SET state = 'serving', updated_at = NOW() \
+ON CONFLICT (payment_key) DO UPDATE SET state = 'serving', \
+updated_at = GREATEST(clock_timestamp(), mpp_payment_claims.updated_at + INTERVAL '1 microsecond') \
 WHERE mpp_payment_claims.state = 'unserved' \
 AND mpp_payment_claims.challenge_id = EXCLUDED.challenge_id \
 RETURNING updated_at";
@@ -31,7 +32,8 @@ RETURNING updated_at";
 /// an earlier attempt matches nothing, so it can neither reopen a served payment nor release
 /// a newer attempt's claim. Idempotent, so it is safe to retry.
 const FINISH_SQL: &str = "\
-UPDATE mpp_payment_claims SET state = $2, updated_at = NOW() \
+UPDATE mpp_payment_claims SET state = $2, \
+updated_at = GREATEST(clock_timestamp(), updated_at + INTERVAL '1 microsecond') \
 WHERE payment_key = $1 AND state = 'serving' AND updated_at = $3";
 
 /// A payment that can no longer be claimed under this challenge (see `CLAIM_SQL`): any row
@@ -41,7 +43,7 @@ SELECT 1 FROM mpp_payment_claims WHERE payment_key = $1 \
 AND NOT (state = 'unserved' AND challenge_id = $2)";
 
 /// Rows deleted per statement: small enough that no statement holds its locks for long.
-const PURGE_BATCH: i64 = 5000;
+const PURGE_BATCH: u32 = 5000;
 /// Statements per call. 200 batches is a million rows; anything left goes at the next call.
 const PURGE_MAX_BATCHES: u32 = 200;
 
@@ -51,6 +53,15 @@ const PURGE_SQL: &str = "\
 DELETE FROM mpp_payment_claims WHERE payment_key IN ( \
 SELECT payment_key FROM mpp_payment_claims WHERE created_at < $1 \
 ORDER BY created_at LIMIT $2 FOR UPDATE SKIP LOCKED)";
+
+/// Recover abandoned serving attempts without waiting on another worker's row locks.
+/// Advancing the lease fences the abandoned request before the same challenge can retry.
+const RECLAIM_SQL: &str = "\
+UPDATE mpp_payment_claims SET state = 'unserved', \
+updated_at = GREATEST(clock_timestamp(), updated_at + INTERVAL '1 microsecond') \
+WHERE payment_key IN ( \
+SELECT payment_key FROM mpp_payment_claims WHERE state = 'serving' AND updated_at < $1 \
+ORDER BY updated_at LIMIT $2 FOR UPDATE SKIP LOCKED)";
 
 pub struct MppPaymentClaimRepository {
     pool: DbPool,
@@ -142,6 +153,28 @@ impl PaymentClaimRepository for MppPaymentClaimRepository {
         })
     }
 
+    async fn reclaim_stale_serving(&self, cutoff: DateTime<Utc>) -> Result<u64, RepositoryError> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .context("Failed to get database connection")
+            .map_err(RepositoryError::PoolError)?;
+        let mut reclaimed = 0u64;
+        let batch = i64::from(PURGE_BATCH);
+        for _ in 0..PURGE_MAX_BATCHES {
+            let updated = client
+                .execute(RECLAIM_SQL, &[&cutoff, &batch])
+                .await
+                .map_err(map_db_error)?;
+            reclaimed += updated;
+            if updated < u64::from(PURGE_BATCH) {
+                break;
+            }
+        }
+        Ok(reclaimed)
+    }
+
     async fn purge_older_than(&self, cutoff: DateTime<Utc>) -> Result<u64, RepositoryError> {
         let client = self
             .pool
@@ -150,13 +183,14 @@ impl PaymentClaimRepository for MppPaymentClaimRepository {
             .context("Failed to get database connection")
             .map_err(RepositoryError::PoolError)?;
         let mut purged = 0u64;
+        let batch = i64::from(PURGE_BATCH);
         for _ in 0..PURGE_MAX_BATCHES {
             let deleted = client
-                .execute(PURGE_SQL, &[&cutoff, &PURGE_BATCH])
+                .execute(PURGE_SQL, &[&cutoff, &batch])
                 .await
                 .map_err(map_db_error)?;
             purged += deleted;
-            if deleted < PURGE_BATCH as u64 {
+            if deleted < u64::from(PURGE_BATCH) {
                 break;
             }
         }

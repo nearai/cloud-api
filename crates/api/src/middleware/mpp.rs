@@ -291,19 +291,29 @@ pub async fn mpp_auth_middleware(
             Err(error) => return error_response(MppError::Malformed(error.reason()), || None),
         }
     }
-    let body = request
+    let is_session = matches!(
+        &parsed,
+        Some(Ok(services::mpp::protocol::ParsedAuthorization::Session(_)))
+    );
+    let Some(body) = request
         .extensions()
         .get::<RequestBodyHash>()
         .map(|hash| hash.body_bytes.clone())
-        .unwrap_or_default();
+    else {
+        return if is_session {
+            error_response(MppError::Malformed("body"), || None)
+        } else {
+            delegate(auth, request, next).await
+        };
+    };
 
-    // Only requests without a Payment credential may fall back to plain authentication.
+    // Charge credentials retain the pre-session fallback for bodies without a price.
     let price = match mpp.price_body(&body) {
         Pricing::Unpriced => {
-            return match parsed {
-                Some(Err(error)) => error_response(error.into(), || None),
-                Some(Ok(_)) => error_response(MppError::Malformed("body"), || None),
-                None => delegate(auth, request, next).await,
+            return if is_session {
+                error_response(MppError::Malformed("body"), || None)
+            } else {
+                delegate(auth, request, next).await
             };
         }
         Pricing::Violation(limit) => {

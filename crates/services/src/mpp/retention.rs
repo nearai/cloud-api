@@ -28,8 +28,37 @@ const _: () = assert!(
 );
 /// How often the purge runs.
 pub const PURGE_INTERVAL: Duration = Duration::from_secs(60 * 60);
+/// Abandoned serving attempts become retryable after this age at the next hourly run.
+pub const SERVING_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 /// One purge (many batches) ends here whatever the database does.
 const PURGE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+
+/// Release stale serving attempts; errors leave their claims closed until a later run.
+pub async fn reclaim_once(repo: &dyn PaymentClaimRepository) -> Option<u64> {
+    let Ok(age) = chrono::Duration::from_std(SERVING_TIMEOUT) else {
+        return None;
+    };
+    match tokio::time::timeout(PURGE_TIMEOUT, repo.reclaim_stale_serving(Utc::now() - age)).await {
+        Ok(Ok(reclaimed)) => {
+            if reclaimed > 0 {
+                tracing::info!(reclaimed, "MPP abandoned claims reclaimed");
+            }
+            Some(reclaimed)
+        }
+        Ok(Err(error)) => {
+            tracing::warn!(
+                outcome = "reclaim_failed",
+                repository_error = repository_error_kind(&error),
+                "MPP claim reclaim failed"
+            );
+            None
+        }
+        Err(_) => {
+            tracing::warn!(outcome = "reclaim_timeout", "MPP claim reclaim timed out");
+            None
+        }
+    }
+}
 
 /// Purge once; returns how many rows went, `None` on failure or timeout (already logged).
 pub async fn purge_once(repo: &dyn PaymentClaimRepository, retention: Duration) -> Option<u64> {
@@ -122,6 +151,7 @@ pub fn spawn_purge_task_with(
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             ticker.tick().await;
+            reclaim_once(repo.as_ref()).await;
             purge_once(repo.as_ref(), retention).await;
         }
     }))
@@ -187,10 +217,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_hourly_task_reclaims_abandoned_serving_attempts() {
+        let repo = Arc::new(InMemoryClaimRepository::default());
+        repo.claim("abandoned", "c").await.unwrap();
+        repo.age("abandoned", chrono::Duration::minutes(16));
+        let task = spawn_purge_task_with(repo.clone(), Duration::from_millis(10), CLAIM_RETENTION)
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while repo.state_of("abandoned") != Some(crate::mpp::ClaimState::Unserved) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        task.abort();
+        assert_eq!(repo.len(), 1, "recovery retains the challenge binding");
+    }
+
+    #[tokio::test]
     async fn a_failing_store_is_reported_not_propagated() {
         let repo = FlakyClaimRepository::default();
         repo.set_fail_purges(true);
         assert_eq!(purge_once(&repo, CLAIM_RETENTION).await, None);
+        assert_eq!(reclaim_once(&repo).await, None);
     }
 
     #[tokio::test]

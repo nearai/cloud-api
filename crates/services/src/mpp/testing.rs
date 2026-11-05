@@ -228,6 +228,8 @@ pub struct FlakyClaimRepository {
     inner: std::sync::Arc<InMemoryClaimRepository>,
     fail_claims: AtomicBool,
     fail_finishes: AtomicBool,
+    finishes_to_fail: AtomicUsize,
+    finish_calls: AtomicUsize,
     fail_purges: AtomicBool,
 }
 
@@ -243,6 +245,14 @@ impl FlakyClaimRepository {
 
     pub fn set_fail_finishes(&self, fail: bool) {
         self.fail_finishes.store(fail, Ordering::SeqCst);
+    }
+
+    pub fn fail_next_finishes(&self, count: usize) {
+        self.finishes_to_fail.store(count, Ordering::SeqCst);
+    }
+
+    pub fn finish_calls(&self) -> usize {
+        self.finish_calls.load(Ordering::SeqCst)
     }
 
     pub fn set_fail_purges(&self, fail: bool) {
@@ -284,7 +294,14 @@ impl PaymentClaimRepository for FlakyClaimRepository {
         lease: ClaimLease,
         outcome: ServeOutcome,
     ) -> Result<(), RepositoryError> {
-        if self.fail_finishes.load(Ordering::SeqCst) {
+        self.finish_calls.fetch_add(1, Ordering::SeqCst);
+        let fail_once = self
+            .finishes_to_fail
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                left.checked_sub(1)
+            })
+            .is_ok();
+        if self.fail_finishes.load(Ordering::SeqCst) || fail_once {
             return Err(store_down());
         }
         self.inner.finish(payment_key, lease, outcome).await
@@ -298,6 +315,16 @@ impl PaymentClaimRepository for FlakyClaimRepository {
             return Err(store_down());
         }
         self.inner.purge_older_than(cutoff).await
+    }
+
+    async fn reclaim_stale_serving(
+        &self,
+        cutoff: chrono::DateTime<chrono::Utc>,
+    ) -> Result<u64, RepositoryError> {
+        if self.fail_purges.load(Ordering::SeqCst) {
+            return Err(store_down());
+        }
+        self.inner.reclaim_stale_serving(cutoff).await
     }
 }
 

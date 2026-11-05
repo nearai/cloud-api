@@ -289,24 +289,32 @@ impl MppService {
         }
     }
 
-    /// Record how the paid request ended. An error leaves the claim `serving` (which also
-    /// refuses reuse); it is logged here, by closed code.
+    /// Record how the paid request ended, retrying one store failure. Both attempts use the
+    /// same lease, so a lost reply cannot finish a newer request. Persistent failure leaves
+    /// the claim `serving` until maintenance reclaims it; log closed codes only.
     pub async fn finish(
         &self,
         payment: &SettledPayment,
         outcome: ServeOutcome,
     ) -> Result<(), MppError> {
-        self.repo
+        let mut result = self
+            .repo
             .finish(&payment.paid.payment_key, payment.lease, outcome)
-            .await
-            .map_err(|error| {
-                tracing::error!(
-                    outcome = "finish_failed",
-                    repository_error = repository_error_kind(&error),
-                    "MPP claim finish failed"
-                );
-                MppError::Unavailable(UnavailableReason::Store)
-            })
+            .await;
+        if result.is_err() {
+            result = self
+                .repo
+                .finish(&payment.paid.payment_key, payment.lease, outcome)
+                .await;
+        }
+        result.map_err(|error| {
+            tracing::error!(
+                outcome = "finish_failed",
+                repository_error = repository_error_kind(&error),
+                "MPP claim finish failed"
+            );
+            MppError::Unavailable(UnavailableReason::Store)
+        })
     }
 
     /// A guard that marks `payment` served if it is dropped before [`ServingGuard::finish`]
@@ -362,8 +370,8 @@ impl Drop for ServingGuard {
         // Dropped means the client went away while its paid request ran (the work may already
         // be done). That counts as served: marking it unserved would let one payment buy a new
         // inference on every disconnect until the challenge expires. Only an error response
-        // releases the claim. No runtime (process shutdown) leaves the row `serving`, which also
-        // refuses reuse.
+        // releases the claim. No runtime (process shutdown) leaves the row `serving` until
+        // maintenance reclaims the abandoned attempt.
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
                 let _ = service.finish(&payment, ServeOutcome::Served).await;

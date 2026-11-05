@@ -511,6 +511,31 @@ async fn a_failing_claim_store_is_unavailable_and_claims_nothing() {
 }
 
 #[tokio::test]
+async fn a_transient_finish_failure_is_retried_once_for_each_outcome() {
+    for outcome in [ServeOutcome::Unserved, ServeOutcome::Served] {
+        let repo = Arc::new(FlakyClaimRepository::default());
+        let chain = Arc::new(FakeTempo::default());
+        let service = MppService::new(&settings(), repo.clone(), chain.clone()).unwrap();
+        let challenge = service
+            .challenge_for_body(CHAT_COMPLETIONS_ROUTE, &body())
+            .unwrap();
+        chain.mine(bound_payment_receipt(
+            TX, PAYER, CURRENCY, RECIPIENT, AMOUNT, REALM, &challenge,
+        ));
+        let header = credential_header(&challenge, hash_payload(TX), None);
+        let verified = service
+            .verify(&header, CHAT_COMPLETIONS_ROUTE, &body())
+            .unwrap();
+        let paid = service.verify_payment(&verified).await.unwrap();
+        let settled = service.claim(&paid).await.unwrap();
+        repo.fail_next_finishes(1);
+        assert!(service.finish(&settled, outcome).await.is_ok());
+        assert_eq!(repo.finish_calls(), 2);
+        assert_eq!(repo.store().state_of(&key(TX)), Some(outcome.state()));
+    }
+}
+
+#[tokio::test]
 async fn a_failing_finish_is_reported_and_leaves_the_claim_serving() {
     let repo = Arc::new(FlakyClaimRepository::default());
     let chain = Arc::new(FakeTempo::default());

@@ -84,14 +84,21 @@ async fn bodyless_open_and_top_up_return_receipts_without_auth_or_handler() {
 }
 
 #[tokio::test]
-async fn bodyless_voucher_and_garbage_return_mpp_problems() {
+async fn bodyless_session_voucher_returns_mpp_problem_and_garbage_delegates() {
     let app = session_app(SERVICE_KEY, AMOUNT, Some(SESSION_PRICE));
-    for authorization in [
-        session_credential(&app, voucher(INITIAL)).await,
-        "Payment garbage".into(),
+    for (authorization, status) in [
+        (
+            session_credential(&app, voucher(INITIAL)).await,
+            StatusCode::BAD_REQUEST,
+        ),
+        ("Payment garbage".into(), StatusCode::UNAUTHORIZED),
     ] {
         let response = bodyless(&app, &authorization).await;
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(response.status(), status);
+        if status == StatusCode::UNAUTHORIZED {
+            no_inference(&app);
+            continue;
+        }
         assert_eq!(
             response.headers()[header::CONTENT_TYPE],
             "application/problem+json"
@@ -120,6 +127,67 @@ async fn bodyless_bearer_preserves_plain_auth_behavior() {
         assert_eq!(current.status, previous.status);
         assert_eq!(current.json(), previous.json());
     }
+}
+
+#[tokio::test]
+async fn parsed_session_credentials_keep_problem_documents_for_unpriceable_or_unbuffered_bodies() {
+    let app = session_app(SERVICE_KEY, AMOUNT, Some(SESSION_PRICE));
+    let authorization = session_credential(&app, voucher(INITIAL)).await;
+    for body in [r#"{"model":"unpriced","messages":[],"max_tokens":8}"#, "{"] {
+        let response = app
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/chat/completions")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, &authorization)
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            "application/problem+json"
+        );
+    }
+    let router = Router::new()
+        .route("/", post(|| async { StatusCode::OK }))
+        .layer(from_fn_with_state(
+            MppAuthState {
+                auth: auth_state_with_calls(Some(app.auth_calls.clone())),
+                mpp: Some(Arc::new(
+                    MppService::new(
+                        &settings(SERVICE_KEY),
+                        Arc::new(InMemoryClaimRepository::default()),
+                        app.rpc.clone(),
+                    )
+                    .unwrap(),
+                )),
+                session: Some(app.session.clone()),
+            },
+            mpp_auth_middleware,
+        ));
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/")
+                .header(header::AUTHORIZATION, authorization)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        response.headers()[header::CONTENT_TYPE],
+        "application/problem+json"
+    );
+    no_inference(&app);
 }
 
 #[tokio::test]

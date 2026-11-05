@@ -39,6 +39,12 @@ filter = 'package(api) & binary(e2e_all) & (test(/^database_encryption::/) | tes
 test-group = "e2e-db"
 threads-required = "num-test-threads"
 
+# MPP maintenance scans the global claim table and must not overlap claim producers.
+[[profile.default.overrides]]
+filter = 'package(api) & binary(e2e_all) & (test(/^mpp::claim_regressions::reclaim_releases_stale_serving_and_preserves_the_new_attempts_lease$/) | test(/^mpp::purge_deletes_only_claims_older_than_the_cutoff$/) | test(/^mpp_channels::hardening::finalized_capture_survives_late_charge_release_and_reaper$/))'
+test-group = "e2e-db"
+threads-required = "num-test-threads"
+
 # The billing summary sums usage_hourly platform-wide; its delta check needs no concurrent writers.
 [[profile.default.overrides]]
 filter = 'package(api) & binary(e2e_all) & test(/^admin_revenue_totals::serial_/)'

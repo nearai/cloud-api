@@ -19,6 +19,9 @@ use uuid::Uuid;
 use wiremock::matchers::{body_partial_json, method};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+#[path = "mpp_claim_regressions.rs"]
+mod claim_regressions;
+
 const REALM: &str = "mpp-e2e.test";
 const SECRET: &str = "e2e-hmac-secret-0123456789abcdef0123456789";
 const AMOUNT: u128 = 20_000;
@@ -73,6 +76,8 @@ async fn claim_is_single_use_and_unserved_is_retryable_by_the_same_challenge_onl
 
     let first = claimed(&repo, &key, "challenge-a").await;
     assert_eq!(state_of(&database, &key).await.as_deref(), Some("serving"));
+    assert!(repo.is_spent(&key, "challenge-a").await.unwrap());
+    assert!(repo.is_spent(&key, "challenge-b").await.unwrap());
 
     // A replay while serving, by the same and by another challenge.
     assert_eq!(
@@ -88,6 +93,8 @@ async fn claim_is_single_use_and_unserved_is_retryable_by_the_same_challenge_onl
         .await
         .unwrap();
     assert_eq!(state_of(&database, &key).await.as_deref(), Some("unserved"));
+    assert!(!repo.is_spent(&key, "challenge-a").await.unwrap());
+    assert!(repo.is_spent(&key, "challenge-b").await.unwrap());
 
     // Another challenge cannot take an unserved payment; the same one can.
     assert_eq!(
@@ -111,6 +118,8 @@ async fn claim_is_single_use_and_unserved_is_retryable_by_the_same_challenge_onl
         .await
         .unwrap();
     assert_eq!(state_of(&database, &key).await.as_deref(), Some("served"));
+    assert!(repo.is_spent(&key, "challenge-a").await.unwrap());
+    assert!(repo.is_spent(&key, "challenge-b").await.unwrap());
     assert_eq!(
         repo.claim(&key, "challenge-a").await.unwrap(),
         ClaimOutcome::AlreadyUsed

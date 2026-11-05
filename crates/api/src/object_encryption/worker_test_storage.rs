@@ -15,6 +15,7 @@ use std::time::Duration;
 #[derive(Clone, Copy)]
 pub(super) enum Failure {
     Changed,
+    ConditionalConflict(usize),
     Transient(usize),
     Persistent,
     Timeout,
@@ -83,6 +84,10 @@ impl StorageTrait for FaultStorage {
                 self.inner.rewrap_object(key, max_bytes).await
             }
             Failure::Changed => Err(FileServiceError::PreconditionFailed),
+            Failure::ConditionalConflict(count) if attempt < count => Err(
+                FileServiceError::TransientStorageError("conditional request conflict".into()),
+            ),
+            Failure::ConditionalConflict(_) => self.inner.rewrap_object(key, max_bytes).await,
             Failure::Transient(count) if attempt < count => Err(
                 FileServiceError::TransientStorageError("private details".into()),
             ),

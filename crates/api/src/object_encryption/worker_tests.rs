@@ -41,6 +41,25 @@ async fn transient_errors_retry_then_process_the_object() {
 }
 
 #[tokio::test]
+async fn conditional_request_conflicts_retry_within_the_worker_budget() {
+    // Given an S3 conditional conflict classified as a transient storage error.
+    let (state, attempts) = fault(Failure::ConditionalConflict(3)).await;
+    let mut progress = Progress::default();
+
+    // When the worker rewraps the object.
+    worker::process_key(&state, Mode::Execute, "object", &mut progress)
+        .await
+        .unwrap();
+
+    // Then the retry budget is bounded and the eventual successful result is counted.
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        STORAGE_RETRY_ATTEMPTS as usize + 1
+    );
+    assert_eq!((progress.errors, progress.already_current), (0, 1));
+}
+
+#[tokio::test]
 async fn exhausted_retries_record_a_sanitized_error() {
     let (state, attempts) = fault(Failure::Transient(20)).await;
     let mut progress = Progress::default();

@@ -26,6 +26,7 @@ fn object_operations_classify_missing_responses_precisely() {
         (403, Some("AccessDenied"), false),
         (412, Some("PreconditionFailed"), false),
         (409, Some("ConditionalRequestConflict"), false),
+        (409, Some("OperationAborted"), false),
         (500, None, false),
     ] {
         let metadata = match code {
@@ -62,7 +63,8 @@ fn object_operations_classify_missing_responses_precisely() {
             );
             if status == 412 {
                 assert!(matches!(error, FileServiceError::PreconditionFailed));
-            } else if status == 500 {
+            } else if (status == 409 && code == Some("ConditionalRequestConflict")) || status == 500
+            {
                 assert!(matches!(error, FileServiceError::TransientStorageError(_)));
             } else if !missing {
                 assert!(matches!(error, FileServiceError::StorageError(_)));

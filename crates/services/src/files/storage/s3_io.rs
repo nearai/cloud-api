@@ -27,7 +27,8 @@ pub(super) fn object_error<E: ProvideErrorMetadata>(
     if code == Some("PreconditionFailed") || status == Some(412) {
         return FileServiceError::PreconditionFailed;
     }
-    if matches!(status, Some(429 | 500..=599))
+    if (status == Some(409) && code == Some("ConditionalRequestConflict"))
+        || matches!(status, Some(429 | 500..=599))
         || matches!(
             &error,
             SdkError::TimeoutError(_) | SdkError::DispatchFailure(_) | SdkError::ResponseError(_)

@@ -29,8 +29,10 @@ use super::rlp;
 pub const SCHEME: &str = "Payment";
 /// The only payment method this server speaks.
 pub const METHOD: &str = "tempo";
-/// The only intent this server speaks.
+/// The one-shot payment intent.
 pub const INTENT_CHARGE: &str = "charge";
+/// The channel-backed, metered payment intent (`session_wire`).
+pub const INTENT_SESSION: &str = "session";
 /// Largest `Authorization` value read before any decoding.
 pub const MAX_AUTHORIZATION_LEN: usize = 16 * 1024;
 /// Largest raw (decoded) transaction accepted in a `transaction` payload.
@@ -325,10 +327,12 @@ impl ChargeRequest {
 pub struct Challenge {
     pub id: String,
     pub realm: String,
-    /// base64url of the JCS charge request.
+    /// base64url of the JCS request (`ChargeRequest`, or `session_wire::SessionTerms`).
     pub request: String,
     pub expires: DateTime<Utc>,
-    /// `sha-256=:…:` of the request body.
+    /// `sha-256=:…:` of the request body. Empty for a `session` challenge, which is reused
+    /// across requests and so binds no body: the header omits it and the id hashes it as
+    /// the empty string.
     pub digest: String,
     /// base64url of the JCS `{"route": …}`.
     pub opaque: String,
@@ -340,21 +344,33 @@ impl Challenge {
         format_timestamp(self.expires)
     }
 
+    /// The challenge's intent: a challenge that binds a request body is a `charge`, one
+    /// that binds none is a `session`.
+    pub fn intent(&self) -> &'static str {
+        if self.digest.is_empty() {
+            INTENT_SESSION
+        } else {
+            INTENT_CHARGE
+        }
+    }
+
     /// The `WWW-Authenticate` header value. Quoting follows the reference
     /// `format_www_authenticate`: `\` and `"` are escaped, anything outside visible ASCII is
     /// refused (this server never emits any).
     pub fn to_header(&self) -> Result<String, ProtocolError> {
         let expires = self.expires_string();
-        let parts = [
+        let mut parts = vec![
             ("id", self.id.as_str()),
             ("realm", self.realm.as_str()),
             ("method", METHOD),
-            ("intent", INTENT_CHARGE),
+            ("intent", self.intent()),
             ("request", self.request.as_str()),
             ("expires", expires.as_str()),
-            ("digest", self.digest.as_str()),
-            ("opaque", self.opaque.as_str()),
         ];
+        if !self.digest.is_empty() {
+            parts.push(("digest", self.digest.as_str()));
+        }
+        parts.push(("opaque", self.opaque.as_str()));
         let mut rendered = Vec::with_capacity(parts.len());
         for (name, value) in parts {
             rendered.push(format!("{name}=\"{}\"", escape_quoted(value)?));
@@ -451,6 +467,30 @@ impl fmt::Debug for Credential {
     }
 }
 
+/// A parsed credential for a `session` challenge. The payload is handed through as the
+/// client wrote it; `session_wire::SessionPayload::parse` reads it.
+#[derive(Clone, PartialEq)]
+pub struct SessionCredential {
+    pub challenge: ChallengeEcho,
+    pub payload: Value,
+    /// `did:pkh:eip155:<chainId>:0x<address>`, when the client sent one.
+    pub source: Option<String>,
+}
+
+impl fmt::Debug for SessionCredential {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("SessionCredential { .. }")
+    }
+}
+
+/// A parsed `Authorization: Payment …` credential of either intent, told apart by the
+/// intent the credential echoes.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ParsedAuthorization {
+    Charge(Credential),
+    Session(SessionCredential),
+}
+
 #[derive(Deserialize)]
 #[serde(untagged)]
 enum WireOpaque {
@@ -494,8 +534,40 @@ pub fn is_payment_scheme(header: &str) -> bool {
         .is_some_and(|scheme| scheme.eq_ignore_ascii_case(SCHEME))
 }
 
-/// Parse `Authorization: Payment <base64url(JSON)>`. The value is capped before decoding.
+/// Parse `Authorization: Payment <base64url(JSON)>`, reading the payload as a `charge`
+/// payload whatever intent the credential echoes (the service checks the intent). The value
+/// is capped before decoding.
 pub fn parse_authorization(header: &str) -> Result<Credential, ProtocolError> {
+    let (challenge, payload, source) = parse_envelope(header)?;
+    Ok(Credential {
+        challenge,
+        payload: parse_payload(&payload)?,
+        source,
+    })
+}
+
+/// Parse `Authorization: Payment <base64url(JSON)>` of either intent. A credential that
+/// echoes a `session` challenge keeps its payload as the client wrote it (for
+/// `session_wire::SessionPayload::parse`); any other is read as by [`parse_authorization`].
+pub fn parse_any_authorization(header: &str) -> Result<ParsedAuthorization, ProtocolError> {
+    let (challenge, payload, source) = parse_envelope(header)?;
+    if challenge.intent == INTENT_SESSION {
+        return Ok(ParsedAuthorization::Session(SessionCredential {
+            challenge,
+            payload,
+            source,
+        }));
+    }
+    Ok(ParsedAuthorization::Charge(Credential {
+        challenge,
+        payload: parse_payload(&payload)?,
+        source,
+    }))
+}
+
+/// The intent-independent part of a credential: the echoed challenge, the raw payload and
+/// the `source`. Bounded and checked before anything intent-specific reads the payload.
+fn parse_envelope(header: &str) -> Result<(ChallengeEcho, Value, Option<String>), ProtocolError> {
     if header.len() > MAX_AUTHORIZATION_LEN {
         return Err(ProtocolError::Malformed("authorization too long"));
     }
@@ -555,11 +627,7 @@ pub fn parse_authorization(header: &str) -> Result<Credential, ProtocolError> {
     if echo.id.is_empty() || bound.iter().flatten().any(|field| field.contains('|')) {
         return Err(ProtocolError::Malformed("invalid challenge fields"));
     }
-    Ok(Credential {
-        challenge: echo,
-        payload: parse_payload(&wire.payload)?,
-        source: wire.source,
-    })
+    Ok((echo, wire.payload, wire.source))
 }
 
 fn parse_payload(payload: &Value) -> Result<PaymentPayload, ProtocolError> {

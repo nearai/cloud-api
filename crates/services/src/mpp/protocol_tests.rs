@@ -812,3 +812,99 @@ fn problem_bodies_use_the_paymentauth_type_uris() {
         );
     }
 }
+
+/// The charge header of `sample_challenge`, byte for byte as it was before `session`
+/// support existed (captured from the commit that precedes it): the `digest` stays,
+/// in its place, and the intent stays `charge`.
+#[test]
+fn charge_header_bytes_are_unchanged() {
+    assert_eq!(
+        sample_challenge().to_header().unwrap(),
+        [
+            r#"Payment id="cQVWEbNHA3al_c_hR2KEQ349Ftlj9U2NGRmq1iCqUyM", realm="cloud-api.near.ai", "#,
+            r#"method="tempo", intent="charge", request=""#,
+            "eyJhbW91bnQiOiIyMDAwMCIsImN1cnJlbmN5IjoiMHgyMGMwMDAwMDAwMDAw",
+            "MDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwIiwibWV0aG9kRGV0YWlscyI6",
+            "eyJjaGFpbklkIjo0MjQzMX0sInJlY2lwaWVudCI6IjB4MTIzNDU2Nzg5MGFi",
+            "Y2RlZjEyMzQ1Njc4OTBhYmNkZWYxMjM0NTY3OCJ9",
+            r#"", expires="2030-05-06T07:08:09Z", "#,
+            r#"digest="sha-256=:VI9Y0cNscVtE8IY0cgdKl8RI1bjRgWS5Kt9VWSsSf4Y=:", "#,
+            r#"opaque="eyJub25jZSI6IkJ3Y0hCd2NIQndjSEJ3Y0hCd2NIQnciLCJyb3V0ZSI6Ii92MS9jaGF0L2NvbXBsZXRpb25zIn0""#,
+        ]
+        .concat()
+    );
+    assert_eq!(sample_challenge().intent(), INTENT_CHARGE);
+}
+
+/// A challenge with no digest is a session challenge: intent `session`, no `digest`
+/// parameter, in the same parameter order otherwise.
+#[test]
+fn a_challenge_without_a_digest_is_a_session_challenge() {
+    let mut challenge = sample_challenge();
+    challenge.digest = String::new();
+    assert_eq!(challenge.intent(), INTENT_SESSION);
+    let header = challenge.to_header().unwrap();
+    let names: Vec<String> = parse_params(&header).into_iter().map(|(n, _)| n).collect();
+    assert_eq!(
+        names,
+        ["id", "realm", "method", "intent", "request", "expires", "opaque"]
+    );
+    assert!(header.contains(r#"intent="session""#));
+    assert!(!header.contains("digest"));
+}
+
+#[test]
+fn parse_any_authorization_routes_on_the_echoed_intent() {
+    let challenge = sample_challenge();
+    let hash_payload =
+        serde_json::json!({"type": "hash", "hash": format!("0x{}", "ab".repeat(32))});
+
+    // A charge credential reads exactly as `parse_authorization` reads it.
+    let header = credential_header(&challenge, hash_payload.clone(), None);
+    assert_eq!(
+        parse_any_authorization(&header).unwrap(),
+        ParsedAuthorization::Charge(parse_authorization(&header).unwrap())
+    );
+
+    // A session credential keeps its payload as the client wrote it, whatever it holds
+    // (this layer does not read it), and carries the echo without a digest.
+    let voucher = serde_json::json!({"action": "voucher", "cumulativeAmount": "5"});
+    let wire = serde_json::json!({
+        "challenge": {
+            "id": challenge.id, "realm": challenge.realm, "method": "tempo",
+            "intent": "session", "request": challenge.request, "opaque": challenge.opaque,
+        },
+        "payload": voucher,
+        "source": "did:pkh:eip155:42431:0x1111111111111111111111111111111111111111",
+    });
+    let header = format!("Payment {}", b64url_encode(wire.to_string().as_bytes()));
+    let ParsedAuthorization::Session(session) = parse_any_authorization(&header).unwrap() else {
+        panic!("expected a session credential");
+    };
+    assert_eq!(session.payload, voucher);
+    assert_eq!(session.challenge.intent, "session");
+    assert_eq!(session.challenge.digest, None);
+    assert_eq!(
+        session.source.as_deref(),
+        Some("did:pkh:eip155:42431:0x1111111111111111111111111111111111111111")
+    );
+    assert_eq!(format!("{session:?}"), "SessionCredential { .. }");
+
+    // The same bounds as the charge entry point: size, scheme, base64, `|` in a bound field.
+    let huge = format!("Payment {}", "A".repeat(MAX_AUTHORIZATION_LEN));
+    for bad in [huge.as_str(), "Bearer abc", "Payment", "Payment !!!"] {
+        assert!(parse_any_authorization(bad).is_err(), "{bad}");
+    }
+    let mut tampered = wire.clone();
+    tampered["challenge"]["realm"] = Value::String("a|b".into());
+    let header = format!("Payment {}", b64url_encode(tampered.to_string().as_bytes()));
+    assert!(parse_any_authorization(&header).is_err());
+
+    // A charge-intent credential is still held to the charge payload rules.
+    let bad_charge = credential_header(
+        &challenge,
+        serde_json::json!({"action": "voucher", "cumulativeAmount": "5"}),
+        None,
+    );
+    assert!(parse_any_authorization(&bad_charge).is_err());
+}

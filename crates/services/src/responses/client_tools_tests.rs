@@ -186,13 +186,13 @@ fn custom_history_replays_without_its_tool_in_the_current_catalog() {
         json!({"type": "function_call_output", "call_id": "call_old", "output": "line 1\nline 2"})
     );
     let restored = adapter.response(json!({"output": [history]})).unwrap();
-    assert_eq!(restored["output"][0]["type"], "custom_tool_call");
-    assert_eq!(restored["output"][0]["namespace"], "functions");
-    assert_eq!(restored["output"][0]["name"], "exec");
-    assert_eq!(restored["output"][0]["input"], script);
+    assert_eq!(restored["output"][0], *history);
+    assert!(adapter
+        .validate_arguments(history["name"].as_str().unwrap(), "{}")
+        .is_ok());
 
     // A client may also omit tools entirely when it only replays old results.
-    let (without_catalog, _) = normalize_request(json!({"model": "test", "input": [
+    let (without_catalog, adapter) = normalize_request(json!({"model": "test", "input": [
         {"type": "custom_tool_call", "call_id": "call_old", "name": "exec", "namespace": "functions", "input": script},
         {"type": "custom_tool_call_output", "call_id": "call_old", "output": "ok"}
     ]})).unwrap();
@@ -201,6 +201,51 @@ fn custom_history_replays_without_its_tool_in_the_current_catalog() {
         without_catalog["input"][0]["name"],
         declared["tools"][0]["name"]
     );
+    let output = json!({"output": [without_catalog["input"][0]]});
+    assert_eq!(adapter.response(output.clone()).unwrap(), output);
+}
+
+#[test]
+fn raw_alias_calls_replay_alongside_their_original_tool_identities() {
+    for (tool, history) in [
+        (
+            custom("exec"),
+            json!({"type":"custom_tool_call", "name":"exec", "input":"text(1)"}),
+        ),
+        (
+            namespace("functions", vec![custom("exec")]),
+            json!({"type":"custom_tool_call", "name":"exec", "namespace":"functions", "input":"text(1)"}),
+        ),
+        (
+            namespace("archive", vec![function("lookup")]),
+            json!({"type":"function_call", "name":"lookup", "namespace":"archive", "arguments":"{}"}),
+        ),
+    ] {
+        let (declared, _) = normalize_request(request(vec![tool.clone()])).unwrap();
+        let name = alias(&declared, 0);
+        let raw = call(&name, "not JSON", "completed");
+        // A tool can also be re-enabled after the client rejected a raw alias.
+        for tools in [vec![function("new_tool")], vec![tool]] {
+            for input in [json!([history, raw]), json!([raw, history])] {
+                let (normalized, _) = normalize_request(json!({
+                    "model":"test", "tools":tools, "input":input
+                }))
+                .unwrap();
+                assert!(normalized["input"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|item| item["name"] == name));
+                let replayed = normalized["input"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|item| item["id"] == "fc_test")
+                    .unwrap();
+                assert_eq!(*replayed, raw);
+            }
+        }
+    }
 }
 
 #[test]

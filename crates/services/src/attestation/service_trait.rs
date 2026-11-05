@@ -101,12 +101,4 @@ impl ports::AttestationServiceTrait for AttestationService {
     ) -> Result<ItaTokenResponse, AttestationError> {
         self.create_ita_attestation_token(query).await
     }
-
-    async fn verify_vpc_signature(
-        &self,
-        timestamp: i64,
-        signature: String,
-    ) -> Result<bool, AttestationError> {
-        self.verify_vpc_signature_impl(timestamp, signature).await
-    }
 }

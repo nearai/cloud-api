@@ -115,14 +115,6 @@ impl services::attestation::ports::AttestationServiceTrait for RecordingItaAttes
         queries.push(query);
         self.result.clone()
     }
-
-    async fn verify_vpc_signature(
-        &self,
-        _timestamp: i64,
-        _signature: String,
-    ) -> Result<bool, AttestationError> {
-        Ok(false)
-    }
 }
 
 #[derive(Clone, Default)]

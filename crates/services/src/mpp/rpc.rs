@@ -125,6 +125,42 @@ impl TempoRpc for HttpTempoRpc {
         let block = result.as_object().ok_or(RpcError::InvalidResponse)?;
         hex_u64(block.get("timestamp").ok_or(RpcError::InvalidResponse)?).map(Some)
     }
+
+    async fn call(&self, to: [u8; 20], data: &[u8]) -> Result<Vec<u8>, RpcError> {
+        let result = self
+            .call(
+                "eth_call",
+                json!([
+                    {"to": format!("0x{}", hex::encode(to)), "data": format!("0x{}", hex::encode(data))},
+                    "latest"
+                ]),
+            )
+            .await?;
+        hex_bytes(&result, MAX_CALL_RETURN_BYTES)
+    }
+
+    async fn gas_price(&self) -> Result<u128, RpcError> {
+        let result = self.call("eth_gasPrice", json!([])).await?;
+        hex_u128(&result)
+    }
+}
+
+/// Longest `eth_call` return data read: a `getChannelStatesBatch` of
+/// [`super::abi::MAX_BATCH_CHANNELS`] channels is under 32 KiB.
+const MAX_CALL_RETURN_BYTES: usize = 64 * 1024;
+
+/// A JSON-RPC quantity of at most 128 bits.
+fn hex_u128(value: &Value) -> Result<u128, RpcError> {
+    let digits = value
+        .as_str()
+        .and_then(|s| s.strip_prefix("0x"))
+        .filter(|digits| {
+            !digits.is_empty()
+                && digits.len() <= 32
+                && digits.bytes().all(|b| b.is_ascii_hexdigit())
+        })
+        .ok_or(RpcError::InvalidResponse)?;
+    u128::from_str_radix(digits, 16).map_err(|_| RpcError::InvalidResponse)
 }
 
 /// A JSON-RPC quantity (`0x`-prefixed hex, at most 64 bits).

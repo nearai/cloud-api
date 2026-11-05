@@ -11,11 +11,16 @@
 //!   channels): [`eip712`] voucher and close digests, [`secp256k1`] recovery and signing,
 //!   [`abi`] calldata for the channel reserve precompile, [`channel`] ids, [`tempo_tx`]
 //!   Tempo transactions, and [`open_check`], the pre-broadcast check of a client's open.
-//! - [`ports`]: the claim store and RPC traits. `memory` (tests and the `test-mocks`
+//! - [`session_wire`], [`session_service`], [`session_settlement`], [`session_supervision`]:
+//!   the `session` intent over the [`ports::ChannelRepository`] ledger and
+//!   [`ports::TempoSigner`] ([`signer`]).
+//! - [`ports`]: the claim store, channel ledger, signer and RPC traits. `memory` (tests and the `test-mocks`
 //!   feature only) is an in-memory claim store; deployments use the Postgres repository.
 
 pub mod abi;
 pub mod channel;
+#[cfg(any(test, feature = "test-mocks"))]
+pub mod channel_memory;
 pub mod eip712;
 pub mod error;
 #[cfg(any(test, feature = "test-mocks"))]
@@ -29,8 +34,13 @@ pub mod rlp;
 pub mod rpc;
 pub mod secp256k1;
 pub mod service;
+pub mod session_service;
+pub mod session_settlement;
+pub mod session_supervision;
 #[cfg(test)]
 mod session_vectors;
+pub mod session_wire;
+pub mod signer;
 pub mod tempo;
 pub mod tempo_tx;
 #[cfg(any(test, feature = "test-mocks"))]
@@ -43,8 +53,10 @@ pub use error::{
 #[cfg(any(test, feature = "test-mocks"))]
 pub use memory::InMemoryClaimRepository;
 pub use ports::{
-    ClaimLease, ClaimOutcome, ClaimState, PaymentClaimRepository, RpcError, RpcLog, RpcReceipt,
-    ServeOutcome, TempoRpc,
+    ChannelLifecycle, ChannelRecord, ChannelRepository, ChargeOutcome, ClaimLease, ClaimOutcome,
+    ClaimState, CloseTransition, NewChannel, PaymentClaimRepository, PendingClose, ReserveOutcome,
+    RetainedVoucher, RpcError, RpcLog, RpcReceipt, ServeOutcome, TempoRpc, TempoSigner,
+    VoucherOutcome, MAX_RETAINED_VOUCHERS,
 };
 pub use pricing::{LimitViolation, Param, Price, Pricing, RequestShape};
 pub use protocol::{Challenge, ProblemCode};
@@ -53,6 +65,7 @@ pub use service::{
     MppService, PaidCredential, ServingGuard, SettledPayment, VerifiedCredential,
     CHAT_COMPLETIONS_ROUTE,
 };
+pub use signer::{LocalSigner, SignerKeyError};
 
 /// The chain-level core of the MPP `session` intent. No I/O and no state: digests,
 /// signatures, ABI, channel ids and Tempo transactions, each verified against golden

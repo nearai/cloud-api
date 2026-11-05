@@ -45,7 +45,15 @@ pub struct FakeTempo {
     block_lookup_hangs: std::sync::atomic::AtomicBool,
     sends: AtomicUsize,
     lookups: AtomicUsize,
+    /// Answers `eth_call` from the target and calldata; `None` answers every call with
+    /// [`RpcError::Rejected`].
+    call_handler: Mutex<Option<CallHandler>>,
+    gas_price: Mutex<Result<u128, RpcError>>,
+    calls: AtomicUsize,
 }
+
+/// A scripted `eth_call`: `(to, calldata) -> return data`.
+pub type CallHandler = Box<dyn Fn([u8; 20], &[u8]) -> Result<Vec<u8>, RpcError> + Send + Sync>;
 
 impl Default for FakeTempo {
     fn default() -> Self {
@@ -58,6 +66,9 @@ impl Default for FakeTempo {
             block_lookup_hangs: std::sync::atomic::AtomicBool::new(false),
             sends: AtomicUsize::new(0),
             lookups: AtomicUsize::new(0),
+            call_handler: Mutex::new(None),
+            gas_price: Mutex::new(Ok(600_000_001)),
+            calls: AtomicUsize::new(0),
         }
     }
 }
@@ -106,6 +117,25 @@ impl FakeTempo {
 
     pub fn set_block_lookup_hangs(&self, hangs: bool) {
         self.block_lookup_hangs.store(hangs, Ordering::SeqCst);
+    }
+
+    /// Script `eth_call`.
+    pub fn set_call_handler(&self, handler: CallHandler) {
+        if let Ok(mut current) = self.call_handler.lock() {
+            *current = Some(handler);
+        }
+    }
+
+    /// Script `eth_gasPrice`.
+    pub fn set_gas_price(&self, price: Result<u128, RpcError>) {
+        if let Ok(mut current) = self.gas_price.lock() {
+            *current = price;
+        }
+    }
+
+    /// How many `eth_call`s were made.
+    pub fn eth_calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
     }
 
     pub fn send_calls(&self) -> usize {
@@ -170,6 +200,25 @@ impl TempoRpc for FakeTempo {
             .lock()
             .ok()
             .and_then(|times| times.get(&number).copied()))
+    }
+
+    async fn call(&self, to: [u8; 20], data: &[u8]) -> Result<Vec<u8>, RpcError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        if let Some(error) = self.lookup_error.lock().ok().and_then(|e| *e) {
+            return Err(error);
+        }
+        let handler = self
+            .call_handler
+            .lock()
+            .map_err(|_| RpcError::Unavailable)?;
+        match handler.as_ref() {
+            Some(handler) => handler(to, data),
+            None => Err(RpcError::Rejected),
+        }
+    }
+
+    async fn gas_price(&self) -> Result<u128, RpcError> {
+        *self.gas_price.lock().map_err(|_| RpcError::Unavailable)?
     }
 }
 

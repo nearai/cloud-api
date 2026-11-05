@@ -1,11 +1,15 @@
-//! Ports of the MPP domain: the single-use claim store and the Tempo JSON-RPC.
+//! Ports of the MPP domain: the single-use claim store, the channel ledger, the payee's
+//! signer and the Tempo JSON-RPC.
 //!
 //! Neither trait names an HTTP, SQL or Axum type, so the service is tested with in-memory
 //! fakes (see `service.rs` tests) and implemented in `crates/database` and `rpc.rs`.
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use uuid::Uuid;
 
+use super::abi::{ChannelDescriptor, ChannelState};
+use super::secp256k1::{SigError, SIGNATURE_LEN};
 use crate::common::RepositoryError;
 
 /// Lifecycle of one claimed payment. A closed set; the claim store is the only writer of
@@ -174,6 +178,351 @@ pub trait TempoRpc: Send + Sync {
 
     /// `eth_getBlockByNumber`: the block's timestamp (Unix seconds), `None` if unknown.
     async fn get_block_timestamp(&self, number: u64) -> Result<Option<u64>, RpcError>;
+
+    /// `eth_call` of `data` to `to` against the latest block: the raw return data. A revert
+    /// is [`RpcError::Rejected`].
+    async fn call(&self, to: [u8; 20], data: &[u8]) -> Result<Vec<u8>, RpcError>;
+
+    /// `eth_gasPrice`: the current gas price in the fee token's base units per gas.
+    async fn gas_price(&self) -> Result<u128, RpcError>;
+}
+
+// ---------------------------------------------------------------------------------------
+// `session` intent: the payee's signer and the channel ledger
+// ---------------------------------------------------------------------------------------
+
+/// Signs for the payee: settlement and payee-close transactions. Deployments hold the key
+/// of `MPP_TEMPO_SIGNER_KEY`; tests use any secp256k1 key.
+pub trait TempoSigner: Send + Sync {
+    /// The payee address: the recipient of every session challenge.
+    fn address(&self) -> [u8; 20];
+
+    /// A 65-byte `r || s || v` secp256k1 signature over a 32-byte digest (a Tempo
+    /// transaction's signing hash).
+    fn sign(&self, digest: &[u8; 32]) -> Result<[u8; SIGNATURE_LEN], SigError>;
+}
+
+/// Lifecycle of a channel row. The ledger is the only writer of these values (`as_str` is
+/// their text form); `parse` reads them back from the store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChannelLifecycle {
+    /// Accepting vouchers and reservations (unless a close was requested on chain).
+    Open,
+    /// A close transaction is built or in flight: no new vouchers or reservations.
+    Closing,
+    /// Closed on chain, or withdrawn by the payer. Terminal; purged after a retention.
+    Finalized,
+}
+
+impl ChannelLifecycle {
+    pub const OPEN: &'static str = "open";
+    pub const CLOSING: &'static str = "closing";
+    pub const FINALIZED: &'static str = "finalized";
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Open => Self::OPEN,
+            Self::Closing => Self::CLOSING,
+            Self::Finalized => Self::FINALIZED,
+        }
+    }
+
+    pub fn parse(text: &str) -> Option<Self> {
+        match text {
+            Self::OPEN => Some(Self::Open),
+            Self::CLOSING => Some(Self::Closing),
+            Self::FINALIZED => Some(Self::Finalized),
+            _ => None,
+        }
+    }
+}
+
+/// A voucher the ledger keeps so that settlement can pick one no higher than what was
+/// delivered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetainedVoucher {
+    pub cumulative: u128,
+    pub signature: [u8; SIGNATURE_LEN],
+}
+
+/// Most earlier vouchers a channel retains beside its highest one.
+pub const MAX_RETAINED_VOUCHERS: usize = 16;
+
+/// A payee close that was built and may have reached the chain. Stored before the
+/// broadcast so a lost reply can be reconciled by looking the hash up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PendingClose {
+    pub tx_hash: [u8; 32],
+    /// The voucher amount the close carries.
+    pub cumulative: u128,
+    /// What the payee captures; the rest of the deposit returns to the payer.
+    pub capture: u128,
+    /// The transaction's `valid_before` (Unix seconds): past it plus a margin, an
+    /// unconfirmed close never lands.
+    pub valid_before: u64,
+}
+
+/// What `open` records: the identity of the channel and its first voucher.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NewChannel {
+    pub channel_id: [u8; 32],
+    pub chain_id: u64,
+    pub escrow: [u8; 20],
+    pub descriptor: ChannelDescriptor,
+    pub deposit: u128,
+    pub settled_on_chain: u128,
+    pub highest_cumulative: u128,
+    pub highest_signature: [u8; SIGNATURE_LEN],
+}
+
+/// One channel as the ledger holds it. Amounts are token base units.
+///
+/// Invariants the ledger keeps: `reserved <= spent`, `spent <= highest_cumulative`,
+/// `settled_on_chain <= deposit` (once read from chain), and every retained voucher is
+/// below `highest_cumulative`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelRecord {
+    pub channel_id: [u8; 32],
+    pub chain_id: u64,
+    pub escrow: [u8; 20],
+    pub descriptor: ChannelDescriptor,
+    /// The escrowed deposit as last read from chain (never decreased by a read).
+    pub deposit: u128,
+    /// The amount settled on chain, as last read or as this server settled it.
+    pub settled_on_chain: u128,
+    /// The highest voucher accepted.
+    pub highest_cumulative: u128,
+    pub highest_signature: [u8; SIGNATURE_LEN],
+    /// Earlier vouchers, highest first, at most [`MAX_RETAINED_VOUCHERS`].
+    pub retained_vouchers: Vec<RetainedVoucher>,
+    /// Charged plus reserved: what the channel is committed to so far.
+    pub spent: u128,
+    /// The part of `spent` held by in-flight requests.
+    pub reserved: u128,
+    /// Tokens charged so far.
+    pub units: u64,
+    pub state: ChannelLifecycle,
+    /// Unix seconds the payer requested a close on chain; `0` when none.
+    pub close_requested_at: u64,
+    pub pending_close: Option<PendingClose>,
+    pub last_chain_read_at: Option<DateTime<Utc>>,
+    pub last_settlement_at: Option<DateTime<Utc>>,
+    /// `spent` at the last settlement, for the amount-based schedule.
+    pub last_settlement_spent: u128,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl ChannelRecord {
+    /// What the highest voucher still covers: `highest_cumulative - spent`.
+    pub fn available(&self) -> u128 {
+        self.highest_cumulative.saturating_sub(self.spent)
+    }
+
+    /// What was actually delivered: `spent - reserved`. Settlement never goes above it.
+    pub fn delivered(&self) -> u128 {
+        self.spent.saturating_sub(self.reserved)
+    }
+
+    /// Whether new vouchers and reservations are taken: open, and no close requested.
+    pub fn accepts_vouchers(&self) -> bool {
+        self.state == ChannelLifecycle::Open && self.close_requested_at == 0
+    }
+
+    /// The voucher to settle now: the highest voucher (the current one or a retained one)
+    /// with `settled_on_chain < cumulative <= delivered()`. `None` when nothing new can
+    /// be settled without claiming more than was delivered.
+    pub fn settleable_voucher(&self) -> Option<RetainedVoucher> {
+        let delivered = self.delivered();
+        let highest = RetainedVoucher {
+            cumulative: self.highest_cumulative,
+            signature: self.highest_signature,
+        };
+        std::iter::once(highest)
+            .chain(self.retained_vouchers.iter().copied())
+            .filter(|voucher| {
+                voucher.cumulative > self.settled_on_chain && voucher.cumulative <= delivered
+            })
+            .max_by_key(|voucher| voucher.cumulative)
+    }
+}
+
+/// Result of [`ChannelRepository::accept_voucher`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VoucherOutcome {
+    /// The voucher is now the channel's highest; the record after the write.
+    Accepted(Box<ChannelRecord>),
+    /// Not above the stored highest voucher: nothing changed.
+    NotHigher,
+    /// The channel is closing, finalized, or has a close requested on chain.
+    NotAccepting,
+    /// No such channel.
+    Missing,
+}
+
+/// Result of [`ChannelRepository::reserve`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReserveOutcome {
+    /// `amount` is held for the request; the record after the write.
+    Reserved(Box<ChannelRecord>),
+    /// The highest voucher does not cover `amount` on top of `spent`; nothing is held.
+    Insufficient { available: u128 },
+    /// The channel is closing, finalized, or has a close requested on chain.
+    NotAccepting,
+    /// No such channel.
+    Missing,
+}
+
+/// Result of [`ChannelRepository::charge`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChargeOutcome {
+    /// The reservation became a charge of `charged` (the actual cost, capped at what the
+    /// highest voucher still covered); the record after the write.
+    Charged {
+        record: Box<ChannelRecord>,
+        charged: u128,
+    },
+    /// No reservation with that request id (released, charged, or reaped already).
+    NoReservation,
+}
+
+/// Result of [`ChannelRepository::mark_closing`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CloseTransition {
+    /// The channel is now `closing` with this pending close; the record after the write.
+    Marked(Box<ChannelRecord>),
+    /// The channel was not `open`.
+    NotOpen,
+    /// No such channel.
+    Missing,
+}
+
+/// The channel ledger of the `session` intent: one row per channel the server is payee
+/// of, plus one row per in-flight reservation. It stores no organization, workspace,
+/// request content or API key.
+///
+/// Every method that reads and then writes a channel is one atomic step (one transaction
+/// with the channel row locked), so two instances serving the same channel never both
+/// spend the same balance. Amounts never go negative: a write that would make
+/// `reserved > spent` or `spent > highest_cumulative` does not happen.
+#[async_trait]
+pub trait ChannelRepository: Send + Sync {
+    /// Insert the channel, or refresh an existing row with the same id: `deposit` and
+    /// `settled_on_chain` take the greater value, and the voucher replaces the stored
+    /// highest only when it is higher (the old highest is then retained). The state of an
+    /// existing row is left as it is. Returns the row after the write.
+    async fn open_or_refresh(&self, channel: NewChannel) -> Result<ChannelRecord, RepositoryError>;
+
+    async fn get(&self, channel_id: &[u8; 32]) -> Result<Option<ChannelRecord>, RepositoryError>;
+
+    /// Make `cumulative` the channel's highest voucher. Only an accepting channel takes a
+    /// voucher, and only one above the stored highest; the old highest joins the retained
+    /// vouchers (highest first, the lowest dropped past [`MAX_RETAINED_VOUCHERS`]). The
+    /// caller has verified the signature and the amount against the chain state.
+    async fn accept_voucher(
+        &self,
+        channel_id: &[u8; 32],
+        cumulative: u128,
+        signature: [u8; SIGNATURE_LEN],
+    ) -> Result<VoucherOutcome, RepositoryError>;
+
+    /// Hold `amount` for `request_id` before inference runs: `spent += amount`,
+    /// `reserved += amount`, one reservation row. Refused without any change when the
+    /// channel is not accepting or `highest_cumulative - spent < amount`. `amount` is
+    /// never zero; a second reservation under the same request id is an error.
+    async fn reserve(
+        &self,
+        channel_id: &[u8; 32],
+        request_id: Uuid,
+        amount: u128,
+    ) -> Result<ReserveOutcome, RepositoryError>;
+
+    /// Turn the reservation of `request_id` into a charge of `actual`, capped at what the
+    /// highest voucher still covers (`highest_cumulative - (spent - amount)`):
+    /// `spent = spent - amount + charged`, `reserved -= amount`, `units += units`, and the
+    /// reservation row goes.
+    async fn charge(
+        &self,
+        request_id: Uuid,
+        actual: u128,
+        units: u64,
+    ) -> Result<ChargeOutcome, RepositoryError>;
+
+    /// Drop the reservation of `request_id` without a charge: `spent -= amount`,
+    /// `reserved -= amount`. `Ok(false)` when there is no such reservation.
+    async fn release(&self, request_id: Uuid) -> Result<bool, RepositoryError>;
+
+    /// Record a chain read: `deposit` takes the greater of the stored and the on-chain
+    /// value unless the on-chain deposit is zero (a withdrawn channel; the caller
+    /// finalizes it), `settled_on_chain` takes the greater value, a non-zero
+    /// `close_requested_at` is stored, and `last_chain_read_at = read_at`. Returns the
+    /// row after the write, `None` for an unknown channel.
+    async fn record_chain_state(
+        &self,
+        channel_id: &[u8; 32],
+        state: ChannelState,
+        read_at: DateTime<Utc>,
+    ) -> Result<Option<ChannelRecord>, RepositoryError>;
+
+    /// `open` to `closing`, storing `pending` before its transaction is broadcast.
+    async fn mark_closing(
+        &self,
+        channel_id: &[u8; 32],
+        pending: PendingClose,
+    ) -> Result<CloseTransition, RepositoryError>;
+
+    /// The channel is closed or withdrawn on chain: state `finalized`,
+    /// `settled_on_chain = max(stored, settled_on_chain)`, `pending_close` cleared. Any
+    /// state may finalize; a no-op for an unknown channel.
+    async fn finalize(
+        &self,
+        channel_id: &[u8; 32],
+        settled_on_chain: u128,
+    ) -> Result<(), RepositoryError>;
+
+    /// A close that did not land: `closing` back to `open`, `pending_close` cleared. A
+    /// no-op for any other state.
+    async fn clear_closing(&self, channel_id: &[u8; 32]) -> Result<(), RepositoryError>;
+
+    /// Take the settlement lease of a channel until `until`, if no instance holds one
+    /// past `now`. Returns the row when this caller now holds the lease.
+    async fn claim_settlement_lease(
+        &self,
+        channel_id: &[u8; 32],
+        now: DateTime<Utc>,
+        until: DateTime<Utc>,
+    ) -> Result<Option<ChannelRecord>, RepositoryError>;
+
+    /// A settlement of `cumulative` landed: `settled_on_chain = max(stored, cumulative)`,
+    /// `last_settlement_at = at`, `last_settlement_spent = spent`, retained vouchers at or
+    /// below `cumulative` dropped, and the lease released.
+    async fn record_settlement(
+        &self,
+        channel_id: &[u8; 32],
+        cumulative: u128,
+        at: DateTime<Utc>,
+    ) -> Result<(), RepositoryError>;
+
+    /// Give the settlement lease back without a settlement.
+    async fn release_settlement_lease(&self, channel_id: &[u8; 32]) -> Result<(), RepositoryError>;
+
+    /// Channels that are not finalized, ordered by channel id, those after `after` first,
+    /// at most `limit`. Pages the close supervision and settlement tasks.
+    async fn list_active(
+        &self,
+        after: Option<[u8; 32]>,
+        limit: usize,
+    ) -> Result<Vec<ChannelRecord>, RepositoryError>;
+
+    /// Release every reservation created before `cutoff` (a crashed instance's), as
+    /// [`Self::release`] would; returns how many went.
+    async fn release_stale_reservations(
+        &self,
+        cutoff: DateTime<Utc>,
+    ) -> Result<u64, RepositoryError>;
+
+    /// Delete finalized channels last updated before `cutoff` (their reservations go with
+    /// them); returns how many went.
+    async fn purge_finalized(&self, cutoff: DateTime<Utc>) -> Result<u64, RepositoryError>;
 }
 
 #[cfg(test)]

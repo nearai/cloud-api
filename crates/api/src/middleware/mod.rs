@@ -10,6 +10,7 @@ pub mod body_hash;
 pub mod metrics;
 pub mod model_deprecation;
 pub mod mpp;
+pub mod mpp_session;
 pub mod rate_limit;
 pub mod reporting_guard;
 pub mod request_correlation;

@@ -2,6 +2,9 @@
 //! `build_completion_routes` wires them (body hash outermost, settle innermost, nested under
 //! `/v1`), against an in-memory claim store and a scripted Tempo node.
 
+#[path = "mpp_session_tests.rs"]
+mod session;
+
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -211,6 +214,7 @@ fn app_with(enabled: bool, service_key: &str) -> App {
             MppAuthState {
                 auth: auth_state(),
                 mpp: service.clone(),
+                session: None,
             },
             mpp_auth_middleware,
         ))

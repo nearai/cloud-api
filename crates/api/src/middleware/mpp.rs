@@ -38,7 +38,7 @@ use chrono::Utc;
 use services::mpp::{
     protocol::{is_payment_scheme, with_private_cache_control},
     MppError, MppResponse, MppService, PaidCredential, Pricing, ProblemCode, ProblemStatus,
-    ServeOutcome, CHAT_COMPLETIONS_ROUTE,
+    ServeOutcome, SessionService, CHAT_COMPLETIONS_ROUTE,
 };
 
 use super::auth::{
@@ -60,6 +60,7 @@ const SERVICE_ORG_RETRY_AFTER_SECS: u64 = 30;
 pub struct MppAuthState {
     pub auth: AuthState,
     pub mpp: Option<Arc<MppService>>,
+    pub session: Option<Arc<SessionService>>,
 }
 
 /// State of [`mpp_settle_middleware`].
@@ -83,18 +84,18 @@ impl std::fmt::Debug for PendingMppPayment {
 // Responses
 // ---------------------------------------------------------------------------------------
 
-fn header_value(value: &str) -> Option<HeaderValue> {
+pub(super) fn header_value(value: &str) -> Option<HeaderValue> {
     HeaderValue::from_str(value).ok()
 }
 
-fn with_no_store(mut response: Response) -> Response {
+pub(super) fn with_no_store(mut response: Response) -> Response {
     response
         .headers_mut()
         .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
     response
 }
 
-fn problem_response(status: StatusCode, content: String) -> Response {
+pub(super) fn problem_response(status: StatusCode, content: String) -> Response {
     let mut response = Response::new(Body::from(content));
     *response.status_mut() = status;
     response
@@ -105,7 +106,7 @@ fn problem_response(status: StatusCode, content: String) -> Response {
 
 /// 503 for "could not take payment now". Not a 402, so a payment client does not read it as
 /// a request to pay. Every one is logged by its closed `kind`.
-fn retry_response(kind: &'static str, retry_after_secs: u64) -> Response {
+pub(super) fn retry_response(kind: &'static str, retry_after_secs: u64) -> Response {
     tracing::warn!(outcome = kind, retry_after_secs, "MPP answered 503");
     let mut response = (
         StatusCode::SERVICE_UNAVAILABLE,
@@ -121,7 +122,7 @@ fn retry_response(kind: &'static str, retry_after_secs: u64) -> Response {
     with_no_store(response)
 }
 
-fn limit_response(message: String) -> Response {
+pub(super) fn limit_response(message: String) -> Response {
     (
         StatusCode::BAD_REQUEST,
         axum::Json(ErrorResponse::new(message, "validation_error".to_string())),
@@ -130,7 +131,7 @@ fn limit_response(message: String) -> Response {
 }
 
 /// `402 Payment Required` with the given fresh challenge.
-fn challenge_response(
+pub(super) fn challenge_response(
     challenge: Result<services::mpp::Challenge, MppError>,
     problem: ProblemCode,
     detail: &str,
@@ -171,6 +172,7 @@ fn error_response(
             let http = match status {
                 ProblemStatus::BadRequest => StatusCode::BAD_REQUEST,
                 ProblemStatus::Forbidden => StatusCode::FORBIDDEN,
+                ProblemStatus::Gone => StatusCode::GONE,
             };
             problem_response(http, problem.body(status.code(), error.detail()))
         }
@@ -247,7 +249,7 @@ pub async fn mpp_auth_middleware(
     mut request: Request,
     next: Next,
 ) -> Response {
-    let MppAuthState { auth, mpp } = state;
+    let MppAuthState { auth, mpp, session } = state;
     let Some(mpp) = mpp else {
         return delegate(auth, request, next).await;
     };
@@ -285,13 +287,36 @@ pub async fn mpp_auth_middleware(
     let header = match presented {
         Presented::Payment(header) => header,
         Presented::Nothing => {
-            return challenge_response(
-                issue(),
+            return super::mpp_session::offers(
+                &mpp,
+                session.as_deref(),
+                &body,
+                &price,
                 ProblemCode::PaymentRequired,
                 "Payment is required to access this resource.",
-            );
+            )
+            .await;
         }
     };
+
+    match services::mpp::protocol::parse_any_authorization(&header) {
+        Ok(services::mpp::protocol::ParsedAuthorization::Session(credential)) => {
+            let Some(session) = session.filter(|_| price.token_price.is_some()) else {
+                return error_response(MppError::InvalidChallenge("session_unavailable"), issue);
+            };
+            return super::mpp_session::serve(
+                session, &mpp, &auth, credential, price, &body, request, next,
+            )
+            .await;
+        }
+        Err(error) if !price.is_chargeable() => {
+            if let Some(session) = session.as_deref() {
+                return super::mpp_session::error_response(session, &price, error.into()).await;
+            }
+        }
+        // Preserve the charge verifier and its error mapping, including malformed input.
+        Ok(services::mpp::protocol::ParsedAuthorization::Charge(_)) | Err(_) => {}
+    }
 
     let verified = match mpp.verify(&header, CHAT_COMPLETIONS_ROUTE, &body) {
         Ok(verified) => verified,

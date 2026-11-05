@@ -13,10 +13,12 @@ use chrono::Utc;
 use tokio::task::JoinHandle;
 
 use super::error::repository_error_kind;
-use super::ports::PaymentClaimRepository;
+use super::ports::{ChannelRepository, PaymentClaimRepository};
 
 /// Claims older than this are purged: a day, against a one-hour maximum challenge lifetime.
 pub const CLAIM_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
+/// Finalized channel rows contain only ledger state and expire after thirty days.
+pub const CHANNEL_RETENTION: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
 // A claim must outlive every credential that could still redeem its payment: the longest
 // challenge plus the late-redemption window. Otherwise a purged claim could be spent again.
@@ -62,6 +64,46 @@ pub fn spawn_purge_task(repo: Arc<dyn PaymentClaimRepository>) -> Option<JoinHan
     spawn_purge_task_with(repo, PURGE_INTERVAL, CLAIM_RETENTION)
 }
 
+/// Purge finalized channels with a bounded database call. Active channels are retained.
+pub async fn purge_channels_once(repo: &dyn ChannelRepository) -> Option<u64> {
+    let Ok(retention) = chrono::Duration::from_std(CHANNEL_RETENTION) else {
+        return None;
+    };
+    match tokio::time::timeout(PURGE_TIMEOUT, repo.purge_finalized(Utc::now() - retention)).await {
+        Ok(Ok(purged)) => {
+            tracing::info!(purged, "MPP finalized channels purged");
+            Some(purged)
+        }
+        Ok(Err(_)) => {
+            tracing::warn!(outcome = "channel_purge_failed", "MPP channel purge failed");
+            None
+        }
+        Err(_) => {
+            tracing::warn!(
+                outcome = "channel_purge_timeout",
+                "MPP channel purge timed out"
+            );
+            None
+        }
+    }
+}
+
+/// Run alongside claim retention, only when sessions are configured.
+pub fn spawn_channel_purge_task(repo: Arc<dyn ChannelRepository>) -> Option<JoinHandle<()>> {
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        tracing::error!(outcome = "no_runtime", "MPP channel purge not started");
+        return None;
+    };
+    Some(runtime.spawn(async move {
+        let mut ticker = tokio::time::interval(PURGE_INTERVAL);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            ticker.tick().await;
+            purge_channels_once(repo.as_ref()).await;
+        }
+    }))
+}
+
 /// [`spawn_purge_task`] with explicit timing (tests).
 pub fn spawn_purge_task_with(
     repo: Arc<dyn PaymentClaimRepository>,
@@ -92,6 +134,45 @@ mod tests {
     use crate::mpp::testing::FlakyClaimRepository;
 
     const DAY: chrono::Duration = chrono::Duration::hours(24);
+
+    #[tokio::test]
+    async fn channel_purge_keeps_active_and_recent_finalized_rows() {
+        use crate::mpp::{
+            channel_memory::InMemoryChannelRepository, session::ChannelDescriptor, NewChannel,
+        };
+        let repo = InMemoryChannelRepository::new();
+        for id in [1, 2, 3] {
+            repo.open_or_refresh(NewChannel {
+                channel_id: [id; 32],
+                chain_id: 42431,
+                escrow: [0xee; 20],
+                descriptor: ChannelDescriptor {
+                    payer: [1; 20],
+                    payee: [2; 20],
+                    operator: [0; 20],
+                    token: [3; 20],
+                    salt: [id; 32],
+                    authorized_signer: [0; 20],
+                    expiring_nonce_hash: [id; 32],
+                },
+                deposit: 100,
+                settled_on_chain: 0,
+                highest_cumulative: 100,
+                highest_signature: [0; 65],
+            })
+            .await
+            .unwrap();
+        }
+        repo.finalize(&[2; 32], 0).await.unwrap();
+        repo.finalize(&[3; 32], 0).await.unwrap();
+        repo.age_channel(&[1; 32], DAY * 31);
+        repo.age_channel(&[2; 32], DAY * 31);
+        repo.age_channel(&[3; 32], DAY * 29);
+        assert_eq!(purge_channels_once(&repo).await, Some(1));
+        assert!(repo.get(&[1; 32]).await.unwrap().is_some());
+        assert!(repo.get(&[2; 32]).await.unwrap().is_none());
+        assert!(repo.get(&[3; 32]).await.unwrap().is_some());
+    }
 
     #[tokio::test]
     async fn purge_once_deletes_only_what_is_past_retention() {

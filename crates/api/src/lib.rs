@@ -1059,9 +1059,7 @@ fn build_cors_layer(cors_config: config::CorsConfig) -> CorsLayer {
     CorsLayer::new()
         .allow_origin(AllowOrigin::predicate(
             move |origin: &HeaderValue, request_parts: &axum::http::request::Parts| {
-                let path = request_parts.uri.path();
-                let is_admin_route = path == "/v1/admin" || path.starts_with("/v1/admin/");
-                if !is_admin_route {
+                if !middleware::admin_audit::is_admin_path(request_parts.uri.path()) {
                     return true;
                 }
 
@@ -1392,7 +1390,7 @@ pub fn build_app_with_config_and_options(
         .route("/.well-known/ohttp-gateway", get(ohttp_config))
         .with_state(app_state.clone());
 
-    Router::new()
+    let router = Router::new()
         .nest(
             "/v1",
             Router::new()
@@ -1426,7 +1424,21 @@ pub fn build_app_with_config_and_options(
         )
         .merge(openapi_routes)
         .merge(mcp_routes)
-        .merge(ohttp_root_routes)
+        .merge(ohttp_root_routes);
+
+    with_app_fallbacks_and_layers(router, metrics_state, cors)
+}
+
+/// Wrap the assembled routes in the app-wide fallbacks and middleware.
+///
+/// Layers added later wrap earlier ones, so a request passes them bottom-up.
+/// All of them run after Axum routing, so `MatchedPath` is available.
+fn with_app_fallbacks_and_layers(
+    router: Router,
+    metrics_state: middleware::MetricsState,
+    cors: CorsLayer,
+) -> Router {
+    router
         // Requests matching no route (or no method on a matched route) get a
         // stable generic JSON envelope instead of Axum's default empty-body
         // 404/405 (nearai/infra#192).
@@ -1447,6 +1459,10 @@ pub fn build_app_with_config_and_options(
         // endpoints) sign the *request* body hash, not the HTTP response body,
         // so compression is safe for them as well.
         .layer(CompressionLayer::new())
+        // One audit event per /v1/admin/* request, including CORS preflights
+        // and unmatched admin paths: after routing (MatchedPath), outside
+        // CORS, and inside request correlation, whose request id it reuses.
+        .layer(from_fn(middleware::admin_audit_middleware))
         .layer(from_fn(middleware::request_correlation_middleware))
         // Outermost response pass: every client-facing 429 gets a
         // machine-readable Retry-After header (SDK backoff honors it).

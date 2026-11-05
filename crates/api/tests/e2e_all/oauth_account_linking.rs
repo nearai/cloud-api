@@ -227,7 +227,7 @@ async fn oauth_verified_email_callback_auto_links_and_signs_into_original_accoun
                     .validate_session_access(token.into(), test_config().auth.encoding_key)
                     .await
                     .unwrap();
-                assert_eq!(signed_in.id, user.id);
+                assert_eq!(signed_in.user.id, user.id);
             } else {
                 assert_eq!(response.status_code(), 409);
                 assert_eq!(body["error"], "oauth_provider_conflict");
@@ -282,6 +282,7 @@ async fn oauth_google_gmail_callback_auto_links_without_hosted_domain() {
         auth.validate_session_access(token, test_config().auth.encoding_key)
             .await
             .unwrap()
+            .user
             .id,
         user.id
     );

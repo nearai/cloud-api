@@ -6,6 +6,11 @@
 //!
 //! Secrets (`MPP_SECRET_KEY`, `MPP_SERVICE_API_KEY`) follow the repo pattern: a value in
 //! the environment or a file path in the matching `*_FILE` variable, redacted in `Debug`.
+//!
+//! The `session` intent (payment channels, billed per token) is on for a deployment when at
+//! least one model in `MPP_MODEL_PRICES` has a `token_price`; it then also needs the payee's
+//! signer key (`MPP_TEMPO_SIGNER_KEY`) and reads the `MPP_SESSION_*` / `MPP_SETTLE_*` /
+//! `MPP_CLOSE_*` tuning below. Those are validated whenever MPP is enabled, used or not.
 
 use serde::de::{Deserializer, MapAccess, Visitor};
 use serde::Deserialize;
@@ -23,6 +28,19 @@ pub const DEFAULT_MPP_RPC_TIMEOUT_SECS: u64 = 15;
 pub const MAX_MPP_RPC_TIMEOUT_SECS: u64 = 120;
 /// The HMAC key must be at least this long (matches the reference implementation).
 pub const MIN_MPP_SECRET_KEY_BYTES: usize = 32;
+/// Deposit suggested in a session challenge, in token base units (1 pathUSD at 6 decimals).
+pub const DEFAULT_MPP_SESSION_SUGGESTED_DEPOSIT: u128 = 1_000_000;
+/// The channel precompile stores a deposit as a `uint96`.
+pub const MAX_MPP_SESSION_DEPOSIT: u128 = (1u128 << 96) - 1;
+pub const DEFAULT_MPP_SETTLE_INTERVAL_SECS: u64 = 3600;
+pub const MIN_MPP_SETTLE_INTERVAL_SECS: u64 = 60;
+/// Spent-since-last-settlement that triggers a settlement, in token base units.
+pub const DEFAULT_MPP_SETTLE_AMOUNT: u128 = 5_000_000;
+pub const DEFAULT_MPP_CLOSE_SUPERVISION_SECS: u64 = 60;
+pub const MIN_MPP_CLOSE_SUPERVISION_SECS: u64 = 10;
+pub const MAX_MPP_CLOSE_SUPERVISION_SECS: u64 = 300;
+/// Without `MPP_SESSION_MIN_VOUCHER_DELTA`, a voucher must rise by this many tokens' worth.
+pub const DEFAULT_MPP_MIN_VOUCHER_DELTA_TOKENS: u128 = 64;
 
 /// MPP settings: either off, or fully validated.
 #[derive(Clone, Default)]
@@ -69,8 +87,10 @@ pub struct MppSettings {
     pub service_api_key: String,
     pub challenge_ttl_secs: u64,
     pub tempo: MppTempoSettings,
-    /// Flat per-request price per model name.
+    /// Price per model name: a flat per-request price, a per-token price, or both.
     pub model_prices: BTreeMap<String, MppModelPrice>,
+    /// The `session` intent. `Some` exactly when a model has a `token_price`.
+    pub session: Option<MppSessionSettings>,
 }
 
 impl fmt::Debug for MppSettings {
@@ -82,6 +102,43 @@ impl fmt::Debug for MppSettings {
             .field("challenge_ttl_secs", &self.challenge_ttl_secs)
             .field("tempo", &self.tempo)
             .field("model_prices", &self.model_prices)
+            .field("session", &self.session)
+            .finish()
+    }
+}
+
+/// Settings of the `session` intent (TIP-1034 payment channels).
+#[derive(Clone, PartialEq, Eq)]
+pub struct MppSessionSettings {
+    /// The payee's secp256k1 key: 32 bytes of hex, `0x` optional. Present whenever sessions
+    /// are on. The scalar is checked where the signer is built. Never logged.
+    pub signer_key: Option<String>,
+    /// Smallest rise, in token base units, between two vouchers of a channel. `None` means
+    /// the model's `token_price` times [`DEFAULT_MPP_MIN_VOUCHER_DELTA_TOKENS`], computed
+    /// where it is used.
+    pub min_voucher_delta: Option<u128>,
+    /// Deposit a session challenge suggests to the payer, in token base units.
+    pub suggested_deposit: u128,
+    /// Longest time between two settlements of a channel with unsettled spend.
+    pub settle_interval_secs: u64,
+    /// Settle a channel once this much was spent since its last settlement.
+    pub settle_amount: u128,
+    /// How often the close supervision looks at channels with a close in flight.
+    pub close_supervision_secs: u64,
+}
+
+impl fmt::Debug for MppSessionSettings {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MppSessionSettings")
+            .field(
+                "signer_key",
+                &self.signer_key.as_ref().map(|_| "<redacted>"),
+            )
+            .field("min_voucher_delta", &self.min_voucher_delta)
+            .field("suggested_deposit", &self.suggested_deposit)
+            .field("settle_interval_secs", &self.settle_interval_secs)
+            .field("settle_amount", &self.settle_amount)
+            .field("close_supervision_secs", &self.close_supervision_secs)
             .finish()
     }
 }
@@ -110,11 +167,14 @@ impl fmt::Debug for MppTempoSettings {
     }
 }
 
-/// One model's flat price and the request limits that keep the price honest.
+/// One model's price and the request limits that keep the price honest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MppModelPrice {
-    /// Price per request in token base units. Always greater than zero.
+    /// Flat price per request (`charge` intent) in token base units. Greater than zero, or
+    /// zero for a model that only has a `token_price`: it cannot be paid per request.
     pub amount: u128,
+    /// Price per token (`session` intent) in token base units. Greater than zero when set.
+    pub token_price: Option<u128>,
     /// Largest `max_tokens` / `max_completion_tokens` a paid request may ask for.
     pub max_tokens: u32,
     /// Largest request body, in bytes, a paid request may send.
@@ -162,6 +222,7 @@ impl MppSettings {
             rpc_timeout_secs,
         };
         let model_prices = parse_model_prices(&required_env("MPP_MODEL_PRICES")?)?;
+        let session = MppSessionSettings::from_env(&model_prices)?;
         Ok(Self {
             realm,
             secret_key,
@@ -169,8 +230,112 @@ impl MppSettings {
             challenge_ttl_secs,
             tempo,
             model_prices,
+            session,
         })
     }
+}
+
+impl MppSessionSettings {
+    /// Parse and validate every session variable; `Some` only when a model has a
+    /// `token_price`, which is also when the signer key becomes required.
+    fn from_env(model_prices: &BTreeMap<String, MppModelPrice>) -> Result<Option<Self>, String> {
+        let signer_key = parse_signer_key()?;
+        let min_voucher_delta = optional_amount_env("MPP_SESSION_MIN_VOUCHER_DELTA")?;
+        let suggested_deposit = amount_env(
+            "MPP_SESSION_SUGGESTED_DEPOSIT",
+            DEFAULT_MPP_SESSION_SUGGESTED_DEPOSIT,
+        )?;
+        if suggested_deposit > MAX_MPP_SESSION_DEPOSIT {
+            return Err("MPP_SESSION_SUGGESTED_DEPOSIT must fit in 96 bits".to_string());
+        }
+        let settle_interval_secs =
+            parse_u64_env("MPP_SETTLE_INTERVAL_SECS", DEFAULT_MPP_SETTLE_INTERVAL_SECS)?;
+        if settle_interval_secs < MIN_MPP_SETTLE_INTERVAL_SECS {
+            return Err(format!(
+                "MPP_SETTLE_INTERVAL_SECS must be at least {MIN_MPP_SETTLE_INTERVAL_SECS}"
+            ));
+        }
+        let settle_amount = amount_env("MPP_SETTLE_AMOUNT", DEFAULT_MPP_SETTLE_AMOUNT)?;
+        let close_supervision_secs = parse_u64_env(
+            "MPP_CLOSE_SUPERVISION_SECS",
+            DEFAULT_MPP_CLOSE_SUPERVISION_SECS,
+        )?;
+        if !(MIN_MPP_CLOSE_SUPERVISION_SECS..=MAX_MPP_CLOSE_SUPERVISION_SECS)
+            .contains(&close_supervision_secs)
+        {
+            return Err(format!(
+                "MPP_CLOSE_SUPERVISION_SECS must be between {MIN_MPP_CLOSE_SUPERVISION_SECS} and {MAX_MPP_CLOSE_SUPERVISION_SECS}"
+            ));
+        }
+        if !model_prices
+            .values()
+            .any(|price| price.token_price.is_some())
+        {
+            return Ok(None);
+        }
+        if signer_key.is_none() {
+            return Err(
+                "MPP_TEMPO_SIGNER_KEY or MPP_TEMPO_SIGNER_KEY_FILE must be set when a model in MPP_MODEL_PRICES has a token_price"
+                    .to_string(),
+            );
+        }
+        Ok(Some(Self {
+            signer_key,
+            min_voucher_delta,
+            suggested_deposit,
+            settle_interval_secs,
+            settle_amount,
+            close_supervision_secs,
+        }))
+    }
+}
+
+/// The payee key from `MPP_TEMPO_SIGNER_KEY` or the trimmed content of
+/// `MPP_TEMPO_SIGNER_KEY_FILE`; both set is an error. Only the shape is checked here (32 bytes
+/// of hex, `0x` optional); an error never carries the value.
+fn parse_signer_key() -> Result<Option<String>, String> {
+    const VALUE: &str = "MPP_TEMPO_SIGNER_KEY";
+    const FILE: &str = "MPP_TEMPO_SIGNER_KEY_FILE";
+    let raw = match (non_empty_env(FILE), non_empty_env(VALUE)) {
+        (Some(_), Some(_)) => return Err(format!("set only one of {VALUE} and {FILE}")),
+        (Some(path), None) => std::fs::read_to_string(&path)
+            .map(|content| content.trim().to_string())
+            .map_err(|_| format!("failed to read {FILE}"))?,
+        (None, Some(value)) => value,
+        (None, None) => return Ok(None),
+    };
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    let digits = raw.strip_prefix("0x").unwrap_or(&raw);
+    if digits.len() != 64 || !digits.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(format!(
+            "{VALUE} must be 32 bytes of hex (64 hex digits, 0x optional)"
+        ));
+    }
+    Ok(Some(raw))
+}
+
+/// A decimal string above zero that fits in 128 bits: digits only, no sign or fraction.
+fn parse_amount(raw: &str) -> Option<u128> {
+    let digits_only = !raw.is_empty() && raw.bytes().all(|b| b.is_ascii_digit());
+    digits_only
+        .then(|| raw.parse::<u128>().ok())
+        .flatten()
+        .filter(|amount| *amount > 0)
+}
+
+fn optional_amount_env(key: &str) -> Result<Option<u128>, String> {
+    non_empty_env(key)
+        .map(|raw| {
+            parse_amount(&raw)
+                .ok_or_else(|| format!("{key} must be a decimal integer above zero (128 bits)"))
+        })
+        .transpose()
+}
+
+fn amount_env(key: &str, default: u128) -> Result<u128, String> {
+    Ok(optional_amount_env(key)?.unwrap_or(default))
 }
 
 fn required_env(key: &str) -> Result<String, String> {
@@ -239,9 +404,17 @@ pub fn parse_address(key: &str, raw: &str) -> Result<String, String> {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawModelPrice {
-    amount: String,
+    #[serde(default, deserialize_with = "present_string")]
+    amount: Option<String>,
+    #[serde(default, deserialize_with = "present_string")]
+    token_price: Option<String>,
     max_tokens: u32,
     max_request_bytes: u32,
+}
+
+/// An optional field that must be a string when present (a `null` is refused).
+fn present_string<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<String>, D::Error> {
+    String::deserialize(deserializer).map(Some)
 }
 
 /// A JSON object that rejects a repeated key, so a duplicated model name cannot silently
@@ -286,15 +459,23 @@ pub fn parse_model_prices(raw: &str) -> Result<BTreeMap<String, MppModelPrice>, 
         if model.is_empty() || model.trim() != model {
             return Err("MPP_MODEL_PRICES has an empty or padded model name".to_string());
         }
-        let digits_only =
-            !price.amount.is_empty() && price.amount.bytes().all(|b| b.is_ascii_digit());
-        let amount = digits_only
-            .then(|| price.amount.parse::<u128>().ok())
-            .flatten()
-            .filter(|amount| *amount > 0)
-            .ok_or_else(|| {
+        if price.amount.is_none() && price.token_price.is_none() {
+            return Err(format!(
+                "MPP_MODEL_PRICES entry for {model} needs an amount, a token_price, or both"
+            ));
+        }
+        let amount = match &price.amount {
+            Some(raw) => parse_amount(raw).ok_or_else(|| {
                 format!("MPP_MODEL_PRICES amount for {model} must be a decimal string above zero that fits in 128 bits")
-            })?;
+            })?,
+            None => 0,
+        };
+        let token_price = match &price.token_price {
+            Some(raw) => Some(parse_amount(raw).ok_or_else(|| {
+                format!("MPP_MODEL_PRICES token_price for {model} must be a decimal string above zero that fits in 128 bits")
+            })?),
+            None => None,
+        };
         if price.max_tokens == 0 || price.max_request_bytes == 0 {
             return Err(format!(
                 "MPP_MODEL_PRICES limits for {model} must be greater than zero"
@@ -304,6 +485,7 @@ pub fn parse_model_prices(raw: &str) -> Result<BTreeMap<String, MppModelPrice>, 
             model,
             MppModelPrice {
                 amount,
+                token_price,
                 max_tokens: price.max_tokens,
                 max_request_bytes: price.max_request_bytes,
             },
@@ -313,271 +495,4 @@ pub fn parse_model_prices(raw: &str) -> Result<BTreeMap<String, MppModelPrice>, 
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use serial_test::serial;
-
-    const KEYS: [&str; 13] = [
-        "MPP_ENABLED",
-        "MPP_REALM",
-        "MPP_SECRET_KEY",
-        "MPP_SECRET_KEY_FILE",
-        "MPP_SERVICE_API_KEY",
-        "MPP_SERVICE_API_KEY_FILE",
-        "MPP_CHALLENGE_TTL_SECS",
-        "MPP_TEMPO_RPC_URL",
-        "MPP_TEMPO_CHAIN_ID",
-        "MPP_TEMPO_CURRENCY",
-        "MPP_TEMPO_RECIPIENT",
-        "MPP_RPC_TIMEOUT_SECS",
-        "MPP_MODEL_PRICES",
-    ];
-
-    const SECRET: &str = "0123456789abcdef0123456789abcdef-hmac";
-    const PRICES: &str =
-        r#"{"zai-org/GLM-5":{"amount":"20000","max_tokens":2048,"max_request_bytes":65536}}"#;
-
-    fn clear() {
-        for key in KEYS {
-            std::env::remove_var(key);
-        }
-    }
-
-    fn set_valid() {
-        clear();
-        std::env::set_var("MPP_ENABLED", "true");
-        std::env::set_var("MPP_REALM", "cloud-api.near.ai");
-        std::env::set_var("MPP_SECRET_KEY", SECRET);
-        std::env::set_var("MPP_SERVICE_API_KEY", "sk-live-service-key-0001");
-        std::env::set_var("MPP_TEMPO_RPC_URL", "https://rpc.moderato.tempo.xyz");
-        std::env::set_var("MPP_TEMPO_CHAIN_ID", "42431");
-        std::env::set_var(
-            "MPP_TEMPO_CURRENCY",
-            "0x20C0000000000000000000000000000000000000",
-        );
-        std::env::set_var(
-            "MPP_TEMPO_RECIPIENT",
-            "0xAbCdEf0123456789aBcDeF0123456789AbCdEf01",
-        );
-        std::env::set_var("MPP_MODEL_PRICES", PRICES);
-    }
-
-    #[test]
-    #[serial]
-    fn disabled_by_default_and_reads_nothing_else() {
-        clear();
-        // Garbage in every other variable must not matter while disabled.
-        std::env::set_var("MPP_MODEL_PRICES", "not json");
-        std::env::set_var("MPP_SECRET_KEY", "short");
-        assert!(MppConfig::from_env().unwrap().settings().is_none());
-        std::env::set_var("MPP_ENABLED", "false");
-        assert!(MppConfig::from_env().unwrap().settings().is_none());
-        clear();
-    }
-
-    #[test]
-    #[serial]
-    fn enabled_with_valid_values_normalizes_addresses() {
-        set_valid();
-        let config = MppConfig::from_env().unwrap();
-        let settings = config.settings().unwrap();
-        assert_eq!(settings.realm, "cloud-api.near.ai");
-        assert_eq!(settings.challenge_ttl_secs, 600);
-        assert_eq!(settings.tempo.rpc_timeout_secs, 15);
-        assert_eq!(settings.tempo.chain_id, 42431);
-        assert_eq!(
-            settings.tempo.currency,
-            "0x20c0000000000000000000000000000000000000"
-        );
-        assert_eq!(
-            settings.tempo.recipient,
-            "0xabcdef0123456789abcdef0123456789abcdef01"
-        );
-        let price = settings.model_prices["zai-org/GLM-5"];
-        assert_eq!(price.amount, 20_000);
-        assert_eq!(price.max_tokens, 2048);
-        clear();
-    }
-
-    #[test]
-    #[serial]
-    fn enabled_requires_every_value() {
-        for missing in [
-            "MPP_REALM",
-            "MPP_SECRET_KEY",
-            "MPP_SERVICE_API_KEY",
-            "MPP_TEMPO_RPC_URL",
-            "MPP_TEMPO_CHAIN_ID",
-            "MPP_TEMPO_CURRENCY",
-            "MPP_TEMPO_RECIPIENT",
-            "MPP_MODEL_PRICES",
-        ] {
-            set_valid();
-            std::env::remove_var(missing);
-            let error = MppConfig::from_env().unwrap_err();
-            assert!(error.contains(missing), "{missing}: {error}");
-        }
-        clear();
-    }
-
-    #[test]
-    #[serial]
-    fn rejects_weak_or_malformed_values() {
-        let cases: [(&str, &str, &str); 9] = [
-            ("MPP_SECRET_KEY", "too-short", "MPP_SECRET_KEY"),
-            (
-                "MPP_SERVICE_API_KEY",
-                "not-an-sk-key",
-                "MPP_SERVICE_API_KEY",
-            ),
-            ("MPP_REALM", "bad realm!", "MPP_REALM"),
-            ("MPP_CHALLENGE_TTL_SECS", "59", "MPP_CHALLENGE_TTL_SECS"),
-            ("MPP_CHALLENGE_TTL_SECS", "3601", "MPP_CHALLENGE_TTL_SECS"),
-            ("MPP_RPC_TIMEOUT_SECS", "0", "MPP_RPC_TIMEOUT_SECS"),
-            ("MPP_TEMPO_CHAIN_ID", "0", "MPP_TEMPO_CHAIN_ID"),
-            ("MPP_TEMPO_CURRENCY", "0x1234", "MPP_TEMPO_CURRENCY"),
-            (
-                "MPP_TEMPO_RPC_URL",
-                "http://rpc.example.com",
-                "MPP_TEMPO_RPC_URL",
-            ),
-        ];
-        for (key, value, expected) in cases {
-            set_valid();
-            std::env::set_var(key, value);
-            let error = MppConfig::from_env().unwrap_err();
-            assert!(error.contains(expected), "{key}: {error}");
-        }
-        clear();
-    }
-
-    #[test]
-    #[serial]
-    fn ttl_bounds_are_inclusive() {
-        for ttl in ["60", "3600"] {
-            set_valid();
-            std::env::set_var("MPP_CHALLENGE_TTL_SECS", ttl);
-            assert!(MppConfig::from_env().is_ok(), "{ttl}");
-        }
-        clear();
-    }
-
-    #[test]
-    #[serial]
-    fn secrets_load_from_files() {
-        set_valid();
-        std::env::remove_var("MPP_SECRET_KEY");
-        std::env::remove_var("MPP_SERVICE_API_KEY");
-        let dir = tempfile::tempdir().unwrap();
-        let secret_path = dir.path().join("secret");
-        let key_path = dir.path().join("key");
-        std::fs::write(&secret_path, format!("{SECRET}\n")).unwrap();
-        std::fs::write(&key_path, "sk-live-from-file-0002\n").unwrap();
-        std::env::set_var("MPP_SECRET_KEY_FILE", &secret_path);
-        std::env::set_var("MPP_SERVICE_API_KEY_FILE", &key_path);
-        let config = MppConfig::from_env().unwrap();
-        let settings = config.settings().unwrap();
-        assert_eq!(settings.secret_key, SECRET);
-        assert_eq!(settings.service_api_key, "sk-live-from-file-0002");
-        clear();
-    }
-
-    #[test]
-    #[serial]
-    fn debug_redacts_secrets_and_rpc_url() {
-        set_valid();
-        std::env::set_var(
-            "MPP_TEMPO_RPC_URL",
-            "https://rpc.example.com/v1/provider-key-xyz",
-        );
-        let config = MppConfig::from_env().unwrap();
-        let debug = format!("{config:?}");
-        assert!(debug.contains("<redacted>"));
-        assert!(!debug.contains(SECRET));
-        assert!(!debug.contains("sk-live-service-key-0001"));
-        assert!(!debug.contains("provider-key-xyz"));
-        clear();
-    }
-
-    #[test]
-    fn rpc_url_allows_https_and_loopback_http_only() {
-        assert!(parse_rpc_url("https://rpc.moderato.tempo.xyz").is_ok());
-        assert!(parse_rpc_url("http://127.0.0.1:8545").is_ok());
-        assert!(parse_rpc_url("http://localhost:8545/").is_ok());
-        assert!(parse_rpc_url("http://[::1]:8545").is_ok());
-        assert!(parse_rpc_url("http://rpc.example.com").is_err());
-        assert!(parse_rpc_url("http://127.0.0.1.evil.example").is_err());
-        assert!(parse_rpc_url("ftp://localhost").is_err());
-        assert!(parse_rpc_url("not a url").is_err());
-    }
-
-    #[test]
-    fn model_prices_parse_strictly() {
-        let ok = parse_model_prices(PRICES).unwrap();
-        assert_eq!(ok.len(), 1);
-
-        for (label, raw) in [
-            ("empty table", "{}"),
-            ("not json", "nope"),
-            ("array", "[]"),
-            (
-                "unknown field",
-                r#"{"m":{"amount":"1","max_tokens":1,"max_request_bytes":1,"fee":1}}"#,
-            ),
-            ("missing field", r#"{"m":{"amount":"1","max_tokens":1}}"#),
-            (
-                "zero amount",
-                r#"{"m":{"amount":"0","max_tokens":1,"max_request_bytes":1}}"#,
-            ),
-            (
-                "numeric amount",
-                r#"{"m":{"amount":5,"max_tokens":1,"max_request_bytes":1}}"#,
-            ),
-            (
-                "signed amount",
-                r#"{"m":{"amount":"+5","max_tokens":1,"max_request_bytes":1}}"#,
-            ),
-            (
-                "fractional amount",
-                r#"{"m":{"amount":"1.5","max_tokens":1,"max_request_bytes":1}}"#,
-            ),
-            (
-                "amount over u128",
-                r#"{"m":{"amount":"340282366920938463463374607431768211456","max_tokens":1,"max_request_bytes":1}}"#,
-            ),
-            (
-                "zero token cap",
-                r#"{"m":{"amount":"1","max_tokens":0,"max_request_bytes":1}}"#,
-            ),
-            (
-                "zero size cap",
-                r#"{"m":{"amount":"1","max_tokens":1,"max_request_bytes":0}}"#,
-            ),
-            (
-                "padded model name",
-                r#"{" m":{"amount":"1","max_tokens":1,"max_request_bytes":1}}"#,
-            ),
-            (
-                "duplicate model",
-                r#"{"m":{"amount":"1","max_tokens":1,"max_request_bytes":1},"m":{"amount":"2","max_tokens":1,"max_request_bytes":1}}"#,
-            ),
-        ] {
-            assert!(parse_model_prices(raw).is_err(), "{label} must be rejected");
-        }
-    }
-
-    #[test]
-    fn u128_max_amount_is_accepted() {
-        let raw = r#"{"m":{"amount":"340282366920938463463374607431768211455","max_tokens":1,"max_request_bytes":1}}"#;
-        assert_eq!(parse_model_prices(raw).unwrap()["m"].amount, u128::MAX);
-    }
-
-    #[test]
-    fn realm_must_be_an_ascii_host() {
-        assert!(parse_realm("cloud-api.near.ai").is_ok());
-        assert!(parse_realm("localhost").is_ok());
-        for bad in ["", ".x", "x.", "-x", "a b", "a\"b", "é.com", "a/b", "a:80"] {
-            assert!(parse_realm(bad).is_err(), "{bad}");
-        }
-    }
-}
+mod tests;

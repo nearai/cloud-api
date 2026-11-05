@@ -70,6 +70,7 @@ fn settings(service_key: &str) -> MppSettings {
         MODEL.to_string(),
         MppModelPrice {
             amount: AMOUNT,
+            token_price: None,
             max_tokens: 2048,
             max_request_bytes: 4096,
         },
@@ -79,6 +80,7 @@ fn settings(service_key: &str) -> MppSettings {
         "zai-org/GLM-5-long".to_string(),
         MppModelPrice {
             amount: AMOUNT,
+            token_price: None,
             max_tokens: 2048,
             max_request_bytes: 65_536,
         },
@@ -96,6 +98,7 @@ fn settings(service_key: &str) -> MppSettings {
             rpc_timeout_secs: 5,
         },
         model_prices: prices,
+        session: None,
     }
 }
 
@@ -847,7 +850,10 @@ async fn an_expired_challenge_is_payment_expired() {
             old,
             CHAT_COMPLETIONS_ROUTE,
             &body(),
-            &services::mpp::Price { amount: AMOUNT },
+            &services::mpp::Price {
+                amount: AMOUNT,
+                token_price: None,
+            },
         )
         .unwrap();
     let credential = credential_header(&challenge, hash_payload(TX), None);

@@ -21,6 +21,8 @@ pub mod abi;
 pub mod channel;
 #[cfg(any(test, feature = "test-mocks"))]
 pub mod channel_memory;
+#[cfg(test)]
+mod channel_memory_tests;
 pub mod eip712;
 pub mod error;
 #[cfg(any(test, feature = "test-mocks"))]

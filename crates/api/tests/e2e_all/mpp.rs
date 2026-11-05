@@ -267,6 +267,7 @@ fn mpp_settings(rpc_url: &str, service_key: &str) -> MppSettings {
         E2E_QWEN_MODEL_NAME.to_string(),
         MppModelPrice {
             amount: AMOUNT,
+            token_price: None,
             max_tokens: 256,
             max_request_bytes: 8192,
         },
@@ -284,6 +285,7 @@ fn mpp_settings(rpc_url: &str, service_key: &str) -> MppSettings {
             rpc_timeout_secs: 5,
         },
         model_prices: prices,
+        session: None,
     }
 }
 

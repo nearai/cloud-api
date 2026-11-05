@@ -574,7 +574,10 @@ async fn a_transaction_credential_cannot_broadcast_after_the_challenge_expired()
             issued,
             CHAT_COMPLETIONS_ROUTE,
             &body(),
-            &Price { amount: AMOUNT },
+            &Price {
+                amount: AMOUNT,
+                token_price: None,
+            },
         )
         .unwrap();
     let raw = payment_transaction(&paying(&challenge, 5));

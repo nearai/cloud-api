@@ -23,7 +23,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, TimeZone, Utc};
-use config::{MppModelPrice, MppSettings};
+use config::{MppModelPrice, MppSessionSettings, MppSettings};
 
 use super::error::{MppError, VerifyFailure};
 use super::ports::{PaymentClaimRepository, TempoRpc};
@@ -102,6 +102,7 @@ pub struct MppService {
     recipient: [u8; 20],
     recipient_hex: String,
     prices: BTreeMap<String, MppModelPrice>,
+    session: Option<MppSessionSettings>,
     /// The largest `max_request_bytes` of any priced model: a longer body is never parsed.
     largest_priced_body: usize,
     repo: Arc<dyn PaymentClaimRepository>,
@@ -152,6 +153,7 @@ impl MppService {
             recipient,
             recipient_hex,
             prices: settings.model_prices.clone(),
+            session: settings.session.clone(),
             largest_priced_body: settings
                 .model_prices
                 .values()
@@ -195,6 +197,11 @@ impl MppService {
         self
     }
 
+    /// The `session` intent's settings: `Some` when a model has a `token_price`.
+    pub fn session_settings(&self) -> Option<&MppSessionSettings> {
+        self.session.as_ref()
+    }
+
     /// The `sk-` key MPP traffic is authenticated and metered under.
     pub fn service_api_key(&self) -> &str {
         &self.service_api_key
@@ -231,6 +238,7 @@ impl MppService {
             Some(violation) => Pricing::Violation(violation),
             None => Pricing::Priced(Price {
                 amount: price.amount,
+                token_price: price.token_price,
             }),
         }
     }
@@ -267,6 +275,10 @@ impl MppService {
         body: &[u8],
         price: &Price,
     ) -> Result<Challenge, MppError> {
+        // A model with only a token price cannot be paid per request.
+        if !price.is_chargeable() {
+            return Err(MppError::Limit(LimitViolation::ModelNotPriced));
+        }
         let request = ChargeRequest {
             amount: price.amount,
             currency: self.currency_hex.clone(),

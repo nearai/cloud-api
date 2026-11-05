@@ -47,6 +47,7 @@ fn settings() -> MppSettings {
         MODEL.to_string(),
         MppModelPrice {
             amount: AMOUNT,
+            token_price: None,
             max_tokens: 2048,
             max_request_bytes: 4096,
         },
@@ -55,6 +56,7 @@ fn settings() -> MppSettings {
         BIG_MODEL.to_string(),
         MppModelPrice {
             amount: AMOUNT * 2,
+            token_price: None,
             max_tokens: 4096,
             max_request_bytes: BIG_BODY_CAP as u32,
         },
@@ -72,6 +74,7 @@ fn settings() -> MppSettings {
             rpc_timeout_secs: 5,
         },
         model_prices: prices,
+        session: None,
     }
 }
 
@@ -133,7 +136,10 @@ fn flat_price_applies_when_the_limits_hold() {
     let f = fixture();
     assert_eq!(
         f.service.price_body(&body()),
-        Pricing::Priced(Price { amount: AMOUNT })
+        Pricing::Priced(Price {
+            amount: AMOUNT,
+            token_price: None,
+        })
     );
     // n = 1 explicitly, null n, and the exact caps are fine.
     for extra in [
@@ -148,7 +154,10 @@ fn flat_price_applies_when_the_limits_hold() {
             .extend(extra.as_object().unwrap().clone());
         assert_eq!(
             priced(&f.service, request),
-            Pricing::Priced(Price { amount: AMOUNT })
+            Pricing::Priced(Price {
+                amount: AMOUNT,
+                token_price: None,
+            })
         );
     }
 }
@@ -331,7 +340,10 @@ fn challenge_is_hmac_bound_and_expires_after_the_ttl() {
     let now = DateTime::parse_from_rfc3339("2030-01-01T00:00:00.789Z")
         .unwrap()
         .with_timezone(&Utc);
-    let price = Price { amount: AMOUNT };
+    let price = Price {
+        amount: AMOUNT,
+        token_price: None,
+    };
     let challenge = f
         .service
         .challenge_at(now, CHAT_COMPLETIONS_ROUTE, &body(), &price)
@@ -710,7 +722,10 @@ fn a_credential_verifies_until_the_late_redemption_window_closes() {
             issued,
             CHAT_COMPLETIONS_ROUTE,
             &body(),
-            &Price { amount: AMOUNT },
+            &Price {
+                amount: AMOUNT,
+                token_price: None,
+            },
         )
         .unwrap();
     let header = credential_header(&challenge, hash_payload([1; 32]), None);

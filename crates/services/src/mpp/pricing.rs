@@ -178,8 +178,18 @@ impl RequestShape {
 /// The price of a request that passed its limits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Price {
-    /// Token base units.
+    /// Flat price of one request (`charge` intent), in token base units. Zero for a model
+    /// that only has a `token_price`: it can be paid for through a session only.
     pub amount: u128,
+    /// Price of one token (`session` intent), in token base units.
+    pub token_price: Option<u128>,
+}
+
+impl Price {
+    /// Whether a `charge` challenge can be issued for this price.
+    pub fn is_chargeable(&self) -> bool {
+        self.amount > 0
+    }
 }
 
 /// Result of pricing one request body.
@@ -197,6 +207,24 @@ pub enum Pricing {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_session_only_price_is_not_chargeable() {
+        let both = Price {
+            amount: 5,
+            token_price: Some(2),
+        };
+        let charge_only = Price {
+            amount: 5,
+            token_price: None,
+        };
+        let session_only = Price {
+            amount: 0,
+            token_price: Some(2),
+        };
+        assert!(both.is_chargeable() && charge_only.is_chargeable());
+        assert!(!session_only.is_chargeable());
+    }
 
     fn shape(value: serde_json::Value) -> Option<RequestShape> {
         RequestShape::from_body(value.to_string().as_bytes())

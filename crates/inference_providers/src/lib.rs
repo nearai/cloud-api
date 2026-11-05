@@ -706,6 +706,10 @@ pub trait InferenceProvider {
     /// Reports for the serving backends behind this provider. Providers without
     /// backend discovery retain their single-report contract. A fleet override
     /// must not silently return a partial collection after a fetch failure.
+    /// Success must contain at least one report. Use `SigningAddressNotFound`
+    /// when no backend matches a requested signer, or `ProviderNotFound` when
+    /// the provider has no serving backends; an empty successful collection is
+    /// a contract violation and fails the whole source group.
     async fn get_attestation_reports(
         &self,
         model: String,

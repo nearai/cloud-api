@@ -68,6 +68,12 @@ impl Fleet {
             .map_err(|e| AttestationError::FetchError(e.without_url().to_string()))?;
 
         if response.status() == reqwest::StatusCode::NOT_FOUND {
+            if query.signing_address.is_none() {
+                return Err(AttestationError::FetchError(format!(
+                    "Backend returned no attestation report for model {} (HTTP 404)",
+                    query.model
+                )));
+            }
             return Err(AttestationError::SigningAddressNotFound(
                 query.signing_address.clone().unwrap_or_default(),
             ));
@@ -76,7 +82,10 @@ impl Fleet {
             return Err(AttestationError::FetchError(format!(
                 "HTTP {}: {}",
                 response.status(),
-                response.text().await.unwrap_or_default()
+                response.text().await.unwrap_or_else(|error| format!(
+                    "Failed to read error response body: {}",
+                    error.without_url()
+                ))
             )));
         }
         response
@@ -89,11 +98,7 @@ impl Fleet {
         &self,
         query: ReportQuery,
     ) -> Result<Vec<Map<String, Value>>, AttestationError> {
-        let parts = url::Url::parse(&self.config.base_url)
-            .ok()
-            .as_ref()
-            .and_then(rotation::split_inference_url);
-        let Some(parts) = parts else {
+        let Some(parts) = self.attestation_rotation_parts() else {
             return self
                 .fetch_attestation_at(&self.client, &self.config.base_url, &query)
                 .await
@@ -109,7 +114,7 @@ impl Fleet {
         // Model requests retain the same fingerprint policy as the Fleet.
         let model_client = self.report_client(self.fingerprint_state.clone())?;
 
-        self.collect_indexed_reports(&parts, &count_client, &model_client, &query)
+        self.collect_indexed_reports(parts, &count_client, &model_client, &query)
             .await
     }
 
@@ -188,7 +193,14 @@ impl Fleet {
         // known-partial set. Equal counts cannot rule out same-size membership
         // replacement; index routing is a discovery observation, not an atomic
         // fleet snapshot.
-        if read_backend_count(count_client, parts).await? != count {
+        let rechecked_count = read_backend_count(count_client, parts)
+            .await
+            .map_err(|error| {
+                AttestationError::FetchError(format!(
+                    "Backend count recheck failed after querying {count} backends: {error}"
+                ))
+            })?;
+        if rechecked_count != count {
             return Err(AttestationError::FetchError(
                 "Backend count changed during attestation collection".into(),
             ));

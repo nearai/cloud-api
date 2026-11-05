@@ -4237,6 +4237,52 @@ impl InferenceProviderPool {
         }
     }
 
+    /// Collect one report from the first successful provider for ITA's single
+    /// GPU evidence set. Keep this separate from Gateway fleet collection:
+    /// different fleets may report different GPU architectures.
+    pub(crate) async fn get_single_attestation_report(
+        &self,
+        model: String,
+        signing_algo: Option<String>,
+        nonce: Option<String>,
+        signing_address: Option<String>,
+        include_tls_fingerprint: bool,
+    ) -> Result<serde_json::Map<String, serde_json::Value>, AttestationError> {
+        let providers = self
+            .get_providers_for_model(&model)
+            .await
+            .ok_or_else(|| AttestationError::ProviderNotFound(model.clone()))?;
+        let mut last_error = None;
+        for provider in self.drop_disabled_sources(providers) {
+            match provider
+                .get_attestation_report(
+                    model.clone(),
+                    signing_algo.clone(),
+                    nonce.clone(),
+                    signing_address.clone(),
+                    include_tls_fingerprint,
+                )
+                .await
+            {
+                Ok(mut report) => {
+                    report.remove("all_attestations");
+                    return Ok(report);
+                }
+                Err(error) => {
+                    debug!(
+                        model = %model,
+                        error = %error,
+                        "Provider returned error for ITA attestation request, trying next"
+                    );
+                    last_error = Some(error);
+                }
+            }
+        }
+        Err(last_error
+            .map(|error| AttestationError::FetchError(error.to_string()))
+            .unwrap_or_else(|| AttestationError::ProviderNotFound(model)))
+    }
+
     /// `provider_filter`: when `Some`, only providers matching the filter (NEAR tier,
     /// or attested 3P of the given source) are tried. NEAR reports cover every
     /// registered NEAR fleet for the model; other sources retain first-success
@@ -4297,17 +4343,21 @@ impl InferenceProviderPool {
             };
             let mut reports = Vec::new();
             let mut failure = None;
-            for target in targets {
-                match target
-                    .get_attestation_reports(
-                        model.clone(),
-                        signing_algo.clone(),
-                        nonce.clone(),
-                        signing_address.clone(),
-                        include_tls_fingerprint,
-                    )
-                    .await
-                {
+            // Fleets come from model configuration. Collect them concurrently
+            // so their timeouts do not add up, retaining provider order in the
+            // response and in failure selection.
+            let collections = futures::future::join_all(targets.into_iter().map(|target| {
+                target.get_attestation_reports(
+                    model.clone(),
+                    signing_algo.clone(),
+                    nonce.clone(),
+                    signing_address.clone(),
+                    include_tls_fingerprint,
+                )
+            }))
+            .await;
+            for (fleet_index, result) in collections.into_iter().enumerate() {
+                match result {
                     Ok(batch) if !batch.is_empty() => {
                         reports.extend(batch.into_iter().map(|mut report| {
                             report.remove("all_attestations");
@@ -4316,7 +4366,14 @@ impl InferenceProviderPool {
                     }
                     // A signer filter can legitimately exclude an entire fleet.
                     Err(AttestationError::SigningAddressNotFound(_))
-                        if signing_address.is_some() => {}
+                        if signing_address.is_some() =>
+                    {
+                        debug!(
+                            model = %model,
+                            fleet_index,
+                            "Attestation fleet excluded: no backend matches the signing address"
+                        );
+                    }
                     result => {
                         failure = Some(match result {
                             Err(error) => error,

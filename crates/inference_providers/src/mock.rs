@@ -762,8 +762,10 @@ type AttestationReportsHandler = Arc<
             Option<String>,
             Option<String>,
             bool,
-        ) -> Result<Vec<serde_json::Map<String, serde_json::Value>>, AttestationError>
-        + Send
+        ) -> futures_util::future::BoxFuture<
+            'static,
+            Result<Vec<serde_json::Map<String, serde_json::Value>>, AttestationError>,
+        > + Send
         + Sync,
 >;
 type PrivacyClassifyHandler =
@@ -878,7 +880,7 @@ impl MockProvider {
 
     /// Supply a fleet report collection for provider-pool tests.
     pub fn with_attestation_reports_handler(
-        mut self,
+        self,
         handler: impl Fn(
                 String,
                 Option<String>,
@@ -891,7 +893,28 @@ impl MockProvider {
             + Sync
             + 'static,
     ) -> Self {
-        self.attestation_reports_handler = Some(Arc::new(handler));
+        self.with_async_attestation_reports_handler(move |model, algo, nonce, address, tls| {
+            let result = handler(model, algo, nonce, address, tls);
+            async move { result }
+        })
+    }
+
+    /// Supply an asynchronous collection, e.g. to coordinate concurrent fleets.
+    pub fn with_async_attestation_reports_handler<F, Fut>(mut self, handler: F) -> Self
+    where
+        F: Fn(String, Option<String>, Option<String>, Option<String>, bool) -> Fut
+            + Send
+            + Sync
+            + 'static,
+        Fut: std::future::Future<
+                Output = Result<Vec<serde_json::Map<String, serde_json::Value>>, AttestationError>,
+            > + Send
+            + 'static,
+    {
+        self.attestation_reports_handler =
+            Some(Arc::new(move |model, algo, nonce, address, tls| {
+                Box::pin(handler(model, algo, nonce, address, tls))
+            }));
         self
     }
 
@@ -1962,7 +1985,8 @@ impl crate::InferenceProvider for MockProvider {
                 nonce,
                 signing_address,
                 include_tls_fingerprint,
-            );
+            )
+            .await;
         }
         self.get_attestation_report(
             model,

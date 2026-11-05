@@ -32,7 +32,7 @@ use reqwest::Client;
 use sha2::{Digest, Sha256};
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::Semaphore;
@@ -252,6 +252,9 @@ pub(super) struct Fleet {
     /// that don't fit the rotation scheme (one-label host, IP literal, …) — then
     /// rotation is a no-op and the canonical-SNI path is used.
     rotation_parts: Option<rotation::UrlParts>,
+    /// Successful backend discovery confirms custom model-proxy routing.
+    /// Keep this capability through later empty/unavailable discovery results.
+    indexed_routing_discovered: AtomicBool,
     /// Stateless prefix/conversation router. Stable keys are reduced modulo the
     /// live backend count, so every Cloud API process agrees on first-turn
     /// prefix primaries and established-conversation homes.
@@ -336,6 +339,7 @@ impl Fleet {
             last_backend_count: AtomicUsize::new(0),
             count_generation: Mutex::new(0),
             rotation_parts,
+            indexed_routing_discovered: AtomicBool::new(false),
             prefix_router,
             index_clients,
             channel_binding_failed_at,
@@ -659,6 +663,16 @@ impl Fleet {
         self.backend_count().min(rotation::MAX_FANOUT)
     }
 
+    /// Indexed collection is available on the built-in model-proxy domain,
+    /// including cold start, or after discovery confirms a custom proxy.
+    /// A multi-label hostname alone can also be a direct vLLM endpoint.
+    pub(super) fn attestation_rotation_parts(&self) -> Option<&rotation::UrlParts> {
+        self.rotation_parts.as_ref().filter(|parts| {
+            parts.base == "completions.near.ai"
+                || self.indexed_routing_discovered.load(Ordering::Relaxed)
+        })
+    }
+
     /// Build the absolute URL `https://<canonical>-i<index>.<base><path>` for a
     /// rotation attempt at the given backend index. `None` only when rotation
     /// parts are missing — callers should have filtered via `rotation_count()`.
@@ -691,6 +705,10 @@ impl Fleet {
     }
 
     pub(super) fn store_backend_count(&self, count: usize) {
+        if count > 0 {
+            self.indexed_routing_discovered
+                .store(true, Ordering::Relaxed);
+        }
         let prev = self.last_backend_count.swap(count, Ordering::Relaxed);
         if prev != count {
             // index↔backend binding via `-iN` is only stable while the healthy

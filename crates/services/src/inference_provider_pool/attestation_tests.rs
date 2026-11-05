@@ -110,6 +110,42 @@ async fn gateway_attestation_collects_all_near_fleets_without_signer_deduplicati
 }
 
 #[tokio::test]
+async fn gateway_attestation_collects_fleets_concurrently_in_provider_order() {
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+    let providers = ["first", "second"]
+        .into_iter()
+        .map(|instance| {
+            let barrier = barrier.clone();
+            Arc::new(
+                MockProvider::new()
+                    .with_tier(ProviderTier::Near)
+                    .with_async_attestation_reports_handler(move |_, _, _, _, _| {
+                        let barrier = barrier.clone();
+                        async move {
+                            // Neither fleet can finish until both have started.
+                            // A serial collector cannot pass this barrier.
+                            barrier.wait().await;
+                            Ok(vec![report(instance)])
+                        }
+                    }),
+            )
+        })
+        .collect();
+    let pool = pool_with(providers).await;
+    let reports = tokio::time::timeout(
+        Duration::from_secs(5),
+        fetch(&pool, Some(ProviderFilter::Near), None),
+    )
+    .await
+    .expect("both fleet collections must be polled concurrently")
+    .unwrap();
+
+    assert_eq!(reports.len(), 2);
+    assert_eq!(reports[0]["instance_id"], "first");
+    assert_eq!(reports[1]["instance_id"], "second");
+}
+
+#[tokio::test]
 async fn gateway_attestation_discards_partial_near_collection_before_source_fallback() {
     let broken = Arc::new(
         MockProvider::new()

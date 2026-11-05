@@ -10,7 +10,10 @@ use uuid::Uuid;
 type Case<'a> = (&'a str, &'a str, &'a str, String, Option<Value>, bool);
 
 fn user_id(session: &str) -> Uuid {
-    Uuid::parse_str(session.strip_prefix("rt_").unwrap()).unwrap()
+    let raw = session
+        .strip_prefix("rt_")
+        .expect("session tokens are formatted as rt_<user uuid>");
+    Uuid::parse_str(raw).expect("session token encodes a valid user UUID")
 }
 
 async fn add_member(database: &Arc<database::Database>, org_id: &str, session: &str, role: &str) {
@@ -41,7 +44,8 @@ async fn call(
         "PATCH" => server.patch(path),
         "DELETE" => server.delete(path),
         "POST" => server.post(path),
-        _ => server.get(path),
+        "GET" => server.get(path),
+        other => panic!("unsupported HTTP method in test case: {other}"),
     }
     .add_header("Authorization", format!("Bearer {session}"))
     .add_header("User-Agent", MOCK_USER_AGENT);
@@ -136,7 +140,7 @@ async fn workspace_and_key_changes_by_creator_or_admin() {
             false,
         ),
         (
-            "member limits the owner's key",
+            "member clears the owner's key spend limit",
             &member,
             "PATCH",
             format!("{owner_key}/spend-limit"),
@@ -160,7 +164,7 @@ async fn workspace_and_key_changes_by_creator_or_admin() {
             true,
         ),
         (
-            "member limits own key",
+            "member clears own key spend limit",
             &member,
             "PATCH",
             format!("{member_key}/spend-limit"),
@@ -176,7 +180,7 @@ async fn workspace_and_key_changes_by_creator_or_admin() {
             true,
         ),
         (
-            "admin limits a member's key",
+            "admin clears a member's key spend limit",
             &admin,
             "PATCH",
             format!("{member_key}/spend-limit"),
@@ -217,16 +221,22 @@ async fn workspace_and_key_changes_by_creator_or_admin() {
         }
     }
 
-    // The refused changes left the owner's key active.
+    // The refused changes left the owner's key active, and the allowed revokes took effect
+    // (a revoked key is soft-deleted, so it drops out of the listing).
     let listed = call(&server, &owner, "GET", &shared_keys, None).await;
     assert_eq!(listed.status_code(), 200);
     let keys = listed.json::<Value>();
-    let owner_row = keys["api_keys"]
-        .as_array()
-        .unwrap()
+    let rows = keys["api_keys"].as_array().expect("api_keys is a list");
+    let owner_row = rows
         .iter()
         .find(|k| k["id"] == owner_key_id.as_str())
-        .cloned()
         .expect("the owner's key is still listed");
     assert_eq!(owner_row["is_active"], true);
+    for path in [member_key, second_member_key] {
+        let revoked_id = path.rsplit('/').next().unwrap();
+        assert!(
+            rows.iter().all(|k| k["id"] != revoked_id),
+            "{path} should be revoked"
+        );
+    }
 }

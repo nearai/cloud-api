@@ -158,7 +158,7 @@ jobs:
         DATABASE_TLS_ENABLED: "false"
         MODEL_DISCOVERY_SERVER_URL: ""
         MODEL_DISCOVERY_API_KEY: ""
-        AUTH_ADMIN_DOMAINS: ""
+        AUTH_ADMIN_EMAILS: ""
         AUTH_ENCODING_KEY: ""
         BRAVE_SEARCH_PRO_API_KEY: ""
         DEV: "true"

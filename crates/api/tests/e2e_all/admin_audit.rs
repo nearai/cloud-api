@@ -106,6 +106,7 @@ const MOUNTED_ADMIN_ROUTES: &[(&str, &str)] = &[
     ("POST", "/admin/database-encryption/scan"),
     ("POST", "/admin/database-encryption/jobs"),
     ("GET", "/admin/database-encryption/jobs/{id}"),
+    ("GET", "/admin/database-encryption/keys"),
     ("POST", "/admin/database-encryption/jobs/{id}/cancel"),
     ("POST", "/admin/database-encryption/verify"),
     ("GET", "/admin/feature-requests"),

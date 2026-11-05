@@ -164,6 +164,13 @@ async fn cancellation_during_usage_wait_charges_the_pending_report() {
     assert_eq!((row(&app).await.spent, row(&app).await.units), (24, 12));
 }
 
+#[test]
+fn serving_claim_reclaim_outlives_stream_wait() {
+    assert!(
+        services::mpp::retention::SERVING_TIMEOUT > crate::middleware::mpp_session::STREAM_WAIT
+    );
+}
+
 #[tokio::test]
 async fn unknown_prompt_uses_body_bound_and_partial_cost_stays_within_reservation() {
     for (handler, expected_units) in [

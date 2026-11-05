@@ -134,11 +134,13 @@ fields, a duplicate model name, an empty table, and zero limits.
    (`serving`, `served`, `unserved`) and two timestamps. It has no organization, workspace,
    request or payer column. cloud-api purges rows older than 24 hours every hour (a claim
    outlives its challenge, at most one hour, many times over). The same hourly task reclaims
-   `serving` rows whose last update is older than 15 minutes as `unserved`, in bounded batches
-   with `SKIP LOCKED`. Only the original challenge can retry them; leases fence late finishes.
-   Reclaimed credentials remain subject to their original challenge expiry. The default
-   ten-minute challenge expires before the fifteen-minute reclaim threshold; reclamation
-   does not extend its lifetime or authorize a replacement challenge.
+   `serving` rows whose last update is older than two hours as `unserved`, in bounded batches
+   with `SKIP LOCKED`. Only the original challenge can retry them, with leases fencing late
+   finishes; the two-hour minimum exceeds the thirty-minute stream wait plus the bounded
+   provider request lifetime. A reclaimed credential can redeem within the twelve-hour late-redemption
+   window. If delivery succeeded but recording `served` failed, reclamation can permit one
+   more serve of that payment. This payer-favouring recovery preserves the original challenge
+   binding and does not authorize a replacement challenge.
 4. **Reconciliation.** Payments are on-chain transfers to the recipient carrying an MPP
    attribution memo (`keccak256("mpp")[0..4] ‖ 0x01 ‖ keccak256(realm)[0..10] ‖ client ‖
    keccak256(challenge id)[0..7]`). Reconcile the treasury's `TransferWithMemo` events with
@@ -243,9 +245,9 @@ on-chain deposit into the channel reserve precompile
 `0x4D50500000000000000000000000000000000000`, one signed voucher per request, server-side
 metering by tokens, periodic on-chain settlement, and cooperative close with refund. Unlike
 `charge`, nothing is transferred per request; the payer escrows funds once, authorizes spend
-with EIP-712 vouchers, and gets the remainder back on close. A successful response that starts
-delivering output consumes its full reservation if final usage is missing or incomplete.
-A complete usage report charges the actual tokens. A successful `charge` payment is already
+with EIP-712 vouchers, and gets the remainder back on close. Delivered output charges known
+token counts, including partial usage, capped at the reservation. Only delivered output with
+no known counts consumes the full reservation. A successful `charge` payment is already
 on chain before inference runs.
 
 A priced model with `token_price` in `MPP_MODEL_PRICES` is offered `intent="session"` alongside
@@ -324,11 +326,14 @@ For each voucher request on a channel:
 3. Reserve `cost_cap` before inference (`spent` and `reserved` increase; a reservation row
    keyed by request id) so concurrent requests cannot spend the same balance. After the
    response: `actual = token_price × (prompt_tokens + completion_tokens)` from completion
-   usage, capped at what the voucher still covers; then adjust `spent` and `units`, and delete
+   usage, capped at the reservation; then adjust `spent` and `units`, and delete
    the reservation. Release the full reservation (`spent -= cost_cap`) for a non-2xx inner
-   response or a stream cancelled before any response bytes were forwarded. After any bytes
-   are forwarded, missing or incomplete usage, including nonzero partial counts, charges
-   the full cap. A successful non-streaming response counts as a produced body.
+   response or when no content was delivered. SSE comments, keep-alives and role-only deltas
+   do not start delivery. Incomplete reports charge observed completion tokens and known
+   prompt tokens, using the body-byte prompt bound when the prompt count is unknown.
+   Content chunks without provider usage count as a completion-token lower bound, marked
+   `partial: true`. Only a non-empty non-streaming body starts delivery. With no known counts,
+   delivered output charges the full cap.
 
 Reservations precede service-key authentication, rate limiting and usage checks. A short
 voucher consumes none of the shared service key's rate limit. Management actions (`open`,
@@ -342,14 +347,17 @@ a fresh challenge, challenge-class errors answer `400 application/problem+json`.
 
 The chat completion's usage observer reports final counts once. Non-streaming completions
 normally report before the handler returns; if no report arrives within one second after a
-successful response, the wrapper charges the full cap and records `usage_missing`.
+non-empty successful response, the wrapper charges the full cap and records `usage_missing`.
+If the client disconnects during this wait, a detached finalizer retains the receiver and
+waits up to one second for its report.
 Streaming completions finalize after body completion or disconnect. A missing stream report
 is bounded at 30 minutes, below supervision's two-hour stale reservation cutoff.
 Charge finalization retries store errors three times with short backoff. If every attempt
-fails, the successful response retains its provisional receipt and the reservation remains
+fails, a non-streaming successful response omits `Payment-Receipt` and the reservation remains
 held. On open channels, the reaper releases the hold, favouring the payer, and persistent
-store failure can leave delivered work uncharged. Finalized channels retain the amount
-already captured on chain as their holds drain. Finalization failures log closed codes.
+store failure can leave delivered work uncharged. Closing channels retain the pending capture
+amount as their holds drain; finalized channels retain at least the amount confirmed on chain.
+Finalization failures log closed codes.
 An inner error, including a rate-limit `429`, releases the reservation. Missing or closed
 channels return `410 application/problem+json`; voucher and minimum-delta refusals return
 `402` with a fresh challenge carrying the authenticated session snapshot.
@@ -371,8 +379,11 @@ settled).
 descriptor must match; cumulative `>= settled_on_chain`, `<= deposit`, strictly above the
 stored highest (or an exact replay of the same highest amount and signature bytes); signature
 verifies (secp256k1, 65 bytes); delta from the previous highest must be at least
-`min_voucher_delta`. On-chain state is read at most once every 60 seconds per channel to
-refresh `deposit`, `settled`, and `closeRequestedAt`; zero deposit means closed, so refuse.
+`min_voucher_delta`. Successful on-chain reads of `deposit`, `settled`, and `closeRequestedAt`
+are reused for 60 seconds per channel; zero deposit means closed, so refuse. While another
+reader holds a pending claim, admission can use the last successful read for up to 300 seconds.
+An older observation or a failed refresh returns `503`. Cancellation clears the request's
+claim, permitting an immediate retry. Supervision claims each batch immediately before its RPC.
 Once the payer has requested close on chain, no further vouchers or reservations are accepted.
 
 `close`: payer or voucher signer supplies `closeSignature` over `CloseAuthorization` and

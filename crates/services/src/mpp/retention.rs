@@ -1,10 +1,9 @@
 //! Retention of the claim table.
 //!
-//! A claim only has to outlive the challenge it was made under (at most an hour, the largest
-//! `MPP_CHALLENGE_TTL_SECS`): after that no credential for it can verify, so a replay is
-//! refused by the HMAC and the expiry, not by the ledger. Rows older than
-//! [`CLAIM_RETENTION`] are deleted by an hourly task. It logs counts and closed outcome
-//! codes only.
+//! A claim must outlive its challenge (at most an hour) plus the late-redemption window.
+//! After both expire, the credential can no longer verify. Rows older than
+//! [`CLAIM_RETENTION`] are deleted by an hourly task, which also recovers abandoned
+//! serving attempts after [`SERVING_TIMEOUT`]. It logs counts and closed outcome codes only.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,7 +14,7 @@ use tokio::task::JoinHandle;
 use super::error::repository_error_kind;
 use super::ports::{ChannelRepository, PaymentClaimRepository};
 
-/// Claims older than this are purged: a day, against a one-hour maximum challenge lifetime.
+/// A day exceeds the maximum challenge lifetime plus the late-redemption window.
 pub const CLAIM_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
 /// Finalized channel rows contain only ledger state and expire after thirty days.
 pub const CHANNEL_RETENTION: Duration = Duration::from_secs(30 * 24 * 60 * 60);
@@ -28,8 +27,9 @@ const _: () = assert!(
 );
 /// How often the purge runs.
 pub const PURGE_INTERVAL: Duration = Duration::from_secs(60 * 60);
-/// Abandoned serving attempts become retryable after this age at the next hourly run.
-pub const SERVING_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+/// Abandoned attempts become retryable at the next hourly run after two hours, beyond
+/// the thirty-minute stream wait and the bounded provider request lifetime.
+pub const SERVING_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
 /// One purge (many batches) ends here whatever the database does.
 const PURGE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
@@ -165,6 +165,12 @@ mod tests {
 
     const DAY: chrono::Duration = chrono::Duration::hours(24);
 
+    #[test]
+    fn serving_reclaim_waits_two_hours_and_outlives_stream_wait() {
+        assert_eq!(SERVING_TIMEOUT, Duration::from_secs(2 * 60 * 60));
+        assert!(SERVING_TIMEOUT > Duration::from_secs(30 * 60));
+    }
+
     #[tokio::test]
     async fn channel_purge_keeps_active_and_recent_finalized_rows() {
         use crate::mpp::{
@@ -220,7 +226,7 @@ mod tests {
     async fn the_hourly_task_reclaims_abandoned_serving_attempts() {
         let repo = Arc::new(InMemoryClaimRepository::default());
         repo.claim("abandoned", "c").await.unwrap();
-        repo.age("abandoned", chrono::Duration::minutes(16));
+        repo.age("abandoned", chrono::Duration::minutes(121));
         let task = spawn_purge_task_with(repo.clone(), Duration::from_millis(10), CLAIM_RETENTION)
             .unwrap();
         tokio::time::timeout(Duration::from_secs(5), async {

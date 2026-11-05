@@ -3,6 +3,30 @@
 use super::*;
 
 #[tokio::test]
+async fn reclaim_enforces_two_hour_minimum_even_with_an_aggressive_cutoff() {
+    let (_server, database) = setup_test_server_with_database().await;
+    let repo = repository(&database);
+    let recent = unique_key();
+    let abandoned = unique_key();
+    claimed(&repo, &recent, "a").await;
+    claimed(&repo, &abandoned, "a").await;
+    let client = database.pool().get().await.unwrap();
+    client.execute("UPDATE mpp_payment_claims SET updated_at = NOW() - INTERVAL '119 minutes' WHERE payment_key = $1", &[&recent]).await.unwrap();
+    client.execute("UPDATE mpp_payment_claims SET updated_at = NOW() - INTERVAL '121 minutes' WHERE payment_key = $1", &[&abandoned]).await.unwrap();
+    repo.reclaim_stale_serving(chrono::Utc::now())
+        .await
+        .unwrap();
+    assert_eq!(
+        state_of(&database, &recent).await.as_deref(),
+        Some("serving")
+    );
+    assert_eq!(
+        state_of(&database, &abandoned).await.as_deref(),
+        Some("unserved")
+    );
+}
+
+#[tokio::test]
 async fn reclaim_releases_stale_serving_and_preserves_the_new_attempts_lease() {
     let (_server, database) = setup_test_server_with_database().await;
     let repo = repository(&database);
@@ -22,7 +46,7 @@ async fn reclaim_releases_stale_serving_and_preserves_the_new_attempts_lease() {
         .unwrap();
     let mut client = database.pool().get().await.unwrap();
     client.execute(
-        "UPDATE mpp_payment_claims SET updated_at = NOW() - INTERVAL '16 minutes' WHERE payment_key = ANY($1)",
+        "UPDATE mpp_payment_claims SET updated_at = NOW() - INTERVAL '121 minutes' WHERE payment_key = ANY($1)",
         &[&vec![stale.clone(), served.clone(), unserved.clone()]],
     ).await.unwrap();
     let abandoned = ClaimLease::new(
@@ -35,7 +59,7 @@ async fn reclaim_releases_stale_serving_and_preserves_the_new_attempts_lease() {
             .unwrap()
             .get(0),
     );
-    let cutoff = chrono::Utc::now() - chrono::Duration::minutes(15);
+    let cutoff = chrono::Utc::now() - chrono::Duration::hours(2);
     // A locked stale row must not block maintenance on another connection.
     let transaction = client.transaction().await.unwrap();
     transaction

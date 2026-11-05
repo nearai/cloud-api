@@ -139,6 +139,8 @@ impl PaymentClaimRepository for InMemoryClaimRepository {
     }
 
     async fn reclaim_stale_serving(&self, cutoff: DateTime<Utc>) -> Result<u64, RepositoryError> {
+        // Match the SQL minimum even when a caller requests a more aggressive cutoff.
+        let cutoff = cutoff.min(Utc::now() - chrono::Duration::hours(2));
         let mut claims = self.claims.lock().map_err(|_| poisoned())?;
         let mut reclaimed = 0;
         for claim in claims
@@ -168,6 +170,18 @@ mod tests {
 
     const KEY: &str = "tempo:0x1111111111111111111111111111111111111111111111111111111111111111";
 
+    #[tokio::test]
+    async fn reclaim_enforces_two_hour_minimum_even_with_an_aggressive_cutoff() {
+        let repo = InMemoryClaimRepository::default();
+        claimed(&repo, "recent", "c").await;
+        claimed(&repo, "abandoned", "c").await;
+        repo.age("recent", chrono::Duration::minutes(119));
+        repo.age("abandoned", chrono::Duration::minutes(121));
+        assert_eq!(repo.reclaim_stale_serving(Utc::now()).await.unwrap(), 1);
+        assert_eq!(repo.state_of("recent"), Some(ClaimState::Serving));
+        assert_eq!(repo.state_of("abandoned"), Some(ClaimState::Unserved));
+    }
+
     async fn claimed(repo: &InMemoryClaimRepository, key: &str, challenge: &str) -> ClaimLease {
         match repo.claim(key, challenge).await.unwrap() {
             ClaimOutcome::Claimed(lease) => lease,
@@ -189,10 +203,10 @@ mod tests {
             .unwrap();
         claimed(&repo, "fresh", "c1").await;
         for key in [KEY, "served", "unserved"] {
-            repo.age(key, chrono::Duration::minutes(16));
+            repo.age(key, chrono::Duration::minutes(121));
         }
         assert_eq!(
-            repo.reclaim_stale_serving(Utc::now() - chrono::Duration::minutes(15))
+            repo.reclaim_stale_serving(Utc::now() - chrono::Duration::hours(2))
                 .await
                 .unwrap(),
             1

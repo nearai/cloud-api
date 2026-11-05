@@ -56,11 +56,13 @@ ORDER BY created_at LIMIT $2 FOR UPDATE SKIP LOCKED)";
 
 /// Recover abandoned serving attempts without waiting on another worker's row locks.
 /// Advancing the lease fences the abandoned request before the same challenge can retry.
+/// The two-hour minimum also applies to callers supplying a more recent cutoff.
 const RECLAIM_SQL: &str = "\
 UPDATE mpp_payment_claims SET state = 'unserved', \
 updated_at = GREATEST(clock_timestamp(), updated_at + INTERVAL '1 microsecond') \
 WHERE payment_key IN ( \
-SELECT payment_key FROM mpp_payment_claims WHERE state = 'serving' AND updated_at < $1 \
+SELECT payment_key FROM mpp_payment_claims WHERE state = 'serving' \
+AND updated_at < LEAST($1, statement_timestamp() - INTERVAL '2 hours') \
 ORDER BY updated_at LIMIT $2 FOR UPDATE SKIP LOCKED)";
 
 pub struct MppPaymentClaimRepository {

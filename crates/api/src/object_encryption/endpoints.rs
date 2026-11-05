@@ -24,12 +24,12 @@ pub async fn get_keys(
 
 #[utoipa::path(post, path="/v1/admin/object-encryption/scan", tag="Admin", request_body=ObjectScanRequest,
     description="Admin session, read_write token, or read_only token. Inventories object metadata without modifying objects.",
-    responses((status=200, description="Object encryption metadata inventory", body=Value)), security(("session_token"=[]), ("admin_token"=[])))]
+    responses((status=200, description="Object encryption metadata inventory", body=ObjectScanResponse)), security(("session_token"=[]), ("admin_token"=[])))]
 pub async fn scan(
     Extension(state): Extension<ObjectEncryptionState>,
     Extension(_admin): Extension<AdminUser>,
     Json(req): Json<ObjectScanRequest>,
-) -> ApiResult<Value> {
+) -> ApiResult<ObjectScanResponse> {
     scan_impl::run(&state, req).await
 }
 

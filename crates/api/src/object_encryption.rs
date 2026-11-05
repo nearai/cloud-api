@@ -32,7 +32,8 @@ pub(crate) use endpoints::{
 };
 pub use endpoints::{cancel_job, create_job, get_job, get_keys, scan, verify};
 pub use types::{
-    ObjectCreateJobRequest, ObjectJobResponse, ObjectScanRequest, ObjectVerifyRequest,
+    ObjectCreateJobRequest, ObjectJobResponse, ObjectScanRequest, ObjectScanResponse,
+    ObjectVerifyRequest,
 };
 
 #[derive(Clone)]

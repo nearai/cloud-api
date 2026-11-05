@@ -107,8 +107,8 @@ async fn scan_skips_objects_deleted_after_listing() {
     assert_eq!(body["totals"]["missing_keys"], json!(["a-deleted"]));
     assert_eq!(body["totals"]["by_key_id"], json!({"current":1}));
     assert_eq!(body["totals"]["processed"], 2);
-    assert_eq!(body["cursor"]["last_key"], "b-retained");
-    assert_eq!(body["cursor"]["complete"], true);
+    assert_eq!(body["cursor"]["state"]["last_key"], "b-retained");
+    assert_eq!(body["cursor"]["state"]["complete"], true);
 }
 
 #[tokio::test]

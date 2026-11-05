@@ -95,10 +95,12 @@ async fn scan_limit_reports_an_incomplete_inventory_without_skipping_the_boundar
     let body = response.json::<Value>();
     assert_eq!(body["totals"]["total"], 1);
     assert_eq!(body["totals"]["complete"], false);
-    assert_eq!(
-        body["cursor"],
-        json!({"continuation":"workspace/a","last_key":"workspace/a","complete":false})
-    );
+    assert_eq!(body["cursor"]["version"], 1);
+    assert_eq!(body["cursor"]["key_id"], "current");
+    assert_eq!(body["cursor"]["state"]["continuation"], "workspace/a");
+    assert_eq!(body["cursor"]["state"]["last_key"], "workspace/a");
+    assert_eq!(body["cursor"]["state"]["complete"], false);
+    assert_eq!(body["cursor"]["tag"].as_str().unwrap().len(), 64);
 }
 
 #[tokio::test]
@@ -188,7 +190,7 @@ async fn scan_continues_at_the_returned_cursor_without_repeating_objects() {
     // Then only the second object is inventoried and the scan completes.
     response.assert_status_ok();
     let result = response.json::<Value>();
-    assert_eq!(result["cursor"]["last_key"], "b");
+    assert_eq!(result["cursor"]["state"]["last_key"], "b");
     assert_eq!(result["complete"], true);
     assert_eq!(result["totals"]["processed"], 1);
 }

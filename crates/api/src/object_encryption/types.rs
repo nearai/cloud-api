@@ -61,12 +61,22 @@ pub struct ObjectScanRequest {
     /// Wall-clock budget for this call: defaults to 60 seconds, at most 60.
     #[schema(minimum = 1, maximum = 60, default = 60)]
     pub(super) deadline_seconds: Option<u64>,
-    /// Pass the cursor returned by an incomplete scan unchanged.
+    /// Pass the signed cursor returned by an incomplete scan unchanged. It remains valid while
+    /// its signing key is present in the configured object read key ring.
     #[schema(inline)]
-    pub(super) cursor: Option<ScanCursor>,
+    pub(super) cursor: Option<SignedScanCursor>,
 }
 
-#[derive(Debug, Default, Deserialize, Serialize, utoipa::ToSchema)]
+#[derive(Clone, Debug, Deserialize, Serialize, utoipa::ToSchema)]
+#[serde(deny_unknown_fields)]
+pub(super) struct SignedScanCursor {
+    pub version: u8,
+    pub key_id: String,
+    pub state: ScanCursor,
+    pub tag: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize, utoipa::ToSchema)]
 #[serde(default, deny_unknown_fields)]
 pub(super) struct ScanCursor {
     pub continuation: Option<String>,
@@ -77,6 +87,16 @@ pub(super) struct ScanCursor {
     pub pending_keys: std::collections::VecDeque<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_continuation: Option<String>,
+}
+
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+#[schema(as = ObjectScanResponse)]
+pub struct ObjectScanResponse {
+    pub(super) run_id: Uuid,
+    pub(super) status: String,
+    pub(super) complete: bool,
+    pub(super) totals: Value,
+    pub(super) cursor: SignedScanCursor,
 }
 
 #[derive(Debug, Deserialize, utoipa::ToSchema)]

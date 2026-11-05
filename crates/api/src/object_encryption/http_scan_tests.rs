@@ -4,7 +4,7 @@ use services::files::{
     storage::{ObjectMetadata, ObjectVerification, RewrapOutcome},
     FileServiceError,
 };
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 fn server(state: ObjectEncryptionState) -> TestServer {
     TestServer::builder()
@@ -45,6 +45,8 @@ async fn rewrap_gate_reports_false_and_refuses_execute_without_affecting_uploads
 struct SlowMetadata {
     inner: Arc<MockStorage>,
     stall: AtomicBool,
+    list_calls: AtomicUsize,
+    metadata_calls: AtomicUsize,
 }
 
 #[async_trait]
@@ -66,9 +68,11 @@ impl StorageTrait for SlowMetadata {
         continuation: Option<String>,
         max: i32,
     ) -> Result<(Vec<String>, Option<String>), FileServiceError> {
+        self.list_calls.fetch_add(1, Ordering::SeqCst);
         self.inner.list_keys(continuation, max).await
     }
     async fn object_metadata(&self, key: &str) -> Result<ObjectMetadata, FileServiceError> {
+        self.metadata_calls.fetch_add(1, Ordering::SeqCst);
         if key == "b" && self.stall.load(Ordering::SeqCst) {
             std::future::pending::<()>().await;
         }
@@ -101,6 +105,8 @@ async fn scan_deadline_returns_the_unprocessed_page_and_resumes_it() {
     let storage = Arc::new(SlowMetadata {
         inner,
         stall: AtomicBool::new(true),
+        list_calls: AtomicUsize::new(0),
+        metadata_calls: AtomicUsize::new(0),
     });
     let server = server(ObjectEncryptionState::new(
         DbPool::uninitialized(),
@@ -121,7 +127,7 @@ async fn scan_deadline_returns_the_unprocessed_page_and_resumes_it() {
     let first = response.json::<Value>();
     assert_eq!(first["complete"], false);
     assert_eq!(first["totals"]["processed"], 1);
-    assert_eq!(first["cursor"]["pending_keys"], json!(["b", "c"]));
+    assert_eq!(first["cursor"]["state"]["pending_keys"], json!(["b", "c"]));
     storage.stall.store(false, Ordering::SeqCst);
     let response = server
         .post("/admin/object-encryption/scan")
@@ -131,7 +137,109 @@ async fn scan_deadline_returns_the_unprocessed_page_and_resumes_it() {
     let second = response.json::<Value>();
     assert_eq!(second["complete"], true);
     assert_eq!(second["totals"]["processed"], 2);
-    assert_eq!(second["cursor"]["last_key"], "c");
+    assert_eq!(second["cursor"]["state"]["last_key"], "c");
+}
+
+#[tokio::test]
+async fn scan_rejects_tampered_pending_keys_before_storage_access() {
+    // Given a genuine deadline cursor containing a pending object from a listed page.
+    let ring = Arc::new(ObjectKeyRing::new("current".into(), [9; 32], vec![]).unwrap());
+    let inner = Arc::new(MockStorage::new_with_ring(ring.clone()));
+    for key in ["a", "b", "c"] {
+        inner.upload(key, vec![], "text/plain").await.unwrap();
+    }
+    let storage = Arc::new(SlowMetadata {
+        inner,
+        stall: AtomicBool::new(true),
+        list_calls: AtomicUsize::new(0),
+        metadata_calls: AtomicUsize::new(0),
+    });
+    let server = server(ObjectEncryptionState::new(
+        DbPool::uninitialized(),
+        storage.clone(),
+        ring,
+    ));
+    let first = server
+        .post("/admin/object-encryption/scan")
+        .json(&json!({"deadline_seconds":1}))
+        .await
+        .json::<Value>();
+    let mut cursor = first["cursor"].clone();
+    cursor["state"]["pending_keys"] = json!(["attacker-controlled-object"]);
+    let list_calls = storage.list_calls.load(Ordering::SeqCst);
+    let metadata_calls = storage.metadata_calls.load(Ordering::SeqCst);
+
+    // When the caller changes the pending object name and resumes the scan.
+    let response = server
+        .post("/admin/object-encryption/scan")
+        .json(&json!({"cursor":cursor}))
+        .await;
+
+    // Then authentication rejects the cursor before either storage operation runs.
+    response.assert_status_bad_request();
+    assert_eq!(storage.list_calls.load(Ordering::SeqCst), list_calls);
+    assert_eq!(
+        storage.metadata_calls.load(Ordering::SeqCst),
+        metadata_calls
+    );
+
+    for (field, value) in [
+        ("continuation", json!("attacker-controlled-continuation")),
+        ("last_key", json!("attacker-controlled-last-key")),
+        ("complete", json!(true)),
+    ] {
+        let mut altered = first["cursor"].clone();
+        altered["state"][field] = value;
+        let response = server
+            .post("/admin/object-encryption/scan")
+            .json(&json!({"cursor":altered}))
+            .await;
+        response.assert_status_bad_request();
+        assert_eq!(storage.list_calls.load(Ordering::SeqCst), list_calls);
+        assert_eq!(
+            storage.metadata_calls.load(Ordering::SeqCst),
+            metadata_calls
+        );
+    }
+
+    let mut unknown_key = first["cursor"].clone();
+    unknown_key["key_id"] = json!("unknown");
+    let response = server
+        .post("/admin/object-encryption/scan")
+        .json(&json!({"cursor":unknown_key}))
+        .await;
+    response.assert_status_bad_request();
+    assert_eq!(storage.list_calls.load(Ordering::SeqCst), list_calls);
+    assert_eq!(
+        storage.metadata_calls.load(Ordering::SeqCst),
+        metadata_calls
+    );
+
+    let mut malformed_tag = first["cursor"].clone();
+    malformed_tag["tag"] = json!("not-hex");
+    let response = server
+        .post("/admin/object-encryption/scan")
+        .json(&json!({"cursor":malformed_tag}))
+        .await;
+    response.assert_status_bad_request();
+    assert_eq!(storage.list_calls.load(Ordering::SeqCst), list_calls);
+    assert_eq!(
+        storage.metadata_calls.load(Ordering::SeqCst),
+        metadata_calls
+    );
+
+    let mut unsigned = first["cursor"].clone();
+    unsigned.as_object_mut().unwrap().remove("tag");
+    let response = server
+        .post("/admin/object-encryption/scan")
+        .json(&json!({"cursor":unsigned}))
+        .await;
+    response.assert_status_unprocessable_entity();
+    assert_eq!(storage.list_calls.load(Ordering::SeqCst), list_calls);
+    assert_eq!(
+        storage.metadata_calls.load(Ordering::SeqCst),
+        metadata_calls
+    );
 }
 
 #[tokio::test]
@@ -153,7 +261,7 @@ async fn scan_defaults_to_ten_thousand_objects() {
     // Then scan stops at the documented default with a continuation.
     assert_eq!(result["totals"]["processed"], 10_000);
     assert_eq!(result["complete"], false);
-    assert_eq!(result["cursor"]["last_key"], "object-09999");
+    assert_eq!(result["cursor"]["state"]["last_key"], "object-09999");
 }
 
 #[test]

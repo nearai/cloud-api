@@ -1,4 +1,5 @@
 use super::{parse_key, EncryptionError};
+use ring::hmac;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// One write key and ordered previous keys for object reads.
@@ -56,6 +57,23 @@ impl ObjectKeyRing {
     /// No accessor returns an owned key.
     pub const fn write_key(&self) -> &[u8; 32] {
         &self.write.1
+    }
+
+    /// Signs opaque state with the current write key.
+    pub fn sign(&self, message: &[u8]) -> Vec<u8> {
+        hmac::sign(
+            &hmac::Key::new(hmac::HMAC_SHA256, self.write_key()),
+            message,
+        )
+        .as_ref()
+        .to_vec()
+    }
+
+    /// Verifies opaque state with a configured read key in constant time.
+    pub fn verify(&self, id: &str, message: &[u8], tag: &[u8]) -> bool {
+        self.lookup(id).is_some_and(|key| {
+            hmac::verify(&hmac::Key::new(hmac::HMAC_SHA256, key), message, tag).is_ok()
+        })
     }
 
     pub fn ids(&self) -> Vec<&str> {

@@ -745,6 +745,20 @@ mod admin_token_permission_tests {
         }
         assert!(doc["components"]["schemas"]["JobResponse"].is_object());
         assert!(doc["components"]["schemas"]["ObjectJobResponse"].is_object());
+        let scan_response = &doc["paths"]["/v1/admin/object-encryption/scan"]["post"]["responses"]
+            ["200"]["content"]["application/json"]["schema"];
+        assert_eq!(
+            scan_response["$ref"],
+            "#/components/schemas/ObjectScanResponse"
+        );
+        assert_eq!(
+            doc["components"]["schemas"]["ObjectScanResponse"]["properties"]["cursor"]["$ref"],
+            "#/components/schemas/SignedScanCursor"
+        );
+        let scan_cursor = &doc["components"]["schemas"]["SignedScanCursor"];
+        for field in ["version", "key_id", "state", "tag"] {
+            assert!(scan_cursor["properties"][field].is_object());
+        }
     }
 
     #[test]

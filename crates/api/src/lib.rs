@@ -218,6 +218,95 @@ fn init_mpp_service(
     }
 }
 
+/// Build session ports only when per-token pricing is configured. The auth wrapper owns
+/// the service; background tasks retain the same ledger, RPC and signer.
+fn init_mpp_session(
+    pool: database::DbPool,
+    config: &ApiConfig,
+) -> Option<Arc<services::mpp::SessionService>> {
+    use services::mpp::{
+        session_chain::PayeeChain,
+        session_settlement::{spawn_settlement_task, SettlementConfig},
+        session_supervision::{spawn_supervision_task, SupervisionConfig},
+        HttpTempoRpc, LocalSigner, MppError, SessionService, SessionServiceConfig,
+    };
+    use std::time::Duration;
+    let settings = config.mpp.settings()?;
+    let session = settings.session.as_ref()?;
+    let build = || -> Result<_, MppError> {
+        let signer = Arc::new(
+            LocalSigner::from_hex(session.signer_key.as_deref().ok_or(MppError::Config)?)
+                .map_err(|_| MppError::Config)?,
+        );
+        let rpc = Arc::new(
+            HttpTempoRpc::new(
+                &settings.tempo.rpc_url,
+                Duration::from_secs(settings.tempo.rpc_timeout_secs),
+            )
+            .map_err(|_| MppError::Config)?,
+        );
+        let repo = Arc::new(database::repositories::MppChannelRepository::new(pool));
+        let address = |raw: &str| -> Result<[u8; 20], MppError> {
+            hex::decode(raw.strip_prefix("0x").ok_or(MppError::Config)?)
+                .map_err(|_| MppError::Config)?
+                .try_into()
+                .map_err(|_| MppError::Config)
+        };
+        let chain = PayeeChain {
+            chain_id: settings.tempo.chain_id,
+            escrow: address("0x4d50500000000000000000000000000000000000")?,
+            fee_token: address(&settings.tempo.currency)?,
+        };
+        let service = SessionService::new(
+            SessionServiceConfig {
+                settings: session.clone(),
+                model_prices: settings.model_prices.clone(),
+                realm: settings.realm.clone(),
+                secret_key: settings.secret_key.as_bytes().to_vec(),
+                challenge_ttl: Duration::from_secs(settings.challenge_ttl_secs),
+                chain_id: chain.chain_id,
+                escrow: chain.escrow,
+                currency: chain.fee_token,
+            },
+            repo.clone(),
+            rpc.clone(),
+            signer.clone(),
+        )?;
+        Ok((service, repo, rpc, signer, chain))
+    };
+    match build() {
+        Ok((service, repo, rpc, signer, chain)) => {
+            spawn_settlement_task(
+                repo.clone(),
+                rpc.clone(),
+                signer.clone(),
+                chain,
+                SettlementConfig {
+                    interval: Duration::from_secs(session.settle_interval_secs),
+                    amount: session.settle_amount,
+                    ..Default::default()
+                },
+            );
+            spawn_supervision_task(
+                repo.clone(),
+                rpc,
+                signer,
+                chain,
+                SupervisionConfig {
+                    every: Duration::from_secs(session.close_supervision_secs),
+                    ..Default::default()
+                },
+            );
+            services::mpp::retention::spawn_channel_purge_task(repo);
+            Some(Arc::new(service))
+        }
+        Err(error) => {
+            tracing::error!(outcome = error.kind(), "MPP session initialization failed");
+            None
+        }
+    }
+}
+
 /// Initialize authentication services and middleware
 pub fn init_auth_services(database: Arc<Database>, config: &ApiConfig) -> AuthComponents {
     // Create organization-related repositories first (needed for organization_service)
@@ -1244,6 +1333,10 @@ pub fn build_app_with_config_and_options(
         &auth_components.auth_state_middleware,
         usage_state.clone(),
         rate_limit_state.clone(),
+        app_state
+            .mpp_service
+            .as_ref()
+            .and_then(|_| init_mpp_session(database.pool().clone(), &config)),
     );
 
     let gateway_routes = build_gateway_routes(
@@ -1596,6 +1689,7 @@ pub fn build_completion_routes(
     auth_state_middleware: &AuthState,
     usage_state: middleware::UsageState,
     rate_limit_state: middleware::RateLimitState,
+    mpp_session: Option<Arc<services::mpp::SessionService>>,
 ) -> Router {
     // Announces a planned model deprecation in response headers. Innermost
     // layer: it only sees requests that passed auth, rate and usage checks.
@@ -1687,6 +1781,7 @@ pub fn build_completion_routes(
         middleware::MppAuthState {
             auth: auth_state_middleware.clone(),
             mpp: app_state.mpp_service.clone(),
+            session: mpp_session,
         },
         middleware::mpp_auth_middleware,
     ))

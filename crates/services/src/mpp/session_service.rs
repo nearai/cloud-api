@@ -210,6 +210,35 @@ impl SessionService {
         route: &str,
         model_price: &Price,
     ) -> Result<SessionCredential, MppError> {
+        self.verify_credential_with_price(credential, route, |_| Ok(*model_price))
+    }
+
+    /// Management actions have no model body. Resolve their price from the authenticated
+    /// offer, then apply the same verification as an inference credential.
+    pub async fn verify_management_credential(
+        &self,
+        credential: &protocol::SessionCredential,
+        route: &str,
+    ) -> Result<SessionCredential, MppError> {
+        self.verify_credential_with_price(credential, route, |echoed| {
+            self.config
+                .model_prices
+                .values()
+                .find(|price| price.token_price == Some(echoed.amount))
+                .map(|price| Price {
+                    amount: price.amount,
+                    token_price: price.token_price,
+                })
+                .ok_or(MppError::InvalidChallenge("model_price"))
+        })
+    }
+
+    fn verify_credential_with_price(
+        &self,
+        credential: &protocol::SessionCredential,
+        route: &str,
+        resolve_price: impl FnOnce(&SessionTerms) -> Result<Price, MppError>,
+    ) -> Result<SessionCredential, MppError> {
         let echo = &credential.challenge;
         if echo.intent != INTENT_SESSION {
             return Err(MppError::InvalidChallenge("intent"));
@@ -247,6 +276,9 @@ impl SessionService {
         {
             return Err(MppError::InvalidChallenge("opaque"));
         }
+        let echoed = SessionTerms::from_b64(&echo.request)
+            .map_err(|_| MppError::InvalidChallenge("request"))?;
+        let model_price = resolve_price(&echoed)?;
         let configured = self.config.model_prices.values().any(|price| {
             price.token_price == model_price.token_price && price.amount == model_price.amount
         });
@@ -254,9 +286,7 @@ impl SessionService {
             return Err(MppError::InvalidChallenge("model_price"));
         }
         let expected = self
-            .terms(model_price, None)
-            .map_err(|_| MppError::InvalidChallenge("request"))?;
-        let echoed = SessionTerms::from_b64(&echo.request)
+            .terms(&model_price, None)
             .map_err(|_| MppError::InvalidChallenge("request"))?;
         if !expected.same_offer(&echoed) {
             return Err(MppError::InvalidChallenge("request"));

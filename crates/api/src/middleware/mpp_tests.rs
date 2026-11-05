@@ -2,6 +2,9 @@
 //! `build_completion_routes` wires them (body hash outermost, settle innermost, nested under
 //! `/v1`), against an in-memory claim store and a scripted Tempo node.
 
+#[path = "mpp_session_tests.rs"]
+mod session;
+
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -211,6 +214,7 @@ fn app_with(enabled: bool, service_key: &str) -> App {
             MppAuthState {
                 auth: auth_state(),
                 mpp: service.clone(),
+                session: None,
             },
             mpp_auth_middleware,
         ))
@@ -505,12 +509,16 @@ async fn bearer_unpriced_unparseable_and_other_routes_are_unchanged_when_enabled
         assert_eq!(reply.json()["error"]["type"], "missing_auth_header");
         assert!(reply.header("www-authenticate").is_none());
     }
-    // A Payment header on an unpriced model is not an MPP request either.
+    // Payment credentials on an unpriced body stay in the MPP error domain.
     let payload = json!({"model": "other/model", "max_tokens": 5})
         .to_string()
         .into_bytes();
     let reply = app.post(&payload, Some("Payment e30")).await;
-    assert_eq!(reply.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        reply.json()["type"],
+        "https://paymentauth.org/problems/malformed-credential"
+    );
 
     // Another route of the group never sees MPP, even with a priced body.
     let reply = send(&app.router, request("/v1/embeddings", &body(), None)).await;

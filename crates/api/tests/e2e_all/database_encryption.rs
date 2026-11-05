@@ -301,14 +301,13 @@ async fn execute_job_encrypts_user_metadata_that_collides_with_the_marker() {
         .expect("encrypted marker collision metadata")
         .get(0);
     assert!(database::field_encryption::is_envelope(&stored));
-    let key = database
+    let ring = database
         .pool()
-        .encryption_key()
-        .expect("database encryption key");
+        .encryption_ring()
+        .expect("database encryption ring");
     assert_eq!(
-        database::field_encryption::decrypt_json_if_encrypted_with_key_id(
-            &key,
-            &database.pool().encryption_key_id(),
+        database::field_encryption::decrypt_json_if_encrypted_with_ring(
+            &ring,
             "responses",
             "metadata",
             response_id,

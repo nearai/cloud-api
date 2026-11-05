@@ -5,6 +5,9 @@ use serde_json::{json, Value};
 use services::responses::models::{ResponseId, ResponseItemId};
 use services::responses::ports::{ResponseItemRepositoryTrait, ResponseRepositoryTrait};
 
+const DB_V1_KEY: [u8; 32] = [7; 32];
+const DB_V2_KEY: [u8; 32] = [9; 32];
+
 fn scope() -> Value {
     json!({"fields":[
         {"table":"files","column":"filename"},
@@ -17,11 +20,11 @@ fn ring_config(config: &mut config::ApiConfig) {
     config.database_encryption_keys = Some(vec![
         KeySourceSpec {
             key_id: "db-v2".into(),
-            source: KeySource::Hex("09".repeat(32)),
+            source: KeySource::Hex(hex::encode(DB_V2_KEY)),
         },
         KeySourceSpec {
             key_id: "db-v1".into(),
-            source: KeySource::Hex("07".repeat(32)),
+            source: KeySource::Hex(hex::encode(DB_V1_KEY)),
         },
         KeySourceSpec {
             key_id: config.database_encryption_key_id.clone(),
@@ -87,7 +90,7 @@ async fn key_rotation_rewraps_previous_envelopes_before_key_removal() {
     assert!(root_flag_before);
     let metadata = json!({"root_response":true});
     let previous_metadata = encrypt_json_with_key_id(
-        &[7; 32],
+        &DB_V1_KEY,
         "db-v1",
         "responses",
         "metadata",
@@ -112,7 +115,7 @@ async fn key_rotation_rewraps_previous_envelopes_before_key_removal() {
     let item = serde_json::to_value(item).unwrap();
     assert_eq!(item["content"][0]["text"], "retained item 0");
     let previous_item = encrypt_json_with_key_id(
-        &[7; 32],
+        &DB_V1_KEY,
         "db-v1",
         "response_items",
         "item",
@@ -138,9 +141,9 @@ async fn key_rotation_rewraps_previous_envelopes_before_key_removal() {
     let ids = [Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()];
     for (index, id) in ids.iter().enumerate() {
         let (key_id, key) = if index < 2 {
-            ("db-v1", [7; 32])
+            ("db-v1", DB_V1_KEY)
         } else {
-            ("db-v2", [9; 32])
+            ("db-v2", DB_V2_KEY)
         };
         let filename =
             encrypt_with_key_id(&key, key_id, "files", "filename", *id, "rotation.txt").unwrap();
@@ -165,7 +168,7 @@ async fn key_rotation_rewraps_previous_envelopes_before_key_removal() {
     assert_eq!(keys["write_key_id"], "db-v2");
     assert_eq!(keys["read_key_ids"][0], "db-v2");
     assert_eq!(keys["fingerprints"]["db-v1"].as_str().unwrap().len(), 16);
-    assert!(!keys.to_string().contains(&"07".repeat(32)));
+    assert!(!keys.to_string().contains(&hex::encode(DB_V1_KEY)));
 
     let scan = server
         .post("/v1/admin/database-encryption/scan")
@@ -270,7 +273,7 @@ async fn key_rotation_rewraps_previous_envelopes_before_key_removal() {
     let (server, database) = setup_test_server_with_config_and_database(|config| {
         config.database_encryption_keys = Some(vec![KeySourceSpec {
             key_id: "db-v2".into(),
-            source: KeySource::Hex("09".repeat(32)),
+            source: KeySource::Hex(hex::encode(DB_V2_KEY)),
         }]);
     })
     .await;
@@ -313,7 +316,9 @@ async fn key_rotation_rewraps_previous_envelopes_before_key_removal() {
     assert_eq!(invalid["status"], "completed");
     assert_eq!(invalid["progress"]["invalid_envelopes"], 1);
     assert_eq!(invalid["progress"]["plaintext"], 1);
-    assert_eq!(invalid["progress"]["by_key_id"]["totals"]["db-v3"], 1);
+    assert!(invalid["progress"]["by_key_id"]["totals"]
+        .get("db-v3")
+        .is_none());
     let client = database.pool().get().await.unwrap();
     assert_eq!(
         client
@@ -343,10 +348,14 @@ async fn key_rotation_rewraps_previous_envelopes_before_key_removal() {
         KeyRing::new(
             "e2e-db-v1".into(),
             database::field_encryption::parse_key(&test_config().database_encryption_key).unwrap(),
-            vec![("db-v2".into(), [9; 32])],
+            vec![("db-v2".into(), DB_V2_KEY)],
         )
         .unwrap(),
     );
     drop(client);
-    job(&server, "execute", "rewrap", None).await;
+    let cleanup_rewrap = job(&server, "execute", "rewrap", None).await;
+    assert_eq!(cleanup_rewrap["progress"]["invalid_envelopes"], 0);
+    let cleanup = job(&server, "verify", "verify", None).await;
+    assert_eq!(cleanup["progress"]["invalid_envelopes"], 0);
+    assert_eq!(cleanup["progress"]["stale"], 0);
 }

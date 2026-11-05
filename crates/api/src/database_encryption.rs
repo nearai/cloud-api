@@ -347,6 +347,9 @@ enum Mode {
     Verify,
 }
 
+/// Creates a resumable job. `batch_delay_ms` throttles every mode, including
+/// verify and dry_run scans. Specify it at the top level or in scope.options,
+/// never both.
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct CreateJobRequest {
     mode: Mode,
@@ -616,20 +619,16 @@ async fn counts(
                     count.empty += 1;
                     continue;
                 };
-                match serde_json::from_str::<Value>(&raw) {
-                    Ok(value) if value[MARKER] == true => {
-                        if let Some(key_id) = database::field_encryption::envelope_key_id(&value) {
-                            *count.by_key_id.entry(key_id.to_string()).or_default() += 1;
-                        }
-                        match classify(&ring, f, id, &raw) {
-                            Classification::Current => count.encrypted += 1,
-                            Classification::Stale(_) => count.stale += 1,
-                            Classification::Invalid | Classification::Plaintext => {
-                                count.invalid_envelope += 1
-                            }
-                        }
-                    }
-                    _ => count.plaintext += 1,
+                let value = serde_json::from_str::<Value>(&raw).unwrap_or(Value::Null);
+                let classification = classify(&ring, f, id, &value);
+                if let Some(key_id) = classification.key_id(&ring) {
+                    *count.by_key_id.entry(key_id.to_string()).or_default() += 1;
+                }
+                match classification {
+                    Classification::Current => count.encrypted += 1,
+                    Classification::Stale(_) => count.stale += 1,
+                    Classification::Invalid => count.invalid_envelope += 1,
+                    Classification::Plaintext => count.plaintext += 1,
                 }
             }
             count.scanned += rows.len() as i64;
@@ -698,22 +697,23 @@ fn decrypt_envelope(
     id: Uuid,
     encoded: &str,
 ) -> anyhow::Result<String> {
-    database::field_encryption::decrypt_with_key_id(key, key_id, f.table, f.column, id, encoded)
+    let ring = KeyRing::new(key_id.to_string(), *key, vec![])?;
+    database::field_encryption::decrypt_with_ring(
+        &serde_json::from_str(encoded)?,
+        &ring,
+        f.table,
+        f.column,
+        id,
+    )
 }
 
 fn decrypt_ring_envelope(
     ring: &KeyRing,
     field: &Field,
     id: Uuid,
-    encoded: &str,
+    value: &Value,
 ) -> anyhow::Result<String> {
-    database::field_encryption::decrypt_with_ring(
-        &serde_json::from_str(encoded)?,
-        ring,
-        field.table,
-        field.column,
-        id,
-    )
+    database::field_encryption::decrypt_with_ring(value, ring, field.table, field.column, id)
 }
 
 #[utoipa::path(
@@ -780,6 +780,11 @@ pub async fn create_job(
         return Err(bad("batch_size must be between 1 and 1000"));
     }
     job_action(req.mode, &req.actions)?;
+    if req.batch_delay_ms.is_some() && req.scope.options.batch_delay_ms.is_some() {
+        return Err(bad(
+            "specify batch_delay_ms at the top level or in scope.options, not both",
+        ));
+    }
     validate_delay(req.batch_delay_ms)?;
     validate_delay(req.scope.options.batch_delay_ms)?;
     if req.max_rows.is_some_and(|max_rows| max_rows <= 0) {
@@ -1010,10 +1015,12 @@ async fn run_locked_job(
             for row in &rows {
                 let row_id: Uuid = row.get(0);
                 after_id = row_id;
+                let raw: String = row.get(1);
+                let value = serde_json::from_str::<Value>(&raw).unwrap_or(Value::Null);
                 if matches!(action, Action::Verify | Action::Rewrap) {
-                    let raw: String = row.get(1);
-                    by_key_id.record(field, &raw);
-                    match classify(&ring, field, row_id, &raw) {
+                    let classification = classify(&ring, field, row_id, &value);
+                    by_key_id.record(field, classification.key_id(&ring));
+                    match classification {
                         Classification::Plaintext => {
                             plaintext += 1;
                             if action == Action::Verify && plaintext_rows.len() < 100 {
@@ -1033,7 +1040,8 @@ async fn run_locked_job(
                             stale += 1;
                             if action == Action::Rewrap && mode == "execute" {
                                 row_ids.push(row_id);
-                                encrypted_values.push(rewrap_envelope(&ring, field, row_id, &raw)?);
+                                encrypted_values
+                                    .push(rewrap_envelope(&ring, field, row_id, &value)?);
                             }
                         }
                         Classification::Invalid => {
@@ -1048,21 +1056,18 @@ async fn run_locked_job(
                     continue;
                 }
                 if mode == "execute" {
-                    let plaintext: String = row.get(1);
-                    if let Ok(value) = serde_json::from_str::<Value>(&plaintext) {
-                        if database::field_encryption::is_envelope(&value) {
-                            if decrypt_ring_envelope(&ring, field, row_id, &plaintext).is_err() {
-                                invalid_envelopes += 1;
-                                if invalid_envelope_rows.len() < 100 {
-                                    invalid_envelope_rows.push(json!({
-                                        "table": field.table,
-                                        "column": field.column,
-                                        "id": row_id,
-                                    }));
-                                }
+                    if database::field_encryption::is_envelope(&value) {
+                        if decrypt_ring_envelope(&ring, field, row_id, &value).is_err() {
+                            invalid_envelopes += 1;
+                            if invalid_envelope_rows.len() < 100 {
+                                invalid_envelope_rows.push(json!({
+                                    "table": field.table,
+                                    "column": field.column,
+                                    "id": row_id,
+                                }));
                             }
-                            continue;
                         }
+                        continue;
                     }
                     row_ids.push(row_id);
                     encrypted_values.push(envelope(
@@ -1070,7 +1075,7 @@ async fn run_locked_job(
                         ring.write_id(),
                         field,
                         row_id,
-                        &plaintext,
+                        &raw,
                     )?);
                 }
             }

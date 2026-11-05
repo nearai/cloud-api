@@ -1767,6 +1767,7 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "wiremock",
+ "zeroize",
 ]
 
 [[package]]
@@ -5645,6 +5646,7 @@ dependencies = [
  "uuid",
  "wiremock",
  "x509-parser 0.18.1",
+ "zeroize",
 ]
 
 [[package]]

@@ -13,19 +13,26 @@ pub(super) enum Classification {
     Invalid,
 }
 
-pub(super) fn classify(ring: &KeyRing, field: &Field, id: Uuid, raw: &str) -> Classification {
-    let Ok(value) = serde_json::from_str::<Value>(raw) else {
-        return Classification::Plaintext;
-    };
+impl Classification {
+    pub(super) fn key_id<'a>(&'a self, ring: &'a KeyRing) -> Option<&'a str> {
+        match self {
+            Self::Current => Some(ring.write_id()),
+            Self::Stale(key_id) => Some(key_id),
+            Self::Invalid | Self::Plaintext => None,
+        }
+    }
+}
+
+pub(super) fn classify(ring: &KeyRing, field: &Field, id: Uuid, value: &Value) -> Classification {
     if value[MARKER] != true {
         return Classification::Plaintext;
     }
-    if database::field_encryption::decrypt_with_ring(&value, ring, field.table, field.column, id)
+    if database::field_encryption::decrypt_with_ring(value, ring, field.table, field.column, id)
         .is_err()
     {
         return Classification::Invalid;
     }
-    match database::field_encryption::envelope_key_id(&value) {
+    match database::field_encryption::envelope_key_id(value) {
         Some(key_id) if key_id == ring.write_id() => Classification::Current,
         Some(key_id) => Classification::Stale(key_id.to_string()),
         None => Classification::Invalid,
@@ -36,9 +43,9 @@ pub(super) fn rewrap_envelope(
     ring: &KeyRing,
     field: &Field,
     id: Uuid,
-    raw: &str,
+    value: &Value,
 ) -> anyhow::Result<String> {
-    let plaintext = decrypt_ring_envelope(ring, field, id, raw)?;
+    let plaintext = decrypt_ring_envelope(ring, field, id, value)?;
     envelope(ring.write_key(), ring.write_id(), field, id, &plaintext).context("rewrap failed")
 }
 
@@ -78,17 +85,15 @@ pub(super) struct KeyCounts {
 }
 
 impl KeyCounts {
-    pub fn record(&mut self, field: &Field, raw: &str) {
-        if let Ok(value) = serde_json::from_str::<Value>(raw) {
-            if let Some(key_id) = database::field_encryption::envelope_key_id(&value) {
-                *self.totals.entry(key_id.to_string()).or_default() += 1;
-                *self
-                    .fields
-                    .entry(format!("{}.{}", field.table, field.column))
-                    .or_default()
-                    .entry(key_id.to_string())
-                    .or_default() += 1;
-            }
+    pub fn record(&mut self, field: &Field, key_id: Option<&str>) {
+        if let Some(key_id) = key_id {
+            *self.totals.entry(key_id.to_string()).or_default() += 1;
+            *self
+                .fields
+                .entry(format!("{}.{}", field.table, field.column))
+                .or_default()
+                .entry(key_id.to_string())
+                .or_default() += 1;
         }
     }
 }
@@ -98,6 +103,11 @@ mod tests {
     use super::super::{Scope, FIELDS};
     use super::*;
     use serde_json::json;
+
+    fn classify(ring: &KeyRing, field: &Field, id: Uuid, raw: &str) -> Classification {
+        let value = serde_json::from_str(raw).unwrap_or(Value::Null);
+        super::classify(ring, field, id, &value)
+    }
 
     #[test]
     fn classification_checks_key_identity_authentication_and_context() {
@@ -144,19 +154,21 @@ mod tests {
             classify(&ring, field, id, &json!({MARKER:false}).to_string()),
             Classification::Plaintext
         );
-        let rewritten = rewrap_envelope(&ring, field, id, &old).unwrap();
+        let old_value = serde_json::from_str(&old).unwrap();
+        let rewritten = rewrap_envelope(&ring, field, id, &old_value).unwrap();
+        let rewritten_value = serde_json::from_str(&rewritten).unwrap();
         let reduced = KeyRing::new("db-v2".into(), [9; 32], vec![]).unwrap();
         assert_eq!(
             classify(&reduced, field, id, &rewritten),
             Classification::Current
         );
         assert_eq!(
-            decrypt_ring_envelope(&reduced, field, id, &rewritten).unwrap(),
+            decrypt_ring_envelope(&reduced, field, id, &rewritten_value).unwrap(),
             "previous"
         );
         let mut counts = KeyCounts::default();
-        counts.record(field, &old);
-        counts.record(field, &rewritten);
+        counts.record(field, classify(&ring, field, id, &old).key_id(&ring));
+        counts.record(field, classify(&ring, field, id, &rewritten).key_id(&ring));
         let restored: KeyCounts =
             serde_json::from_value(serde_json::to_value(counts).unwrap()).unwrap();
         assert_eq!(restored.totals["db-v1"], 1);
@@ -176,6 +188,71 @@ mod tests {
             }
             assert!(job_action(mode, &[]).is_err());
         }
+    }
+
+    #[test]
+    fn forged_envelope_with_real_key_id_is_not_counted() {
+        let ring = KeyRing::new("db-v2".into(), [9; 32], vec![]).unwrap();
+        let field = &FIELDS[0];
+        let id = Uuid::new_v4();
+        let mut forged: Value = serde_json::from_str(
+            &envelope(ring.write_key(), ring.write_id(), field, id, "secret").unwrap(),
+        )
+        .unwrap();
+        forged["ciphertext"] = json!("garbage");
+        let raw = forged.to_string();
+        let classification = classify(&ring, field, id, &raw);
+        assert_eq!(classification, Classification::Invalid);
+
+        let mut counts = KeyCounts::default();
+        counts.record(field, classification.key_id(&ring));
+
+        assert!(counts.totals.is_empty());
+        assert!(counts.fields.is_empty());
+    }
+
+    #[tokio::test]
+    async fn duplicate_delay_sources_are_rejected_before_database_access() {
+        let pool = database::DbPool::uninitialized();
+        pool.set_encryption_ring(KeyRing::new("db-v2".into(), [9; 32], vec![]).unwrap());
+        let state = super::super::DatabaseEncryptionState::new(pool).unwrap();
+        let admin = super::super::AdminUser(database::User {
+            id: Uuid::nil(),
+            email: "admin@example.com".into(),
+            username: "admin".into(),
+            display_name: None,
+            avatar_url: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            last_login_at: None,
+            is_active: true,
+            auth_provider: "google".into(),
+            provider_user_id: "admin".into(),
+            tokens_revoked_at: None,
+            contact_email: None,
+            contact_email_verified_at: None,
+            email_opt_in_at: None,
+        });
+        let request = serde_json::from_value(json!({
+            "mode":"dry_run", "actions":["rewrap"], "batch_delay_ms":5,
+            "scope":{"fields":[{"table":"files","column":"filename"}],
+                     "options":{"batch_delay_ms":10}}
+        }))
+        .unwrap();
+
+        let result = super::super::create_job(
+            axum::Extension(state),
+            axum::Extension(admin),
+            axum::Json(request),
+        )
+        .await;
+
+        let (status, body) = result.expect_err("duplicate delay request rejected");
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body["error"]["message"],
+            "specify batch_delay_ms at the top level or in scope.options, not both"
+        );
     }
 
     #[test]

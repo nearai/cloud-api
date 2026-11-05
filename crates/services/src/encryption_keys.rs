@@ -3,6 +3,7 @@ use async_trait::async_trait;
 use config::{KeySource, KeySourceSpec};
 use dstack_sdk::dstack_client;
 use thiserror::Error;
+use zeroize::Zeroizing;
 
 #[derive(Debug, Error)]
 #[error("database encryption key {key_id} ({source_kind}): {class}")]
@@ -28,7 +29,7 @@ pub enum KeyFetchError {
 
 #[async_trait]
 pub trait KeyFetcher: Send + Sync {
-    async fn fetch(&self, path: &str) -> Result<[u8; 32], KeyFetchError>;
+    async fn fetch(&self, path: &str) -> Result<Zeroizing<[u8; 32]>, KeyFetchError>;
 }
 
 pub struct DstackKeyFetcher {
@@ -45,7 +46,7 @@ impl DstackKeyFetcher {
 
 #[async_trait]
 impl KeyFetcher for DstackKeyFetcher {
-    async fn fetch(&self, path: &str) -> Result<[u8; 32], KeyFetchError> {
+    async fn fetch(&self, path: &str) -> Result<Zeroizing<[u8; 32]>, KeyFetchError> {
         let response = tokio::time::timeout(
             std::time::Duration::from_secs(10),
             self.client.get_key(Some(path.to_string()), None),
@@ -53,19 +54,21 @@ impl KeyFetcher for DstackKeyFetcher {
         .await
         .map_err(|_| KeyFetchError::Timeout)?
         .map_err(|_| KeyFetchError::Unavailable)?;
-        key_bytes(
-            response
-                .decode_key()
-                .map_err(|_| KeyFetchError::InvalidEncoding)?,
-        )
+        let raw = Zeroizing::new(response.key);
+        parse_hex(&raw)
     }
 }
 
-fn key_bytes(bytes: Vec<u8>) -> Result<[u8; 32], KeyFetchError> {
-    bytes.try_into().map_err(|_| KeyFetchError::InvalidLength)
+fn key_bytes(bytes: Vec<u8>) -> Result<Zeroizing<[u8; 32]>, KeyFetchError> {
+    let bytes = Zeroizing::new(bytes);
+    let key = bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| KeyFetchError::InvalidLength)?;
+    Ok(Zeroizing::new(key))
 }
 
-fn parse_hex(raw: &str) -> Result<[u8; 32], KeyFetchError> {
+fn parse_hex(raw: &str) -> Result<Zeroizing<[u8; 32]>, KeyFetchError> {
     key_bytes(hex::decode(raw).map_err(|_| KeyFetchError::InvalidEncoding)?)
 }
 
@@ -73,14 +76,14 @@ fn parse_hex(raw: &str) -> Result<[u8; 32], KeyFetchError> {
 pub async fn resolve_key_ring(
     specs: &[KeySourceSpec],
     dstack_endpoint: Option<&str>,
-) -> Result<Vec<(String, [u8; 32])>, KeyRingResolveError> {
+) -> Result<Zeroizing<Vec<(String, [u8; 32])>>, KeyRingResolveError> {
     resolve_with_fetcher(specs, &DstackKeyFetcher::new(dstack_endpoint)).await
 }
 
 async fn resolve_with_fetcher(
     specs: &[KeySourceSpec],
     fetcher: &impl KeyFetcher,
-) -> Result<Vec<(String, [u8; 32])>, KeyRingResolveError> {
+) -> Result<Zeroizing<Vec<(String, [u8; 32])>>, KeyRingResolveError> {
     if specs.is_empty() {
         return Err(KeyRingResolveError {
             key_id: String::new(),
@@ -88,15 +91,23 @@ async fn resolve_with_fetcher(
             class: KeyFetchError::Empty,
         });
     }
-    let mut keys = Vec::with_capacity(specs.len());
+    let mut keys = Zeroizing::new(Vec::with_capacity(specs.len()));
     for spec in specs {
         let (source_kind, result) = match &spec.source {
             KeySource::Hex(raw) => ("hex", parse_hex(raw)),
             KeySource::File(path) => (
                 "file",
                 match tokio::fs::read_to_string(path).await {
-                    Ok(raw) => parse_hex(raw.trim()),
-                    Err(_) => Err(KeyFetchError::Unavailable),
+                    Ok(raw) => parse_hex(Zeroizing::new(raw).trim()),
+                    Err(error) => {
+                        tracing::warn!(
+                            key_id = %spec.key_id,
+                            path = %path.display(),
+                            error_kind = ?error.kind(),
+                            "database encryption key file unavailable"
+                        );
+                        Err(KeyFetchError::Unavailable)
+                    }
                 },
             ),
             KeySource::Dstack(path) => ("dstack", fetcher.fetch(path).await),
@@ -106,7 +117,7 @@ async fn resolve_with_fetcher(
             source_kind,
             class,
         })?;
-        keys.push((spec.key_id.clone(), key));
+        keys.push((spec.key_id.clone(), *key));
     }
     Ok(keys)
 }
@@ -114,11 +125,58 @@ async fn resolve_with_fetcher(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        io::Write,
+        sync::{Arc, Mutex},
+    };
+    use tracing::instrument::WithSubscriber;
+
+    #[derive(Clone)]
+    struct LogBuffer(Arc<Mutex<Vec<u8>>>);
+    impl Write for LogBuffer {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().write(bytes)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_file_logs_safe_diagnostics() {
+        // Given a missing source and a local tracing capture.
+        let path = std::env::temp_dir().join(format!("missing-key-{}", uuid::Uuid::new_v4()));
+        let specs = [KeySourceSpec {
+            key_id: "db-missing".into(),
+            source: KeySource::File(path.clone()),
+        }];
+        let buffer = LogBuffer(Arc::default());
+        let writer = buffer.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        // When resolution fails, then diagnostics preserve id/path/kind, not contents.
+        let error = resolve_with_fetcher(&specs, &FakeFetcher(vec![]))
+            .with_subscriber(subscriber)
+            .await
+            .unwrap_err();
+        assert!(matches!(error.class, KeyFetchError::Unavailable));
+        assert_eq!(
+            error.to_string(),
+            "database encryption key db-missing (file): source unavailable"
+        );
+        let logs = String::from_utf8(buffer.0.lock().unwrap().clone()).unwrap();
+        assert!(logs.contains("db-missing"), "{logs}");
+        assert!(logs.contains(path.to_str().unwrap()), "{logs}");
+        assert!(logs.contains("NotFound"), "{logs}");
+    }
 
     struct FakeFetcher(Vec<u8>);
     #[async_trait]
     impl KeyFetcher for FakeFetcher {
-        async fn fetch(&self, path: &str) -> Result<[u8; 32], KeyFetchError> {
+        async fn fetch(&self, path: &str) -> Result<Zeroizing<[u8; 32]>, KeyFetchError> {
             assert_eq!(path, "/keys/v1");
             key_bytes(self.0.clone())
         }
@@ -147,8 +205,8 @@ mod tests {
         let result = resolve_with_fetcher(&specs, &FakeFetcher(vec![8; 32])).await;
         tokio::fs::remove_file(path).await.unwrap();
         assert_eq!(
-            result.unwrap(),
-            vec![
+            result.unwrap().as_slice(),
+            &[
                 ("db-v2".into(), [9; 32]),
                 ("db-v1".into(), [7; 32]),
                 ("db-v0".into(), [8; 32])

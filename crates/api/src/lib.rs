@@ -274,7 +274,7 @@ pub fn init_auth_services(database: Arc<Database>, config: &ApiConfig) -> AuthCo
             )),
         ) as Arc<dyn services::reporting_tokens::OrganizationReportingTokenService>,
         admin_access_token_repository,
-        config.auth.admin_domains.clone(),
+        config.auth.admin_emails.clone(),
         config.auth.encoding_key.clone(),
     );
 
@@ -3493,7 +3493,7 @@ mod tests {
                 github: None,
                 google: None,
                 near: config::NearConfig::default(),
-                admin_domains: vec![],
+                admin_emails: vec![],
                 admin_read_only_tokens_enabled: false,
                 require_session_bound_access_tokens: false,
             },
@@ -3616,7 +3616,7 @@ mod tests {
                 github: None,
                 google: None,
                 near: config::NearConfig::default(),
-                admin_domains: vec![],
+                admin_emails: vec![],
                 admin_read_only_tokens_enabled: false,
                 require_session_bound_access_tokens: false,
             },

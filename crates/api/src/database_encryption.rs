@@ -906,6 +906,7 @@ fn classify_job_error(error: &anyhow::Error) -> &'static str {
 }
 
 const GLOBAL_WORKER_LOCK_KEY: i64 = 0x4e454152444245;
+const WORKER_LOCK_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// Hold the per-process worker permit for the entire job (one job at a time),
 /// while returning batch connections and advisory locks before any delay.
@@ -993,7 +994,15 @@ async fn run_job(state: &DatabaseEncryptionState, id: Uuid) -> anyhow::Result<()
             .get(0);
         if !locked {
             transaction.rollback().await?;
-            return Ok(());
+            drop(client);
+            if batch_delay::wait_between_batches(WORKER_LOCK_RETRY_DELAY, || {
+                batch_delay::cancel_if_requested(&state.pool, id)
+            })
+            .await?
+            {
+                return Ok(());
+            }
+            continue;
         }
         let cancelled: bool = transaction
             .query_one(

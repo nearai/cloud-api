@@ -173,9 +173,22 @@ async fn supervise_channel(
         }
         return;
     }
-    if state.close_requested_at == 0 || current.state != ChannelLifecycle::Open {
+    close_requested_channel(repo, rpc, signer, chain, current, now, summary).await;
+}
+
+async fn close_requested_channel(
+    repo: &dyn ChannelRepository,
+    rpc: &dyn TempoRpc,
+    signer: &dyn TempoSigner,
+    chain: PayeeChain,
+    current: ChannelRecord,
+    now: DateTime<Utc>,
+    summary: &mut SupervisionSummary,
+) {
+    if current.close_requested_at == 0 || current.state != ChannelLifecycle::Open {
         return;
     }
+    let id = current.channel_id;
     summary.close_requested += 1;
     let Some(capture) = capture_at(&current, now) else {
         summary.reservation_deferrals += 1;
@@ -227,7 +240,10 @@ async fn supervise_channel(
         Ok(CloseTransition::Marked(marked)) => {
             // An in-flight inference can finish while gas price/signing is awaited.
             // Never close at the old capture if delivered spend changed meanwhile.
-            if capture_at(&marked, now) != Some(capture) || marked.settled_on_chain >= capture {
+            if marked.close_requested_at == 0
+                || capture_at(&marked, now) != Some(capture)
+                || marked.settled_on_chain >= capture
+            {
                 summary.closes_failed += 1;
                 tracing::warn!(
                     outcome = "close_capture_changed",
@@ -377,11 +393,34 @@ pub async fn run_supervision_pass(
                 matches
             })
             .collect();
-        // Recovery runs independently from channel-state batches, with a fixed
-        // in-flight bound so one slow receipt does not stall the entire page.
         let (closing, open): (Vec<_>, Vec<_>) = records
             .into_iter()
             .partition(|record| record.state == ChannelLifecycle::Closing);
+        let Some(observed_at) = pass_time(now, started) else {
+            break;
+        };
+        let (known_closes, open): (Vec<_>, Vec<_>) = open.into_iter().partition(|record| {
+            record.state == ChannelLifecycle::Open
+                && record.close_requested_at != 0
+                && chain_read_is_fresh(record.last_chain_read_at, observed_at, chain_freshness)
+        });
+        // A known close request keeps its deadline even when a recent HTTP refresh
+        // makes another state read unnecessary. Run these before receipt recovery.
+        let mut known_closes = stream::iter(known_closes)
+            .map(|record| async move {
+                let mut summary = SupervisionSummary::default();
+                if let Some(at) = pass_time(now, started) {
+                    close_requested_channel(repo, rpc, signer, chain, record, at, &mut summary)
+                        .await;
+                }
+                summary
+            })
+            .buffer_unordered(MAX_IN_FLIGHT);
+        while let Some(result) = known_closes.next().await {
+            summary.add(result);
+        }
+        // Acquire read claims after recovery so a slow receipt cannot age a claim
+        // before its associated state read starts.
         let mut recoveries = stream::iter(closing)
             .map(|record| async move {
                 let mut summary = SupervisionSummary::default();

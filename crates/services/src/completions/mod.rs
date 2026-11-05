@@ -304,6 +304,7 @@ where
         // returns for interrupted streams) has already settled its counts.
         let usage_complete = self.stream_completed
             && self.last_error.is_none()
+            && self.usage_observer.has_final_usage()
             && self.last_usage_stats.is_some()
             && self.last_chat_id.is_some();
         let (observed_prompt, observed_completion) = self
@@ -648,6 +649,16 @@ where
 
                             // Track usage stats (updated on each chunk that has usage).
                             if let Some(usage) = &chat_chunk.usage {
+                                // Continuous counts before the terminal choice are partial.
+                                // A later EOF or [DONE] cannot make those counts final.
+                                if self.last_finish_reason.is_some()
+                                    || chat_chunk
+                                        .choices
+                                        .iter()
+                                        .any(|choice| choice.finish_reason.is_some())
+                                {
+                                    self.usage_observer.mark_final_usage();
+                                }
                                 self.last_usage_stats = Some(usage.clone());
                             }
 

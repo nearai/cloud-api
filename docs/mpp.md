@@ -347,8 +347,9 @@ Streaming completions finalize after body completion or disconnect. A missing st
 is bounded at 30 minutes, below supervision's two-hour stale reservation cutoff.
 Charge finalization retries store errors three times with short backoff. If every attempt
 fails, the successful response retains its provisional receipt and the reservation remains
-held. The reaper eventually releases that hold, favouring the payer; delivered work can
-remain uncharged after a persistent store failure. Finalization failures log closed codes.
+held. On open channels, the reaper releases the hold, favouring the payer, and persistent
+store failure can leave delivered work uncharged. Finalized channels retain the amount
+already captured on chain as their holds drain. Finalization failures log closed codes.
 An inner error, including a rate-limit `429`, releases the reservation. Missing or closed
 channels return `410 application/problem+json`; voucher and minimum-delta refusals return
 `402` with a fresh challenge carrying the authenticated session snapshot.

@@ -189,6 +189,47 @@ async fn dropped_stream_after_partial_usage_is_incomplete() {
 }
 
 #[tokio::test]
+async fn eof_after_continuous_usage_without_terminal_frame_is_incomplete() {
+    let observer = Arc::new(RecordingObserver::default());
+    let mut partial = chunk(Some(usage(11, 2)));
+    if let Some(StreamChunk::Chat(chat)) = partial.chunk.as_mut() {
+        chat.choices.clear();
+    }
+    let mut stream = observed_stream(vec![Ok(partial)], observer.clone(), Uuid::new_v4());
+    while stream.next().await.is_some() {}
+    drop(stream);
+    assert_eq!(observer.reports().len(), 1);
+    assert!(!observer.reports()[0].completed);
+}
+
+#[tokio::test]
+async fn terminal_marker_after_partial_counts_without_final_usage_is_incomplete() {
+    let observer = Arc::new(RecordingObserver::default());
+    let mut partial = chunk(Some(usage(11, 2)));
+    if let Some(StreamChunk::Chat(chat)) = partial.chunk.as_mut() {
+        chat.choices.clear();
+    }
+    let mut finish = chunk(Some(usage(11, 2)));
+    if let Some(StreamChunk::Chat(chat)) = finish.chunk.as_mut() {
+        chat.usage = None;
+    }
+    let done = SSEEvent {
+        raw_bytes: Bytes::from_static(b"data: [DONE]\n\n"),
+        raw_passthrough: true,
+        chunk: None,
+    };
+    let mut stream = observed_stream(
+        vec![Ok(partial), Ok(finish), Ok(done)],
+        observer.clone(),
+        Uuid::new_v4(),
+    );
+    while stream.next().await.is_some() {}
+    drop(stream);
+    assert_eq!(observer.reports().len(), 1);
+    assert!(!observer.reports()[0].completed);
+}
+
+#[tokio::test]
 async fn streaming_service_propagates_observer_and_final_counts() {
     let model_name = "z-ai/glm-5.1";
     let (service, usage_service) =

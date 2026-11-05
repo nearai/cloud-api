@@ -10,6 +10,75 @@ const TOP_UP: u128 = 1_000_000;
 const PROMPT: &str = "one two three four five six seven eight";
 const ANSWER: &str = "alpha beta gamma delta epsilon";
 
+#[tokio::test]
+async fn configured_session_errors_prevent_both_public_app_builders_from_booting() {
+    let mut captured = None;
+    let (_server, database) = setup_test_server_with_domain_services(|services, _| {
+        captured = Some(services.clone());
+    })
+    .await;
+    let services = captured.unwrap();
+    let vectors: Value = serde_json::from_str(VECTORS).unwrap();
+    for invalid_signer in [true, false] {
+        for with_options in [true, false] {
+            let mut config = test_config();
+            config.mpp = MppConfig::Enabled(Box::new(MppSettings {
+                realm: "session-startup.test".into(),
+                secret_key: "session-startup-hmac-0123456789abcdef".into(),
+                service_api_key: "sk-live-startup-test-0001".into(),
+                challenge_ttl_secs: 600,
+                tempo: MppTempoSettings {
+                    rpc_url: if invalid_signer {
+                        "http://127.0.0.1:1"
+                    } else {
+                        "invalid-rpc-url"
+                    }
+                    .into(),
+                    rpc_timeout_secs: 5,
+                    chain_id: 42431,
+                    currency: hex_prefixed(&fixed::<20>(&vectors, "token")),
+                    recipient: hex_prefixed(&fixed::<20>(&vectors, "payee")),
+                },
+                model_prices: BTreeMap::from([(
+                    "startup-model".into(),
+                    MppModelPrice {
+                        amount: 0,
+                        token_price: Some(TOKEN_PRICE),
+                        max_tokens: 256,
+                        max_request_bytes: 8192,
+                    },
+                )]),
+                session: Some(MppSessionSettings {
+                    signer_key: Some(if invalid_signer {
+                        "00".repeat(32)
+                    } else {
+                        vectors["payeeKey"].as_str().unwrap().into()
+                    }),
+                    min_voucher_delta: Some(1),
+                    suggested_deposit: DEPOSIT,
+                    settle_interval_secs: 3600,
+                    settle_amount: DEPOSIT,
+                    close_supervision_secs: 60,
+                }),
+            }));
+            let auth = api::init_auth_services(database.clone(), &config);
+            let config = Arc::new(config);
+            let result = if with_options {
+                api::build_app_with_config_and_options(
+                    database.clone(),
+                    auth,
+                    services.clone(),
+                    config,
+                    api::AppBuildOptions::default(),
+                )
+            } else {
+                api::build_app_with_config(database.clone(), auth, services.clone(), config)
+            };
+            assert!(matches!(result, Err(services::mpp::MppError::Config)));
+        }
+    }
+}
+
 fn address_word(address: &[u8; 20]) -> [u8; 32] {
     let mut word = [0; 32];
     word[12..].copy_from_slice(address);

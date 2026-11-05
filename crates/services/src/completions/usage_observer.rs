@@ -47,6 +47,7 @@ pub(crate) struct UsageFireOnce {
     observer: Option<Arc<dyn UsageObserver>>,
     fired: AtomicBool,
     output_started: AtomicBool,
+    final_usage: AtomicBool,
 }
 
 impl UsageFireOnce {
@@ -55,6 +56,7 @@ impl UsageFireOnce {
             observer,
             fired: AtomicBool::new(false),
             output_started: AtomicBool::new(false),
+            final_usage: AtomicBool::new(false),
         }
     }
 
@@ -79,6 +81,14 @@ impl UsageFireOnce {
 
     pub(crate) fn output_started(&self) {
         self.output_started.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn mark_final_usage(&self) {
+        self.final_usage.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn has_final_usage(&self) -> bool {
+        self.final_usage.load(Ordering::Acquire)
     }
 }
 

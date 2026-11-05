@@ -1,6 +1,93 @@
 use super::*;
 
 #[tokio::test]
+async fn fresh_chain_observation_does_not_defer_a_due_payee_close() {
+    for reserved in [false, true] {
+        let repo = Arc::new(InMemoryChannelRepository::with_clock(now()));
+        let v = Vectors::load();
+        let mut descriptor = v.descriptor();
+        descriptor.salt = [1; 32];
+        repo.open_or_refresh(NewChannel {
+            channel_id: [1; 32],
+            chain_id: v.chain_id(),
+            escrow: v.escrow(),
+            descriptor,
+            deposit: 1000,
+            settled_on_chain: 0,
+            highest_cumulative: 200,
+            highest_signature: [200; 65],
+        })
+        .await
+        .unwrap();
+        spend(&repo, &[1; 32], 80).await;
+        if reserved {
+            reserve(&repo, &[1; 32], 90).await;
+        }
+        let at = now() + chrono::Duration::seconds(590);
+        repo.record_chain_state(&[1; 32], requested(), at)
+            .await
+            .unwrap();
+        let rpc = OrderedRpc {
+            fake: FakeTempo::default(),
+            repo: repo.clone(),
+            id: [1; 32],
+            observed_closing: AtomicUsize::new(0),
+            cumulative: 200,
+            capture: if reserved { 170 } else { 80 },
+            charge_during_build: None,
+            settled_during_build: None,
+        };
+        let summary = run_supervision_pass(
+            repo.as_ref(),
+            &rpc,
+            &signer(),
+            chain(),
+            &Default::default(),
+            at,
+        )
+        .await;
+        assert_eq!(
+            (summary.closes_submitted, summary.closes_failed),
+            (1, 0),
+            "reserved={reserved}"
+        );
+        assert_eq!(rpc.fake.eth_calls(), 0);
+        assert_eq!(repo.chain_read_claim_count(), 0);
+        let row = repo.get(&[1; 32]).await.unwrap().unwrap();
+        assert_eq!(row.state, ChannelLifecycle::Finalized);
+        assert_eq!(row.last_chain_read_at, Some(at));
+    }
+}
+
+#[tokio::test]
+async fn fresh_close_request_counts_live_reservation_deferral() {
+    let repo = InMemoryChannelRepository::with_clock(now());
+    open(&repo, [1; 32]).await;
+    spend(&repo, &[1; 32], 80).await;
+    reserve(&repo, &[1; 32], 90).await;
+    repo.record_chain_state(&[1; 32], requested(), now())
+        .await
+        .unwrap();
+    let rpc = FakeTempo::default();
+    let summary =
+        run_supervision_pass(&repo, &rpc, &signer(), chain(), &Default::default(), now()).await;
+    assert_eq!(
+        (summary.reservation_deferrals, summary.close_requested),
+        (1, 1)
+    );
+    assert_eq!((rpc.eth_calls(), rpc.send_calls()), (0, 0));
+    assert_eq!(repo.chain_read_claim_count(), 0);
+    assert_eq!(
+        repo.get(&[1; 32])
+            .await
+            .unwrap()
+            .unwrap()
+            .last_chain_read_at,
+        Some(now())
+    );
+}
+
+#[tokio::test]
 async fn live_reservation_defers_a_requested_close_before_withdrawal_deadline() {
     let repo = InMemoryChannelRepository::with_clock(now());
     open(&repo, [1; 32]).await;

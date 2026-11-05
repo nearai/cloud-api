@@ -570,16 +570,21 @@ pub async fn admin_middleware(
     }
 }
 
+/// Auth provider recorded for users created by the retired VPC login route.
+/// Such users remain in the database and must never be treated as admins.
+pub const VPC_AUTH_PROVIDER: &str = "vpc";
+pub const VPC_PROVIDER_USER_ID_PREFIX: &str = "vpc:";
+
 /// Check if a user has admin access based on their email domain
 fn check_admin_access(state: &AuthState, user: &DbUser) -> bool {
     is_admin_user(&state.admin_domains, user)
 }
 
 fn is_admin_user(admin_domains: &[String], user: &DbUser) -> bool {
-    if user.auth_provider == crate::routes::auth_vpc::VPC_AUTH_PROVIDER
+    if user.auth_provider == VPC_AUTH_PROVIDER
         || user
             .provider_user_id
-            .starts_with(crate::routes::auth_vpc::VPC_PROVIDER_USER_ID_PREFIX)
+            .starts_with(VPC_PROVIDER_USER_ID_PREFIX)
     {
         tracing::warn!(user_id = %user.id, "VPC-provisioned user attempted admin action");
         return false;

@@ -104,13 +104,6 @@ pub trait AttestationServiceTrait: Send + Sync {
         &self,
         query: ItaTokenQuery,
     ) -> Result<ItaTokenResponse, AttestationError>;
-
-    /// Verify a VPC shared secret signature
-    async fn verify_vpc_signature(
-        &self,
-        timestamp: i64,
-        signature: String,
-    ) -> Result<bool, AttestationError>;
 }
 
 #[async_trait]

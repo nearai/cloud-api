@@ -826,7 +826,6 @@ fn every_registered_route_has_a_model_access_decision() {
         ("GET", "/docs"),
         ("GET", "/api-docs/openapi.json"),
         // Sign-in and invitations.
-        ("POST", "/auth/vpc/login"),
         ("POST", "/near"),
         ("GET", "/login"),
         ("GET", "/github"),

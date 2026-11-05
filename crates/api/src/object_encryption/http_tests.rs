@@ -15,8 +15,14 @@ fn fixture() -> (TestServer, Arc<MockStorage>) {
         .unwrap(),
     );
     let storage = Arc::new(MockStorage::new_with_ring(ring.clone()));
+    let state = ObjectEncryptionState::new(DbPool::uninitialized(), storage.clone(), ring);
+    let app = router().layer(Extension(state)).layer(Extension(admin()));
+    (TestServer::builder().mock_transport().build(app), storage)
+}
+
+pub(super) fn admin() -> AdminUser {
     let now = chrono::Utc::now();
-    let admin = AdminUser(database::User {
+    AdminUser(database::User {
         id: Uuid::new_v4(),
         email: "admin@near.ai".into(),
         username: "admin".into(),
@@ -32,10 +38,7 @@ fn fixture() -> (TestServer, Arc<MockStorage>) {
         contact_email: None,
         contact_email_verified_at: None,
         email_opt_in_at: None,
-    });
-    let state = ObjectEncryptionState::new(DbPool::uninitialized(), storage.clone(), ring);
-    let app = router().layer(Extension(state)).layer(Extension(admin));
-    (TestServer::builder().mock_transport().build(app), storage)
+    })
 }
 
 #[tokio::test]

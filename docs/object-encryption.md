@@ -49,7 +49,7 @@ Then run a dry run, followed by an execute job with the same options:
 }
 ```
 
-Change `mode` to `execute` to re-encrypt objects under the write key. Each replacement preserves the content type and records the write key ID. Progress counts `rewrapped`, `already_current`, and `undecryptable`, with at most 100 sample object keys for the last category. An object that cannot be decrypted is counted and does not stop the job. A second execute job reports no rewrites for objects already marked current.
+Change `mode` to `execute` to re-encrypt objects under the write key. Each replacement preserves the content type and records the write key ID. Progress counts `rewrapped`, `already_current`, and `undecryptable`, with at most 100 sample object keys for the last category. Scans and all job modes also count `missing` objects, with up to 100 sample keys in `missing_keys`. An object deleted between listing and its metadata read, download, or rewrap is skipped, advances progress and the cursor, and does not prevent verification from passing. Other storage errors still fail the operation. An object that cannot be decrypted is counted and does not stop the job. A second execute job reports no rewrites for objects already marked current.
 
 Jobs use the existing job table with `scope.kind = "objects"`; database-field workers ignore these rows and object workers ignore database-field rows. The continuation token, last processed key, and progress are committed together for each batch under a separate advisory lock. Restarted workers resume from the persisted cursor. An interruption after an object replacement but before its progress commit is safe to retry because rewrap is idempotent.
 
@@ -63,6 +63,10 @@ Content-Type: application/json
 ```
 
 Verification requires both write-key metadata and successful authentication under the write key alone. It passes only when `stale` and `undecryptable` are both zero. After a passing verification, deploy the write-only ring to all replicas and verify again before retiring previous keys.
+
+## Concurrent deletion during rewrap
+
+Rewrap uses the GET response's ETag for a conditional `If-Match` PUT when available, preventing a deleted object from being recreated by that write. If storage does not supply an ETag, the PUT is unconditional: a file deleted during its own rewrap may be recreated. Its file row is gone, so the object is an orphan that the next listing-based cleanup can remove. A PUT that reports `NoSuchKey` or an object-not-found HTTP 404 is counted as missing; permission errors, missing buckets, precondition failures, and other write conflicts still fail the job.
 
 ## Versioned buckets
 

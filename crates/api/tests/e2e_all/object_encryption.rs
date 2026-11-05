@@ -14,7 +14,7 @@ fn ring() -> Arc<ObjectKeyRing> {
 }
 
 async fn server(
-    storage: Arc<MockStorage>,
+    storage: Arc<dyn StorageTrait>,
     ring: Arc<ObjectKeyRing>,
 ) -> (TestServer, Arc<database::Database>) {
     setup_test_server_with_domain_services(move |services, database| {
@@ -177,3 +177,6 @@ async fn rotation_retains_file_reads_and_verifies_after_previous_key_removal() {
 
 #[path = "object_encryption/lifecycle.rs"]
 mod lifecycle;
+
+#[path = "object_encryption/missing.rs"]
+mod missing;

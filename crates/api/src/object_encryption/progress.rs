@@ -15,6 +15,8 @@ pub(super) struct Cursor {
 pub(super) struct Progress {
     pub processed: i64,
     pub total: i64,
+    pub missing: i64,
+    pub missing_keys: Vec<String>,
     pub by_key_id: BTreeMap<String, i64>,
     pub rewrapped: i64,
     pub already_current: i64,
@@ -28,6 +30,13 @@ pub(super) struct Progress {
 }
 
 impl Progress {
+    pub fn record_missing(&mut self, key: &str) {
+        self.missing += 1;
+        if self.missing_keys.len() < 100 {
+            self.missing_keys.push(key.into());
+        }
+    }
+
     pub fn record_key_id(&mut self, key_id: Option<String>) {
         *self
             .by_key_id

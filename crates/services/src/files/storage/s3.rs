@@ -4,7 +4,9 @@ use super::{
 use crate::files::encryption::{self, EncryptionError, ObjectKeyRing};
 use async_trait::async_trait;
 use aws_sdk_s3::{
-    error::ProvideErrorMetadata, operation::get_object::GetObjectOutput, primitives::ByteStream,
+    error::{ProvideErrorMetadata, SdkError},
+    operation::get_object::GetObjectOutput,
+    primitives::ByteStream,
     Client as S3Client,
 };
 use std::{fmt::Display, sync::Arc};
@@ -48,21 +50,28 @@ impl S3Storage {
             .key(key)
             .send()
             .await
-            .map_err(|error| {
-                if error
-                    .as_service_error()
-                    .is_some_and(|service| service.is_no_such_key())
-                {
-                    FileServiceError::NotFound
-                } else {
-                    storage_error("download", error)
-                }
-            })
+            .map_err(|error| object_error("download", error))
     }
 }
 
 fn storage_error(operation: &str, error: impl Display) -> FileServiceError {
     FileServiceError::StorageError(format!("Object {operation} failed: {error}"))
+}
+
+fn object_error<E: ProvideErrorMetadata>(operation: &str, error: SdkError<E>) -> FileServiceError {
+    let code = error
+        .as_service_error()
+        .and_then(ProvideErrorMetadata::code);
+    let missing = matches!(code, Some("NoSuchKey" | "NotFound" | "404"))
+        || (code.is_none()
+            && error
+                .raw_response()
+                .is_some_and(|response| response.status().as_u16() == 404));
+    if missing {
+        FileServiceError::NotFound
+    } else {
+        storage_error(operation, error)
+    }
 }
 
 async fn body(response: GetObjectOutput) -> Result<Vec<u8>, FileServiceError> {
@@ -179,16 +188,7 @@ impl StorageTrait for S3Storage {
             .key(key)
             .send()
             .await
-            .map_err(|error| {
-                if error
-                    .as_service_error()
-                    .is_some_and(|service| service.is_not_found())
-                {
-                    FileServiceError::NotFound
-                } else {
-                    storage_error("metadata read", error)
-                }
-            })?;
+            .map_err(|error| object_error("metadata read", error))?;
         Ok(response
             .metadata()
             .and_then(|metadata| metadata.get(KEY_ID_METADATA))
@@ -216,6 +216,10 @@ impl StorageTrait for S3Storage {
             KEY_ID_METADATA.to_owned(),
             self.key_ring.write_id().to_owned(),
         );
+        // If-Match prevents recreation after deletion when GET supplies an ETag.
+        // Without an ETag the PUT is unconditional: deletion during rewrap may
+        // recreate an orphan after its file row is gone; listing-based cleanup
+        // can remove it. Keep the existing conditional write when available.
         self.client
             .put_object()
             .bucket(&self.bucket)
@@ -226,7 +230,7 @@ impl StorageTrait for S3Storage {
             .set_if_match(etag)
             .send()
             .await
-            .map_err(|error| storage_error("rewrap", error))?;
+            .map_err(|error| object_error("rewrap", error))?;
         Ok(RewrapOutcome::Rewrapped { from })
     }
 
@@ -248,3 +252,7 @@ impl StorageTrait for S3Storage {
         })
     }
 }
+
+#[cfg(test)]
+#[path = "s3_missing_tests.rs"]
+mod missing_tests;

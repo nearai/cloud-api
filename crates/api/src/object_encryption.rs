@@ -138,3 +138,5 @@ fn spawn_job(state: ObjectEncryptionState, id: Uuid) {
 
 #[cfg(test)]
 mod http_tests;
+#[cfg(test)]
+mod missing_tests;

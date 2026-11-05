@@ -100,22 +100,7 @@ async fn run_batch(state: &ObjectEncryptionState, id: Uuid) -> anyhow::Result<Ba
             "object pagination did not advance"
         );
         for key in &keys {
-            match request.mode {
-                Mode::DryRun => {
-                    let key_id = storage_call(state.storage.object_key_id(key)).await?;
-                    progress.record_key_id(key_id);
-                }
-                Mode::Execute => {
-                    let outcome = storage_call(state.storage.rewrap_object(key)).await?;
-                    progress.record_rewrap(key, outcome);
-                }
-                Mode::Verify => {
-                    let result = storage_call(state.storage.verify_object(key)).await?;
-                    progress.record_verification(key, result);
-                }
-            }
-            progress.processed += 1;
-            progress.total += 1;
+            process_key(state, request.mode, key, &mut progress).await?;
         }
         cursor.last_key = keys.last().cloned().or(cursor.last_key);
         cursor.complete = next.is_none();
@@ -148,4 +133,38 @@ async fn run_batch(state: &ObjectEncryptionState, id: Uuid) -> anyhow::Result<Ba
         .transpose()?
         .map(Duration::from_millis);
     Ok(BatchResult::Continue(delay))
+}
+
+pub(super) async fn process_key(
+    state: &ObjectEncryptionState,
+    mode: Mode,
+    key: &str,
+    progress: &mut Progress,
+) -> anyhow::Result<()> {
+    let result = match mode {
+        Mode::DryRun => storage_call(state.storage.object_key_id(key))
+            .await
+            .map(|key_id| progress.record_key_id(key_id)),
+        Mode::Execute => storage_call(state.storage.rewrap_object(key))
+            .await
+            .map(|outcome| progress.record_rewrap(key, outcome)),
+        Mode::Verify => storage_call(state.storage.verify_object(key))
+            .await
+            .map(|result| progress.record_verification(key, result)),
+    };
+    match result {
+        Ok(()) => {}
+        Err(error)
+            if matches!(
+                error.downcast_ref::<FileServiceError>(),
+                Some(FileServiceError::NotFound)
+            ) =>
+        {
+            progress.record_missing(key);
+        }
+        Err(error) => return Err(error),
+    }
+    progress.processed += 1;
+    progress.total += 1;
+    Ok(())
 }

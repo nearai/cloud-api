@@ -54,12 +54,9 @@ pub async fn scan(
             return Err(internal("invalid object page"));
         }
         for key in &keys {
-            let key_id = super::worker::storage_call(state.storage.object_key_id(key))
+            super::worker::process_key(&state, Mode::DryRun, key, &mut progress)
                 .await
                 .map_err(internal)?;
-            progress.record_key_id(key_id);
-            progress.total += 1;
-            progress.processed += 1;
         }
         cursor.last_key = keys.last().cloned().or(cursor.last_key);
         cursor.complete = next.is_none();

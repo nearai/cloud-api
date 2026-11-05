@@ -4,12 +4,22 @@ use aes_gcm::{
 };
 use thiserror::Error;
 
+#[path = "encryption/key_ring.rs"]
+mod key_ring;
+pub use key_ring::ObjectKeyRing;
+
 const NONCE_SIZE: usize = 12; // 96 bits for GCM
 
 #[derive(Debug, Error)]
 pub enum EncryptionError {
     #[error("Invalid encryption key length: expected 32 bytes (256 bits), got {0}")]
     InvalidKeyLength(usize),
+    #[error("Invalid encryption key encoding: expected hexadecimal characters")]
+    InvalidKeyEncoding,
+    #[error("Invalid object encryption key id")]
+    InvalidKeyId,
+    #[error("Duplicate object encryption key id")]
+    DuplicateKeyId,
     #[error("Encryption failed: {0}")]
     EncryptionFailed(String),
     #[error("Decryption failed: {0}")]
@@ -21,17 +31,13 @@ pub enum EncryptionError {
 /// Encrypts data using AES-256-GCM
 /// The nonce is prepended to the ciphertext for later decryption
 pub fn encrypt(data: &[u8], key: &str) -> Result<Vec<u8>, EncryptionError> {
-    // Decode the key from hex string
-    let key_bytes = hex::decode(key)
-        .map_err(|e| EncryptionError::EncryptionFailed(format!("Invalid hex key: {e}")))?;
+    encrypt_with_key(data, &parse_key(key)?)
+}
 
-    if key_bytes.len() != 32 {
-        return Err(EncryptionError::InvalidKeyLength(key_bytes.len()));
-    }
-
+/// Encrypt using a parsed AES-256 key, preserving the nonce-prefixed envelope.
+pub fn encrypt_with_key(data: &[u8], key: &[u8; 32]) -> Result<Vec<u8>, EncryptionError> {
     // Create cipher instance
-    let cipher = Aes256Gcm::new_from_slice(&key_bytes)
-        .map_err(|e| EncryptionError::EncryptionFailed(format!("Failed to create cipher: {e}")))?;
+    let cipher = Aes256Gcm::new(key.into());
 
     // Generate a random nonce
     let mut nonce_bytes = [0u8; NONCE_SIZE];
@@ -54,14 +60,19 @@ pub fn encrypt(data: &[u8], key: &str) -> Result<Vec<u8>, EncryptionError> {
 /// Decrypts data using AES-256-GCM
 /// Expects the nonce to be prepended to the ciphertext
 pub fn decrypt(encrypted_data: &[u8], key: &str) -> Result<Vec<u8>, EncryptionError> {
-    // Decode the key from hex string
-    let key_bytes = hex::decode(key)
-        .map_err(|e| EncryptionError::DecryptionFailed(format!("Invalid hex key: {e}")))?;
+    decrypt_with_key(encrypted_data, &parse_key(key)?)
+}
 
-    if key_bytes.len() != 32 {
-        return Err(EncryptionError::InvalidKeyLength(key_bytes.len()));
-    }
+fn parse_key(key: &str) -> Result<[u8; 32], EncryptionError> {
+    let bytes = hex::decode(key).map_err(|_| EncryptionError::InvalidKeyEncoding)?;
+    let length = bytes.len();
+    bytes
+        .try_into()
+        .map_err(|_| EncryptionError::InvalidKeyLength(length))
+}
 
+/// Decrypt a nonce-prefixed envelope using a parsed AES-256 key.
+pub fn decrypt_with_key(encrypted_data: &[u8], key: &[u8; 32]) -> Result<Vec<u8>, EncryptionError> {
     // Ensure we have at least a nonce
     if encrypted_data.len() < NONCE_SIZE {
         return Err(EncryptionError::InvalidCiphertext);
@@ -75,8 +86,7 @@ pub fn decrypt(encrypted_data: &[u8], key: &str) -> Result<Vec<u8>, EncryptionEr
     );
 
     // Create cipher instance
-    let cipher = Aes256Gcm::new_from_slice(&key_bytes)
-        .map_err(|e| EncryptionError::DecryptionFailed(format!("Failed to create cipher: {e}")))?;
+    let cipher = Aes256Gcm::new(key.into());
 
     // Decrypt the data
     let plaintext = cipher
@@ -85,6 +95,31 @@ pub fn decrypt(encrypted_data: &[u8], key: &str) -> Result<Vec<u8>, EncryptionEr
 
     Ok(plaintext)
 }
+
+/// A known metadata id selects its key; other objects try keys in write-first order.
+pub fn decrypt_with_ring(
+    data: &[u8],
+    ring: &ObjectKeyRing,
+    hint: Option<&str>,
+) -> Result<(Vec<u8>, String), EncryptionError> {
+    if let Some((id, key)) = hint.and_then(|id| ring.lookup(id).map(|key| (id, key))) {
+        return decrypt_with_key(data, key).map(|plaintext| (plaintext, id.to_string()));
+    }
+    for (id, key) in ring.entries() {
+        match decrypt_with_key(data, key) {
+            Ok(plaintext) => return Ok((plaintext, id.to_string())),
+            Err(EncryptionError::DecryptionFailed(_)) => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(EncryptionError::DecryptionFailed(
+        "no configured key authenticated the object".into(),
+    ))
+}
+
+#[cfg(test)]
+#[path = "encryption/tests.rs"]
+mod ring_tests;
 
 #[cfg(test)]
 mod tests {

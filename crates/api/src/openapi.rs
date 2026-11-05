@@ -51,6 +51,12 @@ Operations marked deprecated (account, organization, workspace, invitation, API 
     ),
     paths(
         crate::database_encryption::get_keys,
+        crate::object_encryption::get_keys,
+        crate::object_encryption::scan,
+        crate::object_encryption::create_job,
+        crate::object_encryption::get_job,
+        crate::object_encryption::cancel_job,
+        crate::object_encryption::verify,
         crate::database_encryption::create_job,
         crate::database_encryption::verify,
         // Chat completion endpoints (most important for users)
@@ -671,6 +677,43 @@ mod admin_token_permission_tests {
             assert_eq!(delay["minimum"].as_f64(), Some(0.0));
             assert_eq!(delay["maximum"].as_f64(), Some(10000.0));
         }
+    }
+
+    #[test]
+    fn object_encryption_schema_keeps_permissions_and_job_shapes_distinct() {
+        let doc = serde_json::to_value(ApiDoc::openapi()).unwrap();
+        for (path, method) in [
+            ("keys", "get"),
+            ("scan", "post"),
+            ("jobs", "post"),
+            ("jobs/{id}", "get"),
+            ("jobs/{id}/cancel", "post"),
+            ("verify", "post"),
+        ] {
+            let operation = &doc["paths"][format!("/v1/admin/object-encryption/{path}")][method];
+            assert!(operation.is_object(), "missing {method} {path}");
+            assert!(operation["security"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| value.get("session_token").is_some()));
+            assert!(operation["security"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| value.get("admin_token").is_some()));
+        }
+        for schema in [
+            "ObjectCreateJobRequest",
+            "ObjectVerifyRequest",
+            "ObjectEncryptionOptions",
+        ] {
+            let delay = &doc["components"]["schemas"][schema]["properties"]["batch_delay_ms"];
+            assert_eq!(delay["minimum"].as_f64(), Some(0.0));
+            assert_eq!(delay["maximum"].as_f64(), Some(10000.0));
+        }
+        assert!(doc["components"]["schemas"]["JobResponse"].is_object());
+        assert!(doc["components"]["schemas"]["ObjectJobResponse"].is_object());
     }
 
     #[test]

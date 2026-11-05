@@ -6,6 +6,8 @@ pub mod conversions;
 pub mod database_encryption;
 pub mod middleware;
 pub mod models;
+pub mod object_encryption;
+mod object_storage;
 pub mod ohttp_gateway;
 pub mod openapi;
 pub mod openapi_deprecation;
@@ -124,6 +126,7 @@ pub struct DomainServices {
     pub user_service: Arc<dyn services::user::UserServiceTrait + Send + Sync>,
     pub contact_email_service: Arc<services::contact_email::ContactEmailService>,
     pub files_service: Arc<dyn services::files::FileServiceTrait + Send + Sync>,
+    pub object_encryption_state: object_encryption::ObjectEncryptionState,
     pub metrics_service: Arc<dyn services::metrics::MetricsServiceTrait>,
     pub staking_farm_service: Arc<services::staking_farm::StakingFarmService>,
     pub aml_service: Arc<services::aml::AmlService>,
@@ -586,22 +589,31 @@ pub async fn init_domain_services_with_pool(
 
     // Create S3 storage and FileService for temporary authenticated read views
     // and retained per-file delete operations.
+    let object_key_ring = object_storage::resolve_object_ring(&config.s3)
+        .await
+        .expect("Invalid S3 encryption key configuration");
     let s3_storage: Arc<dyn services::files::storage::StorageTrait> = if config.s3.mock {
         tracing::info!("Using mock S3 storage for temporary file views and deletes");
-        Arc::new(services::files::storage::MockStorage::new(
-            config.s3.encryption_key.clone(),
+        Arc::new(services::files::storage::MockStorage::new_with_ring(
+            object_key_ring.clone(),
         ))
     } else {
         tracing::info!("Using real S3 storage for temporary file views and deletes");
         let s3_config = aws_config::load_from_env().await;
         let s3_client = aws_sdk_s3::Client::new(&s3_config);
 
-        Arc::new(services::files::storage::S3Storage::new(
+        Arc::new(services::files::storage::S3Storage::new_with_ring(
             s3_client,
             config.s3.bucket.clone(),
-            config.s3.encryption_key.clone(),
+            object_key_ring.clone(),
         ))
     };
+
+    let object_encryption_state = object_encryption::ObjectEncryptionState::new(
+        database.pool().clone(),
+        s3_storage.clone(),
+        object_key_ring,
+    );
 
     let file_repository = Arc::new(database::repositories::FileRepository::new(
         database.pool().clone(),
@@ -720,6 +732,7 @@ pub async fn init_domain_services_with_pool(
         user_service,
         contact_email_service,
         files_service,
+        object_encryption_state,
         metrics_service,
         staking_farm_service,
         aml_service,
@@ -1304,6 +1317,7 @@ pub fn build_app_with_config_and_options(
         config.clone(),
         build_options,
         AdminRouteServices {
+            object_encryption_state: domain_services.object_encryption_state.clone(),
             inference_provider_pool: app_state.inference_provider_pool.clone(),
             analytics_service,
             staking_farm_service: app_state.staking_farm_service.clone(),
@@ -2302,6 +2316,7 @@ fn cache_control_layer(value: &'static str) -> CacheControlLayer {
 
 /// Build admin routes (authenticated endpoints)
 pub struct AdminRouteServices {
+    pub object_encryption_state: object_encryption::ObjectEncryptionState,
     pub inference_provider_pool: Arc<services::inference_provider_pool::InferenceProviderPool>,
     pub analytics_service: Arc<services::admin::AnalyticsService>,
     pub staking_farm_service: Arc<services::staking_farm::StakingFarmService>,
@@ -2718,6 +2733,13 @@ fn build_admin_routes_with_options(
     } else {
         admin_routes
     };
+
+    if build_options.start_database_encryption_recovery {
+        services.object_encryption_state.recover_jobs();
+    }
+    let admin_routes = admin_routes.merge(
+        object_encryption::router().layer(axum::Extension(services.object_encryption_state)),
+    );
 
     admin_routes
         // Admin middleware handles both authentication and authorization
@@ -3537,6 +3559,7 @@ mod tests {
             database_encryption_key_id: "test-db-v1".to_string(),
             database_encryption_write_enabled: false,
             s3: config::S3Config {
+                encryption_keys: None,
                 mock: true,
                 bucket: "test-bucket".to_string(),
                 region: "us-east-1".to_string(),
@@ -3661,6 +3684,7 @@ mod tests {
             database_encryption_key_id: "test-db-v1".to_string(),
             database_encryption_write_enabled: false,
             s3: config::S3Config {
+                encryption_keys: None,
                 mock: true,
                 bucket: "test-bucket".to_string(),
                 region: "us-east-1".to_string(),

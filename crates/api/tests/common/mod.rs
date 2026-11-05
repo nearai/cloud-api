@@ -137,6 +137,7 @@ pub fn test_config() -> ApiConfig {
         // Preserve encrypted-write coverage in E2E tests; production defaults off.
         database_encryption_write_enabled: true,
         s3: config::S3Config {
+            encryption_keys: None,
             mock: true,
             bucket: "test-bucket".to_string(),
             region: "us-east-1".to_string(),

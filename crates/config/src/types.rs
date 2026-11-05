@@ -2,7 +2,7 @@ use crate::ita::ItaAttestationConfig;
 use rustls_pki_types::{pem::PemObject, CertificateDer};
 use std::{collections::HashMap, env};
 
-/// Source of one database encryption key. Inline key material is redacted.
+/// Source of one encryption key. Inline key material is redacted.
 #[derive(Clone)]
 pub enum KeySource {
     File(std::path::PathBuf),
@@ -28,11 +28,15 @@ pub struct KeySourceSpec {
 
 /// Parse ordered `<key_id>=file:...|dstack:...|hex:...` entries.
 pub fn parse_key_source_specs(raw: &str) -> Result<Vec<KeySourceSpec>, String> {
+    parse_key_source_specs_for(raw, "DB_ENCRYPTION_KEYS")
+}
+
+fn parse_key_source_specs_for(raw: &str, variable: &str) -> Result<Vec<KeySourceSpec>, String> {
     let mut ids = std::collections::HashSet::new();
     raw.split(',')
         .enumerate()
         .map(|(index, entry)| {
-            let error = |reason: &str| format!("DB_ENCRYPTION_KEYS entry {index}: {reason}");
+            let error = |reason: &str| format!("{variable} entry {index}: {reason}");
             let (key_id, source) = entry
                 .trim()
                 .split_once('=')
@@ -1325,50 +1329,8 @@ impl From<ApiConfig> for DomainConfig {
     }
 }
 
-/// S3 configuration for file storage
-#[derive(Debug, Clone)]
-pub struct S3Config {
-    pub mock: bool,
-    pub bucket: String,
-    pub region: String,
-    pub encryption_key: String,
-}
-
-impl S3Config {
-    /// Load from environment variables
-    pub fn from_env() -> Result<Self, String> {
-        // Check if mock mode is enabled
-        let mock = env::var("S3_MOCK")
-            .ok()
-            .and_then(|v| v.parse::<bool>().ok())
-            .unwrap_or(false);
-
-        // Encryption key is read from a file: S3_ENCRYPTION_KEY_FILE.
-        // This file would be mounted as a secret in production deployments.
-        let encryption_key = if let Ok(path) = env::var("S3_ENCRYPTION_KEY_FILE") {
-            std::fs::read_to_string(path)
-                .map_err(|e| format!("Failed to read S3_ENCRYPTION_KEY_FILE: {e}"))?
-                .trim()
-                .to_string()
-        } else {
-            env::var("S3_ENCRYPTION_KEY").map_err(|_| {
-                "Either S3_ENCRYPTION_KEY_FILE or S3_ENCRYPTION_KEY environment variable must be set"
-                    .to_string()
-            })?
-        };
-
-        if encryption_key.is_empty() {
-            return Err("S3 encryption key cannot be empty".to_string());
-        }
-
-        Ok(Self {
-            mock,
-            bucket: env::var("AWS_S3_BUCKET").map_err(|_| "AWS_S3_BUCKET not set".to_string())?,
-            region: env::var("AWS_S3_REGION").map_err(|_| "AWS_S3_REGION not set".to_string())?,
-            encryption_key,
-        })
-    }
-}
+mod s3;
+pub use s3::S3Config;
 
 /// Smart placement. Its runtime inputs are the placement Valkey endpoint
 /// ([`PlacementEndpoint`]: host, port, TLS and CA, none of them secret) and
@@ -1679,6 +1641,10 @@ fn read_optional_non_empty_file_env(
 
     Ok(fallback_key.and_then(non_empty_env))
 }
+
+#[cfg(test)]
+#[path = "types/s3_tests.rs"]
+mod s3_tests;
 
 #[cfg(test)]
 mod tests {

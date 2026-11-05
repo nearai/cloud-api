@@ -877,3 +877,7 @@ async fn recovery_resumes_the_cursor_and_duplicate_workers_do_not_double_process
 }
 
 mod key_rotation;
+
+// Object jobs share the serialized encryption-job test group.
+#[path = "object_encryption.rs"]
+mod object_encryption;

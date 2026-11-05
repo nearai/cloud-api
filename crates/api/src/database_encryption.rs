@@ -280,7 +280,7 @@ impl DatabaseEncryptionState {
                     let client = state.pool.get().await?;
                     let rows = client
                         .query(
-                            "SELECT id FROM database_encryption_jobs WHERE status IN ('queued', 'running') ORDER BY created_at",
+                            "SELECT id FROM database_encryption_jobs WHERE status IN ('queued', 'running') AND COALESCE(scope->>'kind','') <> 'objects' ORDER BY created_at",
                             &[],
                         )
                         .await?;
@@ -832,7 +832,7 @@ fn spawn_job(state: DatabaseEncryptionState, id: Uuid) {
             if let Ok(client) = state.pool.get().await {
                 let _ = client
                     .execute(
-                        "UPDATE database_encryption_jobs SET status='failed',last_error_class=$2,last_error_message=$2,progress=progress || jsonb_build_object('failure',jsonb_build_object('class',$2,'cursor',cursor)),completed_at=NOW() WHERE id=$1 AND status IN ('queued','running')",
+                        "UPDATE database_encryption_jobs SET status='failed',last_error_class=$2,last_error_message=$2,progress=progress || jsonb_build_object('failure',jsonb_build_object('class',$2,'cursor',cursor)),completed_at=NOW() WHERE id=$1 AND COALESCE(scope->>'kind','') <> 'objects' AND status IN ('queued','running')",
                         &[&id, &error_class],
                     )
                     .await;
@@ -896,7 +896,7 @@ async fn run_locked_job(
         .ok_or_else(|| anyhow::anyhow!("database encryption ring is not configured"))?;
     let job = client
         .query_opt(
-            "UPDATE database_encryption_jobs SET status='running',started_at=COALESCE(started_at,NOW()) WHERE id=$1 AND status IN ('queued','running') RETURNING mode,scope,batch_size,max_rows,cursor,progress,actions",
+            "UPDATE database_encryption_jobs SET status='running',started_at=COALESCE(started_at,NOW()) WHERE id=$1 AND COALESCE(scope->>'kind','') <> 'objects' AND status IN ('queued','running') RETURNING mode,scope,batch_size,max_rows,cursor,progress,actions",
             &[&id],
         )
         .await?;
@@ -1178,7 +1178,7 @@ pub async fn get_job(
 
 async fn get_inner(state: &DatabaseEncryptionState, id: Uuid) -> ApiResult<JobResponse> {
     let c = state.pool.get().await.map_err(internal)?;
-    let r=c.query_opt("SELECT id,status,mode,scope,actions,progress,cursor,created_at,completed_at,last_error_class,last_error_message FROM database_encryption_jobs WHERE id=$1",&[&id]).await.map_err(internal)?.ok_or_else(||(StatusCode::NOT_FOUND,Json(json!({"error":{"code":"job_not_found","message":"Database encryption job not found"}}))))?;
+    let r=c.query_opt("SELECT id,status,mode,scope,actions,progress,cursor,created_at,completed_at,last_error_class,last_error_message FROM database_encryption_jobs WHERE id=$1 AND COALESCE(scope->>'kind','') <> 'objects'",&[&id]).await.map_err(internal)?.ok_or_else(||(StatusCode::NOT_FOUND,Json(json!({"error":{"code":"job_not_found","message":"Database encryption job not found"}}))))?;
     Ok(Json(JobResponse {
         job_id: r.get(0),
         status: r.get(1),
@@ -1200,7 +1200,7 @@ pub async fn cancel_job(
     Path(id): Path<Uuid>,
 ) -> ApiResult<JobResponse> {
     let c = state.pool.get().await.map_err(internal)?;
-    let n=c.execute("UPDATE database_encryption_jobs SET cancel_requested_at=NOW(),status=CASE WHEN status='queued' THEN 'cancelled' ELSE status END,completed_at=CASE WHEN status='queued' THEN NOW() ELSE completed_at END WHERE id=$1 AND status IN('queued','running')",&[&id]).await.map_err(internal)?;
+    let n=c.execute("UPDATE database_encryption_jobs SET cancel_requested_at=NOW(),status=CASE WHEN status='queued' THEN 'cancelled' ELSE status END,completed_at=CASE WHEN status='queued' THEN NOW() ELSE completed_at END WHERE id=$1 AND COALESCE(scope->>'kind','') <> 'objects' AND status IN('queued','running')",&[&id]).await.map_err(internal)?;
     if n == 0 {
         return Err(bad("job is not cancellable"));
     }

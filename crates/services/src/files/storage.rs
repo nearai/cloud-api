@@ -1,11 +1,27 @@
-use super::{encryption, FileServiceError};
+use super::FileServiceError;
 use async_trait::async_trait;
-use aws_sdk_s3::{primitives::ByteStream, Client as S3Client};
-use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
-use tracing::{debug, error};
 
-/// Trait for file storage operations
+mod mock;
+mod s3;
+
+pub use mock::MockStorage;
+pub use s3::S3Storage;
+
+const KEY_ID_METADATA: &str = "near-enc-key-id";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RewrapOutcome {
+    AlreadyCurrent,
+    Rewrapped { from: String },
+    Undecryptable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ObjectVerification {
+    pub is_current: bool,
+    pub is_decryptable: bool,
+}
+
 #[async_trait]
 pub trait StorageTrait: Send + Sync {
     async fn upload(
@@ -14,265 +30,29 @@ pub trait StorageTrait: Send + Sync {
         data: Vec<u8>,
         content_type: &str,
     ) -> Result<(), FileServiceError>;
-
     async fn download(&self, key: &str) -> Result<Vec<u8>, FileServiceError>;
-
     async fn delete(&self, key: &str) -> Result<(), FileServiceError>;
-
     async fn exists(&self, key: &str) -> Result<bool, FileServiceError>;
-}
-
-#[derive(Clone)]
-pub struct S3Storage {
-    client: S3Client,
-    bucket: String,
-    encryption_key: String,
-}
-
-impl S3Storage {
-    pub fn new(client: S3Client, bucket: String, encryption_key: String) -> Self {
-        Self {
-            client,
-            bucket,
-            encryption_key,
-        }
-    }
-}
-
-#[async_trait]
-impl StorageTrait for S3Storage {
-    /// Upload a file to S3 (with encryption)
-    async fn upload(
+    async fn list_keys(
         &self,
-        key: &str,
-        data: Vec<u8>,
-        content_type: &str,
-    ) -> Result<(), FileServiceError> {
-        debug!(
-            "Encrypting and uploading file to S3: bucket={}, key={}",
-            self.bucket, key
-        );
-
-        // Encrypt the data before uploading
-        let encrypted_data = encryption::encrypt(&data, &self.encryption_key)?;
-        debug!(
-            "File encrypted: original_size={}, encrypted_size={}",
-            data.len(),
-            encrypted_data.len()
-        );
-
-        let byte_stream = ByteStream::from(encrypted_data);
-
-        self.client
-            .put_object()
-            .bucket(&self.bucket)
-            .key(key)
-            .body(byte_stream)
-            .content_type(content_type)
-            .send()
-            .await
-            .map_err(|e| {
-                error!("Failed to upload file to S3: {}", e);
-                FileServiceError::StorageError(format!("Failed to upload file: {e}"))
-            })?;
-
-        debug!("Successfully uploaded encrypted file to S3: {}", key);
-        Ok(())
-    }
-
-    /// Download a file from S3 (with decryption)
-    async fn download(&self, key: &str) -> Result<Vec<u8>, FileServiceError> {
-        debug!(
-            "Downloading file from S3: bucket={}, key={}",
-            self.bucket, key
-        );
-
-        let response = self
-            .client
-            .get_object()
-            .bucket(&self.bucket)
-            .key(key)
-            .send()
-            .await
-            .map_err(|e| {
-                error!("Failed to download file from S3: {}", e);
-                FileServiceError::StorageError(format!("Failed to download file: {e:?}"))
-            })?;
-
-        let encrypted_data = response
-            .body
-            .collect()
-            .await
-            .map_err(|e| {
-                error!("Failed to read file data from S3: {}", e);
-                FileServiceError::StorageError(format!("Failed to read file data: {e}"))
-            })?
-            .into_bytes()
-            .to_vec();
-
-        debug!(
-            "Downloaded encrypted file from S3: {} bytes",
-            encrypted_data.len()
-        );
-
-        // Decrypt the data after downloading
-        let decrypted_data = encryption::decrypt(&encrypted_data, &self.encryption_key)?;
-        debug!(
-            "File decrypted: encrypted_size={}, decrypted_size={}",
-            encrypted_data.len(),
-            decrypted_data.len()
-        );
-
-        Ok(decrypted_data)
-    }
-
-    /// Delete a file from S3
-    async fn delete(&self, key: &str) -> Result<(), FileServiceError> {
-        debug!("Deleting file from S3: bucket={}, key={}", self.bucket, key);
-
-        self.client
-            .delete_object()
-            .bucket(&self.bucket)
-            .key(key)
-            .send()
-            .await
-            .map_err(|e| {
-                error!("Failed to delete file from S3: {}", e);
-                FileServiceError::StorageError(format!("Failed to delete file: {e}"))
-            })?;
-
-        debug!("Successfully deleted file from S3: {}", key);
-        Ok(())
-    }
-
-    /// Check if a file exists in S3
-    async fn exists(&self, key: &str) -> Result<bool, FileServiceError> {
-        match self
-            .client
-            .head_object()
-            .bucket(&self.bucket)
-            .key(key)
-            .send()
-            .await
-        {
-            Ok(_) => Ok(true),
-            Err(e) => {
-                let error_str = e.to_string();
-                if error_str.contains("Not Found") || error_str.contains("404") {
-                    Ok(false)
-                } else {
-                    error!("Failed to check file existence in S3: {}", e);
-                    Err(FileServiceError::StorageError(format!(
-                        "Failed to check file existence: {e}"
-                    )))
-                }
-            }
-        }
-    }
+        continuation: Option<String>,
+        max: i32,
+    ) -> Result<(Vec<String>, Option<String>), FileServiceError>;
+    async fn object_key_id(&self, key: &str) -> Result<Option<String>, FileServiceError>;
+    async fn rewrap_object(&self, key: &str) -> Result<RewrapOutcome, FileServiceError>;
+    async fn verify_object(&self, key: &str) -> Result<ObjectVerification, FileServiceError>;
 }
 
-/// Mock storage for testing (stores files in memory)
-#[derive(Clone)]
-pub struct MockStorage {
-    files: Arc<RwLock<HashMap<String, Vec<u8>>>>,
-    encryption_key: String,
-}
-
-impl MockStorage {
-    pub fn new(encryption_key: String) -> Self {
-        Self {
-            files: Arc::new(RwLock::new(HashMap::new())),
-            encryption_key,
-        }
-    }
-}
-
-#[async_trait]
-impl StorageTrait for MockStorage {
-    async fn upload(
-        &self,
-        key: &str,
-        data: Vec<u8>,
-        _content_type: &str,
-    ) -> Result<(), FileServiceError> {
-        debug!("Mock storage: uploading file with key: {}", key);
-
-        // Encrypt the data (same as S3)
-        let encrypted_data = encryption::encrypt(&data, &self.encryption_key)?;
-
-        let mut files = self.files.write().unwrap();
-        files.insert(key.to_string(), encrypted_data);
-
-        debug!("Mock storage: file uploaded successfully");
-        Ok(())
-    }
-
-    async fn download(&self, key: &str) -> Result<Vec<u8>, FileServiceError> {
-        debug!("Mock storage: downloading file with key: {}", key);
-
-        let files = self.files.read().unwrap();
-        let encrypted_data = files.get(key).ok_or(FileServiceError::NotFound)?.clone();
-
-        // Decrypt the data (same as S3)
-        let decrypted_data = encryption::decrypt(&encrypted_data, &self.encryption_key)?;
-
-        debug!("Mock storage: file downloaded successfully");
-        Ok(decrypted_data)
-    }
-
-    async fn delete(&self, key: &str) -> Result<(), FileServiceError> {
-        debug!("Mock storage: deleting file with key: {}", key);
-
-        let mut files = self.files.write().unwrap();
-        files.remove(key);
-
-        debug!("Mock storage: file deleted successfully");
-        Ok(())
-    }
-
-    async fn exists(&self, key: &str) -> Result<bool, FileServiceError> {
-        let files = self.files.read().unwrap();
-        Ok(files.contains_key(key))
+fn page_size(max: i32) -> Result<usize, FileServiceError> {
+    match usize::try_from(max) {
+        Ok(size @ 1..=1000) => Ok(size),
+        Ok(_) | Err(_) => Err(FileServiceError::StorageError(
+            "Object page size must be between 1 and 1000".into(),
+        )),
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use std::time::Duration;
-
-    use aws_sdk_s3::{
-        config::{BehaviorVersion, Credentials, Region},
-        presigning::PresigningConfig,
-    };
-
-    use super::*;
-
-    #[tokio::test]
-    async fn regional_s3_requests_use_sigv4_without_sigv4a() {
-        let config = aws_sdk_s3::Config::builder()
-            .behavior_version(BehaviorVersion::latest())
-            .region(Region::new("us-east-1"))
-            .credentials_provider(Credentials::new(
-                "test-access-key",
-                "test-secret-key",
-                None,
-                None,
-                "test",
-            ))
-            .build();
-        let client = S3Client::from_conf(config);
-
-        // Presigning exercises endpoint resolution and signing without AWS I/O.
-        let request = client
-            .get_object()
-            .bucket("regional-test-bucket")
-            .key("test-object")
-            .presigned(PresigningConfig::expires_in(Duration::from_secs(60)).unwrap())
-            .await
-            .unwrap();
-
-        assert!(request.uri().contains("X-Amz-Algorithm=AWS4-HMAC-SHA256"));
-        assert!(request.uri().contains("us-east-1%2Fs3%2Faws4_request"));
-        assert!(request.uri().contains("X-Amz-Signature="));
-    }
-}
+mod mock_tests;
+#[cfg(test)]
+mod s3_tests;

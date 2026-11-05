@@ -289,9 +289,10 @@ Receipt (`Payment-Receipt`, base64url JSON) for session:
 `{"method":"tempo","intent":"session","reference":"0x<channelId>","status":"success",
 "timestamp":…,"acceptedCumulative":"…","spent":"…","units":<u64>,…}`. The reference is the
 channel id, not a transaction hash. `txHash` is present on `open`, `topUp`, and `close` only.
-On a streaming completion the receipt headers are on the response head with pre-charge
-`spent` and `acceptedCumulative`; the final charge happens when the stream ends, so that head
-receipt is provisional.
+On a streaming completion the receipt headers are on the response head with the reservation
+preview: `spent` includes the request's cost cap, and `units` still counts earlier completed
+requests. The final charge happens when the stream ends, so that head receipt is provisional.
+It is not replaced on the wire; a subsequent receipt reflects the updated ledger.
 
 ### Pricing and metering
 
@@ -303,7 +304,8 @@ For each voucher request on a channel:
 
 1. `cost_cap = token_price × (prompt_estimate + max_tokens)` where
    `prompt_estimate = ceil(body_bytes / 4)` (an approximation; billing uses real usage after
-   the response).
+   the response). Use the larger of the request's `max_tokens` and `max_completion_tokens`
+   when both are present. Arithmetic overflow returns `400` before a reservation.
 2. Require `accepted_cumulative - spent >= cost_cap`. Otherwise return `402` with
    `sessionSnapshot.requiredCumulative = spent + cost_cap` and run no inference (nothing
    charged).
@@ -313,6 +315,19 @@ For each voucher request on a channel:
    usage, capped at what the voucher still covers; then adjust `spent` and `units`, and delete
    the reservation. On an error response or client disconnect, release the full reservation
    (`spent -= cost_cap`): nothing delivered, nothing charged.
+
+Reservations precede service-key authentication, rate limiting and usage checks. A short
+voucher consumes none of the shared service key's rate limit. Management actions bypass
+those checks entirely, after the same body pre-flight and credential verification.
+
+The chat completion's usage observer reports final counts once. Non-streaming completions
+normally report before the handler returns; if no report arrives within one second after a
+successful response, the wrapper releases the reservation and records `usage_missing`.
+Streaming completions charge asynchronously on the final report, or release on an incomplete
+report (including a dropped stream). A missing stream report is bounded at fifteen minutes.
+An inner error, including a rate-limit `429`, releases the reservation. Missing or closed
+channels return `410 application/problem+json`; voucher and minimum-delta refusals return
+`402` with a fresh challenge carrying the authenticated session snapshot.
 
 ### Channel checks
 
@@ -332,7 +347,7 @@ descriptor must match; cumulative `>= settled_on_chain`, `<= deposit`, strictly 
 stored highest (or an exact replay of the same highest amount and signature bytes); signature
 verifies (secp256k1, 65 bytes); delta from the previous highest must be at least
 `min_voucher_delta`. On-chain state is read at most once every 60 seconds per channel to
-refresh `deposit`, `settled`, and `closeRequestedAt`; zero deposit means closed—refuse.
+refresh `deposit`, `settled`, and `closeRequestedAt`; zero deposit means closed, so refuse.
 Once the payer has requested close on chain, no further vouchers or reservations are accepted.
 
 `close`: voucher checks as for inference (amount may equal the highest accepted); payer or
@@ -354,7 +369,7 @@ settlement run holds the channel at a time (60 second lease on the row).
 
 Every `MPP_CLOSE_SUPERVISION_SECS` (default 60), for channels not yet finalized, the server
 reads escrow state in batch. If `closeRequestedAt` is set on chain, it records that, stops
-new vouchers, and—when `spent - reserved` exceeds `settled_on_chain`—submits a payee close
+new vouchers, and, when `spent - reserved` exceeds `settled_on_chain`, submits a payee close
 with capture equal to delivered spend, using a voucher at least that high, inside the 900 second
 grace period. Channels whose on-chain deposit is zero are marked finalized (withdrawn). Stale
 reservations with no finish are released after fifteen minutes. Finalized channel rows are purged
@@ -372,9 +387,18 @@ close, in addition to whatever treasury policy you use for `charge`.
 | `MPP_TEMPO_SIGNER_KEY` / `_FILE` | Payee settlement signer (required if any `token_price`) |
 | `MPP_SESSION_MIN_VOUCHER_DELTA` | Minimum voucher step in base units (default `token_price × 64`) |
 | `MPP_SESSION_SUGGESTED_DEPOSIT` | Suggested opening deposit (default `1000000`) |
-| `MPP_SETTLE_INTERVAL_SECS` | Max time between settlements (default `3600`) |
+| `MPP_SETTLE_INTERVAL_SECS` | Settlement age threshold (minimum `60`, default `3600`); task polls every quarter interval, at least `60` seconds |
 | `MPP_SETTLE_AMOUNT` | Settle when delivered spend since last settlement reaches this (default `5000000`) |
-| `MPP_CLOSE_SUPERVISION_SECS` | Close-supervision poll interval (default `60`) |
+| `MPP_CLOSE_SUPERVISION_SECS` | Close-supervision poll interval (`10` to `300`, default `60`) |
+
+These share the enabled MPP settings above: `MPP_REALM`, `MPP_SECRET_KEY` / `_FILE`,
+`MPP_SERVICE_API_KEY` / `_FILE`, `MPP_CHALLENGE_TTL_SECS`, `MPP_TEMPO_RPC_URL`,
+`MPP_RPC_TIMEOUT_SECS`, `MPP_TEMPO_CHAIN_ID`, `MPP_TEMPO_CURRENCY`,
+`MPP_TEMPO_RECIPIENT` and `MPP_MODEL_PRICES`. The treasury recipient remains the charge
+recipient; sessions use the signer address. The escrow precompile is fixed, with no extra
+environment variable. With `session: None` (no model has `token_price`), no signer, channel
+repository or session background task is constructed. Finalized-channel retention runs hourly
+alongside claim retention, deleting rows last updated more than thirty days ago.
 
 Example model entry with both intents:
 
@@ -427,3 +451,22 @@ Mppx.create({
 ```
 
 Point `MPP_TEMPO_RPC_URL` at Moderato and list `token_price` on the models you test.
+
+For a standalone endpoint with the real RPC and signer, and in-memory ledgers, run the live
+harness from the repository root. Set `MPP_TEMPO_SIGNER_KEY_FILE` to a protected file holding
+the funded payee's hex key, then export:
+
+```sh
+export MPP_TEMPO_RPC_URL=https://rpc.moderato.tempo.xyz
+export MPP_TEMPO_CHAIN_ID=42431
+export MPP_TEMPO_CURRENCY=0x20c0000000000000000000000000000000000000
+export MPP_MODEL_PRICES='{"local":{"token_price":"2","max_tokens":256,"max_request_bytes":8192}}'
+cargo run -p api --features services/test-mocks --example mpp_session_live
+```
+
+The process prints `PORT=<n>` and listens on `127.0.0.1:<n>`. Point the unchanged mppx client
+at `http://127.0.0.1:<n>/v1/chat/completions` with model `local`, `max_tokens: 64`, and a valid
+chat body. The stub reports seven prompt tokens and five completion tokens through the real
+observer, so a completed request costs twenty-four base units at that price. Management
+receipts come from the real chain. The harness loses its ledgers on exit and starts no
+settlement or supervision workers; use the production server to exercise those tasks.

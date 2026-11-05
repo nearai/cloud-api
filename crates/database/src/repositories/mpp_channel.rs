@@ -28,7 +28,9 @@ use chrono::{DateTime, Utc};
 use deadpool_postgres::Transaction;
 use serde_json::{json, Value};
 use services::common::RepositoryError;
-use services::mpp::ports::{chain_read_claim_at, chain_read_may_claim, chain_read_observed_at};
+use services::mpp::ports::{
+    chain_read_claim_with_observation, chain_read_may_claim, chain_read_observed_at, ChainReadClaim,
+};
 use services::mpp::session::{ChannelDescriptor, ChannelState, SIGNATURE_LEN};
 use services::mpp::{
     ChannelLifecycle, ChannelRecord, ChannelRepository, ChargeOutcome, CloseTransition, NewChannel,
@@ -306,11 +308,17 @@ async fn commit(tx: Transaction<'_>) -> Result<(), RepositoryError> {
 
 /// `spent -= amount`, `reserved -= amount` on a locked channel.
 fn give_back(record: &mut ChannelRecord, amount: u128) {
-    record.spent = record.spent.saturating_sub(amount);
-    if record.state == ChannelLifecycle::Finalized {
-        record.spent = record.spent.max(record.settled_on_chain);
-    }
+    record.spent = record.spent.saturating_sub(amount).max(spent_floor(record));
     record.reserved = record.reserved.saturating_sub(amount);
+}
+
+/// A submitted close can capture this amount even while its reservations drain.
+fn spent_floor(record: &ChannelRecord) -> u128 {
+    match record.state {
+        ChannelLifecycle::Open => 0,
+        ChannelLifecycle::Closing => record.pending_close.map_or(0, |pending| pending.capture),
+        ChannelLifecycle::Finalized => record.settled_on_chain,
+    }
 }
 
 #[async_trait]
@@ -460,10 +468,7 @@ impl ChannelRepository for MppChannelRepository {
         let before = record.spent.saturating_sub(amount);
         let cap = record.highest_cumulative.saturating_sub(before);
         let charged = actual.min(cap);
-        record.spent = before.saturating_add(charged);
-        if record.state == ChannelLifecycle::Finalized {
-            record.spent = record.spent.max(record.settled_on_chain);
-        }
+        record.spent = before.saturating_add(charged).max(spent_floor(&record));
         record.reserved = record.reserved.saturating_sub(amount);
         record.units = record
             .units
@@ -600,24 +605,26 @@ impl ChannelRepository for MppChannelRepository {
         close_transition(self, channel_id, expected_tx_hash, Some(settled_on_chain)).await
     }
 
-    async fn claim_chain_read(
+    async fn claim_chain_read_lease(
         &self,
         channel_id: &[u8; 32],
         now: DateTime<Utc>,
         min_interval: chrono::Duration,
-    ) -> Result<bool, RepositoryError> {
+    ) -> Result<Option<ChainReadClaim>, RepositoryError> {
         let mut client = self.client().await?;
         let tx = client.transaction().await.map_err(map_db_error)?;
         let Some(mut record) = lock_channel(&tx, channel_id).await? else {
-            return Ok(false);
+            return Ok(None);
         };
         if !chain_read_may_claim(record.last_chain_read_at, now, min_interval) {
-            return Ok(false);
+            return Ok(None);
         }
-        record.last_chain_read_at =
-            Some(chain_read_claim_at(now, min_interval).ok_or_else(|| {
-                RepositoryError::ValidationFailed("chain read interval".to_string())
-            })?);
+        let claimed_at =
+            chain_read_claim_with_observation(now, min_interval, record.last_chain_read_at)
+                .ok_or_else(|| {
+                    RepositoryError::ValidationFailed("chain read interval".to_string())
+                })?;
+        record.last_chain_read_at = Some(claimed_at);
         tx.execute(
             READ_TIMESTAMP_SQL,
             &[&channel_id.as_slice(), &record.last_chain_read_at],
@@ -625,7 +632,7 @@ impl ChannelRepository for MppChannelRepository {
         .await
         .map_err(map_db_error)?;
         commit(tx).await?;
-        Ok(true)
+        Ok(Some(ChainReadClaim::new(claimed_at)))
     }
 
     async fn clear_chain_read_claim(
@@ -856,6 +863,7 @@ async fn close_transition(
     };
     if let Some(settled) = settled {
         record.settled_on_chain = record.settled_on_chain.max(settled);
+        record.spent = record.spent.max(record.settled_on_chain);
     }
     record.pending_close = None;
     store(&tx, &mut record, false).await?;

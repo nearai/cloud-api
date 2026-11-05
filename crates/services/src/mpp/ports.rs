@@ -434,18 +434,91 @@ impl SettlementLease {
     }
 }
 
-/// Encode a refresh lease distinctly from successful observation timestamps. Negative
-/// Unix microseconds contain the negated claim time, so an expired claim can never
-/// be mistaken for a successful recent read. PostgreSQL stores microsecond precision.
+/// The exact timestamp written by one atomic chain-refresh claim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChainReadClaim(DateTime<Utc>);
+
+impl ChainReadClaim {
+    pub fn new(at: DateTime<Utc>) -> Self {
+        Self(at)
+    }
+
+    pub fn at(self) -> DateTime<Utc> {
+        self.0
+    }
+}
+
+// Compact markers occupy a distinct, bounded past region. A previous binary
+// decodes their magnitude as an expired 1970s claim, allowing recovery during a
+// rollback. Mixed versions can duplicate reads; they cannot strand these leases.
+const CHAIN_READ_COMPACT_LIMIT: i64 = 100_000_000_000_000;
+const CHAIN_READ_CLAIM_SCALE: i64 = 1_000;
+const CHAIN_READ_UNKNOWN_AGE: i64 = CHAIN_READ_CLAIM_SCALE - 1;
+
+/// Encode a refresh lease without an earlier successful observation.
 pub fn chain_read_claim_at(
     now: DateTime<Utc>,
     interval: chrono::Duration,
 ) -> Option<DateTime<Utc>> {
-    let started = now.timestamp_micros();
+    chain_read_claim_with_observation(now, interval, None)
+}
+
+/// Preserve the last positive read in a compact pending marker. Observation
+/// ages round up to whole seconds, so decoding never makes a read appear newer.
+/// Unknown or excessively old observations are deliberately discarded.
+pub fn chain_read_claim_with_observation(
+    now: DateTime<Utc>,
+    interval: chrono::Duration,
+    previous: Option<DateTime<Utc>>,
+) -> Option<DateTime<Utc>> {
+    let started = now.timestamp();
     if interval <= chrono::Duration::zero() || started <= 0 {
         return None;
     }
-    DateTime::from_timestamp_micros(started.checked_neg()?)
+    let age = chain_read_last_observed_at(previous)
+        .filter(|at| *at <= now)
+        .and_then(|at| now.signed_duration_since(at).num_microseconds())
+        .and_then(|age| age.checked_add(999_999))
+        .map(|age| age / 1_000_000)
+        .filter(|age| *age < CHAIN_READ_UNKNOWN_AGE)
+        .unwrap_or(CHAIN_READ_UNKNOWN_AGE);
+    let encoded = started
+        .checked_mul(CHAIN_READ_CLAIM_SCALE)?
+        .checked_add(age)?;
+    if encoded >= CHAIN_READ_COMPACT_LIMIT {
+        return None;
+    }
+    DateTime::from_timestamp_micros(encoded.checked_neg()?)
+}
+
+fn chain_read_claim_started(at: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    let encoded = at.timestamp_micros().checked_neg()?;
+    if encoded > 0 && encoded < CHAIN_READ_COMPACT_LIMIT {
+        DateTime::from_timestamp(encoded / CHAIN_READ_CLAIM_SCALE, 0)
+    } else if encoded > 0 {
+        // Legacy markers carry a claim time, but no trustworthy observation.
+        DateTime::from_timestamp_micros(encoded)
+    } else {
+        None
+    }
+}
+
+/// The actual successful observation, including one retained by a pending claim.
+/// A legacy pending marker has no recoverable positive observation.
+pub fn chain_read_last_observed_at(at: Option<DateTime<Utc>>) -> Option<DateTime<Utc>> {
+    let at = at?;
+    if at.timestamp_micros() >= 0 {
+        return Some(at);
+    }
+    let payload = at.timestamp_micros().checked_neg()?;
+    if payload >= CHAIN_READ_COMPACT_LIMIT {
+        return None;
+    }
+    let age = payload % CHAIN_READ_CLAIM_SCALE;
+    if age == CHAIN_READ_UNKNOWN_AGE {
+        return None;
+    }
+    chain_read_claim_started(at)?.checked_sub_signed(chrono::Duration::seconds(age))
 }
 
 pub fn chain_read_is_fresh(
@@ -464,10 +537,7 @@ pub fn chain_read_may_claim(
     interval: chrono::Duration,
 ) -> bool {
     match at {
-        Some(at) if at.timestamp_micros() < 0 => at
-            .timestamp_micros()
-            .checked_neg()
-            .and_then(DateTime::from_timestamp_micros)
+        Some(at) if at.timestamp_micros() < 0 => chain_read_claim_started(at)
             .is_some_and(|started| now.signed_duration_since(started) >= interval),
         Some(at) => now.signed_duration_since(at) >= interval,
         None => true,
@@ -477,11 +547,7 @@ pub fn chain_read_may_claim(
 /// Record an observation, replacing a pending claim and preserving newer observations.
 pub fn chain_read_observed_at(previous: Option<DateTime<Utc>>, at: DateTime<Utc>) -> DateTime<Utc> {
     if let Some(pending) = previous.filter(|old| old.timestamp_micros() < 0) {
-        if pending
-            .timestamp_micros()
-            .checked_neg()
-            .is_some_and(|started| started > at.timestamp_micros())
-        {
+        if chain_read_claim_started(pending).is_some_and(|started| started > at) {
             return pending;
         }
     }
@@ -595,14 +661,27 @@ pub trait ChannelRepository: Send + Sync {
         settled_on_chain: u128,
     ) -> Result<bool, RepositoryError>;
 
-    /// Claim a chain refresh under the row lock with [`chain_read_claim_at`], only
-    /// when no successful read or unexpired claim covers `min_interval`.
+    /// Boolean compatibility wrapper for callers that do not clean up claims.
     async fn claim_chain_read(
         &self,
         channel_id: &[u8; 32],
         now: DateTime<Utc>,
         min_interval: chrono::Duration,
-    ) -> Result<bool, RepositoryError>;
+    ) -> Result<bool, RepositoryError> {
+        Ok(self
+            .claim_chain_read_lease(channel_id, now, min_interval)
+            .await?
+            .is_some())
+    }
+
+    /// Claim under the row lock and return the exact token written by this
+    /// acquisition. Cleanup must use this token, never a later unlocked read.
+    async fn claim_chain_read_lease(
+        &self,
+        channel_id: &[u8; 32],
+        now: DateTime<Utc>,
+        min_interval: chrono::Duration,
+    ) -> Result<Option<ChainReadClaim>, RepositoryError>;
 
     /// Clear only the exact failed refresh claim. A stale claimant cannot clear a
     /// replacement claim. Also invalidates an exact observed timestamp before a chain
@@ -671,5 +750,55 @@ mod tests {
     fn serve_outcome_only_maps_to_terminal_states() {
         assert_eq!(ServeOutcome::Served.state(), ClaimState::Served);
         assert_eq!(ServeOutcome::Unserved.state(), ClaimState::Unserved);
+    }
+
+    #[test]
+    fn pending_chain_read_preserves_a_conservative_observation_without_becoming_fresh() {
+        let now = DateTime::from_timestamp(1_800_000_000, 900_000_000).unwrap();
+        let previous = now - chrono::Duration::milliseconds(120_250);
+        let interval = chrono::Duration::seconds(60);
+        let claim = chain_read_claim_with_observation(now, interval, Some(previous)).unwrap();
+        let recovered = chain_read_last_observed_at(Some(claim)).unwrap();
+        assert!(recovered <= previous);
+        assert!(previous.signed_duration_since(recovered) < chrono::Duration::seconds(2));
+        assert!(!chain_read_is_fresh(Some(claim), now, interval));
+        assert!(!chain_read_may_claim(Some(claim), now, interval));
+        assert!(chain_read_may_claim(Some(claim), now + interval, interval));
+        assert_eq!(chain_read_observed_at(Some(claim), now), now);
+        assert_eq!(
+            chain_read_observed_at(Some(claim), now - chrono::Duration::seconds(1)),
+            claim
+        );
+    }
+
+    #[test]
+    fn legacy_pending_chain_read_has_no_invented_positive_observation() {
+        let now = DateTime::from_timestamp(1_800_000_000, 123_000_000).unwrap();
+        let legacy = DateTime::from_timestamp_micros(-now.timestamp_micros()).unwrap();
+        let interval = chrono::Duration::seconds(60);
+        assert_eq!(chain_read_last_observed_at(Some(legacy)), None);
+        assert!(!chain_read_may_claim(Some(legacy), now, interval));
+        assert!(chain_read_may_claim(Some(legacy), now + interval, interval));
+        assert_eq!(chain_read_observed_at(Some(legacy), now), now);
+        assert_eq!(
+            chain_read_last_observed_at(chain_read_claim_at(now, interval)),
+            None
+        );
+    }
+
+    #[test]
+    fn compact_pending_claim_is_reclaimable_by_the_previous_binary() {
+        let now = DateTime::from_timestamp(1_800_000_000, 0).unwrap();
+        let interval = chrono::Duration::seconds(60);
+        let claim = chain_read_claim_with_observation(
+            now,
+            interval,
+            Some(now - chrono::Duration::seconds(120)),
+        )
+        .unwrap();
+        let legacy_started = DateTime::from_timestamp_micros(-claim.timestamp_micros()).unwrap();
+        assert!(now.signed_duration_since(legacy_started) >= interval);
+        assert!(!chain_read_may_claim(Some(claim), now, interval));
+        assert!(!chain_read_is_fresh(Some(claim), now, interval));
     }
 }

@@ -468,14 +468,14 @@ impl ChannelRepository for TestRepo<'_> {
             .finalize_pending_close(channel_id, expected_tx_hash, settled)
             .await
     }
-    async fn claim_chain_read(
+    async fn claim_chain_read_lease(
         &self,
         channel_id: &[u8; 32],
         now: DateTime<Utc>,
         min_interval: chrono::Duration,
-    ) -> Result<bool, crate::common::RepositoryError> {
+    ) -> Result<Option<crate::mpp::ports::ChainReadClaim>, crate::common::RepositoryError> {
         self.inner
-            .claim_chain_read(channel_id, now, min_interval)
+            .claim_chain_read_lease(channel_id, now, min_interval)
             .await
     }
     async fn clear_chain_read_claim(

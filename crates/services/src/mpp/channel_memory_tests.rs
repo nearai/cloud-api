@@ -468,9 +468,17 @@ async fn charge_still_lands_on_a_closing_channel() {
     let repo = InMemoryChannelRepository::new();
     open(&repo, 1, 100).await;
     let (request, _) = reserved(&repo, 1, 40).await;
-    repo.mark_closing(&id(1), pending(), Utc::now())
-        .await
-        .unwrap();
+    repo.mark_closing(
+        &id(1),
+        PendingClose {
+            capture: 40,
+            cumulative: 100,
+            ..pending()
+        },
+        Utc::now(),
+    )
+    .await
+    .unwrap();
     let (record, charged_now) = charge_ok(repo.charge(request, 40, 4).await.unwrap());
     assert_eq!(charged_now, 40);
     assert_eq!(record.state, ChannelLifecycle::Closing);

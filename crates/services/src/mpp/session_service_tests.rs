@@ -883,7 +883,7 @@ async fn close_marks_pending_before_send_and_failure_clears_closing() {
             let receipt = result.unwrap().receipt;
             assert_eq!(
                 (receipt.spent, receipt.units),
-                if already_settled { (0, 0) } else { (36, 18) }
+                if already_settled { (36, 0) } else { (36, 18) }
             );
             assert!(receipt.tx_hash.is_some());
             assert_eq!(row.state, ChannelLifecycle::Finalized);

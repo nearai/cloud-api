@@ -62,6 +62,7 @@ DELETE FROM mpp_channel_reservations WHERE request_id = $1 RETURNING amount::TEX
 pub(super) const FINALIZE_SQL: &str = "\
 UPDATE mpp_channels SET state = 'finalized', pending_close = NULL, \
 settled_on_chain = GREATEST(settled_on_chain, $2::TEXT::NUMERIC), \
+spent = GREATEST(spent, settled_on_chain, $2::TEXT::NUMERIC), \
 updated_at = clock_timestamp() \
 WHERE channel_id = $1";
 

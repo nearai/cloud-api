@@ -24,10 +24,10 @@ use uuid::Uuid;
 
 use super::abi::ChannelState;
 use super::ports::{
-    chain_read_claim_at, chain_read_may_claim, chain_read_observed_at, ChannelLifecycle,
-    ChannelRecord, ChannelRepository, ChargeOutcome, CloseTransition, NewChannel, PendingClose,
-    ReserveOutcome, RetainedVoucher, SettlementLease, VoucherOutcome, VoucherRules,
-    MAX_RETAINED_VOUCHERS,
+    chain_read_claim_with_observation, chain_read_may_claim, chain_read_observed_at,
+    ChainReadClaim, ChannelLifecycle, ChannelRecord, ChannelRepository, ChargeOutcome,
+    CloseTransition, NewChannel, PendingClose, ReserveOutcome, RetainedVoucher, SettlementLease,
+    VoucherOutcome, VoucherRules, MAX_RETAINED_VOUCHERS,
 };
 use super::secp256k1::SIGNATURE_LEN;
 use crate::common::RepositoryError;
@@ -63,10 +63,11 @@ impl State {
     fn give_back(&mut self, reservation: &Reservation) {
         let stamp = self.tick();
         if let Some(row) = self.channels.get_mut(&reservation.channel_id) {
-            row.record.spent = row.record.spent.saturating_sub(reservation.amount);
-            if row.record.state == ChannelLifecycle::Finalized {
-                row.record.spent = row.record.spent.max(row.record.settled_on_chain);
-            }
+            row.record.spent = row
+                .record
+                .spent
+                .saturating_sub(reservation.amount)
+                .max(spent_floor(&row.record));
             row.record.reserved = row.record.reserved.saturating_sub(reservation.amount);
             row.record.updated_at = stamp;
         }
@@ -194,6 +195,15 @@ impl InMemoryChannelRepository {
 
 fn poisoned() -> RepositoryError {
     RepositoryError::DatabaseError(anyhow::anyhow!("in-memory channel store poisoned"))
+}
+
+/// A submitted close can capture this amount even while its reservations drain.
+fn spent_floor(record: &ChannelRecord) -> u128 {
+    match record.state {
+        ChannelLifecycle::Open => 0,
+        ChannelLifecycle::Closing => record.pending_close.map_or(0, |pending| pending.capture),
+        ChannelLifecycle::Finalized => record.settled_on_chain,
+    }
 }
 
 /// Keep `old` as a retained voucher: highest first, at most [`MAX_RETAINED_VOUCHERS`].
@@ -369,10 +379,7 @@ impl ChannelRepository for InMemoryChannelRepository {
         let before = record.spent.saturating_sub(reservation.amount);
         let cap = record.highest_cumulative.saturating_sub(before);
         let charged = actual.min(cap);
-        record.spent = before.saturating_add(charged);
-        if record.state == ChannelLifecycle::Finalized {
-            record.spent = record.spent.max(record.settled_on_chain);
-        }
+        record.spent = before.saturating_add(charged).max(spent_floor(record));
         record.reserved = record.reserved.saturating_sub(reservation.amount);
         record.units = record.units.saturating_add(units);
         record.updated_at = stamp;
@@ -463,6 +470,7 @@ impl ChannelRepository for InMemoryChannelRepository {
         if let Some(row) = state.channels.get_mut(channel_id) {
             row.record.state = ChannelLifecycle::Finalized;
             row.record.settled_on_chain = row.record.settled_on_chain.max(settled_on_chain);
+            row.record.spent = row.record.spent.max(row.record.settled_on_chain);
             row.record.pending_close = None;
             row.record.updated_at = stamp;
         }
@@ -514,30 +522,33 @@ impl ChannelRepository for InMemoryChannelRepository {
         }
         row.record.state = ChannelLifecycle::Finalized;
         row.record.settled_on_chain = row.record.settled_on_chain.max(settled_on_chain);
+        row.record.spent = row.record.spent.max(row.record.settled_on_chain);
         row.record.pending_close = None;
         row.record.updated_at = stamp;
         Ok(true)
     }
 
-    async fn claim_chain_read(
+    async fn claim_chain_read_lease(
         &self,
         channel_id: &[u8; 32],
         now: DateTime<Utc>,
         min_interval: Duration,
-    ) -> Result<bool, RepositoryError> {
+    ) -> Result<Option<ChainReadClaim>, RepositoryError> {
         self.chain_read_claims.fetch_add(1, Ordering::Relaxed);
         let mut state = self.state.lock().map_err(|_| poisoned())?;
         let Some(row) = state.channels.get_mut(channel_id) else {
-            return Ok(false);
+            return Ok(None);
         };
         if !chain_read_may_claim(row.record.last_chain_read_at, now, min_interval) {
-            return Ok(false);
+            return Ok(None);
         }
-        row.record.last_chain_read_at =
-            Some(chain_read_claim_at(now, min_interval).ok_or_else(|| {
-                RepositoryError::ValidationFailed("chain read interval".to_string())
-            })?);
-        Ok(true)
+        let claimed_at =
+            chain_read_claim_with_observation(now, min_interval, row.record.last_chain_read_at)
+                .ok_or_else(|| {
+                    RepositoryError::ValidationFailed("chain read interval".to_string())
+                })?;
+        row.record.last_chain_read_at = Some(claimed_at);
+        Ok(Some(ChainReadClaim::new(claimed_at)))
     }
 
     async fn clear_chain_read_claim(

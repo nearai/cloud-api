@@ -1,6 +1,104 @@
 use super::*;
 use services::mpp::VoucherRules;
 
+#[tokio::test]
+async fn closing_capture_survives_smaller_charge_before_finalization() {
+    for pending_finalization in [false, true] {
+        let f = fixture().await;
+        let (id, _) = f.open(300).await;
+        let (request, _) = f.reserve(&id, 100).await;
+        let close = PendingClose {
+            capture: 100,
+            cumulative: 300,
+            ..pending()
+        };
+        assert!(matches!(
+            f.repo.mark_closing(&id, close, test_now()).await.unwrap(),
+            CloseTransition::Marked(_)
+        ));
+        let charged = f.repo.charge(request, 10, 5).await.unwrap();
+        assert!(matches!(
+            charged,
+            ChargeOutcome::Charged { charged: 10, .. }
+        ));
+        let row = f.stored(&id).await;
+        assert_eq!((row.spent, row.reserved, row.units), (100, 0, 5));
+        if pending_finalization {
+            assert!(f
+                .repo
+                .finalize_pending_close(&id, &close.tx_hash, 100)
+                .await
+                .unwrap());
+        } else {
+            f.repo.finalize(&id, 100).await.unwrap();
+        }
+        let row = f.stored(&id).await;
+        assert_eq!((row.spent, row.settled_on_chain), (100, 100));
+        assert_eq!(row.state, ChannelLifecycle::Finalized);
+    }
+}
+
+#[tokio::test]
+async fn closing_capture_survives_release_and_reaper_before_finalization() {
+    for stale in [false, true] {
+        let f = fixture().await;
+        let (id, _) = f.open(300).await;
+        let (request, _) = f.reserve(&id, 100).await;
+        let close = PendingClose {
+            capture: 100,
+            cumulative: 300,
+            ..pending()
+        };
+        f.repo.mark_closing(&id, close, test_now()).await.unwrap();
+        if stale {
+            f.pool.get().await.unwrap().execute("UPDATE mpp_channel_reservations SET created_at = NOW() - INTERVAL '3 hours' WHERE request_id = $1", &[&request]).await.unwrap();
+            f.repo
+                .release_stale_reservations(Utc::now() - Duration::hours(2))
+                .await
+                .unwrap();
+        } else {
+            assert!(f.repo.release(request).await.unwrap());
+        }
+        let closing = f.stored(&id).await;
+        assert_eq!((closing.spent, closing.reserved), (100, 0));
+        assert!(f
+            .repo
+            .finalize_pending_close(&id, &close.tx_hash, 100)
+            .await
+            .unwrap());
+        let row = f.stored(&id).await;
+        assert_eq!(
+            (row.spent, row.reserved, row.settled_on_chain),
+            (100, 0, 100)
+        );
+    }
+}
+
+#[tokio::test]
+async fn finalization_raises_spent_to_the_confirmed_chain_floor() {
+    for pending_finalization in [false, true] {
+        let f = fixture().await;
+        let (id, _) = f.open(300).await;
+        let close = PendingClose {
+            capture: 0,
+            cumulative: 300,
+            ..pending()
+        };
+        if pending_finalization {
+            f.repo.mark_closing(&id, close, test_now()).await.unwrap();
+            assert!(f
+                .repo
+                .finalize_pending_close(&id, &close.tx_hash, 120)
+                .await
+                .unwrap());
+        } else {
+            f.repo.finalize(&id, 120).await.unwrap();
+        }
+        let row = f.stored(&id).await;
+        assert_eq!((row.spent, row.settled_on_chain), (120, 120));
+    }
+}
+
 async fn setup(cumulative: u128, deposit: u128) -> (Arc<MppChannelRepository>, [u8; 32]) {
     let f = fixture().await;
     let id = random_id();

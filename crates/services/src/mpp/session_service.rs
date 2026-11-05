@@ -19,8 +19,8 @@ use crate::mpp::error::{
 };
 use crate::mpp::open_check::{verify_open_transaction, OpenTerms};
 use crate::mpp::ports::{
-    chain_read_claim_at, chain_read_is_fresh, ChannelLifecycle, ChannelRecord, ChannelRepository,
-    ChargeOutcome, NewChannel, ReserveOutcome, TempoRpc, TempoSigner, VoucherOutcome, VoucherRules,
+    ChannelLifecycle, ChannelRecord, ChannelRepository, ChargeOutcome, NewChannel, ReserveOutcome,
+    TempoRpc, TempoSigner, VoucherOutcome, VoucherRules,
 };
 use crate::mpp::pricing::{LimitViolation, Price};
 use crate::mpp::protocol::{self, Challenge, INTENT_SESSION, METHOD};
@@ -33,6 +33,7 @@ use crate::mpp::session_wire::{
 use crate::mpp::tempo_tx::{decode_signed, tx_hash};
 
 mod closing;
+mod refresh;
 
 pub(crate) const CHAIN_READ_FRESHNESS_SECONDS: i64 = 60;
 static MANAGEMENT: Semaphore = Semaphore::const_new(8);
@@ -105,6 +106,7 @@ impl fmt::Debug for ReservedRequest {
 }
 
 /// Session lifecycle and metering over the domain ports. No HTTP or persistence adapter.
+#[derive(Clone)]
 pub struct SessionService {
     config: SessionServiceConfig,
     repo: Arc<dyn ChannelRepository>,
@@ -380,41 +382,6 @@ impl SessionService {
             .ok_or(MppError::ChannelNotFound)?;
         Self::accepting(&record)?;
         Ok(record)
-    }
-
-    async fn refresh(&self, record: ChannelRecord) -> Result<ChannelRecord, MppError> {
-        Self::accepting(&record)?;
-        let now = Utc::now();
-        let interval = chrono::Duration::seconds(CHAIN_READ_FRESHNESS_SECONDS);
-        if chain_read_is_fresh(record.last_chain_read_at, now, interval) {
-            return Ok(record);
-        }
-        let claimed_at = chain_read_claim_at(now, interval).ok_or(MppError::Config)?;
-        if !self
-            .repo
-            .claim_chain_read(&record.channel_id, now, interval)
-            .await
-            .map_err(store_error)?
-        {
-            let current = self.get(&record.channel_id).await?;
-            Self::accepting(&current)?;
-            return if chain_read_is_fresh(current.last_chain_read_at, Utc::now(), interval) {
-                Ok(current)
-            } else {
-                Err(MppError::Unavailable(UnavailableReason::Rpc))
-            };
-        }
-        let result = match self.read_chain(&record.channel_id).await {
-            Ok(chain) => self.record_chain(&record.channel_id, chain).await,
-            Err(error) => Err(error),
-        };
-        if result.is_err() {
-            self.repo
-                .clear_chain_read_claim(&record.channel_id, claimed_at)
-                .await
-                .map_err(store_error)?;
-        }
-        result
     }
 
     fn verify_signature(
@@ -960,4 +927,7 @@ mod port_tests;
 #[cfg(test)]
 #[path = "session_service/ledger_regression_tests.rs"]
 mod ledger_regression_tests;
+
+#[cfg(test)]
+mod refresh_tests;
 // Focused ledger regression coverage remains separate from the service implementation.

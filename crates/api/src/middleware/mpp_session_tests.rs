@@ -970,3 +970,6 @@ mod management;
 
 #[path = "mpp_tests/session_partial.rs"]
 mod partial;
+
+#[path = "mpp_tests/session_refresh.rs"]
+mod refresh;

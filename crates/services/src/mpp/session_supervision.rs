@@ -13,8 +13,8 @@ use crate::mpp::abi::{
     MAX_BATCH_CHANNELS,
 };
 use crate::mpp::ports::{
-    chain_read_claim_at, chain_read_is_fresh, ChannelLifecycle, ChannelRecord, ChannelRepository,
-    CloseTransition, PendingClose, RetainedVoucher, TempoRpc, TempoSigner,
+    chain_read_is_fresh, ChannelLifecycle, ChannelRecord, ChannelRepository, CloseTransition,
+    PendingClose, RetainedVoucher, TempoRpc, TempoSigner,
 };
 use crate::mpp::session_chain::{broadcast, build_payee_tx, PayeeChain};
 use crate::mpp::session_close_reconciliation::{reconcile_pending_close, CloseRecovery};
@@ -435,32 +435,33 @@ pub async fn run_supervision_pass(
         while let Some(result) = recoveries.next().await {
             summary.add(result);
         }
-        let mut claimed = Vec::with_capacity(open.len());
-        let Some(claimed_at) = pass_time(now, started) else {
-            break;
-        };
-        let Some(claim_deadline) = chain_read_claim_at(claimed_at, chain_freshness) else {
-            break;
-        };
-        for record in open {
-            // A fresh observation needs neither another row write nor an RPC.
-            if chain_read_is_fresh(record.last_chain_read_at, claimed_at, chain_freshness) {
+        for candidates in open.chunks(MAX_BATCH_CHANNELS) {
+            // Later batches stay unclaimed while this batch reads and processes
+            // chain state. Their leases start immediately before their own RPC.
+            let Some(claimed_at) = pass_time(now, started) else {
+                break;
+            };
+            let mut batch = Vec::with_capacity(candidates.len());
+            for record in candidates {
+                if chain_read_is_fresh(record.last_chain_read_at, claimed_at, chain_freshness) {
+                    continue;
+                }
+                match repo
+                    .claim_chain_read_lease(&record.channel_id, claimed_at, chain_freshness)
+                    .await
+                {
+                    Ok(Some(claim)) => batch.push((record.clone(), claim)),
+                    Ok(None) => {}
+                    Err(_) => tracing::warn!(
+                        outcome = "chain_read_claim_failed",
+                        "MPP supervision claim failed"
+                    ),
+                }
+            }
+            if batch.is_empty() {
                 continue;
             }
-            match repo
-                .claim_chain_read(&record.channel_id, claimed_at, chain_freshness)
-                .await
-            {
-                Ok(true) => claimed.push(record),
-                Ok(false) => {}
-                Err(_) => tracing::warn!(
-                    outcome = "chain_read_claim_failed",
-                    "MPP supervision claim failed"
-                ),
-            }
-        }
-        for batch in claimed.chunks(MAX_BATCH_CHANNELS) {
-            let ids: Vec<_> = batch.iter().map(|record| record.channel_id).collect();
+            let ids: Vec<_> = batch.iter().map(|(record, _)| record.channel_id).collect();
             let states = if let Ok(data) = get_channel_states_batch_calldata(&ids) {
                 summary.chain_reads += 1;
                 match rpc.call(chain.escrow, &data).await {
@@ -475,9 +476,9 @@ pub async fn run_supervision_pass(
                     outcome = "supervision_chain_read_failed",
                     "MPP supervision batch skipped"
                 );
-                for record in batch {
+                for (record, claim_deadline) in &batch {
                     if repo
-                        .clear_chain_read_claim(&record.channel_id, claim_deadline)
+                        .clear_chain_read_claim(&record.channel_id, claim_deadline.at())
                         .await
                         .is_err()
                     {
@@ -489,7 +490,11 @@ pub async fn run_supervision_pass(
                 }
                 continue;
             };
-            let observations: Vec<_> = batch.iter().cloned().zip(states).collect();
+            let observations: Vec<_> = batch
+                .into_iter()
+                .map(|(record, _)| record)
+                .zip(states)
+                .collect();
             let mut operations = stream::iter(observations)
                 .map(|(record, state)| async move {
                     let mut summary = SupervisionSummary::default();

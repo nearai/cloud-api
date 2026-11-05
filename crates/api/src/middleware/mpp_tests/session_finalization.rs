@@ -142,14 +142,14 @@ impl ChannelRepository for DelayedLedger {
             .await
     }
 
-    async fn claim_chain_read(
+    async fn claim_chain_read_lease(
         &self,
         channel_id: &[u8; 32],
         now: DateTime<Utc>,
         min_interval: chrono::Duration,
-    ) -> Result<bool, RepositoryError> {
+    ) -> Result<Option<services::mpp::ports::ChainReadClaim>, RepositoryError> {
         self.inner
-            .claim_chain_read(channel_id, now, min_interval)
+            .claim_chain_read_lease(channel_id, now, min_interval)
             .await
     }
 

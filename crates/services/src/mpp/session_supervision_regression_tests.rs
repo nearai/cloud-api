@@ -1,5 +1,96 @@
 use super::*;
 
+struct PausedBatchRpc {
+    fake: FakeTempo,
+    entered: tokio::sync::Notify,
+    resume: tokio::sync::Notify,
+    calls: AtomicUsize,
+}
+
+#[async_trait]
+impl TempoRpc for PausedBatchRpc {
+    async fn send_raw_transaction_sync(&self, raw: &[u8]) -> Result<RpcReceipt, RpcError> {
+        self.fake.send_raw_transaction_sync(raw).await
+    }
+    async fn get_transaction_receipt(
+        &self,
+        hash: [u8; 32],
+    ) -> Result<Option<RpcReceipt>, RpcError> {
+        self.fake.get_transaction_receipt(hash).await
+    }
+    async fn get_block_timestamp(&self, number: u64) -> Result<Option<u64>, RpcError> {
+        self.fake.get_block_timestamp(number).await
+    }
+    async fn call(&self, to: [u8; 20], data: &[u8]) -> Result<Vec<u8>, RpcError> {
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            self.entered.notify_one();
+            self.resume.notified().await;
+        }
+        self.fake.call(to, data).await
+    }
+    async fn gas_price(&self) -> Result<u128, RpcError> {
+        self.fake.gas_price().await
+    }
+}
+
+#[tokio::test]
+async fn supervision_claims_only_the_batch_whose_rpc_is_starting() {
+    let repo = Arc::new(InMemoryChannelRepository::with_clock(now()));
+    for index in 1_u16..=257 {
+        let mut id = [0; 32];
+        id[..2].copy_from_slice(&index.to_be_bytes());
+        open(&repo, id).await;
+    }
+    let rpc = Arc::new(PausedBatchRpc {
+        fake: FakeTempo::default(),
+        entered: tokio::sync::Notify::new(),
+        resume: tokio::sync::Notify::new(),
+        calls: AtomicUsize::new(0),
+    });
+    answer(
+        &rpc.fake,
+        ChannelState {
+            close_requested_at: 0,
+            ..requested()
+        },
+    );
+    let pass = {
+        let repo = repo.clone();
+        let rpc = rpc.clone();
+        tokio::spawn(async move {
+            run_supervision_pass(
+                repo.as_ref(),
+                rpc.as_ref(),
+                &signer(),
+                chain(),
+                &SupervisionConfig {
+                    page: 300,
+                    ..Default::default()
+                },
+                now(),
+            )
+            .await
+        })
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(5), rpc.entered.notified())
+        .await
+        .unwrap();
+    assert_eq!(repo.chain_read_claim_count(), MAX_BATCH_CHANNELS);
+    let mut later_id = [0; 32];
+    later_id[..2].copy_from_slice(&257_u16.to_be_bytes());
+    assert!(repo
+        .get(&later_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .last_chain_read_at
+        .is_none());
+    rpc.resume.notify_one();
+    let summary = pass.await.unwrap();
+    assert_eq!(summary.chain_reads, 2);
+    assert_eq!(repo.chain_read_claim_count(), 257);
+}
+
 #[tokio::test]
 async fn fresh_chain_observation_does_not_defer_a_due_payee_close() {
     for reserved in [false, true] {

@@ -5,7 +5,7 @@ use chrono::Utc;
 use crate::mpp::abi::{self, ChannelDescriptor};
 use crate::mpp::channel::voucher_signer;
 use crate::mpp::eip712::close_authorization_digest;
-use crate::mpp::error::{CloseReason, MppError, SessionMismatch};
+use crate::mpp::error::{CloseReason, MppError, SessionMismatch, VoucherReason};
 use crate::mpp::ports::{ChannelLifecycle, ChannelRecord, CloseTransition, PendingClose};
 use crate::mpp::secp256k1::recover_address;
 use crate::mpp::session_chain::{broadcast, build_payee_tx, BroadcastError, PayeeChain};
@@ -48,13 +48,23 @@ impl SessionService {
         if record.reserved != 0 {
             return Err(MppError::CloseRejected(CloseReason::Busy));
         }
-        self.check_voucher(
-            &record,
-            *cumulative_amount,
-            signature,
-            credential.min_voucher_delta,
-            true,
-        )?;
+        if *cumulative_amount < record.highest_cumulative {
+            // A cooperative close can reduce unused authorization to confirmed spend or
+            // an earlier snapshot's amount. Capture is already covered, and both the
+            // voucher and close authorization must sign this exact final amount.
+            if *cumulative_amount > record.deposit {
+                return Err(MppError::VoucherRejected(VoucherReason::AboveDeposit));
+            }
+            self.verify_signature(id, descriptor, *cumulative_amount, signature)?;
+        } else {
+            self.check_voucher(
+                &record,
+                *cumulative_amount,
+                signature,
+                credential.min_voucher_delta,
+                true,
+            )?;
+        }
         let calldata = abi::close_calldata(descriptor, *cumulative_amount, capture, signature)
             .map_err(|_| MppError::CloseRejected(CloseReason::InvalidSignature))?;
         let chain = PayeeChain {
@@ -108,7 +118,7 @@ impl SessionService {
         self.repo.finalize(id, capture).await.map_err(store_error)?;
         let record = self.get(id).await?;
         let mut receipt = receipt(credential, &record, Some(tx.tx_hash));
-        receipt.accepted_cumulative = receipt.accepted_cumulative.max(*cumulative_amount);
+        receipt.accepted_cumulative = *cumulative_amount;
         Ok(ManagementReceipt { receipt })
     }
 
@@ -154,7 +164,7 @@ impl SessionService {
                     .map_err(store_error)?;
                 let current = self.get(&record.channel_id).await?;
                 let mut receipt = receipt(credential, &current, Some(pending.tx_hash));
-                receipt.accepted_cumulative = receipt.accepted_cumulative.max(pending.cumulative);
+                receipt.accepted_cumulative = pending.cumulative;
                 return Ok(Some(ManagementReceipt { receipt }));
             }
             self.repo

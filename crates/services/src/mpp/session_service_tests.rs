@@ -772,6 +772,15 @@ async fn close_refuses_bad_authorization_and_inflight_reservations() {
                 .await
                 .unwrap();
         }
+        if case == 4 {
+            // Closing may reduce unused authorization, but must cover captured usage.
+            let request = Uuid::new_v4();
+            f.repo
+                .reserve(&Vectors::load().fixed("channelId"), request, INITIAL)
+                .await
+                .unwrap();
+            f.repo.charge(request, INITIAL, 0).await.unwrap();
+        }
         let credential = f.credential(payload).await;
         assert_eq!(
             f.service.close(&credential).await.err(),
@@ -780,7 +789,7 @@ async fn close_refuses_bad_authorization_and_inflight_reservations() {
                 1 => MppError::CloseRejected(CloseReason::SignerMismatch),
                 2 => MppError::CloseRejected(CloseReason::Busy),
                 3 => MppError::VoucherRejected(VoucherReason::AboveDeposit),
-                4 => MppError::VoucherRejected(VoucherReason::NotHigher),
+                4 => MppError::CloseRejected(CloseReason::BelowCapture),
                 _ => MppError::VoucherRejected(VoucherReason::DeltaTooSmall),
             })
         );

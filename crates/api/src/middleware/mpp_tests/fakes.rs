@@ -3,7 +3,7 @@
 
 use super::*;
 
-pub(super) struct Keys;
+pub(super) struct Keys(Option<Arc<AtomicUsize>>);
 
 pub(super) fn api_key(key: &str) -> ApiKey {
     ApiKey {
@@ -26,6 +26,9 @@ pub(super) fn api_key(key: &str) -> ApiKey {
 #[async_trait]
 impl ApiKeyRepository for Keys {
     async fn validate(&self, key: String) -> Result<Option<ApiKey>, RepositoryError> {
+        if let Some(calls) = &self.0 {
+            calls.fetch_add(1, Ordering::SeqCst);
+        }
         Ok((key == SERVICE_KEY || key == BEARER_KEY).then(|| api_key(&key)))
     }
     async fn create(&self, _: CreateApiKeyRequest) -> Result<ApiKey, RepositoryError> {
@@ -214,10 +217,14 @@ impl OrganizationReportingTokenService for NoReportingTokens {
 }
 
 pub(super) fn auth_state() -> AuthState {
+    auth_state_with_calls(None)
+}
+
+pub(super) fn auth_state_with_calls(calls: Option<Arc<AtomicUsize>>) -> AuthState {
     AuthState::new(
         Arc::new(services::auth::OAuthManager::new(None, None).unwrap()),
         Arc::new(services::auth::MockAuthService {
-            apikey_repository: Arc::new(Keys),
+            apikey_repository: Arc::new(Keys(calls)),
         }),
         Arc::new(Workspaces),
         Arc::new(NoReportingTokens),

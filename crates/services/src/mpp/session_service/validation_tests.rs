@@ -1,5 +1,8 @@
 // INTEGRATION: register directly as session_service::validation_tests.
 
+#[path = "management_tests.rs"]
+mod management_tests;
+
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;

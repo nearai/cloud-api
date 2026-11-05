@@ -297,6 +297,7 @@ struct SessionApp {
     state: SessionHandlerState,
     blocked: Arc<AtomicBool>,
     price: services::mpp::Price,
+    auth_calls: Arc<AtomicUsize>,
 }
 
 fn session_app(service_key: &str, amount: u128, token_price: Option<u128>) -> SessionApp {
@@ -359,13 +360,14 @@ fn session_app_with_repository(
         mode: Arc::new(Mutex::new(SessionHandlerMode::Report)),
     };
     let blocked = Arc::new(AtomicBool::new(false));
+    let auth_calls = Arc::new(AtomicUsize::new(0));
     let router = Router::new()
         .route("/chat/completions", post(session_handler))
         .with_state(state.clone())
         .layer(from_fn_with_state(blocked.clone(), session_inner_block))
         .layer(from_fn_with_state(
             MppAuthState {
-                auth: auth_state(),
+                auth: auth_state_with_calls(Some(auth_calls.clone())),
                 mpp: Some(mpp),
                 session: Some(session.clone()),
             },
@@ -382,6 +384,7 @@ fn session_app_with_repository(
         rpc,
         state,
         blocked,
+        auth_calls,
         price: services::mpp::Price {
             amount,
             token_price,
@@ -924,3 +927,6 @@ async fn cancelling_handler_releases_reserved_funds() {
 
 #[path = "mpp_tests/session_finalization.rs"]
 mod finalization;
+
+#[path = "mpp_tests/session_management.rs"]
+mod management;

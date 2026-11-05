@@ -246,21 +246,6 @@ pub(super) async fn serve(
         Ok(credential) => credential,
         Err(error) => return error_response(&service, &price, error).await,
     };
-    let management = match credential.payload() {
-        SessionPayload::Open { .. } => Some(service.open(&credential).await),
-        SessionPayload::TopUp { .. } => Some(service.top_up(&credential).await),
-        SessionPayload::Close { .. } => Some(service.close(&credential).await),
-        SessionPayload::Voucher { .. } => None,
-    };
-    if let Some(result) = management {
-        return match result {
-            Ok(management) => receipt_response(
-                with_no_store(axum::Json(serde_json::json!({"status":"ok"})).into_response()),
-                &management.receipt,
-            ),
-            Err(error) => error_response(&service, &price, error).await,
-        };
-    }
     let Some(cap) = cost_cap(&price, body) else {
         return limit_response("Session request cost exceeds the supported limit.".into());
     };
@@ -351,4 +336,42 @@ pub(super) async fn serve(
             Err(error) => error_response(&service, &price, error).await,
         }
     }
+}
+
+/// Management buys no inference and authenticates solely against the echoed session offer.
+pub(super) async fn manage(
+    service: &SessionService,
+    credential: &protocol::SessionCredential,
+) -> Response {
+    let credential = match service
+        .verify_management_credential(credential, CHAT_COMPLETIONS_ROUTE)
+        .await
+    {
+        Ok(credential) => credential,
+        Err(error) => return super::mpp::error_response(error, || None),
+    };
+    let (action, result) = match credential.payload() {
+        SessionPayload::Open { .. } => ("open", service.open(&credential).await),
+        SessionPayload::TopUp { .. } => ("top_up", service.top_up(&credential).await),
+        SessionPayload::Close { .. } => ("close", service.close(&credential).await),
+        SessionPayload::Voucher { .. } => {
+            return super::mpp::error_response(
+                MppError::SessionMismatch(services::mpp::error::SessionMismatch::Action),
+                || None,
+            )
+        }
+    };
+    let response = match result {
+        Ok(management) => receipt_response(
+            with_no_store(axum::Json(serde_json::json!({"status":"ok"})).into_response()),
+            &management.receipt,
+        ),
+        Err(error) => super::mpp::error_response(error, || None),
+    };
+    tracing::info!(
+        action,
+        status = response.status().as_u16(),
+        "MPP session management outcome"
+    );
+    response
 }

@@ -317,8 +317,14 @@ For each voucher request on a channel:
    (`spent -= cost_cap`): nothing delivered, nothing charged.
 
 Reservations precede service-key authentication, rate limiting and usage checks. A short
-voucher consumes none of the shared service key's rate limit. Management actions bypass
-those checks entirely, after the same body pre-flight and credential verification.
+voucher consumes none of the shared service key's rate limit. Management actions (`open`,
+`topUp`, `close`) use the same POST URL with only an `Authorization: Payment` header;
+they bypass body pricing, handler pre-flight, service-key authentication and inference.
+Their price comes from a configured token price matching the HMAC-verified echoed session
+terms. Credential verification still checks the full offer and route. A Payment credential
+with a missing or unpriceable inference body receives an MPP problem document, as does a
+malformed credential; neither falls through to API-key authentication. Without a price for
+a fresh challenge, challenge-class errors answer `400 application/problem+json`.
 
 The chat completion's usage observer reports final counts once. Non-streaming completions
 normally report before the handler returns; if no report arrives within one second after a
@@ -350,10 +356,15 @@ verifies (secp256k1, 65 bytes); delta from the previous highest must be at least
 refresh `deposit`, `settled`, and `closeRequestedAt`; zero deposit means closed, so refuse.
 Once the payer has requested close on chain, no further vouchers or reservations are accepted.
 
-`close`: voucher checks as for inference (amount may equal the highest accepted); payer or
-voucher signer must supply `closeSignature` over `CloseAuthorization`; capture is
-`max(spent, settled_on_chain)` with `cumulativeAmount >= capture`; channel moves to `closing`,
-then the payee broadcasts `close` on chain.
+`close`: payer or voucher signer supplies `closeSignature` over `CloseAuthorization` and
+a voucher signature for the same final `cumulativeAmount`. That amount may be below the
+highest inference voucher (for example, confirmed spend or an earlier snapshot's accepted
+amount), but must cover `capture = max(spent, settled_on_chain)` and stay within the deposit.
+
+An increase above the highest voucher still follows the voucher delta checks. The channel
+moves to `closing`, then the payee broadcasts `close` on chain; its receipt echoes the signed
+final amount in `acceptedCumulative`, while the ledger retains its highest inference voucher
+(including when an uncertain broadcast is reconciled on retry).
 
 ### Settlement
 

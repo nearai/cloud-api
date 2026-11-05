@@ -5,8 +5,8 @@
 //! 1. [`mpp_auth_middleware`] replaces `auth_middleware_with_workspace_context`. It hands the
 //!    request to that function unless MPP applies: the `Authorization` header is `Payment …`,
 //!    or there is none and the body prices.
-//!    - The handler's own pre-flight (JSON content type, request type, `validate_request`)
-//!      runs first, so a body the handler would refuse never gets a challenge or a payment.
+//!    - Session management is verified before body pricing and needs no inference body.
+//!      Inference still passes the handler's pre-flight before a challenge or payment.
 //!    - No header, priced model: 402 with a fresh challenge. Limits broken: 400.
 //!    - `Payment` credential: stateless verification, then the payment is verified on chain
 //!      (`verify_payment`: reads the chain, claims nothing), and only then does the request
@@ -161,13 +161,17 @@ fn retry_secs(error: MppError) -> u64 {
 
 /// Answer an [`MppError`]: the one match over [`MppResponse`]. `challenge` builds the fresh
 /// 402 challenge for the layer's request.
-fn error_response(
+pub(super) fn error_response(
     error: MppError,
-    challenge: impl FnOnce() -> Result<services::mpp::Challenge, MppError>,
+    challenge: impl FnOnce() -> Option<Result<services::mpp::Challenge, MppError>>,
 ) -> Response {
     tracing::debug!(outcome = error.kind(), "MPP payment refused");
     match error.response() {
-        MppResponse::Challenge(problem) => challenge_response(challenge(), problem, error.detail()),
+        MppResponse::Challenge(problem) => match challenge() {
+            Some(challenge) => challenge_response(challenge, problem, error.detail()),
+            // Header-only requests have no inference price from which to mint an offer.
+            None => problem_response(StatusCode::BAD_REQUEST, problem.body(400, error.detail())),
+        },
         MppResponse::Problem(status, problem) => {
             let http = match status {
                 ProblemStatus::BadRequest => StatusCode::BAD_REQUEST,
@@ -261,17 +265,47 @@ pub async fn mpp_auth_middleware(
     let Some(presented) = presented(&request) else {
         return delegate(auth, request, next).await;
     };
-    let Some(body) = request
+    let parsed = match &presented {
+        Presented::Payment(header) => {
+            Some(services::mpp::protocol::parse_any_authorization(header))
+        }
+        Presented::Nothing => None,
+    };
+    if let Some(Ok(services::mpp::protocol::ParsedAuthorization::Session(credential))) = &parsed {
+        use services::mpp::session_wire::SessionPayload;
+        match SessionPayload::parse(&credential.payload) {
+            Ok(
+                SessionPayload::Open { .. }
+                | SessionPayload::TopUp { .. }
+                | SessionPayload::Close { .. },
+            ) => {
+                let Some(service) = session.as_deref() else {
+                    return error_response(
+                        MppError::InvalidChallenge("session_unavailable"),
+                        || None,
+                    );
+                };
+                return super::mpp_session::manage(service, credential).await;
+            }
+            Ok(SessionPayload::Voucher { .. }) => {}
+            Err(error) => return error_response(MppError::Malformed(error.reason()), || None),
+        }
+    }
+    let body = request
         .extensions()
         .get::<RequestBodyHash>()
         .map(|hash| hash.body_bytes.clone())
-    else {
-        return delegate(auth, request, next).await;
-    };
+        .unwrap_or_default();
 
-    // Unparseable or unpriced requests are not MPP requests: today's 401 applies.
+    // Only requests without a Payment credential may fall back to plain authentication.
     let price = match mpp.price_body(&body) {
-        Pricing::Unpriced => return delegate(auth, request, next).await,
+        Pricing::Unpriced => {
+            return match parsed {
+                Some(Err(error)) => error_response(error.into(), || None),
+                Some(Ok(_)) => error_response(MppError::Malformed("body"), || None),
+                None => delegate(auth, request, next).await,
+            };
+        }
         Pricing::Violation(limit) => {
             tracing::debug!(outcome = limit.code(), "MPP request limit violated");
             return limit_response(limit.message());
@@ -282,7 +316,7 @@ pub async fn mpp_auth_middleware(
     if let Err(response) = handler_preflight(preflight_probe(&request, &body)).await {
         return response;
     }
-    let issue = || mpp.challenge(CHAT_COMPLETIONS_ROUTE, &body, &price);
+    let issue = || Some(mpp.challenge(CHAT_COMPLETIONS_ROUTE, &body, &price));
 
     let header = match presented {
         Presented::Payment(header) => header,
@@ -299,8 +333,8 @@ pub async fn mpp_auth_middleware(
         }
     };
 
-    match services::mpp::protocol::parse_any_authorization(&header) {
-        Ok(services::mpp::protocol::ParsedAuthorization::Session(credential)) => {
+    match parsed {
+        Some(Ok(services::mpp::protocol::ParsedAuthorization::Session(credential))) => {
             let Some(session) = session.filter(|_| price.token_price.is_some()) else {
                 return error_response(MppError::InvalidChallenge("session_unavailable"), issue);
             };
@@ -309,13 +343,14 @@ pub async fn mpp_auth_middleware(
             )
             .await;
         }
-        Err(error) if !price.is_chargeable() => {
+        Some(Err(error)) if !price.is_chargeable() => {
             if let Some(session) = session.as_deref() {
                 return super::mpp_session::error_response(session, &price, error.into()).await;
             }
         }
         // Preserve the charge verifier and its error mapping, including malformed input.
-        Ok(services::mpp::protocol::ParsedAuthorization::Charge(_)) | Err(_) => {}
+        Some(Ok(services::mpp::protocol::ParsedAuthorization::Charge(_))) | Some(Err(_)) | None => {
+        }
     }
 
     let verified = match mpp.verify(&header, CHAT_COMPLETIONS_ROUTE, &body) {
@@ -388,7 +423,7 @@ pub async fn mpp_settle_middleware(
         Ok(settled) => settled,
         Err(error) => {
             return error_response(error, || {
-                mpp.challenge_for_body(CHAT_COMPLETIONS_ROUTE, &body)
+                Some(mpp.challenge_for_body(CHAT_COMPLETIONS_ROUTE, &body))
             })
         }
     };

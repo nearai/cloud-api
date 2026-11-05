@@ -69,6 +69,10 @@ async fn completion(request: Request) -> Json<Value> {
 
 #[tokio::main]
 async fn main() {
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_ansi(false)
+        .init();
     let rpc_url = config::mpp::parse_rpc_url(&std::env::var("MPP_TEMPO_RPC_URL").unwrap()).unwrap();
     let signer_key =
         std::fs::read_to_string(std::env::var("MPP_TEMPO_SIGNER_KEY_FILE").unwrap()).unwrap();

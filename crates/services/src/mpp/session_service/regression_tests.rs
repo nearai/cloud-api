@@ -55,6 +55,41 @@ fn assert_retry(error: &MppError) {
 }
 
 #[tokio::test]
+async fn reduced_close_reconciliation_echoes_final_amount_without_lowering_highest_voucher() {
+    let f = Fixture::new();
+    f.seed().await;
+    deliver(&f, 36, 18).await;
+    f.rpc.set_send_mode(SendMode::Unavailable);
+    let credential = f.credential(close(130)).await;
+    assert_retry(&f.service.close(&credential).await.unwrap_err());
+    let record = f.record().await;
+    let pending = record.pending_close.unwrap();
+    assert_eq!((pending.cumulative, pending.capture), (130, 36));
+    f.rpc.mine(pending_receipt(pending, true));
+    let receipt = f.service.close(&credential).await.unwrap().receipt;
+    assert_eq!((receipt.accepted_cumulative, receipt.spent), (130, 36));
+    assert_eq!(receipt.tx_hash, Some(pending.tx_hash));
+    assert_eq!(f.record().await.highest_cumulative, INITIAL);
+    assert_eq!(f.rpc.send_calls(), 1);
+}
+
+#[tokio::test]
+async fn reduced_close_still_requires_a_valid_voucher_signature() {
+    let f = Fixture::new();
+    f.seed().await;
+    deliver(&f, 36, 18).await;
+    let mut payload = close(130);
+    payload["signature"] = json!(crate::mpp::session_wire::hex_prefixed(&[0; 65]));
+    let credential = f.credential(payload).await;
+    assert_eq!(
+        f.service.close(&credential).await.unwrap_err(),
+        MppError::VoucherRejected(crate::mpp::error::VoucherReason::InvalidSignature)
+    );
+    assert_eq!(f.rpc.send_calls(), 0);
+    assert_eq!(f.record().await.state, ChannelLifecycle::Open);
+}
+
+#[tokio::test]
 async fn lost_close_reply_keeps_pending_fence_and_retry_reconciles_without_resend() {
     let f = Fixture::new();
     f.seed().await;

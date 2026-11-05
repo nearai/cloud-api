@@ -882,6 +882,169 @@ mod key_rotation;
 // Object jobs share the serialized encryption-job test group.
 #[path = "object_encryption.rs"]
 mod object_encryption;
+struct AdvisoryLockJobCleanup {
+    connection: Option<deadpool_postgres::Object>,
+    job_id: Option<Uuid>,
+}
+
+impl AdvisoryLockJobCleanup {
+    async fn acquire(pool: database::DbPool) -> Self {
+        const GLOBAL_WORKER_LOCK_KEY: i64 = 0x4e454152444245;
+        let connection = pool.get().await.expect("advisory-lock connection");
+        connection
+            .query_one("SELECT pg_advisory_lock($1)", &[&GLOBAL_WORKER_LOCK_KEY])
+            .await
+            .expect("hold database-encryption worker lock");
+        Self {
+            connection: Some(connection),
+            job_id: None,
+        }
+    }
+
+    fn track_job(&mut self, job_id: Uuid) {
+        self.job_id = Some(job_id);
+    }
+
+    async fn release_lock(&mut self) {
+        const GLOBAL_WORKER_LOCK_KEY: i64 = 0x4e454152444245;
+        let connection = self.connection.as_ref().expect("advisory lock connection");
+        connection
+            .query_one("SELECT pg_advisory_unlock($1)", &[&GLOBAL_WORKER_LOCK_KEY])
+            .await
+            .expect("release database-encryption worker lock");
+    }
+}
+
+impl Drop for AdvisoryLockJobCleanup {
+    fn drop(&mut self) {
+        let cleanup = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(async {
+                    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                        let Some(connection) = self.connection.take() else {
+                            return;
+                        };
+                        const GLOBAL_WORKER_LOCK_KEY: i64 = 0x4e454152444245;
+                        connection
+                            .query_one("SELECT pg_advisory_unlock($1)", &[&GLOBAL_WORKER_LOCK_KEY])
+                            .await
+                            .expect("cleanup releases database-encryption worker lock");
+                        let Some(job_id) = self.job_id else {
+                            return;
+                        };
+                        connection
+                            .execute(
+                                "UPDATE database_encryption_jobs SET cancel_requested_at=NOW(),status=CASE WHEN status='queued' THEN 'cancelled' ELSE status END,completed_at=CASE WHEN status='queued' THEN NOW() ELSE completed_at END WHERE id=$1 AND status IN ('queued','running')",
+                                &[&job_id],
+                            )
+                            .await
+                            .expect("cleanup requests cancellation of the test database-encryption job");
+                        loop {
+                            let active: bool = connection
+                                .query_one(
+                                    "SELECT EXISTS(SELECT 1 FROM database_encryption_jobs WHERE id=$1 AND status IN ('queued','running'))",
+                                    &[&job_id],
+                                )
+                                .await
+                                .expect("check test database-encryption job drain")
+                                .get(0);
+                            if !active {
+                                break;
+                            }
+                            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                        }
+                        connection
+                            .execute(
+                                "DELETE FROM database_encryption_jobs WHERE id=$1",
+                                &[&job_id],
+                            )
+                            .await
+                            .expect("delete test database-encryption job");
+                    })
+                    .await
+                    .expect("database-encryption lock/job cleanup timeout");
+                });
+            });
+        }));
+        match cleanup {
+            Ok(()) => {}
+            Err(error) if !std::thread::panicking() => std::panic::resume_unwind(error),
+            Err(_) => eprintln!("database-encryption lock/job cleanup failed while unwinding"),
+        }
+    }
+}
+
+async fn create_lock_contended_dry_run_job(server: &axum_test::TestServer) -> Uuid {
+    let created = server
+        .post("/v1/admin/database-encryption/jobs")
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .json(&serde_json::json!({
+            "mode": "dry_run",
+            "scope": {"fields": [{"table": "files", "column": "filename"}]},
+            "actions": ["encrypt"],
+            "batch_size": 1,
+            "max_rows": 1
+        }))
+        .await;
+    assert_eq!(created.status_code(), 202);
+    let job_id = Uuid::parse_str(
+        created.json::<serde_json::Value>()["job_id"]
+            .as_str()
+            .expect("created job ID"),
+    )
+    .expect("job ID is a UUID");
+    job_id
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lock_contention_cancellation_terminalizes_while_lock_is_held() {
+    let (server, database) = setup_test_server_with_database().await;
+    let mut cleanup = AdvisoryLockJobCleanup::acquire(database.pool().clone()).await;
+    let job_id = create_lock_contended_dry_run_job(&server).await;
+    cleanup.track_job(job_id);
+    tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        wait_for_database_encryption_job_status(&server, &job_id.to_string(), "running"),
+    )
+    .await
+    .expect("test job starts before lock-contention cancellation");
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        let cancelled = server
+            .post(format!("/v1/admin/database-encryption/jobs/{job_id}/cancel").as_str())
+            .add_header("Authorization", format!("Bearer {}", get_session_id()))
+            .add_header("User-Agent", MOCK_USER_AGENT)
+            .await;
+        assert_eq!(cancelled.status_code(), 200);
+        wait_for_database_encryption_job_status(&server, &job_id.to_string(), "cancelled").await;
+    })
+    .await
+    .expect("cancellation terminalizes while the advisory lock remains held");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lock_contention_job_finishes_after_lock_release_without_recovery() {
+    let (server, database) = setup_test_server_with_database().await;
+    let mut cleanup = AdvisoryLockJobCleanup::acquire(database.pool().clone()).await;
+    let job_id = create_lock_contended_dry_run_job(&server).await;
+    cleanup.track_job(job_id);
+    tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        wait_for_database_encryption_job_status(&server, &job_id.to_string(), "running"),
+    )
+    .await
+    .expect("test job starts before lock-contention release");
+
+    cleanup.release_lock().await;
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        wait_for_database_encryption_job(&server, &job_id.to_string()),
+    )
+    .await
+    .expect("job finishes promptly after advisory lock release without recovery");
+}
+
 #[tokio::test]
 async fn cancellation_interrupts_a_large_batch_delay() {
     let server = setup_test_server().await;

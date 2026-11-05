@@ -464,13 +464,22 @@ pub async fn init_domain_services_with_pool(
         database::repositories::OrganizationUsageRepository::new(database.pool().clone()),
     ) as Arc<dyn services::usage::UsageRepository>;
 
-    // Create models service. It owns the model-resolve cache (models and
-    // access decisions on unlisted models) that the attestation and completion
-    // services below share, so its invalidation reaches all three.
-    let models_service = Arc::new(services::models::ModelsServiceImpl::new(
-        inference_provider_pool.clone(),
-        catalog_models.clone(),
-    ));
+    // Create models service. It owns the model-resolve cache (models, access
+    // decisions on unlisted models, organization model filters) that the
+    // attestation and completion services below share, so its invalidation
+    // reaches all three. The filter source is attached before the cache is
+    // handed out.
+    let models_service = Arc::new(
+        services::models::ModelsServiceImpl::new(
+            inference_provider_pool.clone(),
+            catalog_models.clone(),
+        )
+        .with_organization_model_filter(Arc::new(
+            services::organization_model_filter::OrganizationSettingsModelFilter(Arc::new(
+                database::repositories::PgOrganizationRepository::new(database.pool().clone()),
+            )),
+        )),
+    );
 
     // Create attestation service
     let attestation_service = Arc::new(
@@ -1692,9 +1701,15 @@ pub fn build_completion_routes(
         .route("/models", get(models))
         .with_state(app_state)
         // Public, OpenAI-compatible model catalog. The response is identical for
-        // all clients and changes only when an admin updates the catalog.
+        // all clients and changes only when an admin updates the catalog, except
+        // for an organization that set `allowed_models`, whose answer sets its
+        // own `private, no-store`.
         .layer(cache_control_layer(
             "public, max-age=30, stale-while-revalidate=120",
+        ))
+        .layer(from_fn_with_state(
+            auth_state_middleware.clone(),
+            middleware::auth::filtered_catalog_middleware,
         ));
 
     Router::new()
@@ -3059,9 +3074,11 @@ mod tests {
         let spec = serde_json::to_value(ApiDoc::openapi()).unwrap();
         let models_get = &spec["paths"]["/v1/models"]["get"];
 
+        // Public, with an optional API key: the key of an organization that
+        // set `allowed_models` gets its own catalog.
         assert_eq!(
             models_get["security"],
-            serde_json::json!([{}]),
+            serde_json::json!([{}, { "api_key": [] }]),
             "/v1/models must explicitly override global OpenAPI security"
         );
     }

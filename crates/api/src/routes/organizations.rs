@@ -409,6 +409,7 @@ pub async fn get_organization_settings(
         settings: OrganizationSettings {
             system_prompt: settings.system_prompt,
             fallback_enabled: settings.fallback_enabled,
+            allowed_models: settings.allowed_models,
         },
     }))
 }
@@ -459,6 +460,44 @@ pub async fn patch_organization_settings(
     let organization_uuid = organization_id.0;
     let actor_id = user_id.0;
     let fallback_was_requested = request.fallback_enabled.is_some();
+    let allowed_models_were_requested = request.allowed_models.is_some();
+    if matches!(request.allowed_models, Some(Some(_))) {
+        // Authorize before validating: validating names reads the
+        // organization's grants, so a caller who may not manage the setting
+        // must get the refusal it gets for any names. Membership first (a
+        // non-member gets the answer of every other settings write), then the
+        // owner/admin rule of the service.
+        app_state
+            .organization_service
+            .get_organization_settings(organization_id.clone(), user_id.clone())
+            .await
+            .map_err(crate::routes::common::map_organization_error)?;
+        let may_manage = app_state
+            .organization_service
+            .get_user_role(organization_id.clone(), user_id.clone())
+            .await
+            .map_err(crate::routes::common::map_organization_error)?
+            .is_some_and(|role| role.can_manage_organization());
+        if !may_manage {
+            return Err(crate::routes::common::map_organization_error(
+                services::organization::OrganizationError::Unauthorized(
+                    "Insufficient permissions to manage organization settings".to_string(),
+                ),
+            ));
+        }
+    }
+    let allowed_models = match request.allowed_models {
+        Some(Some(names)) => Some(Some(
+            services::organization_model_filter::canonical_allowed_models(
+                app_state.models_service.as_ref(),
+                organization_uuid,
+                &names,
+            )
+            .await
+            .map_err(allowed_models_error)?,
+        )),
+        other => other,
+    };
     let settings = app_state
         .organization_service
         .patch_organization_settings(
@@ -467,10 +506,26 @@ pub async fn patch_organization_settings(
             services::organization::PatchOrganizationSettings {
                 system_prompt: request.system_prompt,
                 fallback_enabled: request.fallback_enabled,
+                allowed_models,
             },
         )
         .await
         .map_err(crate::routes::common::map_organization_error)?;
+
+    if allowed_models_were_requested {
+        // This instance applies the change to the next request; the others
+        // within the model-resolve cache TTL.
+        app_state
+            .models_service
+            .invalidate_organization_model_filter(organization_uuid)
+            .await;
+        tracing::info!(
+            organization_id = %organization_uuid,
+            actor_id = %actor_id,
+            allowed_model_count = settings.allowed_models.as_ref().map(Vec::len),
+            "Organization allowed models changed"
+        );
+    }
 
     if fallback_was_requested {
         tracing::info!(
@@ -486,8 +541,36 @@ pub async fn patch_organization_settings(
         settings: OrganizationSettings {
             system_prompt: settings.system_prompt,
             fallback_enabled: settings.fallback_enabled,
+            allowed_models: settings.allowed_models,
         },
     }))
+}
+
+/// A refused `allowed_models` list: 400, or 500 when the catalog could not be
+/// read.
+fn allowed_models_error(
+    error: services::organization_model_filter::AllowedModelsError,
+) -> (StatusCode, Json<ErrorResponse>) {
+    use services::organization_model_filter::AllowedModelsError;
+    match error {
+        AllowedModelsError::Models(error) => {
+            tracing::error!(error = %error, "Failed to read the catalog for allowed_models");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse::new(
+                    "Failed to validate allowed_models".to_string(),
+                    "internal_server_error".to_string(),
+                )),
+            )
+        }
+        error => (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new(
+                error.to_string(),
+                "bad_request".to_string(),
+            )),
+        ),
+    }
 }
 
 /// Update organization

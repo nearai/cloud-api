@@ -2952,6 +2952,9 @@ pub struct OrganizationSettings {
     pub system_prompt: Option<String>,
     /// Whether requests may use providers configured as fallbacks.
     pub fallback_enabled: bool,
+    /// The only models the organization's API keys may use (canonical names,
+    /// sorted), on every route and in `GET /v1/models`. Null: every model.
+    pub allowed_models: Option<Vec<String>>,
 }
 
 /// Wrapper type to distinguish between "field not provided" and "field explicitly set to null"
@@ -2985,6 +2988,13 @@ pub struct PatchOrganizationSettingsRequest {
     #[serde(default, deserialize_with = "deserialize_nullable")]
     #[schema(value_type = Option<bool>)]
     pub fallback_enabled: Nullable<bool>,
+    /// Limit the organization's API keys to these models (names or aliases,
+    /// at most 256; stored and returned as canonical names). Every other model
+    /// is answered as if it did not exist. Null allows every model again; an
+    /// empty list is rejected. Owners and admins only.
+    #[serde(default, deserialize_with = "deserialize_nullable")]
+    #[schema(value_type = Option<Vec<String>>)]
+    pub allowed_models: Nullable<Vec<String>>,
 }
 
 impl PatchOrganizationSettingsRequest {

@@ -568,6 +568,35 @@ where
     )
 }
 
+/// Like [`setup_test_server_with_pool_and_config`], with the underlying
+/// router, for a test that also serves it on a real listener: the OHTTP
+/// gateway sends the request it decrypts to this API over a loopback
+/// connection on `config.server.port`.
+pub async fn setup_test_server_with_pool_config_and_router<F>(
+    mutate: F,
+) -> (
+    axum_test::TestServer,
+    axum::Router,
+    std::sync::Arc<services::inference_provider_pool::InferenceProviderPool>,
+    std::sync::Arc<inference_providers::mock::MockProvider>,
+    Arc<Database>,
+)
+where
+    F: FnOnce(&mut config::ApiConfig),
+{
+    let mut infra = setup_test_infrastructure().await;
+    mutate(&mut infra.config);
+    let (server, inference_provider_pool, mock_provider, router) =
+        build_test_server_components(infra.database.clone(), infra.config).await;
+    (
+        server,
+        router,
+        inference_provider_pool,
+        mock_provider,
+        infra.database,
+    )
+}
+
 /// Like `setup_test_server`, but also returns the underlying `axum::Router`,
 /// so a test can drive it in-process (`tower::ServiceExt::oneshot`) and poll
 /// the response body frame-by-frame. `axum_test` buffers whole response

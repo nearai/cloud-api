@@ -294,6 +294,44 @@ pub async fn optional_auth_middleware_with_workspace_context(
     auth_middleware_with_workspace_context(State(state), request, next).await
 }
 
+/// Authentication for the public model catalog (`GET /v1/models`), which
+/// answers an organization that set `allowed_models` with those models only.
+///
+/// It never rejects a request. A request goes on with an `AuthenticatedApiKey`
+/// extension only when it carries a valid API key of an organization with a
+/// filter. Anything else is served the public catalog as before: no header, a
+/// session token, a key that does not authenticate, or a key of an
+/// organization without a filter.
+///
+/// A key that fails to authenticate falls back to the public catalog, so a
+/// lookup error can show a filtered organization the public list. That is a
+/// listing only: every route that serves a model checks the filter itself.
+pub async fn filtered_catalog_middleware(
+    State(state): State<AuthState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    // Either header form: Anthropic SDK clients send the key as `x-api-key`.
+    let token = anthropic_auth_token(request.headers())
+        .ok()
+        .filter(|token| token.starts_with("sk-"))
+        .map(str::to_owned);
+    let Some(token) = token else {
+        return next.run(request).await;
+    };
+    // Authenticating the key counts as using it, like any other call with it:
+    // a key-cache miss updates `last_used_at`.
+    match authenticate_api_key_with_context(&state, &token).await {
+        Ok(api_key) if api_key.organization.allowed_models().is_some() => {
+            let caller_token = caller_key(Some(&token));
+            let mut request = request;
+            request.extensions_mut().insert(api_key);
+            with_caller_key(caller_token, next.run(request)).await
+        }
+        _ => next.run(request).await,
+    }
+}
+
 /// Native Anthropic auth accepts the SDK's `x-api-key` header as well as the
 /// Cloud API Bearer form, while keeping Cloud API as the credential authority.
 pub async fn anthropic_auth_middleware_with_workspace_context(

@@ -35,9 +35,15 @@ pub mod rpc;
 pub mod secp256k1;
 pub mod service;
 pub mod session_chain;
+#[cfg(test)]
+mod session_chain_tests;
 pub mod session_service;
 pub mod session_settlement;
+#[cfg(test)]
+mod session_settlement_tests;
 pub mod session_supervision;
+#[cfg(test)]
+mod session_supervision_tests;
 #[cfg(test)]
 mod session_vectors;
 pub mod session_wire;

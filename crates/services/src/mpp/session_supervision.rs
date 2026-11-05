@@ -60,6 +60,77 @@ pub struct SupervisionSummary {
     pub nothing_to_capture: u64,
     /// Expired reservations released during this pass.
     pub stale_reservations_released: u64,
+    /// Pending closes finalized from a matching successful receipt.
+    pub reconciled_finalized: u64,
+    /// Pending closes cleared after a matching reverted receipt.
+    pub reconciled_reverted: u64,
+    /// Pending closes cleared after expiry plus the nonce safety margin.
+    pub reconciled_expired: u64,
+    /// Pending closes with no receipt, still within their validity window.
+    pub reconciliation_pending: u64,
+    /// Receipt reads, receipt validation or reconciliation writes that failed.
+    pub reconciliation_failed: u64,
+}
+
+async fn reconcile_close(
+    repo: &dyn ChannelRepository,
+    rpc: &dyn TempoRpc,
+    record: &ChannelRecord,
+    now: DateTime<Utc>,
+    summary: &mut SupervisionSummary,
+) {
+    let result = async {
+        let pending = record.pending_close.ok_or("close_pending_missing")?;
+        let receipt = rpc
+            .get_transaction_receipt(pending.tx_hash)
+            .await
+            .map_err(|_| "close_receipt_failed")?;
+        match receipt {
+            Some(receipt) => {
+                if receipt.tx_hash != pending.tx_hash {
+                    return Err("close_receipt_mismatch");
+                }
+                if receipt.success {
+                    repo.finalize(&record.channel_id, pending.capture)
+                        .await
+                        .map_err(|_| "close_finalize_failed")?;
+                    summary.reconciled_finalized += 1;
+                } else {
+                    repo.clear_closing(&record.channel_id)
+                        .await
+                        .map_err(|_| "clear_closing_failed")?;
+                    summary.reconciled_reverted += 1;
+                }
+            }
+            None => {
+                let now_unix = u64::try_from(now.timestamp()).map_err(|_| "close_time_invalid")?;
+                if pending
+                    .valid_before
+                    .checked_add(30)
+                    .is_some_and(|expiry| now_unix > expiry)
+                {
+                    repo.clear_closing(&record.channel_id)
+                        .await
+                        .map_err(|_| "clear_closing_failed")?;
+                    summary.reconciled_expired += 1;
+                } else {
+                    summary.reconciliation_pending += 1;
+                }
+            }
+        }
+        Ok::<_, &'static str>(())
+    }
+    .await;
+    if let Err(outcome) = result {
+        summary.reconciliation_failed += 1;
+        tracing::warn!(outcome, "MPP close reconciliation failed");
+    }
+}
+
+fn pass_time(now: DateTime<Utc>, started: Instant) -> Option<DateTime<Utc>> {
+    i64::try_from(started.elapsed().as_secs())
+        .ok()
+        .and_then(|seconds| now.checked_add_signed(chrono::Duration::seconds(seconds)))
 }
 
 async fn supervise_channel(
@@ -86,6 +157,10 @@ async fn supervise_channel(
         }
     };
     if current.state == ChannelLifecycle::Finalized {
+        return;
+    }
+    if current.state == ChannelLifecycle::Closing {
+        reconcile_close(repo, rpc, &current, now, summary).await;
         return;
     }
     if state.deposit == 0 {
@@ -192,7 +267,7 @@ async fn supervise_channel(
                 outcome = error.code(),
                 "MPP supervised close broadcast failed"
             );
-            if repo.clear_closing(&id).await.is_err() {
+            if error.definitively_failed() && repo.clear_closing(&id).await.is_err() {
                 tracing::warn!(
                     outcome = "clear_closing_failed",
                     "MPP supervised close cleanup failed"
@@ -281,7 +356,21 @@ pub async fn run_supervision_pass(
                 matches
             })
             .collect();
-        for batch in records.chunks(MAX_BATCH_CHANNELS) {
+        // Receipt recovery does not depend on a successful batch eth_call. A close
+        // may already be mined even when channel-state reads are unavailable.
+        let mut open_records = Vec::with_capacity(records.len());
+        for record in records {
+            if record.state == ChannelLifecycle::Closing {
+                if let Some(at) = pass_time(now, started) {
+                    reconcile_close(repo, rpc, &record, at, &mut summary).await;
+                } else {
+                    summary.reconciliation_failed += 1;
+                }
+            } else {
+                open_records.push(record);
+            }
+        }
+        for batch in open_records.chunks(MAX_BATCH_CHANNELS) {
             let ids: Vec<_> = batch.iter().map(|record| record.channel_id).collect();
             let Ok(data) = get_channel_states_batch_calldata(&ids) else {
                 continue;
@@ -299,10 +388,7 @@ pub async fn run_supervision_pass(
                 continue;
             };
             for (record, state) in batch.iter().zip(states) {
-                let Some(at) = i64::try_from(started.elapsed().as_secs())
-                    .ok()
-                    .and_then(|seconds| now.checked_add_signed(chrono::Duration::seconds(seconds)))
-                else {
+                let Some(at) = pass_time(now, started) else {
                     tracing::warn!(
                         outcome = "supervision_time_invalid",
                         "MPP supervision channel skipped"
@@ -364,590 +450,13 @@ pub fn spawn_supervision_task(
                 closes_failed = summary.closes_failed,
                 nothing_to_capture = summary.nothing_to_capture,
                 stale_reservations_released = summary.stale_reservations_released,
+                reconciled_finalized = summary.reconciled_finalized,
+                reconciled_reverted = summary.reconciled_reverted,
+                reconciled_expired = summary.reconciled_expired,
+                reconciliation_pending = summary.reconciliation_pending,
+                reconciliation_failed = summary.reconciliation_failed,
                 "MPP supervision pass completed"
             );
         }
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::mpp::abi::{uint_word, GET_CHANNEL_STATES_BATCH_SELECTOR};
-    use crate::mpp::channel_memory::InMemoryChannelRepository;
-    use crate::mpp::ports::{NewChannel, ReserveOutcome, RpcError, RpcReceipt};
-    use crate::mpp::session_vectors::Vectors;
-    use crate::mpp::signer::LocalSigner;
-    use crate::mpp::tempo_tx::{decode_signed, tx_hash};
-    use crate::mpp::testing::{FakeTempo, SendMode};
-    use async_trait::async_trait;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use uuid::Uuid;
-
-    fn now() -> DateTime<Utc> {
-        DateTime::from_timestamp(1_800_000_000, 0).unwrap()
-    }
-
-    fn chain() -> PayeeChain {
-        let v = Vectors::load();
-        PayeeChain {
-            chain_id: v.chain_id(),
-            escrow: v.escrow(),
-            fee_token: v.fixed("token"),
-        }
-    }
-
-    fn signer() -> LocalSigner {
-        LocalSigner::new(Vectors::load().secret_key("payeeKey"))
-    }
-
-    async fn open(repo: &InMemoryChannelRepository, id: [u8; 32]) {
-        let v = Vectors::load();
-        let mut descriptor = v.descriptor();
-        descriptor.salt = id;
-        repo.open_or_refresh(NewChannel {
-            channel_id: id,
-            chain_id: v.chain_id(),
-            escrow: v.escrow(),
-            descriptor,
-            deposit: 1000,
-            settled_on_chain: 0,
-            highest_cumulative: 60,
-            highest_signature: v.fixed("voucher.signature"),
-        })
-        .await
-        .unwrap();
-        for cumulative in [100, 200] {
-            repo.accept_voucher(&id, cumulative, v.fixed("voucher.signature"))
-                .await
-                .unwrap();
-        }
-    }
-
-    async fn reserve(repo: &InMemoryChannelRepository, id: &[u8; 32], amount: u128) -> Uuid {
-        let request = Uuid::new_v4();
-        assert!(matches!(
-            repo.reserve(id, request, amount).await.unwrap(),
-            ReserveOutcome::Reserved(_)
-        ));
-        request
-    }
-
-    async fn spend(repo: &InMemoryChannelRepository, id: &[u8; 32], amount: u128) {
-        let request = reserve(repo, id, amount).await;
-        repo.charge(request, amount, 1).await.unwrap();
-    }
-
-    fn encode_states(states: &[ChannelState]) -> Vec<u8> {
-        let mut bytes = uint_word(32).to_vec();
-        bytes.extend(uint_word(states.len() as u128));
-        for state in states {
-            bytes.extend(uint_word(state.settled));
-            bytes.extend(uint_word(state.deposit));
-            bytes.extend(uint_word(u128::from(state.close_requested_at)));
-        }
-        bytes
-    }
-
-    fn answer(rpc: &FakeTempo, state: ChannelState) {
-        rpc.set_call_handler(Box::new(move |to, data| {
-            assert_eq!(to, chain().escrow);
-            assert_eq!(data[..4], GET_CHANNEL_STATES_BATCH_SELECTOR);
-            let count = (data.len() - 68) / 32;
-            assert!(count <= MAX_BATCH_CHANNELS);
-            Ok(encode_states(&vec![state; count]))
-        }));
-    }
-
-    fn requested() -> ChannelState {
-        ChannelState {
-            settled: 0,
-            deposit: 1000,
-            close_requested_at: 1_799_999_990,
-        }
-    }
-
-    // The fake observes the ledger *inside* send, making persist-before-send an
-    // ordering assertion rather than an assertion on eventual final state.
-    struct OrderedRpc {
-        fake: FakeTempo,
-        repo: Arc<InMemoryChannelRepository>,
-        id: [u8; 32],
-        observed_closing: AtomicUsize,
-        cumulative: u128,
-        capture: u128,
-        charge_during_build: Option<(Uuid, u128)>,
-    }
-
-    #[async_trait]
-    impl TempoRpc for OrderedRpc {
-        async fn send_raw_transaction_sync(&self, raw: &[u8]) -> Result<RpcReceipt, RpcError> {
-            let record = self.repo.get(&self.id).await.unwrap().unwrap();
-            assert_eq!(record.state, ChannelLifecycle::Closing);
-            let pending = record.pending_close.unwrap();
-            assert_eq!(pending.tx_hash, tx_hash(raw));
-            assert_eq!(
-                (pending.cumulative, pending.capture),
-                (self.cumulative, self.capture)
-            );
-            let (tx, _) = decode_signed(raw).unwrap();
-            assert_eq!(tx.valid_before, Some(pending.valid_before));
-            assert_eq!(
-                tx.calls[0].input,
-                close_calldata(
-                    &record.descriptor,
-                    self.cumulative,
-                    self.capture,
-                    &record.highest_signature
-                )
-                .unwrap()
-            );
-            self.observed_closing.fetch_add(1, Ordering::SeqCst);
-            self.fake.mine(RpcReceipt {
-                tx_hash: tx_hash(raw),
-                block_number: 1,
-                success: true,
-                from: signer().address(),
-                logs: vec![],
-            });
-            self.fake.send_raw_transaction_sync(raw).await
-        }
-        async fn get_transaction_receipt(
-            &self,
-            hash: [u8; 32],
-        ) -> Result<Option<RpcReceipt>, RpcError> {
-            self.fake.get_transaction_receipt(hash).await
-        }
-        async fn get_block_timestamp(&self, number: u64) -> Result<Option<u64>, RpcError> {
-            self.fake.get_block_timestamp(number).await
-        }
-        async fn call(&self, to: [u8; 20], data: &[u8]) -> Result<Vec<u8>, RpcError> {
-            self.fake.call(to, data).await
-        }
-        async fn gas_price(&self) -> Result<u128, RpcError> {
-            if let Some((request, amount)) = self.charge_during_build {
-                self.repo.charge(request, amount, 1).await.unwrap();
-            }
-            self.fake.gas_price().await
-        }
-    }
-
-    #[tokio::test]
-    async fn one_hundred_fifty_channels_use_two_batch_calls() {
-        let repo = InMemoryChannelRepository::with_clock(now());
-        for id in 1..=150 {
-            open(&repo, [id; 32]).await;
-        }
-        let rpc = FakeTempo::default();
-        answer(
-            &rpc,
-            ChannelState {
-                settled: 0,
-                deposit: 1000,
-                close_requested_at: 0,
-            },
-        );
-        let summary = run_supervision_pass(
-            &repo,
-            &rpc,
-            &signer(),
-            chain(),
-            &SupervisionConfig::default(),
-            now(),
-        )
-        .await;
-        assert_eq!((summary.scanned, summary.chain_reads), (150, 2));
-        assert_eq!(rpc.eth_calls(), 2);
-        assert_eq!(rpc.send_calls(), 0);
-        for id in 1..=150 {
-            assert_eq!(
-                repo.get(&[id; 32])
-                    .await
-                    .unwrap()
-                    .unwrap()
-                    .last_chain_read_at,
-                Some(now())
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn a_zero_deposit_is_finalized_at_the_chain_settled_amount() {
-        let repo = InMemoryChannelRepository::with_clock(now());
-        open(&repo, [1; 32]).await;
-        let rpc = FakeTempo::default();
-        answer(
-            &rpc,
-            ChannelState {
-                settled: 45,
-                deposit: 0,
-                close_requested_at: 0,
-            },
-        );
-        let summary = run_supervision_pass(
-            &repo,
-            &rpc,
-            &signer(),
-            chain(),
-            &SupervisionConfig::default(),
-            now(),
-        )
-        .await;
-        assert_eq!(summary.finalized_withdrawn, 1);
-        let record = repo.get(&[1; 32]).await.unwrap().unwrap();
-        assert_eq!(
-            (record.state, record.settled_on_chain),
-            (ChannelLifecycle::Finalized, 45)
-        );
-        assert_eq!(record.last_chain_read_at, Some(now()));
-        assert_eq!(rpc.send_calls(), 0);
-    }
-
-    #[tokio::test]
-    async fn a_large_ledger_page_is_split_at_the_abi_batch_limit() {
-        let repo = InMemoryChannelRepository::with_clock(now());
-        let count = MAX_BATCH_CHANNELS + 1;
-        for number in 0..count {
-            let mut id = [0; 32];
-            id[..2].copy_from_slice(&u16::try_from(number).unwrap().to_be_bytes());
-            open(&repo, id).await;
-        }
-        let rpc = FakeTempo::default();
-        answer(
-            &rpc,
-            ChannelState {
-                settled: 0,
-                deposit: 1000,
-                close_requested_at: 0,
-            },
-        );
-        let cfg = SupervisionConfig {
-            page: count,
-            ..Default::default()
-        };
-        let summary = run_supervision_pass(&repo, &rpc, &signer(), chain(), &cfg, now()).await;
-        assert_eq!(summary.scanned, count as u64);
-        assert_eq!(summary.chain_reads, 2);
-        assert_eq!(rpc.eth_calls(), 2);
-    }
-
-    #[tokio::test]
-    async fn mark_closing_precedes_send_and_capture_excludes_reservations() {
-        let repo = Arc::new(InMemoryChannelRepository::with_clock(now()));
-        open(&repo, [1; 32]).await;
-        spend(&repo, &[1; 32], 80).await;
-        reserve(&repo, &[1; 32], 90).await;
-        let rpc = OrderedRpc {
-            fake: FakeTempo::default(),
-            repo: repo.clone(),
-            id: [1; 32],
-            observed_closing: AtomicUsize::new(0),
-            cumulative: 100,
-            capture: 80,
-            charge_during_build: None,
-        };
-        answer(&rpc.fake, requested());
-        let summary = run_supervision_pass(
-            repo.as_ref(),
-            &rpc,
-            &signer(),
-            chain(),
-            &SupervisionConfig::default(),
-            now(),
-        )
-        .await;
-        assert_eq!(
-            (
-                summary.close_requested,
-                summary.closes_submitted,
-                summary.closes_failed
-            ),
-            (1, 1, 0)
-        );
-        assert_eq!(rpc.observed_closing.load(Ordering::SeqCst), 1);
-        let record = repo.get(&[1; 32]).await.unwrap().unwrap();
-        assert_eq!(
-            (record.state, record.settled_on_chain),
-            (ChannelLifecycle::Finalized, 80)
-        );
-        assert_eq!(record.pending_close, None);
-        assert_eq!(record.close_requested_at, requested().close_requested_at);
-        assert!(!record.accepts_vouchers());
-    }
-
-    #[tokio::test]
-    async fn broadcast_failure_clears_closing_back_to_open() {
-        let repo = Arc::new(InMemoryChannelRepository::with_clock(now()));
-        open(&repo, [1; 32]).await;
-        spend(&repo, &[1; 32], 80).await;
-        let rpc = OrderedRpc {
-            fake: FakeTempo::default(),
-            repo: repo.clone(),
-            id: [1; 32],
-            observed_closing: AtomicUsize::new(0),
-            cumulative: 100,
-            capture: 80,
-            charge_during_build: None,
-        };
-        answer(&rpc.fake, requested());
-        rpc.fake.set_send_mode(SendMode::Unavailable);
-        let summary = run_supervision_pass(
-            repo.as_ref(),
-            &rpc,
-            &signer(),
-            chain(),
-            &SupervisionConfig::default(),
-            now(),
-        )
-        .await;
-        assert_eq!((summary.closes_submitted, summary.closes_failed), (1, 1));
-        assert_eq!(rpc.observed_closing.load(Ordering::SeqCst), 1);
-        let record = repo.get(&[1; 32]).await.unwrap().unwrap();
-        assert_eq!(
-            (record.state, record.settled_on_chain),
-            (ChannelLifecycle::Open, 0)
-        );
-        assert_eq!(record.pending_close, None);
-        assert!(!record.accepts_vouchers());
-    }
-
-    #[tokio::test]
-    async fn requested_close_with_no_new_delivered_spend_sends_nothing() {
-        let repo = InMemoryChannelRepository::with_clock(now());
-        open(&repo, [1; 32]).await;
-        spend(&repo, &[1; 32], 60).await;
-        reserve(&repo, &[1; 32], 100).await;
-        let rpc = FakeTempo::default();
-        answer(
-            &rpc,
-            ChannelState {
-                settled: 60,
-                ..requested()
-            },
-        );
-        let summary = run_supervision_pass(
-            &repo,
-            &rpc,
-            &signer(),
-            chain(),
-            &SupervisionConfig::default(),
-            now(),
-        )
-        .await;
-        assert_eq!(
-            (
-                summary.close_requested,
-                summary.nothing_to_capture,
-                summary.closes_submitted
-            ),
-            (1, 1, 0)
-        );
-        assert_eq!(rpc.send_calls(), 0);
-        let record = repo.get(&[1; 32]).await.unwrap().unwrap();
-        assert_eq!(record.state, ChannelLifecycle::Open);
-        assert!(!record.accepts_vouchers());
-    }
-
-    #[tokio::test]
-    async fn stale_reservations_are_released_once_and_recent_ones_remain() {
-        let repo = InMemoryChannelRepository::with_clock(now());
-        open(&repo, [1; 32]).await;
-        let stale = reserve(&repo, &[1; 32], 60).await;
-        reserve(&repo, &[1; 32], 30).await;
-        repo.age_reservation(stale, chrono::Duration::minutes(16));
-        let rpc = FakeTempo::default();
-        answer(
-            &rpc,
-            ChannelState {
-                settled: 0,
-                deposit: 1000,
-                close_requested_at: 0,
-            },
-        );
-        let summary = run_supervision_pass(
-            &repo,
-            &rpc,
-            &signer(),
-            chain(),
-            &SupervisionConfig::default(),
-            now(),
-        )
-        .await;
-        assert_eq!(summary.stale_reservations_released, 1);
-        assert_eq!(repo.reservation_count(), 1);
-        let record = repo.get(&[1; 32]).await.unwrap().unwrap();
-        assert_eq!((record.spent, record.reserved), (30, 30));
-        assert_eq!(
-            run_supervision_pass(
-                &repo,
-                &rpc,
-                &signer(),
-                chain(),
-                &SupervisionConfig::default(),
-                now()
-            )
-            .await
-            .stale_reservations_released,
-            0
-        );
-    }
-
-    #[tokio::test]
-    async fn failed_chain_read_skips_its_channel_but_later_pages_continue() {
-        let repo = InMemoryChannelRepository::with_clock(now());
-        open(&repo, [1; 32]).await;
-        open(&repo, [2; 32]).await;
-        let rpc = FakeTempo::default();
-        rpc.set_call_handler(Box::new(|_, data| {
-            if data[68..100] == [1; 32] {
-                return Err(RpcError::Unavailable);
-            }
-            Ok(encode_states(&[ChannelState {
-                settled: 20,
-                deposit: 0,
-                close_requested_at: 0,
-            }]))
-        }));
-        let cfg = SupervisionConfig {
-            page: 1,
-            ..Default::default()
-        };
-        let summary = run_supervision_pass(&repo, &rpc, &signer(), chain(), &cfg, now()).await;
-        assert_eq!(
-            (
-                summary.scanned,
-                summary.chain_reads,
-                summary.finalized_withdrawn
-            ),
-            (2, 2, 1)
-        );
-        assert_eq!(
-            repo.get(&[1; 32])
-                .await
-                .unwrap()
-                .unwrap()
-                .last_chain_read_at,
-            None
-        );
-        assert_eq!(
-            repo.get(&[2; 32]).await.unwrap().unwrap().state,
-            ChannelLifecycle::Finalized
-        );
-    }
-
-    #[tokio::test]
-    async fn malformed_and_wrong_length_batches_do_not_update_any_channel() {
-        for bytes in [
-            vec![],
-            encode_states(&[]),
-            encode_states(&[requested(), requested()]),
-        ] {
-            let repo = InMemoryChannelRepository::with_clock(now());
-            open(&repo, [1; 32]).await;
-            let rpc = FakeTempo::default();
-            rpc.set_call_handler(Box::new(move |_, _| Ok(bytes.clone())));
-            let summary = run_supervision_pass(
-                &repo,
-                &rpc,
-                &signer(),
-                chain(),
-                &SupervisionConfig::default(),
-                now(),
-            )
-            .await;
-            assert_eq!(
-                (
-                    summary.scanned,
-                    summary.chain_reads,
-                    summary.closes_submitted
-                ),
-                (1, 1, 0)
-            );
-            assert_eq!(
-                repo.get(&[1; 32])
-                    .await
-                    .unwrap()
-                    .unwrap()
-                    .last_chain_read_at,
-                None
-            );
-            assert_eq!(rpc.send_calls(), 0);
-        }
-    }
-
-    #[tokio::test]
-    async fn changed_capture_during_build_is_not_broadcast() {
-        let repo = Arc::new(InMemoryChannelRepository::with_clock(now()));
-        open(&repo, [1; 32]).await;
-        spend(&repo, &[1; 32], 80).await;
-        let request = reserve(&repo, &[1; 32], 20).await;
-        let rpc = OrderedRpc {
-            fake: FakeTempo::default(),
-            repo: repo.clone(),
-            id: [1; 32],
-            observed_closing: AtomicUsize::new(0),
-            cumulative: 100,
-            capture: 80,
-            charge_during_build: Some((request, 20)),
-        };
-        answer(&rpc.fake, requested());
-        let summary = run_supervision_pass(
-            repo.as_ref(),
-            &rpc,
-            &signer(),
-            chain(),
-            &SupervisionConfig::default(),
-            now(),
-        )
-        .await;
-        assert_eq!((summary.closes_submitted, summary.closes_failed), (0, 1));
-        assert_eq!(rpc.fake.send_calls(), 0);
-        let record = repo.get(&[1; 32]).await.unwrap().unwrap();
-        assert_eq!(
-            (record.state, record.spent, record.reserved),
-            (ChannelLifecycle::Open, 100, 0)
-        );
-        assert_eq!(record.pending_close, None);
-    }
-
-    #[tokio::test]
-    async fn a_foreign_chain_is_never_read_or_finalized() {
-        let repo = InMemoryChannelRepository::with_clock(now());
-        open(&repo, [1; 32]).await;
-        let rpc = FakeTempo::default();
-        answer(
-            &rpc,
-            ChannelState {
-                settled: 0,
-                deposit: 0,
-                close_requested_at: 0,
-            },
-        );
-        let foreign = PayeeChain {
-            chain_id: chain().chain_id + 1,
-            ..chain()
-        };
-        let summary = run_supervision_pass(
-            &repo,
-            &rpc,
-            &signer(),
-            foreign,
-            &SupervisionConfig::default(),
-            now(),
-        )
-        .await;
-        assert_eq!(
-            (
-                summary.scanned,
-                summary.chain_reads,
-                summary.finalized_withdrawn
-            ),
-            (1, 0, 0)
-        );
-        assert_eq!(rpc.eth_calls(), 0);
-        assert_eq!(
-            repo.get(&[1; 32]).await.unwrap().unwrap().state,
-            ChannelLifecycle::Open
-        );
-    }
 }

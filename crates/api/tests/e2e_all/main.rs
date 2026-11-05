@@ -80,6 +80,7 @@ mod model_history_test;
 mod model_pricing_notices;
 mod mpp;
 mod mpp_channels;
+mod mpp_session;
 mod multiturn_tools;
 mod near_auth;
 mod oauth_account_linking;

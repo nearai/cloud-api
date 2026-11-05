@@ -1318,9 +1318,10 @@ fn test_sse_error_frame_is_valid_json() {
 
     for e in &cases {
         let frame = sse_error_frame(e);
-        let text = std::str::from_utf8(&frame)
-            .expect("frame is utf-8")
-            .trim_start_matches('\n');
+        let raw = std::str::from_utf8(&frame).expect("frame is utf-8");
+        let text = raw
+            .strip_prefix("\n\n")
+            .unwrap_or_else(|| panic!("frame missing leading SSE separator: {raw:?}"));
         assert!(
             text.starts_with("data: "),
             "frame missing 'data: ' prefix: {text:?}"

@@ -743,6 +743,13 @@ pub enum ProblemCode {
     VerificationFailed,
     PaymentExpired,
     MethodUnsupported,
+    InsufficientBalance,
+    ChannelNotFound,
+    ChannelClosed,
+    InvalidSignature,
+    SignerMismatch,
+    AmountExceedsDeposit,
+    DeltaTooSmall,
 }
 
 impl ProblemCode {
@@ -754,6 +761,13 @@ impl ProblemCode {
             Self::VerificationFailed => "verification-failed",
             Self::PaymentExpired => "payment-expired",
             Self::MethodUnsupported => "method-unsupported",
+            Self::InsufficientBalance => "insufficient-balance",
+            Self::ChannelNotFound => "channel-not-found",
+            Self::ChannelClosed => "channel-closed",
+            Self::InvalidSignature => "invalid-signature",
+            Self::SignerMismatch => "signer-mismatch",
+            Self::AmountExceedsDeposit => "amount-exceeds-deposit",
+            Self::DeltaTooSmall => "delta-too-small",
         }
     }
 
@@ -769,6 +783,13 @@ impl ProblemCode {
             Self::VerificationFailed => "Payment Verification Failed",
             Self::PaymentExpired => "Payment Expired",
             Self::MethodUnsupported => "Method Unsupported",
+            Self::InsufficientBalance => "Insufficient Balance",
+            Self::ChannelNotFound => "Channel Not Found",
+            Self::ChannelClosed => "Channel Closed",
+            Self::InvalidSignature => "Invalid Signature",
+            Self::SignerMismatch => "Signer Mismatch",
+            Self::AmountExceedsDeposit => "Amount Exceeds Deposit",
+            Self::DeltaTooSmall => "Delta Too Small",
         }
     }
 

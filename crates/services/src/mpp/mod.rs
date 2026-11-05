@@ -36,6 +36,7 @@ pub mod rlp;
 pub mod rpc;
 pub mod secp256k1;
 pub mod service;
+pub mod session_chain;
 pub mod session_service;
 pub mod session_settlement;
 pub mod session_supervision;

@@ -1059,10 +1059,6 @@ pub struct AuthConfig {
     /// outstanding legacy tokens have expired to reject any token that cannot
     /// be tied to a live session.
     pub require_session_bound_access_tokens: bool,
-    /// Serve `POST /auth/vpc/login`. When `false` the route returns 404
-    /// without reading or verifying the request. Env: `VPC_LOGIN_ENABLED`
-    /// (default `true`).
-    pub vpc_login_enabled: bool,
 }
 
 impl AuthConfig {
@@ -1128,7 +1124,6 @@ impl AuthConfig {
                 "AUTH_REQUIRE_SESSION_BOUND_ACCESS_TOKENS",
                 false,
             )?,
-            vpc_login_enabled: parse_bool_env("VPC_LOGIN_ENABLED", true)?,
         })
     }
 
@@ -1937,25 +1932,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
-    fn vpc_login_enabled_parses_env() {
-        std::env::set_var("AUTH_ENCODING_KEY", "test_encoding_key");
-        std::env::remove_var("VPC_LOGIN_ENABLED");
-        assert!(AuthConfig::from_env().unwrap().vpc_login_enabled);
-
-        std::env::set_var("VPC_LOGIN_ENABLED", "false");
-        assert!(!AuthConfig::from_env().unwrap().vpc_login_enabled);
-
-        std::env::set_var("VPC_LOGIN_ENABLED", "true");
-        assert!(AuthConfig::from_env().unwrap().vpc_login_enabled);
-
-        std::env::set_var("VPC_LOGIN_ENABLED", "maybe");
-        assert!(AuthConfig::from_env().is_err());
-
-        std::env::remove_var("VPC_LOGIN_ENABLED");
-    }
-
-    #[test]
     fn test_is_admin_email() {
         let config = AuthConfig {
             mock: false,
@@ -1966,7 +1942,6 @@ mod tests {
             admin_domains: vec!["near.ai".to_string(), "near.org".to_string()],
             admin_read_only_tokens_enabled: false,
             require_session_bound_access_tokens: false,
-            vpc_login_enabled: true,
         };
 
         // Test admin domains
@@ -2058,7 +2033,6 @@ mod tests {
             admin_domains: vec![],
             admin_read_only_tokens_enabled: false,
             require_session_bound_access_tokens: false,
-            vpc_login_enabled: true,
         };
 
         // Should return false when no admin domains configured

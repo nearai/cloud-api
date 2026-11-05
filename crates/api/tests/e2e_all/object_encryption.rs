@@ -9,6 +9,19 @@ use services::files::{
 use std::{sync::Arc, time::Duration};
 use uuid::Uuid;
 
+struct ObjectTestServer {
+    inner: TestServer,
+    jobs: EncryptionJobsCleanup,
+}
+
+impl std::ops::Deref for ObjectTestServer {
+    type Target = TestServer;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
 fn ring() -> Arc<ObjectKeyRing> {
     Arc::new(ObjectKeyRing::new("s3-v2".into(), [9; 32], vec![("s3-v1".into(), [7; 32])]).unwrap())
 }
@@ -16,8 +29,8 @@ fn ring() -> Arc<ObjectKeyRing> {
 async fn server(
     storage: Arc<dyn StorageTrait>,
     ring: Arc<ObjectKeyRing>,
-) -> (TestServer, Arc<database::Database>) {
-    setup_test_server_with_domain_services(move |services, database| {
+) -> (ObjectTestServer, Arc<database::Database>) {
+    let (inner, database) = setup_test_server_with_domain_services(move |services, database| {
         services.files_service = Arc::new(services::files::FileServiceImpl::new(
             Arc::new(database::repositories::FileRepository::new(
                 database.pool().clone(),
@@ -27,16 +40,27 @@ async fn server(
         services.object_encryption_state =
             ObjectEncryptionState::new(database.pool().clone(), storage, ring);
     })
-    .await
+    .await;
+    let jobs = EncryptionJobsCleanup::new(database.pool().clone());
+    (ObjectTestServer { inner, jobs }, database)
 }
 
-async fn post(server: &TestServer, suffix: &str, body: Value) -> axum_test::TestResponse {
-    server
+async fn post(server: &ObjectTestServer, suffix: &str, body: Value) -> axum_test::TestResponse {
+    let response = server
         .post(&format!("/v1/admin/object-encryption/{suffix}"))
         .add_header("Authorization", format!("Bearer {}", get_session_id()))
         .add_header("User-Agent", MOCK_USER_AGENT)
         .json(&body)
-        .await
+        .await;
+    if response.status_code() == 202 && matches!(suffix, "jobs" | "verify") {
+        let id = response.json::<Value>()["job_id"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        server.jobs.track(id);
+    }
+    response
 }
 
 async fn wait(server: &TestServer, id: &str) -> Value {
@@ -60,7 +84,7 @@ async fn wait(server: &TestServer, id: &str) -> Value {
     .expect("object job completion timeout")
 }
 
-async fn job(server: &TestServer, mode: &str) -> Value {
+async fn job(server: &ObjectTestServer, mode: &str) -> Value {
     let response = post(
         server,
         "jobs",
@@ -80,7 +104,7 @@ async fn content(server: &TestServer, file_id: &str, key: &str) {
     assert_eq!(response.as_bytes(), b"retained content".as_slice());
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rotation_retains_file_reads_and_verifies_after_previous_key_removal() {
     let ring = ring();
     let storage = Arc::new(MockStorage::new_with_ring(ring.clone()));
@@ -180,3 +204,15 @@ mod lifecycle;
 
 #[path = "object_encryption/missing.rs"]
 mod missing;
+
+#[path = "object_encryption/paused_storage.rs"]
+mod paused_storage;
+
+#[path = "object_encryption/concurrency.rs"]
+mod concurrency;
+
+#[path = "object_encryption/lease_tests.rs"]
+mod lease_tests;
+
+#[path = "object_encryption/conflicts.rs"]
+mod conflicts;

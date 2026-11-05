@@ -3,14 +3,14 @@ use super::*;
 #[path = "../../common/object_encryption_missing.rs"]
 mod storage_fixture;
 
-async fn fixture(mode: &str, fail: bool) -> (TestServer, Arc<MockStorage>) {
+async fn fixture(mode: &str, fail: bool) -> (ObjectTestServer, Arc<MockStorage>) {
     let ring = ring();
     let (wrapped, storage) = storage_fixture::storage(mode, fail, ring.clone()).await;
     let (server, _) = server(wrapped, ring).await;
     (server, storage)
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn deleted_after_listing_is_skipped_in_all_job_modes() {
     for mode in ["dry_run", "execute", "verify"] {
         // When the listed object disappears before processing.
@@ -51,8 +51,8 @@ async fn deleted_after_listing_is_skipped_in_all_job_modes() {
     }
 }
 
-#[tokio::test]
-async fn non_not_found_storage_error_fails_the_job() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn non_not_found_storage_error_is_counted_without_failing_the_job() {
     // Given a storage adapter returning a non-NotFound failure.
     let (server, _) = fixture("dry_run", true).await;
     // When the job is submitted.
@@ -63,32 +63,14 @@ async fn non_not_found_storage_error_fails_the_job() {
     )
     .await;
     assert_eq!(response.status_code(), 202);
-    // Then the worker reports its failure class.
-    let result = wait_failed(
+    // Then both object errors are counted and the job still completes.
+    let result = wait(
         &server,
         response.json::<Value>()["job_id"].as_str().unwrap(),
     )
     .await;
-    assert_eq!(result["status"], "failed");
-    assert_eq!(result["last_error_class"], "object_worker_failed");
-}
-
-async fn wait_failed(server: &TestServer, id: &str) -> Value {
-    tokio::time::timeout(Duration::from_secs(15), async {
-        loop {
-            let response = server
-                .get(&format!("/v1/admin/object-encryption/jobs/{id}"))
-                .add_header("Authorization", format!("Bearer {}", get_session_id()))
-                .add_header("User-Agent", MOCK_USER_AGENT)
-                .await;
-            assert_eq!(response.status_code(), 200);
-            let body = response.json::<Value>();
-            match body["status"].as_str() {
-                Some("failed") => return body,
-                _ => tokio::time::sleep(Duration::from_millis(10)).await,
-            }
-        }
-    })
-    .await
-    .expect("object job failure timeout")
+    assert_eq!(result["status"], "completed");
+    assert_eq!(result["progress"]["errors"], 2);
+    assert_eq!(result["progress"]["processed"], 2);
+    assert!(result["last_error_class"].is_null());
 }

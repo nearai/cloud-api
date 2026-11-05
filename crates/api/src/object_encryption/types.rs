@@ -53,8 +53,30 @@ pub(super) struct JobOptions {
 }
 
 #[derive(Debug, Deserialize, Default, utoipa::ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ObjectScanRequest {
+    /// Maximum objects in this call: defaults to 10000, at most 100000.
+    #[schema(minimum = 1, maximum = 100000, default = 10000)]
     pub(super) limit: Option<i64>,
+    /// Wall-clock budget for this call: defaults to 60 seconds, at most 60.
+    #[schema(minimum = 1, maximum = 60, default = 60)]
+    pub(super) deadline_seconds: Option<u64>,
+    /// Pass the cursor returned by an incomplete scan unchanged.
+    #[schema(inline)]
+    pub(super) cursor: Option<ScanCursor>,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize, utoipa::ToSchema)]
+#[serde(default, deny_unknown_fields)]
+pub(super) struct ScanCursor {
+    pub continuation: Option<String>,
+    pub last_key: Option<String>,
+    pub complete: bool,
+    #[serde(skip_serializing_if = "std::collections::VecDeque::is_empty")]
+    #[schema(value_type = Vec<String>)]
+    pub pending_keys: std::collections::VecDeque<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_continuation: Option<String>,
 }
 
 #[derive(Debug, Deserialize, utoipa::ToSchema)]

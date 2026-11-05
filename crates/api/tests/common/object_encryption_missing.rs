@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use services::files::{
     encryption::{encrypt_with_key, ObjectKeyRing},
-    storage::{MockStorage, ObjectVerification, RewrapOutcome, StorageTrait},
+    storage::{MockStorage, ObjectMetadata, ObjectVerification, RewrapOutcome, StorageTrait},
     FileServiceError,
 };
 use std::sync::{
@@ -49,19 +49,27 @@ impl StorageTrait for DeleteAfterList {
         }
         Ok(page)
     }
-    async fn object_key_id(&self, key: &str) -> Result<Option<String>, FileServiceError> {
+    async fn object_metadata(&self, key: &str) -> Result<ObjectMetadata, FileServiceError> {
         if self.fail {
             return Err(FileServiceError::StorageError(
                 "injected storage failure".into(),
             ));
         }
-        self.inner.object_key_id(key).await
+        self.inner.object_metadata(key).await
     }
-    async fn rewrap_object(&self, key: &str) -> Result<RewrapOutcome, FileServiceError> {
-        self.inner.rewrap_object(key).await
+    async fn rewrap_object(
+        &self,
+        key: &str,
+        max_bytes: u64,
+    ) -> Result<RewrapOutcome, FileServiceError> {
+        self.inner.rewrap_object(key, max_bytes).await
     }
-    async fn verify_object(&self, key: &str) -> Result<ObjectVerification, FileServiceError> {
-        self.inner.verify_object(key).await
+    async fn verify_object(
+        &self,
+        key: &str,
+        max_bytes: u64,
+    ) -> Result<ObjectVerification, FileServiceError> {
+        self.inner.verify_object(key, max_bytes).await
     }
 }
 

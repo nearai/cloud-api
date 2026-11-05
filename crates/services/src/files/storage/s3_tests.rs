@@ -12,6 +12,9 @@ use wiremock::{
     Mock, MockServer, ResponseTemplate,
 };
 
+#[path = "s3_limit_tests.rs"]
+mod limits;
+
 async fn storage(server: &MockServer) -> S3Storage {
     let config = aws_sdk_s3::Config::builder()
         .behavior_version(BehaviorVersion::latest())
@@ -148,7 +151,11 @@ async fn s3_rewrap_preserves_content_type_and_user_metadata() {
         .mount(&server)
         .await;
     // When the legacy object is rewrapped.
-    let outcome = storage(&server).await.rewrap_object("file").await.unwrap();
+    let outcome = storage(&server)
+        .await
+        .rewrap_object("file", u64::MAX)
+        .await
+        .unwrap();
     // Then the replacement retains content and identifies its source key.
     assert_eq!(
         outcome,
@@ -180,7 +187,11 @@ async fn s3_current_metadata_skips_the_body_download() {
         .mount(&server)
         .await;
     // When a rewrap is requested.
-    let outcome = storage(&server).await.rewrap_object("file").await.unwrap();
+    let outcome = storage(&server)
+        .await
+        .rewrap_object("file", u64::MAX)
+        .await
+        .unwrap();
     // Then only the metadata request is necessary.
     assert_eq!(outcome, RewrapOutcome::AlreadyCurrent);
     assert_eq!(server.received_requests().await.unwrap().len(), 1);
@@ -228,6 +239,14 @@ async fn s3_listing_forwards_the_continuation_and_limit() {
 async fn s3_verify_requires_write_key_authentication() {
     // Given current metadata on previous-key ciphertext.
     let server = MockServer::start().await;
+    Mock::given(method("HEAD"))
+        .and(path("/bucket/file"))
+        .respond_with(
+            ResponseTemplate::new(200).insert_header("x-amz-meta-near-enc-key-id", "current"),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
     Mock::given(method("GET"))
         .and(path("/bucket/file"))
         .respond_with(
@@ -239,13 +258,18 @@ async fn s3_verify_requires_write_key_authentication() {
         .mount(&server)
         .await;
     // When the object is verified.
-    let result = storage(&server).await.verify_object("file").await.unwrap();
+    let result = storage(&server)
+        .await
+        .verify_object("file", u64::MAX)
+        .await
+        .unwrap();
     // Then metadata alone does not make it decryptable.
     assert_eq!(
         result,
         ObjectVerification {
             is_current: true,
-            is_decryptable: false
+            is_decryptable: false,
+            unknown_key_id: false,
         }
     );
 }

@@ -1,4 +1,6 @@
-use super::{page_size, FileServiceError, ObjectVerification, RewrapOutcome, StorageTrait};
+use super::{
+    page_size, FileServiceError, ObjectMetadata, ObjectVerification, RewrapOutcome, StorageTrait,
+};
 use crate::files::encryption::{self, EncryptionError, ObjectKeyRing};
 use async_trait::async_trait;
 use std::{
@@ -118,27 +120,43 @@ impl StorageTrait for MockStorage {
         Ok((keys, next))
     }
 
-    async fn object_key_id(&self, key: &str) -> Result<Option<String>, FileServiceError> {
+    async fn object_metadata(&self, key: &str) -> Result<ObjectMetadata, FileServiceError> {
         let files = self.files.read().map_err(lock_error)?;
-        Ok(files
-            .get(key)
-            .ok_or(FileServiceError::NotFound)?
-            .key_id
-            .clone())
+        let object = files.get(key).ok_or(FileServiceError::NotFound)?;
+        Ok(ObjectMetadata {
+            key_id: object.key_id.clone(),
+            content_length: u64::try_from(object.encrypted_data.len())
+                .map_err(|error| FileServiceError::StorageError(error.to_string()))?,
+        })
     }
 
-    async fn rewrap_object(&self, key: &str) -> Result<RewrapOutcome, FileServiceError> {
+    async fn rewrap_object(
+        &self,
+        key: &str,
+        max_bytes: u64,
+    ) -> Result<RewrapOutcome, FileServiceError> {
         let mut files = self.files.write().map_err(lock_error)?;
         let object = files.get_mut(key).ok_or(FileServiceError::NotFound)?;
+        ObjectMetadata {
+            key_id: object.key_id.clone(),
+            content_length: u64::try_from(object.encrypted_data.len())
+                .map_err(|error| FileServiceError::StorageError(error.to_string()))?,
+        }
+        .enforce_limit(max_bytes, &self.key_ring)?;
         if object.key_id.as_deref() == Some(self.key_ring.write_id()) {
             return Ok(RewrapOutcome::AlreadyCurrent);
         }
+        let unknown_key_id = object
+            .key_id
+            .as_deref()
+            .is_some_and(|id| self.key_ring.lookup(id).is_none());
         let (plaintext, from) = match encryption::decrypt_with_ring(
             &object.encrypted_data,
             &self.key_ring,
             object.key_id.as_deref(),
         ) {
             Ok(value) => value,
+            Err(_) if unknown_key_id => return Ok(RewrapOutcome::UndecryptableUnknownKeyId),
             Err(_) => return Ok(RewrapOutcome::Undecryptable),
         };
         *object = StoredObject {
@@ -146,19 +164,36 @@ impl StorageTrait for MockStorage {
             key_id: Some(self.key_ring.write_id().to_owned()),
             content_type: object.content_type.clone(),
         };
-        Ok(RewrapOutcome::Rewrapped { from })
+        Ok(if unknown_key_id {
+            RewrapOutcome::RewrappedUnknownKeyId
+        } else {
+            RewrapOutcome::Rewrapped { from }
+        })
     }
 
-    async fn verify_object(&self, key: &str) -> Result<ObjectVerification, FileServiceError> {
+    async fn verify_object(
+        &self,
+        key: &str,
+        max_bytes: u64,
+    ) -> Result<ObjectVerification, FileServiceError> {
         let files = self.files.read().map_err(lock_error)?;
         let object = files.get(key).ok_or(FileServiceError::NotFound)?;
+        ObjectMetadata {
+            key_id: object.key_id.clone(),
+            content_length: u64::try_from(object.encrypted_data.len())
+                .map_err(|error| FileServiceError::StorageError(error.to_string()))?,
+        }
+        .enforce_limit(max_bytes, &self.key_ring)?;
+        let unknown_id = object
+            .key_id
+            .as_deref()
+            .is_some_and(|id| self.key_ring.lookup(id).is_none());
         Ok(ObjectVerification {
+            unknown_key_id: unknown_id,
             is_current: object.key_id.as_deref() == Some(self.key_ring.write_id()),
-            is_decryptable: encryption::decrypt_with_key(
-                &object.encrypted_data,
-                self.key_ring.write_key(),
-            )
-            .is_ok(),
+            is_decryptable: !unknown_id
+                && encryption::decrypt_with_key(&object.encrypted_data, self.key_ring.write_key())
+                    .is_ok(),
         })
     }
 }

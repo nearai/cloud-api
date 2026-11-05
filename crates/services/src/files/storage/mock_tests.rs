@@ -82,7 +82,7 @@ async fn rewrap_preserves_content_for_a_write_key_only_reader() {
         )
         .unwrap();
     // When the object is rewrapped.
-    let outcome = storage.rewrap_object("legacy").await.unwrap();
+    let outcome = storage.rewrap_object("legacy", u64::MAX).await.unwrap();
     // Then it carries current metadata and remains readable without the previous key.
     assert_eq!(
         outcome,
@@ -109,7 +109,7 @@ async fn rewrap_skips_current_metadata() {
         .await
         .unwrap();
     // When it is rewrapped again.
-    let outcome = storage.rewrap_object("current").await.unwrap();
+    let outcome = storage.rewrap_object("current", u64::MAX).await.unwrap();
     // Then it is already current.
     assert_eq!(outcome, RewrapOutcome::AlreadyCurrent);
 }
@@ -127,7 +127,7 @@ async fn rewrap_reports_unknown_ciphertext_without_changing_it() {
         )
         .unwrap();
     // When it is rewrapped.
-    let outcome = storage.rewrap_object("unknown").await.unwrap();
+    let outcome = storage.rewrap_object("unknown", u64::MAX).await.unwrap();
     // Then decryption is reported and the metadata stays absent.
     assert_eq!(outcome, RewrapOutcome::Undecryptable);
     assert_eq!(storage.object_key_id("unknown").await.unwrap(), None);
@@ -162,29 +162,32 @@ async fn verification_checks_metadata_and_write_key_independently() {
         )
         .unwrap();
     // When each object is verified.
-    let stale = storage.verify_object("stale").await.unwrap();
-    let wrong = storage.verify_object("wrong").await.unwrap();
-    let both = storage.verify_object("both").await.unwrap();
+    let stale = storage.verify_object("stale", u64::MAX).await.unwrap();
+    let wrong = storage.verify_object("wrong", u64::MAX).await.unwrap();
+    let both = storage.verify_object("both", u64::MAX).await.unwrap();
     // Then metadata and authentication retain separate results.
     assert_eq!(
         stale,
         ObjectVerification {
             is_current: false,
-            is_decryptable: true
+            is_decryptable: true,
+            unknown_key_id: false,
         }
     );
     assert_eq!(
         wrong,
         ObjectVerification {
             is_current: true,
-            is_decryptable: false
+            is_decryptable: false,
+            unknown_key_id: false,
         }
     );
     assert_eq!(
         both,
         ObjectVerification {
             is_current: false,
-            is_decryptable: false
+            is_decryptable: false,
+            unknown_key_id: false,
         }
     );
 }

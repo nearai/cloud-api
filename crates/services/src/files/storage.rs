@@ -1,3 +1,4 @@
+use super::encryption::ObjectKeyRing;
 use super::FileServiceError;
 use async_trait::async_trait;
 
@@ -14,12 +15,36 @@ pub enum RewrapOutcome {
     AlreadyCurrent,
     Rewrapped { from: String },
     Undecryptable,
+    RewrappedUnknownKeyId,
+    UndecryptableUnknownKeyId,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ObjectVerification {
     pub is_current: bool,
     pub is_decryptable: bool,
+    pub unknown_key_id: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectMetadata {
+    pub key_id: Option<String>,
+    pub content_length: u64,
+}
+
+impl ObjectMetadata {
+    fn enforce_limit(&self, max_bytes: u64, ring: &ObjectKeyRing) -> Result<(), FileServiceError> {
+        if self.content_length > max_bytes {
+            return Err(FileServiceError::ObjectTooLarge {
+                is_current: self.key_id.as_deref() == Some(ring.write_id()),
+                unknown_key_id: self
+                    .key_id
+                    .as_deref()
+                    .is_some_and(|id| ring.lookup(id).is_none()),
+            });
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -38,9 +63,20 @@ pub trait StorageTrait: Send + Sync {
         continuation: Option<String>,
         max: i32,
     ) -> Result<(Vec<String>, Option<String>), FileServiceError>;
-    async fn object_key_id(&self, key: &str) -> Result<Option<String>, FileServiceError>;
-    async fn rewrap_object(&self, key: &str) -> Result<RewrapOutcome, FileServiceError>;
-    async fn verify_object(&self, key: &str) -> Result<ObjectVerification, FileServiceError>;
+    async fn object_metadata(&self, key: &str) -> Result<ObjectMetadata, FileServiceError>;
+    async fn object_key_id(&self, key: &str) -> Result<Option<String>, FileServiceError> {
+        Ok(self.object_metadata(key).await?.key_id)
+    }
+    async fn rewrap_object(
+        &self,
+        key: &str,
+        max_bytes: u64,
+    ) -> Result<RewrapOutcome, FileServiceError>;
+    async fn verify_object(
+        &self,
+        key: &str,
+        max_bytes: u64,
+    ) -> Result<ObjectVerification, FileServiceError>;
 }
 
 fn page_size(max: i32) -> Result<usize, FileServiceError> {
@@ -54,5 +90,7 @@ fn page_size(max: i32) -> Result<usize, FileServiceError> {
 
 #[cfg(test)]
 mod mock_tests;
+#[cfg(test)]
+mod review_tests;
 #[cfg(test)]
 mod s3_tests;

@@ -26,6 +26,8 @@ mod tests {
 
     fn config() -> S3Config {
         S3Config {
+            object_rewrap_max_bytes: 268_435_456,
+            object_encryption_write_enabled: true,
             mock: true,
             bucket: "test".into(),
             region: "us-east-1".into(),

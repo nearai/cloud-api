@@ -615,6 +615,10 @@ pub async fn init_domain_services_with_pool(
         database.pool().clone(),
         s3_storage.clone(),
         object_key_ring,
+    )
+    .with_job_options(
+        config.s3.object_rewrap_max_bytes,
+        config.s3.object_encryption_write_enabled,
     );
 
     let file_repository = Arc::new(database::repositories::FileRepository::new(
@@ -2739,12 +2743,14 @@ fn build_admin_routes_with_options(
         admin_routes
     };
 
-    if build_options.start_database_encryption_recovery {
+    let object_encryption_state = if build_options.start_database_encryption_recovery {
         services.object_encryption_state.recover_jobs();
-    }
-    let admin_routes = admin_routes.merge(
-        object_encryption::router().layer(axum::Extension(services.object_encryption_state)),
-    );
+        services.object_encryption_state
+    } else {
+        services.object_encryption_state.with_job_scoped_leases()
+    };
+    let admin_routes = admin_routes
+        .merge(object_encryption::router().layer(axum::Extension(object_encryption_state)));
 
     admin_routes
         // Admin middleware handles both authentication and authorization
@@ -3564,6 +3570,8 @@ mod tests {
             database_encryption_key_id: "test-db-v1".to_string(),
             database_encryption_write_enabled: false,
             s3: config::S3Config {
+                object_rewrap_max_bytes: 268_435_456,
+                object_encryption_write_enabled: true,
                 encryption_keys: None,
                 mock: true,
                 bucket: "test-bucket".to_string(),
@@ -3689,6 +3697,8 @@ mod tests {
             database_encryption_key_id: "test-db-v1".to_string(),
             database_encryption_write_enabled: false,
             s3: config::S3Config {
+                object_rewrap_max_bytes: 268_435_456,
+                object_encryption_write_enabled: true,
                 encryption_keys: None,
                 mock: true,
                 bucket: "test-bucket".to_string(),

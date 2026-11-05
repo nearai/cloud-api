@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use axum_test::TestServer;
 use serde_json::{json, Value};
 use services::files::{
-    storage::{MockStorage, ObjectVerification, RewrapOutcome},
+    storage::{MockStorage, ObjectMetadata, ObjectVerification, RewrapOutcome},
     FileServiceError,
 };
 
@@ -35,23 +35,31 @@ impl StorageTrait for DeletedAfterListing {
         self.inner.delete("a-deleted").await?;
         Ok(page)
     }
-    async fn object_key_id(&self, key: &str) -> Result<Option<String>, FileServiceError> {
+    async fn object_metadata(&self, key: &str) -> Result<ObjectMetadata, FileServiceError> {
         if self.fail {
             return Err(FileServiceError::StorageError("access denied".into()));
         }
-        self.inner.object_key_id(key).await
+        self.inner.object_metadata(key).await
     }
-    async fn rewrap_object(&self, key: &str) -> Result<RewrapOutcome, FileServiceError> {
+    async fn rewrap_object(
+        &self,
+        key: &str,
+        max_bytes: u64,
+    ) -> Result<RewrapOutcome, FileServiceError> {
         if self.fail {
             return Err(FileServiceError::StorageError("access denied".into()));
         }
-        self.inner.rewrap_object(key).await
+        self.inner.rewrap_object(key, max_bytes).await
     }
-    async fn verify_object(&self, key: &str) -> Result<ObjectVerification, FileServiceError> {
+    async fn verify_object(
+        &self,
+        key: &str,
+        max_bytes: u64,
+    ) -> Result<ObjectVerification, FileServiceError> {
         if self.fail {
             return Err(FileServiceError::StorageError("access denied".into()));
         }
-        self.inner.verify_object(key).await
+        self.inner.verify_object(key, max_bytes).await
     }
 }
 
@@ -138,7 +146,7 @@ async fn worker_skips_deleted_objects_in_every_mode() {
 }
 
 #[tokio::test]
-async fn worker_preserves_non_not_found_errors_in_every_mode() {
+async fn worker_counts_persistent_object_errors_and_continues_in_every_mode() {
     // Given an adapter returning access denied rather than a missing object.
     for mode in [
         types::Mode::DryRun,
@@ -148,14 +156,13 @@ async fn worker_preserves_non_not_found_errors_in_every_mode() {
         let state = fixture(true).await;
         let mut progress = progress::Progress::default();
         // When the worker attempts the object operation.
-        let error = worker::process_key(&state, mode, "b-retained", &mut progress)
-            .await
-            .unwrap_err();
-        // Then its original error type survives and progress is not advanced.
-        assert!(
-            matches!(error.downcast_ref::<FileServiceError>(), Some(FileServiceError::StorageError(message)) if message == "access denied")
-        );
-        assert_eq!(progress.processed, 0);
+        let outcome = worker::process_key(&state, mode, "b-retained", &mut progress).await;
+        // Then the object failure is counted and its cursor can advance.
+        assert!(outcome.is_ok());
+        let progress = serde_json::to_value(progress).unwrap();
+        assert_eq!(progress["processed"], 1);
+        assert_eq!(progress["errors"], 1);
+        assert_eq!(progress["error_samples"][0]["class"], "storage_error");
     }
 }
 

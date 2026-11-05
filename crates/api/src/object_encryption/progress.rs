@@ -11,6 +11,18 @@ pub(super) struct Cursor {
     pub continuation: Option<String>,
     pub last_key: Option<String>,
     pub complete: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub pending_keys: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pending_next: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lease: Option<super::lease::Lease>,
+}
+
+#[derive(Deserialize, Serialize)]
+pub(super) struct ErrorSample {
+    pub key: String,
+    pub class: String,
 }
 
 #[derive(Default, Deserialize, Serialize)]
@@ -19,6 +31,15 @@ pub(super) struct Progress {
     pub processed: i64,
     pub total: i64,
     pub missing: i64,
+    pub changed: i64,
+    pub changed_keys: Vec<String>,
+    pub errors: i64,
+    pub error_samples: Vec<ErrorSample>,
+    pub oversized: i64,
+    pub oversized_keys: Vec<String>,
+    pub unknown_key_ids: i64,
+    pub unknown_key_ids_warned: bool,
+    pub undecryptable_classes: BTreeMap<String, i64>,
     pub missing_keys: Vec<String>,
     pub by_key_id: BTreeMap<String, i64>,
     pub rewrapped: i64,
@@ -52,6 +73,11 @@ impl Progress {
     pub fn retain_ring_keys(&mut self, ring: &ObjectKeyRing) {
         // Normalize progress written before unknown metadata was bucketed, or
         // resumed after an operator removed an old read key from the ring.
+        self.missing_keys.truncate(100);
+        self.changed_keys.truncate(100);
+        self.error_samples.truncate(100);
+        self.oversized_keys.truncate(100);
+        self.undecryptable_keys.truncate(100);
         let counts = std::mem::take(&mut self.by_key_id);
         for (id, count) in counts {
             let bucket = if id == "none" || ring.lookup(&id).is_some() {
@@ -66,8 +92,13 @@ impl Progress {
     pub fn record_rewrap(&mut self, key: &str, outcome: RewrapOutcome) {
         match outcome {
             RewrapOutcome::AlreadyCurrent => self.already_current += 1,
-            RewrapOutcome::Rewrapped { .. } => self.rewrapped += 1,
-            RewrapOutcome::Undecryptable => self.record_undecryptable(key),
+            RewrapOutcome::Rewrapped { .. } | RewrapOutcome::RewrappedUnknownKeyId => {
+                self.rewrapped += 1
+            }
+            RewrapOutcome::UndecryptableUnknownKeyId => {
+                self.record_undecryptable(key, "unknown_key_id")
+            }
+            RewrapOutcome::Undecryptable => self.record_undecryptable(key, "decryption_failed"),
         }
     }
 
@@ -78,153 +109,59 @@ impl Progress {
         if result.is_decryptable {
             self.verified += 1;
         } else {
-            self.record_undecryptable(key);
+            self.record_undecryptable(
+                key,
+                if result.unknown_key_id {
+                    "unknown_key_id"
+                } else {
+                    "decryption_failed"
+                },
+            );
         }
     }
 
-    fn record_undecryptable(&mut self, key: &str) {
+    pub fn record_undecryptable(&mut self, key: &str, class: &str) {
         self.undecryptable += 1;
+        *self.undecryptable_classes.entry(class.into()).or_default() += 1;
         if self.undecryptable_keys.len() < 100 {
             self.undecryptable_keys.push(key.into());
         }
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn verification_counts_stale_metadata_and_invalid_ciphertext_independently() {
-        // Given a fresh progress tally.
-        let mut progress = Progress::default();
-        // When an object has stale metadata and cannot decrypt with the write key.
-        progress.record_verification(
-            "workspace/file",
-            ObjectVerification {
-                is_current: false,
-                is_decryptable: false,
-            },
-        );
-        // Then both conditions prevent a passing verification.
-        assert_eq!(
-            (progress.stale, progress.undecryptable, progress.verified),
-            (1, 1, 0)
-        );
-    }
-
-    #[test]
-    fn undecryptable_samples_are_bounded_and_survive_resumption() {
-        // Given more invalid objects than the sample limit.
-        let mut progress = Progress::default();
-        for number in 0..110 {
-            progress.record_rewrap(&format!("workspace/{number}"), RewrapOutcome::Undecryptable);
+impl Progress {
+    pub fn record_changed(&mut self, key: &str) {
+        self.changed += 1;
+        if self.changed_keys.len() < 100 {
+            self.changed_keys.push(key.into());
         }
-        // When restoring persisted progress.
-        let restored: Progress =
-            serde_json::from_value(serde_json::to_value(progress).unwrap()).unwrap();
-        // Then every failure is counted and only the bounded sample remains.
-        assert_eq!(
-            (restored.undecryptable, restored.undecryptable_keys.len()),
-            (110, 100)
-        );
     }
 
-    #[test]
-    fn cursor_retains_the_next_page_and_last_completed_key() {
-        // Given a committed object page.
-        let cursor = Cursor {
-            continuation: Some("next-token".into()),
-            last_key: Some("workspace/file".into()),
-            complete: false,
-        };
-        // When restoring its persisted cursor.
-        let restored: Cursor =
-            serde_json::from_value(serde_json::to_value(cursor).unwrap()).unwrap();
-        // Then resumption starts with the next token and preserves the completed boundary.
-        assert_eq!(
-            (
-                restored.continuation.as_deref(),
-                restored.last_key.as_deref(),
-                restored.complete
-            ),
-            (Some("next-token"), Some("workspace/file"), false)
-        );
-    }
-    #[test]
-    fn scan_groups_legacy_and_known_object_metadata() {
-        // Given a fresh inventory tally.
-        let mut progress = Progress::default();
-        let ring = ObjectKeyRing::new(
-            "current".into(),
-            [9; 32],
-            vec![("previous".into(), [7; 32])],
-        )
-        .unwrap();
-        // When legacy and named metadata are counted.
-        progress.record_key_id(None, &ring);
-        progress.record_key_id(Some("previous".into()), &ring);
-        progress.record_key_id(Some("current".into()), &ring);
-        progress.record_key_id(None, &ring);
-        // Then each metadata identity has its own count.
-        assert_eq!(
-            progress.by_key_id,
-            BTreeMap::from([
-                ("none".into(), 2),
-                ("previous".into(), 1),
-                ("current".into(), 1)
-            ])
-        );
-    }
-
-    #[test]
-    fn rewrap_counts_current_and_updated_objects_separately() {
-        // Given a fresh rewrap tally.
-        let mut progress = Progress::default();
-        // When all rewrap outcomes are recorded.
-        for outcome in [
-            RewrapOutcome::AlreadyCurrent,
-            RewrapOutcome::Rewrapped {
-                from: "previous".into(),
-            },
-            RewrapOutcome::Undecryptable,
-        ] {
-            progress.record_rewrap("workspace/file", outcome);
+    pub fn record_error(&mut self, key: &str, class: &str) {
+        self.errors += 1;
+        if self.error_samples.len() < 100 {
+            self.error_samples.push(ErrorSample {
+                key: key.into(),
+                class: class.into(),
+            });
         }
-        // Then each outcome is counted separately.
-        assert_eq!(
-            (
-                progress.already_current,
-                progress.rewrapped,
-                progress.undecryptable
-            ),
-            (1, 1, 1)
-        );
+    }
+
+    pub fn record_oversized(&mut self, key: &str, stale: bool) {
+        self.oversized += 1;
+        if stale {
+            self.stale += 1;
+        }
+        if self.oversized_keys.len() < 100 {
+            self.oversized_keys.push(key.into());
+        }
+    }
+
+    pub const fn verification_passes(&self) -> bool {
+        self.complete && self.stale == 0 && self.undecryptable == 0 && self.errors == 0
     }
 }
 
 #[cfg(test)]
-mod resumption_tests {
-    use super::*;
-
-    #[test]
-    fn resuming_counts_folds_unconfigured_metadata_into_unknown() {
-        // Given persisted counts from an older ring or worker.
-        let ring = ObjectKeyRing::new("current".into(), [9; 32], vec![]).unwrap();
-        let mut progress: Progress = serde_json::from_value(serde_json::json!({
-            "by_key_id":{"current":2,"none":3,"retired":4,"arbitrary":5,"unknown":1}
-        }))
-        .unwrap();
-        // When the worker resumes using the current ring.
-        progress.retain_ring_keys(&ring);
-        // Then only configured IDs and fixed inventory buckets survive.
-        assert_eq!(
-            progress.by_key_id,
-            BTreeMap::from([
-                ("current".into(), 2),
-                ("none".into(), 3),
-                ("unknown".into(), 10)
-            ])
-        );
-    }
-}
+#[path = "progress_tests.rs"]
+mod tests;

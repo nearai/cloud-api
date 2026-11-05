@@ -1,5 +1,5 @@
 use super::{parse_key, EncryptionError};
-use sha2::{Digest, Sha256};
+use ring::hmac;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// One write key and ordered previous keys for object reads.
@@ -64,10 +64,11 @@ impl ObjectKeyRing {
     pub fn fingerprints(&self) -> Vec<(String, String)> {
         self.entries()
             .map(|(id, key)| {
-                let digest = Sha256::digest(key);
+                let key = hmac::Key::new(hmac::HMAC_SHA256, key);
+                let digest = hmac::sign(&key, b"near-key-fingerprint/v1");
                 (
                     id.to_string(),
-                    hex::encode(digest.iter().take(8).copied().collect::<Vec<_>>()),
+                    hex::encode(digest.as_ref().iter().take(8).copied().collect::<Vec<_>>()),
                 )
             })
             .collect()

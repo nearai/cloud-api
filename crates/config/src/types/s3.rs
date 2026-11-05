@@ -9,6 +9,8 @@ pub struct S3Config {
     pub region: String,
     pub encryption_key: String,
     pub encryption_keys: Option<Vec<KeySourceSpec>>,
+    pub object_rewrap_max_bytes: u64,
+    pub object_encryption_write_enabled: bool,
 }
 
 impl std::fmt::Debug for S3Config {
@@ -19,6 +21,11 @@ impl std::fmt::Debug for S3Config {
             .field("region", &self.region)
             .field("encryption_key", &"<redacted>")
             .field("encryption_keys", &self.encryption_keys)
+            .field("object_rewrap_max_bytes", &self.object_rewrap_max_bytes)
+            .field(
+                "object_encryption_write_enabled",
+                &self.object_encryption_write_enabled,
+            )
             .finish()
     }
 }
@@ -26,6 +33,26 @@ impl std::fmt::Debug for S3Config {
 impl S3Config {
     /// Load from environment variables
     pub fn from_env() -> Result<Self, String> {
+        let object_rewrap_max_bytes = match env::var("OBJECT_REWRAP_MAX_BYTES") {
+            Ok(raw) => raw
+                .parse::<u64>()
+                .ok()
+                .filter(|value| *value > 0)
+                .ok_or("OBJECT_REWRAP_MAX_BYTES must be a positive integer")?,
+            Err(env::VarError::NotPresent) => 268_435_456,
+            Err(env::VarError::NotUnicode(_)) => {
+                return Err("OBJECT_REWRAP_MAX_BYTES must be a positive integer".into());
+            }
+        };
+        let object_encryption_write_enabled = match env::var("OBJECT_ENCRYPTION_WRITE_ENABLED") {
+            Ok(raw) => raw
+                .parse::<bool>()
+                .map_err(|_| "OBJECT_ENCRYPTION_WRITE_ENABLED must be true or false")?,
+            Err(env::VarError::NotPresent) => true,
+            Err(env::VarError::NotUnicode(_)) => {
+                return Err("OBJECT_ENCRYPTION_WRITE_ENABLED must be true or false".into());
+            }
+        };
         // Check if mock mode is enabled
         let mock = env::var("S3_MOCK")
             .ok()
@@ -81,6 +108,8 @@ impl S3Config {
             region: env::var("AWS_S3_REGION").map_err(|_| "AWS_S3_REGION not set".to_string())?,
             encryption_key,
             encryption_keys,
+            object_rewrap_max_bytes,
+            object_encryption_write_enabled,
         })
     }
 }

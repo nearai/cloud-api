@@ -729,7 +729,7 @@ pub struct KeysResponse {
     get,
     path = "/v1/admin/database-encryption/keys",
     tag = "Admin",
-    responses((status = 200, description = "Configured write/read key IDs, 16-character SHA-256 fingerprints, and write status", body = KeysResponse)),
+    responses((status = 200, description = "Configured write/read key IDs, 16-character HMAC-SHA256 fingerprints, and write status", body = KeysResponse)),
     security(("admin_token" = []))
 )]
 pub async fn get_keys(
@@ -757,7 +757,7 @@ pub async fn get_keys(
     path = "/v1/admin/database-encryption/jobs",
     tag = "Admin",
     request_body = CreateJobRequest,
-    responses((status = 202, description = "Resumable database encryption job accepted", body = JobResponse)),
+    responses((status = 202, description = "Resumable database encryption job accepted", body = JobResponse), (status = 409, description = "A database encryption job with this scope is already queued or running", body = Value)),
     security(("admin_token" = []))
 )]
 pub async fn create_job(
@@ -813,7 +813,19 @@ pub async fn create_job(
     let scope = serde_json::to_value(&scope_request).map_err(internal)?;
     let actions = json!(req.actions);
     let client = state.pool.get().await.map_err(internal)?;
-    client.execute("INSERT INTO database_encryption_jobs(id,mode,status,scope,actions,batch_size,max_rows,admin_actor) VALUES($1,$2,'queued',$3,$4,$5,$6,$7)",&[&id,&mode,&scope,&actions,&req.batch_size,&req.max_rows,&admin.0.id]).await.map_err(internal)?;
+    client.execute("INSERT INTO database_encryption_jobs(id,mode,status,scope,actions,batch_size,max_rows,admin_actor) VALUES($1,$2,'queued',$3,$4,$5,$6,$7)",&[&id,&mode,&scope,&actions,&req.batch_size,&req.max_rows,&admin.0.id]).await.map_err(|error| {
+        if error.as_db_error().is_some_and(|error| {
+            error.code() == &tokio_postgres::error::SqlState::UNIQUE_VIOLATION
+                && error.constraint() == Some("idx_database_encryption_jobs_active_scope")
+        }) {
+            (StatusCode::CONFLICT, Json(json!({"error": {
+                "code": "conflict",
+                "message": "a database encryption job with this scope is already queued or running"
+            }})))
+        } else {
+            internal(error)
+        }
+    })?;
     drop(client);
     spawn_job(state.clone(), id);
     let response = get_inner(&state, id).await?;

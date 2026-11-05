@@ -23,7 +23,9 @@ Object-storage encryption keys are separate from database field keys.
 2. Put the new key first on every replica. A replica still on the previous
    configuration continues writing old-key envelopes. Compare
    `GET /v1/admin/database-encryption/keys` write IDs and fingerprints across
-   replicas before starting rewrap.
+   replicas before starting rewrap. Fingerprints are the first 16 lowercase
+   hexadecimal characters of `HMAC-SHA256(key, "near-key-fingerprint/v1")`;
+   the endpoint never exposes key material.
 3. Submit explicitly field-scoped `POST /v1/admin/database-encryption/jobs`
    requests with `actions: ["rewrap"]`. Review `mode: "dry_run"`, then use
    `mode: "execute"` with `DB_ENCRYPTION_WRITE_ENABLED=true`.
@@ -44,6 +46,8 @@ job runs per process at a time.
 
 See [env.example](../env.example) for configuration and request examples.
 
+Creating a job with the same stored scope as a queued or running database encryption job returns HTTP 409 with `a database encryption job with this scope is already queued or running`. A terminal job does not block a new job with the same scope.
+
 ## Object storage key ring
 
 Object encryption has a separate ordered `S3_ENCRYPTION_KEYS` ring and
@@ -57,8 +61,13 @@ IDs and key bytes must be distinct, and keys are zeroed on drop.
 
 Object counts group metadata IDs outside the ring under `unknown` and missing
 metadata under `none`; use verification to authenticate ciphertext. Object
-jobs share the delay semantics above, but use a separate advisory lock and
-`scope.kind = "objects"` so each worker handles only its own jobs.
+jobs use `scope.kind = "objects"` so each worker handles only its own jobs.
+Object storage calls run outside database transactions; short transactions
+persist the cursor, progress, and worker ownership. Object job scope accepts
+only options and always covers the whole bucket. `OBJECT_ENCRYPTION_WRITE_ENABLED`
+is an execute-only rewrap kill switch (default true); uploads are unaffected.
+After a rolling write-key deployment completes and old in-flight writers finish,
+run object execute and verify again before retiring previous keys.
 
 Rewrap replaces only the current object version. Superseded versions, replica
 buckets, and backups can still require previous keys; lifecycle/deletion of

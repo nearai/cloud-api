@@ -1,15 +1,17 @@
 use super::{
-    page_size, FileServiceError, ObjectVerification, RewrapOutcome, StorageTrait, KEY_ID_METADATA,
+    page_size, FileServiceError, ObjectMetadata, ObjectVerification, RewrapOutcome, StorageTrait,
+    KEY_ID_METADATA,
 };
 use crate::files::encryption::{self, EncryptionError, ObjectKeyRing};
 use async_trait::async_trait;
 use aws_sdk_s3::{
-    error::{ProvideErrorMetadata, SdkError},
-    operation::get_object::GetObjectOutput,
-    primitives::ByteStream,
-    Client as S3Client,
+    operation::get_object::GetObjectOutput, primitives::ByteStream, Client as S3Client,
 };
-use std::{fmt::Display, sync::Arc};
+use std::sync::Arc;
+
+#[path = "s3_io.rs"]
+mod io;
+use io::{body, bounded_body, content_length, object_error, storage_error};
 
 #[derive(Clone)]
 pub struct S3Storage {
@@ -54,36 +56,6 @@ impl S3Storage {
     }
 }
 
-fn storage_error(operation: &str, error: impl Display) -> FileServiceError {
-    FileServiceError::StorageError(format!("Object {operation} failed: {error}"))
-}
-
-fn object_error<E: ProvideErrorMetadata>(operation: &str, error: SdkError<E>) -> FileServiceError {
-    let code = error
-        .as_service_error()
-        .and_then(ProvideErrorMetadata::code);
-    let missing = matches!(code, Some("NoSuchKey" | "NotFound" | "404"))
-        || (code.is_none()
-            && error
-                .raw_response()
-                .is_some_and(|response| response.status().as_u16() == 404));
-    if missing {
-        FileServiceError::NotFound
-    } else {
-        storage_error(operation, error)
-    }
-}
-
-async fn body(response: GetObjectOutput) -> Result<Vec<u8>, FileServiceError> {
-    Ok(response
-        .body
-        .collect()
-        .await
-        .map_err(|error| storage_error("body read", error))?
-        .into_bytes()
-        .to_vec())
-}
-
 #[async_trait]
 impl StorageTrait for S3Storage {
     async fn upload(
@@ -102,7 +74,7 @@ impl StorageTrait for S3Storage {
             .metadata(KEY_ID_METADATA, self.key_ring.write_id())
             .send()
             .await
-            .map_err(|error| storage_error("upload", error))?;
+            .map_err(|error| object_error("upload", error))?;
         Ok(())
     }
 
@@ -125,7 +97,7 @@ impl StorageTrait for S3Storage {
             .key(key)
             .send()
             .await
-            .map_err(|error| storage_error("delete", error))?;
+            .map_err(|error| object_error("delete", error))?;
         Ok(())
     }
 
@@ -164,14 +136,7 @@ impl StorageTrait for S3Storage {
             .max_keys(max)
             .send()
             .await
-            .map_err(|error| match error.as_service_error() {
-                Some(service) => FileServiceError::StorageError(format!(
-                    "Object listing failed: {}: {}",
-                    service.code().unwrap_or("Unknown"),
-                    service.message().unwrap_or("No message provided")
-                )),
-                None => storage_error("listing", error),
-            })?;
+            .map_err(|error| object_error("listing", error))?;
         let keys = response
             .contents()
             .iter()
@@ -180,7 +145,7 @@ impl StorageTrait for S3Storage {
         Ok((keys, response.next_continuation_token().map(str::to_owned)))
     }
 
-    async fn object_key_id(&self, key: &str) -> Result<Option<String>, FileServiceError> {
+    async fn object_metadata(&self, key: &str) -> Result<ObjectMetadata, FileServiceError> {
         let response = self
             .client
             .head_object()
@@ -189,26 +154,41 @@ impl StorageTrait for S3Storage {
             .send()
             .await
             .map_err(|error| object_error("metadata read", error))?;
-        Ok(response
-            .metadata()
-            .and_then(|metadata| metadata.get(KEY_ID_METADATA))
-            .cloned())
+        Ok(ObjectMetadata {
+            key_id: response
+                .metadata()
+                .and_then(|metadata| metadata.get(KEY_ID_METADATA))
+                .cloned(),
+            content_length: content_length(response.content_length())?,
+        })
     }
 
-    async fn rewrap_object(&self, key: &str) -> Result<RewrapOutcome, FileServiceError> {
-        if self.object_key_id(key).await?.as_deref() == Some(self.key_ring.write_id()) {
+    async fn rewrap_object(
+        &self,
+        key: &str,
+        max_bytes: u64,
+    ) -> Result<RewrapOutcome, FileServiceError> {
+        let head = self.object_metadata(key).await?;
+        head.enforce_limit(max_bytes, &self.key_ring)?;
+        if head.key_id.as_deref() == Some(self.key_ring.write_id()) {
             return Ok(RewrapOutcome::AlreadyCurrent);
         }
         let response = self.get_object(key).await?;
         let mut metadata = response.metadata().cloned().unwrap_or_default();
         let content_type = response.content_type().map(str::to_owned);
         let etag = response.e_tag().map(str::to_owned);
+        let is_current =
+            metadata.get(KEY_ID_METADATA).map(String::as_str) == Some(self.key_ring.write_id());
+        let unknown_key_id = metadata
+            .get(KEY_ID_METADATA)
+            .is_some_and(|id| self.key_ring.lookup(id).is_none());
         let (plaintext, from) = match encryption::decrypt_with_ring(
-            &body(response).await?,
+            &bounded_body(response, max_bytes, is_current, unknown_key_id).await?,
             &self.key_ring,
             metadata.get(KEY_ID_METADATA).map(String::as_str),
         ) {
             Ok(value) => value,
+            Err(_) if unknown_key_id => return Ok(RewrapOutcome::UndecryptableUnknownKeyId),
             Err(_) => return Ok(RewrapOutcome::Undecryptable),
         };
         let encrypted_data = encryption::encrypt_with_key(&plaintext, self.key_ring.write_key())?;
@@ -231,19 +211,48 @@ impl StorageTrait for S3Storage {
             .send()
             .await
             .map_err(|error| object_error("rewrap", error))?;
-        Ok(RewrapOutcome::Rewrapped { from })
+        Ok(if unknown_key_id {
+            RewrapOutcome::RewrappedUnknownKeyId
+        } else {
+            RewrapOutcome::Rewrapped { from }
+        })
     }
 
-    async fn verify_object(&self, key: &str) -> Result<ObjectVerification, FileServiceError> {
+    async fn verify_object(
+        &self,
+        key: &str,
+        max_bytes: u64,
+    ) -> Result<ObjectVerification, FileServiceError> {
+        let head = self.object_metadata(key).await?;
+        head.enforce_limit(max_bytes, &self.key_ring)?;
+        if head
+            .key_id
+            .as_deref()
+            .is_some_and(|id| self.key_ring.lookup(id).is_none())
+        {
+            return Ok(ObjectVerification {
+                is_current: false,
+                is_decryptable: false,
+                unknown_key_id: true,
+            });
+        }
         let response = self.get_object(key).await?;
-        let is_current = response
+        let key_id = response
             .metadata()
             .and_then(|metadata| metadata.get(KEY_ID_METADATA))
-            .map(String::as_str)
-            == Some(self.key_ring.write_id());
-        let encrypted_data = body(response).await?;
+            .map(String::as_str);
+        let is_current = key_id == Some(self.key_ring.write_id());
+        if key_id.is_some_and(|id| self.key_ring.lookup(id).is_none()) {
+            return Ok(ObjectVerification {
+                is_current,
+                is_decryptable: false,
+                unknown_key_id: true,
+            });
+        }
+        let encrypted_data = bounded_body(response, max_bytes, is_current, false).await?;
         Ok(ObjectVerification {
             is_current,
+            unknown_key_id: false,
             is_decryptable: encryption::decrypt_with_key(
                 &encrypted_data,
                 self.key_ring.write_key(),

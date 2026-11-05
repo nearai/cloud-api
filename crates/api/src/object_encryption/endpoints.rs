@@ -1,13 +1,11 @@
-use super::{
-    progress::{Cursor, Progress},
-    spawn_job,
-    types::*,
-    ObjectEncryptionState,
-};
+use super::{spawn_job, types::*, ObjectEncryptionState};
 use crate::middleware::AdminUser;
 use axum::{extract::Path, http::StatusCode, Extension, Json};
 use serde_json::{json, Value};
 use uuid::Uuid;
+
+#[path = "scan.rs"]
+mod scan_impl;
 
 #[utoipa::path(get, path="/v1/admin/object-encryption/keys", tag="Admin",
     description="Admin session, read_write token, or read_only token. Reports object key IDs and fingerprints.",
@@ -19,7 +17,7 @@ pub async fn get_keys(
     Ok(Json(json!({
         "write_key_id":state.ring.write_id(), "read_key_ids":state.ring.ids(),
         "fingerprints":state.ring.fingerprints().into_iter().collect::<std::collections::BTreeMap<_, _>>(),
-        "write_enabled":true
+        "write_enabled":state.write_enabled
     })))
 }
 
@@ -31,58 +29,21 @@ pub async fn scan(
     Extension(_admin): Extension<AdminUser>,
     Json(req): Json<ObjectScanRequest>,
 ) -> ApiResult<Value> {
-    if req.limit.is_some_and(|limit| limit <= 0) {
-        return Err(bad("limit must be greater than zero"));
-    }
-    let mut progress = Progress::default();
-    let mut cursor = Cursor::default();
-    let limit = req.limit.map(|limit| limit.min(100_000));
-    loop {
-        let cap = limit
-            .map(|limit| (limit - progress.total).min(1000))
-            .unwrap_or(1000);
-        if cap == 0 {
-            break;
-        }
-        let (keys, next) = super::worker::storage_call(state.storage.list_keys(
-            cursor.continuation.clone(),
-            i32::try_from(cap).map_err(internal)?,
-        ))
-        .await
-        .map_err(internal)?;
-        if i64::try_from(keys.len()).map_err(internal)? > cap {
-            return Err(internal("invalid object page"));
-        }
-        for key in &keys {
-            super::worker::process_key(&state, Mode::DryRun, key, &mut progress)
-                .await
-                .map_err(internal)?;
-        }
-        cursor.last_key = keys.last().cloned().or(cursor.last_key);
-        cursor.complete = next.is_none();
-        if next.is_some() && next == cursor.continuation {
-            return Err(internal("object pagination did not advance"));
-        }
-        cursor.continuation = next;
-        if cursor.complete {
-            break;
-        }
-    }
-    progress.complete = cursor.complete;
-    Ok(Json(
-        json!({"run_id":Uuid::new_v4(), "status":"completed", "totals":progress, "cursor":cursor}),
-    ))
+    scan_impl::run(&state, req).await
 }
 
 #[utoipa::path(post, path="/v1/admin/object-encryption/jobs", tag="Admin", request_body=ObjectCreateJobRequest,
     description="Admin session or read_write token. A read_only token receives HTTP 403 with error.type insufficient_permissions.",
-    responses((status=202, description="Resumable object encryption job accepted", body=ObjectJobResponse), (status=403, description="Insufficient permissions", body=crate::models::ErrorResponse)), security(("session_token"=[]), ("admin_token"=[])))]
+    responses((status=202, description="Resumable object encryption job accepted", body=ObjectJobResponse), (status=409, description="An object encryption job with this scope is already queued or running", body=Value), (status=403, description="Insufficient permissions", body=crate::models::ErrorResponse)), security(("session_token"=[]), ("admin_token"=[])))]
 pub async fn create_job(
     Extension(state): Extension<ObjectEncryptionState>,
     Extension(admin): Extension<AdminUser>,
     Json(req): Json<ObjectCreateJobRequest>,
 ) -> AcceptedJob {
     let req = req.validated()?;
+    if matches!(req.mode, Mode::Execute) && !state.write_enabled {
+        return Err(bad("object rewrap write gate is disabled"));
+    }
     let id = Uuid::new_v4();
     let mode = req.mode.as_str();
     let scope = serde_json::to_value(req.scope).map_err(internal)?;
@@ -91,7 +52,19 @@ pub async fn create_job(
     client.execute(
         "INSERT INTO database_encryption_jobs(id,mode,status,scope,actions,batch_size,max_rows,admin_actor) VALUES($1,$2,'queued',$3,$4,$5,$6,$7)",
         &[&id, &mode, &scope, &actions, &req.batch_size, &req.max_rows, &admin.0.id]
-    ).await.map_err(internal)?;
+    ).await.map_err(|error| {
+        if error.as_db_error().is_some_and(|error| {
+            error.code() == &tokio_postgres::error::SqlState::UNIQUE_VIOLATION
+                && error.constraint() == Some("idx_database_encryption_jobs_active_scope")
+        }) {
+            (StatusCode::CONFLICT, Json(json!({"error": {
+                "code": "conflict",
+                "message": "an object encryption job is already queued or running"
+            }})))
+        } else {
+            internal(error)
+        }
+    })?;
     drop(client);
     spawn_job(state.clone(), id);
     Ok((StatusCode::ACCEPTED, get_inner(&state, id).await?))
@@ -120,8 +93,8 @@ async fn get_inner(state: &ObjectEncryptionState, id: Uuid) -> ApiResult<ObjectJ
         mode: row.get(2),
         scope: row.get(3),
         actions: row.get(4),
-        progress: row.get(5),
-        cursor: row.get(6),
+        progress: public_progress(row.get(5)),
+        cursor: public_cursor(row.get(6)),
         created_at: row.get(7),
         completed_at: row.get(8),
         last_error_class: row.get(9),
@@ -152,7 +125,7 @@ pub async fn cancel_job(
 
 #[utoipa::path(post, path="/v1/admin/object-encryption/verify", tag="Admin", request_body=ObjectVerifyRequest,
     description="Admin session or read_write token. A read_only token receives HTTP 403 with error.type insufficient_permissions.",
-    responses((status=202, description="Resumable object verification job accepted", body=ObjectJobResponse), (status=403, description="Insufficient permissions", body=crate::models::ErrorResponse)), security(("session_token"=[]), ("admin_token"=[])))]
+    responses((status=202, description="Resumable object verification job accepted", body=ObjectJobResponse), (status=409, description="An object encryption job with this scope is already queued or running", body=Value), (status=403, description="Insufficient permissions", body=crate::models::ErrorResponse)), security(("session_token"=[]), ("admin_token"=[])))]
 pub async fn verify(
     Extension(state): Extension<ObjectEncryptionState>,
     Extension(admin): Extension<AdminUser>,
@@ -171,4 +144,31 @@ pub async fn verify(
         }),
     )
     .await
+}
+
+pub(super) fn public_progress(mut progress: Value) -> Value {
+    for name in [
+        "missing_keys",
+        "changed_keys",
+        "oversized_keys",
+        "undecryptable_keys",
+        "error_samples",
+    ] {
+        if let Some(samples) = progress.get_mut(name).and_then(Value::as_array_mut) {
+            samples.truncate(20);
+        }
+    }
+    if let Some(fields) = progress.as_object_mut() {
+        fields.remove("unknown_key_ids_warned");
+    }
+    progress
+}
+
+pub(super) fn public_cursor(mut cursor: Value) -> Value {
+    if let Some(fields) = cursor.as_object_mut() {
+        for private in ["lease", "pending_keys", "pending_next"] {
+            fields.remove(private);
+        }
+    }
+    cursor
 }

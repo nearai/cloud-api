@@ -24,6 +24,15 @@ pub enum FileServiceError {
     InvalidPurpose(String),
     #[error("Storage error: {0}")]
     StorageError(String),
+    #[error("Object changed before the conditional rewrite")]
+    PreconditionFailed,
+    #[error("Transient storage error: {0}")]
+    TransientStorageError(String),
+    #[error("Object exceeds the configured rewrap byte limit")]
+    ObjectTooLarge {
+        is_current: bool,
+        unknown_key_id: bool,
+    },
     #[error("Repository error: {0}")]
     RepositoryError(#[from] RepositoryError),
     #[error("Invalid encoding for text file. Expected UTF-8, UTF-16, or ASCII")]

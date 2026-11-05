@@ -14,6 +14,8 @@ impl Environment {
             "S3_ENCRYPTION_KEY",
             "S3_ENCRYPTION_KEY_FILE",
             "S3_ENCRYPTION_ALLOW_INLINE_KEYS",
+            "OBJECT_REWRAP_MAX_BYTES",
+            "OBJECT_ENCRYPTION_WRITE_ENABLED",
         ];
         let saved = Self(keys.iter().map(|key| (*key, env::var_os(key))).collect());
         for key in keys {
@@ -140,4 +142,50 @@ fn invalid_ring_configuration_names_the_s3_variable() {
     let error = S3Config::from_env().unwrap_err();
     assert!(error.contains("S3_ENCRYPTION_KEYS entry 0"));
     assert!(!error.contains("private-key-text"));
+}
+
+#[test]
+#[serial]
+fn object_rewrap_limit_rejects_nonpositive_or_malformed_values() {
+    let _env = Environment::new();
+    env::set_var("S3_ENCRYPTION_KEYS", "s3-v1=file:/keys/current");
+    for value in ["0", "-1", "", "1.5", "256MiB", "18446744073709551616"] {
+        env::set_var("OBJECT_REWRAP_MAX_BYTES", value);
+        let error = S3Config::from_env().unwrap_err();
+        assert!(error.contains("OBJECT_REWRAP_MAX_BYTES"));
+    }
+}
+
+#[test]
+#[serial]
+fn object_rewrap_write_gate_rejects_non_boolean_values() {
+    let _env = Environment::new();
+    env::set_var("S3_ENCRYPTION_KEYS", "s3-v1=file:/keys/current");
+    for value in ["", "1", "0", "TRUE", "false ", "disabled"] {
+        env::set_var("OBJECT_ENCRYPTION_WRITE_ENABLED", value);
+        let error = S3Config::from_env().unwrap_err();
+        assert!(error.contains("OBJECT_ENCRYPTION_WRITE_ENABLED"));
+    }
+}
+
+#[test]
+#[serial]
+fn object_rewrap_settings_preserve_defaults_when_unset() {
+    let _env = Environment::new();
+    env::set_var("S3_ENCRYPTION_KEYS", "s3-v1=file:/keys/current");
+    let config = S3Config::from_env().unwrap();
+    assert_eq!(config.object_rewrap_max_bytes, 268_435_456);
+    assert!(config.object_encryption_write_enabled);
+}
+
+#[test]
+#[serial]
+fn object_rewrap_settings_accept_explicit_limit_and_disabled_gate() {
+    let _env = Environment::new();
+    env::set_var("S3_ENCRYPTION_KEYS", "s3-v1=file:/keys/current");
+    env::set_var("OBJECT_REWRAP_MAX_BYTES", "1");
+    env::set_var("OBJECT_ENCRYPTION_WRITE_ENABLED", "false");
+    let config = S3Config::from_env().unwrap();
+    assert_eq!(config.object_rewrap_max_bytes, 1);
+    assert!(!config.object_encryption_write_enabled);
 }

@@ -98,9 +98,9 @@ fn fingerprints_match_the_database_convention() {
     assert_eq!(
         ring().fingerprints(),
         vec![
-            ("s3-v3".into(), "648aa5c579fb30f3".into()),
-            ("s3-v2".into(), "75877bb41d393b5f".into()),
-            ("s3-v1".into(), "72cd6e8422c407fb".into()),
+            ("s3-v3".into(), "ae69db7a3598fba0".into()),
+            ("s3-v2".into(), "40b36e3215210ec5".into()),
+            ("s3-v1".into(), "0cc3447a2cf4268e".into()),
         ]
     );
 }

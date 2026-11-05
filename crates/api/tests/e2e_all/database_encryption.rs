@@ -1,6 +1,8 @@
 use crate::common::*;
 use uuid::Uuid;
 
+mod conflicts;
+
 #[tokio::test]
 async fn execute_job_is_rejected_until_encrypted_writes_are_enabled() {
     let (server, _) = setup_test_server_with_config_and_database(|config| {

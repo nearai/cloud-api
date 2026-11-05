@@ -167,3 +167,51 @@ async fn scan_groups_unconfigured_metadata_into_unknown_without_trusting_it() {
     );
     assert_eq!(storage.download("retired").await.unwrap(), b"legacy");
 }
+
+#[tokio::test]
+async fn scan_continues_at_the_returned_cursor_without_repeating_objects() {
+    // Given two objects and the first bounded scan result.
+    let (server, storage) = fixture();
+    for key in ["a", "b"] {
+        storage.upload(key, vec![], "text/plain").await.unwrap();
+    }
+    let first = server
+        .post("/admin/object-encryption/scan")
+        .json(&json!({"limit":1}))
+        .await
+        .json::<Value>();
+    // When the caller continues with the returned cursor.
+    let response = server
+        .post("/admin/object-encryption/scan")
+        .json(&json!({"limit":1,"cursor":first["cursor"]}))
+        .await;
+    // Then only the second object is inventoried and the scan completes.
+    response.assert_status_ok();
+    let result = response.json::<Value>();
+    assert_eq!(result["cursor"]["last_key"], "b");
+    assert_eq!(result["complete"], true);
+    assert_eq!(result["totals"]["processed"], 1);
+}
+
+#[tokio::test]
+async fn scan_rejects_invalid_object_and_wall_clock_bounds() {
+    // Given an in-process admin route with empty storage.
+    let (server, _) = fixture();
+    for body in [
+        json!({"limit":100001}),
+        json!({"limit":0}),
+        json!({"deadline_seconds":0}),
+        json!({"deadline_seconds":61}),
+    ] {
+        // When the caller requests a bound outside the supported range.
+        let response = server
+            .post("/admin/object-encryption/scan")
+            .json(&body)
+            .await;
+        // Then validation rejects it before storage work.
+        response.assert_status_bad_request();
+    }
+}
+
+#[path = "http_scan_tests.rs"]
+mod scan_tests;

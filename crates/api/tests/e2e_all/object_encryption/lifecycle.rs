@@ -2,7 +2,7 @@ use super::*;
 use axum::http::Method;
 use database::models::AdminAccessTokenPermission;
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn read_only_tokens_scan_but_cannot_mutate_and_job_kinds_are_isolated() {
     let ring = ring();
     let storage = Arc::new(MockStorage::new_with_ring(ring.clone()));
@@ -23,6 +23,8 @@ async fn read_only_tokens_scan_but_cannot_mutate_and_job_kinds_are_isolated() {
         .unwrap();
     let id = Uuid::new_v4();
     let database_id = Uuid::new_v4();
+    server.jobs.track(id);
+    server.jobs.track(database_id);
     let client = database.pool().get().await.unwrap();
     for (job_id, scope, actions) in [
         (
@@ -94,7 +96,7 @@ async fn read_only_tokens_scan_but_cannot_mutate_and_job_kinds_are_isolated() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn recovery_resumes_committed_object_cursor_and_workers_select_their_own_kind() {
     let ring = ring();
     let storage = Arc::new(MockStorage::new_with_ring(ring.clone()));
@@ -108,16 +110,20 @@ async fn recovery_resumes_committed_object_cursor_and_workers_select_their_own_k
             )
             .unwrap();
     }
-    storage.rewrap_object("workspace/a").await.unwrap();
-    let (_, continuation) = storage.list_keys(None, 1).await.unwrap();
+    storage
+        .rewrap_object("workspace/a", 268_435_456)
+        .await
+        .unwrap();
     let (server, database) = server(storage.clone(), ring.clone()).await;
     let actor = Uuid::parse_str(MOCK_USER_ID).unwrap();
     let object_id = Uuid::new_v4();
     let database_id = Uuid::new_v4();
+    server.jobs.track(object_id);
+    server.jobs.track(database_id);
     let client = database.pool().get().await.unwrap();
     client.execute("INSERT INTO database_encryption_jobs(id,mode,status,scope,actions,batch_size,admin_actor,cursor,progress) VALUES($1,'execute','running',$2,'[\"rewrap\"]',1,$3,$4,$5)", &[
         &object_id,&json!({"kind":"objects","options":{}}),&actor,
-        &json!({"continuation":continuation,"last_key":"workspace/a","complete":false}),
+        &json!({"continuation":null,"last_key":"workspace/a","complete":false,"pending_keys":["workspace/b","workspace/c"],"pending_next":null}),
         &json!({"processed":1,"total":1,"rewrapped":1}),
     ]).await.unwrap();
     client.execute("INSERT INTO database_encryption_jobs(id,mode,status,scope,actions,batch_size,admin_actor) VALUES($1,'dry_run','queued',$2,'[\"encrypt\"]',1,$3)", &[
@@ -127,8 +133,9 @@ async fn recovery_resumes_committed_object_cursor_and_workers_select_their_own_k
 
     // The object worker resumes the persisted page, leaving the database job queued.
     ObjectEncryptionState::new(database.pool().clone(), storage.clone(), ring)
-        .with_recovery_interval(Duration::from_millis(20))
-        .recover_jobs();
+        .with_job_scoped_leases()
+        .with_lease_retry_interval(Duration::from_millis(20))
+        .recover_job(object_id);
     let result = wait(&server, &object_id.to_string()).await;
     assert_eq!(result["progress"]["rewrapped"], 3);
     assert_eq!(result["progress"]["processed"], 3);
@@ -143,57 +150,10 @@ async fn recovery_resumes_committed_object_cursor_and_workers_select_their_own_k
         .unwrap()
         .get(0);
     assert_eq!(status, "queued");
-    // Make an object row queued while database recovery completes its own row.
-    let pending_object = Uuid::new_v4();
-    // Hold the object-specific lock before publishing another pending row.
-    client
-        .query_one("SELECT pg_advisory_lock($1)", &[&0x4e4541524f424ai64])
-        .await
-        .unwrap();
-    client.execute("INSERT INTO database_encryption_jobs(id,mode,status,scope,actions,batch_size,admin_actor) VALUES($1,'dry_run','queued',$2,'[\"rewrap\"]',1,$3)", &[
-        &pending_object,&json!({"kind":"objects","options":{}}),&actor,
-    ]).await.unwrap();
-    api::database_encryption::DatabaseEncryptionState::new(database.pool().clone())
-        .unwrap()
-        .with_recovery_interval(Duration::from_millis(20))
-        .recover_jobs();
-    tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            let status: String = client
-                .query_one(
-                    "SELECT status FROM database_encryption_jobs WHERE id=$1",
-                    &[&database_id],
-                )
-                .await
-                .unwrap()
-                .get(0);
-            if status == "completed" {
-                break;
-            }
-            assert_ne!(status, "failed");
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .unwrap();
-    let status: String = client
-        .query_one(
-            "SELECT status FROM database_encryption_jobs WHERE id=$1",
-            &[&pending_object],
-        )
-        .await
-        .unwrap()
-        .get(0);
-    assert_eq!(status, "queued");
-    client
-        .query_one("SELECT pg_advisory_unlock($1)", &[&0x4e4541524f424ai64])
-        .await
-        .unwrap();
-    drop(client);
-    wait(&server, &pending_object.to_string()).await;
+    // Recovery is scoped to this test-owned object job and never scans shared jobs.
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancellation_is_observed_between_batches_without_rewriting_the_remainder() {
     let ring = ring();
     let storage = Arc::new(MockStorage::new_with_ring(ring.clone()));

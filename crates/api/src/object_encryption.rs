@@ -16,6 +16,10 @@ use tokio::sync::Semaphore;
 use uuid::Uuid;
 
 mod endpoints;
+// Exposed for integration tests to exercise the real lease SQL with opaque jobs.
+#[doc(hidden)]
+pub mod lease;
+mod object_processing;
 mod progress;
 mod types;
 mod worker;
@@ -37,6 +41,12 @@ pub struct ObjectEncryptionState {
     recovery_started: Arc<AtomicBool>,
     active_jobs: Arc<Mutex<HashSet<Uuid>>>,
     recovery_interval: Duration,
+    lease_retry_interval: Duration,
+    storage_retry_interval: Duration,
+    storage_timeout: Duration,
+    job_scoped_leases: bool,
+    max_bytes: u64,
+    write_enabled: bool,
 }
 
 impl ObjectEncryptionState {
@@ -49,6 +59,12 @@ impl ObjectEncryptionState {
             recovery_started: Arc::new(AtomicBool::new(false)),
             active_jobs: Arc::new(Mutex::new(HashSet::new())),
             recovery_interval: Duration::from_secs(30),
+            lease_retry_interval: Duration::from_millis(250),
+            storage_retry_interval: Duration::from_millis(25),
+            storage_timeout: Duration::from_secs(30),
+            job_scoped_leases: false,
+            max_bytes: 256 * 1024 * 1024,
+            write_enabled: true,
         }
     }
 
@@ -56,6 +72,35 @@ impl ObjectEncryptionState {
     pub fn with_recovery_interval(mut self, interval: Duration) -> Self {
         self.recovery_interval = interval;
         self
+    }
+
+    pub fn with_job_options(mut self, max_bytes: u64, write_enabled: bool) -> Self {
+        self.max_bytes = max_bytes;
+        self.write_enabled = write_enabled;
+        self
+    }
+
+    #[doc(hidden)]
+    pub fn with_lease_retry_interval(mut self, interval: Duration) -> Self {
+        self.lease_retry_interval = interval;
+        self
+    }
+
+    #[doc(hidden)]
+    pub fn with_storage_retry_interval(mut self, interval: Duration) -> Self {
+        self.storage_retry_interval = interval;
+        self
+    }
+
+    #[doc(hidden)]
+    pub fn with_job_scoped_leases(mut self) -> Self {
+        self.job_scoped_leases = true;
+        self
+    }
+
+    #[doc(hidden)]
+    pub fn recover_job(&self, id: Uuid) {
+        spawn_job(self.clone().with_job_scoped_leases(), id);
     }
 
     pub fn recover_jobs(&self) {
@@ -120,12 +165,6 @@ fn spawn_job(state: ObjectEncryptionState, id: Uuid) {
             Err(_) => Some("object_worker_panicked"),
         };
         if let Some(error_class) = error_class {
-            if let Ok(client) = state.pool.get().await {
-                let _ = client.execute(
-                    "UPDATE database_encryption_jobs SET status='failed',last_error_class=$2,last_error_message=$2,completed_at=NOW() WHERE id=$1 AND scope->>'kind'='objects' AND status IN ('queued','running')",
-                    &[&id, &error_class]
-                ).await;
-            }
             tracing::error!(job_id=%id, error_class, "Object encryption job failed");
         }
         state
@@ -142,3 +181,17 @@ mod http_tests;
 mod job_missing_tests;
 #[cfg(test)]
 mod missing_tests;
+
+#[cfg(test)]
+mod worker_tests;
+
+#[cfg(test)]
+mod worker_control_tests;
+#[cfg(test)]
+mod worker_test_storage;
+
+#[cfg(test)]
+mod lease_tests;
+
+#[cfg(test)]
+mod worker_warning_tests;

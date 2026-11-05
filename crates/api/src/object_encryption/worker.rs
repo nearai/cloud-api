@@ -1,179 +1,236 @@
 use super::{
-    progress::{Cursor, Progress},
-    types::{Mode, ObjectCreateJobRequest, Scope},
+    lease::{self, Claim, Job},
+    types::Mode,
     ObjectEncryptionState,
 };
-use crate::database_encryption::batch_delay;
-use serde_json::{json, Value};
-use services::files::FileServiceError;
 use std::{future::Future, time::Duration};
 use uuid::Uuid;
 
-const OBJECT_WORKER_LOCK_KEY: i64 = 0x4e4541524f424a;
-const STORAGE_TIMEOUT: Duration = Duration::from_secs(30);
+pub(super) use super::object_processing::{process_key, storage_call};
 
-pub(super) async fn storage_call<T>(
-    operation: impl Future<Output = Result<T, FileServiceError>>,
-) -> anyhow::Result<T> {
-    Ok(tokio::time::timeout(STORAGE_TIMEOUT, operation).await??)
+pub(super) trait JobControl: Sync {
+    fn check(&self) -> impl Future<Output = anyhow::Result<bool>> + Send;
+    fn persist(
+        &self,
+        job: &mut Job,
+        status: &str,
+    ) -> impl Future<Output = anyhow::Result<()>> + Send;
 }
 
-enum BatchResult {
-    Stopped,
-    Continue(Option<Duration>),
+struct DatabaseControl<'a> {
+    state: &'a ObjectEncryptionState,
+    id: Uuid,
+    token: Uuid,
+}
+
+impl JobControl for DatabaseControl<'_> {
+    async fn check(&self) -> anyhow::Result<bool> {
+        lease::check(self.state, self.id, self.token).await
+    }
+    async fn persist(&self, job: &mut Job, status: &str) -> anyhow::Result<()> {
+        lease::persist(self.state, job, status).await
+    }
+}
+
+pub(super) async fn retry_busy<F, Fut>(interval: Duration, mut claim: F) -> anyhow::Result<Claim>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = anyhow::Result<Claim>>,
+{
+    for _ in 0..20 {
+        match claim().await? {
+            Claim::Busy => tokio::time::sleep(interval).await,
+            outcome => return Ok(outcome),
+        }
+    }
+    claim().await
 }
 
 pub(super) async fn run_job(state: &ObjectEncryptionState, id: Uuid) -> anyhow::Result<()> {
     let _permit = state.worker_permit.clone().acquire_owned().await?;
+    let Claim::Owned(mut job) =
+        retry_busy(state.lease_retry_interval, || lease::claim(state, id)).await?
+    else {
+        return Ok(());
+    };
+    let token = job
+        .cursor
+        .lease
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("missing object job lease"))?
+        .token;
+    let control = DatabaseControl { state, id, token };
+    let result = run_owned(state, &mut job, &control).await;
+    if result.is_err() {
+        let warn = mark_unknown(&mut job);
+        if lease::fail(state, &job).await? && warn {
+            emit_unknown(&job);
+        }
+    }
+    result
+}
+
+async fn heartbeat<T>(
+    control: &impl JobControl,
+    operation: impl Future<Output = anyhow::Result<T>>,
+) -> anyhow::Result<T> {
+    tokio::pin!(operation);
+    let mut interval = tokio::time::interval(Duration::from_secs(5));
+    interval.tick().await;
     loop {
-        match run_batch(state, id).await? {
-            BatchResult::Stopped => return Ok(()),
-            BatchResult::Continue(delay) => {
-                if batch_delay::wait_between_batches(delay.unwrap_or_default(), || {
-                    batch_delay::cancel_if_requested(&state.pool, id)
-                })
-                .await?
+        // Renew first after suspension; a lost lease drops the storage future
+        // before the old owner can poll it again.
+        tokio::select! {
+            biased;
+            _ = interval.tick() => { control.check().await?; }
+            result = &mut operation => return result,
+        }
+    }
+}
+
+async fn run_owned(
+    state: &ObjectEncryptionState,
+    job: &mut Job,
+    control: &impl JobControl,
+) -> anyhow::Result<()> {
+    loop {
+        if control.check().await? {
+            return finish(control, job, "cancelled").await;
+        }
+        anyhow::ensure!(
+            !matches!(job.request.mode, Mode::Execute) || state.write_enabled,
+            "object rewrap write gate is disabled"
+        );
+        if job.cursor.pending_keys.is_empty() && !finished(job) {
+            let cap = job
+                .request
+                .max_rows
+                .map(|max| (max - job.progress.processed).min(job.request.batch_size))
+                .unwrap_or(job.request.batch_size);
+            let page = heartbeat(
+                control,
+                storage_call(
+                    state
+                        .storage
+                        .list_keys(job.cursor.continuation.clone(), i32::try_from(cap)?),
+                ),
+            )
+            .await;
+            let (keys, next) = match page {
+                Ok(page) => page,
+                Err(error)
+                    if error.is::<services::files::FileServiceError>()
+                        || error.is::<tokio::time::error::Elapsed>() =>
                 {
-                    return Ok(());
+                    tracing::warn!(
+                        error_class = "object_listing_unavailable",
+                        "Object encryption listing will retry during recovery"
+                    );
+                    return control.persist(job, "queued").await;
                 }
+                Err(error) => return Err(error),
+            };
+            anyhow::ensure!(
+                i64::try_from(keys.len())? <= cap,
+                "invalid object page size"
+            );
+            anyhow::ensure!(
+                next.is_none() || next != job.cursor.continuation,
+                "object pagination did not advance"
+            );
+            job.cursor.pending_keys = keys;
+            job.cursor.pending_next = next;
+            if job.cursor.pending_keys.is_empty() {
+                advance_page(job);
             }
         }
-    }
-}
-
-async fn run_batch(state: &ObjectEncryptionState, id: Uuid) -> anyhow::Result<BatchResult> {
-    let mut client = state.pool.get().await?;
-    let transaction = client.transaction().await?;
-    transaction
-        .batch_execute("SET LOCAL statement_timeout = '30s'")
-        .await?;
-    let locked: bool = transaction
-        .query_one(
-            "SELECT pg_try_advisory_xact_lock($1)",
-            &[&OBJECT_WORKER_LOCK_KEY],
-        )
-        .await?
-        .get(0);
-    if !locked {
-        transaction.rollback().await?;
-        return Ok(BatchResult::Stopped);
-    }
-    let row = transaction.query_opt(
-        "SELECT mode,scope,batch_size,max_rows,cursor,progress,actions,cancel_requested_at IS NOT NULL AS cancelled FROM database_encryption_jobs WHERE id=$1 AND scope->>'kind'='objects' AND status IN ('queued','running') FOR UPDATE",
-        &[&id]
-    ).await?;
-    let Some(row) = row else {
-        transaction.rollback().await?;
-        return Ok(BatchResult::Stopped);
-    };
-    let cancelled: bool = row.get("cancelled");
-    if cancelled {
-        transaction.execute("UPDATE database_encryption_jobs SET status='cancelled',completed_at=NOW() WHERE id=$1 AND scope->>'kind'='objects'", &[&id]).await?;
-        transaction.commit().await?;
-        return Ok(BatchResult::Stopped);
-    }
-    let mode: Mode = serde_json::from_value(json!(row.get::<_, String>("mode")))?;
-    let scope: Scope = serde_json::from_value(row.get("scope"))?;
-    let request = ObjectCreateJobRequest {
-        mode,
-        scope,
-        batch_size: row.get("batch_size"),
-        max_rows: row.get("max_rows"),
-        actions: serde_json::from_value(row.get("actions"))?,
-        batch_delay_ms: None,
-    }
-    .validated()
-    .map_err(|_| anyhow::anyhow!("invalid persisted object job"))?;
-    let mut cursor: Cursor = serde_json::from_value(row.get("cursor"))?;
-    let mut progress: Progress = serde_json::from_value(row.get("progress"))?;
-    progress.retain_ring_keys(&state.ring);
-    let remaining = request
-        .max_rows
-        .map(|max| (max - progress.processed).max(0));
-    let cap = remaining
-        .map(|remaining| remaining.min(request.batch_size))
-        .unwrap_or(request.batch_size);
-    if !cursor.complete && cap > 0 {
-        let (keys, next) = storage_call(
-            state
-                .storage
-                .list_keys(cursor.continuation.clone(), i32::try_from(cap)?),
-        )
-        .await?;
-        anyhow::ensure!(
-            i64::try_from(keys.len())? <= cap,
-            "invalid object page size"
-        );
-        anyhow::ensure!(
-            next.is_none() || next != cursor.continuation,
-            "object pagination did not advance"
-        );
-        for key in &keys {
-            process_key(state, request.mode, key, &mut progress).await?;
+        if process_page(state, job, control).await? {
+            return Ok(());
         }
-        cursor.last_key = keys.last().cloned().or(cursor.last_key);
-        cursor.complete = next.is_none();
-        cursor.continuation = next;
+        if finished(job) {
+            job.progress.complete = job.cursor.complete;
+            if matches!(job.request.mode, Mode::Verify) {
+                job.progress.pass = Some(job.progress.verification_passes());
+            }
+            return finish(control, job, "completed").await;
+        }
+        let delay = Duration::from_millis(u64::try_from(
+            job.request.scope.options.batch_delay_ms.unwrap_or_default(),
+        )?);
+        heartbeat(control, async {
+            crate::database_encryption::batch_delay::wait_between_batches(delay, || control.check())
+                .await
+        })
+        .await?;
     }
-    let finished = cursor.complete
-        || request
-            .max_rows
-            .is_some_and(|max| progress.processed >= max);
-    progress.complete = cursor.complete;
-    if finished && matches!(request.mode, Mode::Verify) {
-        progress.pass = Some(cursor.complete && progress.stale == 0 && progress.undecryptable == 0);
-    }
-    let status = if finished { "completed" } else { "running" };
-    let progress: Value = serde_json::to_value(progress)?;
-    let cursor: Value = serde_json::to_value(cursor)?;
-    transaction.execute(
-        "UPDATE database_encryption_jobs SET status=$2,started_at=COALESCE(started_at,NOW()),completed_at=CASE WHEN $2='completed' THEN NOW() ELSE completed_at END,progress=$3,cursor=$4 WHERE id=$1 AND scope->>'kind'='objects'",
-        &[&id, &status, &progress, &cursor]
-    ).await?;
-    transaction.commit().await?;
-    if finished {
-        return Ok(BatchResult::Stopped);
-    }
-    let delay = request
-        .scope
-        .options
-        .batch_delay_ms
-        .map(u64::try_from)
-        .transpose()?
-        .map(Duration::from_millis);
-    Ok(BatchResult::Continue(delay))
 }
 
-pub(super) async fn process_key(
+pub(super) async fn process_page(
     state: &ObjectEncryptionState,
-    mode: Mode,
-    key: &str,
-    progress: &mut Progress,
-) -> anyhow::Result<()> {
-    let result = match mode {
-        Mode::DryRun => storage_call(state.storage.object_key_id(key))
-            .await
-            .map(|key_id| progress.record_key_id(key_id, &state.ring)),
-        Mode::Execute => storage_call(state.storage.rewrap_object(key))
-            .await
-            .map(|outcome| progress.record_rewrap(key, outcome)),
-        Mode::Verify => storage_call(state.storage.verify_object(key))
-            .await
-            .map(|result| progress.record_verification(key, result)),
-    };
-    match result {
-        Ok(()) => {}
-        Err(error)
-            if matches!(
-                error.downcast_ref::<FileServiceError>(),
-                Some(FileServiceError::NotFound)
-            ) =>
-        {
-            progress.record_missing(key);
+    job: &mut Job,
+    control: &impl JobControl,
+) -> anyhow::Result<bool> {
+    while let Some(key) = job.cursor.pending_keys.first().cloned() {
+        if control.check().await? {
+            finish(control, job, "cancelled").await?;
+            return Ok(true);
         }
-        Err(error) => return Err(error),
+        heartbeat(
+            control,
+            process_key(state, job.request.mode, &key, &mut job.progress),
+        )
+        .await?;
+        job.cursor.last_key = Some(key);
+        job.cursor.pending_keys.remove(0);
+        if job.cursor.pending_keys.is_empty() {
+            advance_page(job);
+        }
+        // Each completed object is checkpointed before starting another storage call.
+        control.persist(job, "running").await?;
     }
-    progress.processed += 1;
-    progress.total += 1;
+    Ok(false)
+}
+
+fn finished(job: &Job) -> bool {
+    job.cursor.complete
+        || job
+            .request
+            .max_rows
+            .is_some_and(|max| job.progress.processed >= max)
+}
+
+fn advance_page(job: &mut Job) {
+    job.cursor.continuation = job.cursor.pending_next.take();
+    job.cursor.complete = job.cursor.continuation.is_none();
+}
+
+async fn finish(control: &impl JobControl, job: &mut Job, status: &str) -> anyhow::Result<()> {
+    let warn = mark_unknown(job);
+    if let Err(error) = control.persist(job, status).await {
+        if warn {
+            job.progress.unknown_key_ids_warned = false;
+        }
+        return Err(error);
+    }
+    if warn {
+        emit_unknown(job);
+    }
     Ok(())
+}
+
+fn mark_unknown(job: &mut Job) -> bool {
+    let warn = matches!(job.request.mode, Mode::Execute)
+        && job.progress.unknown_key_ids > 0
+        && !job.progress.unknown_key_ids_warned;
+    if warn {
+        job.progress.unknown_key_ids_warned = true;
+    }
+    warn
+}
+
+fn emit_unknown(job: &Job) {
+    tracing::warn!(
+        unknown_key_ids = job.progress.unknown_key_ids,
+        "Object encryption job encountered unknown metadata key IDs"
+    );
 }

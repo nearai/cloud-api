@@ -84,7 +84,23 @@ impl KeyRing {
         std::iter::once(&self.write)
             .chain(&self.read)
             .map(|(id, key)| {
-                let digest = Sha256::digest(key);
+                // HMAC-SHA256: fixed 32-byte AES keys fit SHA-256's 64-byte block.
+                let mut inner_pad = Zeroizing::new([0x36; 64]);
+                let mut outer_pad = Zeroizing::new([0x5c; 64]);
+                for ((inner, outer), byte) in
+                    inner_pad.iter_mut().zip(outer_pad.iter_mut()).zip(key)
+                {
+                    *inner ^= byte;
+                    *outer ^= byte;
+                }
+                let inner = Sha256::new()
+                    .chain_update(inner_pad.as_slice())
+                    .chain_update(b"near-key-fingerprint/v1")
+                    .finalize();
+                let digest = Sha256::new()
+                    .chain_update(outer_pad.as_slice())
+                    .chain_update(inner)
+                    .finalize();
                 (id.clone(), hex::encode(&digest[..8]))
             })
             .collect()
@@ -388,6 +404,18 @@ mod tests {
                 )
             );
         }
+    }
+
+    #[test]
+    fn key_ring_fingerprints_match_domain_separated_hmac_vectors() {
+        let ring = KeyRing::new("db-v2".into(), [9; 32], vec![("db-v1".into(), [7; 32])]).unwrap();
+        assert_eq!(
+            ring.fingerprints(),
+            vec![
+                ("db-v2".into(), "825674e6c3e8ca73".into()),
+                ("db-v1".into(), "820ed242bff6e2d9".into()),
+            ]
+        );
     }
 
     #[test]

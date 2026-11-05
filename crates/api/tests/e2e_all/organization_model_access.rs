@@ -2474,6 +2474,26 @@ async fn owners_and_admins_manage_allowed_models() {
 
     let member = patch_settings(server, &member_session, &org.id, body.clone()).await;
     assert_eq!(member.status_code(), 403, "{}", member.text());
+    // The same refusal whatever the names: a member learns nothing from
+    // validation either.
+    for names in [
+        json!([]),
+        json!([unknown_twin(&fixture.text)]),
+        json!([fixture.decisions]),
+    ] {
+        let refused = patch_settings(
+            server,
+            &member_session,
+            &org.id,
+            json!({ "allowed_models": names }),
+        )
+        .await;
+        assert_eq!(
+            (refused.status_code(), refused.text()),
+            (member.status_code(), member.text()),
+            "{names}"
+        );
+    }
 
     // A non-member gets the same refusal whatever the names, so it cannot
     // learn which unlisted models the organization holds a grant for.

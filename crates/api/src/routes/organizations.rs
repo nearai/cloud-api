@@ -462,13 +462,29 @@ pub async fn patch_organization_settings(
     let fallback_was_requested = request.fallback_enabled.is_some();
     let allowed_models_were_requested = request.allowed_models.is_some();
     if matches!(request.allowed_models, Some(Some(_))) {
-        // Membership first: validating names reads the organization's grants,
-        // so a non-member must not learn anything from the answer.
+        // Authorize before validating: validating names reads the
+        // organization's grants, so a caller who may not manage the setting
+        // must get the refusal it gets for any names. Membership first (a
+        // non-member gets the answer of every other settings write), then the
+        // owner/admin rule of the service.
         app_state
             .organization_service
             .get_organization_settings(organization_id.clone(), user_id.clone())
             .await
             .map_err(crate::routes::common::map_organization_error)?;
+        let may_manage = app_state
+            .organization_service
+            .get_user_role(organization_id.clone(), user_id.clone())
+            .await
+            .map_err(crate::routes::common::map_organization_error)?
+            .is_some_and(|role| role.can_manage_organization());
+        if !may_manage {
+            return Err(crate::routes::common::map_organization_error(
+                services::organization::OrganizationError::Unauthorized(
+                    "Insufficient permissions to manage organization settings".to_string(),
+                ),
+            ));
+        }
     }
     let allowed_models = match request.allowed_models {
         Some(Some(names)) => Some(Some(

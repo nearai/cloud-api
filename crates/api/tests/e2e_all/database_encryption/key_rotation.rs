@@ -4,6 +4,7 @@ use database::field_encryption::{encrypt_json_with_key_id, encrypt_with_key_id, 
 use serde_json::{json, Value};
 use services::responses::models::{ResponseId, ResponseItemId};
 use services::responses::ports::{ResponseItemRepositoryTrait, ResponseRepositoryTrait};
+use std::cell::{Cell, RefCell};
 
 const DB_V1_KEY: [u8; 32] = [7; 32];
 const DB_V2_KEY: [u8; 32] = [9; 32];
@@ -33,12 +34,8 @@ fn ring_config(config: &mut config::ApiConfig) {
     ]);
 }
 
-async fn job(
-    server: &axum_test::TestServer,
-    mode: &str,
-    action: &str,
-    delay: Option<i64>,
-) -> Value {
+async fn job(cleanup: &RotationCleanup<'_>, mode: &str, action: &str, delay: Option<i64>) -> Value {
+    let server = cleanup.server;
     let path = if action == "verify" {
         "/v1/admin/database-encryption/verify"
     } else {
@@ -55,16 +52,170 @@ async fn job(
         .await;
     assert_eq!(response.status_code(), 202);
     let response = response.json::<Value>();
-    wait_for_database_encryption_job(server, response["job_id"].as_str().unwrap()).await
+    let id = response["job_id"].as_str().unwrap();
+    cleanup.jobs.borrow_mut().push(id.parse().unwrap());
+    wait_for_database_encryption_job(server, id).await
 }
 
-#[tokio::test]
+struct RotationCleanup<'a> {
+    server: &'a axum_test::TestServer,
+    pool: database::pool::DbPool,
+    jobs: RefCell<Vec<Uuid>>,
+    completed: &'a Cell<bool>,
+    temporary_files: [Uuid; 2],
+}
+
+fn default_ring(retain_rotation_keys: bool) -> KeyRing {
+    let config = test_config();
+    KeyRing::new(
+        config.database_encryption_key_id,
+        database::field_encryption::parse_key(&config.database_encryption_key).unwrap(),
+        if retain_rotation_keys {
+            vec![("db-v1".into(), DB_V1_KEY), ("db-v2".into(), DB_V2_KEY)]
+        } else {
+            vec![]
+        },
+    )
+    .unwrap()
+}
+
+impl Drop for RotationCleanup<'_> {
+    fn drop(&mut self) {
+        // Restore the default writer synchronously even if cleanup later fails.
+        // Retain every source until the field-scoped cleanup has rewrapped them.
+        self.pool.set_encryption_ring(default_ring(true));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            // This test uses a multithread runtime so PostgreSQL and job workers
+            // continue while Drop waits, including during assertion unwinding.
+            tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(async {
+                    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                        let ids = self.jobs.borrow().clone();
+                        let client = self.pool.get().await.unwrap();
+                        client.execute(
+                            "UPDATE database_encryption_jobs SET cancel_requested_at=NOW(),status=CASE WHEN status='queued' THEN 'cancelled' ELSE status END WHERE id=ANY($1) AND status IN('queued','running')",
+                            &[&ids],
+                        ).await.unwrap();
+                        loop {
+                            let active: bool = client.query_one(
+                                "SELECT EXISTS(SELECT 1 FROM database_encryption_jobs WHERE id=ANY($1) AND status IN('queued','running'))",
+                                &[&ids],
+                            ).await.unwrap().get(0);
+                            if !active { break; }
+                            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                        }
+                        client.execute("DELETE FROM files WHERE id=ANY($1)", &[&&self.temporary_files[..]]).await.unwrap();
+                        drop(client);
+                        // Jobs can only scope fields, so restore all affected
+                        // rows, including shared fixtures touched by rewrap.
+                        job(self, "execute", "rewrap", None).await;
+                        let verify = job(self, "verify", "verify", None).await;
+                        assert_eq!(verify["progress"]["stale"], 0);
+                    }).await.expect("rotation cleanup timeout");
+                });
+            });
+        }));
+        match result {
+            Ok(()) => {
+                // Only remove source keys after every affected row is restored.
+                self.pool.set_encryption_ring(default_ring(false));
+                self.completed.set(true);
+            }
+            Err(error) if !std::thread::panicking() => std::panic::resume_unwind(error),
+            Err(_) => eprintln!(
+                "rotation cleanup failed while unwinding; default writer restored, read keys retained"
+            ),
+        }
+    }
+}
+
+async fn seeded_envelopes(
+    pool: &database::pool::DbPool,
+    file_ids: &[Uuid],
+    response_and_item: (Uuid, Uuid),
+) -> Vec<Value> {
+    let client = pool.get().await.unwrap();
+    let mut values: Vec<Value> = client
+        .query(
+            "SELECT filename FROM files WHERE id=ANY($1) ORDER BY id",
+            &[&file_ids],
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|row| serde_json::from_str(&row.get::<_, String>(0)).unwrap())
+        .collect();
+    for (query, id) in [
+        (
+            "SELECT metadata FROM responses WHERE id=$1",
+            response_and_item.0,
+        ),
+        (
+            "SELECT item FROM response_items WHERE id=$1",
+            response_and_item.1,
+        ),
+    ] {
+        values.push(client.query_one(query, &[&id]).await.unwrap().get(0));
+    }
+    assert_eq!(values.len(), file_ids.len() + 2);
+    values
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cleanup_restores_default_writer_and_read_keys_when_database_is_unavailable_during_unwind()
+{
+    let server = axum_test::TestServer::new(axum::Router::new());
+    let pool = database::pool::DbPool::uninitialized();
+    pool.set_encryption_ring(KeyRing::new("db-v2".into(), DB_V2_KEY, vec![]).unwrap());
+    let completed = Cell::new(false);
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _cleanup = RotationCleanup {
+            server: &server,
+            pool: pool.clone(),
+            jobs: RefCell::new(vec![]),
+            completed: &completed,
+            temporary_files: [Uuid::new_v4(), Uuid::new_v4()],
+        };
+        panic!("exercise cleanup without a database");
+    }));
+    assert!(panic.is_err());
+    assert!(!completed.get());
+    assert_eq!(
+        pool.encryption_ring().unwrap().read_ids(),
+        default_ring(true).read_ids()
+    );
+    let ring = pool.encryption_ring().unwrap();
+    assert_eq!(ring.write_id(), test_config().database_encryption_key_id);
+    for (key_id, key) in [("db-v1", DB_V1_KEY), ("db-v2", DB_V2_KEY)] {
+        let id = Uuid::new_v4();
+        let value = serde_json::from_str(
+            &encrypt_with_key_id(&key, key_id, "files", "filename", id, "retained.txt").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            database::field_encryption::decrypt_with_ring(&value, &ring, "files", "filename", id)
+                .unwrap(),
+            "retained.txt"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn key_rotation_rewraps_previous_envelopes_before_key_removal() {
     let (server, database) = setup_test_server_with_config_and_database(ring_config).await;
-    // Bring pre-existing fixtures to the write key before measuring this test's rows.
-    job(&server, "execute", "encrypt", None).await;
-    let initial = job(&server, "execute", "rewrap", None).await;
-    assert_eq!(initial["progress"]["invalid_envelopes"], 0);
+    let cleanup_completed = Cell::new(false);
+    let unknown_id = Uuid::new_v4();
+    let plaintext_id = Uuid::new_v4();
+    let cleanup = RotationCleanup {
+        server: &server,
+        pool: database.pool().clone(),
+        jobs: RefCell::new(vec![]),
+        completed: &cleanup_completed,
+        temporary_files: [unknown_id, plaintext_id],
+    };
+    // Seed unrelated encrypted fields with the ordinary key; jobs below only
+    // rotate the three explicit fields in scope().
+    database.pool().set_encryption_ring(default_ring(true));
     let organization = create_org(&server).await;
     let _ = get_api_key_for_org(&server, organization.id.clone()).await;
     let organization_id = Uuid::parse_str(&organization.id).unwrap();
@@ -88,6 +239,23 @@ async fn key_rotation_rewraps_previous_envelopes_before_key_removal() {
     let response_id: Uuid = root.get(0);
     let root_flag_before: bool = root.get(1);
     assert!(root_flag_before);
+    let config = test_config();
+    database.pool().set_encryption_ring(
+        KeyRing::new(
+            "db-v2".into(),
+            DB_V2_KEY,
+            vec![
+                ("db-v1".into(), DB_V1_KEY),
+                (
+                    config.database_encryption_key_id,
+                    database::field_encryption::parse_key(&config.database_encryption_key).unwrap(),
+                ),
+            ],
+        )
+        .unwrap(),
+    );
+    drop(client);
+    let client = database.pool().get().await.unwrap();
     let metadata = json!({"root_response":true});
     let previous_metadata = encrypt_json_with_key_id(
         &DB_V1_KEY,
@@ -170,55 +338,24 @@ async fn key_rotation_rewraps_previous_envelopes_before_key_removal() {
     assert_eq!(keys["fingerprints"]["db-v1"].as_str().unwrap().len(), 16);
     assert!(!keys.to_string().contains(&hex::encode(DB_V1_KEY)));
 
-    let scan = server
-        .post("/v1/admin/database-encryption/scan")
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
-        .add_header("User-Agent", MOCK_USER_AGENT)
-        .json(&json!({"scope":scope()}))
-        .await;
-    assert_eq!(scan.status_code(), 200);
-    let scan = scan.json::<Value>();
-    assert_eq!(scan["totals"]["stale"], 4);
-    assert_eq!(scan["totals"]["by_key_id"]["db-v1"], 4);
-    let verify = job(&server, "verify", "verify", Some(0)).await;
-    assert_eq!(verify["progress"]["pass"], false);
-    assert_eq!(verify["progress"]["stale"], 4);
+    let before = seeded_envelopes(database.pool(), &ids, (response_id, item_id.0)).await;
     assert_eq!(
-        verify["progress"]["by_key_id"]["fields"]["files.filename"]["db-v1"],
-        2
+        before
+            .iter()
+            .filter(|value| value["key_id"] == "db-v1")
+            .count(),
+        4
     );
-    for field in ["responses.metadata", "response_items.item"] {
-        assert_eq!(verify["progress"]["by_key_id"]["fields"][field]["db-v1"], 1);
-    }
-
-    let client = database.pool().get().await.unwrap();
-    let before: Vec<(Uuid, String)> = client
-        .query("SELECT id,filename FROM files ORDER BY id", &[])
-        .await
-        .unwrap()
-        .iter()
-        .map(|row| (row.get(0), row.get(1)))
-        .collect();
-    drop(client);
-    let dry_run = job(&server, "dry_run", "rewrap", None).await;
-    assert_eq!(dry_run["progress"]["stale"], 4);
+    let dry_run = job(&cleanup, "dry_run", "rewrap", None).await;
     assert_eq!(dry_run["progress"]["rewrapped"], 0);
-    assert!(dry_run["progress"]["already_current"].as_i64().unwrap() >= 1);
-    let client = database.pool().get().await.unwrap();
-    let after: Vec<(Uuid, String)> = client
-        .query("SELECT id,filename FROM files ORDER BY id", &[])
-        .await
-        .unwrap()
-        .iter()
-        .map(|row| (row.get(0), row.get(1)))
-        .collect();
+    let after = seeded_envelopes(database.pool(), &ids, (response_id, item_id.0)).await;
     assert_eq!(before, after);
-    drop(client);
 
     let started = std::time::Instant::now();
-    let execute = job(&server, "execute", "rewrap", Some(25)).await;
+    let execute = job(&cleanup, "execute", "rewrap", Some(25)).await;
     assert_eq!(execute["scope"]["options"]["batch_delay_ms"], 25);
-    assert_eq!(execute["progress"]["rewrapped"], 4);
+    let after = seeded_envelopes(database.pool(), &ids, (response_id, item_id.0)).await;
+    assert!(after.iter().all(|value| value["key_id"] == "db-v2"));
     let batches = execute["progress"]["processed"]
         .as_u64()
         .unwrap()
@@ -238,7 +375,7 @@ async fn key_rotation_rewraps_previous_envelopes_before_key_removal() {
         serde_json::to_value(
             database
                 .response_items
-                .get_by_id(item_id, conversation.workspace_id.clone())
+                .get_by_id(item_id.clone(), conversation.workspace_id.clone())
                 .await
                 .unwrap()
                 .unwrap()
@@ -257,31 +394,22 @@ async fn key_rotation_rewraps_previous_envelopes_before_key_removal() {
         .get(0);
     assert_eq!(root_flag_after, root_flag_before);
     drop(client);
-    let repeat = job(&server, "execute", "rewrap", None).await;
-    assert_eq!(repeat["progress"]["rewrapped"], 0);
-    let verify = job(&server, "verify", "verify", None).await;
-    assert_eq!(verify["progress"]["pass"], true);
+    job(&cleanup, "execute", "rewrap", None).await;
+    assert_eq!(
+        after,
+        seeded_envelopes(database.pool(), &ids, (response_id, item_id.0)).await
+    );
+    let verify = job(&cleanup, "verify", "verify", None).await;
+    // The API cannot scope by row ID. Shared plaintext/invalid rows may keep
+    // pass=false; only absence of stale envelopes is a field-wide invariant.
     assert_eq!(verify["progress"]["stale"], 0);
-    let by_key_id = verify["progress"]["by_key_id"]["totals"]
-        .as_object()
-        .unwrap();
-    assert_eq!(by_key_id.len(), 1);
-    assert!(by_key_id.contains_key("db-v2"));
-
-    drop(repository);
-    drop(server);
-    let (server, database) = setup_test_server_with_config_and_database(|config| {
-        config.database_encryption_keys = Some(vec![KeySourceSpec {
-            key_id: "db-v2".into(),
-            source: KeySource::Hex(hex::encode(DB_V2_KEY)),
-        }]);
-    })
-    .await;
+    database
+        .pool()
+        .set_encryption_ring(KeyRing::new("db-v2".into(), DB_V2_KEY, vec![]).unwrap());
     assert_eq!(
         database.pool().encryption_ring().unwrap().read_ids(),
         vec!["db-v2"]
     );
-    let repository = database::repositories::file::FileRepository::new(database.pool().clone());
     for id in ids {
         assert_eq!(
             repository.get_by_id(id).await.unwrap().unwrap().filename,
@@ -289,11 +417,10 @@ async fn key_rotation_rewraps_previous_envelopes_before_key_removal() {
         );
     }
     assert_eq!(
-        job(&server, "verify", "verify", None).await["progress"]["pass"],
-        true
+        job(&cleanup, "verify", "verify", None).await["progress"]["stale"],
+        0
     );
 
-    let unknown_id = Uuid::new_v4();
     let unknown = encrypt_with_key_id(
         &[8; 32],
         "db-v3",
@@ -303,7 +430,6 @@ async fn key_rotation_rewraps_previous_envelopes_before_key_removal() {
         "unknown.txt",
     )
     .unwrap();
-    let plaintext_id = Uuid::new_v4();
     let client = database.pool().get().await.unwrap();
     for (id, filename) in [
         (unknown_id, unknown.clone()),
@@ -312,10 +438,8 @@ async fn key_rotation_rewraps_previous_envelopes_before_key_removal() {
         client.execute("INSERT INTO files(id,filename,bytes,content_type,purpose,storage_key,workspace_id,uploaded_by_api_key_id) VALUES($1,$2,1,'text/plain','assistants','rotation/key',$3,$4)", &[&id,&filename,&workspace,&api_key]).await.unwrap();
     }
     drop(client);
-    let invalid = job(&server, "execute", "rewrap", None).await;
+    let invalid = job(&cleanup, "execute", "rewrap", None).await;
     assert_eq!(invalid["status"], "completed");
-    assert_eq!(invalid["progress"]["invalid_envelopes"], 1);
-    assert_eq!(invalid["progress"]["plaintext"], 1);
     assert!(invalid["progress"]["by_key_id"]["totals"]
         .get("db-v3")
         .is_none());
@@ -336,26 +460,27 @@ async fn key_rotation_rewraps_previous_envelopes_before_key_removal() {
             .get::<_, String>(0),
         "plain.txt"
     );
-    client
-        .execute(
-            "DELETE FROM files WHERE id=ANY($1)",
-            &[&vec![ids[0], ids[1], ids[2], unknown_id, plaintext_id]],
-        )
-        .await
-        .unwrap();
-    // Restore ordinary shared-test ring semantics after the reduced-ring check.
-    database.pool().set_encryption_ring(
-        KeyRing::new(
-            "e2e-db-v1".into(),
-            database::field_encryption::parse_key(&test_config().database_encryption_key).unwrap(),
-            vec![("db-v2".into(), DB_V2_KEY)],
-        )
-        .unwrap(),
-    );
     drop(client);
-    let cleanup_rewrap = job(&server, "execute", "rewrap", None).await;
-    assert_eq!(cleanup_rewrap["progress"]["invalid_envelopes"], 0);
-    let cleanup = job(&server, "verify", "verify", None).await;
-    assert_eq!(cleanup["progress"]["invalid_envelopes"], 0);
-    assert_eq!(cleanup["progress"]["stale"], 0);
+    // Exercise the same Drop path used by a failed assertion, and prove it
+    // completed rather than merely swallowing a second panic while unwinding.
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _cleanup = cleanup;
+        panic!("exercise rotation cleanup during unwinding");
+    }));
+    assert!(panic.is_err());
+    assert!(cleanup_completed.get());
+    assert_eq!(
+        database.pool().encryption_ring().unwrap().read_ids(),
+        vec![test_config().database_encryption_key_id.as_str()]
+    );
+    let restored = seeded_envelopes(database.pool(), &ids, (response_id, item_id.0)).await;
+    assert!(restored
+        .iter()
+        .all(|value| value["key_id"] == test_config().database_encryption_key_id));
+    for id in ids {
+        assert_eq!(
+            repository.get_by_id(id).await.unwrap().unwrap().filename,
+            "rotation.txt"
+        );
+    }
 }

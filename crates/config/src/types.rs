@@ -127,7 +127,18 @@ impl ApiConfig {
     pub fn from_env() -> Result<Self, String> {
         let auth = AuthConfig::from_env()?;
         let database_encryption_keys = non_empty_env("DB_ENCRYPTION_KEYS")
-            .map(|raw| parse_key_source_specs(&raw))
+            .map(|raw| {
+                let specs = parse_key_source_specs(&raw)?;
+                if env::var("DB_ENCRYPTION_ALLOW_INLINE_KEYS").as_deref() != Ok("true") {
+                    if let Some(index) = specs
+                        .iter()
+                        .position(|spec| matches!(spec.source, KeySource::Hex(_)))
+                    {
+                        return Err(format!("DB_ENCRYPTION_KEYS entry {index}: hex sources require DB_ENCRYPTION_ALLOW_INLINE_KEYS=true (local development and tests only)"));
+                    }
+                }
+                Ok(specs)
+            })
             .transpose()?;
         let (database_encryption_key, database_encryption_key_id) = if let Some(specs) =
             &database_encryption_keys

@@ -89,3 +89,39 @@ fn legacy_mode_preserves_key_and_default_id() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+#[test]
+fn inline_ring_keys_require_explicit_opt_in_without_exposing_values() {
+    let key = "ab".repeat(32);
+    let raw = format!("db-v2=dstack:/keys/v2,db-v1=hex:{key}");
+    for opt_in in [None, Some("false"), Some("TRUE"), Some("1")] {
+        let mut extra = vec![("DB_ENCRYPTION_KEYS", raw.as_str())];
+        if let Some(value) = opt_in {
+            extra.push(("DB_ENCRYPTION_ALLOW_INLINE_KEYS", value));
+        }
+        let output = load_config(&extra);
+        assert!(!output.status.success(), "inline keys must require true");
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(stderr.contains("DB_ENCRYPTION_KEYS entry 1"), "{stderr}");
+        assert!(
+            stderr.contains("DB_ENCRYPTION_ALLOW_INLINE_KEYS"),
+            "{stderr}"
+        );
+        assert!(!stderr.contains(&key));
+        assert!(!stderr.contains(&raw));
+    }
+}
+
+#[test]
+fn inline_ring_keys_load_with_explicit_opt_in() {
+    let raw = format!("db-v2=hex:{}", "cd".repeat(32));
+    let output = load_config(&[
+        ("DB_ENCRYPTION_KEYS", &raw),
+        ("DB_ENCRYPTION_ALLOW_INLINE_KEYS", "true"),
+    ]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

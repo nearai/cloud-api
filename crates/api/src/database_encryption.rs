@@ -11,6 +11,7 @@ use std::sync::{
 use tokio::sync::Semaphore;
 use uuid::Uuid;
 
+mod batch_delay;
 mod key_rotation;
 use key_rotation::{
     classify, job_action, rewrap_envelope, validate_delay, Action, Classification, KeyCounts,
@@ -716,17 +717,25 @@ fn decrypt_ring_envelope(
     database::field_encryption::decrypt_with_ring(value, ring, field.table, field.column, id)
 }
 
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct KeysResponse {
+    write_key_id: String,
+    read_key_ids: Vec<String>,
+    fingerprints: std::collections::BTreeMap<String, String>,
+    write_enabled: bool,
+}
+
 #[utoipa::path(
     get,
     path = "/v1/admin/database-encryption/keys",
     tag = "Admin",
-    responses((status = 200, description = "Configured write/read key IDs, 16-character SHA-256 fingerprints, and write status", body = Value)),
+    responses((status = 200, description = "Configured write/read key IDs, 16-character SHA-256 fingerprints, and write status", body = KeysResponse)),
     security(("admin_token" = []))
 )]
 pub async fn get_keys(
     Extension(state): Extension<DatabaseEncryptionState>,
     Extension(_admin): Extension<AdminUser>,
-) -> ApiResult<Value> {
+) -> ApiResult<KeysResponse> {
     let ring = state
         .pool
         .encryption_ring()
@@ -735,12 +744,12 @@ pub async fn get_keys(
         .fingerprints()
         .into_iter()
         .collect::<std::collections::BTreeMap<_, _>>();
-    Ok(Json(json!({
-        "write_key_id": ring.write_id(),
-        "read_key_ids": ring.read_ids(),
-        "fingerprints": fingerprints,
-        "write_enabled": state.pool.encryption_write_enabled(),
-    })))
+    Ok(Json(KeysResponse {
+        write_key_id: ring.write_id().to_owned(),
+        read_key_ids: ring.read_ids().into_iter().map(str::to_owned).collect(),
+        fingerprints,
+        write_enabled: state.pool.encryption_write_enabled(),
+    }))
 }
 
 #[utoipa::path(
@@ -879,6 +888,8 @@ fn classify_job_error(error: &anyhow::Error) -> &'static str {
 
 const GLOBAL_WORKER_LOCK_KEY: i64 = 0x4e454152444245;
 
+/// Hold the per-process worker permit for the entire job (one job at a time),
+/// while returning batch connections and advisory locks before any delay.
 async fn run_job(state: &DatabaseEncryptionState, id: Uuid) -> anyhow::Result<()> {
     let _worker_permit = state
         .worker_permit
@@ -886,15 +897,7 @@ async fn run_job(state: &DatabaseEncryptionState, id: Uuid) -> anyhow::Result<()
         .acquire_owned()
         .await
         .map_err(|_| anyhow::anyhow!("database encryption worker stopped"))?;
-    let mut client = state.pool.get().await?;
-    run_locked_job(state, id, &mut client).await
-}
-
-async fn run_locked_job(
-    state: &DatabaseEncryptionState,
-    id: Uuid,
-    client: &mut tokio_postgres::Client,
-) -> anyhow::Result<()> {
+    let client = state.pool.get().await?;
     let ring = state
         .pool
         .encryption_ring()
@@ -941,6 +944,7 @@ async fn run_locked_job(
         Some(value) => serde_json::from_value(value.clone())?,
         None => KeyCounts::default(),
     };
+    by_key_id.retain_ring_keys(&ring);
     let mut invalid_envelope_rows = progress["invalid_envelope_rows"]
         .as_array()
         .cloned()
@@ -950,7 +954,9 @@ async fn run_locked_job(
         .cloned()
         .unwrap_or_default();
 
+    drop(client);
     while field_index < fields.len() && max.is_none_or(|limit| processed < limit) {
+        let mut client = state.pool.get().await?;
         let field = fields[field_index];
         let cap = max
             .map(|limit| (limit - processed).min(batch))
@@ -1142,13 +1148,22 @@ async fn run_locked_job(
             )
             .await?;
         transaction.commit().await?;
-        if let Some(delay) = scope.options.batch_delay_ms {
-            tokio::time::sleep(std::time::Duration::from_millis(u64::try_from(delay)?)).await;
+        drop(client);
+        let delay = std::time::Duration::from_millis(u64::try_from(
+            scope.options.batch_delay_ms.unwrap_or(0),
+        )?);
+        if batch_delay::wait_between_batches(delay, || {
+            batch_delay::cancel_if_requested(&state.pool, id)
+        })
+        .await?
+        {
+            return Ok(());
         }
     }
 
+    let client = state.pool.get().await?;
     if mode == "verify" {
-        let (approved, excluded, unclassified) = classify_schema(client).await?;
+        let (approved, excluded, unclassified) = classify_schema(&client).await?;
         let pass =
             plaintext == 0 && invalid_envelopes == 0 && stale == 0 && unclassified.is_empty();
         client

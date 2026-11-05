@@ -42,9 +42,17 @@ impl KeyRing {
             read: previous,
         };
         let mut ids = std::collections::HashSet::new();
-        for id in std::iter::once(&ring.write.0).chain(ring.read.iter().map(|(id, _)| id)) {
+        let mut keys = std::collections::HashMap::new();
+        for (id, key) in std::iter::once(&ring.write).chain(&ring.read) {
             validate_key_id(id)?;
             ensure!(ids.insert(id), "duplicate database encryption key id");
+            if let Some(previous_id) = keys.insert(key, id) {
+                anyhow::bail!(
+                    "database encryption key ids '{}' and '{}' resolve to identical keys",
+                    previous_id,
+                    id
+                );
+            }
         }
         Ok(ring)
     }
@@ -59,6 +67,12 @@ impl KeyRing {
         std::iter::once(self.write_id())
             .chain(self.read.iter().map(|(id, _)| id.as_str()))
             .collect()
+    }
+    pub fn canonical_id(&self, key_id: &str) -> Option<&str> {
+        std::iter::once(&self.write)
+            .chain(&self.read)
+            .find(|(id, _)| id == key_id)
+            .map(|(id, _)| id.as_str())
     }
     pub fn lookup(&self, key_id: &str) -> Option<&[u8; 32]> {
         std::iter::once(&self.write)
@@ -350,6 +364,30 @@ mod tests {
         .is_err());
         assert!(KeyRing::new("bad id".into(), [7; 32], vec![]).is_err());
         assert!(KeyRing::new("db-v2".into(), [7; 32], vec![("".into(), [8; 32])]).is_err());
+    }
+
+    #[test]
+    fn key_ring_rejects_identical_bytes_under_distinct_ids() {
+        for previous in [
+            vec![("db-v1".into(), [7; 32])],
+            vec![("db-v1".into(), [8; 32]), ("db-v0".into(), [8; 32])],
+        ] {
+            let error = KeyRing::new("db-v2".into(), [7; 32], previous.clone())
+                .expect_err("identical key bytes must not have multiple ids")
+                .to_string();
+            let ids = if previous.len() == 1 {
+                ["db-v2", "db-v1"]
+            } else {
+                ["db-v1", "db-v0"]
+            };
+            assert_eq!(
+                error,
+                format!(
+                    "database encryption key ids '{}' and '{}' resolve to identical keys",
+                    ids[0], ids[1]
+                )
+            );
+        }
     }
 
     #[test]

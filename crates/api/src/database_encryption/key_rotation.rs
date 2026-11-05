@@ -14,10 +14,10 @@ pub(super) enum Classification {
 }
 
 impl Classification {
-    pub(super) fn key_id<'a>(&'a self, ring: &'a KeyRing) -> Option<&'a str> {
+    pub(super) fn key_id<'a>(&self, ring: &'a KeyRing) -> Option<&'a str> {
         match self {
             Self::Current => Some(ring.write_id()),
-            Self::Stale(key_id) => Some(key_id),
+            Self::Stale(key_id) => ring.canonical_id(key_id),
             Self::Invalid | Self::Plaintext => None,
         }
     }
@@ -32,7 +32,7 @@ pub(super) fn classify(ring: &KeyRing, field: &Field, id: Uuid, value: &Value) -
     {
         return Classification::Invalid;
     }
-    match database::field_encryption::envelope_key_id(value) {
+    match database::field_encryption::envelope_key_id(value).and_then(|id| ring.canonical_id(id)) {
         Some(key_id) if key_id == ring.write_id() => Classification::Current,
         Some(key_id) => Classification::Stale(key_id.to_string()),
         None => Classification::Invalid,
@@ -85,6 +85,26 @@ pub(super) struct KeyCounts {
 }
 
 impl KeyCounts {
+    pub fn retain_ring_keys(&mut self, ring: &KeyRing) {
+        let canonicalize = |counts: &mut BTreeMap<String, i64>| {
+            *counts = std::mem::take(counts)
+                .into_iter()
+                .filter_map(|(id, count)| ring.canonical_id(&id).map(|id| (id.to_owned(), count)))
+                .collect();
+        };
+        canonicalize(&mut self.totals);
+        self.fields.retain(|name, counts| {
+            if !super::FIELDS
+                .iter()
+                .any(|field| *name == format!("{}.{}", field.table, field.column))
+            {
+                return false;
+            }
+            canonicalize(counts);
+            !counts.is_empty()
+        });
+    }
+
     pub fn record(&mut self, field: &Field, key_id: Option<&str>) {
         if let Some(key_id) = key_id {
             *self.totals.entry(key_id.to_string()).or_default() += 1;
@@ -209,6 +229,55 @@ mod tests {
 
         assert!(counts.totals.is_empty());
         assert!(counts.fields.is_empty());
+    }
+
+    #[test]
+    fn arbitrary_invalid_marker_key_id_is_not_counted() {
+        let ring = KeyRing::new("db-v2".into(), [9; 32], vec![]).unwrap();
+        let field = &FIELDS[0];
+        let value = json!({MARKER:true, "version":1, "alg":"AES-256-GCM",
+            "key_id": "invalid key/".repeat(10_000), "nonce":"", "ciphertext":""});
+        let classification = super::classify(&ring, field, Uuid::new_v4(), &value);
+        assert_eq!(classification, Classification::Invalid);
+        let mut counts = KeyCounts::default();
+        counts.record(field, classification.key_id(&ring));
+        assert!(counts.totals.is_empty());
+        assert!(counts.fields.is_empty());
+    }
+
+    #[test]
+    fn stale_attribution_uses_canonical_ring_ids() {
+        let ring = KeyRing::new("db-v2".into(), [9; 32], vec![("db-v1".into(), [7; 32])]).unwrap();
+        let stale = Classification::Stale("db-v1".into());
+        let id = stale.key_id(&ring).unwrap();
+        let canonical = ring.read_ids()[1];
+        assert!(std::ptr::eq(id, canonical));
+        assert_eq!(Classification::Stale("unknown".into()).key_id(&ring), None);
+    }
+
+    #[test]
+    fn restored_key_counts_only_retain_ring_ids_and_allowed_fields() {
+        let ring = KeyRing::new("db-v2".into(), [9; 32], vec![("db-v1".into(), [7; 32])]).unwrap();
+        let field = format!("{}.{}", FIELDS[0].table, FIELDS[0].column);
+        let invalid_id = "invalid key/".repeat(10_000);
+        let mut counts: KeyCounts = serde_json::from_value(json!({
+            "totals": {"db-v1":2, "db-v2":1, (invalid_id.clone()):9},
+            "fields": {(field.clone()): {"db-v1":2, "db-v2":1, (invalid_id):9},
+                "unknown.field": {"db-v2":7}}
+        }))
+        .unwrap();
+
+        counts.retain_ring_keys(&ring);
+
+        assert_eq!(counts.totals.len(), 2);
+        assert_eq!(counts.fields.len(), 1);
+        assert_eq!(
+            serde_json::to_value(counts).unwrap(),
+            json!({
+                "totals":{"db-v1":2,"db-v2":1},
+                "fields":{(field):{"db-v1":2,"db-v2":1}}
+            })
+        );
     }
 
     #[tokio::test]

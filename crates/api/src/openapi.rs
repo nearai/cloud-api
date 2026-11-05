@@ -642,34 +642,65 @@ mod admin_token_permission_tests {
     use serde_json::{json, Value};
 
     #[test]
-    fn database_encryption_schema_describes_rotation_and_permissions() {
+    fn database_encryption_schema_exposes_rotation_requests_and_keys() {
         let doc = serde_json::to_value(ApiDoc::openapi()).unwrap();
-        for (path, method, phrase) in [
-            (
-                "/v1/admin/database-encryption/keys",
-                "get",
-                "read_only token",
-            ),
-            (
-                "/v1/admin/database-encryption/jobs",
-                "post",
-                "insufficient_permissions",
-            ),
-            (
-                "/v1/admin/database-encryption/verify",
-                "post",
-                "insufficient_permissions",
-            ),
+        let schemas = &doc["components"]["schemas"];
+        for (path, schema) in [
+            ("/v1/admin/database-encryption/jobs", "CreateJobRequest"),
+            ("/v1/admin/database-encryption/verify", "VerifyRequest"),
         ] {
-            assert!(doc["paths"][path][method]["description"]
-                .as_str()
+            assert_eq!(
+                doc["paths"][path]["post"]["requestBody"]["content"]["application/json"]["schema"]
+                    ["$ref"],
+                format!("#/components/schemas/{schema}")
+            );
+            assert_eq!(
+                schemas[schema]["properties"]["scope"]["$ref"],
+                "#/components/schemas/Scope"
+            );
+            assert!(doc["paths"][path]["post"]["security"]
+                .as_array()
                 .unwrap()
-                .contains(phrase));
+                .contains(&json!({"admin_token": []})));
         }
         for schema in ["CreateJobRequest", "VerifyRequest", "JobOptions"] {
-            let delay = &doc["components"]["schemas"][schema]["properties"]["batch_delay_ms"];
+            let delay = &schemas[schema]["properties"]["batch_delay_ms"];
             assert_eq!(delay["minimum"].as_f64(), Some(0.0));
             assert_eq!(delay["maximum"].as_f64(), Some(10000.0));
+        }
+        assert_eq!(
+            schemas["CreateJobRequest"]["properties"]["actions"]["items"]["type"],
+            "string"
+        );
+        assert_eq!(
+            schemas["Scope"]["properties"]["options"]["$ref"],
+            "#/components/schemas/JobOptions"
+        );
+        assert_eq!(
+            doc["paths"]["/v1/admin/database-encryption/keys"]["get"]["responses"]["200"]
+                ["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/KeysResponse"
+        );
+        let keys = &schemas["KeysResponse"];
+        assert_eq!(keys["properties"]["write_key_id"]["type"], "string");
+        assert_eq!(keys["properties"]["read_key_ids"]["type"], "array");
+        assert_eq!(
+            keys["properties"]["read_key_ids"]["items"]["type"],
+            "string"
+        );
+        assert_eq!(keys["properties"]["fingerprints"]["type"], "object");
+        assert_eq!(
+            keys["properties"]["fingerprints"]["additionalProperties"]["type"],
+            "string"
+        );
+        assert_eq!(keys["properties"]["write_enabled"]["type"], "boolean");
+        for field in [
+            "write_key_id",
+            "read_key_ids",
+            "fingerprints",
+            "write_enabled",
+        ] {
+            assert!(keys["required"].as_array().unwrap().contains(&json!(field)));
         }
     }
 

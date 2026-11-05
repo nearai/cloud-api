@@ -837,3 +837,7 @@ impl SessionReceipt {
 #[cfg(test)]
 #[path = "session_wire_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "session_wire_payload_tests.rs"]
+mod payload_tests;

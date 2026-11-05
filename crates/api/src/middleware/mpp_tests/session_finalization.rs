@@ -5,7 +5,8 @@ use super::*;
 use chrono::{DateTime, Utc};
 use services::common::RepositoryError;
 use services::mpp::{
-    ChannelRecord, ChargeOutcome, CloseTransition, PendingClose, ReserveOutcome, VoucherOutcome,
+    ChannelRecord, ChargeOutcome, CloseTransition, PendingClose, ReserveOutcome, SettlementLease,
+    VoucherOutcome, VoucherRules,
 };
 use tokio::sync::Notify;
 
@@ -45,9 +46,10 @@ impl ChannelRepository for DelayedLedger {
         channel_id: &[u8; 32],
         cumulative: u128,
         signature: [u8; 65],
+        rules: VoucherRules,
     ) -> Result<VoucherOutcome, RepositoryError> {
         self.inner
-            .accept_voucher(channel_id, cumulative, signature)
+            .accept_voucher(channel_id, cumulative, signature, rules)
             .await
     }
 
@@ -90,8 +92,9 @@ impl ChannelRepository for DelayedLedger {
         &self,
         channel_id: &[u8; 32],
         pending: PendingClose,
+        now: DateTime<Utc>,
     ) -> Result<CloseTransition, RepositoryError> {
-        self.inner.mark_closing(channel_id, pending).await
+        self.inner.mark_closing(channel_id, pending, now).await
     }
 
     async fn finalize(
@@ -102,8 +105,34 @@ impl ChannelRepository for DelayedLedger {
         self.inner.finalize(channel_id, settled_on_chain).await
     }
 
-    async fn clear_closing(&self, channel_id: &[u8; 32]) -> Result<(), RepositoryError> {
-        self.inner.clear_closing(channel_id).await
+    async fn clear_closing(
+        &self,
+        channel_id: &[u8; 32],
+        expected_tx_hash: &[u8; 32],
+    ) -> Result<bool, RepositoryError> {
+        self.inner.clear_closing(channel_id, expected_tx_hash).await
+    }
+
+    async fn finalize_pending_close(
+        &self,
+        channel_id: &[u8; 32],
+        expected_tx_hash: &[u8; 32],
+        settled_on_chain: u128,
+    ) -> Result<bool, RepositoryError> {
+        self.inner
+            .finalize_pending_close(channel_id, expected_tx_hash, settled_on_chain)
+            .await
+    }
+
+    async fn claim_chain_read(
+        &self,
+        channel_id: &[u8; 32],
+        now: DateTime<Utc>,
+        min_interval: chrono::Duration,
+    ) -> Result<bool, RepositoryError> {
+        self.inner
+            .claim_chain_read(channel_id, now, min_interval)
+            .await
     }
 
     async fn claim_settlement_lease(
@@ -111,7 +140,7 @@ impl ChannelRepository for DelayedLedger {
         channel_id: &[u8; 32],
         now: DateTime<Utc>,
         until: DateTime<Utc>,
-    ) -> Result<Option<ChannelRecord>, RepositoryError> {
+    ) -> Result<Option<(ChannelRecord, SettlementLease)>, RepositoryError> {
         self.inner
             .claim_settlement_lease(channel_id, now, until)
             .await
@@ -120,16 +149,21 @@ impl ChannelRepository for DelayedLedger {
     async fn record_settlement(
         &self,
         channel_id: &[u8; 32],
+        lease: SettlementLease,
         cumulative: u128,
         at: DateTime<Utc>,
-    ) -> Result<(), RepositoryError> {
+    ) -> Result<bool, RepositoryError> {
         self.inner
-            .record_settlement(channel_id, cumulative, at)
+            .record_settlement(channel_id, lease, cumulative, at)
             .await
     }
 
-    async fn release_settlement_lease(&self, channel_id: &[u8; 32]) -> Result<(), RepositoryError> {
-        self.inner.release_settlement_lease(channel_id).await
+    async fn release_settlement_lease(
+        &self,
+        channel_id: &[u8; 32],
+        lease: SettlementLease,
+    ) -> Result<bool, RepositoryError> {
+        self.inner.release_settlement_lease(channel_id, lease).await
     }
 
     async fn list_active(

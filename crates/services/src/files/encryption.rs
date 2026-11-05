@@ -20,6 +20,8 @@ pub enum EncryptionError {
     InvalidKeyId,
     #[error("Duplicate object encryption key id")]
     DuplicateKeyId,
+    #[error("Object encryption key ids resolve to identical keys")]
+    DuplicateKeyMaterial,
     #[error("Encryption failed: {0}")]
     EncryptionFailed(String),
     #[error("Decryption failed: {0}")]

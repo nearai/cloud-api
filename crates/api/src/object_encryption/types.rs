@@ -67,6 +67,7 @@ pub struct ObjectCreateJobRequest {
     pub(super) max_rows: Option<i64>,
     #[serde(default = "rewrap_default")]
     pub(super) actions: Vec<String>,
+    /// Throttle batches; specify here or in scope.options, never both.
     #[serde(default)]
     #[schema(minimum = 0, maximum = 10000)]
     pub(super) batch_delay_ms: Option<i64>,
@@ -91,6 +92,11 @@ impl ObjectCreateJobRequest {
         if !matches!(self.actions.as_slice(), [action] if action == expected) {
             return Err(bad("actions do not match the requested job mode"));
         }
+        if self.batch_delay_ms.is_some() && self.scope.options.batch_delay_ms.is_some() {
+            return Err(bad(
+                "specify batch_delay_ms at the top level or in scope.options, not both",
+            ));
+        }
         for delay in [self.batch_delay_ms, self.scope.options.batch_delay_ms]
             .into_iter()
             .flatten()
@@ -102,8 +108,10 @@ impl ObjectCreateJobRequest {
         if self.max_rows.is_some_and(|max| max <= 0) {
             return Err(bad("max_rows must be greater than zero"));
         }
-        self.scope.options.batch_delay_ms =
-            self.batch_delay_ms.or(self.scope.options.batch_delay_ms);
+        self.scope.options.batch_delay_ms = self
+            .batch_delay_ms
+            .take()
+            .or(self.scope.options.batch_delay_ms);
         Ok(self)
     }
 }
@@ -113,6 +121,7 @@ pub struct ObjectVerifyRequest {
     #[serde(default)]
     pub(super) scope: Scope,
     pub(super) batch_size: Option<i64>,
+    /// Throttle batches; specify here or in scope.options, never both.
     #[serde(default)]
     #[schema(minimum = 0, maximum = 10000)]
     pub(super) batch_delay_ms: Option<i64>,
@@ -197,6 +206,8 @@ mod tests {
             json!({"batch_delay_ms":10001}),
             json!({"scope":{"options":{"batch_delay_ms":10001}}}),
             json!({"max_rows":0}),
+            json!({"batch_delay_ms":0,"scope":{"options":{"batch_delay_ms":10}}}),
+            json!({"batch_delay_ms":10,"scope":{"options":{"batch_delay_ms":10}}}),
         ] {
             let mut value = json!({"mode":"execute"});
             value
@@ -213,15 +224,15 @@ mod tests {
 
     #[test]
     fn object_scope_is_persisted_with_the_selected_delay() {
-        // Given a top-level delay and a different scope delay.
+        // Given a delay specified in exactly one supported location.
         let request: ObjectCreateJobRequest = serde_json::from_value(json!({
-            "mode":"execute", "batch_delay_ms":0,
-            "scope":{"options":{"batch_delay_ms":10}}
+            "mode":"execute", "batch_delay_ms":0
         }))
         .unwrap();
         // When normalizing the request.
         let validated = request.validated().unwrap();
-        // Then the object kind and explicit delay are retained.
+        // Then only the persisted scope owns the selected delay.
+        assert!(validated.batch_delay_ms.is_none());
         assert_eq!(
             serde_json::to_value(validated.scope).unwrap(),
             json!({"kind":"objects","options":{"batch_delay_ms":0}})

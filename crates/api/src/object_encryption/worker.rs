@@ -3,6 +3,7 @@ use super::{
     types::{Mode, ObjectCreateJobRequest, Scope},
     ObjectEncryptionState,
 };
+use crate::database_encryption::batch_delay;
 use serde_json::{json, Value};
 use services::files::FileServiceError;
 use std::{future::Future, time::Duration};
@@ -27,8 +28,15 @@ pub(super) async fn run_job(state: &ObjectEncryptionState, id: Uuid) -> anyhow::
     loop {
         match run_batch(state, id).await? {
             BatchResult::Stopped => return Ok(()),
-            BatchResult::Continue(Some(delay)) => tokio::time::sleep(delay).await,
-            BatchResult::Continue(None) => {}
+            BatchResult::Continue(delay) => {
+                if batch_delay::wait_between_batches(delay.unwrap_or_default(), || {
+                    batch_delay::cancel_if_requested(&state.pool, id)
+                })
+                .await?
+                {
+                    return Ok(());
+                }
+            }
         }
     }
 }
@@ -78,6 +86,7 @@ async fn run_batch(state: &ObjectEncryptionState, id: Uuid) -> anyhow::Result<Ba
     .map_err(|_| anyhow::anyhow!("invalid persisted object job"))?;
     let mut cursor: Cursor = serde_json::from_value(row.get("cursor"))?;
     let mut progress: Progress = serde_json::from_value(row.get("progress"))?;
+    progress.retain_ring_keys(&state.ring);
     let remaining = request
         .max_rows
         .map(|max| (max - progress.processed).max(0));
@@ -144,7 +153,7 @@ pub(super) async fn process_key(
     let result = match mode {
         Mode::DryRun => storage_call(state.storage.object_key_id(key))
             .await
-            .map(|key_id| progress.record_key_id(key_id)),
+            .map(|key_id| progress.record_key_id(key_id, &state.ring)),
         Mode::Execute => storage_call(state.storage.rewrap_object(key))
             .await
             .map(|outcome| progress.record_rewrap(key, outcome)),

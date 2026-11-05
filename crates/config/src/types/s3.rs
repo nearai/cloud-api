@@ -1,4 +1,4 @@
-use super::{non_empty_env, parse_key_source_specs_for, KeySourceSpec};
+use super::{non_empty_env, parse_key_source_specs_for, KeySource, KeySourceSpec};
 use std::env;
 
 /// S3 configuration for file storage
@@ -33,9 +33,26 @@ impl S3Config {
             .unwrap_or(false);
 
         let encryption_keys = non_empty_env("S3_ENCRYPTION_KEYS")
-            .map(|raw| parse_key_source_specs_for(&raw, "S3_ENCRYPTION_KEYS"))
+            .map(|raw| {
+                let specs = parse_key_source_specs_for(&raw, "S3_ENCRYPTION_KEYS")?;
+                if env::var("S3_ENCRYPTION_ALLOW_INLINE_KEYS").as_deref() != Ok("true") {
+                    if let Some(index) = specs
+                        .iter()
+                        .position(|spec| matches!(spec.source, KeySource::Hex(_)))
+                    {
+                        return Err(format!("S3_ENCRYPTION_KEYS entry {index}: hex sources require S3_ENCRYPTION_ALLOW_INLINE_KEYS=true (local development and tests only)"));
+                    }
+                }
+                Ok(specs)
+            })
             .transpose()?;
         let encryption_key = if encryption_keys.is_some() {
+            if ["S3_ENCRYPTION_KEY_FILE", "S3_ENCRYPTION_KEY"]
+                .iter()
+                .any(|name| env::var_os(name).is_some())
+            {
+                eprintln!("WARN: S3_ENCRYPTION_KEY_FILE and S3_ENCRYPTION_KEY are ignored when S3_ENCRYPTION_KEYS is set; the legacy key must be listed as a read entry if it is still needed");
+            }
             String::new()
         } else if let Ok(path) = env::var("S3_ENCRYPTION_KEY_FILE") {
             std::fs::read_to_string(path)

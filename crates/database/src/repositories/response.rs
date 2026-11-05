@@ -42,7 +42,7 @@ impl PgResponseRepository {
         value: Option<String>,
     ) -> Result<Option<String>> {
         value
-            .map(|value| match self.pool.decryption_context() {
+            .map(|value| match self.pool.encryption_ring() {
                 Some(ring) => crate::field_encryption::decrypt_if_encrypted_with_ring(
                     &ring,
                     "responses",
@@ -75,7 +75,7 @@ impl PgResponseRepository {
         value: Option<serde_json::Value>,
     ) -> Result<Option<serde_json::Value>> {
         value
-            .map(|value| match self.pool.decryption_context() {
+            .map(|value| match self.pool.encryption_ring() {
                 Some(ring) => crate::field_encryption::decrypt_json_if_encrypted_with_ring(
                     &ring,
                     "responses",

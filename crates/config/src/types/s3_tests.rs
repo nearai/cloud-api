@@ -13,6 +13,7 @@ impl Environment {
             "S3_ENCRYPTION_KEYS",
             "S3_ENCRYPTION_KEY",
             "S3_ENCRYPTION_KEY_FILE",
+            "S3_ENCRYPTION_ALLOW_INLINE_KEYS",
         ];
         let saved = Self(keys.iter().map(|key| (*key, env::var_os(key))).collect());
         for key in keys {
@@ -55,7 +56,46 @@ fn ring_configuration_replaces_legacy_key_selection() {
         vec!["s3-v2", "s3-v1"]
     );
     env::set_var("S3_ENCRYPTION_KEY_FILE", "/missing/legacy-key");
+    env::set_var("S3_ENCRYPTION_KEY", "invalid-legacy-key");
     assert!(S3Config::from_env().is_ok());
+}
+
+#[test]
+#[serial]
+fn inline_ring_keys_require_explicit_s3_opt_in() {
+    let _env = Environment::new();
+    let key = "07".repeat(32);
+    env::set_var(
+        "S3_ENCRYPTION_KEYS",
+        format!("s3-v2=file:/keys/v2,s3-v1=hex:{key}"),
+    );
+    for opt_in in [None, Some("false"), Some("1"), Some("TRUE")] {
+        match opt_in {
+            Some(value) => env::set_var("S3_ENCRYPTION_ALLOW_INLINE_KEYS", value),
+            None => env::remove_var("S3_ENCRYPTION_ALLOW_INLINE_KEYS"),
+        }
+        let error = S3Config::from_env().unwrap_err();
+        assert!(error.contains("S3_ENCRYPTION_KEYS entry 1"));
+        assert!(error.contains("S3_ENCRYPTION_ALLOW_INLINE_KEYS=true"));
+        assert!(!error.contains(&key));
+    }
+}
+
+#[test]
+#[serial]
+fn inline_ring_keys_load_when_s3_opt_in_is_true() {
+    let _env = Environment::new();
+    env::set_var(
+        "S3_ENCRYPTION_KEYS",
+        format!("s3-v1=hex:{}", "07".repeat(32)),
+    );
+    env::set_var("S3_ENCRYPTION_ALLOW_INLINE_KEYS", "true");
+    let config = S3Config::from_env().unwrap();
+    assert!(config.encryption_key.is_empty());
+    assert!(matches!(
+        config.encryption_keys.unwrap()[0].source,
+        KeySource::Hex(_)
+    ));
 }
 
 #[test]

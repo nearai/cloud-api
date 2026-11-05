@@ -11,6 +11,7 @@ use std::sync::{
 use tokio::sync::Semaphore;
 use uuid::Uuid;
 
+pub(crate) mod batch_delay;
 mod key_rotation;
 use key_rotation::{
     classify, job_action, rewrap_envelope, validate_delay, Action, Classification, KeyCounts,
@@ -347,6 +348,9 @@ enum Mode {
     Verify,
 }
 
+/// Creates a resumable job. `batch_delay_ms` throttles every mode, including
+/// verify and dry_run scans. Specify it at the top level or in scope.options,
+/// never both.
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct CreateJobRequest {
     mode: Mode,
@@ -616,20 +620,16 @@ async fn counts(
                     count.empty += 1;
                     continue;
                 };
-                match serde_json::from_str::<Value>(&raw) {
-                    Ok(value) if value[MARKER] == true => {
-                        if let Some(key_id) = database::field_encryption::envelope_key_id(&value) {
-                            *count.by_key_id.entry(key_id.to_string()).or_default() += 1;
-                        }
-                        match classify(&ring, f, id, &raw) {
-                            Classification::Current => count.encrypted += 1,
-                            Classification::Stale(_) => count.stale += 1,
-                            Classification::Invalid | Classification::Plaintext => {
-                                count.invalid_envelope += 1
-                            }
-                        }
-                    }
-                    _ => count.plaintext += 1,
+                let value = serde_json::from_str::<Value>(&raw).unwrap_or(Value::Null);
+                let classification = classify(&ring, f, id, &value);
+                if let Some(key_id) = classification.key_id(&ring) {
+                    *count.by_key_id.entry(key_id.to_string()).or_default() += 1;
+                }
+                match classification {
+                    Classification::Current => count.encrypted += 1,
+                    Classification::Stale(_) => count.stale += 1,
+                    Classification::Invalid => count.invalid_envelope += 1,
+                    Classification::Plaintext => count.plaintext += 1,
                 }
             }
             count.scanned += rows.len() as i64;
@@ -698,35 +698,44 @@ fn decrypt_envelope(
     id: Uuid,
     encoded: &str,
 ) -> anyhow::Result<String> {
-    database::field_encryption::decrypt_with_key_id(key, key_id, f.table, f.column, id, encoded)
+    let ring = KeyRing::new(key_id.to_string(), *key, vec![])?;
+    database::field_encryption::decrypt_with_ring(
+        &serde_json::from_str(encoded)?,
+        &ring,
+        f.table,
+        f.column,
+        id,
+    )
 }
 
 fn decrypt_ring_envelope(
     ring: &KeyRing,
     field: &Field,
     id: Uuid,
-    encoded: &str,
+    value: &Value,
 ) -> anyhow::Result<String> {
-    database::field_encryption::decrypt_with_ring(
-        &serde_json::from_str(encoded)?,
-        ring,
-        field.table,
-        field.column,
-        id,
-    )
+    database::field_encryption::decrypt_with_ring(value, ring, field.table, field.column, id)
+}
+
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct KeysResponse {
+    write_key_id: String,
+    read_key_ids: Vec<String>,
+    fingerprints: std::collections::BTreeMap<String, String>,
+    write_enabled: bool,
 }
 
 #[utoipa::path(
     get,
     path = "/v1/admin/database-encryption/keys",
     tag = "Admin",
-    responses((status = 200, description = "Configured write/read key IDs, 16-character SHA-256 fingerprints, and write status", body = Value)),
+    responses((status = 200, description = "Configured write/read key IDs, 16-character SHA-256 fingerprints, and write status", body = KeysResponse)),
     security(("admin_token" = []))
 )]
 pub async fn get_keys(
     Extension(state): Extension<DatabaseEncryptionState>,
     Extension(_admin): Extension<AdminUser>,
-) -> ApiResult<Value> {
+) -> ApiResult<KeysResponse> {
     let ring = state
         .pool
         .encryption_ring()
@@ -735,12 +744,12 @@ pub async fn get_keys(
         .fingerprints()
         .into_iter()
         .collect::<std::collections::BTreeMap<_, _>>();
-    Ok(Json(json!({
-        "write_key_id": ring.write_id(),
-        "read_key_ids": ring.read_ids(),
-        "fingerprints": fingerprints,
-        "write_enabled": state.pool.encryption_write_enabled(),
-    })))
+    Ok(Json(KeysResponse {
+        write_key_id: ring.write_id().to_owned(),
+        read_key_ids: ring.read_ids().into_iter().map(str::to_owned).collect(),
+        fingerprints,
+        write_enabled: state.pool.encryption_write_enabled(),
+    }))
 }
 
 #[utoipa::path(
@@ -780,6 +789,11 @@ pub async fn create_job(
         return Err(bad("batch_size must be between 1 and 1000"));
     }
     job_action(req.mode, &req.actions)?;
+    if req.batch_delay_ms.is_some() && req.scope.options.batch_delay_ms.is_some() {
+        return Err(bad(
+            "specify batch_delay_ms at the top level or in scope.options, not both",
+        ));
+    }
     validate_delay(req.batch_delay_ms)?;
     validate_delay(req.scope.options.batch_delay_ms)?;
     if req.max_rows.is_some_and(|max_rows| max_rows <= 0) {
@@ -874,6 +888,8 @@ fn classify_job_error(error: &anyhow::Error) -> &'static str {
 
 const GLOBAL_WORKER_LOCK_KEY: i64 = 0x4e454152444245;
 
+/// Hold the per-process worker permit for the entire job (one job at a time),
+/// while returning batch connections and advisory locks before any delay.
 async fn run_job(state: &DatabaseEncryptionState, id: Uuid) -> anyhow::Result<()> {
     let _worker_permit = state
         .worker_permit
@@ -881,15 +897,7 @@ async fn run_job(state: &DatabaseEncryptionState, id: Uuid) -> anyhow::Result<()
         .acquire_owned()
         .await
         .map_err(|_| anyhow::anyhow!("database encryption worker stopped"))?;
-    let mut client = state.pool.get().await?;
-    run_locked_job(state, id, &mut client).await
-}
-
-async fn run_locked_job(
-    state: &DatabaseEncryptionState,
-    id: Uuid,
-    client: &mut tokio_postgres::Client,
-) -> anyhow::Result<()> {
+    let client = state.pool.get().await?;
     let ring = state
         .pool
         .encryption_ring()
@@ -936,6 +944,7 @@ async fn run_locked_job(
         Some(value) => serde_json::from_value(value.clone())?,
         None => KeyCounts::default(),
     };
+    by_key_id.retain_ring_keys(&ring);
     let mut invalid_envelope_rows = progress["invalid_envelope_rows"]
         .as_array()
         .cloned()
@@ -945,7 +954,9 @@ async fn run_locked_job(
         .cloned()
         .unwrap_or_default();
 
+    drop(client);
     while field_index < fields.len() && max.is_none_or(|limit| processed < limit) {
+        let mut client = state.pool.get().await?;
         let field = fields[field_index];
         let cap = max
             .map(|limit| (limit - processed).min(batch))
@@ -1010,10 +1021,12 @@ async fn run_locked_job(
             for row in &rows {
                 let row_id: Uuid = row.get(0);
                 after_id = row_id;
+                let raw: String = row.get(1);
+                let value = serde_json::from_str::<Value>(&raw).unwrap_or(Value::Null);
                 if matches!(action, Action::Verify | Action::Rewrap) {
-                    let raw: String = row.get(1);
-                    by_key_id.record(field, &raw);
-                    match classify(&ring, field, row_id, &raw) {
+                    let classification = classify(&ring, field, row_id, &value);
+                    by_key_id.record(field, classification.key_id(&ring));
+                    match classification {
                         Classification::Plaintext => {
                             plaintext += 1;
                             if action == Action::Verify && plaintext_rows.len() < 100 {
@@ -1033,7 +1046,8 @@ async fn run_locked_job(
                             stale += 1;
                             if action == Action::Rewrap && mode == "execute" {
                                 row_ids.push(row_id);
-                                encrypted_values.push(rewrap_envelope(&ring, field, row_id, &raw)?);
+                                encrypted_values
+                                    .push(rewrap_envelope(&ring, field, row_id, &value)?);
                             }
                         }
                         Classification::Invalid => {
@@ -1048,21 +1062,18 @@ async fn run_locked_job(
                     continue;
                 }
                 if mode == "execute" {
-                    let plaintext: String = row.get(1);
-                    if let Ok(value) = serde_json::from_str::<Value>(&plaintext) {
-                        if database::field_encryption::is_envelope(&value) {
-                            if decrypt_ring_envelope(&ring, field, row_id, &plaintext).is_err() {
-                                invalid_envelopes += 1;
-                                if invalid_envelope_rows.len() < 100 {
-                                    invalid_envelope_rows.push(json!({
-                                        "table": field.table,
-                                        "column": field.column,
-                                        "id": row_id,
-                                    }));
-                                }
+                    if database::field_encryption::is_envelope(&value) {
+                        if decrypt_ring_envelope(&ring, field, row_id, &value).is_err() {
+                            invalid_envelopes += 1;
+                            if invalid_envelope_rows.len() < 100 {
+                                invalid_envelope_rows.push(json!({
+                                    "table": field.table,
+                                    "column": field.column,
+                                    "id": row_id,
+                                }));
                             }
-                            continue;
                         }
+                        continue;
                     }
                     row_ids.push(row_id);
                     encrypted_values.push(envelope(
@@ -1070,7 +1081,7 @@ async fn run_locked_job(
                         ring.write_id(),
                         field,
                         row_id,
-                        &plaintext,
+                        &raw,
                     )?);
                 }
             }
@@ -1137,13 +1148,22 @@ async fn run_locked_job(
             )
             .await?;
         transaction.commit().await?;
-        if let Some(delay) = scope.options.batch_delay_ms {
-            tokio::time::sleep(std::time::Duration::from_millis(u64::try_from(delay)?)).await;
+        drop(client);
+        let delay = std::time::Duration::from_millis(u64::try_from(
+            scope.options.batch_delay_ms.unwrap_or(0),
+        )?);
+        if batch_delay::wait_between_batches(delay, || {
+            batch_delay::cancel_if_requested(&state.pool, id)
+        })
+        .await?
+        {
+            return Ok(());
         }
     }
 
+    let client = state.pool.get().await?;
     if mode == "verify" {
-        let (approved, excluded, unclassified) = classify_schema(client).await?;
+        let (approved, excluded, unclassified) = classify_schema(&client).await?;
         let pass =
             plaintext == 0 && invalid_envelopes == 0 && stale == 0 && unclassified.is_empty();
         client

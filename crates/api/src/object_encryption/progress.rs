@@ -1,5 +1,8 @@
 use serde::{Deserialize, Serialize};
-use services::files::storage::{ObjectVerification, RewrapOutcome};
+use services::files::{
+    encryption::ObjectKeyRing,
+    storage::{ObjectVerification, RewrapOutcome},
+};
 use std::collections::BTreeMap;
 
 #[derive(Default, Deserialize, Serialize)]
@@ -37,11 +40,27 @@ impl Progress {
         }
     }
 
-    pub fn record_key_id(&mut self, key_id: Option<String>) {
-        *self
-            .by_key_id
-            .entry(key_id.unwrap_or_else(|| "none".into()))
-            .or_default() += 1;
+    pub fn record_key_id(&mut self, key_id: Option<String>, ring: &ObjectKeyRing) {
+        let bucket = match key_id {
+            Some(id) if ring.lookup(&id).is_some() => id,
+            Some(_) => "unknown".into(),
+            None => "none".into(),
+        };
+        *self.by_key_id.entry(bucket).or_default() += 1;
+    }
+
+    pub fn retain_ring_keys(&mut self, ring: &ObjectKeyRing) {
+        // Normalize progress written before unknown metadata was bucketed, or
+        // resumed after an operator removed an old read key from the ring.
+        let counts = std::mem::take(&mut self.by_key_id);
+        for (id, count) in counts {
+            let bucket = if id == "none" || ring.lookup(&id).is_some() {
+                id
+            } else {
+                "unknown".into()
+            };
+            *self.by_key_id.entry(bucket).or_default() += count;
+        }
     }
 
     pub fn record_rewrap(&mut self, key: &str, outcome: RewrapOutcome) {
@@ -136,11 +155,17 @@ mod tests {
     fn scan_groups_legacy_and_known_object_metadata() {
         // Given a fresh inventory tally.
         let mut progress = Progress::default();
+        let ring = ObjectKeyRing::new(
+            "current".into(),
+            [9; 32],
+            vec![("previous".into(), [7; 32])],
+        )
+        .unwrap();
         // When legacy and named metadata are counted.
-        progress.record_key_id(None);
-        progress.record_key_id(Some("previous".into()));
-        progress.record_key_id(Some("current".into()));
-        progress.record_key_id(None);
+        progress.record_key_id(None, &ring);
+        progress.record_key_id(Some("previous".into()), &ring);
+        progress.record_key_id(Some("current".into()), &ring);
+        progress.record_key_id(None, &ring);
         // Then each metadata identity has its own count.
         assert_eq!(
             progress.by_key_id,
@@ -174,6 +199,32 @@ mod tests {
                 progress.undecryptable
             ),
             (1, 1, 1)
+        );
+    }
+}
+
+#[cfg(test)]
+mod resumption_tests {
+    use super::*;
+
+    #[test]
+    fn resuming_counts_folds_unconfigured_metadata_into_unknown() {
+        // Given persisted counts from an older ring or worker.
+        let ring = ObjectKeyRing::new("current".into(), [9; 32], vec![]).unwrap();
+        let mut progress: Progress = serde_json::from_value(serde_json::json!({
+            "by_key_id":{"current":2,"none":3,"retired":4,"arbitrary":5,"unknown":1}
+        }))
+        .unwrap();
+        // When the worker resumes using the current ring.
+        progress.retain_ring_keys(&ring);
+        // Then only configured IDs and fixed inventory buckets survive.
+        assert_eq!(
+            progress.by_key_id,
+            BTreeMap::from([
+                ("current".into(), 2),
+                ("none".into(), 3),
+                ("unknown".into(), 10)
+            ])
         );
     }
 }

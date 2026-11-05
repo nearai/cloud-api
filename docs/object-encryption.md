@@ -10,9 +10,9 @@ S3 objects use AES-256-GCM with the existing `nonce || ciphertext || tag` format
 S3_ENCRYPTION_KEYS=s3-v2=dstack:/nearai-cloud-api/object-encryption/v2,s3-v1=file:/config/object-encryption-key-v1
 ```
 
-Sources can be `file:/absolute/path` (a hex-encoded key), `dstack:/key/path` (a derived key), or `hex:<64 hex characters>` for local configuration. Every key must contain exactly 32 bytes. Invalid sources or keys stop startup without printing key material.
+Sources can be `file:/absolute/path` (a hex-encoded key), `dstack:/key/path` (a derived key), or `hex:<64 hex characters>` for local development and tests only. Inline sources are rejected unless `S3_ENCRYPTION_ALLOW_INLINE_KEYS=true` is explicitly set; the database inline-key switch does not enable object inline keys. Every key must contain exactly 32 bytes. Invalid sources or keys stop startup without printing key material.
 
-When `S3_ENCRYPTION_KEYS` is unset, `S3_ENCRYPTION_KEY_FILE` or `S3_ENCRYPTION_KEY` supplies the single key, with implicit ID `s3-legacy`. With the ring configured, the single-key variables can be omitted. Configure the same ordered keys on every replica before starting a rotation.
+When `S3_ENCRYPTION_KEYS` is unset, `S3_ENCRYPTION_KEY_FILE` or `S3_ENCRYPTION_KEY` supplies the single key, with implicit ID `s3-legacy`. With the ring configured, the legacy single-key variables are ignored without reading their values or files; startup emits one warning if either remains set. Include the legacy key as a read entry when existing objects still require it. Use distinct IDs and distinct key bytes; the ring rejects duplicate IDs or key material and zeroes its keys on drop. Configure the same ordered keys on every replica before starting a rotation.
 
 A known metadata ID selects only that key. Objects with missing or unknown metadata try the write key and then previous keys in order. AES-GCM authentication determines which key matches. Keep previous keys available until all objects have been rewrapped and verified.
 
@@ -23,10 +23,10 @@ All endpoints are under `/v1/admin/object-encryption` and use the existing admin
 | Method | Path | Result |
 |---|---|---|
 | GET | `/keys` | Write key ID, ordered key IDs, and SHA-256 fingerprints; no keys |
-| POST | `/scan` | Counts current bucket objects by metadata key ID; `none` means missing metadata |
+| POST | `/scan` | Counts current bucket objects by configured metadata ID; `none` means missing metadata and `unknown` means an unconfigured ID |
 | POST | `/jobs` | Creates a resumable dry-run or execute job |
 | GET | `/jobs/{id}` | Job status, progress, cursor, and redacted error class |
-| POST | `/jobs/{id}/cancel` | Requests cancellation at the next batch boundary |
+| POST | `/jobs/{id}/cancel` | Requests cancellation at the next batch boundary or during the inter-batch delay |
 | POST | `/verify` | Creates a resumable verification job |
 
 For example, inspect the bucket before rewriting objects:
@@ -38,6 +38,8 @@ Content-Type: application/json
 {}
 ```
 
+Scans report metadata, not proof of decryption. Unconfigured metadata IDs are grouped into the fixed `unknown` bucket, never used as arbitrary map keys. Verification authenticates ciphertext separately.
+
 Then run a dry run, followed by an execute job with the same options:
 
 ```json
@@ -48,6 +50,8 @@ Then run a dry run, followed by an execute job with the same options:
   "batch_delay_ms": 100
 }
 ```
+
+`batch_delay_ms` accepts 0–10000 in every job mode, including dry run and verify. Specify it at the top level or in `scope.options`, never both; duplicates return HTTP 400 even when equal. Before an inter-batch delay the transaction commits and the pooled connection and advisory lock are released. Cancellation is checked before and after sleep slices of at most 500 ms. The process worker permit remains held so only one object job runs per process at a time.
 
 Change `mode` to `execute` to re-encrypt objects under the write key. Each replacement preserves the content type and records the write key ID. Progress counts `rewrapped`, `already_current`, and `undecryptable`, with at most 100 sample object keys for the last category. Scans and all job modes also count `missing` objects, with up to 100 sample keys in `missing_keys`. An object deleted between listing and its metadata read, download, or rewrap is skipped, advances progress and the cursor, and does not prevent verification from passing. Other storage errors still fail the operation. An object that cannot be decrypted is counted and does not stop the job. A second execute job reports no rewrites for objects already marked current.
 

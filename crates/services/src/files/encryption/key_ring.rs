@@ -1,5 +1,6 @@
 use super::{parse_key, EncryptionError};
 use sha2::{Digest, Sha256};
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// One write key and ordered previous keys for object reads.
 pub struct ObjectKeyRing {
@@ -13,8 +14,13 @@ impl ObjectKeyRing {
         write_key: [u8; 32],
         previous: Vec<(String, [u8; 32])>,
     ) -> Result<Self, EncryptionError> {
+        let ring = Self {
+            write: (write_id, write_key),
+            previous,
+        };
         let mut ids = std::collections::HashSet::new();
-        for id in std::iter::once(&write_id).chain(previous.iter().map(|(id, _)| id)) {
+        let mut keys = std::collections::HashSet::new();
+        for (id, key) in ring.entries() {
             if id.is_empty()
                 || id.len() > 64
                 || !id
@@ -26,11 +32,11 @@ impl ObjectKeyRing {
             if !ids.insert(id) {
                 return Err(EncryptionError::DuplicateKeyId);
             }
+            if !keys.insert(key) {
+                return Err(EncryptionError::DuplicateKeyMaterial);
+            }
         }
-        Ok(Self {
-            write: (write_id, write_key),
-            previous,
-        })
+        Ok(ring)
     }
 
     pub fn from_hex(key: &str) -> Result<Self, EncryptionError> {
@@ -71,6 +77,21 @@ impl ObjectKeyRing {
         std::iter::once(&self.write)
             .chain(&self.previous)
             .map(|(id, key)| (id.as_str(), key))
+    }
+}
+
+impl Zeroize for ObjectKeyRing {
+    fn zeroize(&mut self) {
+        self.write.zeroize();
+        self.previous.zeroize();
+    }
+}
+
+impl ZeroizeOnDrop for ObjectKeyRing {}
+
+impl Drop for ObjectKeyRing {
+    fn drop(&mut self) {
+        self.zeroize();
     }
 }
 

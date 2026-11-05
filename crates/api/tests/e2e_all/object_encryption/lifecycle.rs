@@ -211,7 +211,7 @@ async fn cancellation_is_observed_between_batches_without_rewriting_the_remainde
     let response = post(
         &server,
         "jobs",
-        json!({"mode":"execute","actions":["rewrap"],"batch_size":1,"batch_delay_ms":2000}),
+        json!({"mode":"execute","actions":["rewrap"],"batch_size":1,"batch_delay_ms":10000}),
     )
     .await;
     assert_eq!(response.status_code(), 202);
@@ -236,7 +236,7 @@ async fn cancellation_is_observed_between_batches_without_rewriting_the_remainde
     .unwrap();
     let response = post(&server, &format!("jobs/{id}/cancel"), json!({})).await;
     assert_eq!(response.status_code(), 200);
-    tokio::time::timeout(Duration::from_secs(10), async {
+    tokio::time::timeout(Duration::from_secs(2), async {
         loop {
             let response = server
                 .get(&format!("/v1/admin/object-encryption/jobs/{id}"))

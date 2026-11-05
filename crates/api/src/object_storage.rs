@@ -8,7 +8,7 @@ pub(crate) async fn resolve_object_ring(config: &S3Config) -> anyhow::Result<Arc
     let ring = match &config.encryption_keys {
         Some(specs) => {
             let keys = services::encryption_keys::resolve_key_ring(specs, None).await?;
-            let mut keys = keys.into_iter();
+            let mut keys = keys.iter().map(|(id, key)| (id.clone(), *key));
             let (id, key) = keys
                 .next()
                 .ok_or_else(|| anyhow::anyhow!("S3 encryption keys must not be empty"))?;

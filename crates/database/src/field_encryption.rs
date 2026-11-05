@@ -7,6 +7,7 @@ use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 pub const MARKER: &str = "__near_db_encrypted";
 pub const DEFAULT_KEY_ID: &str = "db-v1";
@@ -24,6 +25,7 @@ pub fn validate_key_id(key_id: &str) -> Result<()> {
 }
 
 /// One write key and ordered previous keys used for database field reads.
+#[derive(Zeroize, ZeroizeOnDrop)]
 pub struct KeyRing {
     write: (String, [u8; 32]),
     read: Vec<(String, [u8; 32])>,
@@ -34,18 +36,25 @@ impl KeyRing {
         write_id: String,
         write_key: [u8; 32],
         previous: Vec<(String, [u8; 32])>,
-    ) -> std::result::Result<Self, String> {
-        let mut ids = std::collections::HashSet::new();
-        for id in std::iter::once(&write_id).chain(previous.iter().map(|(id, _)| id)) {
-            validate_key_id(id).map_err(|error| error.to_string())?;
-            if !ids.insert(id) {
-                return Err("duplicate database encryption key id".into());
-            }
-        }
-        Ok(Self {
+    ) -> Result<Self> {
+        let ring = Self {
             write: (write_id, write_key),
             read: previous,
-        })
+        };
+        let mut ids = std::collections::HashSet::new();
+        let mut keys = std::collections::HashMap::new();
+        for (id, key) in std::iter::once(&ring.write).chain(&ring.read) {
+            validate_key_id(id)?;
+            ensure!(ids.insert(id), "duplicate database encryption key id");
+            if let Some(previous_id) = keys.insert(key, id) {
+                anyhow::bail!(
+                    "database encryption key ids '{}' and '{}' resolve to identical keys",
+                    previous_id,
+                    id
+                );
+            }
+        }
+        Ok(ring)
     }
 
     pub fn write_id(&self) -> &str {
@@ -58,6 +67,12 @@ impl KeyRing {
         std::iter::once(self.write_id())
             .chain(self.read.iter().map(|(id, _)| id.as_str()))
             .collect()
+    }
+    pub fn canonical_id(&self, key_id: &str) -> Option<&str> {
+        std::iter::once(&self.write)
+            .chain(&self.read)
+            .find(|(id, _)| id == key_id)
+            .map(|(id, _)| id.as_str())
     }
     pub fn lookup(&self, key_id: &str) -> Option<&[u8; 32]> {
         std::iter::once(&self.write)
@@ -100,9 +115,12 @@ pub fn is_envelope(value: &Value) -> bool {
 }
 
 pub fn parse_key(hex_key: &str) -> Result<[u8; 32]> {
-    let bytes = hex::decode(hex_key).context("database encryption key must be hex encoded")?;
+    let bytes = Zeroizing::new(
+        hex::decode(hex_key).context("database encryption key must be hex encoded")?,
+    );
     let len = bytes.len();
     bytes
+        .as_slice()
         .try_into()
         .map_err(|_| anyhow!("database encryption key must be 32 bytes, got {len}"))
 }
@@ -136,26 +154,9 @@ pub fn encrypt_with_key_id(
     Ok(json!({MARKER:true,"version":1,"alg":"AES-256-GCM","key_id":key_id,"nonce":BASE64.encode(nonce),"ciphertext":BASE64.encode(ciphertext)}).to_string())
 }
 
-pub fn decrypt(
-    key: &[u8; 32],
-    table: &str,
-    column: &str,
-    id: Uuid,
-    encoded: &str,
-) -> Result<String> {
-    decrypt_with_key_id(key, DEFAULT_KEY_ID, table, column, id, encoded)
-}
-
-pub fn decrypt_with_key_id(
-    key: &[u8; 32],
-    expected_key_id: &str,
-    table: &str,
-    column: &str,
-    id: Uuid,
-    encoded: &str,
-) -> Result<String> {
-    let ring =
-        KeyRing::new(expected_key_id.to_string(), *key, vec![]).map_err(anyhow::Error::msg)?;
+#[cfg(test)]
+fn decrypt(key: &[u8; 32], table: &str, column: &str, id: Uuid, encoded: &str) -> Result<String> {
+    let ring = KeyRing::new(DEFAULT_KEY_ID.to_string(), *key, vec![])?;
     decrypt_with_ring(&serde_json::from_str(encoded)?, &ring, table, column, id)
 }
 
@@ -203,32 +204,16 @@ pub fn decrypt_with_ring(
     Ok(String::from_utf8(plaintext)?)
 }
 
-pub fn decrypt_if_encrypted(
+#[cfg(test)]
+fn decrypt_if_encrypted(
     key: &[u8; 32],
     table: &str,
     column: &str,
     id: Uuid,
     value: String,
 ) -> Result<String> {
-    decrypt_if_encrypted_with_key_id(key, DEFAULT_KEY_ID, table, column, id, value)
-}
-
-pub fn decrypt_if_encrypted_with_key_id(
-    key: &[u8; 32],
-    key_id: &str,
-    table: &str,
-    column: &str,
-    id: Uuid,
-    value: String,
-) -> Result<String> {
-    match serde_json::from_str::<Value>(&value) {
-        Ok(envelope) if is_envelope(&envelope) => {
-            let ring =
-                KeyRing::new(key_id.to_string(), *key, vec![]).map_err(anyhow::Error::msg)?;
-            decrypt_with_ring(&envelope, &ring, table, column, id)
-        }
-        _ => Ok(value),
-    }
+    let ring = KeyRing::new(DEFAULT_KEY_ID.to_string(), *key, vec![])?;
+    decrypt_if_encrypted_with_ring(&ring, table, column, id, value)
 }
 
 pub fn decrypt_if_encrypted_with_ring(
@@ -274,28 +259,15 @@ pub fn encrypt_json_with_key_id(
     )?)?)
 }
 
-pub fn decrypt_json_if_encrypted(
+#[cfg(test)]
+fn decrypt_json_if_encrypted(
     key: &[u8; 32],
     table: &str,
     column: &str,
     id: Uuid,
     value: Value,
 ) -> Result<Value> {
-    decrypt_json_if_encrypted_with_key_id(key, DEFAULT_KEY_ID, table, column, id, value)
-}
-
-pub fn decrypt_json_if_encrypted_with_key_id(
-    key: &[u8; 32],
-    key_id: &str,
-    table: &str,
-    column: &str,
-    id: Uuid,
-    value: Value,
-) -> Result<Value> {
-    if !is_envelope(&value) {
-        return Ok(value);
-    }
-    let ring = KeyRing::new(key_id.to_string(), *key, vec![]).map_err(anyhow::Error::msg)?;
+    let ring = KeyRing::new(DEFAULT_KEY_ID.to_string(), *key, vec![])?;
     decrypt_json_if_encrypted_with_ring(&ring, table, column, id, value)
 }
 
@@ -317,6 +289,12 @@ pub fn decrypt_json_if_encrypted_with_ring(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn key_ring_zeroizes_on_drop() {
+        fn assert_zeroizes_on_drop<T: zeroize::ZeroizeOnDrop>() {}
+        assert_zeroizes_on_drop::<KeyRing>();
+    }
 
     #[test]
     fn key_ring_retains_order_and_previous_envelopes() {
@@ -386,6 +364,30 @@ mod tests {
         .is_err());
         assert!(KeyRing::new("bad id".into(), [7; 32], vec![]).is_err());
         assert!(KeyRing::new("db-v2".into(), [7; 32], vec![("".into(), [8; 32])]).is_err());
+    }
+
+    #[test]
+    fn key_ring_rejects_identical_bytes_under_distinct_ids() {
+        for previous in [
+            vec![("db-v1".into(), [7; 32])],
+            vec![("db-v1".into(), [8; 32]), ("db-v0".into(), [8; 32])],
+        ] {
+            let error = KeyRing::new("db-v2".into(), [7; 32], previous.clone())
+                .expect_err("identical key bytes must not have multiple ids")
+                .to_string();
+            let ids = if previous.len() == 1 {
+                ["db-v2", "db-v1"]
+            } else {
+                ["db-v1", "db-v0"]
+            };
+            assert_eq!(
+                error,
+                format!(
+                    "database encryption key ids '{}' and '{}' resolve to identical keys",
+                    ids[0], ids[1]
+                )
+            );
+        }
     }
 
     #[test]

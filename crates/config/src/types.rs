@@ -103,7 +103,8 @@ pub struct ApiConfig {
     pub database_encryption_key: String,
     /// Ordered key sources; first writes and all entries read.
     pub database_encryption_keys: Option<Vec<KeySourceSpec>>,
-    /// Identifier embedded in and validated against every database envelope.
+    /// Identifier embedded in database envelopes. In ring mode the write id is
+    /// the first entry's id.
     pub database_encryption_key_id: String,
     /// Enables encryption for newly written confidential database fields.
     /// Defaults off so dual-read support can be deployed fleet-wide first.
@@ -130,13 +131,45 @@ impl ApiConfig {
     pub fn from_env() -> Result<Self, String> {
         let auth = AuthConfig::from_env()?;
         let database_encryption_keys = non_empty_env("DB_ENCRYPTION_KEYS")
-            .map(|raw| parse_key_source_specs(&raw))
+            .map(|raw| {
+                let specs = parse_key_source_specs(&raw)?;
+                if env::var("DB_ENCRYPTION_ALLOW_INLINE_KEYS").as_deref() != Ok("true") {
+                    if let Some(index) = specs
+                        .iter()
+                        .position(|spec| matches!(spec.source, KeySource::Hex(_)))
+                    {
+                        return Err(format!("DB_ENCRYPTION_KEYS entry {index}: hex sources require DB_ENCRYPTION_ALLOW_INLINE_KEYS=true (local development and tests only)"));
+                    }
+                }
+                Ok(specs)
+            })
             .transpose()?;
-        let database_encryption_key = if database_encryption_keys.is_some() {
-            read_optional_secret_env("DB_ENCRYPTION_KEY_FILE", "DB_ENCRYPTION_KEY")?
-                .unwrap_or_default()
+        let (database_encryption_key, database_encryption_key_id) = if let Some(specs) =
+            &database_encryption_keys
+        {
+            if [
+                "DB_ENCRYPTION_KEY_FILE",
+                "DB_ENCRYPTION_KEY",
+                "DB_ENCRYPTION_KEY_ID",
+            ]
+            .iter()
+            .any(|name| env::var_os(name).is_some())
+            {
+                eprintln!("WARN: DB_ENCRYPTION_KEY_FILE, DB_ENCRYPTION_KEY and DB_ENCRYPTION_KEY_ID are ignored when DB_ENCRYPTION_KEYS is set; the legacy key must be listed as a read entry if it is still needed");
+            }
+            (
+                String::new(),
+                specs
+                    .first()
+                    .ok_or("DB_ENCRYPTION_KEYS must contain at least one entry")?
+                    .key_id
+                    .clone(),
+            )
         } else {
-            read_required_secret_env("DB_ENCRYPTION_KEY_FILE", "DB_ENCRYPTION_KEY")?
+            (
+                read_required_secret_env("DB_ENCRYPTION_KEY_FILE", "DB_ENCRYPTION_KEY")?,
+                non_empty_env("DB_ENCRYPTION_KEY_ID").unwrap_or_else(|| "db-v1".to_string()),
+            )
         };
         Ok(Self {
             server: ServerConfig::from_env()?,
@@ -160,8 +193,7 @@ impl ApiConfig {
             database: DatabaseConfig::from_env()?,
             database_encryption_key,
             database_encryption_keys,
-            database_encryption_key_id: non_empty_env("DB_ENCRYPTION_KEY_ID")
-                .unwrap_or_else(|| "db-v1".to_string()),
+            database_encryption_key_id,
             database_encryption_write_enabled: parse_bool_env(
                 "DB_ENCRYPTION_WRITE_ENABLED",
                 false,

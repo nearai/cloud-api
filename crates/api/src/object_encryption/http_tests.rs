@@ -127,6 +127,7 @@ async fn invalid_jobs_are_rejected_before_accessing_the_database() {
         json!({"mode":"execute","batch_size":0}),
         json!({"mode":"verify","actions":["rewrap"]}),
         json!({"mode":"execute","batch_delay_ms":10001}),
+        json!({"mode":"execute","batch_delay_ms":0,"scope":{"options":{"batch_delay_ms":10}}}),
     ] {
         // When submitting a job to the real handler.
         let response = server
@@ -137,4 +138,32 @@ async fn invalid_jobs_are_rejected_before_accessing_the_database() {
         response.assert_status_bad_request();
         assert_eq!(response.json::<Value>()["error"]["code"], "invalid_request");
     }
+}
+
+#[tokio::test]
+async fn scan_groups_unconfigured_metadata_into_unknown_without_trusting_it() {
+    // Given test-local objects whose metadata names unconfigured IDs.
+    let (server, storage) = fixture();
+    for id in ["retired", "arbitrary-untrusted-id"] {
+        storage
+            .seed_raw(
+                id,
+                encrypt_with_key(b"legacy", &[7; 32]).unwrap(),
+                Some(id.into()),
+                "text/plain",
+            )
+            .unwrap();
+    }
+    // When scanning via the real object route.
+    let response = server
+        .post("/admin/object-encryption/scan")
+        .json(&json!({}))
+        .await;
+    // Then unconfigured names cannot become inventory map keys.
+    response.assert_status_ok();
+    assert_eq!(
+        response.json::<Value>()["totals"]["by_key_id"],
+        json!({"unknown":2})
+    );
+    assert_eq!(storage.download("retired").await.unwrap(), b"legacy");
 }

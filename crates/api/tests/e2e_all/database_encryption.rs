@@ -301,14 +301,13 @@ async fn execute_job_encrypts_user_metadata_that_collides_with_the_marker() {
         .expect("encrypted marker collision metadata")
         .get(0);
     assert!(database::field_encryption::is_envelope(&stored));
-    let key = database
+    let ring = database
         .pool()
-        .encryption_key()
-        .expect("database encryption key");
+        .encryption_ring()
+        .expect("database encryption ring");
     assert_eq!(
-        database::field_encryption::decrypt_json_if_encrypted_with_key_id(
-            &key,
-            &database.pool().encryption_key_id(),
+        database::field_encryption::decrypt_json_if_encrypted_with_ring(
+            &ring,
             "responses",
             "metadata",
             response_id,
@@ -881,3 +880,61 @@ mod key_rotation;
 // Object jobs share the serialized encryption-job test group.
 #[path = "object_encryption.rs"]
 mod object_encryption;
+#[tokio::test]
+async fn cancellation_interrupts_a_large_batch_delay() {
+    let server = setup_test_server().await;
+    let created = server
+        .post("/v1/admin/database-encryption/jobs")
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .json(&serde_json::json!({
+            "mode": "dry_run",
+            "scope": {"fields": [{"table": "files", "column": "filename"}]},
+            "actions": ["rewrap"],
+            "batch_size": 1,
+            "max_rows": 1,
+            "batch_delay_ms": 10000
+        }))
+        .await;
+    assert_eq!(created.status_code(), 202);
+    let job_id = created.json::<serde_json::Value>()["job_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // A persisted cursor proves a batch committed and the worker entered the
+    // delay, even when this shared field scope happens to contain no rows.
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let response = server
+                .get(format!("/v1/admin/database-encryption/jobs/{job_id}").as_str())
+                .add_header("Authorization", format!("Bearer {}", get_session_id()))
+                .add_header("User-Agent", MOCK_USER_AGENT)
+                .await;
+            assert_eq!(response.status_code(), 200);
+            let status = response.json::<serde_json::Value>();
+            assert!(matches!(
+                status["status"].as_str(),
+                Some("queued" | "running")
+            ));
+            if status["cursor"]["table"] == "files" {
+                assert_eq!(status["status"], "running");
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("first batch committed");
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        let response = server
+            .post(format!("/v1/admin/database-encryption/jobs/{job_id}/cancel").as_str())
+            .add_header("Authorization", format!("Bearer {}", get_session_id()))
+            .add_header("User-Agent", MOCK_USER_AGENT)
+            .await;
+        assert_eq!(response.status_code(), 200);
+        wait_for_database_encryption_job_status(&server, &job_id, "cancelled").await;
+    })
+    .await
+    .expect("cancellation must interrupt the ten-second delay within two seconds");
+}

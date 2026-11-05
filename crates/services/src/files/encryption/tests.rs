@@ -40,15 +40,23 @@ fn an_existing_hint_selects_only_that_key() {
 }
 
 #[test]
-fn matching_material_without_metadata_uses_the_first_id() {
-    let ring =
-        ObjectKeyRing::new("current".into(), [1; 32], vec![("old".into(), [1; 32])]).unwrap();
-    let data = encrypt_with_key(b"content", &[1; 32]).unwrap();
-    assert_eq!(decrypt_with_ring(&data, &ring, None).unwrap().1, "current");
-    assert_eq!(
-        decrypt_with_ring(&data, &ring, Some("old")).unwrap().1,
-        "old"
-    );
+fn identical_material_under_distinct_ids_is_rejected() {
+    for previous in [
+        vec![("old".into(), [1; 32])],
+        vec![("old".into(), [2; 32]), ("older".into(), [2; 32])],
+    ] {
+        assert!(ObjectKeyRing::new("current".into(), [1; 32], previous).is_err());
+    }
+}
+
+#[test]
+fn ring_zeroizes_its_keys_and_declares_drop_cleanup() {
+    fn assert_zeroizes_on_drop<T: zeroize::ZeroizeOnDrop>() {}
+    assert_zeroizes_on_drop::<ObjectKeyRing>();
+    let mut ring = ring();
+    zeroize::Zeroize::zeroize(&mut ring);
+    assert_eq!(ring.write_key(), &[0; 32]);
+    assert_eq!(ring.ids(), vec![""]);
 }
 
 #[test]

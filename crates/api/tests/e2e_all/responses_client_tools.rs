@@ -390,6 +390,130 @@ async fn undeclared_function_calls_complete_and_replay_client_errors() {
 }
 
 #[tokio::test]
+async fn removed_client_tool_aliases_complete_and_replay_client_errors() {
+    let (server, _pool, mock, _database) = setup_test_server_with_pool().await;
+    let model = setup_qwen_model(&server).await;
+    let org = setup_org_with_credits(&server, 10_000_000_000).await;
+    let api_key = get_api_key_for_org(&server, org.id).await;
+    let client_error = "unsupported call: removed tool";
+    let histories = [
+        (
+            json!({"type":"custom_tool_call","call_id":"call_old","namespace":"functions","name":"exec","input":"text('old');"}),
+            json!({"type":"custom_tool_call_output","call_id":"call_old","output":"old result"}),
+            json!({"input":"text('old');"}).to_string(),
+        ),
+        (
+            json!({"type":"function_call","call_id":"call_old","namespace":"archive","name":"lookup","arguments":" {\"key\":\"old\"} "}),
+            json!({"type":"function_call_output","call_id":"call_old","output":"old result"}),
+            " {\"key\":\"old\"} ".to_string(),
+        ),
+    ];
+
+    for (history, old_result, old_arguments) in histories {
+        // A valid custom wrapper and a missing input must both remain opaque
+        // once the old tool has been removed from the current catalog.
+        for arguments in [" {\"input\":\"text('new');\"} ", "{}"] {
+            for stream in [false, true] {
+                let mut request = json!({
+                    "model":model,"store":false,"stream":stream,
+                    "input":[
+                        {"role":"user","content":"Inspect the old synthetic value."},
+                        history,old_result,
+                        {"role":"user","content":"Continue with the available tools."}
+                    ],
+                    "tools":[{"type":"function","name":"exec_command","parameters":{"type":"object"}}]
+                });
+                let (normalized, _) = normalize_request(request.clone()).unwrap();
+                let alias = normalized["input"][1]["name"].as_str().unwrap();
+                assert_ne!(alias, history["name"].as_str().unwrap());
+                assert_eq!(normalized["tools"].as_array().unwrap().len(), 1);
+                assert_eq!(normalized["tools"][0]["name"], "exec_command");
+                mock.set_default_response(
+                    ResponseTemplate::new("")
+                        .with_tool_calls(vec![ToolCall::new(alias, arguments)]),
+                )
+                .await;
+                let first = server
+                    .post("/v1/responses")
+                    .add_header("Authorization", format!("Bearer {api_key}"))
+                    .json(&request)
+                    .await;
+                let response = completed_http_response(&first, stream);
+                let output = response["output"].as_array().unwrap();
+                assert_eq!(output.len(), 1);
+                let call = &output[0];
+                assert_eq!(call["type"], "function_call");
+                assert_eq!(call["name"], alias);
+                assert_eq!(call["arguments"], arguments);
+                assert_eq!(call["call_id"], "call_0");
+                assert!(call.get("namespace").is_none());
+                assert!(call.get("input").is_none());
+                if stream {
+                    let events = response_events(&first.text());
+                    assert!(events.iter().all(|event| !event["type"]
+                        .as_str()
+                        .unwrap()
+                        .starts_with("response.custom_tool_call_input.")));
+                    let done = events
+                        .iter()
+                        .find(|event| event["type"] == "response.function_call_arguments.done")
+                        .unwrap();
+                    assert_eq!(done["arguments"], arguments);
+                    assert_eq!(done["item_id"], call["id"]);
+                }
+
+                let input = request["input"].as_array_mut().unwrap();
+                input.push(call.clone());
+                input.push(json!({
+                    "type":"function_call_output","call_id":call["call_id"],"output":client_error
+                }));
+                mock.set_default_response(ResponseTemplate::new(
+                    "Recovered from the removed tool.",
+                ))
+                .await;
+                let second = server
+                    .post("/v1/responses")
+                    .add_header("Authorization", format!("Bearer {api_key}"))
+                    .json(&request)
+                    .await;
+                let response = completed_http_response(&second, stream);
+                assert_eq!(
+                    response["output"][0]["content"][0]["text"],
+                    "Recovered from the removed tool."
+                );
+                let params = mock.last_chat_params().await.unwrap();
+                let tools = params.tools.as_ref().unwrap();
+                assert_eq!(tools.len(), 1);
+                assert_eq!(tools[0].function.name, "exec_command");
+                let calls: Vec<_> = params
+                    .messages
+                    .iter()
+                    .filter_map(|message| message.tool_calls.as_ref())
+                    .flatten()
+                    .collect();
+                assert_eq!(calls.len(), 2);
+                assert_eq!(calls[0].id.as_deref(), Some("call_old"));
+                assert_eq!(calls[0].function.name.as_deref(), Some(alias));
+                assert_eq!(
+                    calls[0].function.arguments.as_deref(),
+                    Some(old_arguments.as_str())
+                );
+                assert_eq!(calls[1].id.as_deref(), Some("call_0"));
+                assert_eq!(calls[1].function.name.as_deref(), Some(alias));
+                assert_eq!(calls[1].function.arguments.as_deref(), Some(arguments));
+                let result = params
+                    .messages
+                    .iter()
+                    .find(|message| message.tool_call_id.as_deref() == Some("call_0"))
+                    .unwrap();
+                assert_eq!(result.content, Some(json!(client_error)));
+            }
+        }
+    }
+    assert_eq!(mock.chat_completion_call_count(), 16);
+}
+
+#[tokio::test]
 async fn undeclared_search_names_return_client_calls_without_hosted_execution() {
     let search = Arc::new(RecordingSearchProvider::default());
     let (server, _database, mock) =

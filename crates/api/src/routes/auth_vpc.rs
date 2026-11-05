@@ -92,12 +92,6 @@ pub async fn vpc_login(
         ));
     }
 
-    // Reject client_ids outside the allowlist before any user is created
-    let allowed = &state.config.auth.vpc_login_allowed_client_ids;
-    if !allowed.is_empty() && !allowed.iter().any(|id| id == &payload.client_id) {
-        return Err((StatusCode::UNAUTHORIZED, "Client not allowed".to_string()));
-    }
-
     // Get or create Chat API user with deterministic mapping
     let provider_user_id = format!("{VPC_PROVIDER_USER_ID_PREFIX}{}", payload.client_id);
     let email = format!("{}@vpc.internal.near.ai", payload.client_id);
@@ -203,11 +197,7 @@ pub async fn vpc_login(
             name: api_key_name,
             workspace_id: workspace.id.clone(),
             created_by_user_id: user.id,
-            expires_at: state
-                .config
-                .auth
-                .vpc_login_api_key_ttl_days
-                .map(|days| chrono::Utc::now() + chrono::Duration::days(i64::from(days))),
+            expires_at: None,  // Unbound expiry
             spend_limit: None, // Unbound spend limit
         })
         .await

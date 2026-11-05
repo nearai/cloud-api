@@ -108,8 +108,7 @@ pub fn test_config() -> ApiConfig {
             admin_domains: vec!["test.com".to_string()],
             admin_read_only_tokens_enabled: false,
             require_session_bound_access_tokens: false,
-            vpc_login_allowed_client_ids: Vec::new(),
-            vpc_login_api_key_ttl_days: None,
+            vpc_login_enabled: true,
         },
         database: config::DatabaseConfig {
             connection_mode: config::DatabaseConnectionMode::Patroni,

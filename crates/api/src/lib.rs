@@ -1456,6 +1456,12 @@ pub fn build_auth_vpc_routes(app_state: AppState) -> Router {
     use crate::routes::auth_vpc::vpc_login;
     use axum::routing::post;
 
+    // When disabled the route is not registered, so requests get a 404 before
+    // any body is read or signature verified.
+    if !app_state.config.auth.vpc_login_enabled {
+        return Router::new();
+    }
+
     Router::new()
         .route("/auth/vpc/login", post(vpc_login))
         .with_state(app_state)
@@ -3509,8 +3515,7 @@ mod tests {
                 admin_domains: vec![],
                 admin_read_only_tokens_enabled: false,
                 require_session_bound_access_tokens: false,
-                vpc_login_allowed_client_ids: Vec::new(),
-                vpc_login_api_key_ttl_days: None,
+                vpc_login_enabled: true,
             },
             database: config::DatabaseConfig {
                 connection_mode: config::DatabaseConnectionMode::Patroni,
@@ -3634,8 +3639,7 @@ mod tests {
                 admin_domains: vec![],
                 admin_read_only_tokens_enabled: false,
                 require_session_bound_access_tokens: false,
-                vpc_login_allowed_client_ids: Vec::new(),
-                vpc_login_api_key_ttl_days: None,
+                vpc_login_enabled: true,
             },
             database: config::DatabaseConfig {
                 connection_mode: config::DatabaseConnectionMode::Patroni,

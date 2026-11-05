@@ -73,10 +73,6 @@ pub struct AttestationService {
     pub usage_repository: Arc<dyn UsageRepository>,
     pub vpc_info: Option<VpcInfo>,
     pub vpc_shared_secret: Option<String>,
-    /// Dedicated login secret (`SERVICE_LOGIN_SECRET_FILE`), checked before the shared secret.
-    pub service_login_secret: Option<String>,
-    /// Whether `vpc_shared_secret` is still accepted for login.
-    pub vpc_login_allow_shared_secret: bool,
     pub tls_cert_fingerprint: Option<String>,
     ed25519_signing_key: Arc<SigningKey>,
     ed25519_verifying_key: Arc<VerifyingKey>,

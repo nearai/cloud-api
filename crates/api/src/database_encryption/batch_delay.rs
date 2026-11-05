@@ -1,3 +1,4 @@
+use super::DATABASE_JOB_KIND_FILTER;
 use std::{future::Future, time::Duration};
 
 pub(super) async fn wait_between_batches<F, Fut>(
@@ -29,7 +30,7 @@ pub(super) async fn cancel_if_requested(
 ) -> anyhow::Result<bool> {
     let client = pool.get().await?;
     Ok(client.execute(
-        "UPDATE database_encryption_jobs SET status='cancelled',completed_at=NOW() WHERE id=$1 AND cancel_requested_at IS NOT NULL AND status IN ('queued','running')",
+        &format!("UPDATE database_encryption_jobs SET status='cancelled',completed_at=NOW() WHERE {DATABASE_JOB_KIND_FILTER} AND id=$1 AND cancel_requested_at IS NOT NULL AND status IN ('queued','running')"),
         &[&id],
     ).await? > 0)
 }

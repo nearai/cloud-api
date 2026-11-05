@@ -12,12 +12,15 @@ use tokio::sync::Semaphore;
 use uuid::Uuid;
 
 mod batch_delay;
+#[cfg(test)]
+mod job_kind_tests;
 mod key_rotation;
 use key_rotation::{
     classify, job_action, rewrap_envelope, validate_delay, Action, Classification, KeyCounts,
 };
 
 const MARKER: &str = "__near_db_encrypted";
+const DATABASE_JOB_KIND_FILTER: &str = "COALESCE(scope->>'kind','') = ''";
 const MAX_BATCH_PLAINTEXT_BYTES: i64 = 8 * 1024 * 1024;
 
 // Confidential fields and API contracts.
@@ -281,7 +284,7 @@ impl DatabaseEncryptionState {
                     let client = state.pool.get().await?;
                     let rows = client
                         .query(
-                            "SELECT id FROM database_encryption_jobs WHERE status IN ('queued', 'running') ORDER BY created_at",
+                            &format!("SELECT id FROM database_encryption_jobs WHERE {DATABASE_JOB_KIND_FILTER} AND status IN ('queued', 'running') ORDER BY created_at"),
                             &[],
                         )
                         .await?;
@@ -305,12 +308,25 @@ impl DatabaseEncryptionState {
 
 #[derive(Debug, Deserialize, Serialize, Default, utoipa::ToSchema)]
 pub struct Scope {
+    #[serde(
+        default,
+        rename = "kind",
+        skip_serializing,
+        deserialize_with = "kind_present"
+    )]
+    #[schema(ignore)]
+    kind_present: bool,
     #[serde(default)]
     tables: Vec<String>,
     #[serde(default)]
     fields: Vec<FieldName>,
     #[serde(default, skip_serializing_if = "JobOptions::is_empty")]
     options: JobOptions,
+}
+
+fn kind_present<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<bool, D::Error> {
+    serde::de::IgnoredAny::deserialize(deserializer)?;
+    Ok(true)
 }
 
 #[derive(Debug, Deserialize, Serialize, Default, utoipa::ToSchema)]
@@ -729,7 +745,7 @@ pub struct KeysResponse {
     get,
     path = "/v1/admin/database-encryption/keys",
     tag = "Admin",
-    responses((status = 200, description = "Configured write/read key IDs, 16-character SHA-256 fingerprints, and write status", body = KeysResponse)),
+    responses((status = 200, description = "Configured write/read key IDs, 16 lowercase hex characters of HMAC-SHA256(key, \"near-key-fingerprint/v1\") fingerprints, and write status", body = KeysResponse)),
     security(("admin_token" = []))
 )]
 pub async fn get_keys(
@@ -765,6 +781,9 @@ pub async fn create_job(
     Extension(admin): Extension<AdminUser>,
     Json(req): Json<CreateJobRequest>,
 ) -> Result<(StatusCode, Json<JobResponse>), (StatusCode, Json<Value>)> {
+    if req.scope.kind_present {
+        return Err(bad("scope.kind is not supported for database jobs"));
+    }
     if !matches!(req.mode, Mode::Verify)
         && req.scope.tables.is_empty()
         && req.scope.fields.is_empty()
@@ -846,7 +865,7 @@ fn spawn_job(state: DatabaseEncryptionState, id: Uuid) {
             if let Ok(client) = state.pool.get().await {
                 let _ = client
                     .execute(
-                        "UPDATE database_encryption_jobs SET status='failed',last_error_class=$2,last_error_message=$2,progress=progress || jsonb_build_object('failure',jsonb_build_object('class',$2,'cursor',cursor)),completed_at=NOW() WHERE id=$1 AND status IN ('queued','running')",
+                        &format!("UPDATE database_encryption_jobs SET status='failed',last_error_class=$2,last_error_message=$2,progress=progress || jsonb_build_object('failure',jsonb_build_object('class',$2,'cursor',cursor)),completed_at=NOW() WHERE {DATABASE_JOB_KIND_FILTER} AND id=$1 AND status IN ('queued','running')"),
                         &[&id, &error_class],
                     )
                     .await;
@@ -904,7 +923,7 @@ async fn run_job(state: &DatabaseEncryptionState, id: Uuid) -> anyhow::Result<()
         .ok_or_else(|| anyhow::anyhow!("database encryption ring is not configured"))?;
     let job = client
         .query_opt(
-            "UPDATE database_encryption_jobs SET status='running',started_at=COALESCE(started_at,NOW()) WHERE id=$1 AND status IN ('queued','running') RETURNING mode,scope,batch_size,max_rows,cursor,progress,actions",
+            &format!("UPDATE database_encryption_jobs SET status='running',started_at=COALESCE(started_at,NOW()) WHERE {DATABASE_JOB_KIND_FILTER} AND id=$1 AND status IN ('queued','running') RETURNING mode,scope,batch_size,max_rows,cursor,progress,actions"),
             &[&id],
         )
         .await?;
@@ -978,7 +997,7 @@ async fn run_job(state: &DatabaseEncryptionState, id: Uuid) -> anyhow::Result<()
         }
         let cancelled: bool = transaction
             .query_one(
-                "SELECT cancel_requested_at IS NOT NULL FROM database_encryption_jobs WHERE id=$1",
+                &format!("SELECT cancel_requested_at IS NOT NULL FROM database_encryption_jobs WHERE {DATABASE_JOB_KIND_FILTER} AND id=$1"),
                 &[&id],
             )
             .await?
@@ -986,7 +1005,7 @@ async fn run_job(state: &DatabaseEncryptionState, id: Uuid) -> anyhow::Result<()
         if cancelled {
             transaction
                 .execute(
-                    "UPDATE database_encryption_jobs SET status='cancelled',completed_at=NOW() WHERE id=$1",
+                    &format!("UPDATE database_encryption_jobs SET status='cancelled',completed_at=NOW() WHERE {DATABASE_JOB_KIND_FILTER} AND id=$1"),
                     &[&id],
                 )
                 .await?;
@@ -1122,7 +1141,7 @@ async fn run_job(state: &DatabaseEncryptionState, id: Uuid) -> anyhow::Result<()
 
         transaction
             .execute(
-                "UPDATE database_encryption_jobs SET progress=$2,cursor=$3 WHERE id=$1",
+                &format!("UPDATE database_encryption_jobs SET progress=$2,cursor=$3 WHERE {DATABASE_JOB_KIND_FILTER} AND id=$1"),
                 &[
                     &id,
                     &json!({
@@ -1168,7 +1187,7 @@ async fn run_job(state: &DatabaseEncryptionState, id: Uuid) -> anyhow::Result<()
             plaintext == 0 && invalid_envelopes == 0 && stale == 0 && unclassified.is_empty();
         client
             .execute(
-                "UPDATE database_encryption_jobs SET status='completed',completed_at=NOW(),progress=progress || $2 WHERE id=$1",
+                &format!("UPDATE database_encryption_jobs SET status='completed',completed_at=NOW(),progress=progress || $2 WHERE {DATABASE_JOB_KIND_FILTER} AND id=$1"),
                 &[&id, &json!({
                     "pass": pass,
                     "approved_plaintext": approved,
@@ -1180,7 +1199,7 @@ async fn run_job(state: &DatabaseEncryptionState, id: Uuid) -> anyhow::Result<()
     } else {
         client
             .execute(
-                "UPDATE database_encryption_jobs SET status='completed',completed_at=NOW() WHERE id=$1",
+                &format!("UPDATE database_encryption_jobs SET status='completed',completed_at=NOW() WHERE {DATABASE_JOB_KIND_FILTER} AND id=$1"),
                 &[&id],
             )
             .await?;
@@ -1198,7 +1217,7 @@ pub async fn get_job(
 
 async fn get_inner(state: &DatabaseEncryptionState, id: Uuid) -> ApiResult<JobResponse> {
     let c = state.pool.get().await.map_err(internal)?;
-    let r=c.query_opt("SELECT id,status,mode,scope,actions,progress,cursor,created_at,completed_at,last_error_class,last_error_message FROM database_encryption_jobs WHERE id=$1",&[&id]).await.map_err(internal)?.ok_or_else(||(StatusCode::NOT_FOUND,Json(json!({"error":{"code":"job_not_found","message":"Database encryption job not found"}}))))?;
+    let r=c.query_opt(&format!("SELECT id,status,mode,scope,actions,progress,cursor,created_at,completed_at,last_error_class,last_error_message FROM database_encryption_jobs WHERE {DATABASE_JOB_KIND_FILTER} AND id=$1"),&[&id]).await.map_err(internal)?.ok_or_else(||(StatusCode::NOT_FOUND,Json(json!({"error":{"code":"job_not_found","message":"Database encryption job not found"}}))))?;
     Ok(Json(JobResponse {
         job_id: r.get(0),
         status: r.get(1),
@@ -1220,7 +1239,7 @@ pub async fn cancel_job(
     Path(id): Path<Uuid>,
 ) -> ApiResult<JobResponse> {
     let c = state.pool.get().await.map_err(internal)?;
-    let n=c.execute("UPDATE database_encryption_jobs SET cancel_requested_at=NOW(),status=CASE WHEN status='queued' THEN 'cancelled' ELSE status END,completed_at=CASE WHEN status='queued' THEN NOW() ELSE completed_at END WHERE id=$1 AND status IN('queued','running')",&[&id]).await.map_err(internal)?;
+    let n=c.execute(&format!("UPDATE database_encryption_jobs SET cancel_requested_at=NOW(),status=CASE WHEN status='queued' THEN 'cancelled' ELSE status END,completed_at=CASE WHEN status='queued' THEN NOW() ELSE completed_at END WHERE {DATABASE_JOB_KIND_FILTER} AND id=$1 AND status IN('queued','running')"),&[&id]).await.map_err(internal)?;
     if n == 0 {
         return Err(bad("job is not cancellable"));
     }

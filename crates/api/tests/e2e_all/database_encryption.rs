@@ -935,3 +935,5 @@ async fn cancellation_interrupts_a_large_batch_delay() {
     .await
     .expect("cancellation must interrupt the ten-second delay within two seconds");
 }
+
+mod foreign_jobs;

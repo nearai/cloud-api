@@ -3509,6 +3509,8 @@ mod tests {
                 admin_domains: vec![],
                 admin_read_only_tokens_enabled: false,
                 require_session_bound_access_tokens: false,
+                vpc_login_allowed_client_ids: Vec::new(),
+                vpc_login_api_key_ttl_days: None,
             },
             database: config::DatabaseConfig {
                 connection_mode: config::DatabaseConnectionMode::Patroni,
@@ -3632,6 +3634,8 @@ mod tests {
                 admin_domains: vec![],
                 admin_read_only_tokens_enabled: false,
                 require_session_bound_access_tokens: false,
+                vpc_login_allowed_client_ids: Vec::new(),
+                vpc_login_api_key_ttl_days: None,
             },
             database: config::DatabaseConfig {
                 connection_mode: config::DatabaseConnectionMode::Patroni,

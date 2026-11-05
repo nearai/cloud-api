@@ -481,3 +481,129 @@ async fn test_vpc_session_is_never_admin() {
         .await;
     assert_eq!(admin_response.status_code(), StatusCode::FORBIDDEN);
 }
+
+/// Set `SERVICE_LOGIN_SECRET_FILE` for the test (separate from the shared secret file).
+fn setup_service_login_secret(secret: &str) -> VpcSecretFileGuard {
+    let file_path = std::env::temp_dir().join(format!(
+        "service_login_secret_test_{}.txt",
+        uuid::Uuid::new_v4()
+    ));
+    fs::write(&file_path, secret).expect("Failed to write service login secret to temp file");
+    std::env::set_var("SERVICE_LOGIN_SECRET_FILE", file_path.to_str().unwrap());
+    VpcSecretFileGuard { file_path }
+}
+
+async fn login_status(server: &axum_test::TestServer, secret: &str, client_id: &str) -> StatusCode {
+    let timestamp = chrono::Utc::now().timestamp();
+    let request = serde_json::json!({
+        "timestamp": timestamp,
+        "signature": generate_vpc_signature(timestamp, secret),
+        "client_id": client_id
+    });
+    server
+        .post("/v1/auth/vpc/login")
+        .json(&request)
+        .await
+        .status_code()
+}
+
+#[tokio::test]
+async fn test_vpc_login_accepts_service_login_secret_and_shared_secret() {
+    let _shared = setup_vpc_shared_secret("test_vpc_secret_123");
+    let _service = setup_service_login_secret("test_service_secret_456");
+    let server = setup_test_server().await;
+    create_org(&server).await;
+
+    assert_eq!(
+        login_status(&server, "test_service_secret_456", "svc-client").await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        login_status(&server, "test_vpc_secret_123", "svc-client").await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        login_status(&server, "some_other_secret", "svc-client").await,
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+#[tokio::test]
+async fn test_vpc_login_shared_secret_disallowed() {
+    let _shared = setup_vpc_shared_secret("test_vpc_secret_123");
+    let _service = setup_service_login_secret("test_service_secret_456");
+    std::env::set_var("VPC_LOGIN_ALLOW_SHARED_SECRET", "false");
+    let server = setup_test_server().await;
+    std::env::remove_var("VPC_LOGIN_ALLOW_SHARED_SECRET");
+    create_org(&server).await;
+
+    assert_eq!(
+        login_status(&server, "test_service_secret_456", "svc-client").await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        login_status(&server, "test_vpc_secret_123", "svc-client").await,
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+#[tokio::test]
+async fn test_vpc_login_client_id_allowlist() {
+    let _shared = setup_vpc_shared_secret("test_vpc_secret_123");
+    let server = setup_test_server_with_config(|config| {
+        config.auth.vpc_login_allowed_client_ids = vec!["allowed-client".to_string()];
+    })
+    .await;
+    create_org(&server).await;
+
+    assert_eq!(
+        login_status(&server, "test_vpc_secret_123", "allowed-client").await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        login_status(&server, "test_vpc_secret_123", "other-client").await,
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+#[tokio::test]
+async fn test_vpc_login_api_key_ttl() {
+    let _shared = setup_vpc_shared_secret("test_vpc_secret_123");
+
+    for (ttl, expect_expiry) in [(Some(7), true), (None, false)] {
+        let server = setup_test_server_with_config(move |config| {
+            config.auth.mock = false;
+            config.auth.vpc_login_api_key_ttl_days = ttl;
+        })
+        .await;
+        let timestamp = chrono::Utc::now().timestamp();
+        let request = serde_json::json!({
+            "timestamp": timestamp,
+            "signature": generate_vpc_signature(timestamp, "test_vpc_secret_123"),
+            "client_id": "ttl-client"
+        });
+        let response = server.post("/v1/auth/vpc/login").json(&request).await;
+        assert_eq!(response.status_code(), StatusCode::OK);
+        let login = response.json::<VpcLoginResponse>();
+
+        let list = server
+            .get(format!("/v1/workspaces/{}/api-keys", login.workspace.id).as_str())
+            .add_header("Authorization", format!("Bearer {}", login.access_token))
+            .await;
+        assert_eq!(list.status_code(), StatusCode::OK, "{}", list.text());
+        let body = list.json::<serde_json::Value>();
+        let keys = body["api_keys"].as_array().unwrap();
+        assert_eq!(keys.len(), 1, "{body}");
+        match keys[0]["expires_at"].as_str() {
+            Some(expires_at) => {
+                assert!(expect_expiry, "unexpected expiry {expires_at}");
+                let expires_at = chrono::DateTime::parse_from_rfc3339(expires_at).unwrap();
+                let days = (expires_at.with_timezone(&chrono::Utc) - chrono::Utc::now()).num_hours()
+                    as f64
+                    / 24.0;
+                assert!((6.9..=7.0).contains(&days), "days until expiry: {days}");
+            }
+            None => assert!(!expect_expiry, "expected an expiry"),
+        }
+    }
+}

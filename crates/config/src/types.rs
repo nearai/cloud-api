@@ -1956,6 +1956,31 @@ mod tests {
     }
 
     #[test]
+    #[serial]
+    fn test_auth_config_vpc_login_env() {
+        env::set_var("AUTH_ENCODING_KEY", "test-only");
+        env::remove_var("VPC_LOGIN_ALLOWED_CLIENT_IDS");
+        env::remove_var("VPC_LOGIN_API_KEY_TTL_DAYS");
+        let config = AuthConfig::from_env().unwrap();
+        assert!(config.vpc_login_allowed_client_ids.is_empty());
+        assert_eq!(config.vpc_login_api_key_ttl_days, None);
+
+        env::set_var("VPC_LOGIN_ALLOWED_CLIENT_IDS", " a, b ,,c ");
+        env::set_var("VPC_LOGIN_API_KEY_TTL_DAYS", "30");
+        let config = AuthConfig::from_env().unwrap();
+        assert_eq!(config.vpc_login_allowed_client_ids, vec!["a", "b", "c"]);
+        assert_eq!(config.vpc_login_api_key_ttl_days, Some(30));
+
+        for invalid in ["0", "-1", "abc", "36501"] {
+            env::set_var("VPC_LOGIN_API_KEY_TTL_DAYS", invalid);
+            assert!(AuthConfig::from_env().is_err(), "{invalid}");
+        }
+        env::remove_var("VPC_LOGIN_ALLOWED_CLIENT_IDS");
+        env::remove_var("VPC_LOGIN_API_KEY_TTL_DAYS");
+        env::remove_var("AUTH_ENCODING_KEY");
+    }
+
+    #[test]
     fn test_is_admin_email() {
         let config = AuthConfig {
             mock: false,

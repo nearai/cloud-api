@@ -389,7 +389,7 @@ Operations marked deprecated (account, organization, workspace, invitation, API 
             crate::routes::usage::UsageByModelEntryResponse,
             crate::routes::usage::ServiceUsageHistoryResponse,
             crate::routes::usage::ServiceUsageEntryResponse,
-            crate::routes::usage::RecordUsageResponse,
+            crate::routes::internal_usage::RecordUsageResponse,
             crate::routes::usage::UserOrganizationMetrics,
             crate::routes::usage::UserMetricsSummary,
             crate::routes::usage::UserModelMetrics,

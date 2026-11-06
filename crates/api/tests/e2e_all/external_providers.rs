@@ -568,55 +568,6 @@ async fn test_external_model_completion_insufficient_credits() {
 }
 
 #[tokio::test]
-async fn test_external_model_cannot_have_attestation_enabled() {
-    let server = setup_test_server().await;
-
-    // Try to create an external model with attestation_supported = true
-    // The database constraint should prevent this
-    let mut batch = BatchUpdateModelApiRequest::new();
-    batch.insert(
-        "test/invalid-external-model".to_string(),
-        serde_json::from_value(serde_json::json!({
-            "inputCostPerToken": {
-                "amount": 1000000,
-                "currency": "USD"
-            },
-            "outputCostPerToken": {
-                "amount": 2000000,
-                "currency": "USD"
-            },
-            "modelDisplayName": "Invalid External Model",
-            "modelDescription": "This should fail",
-            "contextLength": 128000,
-            "maxOutputLength": 1024,
-            "verifiable": false,
-            "isActive": true,
-            "providerType": "external",
-            "providerConfig": {
-                "backend": "openai_compatible",
-                "base_url": "https://api.example.com/v1"
-            },
-            "attestationSupported": true  // This should be rejected
-        }))
-        .unwrap(),
-    );
-
-    let response = server
-        .patch("/v1/admin/models")
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
-        .add_header("User-Agent", MOCK_USER_AGENT)
-        .json(&batch)
-        .await;
-
-    // Should fail due to database constraint
-    assert!(
-        response.status_code() == 400 || response.status_code() == 500,
-        "Should reject external model with attestation enabled, got status {}",
-        response.status_code()
-    );
-}
-
-#[tokio::test]
 async fn test_update_external_provider_config() {
     let server = setup_test_server().await;
 

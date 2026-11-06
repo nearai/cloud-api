@@ -14,8 +14,7 @@
 //! cache invalidation: `seed_models` clears the models caches and `seed_allowed_models` the
 //! organization's filter, on every models service built by the harness in this process,
 //! so a read after a seed sees the seeded rows. A test whose subject is a route, its
-//! validation, its pool effects or its audit trail must call the route (for the catalog,
-//! `admin_batch_upsert_models`), not seed.
+//! validation, its pool effects or its audit trail belongs to the service that owns the route.
 //!
 //! Under nextest every test runs in its own process, so the registries above hold one
 //! server and seeding touches only that one. Under plain `cargo test` the tests share a
@@ -39,8 +38,11 @@ use database::repositories::admin_access_token::AdminAccessTokenRepository;
 use database::repositories::credit_allocation::settle_unfunded_usage;
 use database::repositories::model::ModelRepository;
 use database::repositories::model_alias::ModelAliasRepository;
+use database::repositories::AdminCompositeRepository;
 use database::repositories::CreditAllocationPolicy;
 use database::Database;
+use services::admin::AdminRepository;
+use services::admin_settings::AdminSettingsService;
 use services::inference_provider_pool::InferenceProviderPool;
 use services::models::{ModelsServiceImpl, ModelsServiceTrait};
 use std::sync::{Arc, Mutex, Weak};
@@ -57,12 +59,21 @@ static MODELS_SERVICES: Mutex<Vec<Weak<ModelsServiceImpl>>> = Mutex::new(Vec::ne
 /// seeding can register the providers of seeded models the way the admin route did.
 static PROVIDER_POOLS: Mutex<Vec<Weak<InferenceProviderPool>>> = Mutex::new(Vec::new());
 
-/// Record a server's models service and provider pool so seeding can invalidate its caches
-/// and register providers. Called by the harness for every app it builds.
+/// Admin settings services of the servers built by the harness in this process.
+static ADMIN_SETTINGS: Mutex<Vec<Weak<AdminSettingsService>>> = Mutex::new(Vec::new());
+
+/// Record a server's models service, provider pool and admin settings service so seeding
+/// can invalidate its caches, register providers and apply settings. Called by the harness
+/// for every app it builds.
 pub fn register_models_service(
     models_service: &Arc<ModelsServiceImpl>,
     provider_pool: &Arc<InferenceProviderPool>,
+    admin_settings: &Arc<AdminSettingsService>,
 ) {
+    let mut settings = ADMIN_SETTINGS.lock().expect("admin settings registry");
+    settings.retain(|service| service.strong_count() > 0);
+    settings.push(Arc::downgrade(admin_settings));
+    drop(settings);
     let mut registered = MODELS_SERVICES.lock().expect("models service registry");
     registered.retain(|service| service.strong_count() > 0);
     registered.push(Arc::downgrade(models_service));
@@ -274,6 +285,84 @@ pub async fn seed_credit_limit(
         },
         updated_at: effective_from.to_rfc3339(),
     }
+}
+
+/// What `GET /v1/admin/organizations/{id}/limits/history` returned: every limit row of the
+/// organization, newest `effective_from` first.
+pub async fn limits_history(org_id: &str) -> usage_views::LimitsHistoryResponse {
+    let database = seed_database().await;
+    let organization_id = Uuid::parse_str(org_id).expect("organization id must be a UUID");
+    let client = database
+        .pool()
+        .get()
+        .await
+        .expect("Failed to get database connection");
+    let rows = client
+        .query(
+            "SELECT credit_type, source, spend_limit, effective_until
+             FROM organization_limits_history
+             WHERE organization_id = $1
+             ORDER BY effective_from DESC",
+            &[&organization_id],
+        )
+        .await
+        .expect("Failed to read limits history");
+    usage_views::LimitsHistoryResponse {
+        history: rows
+            .iter()
+            .map(|row| usage_views::LimitsHistoryEntry {
+                credit_type: row.get("credit_type"),
+                source: row.get("source"),
+                spend_limit: usage_views::LimitAmount {
+                    amount: row.get("spend_limit"),
+                },
+                effective_until: row
+                    .get::<_, Option<DateTime<Utc>>>("effective_until")
+                    .map(|t| t.to_rfc3339()),
+            })
+            .collect(),
+    }
+}
+
+/// Patch an admin setting and make it live, as `PATCH /v1/admin/settings/{key}` did: store
+/// the merged value, then apply it on every settings service the harness built (the live
+/// values are process-wide, so one apply is enough when several servers share a process).
+pub async fn seed_admin_setting(key: &str, patch: serde_json::Value) {
+    let services: Vec<Arc<AdminSettingsService>> = ADMIN_SETTINGS
+        .lock()
+        .expect("admin settings registry")
+        .iter()
+        .filter_map(Weak::upgrade)
+        .collect();
+    let service = services
+        .first()
+        .expect("no admin settings service registered");
+    service
+        .update(key, patch, user_id_for_session(&super::get_session_id()))
+        .await
+        .unwrap_or_else(|e| panic!("Failed to seed admin setting {key}: {e:?}"));
+}
+
+/// Set the organization's concurrent request limit, as the admin concurrent-limit update
+/// did. Does not invalidate the completion service's per-organization cache, so call it
+/// before the organization's first completion request.
+pub async fn seed_concurrent_limit(org_id: &str, concurrent_limit: Option<i32>) {
+    let database = seed_database().await;
+    let organization_id = Uuid::parse_str(org_id).expect("organization id must be a UUID");
+    let client = database
+        .pool()
+        .get()
+        .await
+        .expect("Failed to get database connection");
+    let updated = client
+        .execute(
+            "UPDATE organizations SET rate_limit = $1, updated_at = NOW()
+             WHERE id = $2 AND is_active = true",
+            &[&concurrent_limit, &organization_id],
+        )
+        .await
+        .expect("Failed to seed concurrent limit");
+    assert_eq!(updated, 1, "Organization not found: {organization_id}");
 }
 
 /// Active workspaces of an organization, oldest first.
@@ -695,6 +784,97 @@ pub async fn seed_models(
         models_service.invalidate_models_cache().await;
     }
     out
+}
+
+/// Deprecate a model onto a successor, as `POST /v1/admin/models/deprecate` did: the
+/// repository transaction (alias, re-pointed aliases, deactivation, history), then stop
+/// routing live traffic to the deprecated model's provider unless it is pinned, and clear
+/// the models caches.
+pub async fn seed_deprecation(model_id: &str, successor_model_id: &str, change_reason: &str) {
+    let database = seed_database().await;
+    let repo = AdminCompositeRepository::new(database.pool().clone());
+    let outcome = repo
+        .deprecate_model(
+            model_id,
+            successor_model_id,
+            Some(change_reason.to_string()),
+            Some(user_id_for_session(&super::get_session_id())),
+            Some(MOCK_ADMIN_EMAIL.to_string()),
+        )
+        .await
+        .expect("Failed to seed deprecation");
+    assert!(
+        outcome.is_some(),
+        "Either {model_id} or {successor_model_id} was not found, or the successor is not active"
+    );
+    for pool in registered_provider_pools() {
+        if !pool.is_pinned(model_id) {
+            pool.unregister_provider(model_id).await;
+        }
+    }
+    for models_service in registered_models_services() {
+        models_service.invalidate_models_cache().await;
+    }
+}
+
+async fn model_id_by_name(model_name: &str) -> Uuid {
+    let database = seed_database().await;
+    let client = database.pool().get().await.expect("database connection");
+    client
+        .query_one(
+            "SELECT id FROM models WHERE model_name = $1",
+            &[&model_name],
+        )
+        .await
+        .unwrap_or_else(|e| panic!("model {model_name} not found: {e}"))
+        .get("id")
+}
+
+/// Grant an organization access to a model, as `PUT /v1/admin/models/{name}/access/{org}`
+/// did: the grant and its audit row, then the cached access decision dropped.
+pub async fn seed_model_access_grant(model_name: &str, organization_id: &str) {
+    let database = seed_database().await;
+    let repo = AdminCompositeRepository::new(database.pool().clone());
+    let model_id = model_id_by_name(model_name).await;
+    let organization_id = Uuid::parse_str(organization_id).expect("organization id");
+    let granted = repo
+        .grant_model_access(
+            model_id,
+            organization_id,
+            Some(user_id_for_session(&super::get_session_id())),
+        )
+        .await
+        .expect("Failed to seed model access grant");
+    assert!(
+        granted.is_some(),
+        "Organization not found: {organization_id}"
+    );
+    for models_service in registered_models_services() {
+        models_service
+            .invalidate_model_access(organization_id, model_id)
+            .await;
+    }
+}
+
+/// Revoke an organization's access to a model, as `DELETE /v1/admin/models/{name}/access/{org}`
+/// did. Revoking a grant that does not exist changes nothing.
+pub async fn seed_model_access_revoke(model_name: &str, organization_id: &str) {
+    let database = seed_database().await;
+    let repo = AdminCompositeRepository::new(database.pool().clone());
+    let model_id = model_id_by_name(model_name).await;
+    let organization_id = Uuid::parse_str(organization_id).expect("organization id");
+    repo.revoke_model_access(
+        model_id,
+        organization_id,
+        Some(user_id_for_session(&super::get_session_id())),
+    )
+    .await
+    .expect("Failed to seed model access revoke");
+    for models_service in registered_models_services() {
+        models_service
+            .invalidate_model_access(organization_id, model_id)
+            .await;
+    }
 }
 
 /// One page of the admin model listing, ordered by name, with the active aliases of each.

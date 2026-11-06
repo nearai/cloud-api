@@ -1688,31 +1688,14 @@ async fn test_admin_access_token_use_created_token() {
     let admin_token = token_response.access_token;
 
     // Now use the created token to access an admin endpoint
-    let org = create_org(&server).await;
-
-    let update_request = serde_json::json!({
-        "type": "payment",
-        "spendLimit": {
-            "amount": 50000000000i64, // $50.00 USD
-            "currency": "USD"
-        },
-        "changedBy": "admin@test.com",
-        "changeReason": "Test using created admin token"
-    });
-
     let update_response = server
-        .patch(format!("/v1/admin/organizations/{}/limits", org.id).as_str())
+        .get("/v1/admin/database-encryption/keys")
         .add_header("Authorization", format!("Bearer {admin_token}"))
-        .json(&update_request)
         .await;
 
     assert_eq!(update_response.status_code(), 200);
 
-    let update_result = update_response.json::<api::models::UpdateOrganizationLimitsResponse>();
-    assert_eq!(update_result.organization_id, org.id);
-    assert_eq!(update_result.spend_limit.amount, 50000000000i64);
-
-    println!("✅ Successfully used created admin token to update organization limits");
+    println!("✅ Successfully used created admin token on an admin route");
 }
 
 #[tokio::test]
@@ -1737,22 +1720,10 @@ async fn test_admin_access_token_user_agent_match() {
     let token_response = create_response.json::<api::models::AdminAccessTokenResponse>();
     let admin_token = token_response.access_token;
 
-    let org = create_org(&server).await;
-    let update_request = serde_json::json!({
-        "type": "payment",
-        "spendLimit": {
-            "amount": 50000000000i64, // $50.00 USD
-            "currency": "USD"
-        },
-        "changedBy": "admin@test.com",
-        "changeReason": "Test UA Match"
-    });
-
     let update_response = server
-        .patch(format!("/v1/admin/organizations/{}/limits", org.id).as_str())
+        .get("/v1/admin/database-encryption/keys")
         .add_header("Authorization", format!("Bearer {admin_token}"))
         .add_header("User-Agent", user_agent)
-        .json(&update_request)
         .await;
 
     assert_eq!(update_response.status_code(), 200);
@@ -1783,22 +1754,10 @@ async fn test_admin_access_token_user_agent_mismatch() {
     let token_response = create_response.json::<api::models::AdminAccessTokenResponse>();
     let admin_token = token_response.access_token;
 
-    let org = create_org(&server).await;
-    let update_request = serde_json::json!({
-        "type": "payment",
-        "spendLimit": {
-            "amount": 50000000000i64, // $50.00 USD
-            "currency": "USD"
-        },
-        "changedBy": "admin@test.com",
-        "changeReason": "Test UA Mismatch"
-    });
-
     let update_response = server
-        .patch(format!("/v1/admin/organizations/{}/limits", org.id).as_str())
+        .get("/v1/admin/database-encryption/keys")
         .add_header("Authorization", format!("Bearer {admin_token}"))
         .add_header("User-Agent", user_agent_diff)
-        .json(&update_request)
         .await;
 
     assert_eq!(update_response.status_code(), 401);

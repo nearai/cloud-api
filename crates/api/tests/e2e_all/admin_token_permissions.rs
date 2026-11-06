@@ -41,6 +41,9 @@ async fn call(
         .await
 }
 
+const ENCRYPTION_KEYS: &str = "/v1/admin/database-encryption/keys";
+const ENCRYPTION_JOBS: &str = "/v1/admin/database-encryption/jobs";
+
 fn assert_forbidden(response: &axum_test::TestResponse, error_type: &str) {
     assert_eq!(response.status_code(), StatusCode::FORBIDDEN);
     assert_eq!(response.json::<Value>()["error"]["type"], error_type);
@@ -148,53 +151,60 @@ async fn issuance_gate_does_not_relax_existing_token_permissions() {
         .await
         .unwrap();
     assert_eq!(
-        call(&server, Method::GET, "/v1/admin/models", &token, json!({}))
+        call(&server, Method::GET, ENCRYPTION_KEYS, &token, json!({}))
             .await
             .status_code(),
         StatusCode::OK
     );
     assert_forbidden(
-        &call(
-            &server,
-            Method::PATCH,
-            "/v1/admin/models",
-            &token,
-            json!({}),
-        )
-        .await,
+        &call(&server, Method::POST, ENCRYPTION_JOBS, &token, json!({})).await,
         "insufficient_permissions",
     );
 }
 
 #[tokio::test]
 async fn read_only_reads_and_mixed_method_mutations_have_no_side_effects() {
-    let server = setup_test_server_with_config(|config| {
+    let (server, db) = setup_test_server_with_config_and_database(|config| {
         config.auth.admin_read_only_tokens_enabled = true;
     })
     .await;
     let org = create_org(&server).await;
-    let path = format!("/v1/admin/organizations/{}/concurrent-limit", org.id);
     let read_only = issue(&server, Some("read_only")).await.access_token;
     let read_write = issue(&server, Some("read_write")).await.access_token;
+    let job_count = || async {
+        db.pool()
+            .get()
+            .await
+            .unwrap()
+            .query_one("SELECT COUNT(*) FROM database_encryption_jobs", &[])
+            .await
+            .unwrap()
+            .get::<_, i64>(0)
+    };
 
-    let fallback_path = format!("/v1/admin/organizations/{}/fallback", org.id);
-    let fallback_before = call(&server, Method::GET, &fallback_path, &read_only, json!({})).await;
-    assert_eq!(fallback_before.status_code(), StatusCode::OK);
-    let fallback_before = fallback_before.json::<Value>();
-    let before = call(&server, Method::GET, &path, &read_only, json!({})).await;
-    assert_eq!(before.status_code(), StatusCode::OK);
+    let keys_before = call(&server, Method::GET, ENCRYPTION_KEYS, &read_only, json!({})).await;
+    assert_eq!(keys_before.status_code(), StatusCode::OK);
+    let keys_before = keys_before.json::<Value>();
+    let jobs_before = job_count().await;
+    let scope = json!({"fields": [{"table": "files", "column": "filename"}]});
     for (method, route, body) in [
-        (Method::PATCH, path.clone(), json!({"concurrentLimit": 128})),
-        (
-            Method::PATCH,
-            format!("/v1/admin/organizations/{}/fallback", org.id),
-            json!({"enabled": !fallback_before["enabled"].as_bool().unwrap()}),
-        ),
-        (Method::PATCH, "/v1/admin/models".into(), json!({})),
         (
             Method::POST,
-            "/v1/admin/aml/allowlist".into(),
-            json!({"accountId": "read-only-test.near", "reason": "test"}),
+            ENCRYPTION_JOBS.to_string(),
+            json!({"mode": "execute", "scope": scope, "actions": ["rewrap"]}),
+        ),
+        (
+            Method::POST,
+            "/v1/admin/database-encryption/verify".into(),
+            json!({"scope": scope, "mode": "verify", "actions": ["verify"], "batch_size": 1}),
+        ),
+        (
+            Method::POST,
+            format!(
+                "/v1/admin/database-encryption/jobs/{}/cancel",
+                Uuid::new_v4()
+            ),
+            json!({}),
         ),
         (
             Method::PUT,
@@ -204,34 +214,20 @@ async fn read_only_reads_and_mixed_method_mutations_have_no_side_effects() {
             ),
             json!({"role": "member"}),
         ),
-        (
-            Method::DELETE,
-            "/v1/admin/models/missing-model".into(),
-            json!({"reason": "test"}),
-        ),
     ] {
         assert_forbidden(
             &call(&server, method, &route, &read_only, body).await,
             "insufficient_permissions",
         );
     }
-    let after = call(&server, Method::GET, &path, &read_only, json!({})).await;
-    assert_eq!(after.json::<Value>(), before.json::<Value>());
-    let fallback = call(
-        &server,
-        Method::GET,
-        &format!("/v1/admin/organizations/{}/fallback", org.id),
-        &read_only,
-        json!({}),
-    )
-    .await;
-    assert_eq!(fallback.status_code(), StatusCode::OK);
-    assert_eq!(fallback.json::<Value>(), fallback_before);
+    let after = call(&server, Method::GET, ENCRYPTION_KEYS, &read_only, json!({})).await;
+    assert_eq!(after.json::<Value>(), keys_before);
+    assert_eq!(job_count().await, jobs_before);
 
     for route in [
-        "/v1/admin/models",
-        "/v1/admin/feature-requests",
-        "/v1/admin/aml/allowlist",
+        ENCRYPTION_KEYS,
+        "/v1/admin/object-encryption/keys",
+        "/v1/admin/invitation-email-deliveries",
     ] {
         assert_eq!(
             call(&server, Method::GET, route, &read_only, json!({}))
@@ -242,27 +238,31 @@ async fn read_only_reads_and_mixed_method_mutations_have_no_side_effects() {
         );
     }
     assert_eq!(
-        call(&server, Method::HEAD, &path, &read_only, json!({}))
-            .await
-            .status_code(),
+        call(
+            &server,
+            Method::HEAD,
+            ENCRYPTION_KEYS,
+            &read_only,
+            json!({})
+        )
+        .await
+        .status_code(),
         StatusCode::OK
     );
 
-    for (token, limit) in [(&read_write, 128), (&get_session_id(), 256)] {
+    for token in [&read_write, &get_session_id()] {
         assert_eq!(
             call(
                 &server,
-                Method::PATCH,
-                &path,
+                Method::POST,
+                "/v1/admin/database-encryption/scan",
                 token,
-                json!({"concurrentLimit": limit})
+                json!({"scope": scope, "limit": 1})
             )
             .await
             .status_code(),
             StatusCode::OK
         );
-        let updated = call(&server, Method::GET, &path, &read_only, json!({})).await;
-        assert_eq!(updated.json::<Value>()["concurrentLimit"], limit);
     }
 
     for token in [&read_only, &read_write] {
@@ -285,86 +285,6 @@ async fn read_only_reads_and_mixed_method_mutations_have_no_side_effects() {
             );
         }
     }
-}
-
-#[tokio::test]
-async fn post_previews_are_reads_but_confirmation_is_forbidden() {
-    let (server, db) = setup_test_server_with_config_and_database(|config| {
-        config.auth.admin_read_only_tokens_enabled = true;
-    })
-    .await;
-    let token = issue(&server, Some("read_only")).await.access_token;
-    let model = format!("permissions/model-{}", Uuid::new_v4());
-    let successor = format!("permissions/successor-{}", Uuid::new_v4());
-    let mut batch = api::models::BatchUpdateModelApiRequest::new();
-    for name in [&model, &successor] {
-        batch.insert(
-            name.clone(),
-            serde_json::from_value(json!({
-                "inputCostPerToken": {"amount": 1000, "currency": "USD"},
-                "outputCostPerToken": {"amount": 2000, "currency": "USD"},
-                "modelDisplayName": "Permission test model", "modelDescription": "Test",
-                "contextLength": 4096, "maxOutputLength": 1024, "isActive": true
-            }))
-            .unwrap(),
-        );
-    }
-    seed_models(&server, batch, get_session_id()).await;
-    let effective = (chrono::Utc::now() + chrono::Duration::days(7))
-        .format("%Y-%m-%dT13:00:00Z")
-        .to_string();
-    let pricing = json!({"changes": [{"modelId": model, "effectiveAt": effective, "inputCostPerToken": {"amount": 3000, "currency": "USD"}}]});
-    let deprecation = json!({"successorModelId": successor, "deprecationDate": effective});
-    let dep_path = format!(
-        "/v1/admin/models/{}/deprecation",
-        urlencoding::encode(&model)
-    );
-    for (path, body) in [
-        ("/v1/admin/models/pricing-changes".to_string(), pricing),
-        (dep_path, deprecation),
-    ] {
-        let preview = call(
-            &server,
-            Method::POST,
-            &format!("{path}/preview"),
-            &token,
-            body.clone(),
-        )
-        .await;
-        assert_eq!(preview.status_code(), StatusCode::OK, "{}", preview.text());
-        assert_forbidden(
-            &call(
-                &server,
-                Method::POST,
-                &format!("{path}/confirm"),
-                &token,
-                body,
-            )
-            .await,
-            "insufficient_permissions",
-        );
-    }
-    let client = db.pool().get().await.unwrap();
-    let row = client
-        .query_one(
-            "SELECT deprecation_date, input_cost_per_token FROM models WHERE model_name = $1",
-            &[&model],
-        )
-        .await
-        .unwrap();
-    assert!(row
-        .get::<_, Option<chrono::DateTime<chrono::Utc>>>(0)
-        .is_none());
-    assert_eq!(row.get::<_, i64>(1), 1000);
-    let scheduled: i64 = client
-        .query_one(
-            "SELECT COUNT(*) FROM scheduled_model_pricing_changes WHERE model_name = $1",
-            &[&model],
-        )
-        .await
-        .unwrap()
-        .get(0);
-    assert_eq!(scheduled, 0);
 }
 
 #[tokio::test]
@@ -498,14 +418,14 @@ async fn unclassified_routes_deny_reads_and_preserve_authentication_context() {
     let routes = Router::new()
         .route("/admin/unreviewed", get(probe.clone()).post(probe.clone()))
         // The same URL as an approved POST must not accidentally approve a new GET.
-        .route("/admin/models/pricing-changes/preview", get(probe.clone()))
-        .route("/admin/models/{model_name}/history", get(probe))
+        .route("/admin/database-encryption/scan", get(probe.clone()))
+        .route("/admin/database-encryption/jobs/{id}", get(probe))
         .layer(from_fn_with_state(auth, admin_middleware));
     let server = axum_test::TestServer::new(Router::new().nest("/v1", routes));
     for (method, path) in [
         (Method::GET, "/v1/admin/unreviewed"),
         (Method::POST, "/v1/admin/unreviewed"),
-        (Method::GET, "/v1/admin/models/pricing-changes/preview"),
+        (Method::GET, "/v1/admin/database-encryption/scan"),
     ] {
         assert_forbidden(
             &call(&server, method, path, &read_only.access_token, json!({})).await,
@@ -520,7 +440,7 @@ async fn unclassified_routes_deny_reads_and_preserve_authentication_context() {
     let context = call(
         &server,
         Method::GET,
-        "/v1/admin/models/vendor%2Fmodel/history",
+        "/v1/admin/database-encryption/jobs/some-job",
         &read_only.access_token,
         json!({}),
     )
@@ -582,14 +502,14 @@ async fn permissions_preserve_expiration_revocation_user_agent_and_admin_eligibi
             .await
             .unwrap();
         assert_eq!(
-            call(&server, Method::GET, "/v1/admin/models", &token, json!({}))
+            call(&server, Method::GET, ENCRYPTION_KEYS, &token, json!({}))
                 .await
                 .status_code(),
             StatusCode::OK
         );
         for user_agent in [None, Some("different client")] {
             let mut request = server
-                .get("/v1/admin/models")
+                .get(ENCRYPTION_KEYS)
                 .add_header("Authorization", format!("Bearer {token}"));
             if let Some(ua) = user_agent {
                 request = request.add_header("User-Agent", ua);
@@ -605,7 +525,7 @@ async fn permissions_preserve_expiration_revocation_user_agent_and_admin_eligibi
             .await
             .unwrap();
         assert_forbidden(
-            &call(&server, Method::GET, "/v1/admin/models", &token, json!({})).await,
+            &call(&server, Method::GET, ENCRYPTION_KEYS, &token, json!({})).await,
             "forbidden",
         );
         client
@@ -621,7 +541,7 @@ async fn permissions_preserve_expiration_revocation_user_agent_and_admin_eligibi
             .await
             .unwrap());
         assert_eq!(
-            call(&server, Method::GET, "/v1/admin/models", &token, json!({}))
+            call(&server, Method::GET, ENCRYPTION_KEYS, &token, json!({}))
                 .await
                 .status_code(),
             StatusCode::UNAUTHORIZED
@@ -638,15 +558,9 @@ async fn permissions_preserve_expiration_revocation_user_agent_and_admin_eligibi
             .await
             .unwrap();
         assert_eq!(
-            call(
-                &server,
-                Method::GET,
-                "/v1/admin/models",
-                &expired,
-                json!({})
-            )
-            .await
-            .status_code(),
+            call(&server, Method::GET, ENCRYPTION_KEYS, &expired, json!({}))
+                .await
+                .status_code(),
             StatusCode::UNAUTHORIZED
         );
     }
@@ -654,7 +568,7 @@ async fn permissions_preserve_expiration_revocation_user_agent_and_admin_eligibi
         call(
             &server,
             Method::GET,
-            "/v1/admin/models",
+            ENCRYPTION_KEYS,
             "adm_invalid",
             json!({})
         )
@@ -686,7 +600,7 @@ async fn existing_service_tokens_follow_the_creator_email_allowlist() {
     let response = call(
         &allowed_server,
         Method::GET,
-        "/v1/admin/models",
+        ENCRYPTION_KEYS,
         &token,
         json!({}),
     )
@@ -705,7 +619,7 @@ async fn existing_service_tokens_follow_the_creator_email_allowlist() {
             let response = call(
                 &denied_server,
                 Method::GET,
-                "/v1/admin/models",
+                ENCRYPTION_KEYS,
                 credential,
                 json!({}),
             )
@@ -730,7 +644,7 @@ async fn existing_service_tokens_follow_the_creator_email_allowlist() {
     let response = call(
         &allowed_server,
         Method::GET,
-        "/v1/admin/models",
+        ENCRYPTION_KEYS,
         &token,
         json!({}),
     )

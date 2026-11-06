@@ -690,16 +690,7 @@ async fn systemone_enforces_credit_and_concurrency_limits_and_releases_slot() {
     assert_eq!(denied.status_code(), 402, "{}", denied.text());
     let org = setup_org_with_credits(&server, 10_000_000_000).await;
     let key = get_api_key_for_org(&server, org.id.clone()).await;
-    server
-        .patch(&format!(
-            "/v1/admin/organizations/{}/concurrent-limit",
-            org.id
-        ))
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
-        .add_header("User-Agent", MOCK_USER_AGENT)
-        .json(&json!({"concurrentLimit":1}))
-        .await
-        .assert_status_ok();
+    seeding::seed_concurrent_limit(&org.id, Some(1)).await;
     let first_request = axum::http::Request::builder()
         .method("POST")
         .uri("/v1/systemone")
@@ -964,16 +955,7 @@ async fn systemone_finalization_survives_client_disconnect() {
     let (model, _) = catalog(&server, None, true).await;
     let org = setup_org_with_credits(&server, 10_000_000_000).await;
     let key = get_api_key_for_org(&server, org.id.clone()).await;
-    server
-        .patch(&format!(
-            "/v1/admin/organizations/{}/concurrent-limit",
-            org.id
-        ))
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
-        .add_header("User-Agent", MOCK_USER_AGENT)
-        .json(&json!({"concurrentLimit": 1}))
-        .await
-        .assert_status_ok();
+    seeding::seed_concurrent_limit(&org.id, Some(1)).await;
 
     let id = format!("decision-{}", uuid::Uuid::new_v4());
     let response_id = id.clone();

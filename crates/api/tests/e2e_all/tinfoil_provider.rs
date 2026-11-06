@@ -15,8 +15,6 @@ use inference_providers::{mock::MockProvider, CompletionError, ProviderSource, P
 use serde_json::{json, Value};
 use std::sync::Arc;
 
-const SETTING_PATH: &str = "/v1/admin/settings/attested_3p";
-
 struct Fixture {
     server: axum_test::TestServer,
     database: Arc<database::Database>,
@@ -120,14 +118,7 @@ impl Fixture {
     }
 
     async fn set_disabled(&self, sources: Value) {
-        let r = self
-            .server
-            .patch(SETTING_PATH)
-            .add_header("Authorization", format!("Bearer {}", get_session_id()))
-            .add_header("User-Agent", MOCK_USER_AGENT)
-            .json(&json!({ "disabled_sources": sources }))
-            .await;
-        assert_eq!(r.status_code(), 200, "{}", r.text());
+        seeding::seed_admin_setting("attested_3p", json!({ "disabled_sources": sources })).await;
     }
 }
 

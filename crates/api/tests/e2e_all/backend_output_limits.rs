@@ -160,7 +160,7 @@ async fn backend_output_limits_six_model_regression() {
         true,
     );
     insert_catalog_model(&mut batch, &exact, Vec::new(), true);
-    admin_batch_upsert_models(&server, batch, get_session_id()).await;
+    seed_models(&server, batch, get_session_id()).await;
 
     let backend_models: Vec<ModelInfo> = SIX_MODEL_CASES
         .iter()

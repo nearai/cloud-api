@@ -742,7 +742,7 @@ async fn every_documented_paginated_admin_list_records_its_page() {
             "changeReason": "admin audit e2e"
         }))
         .expect("model fixture");
-        admin_batch_upsert_models(
+        seed_models(
             &server,
             std::collections::HashMap::from([(model_name.clone(), model)]),
             get_session_id(),

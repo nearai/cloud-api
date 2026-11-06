@@ -344,8 +344,9 @@ pub async fn seed_admin_setting(key: &str, patch: serde_json::Value) {
 }
 
 /// Set the organization's concurrent request limit, as the admin concurrent-limit update
-/// did. Does not invalidate the completion service's per-organization cache, so call it
-/// before the organization's first completion request.
+/// did, minus its cache invalidation: the completion service caches the limit per
+/// organization for 5 minutes and nothing here clears that entry. Call it before the
+/// organization's first completion request; afterwards the old limit stays in force.
 pub async fn seed_concurrent_limit(org_id: &str, concurrent_limit: Option<i32>) {
     let database = seed_database().await;
     let organization_id = Uuid::parse_str(org_id).expect("organization id must be a UUID");

@@ -1291,11 +1291,6 @@ pub fn build_app_with_config_and_options(
         build_options,
         AdminRouteServices {
             object_encryption_state: domain_services.object_encryption_state.clone(),
-            models_service: cloud_platform::invalidating_models_service(
-                domain_services.models_service.clone(),
-                domain_services.cloud_platform_catalog.clone(),
-            ),
-            completion_service: domain_services.completion_service.clone(),
             organization_service: domain_services.organization_service.clone(),
             user_erasure_service: Arc::new(services::user_erasure::UserErasureService::new(
                 Arc::new(database::repositories::PostgresUserErasureRepository::new(
@@ -2159,9 +2154,6 @@ fn cache_control_layer(value: &'static str) -> CacheControlLayer {
 /// Build admin routes (authenticated endpoints)
 pub struct AdminRouteServices {
     pub object_encryption_state: object_encryption::ObjectEncryptionState,
-    /// Invalidated by admin writes: see `cloud_platform::invalidating_models_service`.
-    pub models_service: Arc<dyn services::models::ModelsServiceTrait>,
-    pub completion_service: Arc<services::CompletionServiceImpl>,
     pub organization_service:
         Arc<dyn services::organization::OrganizationServiceTrait + Send + Sync>,
     pub user_erasure_service: Arc<services::user_erasure::UserErasureService>,

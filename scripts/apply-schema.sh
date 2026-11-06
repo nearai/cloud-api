@@ -22,6 +22,10 @@
 # localhost is routed through a single-label alias to the host gateway instead.
 set -euo pipefail
 
+# The schema is already applied: cloud-platform CI migrates a database itself, then runs this
+# repo's database tests against it to check that a migration keeps these queries working.
+[[ "${APPLY_SCHEMA_SKIP:-}" == 1 ]] && exit 0
+
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 missing=()

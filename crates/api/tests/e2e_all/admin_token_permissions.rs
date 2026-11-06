@@ -322,7 +322,7 @@ async fn post_previews_are_reads_but_confirmation_is_forbidden() {
             .unwrap(),
         );
     }
-    admin_batch_upsert_models(&server, batch, get_session_id()).await;
+    seed_models(&server, batch, get_session_id()).await;
     let effective = (chrono::Utc::now() + chrono::Duration::days(7))
         .format("%Y-%m-%dT13:00:00Z")
         .to_string();

@@ -142,7 +142,7 @@ async fn test_second_upsert_closes_previous_history() {
         .unwrap(),
     );
 
-    admin_batch_upsert_models(&server, batch1, get_session_id()).await;
+    seed_models(&server, batch1, get_session_id()).await;
 
     // Get initial history
     let history_v1 = get_model_history_from_db(&server, &model_name).await;
@@ -176,7 +176,7 @@ async fn test_second_upsert_closes_previous_history() {
         .unwrap(),
     );
 
-    admin_batch_upsert_models(&server, batch2, get_session_id()).await;
+    seed_models(&server, batch2, get_session_id()).await;
 
     // Get updated history
     let history_v2 = get_model_history_from_db(&server, &model_name).await;
@@ -244,7 +244,7 @@ async fn test_soft_delete_creates_history_record() {
         .unwrap(),
     );
 
-    admin_batch_upsert_models(&server, batch, get_session_id()).await;
+    seed_models(&server, batch, get_session_id()).await;
 
     // Verify created
     let history_before = get_model_history_from_db(&server, &model_name).await;
@@ -327,7 +327,7 @@ async fn test_user_tracking_in_history() {
         .unwrap(),
     );
 
-    admin_batch_upsert_models(&server, batch, get_session_id()).await;
+    seed_models(&server, batch, get_session_id()).await;
 
     let history = get_model_history_from_db(&server, &model_name).await;
     assert_eq!(history.len(), 1);
@@ -390,7 +390,7 @@ async fn test_history_progression_multiple_updates() {
             .unwrap(),
         );
 
-        admin_batch_upsert_models(&server, batch, get_session_id()).await;
+        seed_models(&server, batch, get_session_id()).await;
     }
 
     let history = get_model_history_from_db(&server, &model_name).await;
@@ -449,7 +449,7 @@ async fn test_soft_delete_with_custom_reason() {
         .unwrap(),
     );
 
-    admin_batch_upsert_models(&server, batch, get_session_id()).await;
+    seed_models(&server, batch, get_session_id()).await;
 
     // Soft delete with custom reason
     let delete_response = server
@@ -509,7 +509,7 @@ async fn test_soft_delete_without_reason_backward_compatibility() {
         .unwrap(),
     );
 
-    admin_batch_upsert_models(&server, batch, get_session_id()).await;
+    seed_models(&server, batch, get_session_id()).await;
 
     // Soft delete without providing any reason (backward compatible - empty body)
     let delete_response = server
@@ -569,7 +569,7 @@ async fn test_model_history_tracks_modalities() {
         .unwrap(),
     );
 
-    admin_batch_upsert_models(&server, batch, get_session_id()).await;
+    seed_models(&server, batch, get_session_id()).await;
 
     // Get history via API
     let response = server
@@ -626,7 +626,7 @@ async fn test_model_history_tracks_modalities() {
         .unwrap(),
     );
 
-    admin_batch_upsert_models(&server, batch2, get_session_id()).await;
+    seed_models(&server, batch2, get_session_id()).await;
 
     // Get updated history
     let response = server
@@ -694,7 +694,7 @@ async fn test_model_history_records_datacenters() {
         }))
         .unwrap(),
     );
-    admin_batch_upsert_models(&server, batch, get_session_id()).await;
+    seed_models(&server, batch, get_session_id()).await;
 
     let response = server
         .get(format!("/v1/admin/models/{model_name}/history").as_str())
@@ -729,7 +729,7 @@ async fn test_model_history_records_datacenters() {
         }))
         .unwrap(),
     );
-    admin_batch_upsert_models(&server, batch2, get_session_id()).await;
+    seed_models(&server, batch2, get_session_id()).await;
 
     let response = server
         .get(format!("/v1/admin/models/{model_name}/history").as_str())
@@ -781,7 +781,7 @@ async fn test_soft_delete_preserves_datacenters_in_history() {
         }))
         .unwrap(),
     );
-    admin_batch_upsert_models(&server, batch, get_session_id()).await;
+    seed_models(&server, batch, get_session_id()).await;
 
     let encoded_model_name =
         url::form_urlencoded::byte_serialize(model_name.as_bytes()).collect::<String>();

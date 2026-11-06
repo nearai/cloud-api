@@ -195,6 +195,13 @@ async fn systemone_external_catalog_alias_billing_and_gateway_signatures() {
         assert_eq!(row.get::<_, String>("inference_type"), "decisions");
         assert_eq!(row.get::<_, String>("provider_request_id"), id);
         assert_eq!(row.get::<_, String>("served_provider_tier"), "non_attested");
+        let costs: Value = server
+            .post("/v1/billing/costs")
+            .add_header("Authorization", format!("Bearer {key}"))
+            .json(&json!({"requestIds":[inference_id]}))
+            .await
+            .json();
+        assert_eq!(costs["requests"][0]["costNanoUsd"], 36);
     }
 }
 

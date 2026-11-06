@@ -880,6 +880,8 @@ fn every_registered_route_has_a_model_access_decision() {
         ("ANY", "/files/{file_id}/content"),
         ("ANY", "/files/{file_id}/{*legacy_path}"),
         ("POST", "/feature-requests"),
+        // An organization's own costs.
+        ("POST", "/billing/costs"),
         ("POST", "/check_api_key"),
         ("GET", "/services"),
         ("GET", "/services/{service_name}"),

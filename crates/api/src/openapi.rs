@@ -132,6 +132,8 @@ Operations marked deprecated (account, organization, workspace, invitation, API 
         crate::routes::feature_requests::list_admin_feature_requests,
         // Gateway endpoints (model gateway integration)
         crate::routes::gateway::check_api_key,
+        // Billing endpoints (HuggingFace integration)
+        crate::routes::billing::get_billing_costs,
         // Admin endpoints (less frequently used)
         crate::routes::admin::list_models,
         crate::routes::admin::batch_upsert_models,
@@ -325,6 +327,10 @@ Operations marked deprecated (account, organization, workspace, invitation, API 
             crate::routes::feature_requests::AdminFeatureRequestListResponse,
             // Gateway models
             crate::routes::gateway::CheckApiKeyResponse,
+            // Billing models (HuggingFace integration)
+            crate::routes::billing::BillingCostsRequest,
+            crate::routes::billing::BillingCostsResponse,
+            crate::routes::billing::RequestCost,
             // Platform Stats analytics models
             services::admin::InfraSummary,
             services::admin::ModelGpuAllocation,

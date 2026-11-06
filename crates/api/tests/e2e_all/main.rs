@@ -31,6 +31,7 @@ mod auth_tokens;
 mod auto_redact;
 mod auto_redact_adversarial;
 mod backend_output_limits;
+mod billing_and_models;
 mod billing_record_characterization;
 mod body_hash_limit;
 mod chat_encryption;

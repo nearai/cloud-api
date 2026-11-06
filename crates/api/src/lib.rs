@@ -26,6 +26,7 @@ use crate::{
             current_user, github_login, google_login, login_page, logout, oauth_callback,
             StateStore,
         },
+        billing::{get_billing_costs, BillingRouteState},
         completions::{
             audio_transcriptions, chat_completions, completions, embeddings, image_edits,
             image_generations, models, privacy_classify, privacy_redact, rerank, score,
@@ -1324,6 +1325,11 @@ pub fn build_app_with_config_and_options(
         &auth_components.auth_state_middleware,
     );
 
+    let billing_routes = build_billing_routes(
+        domain_services.usage_service.clone(),
+        &auth_components.auth_state_middleware,
+    );
+
     // Build OpenAPI and documentation routes
     let openapi_routes = build_openapi_routes();
 
@@ -1370,6 +1376,7 @@ pub fn build_app_with_config_and_options(
                 .merge(invitation_routes)
                 .merge(files_routes)
                 .merge(feature_request_routes)
+                .merge(billing_routes)
                 .merge(gateway_routes)
                 .merge(internal_routes)
                 .merge(health_routes)
@@ -2009,6 +2016,22 @@ where
     Router::new()
         .route("/files", list)
         .nest("/files/", descendants)
+}
+
+/// Build billing routes with API key auth (HuggingFace billing integration)
+pub fn build_billing_routes(
+    usage_service: Arc<dyn services::usage::UsageServiceTrait + Send + Sync>,
+    auth_state_middleware: &AuthState,
+) -> Router {
+    let billing_state = BillingRouteState { usage_service };
+
+    Router::new()
+        .route("/billing/costs", post(get_billing_costs))
+        .with_state(billing_state)
+        .layer(from_fn_with_state(
+            auth_state_middleware.clone(),
+            middleware::auth::auth_middleware_with_workspace_context,
+        ))
 }
 
 /// Build feature request routes for user submissions and admin aggregation.

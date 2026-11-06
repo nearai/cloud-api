@@ -4,6 +4,7 @@ pub mod anthropic;
 pub mod api;
 pub mod attestation;
 pub mod auth;
+pub mod billing;
 pub mod common;
 pub mod completions;
 pub mod conversations;

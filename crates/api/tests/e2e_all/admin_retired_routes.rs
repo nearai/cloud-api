@@ -33,7 +33,6 @@ fn retired_routes() -> Vec<(Method, String)> {
             format!("/v1/workspaces/{ORG}/api-keys/{ID}/usage/history"),
         ),
         // Billing and credit
-        (Method::POST, "/v1/billing/costs".into()),
         (Method::POST, format!("{org}/credit/transfer")),
         (Method::GET, format!("{org}/credit/transfer/capacity")),
         (Method::GET, format!("{org}/credit/transfers")),

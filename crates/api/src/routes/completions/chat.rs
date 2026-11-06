@@ -336,19 +336,16 @@ pub(super) async fn chat_completions_inner(
     // Auto-redact (opt-in via x-auto-redact header or auto_redact body field).
     // On success this may rewrite service_request.messages to substitute
     // placeholders for PII; the returned map drives the response un-redact.
-    let (auto_redact_requested, redaction_map, auto_redact_classify_tokens, auto_redact_budget_id) =
-        match maybe_redact(
-            &headers,
-            &mut service_request,
-            &app_state.inference_provider_pool,
-            &app_state,
-            &api_key,
-        )
-        .await
-        {
-            Ok(out) => out,
-            Err(e) => return auto_redact_error_response(e),
-        };
+    let (auto_redact_requested, redaction_map, auto_redact_classify_tokens) = match maybe_redact(
+        &headers,
+        &mut service_request,
+        &app_state.inference_provider_pool,
+    )
+    .await
+    {
+        Ok(out) => out,
+        Err(e) => return auto_redact_error_response(e),
+    };
     // Bill the privacy-filter classify pass that auto-redact ran (it is a
     // real inference call to the PII model). Charged like an explicit
     // `/v1/privacy/classify`. Spawned (not awaited) and time-bounded so a
@@ -361,12 +358,7 @@ pub(super) async fn chat_completions_inner(
         tokio::spawn(async move {
             if tokio::time::timeout(
                 AUTO_REDACT_BILL_TIMEOUT,
-                bill_auto_redact_classify(
-                    &app_state,
-                    &api_key,
-                    auto_redact_classify_tokens,
-                    auto_redact_budget_id,
-                ),
+                bill_auto_redact_classify(&app_state, &api_key, auto_redact_classify_tokens),
             )
             .await
             .is_err()

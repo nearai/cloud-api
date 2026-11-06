@@ -2245,6 +2245,30 @@ async fn internal_budget_requires_service_auth_and_organization_model_access() {
     ).await.unwrap().get(0);
     assert_eq!(count, 1);
 
+    // A postpaid non-text receipt may temporarily create debt while text funds are held.
+    let api_key = get_api_key_for_org(server, org.id.clone()).await;
+    let legacy = server
+        .post("/v1/internal/usage")
+        .add_header("Authorization", format!("Bearer {INTERNAL_TOKEN}"))
+        .json(&json!({
+            "id": Uuid::new_v4(), "organization_id": org.id,
+            "workspace_id": workspace.id, "api_key_id": key.id,
+            "model": fixture.text, "type": "embedding", "input_tokens": 6000,
+            "output_tokens": 0
+        }))
+        .await;
+    assert_eq!(legacy.status_code(), 200, "{}", legacy.text());
+    let blocked = server
+        .post("/v1/check_api_key")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .await;
+    assert_eq!(
+        blocked.status_code(),
+        402,
+        "debt blocks preflight: {}",
+        blocked.text()
+    );
+
     // The receipt protocol reports both streaming and non-streaming chat as chat_completion.
     let receipt = json!({
         "id": body["id"], "organization_id": org.id,
@@ -2272,6 +2296,77 @@ async fn internal_budget_requires_service_auth_and_organization_model_access() {
     ).await.unwrap();
     assert_eq!(row.get::<_, i64>(0), 0);
     assert_eq!(row.get::<_, i64>(1), 1);
+    let available = server
+        .post("/v1/check_api_key")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .await;
+    assert_eq!(
+        available.status_code(),
+        200,
+        "released funds repay debt before preflight: {}",
+        available.text()
+    );
+
+    for kind in [
+        "embedding",
+        "audio_transcription",
+        "image_generation",
+        "privacy_classify",
+        "decisions",
+    ] {
+        let mut non_text = body.clone();
+        non_text["id"] = json!(Uuid::new_v4());
+        non_text["inference_type"] = json!(kind);
+        let denied = server
+            .post("/v1/internal/budget")
+            .add_header("Authorization", format!("Bearer {INTERNAL_TOKEN}"))
+            .json(&non_text)
+            .await;
+        assert_eq!(denied.status_code(), 400, "{kind}: {}", denied.text());
+    }
+}
+
+#[tokio::test]
+async fn non_text_endpoints_keep_postpaid_billing_without_reservations() {
+    let fixture = setup().await;
+    for route in [
+        Route::Embeddings,
+        Route::ImageGenerations,
+        Route::ImageEdits,
+        Route::AudioTranscriptions,
+        Route::Rerank,
+        Route::Score,
+        Route::PrivacyClassify,
+        Route::PrivacyRedact,
+        Route::SystemOne,
+    ] {
+        let org = organization(&fixture.server).await;
+        let model = fixture.model(route.model_kind());
+        grant(&fixture.server, model, &org.id).await;
+        let response = send(&fixture.server, route, &org.api_key, model).await;
+        assert_eq!(
+            response.status_code(),
+            200,
+            "{route:?}: {}",
+            response.text()
+        );
+        let org_id = Uuid::parse_str(&org.id).unwrap();
+        let row = fixture
+            .database
+            .pool()
+            .get()
+            .await
+            .unwrap()
+            .query_one(
+                "SELECT (SELECT count(*) FROM usage_budget_reservations WHERE organization_id=$1),
+                    (SELECT count(*) FROM organization_usage_log WHERE organization_id=$1)",
+                &[&org_id],
+            )
+            .await
+            .unwrap();
+        assert_eq!(row.get::<_, i64>(0), 0, "{route:?} must not reserve");
+        assert_eq!(row.get::<_, i64>(1), 1, "{route:?} still records usage");
+    }
 }
 
 fn settings_path(organization_id: &str) -> String {

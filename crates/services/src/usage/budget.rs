@@ -63,37 +63,22 @@ impl UsageBounds {
                 .checked_mul(rate)
                 .ok_or_else(|| UsageError::CostCalculationOverflow("budget quote".into()))
         };
-        match self.inference_type {
-            InferenceType::ImageGeneration | InferenceType::ImageEdit => {
-                product(self.images, pricing.cost_per_image)
-            }
-            InferenceType::AudioTranscription
-            | InferenceType::Embedding
-            | InferenceType::Rerank
-            | InferenceType::Score
-            | InferenceType::PrivacyClassify => {
-                product(self.input_units, pricing.input_cost_per_token)
-            }
-            _ => {
-                if let Some(profile) = &pricing.text_pricing {
-                    return profile.maximum_cost(self.input_units, self.output_tokens);
-                }
-                // Legacy Anthropic cache writes may be charged at 1.25x. Reserving the largest
-                // token-class rate also covers a provider cache miss or a cache-hit price increase.
-                let rate = pricing
-                    .input_cost_per_token
-                    .max(pricing.cache_read_cost_per_token.unwrap_or(0))
-                    .max(
-                        super::five_minute_cache_write_rate(pricing.input_cost_per_token)
-                            .ok_or_else(|| {
-                                UsageError::CostCalculationOverflow("cache write quote".into())
-                            })?,
-                    );
-                product(self.input_units, rate)?
-                    .checked_add(product(self.output_tokens, pricing.output_cost_per_token)?)
-                    .ok_or_else(|| UsageError::CostCalculationOverflow("budget total".into()))
-            }
+        if let Some(profile) = &pricing.text_pricing {
+            return profile.maximum_cost(self.input_units, self.output_tokens);
         }
+        // Legacy Anthropic cache writes may be charged at 1.25x. Reserving the largest
+        // token-class rate also covers a provider cache miss or a cache-hit price increase.
+        let rate = pricing
+            .input_cost_per_token
+            .max(pricing.cache_read_cost_per_token.unwrap_or(0))
+            .max(
+                super::five_minute_cache_write_rate(pricing.input_cost_per_token).ok_or_else(
+                    || UsageError::CostCalculationOverflow("cache write quote".into()),
+                )?,
+            );
+        product(self.input_units, rate)?
+            .checked_add(product(self.output_tokens, pricing.output_cost_per_token)?)
+            .ok_or_else(|| UsageError::CostCalculationOverflow("budget total".into()))
     }
 
     pub fn validate_actual(

@@ -87,20 +87,9 @@ pub async fn score(
     // Call completion service which handles concurrent request limiting
     // Each organization has a per-model concurrent request limit (default: 64 concurrent requests).
     // This prevents resource exhaustion and ensures fair usage. Returns 429 if limit exceeded.
-    let budget = match billing::budget_execution(
-        &app_state,
-        &api_key,
-        &model,
-        services::usage::InferenceType::Score,
-        i64::from(model.context_length),
-        0,
-        0,
-    ) {
-        Ok(budget) => budget,
-        Err(response) => return *response,
-    };
-    match budget
-        .run(app_state.completion_service.try_score(
+    match app_state
+        .completion_service
+        .try_score(
             organization_id,
             model_id,
             &request.model,
@@ -123,7 +112,7 @@ pub async fn score(
                     extra,
                 }
             },
-        ))
+        )
         .await
     {
         Ok(response) => {
@@ -138,17 +127,12 @@ pub async fn score(
                 Err(response) => return *response,
             };
 
-            let budget_id = match billing::budget_id(&budget).await {
-                Ok(id) => id,
-                Err(response) => return *response,
-            };
             let inference_id = hash_inference_id_to_uuid(&response.id);
 
             // Score requests don't have traditional token counts - use input token count as 1
             let usage_request = services::usage::ports::RecordUsageServiceRequest {
                 input_tokens: 1,
                 inference_id: Some(inference_id),
-                budget_id: Some(budget_id),
                 stop_reason: Some(services::usage::StopReason::Completed),
                 ..services::usage::ports::RecordUsageServiceRequest::base(
                     services::usage::ports::BillingIdentity {

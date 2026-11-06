@@ -3783,9 +3783,12 @@ impl InferenceProviderPool {
                     retry_count
                 );
 
-                crate::usage::budget::before_attempt()
-                    .await
-                    .map_err(crate::usage::budget::completion_error)?;
+                // Admission failures are local: do not retry them as provider failures.
+                if matches!(operation_name, "chat_completion" | "chat_completion_stream") {
+                    crate::usage::budget::before_attempt()
+                        .await
+                        .map_err(crate::usage::budget::completion_error)?;
+                }
                 match provider_fn(provider.clone()).await {
                     Ok(result) => {
                         // Reset failure counter on success
@@ -4819,17 +4822,7 @@ impl InferenceProviderPool {
                 }
             })
             .await
-            .map_err(|e| match e {
-                CompletionError::HttpError {
-                    status_code,
-                    message,
-                    ..
-                } => ImageGenerationError::HttpError {
-                    status_code,
-                    message,
-                },
-                other => ImageGenerationError::GenerationError(other.to_string()),
-            })?;
+            .map_err(|e| ImageGenerationError::GenerationError(e.to_string()))?;
         let response = served.value;
         let provider = served.provider;
         let provider_attribution = served.provider_attribution;
@@ -4982,17 +4975,7 @@ impl InferenceProviderPool {
                 }
             })
             .await
-            .map_err(|e| match e {
-                CompletionError::HttpError {
-                    status_code,
-                    message,
-                    ..
-                } => ImageEditError::HttpError {
-                    status_code,
-                    message,
-                },
-                other => ImageEditError::EditError(other.to_string()),
-            })?;
+            .map_err(|e| ImageEditError::EditError(e.to_string()))?;
         let response = served.value;
         let provider = served.provider;
         let provider_attribution = served.provider_attribution;
@@ -5037,16 +5020,6 @@ impl InferenceProviderPool {
         // Try reranking with each provider (with fallback)
         let mut last_error = None;
         for provider in providers {
-            crate::usage::budget::before_attempt()
-                .await
-                .map_err(|e| RerankError::HttpError {
-                    status_code: if matches!(e, crate::usage::UsageError::LimitExceeded(_)) {
-                        402
-                    } else {
-                        503
-                    },
-                    message: e.to_string(),
-                })?;
             match provider.rerank(params.clone()).await {
                 Ok(response) => {
                     tracing::info!(
@@ -5099,16 +5072,6 @@ impl InferenceProviderPool {
         // Try with each provider (with fallback)
         let mut last_error = None;
         for provider in providers {
-            crate::usage::budget::before_attempt().await.map_err(|e| {
-                inference_providers::EmbeddingError::HttpError {
-                    status_code: if matches!(e, crate::usage::UsageError::LimitExceeded(_)) {
-                        402
-                    } else {
-                        503
-                    },
-                    message: e.to_string(),
-                }
-            })?;
             match provider.embeddings_raw(body.clone(), extra.clone()).await {
                 Ok(response) => {
                     tracing::info!(model = %model, "Embeddings completed successfully");
@@ -5248,16 +5211,6 @@ impl InferenceProviderPool {
 
         let mut last_error = None;
         for provider in providers {
-            crate::usage::budget::before_attempt().await.map_err(|e| {
-                inference_providers::PrivacyClassifyError::HttpError {
-                    status_code: if matches!(e, crate::usage::UsageError::LimitExceeded(_)) {
-                        402
-                    } else {
-                        503
-                    },
-                    message: e.to_string(),
-                }
-            })?;
             match provider
                 .privacy_classify_raw(body.clone(), extra.clone())
                 .await
@@ -5329,16 +5282,6 @@ impl InferenceProviderPool {
         // Try scoring with each provider (with fallback)
         let mut last_error = None;
         for provider in providers {
-            crate::usage::budget::before_attempt().await.map_err(|e| {
-                inference_providers::ScoreError::HttpError {
-                    status_code: if matches!(e, crate::usage::UsageError::LimitExceeded(_)) {
-                        402
-                    } else {
-                        503
-                    },
-                    message: e.to_string(),
-                }
-            })?;
             match provider.score(params.clone(), request_hash.clone()).await {
                 Ok(response) => {
                     tracing::info!(
@@ -8214,6 +8157,42 @@ mod tests {
             "Keywords 'does not exist' must be preserved for error detection"
         );
         assert!(!sanitized_exists.contains("https://api.example.com"));
+    }
+
+    #[tokio::test]
+    async fn text_admission_failure_does_not_retry_or_change_provider_health() {
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+        pool.register_provider(
+            "admission-test".into(),
+            Arc::new(inference_providers::mock::MockProvider::new()),
+        )
+        .await;
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        for operation in ["chat_completion", "chat_completion_stream"] {
+            let result = pool
+                .retry_with_fallback("admission-test", operation, None, |_| async {
+                    calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(())
+                })
+                .await;
+            assert!(matches!(
+                result,
+                Err(CompletionError::HttpError {
+                    status_code: 503,
+                    ..
+                })
+            ));
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+            assert!(pool.provider_failure_counts.read().unwrap().is_empty());
+        }
+        // Non-text requests have no monetary scope and still reach their provider once.
+        pool.retry_with_fallback("admission-test", "embeddings", None, |_| async {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

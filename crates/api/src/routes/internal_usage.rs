@@ -369,7 +369,6 @@ struct ReserveUsageRequest {
     api_key_id: Uuid,
     model: String,
     inference_type: services::usage::InferenceType,
-    input_units: Option<i32>,
     #[serde(default = "one")]
     batch_items: i32,
     max_output_tokens: Option<i32>,
@@ -377,8 +376,6 @@ struct ReserveUsageRequest {
     choices: i32,
     #[serde(default = "one")]
     executions: i32,
-    #[serde(default)]
-    images: i32,
 }
 fn one() -> i32 {
     1
@@ -401,6 +398,16 @@ pub async fn reserve_usage_internal(
     };
     let request: ReserveUsageRequest = serde_json::from_slice(&body)
         .map_err(|_| failure(StatusCode::BAD_REQUEST, "Invalid admission metadata"))?;
+    if !matches!(
+        request.inference_type,
+        services::usage::InferenceType::ChatCompletion
+            | services::usage::InferenceType::ChatCompletionStream
+    ) {
+        return Err(failure(
+            StatusCode::BAD_REQUEST,
+            "Admission is limited to text generation",
+        ));
+    }
     if request.id.is_nil()
         || request.batch_items <= 0
         || request.batch_items > 1024
@@ -430,21 +437,11 @@ pub async fn reserve_usage_internal(
     } else {
         model.clone()
     };
-    let text = matches!(
-        request.inference_type,
-        services::usage::InferenceType::ChatCompletion
-            | services::usage::InferenceType::ChatCompletionStream
-            | services::usage::InferenceType::Decisions
-    );
     let output_limit = execution_model
         .max_output_length
         .unwrap_or(execution_model.context_length);
-    let output = if text {
-        request.max_output_tokens.unwrap_or(output_limit)
-    } else {
-        0
-    };
-    if output < 0 || (text && (output == 0 || output > output_limit)) || request.images < 0 {
+    let output = request.max_output_tokens.unwrap_or(output_limit);
+    if output <= 0 || output > output_limit {
         return Err(failure(StatusCode::BAD_REQUEST, "Invalid output bounds"));
     }
     let overflow = || {
@@ -455,15 +452,10 @@ pub async fn reserve_usage_internal(
     };
     let bounds = services::usage::budget::UsageBounds {
         inference_type: request.inference_type,
-        input_units: request
-            .input_units
-            .unwrap_or(
-                execution_model
-                    .context_length
-                    .checked_mul(request.batch_items)
-                    .ok_or_else(overflow)?,
-            )
-            .checked_mul(if text { request.choices } else { 1 })
+        input_units: execution_model
+            .context_length
+            .checked_mul(request.batch_items)
+            .and_then(|n| n.checked_mul(request.choices))
             .and_then(|n| n.checked_mul(request.executions))
             .ok_or_else(overflow)?,
         output_tokens: output
@@ -471,7 +463,7 @@ pub async fn reserve_usage_internal(
             .and_then(|n| n.checked_mul(request.choices))
             .and_then(|n| n.checked_mul(request.executions))
             .ok_or_else(overflow)?,
-        images: request.images,
+        images: 0,
     };
     state
         .usage_service

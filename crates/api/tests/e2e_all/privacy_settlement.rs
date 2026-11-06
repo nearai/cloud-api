@@ -16,14 +16,13 @@ async fn setup() -> (
     std::sync::Arc<inference_providers::mock::MockProvider>,
     String,
     String,
-    std::sync::Arc<database::Database>,
 ) {
-    let (server, _pool, mock, db) = setup_test_server_with_pool().await;
+    let (server, _pool, mock, _db) = setup_test_server_with_pool().await;
     setup_privacy_filter_model(&server).await;
     let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
     let org_id = org.id.clone();
     let api_key = get_api_key_for_org(&server, org.id).await;
-    (server, mock, org_id, api_key, db)
+    (server, mock, org_id, api_key)
 }
 
 async fn post(
@@ -55,26 +54,6 @@ async fn recorded_input_tokens(server: &axum_test::TestServer, org_id: &str) -> 
     assert_eq!(resp.status_code(), 200, "{}", resp.text());
     let history: api::routes::usage::UsageHistoryResponse = resp.json();
     history.data.iter().map(|e| e.input_tokens).collect()
-}
-
-/// An impossible receipt must not settle beyond the admitted bound or release
-/// the funds reserved for an attempt that already reached the provider.
-async fn assert_unsettled_hold(
-    server: &axum_test::TestServer,
-    org_id: &str,
-    db: &database::Database,
-) {
-    assert!(recorded_input_tokens(server, org_id).await.is_empty());
-    let org_id = uuid::Uuid::parse_str(org_id).unwrap();
-    let row = db.pool().get().await.unwrap().query_one(
-        "SELECT count(*), sum(amount)::bigint, reserved_credit($1) FROM usage_budget_reservations
-         WHERE organization_id=$1 AND state='dispatched' AND actual_cost IS NULL",
-        &[&org_id],
-    ).await.unwrap();
-    assert_eq!(row.get::<_, i64>(0), 1, "retain the dispatched attempt");
-    let amount: i64 = row.get(1);
-    assert!(amount > 0);
-    assert_eq!(row.get::<_, i64>(2), amount, "retain its full reservation");
 }
 
 fn error_parts(resp: &axum_test::TestResponse) -> (u16, String, String) {
@@ -134,7 +113,7 @@ fn expected_for_upstream(status: u16, generic: &str) -> (u16, String, String) {
 }
 
 async fn assert_upstream_error_mapping(path: &str, generic: &str) {
-    let (server, mock, org_id, api_key, _db) = setup().await;
+    let (server, mock, org_id, api_key) = setup().await;
     for status in [400u16, 401, 403, 404, 422, 429, 500, 502, 503] {
         upstream_http_error(&mock, status).await;
 
@@ -171,7 +150,7 @@ async fn redact_upstream_http_error_mapping() {
 
 #[tokio::test]
 async fn classify_sums_same_index_entries() {
-    let (server, mock, org_id, api_key, _db) = setup().await;
+    let (server, mock, org_id, api_key) = setup().await;
     upstream_body(
         &mock,
         serde_json::json!({
@@ -196,7 +175,7 @@ async fn classify_sums_same_index_entries() {
 /// and reports the summed per-input usage.
 #[tokio::test]
 async fn redact_sums_same_index_entries() {
-    let (server, mock, org_id, api_key, _db) = setup().await;
+    let (server, mock, org_id, api_key) = setup().await;
     upstream_body(
         &mock,
         serde_json::json!({
@@ -246,7 +225,7 @@ fn usage_with_one_oversized_entry() -> serde_json::Value {
 
 #[tokio::test]
 async fn classify_malformed_usage_entry_skips_only_that_entry() {
-    let (server, mock, org_id, api_key, _db) = setup().await;
+    let (server, mock, org_id, api_key) = setup().await;
     upstream_body(&mock, usage_with_one_non_numeric_entry()).await;
 
     let resp = post(&server, CLASSIFY, &api_key, serde_json::json!(["a", "b"])).await;
@@ -256,22 +235,25 @@ async fn classify_malformed_usage_entry_skips_only_that_entry() {
 }
 
 #[tokio::test]
-async fn classify_oversized_usage_retains_hold() {
-    let (server, mock, org_id, api_key, _db) = setup().await;
+async fn classify_oversized_usage_entry_is_capped() {
+    let (server, mock, org_id, api_key) = setup().await;
     upstream_body(&mock, usage_with_one_oversized_entry()).await;
 
     let resp = post(&server, CLASSIFY, &api_key, serde_json::json!(["a", "b"])).await;
 
     assert_eq!(resp.status_code(), 200, "{}", resp.text());
-    assert_unsettled_hold(&server, &org_id, &_db).await;
+    assert_eq!(
+        recorded_input_tokens(&server, &org_id).await,
+        vec![1_000_000]
+    );
 }
 
 /// A count above i64::MAX must not be dropped as malformed (which would
 /// bill only the other entry and skip the overflow anomaly); it saturates
-/// and hits the anomaly cap, then remains unsettled because it exceeds the reservation.
+/// and hits the cap.
 #[tokio::test]
-async fn classify_usage_above_i64_max_retains_hold() {
-    let (server, mock, org_id, api_key, _db) = setup().await;
+async fn classify_usage_entry_above_i64_max_is_capped() {
+    let (server, mock, org_id, api_key) = setup().await;
     upstream_body(
         &mock,
         serde_json::json!({
@@ -286,12 +268,15 @@ async fn classify_usage_above_i64_max_retains_hold() {
     let resp = post(&server, CLASSIFY, &api_key, serde_json::json!(["a", "b"])).await;
 
     assert_eq!(resp.status_code(), 200, "{}", resp.text());
-    assert_unsettled_hold(&server, &org_id, &_db).await;
+    assert_eq!(
+        recorded_input_tokens(&server, &org_id).await,
+        vec![1_000_000]
+    );
 }
 
 #[tokio::test]
 async fn redact_malformed_usage_entry_skips_only_that_entry() {
-    let (server, mock, org_id, api_key, _db) = setup().await;
+    let (server, mock, org_id, api_key) = setup().await;
     upstream_body(&mock, usage_with_one_non_numeric_entry()).await;
 
     let resp = post(&server, REDACT, &api_key, serde_json::json!(["a", "b"])).await;
@@ -307,8 +292,8 @@ async fn redact_malformed_usage_entry_skips_only_that_entry() {
 }
 
 #[tokio::test]
-async fn redact_oversized_usage_retains_hold() {
-    let (server, mock, org_id, api_key, _db) = setup().await;
+async fn redact_oversized_usage_entry_is_capped() {
+    let (server, mock, org_id, api_key) = setup().await;
     upstream_body(&mock, usage_with_one_oversized_entry()).await;
 
     let resp = post(&server, REDACT, &api_key, serde_json::json!(["a", "b"])).await;
@@ -323,12 +308,15 @@ async fn redact_oversized_usage_retains_hold() {
         body["data"][1]["usage"],
         serde_json::json!({"input_tokens": 3_000_000_000i64})
     );
-    assert_unsettled_hold(&server, &org_id, &_db).await;
+    assert_eq!(
+        recorded_input_tokens(&server, &org_id).await,
+        vec![1_000_000]
+    );
 }
 
 #[tokio::test]
-async fn classify_unreasonable_token_count_retains_hold() {
-    let (server, mock, org_id, api_key, _db) = setup().await;
+async fn classify_caps_unreasonable_token_count() {
+    let (server, mock, org_id, api_key) = setup().await;
     upstream_body(
         &mock,
         serde_json::json!({
@@ -343,12 +331,15 @@ async fn classify_unreasonable_token_count_retains_hold() {
     let resp = post(&server, CLASSIFY, &api_key, serde_json::json!(["a", "b"])).await;
 
     assert_eq!(resp.status_code(), 200, "{}", resp.text());
-    assert_unsettled_hold(&server, &org_id, &_db).await;
+    assert_eq!(
+        recorded_input_tokens(&server, &org_id).await,
+        vec![1_000_000]
+    );
 }
 
 #[tokio::test]
-async fn redact_unreasonable_token_count_retains_hold() {
-    let (server, mock, org_id, api_key, _db) = setup().await;
+async fn redact_caps_unreasonable_token_count() {
+    let (server, mock, org_id, api_key) = setup().await;
     upstream_body(
         &mock,
         serde_json::json!({
@@ -363,12 +354,15 @@ async fn redact_unreasonable_token_count_retains_hold() {
     let resp = post(&server, REDACT, &api_key, serde_json::json!(["a", "b"])).await;
 
     assert_eq!(resp.status_code(), 200, "{}", resp.text());
-    assert_unsettled_hold(&server, &org_id, &_db).await;
+    assert_eq!(
+        recorded_input_tokens(&server, &org_id).await,
+        vec![1_000_000]
+    );
 }
 
 #[tokio::test]
 async fn redact_ignores_out_of_range_index_usage() {
-    let (server, mock, org_id, api_key, _db) = setup().await;
+    let (server, mock, org_id, api_key) = setup().await;
     upstream_body(
         &mock,
         serde_json::json!({

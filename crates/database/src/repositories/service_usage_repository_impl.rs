@@ -30,59 +30,6 @@ impl ServiceUsageRepositoryImpl {
 
 #[async_trait]
 impl ServiceUsageRepositoryTrait for ServiceUsageRepositoryImpl {
-    async fn reserve_service(
-        &self,
-        params: &services::service_usage::ports::RecordServiceUsageWithPricingParams,
-    ) -> anyhow::Result<Uuid> {
-        anyhow::ensure!(
-            params.quantity > 0 && params.cost_per_unit >= 0,
-            "invalid service quote"
-        );
-        let amount = i64::from(params.quantity)
-            .checked_mul(params.cost_per_unit)
-            .ok_or_else(|| anyhow::anyhow!("service quote overflow"))?;
-        let id = Uuid::new_v4();
-        let mut client = self.usage_repo.pool.get().await?;
-        let tx = client.transaction().await?;
-        tx.batch_execute("SET LOCAL statement_timeout = '10s'; SET LOCAL lock_timeout = '5s'")
-            .await?;
-        tx.query_one(
-            "SELECT id FROM reserve_usage_budget($1,$2,$3,$4,NULL,$5,$6,$7,$8,$9,$10)",
-            &[
-                &id,
-                &params.organization_id,
-                &params.workspace_id,
-                &params.api_key_id,
-                &params.service_id,
-                &amount,
-                &serde_json::json!({"cost_per_unit": params.cost_per_unit}),
-                &serde_json::json!({"quantity": params.quantity}),
-                &self.usage_repo.allocation_policy.priority,
-                &self.usage_repo.allocation_policy.version,
-            ],
-        )
-        .await
-        .map_err(|error| {
-            if matches!(error.code().map(|c| c.code()), Some("NBKEX" | "NBOEX")) {
-                anyhow::Error::new(services::usage::UsageError::LimitExceeded(
-                    "Insufficient available budget".into(),
-                ))
-            } else {
-                error.into()
-            }
-        })?;
-        let claimed: bool = tx
-            .query_one(
-                "SELECT dispatch_usage_budget($1,$2)",
-                &[&params.organization_id, &id],
-            )
-            .await?
-            .get(0);
-        anyhow::ensure!(claimed, "service reservation is already dispatched");
-        tx.commit().await?;
-        Ok(id)
-    }
-
     async fn get_active_service_pricing(
         &self,
         service_name: &str,

@@ -18,6 +18,7 @@ use inference_providers::{
 };
 use services::{
     attestation::SignatureKind,
+    completions::hash_inference_id_to_uuid,
     models::{ModelCaller, ModelsError},
     usage::{InferenceType, ProviderAttribution, RecordUsageServiceRequest, StopReason},
 };
@@ -124,25 +125,14 @@ pub async fn systemone(
             )
         }
     };
-    let budget = match super::completions::billing::budget_execution(
-        &state,
-        &api_key,
-        &model,
-        services::usage::InferenceType::Decisions,
-        i64::from(model.context_length),
-        i64::from(model.max_output_length.unwrap_or(model.context_length)),
-        0,
-    ) {
-        Ok(budget) => budget,
-        Err(response) => return *response,
-    };
-    let served = match budget
-        .run(state.inference_provider_pool.systemone_with_attribution(
+    let served = match state
+        .inference_provider_pool
+        .systemone_with_attribution(
             request,
             body_hash.hash.clone(),
             encryption.model_pub_key.as_deref(),
             !api_key.organization.fallback_enabled(),
-        ))
+        )
         .await
     {
         Ok(response) => response,
@@ -156,17 +146,12 @@ pub async fn systemone(
     let finalize = tokio::spawn(async move {
         let _slot = slot;
         let decision_id = &served.decision_id;
-        let budget_id = match super::completions::billing::budget_id(&budget).await {
-            Ok(id) => id,
-            Err(response) => return *response,
-        };
-        let inference_id = services::completions::hash_inference_id_to_uuid(decision_id);
+        let inference_id = hash_inference_id_to_uuid(decision_id);
         let usage = &served.response.response.usage;
         let usage_request = RecordUsageServiceRequest {
             input_tokens: usage.input_tokens,
             output_tokens: usage.output_tokens,
             inference_id: Some(inference_id),
-            budget_id: Some(budget_id),
             provider_request_id: Some(decision_id.clone()),
             stop_reason: Some(StopReason::Completed),
             provider_attribution: served.provider_attribution,

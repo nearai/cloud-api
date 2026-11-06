@@ -1,10 +1,6 @@
 pub(super) fn assert_production_logs_exclude_forbidden_expressions() {
     let sources = [
         (
-            "crates/api/src/routes/completions/audio_budget.rs",
-            include_str!("../../routes/completions/audio_budget.rs"),
-        ),
-        (
             "crates/api/src/routes/completions/mod.rs",
             include_str!("../../routes/completions/mod.rs"),
         ),

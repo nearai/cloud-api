@@ -20,7 +20,6 @@
 //! or logged.
 
 mod apply;
-pub use apply::collect_text_fragments;
 mod detect;
 mod placeholders;
 mod stream_unredact;

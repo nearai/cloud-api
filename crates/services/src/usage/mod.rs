@@ -206,6 +206,14 @@ impl UsageServiceImpl {
         identity: BillingIdentity,
         bounds: budget::UsageBounds,
     ) -> Result<Uuid, UsageError> {
+        if !matches!(
+            bounds.inference_type,
+            InferenceType::ChatCompletion | InferenceType::ChatCompletionStream
+        ) {
+            return Err(UsageError::ValidationError(
+                "Admission is limited to text generation".into(),
+            ));
+        }
         let pricing = self
             .model_repository
             .get_model_by_id(identity.model_id)

@@ -260,27 +260,9 @@ pub async fn rerank(
     // Call completion service which handles concurrent request limiting
     // Each organization has a per-model concurrent request limit (default: 64 concurrent requests).
     // This prevents resource exhaustion and ensures fair usage. Returns 429 if limit exceeded.
-    let budget = match billing::budget_execution(
-        &app_state,
-        &api_key,
-        &model,
-        services::usage::InferenceType::Rerank,
-        (request.documents.len() as i64)
-            .checked_mul(i64::from(model.context_length))
-            .unwrap_or(i64::MAX),
-        0,
-        0,
-    ) {
-        Ok(budget) => budget,
-        Err(response) => return *response,
-    };
-    match budget
-        .run(app_state.completion_service.try_rerank(
-            organization_id,
-            model_id,
-            &request.model,
-            params,
-        ))
+    match app_state
+        .completion_service
+        .try_rerank(organization_id, model_id, &request.model, params)
         .await
     {
         Ok(mut response) => {
@@ -315,15 +297,10 @@ pub async fn rerank(
                 Err(response) => return *response,
             };
 
-            let budget_id = match billing::budget_id(&budget).await {
-                Ok(id) => id,
-                Err(response) => return *response,
-            };
-            let inference_id = Uuid::new_v4();
+            let inference_id = uuid::Uuid::new_v4();
             let usage_request = services::usage::RecordUsageServiceRequest {
                 input_tokens: token_count,
                 inference_id: Some(inference_id),
-                budget_id: Some(budget_id),
                 stop_reason: Some(services::usage::StopReason::Completed),
                 ..services::usage::RecordUsageServiceRequest::base(
                     services::usage::BillingIdentity {

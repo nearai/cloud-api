@@ -72,7 +72,6 @@ RUN --mount=type=bind,source=pinned-packages-runtime.txt,target=/tmp/pinned-pack
     done && \
     apt-get -o Acquire::https::CAInfo=/run/bootstrap-ca.crt update && \
     apt-get -o Acquire::https::CAInfo=/run/bootstrap-ca.crt install -y --no-install-recommends \
-        ffmpeg \
         ca-certificates \
         libssl3 \
         curl \

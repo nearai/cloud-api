@@ -852,10 +852,10 @@ async fn systemone_fallback_respects_trust_and_organization_policy() {
     )
     .await;
     let req = serde_json::from_value(request(&model)).unwrap();
-    let served =
-        with_pool_test_budget(pool.systemone_with_attribution(req, "hash".into(), None, false))
-            .await
-            .unwrap();
+    let served = pool
+        .systemone_with_attribution(req, "hash".into(), None, false)
+        .await
+        .unwrap();
     assert_eq!(
         served.signature_kind,
         services::attestation::SignatureKind::Gateway
@@ -863,11 +863,10 @@ async fn systemone_fallback_respects_trust_and_organization_policy() {
     assert!(served.provider_attribution.served_via_fallback);
     assert_eq!(hits.load(Ordering::SeqCst), 1);
     let req = serde_json::from_value(request(&model)).unwrap();
-    assert!(
-        with_pool_test_budget(pool.systemone_with_attribution(req, "hash".into(), None, true))
-            .await
-            .is_err()
-    );
+    assert!(pool
+        .systemone_with_attribution(req, "hash".into(), None, true)
+        .await
+        .is_err());
     assert_eq!(hits.load(Ordering::SeqCst), 1);
 }
 
@@ -917,15 +916,16 @@ async fn systemone_invalid_success_and_timeout_never_invoke_a_second_provider() 
             None,
         )
         .await;
-        let error = with_pool_test_budget(pool.systemone_with_attribution(
-            serde_json::from_value(request(&model)).unwrap(),
-            "hash".into(),
-            None,
-            false,
-        ))
-        .await
-        .err()
-        .expect("invalid System One responses must fail without fallback");
+        let error = pool
+            .systemone_with_attribution(
+                serde_json::from_value(request(&model)).unwrap(),
+                "hash".into(),
+                None,
+                false,
+            )
+            .await
+            .err()
+            .expect("invalid System One responses must fail without fallback");
         assert!(matches!(
             error,
             CompletionError::InvalidResponse(_) | CompletionError::Timeout { .. }

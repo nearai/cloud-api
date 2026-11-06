@@ -16,7 +16,7 @@ pub async fn scope<F: std::future::Future>(
 }
 pub async fn before_retry() -> Result<(), CompletionError> {
     // Provider transport tests and non-billing consumers may use providers directly.
-    // Cloud's pool enforces mandatory admission before entering any provider.
+    // Cloud's text-generation dispatch sites enforce admission before entering a provider.
     if let Ok(admission) = ADMISSION.try_with(Clone::clone) {
         admission.admit_retry().await?;
     }

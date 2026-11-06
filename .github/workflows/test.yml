@@ -142,9 +142,6 @@ jobs:
       with:
         cache-key: unit
 
-    - name: Install audio test decoder
-      run: bash scripts/setup-ci-audio.sh
-
     - name: Run unit tests
       run: cargo nextest run --lib --bins
       env:
@@ -267,9 +264,6 @@ jobs:
         PGDATABASE: platform_api
         PGUSER: postgres
         PGPASSWORD: postgres
-
-    - name: Install audio test decoder
-      run: bash scripts/setup-ci-audio.sh
 
     - name: Run e2e tests
       run: cargo nextest run --test e2e_all

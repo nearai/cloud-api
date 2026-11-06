@@ -218,6 +218,7 @@ async fn settle_privacy_usage(
     };
 
     let usage_request = services::usage::RecordUsageServiceRequest {
+        budget_id: None,
         organization_id,
         workspace_id: api_key.workspace.id.0,
         api_key_id,
@@ -236,7 +237,6 @@ async fn settle_privacy_usage(
         ttft_ms: None,
         avg_itl_ms: None,
         inference_id: Some(identity.inference_id),
-        budget_id: identity.budget_id,
         provider_request_id: identity.response_id.clone(),
         stop_reason: Some(services::usage::StopReason::Completed),
         response_id: None,
@@ -385,30 +385,15 @@ pub async fn privacy_classify(
     insert_encryption_headers(&encryption_headers, &mut extra);
     insert_request_id_header(correlation, &mut extra);
 
-    let input_bound = match billing::batch_input_bound(&body, model.context_length) {
-        Ok(n) => n,
-        Err(r) => return *r,
-    };
-    let budget = match billing::budget_execution(
-        &app_state,
-        &api_key,
-        &model,
-        services::usage::InferenceType::PrivacyClassify,
-        input_bound,
-        0,
-        0,
-    ) {
-        Ok(budget) => budget,
-        Err(response) => return *response,
-    };
-    match budget
-        .run(app_state.completion_service.try_privacy_classify(
+    match app_state
+        .completion_service
+        .try_privacy_classify(
             organization_id,
             model_id,
             &model_name,
             strip_client_request_ids(body),
             extra,
-        ))
+        )
         .await
     {
         Ok(response_bytes) => {
@@ -418,11 +403,7 @@ pub async fn privacy_classify(
             let token_sum_i64: i64 = services::auto_redact::parse_usage_entries(&response_bytes)
                 .iter()
                 .fold(0i64, |acc, e| acc.saturating_add(e.input_tokens));
-            let mut identity = PrivacyIdentity::from_response(&response_bytes);
-            identity.budget_id = Some(match billing::budget_id(&budget).await {
-                Ok(id) => id,
-                Err(r) => return *r,
-            });
+            let identity = PrivacyIdentity::from_response(&response_bytes);
             signatures::finalize(
                 app_state,
                 api_key,
@@ -687,30 +668,15 @@ pub async fn privacy_redact(
         }
     };
 
-    let input_bound = match billing::batch_input_bound(&upstream_bytes, model.context_length) {
-        Ok(n) => n,
-        Err(r) => return *r,
-    };
-    let budget = match billing::budget_execution(
-        &app_state,
-        &api_key,
-        &model,
-        services::usage::InferenceType::PrivacyClassify,
-        input_bound,
-        0,
-        0,
-    ) {
-        Ok(budget) => budget,
-        Err(response) => return *response,
-    };
-    let response_bytes = match budget
-        .run(app_state.completion_service.try_privacy_classify(
+    let response_bytes = match app_state
+        .completion_service
+        .try_privacy_classify(
             organization_id,
             model_id,
             &model_name,
             upstream_bytes,
             extra,
-        ))
+        )
         .await
     {
         Ok(b) => b,
@@ -756,11 +722,7 @@ pub async fn privacy_redact(
     let token_sum_i64: i64 = per_index_tokens
         .values()
         .fold(0i64, |acc, t| acc.saturating_add(*t));
-    let mut identity = PrivacyIdentity::from_response(&response_bytes);
-    identity.budget_id = Some(match billing::budget_id(&budget).await {
-        Ok(id) => id,
-        Err(r) => return *r,
-    });
+    let identity = PrivacyIdentity::from_response(&response_bytes);
 
     let data: Vec<serde_json::Value> = redacted
         .into_iter()

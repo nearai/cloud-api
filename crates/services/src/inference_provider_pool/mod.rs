@@ -1899,6 +1899,7 @@ impl InferenceProviderPool {
     /// Re-read the catalog rows of pinned models and reclassify their providers,
     /// so role edits made elsewhere reach this process without a restart. A
     /// failed read leaves the current roles in place.
+    /// A pinned model with no active catalog row keeps its current role.
     async fn refresh_pinned_roles_from_source(&self, source: &dyn ExternalModelsSource) {
         let names: Vec<String> = self
             .pinned_providers

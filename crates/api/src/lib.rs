@@ -26,7 +26,6 @@ use crate::{
             current_user, github_login, google_login, login_page, logout, oauth_callback,
             StateStore,
         },
-        billing::{get_billing_costs, BillingRouteState},
         completions::{
             audio_transcriptions, chat_completions, completions, embeddings, image_edits,
             image_generations, models, privacy_classify, privacy_redact, rerank, score,
@@ -1279,15 +1278,6 @@ pub fn build_app_with_config_and_options(
         &auth_components.auth_state_middleware,
     );
 
-    let organization_credit_service = build_organization_credit_service(&database, &config);
-    let transfer_routes = crate::routes::credit_transfers::routes(
-        organization_credit_service.clone(),
-        auth_components.auth_state_middleware.clone(),
-    );
-    let organization_credential_routes = crate::routes::organization_credentials::routes(
-        organization_credit_service,
-        auth_components.auth_state_middleware.clone(),
-    );
     let management_routes = build_management_router(
         app_state.clone(),
         auth_components.auth_state_middleware.clone(),
@@ -1344,10 +1334,6 @@ pub fn build_app_with_config_and_options(
         &auth_components.auth_state_middleware,
     );
 
-    let billing_routes = build_billing_routes(
-        domain_services.usage_service.clone(),
-        &auth_components.auth_state_middleware,
-    );
     // Build OpenAPI and documentation routes
     let openapi_routes = build_openapi_routes();
 
@@ -1386,8 +1372,6 @@ pub fn build_app_with_config_and_options(
                 .merge(unsupported_openai_routes)
                 .merge(conversation_routes)
                 .merge(management_routes)
-                .merge(transfer_routes)
-                .merge(organization_credential_routes)
                 .merge(workspace_routes)
                 .merge(attestation_routes.clone())
                 .merge(model_routes)
@@ -1396,7 +1380,6 @@ pub fn build_app_with_config_and_options(
                 .merge(invitation_routes)
                 .merge(files_routes)
                 .merge(feature_request_routes)
-                .merge(billing_routes)
                 .merge(gateway_routes)
                 .merge(internal_routes)
                 .merge(health_routes)
@@ -2069,22 +2052,6 @@ pub fn build_feature_request_routes(
     Router::new().merge(user_routes).merge(admin_routes)
 }
 
-/// Build billing routes with API key auth (HuggingFace billing integration)
-pub fn build_billing_routes(
-    usage_service: Arc<dyn services::usage::UsageServiceTrait + Send + Sync>,
-    auth_state_middleware: &AuthState,
-) -> Router {
-    let billing_state = BillingRouteState { usage_service };
-
-    Router::new()
-        .route("/billing/costs", post(get_billing_costs))
-        .with_state(billing_state)
-        .layer(from_fn_with_state(
-            auth_state_middleware.clone(),
-            middleware::auth::auth_middleware_with_workspace_context,
-        ))
-}
-
 /// Build gateway routes for external model gateways to validate API keys.
 ///
 /// `/v1/check_api_key` runs the same API-key auth and credit (usage) check
@@ -2303,9 +2270,6 @@ fn build_admin_routes_with_options(
         update_organization_fallback, update_organization_limits, update_organization_member_role,
         update_organization_priority, update_service, upsert_aml_allowlist_entry, AdminAppState,
     };
-    use crate::routes::staking_farm::{
-        get_admin_organization_staking_farm, sync_admin_organization_staking_farm,
-    };
     use database::repositories::{AdminAccessTokenRepository, AdminCompositeRepository};
     use services::admin::AdminServiceImpl;
 
@@ -2439,14 +2403,6 @@ fn build_admin_routes_with_options(
             "/admin/organizations/{org_id}/limits/history",
             axum::routing::get(get_organization_limits_history),
         )
-        .route(
-            "/admin/organizations/{org_id}/staking/farm",
-            axum::routing::get(get_admin_organization_staking_farm),
-        )
-        .route(
-            "/admin/organizations/{org_id}/staking/farm/sync",
-            axum::routing::post(sync_admin_organization_staking_farm),
-        )
         .route("/admin/aml/reports", axum::routing::get(list_aml_reports))
         .route(
             "/admin/aml/reports/{report_id}/status",
@@ -2572,56 +2528,7 @@ fn build_admin_routes_with_options(
             "/admin/access-tokens/{token_id}",
             axum::routing::delete(delete_admin_access_token),
         )
-        .with_state(admin_app_state)
-        .merge(
-            Router::new()
-                .route(
-                    "/admin/organizations/{org_id}/policy",
-                    get(crate::routes::organization_policy::get_policy)
-                        .put(crate::routes::organization_policy::put_policy),
-                )
-                .route("/admin/organizations/{org_id}/credit/transfer/reconciliation", get(crate::routes::credit_transfers::reconciliation))
-                .layer(axum::Extension(
-                    build_organization_credit_service(&database, &config),
-                ))
-        )
-        .merge(
-            Router::new()
-                .route(
-                    "/admin/organizations/{org_id}/credit/reconciliations",
-                    axum::routing::post(
-                        crate::routes::admin_credit_reconciliation::reconcile_organization_credits,
-                    ),
-                )
-                .layer(axum::Extension(
-                    database::repositories::credit_reconciliation::CreditReconciliationRepository::new(
-                        database.pool().clone(),
-                    ),
-                ))
-        )
-        .merge(
-            Router::new()
-                .route("/admin/organizations/{org_id}/usage-discount",
-                    axum::routing::get(crate::routes::admin_usage_discount::get_usage_discount)
-                        .put(crate::routes::admin_usage_discount::put_usage_discount))
-                .layer(axum::Extension(database::repositories::organization_usage_discount::OrganizationUsageDiscountRepository::new(database.pool().clone())))
-        )
-        .merge(
-            Router::new()
-                .route(
-                    "/admin/usage-hourly/recompute",
-                    axum::routing::post(crate::routes::admin_usage_hourly::recompute_usage_hourly),
-                )
-                .layer(axum::Extension(
-                    crate::routes::admin_usage_hourly::UsageHourlyRepairState {
-                        repository: Arc::new(
-                            database::repositories::UsageHourlyRepositoryImpl::new(
-                                database.pool().clone(),
-                            ),
-                        ),
-                    },
-                )),
-        );
+        .with_state(admin_app_state);
 
     let admin_routes = if let Some(database_encryption_state) = database_encryption_state {
         if build_options.start_database_encryption_recovery {
@@ -2735,25 +2642,6 @@ async fn swagger_ui_handler() -> Html<String> {
 </html>"#
             .to_string(),
     )
-}
-
-fn build_organization_credit_service(
-    database: &database::Database,
-    config: &ApiConfig,
-) -> Arc<dyn services::organization_credits::OrganizationCreditServiceTrait> {
-    use database::repositories::credit_transfers::CreditTransferRepository;
-    use database::repositories::organization_credentials::OrganizationCredentialRepository;
-    use services::organization_credits::OrganizationCreditService;
-
-    let transfers = Arc::new(CreditTransferRepository::new(
-        database.pool().clone(),
-        &config.credit_allocation,
-    ));
-    let credentials = Arc::new(OrganizationCredentialRepository::new(
-        database.pool().clone(),
-    ));
-
-    Arc::new(OrganizationCreditService::new(transfers, credentials))
 }
 
 #[cfg(test)]

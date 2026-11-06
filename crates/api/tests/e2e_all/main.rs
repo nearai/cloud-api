@@ -15,7 +15,6 @@ mod admin_analytics_statement_budget;
 mod admin_api_keys;
 mod admin_audit;
 mod admin_consumption_hourly;
-mod admin_credit_reconciliation;
 mod admin_deprecate_model;
 mod admin_invitation_email_deliveries;
 mod admin_list_models;
@@ -30,7 +29,6 @@ mod admin_routing_policy;
 mod admin_services;
 mod admin_settings;
 mod admin_token_permissions;
-mod admin_usage_hourly_repair;
 mod anthropic_signatures;
 mod api_key_usage_hourly;
 mod api_keys;
@@ -42,7 +40,6 @@ mod auth_tokens;
 mod auto_redact;
 mod auto_redact_adversarial;
 mod backend_output_limits;
-mod billing_and_models;
 mod billing_record_characterization;
 mod body_hash_limit;
 mod chat_encryption;
@@ -89,7 +86,6 @@ mod organization_deletion;
 mod organization_membership_order;
 mod organization_model_access;
 mod organization_priority;
-mod organization_usage_discount;
 mod pagination_validation;
 mod patroni_failover;
 mod privacy_classify;
@@ -112,7 +108,6 @@ mod score;
 mod serving_provider;
 mod session_logout;
 mod signature_verification;
-mod staking_wallet_binding;
 mod systemone;
 mod tinfoil_provider;
 mod unlisted_models;
@@ -200,5 +195,3 @@ fn no_proxy_with_loopback() -> String {
 
     entries.join(",")
 }
-
-mod credit_transfers;

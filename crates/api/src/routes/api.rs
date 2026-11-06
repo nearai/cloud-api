@@ -2,7 +2,7 @@ use crate::middleware::{auth_middleware, AuthState};
 use crate::ohttp_gateway::{OhttpAttestation, OhttpGateway};
 use axum::{
     middleware::from_fn_with_state,
-    routing::{delete, get, post, put},
+    routing::{delete, get, put},
     Router,
 };
 use services::{
@@ -96,10 +96,6 @@ pub fn build_management_router(app_state: AppState, auth_state: AuthState) -> Ro
             "/{id}/members/{user_id}",
             put(update_organization_member).delete(remove_organization_member),
         )
-        .route(
-            "/{id}/staking/farm/bind",
-            post(crate::routes::staking_farm::bind_organization_staking_farm),
-        )
         // // MCP Connector management
         // .route(
         //     "/{id}/mcp-connectors",
@@ -127,14 +123,7 @@ pub fn build_management_router(app_state: AppState, auth_state: AuthState) -> Ro
         //     "/{id}/mcp-connectors/{connector_id}/usage",
         //     get(get_mcp_usage_logs),
         // )
-        .route(
-            "/{id}/staking/farm",
-            get(crate::routes::staking_farm::get_organization_staking_farm),
-        )
-        .route(
-            "/{id}/staking/farm/sync",
-            post(crate::routes::staking_farm::sync_organization_staking_farm),
-        );
+;
 
     // User routes (require access token authentication)
     let user_routes = Router::new()
@@ -184,10 +173,6 @@ pub fn build_management_router(app_state: AppState, auth_state: AuthState) -> Ro
 
     // Combine all routes with appropriate auth middleware
     Router::new()
-        .route(
-            "/staking/farm/config",
-            get(crate::routes::staking_farm::get_staking_farm_config),
-        )
         .nest("/organizations", org_routes)
         .nest("/users", user_routes)
         .with_state(app_state)

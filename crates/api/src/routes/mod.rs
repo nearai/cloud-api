@@ -1,12 +1,9 @@
 pub mod admin;
-pub mod admin_credit_reconciliation;
 pub mod admin_model_access;
-pub mod admin_usage_hourly;
 pub mod anthropic;
 pub mod api;
 pub mod attestation;
 pub mod auth;
-pub mod billing;
 pub mod common;
 pub mod completions;
 pub mod conversations;
@@ -23,17 +20,9 @@ pub mod organization_members;
 pub mod organizations;
 pub mod responses;
 pub mod services;
-pub mod staking_farm;
 pub mod systemone;
 pub mod unsupported;
 pub mod users;
 pub mod workspaces;
 
 mod responses_native;
-
-pub mod admin_usage_discount;
-
-pub mod credit_transfers;
-
-pub(crate) mod organization_credentials;
-pub(crate) mod organization_policy;

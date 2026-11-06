@@ -209,16 +209,6 @@ async fn read_only_reads_and_mixed_method_mutations_have_no_side_effects() {
             "/v1/admin/models/missing-model".into(),
             json!({"reason": "test"}),
         ),
-        (
-            Method::POST,
-            format!("/v1/admin/organizations/{}/staking/farm/sync", org.id),
-            json!({}),
-        ),
-        (
-            Method::POST,
-            "/v1/admin/usage-hourly/recompute".into(),
-            json!({"start": "1900-01-01T00:00:00Z", "end": "1900-01-01T01:00:00Z"}),
-        ),
     ] {
         assert_forbidden(
             &call(&server, method, &route, &read_only, body).await,

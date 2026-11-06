@@ -133,10 +133,6 @@ Operations marked deprecated (account, organization, workspace, invitation, API 
         crate::routes::users::accept_invitation_by_token,
         // Usage endpoints
         // Staking farm endpoints
-        crate::routes::staking_farm::get_staking_farm_config,
-        crate::routes::staking_farm::get_organization_staking_farm,
-        crate::routes::staking_farm::bind_organization_staking_farm,
-        crate::routes::staking_farm::sync_organization_staking_farm,
         // Customer reporting endpoints
         // Feature request endpoints
         crate::routes::feature_requests::submit_feature_request,
@@ -144,7 +140,6 @@ Operations marked deprecated (account, organization, workspace, invitation, API 
         // Gateway endpoints (model gateway integration)
         crate::routes::gateway::check_api_key,
         // Billing endpoints (HuggingFace integration)
-        crate::routes::billing::get_billing_costs,
         // Admin endpoints (less frequently used)
         crate::routes::admin::list_models,
         crate::routes::admin::batch_upsert_models,
@@ -166,8 +161,6 @@ Operations marked deprecated (account, organization, workspace, invitation, API 
         crate::routes::admin_model_access::list_organization_model_access,
         crate::routes::admin::update_organization_limits,
         crate::routes::admin::get_organization_limits_history,
-        crate::routes::staking_farm::get_admin_organization_staking_farm,
-        crate::routes::staking_farm::sync_admin_organization_staking_farm,
         crate::routes::admin::list_aml_reports,
         crate::routes::admin::update_aml_report_status,
         crate::routes::admin::list_aml_allowlist,
@@ -189,22 +182,6 @@ Operations marked deprecated (account, organization, workspace, invitation, API 
         crate::routes::admin::get_billing_summary,
         crate::routes::admin::get_model_revenue,
         crate::routes::admin::get_revenue_density,
-        crate::routes::admin_usage_hourly::recompute_usage_hourly,
-        crate::routes::admin_usage_discount::get_usage_discount,
-        crate::routes::admin_credit_reconciliation::reconcile_organization_credits,
-        crate::routes::credit_transfers::create,
-        crate::routes::credit_transfers::history,
-        crate::routes::credit_transfers::detail,
-        crate::routes::credit_transfers::capacity,
-        crate::routes::organization_policy::get_policy,
-        crate::routes::organization_policy::put_policy,
-        crate::routes::organization_credentials::create_credential,
-        crate::routes::organization_credentials::revoke_credential,
-        crate::routes::organization_credentials::list_credentials,
-        crate::routes::organization_credentials::update_credential,
-        crate::routes::organization_credentials::rotate_credential,
-        crate::routes::credit_transfers::reconciliation,
-        crate::routes::admin_usage_discount::put_usage_discount,
         crate::routes::admin::get_org_revenue,
         crate::routes::admin::get_infra_summary,
         crate::routes::admin::list_admin_settings,
@@ -266,15 +243,6 @@ Operations marked deprecated (account, organization, workspace, invitation, API 
             crate::routes::admin_model_access::ModelAccessGrantResponse,
             crate::routes::admin_model_access::OrganizationModelAccessResponse,
             crate::routes::admin_model_access::OrganizationModelAccessEntry,
-            crate::routes::admin_usage_discount::UsageDiscountRequest,
-            crate::routes::admin_credit_reconciliation::CreditReconciliationRequest,
-            crate::routes::admin_credit_reconciliation::CreditReconciliationResponse,
-            crate::routes::admin_credit_reconciliation::AccountingPositionResponse,
-            crate::routes::admin_credit_reconciliation::CreditPositionResponse,
-            crate::routes::admin_usage_discount::UsageDiscountResponse,
-            crate::routes::admin_usage_hourly::UsageHourlyRepairRequest,
-            crate::routes::admin_usage_hourly::UsageHourlyRepairResponse,
-            crate::routes::admin_usage_hourly::UsageHourlyDayParity,
             // Workspace models
             crate::routes::workspaces::CreateWorkspaceRequest,
             crate::routes::workspaces::UpdateWorkspaceRequest,
@@ -371,11 +339,6 @@ Operations marked deprecated (account, organization, workspace, invitation, API 
             // Usage tracking models
             crate::routes::internal_usage::RecordUsageResponse,
             // Staking farm models
-            crate::routes::staking_farm::StakingFarmConfigResponse,
-            crate::routes::staking_farm::StakingFarmStateResponse,
-            crate::routes::staking_farm::OrganizationStakingState,
-            crate::routes::staking_farm::BindRequest,
-            crate::routes::staking_farm::BindResponse,
             // Customer reporting models
             // Feature request models
             crate::routes::feature_requests::FeatureRequestKind,
@@ -388,9 +351,6 @@ Operations marked deprecated (account, organization, workspace, invitation, API 
             // Gateway models
             crate::routes::gateway::CheckApiKeyResponse,
             // Billing models (HuggingFace integration)
-            crate::routes::billing::BillingCostsRequest,
-            crate::routes::billing::BillingCostsResponse,
-            crate::routes::billing::RequestCost,
             // Organization metrics (admin)
             services::admin::OrganizationMetrics,
             services::admin::MetricsSummary,

@@ -39,4 +39,3 @@ pub use responses::service::ResponseServiceImpl as ResponseService;
 
 #[cfg(test)]
 mod test_utils;
-

@@ -1291,17 +1291,6 @@ pub fn build_app_with_config_and_options(
         build_options,
         AdminRouteServices {
             object_encryption_state: domain_services.object_encryption_state.clone(),
-            models_service: cloud_platform::invalidating_models_service(
-                domain_services.models_service.clone(),
-                domain_services.cloud_platform_catalog.clone(),
-            ),
-            completion_service: domain_services.completion_service.clone(),
-            organization_service: domain_services.organization_service.clone(),
-            user_erasure_service: Arc::new(services::user_erasure::UserErasureService::new(
-                Arc::new(database::repositories::PostgresUserErasureRepository::new(
-                    database.pool().clone(),
-                )),
-            )),
         },
     );
 
@@ -2159,12 +2148,6 @@ fn cache_control_layer(value: &'static str) -> CacheControlLayer {
 /// Build admin routes (authenticated endpoints)
 pub struct AdminRouteServices {
     pub object_encryption_state: object_encryption::ObjectEncryptionState,
-    /// Invalidated by admin writes: see `cloud_platform::invalidating_models_service`.
-    pub models_service: Arc<dyn services::models::ModelsServiceTrait>,
-    pub completion_service: Arc<services::CompletionServiceImpl>,
-    pub organization_service:
-        Arc<dyn services::organization::OrganizationServiceTrait + Send + Sync>,
-    pub user_erasure_service: Arc<services::user_erasure::UserErasureService>,
 }
 
 pub fn build_admin_routes(
@@ -2190,18 +2173,8 @@ fn build_admin_routes_with_options(
     services: AdminRouteServices,
 ) -> Router {
     use crate::middleware::admin_middleware;
-    use crate::routes::admin::{
-        create_admin_access_token, delete_admin_access_token, erase_user, get_infra_summary,
-        list_admin_access_tokens, list_invitation_email_deliveries, lookup_user_erasures,
-        preview_user_erasure, resend_invitation_email, update_organization_member_role,
-        AdminAppState,
-    };
+    use crate::routes::admin::{get_infra_summary, AdminAppState};
 
-    use database::repositories::AdminAccessTokenRepository;
-
-    // Create admin access token repository
-    let admin_access_token_repository =
-        Arc::new(AdminAccessTokenRepository::new(database.pool().clone()));
     let infra_service = Arc::new(services::admin::InfraService::new(
         config.infra.machines_url.clone(),
         config.infra.cost_per_host_usd_month,
@@ -2211,14 +2184,7 @@ fn build_admin_routes_with_options(
         config.infra.cost_per_gpu_hour_usd,
     ));
 
-    let admin_app_state = AdminAppState {
-        organization_service: services.organization_service,
-        auth_service: auth_state_middleware.auth_service.clone(),
-        config: config.clone(),
-        admin_access_token_repository,
-        infra_service,
-        user_erasure_service: services.user_erasure_service,
-    };
+    let admin_app_state = AdminAppState { infra_service };
 
     let database_encryption_state =
         crate::database_encryption::DatabaseEncryptionState::new(database.pool().clone())
@@ -2235,42 +2201,6 @@ fn build_admin_routes_with_options(
         .route(
             "/admin/platform/infra-summary",
             axum::routing::get(get_infra_summary),
-        )
-        .route(
-            "/admin/invitation-email-deliveries",
-            axum::routing::get(list_invitation_email_deliveries),
-        )
-        .route(
-            "/admin/invitation-email-deliveries/{invitation_id}/resend",
-            axum::routing::post(resend_invitation_email),
-        )
-        .route(
-            "/admin/users/{user_id}/erasure/preview",
-            axum::routing::post(preview_user_erasure),
-        )
-        .route(
-            "/admin/users/{user_id}/erasure",
-            axum::routing::post(erase_user),
-        )
-        .route(
-            "/admin/user-erasures/lookup",
-            axum::routing::post(lookup_user_erasures),
-        )
-        .route(
-            "/admin/organizations/{org_id}/members/{user_id}",
-            axum::routing::put(update_organization_member_role),
-        )
-        .route(
-            "/admin/access-tokens",
-            axum::routing::post(create_admin_access_token),
-        )
-        .route(
-            "/admin/access-tokens",
-            axum::routing::get(list_admin_access_tokens),
-        )
-        .route(
-            "/admin/access-tokens/{token_id}",
-            axum::routing::delete(delete_admin_access_token),
         )
         .with_state(admin_app_state);
 

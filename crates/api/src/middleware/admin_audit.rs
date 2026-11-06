@@ -134,11 +134,15 @@ impl AdminAudit {
     }
 
     /// A validated organization filter restricted the request to one organization.
+    // No remaining admin handler records this: the list handlers moved to cloud-platform.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn record_organization(&self, organization_id: Uuid) {
         self.update(|record| record.organization_id = Some(organization_id));
     }
 
     /// A list handler served `returned_count` rows for its validated page.
+    // No remaining admin handler records this: the list handlers moved to cloud-platform.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn record_page(&self, limit: i64, offset: i64, returned_count: usize) {
         self.update(|record| {
             record.page = Some(Page {

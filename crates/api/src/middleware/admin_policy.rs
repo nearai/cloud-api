@@ -22,21 +22,11 @@ pub(crate) fn admin_operation(method: &Method, matched_path: &str) -> AdminOpera
         matched_path
     };
 
-    // Confirms whether an email was ever a customer, so no admin tokens.
-    if path == "/admin/users/{user_id}/erasure" || path == "/admin/user-erasures/lookup" {
-        return AdminOperation::SessionOnly;
-    }
-
-    if path == "/admin/access-tokens" || path.starts_with("/admin/access-tokens/") {
-        return AdminOperation::SessionOnly;
-    }
-
     // Explicitly approve GET and its Axum HEAD fallback on these routes only.
     if matches!(*method, Method::GET | Method::HEAD)
         && matches!(
             path,
             "/admin/platform/infra-summary"
-                | "/admin/invitation-email-deliveries"
                 | "/admin/database-encryption/jobs/{id}"
                 | "/admin/database-encryption/keys"
                 | "/admin/object-encryption/jobs/{id}"
@@ -52,9 +42,7 @@ pub(crate) fn admin_operation(method: &Method, matched_path: &str) -> AdminOpera
     if *method == Method::POST
         && matches!(
             path,
-            "/admin/database-encryption/scan"
-                | "/admin/object-encryption/scan"
-                | "/admin/users/{user_id}/erasure/preview"
+            "/admin/database-encryption/scan" | "/admin/object-encryption/scan"
         )
     {
         return AdminOperation::Read;
@@ -112,35 +100,6 @@ mod tests {
     }
 
     #[test]
-    fn user_erasure_preview_is_read_and_execute_is_session_only() {
-        for prefix in ["/v1", ""] {
-            let preview = format!("{prefix}/admin/users/{{user_id}}/erasure/preview");
-            let execute = format!("{prefix}/admin/users/{{user_id}}/erasure");
-            assert_eq!(
-                admin_operation(&Method::POST, &preview),
-                AdminOperation::Read
-            );
-            assert_eq!(
-                admin_operation(&Method::POST, &execute),
-                AdminOperation::SessionOnly
-            );
-        }
-    }
-
-    #[test]
-    fn user_erasure_lookup_is_session_only() {
-        for path in [
-            "/v1/admin/user-erasures/lookup",
-            "/admin/user-erasures/lookup",
-        ] {
-            assert_eq!(
-                admin_operation(&Method::POST, path),
-                AdminOperation::SessionOnly
-            );
-        }
-    }
-
-    #[test]
     fn retired_admin_routes_are_not_reads() {
         // Routes that moved to cloud-platform must not keep a Read classification:
         // a route re-added at one of these paths is a Write until it is audited.
@@ -158,6 +117,9 @@ mod tests {
             "/v1/admin/settings/{key}",
             "/v1/admin/aml/reports",
             "/v1/admin/feature-requests",
+            "/v1/admin/invitation-email-deliveries",
+            "/v1/admin/organizations/{org_id}/members",
+            "/v1/admin/access-tokens",
         ] {
             assert_eq!(admin_operation(&Method::GET, path), AdminOperation::Write);
         }

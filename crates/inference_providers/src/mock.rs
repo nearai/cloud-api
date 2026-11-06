@@ -246,6 +246,7 @@ pub struct ResponseTemplate {
     disconnect_after_chunks: Option<usize>,
     /// Simulate an upstream stream error after N chunks.
     stream_error_after_chunks: Option<(usize, CompletionError)>,
+    usage_omitted: bool,
     /// Number of raw SSE comments emitted before the first chat-id-bearing chunk.
     leading_control_events: usize,
     /// Tool calls to include in the response
@@ -271,6 +272,7 @@ impl ResponseTemplate {
             reasoning_content: None,
             disconnect_after_chunks: None,
             stream_error_after_chunks: None,
+            usage_omitted: false,
             leading_control_events: 0,
             tool_calls: None,
             cache_tokens: None,
@@ -341,6 +343,11 @@ impl ResponseTemplate {
     /// The stream will be truncated and end without the final usage chunk
     pub fn with_disconnect_after(mut self, chunks: usize) -> Self {
         self.disconnect_after_chunks = Some(chunks);
+        self
+    }
+
+    pub fn with_usage_omitted(mut self) -> Self {
+        self.usage_omitted = true;
         self
     }
 
@@ -698,6 +705,13 @@ impl ResponseTemplate {
             modality: None,
             extra: Default::default(),
         });
+
+        if self.usage_omitted {
+            chunks.pop();
+            for chunk in &mut chunks {
+                chunk.usage = None;
+            }
+        }
 
         chunks
     }

@@ -119,6 +119,7 @@ pub struct ApiConfig {
     pub staking_farm: StakingFarmConfig,
     pub aml: AmlConfig,
     pub usage_reporting: UsageReportingConfig,
+    pub usage_estimate_incomplete_streams: bool,
     /// Posting-time credit allocation policy. The order is persisted with
     /// every attributed usage charge, so changing it never rewrites history.
     pub credit_allocation: CreditAllocationConfig,
@@ -208,6 +209,10 @@ impl ApiConfig {
             aml: AmlConfig::from_env()?,
             ita: ItaAttestationConfig::from_env()?,
             usage_reporting: UsageReportingConfig::from_env()?,
+            usage_estimate_incomplete_streams: parse_bool_env(
+                "USAGE_ESTIMATE_INCOMPLETE_STREAMS",
+                true,
+            )?,
             credit_allocation: CreditAllocationConfig::from_env()?,
             placement: PlacementConfig::from_env()?,
         })
@@ -2002,6 +2007,28 @@ mod tests {
             config.database_statement_timeout()
                 < std::time::Duration::from_secs(config.request_timeout_seconds)
         );
+    }
+
+    #[test]
+    #[serial]
+    fn usage_estimate_incomplete_streams_defaults_on_and_accepts_false() {
+        let key = "USAGE_ESTIMATE_INCOMPLETE_STREAMS";
+        let original = std::env::var_os(key);
+        std::env::remove_var(key);
+        assert!(parse_bool_env(key, true).unwrap());
+        std::env::set_var(key, "false");
+        assert!(!parse_bool_env(key, true).unwrap());
+        std::env::set_var(key, "0");
+        assert!(!parse_bool_env(key, true).unwrap());
+        std::env::set_var(key, "garbage");
+        assert_eq!(
+            parse_bool_env(key, true),
+            Err(format!("{key} must be true or false"))
+        );
+        match original {
+            Some(value) => std::env::set_var(key, value),
+            None => std::env::remove_var(key),
+        }
     }
 
     #[test]

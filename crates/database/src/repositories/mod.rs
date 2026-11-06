@@ -84,12 +84,9 @@ pub use user::UserRepository;
 pub use user_erasure::PostgresUserErasureRepository;
 pub use workspace::WorkspaceRepository;
 
-pub mod credit_reconciliation;
 pub mod organization_usage_discount;
 
 pub mod staking_wallet_binding;
 pub use staking_wallet_binding::PostgresStakingBindingRepository;
 
-pub mod credit_transfers;
 
-pub mod organization_credentials;

@@ -77,8 +77,7 @@ coverage for those routes is a paired cloud-platform change, not described here.
 on the root router, after routing, inside request correlation and outside CORS.
 `admin_middleware` records the authentication facts; list handlers record their
 validated page through the `AdminAudit` extractor. Nothing reads bodies. The
-list handlers are in frozen route modules (`routes/admin.rs`,
-`routes/feature_requests.rs`), where the audit adds only the extractor and its
+list handlers are in a frozen route module (`routes/admin.rs`), where the audit adds only the extractor and its
 `record_*` calls; a new call there is paired with cloud-platform like any other
 change to those modules.
 

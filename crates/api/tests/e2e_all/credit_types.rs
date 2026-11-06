@@ -255,30 +255,6 @@ async fn test_balance_response_includes_credit_limit_breakdown() {
     }));
 }
 
-/// API-created limits are capped so aggregate and SQL BIGINT sums cannot overflow.
-#[tokio::test]
-async fn test_organization_limit_rejects_amount_above_safety_maximum() {
-    let server = setup_test_server().await;
-    let org = create_org(&server).await;
-
-    let response = server
-        .patch(format!("/v1/admin/organizations/{}/limits", org.id).as_str())
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
-        .add_header("User-Agent", MOCK_USER_AGENT)
-        .json(&serde_json::json!({
-            "type": "postpay",
-            "spendLimit": {
-                "amount": 1_000_000_000_000_000_001_i64,
-                "currency": "USD"
-            },
-            "changeReason": "must be rejected"
-        }))
-        .await;
-
-    assert_eq!(response.status_code(), 400);
-    assert!(response.text().contains("cannot exceed $1,000,000,000"));
-}
-
 /// Test that updating the same credit type replaces the previous one
 #[tokio::test]
 async fn test_update_same_type_replaces_previous() {

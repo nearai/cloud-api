@@ -5,6 +5,17 @@
 //! are not about those management routes do not depend on them. The SQL mirrors what the
 //! management handlers wrote: same columns, same defaults, same ledger rows.
 //!
+//! Seeding is not the route. It skips request validation (a malformed setup call panics
+//! instead of returning 400), admin authentication and the admin identity (history rows
+//! are attributed to the session's user with the mock admin email), the inference
+//! provider pool (no provider is registered, replaced or removed), and the side effects
+//! of the handlers beyond the row writes. The one side effect it does keep is cache
+//! invalidation: `seed_models` clears the models caches and `seed_allowed_models` the
+//! organization's filter, on every models service built by the harness in this process,
+//! so a read after a seed sees the seeded rows. A test whose subject is a route, its
+//! validation, its pool effects or its audit trail must call the route (for the catalog,
+//! `admin_batch_upsert_models`), not seed.
+//!
 //! The pool is created once per process on first use. Seeded users must already exist in
 //! `users` (see `setup_unique_test_session`); the mock auth resolves `rt_<uuid>` to that
 //! user and anything else to `MOCK_USER_ID`.
@@ -24,11 +35,33 @@ use database::repositories::model::ModelRepository;
 use database::repositories::model_alias::ModelAliasRepository;
 use database::repositories::CreditAllocationPolicy;
 use database::Database;
-use std::sync::Arc;
+use services::models::{ModelsServiceImpl, ModelsServiceTrait};
+use std::sync::{Arc, Mutex, Weak};
 use tokio::sync::OnceCell;
 use uuid::Uuid;
 
 static SEED_DB: OnceCell<Arc<Database>> = OnceCell::const_new();
+
+/// Models services of the servers built by the harness in this process. Their caches sit
+/// in front of the rows seeding writes, and a `TestServer` does not expose its service.
+static MODELS_SERVICES: Mutex<Vec<Weak<ModelsServiceImpl>>> = Mutex::new(Vec::new());
+
+/// Record a server's models service so seeding can invalidate its caches. Called by the
+/// harness for every app it builds.
+pub fn register_models_service(models_service: &Arc<ModelsServiceImpl>) {
+    let mut registered = MODELS_SERVICES.lock().expect("models service registry");
+    registered.retain(|service| service.strong_count() > 0);
+    registered.push(Arc::downgrade(models_service));
+}
+
+fn registered_models_services() -> Vec<Arc<ModelsServiceImpl>> {
+    MODELS_SERVICES
+        .lock()
+        .expect("models service registry")
+        .iter()
+        .filter_map(Weak::upgrade)
+        .collect()
+}
 
 /// Shared database handle for seeding. Created lazily, once per process.
 pub async fn seed_database() -> Arc<Database> {
@@ -437,7 +470,8 @@ fn model_metadata(model: database::models::Model) -> ModelMetadata {
 /// batch update did, without validation: setup calls are expected to be well formed.
 ///
 /// The running provider pool is not touched. A model that must route needs to be among the
-/// mock pool's registered names, or be picked up by the provider refresh.
+/// mock pool's registered names, or be picked up by the provider refresh. The models caches
+/// are invalidated once the rows are written.
 pub async fn seed_models(
     models: BatchUpdateModelApiRequest,
     session_id: &str,
@@ -558,6 +592,9 @@ pub async fn seed_models(
             text_pricing: model.text_pricing.clone(),
             metadata: model_metadata(model),
         });
+    }
+    for models_service in registered_models_services() {
+        models_service.invalidate_models_cache().await;
     }
     out
 }
@@ -713,7 +750,8 @@ pub async fn seed_admin_access_token(email: &str) -> String {
 
 /// Set or clear the organization's `allowed_models` setting. It is a key of the
 /// `organizations.settings` JSON; `None` removes it, which allows every model. Names are
-/// stored as given, so pass canonical model names.
+/// stored as given, not validated or canonicalized as the route does, so pass canonical
+/// model names. The organization's cached filter is invalidated after the write.
 pub async fn seed_allowed_models(org_id: &str, allowed_models: Option<&[String]>) {
     let database = seed_database().await;
     let organization_id = Uuid::parse_str(org_id).expect("organization id must be a UUID");
@@ -736,4 +774,9 @@ pub async fn seed_allowed_models(org_id: &str, allowed_models: Option<&[String]>
         .await
         .expect("Failed to seed allowed_models");
     assert_eq!(updated, 1, "Organization not found: {organization_id}");
+    for models_service in registered_models_services() {
+        models_service
+            .invalidate_organization_model_filter(organization_id)
+            .await;
+    }
 }

@@ -18,8 +18,7 @@ pub use ita_evidence::setup_test_server_with_config_and_ita_model_evidence;
 pub use ita_server::{setup_ita_server, setup_ita_server_with_env_policy, ItaServerMode};
 
 use api::{
-    build_app_with_config_and_options, init_auth_services, models::BatchUpdateModelApiRequest,
-    AppBuildOptions,
+    init_auth_services, models::BatchUpdateModelApiRequest, AppBuildOptions, DomainServices,
 };
 use async_trait::async_trait;
 use base64::Engine;
@@ -1102,12 +1101,55 @@ pub fn create_test_audio_base64() -> String {
     base64::engine::general_purpose::STANDARD.encode(&wav_data)
 }
 
-pub async fn admin_batch_upsert_models(
+/// `api::build_app_with_config_and_options`, registering the app's models service so
+/// seeding can invalidate its caches.
+pub(crate) fn build_app_with_config_and_options(
+    database: Arc<Database>,
+    auth_components: api::AuthComponents,
+    domain_services: DomainServices,
+    config: Arc<ApiConfig>,
+    build_options: AppBuildOptions,
+) -> axum::Router {
+    seeding::register_models_service(&domain_services.models_service);
+    api::build_app_with_config_and_options(
+        database,
+        auth_components,
+        domain_services,
+        config,
+        build_options,
+    )
+}
+
+/// Setup: write catalog models straight to the database and invalidate the models caches.
+/// Skips the admin route's validation, provider pool changes and admin identity (see
+/// `seeding`). A test whose subject is the route calls `admin_batch_upsert_models`.
+pub async fn seed_models(
     _server: &axum_test::TestServer,
     models: BatchUpdateModelApiRequest,
     session_id: String,
 ) -> Vec<api::models::ModelWithPricing> {
     seeding::seed_models(models, &session_id).await
+}
+
+/// The admin route itself: `PATCH /v1/admin/models` as an admin session.
+pub async fn admin_batch_upsert_models(
+    server: &axum_test::TestServer,
+    models: BatchUpdateModelApiRequest,
+    session_id: String,
+) -> Vec<api::models::ModelWithPricing> {
+    let response = server
+        .patch("/v1/admin/models")
+        .add_header("Authorization", format!("Bearer {session_id}"))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .json(&models)
+        .await;
+
+    assert_eq!(
+        response.status_code(),
+        200,
+        "Admin batch upsert should succeed"
+    );
+    response.json::<Vec<api::models::ModelWithPricing>>()
 }
 
 pub async fn list_models(

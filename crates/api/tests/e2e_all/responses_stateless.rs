@@ -193,7 +193,7 @@ async fn stateless_responses_reject_image_output_model_aliases_before_provider_w
         }))
         .expect("image-output model configuration must be valid"),
     );
-    let updated = admin_batch_upsert_models(&server, batch, get_session_id()).await;
+    let updated = seed_models(&server, batch, get_session_id()).await;
     assert_eq!(updated.len(), 1, "image-output model must be active");
     assert_eq!(
         updated[0]

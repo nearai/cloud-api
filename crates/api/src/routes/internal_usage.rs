@@ -1,6 +1,6 @@
 use crate::{
     models::ErrorResponse,
-    routes::{api::AppState, common::format_amount, usage::UsageError},
+    routes::{api::AppState, common::format_amount},
 };
 use axum::{
     extract::State,
@@ -11,6 +11,8 @@ use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 use utoipa::ToSchema;
 use uuid::Uuid;
+
+type UsageError = (StatusCode, ResponseJson<ErrorResponse>);
 
 // ============================================
 // Usage recording response

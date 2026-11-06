@@ -33,7 +33,6 @@ use crate::models::{
     UpsertAmlAllowlistEntryRequest, UserErasureRecordResponse,
 };
 use crate::routes::common::{analytics_error_response, format_amount};
-use crate::routes::usage::{compute_organization_balance_response, OrganizationBalanceResponse};
 use axum::{
     extract::{Json, Path, Query, State},
     http::HeaderMap,
@@ -1677,54 +1676,6 @@ pub async fn get_organization_limits_history(
     };
 
     Ok(ResponseJson(response))
-}
-
-/// Get organization balance (Admin only)
-///
-/// Returns the current spending balance for an organization without requiring
-/// the caller to be a member of that organization. Intended for trusted
-/// automated billing services.
-#[utoipa::path(
-    get,
-    path = "/v1/admin/organizations/{org_id}/usage/balance",
-    tag = "Admin",
-    params(
-        ("org_id" = String, Path, description = "Organization ID")
-    ),
-    responses(
-        (status = 200, description = "Organization balance", body = OrganizationBalanceResponse),
-        (status = 400, description = "Invalid request", body = ErrorResponse),
-        (status = 401, description = "Unauthorized", body = ErrorResponse),
-        (status = 404, description = "Not found", body = ErrorResponse),
-        (status = 500, description = "Internal server error", body = ErrorResponse)
-    ),
-    security(
-        ("session_token" = [])
-    )
-)]
-pub async fn get_admin_organization_balance(
-    State(app_state): State<AdminAppState>,
-    Path(org_id): Path<String>,
-    Extension(_admin_user): Extension<AdminUser>,
-) -> Result<ResponseJson<OrganizationBalanceResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
-    debug!(
-        "Admin get organization balance request for org_id: {}",
-        org_id
-    );
-
-    let organization_id = uuid::Uuid::parse_str(&org_id).map_err(|_| {
-        (
-            StatusCode::BAD_REQUEST,
-            ResponseJson(ErrorResponse::new(
-                "Invalid organization ID format".to_string(),
-                "invalid_id".to_string(),
-            )),
-        )
-    })?;
-
-    compute_organization_balance_response(&*app_state.usage_service, organization_id)
-        .await
-        .map(ResponseJson)
 }
 
 /// Delete a model (Admin only)

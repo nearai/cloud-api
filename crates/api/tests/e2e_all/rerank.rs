@@ -456,21 +456,7 @@ async fn test_rerank_costs_deducted_correctly() {
     let api_key = get_api_key_for_org(&server, org.id).await;
 
     // Get initial balance
-    let initial_balance_response = server
-        .get(format!("/v1/organizations/{}/usage/balance", org_id).as_str())
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
-        .add_header("User-Agent", MOCK_USER_AGENT)
-        .await;
-
-    assert_eq!(
-        initial_balance_response.status_code(),
-        200,
-        "Should get initial balance"
-    );
-    let initial_balance = serde_json::from_str::<api::routes::usage::OrganizationBalanceResponse>(
-        &initial_balance_response.text(),
-    )
-    .expect("Failed to parse initial balance response");
+    let initial_balance = seeding::organization_balance(&org_id).await;
     let initial_spent = initial_balance.total_spent;
 
     // Make rerank request
@@ -497,21 +483,7 @@ async fn test_rerank_costs_deducted_correctly() {
     // No sleep needed - the balance update is already committed.
 
     // Get final balance
-    let final_balance_response = server
-        .get(format!("/v1/organizations/{}/usage/balance", org_id).as_str())
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
-        .add_header("User-Agent", MOCK_USER_AGENT)
-        .await;
-
-    assert_eq!(
-        final_balance_response.status_code(),
-        200,
-        "Should get final balance"
-    );
-    let final_balance = serde_json::from_str::<api::routes::usage::OrganizationBalanceResponse>(
-        &final_balance_response.text(),
-    )
-    .expect("Failed to parse final balance response");
+    let final_balance = seeding::organization_balance(&org_id).await;
     let final_spent = final_balance.total_spent;
 
     // Verify cost was charged

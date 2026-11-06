@@ -1112,193 +1112,6 @@ async fn test_usage_limit_enforcement() {
 }
 
 #[tokio::test]
-async fn test_get_organization_balance() {
-    let server = setup_test_server().await;
-    let org = setup_org_with_credits(&server, 5000000000i64).await; // $5.00 USD
-
-    // Get balance - should now show limit even with no usage
-    let response = server
-        .get(format!("/v1/organizations/{}/usage/balance", org.id).as_str())
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
-        .await;
-
-    println!("Balance response status: {}", response.status_code());
-    println!("Balance response body: {}", response.text());
-
-    assert_eq!(response.status_code(), 200, "Should get balance with limit");
-
-    let balance =
-        serde_json::from_str::<api::routes::usage::OrganizationBalanceResponse>(&response.text())
-            .expect("Failed to parse balance response");
-
-    println!("Balance: {balance:?}");
-
-    // Verify limit is included
-    assert!(balance.spend_limit.is_some(), "Should have spend_limit");
-    assert_eq!(
-        balance.spend_limit.unwrap(),
-        5000000000i64,
-        "Limit should be $5.00 (5B nano-dollars)"
-    );
-    assert!(
-        balance.spend_limit_display.is_some(),
-        "Should have spend_limit_display"
-    );
-    assert_eq!(
-        balance.spend_limit_display.unwrap(),
-        "$5.00",
-        "Display should show $5.00"
-    );
-
-    // Verify remaining is calculated correctly (no usage yet, so remaining = limit)
-    assert!(balance.remaining.is_some(), "Should have remaining");
-    assert_eq!(
-        balance.remaining.unwrap(),
-        5000000000i64,
-        "Remaining should equal limit with no usage"
-    );
-    assert!(
-        balance.remaining_display.is_some(),
-        "Should have remaining_display"
-    );
-
-    // Verify spent is zero
-    assert_eq!(balance.total_spent, 0, "Total spent should be zero");
-    assert_eq!(
-        balance.total_spent_display, "$0.00",
-        "Spent display should be $0.00"
-    );
-}
-
-#[tokio::test]
-async fn test_admin_get_organization_balance() {
-    let server = setup_test_server().await;
-    let org = setup_org_with_credits(&server, 5000000000i64).await; // $5.00 USD
-
-    let response = server
-        .get(format!("/v1/admin/organizations/{}/usage/balance", org.id).as_str())
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
-        .await;
-
-    assert_eq!(response.status_code(), 200);
-
-    let balance =
-        serde_json::from_str::<api::routes::usage::OrganizationBalanceResponse>(&response.text())
-            .expect("Failed to parse admin balance response");
-
-    assert_eq!(balance.organization_id, org.id);
-    assert_eq!(balance.total_spent, 0);
-    assert_eq!(balance.spend_limit, Some(5000000000i64));
-    assert_eq!(balance.remaining, Some(5000000000i64));
-    assert_eq!(balance.total_requests, 0);
-    assert_eq!(balance.total_tokens, 0);
-}
-
-#[tokio::test]
-async fn test_admin_get_organization_balance_missing_org_returns_404() {
-    let server = setup_test_server().await;
-    let fake_org_id = uuid::Uuid::new_v4();
-
-    let response = server
-        .get(format!("/v1/admin/organizations/{fake_org_id}/usage/balance").as_str())
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
-        .await;
-
-    assert_eq!(response.status_code(), 404);
-}
-
-#[tokio::test]
-async fn test_admin_get_organization_balance_invalid_org_id_returns_400() {
-    let server = setup_test_server().await;
-
-    let response = server
-        .get("/v1/admin/organizations/not-a-uuid/usage/balance")
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
-        .await;
-
-    assert_eq!(response.status_code(), 400);
-}
-
-#[tokio::test]
-async fn test_admin_get_organization_balance_accepts_admin_access_token() {
-    let server = setup_test_server().await;
-    let org = setup_org_with_credits(&server, 5000000000i64).await; // $5.00 USD
-    let user_agent = "BillingService/1.0";
-
-    let create_request = serde_json::json!({
-        "expires_in_hours": 24,
-        "name": "Billing Service Test Token",
-        "reason": "Testing admin balance endpoint for billing service",
-    });
-
-    let create_response = server
-        .post("/v1/admin/access-tokens")
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
-        .add_header("User-Agent", user_agent)
-        .json(&create_request)
-        .await;
-
-    assert_eq!(create_response.status_code(), 200);
-    let token_response = create_response.json::<api::models::AdminAccessTokenResponse>();
-
-    let response = server
-        .get(format!("/v1/admin/organizations/{}/usage/balance", org.id).as_str())
-        .add_header(
-            "Authorization",
-            format!("Bearer {}", token_response.access_token),
-        )
-        .add_header("User-Agent", user_agent)
-        .await;
-
-    assert_eq!(response.status_code(), 200);
-
-    let balance =
-        serde_json::from_str::<api::routes::usage::OrganizationBalanceResponse>(&response.text())
-            .expect("Failed to parse admin balance response");
-
-    assert_eq!(balance.organization_id, org.id);
-    assert_eq!(balance.spend_limit, Some(5000000000i64));
-    assert_eq!(balance.remaining, Some(5000000000i64));
-}
-
-#[tokio::test]
-async fn test_admin_get_organization_balance_rejects_non_admin() {
-    let server = setup_test_server_with_config(|config| {
-        config.auth.admin_emails = vec![NON_ADMIN_ALLOWLIST_EMAIL.to_string()];
-    })
-    .await;
-    let org = create_org(&server).await;
-
-    let response = server
-        .get(format!("/v1/admin/organizations/{}/usage/balance", org.id).as_str())
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
-        .await;
-
-    assert_eq!(response.status_code(), 403);
-}
-
-#[tokio::test]
-async fn test_get_organization_usage_history() {
-    let server = setup_test_server().await;
-    let org = create_org(&server).await;
-
-    // Get usage history (should be empty initially)
-    let response = server
-        .get(format!("/v1/organizations/{}/usage/history", org.id).as_str())
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
-        .await;
-
-    println!("Usage history response status: {}", response.status_code());
-    assert_eq!(response.status_code(), 200);
-
-    let history_response = response.json::<serde_json::Value>();
-    println!("Usage history: {history_response:?}");
-
-    // Should have data array (empty is fine)
-    assert!(history_response.get("data").is_some());
-}
-
-#[tokio::test]
 async fn test_completion_cost_calculation() {
     let server = setup_test_server().await;
     let org = setup_org_with_credits(&server, 1000000000000i64).await; // $1000.00 USD
@@ -1330,18 +1143,9 @@ async fn test_completion_cost_calculation() {
     println!("Model pricing BEFORE completion - input: {input_cost_per_token}, output: {output_cost_per_token}");
 
     // Get initial balance (should be 0 or not found)
-    let initial_balance_response = server
-        .get(format!("/v1/organizations/{}/usage/balance", org.id).as_str())
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
-        .await;
-
-    let initial_spent = if initial_balance_response.status_code() == 200 {
-        let balance =
-            initial_balance_response.json::<api::routes::usage::OrganizationBalanceResponse>();
-        balance.total_spent
-    } else {
-        0i64
-    };
+    let initial_spent = seeding::try_organization_balance(&org.id)
+        .await
+        .map_or(0i64, |balance| balance.total_spent);
     println!("Initial spent amount (nano-dollars): {initial_spent}");
 
     // Make a chat completion request with controlled parameters
@@ -1395,17 +1199,7 @@ async fn test_completion_cost_calculation() {
     tokio::time::sleep(tokio::time::Duration::from_millis(3000)).await;
 
     // Get the updated balance
-    let balance_response = server
-        .get(format!("/v1/organizations/{}/usage/balance", org.id).as_str())
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
-        .await;
-
-    assert_eq!(
-        balance_response.status_code(),
-        200,
-        "Should be able to get balance"
-    );
-    let balance = balance_response.json::<api::routes::usage::OrganizationBalanceResponse>();
+    let balance = seeding::organization_balance(&org.id).await;
     println!("Balance: {balance:?}");
     println!("Total spent: {} nano-dollars", balance.total_spent);
 
@@ -1460,13 +1254,7 @@ async fn test_completion_cost_calculation() {
     println!("Total spent display: {}", balance.total_spent_display);
 
     // Verify usage history also shows the correct cost
-    let history_response = server
-        .get(format!("/v1/organizations/{}/usage/history?limit=10", org.id).as_str())
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
-        .await;
-
-    assert_eq!(history_response.status_code(), 200);
-    let history = history_response.json::<api::routes::usage::UsageHistoryResponse>();
+    let history = seeding::usage_history(&org.id, 10, 0).await;
     println!("Usage history: {history:?}");
 
     // Find the most recent entry (should be our completion)
@@ -1539,15 +1327,7 @@ async fn test_organization_balance_with_limit_and_usage() {
     let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD
 
     // Get balance before any usage
-    let response = server
-        .get(format!("/v1/organizations/{}/usage/balance", org.id).as_str())
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
-        .await;
-
-    assert_eq!(response.status_code(), 200);
-    let initial_balance =
-        serde_json::from_str::<api::routes::usage::OrganizationBalanceResponse>(&response.text())
-            .expect("Failed to parse balance");
+    let initial_balance = seeding::organization_balance(&org.id).await;
 
     println!("Initial balance: {initial_balance:?}");
 
@@ -1579,15 +1359,7 @@ async fn test_organization_balance_with_limit_and_usage() {
     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
     // Get balance after usage
-    let response = server
-        .get(format!("/v1/organizations/{}/usage/balance", org.id).as_str())
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
-        .await;
-
-    assert_eq!(response.status_code(), 200);
-    let final_balance =
-        serde_json::from_str::<api::routes::usage::OrganizationBalanceResponse>(&response.text())
-            .expect("Failed to parse balance");
+    let final_balance = seeding::organization_balance(&org.id).await;
 
     println!("Final balance: {final_balance:?}");
 
@@ -2031,13 +1803,7 @@ async fn test_model_aliases() {
     println!("\n=== Test 4: Verify usage tracking uses canonical model name ===");
     tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
 
-    let history_response = server
-        .get(format!("/v1/organizations/{org_id}/usage/history?limit=50").as_str())
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
-        .await;
-
-    assert_eq!(history_response.status_code(), 200);
-    let history = history_response.json::<api::routes::usage::UsageHistoryResponse>();
+    let history = seeding::usage_history(&org_id, 50, 0).await;
     println!("Usage history entries: {}", history.data.len());
 
     // Check that usage is recorded with canonical model names

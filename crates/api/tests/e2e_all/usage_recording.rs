@@ -616,16 +616,7 @@ async fn test_external_usage_record_does_not_collide_with_internal_pipeline() {
     // flake risk of a fixed sleep on slow CI.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     let history = loop {
-        let resp = server
-            .get(&format!(
-                "/v1/organizations/{}/usage/history?limit=10&offset=0",
-                id.org_id
-            ))
-            .add_header("Authorization", format!("Bearer {}", get_session_id()))
-            .add_header("User-Agent", MOCK_USER_AGENT)
-            .await;
-        assert_eq!(resp.status_code(), 200);
-        let history: api::routes::usage::UsageHistoryResponse = resp.json();
+        let history = seeding::usage_history(&id.org_id, 10, 0).await;
         let matching = history
             .data
             .iter()
@@ -944,19 +935,10 @@ async fn test_record_input_only_usage_rejects_zero_tokens() {
 /// `provider_request_id`. The internal endpoint writes the row before it
 /// answers, so no polling is needed.
 async fn usage_history_entry(
-    server: &axum_test::TestServer,
     org_id: &str,
     provider_request_id: &str,
-) -> api::routes::usage::UsageHistoryEntryResponse {
-    let resp = server
-        .get(&format!(
-            "/v1/organizations/{org_id}/usage/history?limit=20&offset=0"
-        ))
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
-        .add_header("User-Agent", MOCK_USER_AGENT)
-        .await;
-    assert_eq!(resp.status_code(), 200, "{}", resp.text());
-    let history: api::routes::usage::UsageHistoryResponse = resp.json();
+) -> crate::common::usage_views::UsageHistoryEntryResponse {
+    let history = seeding::usage_history(org_id, 20, 0).await;
     history
         .data
         .into_iter()
@@ -996,7 +978,7 @@ async fn test_record_chat_completion_usage_with_discount() {
     assert_eq!(body["input_tokens"], 100);
     assert_eq!(body["output_tokens"], 50);
 
-    let entry = usage_history_entry(&server, &id.org_id, "test-chat-completion-discount-001").await;
+    let entry = usage_history_entry(&id.org_id, "test-chat-completion-discount-001").await;
     assert_eq!(entry.total_cost, 160_000_000i64);
     let details = entry
         .billing_details
@@ -1033,8 +1015,7 @@ async fn test_internal_usage_discount_zero_bills_list_price() {
     let body: serde_json::Value = response.json();
     assert_eq!(body["total_cost"], 200_000_000i64);
 
-    let entry =
-        usage_history_entry(&server, &id.org_id, "test-chat-completion-discount-zero").await;
+    let entry = usage_history_entry(&id.org_id, "test-chat-completion-discount-zero").await;
     assert!(
         entry
             .billing_details
@@ -1075,16 +1056,7 @@ async fn test_internal_usage_rejects_invalid_discount() {
     }
 
     // The org is fresh, so a rejected submission must leave its ledger empty.
-    let resp = server
-        .get(&format!(
-            "/v1/organizations/{}/usage/history?limit=20&offset=0",
-            id.org_id
-        ))
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
-        .add_header("User-Agent", MOCK_USER_AGENT)
-        .await;
-    assert_eq!(resp.status_code(), 200, "{}", resp.text());
-    let history: api::routes::usage::UsageHistoryResponse = resp.json();
+    let history = seeding::usage_history(&id.org_id, 20, 0).await;
     assert!(
         history.data.is_empty(),
         "rejected discounts must not record usage: {:?}",

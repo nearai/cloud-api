@@ -873,10 +873,6 @@ fn every_registered_route_has_a_model_access_decision() {
             "PATCH",
             "/workspaces/{workspace_id}/api-keys/{key_id}/spend-limit",
         ),
-        (
-            "GET",
-            "/workspaces/{workspace_id}/api-keys/{key_id}/usage/history",
-        ),
         ("ANY", "/files"),
         ("ANY", "/files/"),
         ("ANY", "/files/{file_id}"),
@@ -886,12 +882,6 @@ fn every_registered_route_has_a_model_access_decision() {
         ("POST", "/feature-requests"),
         // An organization's own usage and costs.
         ("POST", "/billing/costs"),
-        ("GET", "/organizations/{org_id}/usage/export"),
-        ("GET", "/organizations/{org_id}/usage/summary"),
-        (
-            "GET",
-            "/organizations/{org_id}/usage/reporting-token-auth-probe",
-        ),
         ("POST", "/check_api_key"),
         ("GET", "/services"),
         ("GET", "/services/{service_name}"),

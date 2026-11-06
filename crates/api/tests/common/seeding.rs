@@ -26,6 +26,7 @@
 //! user and anything else to `MOCK_USER_ID`.
 
 use super::db_setup::{self, MOCK_USER_ID};
+use super::usage_views;
 use api::models::{
     AdminModelWithPricing, ApiKeyResponse, BatchUpdateModelApiRequest, Datacenter, DecimalPrice,
     ModelArchitecture, ModelMetadata, ModelWithPricing, OrganizationResponse, ServiceResponse,
@@ -875,5 +876,347 @@ pub async fn seed_allowed_models(org_id: &str, allowed_models: Option<&[String]>
         models_service
             .invalidate_organization_model_filter(organization_id)
             .await;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Reads of what the usage console showed
+// ---------------------------------------------------------------------------
+
+/// Credit allocations of one charge, as the usage history showed them: `None` for legacy
+/// usage whose funding was never captured.
+fn parse_credit_allocations(
+    value: Option<serde_json::Value>,
+) -> Option<Vec<services::usage::CreditAllocation>> {
+    value.map(|value| serde_json::from_value(value).expect("credit allocations should parse"))
+}
+
+/// What `GET /v1/organizations/{id}/usage/balance` returned: the balance row, the active
+/// credit limits and their lifetime consumption. Panics when the organization has neither a
+/// balance row nor a limit, where the route answered 404.
+pub async fn organization_balance(org_id: &str) -> usage_views::OrganizationBalanceResponse {
+    try_organization_balance(org_id)
+        .await
+        .unwrap_or_else(|| panic!("No usage data or limit found for organization {org_id}"))
+}
+
+/// Like `organization_balance`, but `None` where the route answered 404.
+pub async fn try_organization_balance(
+    org_id: &str,
+) -> Option<usage_views::OrganizationBalanceResponse> {
+    let database = seed_database().await;
+    let organization_id = Uuid::parse_str(org_id).expect("organization id must be a UUID");
+    let client = database
+        .pool()
+        .get()
+        .await
+        .expect("Failed to get database connection");
+    let balance = client
+        .query_opt(
+            "SELECT total_spent, legacy_unattributed_amount, last_usage_at, total_requests,
+                    total_tokens, updated_at
+             FROM organization_balance WHERE organization_id = $1",
+            &[&organization_id],
+        )
+        .await
+        .expect("Failed to read organization balance");
+    let rows = client
+        .query(
+            "SELECT olh.spend_limit, olh.credit_type, olh.source, olh.currency,
+                    olh.transferred_out, olh.effective_capacity,
+                    COALESCE(consumed.amount, 0)::BIGINT AS consumed,
+                    COALESCE(balance.unresolved_unfunded_amount, 0)::BIGINT AS unfunded,
+                    COALESCE(balance.legacy_unattributed_amount, 0)::BIGINT AS unattributed
+             FROM organization_credit_capacities olh
+             LEFT JOIN organization_credit_consumption consumed
+               ON consumed.organization_id = olh.organization_id
+              AND consumed.credit_type = olh.credit_type
+             LEFT JOIN organization_balance balance
+               ON balance.organization_id = olh.organization_id
+             WHERE olh.organization_id = $1 AND olh.effective_until IS NULL
+             ORDER BY olh.credit_type, olh.effective_from DESC",
+            &[&organization_id],
+        )
+        .await
+        .expect("Failed to read organization credit limits");
+
+    let credit_limits: Vec<usage_views::CreditLimitBreakdownResponse> = rows
+        .iter()
+        .map(|row| {
+            let consumed: i64 = row.get("consumed");
+            let effective_capacity: i64 = row.get("effective_capacity");
+            usage_views::CreditLimitBreakdownResponse {
+                credit_type: row.get("credit_type"),
+                source: row.get("source"),
+                amount: row.get("spend_limit"),
+                transferred_out: row.get("transferred_out"),
+                effective_capacity,
+                consumed,
+                available: effective_capacity.saturating_sub(consumed).max(0),
+                currency: row.get("currency"),
+            }
+        })
+        .collect();
+    // Totals over every active type, minus legacy spend that has no type.
+    let limit = rows.first().map(|first| {
+        let spend_limit = rows
+            .iter()
+            .map(|row| row.get::<_, i64>("spend_limit"))
+            .fold(0_i64, i64::saturating_add);
+        let available = credit_limits
+            .iter()
+            .map(|limit| limit.available)
+            .fold(0_i64, i64::saturating_add)
+            .saturating_sub(first.get::<_, i64>("unattributed"))
+            .max(0);
+        (spend_limit, available, first.get::<_, i64>("unfunded"))
+    });
+    let (spend_limit, remaining) = match limit {
+        Some((spend_limit, available, _)) => (Some(spend_limit), Some(available)),
+        None => (None, None),
+    };
+    let unfunded_amount = limit.map_or(0, |(_, _, unfunded)| unfunded);
+    let display = |amount: Option<i64>| amount.map(api::routes::common::format_amount);
+
+    Some(match balance {
+        Some(row) => {
+            let total_spent: i64 = row.get("total_spent");
+            let last_usage_at: Option<DateTime<Utc>> = row.get("last_usage_at");
+            let updated_at: DateTime<Utc> = row.get("updated_at");
+            usage_views::OrganizationBalanceResponse {
+                organization_id: organization_id.to_string(),
+                legacy_unattributed_amount: row.get("legacy_unattributed_amount"),
+                total_spent,
+                total_spent_display: api::routes::common::format_amount(total_spent),
+                spend_limit,
+                spend_limit_display: display(spend_limit),
+                remaining,
+                remaining_display: display(remaining),
+                last_usage_at: last_usage_at.map(|at| at.to_rfc3339()),
+                total_requests: row.get("total_requests"),
+                total_tokens: row.get("total_tokens"),
+                updated_at: updated_at.to_rfc3339(),
+                credit_limits,
+                unfunded_amount,
+            }
+        }
+        None => {
+            limit?;
+            usage_views::OrganizationBalanceResponse {
+                organization_id: organization_id.to_string(),
+                legacy_unattributed_amount: 0,
+                total_spent: 0,
+                total_spent_display: api::routes::common::format_amount(0),
+                spend_limit,
+                spend_limit_display: display(spend_limit),
+                remaining,
+                remaining_display: display(remaining),
+                last_usage_at: None,
+                total_requests: 0,
+                total_tokens: 0,
+                updated_at: Utc::now().to_rfc3339(),
+                credit_limits,
+                unfunded_amount,
+            }
+        }
+    })
+}
+
+/// What `GET /v1/organizations/{id}/usage/history?limit=&offset=` returned without filters:
+/// one page of inference usage, newest first, with the balance's request counter as total.
+pub async fn usage_history(
+    org_id: &str,
+    limit: i64,
+    offset: i64,
+) -> usage_views::UsageHistoryResponse {
+    let database = seed_database().await;
+    let organization_id = Uuid::parse_str(org_id).expect("organization id must be a UUID");
+    let client = database
+        .pool()
+        .get()
+        .await
+        .expect("Failed to get database connection");
+    let rows = client
+        .query(
+            "SELECT ul.id, ul.workspace_id, ul.api_key_id, ul.model_name, ul.input_tokens,
+                    ul.output_tokens, ul.cache_read_tokens, ul.cache_write_tokens,
+                    ul.service_tier, ul.context_band, ul.billing_details, ul.total_tokens,
+                    ul.total_cost, ul.inference_type, ul.created_at, ul.stop_reason,
+                    ul.response_id, ul.provider_request_id, ul.inference_id, ul.image_count,
+                    ul.funded_amount, ul.allocation_policy_version,
+                    CASE WHEN ul.funded_amount IS NULL THEN NULL ELSE
+                        COALESCE((SELECT jsonb_agg(jsonb_build_object(
+                            'type', a.credit_type, 'amount', a.amount, 'source', a.source,
+                            'organization_limit_id', a.organization_limit_id,
+                            'policy_version', a.policy_version
+                        ) ORDER BY a.created_at, a.priority_position, a.id)
+                        FROM effective_usage_credit_allocations a
+                        WHERE a.inference_usage_id = ul.id), '[]'::jsonb)
+                    END AS credit_allocations
+             FROM organization_usage_log ul
+             WHERE ul.organization_id = $1
+             ORDER BY ul.created_at DESC
+             LIMIT $2 OFFSET $3",
+            &[&organization_id, &limit, &offset],
+        )
+        .await
+        .expect("Failed to read usage history");
+    let total: i64 = client
+        .query_one(
+            "SELECT COALESCE((SELECT total_requests FROM organization_balance
+                              WHERE organization_id = $1), 0)::BIGINT",
+            &[&organization_id],
+        )
+        .await
+        .expect("Failed to read usage total")
+        .get(0);
+
+    let data = rows
+        .iter()
+        .map(|row| {
+            let total_cost: i64 = row.get("total_cost");
+            let created_at: DateTime<Utc> = row.get("created_at");
+            let credit_allocations = parse_credit_allocations(row.get("credit_allocations"));
+            let funded_amount: Option<i64> = row.get("funded_amount");
+            // Funded and unfunded amounts are reported only for usage with captured funding.
+            let (funded_amount, unfunded_amount) = match funded_amount {
+                Some(_) => {
+                    let funded: i64 = credit_allocations
+                        .iter()
+                        .flatten()
+                        .map(|allocation| allocation.amount)
+                        .sum();
+                    (Some(funded), Some(total_cost - funded))
+                }
+                None => (None, None),
+            };
+            usage_views::UsageHistoryEntryResponse {
+                id: row.get::<_, Uuid>("id").to_string(),
+                workspace_id: row.get::<_, Uuid>("workspace_id").to_string(),
+                api_key_id: row.get::<_, Uuid>("api_key_id").to_string(),
+                model: row.get("model_name"),
+                input_tokens: row.get("input_tokens"),
+                output_tokens: row.get("output_tokens"),
+                cache_read_tokens: row.get("cache_read_tokens"),
+                cache_write_tokens: row.get("cache_write_tokens"),
+                service_tier: row.get("service_tier"),
+                context_band: row.get("context_band"),
+                billing_details: row.get("billing_details"),
+                total_tokens: row.get("total_tokens"),
+                total_cost,
+                total_cost_display: api::routes::common::format_amount(total_cost),
+                inference_type: row.get("inference_type"),
+                created_at: created_at.to_rfc3339(),
+                stop_reason: row.get("stop_reason"),
+                response_id: row
+                    .get::<_, Option<Uuid>>("response_id")
+                    .map(|id| id.to_string()),
+                provider_request_id: row.get("provider_request_id"),
+                inference_id: row
+                    .get::<_, Option<Uuid>>("inference_id")
+                    .map(|id| id.to_string()),
+                image_count: row.get("image_count"),
+                credit_allocations,
+                funded_amount,
+                unfunded_amount,
+                allocation_policy_version: row.get("allocation_policy_version"),
+            }
+        })
+        .collect();
+    usage_views::UsageHistoryResponse {
+        data,
+        total: total as usize,
+        limit,
+        offset,
+    }
+}
+
+/// What `GET /v1/organizations/{id}/service-usage/history?limit=&serviceName=` returned: one
+/// page of platform-service usage, newest first.
+pub async fn service_usage_history(
+    org_id: &str,
+    service_name: &str,
+    limit: i64,
+) -> usage_views::ServiceUsageHistoryResponse {
+    let database = seed_database().await;
+    let organization_id = Uuid::parse_str(org_id).expect("organization id must be a UUID");
+    let client = database
+        .pool()
+        .get()
+        .await
+        .expect("Failed to get database connection");
+    let rows = client
+        .query(
+            "SELECT usage_log.id, usage_log.workspace_id, usage_log.api_key_id,
+                    usage_log.service_id, usage_log.quantity, usage_log.total_cost,
+                    usage_log.created_at, usage_log.funded_amount,
+                    CASE WHEN usage_log.funded_amount IS NULL THEN NULL ELSE
+                        COALESCE((SELECT jsonb_agg(jsonb_build_object(
+                            'type', a.credit_type, 'amount', a.amount, 'source', a.source,
+                            'organization_limit_id', a.organization_limit_id,
+                            'policy_version', a.policy_version
+                        ) ORDER BY a.created_at, a.priority_position, a.id)
+                        FROM effective_usage_credit_allocations a
+                        WHERE a.service_usage_id = usage_log.id), '[]'::jsonb)
+                    END AS credit_allocations
+             FROM organization_service_usage_log usage_log
+             JOIN services ON services.id = usage_log.service_id
+             WHERE usage_log.organization_id = $1 AND services.service_name = $2
+             ORDER BY usage_log.created_at DESC
+             LIMIT $3",
+            &[&organization_id, &service_name, &limit],
+        )
+        .await
+        .expect("Failed to read service usage history");
+    let total: i64 = client
+        .query_one(
+            "SELECT COUNT(*)::BIGINT FROM organization_service_usage_log usage_log
+             JOIN services ON services.id = usage_log.service_id
+             WHERE usage_log.organization_id = $1 AND services.service_name = $2",
+            &[&organization_id, &service_name],
+        )
+        .await
+        .expect("Failed to count service usage")
+        .get(0);
+
+    let data = rows
+        .iter()
+        .map(|row| {
+            let total_cost: i64 = row.get("total_cost");
+            let created_at: DateTime<Utc> = row.get("created_at");
+            let credit_allocations = parse_credit_allocations(row.get("credit_allocations"));
+            let funded_amount: Option<i64> = row.get("funded_amount");
+            let (funded_amount, unfunded_amount) = match funded_amount {
+                Some(_) => {
+                    let funded: i64 = credit_allocations
+                        .iter()
+                        .flatten()
+                        .map(|allocation| allocation.amount)
+                        .sum();
+                    (Some(funded), Some(total_cost - funded))
+                }
+                None => (None, None),
+            };
+            usage_views::ServiceUsageEntryResponse {
+                id: row.get::<_, Uuid>("id").to_string(),
+                organization_id: organization_id.to_string(),
+                workspace_id: row.get::<_, Uuid>("workspace_id").to_string(),
+                api_key_id: row.get::<_, Uuid>("api_key_id").to_string(),
+                service_id: row.get::<_, Uuid>("service_id").to_string(),
+                quantity: row.get("quantity"),
+                total_cost,
+                total_cost_display: api::routes::common::format_amount(total_cost),
+                created_at: created_at.to_rfc3339(),
+                credit_allocations,
+                funded_amount,
+                unfunded_amount,
+            }
+        })
+        .collect();
+    usage_views::ServiceUsageHistoryResponse {
+        data,
+        total: total as usize,
+        limit,
+        offset: 0,
     }
 }

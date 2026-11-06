@@ -1971,10 +1971,6 @@ pub fn build_workspace_routes(app_state: AppState, auth_state_middleware: &AuthS
             "/workspaces/{workspace_id}/api-keys/{key_id}/spend-limit",
             axum::routing::patch(update_api_key_spend_limit),
         )
-        .route(
-            "/workspaces/{workspace_id}/api-keys/{key_id}/usage/history",
-            get(crate::routes::usage::get_api_key_usage_history),
-        )
         .with_state(app_state)
         .layer(from_fn_with_state(
             auth_state_middleware.clone(),
@@ -2292,15 +2288,14 @@ fn build_admin_routes_with_options(
         batch_upsert_models, cancel_model_pricing_change, confirm_model_deprecation,
         confirm_model_pricing_changes, create_admin_access_token, create_service,
         delete_admin_access_token, delete_aml_allowlist_entry, delete_model, deprecate_model,
-        erase_user, get_admin_organization_balance, get_admin_setting, get_billing_summary,
-        get_infra_summary, get_model_consumption_timeseries, get_model_history, get_model_revenue,
-        get_org_revenue, get_organization as get_admin_organization,
-        get_organization_concurrent_limit, get_organization_fallback,
-        get_organization_limits_history, get_organization_metrics, get_organization_priority,
-        get_organization_timeseries, get_performance_timeseries, get_platform_metrics,
-        get_platform_timeseries, get_revenue_density, list_admin_access_tokens,
-        list_admin_settings, list_aml_allowlist, list_aml_reports, list_api_keys,
-        list_invitation_email_deliveries, list_model_pricing_changes,
+        erase_user, get_admin_setting, get_billing_summary, get_infra_summary,
+        get_model_consumption_timeseries, get_model_history, get_model_revenue, get_org_revenue,
+        get_organization as get_admin_organization, get_organization_concurrent_limit,
+        get_organization_fallback, get_organization_limits_history, get_organization_metrics,
+        get_organization_priority, get_organization_timeseries, get_performance_timeseries,
+        get_platform_metrics, get_platform_timeseries, get_revenue_density,
+        list_admin_access_tokens, list_admin_settings, list_aml_allowlist, list_aml_reports,
+        list_api_keys, list_invitation_email_deliveries, list_model_pricing_changes,
         list_models as admin_list_models, list_organization_members, list_organizations,
         list_users, lookup_user_erasures, preview_model_deprecation, preview_model_pricing_changes,
         preview_user_erasure, resend_invitation_email, update_admin_setting,
@@ -2443,10 +2438,6 @@ fn build_admin_routes_with_options(
         .route(
             "/admin/organizations/{org_id}/limits/history",
             axum::routing::get(get_organization_limits_history),
-        )
-        .route(
-            "/admin/organizations/{org_id}/usage/balance",
-            axum::routing::get(get_admin_organization_balance),
         )
         .route(
             "/admin/organizations/{org_id}/staking/farm",

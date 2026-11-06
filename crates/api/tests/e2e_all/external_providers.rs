@@ -591,19 +591,10 @@ async fn test_external_model_completion_tracks_usage() {
     tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
 
     // Check organization usage was updated (requires session auth, not API key auth)
-    let session_id = get_session_id();
-    let usage_response = server
-        .get(format!("/v1/organizations/{}/usage/balance", org.id).as_str())
-        .add_header("Authorization", format!("Bearer {session_id}"))
-        .add_header("User-Agent", MOCK_USER_AGENT)
-        .await;
-
-    assert_eq!(usage_response.status_code(), 200);
-
-    let usage: serde_json::Value = usage_response.json();
+    let usage = seeding::organization_balance(&org.id).await;
 
     // Verify usage was tracked
-    let total_tokens = usage["total_tokens"].as_i64().unwrap_or(0);
+    let total_tokens = usage.total_tokens;
     assert!(
         total_tokens > 0,
         "Should have recorded token usage after completions"
@@ -1038,7 +1029,7 @@ async fn gemini_thinking_completion(
     stream: bool,
 ) -> (
     serde_json::Value,
-    api::routes::usage::UsageHistoryEntryResponse,
+    crate::common::usage_views::UsageHistoryEntryResponse,
 ) {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -1150,16 +1141,7 @@ async fn gemini_thinking_completion(
 
     // Usage is recorded asynchronously.
     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-    let history = server
-        .get(&format!(
-            "/v1/organizations/{}/usage/history?limit=1&offset=0",
-            org.id
-        ))
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
-        .add_header("User-Agent", MOCK_USER_AGENT)
-        .await;
-    assert_eq!(history.status_code(), 200, "usage history should succeed");
-    let history: api::routes::usage::UsageHistoryResponse = history.json();
+    let history = seeding::usage_history(&org.id, 1, 0).await;
     let entry = history
         .data
         .into_iter()

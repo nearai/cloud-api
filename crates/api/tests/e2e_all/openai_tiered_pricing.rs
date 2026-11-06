@@ -88,19 +88,10 @@ async fn setup_profiled_model(
 }
 
 async fn latest_usage(
-    server: &axum_test::TestServer,
     organization_id: &str,
-) -> api::routes::usage::UsageHistoryEntryResponse {
+) -> crate::common::usage_views::UsageHistoryEntryResponse {
     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-    let response = server
-        .get(&format!(
-            "/v1/organizations/{organization_id}/usage/history?limit=1&offset=0"
-        ))
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
-        .add_header("User-Agent", MOCK_USER_AGENT)
-        .await;
-    assert_eq!(response.status_code(), 200, "{}", response.text());
-    let history: api::routes::usage::UsageHistoryResponse = response.json();
+    let history = seeding::usage_history(organization_id, 1, 0).await;
     history.data.into_iter().next().expect("usage entry")
 }
 
@@ -158,7 +149,7 @@ async fn fast_alias_downgrade_bills_canonical_default_profile_exactly() {
     assert_eq!(forwarded.model, CANONICAL_MODEL);
     assert_eq!(forwarded.service_tier, Some(ChatServiceTier::Priority));
 
-    let usage = latest_usage(&server, &organization.id).await;
+    let usage = latest_usage(&organization.id).await;
     assert_eq!(usage.model, CANONICAL_MODEL);
     assert_eq!(usage.cache_read_tokens, 1);
     assert_eq!(usage.cache_write_tokens, 2);
@@ -233,7 +224,7 @@ async fn streaming_flex_captures_actual_tier_and_cache_write_usage() {
     assert!(saw_flex, "stream must preserve provider actual tier");
     assert!(saw_cache_write, "stream must preserve cache-write usage");
 
-    let usage = latest_usage(&server, &organization.id).await;
+    let usage = latest_usage(&organization.id).await;
     assert_eq!(usage.service_tier.as_deref(), Some("flex"));
     assert_eq!(usage.context_band.as_deref(), Some("short"));
     assert_eq!(usage.cache_write_tokens, 2);

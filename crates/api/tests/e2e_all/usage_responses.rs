@@ -76,23 +76,7 @@ async fn test_responses_non_stream_records_cache_usage_in_history() {
     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
     // Verify org usage history reflects the same cache_read_tokens
-    let history_resp = server
-        .get(&format!(
-            "/v1/organizations/{}/usage/history?limit=1&offset=0",
-            org.id
-        ))
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
-        .add_header("User-Agent", MOCK_USER_AGENT)
-        .await;
-
-    assert_eq!(
-        history_resp.status_code(),
-        200,
-        "usage history should succeed: {}",
-        history_resp.text()
-    );
-
-    let history: api::routes::usage::UsageHistoryResponse = history_resp.json();
+    let history = seeding::usage_history(&org.id, 1, 0).await;
     assert!(
         !history.data.is_empty(),
         "Should have usage history entries"
@@ -212,22 +196,7 @@ async fn test_responses_stream_records_cache_usage_in_history() {
     // Give ResponseService time to finalize and record usage
     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
-    let history_resp = server
-        .get(&format!(
-            "/v1/organizations/{}/usage/history?limit=1&offset=0",
-            org.id
-        ))
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
-        .add_header("User-Agent", MOCK_USER_AGENT)
-        .await;
-
-    assert_eq!(
-        history_resp.status_code(),
-        200,
-        "usage history should succeed after streaming response"
-    );
-
-    let history: api::routes::usage::UsageHistoryResponse = history_resp.json();
+    let history = seeding::usage_history(&org.id, 1, 0).await;
     assert!(
         !history.data.is_empty(),
         "Should have usage history entries after streaming response"

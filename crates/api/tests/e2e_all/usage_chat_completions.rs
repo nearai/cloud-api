@@ -70,23 +70,7 @@ async fn test_chat_completions_records_usage_and_history() {
     // Allow a short delay for async usage recording (completions record in Drop / spawn)
     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
-    let history_resp = server
-        .get(&format!(
-            "/v1/organizations/{}/usage/history?limit=1&offset=0",
-            org.id
-        ))
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
-        .add_header("User-Agent", MOCK_USER_AGENT)
-        .await;
-
-    assert_eq!(
-        history_resp.status_code(),
-        200,
-        "usage history should succeed: {}",
-        history_resp.text()
-    );
-
-    let history: api::routes::usage::UsageHistoryResponse = history_resp.json();
+    let history = seeding::usage_history(&org.id, 1, 0).await;
 
     assert!(
         !history.data.is_empty(),
@@ -175,21 +159,7 @@ async fn test_chat_completions_stream_records_usage_in_history() {
 
     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
-    let history_resp = server
-        .get(&format!(
-            "/v1/organizations/{}/usage/history?limit=1&offset=0",
-            org.id
-        ))
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
-        .add_header("User-Agent", MOCK_USER_AGENT)
-        .await;
-
-    assert_eq!(
-        history_resp.status_code(),
-        200,
-        "usage history should succeed"
-    );
-    let history: api::routes::usage::UsageHistoryResponse = history_resp.json();
+    let history = seeding::usage_history(&org.id, 1, 0).await;
     assert!(!history.data.is_empty(), "should have usage history entry");
     let entry = &history.data[0];
     assert!(entry.input_tokens > 0);
@@ -681,17 +651,7 @@ async fn test_chat_completions_with_cache_records_cache_in_history() {
 
     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
-    let history_resp = server
-        .get(&format!(
-            "/v1/organizations/{}/usage/history?limit=1&offset=0",
-            org.id
-        ))
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
-        .add_header("User-Agent", MOCK_USER_AGENT)
-        .await;
-
-    assert_eq!(history_resp.status_code(), 200);
-    let history: api::routes::usage::UsageHistoryResponse = history_resp.json();
+    let history = seeding::usage_history(&org.id, 1, 0).await;
     assert!(!history.data.is_empty());
     let entry = &history.data[0];
     assert_eq!(
@@ -763,17 +723,7 @@ async fn test_chat_completions_stream_with_cache_records_cache_in_history() {
 
     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
-    let history_resp = server
-        .get(&format!(
-            "/v1/organizations/{}/usage/history?limit=1&offset=0",
-            org.id
-        ))
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
-        .add_header("User-Agent", MOCK_USER_AGENT)
-        .await;
-
-    assert_eq!(history_resp.status_code(), 200);
-    let history: api::routes::usage::UsageHistoryResponse = history_resp.json();
+    let history = seeding::usage_history(&org.id, 1, 0).await;
     assert!(!history.data.is_empty());
     let entry = &history.data[0];
     assert_eq!(entry.input_tokens, prompt_tokens);

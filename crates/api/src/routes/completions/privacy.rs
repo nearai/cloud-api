@@ -218,6 +218,7 @@ async fn settle_privacy_usage(
     };
 
     let usage_request = services::usage::RecordUsageServiceRequest {
+        budget_id: None,
         organization_id,
         workspace_id: api_key.workspace.id.0,
         api_key_id,

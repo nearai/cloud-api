@@ -205,8 +205,13 @@ jobs:
     runs-on: ${{ (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","ci-cloud-api"]') || 'ubuntu-latest' }}
     permissions:
       contents: read
-      # Pulls the cloud-platform schema image (scripts/cloud-platform-schema.env).
+      # Pulls the normal schema image or the private companion test image.
       packages: read
+
+    env:
+      # Companion schema from nearai/cloud-platform#113, head b194d4d5f71296b080b9d89251b9c2ff2ca4486d.
+      # PR tests can validate V0099 before merge; main still requires a published normal pin.
+      CLOUD_PLATFORM_TEST_IMAGE: ${{ github.event_name == 'pull_request' && 'ghcr.io/nearai/cloud-platform@sha256:3bc0a89cd78a1d6f9a4aaf9e11df27c58241bd19f0b4b44214734c411fd58fcc' || '' }}
 
     services:
       postgres:
@@ -250,7 +255,7 @@ jobs:
 
     - name: Run typed-query, credit, analytics, session, and binding regressions
       run: |
-        cargo test --locked -p database --test hot_path_typed_queries --test billing_typed_queries --test credit_allocation --test session_rotation --test staking_wallet_binding --test organization_credit_metrics -- --test-threads=4
+        cargo test --locked -p database --test hot_path_typed_queries --test billing_typed_queries --test usage_budget --test credit_allocation --test session_rotation --test staking_wallet_binding --test organization_credit_metrics -- --test-threads=4
         # Fault injection changes shared table constraints; isolate this binary.
         cargo test --locked -p database --test credit_transfers -- --test-threads=1
       env:

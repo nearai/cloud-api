@@ -17,7 +17,7 @@ use api::models::BatchUpdateModelApiRequest;
 use std::sync::Arc;
 
 /// Helper to create mock audio file bytes
-fn create_mock_audio_file(size_kb: usize) -> Vec<u8> {
+pub(super) fn create_mock_audio_file(size_kb: usize) -> Vec<u8> {
     vec![0u8; size_kb * 1024]
 }
 

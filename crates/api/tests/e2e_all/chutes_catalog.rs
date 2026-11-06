@@ -101,17 +101,16 @@ async fn admin_patch_with_provider_type_keeps_pinned_provider() {
     );
     assert!(pool.is_pinned(&model));
 
-    let served = pool
-        .chat_completion_with_attribution_and_hints(
-            chat_params(&model),
-            "live-catalog-role".to_string(),
-            ChatRoutingHints {
-                fallback_disabled: true,
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("the live catalog update must reclassify the standalone pin as primary");
+    let served = with_pool_test_budget(pool.chat_completion_with_attribution_and_hints(
+        chat_params(&model),
+        "live-catalog-role".to_string(),
+        ChatRoutingHints {
+            fallback_disabled: true,
+            ..Default::default()
+        },
+    ))
+    .await
+    .expect("the live catalog update must reclassify the standalone pin as primary");
     assert!(String::from_utf8_lossy(&served.response.raw_bytes).contains("served-by-live-primary"));
 }
 

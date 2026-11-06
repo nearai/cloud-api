@@ -135,6 +135,37 @@ struct ParsedRates {
 }
 
 impl TextPricingProfile {
+    /// Upper bound across every configured tier, context band and input token class.
+    pub fn maximum_cost(&self, input: i32, output: i32) -> Result<i64, UsageError> {
+        self.validate()?;
+        if input < 0 || output < 0 {
+            return Err(UsageError::ValidationError("negative usage bound".into()));
+        }
+        let rates = self.highest_rates()?.parse()?;
+        let input_rate = rates
+            .uncached_input
+            .max(rates.cached_input)
+            .max(rates.cache_write.unwrap_or(0));
+        let numerator = i128::from(input)
+            .checked_mul(input_rate)
+            .and_then(|v| {
+                i128::from(output)
+                    .checked_mul(rates.output)
+                    .and_then(|o| v.checked_add(o))
+            })
+            .ok_or_else(|| UsageError::CostCalculationOverflow("profile budget quote".into()))?;
+        // parse_rate uses nano-USD per million tokens; round upward for admission.
+        i64::try_from(
+            numerator
+                .checked_add(TOKENS_PER_PRICING_UNIT - 1)
+                .ok_or_else(|| {
+                    UsageError::CostCalculationOverflow("profile budget rounding".into())
+                })?
+                / TOKENS_PER_PRICING_UNIT,
+        )
+        .map_err(|_| UsageError::CostCalculationOverflow("profile budget quote".into()))
+    }
+
     pub fn from_json(value: serde_json::Value) -> Result<Self, UsageError> {
         let profile: Self = serde_json::from_value(value).map_err(|error| {
             UsageError::ValidationError(format!("invalid textPricing profile: {error}"))
@@ -647,6 +678,31 @@ mod tests {
                 }),
             },
         }
+    }
+
+    #[test]
+    fn admission_covers_priority_long_context_cache_writes() {
+        // 300k inputs at $25/M and 20k outputs at $90/M: $9.30.
+        assert_eq!(
+            profile().maximum_cost(300_000, 20_000).unwrap(),
+            9_300_000_000
+        );
+        let mut tiny = profile();
+        tiny.long_context_threshold = None;
+        tiny.tiers.flex = None;
+        tiny.tiers.priority = None;
+        tiny.tiers.default.long = None;
+        tiny.tiers.default.short = TextTokenRates {
+            uncached_input: "0.0001".into(),
+            cached_input: "0.0001".into(),
+            cache_write: None,
+            output: "0.0001".into(),
+        };
+        assert_eq!(
+            tiny.maximum_cost(1, 1).unwrap(),
+            1,
+            "round up sub-nano bounds"
+        );
     }
 
     #[test]

@@ -521,17 +521,14 @@ async fn test_rerank_costs_deducted_correctly() {
         "Cost should be greater than 0, got {actual_cost}"
     );
 
-    // Mock provider returns 50 tokens (see mock.rs line 922)
-    // Cost per token: 1,000,000 nano-dollars
-    // Expected cost: 50 * 1,000,000 = 50,000,000 nano-dollars = $0.05
-    let expected_cost = 50_000_000i64;
+    // The shared reranker fixture uses the same catalog tariff as the Qwen fixtures.
+    // MockProvider reports 50 input tokens.
+    let expected_cost = 50 * E2E_QWEN_INPUT_COST_PER_TOKEN;
     let tolerance = 10; // Allow small rounding differences
 
     assert!(
         (actual_cost - expected_cost).abs() <= tolerance,
-        "Cost calculation mismatch: expected {expected_cost} nano-dollars (±{tolerance}), got {actual_cost}. \
-         This is a ${} charge (expected $0.05)",
-        actual_cost as f64 / 1_000_000_000.0
+        "Cost calculation mismatch: expected {expected_cost} nano-dollars (±{tolerance}), got {actual_cost}"
     );
 
     // Verify total_tokens in balance response increased

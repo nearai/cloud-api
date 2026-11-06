@@ -85,6 +85,14 @@ pub struct MockUsageService;
 
 #[async_trait]
 impl UsageServiceTrait for MockUsageService {
+    async fn admit(
+        &self,
+        _: crate::usage::BillingIdentity,
+        _: crate::usage::budget::UsageBounds,
+    ) -> Result<Uuid, UsageError> {
+        Ok(Uuid::new_v4())
+    }
+
     async fn record_usage(
         &self,
         _request: RecordUsageServiceRequest,
@@ -148,6 +156,18 @@ impl UsageServiceTrait for MockUsageService {
                     cache_read_tokens.unwrap_or(0),
                     None,
                     InferenceType::ChatCompletion,
+                ),
+                RecordUsageApiRequest::AudioTranscription {
+                    model,
+                    duration_seconds,
+                    ..
+                } => (
+                    model.clone(),
+                    *duration_seconds,
+                    0,
+                    0,
+                    None,
+                    InferenceType::AudioTranscription,
                 ),
                 RecordUsageApiRequest::ImageGeneration {
                     model, image_count, ..
@@ -334,12 +354,16 @@ impl UsageServiceTrait for MockUsageService {
 
 /// A usage service that captures requests for testing
 pub struct CapturingUsageService {
+    pub admissions: std::sync::Mutex<Vec<Uuid>>,
+    pub admission_limit: Option<usize>,
     requests: std::sync::Mutex<Vec<RecordUsageServiceRequest>>,
 }
 
 impl CapturingUsageService {
     pub fn new() -> Self {
         Self {
+            admissions: std::sync::Mutex::new(Vec::new()),
+            admission_limit: None,
             requests: std::sync::Mutex::new(Vec::new()),
         }
     }
@@ -351,6 +375,25 @@ impl CapturingUsageService {
 
 #[async_trait]
 impl UsageServiceTrait for CapturingUsageService {
+    async fn admit(
+        &self,
+        _: crate::usage::BillingIdentity,
+        _: crate::usage::budget::UsageBounds,
+    ) -> Result<Uuid, UsageError> {
+        let mut admissions = self.admissions.lock().unwrap();
+        if self
+            .admission_limit
+            .is_some_and(|limit| admissions.len() >= limit)
+        {
+            return Err(UsageError::LimitExceeded(
+                "synthetic budget exhausted".into(),
+            ));
+        }
+        let id = Uuid::new_v4();
+        admissions.push(id);
+        Ok(id)
+    }
+
     async fn record_usage(
         &self,
         request: RecordUsageServiceRequest,
@@ -416,6 +459,18 @@ impl UsageServiceTrait for CapturingUsageService {
                     cache_read_tokens.unwrap_or(0),
                     None,
                     InferenceType::ChatCompletion,
+                ),
+                RecordUsageApiRequest::AudioTranscription {
+                    model,
+                    duration_seconds,
+                    ..
+                } => (
+                    model.clone(),
+                    *duration_seconds,
+                    0,
+                    0,
+                    None,
+                    InferenceType::AudioTranscription,
                 ),
                 RecordUsageApiRequest::ImageGeneration {
                     model, image_count, ..
@@ -598,4 +653,20 @@ impl UsageServiceTrait for CapturingUsageService {
     ) -> Result<(Vec<InferenceUsageReportRow>, i64), UsageError> {
         Ok((vec![], 0))
     }
+}
+
+/// Transport tests explicitly admit synthetic calls without accessing a ledger.
+pub async fn with_test_budget<F: std::future::Future>(future: F) -> F::Output {
+    crate::usage::budget::BudgetExecution::new(
+        std::sync::Arc::new(MockUsageService),
+        crate::usage::BillingIdentity {
+            organization_id: Uuid::new_v4(),
+            workspace_id: Uuid::new_v4(),
+            api_key_id: Uuid::new_v4(),
+            model_id: Uuid::new_v4(),
+        },
+        crate::usage::budget::UsageBounds::text(100_000, 10_000, 1).unwrap(),
+    )
+    .run(future)
+    .await
 }

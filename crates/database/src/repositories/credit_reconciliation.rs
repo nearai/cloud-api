@@ -274,7 +274,8 @@ async fn load_position(tx: &Transaction<'_>, org: Uuid) -> Result<AccountingPosi
         ) SELECT COALESCE(l.credit_type,c.credit_type) AS credit_type,
                  l.credit_type IS NOT NULL AS active, COALESCE(l.spend_limit,0)::BIGINT AS spend_limit,
                  l.currency, COALESCE(l.effective_capacity,0)::BIGINT AS effective_capacity,
-                 COALESCE(c.amount,0)::BIGINT AS consumed
+                 COALESCE(c.amount,0)::BIGINT AS consumed,
+                 reserved_credit($1, COALESCE(l.credit_type,c.credit_type)) AS reserved
           FROM active l FULL JOIN consumed c USING (credit_type)"#,
         &[&org],
     )
@@ -310,6 +311,7 @@ async fn load_position(tx: &Transaction<'_>, org: Uuid) -> Result<AccountingPosi
                 available: if active {
                     row.get::<_, i64>("effective_capacity")
                         .saturating_sub(consumed)
+                        .saturating_sub(row.get::<_, i64>("reserved"))
                         .max(0)
                 } else {
                     0

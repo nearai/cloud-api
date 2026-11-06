@@ -65,12 +65,13 @@ pub const E2E_DEEPSEEK_MODEL_NAME: &str = "deepseek-ai/DeepSeek-V3.1";
 pub const E2E_QWEN_OMNI_MODEL_NAME: &str = "Qwen/Qwen3-Omni-30B-A3B-Instruct";
 pub const E2E_QWEN_IMAGE_MODEL_NAME: &str = "Qwen/Qwen-Image-2512";
 pub const E2E_QWEN_RERANKER_MODEL_NAME: &str = "Qwen/Qwen3-Reranker-0.6B";
-pub const E2E_QWEN_INPUT_COST_PER_TOKEN: i64 = 1_000_000;
-pub const E2E_QWEN_OUTPUT_COST_PER_TOKEN: i64 = 2_000_000;
+// Catalog-scale fixture prices let $10 grants reserve the full context window.
+pub const E2E_QWEN_INPUT_COST_PER_TOKEN: i64 = 1_000;
+pub const E2E_QWEN_OUTPUT_COST_PER_TOKEN: i64 = 2_000;
 /// Cache-read cost when setup_qwen_model is used (cache pricing disabled).
 pub const E2E_QWEN_CACHE_READ_COST_NO_CACHE: Option<i64> = None;
 /// Cache-read cost when setup_qwen_model_with_cache_pricing is used.
-pub const E2E_QWEN_CACHE_READ_COST_WITH_CACHE: i64 = 500_000;
+pub const E2E_QWEN_CACHE_READ_COST_WITH_CACHE: i64 = 500;
 
 pub fn test_config() -> ApiConfig {
     let _ = dotenvy::dotenv();
@@ -452,6 +453,44 @@ pub async fn setup_test_server_with_search_providers(
     )
     .await;
     (server, infra.database, mock_provider)
+}
+
+/// Direct pool routing tests still pass through real ledger admission. Their
+/// isolated billing fixture uses the standard test tariff and never touches a live provider.
+pub async fn with_pool_test_budget<F: std::future::Future>(future: F) -> F::Output {
+    let mut usage = None;
+    let (server, database) = setup_test_server_with_domain_services(|services, _| {
+        usage = Some(services.usage_service.clone());
+    })
+    .await;
+    setup_qwen_model(&server).await;
+    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+    let _key = get_api_key_for_org(&server, org.id.clone()).await;
+    let org_id = uuid::Uuid::parse_str(&org.id).unwrap();
+    let row = database
+        .pool()
+        .get()
+        .await
+        .unwrap()
+        .query_one(
+            "SELECT k.id, w.id, m.id FROM api_keys k JOIN workspaces w ON w.id=k.workspace_id
+         CROSS JOIN models m WHERE w.organization_id=$1 AND m.model_name=$2 LIMIT 1",
+            &[&org_id, &E2E_QWEN_MODEL_NAME],
+        )
+        .await
+        .unwrap();
+    services::usage::budget::BudgetExecution::new(
+        usage.unwrap(),
+        services::usage::BillingIdentity {
+            organization_id: org_id,
+            workspace_id: row.get(1),
+            api_key_id: row.get(0),
+            model_id: row.get(2),
+        },
+        services::usage::budget::UsageBounds::text(128_000, 1024, 1).unwrap(),
+    )
+    .run(future)
+    .await
 }
 
 pub async fn setup_test_server() -> axum_test::TestServer {

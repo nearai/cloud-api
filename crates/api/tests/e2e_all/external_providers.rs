@@ -18,11 +18,11 @@ async fn setup_external_openai_model(server: &axum_test::TestServer) -> String {
         model_name.clone(),
         serde_json::from_value(serde_json::json!({
             "inputCostPerToken": {
-                "amount": 2500000,  // $2.50 per million tokens
+                "amount": 2500,  // $2.50 per million tokens
                 "currency": "USD"
             },
             "outputCostPerToken": {
-                "amount": 10000000,  // $10.00 per million tokens
+                "amount": 10000,  // $10.00 per million tokens
                 "currency": "USD"
             },
             "modelDisplayName": "GPT-4o",
@@ -66,11 +66,11 @@ async fn setup_external_anthropic_model(server: &axum_test::TestServer) -> Strin
         model_name.clone(),
         serde_json::from_value(serde_json::json!({
             "inputCostPerToken": {
-                "amount": 3000000,  // $3.00 per million tokens
+                "amount": 3000,  // $3.00 per million tokens
                 "currency": "USD"
             },
             "outputCostPerToken": {
-                "amount": 15000000,  // $15.00 per million tokens
+                "amount": 15000,  // $15.00 per million tokens
                 "currency": "USD"
             },
             "modelDisplayName": "Claude 3.5 Sonnet",
@@ -105,11 +105,11 @@ async fn setup_external_gemini_model(server: &axum_test::TestServer) -> String {
         model_name.clone(),
         serde_json::from_value(serde_json::json!({
             "inputCostPerToken": {
-                "amount": 75000,  // $0.075 per million tokens
+                "amount": 75,  // $0.075 per million tokens
                 "currency": "USD"
             },
             "outputCostPerToken": {
-                "amount": 300000,  // $0.30 per million tokens
+                "amount": 300,  // $0.30 per million tokens
                 "currency": "USD"
             },
             "modelDisplayName": "Gemini 2.0 Flash",

@@ -19,6 +19,8 @@
 # --rm schema, also run by `make dev`). Use this script for a non-compose local Postgres.
 #
 # APPLY_SCHEMA_SKIP=1 skips this script when the caller has already applied a schema.
+# CLOUD_PLATFORM_TEST_IMAGE selects a private cloud-platform image by digest for companion
+# schema tests. It does not change the normal pin or any deployment configuration.
 #
 # SCHEMA_DOCKER_NETWORK overrides the docker --network value (default: host). On Docker Desktop,
 # localhost is routed through a single-label alias to the host gateway instead.
@@ -49,6 +51,15 @@ fi
 
 # shellcheck disable=SC1091
 source "$script_dir/cloud-platform-schema.env"
+
+if [[ -n "${CLOUD_PLATFORM_TEST_IMAGE:-}" ]]; then
+  if [[ ! "$CLOUD_PLATFORM_TEST_IMAGE" =~ ^ghcr\.io/nearai/cloud-platform@sha256:[0-9a-f]{64}$ ]]; then
+    echo "apply-schema: CLOUD_PLATFORM_TEST_IMAGE must pin ghcr.io/nearai/cloud-platform by digest" >&2
+    exit 1
+  fi
+  CLOUD_PLATFORM_IMAGE="$CLOUD_PLATFORM_TEST_IMAGE"
+  echo "apply-schema: using companion test image $CLOUD_PLATFORM_IMAGE" >&2
+fi
 
 if ! command -v docker >/dev/null 2>&1; then
   echo "apply-schema: docker is required to run $CLOUD_PLATFORM_IMAGE" >&2

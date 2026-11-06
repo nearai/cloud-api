@@ -93,3 +93,55 @@ async fn chat_completion_signature_returns_stream_disconnected_on_client_disconn
         Some("Verification not available due to disconnection.")
     );
 }
+
+/// Truncate the actual upstream stream, with no final usage or DONE frame.
+#[tokio::test]
+async fn interrupted_chat_retains_its_entire_budget_without_settling_partial_usage() {
+    let (server, _pool, mock, database) = setup_test_server_with_pool().await;
+    setup_qwen_model(&server).await;
+    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+    let org_id = uuid::Uuid::parse_str(&org.id).unwrap();
+    let api_key = get_api_key_for_org(&server, org.id).await;
+    mock.set_default_response(
+        inference_providers::mock::ResponseTemplate::new("one two three four five six seven")
+            .with_disconnect_after(2),
+    )
+    .await;
+    let response = server
+        .post("/v1/chat/completions")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&serde_json::json!({
+            "model": E2E_QWEN_MODEL_NAME,
+            "messages": [{"role": "user", "content": "Hello"}],
+            "stream": true
+        }))
+        .await;
+    assert_eq!(response.status_code(), 200, "{}", response.text());
+    assert!(
+        response.text().contains("one"),
+        "the truncated mock must have executed"
+    );
+    let row = database
+        .pool()
+        .get()
+        .await
+        .unwrap()
+        .query_one(
+            "SELECT count(*), sum(amount)::bigint, reserved_credit($1),
+            (SELECT count(*) FROM organization_usage_log WHERE organization_id=$1)
+         FROM usage_budget_reservations
+         WHERE organization_id=$1 AND state='dispatched' AND actual_cost IS NULL",
+            &[&org_id],
+        )
+        .await
+        .unwrap();
+    assert_eq!(row.get::<_, i64>(0), 1);
+    let held: i64 = row.get(1);
+    assert!(held > 0);
+    assert_eq!(row.get::<_, i64>(2), held);
+    assert_eq!(
+        row.get::<_, i64>(3),
+        0,
+        "partial usage must remain unsettled"
+    );
+}

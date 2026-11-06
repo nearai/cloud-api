@@ -174,7 +174,7 @@ async fn partial_external_config_update_reloads_the_live_provider() {
             "zdr": false, "data_collection": "allow"}
     }))
     .unwrap();
-    pool.chat_completion(params, "synthetic-request".into())
+    with_pool_test_budget(pool.chat_completion(params, "synthetic-request".into()))
         .await
         .unwrap();
 
@@ -307,7 +307,7 @@ async fn provider_config_writes_keep_the_stored_key_and_routing_policy() {
         "messages": [{"role": "user", "content": "Reply only with 42"}]
     }))
     .unwrap();
-    pool.chat_completion(params, "synthetic-request".into())
+    with_pool_test_budget(pool.chat_completion(params, "synthetic-request".into()))
         .await
         .unwrap();
     let requests = upstream.received_requests().await.unwrap();

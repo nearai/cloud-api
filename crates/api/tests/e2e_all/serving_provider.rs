@@ -305,8 +305,8 @@ async fn test_completions_stream_serving_provider_is_3p_source() {
     batch.insert(
         model_name.clone(),
         serde_json::from_value(serde_json::json!({
-            "inputCostPerToken": { "amount": 1_000_000, "currency": "USD" },
-            "outputCostPerToken": { "amount": 2_000_000, "currency": "USD" },
+            "inputCostPerToken": { "amount": E2E_QWEN_INPUT_COST_PER_TOKEN, "currency": "USD" },
+            "outputCostPerToken": { "amount": E2E_QWEN_OUTPUT_COST_PER_TOKEN, "currency": "USD" },
             "modelDisplayName": "Tinfoil label fixture",
             "modelDescription": "Serving-provider label test model",
             "contextLength": 128000,

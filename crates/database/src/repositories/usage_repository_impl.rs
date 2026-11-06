@@ -10,6 +10,83 @@ use uuid::Uuid;
 /// Trait implementation adapter for UsageRepository
 #[async_trait::async_trait]
 impl services::usage::ports::UsageRepository for OrganizationUsageRepository {
+    async fn reserve_and_dispatch(
+        &self,
+        r: &services::usage::budget::BudgetReservation,
+    ) -> Result<(), services::usage::UsageError> {
+        use services::usage::UsageError;
+        let result: anyhow::Result<()> = async {
+            let mut client = self.pool.get().await?;
+            let tx = client.transaction().await?;
+            tx.batch_execute("SET LOCAL statement_timeout = '10s'; SET LOCAL lock_timeout = '5s'")
+                .await?;
+            let pricing = serde_json::to_value(&r.pricing)?;
+            let bounds = serde_json::to_value(&r.bounds)?;
+            tx.query_one(
+                "SELECT id FROM reserve_usage_budget($1,$2,$3,$4,$5,NULL,$6,$7,$8,$9,$10)",
+                &[
+                    &r.id,
+                    &r.identity.organization_id,
+                    &r.identity.workspace_id,
+                    &r.identity.api_key_id,
+                    &r.identity.model_id,
+                    &r.amount,
+                    &pricing,
+                    &bounds,
+                    &self.allocation_policy.priority,
+                    &self.allocation_policy.version,
+                ],
+            )
+            .await?;
+            let claimed: bool = tx
+                .query_one(
+                    "SELECT dispatch_usage_budget($1,$2)",
+                    &[&r.identity.organization_id, &r.id],
+                )
+                .await?
+                .get(0);
+            anyhow::ensure!(claimed, "reservation is already dispatched");
+            tx.commit().await?;
+            Ok(())
+        }
+        .await;
+        result.map_err(|error| {
+            match error
+                .downcast_ref::<tokio_postgres::Error>()
+                .and_then(|e| e.code())
+                .map(|c| c.code())
+            {
+                Some("NBKEX") => UsageError::LimitExceeded(
+                    "API key spend limit exceeded. Insufficient available budget for this request."
+                        .into(),
+                ),
+                Some("NBOEX") => UsageError::LimitExceeded(
+                    "Credit limit exceeded. Insufficient available budget for this request.".into(),
+                ),
+                Some("NBORG" | "NBKEY") => {
+                    UsageError::Unauthorized("Billing identity is unavailable".into())
+                }
+                _ => UsageError::InternalError(format!("Budget admission failed: {error}")),
+            }
+        })
+    }
+
+    async fn budget_snapshot(
+        &self,
+        organization_id: Uuid,
+        id: Uuid,
+    ) -> anyhow::Result<Option<services::usage::budget::BudgetSnapshot>> {
+        let client = self.pool.get().await?;
+        let row = client.query_opt("SELECT pricing, bounds FROM usage_budget_reservations WHERE organization_id = $1 AND id = $2", &[&organization_id, &id]).await?;
+        row.map(|row| {
+            Ok(services::usage::budget::BudgetSnapshot {
+                pricing: serde_json::from_value(row.get(0))?,
+                bounds: serde_json::from_value(row.get(1))?,
+            })
+        })
+        .transpose()
+    }
+
     async fn record_usage(
         &self,
         request: services::usage::ports::RecordUsageDbRequest,

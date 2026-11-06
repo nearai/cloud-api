@@ -59,6 +59,14 @@ impl RecordingUsageService {
 
 #[async_trait::async_trait]
 impl UsageServiceTrait for RecordingUsageService {
+    async fn admit(
+        &self,
+        identity: services::usage::BillingIdentity,
+        bounds: services::usage::budget::UsageBounds,
+    ) -> Result<Uuid, UsageError> {
+        self.inner.admit(identity, bounds).await
+    }
+
     async fn record_usage(
         &self,
         request: RecordUsageServiceRequest,
@@ -226,7 +234,7 @@ async fn fixture(fail_next: usize, extra_models: &[&str]) -> Fixture {
             Arc::new(inference_providers::mock::MockProvider::new_accept_all());
         pool.register_provider(model.to_string(), provider).await;
     }
-    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+    let org = setup_org_with_credits(&server, 100_000_000_000i64).await;
     let org_id = Uuid::parse_str(&org.id).expect("org id should be a UUID");
     let api_key = get_api_key_for_org(&server, org.id).await;
     Fixture {

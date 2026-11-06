@@ -357,6 +357,149 @@ pub async fn record_usage_internal(
     Ok(ResponseJson(build_record_usage_response(entry)))
 }
 
+/// Metadata-only admission for trusted execution gateways. It remains mandatory when their
+/// usage receipts travel by SQS: cached key authorization never authorizes monetary spending.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReserveUsageRequest {
+    execution_model: Option<String>,
+    id: Uuid,
+    organization_id: Uuid,
+    workspace_id: Uuid,
+    api_key_id: Uuid,
+    model: String,
+    inference_type: services::usage::InferenceType,
+    #[serde(default = "one")]
+    batch_items: i32,
+    max_output_tokens: Option<i32>,
+    #[serde(default = "one")]
+    choices: i32,
+    #[serde(default = "one")]
+    executions: i32,
+}
+fn one() -> i32 {
+    1
+}
+
+pub async fn reserve_usage_internal(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<ResponseJson<serde_json::Value>, UsageError> {
+    verify_internal_usage_token(&headers, state.config.internal_usage_token.as_deref())?;
+    let failure = |status, message: &str| {
+        (
+            status,
+            ResponseJson(ErrorResponse::new(
+                message.into(),
+                "budget_admission_error".into(),
+            )),
+        )
+    };
+    let request: ReserveUsageRequest = serde_json::from_slice(&body)
+        .map_err(|_| failure(StatusCode::BAD_REQUEST, "Invalid admission metadata"))?;
+    if !matches!(
+        request.inference_type,
+        services::usage::InferenceType::ChatCompletion
+            | services::usage::InferenceType::ChatCompletionStream
+    ) {
+        return Err(failure(
+            StatusCode::BAD_REQUEST,
+            "Admission is limited to text generation",
+        ));
+    }
+    if request.id.is_nil()
+        || request.batch_items <= 0
+        || request.batch_items > 1024
+        || request.choices <= 0
+        || request.executions <= 0
+        || request.executions > 1024
+    {
+        return Err(failure(StatusCode::BAD_REQUEST, "Invalid execution bounds"));
+    }
+    let model = state
+        .models_service
+        .resolve_and_get_model(
+            &request.model,
+            services::models::ModelCaller::Organization(request.organization_id),
+        )
+        .await
+        .map_err(|_| failure(StatusCode::BAD_REQUEST, "Model unavailable"))?;
+    let execution_model = if let Some(name) = request.execution_model.as_deref() {
+        state
+            .models_service
+            .resolve_and_get_model(
+                name,
+                services::models::ModelCaller::Organization(request.organization_id),
+            )
+            .await
+            .map_err(|_| failure(StatusCode::BAD_REQUEST, "Execution model unavailable"))?
+    } else {
+        model.clone()
+    };
+    let output_limit = execution_model
+        .max_output_length
+        .unwrap_or(execution_model.context_length);
+    let output = request.max_output_tokens.unwrap_or(output_limit);
+    if output <= 0 || output > output_limit {
+        return Err(failure(StatusCode::BAD_REQUEST, "Invalid output bounds"));
+    }
+    let overflow = || {
+        failure(
+            StatusCode::BAD_REQUEST,
+            "Execution bounds exceed supported range",
+        )
+    };
+    let bounds = services::usage::budget::UsageBounds {
+        inference_type: request.inference_type,
+        input_units: execution_model
+            .context_length
+            .checked_mul(request.batch_items)
+            .and_then(|n| n.checked_mul(request.choices))
+            .and_then(|n| n.checked_mul(request.executions))
+            .ok_or_else(overflow)?,
+        output_tokens: output
+            .checked_mul(request.batch_items)
+            .and_then(|n| n.checked_mul(request.choices))
+            .and_then(|n| n.checked_mul(request.executions))
+            .ok_or_else(overflow)?,
+        images: 0,
+    };
+    state
+        .usage_service
+        .admit_external(
+            services::usage::BillingIdentity {
+                organization_id: request.organization_id,
+                workspace_id: request.workspace_id,
+                api_key_id: request.api_key_id,
+                model_id: model.id,
+            },
+            bounds,
+            request.id,
+        )
+        .await
+        .map_err(|error| match error {
+            services::usage::UsageError::LimitExceeded(_) => failure(
+                StatusCode::PAYMENT_REQUIRED,
+                "Insufficient available budget",
+            ),
+            services::usage::UsageError::Unauthorized(_) => {
+                failure(StatusCode::FORBIDDEN, "Billing identity unavailable")
+            }
+            services::usage::UsageError::ValidationError(_)
+            | services::usage::UsageError::CostCalculationOverflow(_) => {
+                failure(StatusCode::BAD_REQUEST, "Invalid execution bounds")
+            }
+            _ => failure(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Budget admission unavailable",
+            ),
+        })?;
+    Ok(ResponseJson(
+        serde_json::json!({"id": request.id, "model": model.model_name, "max_output_tokens": output}),
+    ))
+}
+
 #[cfg(test)]
 mod internal_usage_tests {
     use super::*;

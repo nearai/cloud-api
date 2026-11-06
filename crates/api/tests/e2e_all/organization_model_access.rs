@@ -538,9 +538,11 @@ async fn send(
                     axum_test::multipart::MultipartForm::new()
                         .add_part(
                             "file",
-                            axum_test::multipart::Part::bytes(vec![0u8; 1024])
-                                .file_name("test.mp3")
-                                .mime_type("audio/mpeg"),
+                            axum_test::multipart::Part::bytes(
+                                crate::audio_transcriptions::create_mock_audio_file(1),
+                            )
+                            .file_name("test.wav")
+                            .mime_type("audio/wav"),
                         )
                         .add_text("model", model),
                 )
@@ -823,6 +825,8 @@ fn every_registered_route_has_a_model_access_decision() {
         // Service token: usage is recorded for any model, and the two
         // documents are for a gateway that enforces access itself.
         ("POST", "/internal/usage"),
+        // Service token plus the named organization's model access; tested below.
+        ("POST", "/internal/budget"),
         ("GET", "/internal/models"),
         ("GET", "/internal/model-access"),
     ];
@@ -2191,6 +2195,178 @@ async fn usage_is_recorded_for_an_organization_without_a_grant() {
     assert_eq!(body["model"], fixture.text.as_str());
     assert_eq!(body["input_cost"], 1_000_000_000i64);
     assert_eq!(body["output_cost"], 400_000_000i64);
+}
+
+/// Admission authorizes new work, so service credentials do not bypass the
+/// organization's model access policy (unlike final usage for previously served work).
+#[tokio::test]
+async fn internal_budget_requires_service_auth_and_organization_model_access() {
+    let fixture = setup().await;
+    let server = &fixture.server;
+    let org = setup_org_with_credits(server, 10_000_000_000i64).await;
+    let workspace = list_workspaces(server, org.id.clone()).await.remove(0);
+    let key = create_api_key_in_workspace(server, workspace.id.clone(), "admission".into()).await;
+    let body = json!({
+        "id": Uuid::new_v4(), "organization_id": org.id,
+        "workspace_id": workspace.id, "api_key_id": key.id,
+        "model": fixture.text, "inference_type": "chat_completion_stream",
+        "max_output_tokens": 10
+    });
+    let unauthenticated = server.post("/v1/internal/budget").json(&body).await;
+    assert_eq!(unauthenticated.status_code(), 401);
+    let refused = server
+        .post("/v1/internal/budget")
+        .add_header("Authorization", format!("Bearer {INTERNAL_TOKEN}"))
+        .json(&body)
+        .await;
+    assert_eq!(refused.status_code(), 400, "{}", refused.text());
+    grant(server, &fixture.text, &org.id).await;
+    let admitted = server
+        .post("/v1/internal/budget")
+        .add_header("Authorization", format!("Bearer {INTERNAL_TOKEN}"))
+        .json(&body)
+        .await;
+    assert_eq!(admitted.status_code(), 200, "{}", admitted.text());
+    assert_eq!(admitted.json::<Value>()["id"], body["id"]);
+    let replay = server
+        .post("/v1/internal/budget")
+        .add_header("Authorization", format!("Bearer {INTERNAL_TOKEN}"))
+        .json(&body)
+        .await;
+    assert_eq!(
+        replay.status_code(),
+        503,
+        "an execution id cannot be claimed twice"
+    );
+    let org_id = Uuid::parse_str(&org.id).unwrap();
+    let count: i64 = fixture.database.pool().get().await.unwrap().query_one(
+        "SELECT count(*) FROM usage_budget_reservations WHERE organization_id=$1 AND state='dispatched'",
+        &[&org_id],
+    ).await.unwrap().get(0);
+    assert_eq!(count, 1);
+
+    // A postpaid non-text receipt may temporarily create debt while text funds are held.
+    let api_key = get_api_key_for_org(server, org.id.clone()).await;
+    let legacy = server
+        .post("/v1/internal/usage")
+        .add_header("Authorization", format!("Bearer {INTERNAL_TOKEN}"))
+        .json(&json!({
+            "id": Uuid::new_v4(), "organization_id": org.id,
+            "workspace_id": workspace.id, "api_key_id": key.id,
+            "model": fixture.text, "type": "embedding", "input_tokens": 6000,
+            "output_tokens": 0
+        }))
+        .await;
+    assert_eq!(legacy.status_code(), 200, "{}", legacy.text());
+    let blocked = server
+        .post("/v1/check_api_key")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .await;
+    assert_eq!(
+        blocked.status_code(),
+        402,
+        "debt blocks preflight: {}",
+        blocked.text()
+    );
+
+    // The receipt protocol reports both streaming and non-streaming chat as chat_completion.
+    let receipt = json!({
+        "id": body["id"], "organization_id": org.id,
+        "workspace_id": workspace.id, "api_key_id": key.id,
+        "model": fixture.text, "type": "chat_completion",
+        "input_tokens": 1, "output_tokens": 1
+    });
+    let mut usage_id = None;
+    for _ in 0..2 {
+        let response = server
+            .post("/v1/internal/usage")
+            .add_header("Authorization", format!("Bearer {INTERNAL_TOKEN}"))
+            .json(&receipt)
+            .await;
+        assert_eq!(response.status_code(), 200, "{}", response.text());
+        let id = response.json::<Value>()["id"].clone();
+        if let Some(previous) = &usage_id {
+            assert_eq!(&id, previous);
+        }
+        usage_id = Some(id);
+    }
+    let row = fixture.database.pool().get().await.unwrap().query_one(
+        "SELECT reserved_credit($1), count(*) FROM usage_budget_reservations WHERE organization_id=$1 AND state='settled'",
+        &[&org_id],
+    ).await.unwrap();
+    assert_eq!(row.get::<_, i64>(0), 0);
+    assert_eq!(row.get::<_, i64>(1), 1);
+    let available = server
+        .post("/v1/check_api_key")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .await;
+    assert_eq!(
+        available.status_code(),
+        200,
+        "released funds repay debt before preflight: {}",
+        available.text()
+    );
+
+    for kind in [
+        "embedding",
+        "audio_transcription",
+        "image_generation",
+        "privacy_classify",
+        "decisions",
+    ] {
+        let mut non_text = body.clone();
+        non_text["id"] = json!(Uuid::new_v4());
+        non_text["inference_type"] = json!(kind);
+        let denied = server
+            .post("/v1/internal/budget")
+            .add_header("Authorization", format!("Bearer {INTERNAL_TOKEN}"))
+            .json(&non_text)
+            .await;
+        assert_eq!(denied.status_code(), 400, "{kind}: {}", denied.text());
+    }
+}
+
+#[tokio::test]
+async fn non_text_endpoints_keep_postpaid_billing_without_reservations() {
+    let fixture = setup().await;
+    for route in [
+        Route::Embeddings,
+        Route::ImageGenerations,
+        Route::ImageEdits,
+        Route::AudioTranscriptions,
+        Route::Rerank,
+        Route::Score,
+        Route::PrivacyClassify,
+        Route::PrivacyRedact,
+        Route::SystemOne,
+    ] {
+        let org = organization(&fixture.server).await;
+        let model = fixture.model(route.model_kind());
+        grant(&fixture.server, model, &org.id).await;
+        let response = send(&fixture.server, route, &org.api_key, model).await;
+        assert_eq!(
+            response.status_code(),
+            200,
+            "{route:?}: {}",
+            response.text()
+        );
+        let org_id = Uuid::parse_str(&org.id).unwrap();
+        let row = fixture
+            .database
+            .pool()
+            .get()
+            .await
+            .unwrap()
+            .query_one(
+                "SELECT (SELECT count(*) FROM usage_budget_reservations WHERE organization_id=$1),
+                    (SELECT count(*) FROM organization_usage_log WHERE organization_id=$1)",
+                &[&org_id],
+            )
+            .await
+            .unwrap();
+        assert_eq!(row.get::<_, i64>(0), 0, "{route:?} must not reserve");
+        assert_eq!(row.get::<_, i64>(1), 1, "{route:?} still records usage");
+    }
 }
 
 fn settings_path(organization_id: &str) -> String {

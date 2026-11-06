@@ -1308,6 +1308,7 @@ impl Fleet {
                 stream,
                 self.backend_stats.clone(),
                 index,
+                params.placement.prompt_tokens,
                 started,
                 Some(route_lease),
             ));
@@ -1377,6 +1378,9 @@ struct TtftProbe<S> {
     inner: S,
     stats: Arc<std::sync::Mutex<Vec<fleet::BackendStat>>>,
     index: usize,
+    /// Whether the TTFT feeds the steering EMA (`fleet::learns_ttft`). The
+    /// lease's latency metric is recorded either way.
+    learn_ttft: bool,
     /// Send instant; `None` once the first content TTFT has been recorded.
     start: Option<std::time::Instant>,
     /// Send instant, kept for the end-of-stream duration.
@@ -1396,6 +1400,7 @@ impl<S> TtftProbe<S> {
         inner: S,
         stats: Arc<std::sync::Mutex<Vec<fleet::BackendStat>>>,
         index: usize,
+        prompt_tokens: Option<u64>,
         start: std::time::Instant,
         route_lease: Option<fleet::RouteLease>,
     ) -> Self {
@@ -1403,6 +1408,7 @@ impl<S> TtftProbe<S> {
             inner,
             stats,
             index,
+            learn_ttft: fleet::learns_ttft(prompt_tokens),
             start: Some(start),
             sent: start,
             first_token: None,
@@ -1439,10 +1445,12 @@ where
                     if let Some(lease) = self._route_lease.as_ref() {
                         lease.record_ttft_ms(ttft_ms);
                     }
-                    let index = self.index;
-                    let mut stats = self.stats.lock().unwrap_or_else(|e| e.into_inner());
-                    if let Some(s) = stats.get_mut(index) {
-                        fleet::update_ema(s, ttft_ms);
+                    if self.learn_ttft {
+                        let index = self.index;
+                        let mut stats = self.stats.lock().unwrap_or_else(|e| e.into_inner());
+                        if let Some(s) = stats.get_mut(index) {
+                            fleet::update_ema(s, ttft_ms);
+                        }
                     }
                 }
             }
@@ -2071,6 +2079,7 @@ impl InferenceProvider for Fleet {
                             stream,
                             self.backend_stats.clone(),
                             index,
+                            streaming_params.placement.prompt_tokens,
                             started,
                             Some(route_lease),
                         ));
@@ -5368,6 +5377,138 @@ mod tests {
         assert!(leases.iter().all(|lease| lease.index() != preferred));
     }
 
+    /// Stream `rounds` single-chunk responses from `index` through
+    /// `TtftProbe`, each measuring a TTFT of about `ttft_ms` for a request
+    /// with the given pool prompt estimate.
+    async fn probe_ttft(
+        provider: &Provider,
+        index: usize,
+        prompt_tokens: Option<u64>,
+        ttft_ms: u64,
+        rounds: u32,
+    ) {
+        use tokio_stream::StreamExt;
+        for _ in 0..rounds {
+            let inner: StreamingResult =
+                Box::pin(futures_util::stream::iter(vec![Ok(data_event())]));
+            let start = std::time::Instant::now() - std::time::Duration::from_millis(ttft_ms);
+            let probe = TtftProbe::new(
+                inner,
+                provider.fleet.backend_stats.clone(),
+                index,
+                prompt_tokens,
+                start,
+                None,
+            );
+            tokio::pin!(probe);
+            while probe.next().await.is_some() {}
+        }
+    }
+
+    /// Two backends with `msgs`' modulo primary first; the peer is warmed
+    /// fast through short prompts.
+    async fn two_backends_with_fast_peer(msgs: &[crate::ChatMessage]) -> (Provider, usize, usize) {
+        let provider = rotation_provider(2);
+        let preferred = (provider.fleet.prefix_router.route(msgs) % 2) as usize;
+        let peer = 1 - preferred;
+        probe_ttft(
+            &provider,
+            peer,
+            Some(500),
+            100,
+            super::fleet::TTFT_WARMUP_SAMPLES * 2,
+        )
+        .await;
+        (provider, preferred, peer)
+    }
+
+    #[tokio::test]
+    async fn long_prompt_ttft_does_not_mark_backend_slow() {
+        assert!(super::fleet::learns_ttft(Some(8_000)));
+        assert!(!super::fleet::learns_ttft(Some(8_001)));
+
+        let msgs = vec![user_msg("route me")];
+        let (provider, preferred, _) = two_backends_with_fast_peer(&msgs).await;
+        // A cache-cold long prompt: multi-second TTFT, far past 2x the peer.
+        probe_ttft(
+            &provider,
+            preferred,
+            Some(120_000),
+            3_000,
+            super::fleet::TTFT_WARMUP_SAMPLES * 2,
+        )
+        .await;
+        assert_eq!(
+            provider.fleet.backend_stats.lock().unwrap()[preferred].samples,
+            0,
+            "long-prompt TTFT must not feed the steering EMA"
+        );
+        assert_eq!(provider.fleet.select_index(&msgs, None), Some(preferred));
+    }
+
+    #[tokio::test]
+    async fn short_prompt_slow_ttft_still_marks_backend_slow() {
+        // `None` (no pool estimate) keeps learning from every request.
+        for prompt_tokens in [Some(2_000), None] {
+            let msgs = vec![user_msg("route me")];
+            let (provider, preferred, peer) = two_backends_with_fast_peer(&msgs).await;
+            probe_ttft(
+                &provider,
+                preferred,
+                prompt_tokens,
+                3_000,
+                super::fleet::TTFT_WARMUP_SAMPLES,
+            )
+            .await;
+            assert_eq!(
+                provider.fleet.select_index(&msgs, None),
+                Some(peer),
+                "{prompt_tokens:?}: slow short-prompt TTFT steers away"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stale_slow_mark_expires_and_rewarms() {
+        use super::fleet::{TTFT_STAT_TTL, TTFT_WARMUP_SAMPLES};
+        use std::time::Duration;
+
+        let provider = rotation_provider(2);
+        let msgs = vec![user_msg("route me")];
+        let preferred = (provider.fleet.prefix_router.route(&msgs) % 2) as usize;
+        let peer = 1 - preferred;
+        for _ in 0..TTFT_WARMUP_SAMPLES {
+            provider.fleet.record_ttft(preferred, 2000.0);
+            provider.fleet.record_ttft(peer, 100.0);
+        }
+        assert_eq!(provider.fleet.select_index(&msgs, None), Some(peer));
+
+        // Excluded backends get no samples; the mark holds until the TTL.
+        tokio::time::advance(TTFT_STAT_TTL - Duration::from_secs(1)).await;
+        assert_eq!(provider.fleet.select_index(&msgs, None), Some(peer));
+        provider.fleet.record_ttft(peer, 100.0);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert_eq!(
+            provider.fleet.select_index(&msgs, None),
+            Some(preferred),
+            "an expired slow mark lets the backend back in"
+        );
+
+        // The first new sample restarts warmup instead of folding into the
+        // old EMA, so one sample cannot re-exclude it.
+        provider.fleet.record_ttft(preferred, 2000.0);
+        assert_eq!(
+            provider.fleet.backend_stats.lock().unwrap()[preferred].samples,
+            1
+        );
+        assert_eq!(provider.fleet.select_index(&msgs, None), Some(preferred));
+        // Still slow after a full warmup: excluded again.
+        for _ in 1..TTFT_WARMUP_SAMPLES {
+            provider.fleet.record_ttft(preferred, 2000.0);
+        }
+        assert_eq!(provider.fleet.select_index(&msgs, None), Some(peer));
+    }
+
     #[test]
     fn record_ttft_ema_warmup_then_stable() {
         let provider = rotation_provider(4);
@@ -5644,7 +5785,7 @@ mod tests {
         // (a 0ms reading is dropped by the EMA guard) — deterministic regardless
         // of how fast the test polls.
         let start = std::time::Instant::now() - std::time::Duration::from_millis(5);
-        let probe = TtftProbe::new(inner, stats.clone(), index, start, None);
+        let probe = TtftProbe::new(inner, stats.clone(), index, None, start, None);
         tokio::pin!(probe);
         let mut count = 0;
         while let Some(_ev) = probe.next().await {
@@ -5675,6 +5816,7 @@ mod tests {
             inner,
             provider.fleet.backend_stats.clone(),
             lease.index(),
+            None,
             std::time::Instant::now(),
             Some(lease),
         );
@@ -6808,6 +6950,7 @@ mod tests {
                     inner,
                     h.provider.fleet.backend_stats.clone(),
                     lease.index(),
+                    None,
                     start,
                     Some(lease),
                 );

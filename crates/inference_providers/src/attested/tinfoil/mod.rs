@@ -252,6 +252,17 @@ async fn read_success_body(
 
 #[async_trait]
 impl InferenceProvider for Provider {
+    async fn count_input_tokens(
+        &self,
+        request: &crate::input_tokens::InputTokenRequest,
+    ) -> Result<i32, CompletionError> {
+        // Router verification still gates execution; counting text alone cannot waive it.
+        if let Some(params) = &request.chat {
+            Self::reject_client_e2ee(params)?;
+        }
+        crate::input_tokens::text_input_bound(&request.body)
+    }
+
     async fn models(&self) -> Result<ModelsResponse, ListModelsError> {
         Ok(ModelsResponse {
             object: "list".to_string(),

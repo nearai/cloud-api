@@ -385,10 +385,7 @@ pub async fn privacy_classify(
     insert_encryption_headers(&encryption_headers, &mut extra);
     insert_request_id_header(correlation, &mut extra);
 
-    let input_bound = match billing::batch_input_bound(&body, model.context_length) {
-        Ok(n) => n,
-        Err(r) => return *r,
-    };
+    let input_bound = 0;
     let budget = match billing::budget_execution(
         &app_state,
         &api_key,
@@ -687,10 +684,7 @@ pub async fn privacy_redact(
         }
     };
 
-    let input_bound = match billing::batch_input_bound(&upstream_bytes, model.context_length) {
-        Ok(n) => n,
-        Err(r) => return *r,
-    };
+    let input_bound = 0;
     let budget = match billing::budget_execution(
         &app_state,
         &api_key,

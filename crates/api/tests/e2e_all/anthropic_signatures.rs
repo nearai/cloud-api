@@ -19,6 +19,10 @@ async fn streaming_message_has_gateway_receipts_and_correlated_billing() {
 
 async fn verify_message(stream: bool) {
     let upstream = MockServer::start().await;
+    Mock::given(path("/v1/messages/count_tokens"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"input_tokens":10})))
+        .mount(&upstream)
+        .await;
     let id = format!("msg_{}", uuid::Uuid::new_v4());
     let raw = if stream {
         format!("event: message_start\r\ndata: {}\r\n\r\nevent: ping\ndata: {{\"type\":\"ping\"}}\n\nevent: content_block_start\ndata: {}\n\nevent: content_block_stop\ndata: {{\"type\":\"content_block_stop\",\"index\":0}}\n\nevent: message_delta\ndata: {}\n\nevent: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n",

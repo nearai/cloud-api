@@ -15,6 +15,32 @@ pub struct TypeSafeBackend {
 
 #[async_trait]
 impl ExternalBackend for TypeSafeBackend {
+    async fn count_input_tokens(
+        &self,
+        config: &super::backend::BackendConfig,
+        model: &str,
+        request: &crate::input_tokens::InputTokenRequest,
+    ) -> Result<i32, CompletionError> {
+        let mut body = request.body.clone();
+        body["model"] = serde_json::json!(model);
+        let response = self
+            .client
+            .post(format!(
+                "{}/systemone/count_tokens",
+                config.base_url.trim_end_matches('/')
+            ))
+            .bearer_auth(&config.api_key)
+            .timeout(Duration::from_secs(15))
+            .json(&body)
+            .send()
+            .await
+            .map_err(|_| crate::input_tokens::unavailable())?;
+        if matches!(response.status().as_u16(), 404 | 405 | 501) {
+            return crate::input_tokens::text_input_bound(&body);
+        }
+        crate::input_tokens::read_count(response, "input_tokens").await
+    }
+
     fn backend_type(&self) -> &'static str {
         "typesafe"
     }

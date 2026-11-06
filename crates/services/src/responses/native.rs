@@ -156,7 +156,7 @@ impl NativeResponsesService {
                 api_key_id: context.api_key_id,
                 model_id: model.id,
             },
-            crate::usage::budget::UsageBounds::text(model.context_length, max_output as i32, 1)
+            crate::usage::budget::UsageBounds::text(0, max_output as i32, 1)
                 .map_err(|_| NativeResponsesError::Internal("Invalid model budget bounds"))?,
         );
         if let Some(prompt) = context.system_prompt.as_deref().filter(|s| !s.is_empty()) {

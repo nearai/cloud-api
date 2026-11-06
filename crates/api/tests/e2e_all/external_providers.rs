@@ -1044,6 +1044,12 @@ async fn gemini_thinking_completion(
     .await;
     let upstream = MockServer::start().await;
     let upstream_model = format!("gemini-thinking-billing-{}", uuid::Uuid::new_v4());
+    Mock::given(path(format!("/models/{upstream_model}:countTokens")))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({"totalTokens":5000})),
+        )
+        .mount(&upstream)
+        .await;
 
     Mock::given(method("POST"))
         .and(path(format!("/models/{upstream_model}:generateContent")))

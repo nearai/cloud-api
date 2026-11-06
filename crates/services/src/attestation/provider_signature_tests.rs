@@ -36,6 +36,13 @@ struct ControlledProvider {
 
 #[async_trait]
 impl InferenceProvider for ControlledProvider {
+    async fn count_input_tokens(
+        &self,
+        request: &inference_providers::input_tokens::InputTokenRequest,
+    ) -> Result<i32, inference_providers::CompletionError> {
+        inference_providers::InferenceProvider::count_input_tokens(&self.inner, request).await
+    }
+
     async fn get_signature(
         &self,
         chat_id: &str,

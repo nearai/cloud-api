@@ -190,6 +190,48 @@ fn strip_unsupported_sampling_params(
 
 #[async_trait]
 impl ExternalBackend for OpenAiCompatibleBackend {
+    async fn count_input_tokens(
+        &self,
+        config: &BackendConfig,
+        model: &str,
+        request: &crate::input_tokens::InputTokenRequest,
+    ) -> Result<i32, CompletionError> {
+        use crate::input_tokens::{read_count, unavailable, InputKind};
+        let official = url::Url::parse(&config.base_url)
+            .ok()
+            .and_then(|u| u.host_str().map(str::to_owned))
+            .is_some_and(|host| host == "api.openai.com");
+        let responses =
+            request.kind == InputKind::Responses || (official && request.kind == InputKind::Chat);
+        let mut body = if responses {
+            crate::input_tokens::responses_count_body(request)?
+        } else {
+            request.body.clone()
+        };
+        body["model"] = serde_json::json!(model);
+        let base = config.base_url.trim_end_matches('/');
+        let url = if responses {
+            format!("{base}/responses/input_tokens")
+        } else {
+            format!("{}/tokenize", base.strip_suffix("/v1").unwrap_or(base))
+        };
+        let response = self
+            .client
+            .post(url)
+            .headers(self.build_headers(config).map_err(|_| unavailable())?)
+            .timeout(std::time::Duration::from_secs(15))
+            .json(&body)
+            .send()
+            .await
+            .map_err(|_| unavailable())?;
+        // Compatible APIs without a counter may use a request-sized text upper bound.
+        // An outage, invalid counter reply or unsupported media never falls back to a cheaper guess.
+        if matches!(response.status().as_u16(), 404 | 405 | 501) && !official {
+            return crate::input_tokens::text_input_bound(&body);
+        }
+        read_count(response, if responses { "input_tokens" } else { "count" }).await
+    }
+
     fn backend_type(&self) -> &'static str {
         "openai_compatible"
     }

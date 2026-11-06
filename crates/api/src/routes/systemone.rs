@@ -129,7 +129,7 @@ pub async fn systemone(
         &api_key,
         &model,
         services::usage::InferenceType::Decisions,
-        i64::from(model.context_length),
+        0,
         i64::from(model.max_output_length.unwrap_or(model.context_length)),
         0,
     ) {

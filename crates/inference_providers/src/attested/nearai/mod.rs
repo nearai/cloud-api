@@ -1475,6 +1475,98 @@ fn is_token_chunk(chunk: &StreamChunk) -> bool {
 
 #[async_trait]
 impl InferenceProvider for Fleet {
+    async fn delegates_billing(
+        &self,
+        request: &crate::input_tokens::InputTokenRequest,
+    ) -> Result<bool, CompletionError> {
+        if !request.is_orchestrated() {
+            return Ok(false);
+        }
+        // A count-only handshake prevents old gateways from silently accepting unbilled work.
+        let mut probe = request.clone();
+        probe.billing_probe = true;
+        self.count_input_tokens(&probe).await?;
+        Ok(true)
+    }
+    async fn count_input_tokens(
+        &self,
+        request: &crate::input_tokens::InputTokenRequest,
+    ) -> Result<i32, CompletionError> {
+        let decisions = request.kind == crate::input_tokens::InputKind::Decisions;
+        let count_path = if decisions {
+            "/v1/systemone/count_tokens"
+        } else {
+            "/v1/internal/input-tokens"
+        };
+        let mut extra = request.extra.clone();
+        let mut headers = self
+            .build_headers()
+            .map_err(|_| crate::input_tokens::unavailable())?;
+        self.prepare_tracing_headers(&mut headers, &mut extra);
+        let pin = self.prepare_encryption_headers(&mut headers, &mut extra);
+        let mut body = request.body.clone();
+        if let Some(fields) = body.as_object_mut() {
+            for key in [
+                encryption_headers::SIGNING_ALGO,
+                encryption_headers::CLIENT_PUB_KEY,
+                encryption_headers::MODEL_PUB_KEY,
+                encryption_headers::ENCRYPTION_VERSION,
+                encryption_headers::ENCRYPT_ALL_FIELDS,
+                tracing_headers::REQUEST_ID,
+                tracing_headers::ORG_ID,
+                tracing_headers::WORKSPACE_ID,
+            ] {
+                fields.remove(key);
+            }
+        }
+        // Use the same attestation-verified, key-affine fleet as inference. The counter
+        // decrypts in the TEE and returns only a count, never plaintext or token ids.
+        let lease = self.acquire_systemone_index("input-token-count", pin.as_deref());
+        let (client, url) = if let Some(lease) = lease.as_ref() {
+            (
+                self.get_or_verify_index_client(lease.index()).await?,
+                self.rotation_url(lease.index() as u64, count_path)
+                    .ok_or_else(crate::input_tokens::unavailable)?,
+            )
+        } else {
+            (
+                self.fallback_client.clone(),
+                format!("{}{count_path}", self.config.base_url),
+            )
+        };
+        let count_body = if decisions {
+            body
+        } else {
+            let mut envelope = serde_json::json!({"kind": request.kind, "request": body});
+            if request.billing_probe {
+                envelope["billing_probe"] = serde_json::json!("per_attempt_v1");
+            }
+            envelope
+        };
+        let response = client
+            .post(url)
+            .headers(headers)
+            .timeout(std::time::Duration::from_secs(15))
+            .json(&count_body)
+            .send()
+            .await
+            .map_err(|_| crate::input_tokens::unavailable())?;
+        if decisions && matches!(response.status().as_u16(), 404 | 405 | 501) {
+            return crate::input_tokens::text_input_bound(&request.body);
+        }
+        if request.billing_probe {
+            if !response.status().is_success() {
+                return Err(crate::input_tokens::unavailable());
+            }
+            let metadata = crate::input_tokens::read_metadata(response).await?;
+            if metadata["billing"] != "per_attempt_v1" {
+                return Err(crate::input_tokens::unavailable());
+            }
+            return Ok(0);
+        }
+        crate::input_tokens::read_count(response, "input_tokens").await
+    }
+
     fn supports_systemone(&self) -> bool {
         true
     }
@@ -1976,6 +2068,7 @@ impl InferenceProvider for Fleet {
         let placement_request = PlacementRequest::from_params(&streaming_params);
         // Prepare tracing headers (request_id, org_id, workspace_id)
         self.prepare_tracing_headers(&mut headers, &mut streaming_params.extra);
+        headers.extend(crate::retry_admission::delegated_headers().await);
         // Prepare encryption headers
         let pinned_pub_key =
             self.prepare_encryption_headers(&mut headers, &mut streaming_params.extra);
@@ -2149,6 +2242,7 @@ impl InferenceProvider for Fleet {
         let placement_request = PlacementRequest::from_params(&non_streaming_params);
         // Prepare tracing headers (request_id, org_id, workspace_id)
         self.prepare_tracing_headers(&mut headers, &mut non_streaming_params.extra);
+        headers.extend(crate::retry_admission::delegated_headers().await);
         // Prepare encryption headers
         let pinned_pub_key =
             self.prepare_encryption_headers(&mut headers, &mut non_streaming_params.extra);
@@ -2772,6 +2866,19 @@ impl InferenceProvider for Fleet {
 /// to its Fleet, which holds all NEAR-AI model-proxy state and logic.
 #[async_trait]
 impl InferenceProvider for Provider {
+    async fn delegates_billing(
+        &self,
+        request: &crate::input_tokens::InputTokenRequest,
+    ) -> Result<bool, CompletionError> {
+        self.fleet.delegates_billing(request).await
+    }
+    async fn count_input_tokens(
+        &self,
+        request: &crate::input_tokens::InputTokenRequest,
+    ) -> Result<i32, CompletionError> {
+        self.fleet.count_input_tokens(request).await
+    }
+
     fn supports_systemone(&self) -> bool {
         true
     }

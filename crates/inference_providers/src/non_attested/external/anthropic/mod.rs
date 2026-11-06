@@ -263,6 +263,69 @@ where
 
 #[async_trait]
 impl ExternalBackend for AnthropicBackend {
+    async fn count_input_tokens(
+        &self,
+        config: &BackendConfig,
+        model: &str,
+        request: &crate::input_tokens::InputTokenRequest,
+    ) -> Result<i32, CompletionError> {
+        let mut body = if let Some(params) = request.chat.as_ref() {
+            self.build_request_body(model, params, false)?
+        } else {
+            request.body.clone()
+        };
+        body["model"] = serde_json::json!(model);
+        // Count the same Messages fields; generation-only controls are not accepted by count_tokens.
+        let fields = body
+            .as_object_mut()
+            .ok_or_else(crate::input_tokens::unavailable)?;
+        fields.retain(|key, _| {
+            matches!(
+                key.as_str(),
+                "model"
+                    | "messages"
+                    | "system"
+                    | "tools"
+                    | "tool_choice"
+                    | "thinking"
+                    | "output_config"
+            )
+        });
+        let headers = self
+            .build_raw_headers(
+                config,
+                &AnthropicRawRequest {
+                    endpoint: crate::AnthropicRawEndpoint::CountTokens,
+                    beta: request.anthropic.as_ref().is_some_and(|r| r.beta),
+                    body: body.clone(),
+                    headers: request
+                        .anthropic
+                        .as_ref()
+                        .map(|r| r.headers.clone())
+                        .unwrap_or_default(),
+                },
+            )
+            .map_err(|_| crate::input_tokens::unavailable())?;
+        let response = self
+            .client
+            .post(format!(
+                "{}/messages/count_tokens",
+                config.base_url.trim_end_matches('/')
+            ))
+            .headers(headers)
+            .query(&if request.anthropic.as_ref().is_some_and(|r| r.beta) {
+                vec![("beta", "true")]
+            } else {
+                vec![]
+            })
+            .timeout(std::time::Duration::from_secs(15))
+            .json(&body)
+            .send()
+            .await
+            .map_err(|_| crate::input_tokens::unavailable())?;
+        crate::input_tokens::read_count(response, "input_tokens").await
+    }
+
     fn backend_type(&self) -> &'static str {
         "anthropic"
     }

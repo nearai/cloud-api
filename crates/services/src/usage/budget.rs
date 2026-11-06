@@ -33,15 +33,15 @@ pub struct UsageBounds {
 }
 
 impl UsageBounds {
-    pub fn text(context_length: i32, max_output: i32, choices: i32) -> Result<Self, UsageError> {
-        if context_length <= 0 || max_output <= 0 || choices <= 0 {
+    pub fn text(input_tokens: i32, max_output: i32, choices: i32) -> Result<Self, UsageError> {
+        if input_tokens < 0 || max_output <= 0 || choices <= 0 {
             return Err(UsageError::ValidationError(
                 "positive model and execution bounds are required".into(),
             ));
         }
         Ok(Self {
             inference_type: InferenceType::ChatCompletion,
-            input_units: context_length
+            input_units: input_tokens
                 .checked_mul(choices)
                 .ok_or_else(|| UsageError::CostCalculationOverflow("input bound".into()))?,
             output_tokens: max_output
@@ -163,6 +163,8 @@ pub struct BudgetExecution {
     identity: BillingIdentity,
     bounds: UsageBounds,
     last: Arc<Mutex<Option<Uuid>>>,
+    admitted_bounds: Arc<Mutex<Option<UsageBounds>>>,
+    delegated: Arc<std::sync::atomic::AtomicBool>,
 }
 
 tokio::task_local! { static EXECUTION: BudgetExecution; }
@@ -178,6 +180,8 @@ impl BudgetExecution {
             identity,
             bounds,
             last: Arc::new(Mutex::new(None)),
+            admitted_bounds: Arc::new(Mutex::new(None)),
+            delegated: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -190,6 +194,14 @@ impl BudgetExecution {
             .await
     }
 
+    pub async fn settlement_id(&self) -> Result<Option<Uuid>, UsageError> {
+        if self.delegated.load(std::sync::atomic::Ordering::Acquire) {
+            Ok(None)
+        } else {
+            self.id().await.map(Some)
+        }
+    }
+
     pub async fn id(&self) -> Result<Uuid, UsageError> {
         self.last
             .lock()
@@ -200,6 +212,35 @@ impl BudgetExecution {
 
 /// Called immediately before each provider dispatch, including retries. No request-content
 /// or HTTP task-local state escapes into background streaming/settlement work.
+pub async fn before_counted_attempt(
+    provider: &(dyn inference_providers::InferenceProvider + Send + Sync),
+    request: &inference_providers::input_tokens::InputTokenRequest,
+) -> Result<(), inference_providers::CompletionError> {
+    let execution = EXECUTION.try_with(Clone::clone).map_err(|_| {
+        completion_error(UsageError::InternalError(
+            "execution is missing monetary admission".into(),
+        ))
+    })?;
+    let delegated = provider.delegates_billing(request).await?;
+    execution
+        .delegated
+        .store(delegated, std::sync::atomic::Ordering::Release);
+    if delegated {
+        return Ok(());
+    }
+    let count = provider.count_input_tokens(request).await?;
+    let mut bounds = execution.bounds.clone();
+    bounds.input_units = request.charged_input(count)?;
+    let id = execution
+        .service
+        .admit(execution.identity, bounds.clone())
+        .await
+        .map_err(completion_error)?;
+    *execution.admitted_bounds.lock().await = Some(bounds);
+    *execution.last.lock().await = Some(id);
+    Ok(())
+}
+
 pub async fn before_attempt() -> Result<(), UsageError> {
     let execution = EXECUTION
         .try_with(Clone::clone)
@@ -208,6 +249,7 @@ pub async fn before_attempt() -> Result<(), UsageError> {
         .service
         .admit(execution.identity, execution.bounds.clone())
         .await?;
+    *execution.admitted_bounds.lock().await = Some(execution.bounds.clone());
     *execution.last.lock().await = Some(id);
     Ok(())
 }
@@ -237,10 +279,31 @@ pub fn service_error(error: UsageError) -> crate::completions::ports::Completion
 
 #[async_trait::async_trait]
 impl inference_providers::retry_admission::RetryAdmission for BudgetExecution {
+    async fn delegated_identity(
+        &self,
+    ) -> Option<inference_providers::retry_admission::DelegatedIdentity> {
+        self.delegated
+            .load(std::sync::atomic::Ordering::Acquire)
+            .then(|| inference_providers::retry_admission::DelegatedIdentity {
+                organization_id: self.identity.organization_id.to_string(),
+                workspace_id: self.identity.workspace_id.to_string(),
+                api_key_id: self.identity.api_key_id.to_string(),
+            })
+    }
     async fn admit_retry(&self) -> Result<(), inference_providers::CompletionError> {
+        if self.delegated.load(std::sync::atomic::Ordering::Acquire) {
+            return Ok(());
+        }
         let id = self
             .service
-            .admit(self.identity, self.bounds.clone())
+            .admit(
+                self.identity,
+                self.admitted_bounds.lock().await.clone().ok_or_else(|| {
+                    completion_error(UsageError::InternalError(
+                        "retry has no counted attempt".into(),
+                    ))
+                })?,
+            )
             .await
             .map_err(completion_error)?;
         *self.last.lock().await = Some(id);
@@ -260,6 +323,131 @@ mod tests {
             model_id: Uuid::new_v4(),
         }
     }
+    #[tokio::test]
+    async fn count_current_request_and_recount_changed_inputs_on_retry() {
+        use inference_providers::{input_tokens::InputTokenRequest, mock::MockProvider};
+        let service = Arc::new(CapturingUsageService::new());
+        let execution = BudgetExecution::new(
+            service.clone(),
+            identity(),
+            UsageBounds::text(0, 30, 2).unwrap(),
+        );
+        let provider = MockProvider::new_accept_all();
+        execution.run(async {
+            let short = InputTokenRequest::chat(&serde_json::from_value(serde_json::json!({"model":"mock", "messages":[{"role":"user","content":"hello world"}],"n":2})).unwrap()).unwrap();
+            before_counted_attempt(&provider, &short).await.unwrap();
+            let first = execution.id().await.unwrap();
+            let longer = InputTokenRequest::chat(&serde_json::from_value(serde_json::json!({"model":"mock", "messages":[{"role":"user","content":"one two three four five six seven eight nine"}],"n":2})).unwrap()).unwrap();
+            before_counted_attempt(&provider, &longer).await.unwrap();
+            assert_ne!(execution.id().await.unwrap(), first);
+            inference_providers::retry_admission::before_retry().await.unwrap();
+        }).await;
+        let bounds = service.admitted_bounds.lock().unwrap();
+        assert_eq!(bounds[0].input_units, 12);
+        assert_eq!(bounds[1].input_units, 18);
+        assert_eq!(bounds[2], bounds[1]);
+        assert!(bounds.iter().all(|b| b.output_tokens == 60));
+    }
+
+    #[tokio::test]
+    async fn caller_body_cannot_turn_counting_into_a_capability_probe() {
+        use inference_providers::{
+            attested::nearai::{Config, Provider},
+            input_tokens::{InputKind, InputTokenRequest},
+        };
+        use wiremock::{matchers::path, Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(path("/v1/internal/input-tokens"))
+            .respond_with(|r: &wiremock::Request| {
+                let envelope: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
+                assert!(envelope.get("billing_probe").is_none());
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"input_tokens":14}))
+            })
+            .expect(1)
+            .mount(&server)
+            .await;
+        let service = Arc::new(CapturingUsageService::new());
+        let execution = BudgetExecution::new(
+            service.clone(),
+            identity(),
+            UsageBounds::text(0, 20, 1).unwrap(),
+        );
+        let provider = Provider::new(Config::new(server.uri(), None, Some(5)));
+        let input = InputTokenRequest::json(
+            InputKind::Chat,
+            serde_json::json!({
+                "messages":[{"role":"user","content":"hello"}],
+                "_nearai_billing_probe":"per_attempt_v1", "billing_probe":"per_attempt_v1"
+            }),
+            Default::default(),
+        );
+        execution
+            .run(async {
+                before_counted_attempt(&provider, &input).await.unwrap();
+                assert!(execution.settlement_id().await.unwrap().is_some());
+            })
+            .await;
+        assert_eq!(service.admitted_bounds.lock().unwrap()[0].input_units, 14);
+    }
+
+    #[tokio::test]
+    async fn delegation_requires_gateway_capability_and_never_creates_an_aggregate_charge() {
+        use inference_providers::{
+            attested::nearai::{Config, Provider},
+            input_tokens::{InputKind, InputTokenRequest},
+        };
+        use wiremock::{matchers::path, Mock, MockServer, ResponseTemplate};
+        for supported in [false, true] {
+            let server = MockServer::start().await;
+            Mock::given(path("/v1/internal/input-tokens"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(if supported {
+                    serde_json::json!({"billing":"per_attempt_v1"})
+                } else {
+                    serde_json::json!({"input_tokens":10})
+                }))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let provider = Provider::new(Config::new(server.uri(), None, Some(5)));
+            let service = Arc::new(CapturingUsageService::new());
+            let subject = identity();
+            let execution = BudgetExecution::new(
+                service.clone(),
+                subject,
+                UsageBounds::text(0, 20, 1).unwrap(),
+            );
+            let input = InputTokenRequest::json(
+                InputKind::Chat,
+                serde_json::json!({"messages":[{"role":"user","content":"hello"}], "tools":[{"type":"web_context_search"}]}),
+                Default::default(),
+            );
+            execution
+                .run(async {
+                    let result = before_counted_attempt(&provider, &input).await;
+                    assert_eq!(result.is_ok(), supported);
+                    let headers = inference_providers::retry_admission::delegated_headers().await;
+                    if supported {
+                        assert_eq!(
+                            headers["x-nearai-billing-key"],
+                            subject.api_key_id.to_string()
+                        );
+                        assert!(execution.settlement_id().await.unwrap().is_none());
+                        inference_providers::retry_admission::before_retry()
+                            .await
+                            .unwrap();
+                    } else {
+                        assert!(headers.is_empty());
+                    }
+                })
+                .await;
+            assert!(service.admissions.lock().unwrap().is_empty());
+            assert!(service.get_requests().is_empty());
+            assert!(inference_providers::retry_admission::delegated_headers()
+                .await
+                .is_empty());
+        }
+    }
+
     #[test]
     fn best_of_covers_hidden_generations() {
         assert_eq!(

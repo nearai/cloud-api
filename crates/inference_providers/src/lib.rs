@@ -59,6 +59,7 @@ pub mod anthropic_raw;
 pub mod attested;
 pub mod bucket_keepalive;
 pub mod chunk_builder;
+pub mod input_tokens;
 pub mod mock;
 pub mod models;
 pub mod non_attested;
@@ -425,6 +426,21 @@ pub struct DiscoveryPush {
 
 #[async_trait]
 pub trait InferenceProvider {
+    /// Count complete input for this provider before inference. Unsupported counters fail closed.
+    /// True only after the trusted execution gateway confirms per-call admission support.
+    async fn delegates_billing(
+        &self,
+        _request: &input_tokens::InputTokenRequest,
+    ) -> Result<bool, CompletionError> {
+        Ok(false)
+    }
+
+    async fn count_input_tokens(
+        &self,
+        _request: &input_tokens::InputTokenRequest,
+    ) -> Result<i32, CompletionError> {
+        Err(input_tokens::unavailable())
+    }
     /// Lists all available models from this provider
     ///
     /// Returns a list of `ModelInfo` structs containing model details like ID, name,

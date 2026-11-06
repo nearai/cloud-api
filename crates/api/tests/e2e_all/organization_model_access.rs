@@ -2210,7 +2210,7 @@ async fn internal_budget_requires_service_auth_and_organization_model_access() {
         "id": Uuid::new_v4(), "organization_id": org.id,
         "workspace_id": workspace.id, "api_key_id": key.id,
         "model": fixture.text, "inference_type": "chat_completion",
-        "max_output_tokens": 10
+        "max_output_tokens": 10, "input_units": 5
     });
     let unauthenticated = server.post("/v1/internal/budget").json(&body).await;
     assert_eq!(unauthenticated.status_code(), 401);
@@ -2221,6 +2221,16 @@ async fn internal_budget_requires_service_auth_and_organization_model_access() {
         .await;
     assert_eq!(refused.status_code(), 400, "{}", refused.text());
     grant(server, &fixture.text, &org.id).await;
+    for input in [Value::Null, json!(-1)] {
+        let mut invalid = body.clone();
+        invalid["input_units"] = input;
+        let rejected = server
+            .post("/v1/internal/budget")
+            .add_header("Authorization", format!("Bearer {INTERNAL_TOKEN}"))
+            .json(&invalid)
+            .await;
+        assert_eq!(rejected.status_code(), 400, "{}", rejected.text());
+    }
     let admitted = server
         .post("/v1/internal/budget")
         .add_header("Authorization", format!("Bearer {INTERNAL_TOKEN}"))
@@ -2244,6 +2254,12 @@ async fn internal_budget_requires_service_auth_and_organization_model_access() {
         &[&org_id],
     ).await.unwrap().get(0);
     assert_eq!(count, 1);
+    let bounds: Value = fixture.database.pool().get().await.unwrap().query_one(
+        "SELECT bounds FROM usage_budget_reservations WHERE organization_id=$1 AND state='dispatched'",
+        &[&org_id],
+    ).await.unwrap().get(0);
+    assert_eq!(bounds["input_units"], 5);
+    assert_eq!(bounds["output_tokens"], 10);
 }
 
 fn settings_path(organization_id: &str) -> String {

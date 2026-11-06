@@ -356,6 +356,7 @@ impl UsageServiceTrait for MockUsageService {
 pub struct CapturingUsageService {
     pub admissions: std::sync::Mutex<Vec<Uuid>>,
     pub admission_limit: Option<usize>,
+    pub admitted_bounds: std::sync::Mutex<Vec<crate::usage::budget::UsageBounds>>,
     requests: std::sync::Mutex<Vec<RecordUsageServiceRequest>>,
 }
 
@@ -364,6 +365,7 @@ impl CapturingUsageService {
         Self {
             admissions: std::sync::Mutex::new(Vec::new()),
             admission_limit: None,
+            admitted_bounds: std::sync::Mutex::new(Vec::new()),
             requests: std::sync::Mutex::new(Vec::new()),
         }
     }
@@ -378,7 +380,7 @@ impl UsageServiceTrait for CapturingUsageService {
     async fn admit(
         &self,
         _: crate::usage::BillingIdentity,
-        _: crate::usage::budget::UsageBounds,
+        bounds: crate::usage::budget::UsageBounds,
     ) -> Result<Uuid, UsageError> {
         let mut admissions = self.admissions.lock().unwrap();
         if self
@@ -391,6 +393,7 @@ impl UsageServiceTrait for CapturingUsageService {
         }
         let id = Uuid::new_v4();
         admissions.push(id);
+        self.admitted_bounds.lock().unwrap().push(bounds);
         Ok(id)
     }
 

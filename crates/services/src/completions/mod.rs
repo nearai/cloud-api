@@ -124,7 +124,7 @@ where
     metrics_service: Arc<dyn MetricsServiceTrait>,
     // IDs for usage tracking (database) and tracing
     request_id: Uuid,
-    budget_id: Uuid,
+    budget_id: Option<Uuid>,
     organization_id: Uuid,
     workspace_id: Uuid,
     api_key_id: Uuid,
@@ -278,7 +278,8 @@ where
 
     /// Record usage and metrics. Called from Drop to ensure it always runs.
     fn record_usage_and_metrics(&self) {
-        let may_settle = self.stream_completed
+        let may_settle = self.budget_id.is_some()
+            && self.stream_completed
             && self.saw_upstream_done_marker
             && self.last_error.is_none()
             && self.last_finish_reason.is_some();
@@ -470,7 +471,7 @@ where
                         last_finish_reason.as_ref(),
                     ));
                     let usage_request = RecordUsageServiceRequest {
-                        budget_id: Some(budget_id),
+                        budget_id,
                         input_tokens,
                         output_tokens,
                         cache_read_tokens,
@@ -1698,7 +1699,7 @@ impl CompletionServiceImpl {
         &self,
         llm_stream: StreamingResult,
         request_id: Uuid,
-        budget_id: Uuid,
+        budget_id: Option<Uuid>,
         organization_id: Uuid,
         workspace_id: Uuid,
         api_key_id: Uuid,
@@ -1968,12 +1969,8 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
                 api_key_id,
                 model_id: model.id,
             },
-            crate::usage::budget::UsageBounds::text(
-                model.context_length,
-                max_output as i32,
-                choices,
-            )
-            .map_err(crate::usage::budget::service_error)?,
+            crate::usage::budget::UsageBounds::text(0, max_output as i32, choices)
+                .map_err(crate::usage::budget::service_error)?,
         );
 
         let provider_start_time = Instant::now();
@@ -2031,7 +2028,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
                 llm_stream,
                 request_id,
                 budget
-                    .id()
+                    .settlement_id()
                     .await
                     .map_err(crate::usage::budget::service_error)?,
                 organization_id,
@@ -2248,12 +2245,8 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
                 api_key_id,
                 model_id: model.id,
             },
-            crate::usage::budget::UsageBounds::text(
-                model.context_length,
-                max_output as i32,
-                choices,
-            )
-            .map_err(crate::usage::budget::service_error)?,
+            crate::usage::budget::UsageBounds::text(0, max_output as i32, choices)
+                .map_err(crate::usage::budget::service_error)?,
         );
 
         let provider_start_time = Instant::now();
@@ -2373,7 +2366,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         let provider_request_id = response_with_bytes.response.id.clone();
         let inference_id = hash_inference_id_to_uuid(&provider_request_id);
         let budget_id = budget
-            .id()
+            .settlement_id()
             .await
             .map_err(crate::usage::budget::service_error)?;
         let response_id = request.response_id;
@@ -2387,47 +2380,50 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             .map(|reason| crate::usage::StopReason::from_finish_reason(reason))
             .unwrap_or(crate::usage::StopReason::Incomplete);
 
-        usage_service
-            .record_usage(RecordUsageServiceRequest {
-                budget_id: Some(budget_id),
-                input_tokens,
-                output_tokens,
-                cache_read_tokens,
-                cache_write: cache_write_cost_per_token
-                    .filter(|_| anthropic_cache_write_tokens > 0)
-                    .map(|cost_per_token| CacheWriteBilling {
-                        tokens: anthropic_cache_write_tokens,
-                        cost_per_token,
-                    }),
-                profiled_cache_write_tokens,
-                requested_service_tier,
-                provider_service_tier,
-                // ttft_ms / avg_itl_ms stay None: N/A for non-streaming
-                inference_id: Some(inference_id),
-                provider_request_id: Some(provider_request_id),
-                stop_reason: Some(stop_reason),
-                response_id,
-                provider_attribution,
-                // Written once per served request: a provider id seen
-                // before is not a retry.
-                dedupe_on_conflict: true,
-                ..RecordUsageServiceRequest::base(
-                    crate::usage::BillingIdentity {
-                        organization_id,
-                        workspace_id,
-                        api_key_id,
-                        model_id,
-                    },
-                    crate::usage::ports::InferenceType::ChatCompletion,
-                )
-            })
-            .await
-            .map_err(|e| {
-                let err =
-                    ports::CompletionError::InternalError(format!("Failed to record usage: {e}"));
-                self.record_error(&err, Some(&model.model_name));
-                err
-            })?;
+        if budget_id.is_some() {
+            usage_service
+                .record_usage(RecordUsageServiceRequest {
+                    budget_id,
+                    input_tokens,
+                    output_tokens,
+                    cache_read_tokens,
+                    cache_write: cache_write_cost_per_token
+                        .filter(|_| anthropic_cache_write_tokens > 0)
+                        .map(|cost_per_token| CacheWriteBilling {
+                            tokens: anthropic_cache_write_tokens,
+                            cost_per_token,
+                        }),
+                    profiled_cache_write_tokens,
+                    requested_service_tier,
+                    provider_service_tier,
+                    // ttft_ms / avg_itl_ms stay None: N/A for non-streaming
+                    inference_id: Some(inference_id),
+                    provider_request_id: Some(provider_request_id),
+                    stop_reason: Some(stop_reason),
+                    response_id,
+                    provider_attribution,
+                    // Written once per served request: a provider id seen
+                    // before is not a retry.
+                    dedupe_on_conflict: true,
+                    ..RecordUsageServiceRequest::base(
+                        crate::usage::BillingIdentity {
+                            organization_id,
+                            workspace_id,
+                            api_key_id,
+                            model_id,
+                        },
+                        crate::usage::ports::InferenceType::ChatCompletion,
+                    )
+                })
+                .await
+                .map_err(|e| {
+                    let err = ports::CompletionError::InternalError(format!(
+                        "Failed to record usage: {e}"
+                    ));
+                    self.record_error(&err, Some(&model.model_name));
+                    err
+                })?;
+        }
 
         tracing::debug!(
             "Recorded usage for org {}: {} input, {} output tokens (api_key: {})",
@@ -2803,7 +2799,7 @@ mod tests {
             usage_service: Arc::new(MockUsageService),
             metrics_service: Arc::new(CapturingMetricsService::new()),
             request_id: Uuid::new_v4(),
-            budget_id: Uuid::new_v4(),
+            budget_id: Some(Uuid::new_v4()),
             organization_id: Uuid::new_v4(),
             workspace_id: Uuid::new_v4(),
             api_key_id: Uuid::new_v4(),
@@ -3027,7 +3023,7 @@ mod tests {
             usage_service,
             metrics_service: metrics_service.clone(),
             request_id: Uuid::new_v4(),
-            budget_id: Uuid::new_v4(),
+            budget_id: Some(Uuid::new_v4()),
             organization_id,
             workspace_id,
             api_key_id,
@@ -3208,7 +3204,7 @@ mod tests {
             usage_service: usage_service.clone(),
             metrics_service: metrics_service.clone(),
             request_id: Uuid::new_v4(),
-            budget_id: Uuid::new_v4(),
+            budget_id: Some(Uuid::new_v4()),
             organization_id: Uuid::new_v4(),
             workspace_id: Uuid::new_v4(),
             api_key_id: Uuid::new_v4(),
@@ -3369,7 +3365,7 @@ mod tests {
             usage_service: usage_service.clone(),
             metrics_service: metrics_service.clone(),
             request_id: Uuid::new_v4(),
-            budget_id: Uuid::new_v4(),
+            budget_id: Some(Uuid::new_v4()),
             organization_id,
             workspace_id,
             api_key_id,
@@ -3504,7 +3500,7 @@ mod tests {
             usage_service: usage_service.clone(),
             metrics_service: metrics_service.clone(),
             request_id: Uuid::new_v4(),
-            budget_id: Uuid::new_v4(),
+            budget_id: Some(Uuid::new_v4()),
             organization_id,
             workspace_id,
             api_key_id,
@@ -3716,7 +3712,7 @@ mod tests {
                 usage_service,
                 metrics_service,
                 request_id: Uuid::new_v4(),
-                budget_id: Uuid::new_v4(),
+                budget_id: Some(Uuid::new_v4()),
                 organization_id: Uuid::new_v4(),
                 workspace_id: Uuid::new_v4(),
                 api_key_id: Uuid::new_v4(),

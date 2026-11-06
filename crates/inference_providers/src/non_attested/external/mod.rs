@@ -438,6 +438,27 @@ impl ExternalProvider {
 
 #[async_trait]
 impl InferenceProvider for ExternalProvider {
+    async fn count_input_tokens(
+        &self,
+        request: &crate::input_tokens::InputTokenRequest,
+    ) -> Result<i32, CompletionError> {
+        let mut request = request.clone();
+        if let Some(params) = request.chat.as_mut() {
+            params.strip_client_priority();
+            params.strip_third_party_retention();
+            strip_internal_keys(&mut params.extra);
+            self.inject_extra_request_body(&mut params.extra);
+            request.body =
+                serde_json::to_value(&params).map_err(|_| crate::input_tokens::unavailable())?;
+        } else if let Some(fields) = request.body.as_object_mut() {
+            let mut extra = fields.clone().into_iter().collect();
+            self.inject_extra_request_body(&mut extra);
+            *fields = extra.into_iter().collect();
+        }
+        self.backend
+            .count_input_tokens(&self.config, &self.model_name, &request)
+            .await
+    }
     fn supports_systemone(&self) -> bool {
         self.backend.backend_type() == "typesafe"
     }

@@ -265,9 +265,7 @@ pub async fn rerank(
         &api_key,
         &model,
         services::usage::InferenceType::Rerank,
-        (request.documents.len() as i64)
-            .checked_mul(i64::from(model.context_length))
-            .unwrap_or(i64::MAX),
+        0,
         0,
         0,
     ) {

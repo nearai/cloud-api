@@ -157,28 +157,6 @@ pub(crate) async fn budget_id(
         .map_err(|_| Box::new(StatusCode::INTERNAL_SERVER_ERROR.into_response()))
 }
 
-/// Plain input tokenization cannot exceed the encoded input bytes plus model framing.
-/// Token-id arrays are also covered (one or more JSON bytes per token). Reserving the
-/// context framing per input covers batching, padding, and encrypted text payloads.
-pub(crate) fn batch_input_bound(body: &[u8], context: i32) -> Result<i64, Box<Response>> {
-    let value: serde_json::Value = serde_json::from_slice(body)
-        .map_err(|_| Box::new(StatusCode::BAD_REQUEST.into_response()))?;
-    let items = value
-        .get("input")
-        .and_then(|v| v.as_array())
-        .map_or(1, Vec::len)
-        .max(1);
-    i64::try_from(body.len())
-        .ok()
-        .and_then(|bytes| {
-            i64::try_from(items)
-                .ok()
-                .and_then(|items| items.checked_mul(i64::from(context.max(0))))
-                .and_then(|framing| bytes.checked_add(framing))
-        })
-        .ok_or_else(|| Box::new(StatusCode::BAD_REQUEST.into_response()))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

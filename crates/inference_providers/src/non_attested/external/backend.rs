@@ -61,6 +61,14 @@ impl Default for BackendConfig {
 /// ChatCompletionParams format and the provider's native format.
 #[async_trait]
 pub trait ExternalBackend: Send + Sync {
+    async fn count_input_tokens(
+        &self,
+        _config: &BackendConfig,
+        _model: &str,
+        request: &crate::input_tokens::InputTokenRequest,
+    ) -> Result<i32, CompletionError> {
+        crate::input_tokens::text_input_bound(&request.body)
+    }
     async fn systemone(
         &self,
         _config: &BackendConfig,

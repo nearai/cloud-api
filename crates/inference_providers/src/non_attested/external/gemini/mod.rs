@@ -287,6 +287,36 @@ fn size_to_aspect_ratio(size: Option<&String>) -> Option<String> {
 
 #[async_trait]
 impl ExternalBackend for GeminiBackend {
+    async fn count_input_tokens(
+        &self,
+        config: &BackendConfig,
+        model: &str,
+        request: &crate::input_tokens::InputTokenRequest,
+    ) -> Result<i32, CompletionError> {
+        let params = request
+            .chat
+            .as_ref()
+            .ok_or_else(crate::input_tokens::unavailable)?;
+        let mut generate = serde_json::to_value(self.build_request(params))
+            .map_err(|_| crate::input_tokens::unavailable())?;
+        let name = strip_vendor_prefix(model);
+        generate["model"] = serde_json::json!(format!("models/{name}"));
+        let response = self
+            .client
+            .post(format!(
+                "{}/models/{}:countTokens",
+                config.base_url.trim_end_matches('/'),
+                name
+            ))
+            .headers(self.build_headers(config)?)
+            .timeout(std::time::Duration::from_secs(15))
+            .json(&serde_json::json!({"generateContentRequest": generate}))
+            .send()
+            .await
+            .map_err(|_| crate::input_tokens::unavailable())?;
+        crate::input_tokens::read_count(response, "totalTokens").await
+    }
+
     fn backend_type(&self) -> &'static str {
         "gemini"
     }

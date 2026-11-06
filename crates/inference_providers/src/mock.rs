@@ -1239,6 +1239,23 @@ impl Default for MockProvider {
 
 #[async_trait]
 impl crate::InferenceProvider for MockProvider {
+    async fn count_input_tokens(
+        &self,
+        request: &crate::input_tokens::InputTokenRequest,
+    ) -> Result<i32, CompletionError> {
+        if let Some(params) = &request.chat {
+            Ok(params
+                .messages
+                .iter()
+                .filter_map(|m| m.content.as_ref())
+                .map(Self::count_tokens_in_content)
+                .sum::<i32>()
+                .max(6))
+        } else {
+            crate::input_tokens::text_input_bound(&request.body)
+        }
+    }
+
     fn supports_systemone(&self) -> bool {
         self.systemone_handler.is_some()
     }

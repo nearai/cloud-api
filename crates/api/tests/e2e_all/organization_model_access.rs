@@ -317,6 +317,35 @@ const ROUTES: &[Route] = &[
 ];
 
 impl Route {
+    /// The route template as it is registered in the router.
+    fn path(self) -> &'static str {
+        match self {
+            Route::ChatCompletions | Route::ChatCompletionsStream => "/chat/completions",
+            Route::Completions | Route::CompletionsStream => "/completions",
+            Route::Responses | Route::ResponsesStream | Route::ResponsesNative => "/responses",
+            Route::Messages => "/messages",
+            Route::MessagesCountTokens => "/messages/count_tokens",
+            Route::Embeddings => "/embeddings",
+            Route::ImageGenerations => "/images/generations",
+            Route::ImageEdits => "/images/edits",
+            Route::AudioTranscriptions => "/audio/transcriptions",
+            Route::Rerank => "/rerank",
+            Route::Score => "/score",
+            Route::PrivacyClassify => "/privacy/classify",
+            Route::PrivacyRedact => "/privacy/redact",
+            Route::SystemOne => "/systemone",
+            Route::AttestationReport | Route::AttestationReportWithNonce => "/attestation/report",
+        }
+    }
+
+    /// The method the route is registered with.
+    fn method(self) -> &'static str {
+        match self {
+            Route::AttestationReport | Route::AttestationReportWithNonce => "GET",
+            _ => "POST",
+        }
+    }
+
     fn model_kind(self) -> ModelKind {
         match self {
             Route::SystemOne => ModelKind::Decisions,
@@ -749,6 +778,142 @@ fn registered_routes(source: &str) -> Vec<(String, String)> {
         rest = &rest[end..];
     }
     routes
+}
+
+/// The access tests cover the routes in `ROUTES`. This one fails when a route
+/// is registered in any router builder of `src/lib.rs` (or in the public
+/// attestation, credit transfer and organization credential routers it
+/// merges) without a decision on record here: either
+/// the route is in `ROUTES`, and so in the table test, or it is listed below
+/// with the reason it is not. A new route cannot ship without that decision.
+///
+/// Routes are matched by method and path, as they are registered.
+#[test]
+fn every_registered_route_has_a_model_access_decision() {
+    /// Routes that deal in model names without being inference for an
+    /// organization. Each has its own rule, tested elsewhere in this file or
+    /// in `unlisted_models.rs`.
+    const OTHER_MODEL_ROUTES: &[(&str, &str)] = &[
+        // Public catalogs: listed models only.
+        ("GET", "/models"),
+        ("GET", "/model/list"),
+        ("GET", "/model/{model_name}"),
+        // Public: resolves as an anonymous caller.
+        ("GET", "/attestation/ita-token"),
+        // Public: the attested providers' trust pins, published for
+        // verifiers. It takes no model name and reads no catalog row.
+        ("GET", "/attestation/pins"),
+        // Service token: usage is recorded for any model, and the two
+        // documents are for a gateway that enforces access itself.
+        ("POST", "/internal/usage"),
+        ("GET", "/internal/models"),
+        ("GET", "/internal/model-access"),
+    ];
+    /// Routes that take no model name from the caller.
+    const NO_MODEL_NAME: &[(&str, &str)] = &[
+        ("GET", "/health"),
+        ("POST", "/ohttp"),
+        ("GET", "/.well-known/ohttp-gateway"),
+        ("GET", "/ohttp/config"),
+        ("GET", "/docs"),
+        ("GET", "/api-docs/openapi.json"),
+        // Sign-in and invitations.
+        ("POST", "/near"),
+        ("GET", "/login"),
+        ("GET", "/github"),
+        ("GET", "/google"),
+        ("GET", "/callback"),
+        ("GET", "/user"),
+        ("POST", "/logout"),
+        ("GET", "/{token}"),
+        ("POST", "/{token}/accept"),
+        // Retired response history always returns authenticated 410.
+        ("ANY", "/responses/{response_id}"),
+        ("ANY", "/responses/{response_id}/cancel"),
+        ("ANY", "/responses/{response_id}/input_items"),
+        // The MCP endpoint serves web search only.
+        ("POST", "/mcp"),
+        // Stage I migration surfaces take no model name on any method.
+        ("ANY", "/conversations"),
+        ("ANY", "/conversations/"),
+        ("ANY", "/conversations/batch"),
+        ("ANY", "/conversations/{conversation_id}"),
+        ("ANY", "/conversations/{conversation_id}/"),
+        ("ANY", "/conversations/{conversation_id}/items"),
+        ("ANY", "/conversations/{conversation_id}/{*legacy_path}"),
+        // Looked up by chat id. The `model` query parameter is not read.
+        ("GET", "/signature/{chat_id}"),
+        ("GET", "/organizations/{org_id}/workspaces"),
+        ("POST", "/organizations/{org_id}/workspaces"),
+        ("GET", "/workspaces/{workspace_id}"),
+        ("PUT", "/workspaces/{workspace_id}"),
+        ("DELETE", "/workspaces/{workspace_id}"),
+        ("GET", "/workspaces/{workspace_id}/api-keys"),
+        ("POST", "/workspaces/{workspace_id}/api-keys"),
+        ("DELETE", "/workspaces/{workspace_id}/api-keys/{key_id}"),
+        ("PATCH", "/workspaces/{workspace_id}/api-keys/{key_id}"),
+        (
+            "PATCH",
+            "/workspaces/{workspace_id}/api-keys/{key_id}/spend-limit",
+        ),
+        ("ANY", "/files"),
+        ("ANY", "/files/"),
+        ("ANY", "/files/{file_id}"),
+        ("ANY", "/files/{file_id}/"),
+        ("ANY", "/files/{file_id}/content"),
+        ("ANY", "/files/{file_id}/{*legacy_path}"),
+        ("POST", "/check_api_key"),
+        ("GET", "/services"),
+        ("GET", "/services/{service_name}"),
+    ];
+
+    let mut registered = registered_routes(include_str!("../../src/lib.rs"));
+    // Router builders that `src/lib.rs` calls from other modules.
+    registered.extend(registered_routes(include_str!(
+        "../../src/routes/attestation.rs"
+    )));
+    assert!(
+        registered.len() >= 60,
+        "found too few routes, the scan is broken: {registered:?}"
+    );
+    let is_registered =
+        |method: &str, path: &str| registered.iter().any(|(m, p)| m == method && p == path);
+
+    for (method, path) in &registered {
+        // Admin routes act as the platform: their model names are not
+        // subject to grants. Their own access rule is the admin permission
+        // policy.
+        let admin = path.starts_with("/admin/");
+        let in_table = ROUTES
+            .iter()
+            .any(|route| route.method() == method && route.path() == path);
+        let listed = [OTHER_MODEL_ROUTES, NO_MODEL_NAME]
+            .concat()
+            .contains(&(method.as_str(), path.as_str()));
+        assert!(
+            admin || in_table || listed,
+            "{method} {path} has no model access decision. If it takes a model name from \
+             the caller, add it to ROUTES (and `send`) so the table test covers it. If not, \
+             add it to NO_MODEL_NAME or OTHER_MODEL_ROUTES."
+        );
+    }
+
+    // The lists must not rot: every entry is still a registered route, and
+    // the scan saw every route of the table.
+    for (method, path) in OTHER_MODEL_ROUTES.iter().chain(NO_MODEL_NAME) {
+        assert!(
+            is_registered(method, path),
+            "{method} {path} is listed here but no longer registered"
+        );
+    }
+    for route in ROUTES {
+        assert!(
+            is_registered(route.method(), route.path()),
+            "{route:?} is in the table but {} {} is not registered",
+            route.method(),
+            route.path()
+        );
+    }
 }
 
 /// The scanner itself: methods chained on one path, a layered handler, and

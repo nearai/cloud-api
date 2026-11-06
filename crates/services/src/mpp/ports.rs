@@ -297,8 +297,13 @@ pub struct ChannelRecord {
     pub deposit: u128,
     /// The amount settled on chain, as last read or as this server settled it.
     pub settled_on_chain: u128,
-    /// The highest voucher accepted.
+    /// The accepted voucher high-water mark, raised to cover any committed spent floor.
+    /// A payer can settle a signed voucher this server never accepted. A chain-confirmed
+    /// floor can therefore raise this amount without changing `highest_signature`.
     pub highest_cumulative: u128,
+    /// The last accepted voucher's signature. A raised chain floor is already settled,
+    /// so `settleable_voucher` excludes it; this signature never authorizes a larger
+    /// settlement. Pending capture floors remain fenced by the closing state.
     pub highest_signature: [u8; SIGNATURE_LEN],
     /// Earlier vouchers, highest first, at most [`MAX_RETAINED_VOUCHERS`].
     pub retained_vouchers: Vec<RetainedVoucher>,
@@ -320,6 +325,13 @@ pub struct ChannelRecord {
 }
 
 impl ChannelRecord {
+    /// Preserve `spent <= highest_cumulative` when a close or settlement sets a floor.
+    /// The signature remains the last accepted voucher's; a floor is no new voucher.
+    pub fn raise_spent_floor(&mut self, floor: u128) {
+        self.spent = self.spent.max(floor);
+        self.highest_cumulative = self.highest_cumulative.max(self.spent);
+    }
+
     /// What the highest voucher still covers: `highest_cumulative - spent`.
     pub fn available(&self) -> u128 {
         self.highest_cumulative.saturating_sub(self.spent)
@@ -600,6 +612,8 @@ pub trait ChannelRepository: Send + Sync {
 
     /// Turn the reservation of `request_id` into a charge of `actual`, capped at what the
     /// highest voucher still covers (`highest_cumulative - (spent - amount)`):
+    /// equivalently `amount + (highest_cumulative - spent)`, so another in-flight
+    /// reservation's funds cannot be taken by an overrun.
     /// `spent = spent - amount + charged`, `reserved -= amount`, `units += units`, and the
     /// reservation row goes.
     async fn charge(
@@ -637,7 +651,8 @@ pub trait ChannelRepository: Send + Sync {
 
     /// The channel is closed or withdrawn on chain: state `finalized`,
     /// `settled_on_chain = max(stored, settled_on_chain)`, `pending_close` cleared. Any
-    /// state may finalize; a no-op for an unknown channel.
+    /// state may finalize; a no-op for an unknown channel. Raise `spent` to the settled
+    /// floor and `highest_cumulative` to cover it, preserving the accepted signature.
     async fn finalize(
         &self,
         channel_id: &[u8; 32],

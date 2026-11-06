@@ -5,6 +5,7 @@ const RULES: crate::mpp::ports::VoucherRules = crate::mpp::ports::VoucherRules {
     settled_floor_from_chain: true,
 };
 
+mod floor_regressions;
 #[path = "channel_memory_tests/ledger_regressions.rs"]
 mod ledger_regressions;
 

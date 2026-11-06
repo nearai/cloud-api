@@ -41,6 +41,8 @@ WHERE channel_id = $1 AND last_chain_read_at IS DISTINCT FROM $2";
 pub(super) const CLEAR_READ_CLAIM_SQL: &str = "UPDATE mpp_channels SET last_chain_read_at = NULL \
 WHERE channel_id = $1 AND last_chain_read_at = $2";
 
+/// An observation may exceed the accepted voucher; this write does not move `spent`.
+/// Subsequent spent floors raise the high-water mark with it (`raise_spent_floor`).
 pub(super) const CHAIN_STATE_SQL: &str = "UPDATE mpp_channels SET deposit = $2::TEXT::NUMERIC, \
 settled_on_chain = $3::TEXT::NUMERIC, close_requested_at = $4, updated_at = clock_timestamp() \
 WHERE channel_id = $1 AND (deposit, settled_on_chain, close_requested_at) IS DISTINCT FROM \
@@ -63,6 +65,7 @@ pub(super) const FINALIZE_SQL: &str = "\
 UPDATE mpp_channels SET state = 'finalized', pending_close = NULL, \
 settled_on_chain = GREATEST(settled_on_chain, $2::TEXT::NUMERIC), \
 spent = GREATEST(spent, settled_on_chain, $2::TEXT::NUMERIC), \
+highest_cumulative = GREATEST(highest_cumulative, spent, settled_on_chain, $2::TEXT::NUMERIC), \
 updated_at = clock_timestamp() \
 WHERE channel_id = $1";
 

@@ -63,11 +63,8 @@ impl State {
     fn give_back(&mut self, reservation: &Reservation) {
         let stamp = self.tick();
         if let Some(row) = self.channels.get_mut(&reservation.channel_id) {
-            row.record.spent = row
-                .record
-                .spent
-                .saturating_sub(reservation.amount)
-                .max(spent_floor(&row.record));
+            row.record.spent = row.record.spent.saturating_sub(reservation.amount);
+            row.record.raise_spent_floor(spent_floor(&row.record));
             row.record.reserved = row.record.reserved.saturating_sub(reservation.amount);
             row.record.updated_at = stamp;
         }
@@ -379,7 +376,8 @@ impl ChannelRepository for InMemoryChannelRepository {
         let before = record.spent.saturating_sub(reservation.amount);
         let cap = record.highest_cumulative.saturating_sub(before);
         let charged = actual.min(cap);
-        record.spent = before.saturating_add(charged).max(spent_floor(record));
+        record.spent = before.saturating_add(charged);
+        record.raise_spent_floor(spent_floor(record));
         record.reserved = record.reserved.saturating_sub(reservation.amount);
         record.units = record.units.saturating_add(units);
         record.updated_at = stamp;
@@ -470,7 +468,7 @@ impl ChannelRepository for InMemoryChannelRepository {
         if let Some(row) = state.channels.get_mut(channel_id) {
             row.record.state = ChannelLifecycle::Finalized;
             row.record.settled_on_chain = row.record.settled_on_chain.max(settled_on_chain);
-            row.record.spent = row.record.spent.max(row.record.settled_on_chain);
+            row.record.raise_spent_floor(row.record.settled_on_chain);
             row.record.pending_close = None;
             row.record.updated_at = stamp;
         }
@@ -522,7 +520,7 @@ impl ChannelRepository for InMemoryChannelRepository {
         }
         row.record.state = ChannelLifecycle::Finalized;
         row.record.settled_on_chain = row.record.settled_on_chain.max(settled_on_chain);
-        row.record.spent = row.record.spent.max(row.record.settled_on_chain);
+        row.record.raise_spent_floor(row.record.settled_on_chain);
         row.record.pending_close = None;
         row.record.updated_at = stamp;
         Ok(true)

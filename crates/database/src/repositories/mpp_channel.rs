@@ -15,6 +15,7 @@
 //! Operations whose retry after a lost reply would answer differently (`reserve`, `charge`,
 //! `release`, `accept_voucher`, `mark_closing`, the lease claim) are not retried; the
 //! idempotent ones are. No error carries a row, an address, a signature or a hash.
+//! Supervision releases stale reservations after two hours, beyond the 30-minute stream wait.
 
 use std::str::FromStr;
 use std::sync::Mutex;
@@ -308,7 +309,8 @@ async fn commit(tx: Transaction<'_>) -> Result<(), RepositoryError> {
 
 /// `spent -= amount`, `reserved -= amount` on a locked channel.
 fn give_back(record: &mut ChannelRecord, amount: u128) {
-    record.spent = record.spent.saturating_sub(amount).max(spent_floor(record));
+    record.spent = record.spent.saturating_sub(amount);
+    record.raise_spent_floor(spent_floor(record));
     record.reserved = record.reserved.saturating_sub(amount);
 }
 
@@ -468,7 +470,8 @@ impl ChannelRepository for MppChannelRepository {
         let before = record.spent.saturating_sub(amount);
         let cap = record.highest_cumulative.saturating_sub(before);
         let charged = actual.min(cap);
-        record.spent = before.saturating_add(charged).max(spent_floor(&record));
+        record.spent = before.saturating_add(charged);
+        record.raise_spent_floor(spent_floor(&record));
         record.reserved = record.reserved.saturating_sub(amount);
         record.units = record
             .units
@@ -863,7 +866,7 @@ async fn close_transition(
     };
     if let Some(settled) = settled {
         record.settled_on_chain = record.settled_on_chain.max(settled);
-        record.spent = record.spent.max(record.settled_on_chain);
+        record.raise_spent_floor(record.settled_on_chain);
     }
     record.pending_close = None;
     store(&tx, &mut record, false).await?;

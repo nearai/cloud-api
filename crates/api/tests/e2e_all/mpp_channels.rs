@@ -5,6 +5,10 @@
 //!
 //! Every test uses channels with random ids, so tests share the database without touching
 //! each other's rows.
+//! SQL-applied local DB: set DATABASE_{HOST,PORT,USERNAME,PASSWORD}, TEST_DATABASE_NAME,
+//! NEXTEST=1, NEXTEST_RUN_ID, and CLOUD_API_E2E_DATABASE_BOOTSTRAPPED (SHA-256 of
+//! run-id\0host\0port\0user\0database), then:
+//! cargo test -p api --test e2e_all mpp_channels:: -- --test-threads=1
 
 const RULES: services::mpp::VoucherRules = services::mpp::VoucherRules {
     min_delta: 0,
@@ -990,4 +994,5 @@ async fn amounts_up_to_the_numeric_range_round_trip_exactly() {
     assert_eq!((paid, record.spent), (big, big));
 }
 
+mod floor_regressions;
 mod hardening;

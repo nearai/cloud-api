@@ -28,6 +28,8 @@ mod context_routing;
 pub use context_routing::expand_inference_endpoints;
 
 #[cfg(test)]
+mod attestation_tests;
+#[cfg(test)]
 mod channel_binding_tests;
 #[cfg(test)]
 mod chutes_routing_tests;
@@ -4235,8 +4237,57 @@ impl InferenceProviderPool {
         }
     }
 
+    /// Collect one report from the first successful provider for ITA's single
+    /// GPU evidence set. Keep this separate from Gateway fleet collection:
+    /// different fleets may report different GPU architectures.
+    pub(crate) async fn get_single_attestation_report(
+        &self,
+        model: String,
+        signing_algo: Option<String>,
+        nonce: Option<String>,
+        signing_address: Option<String>,
+        include_tls_fingerprint: bool,
+    ) -> Result<serde_json::Map<String, serde_json::Value>, AttestationError> {
+        let providers = self
+            .get_providers_for_model(&model)
+            .await
+            .ok_or_else(|| AttestationError::ProviderNotFound(model.clone()))?;
+        let mut last_error = None;
+        for provider in self.drop_disabled_sources(providers) {
+            match provider
+                .get_attestation_report(
+                    model.clone(),
+                    signing_algo.clone(),
+                    nonce.clone(),
+                    signing_address.clone(),
+                    include_tls_fingerprint,
+                )
+                .await
+            {
+                Ok(mut report) => {
+                    report.remove("all_attestations");
+                    return Ok(report);
+                }
+                Err(error) => {
+                    debug!(
+                        model = %model,
+                        error = %error,
+                        "Provider returned error for ITA attestation request, trying next"
+                    );
+                    last_error = Some(error);
+                }
+            }
+        }
+        Err(last_error
+            .map(|error| AttestationError::FetchError(error.to_string()))
+            .unwrap_or_else(|| AttestationError::ProviderNotFound(model)))
+    }
+
     /// `provider_filter`: when `Some`, only providers matching the filter (NEAR tier,
-    /// or attested 3P of the given source) are tried. `None` preserves the existing behaviour (first successful wins).
+    /// or attested 3P of the given source) are tried. NEAR reports cover every
+    /// registered NEAR fleet for the model; other sources retain first-success
+    /// selection. A failed NEAR collection can fall back to another source when
+    /// the filter permits it, but reports from different sources are never mixed.
     ///
     /// `signing_algo` is forwarded to each backend verbatim. Backends accept
     /// only lowercase `ecdsa` / `ed25519`, so callers must pass a normalized
@@ -4270,36 +4321,84 @@ impl InferenceProviderPool {
             return Err(AttestationError::ProviderNotFound(model));
         }
 
-        // Keys are KMS-root-derived, so replicas under different roots can
-        // return different reports. Returning one report is still correct:
-        // discovery registers every key and request-time backend affinity keeps
-        // a client-pinned key within the matching identity group.
-        // Try providers in order and return the first successful response.
+        // A model can have multiple NEAR inference URLs/context tiers, each
+        // backed by several CVMs. Collect the entire NEAR group at its first
+        // position in the existing provider order. Never merge a partial group
+        // with a fallback source, or collapse CVMs that share a signing key.
         let mut last_error = None;
-        for provider in providers {
-            match provider
-                .get_attestation_report(
+        let mut tried_near = false;
+        for provider in &providers {
+            let is_near = provider.tier() == inference_providers::ProviderTier::Near;
+            let targets = if is_near {
+                if tried_near {
+                    continue;
+                }
+                tried_near = true;
+                providers
+                    .iter()
+                    .filter(|p| p.tier() == inference_providers::ProviderTier::Near)
+                    .collect::<Vec<_>>()
+            } else {
+                vec![provider]
+            };
+            let mut reports = Vec::new();
+            let mut failure = None;
+            // Fleets come from model configuration. Collect them concurrently
+            // so their timeouts do not add up, retaining provider order in the
+            // response and in failure selection.
+            let collections = futures::future::join_all(targets.into_iter().map(|target| {
+                target.get_attestation_reports(
                     model.clone(),
                     signing_algo.clone(),
                     nonce.clone(),
                     signing_address.clone(),
                     include_tls_fingerprint,
                 )
-                .await
-            {
-                Ok(mut attestation) => {
-                    attestation.remove("all_attestations");
-                    return Ok(vec![attestation]);
-                }
-                Err(e) => {
-                    tracing::debug!(
-                        model = %model,
-                        error = %e,
-                        "Provider returned error for attestation request, trying next"
-                    );
-                    last_error = Some(e);
+            }))
+            .await;
+            for (fleet_index, result) in collections.into_iter().enumerate() {
+                match result {
+                    Ok(batch) if !batch.is_empty() => {
+                        reports.extend(batch.into_iter().map(|mut report| {
+                            report.remove("all_attestations");
+                            report
+                        }));
+                    }
+                    // A signer filter can legitimately exclude an entire fleet.
+                    Err(AttestationError::SigningAddressNotFound(_))
+                        if signing_address.is_some() =>
+                    {
+                        debug!(
+                            model = %model,
+                            fleet_index,
+                            "Attestation fleet excluded: no backend matches the signing address"
+                        );
+                    }
+                    result => {
+                        failure = Some(match result {
+                            Err(error) => error,
+                            Ok(_) => AttestationError::InvalidResponse(
+                                "Provider returned an empty attestation collection".to_string(),
+                            ),
+                        });
+                        break;
+                    }
                 }
             }
+            if failure.is_none() && !reports.is_empty() {
+                return Ok(reports);
+            }
+            let error = failure.unwrap_or_else(|| {
+                AttestationError::SigningAddressNotFound(
+                    signing_address.clone().unwrap_or_default(),
+                )
+            });
+            debug!(
+                model = %model,
+                error = %error,
+                "Provider attestation collection failed, trying the next source"
+            );
+            last_error = Some(error);
         }
 
         Err(last_error

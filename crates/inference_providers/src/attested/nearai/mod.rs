@@ -1,3 +1,4 @@
+mod attestation;
 mod fleet;
 mod placement_report;
 mod prefix_router;
@@ -14,7 +15,6 @@ use fleet::Fleet;
 use placement_report::PlacementRequest;
 use prefix_router::PrefixRouter;
 use reqwest::{header::HeaderValue, Client};
-use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -803,6 +803,7 @@ impl Provider {
                 index_clients,
                 config,
                 client,
+                tls_roots,
                 fallback_client,
                 verification_semaphore,
                 fingerprint_state,
@@ -1810,67 +1811,36 @@ impl InferenceProvider for Fleet {
         signing_address: Option<String>,
         include_tls_fingerprint: bool,
     ) -> Result<serde_json::Map<String, serde_json::Value>, AttestationError> {
-        #[derive(Serialize)]
-        struct Query {
-            model: String,
-            signing_algo: Option<String>,
-            nonce: Option<String>,
-            signing_address: Option<String>,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            include_tls_fingerprint: Option<bool>,
-        }
+        self.fetch_attestation_at(
+            &self.client,
+            &self.config.base_url,
+            &attestation::ReportQuery::new(
+                model,
+                signing_algo,
+                nonce,
+                signing_address,
+                include_tls_fingerprint,
+            ),
+        )
+        .await
+    }
 
-        let query = Query {
+    async fn get_attestation_reports(
+        &self,
+        model: String,
+        signing_algo: Option<String>,
+        nonce: Option<String>,
+        signing_address: Option<String>,
+        include_tls_fingerprint: bool,
+    ) -> Result<Vec<serde_json::Map<String, serde_json::Value>>, AttestationError> {
+        self.collect_attestation_reports(attestation::ReportQuery::new(
             model,
             signing_algo,
             nonce,
             signing_address,
-            include_tls_fingerprint: include_tls_fingerprint.then_some(true),
-        };
-
-        // Build URL with optional query parameters
-        let url = format!(
-            "{}/v1/attestation/report?{}",
-            self.config.base_url,
-            serde_urlencoded::to_string(&query).map_err(|_| AttestationError::Unknown(
-                "Failed to serialize query string".to_string()
-            ))?
-        );
-
-        let headers = self.build_headers().map_err(AttestationError::FetchError)?;
-
-        let response = self
-            .client
-            .get(&url)
-            .headers(headers)
-            .timeout(self.config.control_timeout())
-            .send()
-            .await
-            .map_err(|e| AttestationError::FetchError(e.to_string()))?;
-
-        // Handle 404 responses (expected when signing_address doesn't match)
-        if response.status() == 404 {
-            return Err(AttestationError::SigningAddressNotFound(
-                query.signing_address.unwrap_or_default().to_string(),
-            ));
-        }
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let error_text = response
-                .text()
-                .await
-                .unwrap_or_else(|e| format!("Failed to read error response body: {e}"));
-            return Err(AttestationError::FetchError(format!(
-                "HTTP {status}: {error_text}",
-            )));
-        }
-
-        let attestation_report = response
-            .json()
-            .await
-            .map_err(|e| AttestationError::InvalidResponse(e.to_string()))?;
-        Ok(attestation_report)
+            include_tls_fingerprint,
+        ))
+        .await
     }
 
     /// Lists all available models from the vLLM server
@@ -2900,6 +2870,24 @@ impl InferenceProvider for Provider {
     ) -> Result<serde_json::Map<String, serde_json::Value>, AttestationError> {
         self.fleet
             .get_attestation_report(
+                model,
+                signing_algo,
+                nonce,
+                signing_address,
+                include_tls_fingerprint,
+            )
+            .await
+    }
+    async fn get_attestation_reports(
+        &self,
+        model: String,
+        signing_algo: Option<String>,
+        nonce: Option<String>,
+        signing_address: Option<String>,
+        include_tls_fingerprint: bool,
+    ) -> Result<Vec<serde_json::Map<String, serde_json::Value>>, AttestationError> {
+        self.fleet
+            .get_attestation_reports(
                 model,
                 signing_algo,
                 nonce,

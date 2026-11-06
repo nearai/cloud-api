@@ -23,10 +23,7 @@
 //! - `admin_credential_id`: admin token id, or the session's `sid` claim
 //! - `admin_user_id`: set once a credential authenticated, even if the
 //!   request is then denied; never for a rejected credential
-//! - `admin_organization_id`: the `{org_id}` of an allowed org-scoped route,
-//!   or a validated organization filter recorded by its handler
-//! - `admin_limit`, `admin_offset`, `admin_returned_count`: recorded by list
-//!   handlers on success
+//! - `admin_organization_id`: the `{org_id}` of an allowed org-scoped route
 //!
 //! Optional fields are omitted when unknown. A request whose future is
 //! dropped before a response (client disconnect) is still logged once,
@@ -82,21 +79,12 @@ enum AuthOutcome {
     Denied,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct Page {
-    limit: i64,
-    offset: i64,
-    returned_count: usize,
-}
-
 #[derive(Debug, Clone, Copy, Default)]
 struct Record {
     outcome: Option<AuthOutcome>,
     credential_kind: Option<AdminCredentialKind>,
     credential_id: Option<Uuid>,
     user_id: Option<Uuid>,
-    organization_id: Option<Uuid>,
-    page: Option<Page>,
 }
 
 /// Request-scoped audit record of an admin request.
@@ -131,22 +119,6 @@ impl AdminAudit {
 
     pub(crate) fn record_denied(&self) {
         self.update(|record| record.outcome = Some(AuthOutcome::Denied));
-    }
-
-    /// A validated organization filter restricted the request to one organization.
-    pub(crate) fn record_organization(&self, organization_id: Uuid) {
-        self.update(|record| record.organization_id = Some(organization_id));
-    }
-
-    /// A list handler served `returned_count` rows for its validated page.
-    pub(crate) fn record_page(&self, limit: i64, offset: i64, returned_count: usize) {
-        self.update(|record| {
-            record.page = Some(Page {
-                limit,
-                offset,
-                returned_count,
-            })
-        });
     }
 
     fn update(&self, apply: impl FnOnce(&mut Record)) {
@@ -191,10 +163,7 @@ impl Drop for AdminAuditEvent {
     fn drop(&mut self) {
         let record = self.record.snapshot();
         let allowed = record.outcome == Some(AuthOutcome::Allowed);
-        let organization_id = record
-            .organization_id
-            .or(self.route_organization_id.filter(|_| allowed));
-        let page = record.page;
+        let organization_id = self.route_organization_id.filter(|_| allowed);
         let duration_ms = u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX);
         // A root event, so the full and compact formats leave out the request
         // span's fields (raw path, client x-request-id). Production's JSON
@@ -217,9 +186,6 @@ impl Drop for AdminAuditEvent {
                 .map_or("none", AdminCredentialKind::as_str),
             admin_credential_id = record.credential_id.map(tracing::field::display),
             admin_organization_id = organization_id.map(tracing::field::display),
-            admin_limit = page.map(|page| page.limit),
-            admin_offset = page.map(|page| page.offset),
-            admin_returned_count = page.map(|page| page.returned_count as u64),
             admin_duration_ms = duration_ms,
             "admin request"
         );

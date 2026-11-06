@@ -1,7 +1,7 @@
 //! The models an organization allows itself to use.
 //!
 //! Owners and admins set `allowed_models` in the organization's settings
-//! (`PATCH /v1/organizations/{org_id}/settings`). When it is set, the
+//! (written through cloud-platform; this service has no write route). When it is set, the
 //! organization may use only those models, on every route that resolves a
 //! model, and `GET /v1/models` called with one of its API keys lists only
 //! those. Every other model is answered exactly like a model that does not
@@ -9,8 +9,7 @@
 //! `null` allows every model again.
 //!
 //! The settings need a signed-in member, so a leaked API key cannot lift the
-//! filter. Changes apply at once on the instance that handled the PATCH and
-//! within the model-resolve cache TTL (30 s) on the others.
+//! filter. Changes apply within the model-resolve cache TTL (30 s).
 
 use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;

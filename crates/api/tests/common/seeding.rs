@@ -31,7 +31,6 @@ use api::models::{
     ModelArchitecture, ModelMetadata, ModelWithPricing, OrganizationResponse, ServiceResponse,
     SpendLimit, UpdateOrganizationLimitsResponse,
 };
-use api::routes::workspaces::WorkspaceResponse;
 use chrono::{DateTime, Utc};
 use database::models::{AdminAccessTokenPermission, UpdateModelPricingRequest};
 use database::repositories::admin_access_token::AdminAccessTokenRepository;
@@ -48,6 +47,20 @@ use services::models::{ModelsServiceImpl, ModelsServiceTrait};
 use std::sync::{Arc, Mutex, Weak};
 use tokio::sync::OnceCell;
 use uuid::Uuid;
+
+/// A workspace row as seeding returns it.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct WorkspaceResponse {
+    pub id: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub organization_id: String,
+    pub created_by_user_id: String,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+    pub is_active: bool,
+    pub settings: Option<serde_json::Value>,
+}
 
 static SEED_DB: OnceCell<Arc<Database>> = OnceCell::const_new();
 
@@ -1127,6 +1140,11 @@ pub async fn seed_web_search_service() -> ServiceResponse {
 /// The shared mock user already holds `admin@test.com`, the default allowlisted email, so
 /// that email reuses it. The token has no User-Agent binding and read-write permission.
 pub async fn seed_admin_access_token(email: &str) -> String {
+    seed_admin_access_token_for_agent(email, None).await
+}
+
+/// Like `seed_admin_access_token`, with the token bound to `user_agent`.
+pub async fn seed_admin_access_token_for_agent(email: &str, user_agent: Option<&str>) -> String {
     let database = seed_database().await;
     let client = database
         .pool()
@@ -1162,12 +1180,124 @@ pub async fn seed_admin_access_token(email: &str) -> String {
             format!("e2e-{}", Uuid::new_v4()),
             "e2e test".to_string(),
             Utc::now() + chrono::Duration::days(1),
-            None,
+            user_agent.map(str::to_string),
             AdminAccessTokenPermission::ReadWrite,
         )
         .await
         .expect("Failed to seed admin access token");
     token
+}
+
+/// Revoke an API key as `ApiKeyRepository::revoke` does: stamp `deleted_at`.
+pub async fn seed_revoke_api_key(api_key_id: &str) {
+    let database = seed_database().await;
+    let id = Uuid::parse_str(api_key_id).expect("API key id must be a UUID");
+    let updated = database
+        .pool()
+        .get()
+        .await
+        .expect("Failed to get database connection")
+        .execute(
+            "UPDATE api_keys SET deleted_at = NOW() WHERE id = $1 AND deleted_at IS NULL",
+            &[&id],
+        )
+        .await
+        .expect("Failed to revoke API key");
+    assert_eq!(updated, 1, "API key not found or already revoked: {id}");
+}
+
+/// Set or clear an API key's spend limit, in nano-dollars.
+pub async fn seed_api_key_spend_limit(api_key_id: &str, spend_limit: Option<i64>) {
+    let database = seed_database().await;
+    let id = Uuid::parse_str(api_key_id).expect("API key id must be a UUID");
+    let updated = database
+        .pool()
+        .get()
+        .await
+        .expect("Failed to get database connection")
+        .execute(
+            "UPDATE api_keys SET spend_limit = $1 WHERE id = $2",
+            &[&spend_limit, &id],
+        )
+        .await
+        .expect("Failed to set API key spend limit");
+    assert_eq!(updated, 1, "API key not found: {id}");
+}
+
+/// Total cost recorded against one API key, in nano-dollars: the figure the per-key
+/// spend limit check compares with the key's limit.
+pub async fn api_key_spend(api_key_id: &str) -> i64 {
+    let database = seed_database().await;
+    let id = Uuid::parse_str(api_key_id).expect("API key id must be a UUID");
+    database
+        .pool()
+        .get()
+        .await
+        .expect("Failed to get database connection")
+        .query_one(
+            "SELECT COALESCE(SUM(total_cost), 0)::BIGINT FROM organization_usage_log
+             WHERE api_key_id = $1",
+            &[&id],
+        )
+        .await
+        .expect("Failed to read API key spend")
+        .get(0)
+}
+
+/// Merge `patch` into the organization's `settings` JSON, as the settings route wrote
+/// its keys. Keys are stored as given, without the route's validation.
+pub async fn seed_organization_settings(org_id: &str, patch: serde_json::Value) {
+    let database = seed_database().await;
+    let organization_id = Uuid::parse_str(org_id).expect("organization id must be a UUID");
+    let updated = database
+        .pool()
+        .get()
+        .await
+        .expect("Failed to get database connection")
+        .execute(
+            "UPDATE organizations
+             SET settings = COALESCE(settings, '{}'::jsonb) || $2::jsonb, updated_at = NOW()
+             WHERE id = $1 AND is_active = true",
+            &[&organization_id, &patch],
+        )
+        .await
+        .expect("Failed to seed organization settings");
+    assert_eq!(updated, 1, "Organization not found: {organization_id}");
+}
+
+/// Soft-delete an organization the way the delete route did: clear `is_active` on the
+/// organization, its workspaces and its API keys.
+pub async fn seed_delete_organization(org_id: &str) {
+    let database = seed_database().await;
+    let organization_id = Uuid::parse_str(org_id).expect("organization id must be a UUID");
+    let client = database
+        .pool()
+        .get()
+        .await
+        .expect("Failed to get database connection");
+    client
+        .execute(
+            "UPDATE organizations SET is_active = false WHERE id = $1",
+            &[&organization_id],
+        )
+        .await
+        .expect("Failed to deactivate organization");
+    client
+        .execute(
+            "UPDATE api_keys SET is_active = false, deleted_at = COALESCE(deleted_at, NOW())
+             WHERE workspace_id IN (SELECT id FROM workspaces WHERE organization_id = $1)",
+            &[&organization_id],
+        )
+        .await
+        .expect("Failed to deactivate API keys");
+    client
+        .execute(
+            "UPDATE workspaces SET is_active = false, updated_at = NOW()
+             WHERE organization_id = $1",
+            &[&organization_id],
+        )
+        .await
+        .expect("Failed to deactivate workspaces");
 }
 
 /// Set or clear the organization's `allowed_models` setting. It is a key of the

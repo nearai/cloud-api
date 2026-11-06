@@ -34,11 +34,6 @@ Operations marked deprecated (account, organization, workspace, invitation, API 
         (name = "Conversations", description = "Temporary authenticated, workspace-scoped migration access for export and account deletion. Only `POST /v1/conversations/batch`, `GET /v1/conversations/{conversation_id}`, `GET /v1/conversations/{conversation_id}/items`, and `DELETE /v1/conversations/{conversation_id}` are available. Conversation creation and every other mutation return `410 Gone`; this surface will be removed after data migration. Migration responses use `Cache-Control: no-store`."),
         (name = "Files", description = "Temporary authenticated, workspace-scoped migration access for export and account deletion. Only `GET /v1/files`, `GET /v1/files/{file_id}`, `GET /v1/files/{file_id}/content`, and `DELETE /v1/files/{file_id}` are available. Upload and every other mutation return `410 Gone`; this surface will be removed after data migration. Migration responses use `Cache-Control: no-store`."),
         (name = "Responses", description = "Stateless response inference. Both paths normalize omitted or null `store` to `false` and reject `store: true`. Raw request/response content, response items, and history are not persisted. Clients must include any prior context in each request. Canonical `openai/` models use one upstream native Responses request after alias resolution. Other models use the typed adapter, with bounded request-scoped inference rounds when hosted search is requested.\n\nBoth paths accept client-managed `function` and `custom` tools, including tools grouped in a `namespace`, and leading developer `additional_tools` declarations. Cloud returns calls without executing them; clients replay each `function_call` or `custom_tool_call` with its matching output and caller-managed history. Preserve `call_id`, names, namespaces, raw arguments or custom input, and provider metadata such as `thought_signature`. The typed replay path accepts assistant `output_text` parts and plaintext `reasoning` items, using reasoning content or its summary as prior assistant context. Encrypted-only reasoning requires a native Responses backend. The typed adapter supports text custom tools and the Codex `exec` Lark source grammar; other grammars require a native backend.\n\nEach generated item has its own `output_index`. Tool calls finish with `response.output_item.done`; a successful model turn ends with `response.completed`, including when tools await client execution. Reasoning uses `response.reasoning_text.delta`; failures expose `response.error` in `response.failed` and preserve partial usage.\n\nThe typed adapter executes `web_search` and `web_context_search` using a bounded request-scoped loop, emits search lifecycle events and URL citations, and accumulates usage across inference rounds without storing history. Optional `web_search.count` (0–20) overrides model-selected counts; 0 skips the search provider. If a model emits client tool calls and searches in the same round, client calls are returned without executing that round's searches. On the typed path, completed search output markers may accompany replayed assistant text, but raw search results are not restored across requests. Native Responses also accepts top-level `web_search`, executed by the upstream provider without a Cloud search loop. Complete native `web_search_call` replay items, search configuration, and `include` are forwarded unchanged; provider-returned search citations and sources retain their native shape. `file_search`, `code_interpreter`, `computer`, and remote `mcp` are unsupported. Image-generation/editing models are rejected on both paths. The separate `POST /mcp` endpoint exposes its `web_search` tool independently of Responses; use `/v1/images/*` for image generation/editing. Existing completed-response gateway attestation is preserved best-effort: when the signature write succeeds, `GET /v1/signature/resp_*` retrieves signatures over SHA-256 request/response digests, never raw content. Interrupted streams create no `resp_*` attestation record or legacy disconnect fallback. Responses rejects conversation linkage, response history, and file input; the separate Conversation and File endpoints are not part of Responses inference."),
-        (name = "Organizations", description = "Organization management"),
-        (name = "Organization Members", description = "Organization member and invitation management"),
-        (name = "Workspaces", description = "Workspace and API key management"),
-        (name = "Users", description = "User profile and token management"),
-        (name = "Invitations", description = "Token-based invitation handling"),
         (name = "Health", description = "Health check endpoints"),
         (name = "Attestation", description = "Attestation and verification endpoints"),
         (name = "Gateway", description = "Model gateway integration endpoints"),
@@ -82,64 +77,10 @@ Operations marked deprecated (account, organization, workspace, invitation, API 
         crate::routes::files::delete_file,
         // Response endpoints
         crate::routes::responses::create_response,
-        // Organization endpoints
-        crate::routes::organizations::list_organizations,
-        crate::routes::organizations::create_organization,
-        crate::routes::organizations::get_organization,
-        crate::routes::organizations::update_organization,
-        crate::routes::organizations::delete_organization,
-        crate::routes::organizations::get_organization_settings,
-        crate::routes::organizations::patch_organization_settings,
-        // Organization Members endpoints
-        crate::routes::organization_members::add_organization_member,
-        crate::routes::organization_members::invite_organization_member_by_email,
-        crate::routes::organization_members::update_organization_member,
-        crate::routes::organization_members::remove_organization_member,
-        crate::routes::organization_members::list_organization_members,
-        crate::routes::organization_members::list_organization_invitations,
-        crate::routes::organization_members::cancel_organization_invitation,
-        crate::routes::organization_members::cancel_invitation,
-        // Workspace endpoints
-        crate::routes::workspaces::create_workspace,
-        crate::routes::workspaces::list_organization_workspaces,
-        crate::routes::workspaces::get_workspace,
-        crate::routes::workspaces::update_workspace,
-        crate::routes::workspaces::delete_workspace,
-        crate::routes::workspaces::create_workspace_api_key,
-        crate::routes::workspaces::list_workspace_api_keys,
-        crate::routes::workspaces::revoke_workspace_api_key,
-        crate::routes::workspaces::update_api_key_spend_limit,
-        crate::routes::workspaces::update_workspace_api_key,
-        // Users endpoints
-        crate::routes::users::get_current_user,
-        crate::routes::users::get_user_status,
-        crate::routes::users::update_current_user_profile,
-        crate::routes::users::request_contact_email,
-        crate::routes::users::remove_contact_email,
-        crate::routes::users::verify_contact_email,
-        crate::routes::users::get_user_refresh_tokens,
-        crate::routes::users::revoke_user_refresh_token,
-        crate::routes::users::revoke_all_user_tokens,
-        crate::routes::users::create_access_token,
-        crate::routes::users::list_user_invitations,
-        crate::routes::users::accept_invitation,
-        crate::routes::users::decline_invitation,
-        // Invitation endpoints (token-based)
-        crate::routes::users::get_invitation_by_token,
-        crate::routes::users::accept_invitation_by_token,
         // Gateway endpoints (model gateway integration)
         crate::routes::gateway::check_api_key,
         // Admin endpoints (less frequently used)
-        crate::routes::admin::preview_user_erasure,
-        crate::routes::admin::erase_user,
-        crate::routes::admin::lookup_user_erasures,
         crate::routes::admin::get_infra_summary,
-        crate::routes::admin::list_invitation_email_deliveries,
-        crate::routes::admin::resend_invitation_email,
-        crate::routes::admin::update_organization_member_role,
-        crate::routes::admin::create_admin_access_token,
-        crate::routes::admin::list_admin_access_tokens,
-        crate::routes::admin::delete_admin_access_token,
         crate::routes::services::list_services,
         crate::routes::services::get_service_by_name,
         // Health check endpoint
@@ -154,13 +95,6 @@ Operations marked deprecated (account, organization, workspace, invitation, API 
         schemas(
             // Health check models
             crate::routes::health::HealthResponse,
-            // List query parameter enums: utoipa does not collect types used only in `params`
-            crate::routes::organizations::OrganizationOrderBy,
-            crate::routes::organizations::OrganizationOrderDirection,
-            crate::routes::workspaces::WorkspaceOrderBy,
-            crate::routes::workspaces::WorkspaceOrderDirection,
-            crate::routes::workspaces::ApiKeyOrderBy,
-            crate::routes::workspaces::ApiKeyOrderDirection,
             // Core API models
             ChatCompletionRequest, ChatCompletionResponse, Message, CompletionUsage,
             CompletionRequest, CompletionPrompt, StopSequences, CompletionResponse,
@@ -175,47 +109,6 @@ Operations marked deprecated (account, organization, workspace, invitation, API 
             RerankRequest, RerankResponse, RerankResult, RerankUsage,
             // Score models
             ScoreRequest, ScoreResponse,
-            // Organization models
-            CreateOrganizationRequest, OrganizationResponse,
-            UpdateOrganizationRequest, CreateApiKeyRequest, ApiKeyResponse,
-            UpdateApiKeySpendLimitRequest, UpdateApiKeyRequest,
-            // usage_hourly repair models
-                            // Workspace models
-            crate::routes::workspaces::CreateWorkspaceRequest,
-            crate::routes::workspaces::UpdateWorkspaceRequest,
-            crate::routes::workspaces::WorkspaceResponse,
-            // Organization Members models
-            AddOrganizationMemberRequest,
-            InvitationEntry,
-            InviteOrganizationMemberByEmailRequest,
-            InvitationResult,
-            InviteOrganizationMemberByEmailResponse,
-            UpdateOrganizationMemberRequest,
-            OrganizationMemberResponse,
-            PublicOrganizationMemberResponse,
-            AdminOrganizationMemberResponse,
-            ListAdminOrganizationMembersResponse,
-            AdminOrganizationResponse,
-            AdminApiKeyResponse,
-            ListAdminApiKeysResponse,
-            MemberRole,
-            // Organization Invitation models
-            InvitationStatus,
-            InvitationEmailStatus,
-            OrganizationInvitationResponse,
-            OrganizationInvitationWithOrgResponse,
-            AcceptInvitationResponse,
-            // Users models
-            UserResponse,
-            RefreshTokenResponse,
-            AccessAndRefreshTokenResponse,
-            PublicUserResponse,
-            AdminUserResponse,
-            crate::routes::users::UpdateUserProfileRequest,
-            crate::routes::users::UserStatusResponse,
-            crate::routes::users::RequestContactEmailRequest,
-            crate::routes::users::VerifyContactEmailRequest,
-            crate::routes::users::ContactEmailStatusResponse,
             // Temporary Conversation migration models
             BatchConversationsRequest, ConversationBatchResponse, ConversationObject,
             ConversationItemList, ConversationDeleteResult,
@@ -239,19 +132,6 @@ Operations marked deprecated (account, organization, workspace, invitation, API 
             DecimalPrice, DecimalPriceRequest, ModelMetadata,
             ServiceResponse, ServiceListResponse,
             SpendLimit, SpendLimitRequest,
-            // Invitation email delivery models (Admin)
-            AdminInvitationEmailDeliveryResponse, ListAdminInvitationEmailDeliveriesResponse,
-            AdminInvitationEmailResendResultResponse,
-            // User models (Admin)
-            ListUsersResponse, AdminUserResponse,
-            ErasurePreviewResponse, ErasedOrganizationResponse, RetainedOrganizationResponse,
-            ErasureLogResponse, EraseUserRequest, EraseUserResponse, ErasureBlockedResponse,
-            LookupUserErasuresRequest, LookupUserErasuresResponse, UserErasureRecordResponse,
-            ErasureLookupOrganizationResponse,
-            services::user_erasure::ErasureBlocker,
-            // Admin access token models
-            CreateAdminAccessTokenRequest, AdminAccessTokenResponse,
-            AdminAccessTokenPermission, AdminAccessTokenListEntry, ListAdminAccessTokensResponse,
             // Usage tracking models
             crate::routes::internal_usage::RecordUsageResponse,
             // Gateway models
@@ -570,58 +450,5 @@ mod admin_token_permission_tests {
         assert!("unknown"
             .parse::<database::models::AdminAccessTokenPermission>()
             .is_err());
-    }
-
-    #[test]
-    fn permission_schema_and_admin_authorization_are_documented() {
-        let doc = serde_json::to_value(ApiDoc::openapi()).unwrap();
-        let schemas = &doc["components"]["schemas"];
-        assert_eq!(
-            schemas["AdminAccessTokenPermission"]["enum"],
-            json!(["read_only", "read_write"])
-        );
-        let create = &schemas["CreateAdminAccessTokenRequest"];
-        assert_eq!(create["properties"]["permission"]["default"], "read_write");
-        assert!(!create["required"]
-            .as_array()
-            .unwrap()
-            .contains(&json!("permission")));
-        for model in ["AdminAccessTokenResponse", "AdminAccessTokenListEntry"] {
-            assert!(schemas[model]["properties"].get("permission").is_some());
-        }
-        for (path, method, phrase, tokens_allowed) in [
-            ("/v1/admin/access-tokens", "get", "session only", false),
-            ("/v1/admin/access-tokens", "post", "session only", false),
-            (
-                "/v1/admin/access-tokens/{token_id}",
-                "delete",
-                "session only",
-                false,
-            ),
-        ] {
-            let operation = &doc["paths"][path][method];
-            assert!(
-                operation["description"].as_str().unwrap().contains(phrase),
-                "{method} {path}"
-            );
-            assert!(operation["responses"].get("403").is_some());
-            assert_eq!(
-                operation["security"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .any(|s| s.get("admin_token").is_some()),
-                tokens_allowed
-            );
-        }
-        assert!(doc["paths"]["/v1/admin/access-tokens"]["post"]["responses"]
-            .get("503")
-            .is_some());
-        assert!(
-            doc["paths"]["/v1/admin/access-tokens"]["get"]["responses"]["200"]["content"]
-                ["application/json"]["schema"]
-                .to_string()
-                .contains("ListAdminAccessTokensResponse")
-        );
     }
 }

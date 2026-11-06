@@ -1,29 +1,38 @@
 use crate::common::*;
-use api::models::{AdminAccessTokenPermission, AdminAccessTokenResponse};
+use api::models::AdminAccessTokenPermission;
 use axum::http::{Method, StatusCode};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-async fn issue(
-    server: &axum_test::TestServer,
-    permission: Option<&str>,
-) -> AdminAccessTokenResponse {
-    let mut body = json!({
-        "name": format!("permissions-{}", Uuid::new_v4()),
-        "reason": "Admin permission integration test",
-        "expires_in_hours": 24
-    });
-    if let Some(permission) = permission {
-        body["permission"] = json!(permission);
+struct Issued {
+    id: Uuid,
+    access_token: String,
+}
+
+/// An admin token for the mock user with the given permission, written by the
+/// repository that hashes and validates admin tokens.
+async fn issue(db: &database::Database, permission: Option<&str>) -> Issued {
+    let permission = match permission {
+        None | Some("read_write") => database::models::AdminAccessTokenPermission::ReadWrite,
+        Some("read_only") => database::models::AdminAccessTokenPermission::ReadOnly,
+        Some(other) => panic!("unknown permission {other}"),
+    };
+    let (row, access_token) =
+        database::repositories::AdminAccessTokenRepository::new(db.pool().clone())
+            .create(
+                Uuid::parse_str(MOCK_USER_ID).unwrap(),
+                format!("permissions-{}", Uuid::new_v4()),
+                "Admin permission integration test".to_string(),
+                chrono::Utc::now() + chrono::Duration::hours(24),
+                Some(MOCK_USER_AGENT.to_string()),
+                permission,
+            )
+            .await
+            .unwrap();
+    Issued {
+        id: row.id,
+        access_token,
     }
-    let response = server
-        .post("/v1/admin/access-tokens")
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
-        .add_header("User-Agent", MOCK_USER_AGENT)
-        .json(&body)
-        .await;
-    assert_eq!(response.status_code(), StatusCode::OK);
-    response.json()
 }
 
 async fn call(
@@ -50,8 +59,8 @@ fn assert_forbidden(response: &axum_test::TestResponse, error_type: &str) {
 }
 
 #[tokio::test]
-async fn permissions_persist_in_create_validate_get_and_list() {
-    let (server, db) = setup_test_server_with_config_and_database(|config| {
+async fn permissions_persist_in_create_validate_and_get() {
+    let (_server, db) = setup_test_server_with_config_and_database(|config| {
         config.auth.admin_read_only_tokens_enabled = true;
     })
     .await;
@@ -61,11 +70,9 @@ async fn permissions_persist_in_create_validate_get_and_list() {
         (Some("read_write"), AdminAccessTokenPermission::ReadWrite),
         (Some("read_only"), AdminAccessTokenPermission::ReadOnly),
     ] {
-        let created = issue(&server, requested).await;
-        assert_eq!(created.permission, expected);
+        let created = issue(&db, requested).await;
         assert!(created.access_token.starts_with("adm_"));
-        let id = Uuid::parse_str(&created.id).unwrap();
-        let stored = repo.get_by_id(id).await.unwrap().unwrap();
+        let stored = repo.get_by_id(created.id).await.unwrap().unwrap();
         assert_eq!(stored.permission, expected.into());
         assert_ne!(stored.token_hash, created.access_token);
         let validated = repo
@@ -75,67 +82,15 @@ async fn permissions_persist_in_create_validate_get_and_list() {
             .unwrap();
         assert_eq!(validated.permission, expected.into());
         assert!(validated.last_used_at.is_some());
-        let listed = call(
-            &server,
-            Method::GET,
-            "/v1/admin/access-tokens?limit=1000",
-            &get_session_id(),
-            json!({}),
-        )
-        .await;
-        assert_eq!(listed.status_code(), StatusCode::OK);
-        let listed = listed.json::<api::models::ListAdminAccessTokensResponse>();
-        let entry = listed.data.iter().find(|entry| entry.id == id).unwrap();
-        assert_eq!(entry.permission, expected);
-    }
-
-    for invalid in [Value::Null, json!("admin"), json!("READ_ONLY"), json!(7)] {
-        let response = call(
-            &server,
-            Method::POST,
-            "/v1/admin/access-tokens",
-            &get_session_id(),
-            json!({
-                "name": "invalid", "reason": "test", "expires_in_hours": 24, "permission": invalid
-            }),
-        )
-        .await;
-        assert!(matches!(
-            response.status_code(),
-            StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY
-        ));
     }
 }
 
 #[tokio::test]
-async fn issuance_gate_does_not_relax_existing_token_permissions() {
+async fn existing_read_only_token_keeps_its_permission_when_issuance_is_disabled() {
     let (server, db) = setup_test_server_with_config_and_database(|config| {
         config.auth.admin_read_only_tokens_enabled = false;
     })
     .await;
-    let response = call(
-        &server,
-        Method::POST,
-        "/v1/admin/access-tokens",
-        &get_session_id(),
-        json!({
-            "name": "gated", "reason": "test", "expires_in_hours": 24, "permission": "read_only"
-        }),
-    )
-    .await;
-    assert_eq!(response.status_code(), StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(
-        response.json::<Value>()["error"]["type"],
-        "read_only_token_issuance_disabled"
-    );
-    assert_eq!(
-        issue(&server, None).await.permission,
-        AdminAccessTokenPermission::ReadWrite
-    );
-    assert_eq!(
-        issue(&server, Some("read_write")).await.permission,
-        AdminAccessTokenPermission::ReadWrite
-    );
 
     // Model a token issued before the gate was disabled, without enabling it on this server.
     let repo = database::repositories::AdminAccessTokenRepository::new(db.pool().clone());
@@ -168,9 +123,8 @@ async fn read_only_reads_and_mixed_method_mutations_have_no_side_effects() {
         config.auth.admin_read_only_tokens_enabled = true;
     })
     .await;
-    let org = create_org(&server).await;
-    let read_only = issue(&server, Some("read_only")).await.access_token;
-    let read_write = issue(&server, Some("read_write")).await.access_token;
+    let read_only = issue(&db, Some("read_only")).await.access_token;
+    let read_write = issue(&db, Some("read_write")).await.access_token;
     let job_count = || async {
         db.pool()
             .get()
@@ -206,14 +160,6 @@ async fn read_only_reads_and_mixed_method_mutations_have_no_side_effects() {
             ),
             json!({}),
         ),
-        (
-            Method::PUT,
-            format!(
-                "/v1/admin/organizations/{}/members/{}",
-                org.id, MOCK_USER_ID
-            ),
-            json!({"role": "member"}),
-        ),
     ] {
         assert_forbidden(
             &call(&server, method, &route, &read_only, body).await,
@@ -224,11 +170,7 @@ async fn read_only_reads_and_mixed_method_mutations_have_no_side_effects() {
     assert_eq!(after.json::<Value>(), keys_before);
     assert_eq!(job_count().await, jobs_before);
 
-    for route in [
-        ENCRYPTION_KEYS,
-        "/v1/admin/object-encryption/keys",
-        "/v1/admin/invitation-email-deliveries",
-    ] {
+    for route in [ENCRYPTION_KEYS, "/v1/admin/object-encryption/keys"] {
         assert_eq!(
             call(&server, Method::GET, route, &read_only, json!({}))
                 .await
@@ -263,27 +205,6 @@ async fn read_only_reads_and_mixed_method_mutations_have_no_side_effects() {
             .status_code(),
             StatusCode::OK
         );
-    }
-
-    for token in [&read_only, &read_write] {
-        for (method, route, body) in [
-            (Method::GET, "/v1/admin/access-tokens".into(), json!({})),
-            (
-                Method::POST,
-                "/v1/admin/access-tokens".into(),
-                json!({"name": "forbidden", "reason": "test", "expires_in_hours": 1}),
-            ),
-            (
-                Method::DELETE,
-                format!("/v1/admin/access-tokens/{}", Uuid::new_v4()),
-                json!({"reason": "test"}),
-            ),
-        ] {
-            assert_forbidden(
-                &call(&server, method, &route, token, body).await,
-                "forbidden",
-            );
-        }
     }
 }
 
@@ -393,12 +314,12 @@ async fn unclassified_routes_deny_reads_and_preserve_authentication_context() {
         Arc,
     };
 
-    let (server, db) = setup_test_server_with_config_and_database(|config| {
+    let (_server, db) = setup_test_server_with_config_and_database(|config| {
         config.auth.admin_read_only_tokens_enabled = true;
     })
     .await;
-    let read_only = issue(&server, Some("read_only")).await;
-    let read_write = issue(&server, Some("read_write")).await;
+    let read_only = issue(&db, Some("read_only")).await;
+    let read_write = issue(&db, Some("read_write")).await;
     let entered = Arc::new(AtomicUsize::new(0));
     let count = entered.clone();
     let probe = move |Extension(context): Extension<AdminAuthContext>,
@@ -414,7 +335,7 @@ async fn unclassified_routes_deny_reads_and_preserve_authentication_context() {
             })
         }
     };
-    let auth = api::init_auth_services(db, &test_config()).auth_state_middleware;
+    let auth = api::init_auth_services(db.clone(), &test_config()).auth_state_middleware;
     let routes = Router::new()
         .route("/admin/unreviewed", get(probe.clone()).post(probe.clone()))
         // The same URL as an approved POST must not accidentally approve a new GET.
@@ -627,18 +548,6 @@ async fn existing_service_tokens_follow_the_creator_email_allowlist() {
 
             assert_forbidden(&response, "forbidden");
         }
-
-        // Ordinary authenticated user endpoints remain available.
-        let response = call(
-            &denied_server,
-            Method::GET,
-            "/v1/users/me",
-            &get_session_id(),
-            json!({}),
-        )
-        .await;
-
-        assert_eq!(response.status_code(), StatusCode::OK);
     }
 
     let response = call(

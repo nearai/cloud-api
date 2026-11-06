@@ -17,70 +17,7 @@ pub const DEPRECATION_NOTE: &str = "**Deprecated:** this endpoint is moving to c
 ///
 /// Not listed: `/v1/auth/*`, which moves too but has no `#[utoipa::path]`
 /// annotation, so it is not in the generated spec for the hook to mark.
-pub const MOVED_TO_CLOUD_PLATFORM: &[(&str, &str)] = &[
-    ("get", "/v1/admin/access-tokens"),
-    ("post", "/v1/admin/access-tokens"),
-    ("delete", "/v1/admin/access-tokens/{token_id}"),
-    ("get", "/v1/admin/invitation-email-deliveries"),
-    (
-        "post",
-        "/v1/admin/invitation-email-deliveries/{invitation_id}/resend",
-    ),
-    ("put", "/v1/admin/organizations/{org_id}/members/{user_id}"),
-    ("post", "/v1/admin/user-erasures/lookup"),
-    ("post", "/v1/admin/users/{user_id}/erasure"),
-    ("post", "/v1/admin/users/{user_id}/erasure/preview"),
-    ("post", "/v1/check_api_key"),
-    ("get", "/v1/invitations/{token}"),
-    ("post", "/v1/invitations/{token}/accept"),
-    ("get", "/v1/organizations"),
-    ("post", "/v1/organizations"),
-    ("get", "/v1/organizations/{org_id}"),
-    ("put", "/v1/organizations/{org_id}"),
-    ("delete", "/v1/organizations/{org_id}"),
-    (
-        "delete",
-        "/v1/organizations/{org_id}/invitations/{invitation_id}",
-    ),
-    ("get", "/v1/organizations/{org_id}/members"),
-    ("post", "/v1/organizations/{org_id}/members"),
-    ("get", "/v1/organizations/{org_id}/members/invitations"),
-    (
-        "delete",
-        "/v1/organizations/{org_id}/members/invitations/{invitation_id}",
-    ),
-    ("post", "/v1/organizations/{org_id}/members/invite-by-email"),
-    ("put", "/v1/organizations/{org_id}/members/{user_id}"),
-    ("delete", "/v1/organizations/{org_id}/members/{user_id}"),
-    ("get", "/v1/organizations/{org_id}/settings"),
-    ("patch", "/v1/organizations/{org_id}/settings"),
-    ("get", "/v1/organizations/{org_id}/workspaces"),
-    ("post", "/v1/organizations/{org_id}/workspaces"),
-    ("post", "/v1/users/contact-email/verify"),
-    ("get", "/v1/users/me"),
-    ("post", "/v1/users/me/access-tokens"),
-    ("post", "/v1/users/me/contact-email"),
-    ("delete", "/v1/users/me/contact-email"),
-    ("get", "/v1/users/me/invitations"),
-    ("post", "/v1/users/me/invitations/{invitation_id}/accept"),
-    ("post", "/v1/users/me/invitations/{invitation_id}/decline"),
-    ("put", "/v1/users/me/profile"),
-    ("get", "/v1/users/me/refresh-tokens"),
-    ("delete", "/v1/users/me/refresh-tokens/{refresh_token_id}"),
-    ("get", "/v1/users/me/status"),
-    ("delete", "/v1/users/me/tokens"),
-    ("get", "/v1/workspaces/{workspace_id}"),
-    ("put", "/v1/workspaces/{workspace_id}"),
-    ("delete", "/v1/workspaces/{workspace_id}"),
-    ("get", "/v1/workspaces/{workspace_id}/api-keys"),
-    ("post", "/v1/workspaces/{workspace_id}/api-keys"),
-    ("patch", "/v1/workspaces/{workspace_id}/api-keys/{key_id}"),
-    ("delete", "/v1/workspaces/{workspace_id}/api-keys/{key_id}"),
-    (
-        "patch",
-        "/v1/workspaces/{workspace_id}/api-keys/{key_id}/spend-limit",
-    ),
-];
+pub const MOVED_TO_CLOUD_PLATFORM: &[(&str, &str)] = &[("post", "/v1/check_api_key")];
 
 pub struct DeprecatedRoutesAddon;
 

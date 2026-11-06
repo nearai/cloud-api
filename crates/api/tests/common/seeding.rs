@@ -710,3 +710,30 @@ pub async fn seed_admin_access_token(email: &str) -> String {
         .expect("Failed to seed admin access token");
     token
 }
+
+/// Set or clear the organization's `allowed_models` setting. It is a key of the
+/// `organizations.settings` JSON; `None` removes it, which allows every model. Names are
+/// stored as given, so pass canonical model names.
+pub async fn seed_allowed_models(org_id: &str, allowed_models: Option<&[String]>) {
+    let database = seed_database().await;
+    let organization_id = Uuid::parse_str(org_id).expect("organization id must be a UUID");
+    let allowed = allowed_models.map(|names| serde_json::json!(names));
+    let updated = database
+        .pool()
+        .get()
+        .await
+        .expect("Failed to get database connection")
+        .execute(
+            "UPDATE organizations
+             SET settings = CASE
+                     WHEN $2::jsonb IS NULL THEN COALESCE(settings, '{}'::jsonb) - 'allowed_models'
+                     ELSE jsonb_set(COALESCE(settings, '{}'::jsonb), '{allowed_models}', $2::jsonb, true)
+                 END,
+                 updated_at = NOW()
+             WHERE id = $1 AND is_active = true",
+            &[&organization_id, &allowed],
+        )
+        .await
+        .expect("Failed to seed allowed_models");
+    assert_eq!(updated, 1, "Organization not found: {organization_id}");
+}

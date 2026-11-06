@@ -1148,14 +1148,6 @@ pub fn build_app_with_config_and_options(
     config: Arc<ApiConfig>,
     build_options: AppBuildOptions,
 ) -> Router {
-    // Create analytics service (shared between user and admin routes)
-    let analytics_repository = Arc::new(database::repositories::PgAnalyticsRepository::new(
-        database.pool().clone(),
-    ));
-    let analytics_service = Arc::new(services::admin::AnalyticsService::new(
-        analytics_repository as Arc<dyn services::admin::AnalyticsRepository>,
-    ));
-
     // Initialize OHTTP gateway (RFC 9458) if OHTTP_ENABLED=true.
     // The gateway key is deterministically derived from the same dstack KMS Ed25519 seed
     // used for chat-completion signing — all instances share the same HPKE public key.
@@ -1203,7 +1195,6 @@ pub fn build_app_with_config_and_options(
         files_service: domain_services.files_service.clone(),
         inference_provider_pool: domain_services.inference_provider_pool.clone(),
         metrics_service: domain_services.metrics_service.clone(),
-        analytics_service: analytics_service.clone(),
         staking_farm_service: domain_services.staking_farm_service.clone(),
         aml_service: domain_services.aml_service.clone(),
         config: config.clone(),
@@ -1304,7 +1295,6 @@ pub fn build_app_with_config_and_options(
         AdminRouteServices {
             object_encryption_state: domain_services.object_encryption_state.clone(),
             inference_provider_pool: app_state.inference_provider_pool.clone(),
-            analytics_service,
             staking_farm_service: app_state.staking_farm_service.clone(),
             aml_service: app_state.aml_service.clone(),
             models_service: cloud_platform::invalidating_models_service(
@@ -2215,7 +2205,6 @@ fn cache_control_layer(value: &'static str) -> CacheControlLayer {
 pub struct AdminRouteServices {
     pub object_encryption_state: object_encryption::ObjectEncryptionState,
     pub inference_provider_pool: Arc<services::inference_provider_pool::InferenceProviderPool>,
-    pub analytics_service: Arc<services::admin::AnalyticsService>,
     pub staking_farm_service: Arc<services::staking_farm::StakingFarmService>,
     pub aml_service: Arc<services::aml::AmlService>,
     /// Invalidated by admin writes: see `cloud_platform::invalidating_models_service`.
@@ -2255,18 +2244,14 @@ fn build_admin_routes_with_options(
         batch_upsert_models, cancel_model_pricing_change, confirm_model_deprecation,
         confirm_model_pricing_changes, create_admin_access_token, create_service,
         delete_admin_access_token, delete_aml_allowlist_entry, delete_model, deprecate_model,
-        erase_user, get_admin_setting, get_billing_summary, get_infra_summary,
-        get_model_consumption_timeseries, get_model_history, get_model_revenue, get_org_revenue,
-        get_organization as get_admin_organization, get_organization_concurrent_limit,
-        get_organization_fallback, get_organization_limits_history, get_organization_metrics,
-        get_organization_priority, get_organization_timeseries, get_performance_timeseries,
-        get_platform_metrics, get_platform_timeseries, get_revenue_density,
-        list_admin_access_tokens, list_admin_settings, list_aml_allowlist, list_aml_reports,
-        list_api_keys, list_invitation_email_deliveries, list_model_pricing_changes,
-        list_models as admin_list_models, list_organization_members, list_organizations,
-        list_users, lookup_user_erasures, preview_model_deprecation, preview_model_pricing_changes,
-        preview_user_erasure, resend_invitation_email, update_admin_setting,
-        update_aml_report_status, update_organization_concurrent_limit,
+        erase_user, get_admin_setting, get_infra_summary, get_model_history,
+        get_organization_concurrent_limit, get_organization_fallback,
+        get_organization_limits_history, get_organization_priority, list_admin_access_tokens,
+        list_admin_settings, list_aml_allowlist, list_aml_reports,
+        list_invitation_email_deliveries, list_model_pricing_changes,
+        list_models as admin_list_models, lookup_user_erasures, preview_model_deprecation,
+        preview_model_pricing_changes, preview_user_erasure, resend_invitation_email,
+        update_admin_setting, update_aml_report_status, update_organization_concurrent_limit,
         update_organization_fallback, update_organization_limits, update_organization_member_role,
         update_organization_priority, update_service, upsert_aml_allowlist_entry, AdminAppState,
     };
@@ -2313,7 +2298,6 @@ fn build_admin_routes_with_options(
 
     let admin_app_state = AdminAppState {
         admin_service,
-        analytics_service: services.analytics_service,
         organization_service: services.organization_service,
         auth_service: auth_state_middleware.auth_service.clone(),
         usage_service: services.usage_service,
@@ -2430,34 +2414,6 @@ fn build_admin_routes_with_options(
             axum::routing::get(get_organization_fallback).patch(update_organization_fallback),
         )
         .route(
-            "/admin/organizations/{org_id}/metrics",
-            axum::routing::get(get_organization_metrics),
-        )
-        .route(
-            "/admin/organizations/{org_id}/metrics/timeseries",
-            axum::routing::get(get_organization_timeseries),
-        )
-        .route(
-            "/admin/platform/metrics",
-            axum::routing::get(get_platform_metrics),
-        )
-        .route(
-            "/admin/platform/metrics/timeseries",
-            axum::routing::get(get_platform_timeseries),
-        )
-        .route(
-            "/admin/platform/billing-summary",
-            axum::routing::get(get_billing_summary),
-        )
-        .route(
-            "/admin/platform/model-revenue",
-            axum::routing::get(get_model_revenue),
-        )
-        .route(
-            "/admin/platform/org-revenue",
-            axum::routing::get(get_org_revenue),
-        )
-        .route(
             "/admin/platform/infra-summary",
             axum::routing::get(get_infra_summary),
         )
@@ -2467,18 +2423,6 @@ fn build_admin_routes_with_options(
             axum::routing::get(get_admin_setting).patch(update_admin_setting),
         )
         .route(
-            "/admin/platform/model-consumption-timeseries",
-            axum::routing::get(get_model_consumption_timeseries),
-        )
-        .route(
-            "/admin/platform/performance-timeseries",
-            axum::routing::get(get_performance_timeseries),
-        )
-        .route(
-            "/admin/platform/revenue-density",
-            axum::routing::get(get_revenue_density),
-        )
-        .route(
             "/admin/invitation-email-deliveries",
             axum::routing::get(list_invitation_email_deliveries),
         )
@@ -2486,7 +2430,6 @@ fn build_admin_routes_with_options(
             "/admin/invitation-email-deliveries/{invitation_id}/resend",
             axum::routing::post(resend_invitation_email),
         )
-        .route("/admin/users", axum::routing::get(list_users))
         .route(
             "/admin/users/{user_id}/erasure/preview",
             axum::routing::post(preview_user_erasure),
@@ -2498,19 +2441,6 @@ fn build_admin_routes_with_options(
         .route(
             "/admin/user-erasures/lookup",
             axum::routing::post(lookup_user_erasures),
-        )
-        .route(
-            "/admin/organizations",
-            axum::routing::get(list_organizations),
-        )
-        .route("/admin/api-keys", axum::routing::get(list_api_keys))
-        .route(
-            "/admin/organizations/{org_id}",
-            axum::routing::get(get_admin_organization),
-        )
-        .route(
-            "/admin/organizations/{org_id}/members",
-            axum::routing::get(list_organization_members),
         )
         .route(
             "/admin/organizations/{org_id}/members/{user_id}",

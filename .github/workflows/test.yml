@@ -209,9 +209,9 @@ jobs:
       packages: read
 
     env:
-      # Companion schema from nearai/cloud-platform#113, head 16b9d2bbe9093819bb17218707d5d93f1df10d3f.
+      # Companion schema from nearai/cloud-platform#113, head b194d4d5f71296b080b9d89251b9c2ff2ca4486d.
       # PR tests can validate V0099 before merge; main still requires a published normal pin.
-      CLOUD_PLATFORM_TEST_IMAGE: ${{ github.event_name == 'pull_request' && 'ghcr.io/nearai/cloud-platform@sha256:e30d25a5d4c0a474ff98e49b10f5a0c4fc03986b5994a095bcd1f6d6254759e9' || '' }}
+      CLOUD_PLATFORM_TEST_IMAGE: ${{ github.event_name == 'pull_request' && 'ghcr.io/nearai/cloud-platform@sha256:3bc0a89cd78a1d6f9a4aaf9e11df27c58241bd19f0b4b44214734c411fd58fcc' || '' }}
 
     services:
       postgres:

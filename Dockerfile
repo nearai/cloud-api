@@ -1,30 +1,33 @@
+# Locally assembled digest; publication and anonymous pull verification pending.
+FROM nearaidev/apt-bundle-cloud-api@sha256:ecfed6536d176857f0c7f3199fac4b6cdba449a9155e8820817b8479351d522e AS apt-bundle
+FROM scratch AS apt-bundle-files
+COPY --from=apt-bundle /apt-bundle /apt-bundle
+
 # Build stage
 FROM rust:1.92.0-bookworm@sha256:9676d0547a259997add8f5924eb6b959c589ed39055338e23b99aba7958d6d31 AS builder-base
 
 FROM builder-base AS builder
 
 # Install pinned apt dependencies
-RUN --mount=type=bind,source=pinned-packages-builder.txt,target=/tmp/pinned-packages-builder.txt,ro \
+RUN --network=none \
+    --mount=type=bind,from=apt-bundle-files,source=/apt-bundle,target=/opt/apt-bundle,ro \
+    --mount=type=bind,source=build/apt-bundle/prepare-apt.sh,target=/run/prepare-apt.sh,ro \
+    --mount=type=bind,source=pinned-packages-builder.txt,target=/tmp/pinned-packages-builder.txt,ro \
     set -e; \
-    # Create a sources.list file pointing to a specific snapshot
-    echo 'deb [check-valid-until=no] https://snapshot.debian.org/archive/debian/20260928T000000Z bookworm main' > /etc/apt/sources.list && \
-    echo 'deb [check-valid-until=no] https://snapshot.debian.org/archive/debian-security/20260928T000000Z bookworm-security main' >> /etc/apt/sources.list && \
-    echo 'Acquire::Check-Valid-Until "false";' > /etc/apt/apt.conf.d/10no-check-valid-until && \
-    # Create preferences file to pin all packages
-    rm -rf /etc/apt/sources.list.d/debian.sources && \
-    mkdir -p /etc/apt/preferences.d && \
-    cat /tmp/pinned-packages-builder.txt | while read line; do \
-        pkg=$(echo $line | cut -d= -f1); \
-        ver=$(echo $line | cut -d= -f2); \
-        if [ ! -z "$pkg" ] && [ ! -z "$ver" ]; then \
-            printf "Package: %s\nPin: version %s\nPin-Priority: 1001\n\n" "$pkg" "$ver" >> /etc/apt/preferences.d/pinned-packages; \
-        fi; \
-    done && \
+    bash /run/prepare-apt.sh --bundle /opt/apt-bundle --snapshot 20260928T000000Z \
+        --config /tmp/apt-bundle.conf --debian-keyring /usr/share/keyrings/debian-archive-keyring.gpg \
+        --status /var/lib/dpkg/status --pins /tmp/pinned-packages-builder.txt && \
+    if [ -f /var/lib/apt/extended_states ]; then \
+        cp /var/lib/apt/extended_states /tmp/apt-bundle.conf.d/state/extended_states; \
+    fi && \
+    export APT_CONFIG=/tmp/apt-bundle.conf && \
     apt-get update && \
     apt-get install -y --no-install-recommends \
         pkg-config \
         libssl-dev \
-        && rm -rf /var/lib/apt/lists/* /var/log/* /var/cache/ldconfig/aux-cache
+        && cp /tmp/apt-bundle.conf.d/state/extended_states /var/lib/apt/extended_states \
+        && rm -rf /tmp/apt-bundle.conf /tmp/apt-bundle.conf.d \
+            /var/lib/apt/lists/* /var/log/* /var/cache/ldconfig/aux-cache
 
 # Set the working directory
 WORKDIR /app
@@ -53,25 +56,20 @@ FROM debian:bookworm-slim@sha256:78d2f66e0fec9e5a39fb2c72ea5e052b548df75602b5215
 # eMudhra intermediate CA key compromise (2026-10-20): bookworm has no fixed
 # ca-certificates yet, so distrust the two roots the compromised intermediates
 # chain to. Remove once the pinned ca-certificates no longer ships them.
-RUN --mount=type=bind,source=pinned-packages-runtime.txt,target=/tmp/pinned-packages-runtime.txt,ro \
-    --mount=type=bind,from=builder-base,source=/etc/ssl/certs/ca-certificates.crt,target=/run/bootstrap-ca.crt,ro \
+RUN --network=none \
+    --mount=type=bind,from=apt-bundle-files,source=/apt-bundle,target=/opt/apt-bundle,ro \
+    --mount=type=bind,source=build/apt-bundle/prepare-apt.sh,target=/run/prepare-apt.sh,ro \
+    --mount=type=bind,source=pinned-packages-runtime.txt,target=/tmp/pinned-packages-runtime.txt,ro \
     set -e; \
-    # Create a sources.list file pointing to a specific snapshot
-    echo 'deb [check-valid-until=no] https://snapshot.debian.org/archive/debian/20260928T000000Z bookworm main' > /etc/apt/sources.list && \
-    echo 'deb [check-valid-until=no] https://snapshot.debian.org/archive/debian-security/20260928T000000Z bookworm-security main' >> /etc/apt/sources.list && \
-    echo 'Acquire::Check-Valid-Until "false";' > /etc/apt/apt.conf.d/10no-check-valid-until && \
-    # Create preferences file to pin all packages
-    rm -rf /etc/apt/sources.list.d/debian.sources && \
-    mkdir -p /etc/apt/preferences.d && \
-    cat /tmp/pinned-packages-runtime.txt | while read line; do \
-        pkg=$(echo $line | cut -d= -f1); \
-        ver=$(echo $line | cut -d= -f2); \
-        if [ ! -z "$pkg" ] && [ ! -z "$ver" ]; then \
-            printf "Package: %s\nPin: version %s\nPin-Priority: 1001\n\n" "$pkg" "$ver" >> /etc/apt/preferences.d/pinned-packages; \
-        fi; \
-    done && \
-    apt-get -o Acquire::https::CAInfo=/run/bootstrap-ca.crt update && \
-    apt-get -o Acquire::https::CAInfo=/run/bootstrap-ca.crt install -y --no-install-recommends \
+    bash /run/prepare-apt.sh --bundle /opt/apt-bundle --snapshot 20260928T000000Z \
+        --config /tmp/apt-bundle.conf --debian-keyring /usr/share/keyrings/debian-archive-keyring.gpg \
+        --status /var/lib/dpkg/status --pins /tmp/pinned-packages-runtime.txt && \
+    if [ -f /var/lib/apt/extended_states ]; then \
+        cp /var/lib/apt/extended_states /tmp/apt-bundle.conf.d/state/extended_states; \
+    fi && \
+    export APT_CONFIG=/tmp/apt-bundle.conf && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends \
         ca-certificates \
         libssl3 \
         curl \
@@ -80,7 +78,9 @@ RUN --mount=type=bind,source=pinned-packages-runtime.txt,target=/tmp/pinned-pack
     update-ca-certificates && \
     test ! -e /etc/ssl/certs/emSign_ECC_Root_CA_-_G3.pem && \
     test ! -e /etc/ssl/certs/Comodo_AAA_Services_root.pem && \
-    rm -rf /var/lib/apt/lists/* /var/log/* /var/cache/ldconfig/aux-cache
+    cp /tmp/apt-bundle.conf.d/state/extended_states /var/lib/apt/extended_states && \
+    rm -rf /tmp/apt-bundle.conf /tmp/apt-bundle.conf.d \
+        /var/lib/apt/lists/* /var/log/* /var/cache/ldconfig/aux-cache
 
 # Create app user
 # Normalize /etc/shadow file last password change date to 0 for app user

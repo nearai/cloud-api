@@ -2835,15 +2835,6 @@ pub struct OrganizationResponse {
     pub updated_at: DateTime<Utc>,
 }
 
-/// Paginated organizations list response
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct ListOrganizationsResponse {
-    pub organizations: Vec<OrganizationResponse>,
-    pub total: i64,
-    pub limit: i64,
-    pub offset: i64,
-}
-
 /// Member role enum for API
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ToSchema)]
 #[serde(rename_all = "lowercase")]
@@ -3006,42 +2997,6 @@ impl PatchOrganizationSettingsRequest {
     }
 }
 
-/// Response containing organization settings
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
-pub struct OrganizationSettingsResponse {
-    pub settings: OrganizationSettings,
-}
-
-/// Operator-controlled priority for the inference scheduler. Higher values run first.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct UpdateOrganizationPriorityRequest {
-    /// Inclusive range -1000..1000. Set 0 to restore the default.
-    #[schema(minimum = -1000, maximum = 1000)]
-    pub priority: i32,
-}
-
-/// Scheduler priority, available only through platform-admin endpoints.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct OrganizationPriorityResponse {
-    pub organization_id: uuid::Uuid,
-    pub priority: i32,
-}
-
-/// Admin request to update an organization's fallback policy.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct UpdateOrganizationFallbackRequest {
-    pub enabled: bool,
-}
-
-/// Effective fallback policy returned by admin organization endpoints.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct OrganizationFallbackResponse {
-    pub organization_id: uuid::Uuid,
-    pub enabled: bool,
-}
-
 /// Result of a single invitation attempt
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct InvitationResult {
@@ -3054,47 +3009,6 @@ pub struct InvitationResult {
     pub error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub email_error: Option<String>,
-}
-
-/// Response for batch invitation requests
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
-pub struct InviteOrganizationMemberByEmailResponse {
-    pub results: Vec<InvitationResult>,
-    pub total: usize,
-    pub successful: usize,
-    pub failed: usize,
-}
-
-/// Public organization member response (for regular members)
-/// Contains member info with limited user details
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct PublicOrganizationMemberResponse {
-    pub id: String,
-    pub organization_id: String,
-    pub role: MemberRole,
-    pub joined_at: DateTime<Utc>,
-    pub user: PublicUserResponse,
-}
-
-/// List organization members response with pagination
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct ListOrganizationMembersResponse {
-    pub members: Vec<PublicOrganizationMemberResponse>,
-    pub total: i64,
-    pub limit: i64,
-    pub offset: i64,
-}
-
-/// Admin organization member response (for owners/admins)
-/// Contains member info with full user details including sensitive data
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct AdminOrganizationMemberResponse {
-    pub id: String,
-    pub organization_id: String,
-    pub role: MemberRole,
-    pub joined_at: DateTime<Utc>,
-    pub invited_by: Option<String>,
-    pub user: AdminUserResponse,
 }
 
 /// Public user response model (for regular members)
@@ -3132,93 +3046,6 @@ pub struct AdminUserOrganizationDetails {
     pub spend_limit: Option<SpendLimit>,
     #[serde(rename = "currentUsage", skip_serializing_if = "Option::is_none")]
     pub current_usage: Option<OrganizationUsage>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct ErasedOrganizationResponse {
-    pub id: String,
-    pub lifecycle: services::lifecycle::OrganizationLifecycle,
-    pub workspaces: i64,
-    pub api_keys: i64,
-    pub conversations: i64,
-    pub files: i64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct RetainedOrganizationResponse {
-    pub id: String,
-    pub role: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct ErasureLogResponse {
-    pub requested_at: DateTime<Utc>,
-    pub erased_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct ErasurePreviewResponse {
-    pub user_id: String,
-    pub lifecycle: services::lifecycle::UserLifecycle,
-    pub blockers: Vec<services::user_erasure::ErasureBlocker>,
-    pub erased_organizations: Vec<ErasedOrganizationResponse>,
-    pub retained_organizations: Vec<RetainedOrganizationResponse>,
-    pub log: Option<ErasureLogResponse>,
-}
-
-/// Body of the 409 returned when erasure is blocked: the usual error envelope plus the blockers.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct ErasureBlockedResponse {
-    pub error: ErrorDetail,
-    pub blockers: Vec<services::user_erasure::ErasureBlocker>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct EraseUserRequest {
-    /// Must match the user's current email, ignoring case and surrounding whitespace.
-    /// Typed by the operator as a guard against erasing the wrong id.
-    pub confirm_email: String,
-    /// When the person asked (starts the GDPR response clock). Defaults to now.
-    pub requested_at: Option<DateTime<Utc>>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct EraseUserResponse {
-    pub user_id: String,
-    pub lifecycle: services::lifecycle::UserLifecycle,
-    pub already_erased: bool,
-    pub erased_organization_ids: Vec<String>,
-}
-
-/// Body of the erasure lookup: exactly one of `email` or `user_id`. The email is
-/// compared as a digest and must never appear in a URL or query string.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct LookupUserErasuresRequest {
-    pub email: Option<String>,
-    pub user_id: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct ErasureLookupOrganizationResponse {
-    pub organization_id: String,
-    pub lifecycle: services::lifecycle::OrganizationLifecycle,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct UserErasureRecordResponse {
-    pub user_id: String,
-    pub user_lifecycle: services::lifecycle::UserLifecycle,
-    pub admin_user_id: String,
-    pub requested_at: DateTime<Utc>,
-    pub erased_at: DateTime<Utc>,
-    pub erased_organizations: Vec<ErasureLookupOrganizationResponse>,
-    pub retained_organizations: Vec<ErasureLookupOrganizationResponse>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct LookupUserErasuresResponse {
-    /// Newest `erased_at` first; empty when nothing matches.
-    pub erasures: Vec<UserErasureRecordResponse>,
 }
 
 /// Admin user response model (for owners/admins)
@@ -3298,25 +3125,6 @@ pub struct UserWorkspaceResponse {
     pub created_at: DateTime<Utc>,
 }
 
-/// Refresh token response model
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct RefreshTokenResponse {
-    pub id: String,
-    pub user_id: String,
-    pub created_at: DateTime<Utc>,
-    pub expires_at: DateTime<Utc>,
-    pub ip_address: Option<String>,
-    pub user_agent: String,
-}
-
-/// Access token + refresh token response model
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct AccessAndRefreshTokenResponse {
-    pub access_token: String,
-    pub refresh_token: String,
-    pub refresh_token_expiration: DateTime<Utc>,
-}
-
 /// Organization member response model (non-sensitive)
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct OrganizationMemberResponse {
@@ -3326,15 +3134,6 @@ pub struct OrganizationMemberResponse {
     pub role: MemberRole,
     pub joined_at: DateTime<Utc>,
     pub invited_by: Option<String>,
-}
-
-/// List users response model (admin only)
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct ListUsersResponse {
-    pub users: Vec<AdminUserResponse>,
-    pub total: i64,
-    pub limit: i64,
-    pub offset: i64,
 }
 
 /// Admin AML report audit entry.
@@ -3365,12 +3164,6 @@ pub struct ListAdminAmlReportsResponse {
     pub offset: i64,
 }
 
-/// Admin AML report status update request.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct UpdateAmlReportStatusRequest {
-    pub active: bool,
-}
-
 /// Admin AML allowlist entry response.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct AdminAmlAllowlistEntryResponse {
@@ -3385,76 +3178,6 @@ pub struct AdminAmlAllowlistEntryResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ListAdminAmlAllowlistResponse {
     pub accounts: Vec<AdminAmlAllowlistEntryResponse>,
-    pub total: i64,
-    pub limit: i64,
-    pub offset: i64,
-}
-
-/// Admin AML allowlist upsert request.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct UpsertAmlAllowlistEntryRequest {
-    pub account_id: String,
-    pub reason: Option<String>,
-}
-
-/// Organization details for admin organization listing
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct AdminOrganizationResponse {
-    pub id: String,
-    pub name: String,
-    pub description: Option<String>,
-    #[serde(rename = "spendLimit", skip_serializing_if = "Option::is_none")]
-    pub spend_limit: Option<SpendLimit>,
-    #[serde(rename = "currentUsage", skip_serializing_if = "Option::is_none")]
-    pub current_usage: Option<OrganizationUsage>,
-    pub created_at: DateTime<Utc>,
-    /// Always `active` on org detail, which only returns active organizations.
-    pub lifecycle: services::lifecycle::OrganizationLifecycle,
-}
-
-/// List organizations response model (admin only)
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct ListOrganizationsAdminResponse {
-    pub organizations: Vec<AdminOrganizationResponse>,
-    pub total: i64,
-    pub limit: i64,
-    pub offset: i64,
-}
-
-/// API key metadata for admin listing. Never includes key material (raw key,
-/// hash, or prefix) or the user-supplied key name.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct AdminApiKeyResponse {
-    pub id: String,
-    pub organization_id: String,
-    pub organization_name: String,
-    pub workspace_id: String,
-    /// User who created the key
-    pub created_by_user_id: String,
-    pub created_at: DateTime<Utc>,
-    pub is_active: bool,
-    /// Set when the key was revoked
-    pub deleted_at: Option<DateTime<Utc>>,
-    /// True when the key's name matches the Cloud UI's managed Playground key
-    /// naming (`Playground-<uuid>-g<generation>`). Best-effort: derived from the
-    /// user-editable key name, not stored provenance.
-    pub is_managed_playground: bool,
-}
-
-/// List API keys response model (admin only)
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct ListAdminApiKeysResponse {
-    pub api_keys: Vec<AdminApiKeyResponse>,
-    pub total: i64,
-    pub limit: i64,
-    pub offset: i64,
-}
-
-/// List organization members response model (admin only).
-/// Exposes full user details (email, last login, active status) for each member.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct ListAdminOrganizationMembersResponse {
-    pub members: Vec<AdminOrganizationMemberResponse>,
     pub total: i64,
     pub limit: i64,
     pub offset: i64,
@@ -3568,13 +3291,6 @@ pub struct ListAdminAccessTokensResponse {
     pub total: i64,
 }
 
-/// Delete admin access token request model
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct DeleteAdminAccessTokenRequest {
-    /// Reason for revoking the token (required)
-    pub reason: String,
-}
-
 /// API Key response model
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ApiKeyResponse {
@@ -3594,15 +3310,6 @@ pub struct ApiKeyResponse {
     pub deleted_at: Option<DateTime<Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usage: Option<DecimalPrice>,
-}
-
-/// Paginated API keys list response
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct ListApiKeysResponse {
-    pub api_keys: Vec<ApiKeyResponse>,
-    pub total: i64,
-    pub limit: i64,
-    pub offset: i64,
 }
 
 /// Request to update API key spend limit
@@ -3671,84 +3378,6 @@ pub enum InvitationEmailStatus {
     Sent,
     Failed,
     Skipped,
-}
-
-/// Organization invitation response
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct OrganizationInvitationResponse {
-    pub id: String,
-    pub organization_id: String,
-    pub email: String,
-    pub role: MemberRole,
-    pub invited_by_user_id: String,
-    pub status: InvitationStatus,
-    pub created_at: DateTime<Utc>,
-    pub expires_at: DateTime<Utc>,
-    pub responded_at: Option<DateTime<Utc>>,
-    pub email_status: InvitationEmailStatus,
-    pub email_sent_at: Option<DateTime<Utc>>,
-    pub email_last_error: Option<String>,
-    pub email_message_id: Option<String>,
-}
-
-/// Organization invitation with organization details
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct OrganizationInvitationWithOrgResponse {
-    #[serde(flatten)]
-    pub invitation: OrganizationInvitationResponse,
-    pub organization_name: String,
-    pub invited_by_display_name: Option<String>,
-}
-
-/// Admin view of invitation email delivery metadata.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct AdminInvitationEmailDeliveryResponse {
-    pub organization_id: String,
-    pub organization_name: String,
-    pub invitation_id: String,
-    pub recipient_email: String,
-    pub role: MemberRole,
-    pub invitation_status: InvitationStatus,
-    pub email_status: InvitationEmailStatus,
-    pub email_sent_at: Option<DateTime<Utc>>,
-    pub email_last_error: Option<String>,
-    pub email_message_id: Option<String>,
-    pub invited_by_user_id: String,
-    pub invited_by_email: Option<String>,
-    pub invited_by_display_name: Option<String>,
-    pub created_at: DateTime<Utc>,
-    pub expires_at: DateTime<Utc>,
-    pub responded_at: Option<DateTime<Utc>>,
-}
-
-/// Paginated admin invitation email delivery response.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct ListAdminInvitationEmailDeliveriesResponse {
-    pub deliveries: Vec<AdminInvitationEmailDeliveryResponse>,
-    pub total: i64,
-    pub limit: i64,
-    pub offset: i64,
-}
-
-/// Admin invitation email resend result.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct AdminInvitationEmailResendResultResponse {
-    pub invitation_id: String,
-    pub recipient_email: String,
-    pub success: bool,
-    pub email_sent: bool,
-    pub email_status: InvitationEmailStatus,
-    pub email_sent_at: Option<DateTime<Utc>>,
-    pub email_message_id: Option<String>,
-    pub email_last_error: Option<String>,
-    pub error: Option<String>,
-}
-
-/// Accept invitation response
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
-pub struct AcceptInvitationResponse {
-    pub organization_member: OrganizationMemberResponse,
-    pub message: String,
 }
 
 // ============================================
@@ -3875,33 +3504,6 @@ pub struct ServiceListResponse {
     pub limit: i64,
     pub offset: i64,
     pub total: i64,
-}
-
-/// Request to create a platform service (admin)
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
-pub struct CreateServiceRequest {
-    #[serde(rename = "serviceName")]
-    pub service_name: String,
-    #[serde(rename = "displayName")]
-    pub display_name: String,
-    pub description: Option<String>,
-    pub unit: ServiceUnit,
-    /// Price per unit in nano-USD (scale 9).
-    #[serde(rename = "costPerUnit")]
-    pub cost_per_unit: i64,
-}
-
-/// Request to update a platform service (admin; display_name, description, cost_per_unit, is_active)
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
-pub struct UpdateServiceRequest {
-    #[serde(rename = "displayName")]
-    pub display_name: Option<String>,
-    pub description: Option<String>,
-    /// Price per unit in nano-USD (scale 9).
-    #[serde(rename = "costPerUnit")]
-    pub cost_per_unit: Option<i64>,
-    #[serde(rename = "isActive")]
-    pub is_active: Option<bool>,
 }
 
 /// Model with pricing information for admin listing
@@ -4356,35 +3958,6 @@ pub struct UpdateModelApiRequest {
 /// Batch update request format - Array of model name to update data
 pub type BatchUpdateModelApiRequest = std::collections::HashMap<String, UpdateModelApiRequest>;
 
-/// Delete model request - optional reason for deletion
-#[derive(Debug, Deserialize, Serialize, ToSchema)]
-pub struct DeleteModelRequest {
-    #[serde(rename = "changeReason", skip_serializing_if = "Option::is_none")]
-    pub change_reason: Option<String>,
-}
-
-/// Request to deprecate one model in favor of another.
-///
-/// Atomically:
-/// - adds `modelId` as an alias of `successorModelId` (so existing clients
-///   continue to work, with their request-side `model` rewritten to the
-///   successor at resolution time),
-/// - re-points any existing inbound aliases of `modelId` at the successor,
-/// - sets `modelId.isActive = false` so it is hidden from `GET /v1/models`
-///   and `GET /v1/admin/models` (unless `include_inactive` is set).
-#[derive(Debug, Deserialize, Serialize, ToSchema)]
-pub struct DeprecateModelRequest {
-    /// Canonical model_name of the model being deprecated.
-    #[serde(rename = "modelId")]
-    pub model_id: String,
-    /// Canonical model_name of the replacement model. Must be active.
-    #[serde(rename = "successorModelId")]
-    pub successor_model_id: String,
-    /// Optional reason recorded in the model history.
-    #[serde(rename = "changeReason", skip_serializing_if = "Option::is_none")]
-    pub change_reason: Option<String>,
-}
-
 /// Response from a deprecation operation.
 ///
 /// Both sides use the public `ModelWithPricing` shape (no `isActive` /
@@ -4408,20 +3981,6 @@ pub struct DeprecateModelResponse {
     /// are left untouched — see repository docs).
     #[serde(rename = "aliasesCarried")]
     pub aliases_carried: u32,
-}
-
-/// Request to mark an active model with a planned deprecation date and notify affected admins.
-#[derive(Debug, Deserialize, Serialize, ToSchema)]
-pub struct ModelDeprecationRequest {
-    /// Active replacement model to recommend in the email. Does not affect routing.
-    #[serde(rename = "successorModelId")]
-    pub successor_model_id: String,
-    /// Planned deprecation date (`YYYY-MM-DD` or `YYYY-MM-DDTHH:00:00Z`).
-    #[serde(rename = "deprecationDate")]
-    pub deprecation_date: String,
-    /// Optional reason recorded in model history.
-    #[serde(rename = "changeReason", skip_serializing_if = "Option::is_none")]
-    pub change_reason: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -4452,47 +4011,6 @@ pub struct ModelDeprecationConfirmResponse {
     pub failed_count: i64,
     #[serde(rename = "skippedCount")]
     pub skipped_count: i64,
-}
-
-/// One model's entry in a scheduled pricing change batch.
-/// Omitted pricing fields are left unchanged; at least one is required.
-#[derive(Debug, Deserialize, Serialize, ToSchema)]
-pub struct PricingChangeItemRequest {
-    #[serde(rename = "modelId")]
-    pub model_id: String,
-    /// When the new pricing takes effect (`YYYY-MM-DD`, defaults to 13:00
-    /// UTC, or a whole-hour UTC instant `YYYY-MM-DDTHH:00:00Z`). Must be at
-    /// least one hour in the future.
-    #[serde(rename = "effectiveAt")]
-    pub effective_at: String,
-    #[serde(rename = "inputCostPerToken", skip_serializing_if = "Option::is_none")]
-    pub input_cost_per_token: Option<DecimalPriceRequest>,
-    #[serde(rename = "outputCostPerToken", skip_serializing_if = "Option::is_none")]
-    pub output_cost_per_token: Option<DecimalPriceRequest>,
-    #[serde(
-        rename = "cacheReadCostPerToken",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub cache_read_cost_per_token: Option<DecimalPriceRequest>,
-    #[serde(rename = "costPerImage", skip_serializing_if = "Option::is_none")]
-    pub cost_per_image: Option<DecimalPriceRequest>,
-    #[serde(rename = "textPricing", skip_serializing_if = "Option::is_none")]
-    #[schema(value_type = Option<Object>)]
-    pub text_pricing: Option<serde_json::Value>,
-}
-
-/// Request to preview or confirm a batch of scheduled pricing changes.
-#[derive(Debug, Deserialize, Serialize, ToSchema)]
-pub struct PricingChangeBatchRequest {
-    /// Idempotency key for the batch. Generate once client-side and reuse on
-    /// retries so a re-confirm never sends duplicate emails. Confirm
-    /// generates one when omitted.
-    #[serde(rename = "batchId", skip_serializing_if = "Option::is_none")]
-    pub batch_id: Option<uuid::Uuid>,
-    pub changes: Vec<PricingChangeItemRequest>,
-    /// Optional reason recorded in model history when the change is applied.
-    #[serde(rename = "changeReason", skip_serializing_if = "Option::is_none")]
-    pub change_reason: Option<String>,
 }
 
 /// Full pricing snapshot. `cacheReadCostPerToken` is omitted when cache
@@ -4789,21 +4307,6 @@ impl std::str::FromStr for CreditType {
     }
 }
 
-/// Request to update organization limits (Admin only)
-#[derive(Debug, Deserialize, ToSchema)]
-pub struct UpdateOrganizationLimitsRequest {
-    #[serde(rename = "type")]
-    pub credit_type: CreditType,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub source: Option<String>,
-    #[serde(rename = "spendLimit")]
-    pub spend_limit: SpendLimitRequest,
-    #[serde(rename = "changedBy", skip_serializing_if = "Option::is_none")]
-    pub changed_by: Option<String>,
-    #[serde(rename = "changeReason", skip_serializing_if = "Option::is_none")]
-    pub change_reason: Option<String>,
-}
-
 /// Spend limit for API requests
 ///
 /// The system internally uses a fixed scale of 9 (nano-dollars = 1 billionth of a dollar).
@@ -4848,82 +4351,9 @@ pub struct UpdateOrganizationLimitsResponse {
     pub updated_at: String,
 }
 
-/// Organization limits history entry
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
-pub struct OrgLimitsHistoryEntry {
-    pub id: String,
-    #[serde(rename = "organizationId")]
-    pub organization_id: String,
-    #[serde(rename = "type")]
-    pub credit_type: CreditType,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub source: Option<String>,
-    #[serde(rename = "spendLimit")]
-    pub spend_limit: SpendLimit,
-    #[serde(rename = "effectiveFrom")]
-    pub effective_from: String,
-    #[serde(rename = "effectiveUntil")]
-    pub effective_until: Option<String>,
-    #[serde(rename = "changedBy")]
-    pub changed_by: Option<String>,
-    #[serde(rename = "changeReason")]
-    pub change_reason: Option<String>,
-    #[serde(rename = "changedByUserId")]
-    pub changed_by_user_id: Option<String>,
-    #[serde(rename = "changedByUserEmail")]
-    pub changed_by_user_email: Option<String>,
-    #[serde(rename = "createdAt")]
-    pub created_at: String,
-}
-
-/// Organization limits history response
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
-pub struct OrgLimitsHistoryResponse {
-    pub history: Vec<OrgLimitsHistoryEntry>,
-    pub total: i64,
-    pub limit: i64,
-    pub offset: i64,
-}
-
 // ============================================
 // Organization Concurrent Limit API Models (Admin)
 // ============================================
-
-/// Request to update organization concurrent request limit (Admin only)
-///
-/// The concurrent limit controls how many requests an organization can have
-/// in-flight simultaneously per model. Set to null to use the default (64).
-#[derive(Debug, Deserialize, ToSchema)]
-pub struct UpdateOrganizationConcurrentLimitRequest {
-    /// Concurrent request limit per model. Set to null to use default (64).
-    #[serde(rename = "concurrentLimit")]
-    pub concurrent_limit: Option<u32>,
-}
-
-/// Response after updating organization concurrent limit
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
-pub struct UpdateOrganizationConcurrentLimitResponse {
-    #[serde(rename = "organizationId")]
-    pub organization_id: String,
-    /// Current concurrent limit. Null means default (64) is used.
-    #[serde(rename = "concurrentLimit")]
-    pub concurrent_limit: Option<u32>,
-    #[serde(rename = "updatedAt")]
-    pub updated_at: String,
-}
-
-/// Response for getting organization concurrent limit
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
-pub struct GetOrganizationConcurrentLimitResponse {
-    #[serde(rename = "organizationId")]
-    pub organization_id: String,
-    /// Current concurrent limit. Null means default (64) is used.
-    #[serde(rename = "concurrentLimit")]
-    pub concurrent_limit: Option<u32>,
-    /// The effective limit (either custom or default)
-    #[serde(rename = "effectiveLimit")]
-    pub effective_limit: u32,
-}
 
 // ============================================
 // File Upload Models

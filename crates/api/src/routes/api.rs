@@ -2,16 +2,13 @@ use crate::ohttp_gateway::{OhttpAttestation, OhttpGateway};
 use services::{
     attestation::ports::AttestationServiceTrait, auth::AuthServiceTrait,
     completions::CompletionServiceTrait, files::FileServiceTrait, mcp::McpClientManager,
-    models::ModelsServiceTrait, organization::OrganizationServiceTrait,
-    workspace::WorkspaceServiceTrait,
+    models::ModelsServiceTrait,
 };
 use std::sync::Arc;
 
 /// Application state shared across all route handlers
 #[derive(Clone)]
 pub struct AppState {
-    pub organization_service: Arc<dyn OrganizationServiceTrait + Send + Sync>,
-    pub workspace_service: Arc<dyn WorkspaceServiceTrait + Send + Sync>,
     pub mcp_manager: Arc<McpClientManager>,
     pub completion_service: Arc<dyn CompletionServiceTrait>,
     pub models_service: Arc<dyn ModelsServiceTrait>,
@@ -20,8 +17,6 @@ pub struct AppState {
     pub usage_service: Arc<dyn services::usage::UsageServiceTrait + Send + Sync>,
     pub service_usage_service:
         Arc<dyn services::service_usage::ServiceUsageServiceTrait + Send + Sync>,
-    pub user_service: Arc<dyn services::user::UserServiceTrait + Send + Sync>,
-    pub contact_email_service: Arc<services::contact_email::ContactEmailService>,
     pub files_service: Arc<dyn FileServiceTrait + Send + Sync>,
     pub inference_provider_pool: Arc<services::inference_provider_pool::InferenceProviderPool>,
     pub metrics_service: Arc<dyn services::metrics::MetricsServiceTrait>,

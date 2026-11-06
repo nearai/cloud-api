@@ -1,4 +1,4 @@
-use super::super::auth::ports::{User, UserId};
+use super::super::auth::ports::UserId;
 use super::super::common::RepositoryError;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -241,16 +241,6 @@ pub enum RemoveOrganizationMemberResult {
     LastOwner,
 }
 
-/// Organization member with full user information
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OrganizationMemberWithUser {
-    pub organization_id: OrganizationId,
-    pub user_id: UserId,
-    pub role: MemberRole,
-    pub joined_at: DateTime<Utc>,
-    pub user: User,
-}
-
 /// Result of a single invitation attempt
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InvitationResult {
@@ -260,15 +250,6 @@ pub struct InvitationResult {
     pub error: Option<String>,
     pub email_sent: bool,
     pub email_error: Option<String>,
-}
-
-/// Batch invitation response
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BatchInvitationResponse {
-    pub results: Vec<InvitationResult>,
-    pub total: usize,
-    pub successful: usize,
-    pub failed: usize,
 }
 
 /// Organization invitation status
@@ -310,56 +291,6 @@ pub struct OrganizationInvitation {
     pub email_message_id: Option<String>,
 }
 
-/// Organization invitation with display details needed by invitees
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OrganizationInvitationWithDetails {
-    pub invitation: OrganizationInvitation,
-    pub organization_name: String,
-    pub invited_by_display_name: Option<String>,
-}
-
-/// Filters for admin invitation email delivery oversight.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct InvitationEmailDeliveryFilters {
-    pub organization_id: Option<OrganizationId>,
-    pub recipient_email: Option<String>,
-    pub email_status: Option<InvitationEmailStatus>,
-    pub invitation_status: Option<InvitationStatus>,
-    pub created_after: Option<DateTime<Utc>>,
-    pub created_before: Option<DateTime<Utc>>,
-}
-
-/// Invitation email delivery row enriched for admin oversight.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OrganizationInvitationEmailDelivery {
-    pub invitation: OrganizationInvitation,
-    pub organization_name: String,
-    pub invited_by_email: Option<String>,
-    pub invited_by_display_name: Option<String>,
-}
-
-/// Result of an admin invitation email resend attempt.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct InvitationEmailResendResult {
-    pub invitation_id: Uuid,
-    pub recipient_email: String,
-    pub success: bool,
-    pub email_sent: bool,
-    pub email_status: InvitationEmailStatus,
-    pub email_sent_at: Option<DateTime<Utc>>,
-    pub email_message_id: Option<String>,
-    pub email_last_error: Option<String>,
-    pub error: Option<String>,
-}
-
-/// Create invitation request
-#[derive(Debug, Clone)]
-pub struct CreateInvitationRequest {
-    pub email: String,
-    pub role: MemberRole,
-    pub expires_in_hours: i64,
-}
-
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OrganizationOrderBy {
@@ -385,13 +316,6 @@ pub trait OrganizationRepository: Send + Sync {
 
     async fn get_by_id(&self, id: Uuid) -> Result<Option<Organization>, RepositoryError>;
 
-    /// Set operator policy without touching customer-editable settings.
-    async fn set_request_priority(
-        &self,
-        id: Uuid,
-        priority: i32,
-    ) -> Result<Option<i32>, RepositoryError>;
-
     async fn get_by_name(&self, name: &str) -> Result<Option<Organization>, RepositoryError>;
 
     async fn get_member(
@@ -410,168 +334,13 @@ pub trait OrganizationRepository: Send + Sync {
         actor_user_id: Uuid,
     ) -> Result<Organization, RepositoryError>;
 
-    /// Atomically applies the organization-settings fields present in `patch`.
-    /// Omitted fields are preserved and explicit nulls remove their JSON keys.
-    /// `actor_user_id = None` is reserved for system-administrator operations.
-    async fn patch_settings(
-        &self,
-        id: Uuid,
-        patch: PatchOrganizationSettings,
-        actor_user_id: Option<Uuid>,
-    ) -> Result<Organization, RepositoryError>;
-
-    /// Soft-deletes an active organization only if it has no staking farm source
-    /// and is not any current member's earliest active membership (joined_at, ID).
-    ///
-    /// The staking-source check is deliberately status-agnostic: the org-to-wallet
-    /// binding is permanent, and unbinding is not an API operation. Scoping this to
-    /// active rows would break that invariant. Implementations must serialize this
-    /// check with staking farm source creation for the same organization.
-    async fn delete_if_no_staking_farm_source(
-        &self,
-        id: Uuid,
-        owner_user_id: Uuid,
-    ) -> Result<DeleteOrganizationResult, RepositoryError>;
-
-    async fn add_member(
-        &self,
-        org_id: Uuid,
-        request: AddOrganizationMemberRequest,
-        invited_by: Uuid,
-    ) -> Result<OrganizationMember, RepositoryError>;
-
-    async fn update_member(
-        &self,
-        org_id: Uuid,
-        user_id: Uuid,
-        request: UpdateOrganizationMemberRequest,
-        requester_user_id: Uuid,
-    ) -> Result<OrganizationMember, RepositoryError>;
-
-    /// Atomically update a member role and record the system administrator
-    /// responsible for the change. Promoting an existing member to owner transfers
-    /// ownership and demotes the previous owner to admin.
-    async fn update_member_role_with_audit(
-        &self,
-        org_id: Uuid,
-        user_id: Uuid,
-        request: UpdateOrganizationMemberRequest,
-        changed_by_user_id: Uuid,
-    ) -> Result<OrganizationMemberRoleUpdate, RepositoryError>;
-
     async fn remove_member(
         &self,
         org_id: Uuid,
         user_id: Uuid,
         requester_user_id: Uuid,
     ) -> Result<RemoveOrganizationMemberResult, RepositoryError>;
-
-    async fn list_members_paginated(
-        &self,
-        org_id: Uuid,
-        limit: i64,
-        offset: i64,
-    ) -> Result<Vec<OrganizationMember>, RepositoryError>;
-
-    async fn get_member_count(&self, org_id: Uuid) -> Result<i64, RepositoryError>;
-
-    async fn count_organizations_by_user(&self, user_id: Uuid) -> Result<i64, RepositoryError>;
-
-    async fn list_organizations_by_user(
-        &self,
-        user_id: Uuid,
-        limit: i64,
-        offset: i64,
-        order_by: Option<OrganizationOrderBy>,
-        order_direction: Option<OrganizationOrderDirection>,
-    ) -> Result<Vec<Organization>, RepositoryError>;
-
-    async fn list_organizations_with_roles_by_user(
-        &self,
-        user_id: Uuid,
-        limit: i64,
-        offset: i64,
-        order_by: Option<OrganizationOrderBy>,
-        order_direction: Option<OrganizationOrderDirection>,
-    ) -> Result<Vec<OrganizationWithRole>, RepositoryError>;
 }
-
-/// Repository trait for organization invitations
-#[async_trait]
-pub trait OrganizationInvitationRepository: Send + Sync {
-    /// Create a new invitation
-    async fn create(
-        &self,
-        org_id: Uuid,
-        request: CreateInvitationRequest,
-        invited_by: Uuid,
-    ) -> Result<OrganizationInvitation>;
-
-    /// Get invitation by ID
-    async fn get_by_id(&self, id: Uuid) -> Result<Option<OrganizationInvitation>>;
-
-    /// Get invitation by token
-    async fn get_by_token(&self, token: &str) -> Result<Option<OrganizationInvitation>>;
-
-    /// List invitations for an organization
-    async fn list_by_organization(
-        &self,
-        org_id: Uuid,
-        status: Option<InvitationStatus>,
-    ) -> Result<Vec<OrganizationInvitation>>;
-
-    /// List invitations for a user by email
-    async fn list_by_email(
-        &self,
-        email: &str,
-        status: Option<InvitationStatus>,
-    ) -> Result<Vec<OrganizationInvitation>>;
-
-    /// List invitations for a user by email, enriched with organization and inviter details
-    async fn list_by_email_with_details(
-        &self,
-        email: &str,
-        status: Option<InvitationStatus>,
-    ) -> Result<Vec<OrganizationInvitationWithDetails>>;
-
-    /// List invitation email deliveries for admin oversight.
-    async fn list_email_deliveries(
-        &self,
-        filters: InvitationEmailDeliveryFilters,
-        limit: i64,
-        offset: i64,
-    ) -> Result<(Vec<OrganizationInvitationEmailDelivery>, i64)>;
-
-    /// Update invitation status
-    async fn update_status(
-        &self,
-        id: Uuid,
-        status: InvitationStatus,
-    ) -> Result<OrganizationInvitation>;
-
-    /// Record a successful invitation email delivery
-    async fn record_email_sent(
-        &self,
-        id: Uuid,
-        message_id: Option<String>,
-    ) -> Result<OrganizationInvitation>;
-
-    /// Record a failed invitation email delivery
-    async fn record_email_failed(&self, id: Uuid, error: String) -> Result<OrganizationInvitation>;
-
-    /// Record a skipped invitation email delivery
-    async fn record_email_skipped(&self, id: Uuid) -> Result<OrganizationInvitation>;
-
-    /// Delete invitation
-    async fn delete(&self, id: Uuid) -> Result<bool>;
-
-    /// Delete invitation only if it is still pending
-    async fn delete_pending(&self, id: Uuid) -> Result<bool>;
-
-    /// Mark expired invitations
-    async fn mark_expired(&self) -> Result<usize>;
-}
-
 /// Service trait for organization operations
 #[cfg_attr(any(test, feature = "test-mocks"), mockall::automock)]
 #[async_trait]
@@ -583,77 +352,6 @@ pub trait OrganizationServiceTrait: Send + Sync {
         description: Option<String>,
         owner_id: UserId,
     ) -> Result<Organization, OrganizationError>;
-
-    /// Get an organization by ID
-    async fn get_organization(&self, id: OrganizationId)
-        -> Result<Organization, OrganizationError>;
-
-    /// Update an organization
-    async fn update_organization(
-        &self,
-        id: OrganizationId,
-        user_id: UserId,
-        name: Option<String>,
-        description: Option<String>,
-        rate_limit: Option<i32>,
-        settings: Option<serde_json::Value>,
-    ) -> Result<Organization, OrganizationError>;
-
-    /// Delete an organization (owner only)
-    async fn delete_organization(
-        &self,
-        id: OrganizationId,
-        user_id: UserId,
-    ) -> Result<bool, OrganizationError>;
-
-    /// List organizations accessible to a user (where they are a member)
-    async fn list_organizations_for_user(
-        &self,
-        user_id: UserId,
-        limit: i64,
-        offset: i64,
-        order_by: Option<OrganizationOrderBy>,
-        order_direction: Option<OrganizationOrderDirection>,
-    ) -> Result<Vec<Organization>, OrganizationError>;
-
-    async fn list_organizations_with_roles_for_user(
-        &self,
-        user_id: UserId,
-        limit: i64,
-        offset: i64,
-        order_by: Option<OrganizationOrderBy>,
-        order_direction: Option<OrganizationOrderDirection>,
-    ) -> Result<Vec<OrganizationWithRole>, OrganizationError>;
-
-    /// Count organizations accessible to a user
-    async fn count_organizations_for_user(&self, user_id: UserId)
-        -> Result<i64, OrganizationError>;
-
-    /// Add a member to an organization
-    async fn add_member(
-        &self,
-        organization_id: OrganizationId,
-        requester_id: UserId,
-        new_member_id: UserId,
-        role: MemberRole,
-    ) -> Result<OrganizationMember, OrganizationError>;
-
-    /// Remove a member from an organization
-    async fn remove_member(
-        &self,
-        organization_id: OrganizationId,
-        requester_id: UserId,
-        member_id: UserId,
-    ) -> Result<bool, OrganizationError>;
-
-    /// Update a member's role
-    async fn update_member_role(
-        &self,
-        organization_id: OrganizationId,
-        requester_id: UserId,
-        member_id: UserId,
-        new_role: MemberRole,
-    ) -> Result<OrganizationMember, OrganizationError>;
 
     /// Check if a user is a member of an organization
     async fn is_member(
@@ -669,201 +367,10 @@ pub trait OrganizationServiceTrait: Send + Sync {
         user_id: UserId,
     ) -> Result<Option<MemberRole>, OrganizationError>;
 
-    /// Get the number of members in an organization
-    async fn get_member_count(
-        &self,
-        organization_id: OrganizationId,
-        requester_id: UserId,
-    ) -> Result<i64, OrganizationError>;
-
-    /// Get organization by name
-    async fn get_organization_by_name(
-        &self,
-        name: &str,
-    ) -> Result<Option<Organization>, OrganizationError>;
-
-    /// List organization members with full user information (paginated)
-    async fn get_members_with_users_paginated(
-        &self,
-        organization_id: OrganizationId,
-        requester_id: UserId,
-        limit: i64,
-        offset: i64,
-    ) -> Result<Vec<OrganizationMemberWithUser>, OrganizationError>;
-
-    /// Invite members by email (batch operation)
-    async fn invite_members_by_email(
-        &self,
-        organization_id: OrganizationId,
-        requester_id: UserId,
-        invitations: Vec<(String, MemberRole)>,
-    ) -> Result<BatchInvitationResponse, OrganizationError>;
-
-    /// Add a member by user ID (validates user exists)
-    async fn add_member_validated(
-        &self,
-        organization_id: OrganizationId,
-        requester_id: UserId,
-        new_member_id: UserId,
-        role: MemberRole,
-    ) -> Result<OrganizationMember, OrganizationError>;
-
-    /// Update member role with additional validation
-    async fn update_member_role_validated(
-        &self,
-        organization_id: OrganizationId,
-        requester_id: UserId,
-        member_id: UserId,
-        new_role: MemberRole,
-    ) -> Result<OrganizationMember, OrganizationError>;
-
-    /// Update a member role after system-admin authorization has been verified.
-    /// The caller MUST enforce system-admin authorization (the API uses
-    /// `admin_middleware` and the `AdminUser` extension). This method does not
-    /// check the caller's organization membership or system-admin privileges.
-    async fn update_member_role_for_admin(
-        &self,
-        organization_id: OrganizationId,
-        member_id: UserId,
-        new_role: MemberRole,
-        changed_by_user_id: UserId,
-    ) -> Result<OrganizationMemberRoleUpdate, OrganizationError>;
-
-    /// Remove member with last owner protection
-    async fn remove_member_validated(
-        &self,
-        organization_id: OrganizationId,
-        requester_id: UserId,
-        member_id: UserId,
-    ) -> Result<bool, OrganizationError>;
-
-    /// Create invitations for users (supports unregistered users)
-    async fn create_invitations(
-        &self,
-        organization_id: OrganizationId,
-        requester_id: UserId,
-        invitations: Vec<(String, MemberRole)>,
-        expires_in_hours: i64,
-    ) -> Result<BatchInvitationResponse, OrganizationError>;
-
-    /// List pending invitations for a user by email
-    async fn list_user_invitations(
-        &self,
-        email: &str,
-    ) -> Result<Vec<OrganizationInvitationWithDetails>, OrganizationError>;
-
-    /// Get invitation by token (public, for viewing before auth)
-    async fn get_invitation_by_token(
-        &self,
-        token: &str,
-    ) -> Result<OrganizationInvitation, OrganizationError>;
-
-    /// Accept invitation by token
-    async fn accept_invitation_by_token(
-        &self,
-        token: &str,
-        user_id: UserId,
-        user_email: &str,
-    ) -> Result<OrganizationMember, OrganizationError>;
-
-    /// Accept an invitation (creates membership if user is registered)
-    async fn accept_invitation(
-        &self,
-        invitation_id: uuid::Uuid,
-        user_id: UserId,
-        user_email: &str,
-    ) -> Result<OrganizationMember, OrganizationError>;
-
-    /// Decline an invitation
-    async fn decline_invitation(
-        &self,
-        invitation_id: uuid::Uuid,
-        user_email: &str,
-    ) -> Result<(), OrganizationError>;
-
-    /// Cancel a pending invitation for an organization (admin/owner only)
-    async fn cancel_organization_invitation(
-        &self,
-        organization_id: OrganizationId,
-        requester_id: UserId,
-        invitation_id: uuid::Uuid,
-    ) -> Result<(), OrganizationError>;
-
-    /// List invitations for an organization (admin/owner only)
-    async fn list_organization_invitations(
-        &self,
-        organization_id: OrganizationId,
-        requester_id: UserId,
-        status: Option<InvitationStatus>,
-    ) -> Result<Vec<OrganizationInvitation>, OrganizationError>;
-
-    /// List invitation email deliveries across organizations (platform admin route).
-    async fn list_invitation_email_deliveries(
-        &self,
-        filters: InvitationEmailDeliveryFilters,
-        limit: i64,
-        offset: i64,
-    ) -> Result<(Vec<OrganizationInvitationEmailDelivery>, i64), OrganizationError>;
-
-    /// Resend a single invitation email (platform admin route).
-    async fn resend_invitation_email(
-        &self,
-        invitation_id: Uuid,
-    ) -> Result<InvitationEmailResendResult, OrganizationError>;
-
-    /// Get the effective organization settings for an organization member.
-    async fn get_organization_settings(
-        &self,
-        organization_id: OrganizationId,
-        user_id: UserId,
-    ) -> Result<OrganizationSettings, OrganizationError>;
-
-    /// Atomically patch organization settings with field-specific authorization.
-    async fn patch_organization_settings(
-        &self,
-        organization_id: OrganizationId,
-        user_id: UserId,
-        patch: PatchOrganizationSettings,
-    ) -> Result<OrganizationSettings, OrganizationError>;
-
-    /// Read scheduler priority from an admin-authenticated call path.
-    async fn get_request_priority_for_admin(
-        &self,
-        organization_id: OrganizationId,
-    ) -> Result<i32, OrganizationError>;
-
-    /// Set scheduler priority from an admin-authenticated call path.
-    async fn update_request_priority_for_admin(
-        &self,
-        organization_id: OrganizationId,
-        priority: i32,
-    ) -> Result<i32, OrganizationError>;
-
-    /// Get the effective fallback policy from an admin-authenticated call path.
-    async fn get_fallback_enabled_for_admin(
-        &self,
-        organization_id: OrganizationId,
-    ) -> Result<bool, OrganizationError>;
-
-    /// Set the fallback policy from an admin-authenticated call path.
-    async fn update_fallback_enabled_for_admin(
-        &self,
-        organization_id: OrganizationId,
-        fallback_enabled: bool,
-    ) -> Result<bool, OrganizationError>;
-
     /// Get organization system prompt
     async fn get_system_prompt(
         &self,
         organization_id: OrganizationId,
         user_id: UserId,
-    ) -> Result<Option<String>, OrganizationError>;
-
-    /// Update organization system prompt
-    async fn update_system_prompt(
-        &self,
-        organization_id: OrganizationId,
-        user_id: UserId,
-        system_prompt: Option<String>,
     ) -> Result<Option<String>, OrganizationError>;
 }

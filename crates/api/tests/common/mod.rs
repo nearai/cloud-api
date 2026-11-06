@@ -1115,7 +1115,7 @@ pub(crate) fn build_app_with_config_and_options(
     domain_services: DomainServices,
     config: Arc<ApiConfig>,
     build_options: AppBuildOptions,
-) -> axum::Router {
+) -> Result<axum::Router, services::mpp::MppError> {
     seeding::register_models_service(
         &domain_services.models_service,
         &domain_services.inference_provider_pool,

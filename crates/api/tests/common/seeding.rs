@@ -17,6 +17,10 @@
 //! validation, its pool effects or its audit trail must call the route (for the catalog,
 //! `admin_batch_upsert_models`), not seed.
 //!
+//! Under nextest every test runs in its own process, so the registries above hold one
+//! server and seeding touches only that one. Under plain `cargo test` the tests share a
+//! process and seeding touches every server built so far, including other tests' servers.
+//!
 //! The pool is created once per process on first use. Seeded users must already exist in
 //! `users` (see `setup_unique_test_session`); the mock auth resolves `rt_<uuid>` to that
 //! user and anything else to `MOCK_USER_ID`.
@@ -608,8 +612,15 @@ pub async fn seed_models(
                 .expect("Failed to seed model aliases");
         }
 
-        let touches_registration = request.provider_type.is_some()
+        // The route's two registration triggers (admin.rs, `inference_url_models` and
+        // `external_models`): the inference-URL one also reacts to `context_length`, the
+        // external one does not look at `inference_url`.
+        let touches_url_registration = request.provider_type.is_some()
             || request.inference_url.is_some()
+            || request.provider_config.is_some()
+            || request.is_active.is_some()
+            || request.context_length.is_some();
+        let touches_external_registration = request.provider_type.is_some()
             || request.provider_config.is_some()
             || request.is_active.is_some();
         if request.is_active == Some(false)
@@ -618,12 +629,16 @@ pub async fn seed_models(
         {
             unregister.push(model_name.clone());
         }
-        if touches_registration && model.is_active {
+        if model.is_active {
             if model.provider_type == "external" {
-                if let Some(config) = model.provider_config.clone() {
-                    external_models.push((model_name.clone(), config));
+                if touches_external_registration {
+                    if let Some(config) = model.provider_config.clone() {
+                        external_models.push((model_name.clone(), config));
+                    }
                 }
-            } else if let Some(url) = model.inference_url.clone() {
+            } else if let (true, Some(url)) =
+                (touches_url_registration, model.inference_url.clone())
+            {
                 inference_url_models.push(
                     services::inference_provider_pool::expand_inference_endpoints(
                         &model_name,
@@ -662,8 +677,15 @@ pub async fn seed_models(
         }
         if !external_models.is_empty() {
             // The route only warned: a model without a usable key (the e2e config has
-            // none) is simply not registered.
+            // none) is simply not registered. A config that carries its own api_key is
+            // seeded because a test needs the provider, so its failed load panics.
             if let Err(error) = pool.load_external_providers(external_models.clone()).await {
+                assert!(
+                    !external_models
+                        .iter()
+                        .any(|(_, config)| config.get("api_key").is_some()),
+                    "Failed to register a seeded external provider with an api_key: {error}"
+                );
                 tracing::warn!(%error, "Failed to register some seeded external providers");
             }
         }

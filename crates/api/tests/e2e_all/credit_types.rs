@@ -5,34 +5,6 @@
 
 use crate::common::*;
 
-/// Helper to get limits history for an organization
-async fn get_limits_history(
-    server: &axum_test::TestServer,
-    org_id: &str,
-) -> api::models::OrgLimitsHistoryResponse {
-    let response = server
-        .get(format!("/v1/admin/organizations/{}/limits/history", org_id).as_str())
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
-        .add_header("User-Agent", MOCK_USER_AGENT)
-        .await;
-    assert_eq!(response.status_code(), 200);
-    response.json::<api::models::OrgLimitsHistoryResponse>()
-}
-
-/// Helper to send a raw limits update request (for error cases)
-async fn update_limits_raw(
-    server: &axum_test::TestServer,
-    org_id: &str,
-    request: serde_json::Value,
-) -> axum_test::TestResponse {
-    server
-        .patch(format!("/v1/admin/organizations/{}/limits", org_id).as_str())
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
-        .add_header("User-Agent", MOCK_USER_AGENT)
-        .json(&request)
-        .await
-}
-
 /// Test adding various credit types with different sources and currencies
 #[tokio::test]
 async fn test_add_credits_variations() {
@@ -116,7 +88,7 @@ async fn test_credits_accumulate_across_types() {
     )
     .await;
 
-    let history = get_limits_history(&server, &org.id).await;
+    let history = seeding::limits_history(&org.id).await;
     assert_eq!(history.history.len(), 2);
 
     let types: Vec<&str> = history
@@ -165,7 +137,7 @@ async fn test_staking_farm_does_not_overwrite_payment_credits() {
     )
     .await;
 
-    let history = get_limits_history(&server, &org.id).await;
+    let history = seeding::limits_history(&org.id).await;
     let active: Vec<_> = history
         .history
         .iter()
@@ -255,30 +227,6 @@ async fn test_balance_response_includes_credit_limit_breakdown() {
     }));
 }
 
-/// API-created limits are capped so aggregate and SQL BIGINT sums cannot overflow.
-#[tokio::test]
-async fn test_organization_limit_rejects_amount_above_safety_maximum() {
-    let server = setup_test_server().await;
-    let org = create_org(&server).await;
-
-    let response = server
-        .patch(format!("/v1/admin/organizations/{}/limits", org.id).as_str())
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
-        .add_header("User-Agent", MOCK_USER_AGENT)
-        .json(&serde_json::json!({
-            "type": "postpay",
-            "spendLimit": {
-                "amount": 1_000_000_000_000_000_001_i64,
-                "currency": "USD"
-            },
-            "changeReason": "must be rejected"
-        }))
-        .await;
-
-    assert_eq!(response.status_code(), 400);
-    assert!(response.text().contains("cannot exceed $1,000,000,000"));
-}
-
 /// Test that updating the same credit type replaces the previous one
 #[tokio::test]
 async fn test_update_same_type_replaces_previous() {
@@ -308,7 +256,7 @@ async fn test_update_same_type_replaces_previous() {
     )
     .await;
 
-    let history = get_limits_history(&server, &org.id).await;
+    let history = seeding::limits_history(&org.id).await;
     assert_eq!(history.history.len(), 2);
 
     // Most recent (first) should be active with $20, older (second) should be closed with $10
@@ -356,7 +304,7 @@ async fn test_independent_credit_type_updates() {
     )
     .await;
 
-    let history = get_limits_history(&server, &org.id).await;
+    let history = seeding::limits_history(&org.id).await;
 
     // Should have 3 entries: 2 grants (1 active, 1 closed) + 1 payment (active)
     assert_eq!(history.history.len(), 3);
@@ -407,7 +355,7 @@ async fn test_history_includes_credit_type_and_source() {
     )
     .await;
 
-    let history = get_limits_history(&server, &org.id).await;
+    let history = seeding::limits_history(&org.id).await;
 
     let grant = history
         .history
@@ -422,74 +370,4 @@ async fn test_history_includes_credit_type_and_source() {
 
     assert_eq!(grant.source.as_deref(), Some("nearai"));
     assert_eq!(payment.source.as_deref(), Some("stripe"));
-}
-
-/// Test invalid credit type returns 400 error
-#[tokio::test]
-async fn test_invalid_credit_type_returns_error() {
-    let server = setup_test_server().await;
-    let org = create_org(&server).await;
-
-    let response = update_limits_raw(
-        &server,
-        &org.id,
-        serde_json::json!({
-            "type": "invalid_type",
-            "spendLimit": { "amount": 10_000_000_000i64, "currency": "USD" },
-            "changedBy": "admin@test.com",
-            "changeReason": "Test invalid type"
-        }),
-    )
-    .await;
-
-    // Serde deserialization errors return 422 Unprocessable Entity
-    assert_eq!(response.status_code(), 422);
-}
-
-/// Test credit type case insensitivity (GRANT -> grant)
-#[tokio::test]
-async fn test_credit_type_case_insensitive() {
-    let server = setup_test_server().await;
-    let org = create_org(&server).await;
-
-    let response = update_limits_raw(
-        &server,
-        &org.id,
-        serde_json::json!({
-            "type": "GRANT",
-            "spendLimit": { "amount": 10_000_000_000i64, "currency": "USD" },
-            "changedBy": "admin@test.com",
-            "changeReason": "Test case insensitive"
-        }),
-    )
-    .await;
-
-    assert_eq!(response.status_code(), 200);
-    assert_eq!(
-        response
-            .json::<api::models::UpdateOrganizationLimitsResponse>()
-            .credit_type
-            .as_str(),
-        "grant"
-    );
-}
-
-/// Test missing type field returns error (type is required)
-#[tokio::test]
-async fn test_missing_type_field_returns_error() {
-    let server = setup_test_server().await;
-    let org = create_org(&server).await;
-
-    let response = update_limits_raw(
-        &server,
-        &org.id,
-        serde_json::json!({
-            "spendLimit": { "amount": 10_000_000_000i64, "currency": "USD" },
-            "changedBy": "admin@test.com",
-            "changeReason": "Test missing type"
-        }),
-    )
-    .await;
-
-    assert!(response.status_code() == 400 || response.status_code() == 422);
 }

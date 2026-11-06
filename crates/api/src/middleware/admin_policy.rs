@@ -35,22 +35,8 @@ pub(crate) fn admin_operation(method: &Method, matched_path: &str) -> AdminOpera
     if matches!(*method, Method::GET | Method::HEAD)
         && matches!(
             path,
-            "/admin/models"
-                | "/admin/models/pricing-changes"
-                | "/admin/models/{model_name}/history"
-                | "/admin/models/{model_name}/access"
-                | "/admin/organizations/{org_id}/model-access"
-                | "/admin/organizations/{org_id}/limits/history"
-                | "/admin/aml/reports"
-                | "/admin/aml/allowlist"
-                | "/admin/organizations/{org_id}/concurrent-limit"
-                | "/admin/organizations/{org_id}/fallback"
-                | "/admin/organizations/{org_id}/priority"
-                | "/admin/platform/infra-summary"
-                | "/admin/settings"
-                | "/admin/settings/{key}"
+            "/admin/platform/infra-summary"
                 | "/admin/invitation-email-deliveries"
-                | "/admin/feature-requests"
                 | "/admin/database-encryption/jobs/{id}"
                 | "/admin/database-encryption/keys"
                 | "/admin/object-encryption/jobs/{id}"
@@ -66,9 +52,7 @@ pub(crate) fn admin_operation(method: &Method, matched_path: &str) -> AdminOpera
     if *method == Method::POST
         && matches!(
             path,
-            "/admin/models/pricing-changes/preview"
-                | "/admin/models/{model_name}/deprecation/preview"
-                | "/admin/database-encryption/scan"
+            "/admin/database-encryption/scan"
                 | "/admin/object-encryption/scan"
                 | "/admin/users/{user_id}/erasure/preview"
         )
@@ -157,38 +141,6 @@ mod tests {
     }
 
     #[test]
-    fn settings_get_is_read_and_patch_is_write() {
-        for path in [
-            "/v1/admin/settings",
-            "/admin/settings",
-            "/v1/admin/settings/{key}",
-            "/admin/settings/{key}",
-        ] {
-            assert_eq!(admin_operation(&Method::GET, path), AdminOperation::Read);
-            assert_eq!(admin_operation(&Method::PATCH, path), AdminOperation::Write);
-            assert_eq!(admin_operation(&Method::PUT, path), AdminOperation::Write);
-        }
-    }
-
-    #[test]
-    fn model_access_listings_are_reads_and_grant_and_revoke_are_writes() {
-        for prefix in ["/v1", ""] {
-            for listing in [
-                "/admin/models/{model_name}/access",
-                "/admin/organizations/{org_id}/model-access",
-            ] {
-                let path = format!("{prefix}{listing}");
-                assert_eq!(admin_operation(&Method::GET, &path), AdminOperation::Read);
-                assert_eq!(admin_operation(&Method::PUT, &path), AdminOperation::Write);
-            }
-            let grant = format!("{prefix}/admin/models/{{model_name}}/access/{{org_id}}");
-            for method in [Method::PUT, Method::DELETE, Method::GET] {
-                assert_eq!(admin_operation(&method, &grant), AdminOperation::Write);
-            }
-        }
-    }
-
-    #[test]
     fn retired_admin_routes_are_not_reads() {
         // Routes that moved to cloud-platform must not keep a Read classification:
         // a route re-added at one of these paths is a Write until it is audited.
@@ -198,6 +150,14 @@ mod tests {
             "/v1/admin/organizations",
             "/v1/admin/organizations/{org_id}/usage/balance",
             "/v1/admin/platform/metrics",
+            "/v1/admin/models",
+            "/v1/admin/models/{model_name}/access",
+            "/v1/admin/organizations/{org_id}/model-access",
+            "/v1/admin/organizations/{org_id}/limits/history",
+            "/v1/admin/settings",
+            "/v1/admin/settings/{key}",
+            "/v1/admin/aml/reports",
+            "/v1/admin/feature-requests",
         ] {
             assert_eq!(admin_operation(&Method::GET, path), AdminOperation::Write);
         }

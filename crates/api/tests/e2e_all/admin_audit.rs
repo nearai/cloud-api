@@ -22,45 +22,11 @@ use uuid::Uuid;
 const AUDIT_HEADER: &str = "x-admin-audit-request-id";
 const REQUEST_ID_HEADER: &str = "x-request-id";
 
-/// Every admin route the app mounts: `build_admin_routes`, the admin
-/// feature-request route, the database-encryption routes (mounted because
+/// Every admin route the app mounts: `build_admin_routes`, the database-encryption routes (mounted because
 /// the e2e configuration has a valid encryption key), and the object-encryption
 /// router (using mock storage).
 const MOUNTED_ADMIN_ROUTES: &[(&str, &str)] = &[
-    ("GET", "/admin/models"),
-    ("PATCH", "/admin/models"),
-    ("POST", "/admin/models/deprecate"),
-    ("GET", "/admin/models/pricing-changes"),
-    ("POST", "/admin/models/pricing-changes/preview"),
-    ("POST", "/admin/models/pricing-changes/confirm"),
-    ("DELETE", "/admin/models/pricing-changes/{id}"),
-    ("DELETE", "/admin/models/{model_name}"),
-    ("GET", "/admin/models/{model_name}/history"),
-    ("POST", "/admin/models/{model_name}/deprecation/preview"),
-    ("POST", "/admin/models/{model_name}/deprecation/confirm"),
-    ("GET", "/admin/models/{model_name}/access"),
-    ("PUT", "/admin/models/{model_name}/access/{org_id}"),
-    ("DELETE", "/admin/models/{model_name}/access/{org_id}"),
-    ("GET", "/admin/organizations/{org_id}/model-access"),
-    ("POST", "/admin/services"),
-    ("PATCH", "/admin/services/{id}"),
-    ("PATCH", "/admin/organizations/{org_id}/limits"),
-    ("GET", "/admin/organizations/{org_id}/limits/history"),
-    ("GET", "/admin/aml/reports"),
-    ("PATCH", "/admin/aml/reports/{report_id}/status"),
-    ("GET", "/admin/aml/allowlist"),
-    ("POST", "/admin/aml/allowlist"),
-    ("DELETE", "/admin/aml/allowlist/{account_id}"),
-    ("GET", "/admin/organizations/{org_id}/concurrent-limit"),
-    ("PATCH", "/admin/organizations/{org_id}/concurrent-limit"),
-    ("GET", "/admin/organizations/{org_id}/priority"),
-    ("PATCH", "/admin/organizations/{org_id}/priority"),
-    ("GET", "/admin/organizations/{org_id}/fallback"),
-    ("PATCH", "/admin/organizations/{org_id}/fallback"),
     ("GET", "/admin/platform/infra-summary"),
-    ("GET", "/admin/settings"),
-    ("GET", "/admin/settings/{key}"),
-    ("PATCH", "/admin/settings/{key}"),
     ("GET", "/admin/invitation-email-deliveries"),
     (
         "POST",
@@ -85,7 +51,6 @@ const MOUNTED_ADMIN_ROUTES: &[(&str, &str)] = &[
     ("GET", "/admin/object-encryption/jobs/{id}"),
     ("POST", "/admin/object-encryption/jobs/{id}/cancel"),
     ("POST", "/admin/object-encryption/verify"),
-    ("GET", "/admin/feature-requests"),
 ];
 
 #[derive(Clone, Default)]
@@ -229,17 +194,8 @@ async fn json_body(response: Response) -> Value {
 
 /// Paginated admin lists the page guard must find in the OpenAPI document. A
 /// newly documented paginated list is checked without being listed here.
-const KNOWN_PAGINATED_ADMIN_LISTS: &[&str] = &[
-    "/admin/access-tokens",
-    "/admin/aml/allowlist",
-    "/admin/aml/reports",
-    "/admin/feature-requests",
-    "/admin/invitation-email-deliveries",
-    "/admin/models",
-    "/admin/models/pricing-changes",
-    "/admin/models/{model_name}/history",
-    "/admin/organizations/{org_id}/limits/history",
-];
+const KNOWN_PAGINATED_ADMIN_LISTS: &[&str] =
+    &["/admin/access-tokens", "/admin/invitation-email-deliveries"];
 
 /// Admin GET routes documented with `limit` and `offset` query parameters.
 fn documented_paginated_admin_lists() -> BTreeSet<String> {
@@ -263,12 +219,10 @@ fn documented_paginated_admin_lists() -> BTreeSet<String> {
 }
 
 /// A paginated list route with the test's fixtures as its parameters.
-fn fixture_list_path(route: &str, organization_id: &str, model_name: &str) -> String {
+fn fixture_list_path(route: &str) -> String {
     let segments: Vec<&str> = route
         .split('/')
         .map(|segment| match segment {
-            "{org_id}" => organization_id,
-            "{model_name}" => model_name,
             parameter if parameter.starts_with('{') => {
                 panic!("give {parameter} of {route} a fixture with at least two rows")
             }
@@ -407,19 +361,22 @@ async fn admin_token_identity_is_audited_for_allowed_and_denied_requests() {
         &router,
         authorized(
             Method::GET,
-            "/v1/admin/aml/reports?limit=1",
+            "/v1/admin/invitation-email-deliveries?limit=1",
             &read_only_token,
             json!({}),
         ),
     )
     .await;
     assert_eq!(response.status(), StatusCode::OK);
-    let returned = json_body(response).await["reports"]
+    let returned = json_body(response).await["deliveries"]
         .as_array()
-        .expect("reports")
+        .expect("deliveries")
         .len();
     let event = logs.take_single_event();
-    assert_eq!(event["admin_route"], "/v1/admin/aml/reports");
+    assert_eq!(
+        event["admin_route"],
+        "/v1/admin/invitation-email-deliveries"
+    );
     assert_eq!(event["admin_auth_outcome"], "allowed");
     assert_eq!(event["admin_credential_kind"], "admin_access_token");
     assert_eq!(event["admin_credential_id"], read_only.id.to_string());
@@ -432,11 +389,8 @@ async fn admin_token_identity_is_audited_for_allowed_and_denied_requests() {
     // Policy denials keep the authenticated identity but name no organization.
     for (method, uri, token, credential_id) in [
         (
-            Method::PATCH,
-            format!(
-                "/v1/admin/organizations/{}/concurrent-limit",
-                Uuid::new_v4()
-            ),
+            Method::POST,
+            "/v1/admin/database-encryption/jobs".to_string(),
             &read_only_token,
             read_only.id,
         ),
@@ -471,7 +425,7 @@ async fn admin_token_identity_is_audited_for_allowed_and_denied_requests() {
         &router,
         authorized(
             Method::GET,
-            "/v1/admin/aml/reports",
+            "/v1/admin/invitation-email-deliveries",
             &read_write_token,
             json!({}),
         ),
@@ -495,15 +449,8 @@ async fn list_handlers_record_validated_pages_and_organization_scope() {
 
     let lists = [
         (
-            "/v1/admin/aml/reports?limit=1".to_string(),
-            "reports",
-            1,
-            0,
-            None,
-        ),
-        (
-            "/v1/admin/aml/allowlist?limit=1&offset=2".to_string(),
-            "accounts",
+            "/v1/admin/invitation-email-deliveries?limit=1&offset=2".to_string(),
+            "deliveries",
             1,
             2,
             None,
@@ -546,7 +493,7 @@ async fn list_handlers_record_validated_pages_and_organization_scope() {
         &router,
         authorized(
             Method::GET,
-            "/v1/admin/aml/reports?limit=0",
+            "/v1/admin/invitation-email-deliveries?limit=0",
             &session,
             json!({}),
         ),
@@ -560,13 +507,27 @@ async fn list_handlers_record_validated_pages_and_organization_scope() {
     }
 
     // An allowed org-scoped write names its organization.
+    let database = seeding::seed_database().await;
+    let (member_session, _) = setup_unique_test_session(&database).await;
+    let member_id = Uuid::parse_str(member_session.trim_start_matches("rt_")).unwrap();
+    database
+        .pool()
+        .get()
+        .await
+        .expect("database connection")
+        .execute(
+            "INSERT INTO organization_members (organization_id, user_id, role) VALUES ($1, $2, 'member')",
+            &[&Uuid::parse_str(&organization_id).unwrap(), &member_id],
+        )
+        .await
+        .expect("member is seeded");
     let response = send(
         &router,
         authorized(
-            Method::PATCH,
-            &format!("/v1/admin/organizations/{organization_id}/concurrent-limit"),
+            Method::PUT,
+            &format!("/v1/admin/organizations/{organization_id}/members/{member_id}"),
             &session,
-            json!({"concurrentLimit": 64}),
+            json!({"role": "admin"}),
         ),
     )
     .await;
@@ -574,9 +535,9 @@ async fn list_handlers_record_validated_pages_and_organization_scope() {
     let event = logs.take_single_event();
     assert_eq!(
         event["admin_route"],
-        "/v1/admin/organizations/{org_id}/concurrent-limit"
+        "/v1/admin/organizations/{org_id}/members/{user_id}"
     );
-    assert_eq!(event["admin_method"], "PATCH");
+    assert_eq!(event["admin_method"], "PUT");
     assert_eq!(event["admin_auth_outcome"], "allowed");
     assert_eq!(event["admin_organization_id"], organization_id.as_str());
 }
@@ -593,8 +554,8 @@ async fn audit_events_exclude_request_content_on_the_real_router() {
     let (logs, _guard) = CapturedLogs::start();
 
     for uri in [
-        format!("/v1/admin/models?search={EMAIL}&limit=1"),
-        format!("/v1/admin/users/{EMAIL}/lookup"),
+        format!("/v1/admin/invitation-email-deliveries?recipient_email={EMAIL}&limit=1"),
+        format!("/v1/admin/access-tokens?lookup={EMAIL}"),
     ] {
         let response = send(
             &router,
@@ -653,50 +614,6 @@ fn page_guard_finds_every_known_paginated_admin_list() {
 #[tokio::test]
 async fn every_documented_paginated_admin_list_records_its_page() {
     let (server, router) = setup_test_server_and_router().await;
-    // Fixtures so both pages below can return rows: limits history fails on
-    // an empty page, and model history fails for a model without history.
-    let organization_id = setup_org_with_credits(&server, 1_000_000_000).await.id;
-    add_credits_with_type(
-        &server,
-        &organization_id,
-        "grant",
-        None,
-        1_000_000_000,
-        "USD",
-        &get_session_id(),
-    )
-    .await;
-    let model_name = format!("admin-audit-history-{}", Uuid::new_v4());
-    for input_cost in [1_000, 2_000] {
-        let model = serde_json::from_value(json!({
-            "inputCostPerToken": {"amount": input_cost, "currency": "USD"},
-            "outputCostPerToken": {"amount": 2_000, "currency": "USD"},
-            "modelDisplayName": "Admin audit history fixture",
-            "modelDescription": "Admin audit history fixture",
-            "contextLength": 4096,
-            "verifiable": true,
-            "isActive": false,
-            "changeReason": "admin audit e2e"
-        }))
-        .expect("model fixture");
-        seed_models(
-            &server,
-            std::collections::HashMap::from([(model_name.clone(), model)]),
-            get_session_id(),
-        )
-        .await;
-    }
-    let feature_request = server
-        .post("/v1/feature-requests")
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
-        .add_header("User-Agent", MOCK_USER_AGENT)
-        .json(&json!({
-            "kind": "model",
-            "key": format!("admin-audit-{}", Uuid::new_v4()),
-            "title": "Admin audit fixture"
-        }))
-        .await;
-    assert_eq!(feature_request.status_code(), StatusCode::OK);
     let access_token = server
         .post("/v1/admin/access-tokens")
         .add_header("Authorization", format!("Bearer {}", get_session_id()))
@@ -712,7 +629,7 @@ async fn every_documented_paginated_admin_list_records_its_page() {
     let (logs, _guard) = CapturedLogs::start();
 
     for route in documented_paginated_admin_lists() {
-        let path = fixture_list_path(&route, &organization_id, &model_name);
+        let path = fixture_list_path(&route);
         for (limit, offset) in [(2, 0), (1, 1)] {
             let uri = format!("{path}?limit={limit}&offset={offset}");
             let response = send(&router, authorized(Method::GET, &uri, &session, json!({}))).await;
@@ -733,9 +650,6 @@ async fn every_documented_paginated_admin_list_records_its_page() {
                 ),
                 "{uri} must record the page it served"
             );
-            if route.contains("{org_id}") {
-                assert_eq!(event["admin_organization_id"], organization_id.as_str());
-            }
         }
     }
 }
@@ -748,23 +662,7 @@ async fn paginated_lists_record_no_page_when_the_request_fails() {
 
     for (uri, status) in [
         (
-            "/v1/admin/models?limit=0".to_string(),
-            StatusCode::BAD_REQUEST,
-        ),
-        (
-            format!(
-                "/v1/admin/models/admin-audit-missing-{}/history",
-                Uuid::new_v4()
-            ),
-            StatusCode::NOT_FOUND,
-        ),
-        (
-            format!("/v1/admin/organizations/{}/limits/history", Uuid::new_v4()),
-            StatusCode::NOT_FOUND,
-        ),
-        // The pricing-change service, not the handler, validates this page.
-        (
-            "/v1/admin/models/pricing-changes?limit=0".to_string(),
+            "/v1/admin/invitation-email-deliveries?limit=0".to_string(),
             StatusCode::BAD_REQUEST,
         ),
         (
@@ -773,7 +671,7 @@ async fn paginated_lists_record_no_page_when_the_request_fails() {
         ),
         // A valid page with an invalid filter.
         (
-            "/v1/admin/feature-requests?kind=unknown".to_string(),
+            "/v1/admin/invitation-email-deliveries?email_status=unknown".to_string(),
             StatusCode::BAD_REQUEST,
         ),
     ] {

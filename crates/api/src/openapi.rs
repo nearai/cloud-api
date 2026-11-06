@@ -127,47 +127,13 @@ Operations marked deprecated (account, organization, workspace, invitation, API 
         // Invitation endpoints (token-based)
         crate::routes::users::get_invitation_by_token,
         crate::routes::users::accept_invitation_by_token,
-        // Feature request endpoints
-        crate::routes::feature_requests::submit_feature_request,
-        crate::routes::feature_requests::list_admin_feature_requests,
         // Gateway endpoints (model gateway integration)
         crate::routes::gateway::check_api_key,
         // Admin endpoints (less frequently used)
-        crate::routes::admin::list_models,
-        crate::routes::admin::batch_upsert_models,
-        crate::routes::admin::delete_model,
-        crate::routes::admin::deprecate_model,
-        crate::routes::admin::preview_model_deprecation,
-        crate::routes::admin::confirm_model_deprecation,
-        crate::routes::admin::preview_model_pricing_changes,
         crate::routes::admin::preview_user_erasure,
         crate::routes::admin::erase_user,
         crate::routes::admin::lookup_user_erasures,
-        crate::routes::admin::confirm_model_pricing_changes,
-        crate::routes::admin::list_model_pricing_changes,
-        crate::routes::admin::cancel_model_pricing_change,
-        crate::routes::admin::get_model_history,
-        crate::routes::admin_model_access::get_model_access,
-        crate::routes::admin_model_access::grant_model_access,
-        crate::routes::admin_model_access::revoke_model_access,
-        crate::routes::admin_model_access::list_organization_model_access,
-        crate::routes::admin::update_organization_limits,
-        crate::routes::admin::get_organization_limits_history,
-        crate::routes::admin::list_aml_reports,
-        crate::routes::admin::update_aml_report_status,
-        crate::routes::admin::list_aml_allowlist,
-        crate::routes::admin::upsert_aml_allowlist_entry,
-        crate::routes::admin::delete_aml_allowlist_entry,
-        crate::routes::admin::update_organization_concurrent_limit,
-        crate::routes::admin::get_organization_concurrent_limit,
-        crate::routes::admin::get_organization_fallback,
-        crate::routes::admin::get_organization_priority,
-        crate::routes::admin::update_organization_priority,
-        crate::routes::admin::update_organization_fallback,
         crate::routes::admin::get_infra_summary,
-        crate::routes::admin::list_admin_settings,
-        crate::routes::admin::get_admin_setting,
-        crate::routes::admin::update_admin_setting,
         crate::routes::admin::list_invitation_email_deliveries,
         crate::routes::admin::resend_invitation_email,
         crate::routes::admin::update_organization_member_role,
@@ -176,8 +142,6 @@ Operations marked deprecated (account, organization, workspace, invitation, API 
         crate::routes::admin::delete_admin_access_token,
         crate::routes::services::list_services,
         crate::routes::services::get_service_by_name,
-        crate::routes::admin::create_service,
-        crate::routes::admin::update_service,
         // Health check endpoint
         crate::routes::health::health_check,
         // Attestation endpoints
@@ -216,11 +180,7 @@ Operations marked deprecated (account, organization, workspace, invitation, API 
             UpdateOrganizationRequest, CreateApiKeyRequest, ApiKeyResponse,
             UpdateApiKeySpendLimitRequest, UpdateApiKeyRequest,
             // usage_hourly repair models
-            crate::routes::admin_model_access::ModelAccessResponse,
-            crate::routes::admin_model_access::ModelAccessGrantResponse,
-            crate::routes::admin_model_access::OrganizationModelAccessResponse,
-            crate::routes::admin_model_access::OrganizationModelAccessEntry,
-            // Workspace models
+                            // Workspace models
             crate::routes::workspaces::CreateWorkspaceRequest,
             crate::routes::workspaces::UpdateWorkspaceRequest,
             crate::routes::workspaces::WorkspaceResponse,
@@ -275,24 +235,10 @@ Operations marked deprecated (account, organization, workspace, invitation, API 
             crate::routes::attestation::NvidiaPayload,
             crate::routes::attestation::QuoteResponse,
             // Model pricing models
-            ModelListResponse, ModelWithPricing, UpcomingPricing, AdminModelListResponse, AdminModelWithPricing,
+            ModelListResponse, ModelWithPricing, UpcomingPricing,
             DecimalPrice, DecimalPriceRequest, ModelMetadata,
             ServiceResponse, ServiceListResponse,
-            AdminServiceResponse, AdminServiceListResponse, CreateServiceRequest, UpdateServiceRequest,
-            UpdateModelApiRequest, ModelHistoryEntry, ModelHistoryResponse,
-            DeprecateModelRequest, DeprecateModelResponse, ModelDeprecationRequest,
-            ModelDeprecationPreviewResponse, ModelDeprecationConfirmResponse,
-            PricingChangeItemRequest, PricingChangeBatchRequest, PricingFields, PricingFieldUpdates,
-            PricingChangeModelPreviewDto, PricingChangePreviewResponse, ScheduledPricingChangeDto,
-            PricingChangeConfirmResponse, ListPricingChangesResponse,
-            // Organization limits models (Admin)
-            UpdateOrganizationLimitsRequest, UpdateOrganizationLimitsResponse, SpendLimit, SpendLimitRequest,
-            OrgLimitsHistoryEntry, OrgLimitsHistoryResponse,
-            // Organization concurrent limit models (Admin)
-            UpdateOrganizationConcurrentLimitRequest, UpdateOrganizationConcurrentLimitResponse,
-            GetOrganizationConcurrentLimitResponse,
-            UpdateOrganizationFallbackRequest, OrganizationFallbackResponse,
-            UpdateOrganizationPriorityRequest, OrganizationPriorityResponse,
+            SpendLimit, SpendLimitRequest,
             // Invitation email delivery models (Admin)
             AdminInvitationEmailDeliveryResponse, ListAdminInvitationEmailDeliveriesResponse,
             AdminInvitationEmailResendResultResponse,
@@ -303,26 +249,11 @@ Operations marked deprecated (account, organization, workspace, invitation, API 
             LookupUserErasuresRequest, LookupUserErasuresResponse, UserErasureRecordResponse,
             ErasureLookupOrganizationResponse,
             services::user_erasure::ErasureBlocker,
-            // AML models (Admin)
-            AdminAmlReportResponse, ListAdminAmlReportsResponse, UpdateAmlReportStatusRequest,
-            AdminAmlAllowlistEntryResponse, ListAdminAmlAllowlistResponse,
-            UpsertAmlAllowlistEntryRequest,
             // Admin access token models
             CreateAdminAccessTokenRequest, AdminAccessTokenResponse,
             AdminAccessTokenPermission, AdminAccessTokenListEntry, ListAdminAccessTokensResponse,
-            // Admin settings models
-            crate::routes::admin::AdminSettingResponse,
-            crate::routes::admin::ListAdminSettingsResponse,
             // Usage tracking models
             crate::routes::internal_usage::RecordUsageResponse,
-            // Feature request models
-            crate::routes::feature_requests::FeatureRequestKind,
-            crate::routes::feature_requests::SubmitFeatureRequest,
-            crate::routes::feature_requests::SubmitFeatureRequestResponse,
-            crate::routes::feature_requests::FeatureRequestTargetResponse,
-            crate::routes::feature_requests::FeatureRequestVoteResponse,
-            crate::routes::feature_requests::AdminFeatureRequestSummaryResponse,
-            crate::routes::feature_requests::AdminFeatureRequestListResponse,
             // Gateway models
             crate::routes::gateway::CheckApiKeyResponse,
             // Platform Stats analytics models
@@ -398,7 +329,6 @@ impl Modify for AdminPermissionsAddon {
                     ));
                 }
                 operation.security = Some(security);
-
                 let forbidden = if policy == AdminOperation::SessionOnly {
                     "Admin session required; admin tokens receive error.type forbidden."
                 } else {
@@ -659,24 +589,7 @@ mod admin_token_permission_tests {
         for model in ["AdminAccessTokenResponse", "AdminAccessTokenListEntry"] {
             assert!(schemas[model]["properties"].get("permission").is_some());
         }
-        for model in ["AdminSettingResponse", "ListAdminSettingsResponse"] {
-            assert!(schemas.get(model).is_some(), "{model} is registered");
-        }
         for (path, method, phrase, tokens_allowed) in [
-            ("/v1/admin/models", "get", "read_only token", true),
-            (
-                "/v1/admin/models",
-                "patch",
-                "insufficient_permissions",
-                true,
-            ),
-            (
-                "/v1/admin/models/pricing-changes/preview",
-                "post",
-                "read_only token",
-                true,
-            ),
-            ("/v1/admin/feature-requests", "get", "read_only token", true),
             ("/v1/admin/access-tokens", "get", "session only", false),
             ("/v1/admin/access-tokens", "post", "session only", false),
             (

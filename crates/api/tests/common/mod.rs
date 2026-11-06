@@ -160,7 +160,6 @@ pub fn test_config() -> ApiConfig {
         },
         cors: config::CorsConfig::default(),
         external_providers: config::ExternalProvidersConfig::default(),
-        github_dispatch: config::GitHubDispatchConfig::default(),
         infra: config::InfraConfig::default(),
         staking_farm: config::StakingFarmConfig::default(),
         aml: config::AmlConfig::default(),
@@ -1114,6 +1113,7 @@ pub(crate) fn build_app_with_config_and_options(
     seeding::register_models_service(
         &domain_services.models_service,
         &domain_services.inference_provider_pool,
+        &domain_services.admin_settings_service,
     );
     api::build_app_with_config_and_options(
         database,
@@ -1126,34 +1126,13 @@ pub(crate) fn build_app_with_config_and_options(
 
 /// Setup: write catalog models straight to the database and invalidate the models caches.
 /// Skips the admin route's validation, provider pool changes and admin identity (see
-/// `seeding`). A test whose subject is the route calls `admin_batch_upsert_models`.
+/// `seeding`).
 pub async fn seed_models(
     _server: &axum_test::TestServer,
     models: BatchUpdateModelApiRequest,
     session_id: String,
 ) -> Vec<api::models::ModelWithPricing> {
     seeding::seed_models(models, &session_id).await
-}
-
-/// The admin route itself: `PATCH /v1/admin/models` as an admin session.
-pub async fn admin_batch_upsert_models(
-    server: &axum_test::TestServer,
-    models: BatchUpdateModelApiRequest,
-    session_id: String,
-) -> Vec<api::models::ModelWithPricing> {
-    let response = server
-        .patch("/v1/admin/models")
-        .add_header("Authorization", format!("Bearer {session_id}"))
-        .add_header("User-Agent", MOCK_USER_AGENT)
-        .json(&models)
-        .await;
-
-    assert_eq!(
-        response.status_code(),
-        200,
-        "Admin batch upsert should succeed"
-    );
-    response.json::<Vec<api::models::ModelWithPricing>>()
 }
 
 pub async fn list_models(

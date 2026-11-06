@@ -2721,42 +2721,6 @@ mod tests {
     }
 
     #[test]
-    fn test_openapi_admin_aml_paths_require_admin_security() {
-        let spec = serde_json::to_value(ApiDoc::openapi()).unwrap();
-        let paths = spec["paths"].as_object().unwrap();
-
-        for (path, method) in [
-            ("/v1/admin/aml/reports", "get"),
-            ("/v1/admin/aml/reports/{report_id}/status", "patch"),
-            ("/v1/admin/aml/allowlist", "get"),
-            ("/v1/admin/aml/allowlist", "post"),
-            ("/v1/admin/aml/allowlist/{account_id}", "delete"),
-        ] {
-            let operation = &paths[path][method];
-            assert!(
-                operation.is_object(),
-                "missing OpenAPI operation: {method} {path}"
-            );
-            assert_eq!(
-                operation["security"],
-                serde_json::json!([{ "session_token": [] }, { "admin_token": [] }]),
-                "{method} {path} must require session_token or admin_token security"
-            );
-        }
-    }
-
-    #[test]
-    fn test_openapi_admin_aml_report_response_excludes_raw_provider_result() {
-        let spec = serde_json::to_value(ApiDoc::openapi()).unwrap();
-        let properties = spec["components"]["schemas"]["AdminAmlReportResponse"]["properties"]
-            .as_object()
-            .expect("AdminAmlReportResponse should have schema properties");
-
-        assert!(!properties.contains_key("result_json"));
-        assert!(!properties.contains_key("resultJson"));
-    }
-
-    #[test]
     fn stage_one_openapi_exposes_only_allowed_resource_deletes() {
         let spec = serde_json::to_value(ApiDoc::openapi()).unwrap();
         let paths = spec["paths"]

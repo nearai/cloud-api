@@ -243,24 +243,10 @@ Operations marked deprecated (account, organization, workspace, invitation, API 
             crate::routes::attestation::NvidiaPayload,
             crate::routes::attestation::QuoteResponse,
             // Model pricing models
-            ModelListResponse, ModelWithPricing, UpcomingPricing, AdminModelListResponse, AdminModelWithPricing,
+            ModelListResponse, ModelWithPricing, UpcomingPricing,
             DecimalPrice, DecimalPriceRequest, ModelMetadata,
             ServiceResponse, ServiceListResponse,
-            AdminServiceResponse, AdminServiceListResponse, CreateServiceRequest, UpdateServiceRequest,
-            UpdateModelApiRequest, ModelHistoryEntry, ModelHistoryResponse,
-            DeprecateModelRequest, DeprecateModelResponse, ModelDeprecationRequest,
-            ModelDeprecationPreviewResponse, ModelDeprecationConfirmResponse,
-            PricingChangeItemRequest, PricingChangeBatchRequest, PricingFields, PricingFieldUpdates,
-            PricingChangeModelPreviewDto, PricingChangePreviewResponse, ScheduledPricingChangeDto,
-            PricingChangeConfirmResponse, ListPricingChangesResponse,
-            // Organization limits models (Admin)
-            UpdateOrganizationLimitsRequest, UpdateOrganizationLimitsResponse, SpendLimit, SpendLimitRequest,
-            OrgLimitsHistoryEntry, OrgLimitsHistoryResponse,
-            // Organization concurrent limit models (Admin)
-            UpdateOrganizationConcurrentLimitRequest, UpdateOrganizationConcurrentLimitResponse,
-            GetOrganizationConcurrentLimitResponse,
-            UpdateOrganizationFallbackRequest, OrganizationFallbackResponse,
-            UpdateOrganizationPriorityRequest, OrganizationPriorityResponse,
+            SpendLimit, SpendLimitRequest,
             // Invitation email delivery models (Admin)
             AdminInvitationEmailDeliveryResponse, ListAdminInvitationEmailDeliveriesResponse,
             AdminInvitationEmailResendResultResponse,
@@ -271,10 +257,6 @@ Operations marked deprecated (account, organization, workspace, invitation, API 
             LookupUserErasuresRequest, LookupUserErasuresResponse, UserErasureRecordResponse,
             ErasureLookupOrganizationResponse,
             services::user_erasure::ErasureBlocker,
-            // AML models (Admin)
-            AdminAmlReportResponse, ListAdminAmlReportsResponse, UpdateAmlReportStatusRequest,
-            AdminAmlAllowlistEntryResponse, ListAdminAmlAllowlistResponse,
-            UpsertAmlAllowlistEntryRequest,
             // Admin access token models
             CreateAdminAccessTokenRequest, AdminAccessTokenResponse,
             AdminAccessTokenPermission, AdminAccessTokenListEntry, ListAdminAccessTokensResponse,
@@ -360,7 +342,6 @@ impl Modify for AdminPermissionsAddon {
                     ));
                 }
                 operation.security = Some(security);
-
                 let forbidden = if policy == AdminOperation::SessionOnly {
                     "Admin session required; admin tokens receive error.type forbidden."
                 } else {
@@ -621,24 +602,7 @@ mod admin_token_permission_tests {
         for model in ["AdminAccessTokenResponse", "AdminAccessTokenListEntry"] {
             assert!(schemas[model]["properties"].get("permission").is_some());
         }
-        for model in ["AdminSettingResponse", "ListAdminSettingsResponse"] {
-            assert!(schemas.get(model).is_some(), "{model} is registered");
-        }
         for (path, method, phrase, tokens_allowed) in [
-            ("/v1/admin/models", "get", "read_only token", true),
-            (
-                "/v1/admin/models",
-                "patch",
-                "insufficient_permissions",
-                true,
-            ),
-            (
-                "/v1/admin/models/pricing-changes/preview",
-                "post",
-                "read_only token",
-                true,
-            ),
-            ("/v1/admin/feature-requests", "get", "read_only token", true),
             ("/v1/admin/access-tokens", "get", "session only", false),
             ("/v1/admin/access-tokens", "post", "session only", false),
             (

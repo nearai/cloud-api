@@ -22,45 +22,11 @@ use uuid::Uuid;
 const AUDIT_HEADER: &str = "x-admin-audit-request-id";
 const REQUEST_ID_HEADER: &str = "x-request-id";
 
-/// Every admin route the app mounts: `build_admin_routes`, the admin
-/// feature-request route, the database-encryption routes (mounted because
+/// Every admin route the app mounts: `build_admin_routes`, the database-encryption routes (mounted because
 /// the e2e configuration has a valid encryption key), and the object-encryption
 /// router (using mock storage).
 const MOUNTED_ADMIN_ROUTES: &[(&str, &str)] = &[
-    ("GET", "/admin/models"),
-    ("PATCH", "/admin/models"),
-    ("POST", "/admin/models/deprecate"),
-    ("GET", "/admin/models/pricing-changes"),
-    ("POST", "/admin/models/pricing-changes/preview"),
-    ("POST", "/admin/models/pricing-changes/confirm"),
-    ("DELETE", "/admin/models/pricing-changes/{id}"),
-    ("DELETE", "/admin/models/{model_name}"),
-    ("GET", "/admin/models/{model_name}/history"),
-    ("POST", "/admin/models/{model_name}/deprecation/preview"),
-    ("POST", "/admin/models/{model_name}/deprecation/confirm"),
-    ("GET", "/admin/models/{model_name}/access"),
-    ("PUT", "/admin/models/{model_name}/access/{org_id}"),
-    ("DELETE", "/admin/models/{model_name}/access/{org_id}"),
-    ("GET", "/admin/organizations/{org_id}/model-access"),
-    ("POST", "/admin/services"),
-    ("PATCH", "/admin/services/{id}"),
-    ("PATCH", "/admin/organizations/{org_id}/limits"),
-    ("GET", "/admin/organizations/{org_id}/limits/history"),
-    ("GET", "/admin/aml/reports"),
-    ("PATCH", "/admin/aml/reports/{report_id}/status"),
-    ("GET", "/admin/aml/allowlist"),
-    ("POST", "/admin/aml/allowlist"),
-    ("DELETE", "/admin/aml/allowlist/{account_id}"),
-    ("GET", "/admin/organizations/{org_id}/concurrent-limit"),
-    ("PATCH", "/admin/organizations/{org_id}/concurrent-limit"),
-    ("GET", "/admin/organizations/{org_id}/priority"),
-    ("PATCH", "/admin/organizations/{org_id}/priority"),
-    ("GET", "/admin/organizations/{org_id}/fallback"),
-    ("PATCH", "/admin/organizations/{org_id}/fallback"),
     ("GET", "/admin/platform/infra-summary"),
-    ("GET", "/admin/settings"),
-    ("GET", "/admin/settings/{key}"),
-    ("PATCH", "/admin/settings/{key}"),
     ("GET", "/admin/invitation-email-deliveries"),
     (
         "POST",
@@ -85,7 +51,6 @@ const MOUNTED_ADMIN_ROUTES: &[(&str, &str)] = &[
     ("GET", "/admin/object-encryption/jobs/{id}"),
     ("POST", "/admin/object-encryption/jobs/{id}/cancel"),
     ("POST", "/admin/object-encryption/verify"),
-    ("GET", "/admin/feature-requests"),
 ];
 
 #[derive(Clone, Default)]
@@ -229,17 +194,8 @@ async fn json_body(response: Response) -> Value {
 
 /// Paginated admin lists the page guard must find in the OpenAPI document. A
 /// newly documented paginated list is checked without being listed here.
-const KNOWN_PAGINATED_ADMIN_LISTS: &[&str] = &[
-    "/admin/access-tokens",
-    "/admin/aml/allowlist",
-    "/admin/aml/reports",
-    "/admin/feature-requests",
-    "/admin/invitation-email-deliveries",
-    "/admin/models",
-    "/admin/models/pricing-changes",
-    "/admin/models/{model_name}/history",
-    "/admin/organizations/{org_id}/limits/history",
-];
+const KNOWN_PAGINATED_ADMIN_LISTS: &[&str] =
+    &["/admin/access-tokens", "/admin/invitation-email-deliveries"];
 
 /// Admin GET routes documented with `limit` and `offset` query parameters.
 fn documented_paginated_admin_lists() -> BTreeSet<String> {

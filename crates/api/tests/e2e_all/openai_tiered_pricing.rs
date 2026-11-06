@@ -72,7 +72,7 @@ async fn setup_profiled_model(
         }))
         .unwrap(),
     );
-    let models = admin_batch_upsert_models(server, batch, get_session_id()).await;
+    let models = seed_models(server, batch, get_session_id()).await;
     assert_eq!(models.len(), 1);
     assert_eq!(models[0].input_cost_per_token.amount, 5_000);
     assert_eq!(

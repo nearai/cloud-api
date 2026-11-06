@@ -34,7 +34,7 @@ impl Fixture {
             "verifiable":tier != ProviderTier::NonAttested,"attestationSupported":tier != ProviderTier::NonAttested,
             "inputModalities":["text"],"outputModalities":["text"],"providerType":"vllm"
         })).unwrap());
-        admin_batch_upsert_models(&server, batch, get_session_id()).await;
+        seed_models(&server, batch, get_session_id()).await;
         let requests = Arc::new(Mutex::new(Vec::new()));
         let seen = requests.clone();
         pool.register_provider(

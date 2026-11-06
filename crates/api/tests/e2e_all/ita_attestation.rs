@@ -310,7 +310,7 @@ async fn setup_deprecated_alias(fake_ita: &FakeIta) -> (axum_test::TestServer, S
         }))
         .expect("test model request should deserialize"),
     );
-    admin_batch_upsert_models(&server, batch, get_session_id()).await;
+    seed_models(&server, batch, get_session_id()).await;
 
     let response = server
         .post("/v1/admin/models/deprecate")

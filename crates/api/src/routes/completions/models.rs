@@ -124,7 +124,7 @@ pub async fn models_internal(
     ),
     (StatusCode, ResponseJson<ErrorResponse>),
 > {
-    crate::routes::usage::verify_internal_usage_token(
+    crate::routes::internal_usage::verify_internal_usage_token(
         &headers,
         app_state.config.internal_usage_token.as_deref(),
     )?;
@@ -183,7 +183,7 @@ pub async fn model_access_internal(
     ),
     (StatusCode, ResponseJson<ErrorResponse>),
 > {
-    crate::routes::usage::verify_internal_usage_token(
+    crate::routes::internal_usage::verify_internal_usage_token(
         &headers,
         app_state.config.internal_usage_token.as_deref(),
     )?;

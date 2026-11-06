@@ -103,7 +103,7 @@ async fn upsert_models(server: &axum_test::TestServer, models: Vec<(&str, Value)
             serde_json::from_value(fields).expect("valid model update"),
         );
     }
-    admin_batch_upsert_models(server, batch, get_session_id()).await;
+    seed_models(server, batch, get_session_id()).await;
 }
 
 /// A server with one unlisted model of each kind, all served by one mock

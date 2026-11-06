@@ -74,7 +74,7 @@ async fn setup_whisper_model() -> (
         }))
         .unwrap(),
     );
-    let _ = admin_batch_upsert_models(&server, batch, get_session_id()).await;
+    let _ = seed_models(&server, batch, get_session_id()).await;
 
     let provider: Arc<dyn inference_providers::InferenceProvider + Send + Sync> =
         mock_provider.clone();

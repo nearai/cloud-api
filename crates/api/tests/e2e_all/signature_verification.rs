@@ -37,7 +37,7 @@ async fn setup_non_attested_signature_model(
         }))
         .expect("test model fixture should deserialize"),
     );
-    let updated = admin_batch_upsert_models(server, batch, get_session_id()).await;
+    let updated = seed_models(server, batch, get_session_id()).await;
     assert!(!updated[0].metadata.attestation_supported);
     (model_name, mock)
 }
@@ -483,7 +483,7 @@ pub(crate) async fn setup_chutes_signature_model(
         }))
         .expect("test model fixture should deserialize"),
     );
-    let updated = admin_batch_upsert_models(server, batch, get_session_id()).await;
+    let updated = seed_models(server, batch, get_session_id()).await;
     assert!(updated[0].metadata.attestation_supported);
     (model_name, near, chutes)
 }
@@ -1507,7 +1507,7 @@ async fn test_dropping_alias_stream_releases_signature_routing_pin() {
         }))
         .expect("alias model should deserialize"),
     );
-    admin_batch_upsert_models(&server, batch, get_session_id()).await;
+    seed_models(&server, batch, get_session_id()).await;
     let provider: Arc<dyn InferenceProvider + Send + Sync> = mock.clone();
     pool.register_provider(model_name, provider).await;
     let org = setup_org_with_credits(&server, 10_000_000_000i64).await;

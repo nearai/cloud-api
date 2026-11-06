@@ -2235,11 +2235,11 @@ pub fn build_internal_routes(app_state: AppState) -> Router {
     Router::new()
         .route(
             "/internal/usage",
-            post(crate::routes::usage::record_usage_internal),
+            post(crate::routes::internal_usage::record_usage_internal),
         )
         .route(
             "/internal/budget",
-            post(crate::routes::usage::reserve_usage_internal),
+            post(crate::routes::internal_usage::reserve_usage_internal),
         )
         .route(
             "/internal/models",

@@ -7,7 +7,6 @@ use crate::auth::ports::UserId;
 use crate::common::RepositoryError;
 use crate::organization::{MemberRole, OrganizationId, OrganizationServiceTrait};
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
 
 pub struct WorkspaceServiceImpl {
     workspace_repository: Arc<dyn WorkspaceRepository>,
@@ -116,47 +115,7 @@ impl WorkspaceServiceImpl {
 
         Ok((workspace, organization, role))
     }
-
-    /// A workspace is renamed, reconfigured or deleted only by its creator or an organization
-    /// owner or admin. Every member can still read it and create keys in it.
-    async fn check_workspace_change_permission(
-        &self,
-        workspace_id: WorkspaceId,
-        user_id: UserId,
-    ) -> Result<(), WorkspaceError> {
-        let (workspace, _, role) = self
-            .workspace_member_role(workspace_id, user_id.clone())
-            .await?;
-        if workspace.created_by_user_id == user_id || role.can_manage_organization() {
-            return Ok(());
-        }
-        Err(WorkspaceError::Unauthorized(
-            WORKSPACE_CHANGE_FORBIDDEN.to_string(),
-        ))
-    }
-
-    /// A key is revoked, deleted or updated only by its creator or an organization owner or admin.
-    fn check_api_key_change_permission(
-        api_key: &ApiKey,
-        requester_id: &UserId,
-        role: &MemberRole,
-    ) -> Result<(), WorkspaceError> {
-        if &api_key.created_by_user_id == requester_id || role.can_manage_organization() {
-            return Ok(());
-        }
-        Err(WorkspaceError::Unauthorized(
-            API_KEY_CHANGE_FORBIDDEN.to_string(),
-        ))
-    }
 }
-
-/// Refusal when a member who did not create the workspace tries to change it.
-const WORKSPACE_CHANGE_FORBIDDEN: &str =
-    "Only the workspace creator or an organization owner or admin can change this workspace";
-
-/// Refusal when a member who did not create the key tries to change it.
-const API_KEY_CHANGE_FORBIDDEN: &str =
-    "Only the key creator or an organization owner or admin can change this API key";
 
 #[async_trait]
 impl WorkspaceServiceTrait for WorkspaceServiceImpl {
@@ -248,72 +207,6 @@ impl WorkspaceServiceTrait for WorkspaceServiceImpl {
             .map_err(Self::map_repository_error)
     }
 
-    async fn create_workspace(
-        &self,
-        name: String,
-        description: Option<String>,
-        organization_id: OrganizationId,
-        requester_id: UserId,
-    ) -> Result<Workspace, WorkspaceError> {
-        // Check if user is a member of the organization. A deleted org reads as
-        // not-found here, which is a 404 — not an internal error.
-        let is_member = self
-            .organization_service
-            .is_member(organization_id.clone(), requester_id.clone())
-            .await
-            .map_err(|e| match e {
-                crate::organization::OrganizationError::NotFound => WorkspaceError::NotFound,
-                other => WorkspaceError::InternalError(format!(
-                    "Failed to check organization membership: {other}"
-                )),
-            })?;
-
-        if !is_member {
-            return Err(WorkspaceError::Unauthorized(
-                "User is not a member of this organization".to_string(),
-            ));
-        }
-
-        // Create the workspace. A `NotFound` here means the org was deleted between
-        // the membership check and the insert — report it as such, not as a 500.
-        self.workspace_repository
-            .create(name, description, organization_id, requester_id)
-            .await
-            .map_err(|e| match e {
-                RepositoryError::NotFound(_) => WorkspaceError::NotFound,
-                other => Self::map_repository_error(other),
-            })
-    }
-
-    async fn create_api_key(&self, request: CreateApiKeyRequest) -> Result<ApiKey, WorkspaceError> {
-        let workspace_id = request.workspace_id.clone();
-        let requester_id = request.created_by_user_id.clone();
-
-        // Check permissions
-        let (workspace, _) = self
-            .check_workspace_permission(workspace_id, requester_id)
-            .await?;
-
-        // Verify the request matches the workspace
-        if workspace.id.0 != request.workspace_id.0 {
-            return Err(WorkspaceError::InvalidParams(
-                "Workspace ID mismatch".to_string(),
-            ));
-        }
-
-        // Create the API key. A `NotFound` here means the workspace or its org was
-        // deleted between the permission check and the insert.
-        self.api_key_repository
-            .create(request)
-            .await
-            .map_err(|e| match e {
-                RepositoryError::NotFound(_) => WorkspaceError::NotFound,
-                other => {
-                    WorkspaceError::InternalError(format!("Failed to create API key: {other}"))
-                }
-            })
-    }
-
     async fn list_api_keys_paginated(
         &self,
         workspace_id: WorkspaceId,
@@ -365,122 +258,6 @@ impl WorkspaceServiceTrait for WorkspaceServiceImpl {
         Ok(api_key)
     }
 
-    async fn delete_api_key(
-        &self,
-        workspace_id: WorkspaceId,
-        api_key_id: ApiKeyId,
-        requester_id: UserId,
-    ) -> Result<bool, WorkspaceError> {
-        // Check permissions
-        let (_, _, role) = self
-            .workspace_member_role(workspace_id.clone(), requester_id.clone())
-            .await?;
-
-        // Verify the API key belongs to this workspace
-        let api_key = self
-            .api_key_repository
-            .get_by_id(api_key_id.clone())
-            .await
-            .map_err(|e| WorkspaceError::InternalError(format!("Failed to get API key: {e}")))?
-            .ok_or(WorkspaceError::ApiKeyNotFound)?;
-
-        if api_key.workspace_id.0 != workspace_id.0 {
-            return Err(WorkspaceError::ApiKeyNotFound);
-        }
-        Self::check_api_key_change_permission(&api_key, &requester_id, &role)?;
-
-        // Delete the API key
-        self.api_key_repository
-            .delete(api_key_id)
-            .await
-            .map_err(|e| WorkspaceError::InternalError(format!("Failed to delete API key: {e}")))
-    }
-
-    async fn update_api_key_spend_limit(
-        &self,
-        workspace_id: WorkspaceId,
-        api_key_id: ApiKeyId,
-        requester_id: UserId,
-        spend_limit: Option<i64>,
-    ) -> Result<ApiKey, WorkspaceError> {
-        // Check permissions
-        let (_, _, role) = self
-            .workspace_member_role(workspace_id.clone(), requester_id.clone())
-            .await?;
-
-        // Verify the API key belongs to this workspace
-        let api_key = self
-            .api_key_repository
-            .get_by_id(api_key_id.clone())
-            .await
-            .map_err(|e| WorkspaceError::InternalError(format!("Failed to get API key: {e}")))?
-            .ok_or(WorkspaceError::ApiKeyNotFound)?;
-
-        if api_key.workspace_id.0 != workspace_id.0 {
-            return Err(WorkspaceError::ApiKeyNotFound);
-        }
-        Self::check_api_key_change_permission(&api_key, &requester_id, &role)?;
-
-        // Update the spend limit
-        self.api_key_repository
-            .update_spend_limit(api_key_id, spend_limit)
-            .await
-            .map_err(|e| {
-                WorkspaceError::InternalError(format!("Failed to update API key spend limit: {e}"))
-            })
-    }
-
-    async fn update_api_key(
-        &self,
-        workspace_id: WorkspaceId,
-        api_key_id: ApiKeyId,
-        requester_id: UserId,
-        name: Option<String>,
-        expires_at: Option<Option<DateTime<Utc>>>,
-        spend_limit: Option<Option<i64>>,
-        is_active: Option<bool>,
-    ) -> Result<ApiKey, WorkspaceError> {
-        // Check permissions
-        let (_, _, role) = self
-            .workspace_member_role(workspace_id.clone(), requester_id.clone())
-            .await?;
-
-        // Verify the API key belongs to this workspace
-        let api_key = self
-            .api_key_repository
-            .get_by_id(api_key_id.clone())
-            .await
-            .map_err(Self::map_repository_error)?
-            .ok_or(WorkspaceError::ApiKeyNotFound)?;
-
-        if api_key.workspace_id.0 != workspace_id.0 {
-            return Err(WorkspaceError::ApiKeyNotFound);
-        }
-        Self::check_api_key_change_permission(&api_key, &requester_id, &role)?;
-
-        // If updating the name, check for duplicates
-        if let Some(ref new_name) = name {
-            // Only check for duplicates if the name is actually changing
-            if new_name != &api_key.name {
-                let is_duplicate = self
-                    .api_key_repository
-                    .check_name_duplication(workspace_id.clone(), new_name)
-                    .await
-                    .map_err(Self::map_repository_error)?;
-
-                if is_duplicate {
-                    return Err(WorkspaceError::AlreadyExists);
-                }
-            }
-        }
-
-        // Update the API key
-        self.api_key_repository
-            .update(api_key_id, name, expires_at, spend_limit, is_active)
-            .await
-            .map_err(Self::map_repository_error)
-    }
-
     async fn can_manage_api_keys(
         &self,
         workspace_id: WorkspaceId,
@@ -493,63 +270,6 @@ impl WorkspaceServiceTrait for WorkspaceServiceImpl {
             Err(WorkspaceError::NotFound) => Ok(false),
             Err(e) => Err(e),
         }
-    }
-
-    async fn update_workspace(
-        &self,
-        workspace_id: WorkspaceId,
-        requester_id: UserId,
-        name: Option<String>,
-        description: Option<String>,
-        settings: Option<serde_json::Value>,
-    ) -> Result<Workspace, WorkspaceError> {
-        // Check permissions
-        self.check_workspace_change_permission(workspace_id.clone(), requester_id)
-            .await?;
-
-        // If name is being updated, check for duplicates in the same organization
-        if let Some(ref new_name) = name {
-            let workspace = self
-                .workspace_repository
-                .get_by_id(workspace_id.clone())
-                .await
-                .map_err(Self::map_repository_error)?
-                .ok_or(WorkspaceError::NotFound)?;
-
-            if let Some(existing) = self
-                .workspace_repository
-                .get_by_name(workspace.organization_id.0, new_name)
-                .await
-                .map_err(Self::map_repository_error)?
-            {
-                if existing.id != workspace_id {
-                    return Err(WorkspaceError::AlreadyExists);
-                }
-            }
-        }
-
-        // Update the workspace
-        self.workspace_repository
-            .update(workspace_id, name, description, settings)
-            .await
-            .map_err(Self::map_repository_error)?
-            .ok_or(WorkspaceError::NotFound)
-    }
-
-    async fn delete_workspace(
-        &self,
-        workspace_id: WorkspaceId,
-        requester_id: UserId,
-    ) -> Result<bool, WorkspaceError> {
-        // Check permissions
-        self.check_workspace_change_permission(workspace_id.clone(), requester_id)
-            .await?;
-
-        // Delete the workspace
-        self.workspace_repository
-            .delete(workspace_id)
-            .await
-            .map_err(Self::map_repository_error)
     }
 
     async fn list_workspaces_for_user(
@@ -627,36 +347,5 @@ impl WorkspaceServiceTrait for WorkspaceServiceImpl {
                     "Failed to check API key name duplication: {e}"
                 ))
             })
-    }
-
-    async fn revoke_api_key(
-        &self,
-        workspace_id: WorkspaceId,
-        api_key_id: ApiKeyId,
-        requester_id: UserId,
-    ) -> Result<bool, WorkspaceError> {
-        // Check permissions
-        let (_, _, role) = self
-            .workspace_member_role(workspace_id.clone(), requester_id.clone())
-            .await?;
-
-        // Verify the API key belongs to this workspace
-        let api_key = self
-            .api_key_repository
-            .get_by_id(api_key_id.clone())
-            .await
-            .map_err(|e| WorkspaceError::InternalError(format!("Failed to get API key: {e}")))?
-            .ok_or(WorkspaceError::ApiKeyNotFound)?;
-
-        if api_key.workspace_id.0 != workspace_id.0 {
-            return Err(WorkspaceError::ApiKeyNotFound);
-        }
-        Self::check_api_key_change_permission(&api_key, &requester_id, &role)?;
-
-        // Revoke the API key
-        self.api_key_repository
-            .revoke(api_key_id)
-            .await
-            .map_err(|e| WorkspaceError::InternalError(format!("Failed to revoke API key: {e}")))
     }
 }

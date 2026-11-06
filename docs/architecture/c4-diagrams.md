@@ -33,10 +33,10 @@ The NEAR AI Cloud API is a **multi-tenant AI inference platform** running in a *
 
 | Use Case | Auth Method | Endpoints |
 |----------|-------------|-----------|
-| **Interactive Management** | Session Token (OAuth) | `/v1/organizations/*`, `/v1/workspaces/*`, `/v1/users/*` |
+| **Session** | Session Token (OAuth) | `/v1/auth/*` |
 | **AI Inference** | API Key (Bearer Token) | `/v1/chat/completions`, `/v1/responses`, `/v1/conversations/*` |
 
-> **Important**: These authentication methods are **mutually exclusive**. Management operations require OAuth session tokens, while AI operations require workspace-scoped API keys.
+> **Important**: These authentication methods are **mutually exclusive**. Organization, workspace, user and API key management is no longer served by this service (it moved to cloud-platform); AI operations require workspace-scoped API keys.
 
 ### Key Features
 
@@ -132,9 +132,6 @@ graph TB
         subgraph API["Cloud API Container [Rust/Axum]"]
             subgraph Routes["API Routes Layer"]
                 AuthRoutes["<b>Auth Routes</b><br/>OAuth flows,<br/>login, sessions"]
-                OrgRoutes["<b>Organization Routes</b><br/>CRUD operations"]
-                WorkspaceRoutes["<b>Workspace Routes</b><br/>Workspace & API key<br/>management"]
-                UserRoutes["<b>User Routes</b><br/>Profile, invitations,<br/>sessions"]
                 CompletionRoutes["<b>Completion Routes</b><br/>Chat & text<br/>completions"]
                 ConvRoutes["<b>Conversation Routes</b><br/>Temporary migration<br/>views and deletion"]
                 ResponseRoutes["<b>Response Routes</b><br/>Stateless request-scoped<br/>AI responses"]
@@ -195,9 +192,6 @@ graph TB
     
     %% Client to Routes
     Client -->|HTTPS/REST API<br/>Session Auth| AuthRoutes
-    Client -->|HTTPS/REST API<br/>Session Auth| OrgRoutes
-    Client -->|HTTPS/REST API<br/>Session Auth| WorkspaceRoutes
-    Client -->|HTTPS/REST API<br/>Session Auth| UserRoutes
     Client -->|HTTPS/REST API<br/>SSE Streaming<br/>API Key Auth| CompletionRoutes
     Client -->|HTTPS/REST API<br/>API Key Auth| ConvRoutes
     Client -->|HTTPS/REST API<br/>SSE Streaming<br/>API Key Auth| ResponseRoutes
@@ -207,9 +201,6 @@ graph TB
     
     %% Routes through Middleware to Services
     AuthRoutes --> AuthMiddleware
-    OrgRoutes --> AuthMiddleware
-    WorkspaceRoutes --> AuthMiddleware
-    UserRoutes --> AuthMiddleware
     UsageRoutes --> AuthMiddleware
     
     CompletionRoutes --> AuthMiddleware
@@ -226,9 +217,6 @@ graph TB
     
     %% Routes to Services
     AuthRoutes --> AuthService
-    OrgRoutes --> OrgService
-    WorkspaceRoutes --> OrgService
-    UserRoutes --> UserService
     CompletionRoutes --> CompletionService
     ConvRoutes --> ConvService
     ResponseRoutes --> ResponseService
@@ -290,7 +278,7 @@ graph TB
     classDef dbStyle fill:#424242,stroke:#212121,stroke-width:3px,color:#fff
     classDef clientStyle fill:#37474f,stroke:#263238,stroke-width:2px,color:#fff
     
-    class AuthRoutes,OrgRoutes,WorkspaceRoutes,UserRoutes,CompletionRoutes,ConvRoutes,ResponseRoutes,ModelRoutes,UsageRoutes,AttestationRoutes routeStyle
+    class AuthRoutes,CompletionRoutes,ConvRoutes,ResponseRoutes,ModelRoutes,UsageRoutes,AttestationRoutes routeStyle
     class AuthMiddleware,UsageMiddleware middlewareStyle
     class AuthService,OrgService,UserService,ConvService,ResponseService,CompletionService,ModelService,UsageService,AttestationService,ProviderPool serviceStyle
     class UserRepo,OrgRepo,WorkspaceRepo,SessionRepo,APIKeyRepo,ConvRepo,ResponseRepo,ModelRepo,UsageRepo,AttestationRepo repoStyle
@@ -306,9 +294,6 @@ graph TB
 | Route Handler | Responsibility | Authentication |
 |--------------|----------------|----------------|
 | **Auth Routes** | OAuth flows, login, logout, session management | Public + Session |
-| **Organization Routes** | CRUD for organizations, member management | Session (OAuth) |
-| **Workspace Routes** | Workspace and API key management | Session (OAuth) |
-| **User Routes** | User profile, invitations, sessions | Session (OAuth) |
 | **Completion Routes** | Chat & text completions (OpenAI-compatible) | API Key |
 | **Conversation Routes** | Temporary known-ID views and per-resource deletion; other paths return `410` | API Key |
 | **Response Routes** | Stateless request-scoped inference; response history returns `410` | API Key |
@@ -396,46 +381,9 @@ sequenceDiagram
 
 ### 2. API Key Creation Flow
 
-Organization admin creates a workspace-scoped API key for programmatic access.
-
-```mermaid
-sequenceDiagram
-    actor Admin
-    participant Browser
-    participant PlatformAPI
-    participant AuthService
-    participant Database
-    
-    Admin->>Browser: Navigate to workspace settings
-    Browser->>PlatformAPI: GET /v1/workspaces/{id}/api-keys<br/>(Cookie: session_token)
-    
-    PlatformAPI->>AuthService: Validate session token
-    AuthService->>Database: Query sessions table
-    Database-->>AuthService: Session valid, user_id
-    
-    AuthService->>Database: Get user's org membership
-    Database-->>AuthService: User is admin/owner
-    
-    PlatformAPI->>Browser: Return list of API keys (hashed)
-    
-    Admin->>Browser: Click "Create API Key"
-    Browser->>PlatformAPI: POST /v1/workspaces/{id}/api-keys<br/>{ name: "Production Key" }
-    
-    PlatformAPI->>AuthService: Validate session & check permissions
-    AuthService->>Database: Verify user can manage API keys
-    Database-->>AuthService: Permission granted
-    
-    PlatformAPI->>PlatformAPI: Generate random API key<br/>(sk-live-xxx format)
-    PlatformAPI->>PlatformAPI: Hash with SHA-256
-    
-    PlatformAPI->>Database: INSERT into api_keys<br/>(key_hash, workspace_id, user_id)
-    Database-->>PlatformAPI: API key record created
-    
-    PlatformAPI->>Browser: Return API key (plain text, ONLY TIME shown)
-    Browser->>Admin: Display key with warning:<br/>"Save this key, it won't be shown again"
-    
-    Note over Admin,Database: Key is shown in plain text once,<br/>then only hashed version is stored
-```
+This service no longer exposes API key creation routes. Keys are created through
+cloud-platform (or seeded in SQL for local and e2e setups); cloud-api only
+validates them (hash lookup) when they are presented on inference requests.
 
 ### 3. Chat Completion Request Flow (Streaming)
 
@@ -624,63 +572,7 @@ sequenceDiagram
 
 ### 7. Organization Invitation Flow
 
-Inviting a new member to an organization via email.
-
-```mermaid
-sequenceDiagram
-    actor Admin
-    participant Browser
-    participant PlatformAPI
-    participant Database
-    participant EmailService
-    actor NewUser
-    
-    Admin->>Browser: Enter email to invite
-    Browser->>PlatformAPI: POST /v1/organizations/{id}/members/invite-by-email<br/>{ email: "user@example.com", role: "member" }
-    
-    PlatformAPI->>Database: Check admin permissions
-    Database-->>PlatformAPI: Admin confirmed
-    
-    PlatformAPI->>Database: Check if user already exists
-    alt User exists
-        Database-->>PlatformAPI: User found
-        PlatformAPI->>Database: Check if already member
-        alt Already member
-            PlatformAPI-->>Browser: Error: Already a member
-        else Not a member
-            PlatformAPI->>Database: INSERT organization_members
-            Database-->>PlatformAPI: Member added
-            PlatformAPI-->>Browser: Success: User added
-        end
-    else User doesn't exist
-        PlatformAPI->>Database: CREATE organization_invitation<br/>(email, org_id, role, token)
-        Database-->>PlatformAPI: Invitation created
-        
-        PlatformAPI->>EmailService: Send invitation email<br/>(with magic link)
-        EmailService-->>NewUser: Email with invitation link
-        
-        PlatformAPI-->>Browser: Success: Invitation sent
-    end
-    
-    NewUser->>Browser: Click invitation link
-    Browser->>PlatformAPI: GET /v1/invitations/{token}
-    PlatformAPI->>Database: Validate invitation token
-    Database-->>PlatformAPI: Invitation valid
-    PlatformAPI-->>Browser: Show invitation details page
-    
-    NewUser->>Browser: Click "Accept" or "Sign up & Accept"
-    Browser->>PlatformAPI: POST /v1/invitations/{token}/accept
-    
-    alt User not logged in
-        PlatformAPI-->>Browser: Redirect to OAuth login
-        Browser->>PlatformAPI: Complete OAuth flow
-    end
-    
-    PlatformAPI->>Database: INSERT organization_members
-    PlatformAPI->>Database: DELETE organization_invitation
-    
-    PlatformAPI-->>Browser: Redirect to organization dashboard
-```
+Invitations are no longer served by this service; they moved to cloud-platform.
 
 ### 8. TEE Attestation Verification Flow
 
@@ -817,9 +709,7 @@ flowchart TD
     
     CheckPath -->|/v1/auth/*| Public[Public/Auth Endpoints]
     CheckPath -->|/v1/model/list| Public
-    CheckPath -->|/v1/organizations/*| SessionAuth[Session Auth Required]
-    CheckPath -->|/v1/workspaces/*| SessionAuth
-    CheckPath -->|/v1/users/*| SessionAuth
+    CheckPath -->|/v1/auth/user, /v1/auth/logout| SessionAuth[Session Auth Required]
     CheckPath -->|/v1/chat/completions| APIKeyAuth[API Key Auth Required]
     CheckPath -->|/v1/completions| APIKeyAuth
     CheckPath -->|/v1/responses| APIKeyAuth
@@ -1039,8 +929,9 @@ Database
    - **Providers**: GitHub OAuth, Google OAuth
    - Session stored in database with expiration
    - Cookie-based authentication
-   - **Used for**: Organization, workspace, user, and API key management
-   - **Endpoints**: `/v1/organizations/*`, `/v1/workspaces/*`, `/v1/users/*`
+   - **Used for**: Current-user and logout calls under `/v1/auth/*`; management of
+     organizations, workspaces, users and API keys is served by cloud-platform
+   - **Endpoints**: `/v1/auth/user`, `/v1/auth/logout`
 
 2. **API Key-Based** - For AI inference operations:
    ```
@@ -1341,47 +1232,12 @@ erDiagram
 - `POST /v1/auth/logout` - Logout and end session
 - `GET /v1/auth/user` - Get current authenticated user
 
-### Management Endpoints (Session Auth Only)
-**Organizations:**
-- `GET /v1/organizations` - List user's organizations
-- `POST /v1/organizations` - Create organization
-- `GET /v1/organizations/{id}` - Get organization details
-- `PUT /v1/organizations/{id}` - Update organization
-- `DELETE /v1/organizations/{id}` - Delete organization
+### Management Endpoints
 
-**Organization Members:**
-- `GET /v1/organizations/{id}/members` - List members
-- `POST /v1/organizations/{id}/members` - Add member
-- `POST /v1/organizations/{id}/members/invite-by-email` - Invite by email
-- `PUT /v1/organizations/{id}/members/{user_id}` - Update member role
-- `DELETE /v1/organizations/{id}/members/{user_id}` - Remove member
-
-**Workspaces:**
-- `GET /v1/organizations/{org_id}/workspaces` - List workspaces
-- `POST /v1/organizations/{org_id}/workspaces` - Create workspace
-- `GET /v1/workspaces/{workspace_id}` - Get workspace
-- `PUT /v1/workspaces/{workspace_id}` - Update workspace
-- `DELETE /v1/workspaces/{workspace_id}` - Delete workspace
-
-**API Keys:**
-- `GET /v1/workspaces/{workspace_id}/api-keys` - List API keys
-- `POST /v1/workspaces/{workspace_id}/api-keys` - Create API key
-- `DELETE /v1/workspaces/{workspace_id}/api-keys/{key_id}` - Revoke API key
-- `PUT /v1/workspaces/{workspace_id}/api-keys/{key_id}/spend-limit` - Update spend limit
-
-**Users:**
-- `GET /v1/users/me` - Get current user profile
-- `PUT /v1/users/me/profile` - Update profile
-- `GET /v1/users/me/invitations` - List invitations
-- `POST /v1/users/me/invitations/{id}/accept` - Accept invitation
-- `POST /v1/users/me/invitations/{id}/decline` - Decline invitation
-- `GET /v1/users/me/sessions` - List active sessions
-- `DELETE /v1/users/me/sessions` - Revoke all sessions
-- `DELETE /v1/users/me/sessions/{session_id}` - Revoke specific session
-
-**Usage & Billing:**
-- `GET /v1/organizations/{id}/usage/balance` - Current usage balance
-- `GET /v1/organizations/{id}/usage/history` - Usage history
+Organization, member, workspace, API key, user-profile, invitation, session and
+usage/billing management is not served by this service; it lives in
+cloud-platform. Locally, create API keys through cloud-platform or seed them in
+SQL.
 
 ### AI Inference Endpoints (API Key Auth Only)
 **Chat Completions (OpenAI-compatible):**

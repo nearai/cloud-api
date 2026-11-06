@@ -145,9 +145,8 @@ Authorization: Bearer $SESSION
 User-Agent: Mock User Agent
 ```
 
-The `User-Agent: Mock User Agent` header is **only** required for
-refresh-token endpoints (`POST /v1/users/me/access_tokens` and the
-auth callback). For ordinary management endpoints, mock auth accepts
+The `User-Agent: Mock User Agent` header is **only** required for the
+auth callback. For other session-authenticated endpoints, mock auth accepts
 any `rt_…` Bearer regardless of User-Agent. Setting it everywhere is
 harmless and makes the curl examples uniform.
 
@@ -189,44 +188,23 @@ existing response handling.
 
 ## 4. End-to-end walkthrough
 
-This sequence creates an organization, workspace, and API key with
-session auth, then makes an inference request with the resulting API key.
-It assumes `make dev` is running and `$SESSION` is exported.
+cloud-api no longer serves organization, workspace or API key management
+routes, so it cannot mint a key itself. Create the organization, workspace and
+API key through cloud-platform, or seed the rows directly in SQL (the e2e
+helpers in `crates/api/tests/common/seeding.rs` show the tables and columns).
+Then export the plaintext key and make an inference request with it.
+It assumes `make dev` is running.
 
 ```bash
 BASE=http://localhost:3000
-AUTH=(-H "Authorization: Bearer $SESSION" -H "User-Agent: Mock User Agent")
+API_KEY=...   # plaintext key from cloud-platform or your SQL seed
 
-# 1. Confirm the seeded admin is wired up
-curl -s "$BASE/v1/users/me" "${AUTH[@]}" | jq .
-
-# 2. Create an organization
-ORG_ID=$(curl -s "$BASE/v1/organizations" "${AUTH[@]}" \
-  -H 'Content-Type: application/json' \
-  -d '{"name":"local-dev","description":"manual testing"}' \
-  | jq -r .id)
-echo "org=$ORG_ID"
-
-# 3. Reuse the default workspace — `POST /v1/organizations` already
-#    creates one named `default`. Posting another with the same name
-#    would conflict on the (organization_id, name) unique index.
-WS_ID=$(curl -s "$BASE/v1/organizations/$ORG_ID/workspaces" "${AUTH[@]}" \
-  | jq -r '.workspaces[] | select(.name == "default") | .id')
-echo "workspace=$WS_ID"
-
-# 4. Mint an API key — capture the plaintext `key` field, it is shown once.
-API_KEY=$(curl -s "$BASE/v1/workspaces/$WS_ID/api-keys" "${AUTH[@]}" \
-  -H 'Content-Type: application/json' \
-  -d '{"name":"local-test"}' \
-  | jq -r .key)
-echo "api_key=$API_KEY"
-
-# 5. List models visible to that workspace (note: empty until backends
+# 1. List models visible to that workspace (note: empty until backends
 #    are wired up — see §5).
 curl -s "$BASE/v1/models" \
   -H "Authorization: Bearer $API_KEY" | jq .
 
-# 6. Make a chat completion (also requires backends — see §5).
+# 2. Make a chat completion (also requires backends — see §5).
 curl -s "$BASE/v1/chat/completions" \
   -H "Authorization: Bearer $API_KEY" \
   -H 'Content-Type: application/json' \
@@ -238,7 +216,7 @@ curl -s "$BASE/v1/chat/completions" \
 ```
 
 > Newly-created API keys can take up to 10 seconds to be picked up by the
-> in-memory cache. If step 5 returns 401, retry after a short pause.
+> in-memory cache. If step 1 returns 401, retry after a short pause.
 
 ## 5. Wiring up inference backends
 
@@ -327,10 +305,6 @@ Provider refresh runs every 300s by default
 
 | Endpoint                                    | Auth     | Notes                                                       |
 | ------------------------------------------- | -------- | ----------------------------------------------------------- |
-| `GET  /v1/users/me`                         | session  | Sanity check that mock auth works                           |
-| `POST /v1/organizations`                    | session  | Body: `{"name": "...", "description": "..."}`               |
-| `POST /v1/organizations/{id}/workspaces`    | session  | Same body shape                                             |
-| `POST /v1/workspaces/{id}/api-keys`         | session  | Returns plaintext `key` — store it, it isn't shown again    |
 | `GET  /v1/models`                           | public   | OpenAI-compatible model catalog with pricing metadata       |
 | `POST /v1/chat/completions`                 | API key  | OpenAI-compatible. Add `"stream": true` for SSE             |
 | `POST /v1/responses`                        | API key  | Stateless `store: false` inference; client-managed function/custom tools and namespaces |
@@ -465,10 +439,10 @@ every other Conversation or File mutation return `410 Gone`.
 The seeder reads `crates/database/src/seed/` relative to the current
 directory. Run `make dev` from the repo root.
 
-**401 on management endpoints with mock auth**
+**401 on session endpoints with mock auth**
 Confirm `AUTH_MOCK=true` in the local env and that the Bearer token
 starts with `rt_`. The `User-Agent: Mock User Agent` header is only
-required for refresh-token endpoints (e.g. `POST /v1/users/me/access_tokens`).
+required for the auth callback.
 
 **403 on `/v1/admin/*` with mock auth**
 The seeded mock user is `admin@test.com`. `AUTH_ADMIN_EMAILS` has no default

@@ -10,7 +10,6 @@ use axum::{
     Router,
 };
 use serde_json::{json, Map, Value};
-use services::auth::{AuthServiceTrait, MockAuthService, SessionId, UserId};
 use std::collections::BTreeSet;
 use std::io;
 use std::sync::{Arc, Mutex};
@@ -130,21 +129,6 @@ fn admin_route_literals(source: &str) -> BTreeSet<&str> {
         .collect()
 }
 
-fn session_jwt(session_id: Uuid) -> String {
-    MockAuthService {
-        apikey_repository: Arc::new(database::repositories::ApiKeyRepository::new(
-            database::DbPool::uninitialized(),
-        )),
-    }
-    .create_session_access_token(
-        UserId(Uuid::parse_str(MOCK_USER_ID).expect("mock user id")),
-        Some(SessionId(session_id)),
-        test_config().auth.encoding_key,
-        1,
-    )
-    .expect("mock auth signs session tokens")
-}
-
 fn authorized(method: Method, uri: &str, token: &str, body: Value) -> Request<Body> {
     Request::builder()
         .method(method)
@@ -171,64 +155,6 @@ fn header(response: &Response, name: &str) -> String {
         .and_then(|value| value.to_str().ok())
         .unwrap_or_else(|| panic!("response has {name}"))
         .to_string()
-}
-
-async fn json_body(response: Response) -> Value {
-    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .expect("body reads");
-    serde_json::from_slice(&body).expect("JSON body")
-}
-
-/// Paginated admin lists the page guard must find in the OpenAPI document. A
-/// newly documented paginated list is checked without being listed here.
-const KNOWN_PAGINATED_ADMIN_LISTS: &[&str] = &[];
-
-/// Admin GET routes documented with `limit` and `offset` query parameters.
-fn documented_paginated_admin_lists() -> BTreeSet<String> {
-    let openapi = serde_json::to_value(api::openapi::ApiDoc::openapi()).expect("OpenAPI JSON");
-    openapi["paths"]
-        .as_object()
-        .expect("OpenAPI paths")
-        .iter()
-        .filter_map(|(path, operations)| {
-            let route = path.strip_prefix("/v1")?;
-            let query: BTreeSet<&str> = operations["get"]["parameters"]
-                .as_array()?
-                .iter()
-                .filter(|parameter| parameter["in"] == "query")
-                .filter_map(|parameter| parameter["name"].as_str())
-                .collect();
-            (route.starts_with("/admin") && query.contains("limit") && query.contains("offset"))
-                .then(|| route.to_string())
-        })
-        .collect()
-}
-
-/// A paginated list route with the test's fixtures as its parameters.
-fn fixture_list_path(route: &str) -> String {
-    let segments: Vec<&str> = route
-        .split('/')
-        .map(|segment| match segment {
-            parameter if parameter.starts_with('{') => {
-                panic!("give {parameter} of {route} a fixture with at least two rows")
-            }
-            literal => literal,
-        })
-        .collect();
-    format!("/v1{}", segments.join("/"))
-}
-
-/// The rows a list response returned: its only top-level array.
-fn list_rows(body: &Value, uri: &str) -> usize {
-    let arrays: Vec<_> = body
-        .as_object()
-        .unwrap_or_else(|| panic!("{uri} returns an object"))
-        .values()
-        .filter_map(Value::as_array)
-        .collect();
-    assert_eq!(arrays.len(), 1, "{uri} returns one row array: {body}");
-    arrays[0].len()
 }
 
 #[test]
@@ -468,51 +394,6 @@ async fn audit_events_exclude_request_content_on_the_real_router() {
             ] {
                 assert!(!line.contains(forbidden), "{forbidden} leaked: {line}");
             }
-        }
-    }
-}
-
-#[test]
-fn page_guard_finds_every_known_paginated_admin_list() {
-    let documented = documented_paginated_admin_lists();
-    for route in KNOWN_PAGINATED_ADMIN_LISTS {
-        assert!(
-            documented.contains(*route),
-            "{route} must document its limit and offset query parameters"
-        );
-    }
-}
-
-/// Guard: every documented paginated admin list records the page it served,
-/// so a new list handler cannot leave its audit event without one.
-#[tokio::test]
-async fn every_documented_paginated_admin_list_records_its_page() {
-    let (_server, router) = setup_test_server_and_router().await;
-    let session = session_jwt(Uuid::new_v4());
-    let (logs, _guard) = CapturedLogs::start();
-
-    for route in documented_paginated_admin_lists() {
-        let path = fixture_list_path(&route);
-        for (limit, offset) in [(2, 0), (1, 1)] {
-            let uri = format!("{path}?limit={limit}&offset={offset}");
-            let response = send(&router, authorized(Method::GET, &uri, &session, json!({}))).await;
-            assert_eq!(response.status(), StatusCode::OK, "{uri}");
-            let rows = list_rows(&json_body(response).await, &uri);
-            let event = logs.take_single_event();
-            assert_eq!(event["admin_route"], format!("/v1{route}"), "{uri}");
-            assert_eq!(
-                (
-                    event.get("admin_limit"),
-                    event.get("admin_offset"),
-                    event.get("admin_returned_count")
-                ),
-                (
-                    Some(&json!(limit)),
-                    Some(&json!(offset)),
-                    Some(&json!(rows))
-                ),
-                "{uri} must record the page it served"
-            );
         }
     }
 }

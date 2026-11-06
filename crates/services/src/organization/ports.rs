@@ -49,7 +49,7 @@ impl Organization {
     /// The models this organization's owners and admins allow it to use
     /// (`allowed_models`, canonical names). `None`: every model.
     ///
-    /// The validated write path is `PATCH /v1/organizations/{org_id}/settings`.
+    /// The validated write path is in cloud-platform; this service does not write settings.
     /// A stored value that is not a list of strings, which only a full
     /// settings `PUT` can write, allows no model: the filter fails closed.
     pub fn allowed_models(&self) -> Option<std::collections::HashSet<String>> {

@@ -286,18 +286,6 @@ pub trait WorkspaceServiceTrait: Send + Sync {
         order_direction: Option<WorkspaceOrderDirection>,
     ) -> Result<Vec<Workspace>, WorkspaceError>;
 
-    /// Create a new workspace in an organization with permission checking
-    async fn create_workspace(
-        &self,
-        name: String,
-        description: Option<String>,
-        organization_id: OrganizationId,
-        requester_id: UserId,
-    ) -> Result<Workspace, WorkspaceError>;
-
-    /// Create an API key for a workspace with permission checking
-    async fn create_api_key(&self, request: CreateApiKeyRequest) -> Result<ApiKey, WorkspaceError>;
-
     /// List API keys for a workspace with pagination and permission checking
     async fn list_api_keys_paginated(
         &self,
@@ -317,57 +305,11 @@ pub trait WorkspaceServiceTrait: Send + Sync {
         requester_id: UserId,
     ) -> Result<Option<ApiKey>, WorkspaceError>;
 
-    /// Delete an API key with permission checking
-    async fn delete_api_key(
-        &self,
-        workspace_id: WorkspaceId,
-        api_key_id: ApiKeyId,
-        requester_id: UserId,
-    ) -> Result<bool, WorkspaceError>;
-
-    /// Update API key spend limit with permission checking
-    async fn update_api_key_spend_limit(
-        &self,
-        workspace_id: WorkspaceId,
-        api_key_id: ApiKeyId,
-        requester_id: UserId,
-        spend_limit: Option<i64>,
-    ) -> Result<ApiKey, WorkspaceError>;
-
-    /// Update API key (name, expires_at, and/or spend_limit) with permission checking
-    async fn update_api_key(
-        &self,
-        workspace_id: WorkspaceId,
-        api_key_id: ApiKeyId,
-        requester_id: UserId,
-        name: Option<String>,
-        expires_at: Option<Option<DateTime<Utc>>>,
-        spend_limit: Option<Option<i64>>,
-        is_active: Option<bool>,
-    ) -> Result<ApiKey, WorkspaceError>;
-
     /// Check if a user can manage API keys for a workspace
     async fn can_manage_api_keys(
         &self,
         workspace_id: WorkspaceId,
         user_id: UserId,
-    ) -> Result<bool, WorkspaceError>;
-
-    /// Update a workspace with permission checking
-    async fn update_workspace(
-        &self,
-        workspace_id: WorkspaceId,
-        requester_id: UserId,
-        name: Option<String>,
-        description: Option<String>,
-        settings: Option<serde_json::Value>,
-    ) -> Result<Workspace, WorkspaceError>;
-
-    /// Delete (deactivate) a workspace with permission checking
-    async fn delete_workspace(
-        &self,
-        workspace_id: WorkspaceId,
-        requester_id: UserId,
     ) -> Result<bool, WorkspaceError>;
 
     /// List all workspaces accessible to a user across all their organizations in a single query.
@@ -399,14 +341,6 @@ pub trait WorkspaceServiceTrait: Send + Sync {
         &self,
         workspace_id: WorkspaceId,
         name: &str,
-        requester_id: UserId,
-    ) -> Result<bool, WorkspaceError>;
-
-    /// Revoke an API key (alias for delete_api_key with revoke semantics)
-    async fn revoke_api_key(
-        &self,
-        workspace_id: WorkspaceId,
-        api_key_id: ApiKeyId,
         requester_id: UserId,
     ) -> Result<bool, WorkspaceError>;
 }

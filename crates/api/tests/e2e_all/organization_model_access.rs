@@ -2209,7 +2209,7 @@ async fn internal_budget_requires_service_auth_and_organization_model_access() {
     let body = json!({
         "id": Uuid::new_v4(), "organization_id": org.id,
         "workspace_id": workspace.id, "api_key_id": key.id,
-        "model": fixture.text, "inference_type": "chat_completion",
+        "model": fixture.text, "inference_type": "chat_completion_stream",
         "max_output_tokens": 10
     });
     let unauthenticated = server.post("/v1/internal/budget").json(&body).await;
@@ -2244,6 +2244,34 @@ async fn internal_budget_requires_service_auth_and_organization_model_access() {
         &[&org_id],
     ).await.unwrap().get(0);
     assert_eq!(count, 1);
+
+    // The receipt protocol reports both streaming and non-streaming chat as chat_completion.
+    let receipt = json!({
+        "id": body["id"], "organization_id": org.id,
+        "workspace_id": workspace.id, "api_key_id": key.id,
+        "model": fixture.text, "type": "chat_completion",
+        "input_tokens": 1, "output_tokens": 1
+    });
+    let mut usage_id = None;
+    for _ in 0..2 {
+        let response = server
+            .post("/v1/internal/usage")
+            .add_header("Authorization", format!("Bearer {INTERNAL_TOKEN}"))
+            .json(&receipt)
+            .await;
+        assert_eq!(response.status_code(), 200, "{}", response.text());
+        let id = response.json::<Value>()["id"].clone();
+        if let Some(previous) = &usage_id {
+            assert_eq!(&id, previous);
+        }
+        usage_id = Some(id);
+    }
+    let row = fixture.database.pool().get().await.unwrap().query_one(
+        "SELECT reserved_credit($1), count(*) FROM usage_budget_reservations WHERE organization_id=$1 AND state='settled'",
+        &[&org_id],
+    ).await.unwrap();
+    assert_eq!(row.get::<_, i64>(0), 0);
+    assert_eq!(row.get::<_, i64>(1), 1);
 }
 
 fn settings_path(organization_id: &str) -> String {

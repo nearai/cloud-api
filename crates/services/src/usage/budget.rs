@@ -126,6 +126,9 @@ impl UsageBounds {
                 (
                     InferenceType::ChatCompletion,
                     InferenceType::ChatCompletionStream
+                ) | (
+                    InferenceType::ChatCompletionStream,
+                    InferenceType::ChatCompletion
                 )
             );
         if !compatible {
@@ -364,6 +367,20 @@ mod tests {
         request.input_tokens = 100;
         request.output_tokens = 20;
         assert!(bounds.validate_actual(&request).is_ok());
+        for admitted in [
+            InferenceType::ChatCompletion,
+            InferenceType::ChatCompletionStream,
+        ] {
+            for reported in [
+                InferenceType::ChatCompletion,
+                InferenceType::ChatCompletionStream,
+            ] {
+                let mut bounds = bounds.clone();
+                bounds.inference_type = admitted;
+                request.inference_type = reported;
+                assert!(bounds.validate_actual(&request).is_ok());
+            }
+        }
         request.output_tokens = 21;
         assert!(bounds.validate_actual(&request).is_err());
         request.output_tokens = 0;

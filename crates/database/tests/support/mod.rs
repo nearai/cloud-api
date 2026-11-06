@@ -212,6 +212,16 @@ pub async fn cleanup_usage_fixtures(
     let client = pool.get().await?;
     let org_ids = org_ids.to_vec();
     let model_ids = model_ids.to_vec();
+    client.execute(
+        "DELETE FROM usage_budget_funding WHERE reservation_id IN (SELECT id FROM usage_budget_reservations WHERE organization_id = ANY($1))",
+        &[&org_ids],
+    ).await?;
+    client
+        .execute(
+            "DELETE FROM usage_budget_reservations WHERE organization_id = ANY($1)",
+            &[&org_ids],
+        )
+        .await?;
     client
         .execute("DELETE FROM organizations WHERE id = ANY($1)", &[&org_ids])
         .await?;

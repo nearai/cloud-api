@@ -1472,6 +1472,51 @@ async fn reconciliation_preview_commit_replay_and_future_usage() -> anyhow::Resu
     let actor = Uuid::new_v4();
     let amounts = [("payment".to_string(), 80)].into_iter().collect();
 
+    use services::usage::budget::{BudgetReservation, UsageBounds};
+    use services::usage::{BillingIdentity, ModelPricing, UsageRepository};
+    let budgets = OrganizationUsageRepository::new(pool.clone());
+    let held = BudgetReservation {
+        id: Uuid::new_v4(),
+        identity: BillingIdentity {
+            organization_id: org.org_id,
+            workspace_id: org.workspace_a_id,
+            api_key_id: org.api_key_a_id,
+            model_id: model.id,
+        },
+        amount: 80,
+        pricing: ModelPricing {
+            id: model.id,
+            model_name: model.name.clone(),
+            input_cost_per_token: 1,
+            output_cost_per_token: 1,
+            cost_per_image: 0,
+            cache_read_cost_per_token: None,
+            text_pricing: None,
+        },
+        bounds: UsageBounds::text(79, 1, 1)?,
+    };
+    budgets.reserve_and_dispatch(&held).await?;
+    for dry_run in [true, false] {
+        let error = repository
+            .reconcile(org.org_id, &amounts, "held", "review", actor, dry_run)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<ReconciliationError>(),
+            Some(ReconciliationError::Conflict(_))
+        ));
+    }
+    let other = [("postpay".to_string(), 80)].into_iter().collect();
+    let preview = repository
+        .reconcile(org.org_id, &other, "other", "review", actor, true)
+        .await?;
+    assert_eq!(preview.before.credits["payment"].available, 20);
+    assert_eq!(preview.after.credits["payment"].available, 20);
+    pool.get().await?.query_one(
+        "SELECT release_confirmed_unused_budget($1,$2,'test executed no upstream work','test/reconciliation')",
+        &[&org.org_id, &held.id],
+    ).await?;
+
     let mixed = [("payment".to_string(), 30), ("postpay".to_string(), 20)]
         .into_iter()
         .collect();

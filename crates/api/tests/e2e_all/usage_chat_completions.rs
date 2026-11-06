@@ -235,8 +235,8 @@ async fn setup_non_attested_model(
     batch.insert(
         model_name.clone(),
         serde_json::from_value(json!({
-            "inputCostPerToken": { "amount": 1_000_000, "currency": "USD" },
-            "outputCostPerToken": { "amount": 2_000_000, "currency": "USD" },
+            "inputCostPerToken": { "amount": E2E_QWEN_INPUT_COST_PER_TOKEN, "currency": "USD" },
+            "outputCostPerToken": { "amount": E2E_QWEN_OUTPUT_COST_PER_TOKEN, "currency": "USD" },
             "modelDisplayName": "Non-attested test model",
             "modelDescription": "Test model (non-attested) for usage-stripping tests",
             "contextLength": 128000,

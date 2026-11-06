@@ -126,7 +126,7 @@ async fn fast_alias_downgrade_bills_canonical_default_profile_exactly() {
     )
     .await;
 
-    let organization = setup_org_with_credits(&server, 10_000_000_000).await;
+    let organization = setup_org_with_credits(&server, 100_000_000_000).await;
     let api_key = get_api_key_for_org(&server, organization.id.clone()).await;
 
     let catalog = list_models(&server, api_key.clone()).await;
@@ -198,7 +198,7 @@ async fn streaming_flex_captures_actual_tier_and_cache_write_usage() {
         .await;
     setup_profiled_model(&server, &pool, provider, STREAMING_MODEL, &[]).await;
 
-    let organization = setup_org_with_credits(&server, 10_000_000_000).await;
+    let organization = setup_org_with_credits(&server, 100_000_000_000).await;
     let api_key = get_api_key_for_org(&server, organization.id.clone()).await;
     let response = server
         .post("/v1/chat/completions")
@@ -247,7 +247,7 @@ async fn streaming_flex_captures_actual_tier_and_cache_write_usage() {
 async fn responses_rejects_non_standard_processing_tiers() {
     ensure_env();
     let server = setup_test_server().await;
-    let organization = setup_org_with_credits(&server, 10_000_000_000).await;
+    let organization = setup_org_with_credits(&server, 100_000_000_000).await;
     let api_key = get_api_key_for_org(&server, organization.id).await;
     let response = server
         .post("/v1/responses")

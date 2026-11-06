@@ -522,15 +522,15 @@ async fn test_rerank_costs_deducted_correctly() {
     );
 
     // Mock provider returns 50 tokens (see mock.rs line 922)
-    // Cost per token: 1,000,000 nano-dollars
-    // Expected cost: 50 * 1,000,000 = 50,000,000 nano-dollars = $0.05
-    let expected_cost = 50_000_000i64;
+    // Cost per token: 1,000 nano-dollars
+    // Expected cost: 50 * 1,000 = 50,000 nano-dollars = $0.00005
+    let expected_cost = 50_000i64;
     let tolerance = 10; // Allow small rounding differences
 
     assert!(
         (actual_cost - expected_cost).abs() <= tolerance,
         "Cost calculation mismatch: expected {expected_cost} nano-dollars (±{tolerance}), got {actual_cost}. \
-         This is a ${} charge (expected $0.05)",
+         This is a ${} charge (expected $0.00005)",
         actual_cost as f64 / 1_000_000_000.0
     );
 

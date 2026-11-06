@@ -1634,11 +1634,11 @@ async fn test_high_context_length_completion() {
         HIGH_CONTEXT_COMPLETION_MODEL.to_string(),
         serde_json::from_value(serde_json::json!({
             "inputCostPerToken": {
-                "amount": 1000000,  // $0.000001 per token
+                "amount": 1000,  // $0.000001 per token
                 "currency": "USD"
             },
             "outputCostPerToken": {
-                "amount": 2000000,  // $0.000002 per token
+                "amount": 2000,  // $0.000002 per token
                 "currency": "USD"
             },
             "modelDisplayName": "Qwen3 30B Instruct",

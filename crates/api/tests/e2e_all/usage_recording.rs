@@ -78,7 +78,7 @@ async fn post_internal_usage(
 async fn test_record_chat_completion_usage() {
     let server = enable_internal_usage_server().await;
 
-    // Setup model with known pricing (input: 1_000_000, output: 2_000_000 nano-dollars per token)
+    // Setup model with known pricing (input: 1_000, output: 2_000 nano-dollars per token)
     setup_qwen_model(&server).await;
 
     // Setup org with $10 credits and an API key identity
@@ -118,12 +118,12 @@ async fn test_record_chat_completion_usage() {
     assert_eq!(body["cache_read_tokens"], 0);
 
     // Verify costs are calculated correctly
-    // input: 100 tokens * 1_000_000 nano-dollars = 100_000_000
-    // output: 50 tokens * 2_000_000 nano-dollars = 100_000_000
-    // total: 200_000_000
-    assert_eq!(body["input_cost"], 100_000_000i64);
-    assert_eq!(body["output_cost"], 100_000_000i64);
-    assert_eq!(body["total_cost"], 200_000_000i64);
+    // input: 100 tokens * 1_000 nano-dollars = 100_000
+    // output: 50 tokens * 2_000 nano-dollars = 100_000
+    // total: 200_000
+    assert_eq!(body["input_cost"], 100_000i64);
+    assert_eq!(body["output_cost"], 100_000i64);
+    assert_eq!(body["total_cost"], 200_000i64);
 
     // Verify model name
     assert_eq!(body["model"], "Qwen/Qwen3-30B-A3B-Instruct-2507");
@@ -400,7 +400,7 @@ async fn test_record_usage_idempotent_duplicate() {
     assert_eq!(body1["total_cost"], body2["total_cost"]);
     assert_eq!(body1["created_at"], body2["created_at"]);
 
-    // Verify the balance was only charged once (total_cost = 200_000_000)
+    // Verify the balance was only charged once (total_cost = 200_000)
     // by recording a second distinct usage and checking the combined balance
     let response3 = post_internal_usage(
         &server,
@@ -495,7 +495,7 @@ async fn test_record_chat_completion_usage_with_cached_tokens() {
     let server = enable_internal_usage_server().await;
 
     // Setup model with cache-read pricing:
-    // input: 1_000_000, output: 2_000_000, cache_read: 500_000 nano-dollars per token
+    // input: 1_000, output: 2_000, cache_read: 500 nano-dollars per token
     let model = setup_qwen_model_with_cache_pricing(&server).await;
 
     // Setup org with $10 credits and an API key identity
@@ -537,12 +537,12 @@ async fn test_record_chat_completion_usage_with_cached_tokens() {
     // Cost expectations with cache pricing:
     // - input_tokens = 100, cache_read_tokens = 40
     // - non_cached_input = 60
-    // - input_cost = 60 * 1_000_000 + 40 * 500_000 = 80_000_000
-    // - output_cost = 50 * 2_000_000 = 100_000_000
-    // - total_cost = 180_000_000
-    assert_eq!(body["input_cost"], 80_000_000i64);
-    assert_eq!(body["output_cost"], 100_000_000i64);
-    assert_eq!(body["total_cost"], 180_000_000i64);
+    // - input_cost = 60 * 1_000 + 40 * 500 = 80_000
+    // - output_cost = 50 * 2_000 = 100_000
+    // - total_cost = 180_000
+    assert_eq!(body["input_cost"], 80_000i64);
+    assert_eq!(body["output_cost"], 100_000i64);
+    assert_eq!(body["total_cost"], 180_000i64);
 }
 
 /// Pins the invariant that an external usage submission (`/v1/internal/usage`)
@@ -836,8 +836,8 @@ async fn test_internal_usage_records_with_valid_token() {
     assert_eq!(body["type"], "chat_completion");
     assert_eq!(body["input_tokens"], 100);
     assert_eq!(body["output_tokens"], 50);
-    // input: 100 * 1_000_000 + output: 50 * 2_000_000 = 200_000_000
-    assert_eq!(body["total_cost"], 200_000_000i64);
+    // input: 100 * 1_000 + output: 50 * 2_000 = 200_000
+    assert_eq!(body["total_cost"], 200_000i64);
 }
 
 /// `/v1/internal/usage` returns 401 when configured but called with the
@@ -906,10 +906,10 @@ async fn test_record_input_only_usage_types() {
         let body: serde_json::Value = response.json();
         assert_eq!(body["input_tokens"], 100);
         assert_eq!(body["output_tokens"], 0);
-        // 100 input tokens * 1_000_000 nano-dollars input rate; no output cost.
-        assert_eq!(body["input_cost"], 100_000_000i64);
+        // 100 input tokens * 1_000 nano-dollars input rate; no output cost.
+        assert_eq!(body["input_cost"], 100_000i64);
         assert_eq!(body["output_cost"], 0i64);
-        assert_eq!(body["total_cost"], 100_000_000i64);
+        assert_eq!(body["total_cost"], 100_000i64);
     }
 }
 
@@ -989,23 +989,23 @@ async fn test_record_chat_completion_usage_with_discount() {
     assert_eq!(response.status_code(), 200, "{}", response.text());
     let body: serde_json::Value = response.json();
 
-    // List: 100 * 1_000_000 input + 50 * 2_000_000 output = 200_000_000; 20% off.
-    assert_eq!(body["input_cost"], 80_000_000i64);
-    assert_eq!(body["output_cost"], 80_000_000i64);
-    assert_eq!(body["total_cost"], 160_000_000i64);
+    // List: 100 * 1_000 input + 50 * 2_000 output = 200_000; 20% off.
+    assert_eq!(body["input_cost"], 80_000i64);
+    assert_eq!(body["output_cost"], 80_000i64);
+    assert_eq!(body["total_cost"], 160_000i64);
     assert_eq!(body["input_tokens"], 100);
     assert_eq!(body["output_tokens"], 50);
 
     let entry = usage_history_entry(&server, &id.org_id, "test-chat-completion-discount-001").await;
-    assert_eq!(entry.total_cost, 160_000_000i64);
+    assert_eq!(entry.total_cost, 160_000i64);
     let details = entry
         .billing_details
         .expect("discounted rows carry billing_details");
     assert_eq!(details["discount"]["discount_to_user"], 0.2);
     assert_eq!(details["discount"]["basis_points"], 2000);
-    assert_eq!(details["discount"]["list_input_cost"], 100_000_000i64);
-    assert_eq!(details["discount"]["list_output_cost"], 100_000_000i64);
-    assert_eq!(details["discount"]["list_total_cost"], 200_000_000i64);
+    assert_eq!(details["discount"]["list_input_cost"], 100_000i64);
+    assert_eq!(details["discount"]["list_output_cost"], 100_000i64);
+    assert_eq!(details["discount"]["list_total_cost"], 200_000i64);
 }
 
 /// `discount_to_user: 0` (the aggregator's "no discount") records the row at
@@ -1031,7 +1031,7 @@ async fn test_internal_usage_discount_zero_bills_list_price() {
     .await;
     assert_eq!(response.status_code(), 200, "{}", response.text());
     let body: serde_json::Value = response.json();
-    assert_eq!(body["total_cost"], 200_000_000i64);
+    assert_eq!(body["total_cost"], 200_000i64);
 
     let entry =
         usage_history_entry(&server, &id.org_id, "test-chat-completion-discount-zero").await;
@@ -1126,7 +1126,7 @@ async fn test_internal_usage_rejects_discount_above_ceiling() {
     let accepted = post_internal_usage(&server, &id, usage("at", 0.1)).await;
     assert_eq!(accepted.status_code(), 200, "{}", accepted.text());
     let body: serde_json::Value = accepted.json();
-    assert_eq!(body["input_cost"], 90_000_000i64);
-    assert_eq!(body["output_cost"], 90_000_000i64);
-    assert_eq!(body["total_cost"], 180_000_000i64);
+    assert_eq!(body["input_cost"], 90_000i64);
+    assert_eq!(body["output_cost"], 90_000i64);
+    assert_eq!(body["total_cost"], 180_000i64);
 }

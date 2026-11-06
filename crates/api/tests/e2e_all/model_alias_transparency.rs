@@ -34,8 +34,8 @@ async fn setup_deprecated_alias_with_mock() -> (
     batch.insert(
         canonical.clone(),
         serde_json::from_value(serde_json::json!({
-            "inputCostPerToken":  { "amount": 1_000_000, "currency": "USD" },
-            "outputCostPerToken": { "amount": 2_000_000, "currency": "USD" },
+            "inputCostPerToken":  { "amount": E2E_QWEN_INPUT_COST_PER_TOKEN, "currency": "USD" },
+            "outputCostPerToken": { "amount": E2E_QWEN_OUTPUT_COST_PER_TOKEN, "currency": "USD" },
             "modelDisplayName":   "Alias Transparency Successor",
             "modelDescription":   "Per-test successor for alias transparency e2e",
             "contextLength":      128000,
@@ -48,8 +48,8 @@ async fn setup_deprecated_alias_with_mock() -> (
     batch.insert(
         old.clone(),
         serde_json::from_value(serde_json::json!({
-            "inputCostPerToken":  { "amount": 1_000_000, "currency": "USD" },
-            "outputCostPerToken": { "amount": 2_000_000, "currency": "USD" },
+            "inputCostPerToken":  { "amount": E2E_QWEN_INPUT_COST_PER_TOKEN, "currency": "USD" },
+            "outputCostPerToken": { "amount": E2E_QWEN_OUTPUT_COST_PER_TOKEN, "currency": "USD" },
             "modelDisplayName":   "Alias Transparency Test Model",
             "modelDescription":   "Synthetic model deprecated onto a per-test successor",
             "contextLength":      4096,
@@ -506,8 +506,8 @@ async fn test_alias_to_external_model_with_upstream_name_override_warns() {
     batch.insert(
         canonical.clone(),
         serde_json::from_value(serde_json::json!({
-            "inputCostPerToken":  { "amount": 2_500_000, "currency": "USD" },
-            "outputCostPerToken": { "amount": 10_000_000, "currency": "USD" },
+            "inputCostPerToken":  { "amount": 2_500, "currency": "USD" },
+            "outputCostPerToken": { "amount": 10_000, "currency": "USD" },
             "modelDisplayName":   "External Override Test Model",
             "modelDescription":   "External model with upstream name override",
             "contextLength":      128000,
@@ -527,8 +527,8 @@ async fn test_alias_to_external_model_with_upstream_name_override_warns() {
     batch.insert(
         old.clone(),
         serde_json::from_value(serde_json::json!({
-            "inputCostPerToken":  { "amount": 1_000_000, "currency": "USD" },
-            "outputCostPerToken": { "amount": 2_000_000, "currency": "USD" },
+            "inputCostPerToken":  { "amount": E2E_QWEN_INPUT_COST_PER_TOKEN, "currency": "USD" },
+            "outputCostPerToken": { "amount": E2E_QWEN_OUTPUT_COST_PER_TOKEN, "currency": "USD" },
             "modelDisplayName":   "External Override Old Model",
             "modelDescription":   "Synthetic model deprecated onto the external model",
             "contextLength":      4096,
@@ -619,8 +619,8 @@ async fn test_alias_equal_to_upstream_override_still_warns() {
     batch.insert(
         canonical.clone(),
         serde_json::from_value(serde_json::json!({
-            "inputCostPerToken":  { "amount": 2_500_000, "currency": "USD" },
-            "outputCostPerToken": { "amount": 10_000_000, "currency": "USD" },
+            "inputCostPerToken":  { "amount": 2_500, "currency": "USD" },
+            "outputCostPerToken": { "amount": 10_000, "currency": "USD" },
             "modelDisplayName":   "Bare-Alias Override Test Model",
             "modelDescription":   "External model whose alias equals its upstream name",
             "contextLength":      128000,

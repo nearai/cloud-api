@@ -28,11 +28,11 @@ async fn setup_isolated_model_revenue_models(
             model_name.clone(),
             serde_json::from_value(serde_json::json!({
                 "inputCostPerToken": {
-                    "amount": 1_000_000 * price_multiplier,
+                    "amount": E2E_QWEN_INPUT_COST_PER_TOKEN * price_multiplier,
                     "currency": "USD"
                 },
                 "outputCostPerToken": {
-                    "amount": 2_000_000 * price_multiplier,
+                    "amount": E2E_QWEN_OUTPUT_COST_PER_TOKEN * price_multiplier,
                     "currency": "USD"
                 },
                 "modelDisplayName": format!("Model revenue fixture {index}"),

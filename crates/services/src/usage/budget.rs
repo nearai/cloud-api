@@ -235,6 +235,19 @@ pub fn service_error(error: UsageError) -> crate::completions::ports::Completion
     }
 }
 
+#[async_trait::async_trait]
+impl inference_providers::retry_admission::RetryAdmission for BudgetExecution {
+    async fn admit_retry(&self) -> Result<(), inference_providers::CompletionError> {
+        let id = self
+            .service
+            .admit(self.identity, self.bounds.clone())
+            .await
+            .map_err(completion_error)?;
+        *self.last.lock().await = Some(id);
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -379,18 +392,5 @@ mod tests {
         let mut pricing = pricing;
         pricing.output_cost_per_token = i64::MAX;
         assert!(UsageBounds::text(1, 2, 1).unwrap().quote(&pricing).is_err());
-    }
-}
-
-#[async_trait::async_trait]
-impl inference_providers::retry_admission::RetryAdmission for BudgetExecution {
-    async fn admit_retry(&self) -> Result<(), inference_providers::CompletionError> {
-        let id = self
-            .service
-            .admit(self.identity, self.bounds.clone())
-            .await
-            .map_err(completion_error)?;
-        *self.last.lock().await = Some(id);
-        Ok(())
     }
 }

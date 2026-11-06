@@ -105,6 +105,80 @@ pub(super) fn cap_reported_tokens(
     token_count
 }
 
+/// Construct the metadata passed to every upstream attempt, after request validation.
+pub(crate) fn budget_execution(
+    state: &crate::AppState,
+    key: &AuthenticatedApiKey,
+    model: &services::models::ModelWithPricing,
+    kind: services::usage::InferenceType,
+    input_units: i64,
+    output_tokens: i64,
+    images: i64,
+) -> Result<services::usage::budget::BudgetExecution, Box<Response>> {
+    let bad_bound = || {
+        Box::new(
+            (
+                StatusCode::BAD_REQUEST,
+                ResponseJson(ErrorResponse::new(
+                    "Request exceeds supported billing bounds".into(),
+                    "invalid_request_error".into(),
+                )),
+            )
+                .into_response(),
+        )
+    };
+    if input_units < 0 || output_tokens < 0 || images < 0 {
+        return Err(bad_bound());
+    }
+    let bounds = services::usage::budget::UsageBounds {
+        inference_type: kind,
+        input_units: i32::try_from(input_units).map_err(|_| bad_bound())?,
+        output_tokens: i32::try_from(output_tokens).map_err(|_| bad_bound())?,
+        images: i32::try_from(images).map_err(|_| bad_bound())?,
+    };
+    Ok(services::usage::budget::BudgetExecution::new(
+        state.usage_service.clone(),
+        services::usage::BillingIdentity {
+            organization_id: key.organization.id.0,
+            workspace_id: key.workspace.id.0,
+            api_key_id: billing_api_key_id(key)?,
+            model_id: model.id,
+        },
+        bounds,
+    ))
+}
+
+pub(crate) async fn budget_id(
+    budget: &services::usage::budget::BudgetExecution,
+) -> Result<Uuid, Box<Response>> {
+    budget
+        .id()
+        .await
+        .map_err(|_| Box::new(StatusCode::INTERNAL_SERVER_ERROR.into_response()))
+}
+
+/// Plain input tokenization cannot exceed the encoded input bytes plus model framing.
+/// Token-id arrays are also covered (one or more JSON bytes per token). Reserving the
+/// context framing per input covers batching, padding, and encrypted text payloads.
+pub(crate) fn batch_input_bound(body: &[u8], context: i32) -> Result<i64, Box<Response>> {
+    let value: serde_json::Value = serde_json::from_slice(body)
+        .map_err(|_| Box::new(StatusCode::BAD_REQUEST.into_response()))?;
+    let items = value
+        .get("input")
+        .and_then(|v| v.as_array())
+        .map_or(1, Vec::len)
+        .max(1);
+    i64::try_from(body.len())
+        .ok()
+        .and_then(|bytes| {
+            i64::try_from(items)
+                .ok()
+                .and_then(|items| items.checked_mul(i64::from(context.max(0))))
+                .and_then(|framing| bytes.checked_add(framing))
+        })
+        .ok_or_else(|| Box::new(StatusCode::BAD_REQUEST.into_response()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -189,78 +263,4 @@ mod tests {
             )
         );
     }
-}
-
-/// Construct the metadata passed to every upstream attempt, after request validation.
-pub(crate) fn budget_execution(
-    state: &crate::AppState,
-    key: &AuthenticatedApiKey,
-    model: &services::models::ModelWithPricing,
-    kind: services::usage::InferenceType,
-    input_units: i64,
-    output_tokens: i64,
-    images: i64,
-) -> Result<services::usage::budget::BudgetExecution, Box<Response>> {
-    let bad_bound = || {
-        Box::new(
-            (
-                StatusCode::BAD_REQUEST,
-                ResponseJson(ErrorResponse::new(
-                    "Request exceeds supported billing bounds".into(),
-                    "invalid_request_error".into(),
-                )),
-            )
-                .into_response(),
-        )
-    };
-    if input_units < 0 || output_tokens < 0 || images < 0 {
-        return Err(bad_bound());
-    }
-    let bounds = services::usage::budget::UsageBounds {
-        inference_type: kind,
-        input_units: i32::try_from(input_units).map_err(|_| bad_bound())?,
-        output_tokens: i32::try_from(output_tokens).map_err(|_| bad_bound())?,
-        images: i32::try_from(images).map_err(|_| bad_bound())?,
-    };
-    Ok(services::usage::budget::BudgetExecution::new(
-        state.usage_service.clone(),
-        services::usage::BillingIdentity {
-            organization_id: key.organization.id.0,
-            workspace_id: key.workspace.id.0,
-            api_key_id: billing_api_key_id(key)?,
-            model_id: model.id,
-        },
-        bounds,
-    ))
-}
-
-pub(crate) async fn budget_id(
-    budget: &services::usage::budget::BudgetExecution,
-) -> Result<Uuid, Box<Response>> {
-    budget
-        .id()
-        .await
-        .map_err(|_| Box::new(StatusCode::INTERNAL_SERVER_ERROR.into_response()))
-}
-
-/// Plain input tokenization cannot exceed the encoded input bytes plus model framing.
-/// Token-id arrays are also covered (one or more JSON bytes per token). Reserving the
-/// context framing per input covers batching, padding, and encrypted text payloads.
-pub(crate) fn batch_input_bound(body: &[u8], context: i32) -> Result<i64, Box<Response>> {
-    let value: serde_json::Value = serde_json::from_slice(body)
-        .map_err(|_| Box::new(StatusCode::BAD_REQUEST.into_response()))?;
-    let items = value
-        .get("input")
-        .and_then(|v| v.as_array())
-        .map_or(1, Vec::len)
-        .max(1);
-    i64::try_from(body.len())
-        .ok()
-        .and_then(|bytes| {
-            i64::try_from(items)
-                .ok()
-                .and_then(|items| items.checked_mul(i64::from(context.max(0))))
-                .and_then(|framing| bytes.checked_add(framing))
-        })
-        .ok_or_else(|| Box::new(StatusCode::BAD_REQUEST.into_response()))
 }

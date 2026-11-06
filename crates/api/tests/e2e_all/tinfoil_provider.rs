@@ -69,8 +69,8 @@ async fn fixture(with_chutes: bool) -> Fixture {
     batch.insert(
         model.clone(),
         serde_json::from_value(json!({
-            "inputCostPerToken": { "amount": 1_000_000, "currency": "USD" },
-            "outputCostPerToken": { "amount": 2_000_000, "currency": "USD" },
+            "inputCostPerToken": { "amount": E2E_QWEN_INPUT_COST_PER_TOKEN, "currency": "USD" },
+            "outputCostPerToken": { "amount": E2E_QWEN_OUTPUT_COST_PER_TOKEN, "currency": "USD" },
             "modelDisplayName": "Tinfoil fixture",
             "modelDescription": "Tinfoil attested fallback test model",
             "contextLength": 128000,
@@ -297,8 +297,8 @@ async fn tinfoil_catalog_row(server: &axum_test::TestServer, model: &str) {
     batch.insert(
         model.to_string(),
         serde_json::from_value(json!({
-            "inputCostPerToken": { "amount": 1_000_000, "currency": "USD" },
-            "outputCostPerToken": { "amount": 2_000_000, "currency": "USD" },
+            "inputCostPerToken": { "amount": E2E_QWEN_INPUT_COST_PER_TOKEN, "currency": "USD" },
+            "outputCostPerToken": { "amount": E2E_QWEN_OUTPUT_COST_PER_TOKEN, "currency": "USD" },
             "modelDisplayName": "Tinfoil registration fixture",
             "modelDescription": "Tinfoil registration test model",
             "contextLength": 131072,
@@ -376,7 +376,7 @@ async fn failed_first_verification_still_registers_and_answers_503() {
         json!({"model": model, "messages": [{"role":"user","content":"Hello"}], "max_tokens": 8}),
     )
     .unwrap();
-    match pool.chat_completion(params, "hash".to_string()).await {
+    match with_pool_test_budget(pool.chat_completion(params, "hash".to_string())).await {
         Err(inference_providers::CompletionError::HttpError {
             status_code,
             message,
@@ -448,7 +448,7 @@ async fn startup_does_not_wait_for_a_hanging_first_verification() {
         json!({"model": model, "messages": [{"role":"user","content":"Hello"}], "max_tokens": 8}),
     )
     .unwrap();
-    match pool.chat_completion(params, "hash".to_string()).await {
+    match with_pool_test_budget(pool.chat_completion(params, "hash".to_string())).await {
         Err(inference_providers::CompletionError::HttpError { status_code, .. }) => {
             assert_eq!(status_code, 503)
         }

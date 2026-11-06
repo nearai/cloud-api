@@ -4,60 +4,7 @@ use uuid::Uuid;
 
 #[tokio::test]
 async fn test_responses_api_usage_limit_enforcement() {
-    let (server, database) = setup_test_server_with_database().await;
-    let org = setup_org_with_credits(&server, 1).await; // 1 nano-dollar (minimal)
-    println!("Created organization: {org:?}");
-    let api_key = get_api_key_for_org(&server, org.id.clone()).await;
-    let model_name = setup_qwen_model(&server).await;
-
-    // The first request consumes the test-owned organization's one nano-dollar.
-    let response1 = server
-        .post("/v1/responses")
-        .add_header("Authorization", format!("Bearer {api_key}"))
-        .json(&serde_json::json!({
-            "input": "Hi",
-            "model": model_name,
-            "stream": false,
-            "max_output_tokens": 10
-        }))
-        .await;
-
-    println!("First request status: {}", response1.status_code());
-    assert_eq!(response1.status_code(), 200, "{}", response1.text());
-    wait_for_recorded_spend(&database, org.id.parse().unwrap()).await;
-
-    // Second request should fail with payment required
-    let response2 = server
-        .post("/v1/responses")
-        .add_header("Authorization", format!("Bearer {api_key}"))
-        .json(&serde_json::json!({
-            "input": "Hi again",
-            "model": model_name,
-            "stream": false,
-            "max_output_tokens": 10
-        }))
-        .await;
-
-    println!("Second request status: {}", response2.status_code());
-    println!("Second request body: {}", response2.text());
-
-    // Should get 402 Payment Required after exceeding limit
-    assert!(
-        response2.status_code() == 402,
-        "Expected 402 Payment Required, got: {}",
-        response2.status_code()
-    );
-
-    // Since we got 402, verify the error message
-    let error_response = response2.json::<api::models::ErrorResponse>();
-    assert!(
-        error_response
-            .error
-            .message
-            .contains("Credit limit exceeded."),
-        "Error response should indicate no credits, got: {}",
-        error_response.error.message
-    );
+    assert_responses_rejected_before_execution(false).await;
 }
 
 #[tokio::test]
@@ -177,66 +124,7 @@ async fn test_responses_api_sufficient_credits() {
 
 #[tokio::test]
 async fn test_responses_api_streaming_usage_limit() {
-    let (server, database) = setup_test_server_with_database().await;
-    let org = setup_org_with_credits(&server, 1).await; // 1 nano-dollar (minimal)
-    println!("Created organization: {org:?}");
-    let api_key = get_api_key_for_org(&server, org.id.clone()).await;
-    let model_name = setup_qwen_model(&server).await;
-
-    // The first stream consumes the test-owned organization's one nano-dollar.
-    let response1 = server
-        .post("/v1/responses")
-        .add_header("Authorization", format!("Bearer {api_key}"))
-        .json(&serde_json::json!({
-            "input": "Hi",
-            "model": model_name,
-            "stream": true,
-            "max_output_tokens": 10
-        }))
-        .await;
-
-    println!(
-        "First streaming request status: {}",
-        response1.status_code()
-    );
-    assert_eq!(response1.status_code(), 200, "{}", response1.text());
-    wait_for_recorded_spend(&database, org.id.parse().unwrap()).await;
-
-    // Second streaming request should fail with payment required
-    let response2 = server
-        .post("/v1/responses")
-        .add_header("Authorization", format!("Bearer {api_key}"))
-        .json(&serde_json::json!({
-            "input": "Hi again",
-            "model": model_name,
-            "stream": true,
-            "max_output_tokens": 10
-        }))
-        .await;
-
-    println!(
-        "Second streaming request status: {}",
-        response2.status_code()
-    );
-    println!("Second streaming request body: {}", response2.text());
-
-    // Should get 402 Payment Required after exceeding limit
-    assert!(
-        response2.status_code() == 402,
-        "Expected 402 Payment Required, got: {}",
-        response2.status_code()
-    );
-
-    // If we got 402, verify the error message
-    let error_response = response2.json::<api::models::ErrorResponse>();
-    assert!(
-        error_response
-            .error
-            .message
-            .contains("Credit limit exceeded."),
-        "Error response should indicate no credits, got: {}",
-        error_response.error.message
-    );
+    assert_responses_rejected_before_execution(true).await;
 }
 
 #[tokio::test]
@@ -391,21 +279,54 @@ async fn test_responses_api_with_json_schema() {
     }
 }
 
-/// Synchronize on the actual debit before testing the next request's rejection.
-async fn wait_for_recorded_spend(database: &std::sync::Arc<database::Database>, org: Uuid) {
-    use services::usage::ports::UsageRepository;
-
-    let usage = database::repositories::OrganizationUsageRepository::new(database.pool().clone());
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-    loop {
-        let balance = UsageRepository::get_balance(&usage, org).await.unwrap();
-        if balance.is_some_and(|balance| balance.total_spent >= 1) {
-            return;
+/// A positive balance below the request bound must never authorize paid work,
+/// including a second call after the first rejection.
+async fn assert_responses_rejected_before_execution(stream: bool) {
+    let (server, _pool, mock, database) = setup_test_server_with_pool().await;
+    setup_qwen_model(&server).await;
+    let org = setup_org_with_credits(&server, 1).await;
+    let org_id = Uuid::parse_str(&org.id).unwrap();
+    let key = get_api_key_for_org(&server, org.id).await;
+    for _ in 0..2 {
+        let response = server
+            .post("/v1/responses")
+            .add_header("Authorization", format!("Bearer {key}"))
+            .json(&serde_json::json!({
+                "model": E2E_QWEN_MODEL_NAME, "input": "Hi", "stream": stream,
+                "max_output_tokens": 10
+            }))
+            .await;
+        if stream {
+            // Typed Responses starts its SSE lifecycle before dispatch. The
+            // failed generation is delivered in the stream with no provider call.
+            assert_eq!(response.status_code(), 200);
+            assert!(
+                response.text().contains("response.failed"),
+                "{}",
+                response.text()
+            );
+        } else {
+            assert_eq!(response.status_code(), 402, "{}", response.text());
         }
         assert!(
-            tokio::time::Instant::now() < deadline,
-            "response usage was not recorded"
+            response.text().contains("Credit limit exceeded."),
+            "{}",
+            response.text()
         );
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
+    assert_eq!(mock.chat_completion_call_count(), 0);
+    let row = database
+        .pool()
+        .get()
+        .await
+        .unwrap()
+        .query_one(
+            "SELECT (SELECT count(*) FROM organization_usage_log WHERE organization_id=$1),
+                (SELECT count(*) FROM usage_budget_reservations WHERE organization_id=$1)",
+            &[&org_id],
+        )
+        .await
+        .unwrap();
+    assert_eq!(row.get::<_, i64>(0), 0);
+    assert_eq!(row.get::<_, i64>(1), 0);
 }

@@ -56,11 +56,12 @@ impl services::usage::ports::UsageRepository for OrganizationUsageRepository {
                 .and_then(|e| e.code())
                 .map(|c| c.code())
             {
-                Some("NBKEX") => {
-                    UsageError::LimitExceeded("API key has insufficient available budget".into())
-                }
+                Some("NBKEX") => UsageError::LimitExceeded(
+                    "API key spend limit exceeded. Insufficient available budget for this request."
+                        .into(),
+                ),
                 Some("NBOEX") => UsageError::LimitExceeded(
-                    "Organization has insufficient available budget".into(),
+                    "Credit limit exceeded. Insufficient available budget for this request.".into(),
                 ),
                 Some("NBORG" | "NBKEY") => {
                     UsageError::Unauthorized("Billing identity is unavailable".into())

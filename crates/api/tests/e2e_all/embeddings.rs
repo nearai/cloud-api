@@ -12,7 +12,7 @@ async fn setup_embedding_model(server: &axum_test::TestServer) -> String {
         "Qwen/Qwen3-Embedding-0.6B".to_string(),
         serde_json::from_value(serde_json::json!({
             "inputCostPerToken": {
-                "amount": 1000000,
+                "amount": 1000,
                 "currency": "USD"
             },
             "outputCostPerToken": {
@@ -264,9 +264,9 @@ async fn test_embeddings_costs_deducted() {
     );
 
     // Mock provider returns 10 prompt_tokens (see mock.rs embeddings_raw)
-    // Cost per token: 1,000,000 nano-dollars
-    // Expected cost: 10 * 1,000,000 = 10,000,000 nano-dollars
-    let expected_cost = 10_000_000i64;
+    // Cost per token: 1,000 nano-dollars
+    // Expected cost: 10 * 1,000 = 10,000 nano-dollars
+    let expected_cost = 10_000i64;
     let tolerance = 10;
 
     assert!(

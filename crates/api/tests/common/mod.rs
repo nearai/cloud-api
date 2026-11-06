@@ -456,6 +456,44 @@ pub async fn setup_test_server_with_search_providers(
     (server, infra.database, mock_provider)
 }
 
+/// Direct pool routing tests still pass through real ledger admission. Their
+/// isolated billing fixture uses the standard test tariff and never touches a live provider.
+pub async fn with_pool_test_budget<F: std::future::Future>(future: F) -> F::Output {
+    let mut usage = None;
+    let (server, database) = setup_test_server_with_domain_services(|services, _| {
+        usage = Some(services.usage_service.clone());
+    })
+    .await;
+    setup_qwen_model(&server).await;
+    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+    let _key = get_api_key_for_org(&server, org.id.clone()).await;
+    let org_id = uuid::Uuid::parse_str(&org.id).unwrap();
+    let row = database
+        .pool()
+        .get()
+        .await
+        .unwrap()
+        .query_one(
+            "SELECT k.id, w.id, m.id FROM api_keys k JOIN workspaces w ON w.id=k.workspace_id
+         CROSS JOIN models m WHERE w.organization_id=$1 AND m.model_name=$2 LIMIT 1",
+            &[&org_id, &E2E_QWEN_MODEL_NAME],
+        )
+        .await
+        .unwrap();
+    services::usage::budget::BudgetExecution::new(
+        usage.unwrap(),
+        services::usage::BillingIdentity {
+            organization_id: org_id,
+            workspace_id: row.get(1),
+            api_key_id: row.get(0),
+            model_id: row.get(2),
+        },
+        services::usage::budget::UsageBounds::text(128_000, 1024, 1).unwrap(),
+    )
+    .run(future)
+    .await
+}
+
 pub async fn setup_test_server() -> axum_test::TestServer {
     let (server, _, _, _) = setup_test_server_with_pool().await;
     server

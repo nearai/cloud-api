@@ -538,9 +538,11 @@ async fn send(
                     axum_test::multipart::MultipartForm::new()
                         .add_part(
                             "file",
-                            axum_test::multipart::Part::bytes(vec![0u8; 1024])
-                                .file_name("test.mp3")
-                                .mime_type("audio/mpeg"),
+                            axum_test::multipart::Part::bytes(
+                                crate::audio_transcriptions::create_mock_audio_file(1),
+                            )
+                            .file_name("test.wav")
+                            .mime_type("audio/wav"),
                         )
                         .add_text("model", model),
                 )
@@ -823,6 +825,8 @@ fn every_registered_route_has_a_model_access_decision() {
         // Service token: usage is recorded for any model, and the two
         // documents are for a gateway that enforces access itself.
         ("POST", "/internal/usage"),
+        // Service token plus the named organization's model access; tested below.
+        ("POST", "/internal/budget"),
         ("GET", "/internal/models"),
         ("GET", "/internal/model-access"),
     ];
@@ -2191,6 +2195,55 @@ async fn usage_is_recorded_for_an_organization_without_a_grant() {
     assert_eq!(body["model"], fixture.text.as_str());
     assert_eq!(body["input_cost"], 1_000_000_000i64);
     assert_eq!(body["output_cost"], 400_000_000i64);
+}
+
+/// Admission authorizes new work, so service credentials do not bypass the
+/// organization's model access policy (unlike final usage for previously served work).
+#[tokio::test]
+async fn internal_budget_requires_service_auth_and_organization_model_access() {
+    let fixture = setup().await;
+    let server = &fixture.server;
+    let org = setup_org_with_credits(server, 10_000_000_000i64).await;
+    let workspace = list_workspaces(server, org.id.clone()).await.remove(0);
+    let key = create_api_key_in_workspace(server, workspace.id.clone(), "admission".into()).await;
+    let body = json!({
+        "id": Uuid::new_v4(), "organization_id": org.id,
+        "workspace_id": workspace.id, "api_key_id": key.id,
+        "model": fixture.text, "inference_type": "chat_completion",
+        "max_output_tokens": 10
+    });
+    let unauthenticated = server.post("/v1/internal/budget").json(&body).await;
+    assert_eq!(unauthenticated.status_code(), 401);
+    let refused = server
+        .post("/v1/internal/budget")
+        .add_header("Authorization", format!("Bearer {INTERNAL_TOKEN}"))
+        .json(&body)
+        .await;
+    assert_eq!(refused.status_code(), 400, "{}", refused.text());
+    grant(server, &fixture.text, &org.id).await;
+    let admitted = server
+        .post("/v1/internal/budget")
+        .add_header("Authorization", format!("Bearer {INTERNAL_TOKEN}"))
+        .json(&body)
+        .await;
+    assert_eq!(admitted.status_code(), 200, "{}", admitted.text());
+    assert_eq!(admitted.json::<Value>()["id"], body["id"]);
+    let replay = server
+        .post("/v1/internal/budget")
+        .add_header("Authorization", format!("Bearer {INTERNAL_TOKEN}"))
+        .json(&body)
+        .await;
+    assert_eq!(
+        replay.status_code(),
+        503,
+        "an execution id cannot be claimed twice"
+    );
+    let org_id = Uuid::parse_str(&org.id).unwrap();
+    let count: i64 = fixture.database.pool().get().await.unwrap().query_one(
+        "SELECT count(*) FROM usage_budget_reservations WHERE organization_id=$1 AND state='dispatched'",
+        &[&org_id],
+    ).await.unwrap().get(0);
+    assert_eq!(count, 1);
 }
 
 fn settings_path(organization_id: &str) -> String {

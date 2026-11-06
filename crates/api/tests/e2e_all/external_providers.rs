@@ -238,6 +238,76 @@ async fn test_external_model_appears_in_models_list() {
 }
 
 #[tokio::test]
+async fn test_external_provider_billing_recorded() {
+    let (server, inference_pool, mock_provider, database) = setup_test_server_with_pool().await;
+
+    // Setup external model
+    let model_name = setup_external_openai_model(&server).await;
+
+    // Register mock provider for this external model
+    // This simulates what would happen with a real external provider
+    let mock_provider_trait: std::sync::Arc<
+        dyn inference_providers::InferenceProvider + Send + Sync,
+    > = mock_provider.clone();
+    inference_pool
+        .register_provider(model_name.clone(), mock_provider_trait)
+        .await;
+
+    // Create org with credits and get API key
+    let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00
+    let api_key = get_api_key_for_org(&server, org.id.clone()).await;
+
+    // Make a completion request
+    let completion_response = server
+        .post("/v1/chat/completions")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&serde_json::json!({
+            "model": model_name,
+            "messages": [{"role": "user", "content": "Hello, world!"}],
+            "max_tokens": 50,
+            "stream": false
+        }))
+        .await;
+
+    assert_eq!(
+        completion_response.status_code(),
+        200,
+        "Chat completion should succeed: {}",
+        completion_response.text()
+    );
+
+    // Extract Inference-Id header
+    let inference_id = completion_response
+        .headers()
+        .get("Inference-Id")
+        .expect("Missing Inference-Id header")
+        .to_str()
+        .unwrap();
+    let inference_uuid = uuid::Uuid::parse_str(inference_id).unwrap();
+
+    // Wait for async usage recording
+    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
+    // The recorded usage row is the subject; read its cost by inference id.
+    let total_cost: i64 = database
+        .pool()
+        .get()
+        .await
+        .expect("failed to get database connection")
+        .query_one(
+            "SELECT total_cost FROM organization_usage_log WHERE inference_id = $1",
+            &[&inference_uuid],
+        )
+        .await
+        .expect("External provider completion should record a usage row")
+        .get(0);
+    assert!(
+        total_cost > 0,
+        "External provider completion should have positive cost"
+    );
+}
+
+#[tokio::test]
 async fn test_external_model_non_streaming_completion() {
     let (server, inference_pool, mock_provider, _) = setup_test_server_with_pool().await;
 

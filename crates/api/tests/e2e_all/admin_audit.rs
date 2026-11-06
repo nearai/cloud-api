@@ -594,7 +594,7 @@ async fn audit_events_exclude_request_content_on_the_real_router() {
 
     for uri in [
         format!("/v1/admin/models?search={EMAIL}&limit=1"),
-        format!("/v1/admin/settings?lookup={EMAIL}"),
+        format!("/v1/admin/users/{EMAIL}/lookup"),
     ] {
         let response = send(
             &router,

@@ -14,13 +14,10 @@ pub mod internal_usage;
 pub mod mcp_server;
 pub mod models;
 pub mod ohttp;
-pub mod organization_members;
-pub mod organizations;
 pub mod responses;
 pub mod services;
 pub mod systemone;
 pub mod unsupported;
-pub mod users;
 pub mod workspaces;
 
 mod responses_native;

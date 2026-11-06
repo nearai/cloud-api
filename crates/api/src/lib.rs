@@ -20,7 +20,7 @@ use crate::{
     middleware::{auth::auth_middleware_with_api_key, auth_middleware, AuthState},
     openapi::ApiDoc,
     routes::{
-        api::{build_management_router, AppState},
+        api::AppState,
         attestation::{self, get_attestation_report, get_signature},
         auth::{
             current_user, github_login, google_login, login_page, logout, oauth_callback,
@@ -1266,11 +1266,6 @@ pub fn build_app_with_config_and_options(
         &auth_components.auth_state_middleware,
     );
 
-    let management_routes = build_management_router(
-        app_state.clone(),
-        auth_components.auth_state_middleware.clone(),
-    );
-
     let workspace_routes =
         build_workspace_routes(app_state.clone(), &auth_components.auth_state_middleware);
 
@@ -1293,9 +1288,6 @@ pub fn build_app_with_config_and_options(
             object_encryption_state: domain_services.object_encryption_state.clone(),
         },
     );
-
-    let invitation_routes =
-        build_invitation_routes(app_state.clone(), &auth_components.auth_state_middleware);
 
     let files_routes =
         build_files_routes(app_state.clone(), &auth_components.auth_state_middleware);
@@ -1337,13 +1329,11 @@ pub fn build_app_with_config_and_options(
                 .merge(response_routes)
                 .merge(unsupported_openai_routes)
                 .merge(conversation_routes)
-                .merge(management_routes)
                 .merge(workspace_routes)
                 .merge(attestation_routes.clone())
                 .merge(model_routes)
                 .merge(services_routes)
                 .merge(admin_routes)
-                .merge(invitation_routes)
                 .merge(files_routes)
                 .merge(gateway_routes)
                 .merge(internal_routes)
@@ -1401,28 +1391,6 @@ fn with_app_fallbacks_and_layers(
         // Sites that set their own value (per-key limiter window, upstream
         // ITA propagation) are left untouched.
         .layer(map_response(middleware::retry_after_middleware))
-}
-
-/// Build invitation routes with selective auth
-pub fn build_invitation_routes(app_state: AppState, auth_state_middleware: &AuthState) -> Router {
-    use crate::routes::users::{accept_invitation_by_token, get_invitation_by_token};
-    use axum::routing::{get, post};
-
-    Router::new().nest(
-        "/invitations",
-        Router::new()
-            // Public route - no auth required to view invitation
-            .route("/{token}", get(get_invitation_by_token))
-            // Auth required to accept
-            .route(
-                "/{token}/accept",
-                post(accept_invitation_by_token).layer(from_fn_with_state(
-                    auth_state_middleware.clone(),
-                    auth_middleware,
-                )),
-            )
-            .with_state(app_state),
-    )
 }
 
 /// Build authentication routes

@@ -296,10 +296,28 @@ pub(crate) async fn read_response(
     is_external: bool,
 ) -> Result<SystemOneResponseWithBytes, CompletionError> {
     if !response.status().is_success() {
+        let status_code = response.status().as_u16();
+        let mut message = "System One provider rejected the request";
+        if status_code == 400 && !is_external {
+            let mut body = Vec::new();
+            while let Ok(Some(chunk)) = response.chunk().await {
+                if body.len().saturating_add(chunk.len()) > 4096 {
+                    break;
+                }
+                body.extend_from_slice(&chunk);
+            }
+            if std::str::from_utf8(&body).ok().is_some_and(|body| {
+                crate::extract_error_message(body)
+                    .trim()
+                    .eq_ignore_ascii_case("Decryption failed")
+            }) {
+                message = "Decryption failed";
+            }
+        }
         return Err(CompletionError::HttpError {
-            status_code: response.status().as_u16(),
+            status_code,
             // Do not retain upstream error bodies: validation errors can echo state.
-            message: "System One provider rejected the request".into(),
+            message: message.into(),
             is_external,
         });
     }

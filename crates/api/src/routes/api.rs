@@ -26,8 +26,6 @@ pub struct AppState {
     pub usage_service: Arc<dyn services::usage::UsageServiceTrait + Send + Sync>,
     pub service_usage_service:
         Arc<dyn services::service_usage::ServiceUsageServiceTrait + Send + Sync>,
-    pub reporting_token_service:
-        Arc<dyn services::reporting_tokens::OrganizationReportingTokenService>,
     pub user_service: Arc<dyn services::user::UserServiceTrait + Send + Sync>,
     pub contact_email_service: Arc<services::contact_email::ContactEmailService>,
     pub files_service: Arc<dyn FileServiceTrait + Send + Sync>,
@@ -161,15 +159,6 @@ pub fn build_management_router(app_state: AppState, auth_state: AuthState) -> Ro
         .route(
             "/{id}/usage/timeseries",
             get(crate::routes::usage::get_user_organization_timeseries),
-        )
-        .route(
-            "/{id}/reporting-tokens",
-            get(crate::routes::reporting_tokens::list_reporting_tokens)
-                .post(crate::routes::reporting_tokens::create_reporting_token),
-        )
-        .route(
-            "/{id}/reporting-tokens/{token_id}",
-            delete(crate::routes::reporting_tokens::revoke_reporting_token),
         );
 
     // User routes (require access token authentication)

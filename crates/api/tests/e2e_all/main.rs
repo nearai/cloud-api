@@ -99,7 +99,6 @@ mod privacy_settlement;
 mod privacy_signatures;
 mod provider_errors;
 mod reasoning;
-mod reporting_usage;
 mod repositories;
 mod request_id_contract;
 mod rerank;

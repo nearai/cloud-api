@@ -8,7 +8,7 @@ use utoipa::{Modify, OpenApi};
 #[openapi(
     info(
         title = "NEAR AI Cloud API",
-        description = "A comprehensive cloud API for AI model inference, temporary confidential-data migration views, and organization administration.\n\n## Authentication\n\nThis API supports five authentication methods:\n\n1. **Access Token (JWT)**: Use `Authorization: Bearer <jwt_token>` with a short-lived JWT access token for most API endpoints. Obtain this by calling POST /users/me/access_tokens with a refresh token.\n2. **Refresh Token**: Use `Authorization: Bearer <refresh_token>` (prefix: `rt_`) only with POST /users/me/access_tokens to create new JWT access tokens. Obtained from OAuth login.\n3. **API Key (Programmatic Access)**: Use `Authorization: Bearer sk-<api_key>` with an API key (prefix: `sk-`).\n4. **Reporting Token (Read-only Usage Reporting)**: Use `Authorization: Bearer rpt-<reporting_token>` only with usage reporting endpoints.\n5. **Admin Access Token**: Use `Authorization: Bearer adm_<token>` with approved admin operations. `read_only` permits explicitly approved reads across organizations; `read_write` preserves admin-token write access. Token management always requires an admin session.\n\nClick the **Authorize** button above to configure authentication.
+        description = "A comprehensive cloud API for AI model inference, temporary confidential-data migration views, and organization administration.\n\n## Authentication\n\nThis API supports four authentication methods:\n\n1. **Access Token (JWT)**: Use `Authorization: Bearer <jwt_token>` with a short-lived JWT access token for most API endpoints. Obtain this by calling POST /users/me/access_tokens with a refresh token.\n2. **Refresh Token**: Use `Authorization: Bearer <refresh_token>` (prefix: `rt_`) only with POST /users/me/access_tokens to create new JWT access tokens. Obtained from OAuth login.\n3. **API Key (Programmatic Access)**: Use `Authorization: Bearer sk-<api_key>` with an API key (prefix: `sk-`).\n4. **Admin Access Token**: Use `Authorization: Bearer adm_<token>` with approved admin operations. `read_only` permits explicitly approved reads across organizations; `read_write` preserves admin-token write access. Token management always requires an admin session.\n\nClick the **Authorize** button above to configure authentication.
 
 ## Deprecations
 
@@ -145,11 +145,6 @@ Operations marked deprecated (account, organization, workspace, invitation, API 
         crate::routes::staking_farm::bind_organization_staking_farm,
         crate::routes::staking_farm::sync_organization_staking_farm,
         // Customer reporting endpoints
-        crate::routes::reporting_tokens::create_reporting_token,
-        crate::routes::reporting_tokens::list_reporting_tokens,
-        crate::routes::reporting_tokens::revoke_reporting_token,
-        crate::routes::reporting_usage::export::export_usage,
-        crate::routes::reporting_usage::summary::summary_usage,
         // Feature request endpoints
         crate::routes::feature_requests::submit_feature_request,
         crate::routes::feature_requests::list_admin_feature_requests,
@@ -403,25 +398,6 @@ Operations marked deprecated (account, organization, workspace, invitation, API 
             crate::routes::staking_farm::BindRequest,
             crate::routes::staking_farm::BindResponse,
             // Customer reporting models
-            services::reporting_tokens::ReportingTokenScope,
-            crate::routes::reporting_tokens::CreateReportingTokenRequest,
-            crate::routes::reporting_tokens::CreateReportingTokenResponse,
-            crate::routes::reporting_tokens::ReportingTokenResponse,
-            crate::routes::reporting_tokens::ListReportingTokensResponse,
-            crate::routes::reporting_usage::ReportingUsageSource,
-            crate::routes::reporting_usage::ReportingUsageRowSource,
-            crate::routes::reporting_usage::ReportingUsageExportResponse,
-            crate::routes::reporting_usage::ReportingUsageExportRow,
-            crate::routes::reporting_usage::ReportingUsageDetails,
-            crate::routes::reporting_usage::ReportingInferenceUsage,
-            crate::routes::reporting_usage::ReportingServiceUsage,
-            crate::routes::reporting_usage::ReportingUsageSummaryResponse,
-            crate::routes::reporting_usage::ReportingUsageTotals,
-            crate::routes::reporting_usage::ReportingWorkspaceSummary,
-            crate::routes::reporting_usage::ReportingApiKeySummary,
-            crate::routes::reporting_usage::ReportingModelSummary,
-            crate::routes::reporting_usage::ReportingServiceSummary,
-            crate::routes::reporting_usage::ReportingDaySummary,
             // Feature request models
             crate::routes::feature_requests::FeatureRequestKind,
             crate::routes::feature_requests::SubmitFeatureRequest,
@@ -612,16 +588,6 @@ impl Modify for SecurityAddon {
                         .scheme(HttpAuthScheme::Bearer)
                         .bearer_format("oc_")
                         .description(Some("Organization-owned credential with explicit credits:read and/or credits:transfer permissions; never valid for inference"))
-                        .build(),
-                ),
-            );
-            components.add_security_scheme(
-                "reporting_token",
-                SecurityScheme::Http(
-                    HttpBuilder::new()
-                        .scheme(HttpAuthScheme::Bearer)
-                        .bearer_format("reporting_token")
-                        .description(Some("Read-only reporting token for usage reporting endpoints (Authorization: Bearer rpt-<reporting_token>)"))
                         .build(),
                 ),
             );

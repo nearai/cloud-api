@@ -5,10 +5,7 @@ use database::models::{RecordUsageRequest, UpdateOrganizationLimitsDbRequest};
 use database::repositories::{
     OrganizationLimitsRepository, OrganizationServiceUsageRepository,
     OrganizationStakingFarmSourcesRepository, OrganizationUsageRepository,
-    PostgresReportingUsageSummaryRepository, RecordServiceUsageRequest,
-};
-use services::reporting_usage::{
-    ReportingUsageSummaryFilters, ReportingUsageSummaryRepository, ReportingUsageSummarySource,
+    RecordServiceUsageRequest,
 };
 use services::service_usage::ports::ServiceUsageReportFilters;
 use services::staking_farm::{StakingFarmRepository, CREDIT_SOURCE_HOUSE_OF_STAKE};
@@ -1107,28 +1104,6 @@ async fn concurrent_inference_and_service_cannot_double_spend_capacity() -> anyh
         service_rows[0].credit_allocations.as_ref().unwrap().len(),
         1
     );
-
-    let summary = PostgresReportingUsageSummaryRepository::new(pool.clone())
-        .summarize_usage(&ReportingUsageSummaryFilters {
-            organization_id: org.org_id,
-            start_time: None,
-            end_time: None,
-            workspace_id: None,
-            api_key_id: None,
-            model: None,
-            inference_type: None,
-            service_name: None,
-            credit_type: Some("grant".to_string()),
-            source: ReportingUsageSummarySource::All,
-            deadline: None,
-        })
-        .await?;
-    assert_eq!(
-        summary.inference.totals.total_cost_nano_usd + summary.service.totals.total_cost_nano_usd,
-        10
-    );
-    assert_eq!(summary.inference.totals.request_count, 1);
-    assert_eq!(summary.service.totals.usage_count, 1);
 
     cleanup_usage_fixtures(&pool, &[org.org_id], &[model.id]).await?;
     pool.get()

@@ -1110,7 +1110,10 @@ pub(crate) fn build_app_with_config_and_options(
     config: Arc<ApiConfig>,
     build_options: AppBuildOptions,
 ) -> axum::Router {
-    seeding::register_models_service(&domain_services.models_service);
+    seeding::register_models_service(
+        &domain_services.models_service,
+        &domain_services.inference_provider_pool,
+    );
     api::build_app_with_config_and_options(
         database,
         auth_components,

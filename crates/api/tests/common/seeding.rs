@@ -7,10 +7,11 @@
 //!
 //! Seeding is not the route. It skips request validation (a malformed setup call panics
 //! instead of returning 400), admin authentication and the admin identity (history rows
-//! are attributed to the session's user with the mock admin email), the inference
-//! provider pool (no provider is registered, replaced or removed), and the side effects
-//! of the handlers beyond the row writes. The one side effect it does keep is cache
-//! invalidation: `seed_models` clears the models caches and `seed_allowed_models` the
+//! are attributed to the session's user with the mock admin email), the side
+//! effects of the handlers beyond the row writes. It keeps two: `seed_models` registers
+//! and unregisters the providers of the models it writes, in the harness's provider pools
+//! (the route's pool changes, without the pinned-role refresh or GitHub dispatch), and
+//! cache invalidation: `seed_models` clears the models caches and `seed_allowed_models` the
 //! organization's filter, on every models service built by the harness in this process,
 //! so a read after a seed sees the seeded rows. A test whose subject is a route, its
 //! validation, its pool effects or its audit trail must call the route (for the catalog,
@@ -35,6 +36,7 @@ use database::repositories::model::ModelRepository;
 use database::repositories::model_alias::ModelAliasRepository;
 use database::repositories::CreditAllocationPolicy;
 use database::Database;
+use services::inference_provider_pool::InferenceProviderPool;
 use services::models::{ModelsServiceImpl, ModelsServiceTrait};
 use std::sync::{Arc, Mutex, Weak};
 use tokio::sync::OnceCell;
@@ -46,12 +48,31 @@ static SEED_DB: OnceCell<Arc<Database>> = OnceCell::const_new();
 /// in front of the rows seeding writes, and a `TestServer` does not expose its service.
 static MODELS_SERVICES: Mutex<Vec<Weak<ModelsServiceImpl>>> = Mutex::new(Vec::new());
 
-/// Record a server's models service so seeding can invalidate its caches. Called by the
-/// harness for every app it builds.
-pub fn register_models_service(models_service: &Arc<ModelsServiceImpl>) {
+/// Inference provider pools of the servers built by the harness in this process, so
+/// seeding can register the providers of seeded models the way the admin route did.
+static PROVIDER_POOLS: Mutex<Vec<Weak<InferenceProviderPool>>> = Mutex::new(Vec::new());
+
+/// Record a server's models service and provider pool so seeding can invalidate its caches
+/// and register providers. Called by the harness for every app it builds.
+pub fn register_models_service(
+    models_service: &Arc<ModelsServiceImpl>,
+    provider_pool: &Arc<InferenceProviderPool>,
+) {
     let mut registered = MODELS_SERVICES.lock().expect("models service registry");
     registered.retain(|service| service.strong_count() > 0);
     registered.push(Arc::downgrade(models_service));
+    let mut pools = PROVIDER_POOLS.lock().expect("provider pool registry");
+    pools.retain(|pool| pool.strong_count() > 0);
+    pools.push(Arc::downgrade(provider_pool));
+}
+
+fn registered_provider_pools() -> Vec<Arc<InferenceProviderPool>> {
+    PROVIDER_POOLS
+        .lock()
+        .expect("provider pool registry")
+        .iter()
+        .filter_map(Weak::upgrade)
+        .collect()
 }
 
 fn registered_models_services() -> Vec<Arc<ModelsServiceImpl>> {
@@ -469,9 +490,11 @@ fn model_metadata(model: database::models::Model) -> ModelMetadata {
 /// Create or update catalog models (and their aliases and history rows) the way the admin
 /// batch update did, without validation: setup calls are expected to be well formed.
 ///
-/// The running provider pool is not touched. A model that must route needs to be among the
-/// mock pool's registered names, or be picked up by the provider refresh. The models caches
-/// are invalidated once the rows are written.
+/// Providers are registered as the route did, from the merged row: a model that changed
+/// provider type, inference URL, provider config or activity is unregistered (unless
+/// pinned) and an active one is registered again, as an inference-URL or an external
+/// provider, in every pool the harness built. The models caches are invalidated once the
+/// rows are written.
 pub async fn seed_models(
     models: BatchUpdateModelApiRequest,
     session_id: &str,
@@ -481,6 +504,9 @@ pub async fn seed_models(
     let alias_repo = ModelAliasRepository::new(database.pool().clone());
     let changed_by = user_id_for_session(session_id);
     let mut out = Vec::new();
+    let mut inference_url_models = Vec::new();
+    let mut external_models = Vec::new();
+    let mut unregister = Vec::new();
 
     for (model_name, request) in models {
         let text_pricing = request.text_pricing.as_ref().map(|inner| {
@@ -582,6 +608,33 @@ pub async fn seed_models(
                 .expect("Failed to seed model aliases");
         }
 
+        let touches_registration = request.provider_type.is_some()
+            || request.inference_url.is_some()
+            || request.provider_config.is_some()
+            || request.is_active.is_some();
+        if request.is_active == Some(false)
+            || request.provider_type.is_some()
+            || request.inference_url.is_some()
+        {
+            unregister.push(model_name.clone());
+        }
+        if touches_registration && model.is_active {
+            if model.provider_type == "external" {
+                if let Some(config) = model.provider_config.clone() {
+                    external_models.push((model_name.clone(), config));
+                }
+            } else if let Some(url) = model.inference_url.clone() {
+                inference_url_models.push(
+                    services::inference_provider_pool::expand_inference_endpoints(
+                        &model_name,
+                        &url,
+                        u32::try_from(model.context_length).ok(),
+                        model.provider_config.as_ref(),
+                    ),
+                );
+            }
+        }
+
         out.push(ModelWithPricing {
             upcoming_pricing: None,
             model_id: model_name,
@@ -592,6 +645,26 @@ pub async fn seed_models(
             text_pricing: model.text_pricing.clone(),
             metadata: model_metadata(model),
         });
+    }
+    for pool in registered_provider_pools() {
+        if !(unregister.is_empty() && inference_url_models.is_empty() && external_models.is_empty())
+        {
+            pool.invalidate_periodic_provider_refreshes().await;
+        }
+        for model_name in &unregister {
+            if !pool.is_pinned(model_name) {
+                pool.unregister_provider(model_name).await;
+            }
+        }
+        let url_models: Vec<_> = inference_url_models.iter().flatten().cloned().collect();
+        if !url_models.is_empty() {
+            pool.load_inference_url_models(url_models, true).await;
+        }
+        if !external_models.is_empty() {
+            pool.load_external_providers(external_models.clone())
+                .await
+                .expect("Failed to register seeded external providers");
+        }
     }
     for models_service in registered_models_services() {
         models_service.invalidate_models_cache().await;

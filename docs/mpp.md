@@ -127,7 +127,7 @@ fields, a duplicate model name, an empty table, and zero limits.
 2. **Recipient treasury.** Use an address you control and monitor. The server never signs or
    sends anything; it only reads Tempo.
 3. **Schema.** The single-use ledger is the table `mpp_payment_claims`
-   (`V0098__mpp_payment_claims.sql` in `nearai/cloud-platform`). cloud-api does not migrate:
+   (`V0099__mpp_payment_claims.sql` in `nearai/cloud-platform`). cloud-api does not migrate:
    deploy the cloud-platform migration, then the pin in `scripts/cloud-platform-schema.env`,
    before enabling MPP. The table holds `payment_key` (`tempo:` + hex of
    `HMAC-SHA256(MPP_SECRET_KEY, tx hash)`, never the hash itself), `challenge_id`, `state`

@@ -2,7 +2,7 @@
 //!
 //! The table proves a payment was used once and stores nothing else: no organization,
 //! workspace, request or payer. The schema is owned by `nearai/cloud-platform`
-//! (`V0098__mpp_payment_claims.sql`); cloud-api only reads and writes it, with the
+//! (`V0099__mpp_payment_claims.sql`); cloud-api only reads and writes it, with the
 //! `cloud_api_responses` role.
 
 use crate::pool::DbPool;

@@ -1,7 +1,7 @@
 //! E2E tests for MPP (HTTP 402 payments): the Postgres claim repository and the full paid
 //! request through the real router, with a scripted Tempo node (wiremock on loopback).
 //!
-//! They need the `mpp_payment_claims` table (`V0098__mpp_payment_claims.sql` in
+//! They need the `mpp_payment_claims` table (`V0099__mpp_payment_claims.sql` in
 //! nearai/cloud-platform), which arrives with the schema pin in
 //! `scripts/cloud-platform-schema.env`.
 

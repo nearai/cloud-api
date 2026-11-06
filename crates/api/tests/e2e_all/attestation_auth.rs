@@ -291,21 +291,7 @@ async fn test_attestation_report_creates_no_usage_records() {
     // Allow any (incorrectly) spawned background usage recording to land.
     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
-    let history_resp = server
-        .get(&format!(
-            "/v1/organizations/{}/usage/history?limit=10&offset=0",
-            org.id
-        ))
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
-        .add_header("User-Agent", MOCK_USER_AGENT)
-        .await;
-    assert_eq!(
-        history_resp.status_code(),
-        200,
-        "usage history should succeed: {}",
-        history_resp.text()
-    );
-    let history: api::routes::usage::UsageHistoryResponse = history_resp.json();
+    let history = seeding::usage_history(&org.id, 10, 0).await;
     assert!(
         history.data.is_empty(),
         "attestation report retrieval must not create usage records, found: {:?}",

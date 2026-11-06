@@ -873,10 +873,6 @@ fn every_registered_route_has_a_model_access_decision() {
             "PATCH",
             "/workspaces/{workspace_id}/api-keys/{key_id}/spend-limit",
         ),
-        (
-            "GET",
-            "/workspaces/{workspace_id}/api-keys/{key_id}/usage/history",
-        ),
         ("ANY", "/files"),
         ("ANY", "/files/"),
         ("ANY", "/files/{file_id}"),
@@ -884,38 +880,18 @@ fn every_registered_route_has_a_model_access_decision() {
         ("ANY", "/files/{file_id}/content"),
         ("ANY", "/files/{file_id}/{*legacy_path}"),
         ("POST", "/feature-requests"),
-        // An organization's own usage and costs.
+        // An organization's own costs.
         ("POST", "/billing/costs"),
-        ("GET", "/organizations/{org_id}/usage/export"),
-        ("GET", "/organizations/{org_id}/usage/summary"),
-        (
-            "GET",
-            "/organizations/{org_id}/usage/reporting-token-auth-probe",
-        ),
         ("POST", "/check_api_key"),
         ("GET", "/services"),
         ("GET", "/services/{service_name}"),
-        // Credit transfers and the scoped credentials that authorize them.
-        ("POST", "/organizations/{org_id}/credit/transfer"),
-        ("GET", "/organizations/{org_id}/credit/transfers"),
-        ("GET", "/organizations/{org_id}/credit/transfers/{id}"),
-        ("GET", "/organizations/{org_id}/credit/transfer/capacity"),
-        ("POST", "/organizations/{org_id}/credentials"),
-        ("GET", "/organizations/{org_id}/credentials"),
-        ("DELETE", "/organizations/{org_id}/credentials/{id}"),
-        ("PUT", "/organizations/{org_id}/credentials/{id}"),
-        ("POST", "/organizations/{org_id}/credentials/{id}/rotate"),
     ];
 
     let mut registered = registered_routes(include_str!("../../src/lib.rs"));
     // Router builders that `src/lib.rs` calls from other modules.
-    for source in [
-        include_str!("../../src/routes/attestation.rs"),
-        include_str!("../../src/routes/credit_transfers.rs"),
-        include_str!("../../src/routes/organization_credentials.rs"),
-    ] {
-        registered.extend(registered_routes(source));
-    }
+    registered.extend(registered_routes(include_str!(
+        "../../src/routes/attestation.rs"
+    )));
     assert!(
         registered.len() >= 100,
         "found too few routes, the scan is broken: {registered:?}"

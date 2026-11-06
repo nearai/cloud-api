@@ -9,29 +9,17 @@ use std::io::Write;
 mod common;
 
 mod admin_activation_pricing_gate;
-mod admin_analytics;
-mod admin_analytics_range_hygiene;
-mod admin_analytics_statement_budget;
-mod admin_api_keys;
 mod admin_audit;
-mod admin_consumption_hourly;
-mod admin_credit_reconciliation;
 mod admin_deprecate_model;
 mod admin_invitation_email_deliveries;
 mod admin_list_models;
-mod admin_metrics_credit_type;
-mod admin_organization_members;
 mod admin_pricing_changes;
-mod admin_provider_attribution_model_revenue;
-mod admin_provider_attribution_platform;
 mod admin_provider_attribution_support;
-mod admin_revenue_totals;
+mod admin_retired_routes;
 mod admin_routing_policy;
-mod admin_schema_compatibility;
 mod admin_services;
 mod admin_settings;
 mod admin_token_permissions;
-mod admin_usage_hourly_repair;
 mod anthropic_signatures;
 mod api_key_usage_hourly;
 mod api_keys;
@@ -99,7 +87,6 @@ mod privacy_settlement;
 mod privacy_signatures;
 mod provider_errors;
 mod reasoning;
-mod reporting_usage;
 mod repositories;
 mod request_id_contract;
 mod rerank;
@@ -114,12 +101,10 @@ mod score;
 mod serving_provider;
 mod session_logout;
 mod signature_verification;
-mod staking_wallet_binding;
 mod systemone;
 mod tinfoil_provider;
 mod unlisted_models;
 mod usage_chat_completions;
-mod usage_history_bounds;
 mod usage_hourly;
 mod usage_provider_attribution;
 mod usage_recording;
@@ -203,5 +188,3 @@ fn no_proxy_with_loopback() -> String {
 
     entries.join(",")
 }
-
-mod credit_transfers;

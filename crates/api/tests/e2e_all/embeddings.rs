@@ -216,17 +216,7 @@ async fn test_embeddings_costs_deducted() {
     let api_key = get_api_key_for_org(&server, org.id).await;
 
     // Get initial balance
-    let initial_balance_response = server
-        .get(format!("/v1/organizations/{}/usage/balance", org_id).as_str())
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
-        .add_header("User-Agent", MOCK_USER_AGENT)
-        .await;
-
-    assert_eq!(initial_balance_response.status_code(), 200);
-    let initial_balance = serde_json::from_str::<api::routes::usage::OrganizationBalanceResponse>(
-        &initial_balance_response.text(),
-    )
-    .expect("Failed to parse initial balance");
+    let initial_balance = seeding::organization_balance(&org_id).await;
     let initial_spent = initial_balance.total_spent;
 
     // Make embeddings request
@@ -243,17 +233,7 @@ async fn test_embeddings_costs_deducted() {
     assert_eq!(response.status_code(), 200);
 
     // Get final balance
-    let final_balance_response = server
-        .get(format!("/v1/organizations/{}/usage/balance", org_id).as_str())
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
-        .add_header("User-Agent", MOCK_USER_AGENT)
-        .await;
-
-    assert_eq!(final_balance_response.status_code(), 200);
-    let final_balance = serde_json::from_str::<api::routes::usage::OrganizationBalanceResponse>(
-        &final_balance_response.text(),
-    )
-    .expect("Failed to parse final balance");
+    let final_balance = seeding::organization_balance(&org_id).await;
     let final_spent = final_balance.total_spent;
 
     // Verify cost was charged

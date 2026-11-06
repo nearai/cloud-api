@@ -1,7 +1,9 @@
-//! Canonical discounts must leave billing, balances, allocation reports and hourly
-//! snapshots in agreement. This module owns the global hourly lock and runs serially.
+//! The discount worker and repository stay in cloud-api until the jobs PR removes
+//! them. These tests drive the repository and the kept usage paths directly; the
+//! admin route that saved rules has moved, so rules are saved with `save` and read
+//! back through the repository and `seeding`. Delete this module with the worker.
+//! This module owns the global hourly lock and runs serially.
 use crate::common::*;
-use axum::http::{Method, StatusCode};
 use chrono::{DateTime, Duration, Utc};
 use database::{
     models::RecordUsageRequest,
@@ -23,7 +25,6 @@ struct Fixture {
     org: Uuid,
     workspace: Uuid,
     key: Uuid,
-    key_secret: String,
     model: Uuid,
     model_name: String,
 }
@@ -61,61 +62,36 @@ async fn fixture() -> Fixture {
         org: Uuid::parse_str(&org.id).unwrap(),
         workspace: Uuid::parse_str(&workspace).unwrap(),
         key: Uuid::parse_str(&key.id).unwrap(),
-        key_secret: key.key.unwrap(),
         model,
         model_name,
     }
 }
 
-async fn admin(f: &Fixture, method: Method, token: &str, body: Value) -> axum_test::TestResponse {
-    f.server
-        .method(
-            method,
-            &format!("/v1/admin/organizations/{}/usage-discount", f.org),
+async fn save(f: &Fixture, since: Option<DateTime<Utc>>) {
+    OrganizationUsageDiscountRepository::new(f.db.pool().clone())
+        .save(
+            f.org,
+            BASIS_POINTS,
+            since,
+            Uuid::parse_str(MOCK_USER_ID).unwrap(),
         )
-        .add_header("Authorization", format!("Bearer {token}"))
-        .add_header("User-Agent", MOCK_USER_AGENT)
-        .json(&body)
         .await
+        .unwrap();
 }
 
-async fn save(f: &Fixture, since: Option<DateTime<Utc>>) -> Value {
-    let response = admin(
-        f,
-        Method::PUT,
-        &get_session_id(),
-        json!({
-            "discount_basis_points": BASIS_POINTS, "apply_since": since,
-        }),
-    )
-    .await;
-    assert_eq!(
-        response.status_code(),
-        if since.is_some() {
-            StatusCode::ACCEPTED
-        } else {
-            StatusCode::OK
-        },
-        "{}",
-        response.text()
-    );
-    response.json()
+async fn rule(
+    f: &Fixture,
+) -> Option<database::repositories::organization_usage_discount::OrganizationUsageDiscount> {
+    OrganizationUsageDiscountRepository::new(f.db.pool().clone())
+        .get(f.org)
+        .await
+        .unwrap()
 }
 
-async fn get(f: &Fixture, path: &str) -> Value {
-    let response = f
-        .server
-        .get(path)
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
-        .add_header("User-Agent", MOCK_USER_AGENT)
-        .await;
-    assert_eq!(
-        response.status_code(),
-        StatusCode::OK,
-        "{}",
-        response.text()
-    );
-    response.json()
+async fn total_spent(f: &Fixture) -> i64 {
+    seeding::organization_balance(&f.org.to_string())
+        .await
+        .total_spent
 }
 
 async fn credits(f: &Fixture, kind: &str, amount: i64) {
@@ -220,122 +196,6 @@ async fn finish(f: &Fixture) {
     panic!("small synthetic history did not finish");
 }
 
-#[tokio::test]
-async fn admin_permissions_validation_and_identical_save_retry() {
-    let f = fixture().await;
-    f.server
-        .get(&format!("/v1/admin/organizations/{}/usage-discount", f.org))
-        .await
-        .assert_status_unauthorized();
-    admin(&f, Method::GET, &get_session_id(), json!({}))
-        .await
-        .assert_json(&Value::Null);
-    for body in [
-        json!({"discount_basis_points":0}),
-        json!({"discount_basis_points":10001}),
-        json!({"discount_basis_points":-1}),
-        json!({"discount_basis_points":2500,"apply_since":Utc::now()+Duration::days(1)}),
-    ] {
-        admin(&f, Method::PUT, &get_session_id(), body)
-            .await
-            .assert_status_bad_request();
-    }
-    for body in [
-        json!({"discount_basis_points":1.5}),
-        json!({"discount_basis_points":"2500"}),
-        json!({"discount_basis_points":2500,"apply_since":"invalid"}),
-        json!({}),
-    ] {
-        assert!(admin(&f, Method::PUT, &get_session_id(), body)
-            .await
-            .status_code()
-            .is_client_error());
-    }
-    let issued = f.server.post("/v1/admin/access-tokens")
-        .add_header("Authorization", format!("Bearer {}",get_session_id()))
-        .add_header("User-Agent", MOCK_USER_AGENT)
-        .json(&json!({"name":"Synthetic discount read test","reason":"test","expires_in_hours":1,"permission":"read_only"})).await;
-    issued.assert_status_ok();
-    let read_token = issued
-        .json::<api::models::AdminAccessTokenResponse>()
-        .access_token;
-    admin(&f, Method::GET, &read_token, json!({}))
-        .await
-        .assert_status_ok();
-    admin(
-        &f,
-        Method::PUT,
-        &read_token,
-        json!({"discount_basis_points":BASIS_POINTS}),
-    )
-    .await
-    .assert_status_forbidden();
-    admin(&f, Method::GET, &get_session_id(), json!({}))
-        .await
-        .assert_json(&Value::Null);
-
-    // A real authenticated organization owner is not a platform administrator.
-    let (session, _) = setup_unique_test_session(&f.db).await;
-    let user = Uuid::parse_str(session.trim_start_matches("rt_")).unwrap();
-    let client = f.db.pool().get().await.unwrap();
-    client
-        .execute(
-            "UPDATE users SET email=$2 WHERE id=$1",
-            &[&user, &format!("{user}@example.org")],
-        )
-        .await
-        .unwrap();
-    client.execute("INSERT INTO organization_members (organization_id,user_id,role,joined_at) VALUES ($1,$2,'owner',NOW())", &[&f.org,&user]).await.unwrap();
-    drop(client);
-    let (real_server, _) =
-        setup_test_server_with_config_and_database(|config| config.auth.mock = false).await;
-    let (_, refresh) = database::repositories::SessionRepository::new(f.db.pool().clone())
-        .create(user, None, MOCK_USER_AGENT.into(), 1)
-        .await
-        .unwrap();
-    let token = get_access_token_from_refresh_token(&real_server, refresh).await;
-    for method in [Method::GET, Method::PUT] {
-        let response = real_server
-            .method(
-                method,
-                &format!("/v1/admin/organizations/{}/usage-discount", f.org),
-            )
-            .add_header("Authorization", format!("Bearer {token}"))
-            .add_header("User-Agent", MOCK_USER_AGENT)
-            .json(&json!({"discount_basis_points":BASIS_POINTS}))
-            .await;
-        assert!(matches!(
-            response.status_code(),
-            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
-        ));
-    }
-    let saved = save(&f, None).await;
-    assert_eq!(saved["status"], "active");
-    assert_eq!(save(&f, None).await, saved);
-    admin(
-        &f,
-        Method::PUT,
-        &get_session_id(),
-        json!({"discount_basis_points":3000}),
-    )
-    .await
-    .assert_status(StatusCode::CONFLICT);
-    admin(
-        &f,
-        Method::PUT,
-        &get_session_id(),
-        json!({"discount_basis_points":BASIS_POINTS,"apply_since":Utc::now()-Duration::days(1)}),
-    )
-    .await
-    .assert_status(StatusCode::CONFLICT);
-    assert_eq!(
-        admin(&f, Method::GET, &read_token, json!({}))
-            .await
-            .json::<Value>(),
-        saved
-    );
-}
-
 async fn report(f: &Fixture, id: &str, input_tokens: i32) -> axum_test::TestResponse {
     f.server
         .post("/v1/internal/usage")
@@ -376,26 +236,26 @@ async fn forward_discount_composes_with_reporter_price_and_retries_once() {
         .await
         .status_code()
         .is_success());
-    let history = get(&f, &format!("/v1/organizations/{}/usage/history", f.org)).await;
-    let row = history["data"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|row| row["id"] == fresh["id"])
-        .unwrap();
+    let fresh_id: Uuid = fresh["id"].as_str().unwrap().parse().unwrap();
+    let row =
+        f.db.pool()
+            .get()
+            .await
+            .unwrap()
+            .query_one(
+                "SELECT billing_details, funded_amount FROM organization_usage_log WHERE id=$1",
+                &[&fresh_id],
+            )
+            .await
+            .unwrap();
+    let details: Value = row.get("billing_details");
+    assert_eq!(details["discount"]["list_total_cost"], 200_000_000);
+    assert_eq!(details["contract_discount"]["total_cost"], 160_000_000);
     assert_eq!(
-        row["billingDetails"]["discount"]["list_total_cost"],
-        200_000_000
+        row.get::<_, Option<i64>>("funded_amount"),
+        Some(120_000_000)
     );
-    assert_eq!(
-        row["billingDetails"]["contract_discount"]["total_cost"],
-        160_000_000
-    );
-    assert_eq!(row["funded_amount"], 120_000_000);
-    assert_eq!(
-        get(&f, &format!("/v1/organizations/{}/usage/balance", f.org)).await["total_spent"],
-        280_000_000
-    );
+    assert_eq!(total_spent(&f).await, 280_000_000);
     let client = f.db.pool().get().await.unwrap();
     let totals = client.query_one("SELECT COUNT(*) AS count,SUM(amount)::BIGINT AS amount FROM usage_credit_allocations WHERE organization_id=$1", &[&f.org]).await.unwrap();
     assert_eq!(totals.get::<_, i64>("count"), 2);
@@ -501,72 +361,11 @@ async fn history_corrects_legacy_and_split_funding_with_reporting_parity() {
         ("grant".into(), 150_000_000)
     );
     drop(client);
-    for prefix in ["/v1/organizations", "/v1/admin/organizations"] {
-        let balance = get(&f, &format!("{prefix}/{}/usage/balance", f.org)).await;
-        assert_eq!(balance["total_spent"], 475_000_000);
-        assert_eq!(balance["total_requests"], 4);
-        assert_eq!(balance["remaining"], 725_000_000);
-    }
-    let billing = f
-        .server
-        .post("/v1/billing/costs")
-        .add_header("Authorization", format!("Bearer {}", f.key_secret))
-        .json(&json!({"requestIds":[split.inference_id,paid.inference_id]}))
-        .await;
-    billing.assert_status_ok();
-    let billed: Value = billing.json();
-    assert_eq!(
-        billed["requests"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|r| r["costNanoUsd"].as_i64().unwrap())
-            .sum::<i64>(),
-        300_000_000
-    );
-    let range = format!(
-        "start={}&end={}",
-        hour.format("%Y-%m-%dT%H:%M:%SZ"),
-        (hour + Duration::hours(1)).format("%Y-%m-%dT%H:%M:%SZ")
-    );
-    for (filter, cost, count) in [
-        ("", 0.375, 3),
-        ("&credit_type=grant", 0.15, 1),
-        ("&credit_type=postpay", 0.15, 1),
-    ] {
-        let metrics = get(
-            &f,
-            &format!("/v1/admin/organizations/{}/metrics?{range}{filter}", f.org),
-        )
-        .await;
-        assert_eq!(metrics["summary"]["total_cost_usd"], cost);
-        assert_eq!(metrics["summary"]["total_requests"], count);
-        let points = get(
-            &f,
-            &format!(
-                "/v1/admin/organizations/{}/metrics/timeseries?{range}{filter}&granularity=hour",
-                f.org
-            ),
-        )
-        .await;
-        assert_eq!(
-            points["data"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|p| p["cost_usd"].as_f64().unwrap())
-                .sum::<f64>(),
-            cost
-        );
-    }
-    assert_eq!(
-        get(
-            &f,
-            &format!("/v1/admin/organizations/{}/usage-discount", f.org)
-        )
-        .await["processed_count"],
-        3
-    );
+    let balance = seeding::organization_balance(&f.org.to_string()).await;
+    assert_eq!(balance.total_spent, 475_000_000);
+    assert_eq!(balance.total_requests, 4);
+    assert_eq!(balance.remaining, Some(725_000_000));
+    assert_eq!(rule(&f).await.unwrap().processed_count, 3);
 }
 
 #[tokio::test]
@@ -636,14 +435,7 @@ async fn historical_batches_rollback_resume_and_never_compound() {
         ("applying", 500)
     );
     // Half-up rounding on each component: 2 * .75 -> 2; 4 * .75 -> 3.
-    assert_eq!(
-        get(
-            &f,
-            &format!("/v1/admin/organizations/{}/usage/balance", f.org)
-        )
-        .await["total_spent"],
-        2518
-    );
+    assert_eq!(total_spent(&f).await, 2518);
     // A fresh repository represents worker restart; the persisted composite cursor
     // must distinguish the 503 rows even though every timestamp is identical.
     let restarted = OrganizationUsageDiscountRepository::new(f.db.pool().clone());
@@ -652,14 +444,7 @@ async fn historical_batches_rollback_resume_and_never_compound() {
     assert!(!restarted.apply_batch(f.org).await.unwrap());
     let final_rule = restarted.get(f.org).await.unwrap().unwrap();
     assert_eq!(final_rule.processed_count, 503);
-    let retried = admin(
-        &f,
-        Method::PUT,
-        &get_session_id(),
-        json!({"discount_basis_points":BASIS_POINTS,"apply_since":hour}),
-    )
-    .await;
-    retried.assert_status_ok();
+    save(&f, Some(hour)).await;
     let client = f.db.pool().get().await.unwrap();
     let totals = client.query_one("SELECT b.total_spent,b.legacy_unattributed_amount,
         (SELECT SUM(total_cost)::BIGINT FROM usage_hourly WHERE organization_id=$1),
@@ -702,17 +487,16 @@ async fn unsupported_history_rejects_before_persisting_terms() {
             let count: i64 = client.query_one("SELECT COUNT(*) FROM usage_credit_allocations WHERE inference_usage_id=$1 AND allocation_phase='overage_settlement'", &[&row.id]).await.unwrap().get(0);
             assert_eq!(count, 1);
         }
-        let response = admin(
-            &f,
-            Method::PUT,
-            &get_session_id(),
-            json!({"discount_basis_points":BASIS_POINTS,"apply_since":hour}),
-        )
-        .await;
-        response.assert_status(StatusCode::CONFLICT);
-        admin(&f, Method::GET, &get_session_id(), json!({}))
-            .await
-            .assert_json(&Value::Null);
+        let refused = OrganizationUsageDiscountRepository::new(f.db.pool().clone())
+            .save(
+                f.org,
+                BASIS_POINTS,
+                Some(hour),
+                Uuid::parse_str(MOCK_USER_ID).unwrap(),
+            )
+            .await;
+        assert!(refused.is_err(), "settled={settled}");
+        assert!(rule(&f).await.is_none());
         let stored = usage.get_balance(f.org).await.unwrap().unwrap();
         assert_eq!(stored.total_spent, 200);
     }
@@ -797,22 +581,8 @@ async fn platform_services_stay_outside_forward_and_historical_discount() {
             .total_cost,
         80
     );
-    assert_eq!(
-        get(
-            &f,
-            &format!("/v1/admin/organizations/{}/usage/balance", f.org)
-        )
-        .await["total_spent"],
-        165
-    );
-    assert_eq!(
-        get(
-            &f,
-            &format!("/v1/admin/organizations/{}/usage-discount", f.org)
-        )
-        .await["processed_count"],
-        1
-    );
+    assert_eq!(total_spent(&f).await, 165);
+    assert_eq!(rule(&f).await.unwrap().processed_count, 1);
 }
 
 #[tokio::test]
@@ -836,13 +606,18 @@ async fn full_discount_zeroes_funding_and_nanosecond_cutoff_retries_are_idempote
         .unwrap();
     crate::usage_hourly::recompute_usage_hours(hour, hour + Duration::hours(1)).await;
     let since = hour + Duration::nanoseconds(123_456_789);
-    let body = json!({"discount_basis_points":10_000,"apply_since":since});
-    let saved = admin(&f, Method::PUT, &get_session_id(), body.clone()).await;
-    saved.assert_status(StatusCode::ACCEPTED);
-    let saved: Value = saved.json();
-    let retry = admin(&f, Method::PUT, &get_session_id(), body.clone()).await;
-    retry.assert_status(StatusCode::ACCEPTED);
-    assert_eq!(retry.json::<Value>(), saved);
+    let creator = Uuid::parse_str(MOCK_USER_ID).unwrap();
+    let repo = OrganizationUsageDiscountRepository::new(f.db.pool().clone());
+    let saved = repo
+        .save(f.org, 10_000, Some(since), creator)
+        .await
+        .unwrap();
+    let retry = repo
+        .save(f.org, 10_000, Some(since), creator)
+        .await
+        .unwrap();
+    assert_eq!(retry.id, saved.id);
+    assert_eq!(retry.apply_since, saved.apply_since);
     finish(&f).await;
     let corrected = usage.record_usage(original).await.unwrap();
     assert_eq!(
@@ -873,17 +648,13 @@ async fn full_discount_zeroes_funding_and_nanosecond_cutoff_retries_are_idempote
         (100, 0, 0, 0)
     );
     drop(client);
-    let balance = get(
-        &f,
-        &format!("/v1/admin/organizations/{}/usage/balance", f.org),
-    )
-    .await;
-    assert_eq!(balance["total_spent"], 0);
-    assert_eq!(balance["remaining"], 200);
-    assert_eq!(balance["total_requests"], 2);
-    admin(&f, Method::PUT, &get_session_id(), body)
+    let balance = seeding::organization_balance(&f.org.to_string()).await;
+    assert_eq!(balance.total_spent, 0);
+    assert_eq!(balance.remaining, Some(200));
+    assert_eq!(balance.total_requests, 2);
+    repo.save(f.org, 10_000, Some(since), creator)
         .await
-        .assert_status_ok();
+        .unwrap();
 }
 
 #[tokio::test]
@@ -967,20 +738,13 @@ async fn worker_failures_back_off_show_safe_diagnostics_and_clear_after_repair()
         let claim = repo.claim_next().await.unwrap().unwrap();
         assert_eq!(claim.organization_id, f.org);
         assert!(repo.run_claimed(claim).await.is_err());
-        let response = get(
-            &f,
-            &format!("/v1/admin/organizations/{}/usage-discount", f.org),
-        )
-        .await;
-        assert_eq!(response["status"], "applying");
+        let state = rule(&f).await.unwrap();
+        assert_eq!(state.status, "applying");
         assert_eq!(
-            response["last_error"],
-            "Accounting verification failed. Reconcile organization balances before retry."
+            state.last_error.as_deref(),
+            Some("Accounting verification failed. Reconcile organization balances before retry.")
         );
-        let retry = DateTime::parse_from_rfc3339(response["next_retry_at"].as_str().unwrap())
-            .unwrap()
-            .with_timezone(&Utc);
-        let delay = (retry - Utc::now()).num_seconds();
+        let delay = (state.next_retry_at.unwrap() - Utc::now()).num_seconds();
         assert!(
             (expected_delay - 5..=expected_delay).contains(&delay),
             "{delay}"
@@ -997,14 +761,10 @@ async fn worker_failures_back_off_show_safe_diagnostics_and_clear_after_repair()
         .run_claimed(repo.claim_next().await.unwrap().unwrap())
         .await
         .unwrap());
-    let response = get(
-        &f,
-        &format!("/v1/admin/organizations/{}/usage-discount", f.org),
-    )
-    .await;
-    assert_eq!(response["status"], "active");
-    assert_eq!(response["last_error"], Value::Null);
-    assert_eq!(response["next_retry_at"], Value::Null);
+    let state = rule(&f).await.unwrap();
+    assert_eq!(state.status, "active");
+    assert_eq!(state.last_error, None);
+    assert_eq!(state.next_retry_at, None);
 }
 
 #[tokio::test]

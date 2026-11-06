@@ -161,11 +161,6 @@ fn auth_state(admin_emails: &[&str]) -> AuthState {
         Arc::new(database::repositories::WorkspaceRepository::new(
             pool.clone(),
         )),
-        Arc::new(
-            services::reporting_tokens::OrganizationReportingTokenServiceImpl::new(Arc::new(
-                database::repositories::OrganizationReportingTokenRepository::new(pool.clone()),
-            )),
-        ),
         // No database: validating an admin access token fails as a 500.
         Arc::new(database::repositories::AdminAccessTokenRepository::new(
             pool,

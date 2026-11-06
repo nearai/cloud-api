@@ -234,13 +234,7 @@ async fn test_balance_response_includes_credit_limit_breakdown() {
     )
     .await;
 
-    let response = server
-        .get(format!("/v1/organizations/{}/usage/balance", org.id).as_str())
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
-        .add_header("User-Agent", MOCK_USER_AGENT)
-        .await;
-    assert_eq!(response.status_code(), 200);
-    let balance = response.json::<api::routes::usage::OrganizationBalanceResponse>();
+    let balance = seeding::organization_balance(&org.id).await;
 
     assert_eq!(balance.spend_limit, Some(10_000_080_000_000_000));
     assert_eq!(balance.credit_limits.len(), 4);

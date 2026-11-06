@@ -248,11 +248,9 @@ jobs:
       env:
         GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-    - name: Run typed-query, credit, analytics, session, and binding regressions
+    - name: Run typed-query, credit, session, and binding regressions
       run: |
-        cargo test --locked -p database --test hot_path_typed_queries --test billing_typed_queries --test credit_allocation --test session_rotation --test staking_wallet_binding --test organization_credit_metrics -- --test-threads=4
-        # Fault injection changes shared table constraints; isolate this binary.
-        cargo test --locked -p database --test credit_transfers -- --test-threads=1
+        cargo test --locked -p database --test hot_path_typed_queries --test billing_typed_queries --test credit_allocation --test credit_transfer_capacity --test session_rotation --test staking_wallet_binding -- --test-threads=4
       env:
         PGHOST: localhost
         PGPORT: ${{ job.services.postgres.ports['5432'] }}

@@ -2,7 +2,7 @@ use crate::middleware::{auth_middleware, AuthState};
 use crate::ohttp_gateway::{OhttpAttestation, OhttpGateway};
 use axum::{
     middleware::from_fn_with_state,
-    routing::{delete, get, post, put},
+    routing::{delete, get, put},
     Router,
 };
 use services::{
@@ -26,14 +26,11 @@ pub struct AppState {
     pub usage_service: Arc<dyn services::usage::UsageServiceTrait + Send + Sync>,
     pub service_usage_service:
         Arc<dyn services::service_usage::ServiceUsageServiceTrait + Send + Sync>,
-    pub reporting_token_service:
-        Arc<dyn services::reporting_tokens::OrganizationReportingTokenService>,
     pub user_service: Arc<dyn services::user::UserServiceTrait + Send + Sync>,
     pub contact_email_service: Arc<services::contact_email::ContactEmailService>,
     pub files_service: Arc<dyn FileServiceTrait + Send + Sync>,
     pub inference_provider_pool: Arc<services::inference_provider_pool::InferenceProviderPool>,
     pub metrics_service: Arc<dyn services::metrics::MetricsServiceTrait>,
-    pub analytics_service: Arc<services::admin::AnalyticsService>,
     pub staking_farm_service: Arc<services::staking_farm::StakingFarmService>,
     pub aml_service: Arc<services::aml::AmlService>,
     pub config: Arc<config::ApiConfig>,
@@ -97,80 +94,34 @@ pub fn build_management_router(app_state: AppState, auth_state: AuthState) -> Ro
         .route(
             "/{id}/members/{user_id}",
             put(update_organization_member).delete(remove_organization_member),
-        )
-        .route(
-            "/{id}/staking/farm/bind",
-            post(crate::routes::staking_farm::bind_organization_staking_farm),
-        )
-        // // MCP Connector management
-        // .route(
-        //     "/{id}/mcp-connectors",
-        //     get(list_mcp_connectors).post(create_mcp_connector),
-        // )
-        // .route(
-        //     "/{id}/mcp-connectors/{connector_id}",
-        //     get(get_mcp_connector)
-        //         .put(update_mcp_connector)
-        //         .delete(delete_mcp_connector),
-        // )
-        // .route(
-        //     "/{id}/mcp-connectors/{connector_id}/test",
-        //     post(test_mcp_connector),
-        // )
-        // .route(
-        //     "/{id}/mcp-connectors/{connector_id}/tools",
-        //     get(list_mcp_tools),
-        // )
-        // .route(
-        //     "/{id}/mcp-connectors/{connector_id}/tools/call",
-        //     post(call_mcp_tool),
-        // )
-        // .route(
-        //     "/{id}/mcp-connectors/{connector_id}/usage",
-        //     get(get_mcp_usage_logs),
-        // )
-        // Usage tracking routes
-        .route(
-            "/{id}/usage/balance",
-            get(crate::routes::usage::get_organization_balance),
-        )
-        .route(
-            "/{id}/usage/history",
-            get(crate::routes::usage::get_organization_usage_history),
-        )
-        .route(
-            "/{id}/staking/farm",
-            get(crate::routes::staking_farm::get_organization_staking_farm),
-        )
-        .route(
-            "/{id}/staking/farm/sync",
-            post(crate::routes::staking_farm::sync_organization_staking_farm),
-        )
-        .route(
-            "/{id}/usage/by-model",
-            get(crate::routes::usage::get_organization_usage_by_model),
-        )
-        .route(
-            "/{id}/service-usage/history",
-            get(crate::routes::usage::get_service_usage_history),
-        )
-        .route(
-            "/{id}/usage/metrics",
-            get(crate::routes::usage::get_user_organization_metrics),
-        )
-        .route(
-            "/{id}/usage/timeseries",
-            get(crate::routes::usage::get_user_organization_timeseries),
-        )
-        .route(
-            "/{id}/reporting-tokens",
-            get(crate::routes::reporting_tokens::list_reporting_tokens)
-                .post(crate::routes::reporting_tokens::create_reporting_token),
-        )
-        .route(
-            "/{id}/reporting-tokens/{token_id}",
-            delete(crate::routes::reporting_tokens::revoke_reporting_token),
         );
+    // // MCP Connector management
+    // .route(
+    //     "/{id}/mcp-connectors",
+    //     get(list_mcp_connectors).post(create_mcp_connector),
+    // )
+    // .route(
+    //     "/{id}/mcp-connectors/{connector_id}",
+    //     get(get_mcp_connector)
+    //         .put(update_mcp_connector)
+    //         .delete(delete_mcp_connector),
+    // )
+    // .route(
+    //     "/{id}/mcp-connectors/{connector_id}/test",
+    //     post(test_mcp_connector),
+    // )
+    // .route(
+    //     "/{id}/mcp-connectors/{connector_id}/tools",
+    //     get(list_mcp_tools),
+    // )
+    // .route(
+    //     "/{id}/mcp-connectors/{connector_id}/tools/call",
+    //     post(call_mcp_tool),
+    // )
+    // .route(
+    //     "/{id}/mcp-connectors/{connector_id}/usage",
+    //     get(get_mcp_usage_logs),
+    // )
 
     // User routes (require access token authentication)
     let user_routes = Router::new()
@@ -220,10 +171,6 @@ pub fn build_management_router(app_state: AppState, auth_state: AuthState) -> Ro
 
     // Combine all routes with appropriate auth middleware
     Router::new()
-        .route(
-            "/staking/farm/config",
-            get(crate::routes::staking_farm::get_staking_farm_config),
-        )
         .nest("/organizations", org_routes)
         .nest("/users", user_routes)
         .with_state(app_state)

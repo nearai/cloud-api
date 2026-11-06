@@ -43,16 +43,8 @@ async fn post(
 }
 
 /// `input_tokens` of every usage row recorded for the org, newest first.
-async fn recorded_input_tokens(server: &axum_test::TestServer, org_id: &str) -> Vec<i32> {
-    let resp = server
-        .get(&format!(
-            "/v1/organizations/{org_id}/usage/history?limit=20&offset=0"
-        ))
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
-        .add_header("User-Agent", MOCK_USER_AGENT)
-        .await;
-    assert_eq!(resp.status_code(), 200, "{}", resp.text());
-    let history: api::routes::usage::UsageHistoryResponse = resp.json();
+async fn recorded_input_tokens(org_id: &str) -> Vec<i32> {
+    let history = seeding::usage_history(org_id, 20, 0).await;
     history.data.iter().map(|e| e.input_tokens).collect()
 }
 
@@ -125,7 +117,7 @@ async fn assert_upstream_error_mapping(path: &str, generic: &str) {
             "{path} upstream {status}"
         );
     }
-    assert!(recorded_input_tokens(&server, &org_id).await.is_empty());
+    assert!(recorded_input_tokens(&org_id).await.is_empty());
 }
 
 #[tokio::test]
@@ -166,7 +158,7 @@ async fn classify_sums_same_index_entries() {
     let resp = post(&server, CLASSIFY, &api_key, serde_json::json!("hi")).await;
 
     assert_eq!(resp.status_code(), 200, "{}", resp.text());
-    assert_eq!(recorded_input_tokens(&server, &org_id).await, vec![12]);
+    assert_eq!(recorded_input_tokens(&org_id).await, vec![12]);
 }
 
 /// Redact used to keep only the last same-index entry (billing 7 here)
@@ -193,7 +185,7 @@ async fn redact_sums_same_index_entries() {
     assert_eq!(resp.status_code(), 200, "{}", resp.text());
     let body: serde_json::Value = resp.json();
     assert_eq!(body["data"][0]["usage"]["input_tokens"], 12);
-    assert_eq!(recorded_input_tokens(&server, &org_id).await, vec![12]);
+    assert_eq!(recorded_input_tokens(&org_id).await, vec![12]);
 }
 
 /// One entry's `input_tokens` is not a number. It used to fail the whole
@@ -231,7 +223,7 @@ async fn classify_malformed_usage_entry_skips_only_that_entry() {
     let resp = post(&server, CLASSIFY, &api_key, serde_json::json!(["a", "b"])).await;
 
     assert_eq!(resp.status_code(), 200, "{}", resp.text());
-    assert_eq!(recorded_input_tokens(&server, &org_id).await, vec![5]);
+    assert_eq!(recorded_input_tokens(&org_id).await, vec![5]);
 }
 
 #[tokio::test]
@@ -242,10 +234,7 @@ async fn classify_oversized_usage_entry_is_capped() {
     let resp = post(&server, CLASSIFY, &api_key, serde_json::json!(["a", "b"])).await;
 
     assert_eq!(resp.status_code(), 200, "{}", resp.text());
-    assert_eq!(
-        recorded_input_tokens(&server, &org_id).await,
-        vec![1_000_000]
-    );
+    assert_eq!(recorded_input_tokens(&org_id).await, vec![1_000_000]);
 }
 
 /// A count above i64::MAX must not be dropped as malformed (which would
@@ -268,10 +257,7 @@ async fn classify_usage_entry_above_i64_max_is_capped() {
     let resp = post(&server, CLASSIFY, &api_key, serde_json::json!(["a", "b"])).await;
 
     assert_eq!(resp.status_code(), 200, "{}", resp.text());
-    assert_eq!(
-        recorded_input_tokens(&server, &org_id).await,
-        vec![1_000_000]
-    );
+    assert_eq!(recorded_input_tokens(&org_id).await, vec![1_000_000]);
 }
 
 #[tokio::test]
@@ -288,7 +274,7 @@ async fn redact_malformed_usage_entry_skips_only_that_entry() {
         serde_json::json!({"input_tokens": 5})
     );
     assert_eq!(body["data"][1]["usage"], serde_json::json!({}));
-    assert_eq!(recorded_input_tokens(&server, &org_id).await, vec![5]);
+    assert_eq!(recorded_input_tokens(&org_id).await, vec![5]);
 }
 
 #[tokio::test]
@@ -308,10 +294,7 @@ async fn redact_oversized_usage_entry_is_capped() {
         body["data"][1]["usage"],
         serde_json::json!({"input_tokens": 3_000_000_000i64})
     );
-    assert_eq!(
-        recorded_input_tokens(&server, &org_id).await,
-        vec![1_000_000]
-    );
+    assert_eq!(recorded_input_tokens(&org_id).await, vec![1_000_000]);
 }
 
 #[tokio::test]
@@ -331,10 +314,7 @@ async fn classify_caps_unreasonable_token_count() {
     let resp = post(&server, CLASSIFY, &api_key, serde_json::json!(["a", "b"])).await;
 
     assert_eq!(resp.status_code(), 200, "{}", resp.text());
-    assert_eq!(
-        recorded_input_tokens(&server, &org_id).await,
-        vec![1_000_000]
-    );
+    assert_eq!(recorded_input_tokens(&org_id).await, vec![1_000_000]);
 }
 
 #[tokio::test]
@@ -354,10 +334,7 @@ async fn redact_caps_unreasonable_token_count() {
     let resp = post(&server, REDACT, &api_key, serde_json::json!(["a", "b"])).await;
 
     assert_eq!(resp.status_code(), 200, "{}", resp.text());
-    assert_eq!(
-        recorded_input_tokens(&server, &org_id).await,
-        vec![1_000_000]
-    );
+    assert_eq!(recorded_input_tokens(&org_id).await, vec![1_000_000]);
 }
 
 #[tokio::test]
@@ -377,5 +354,5 @@ async fn redact_ignores_out_of_range_index_usage() {
     let resp = post(&server, REDACT, &api_key, serde_json::json!("hi")).await;
 
     assert_eq!(resp.status_code(), 200, "{}", resp.text());
-    assert_eq!(recorded_input_tokens(&server, &org_id).await, vec![4]);
+    assert_eq!(recorded_input_tokens(&org_id).await, vec![4]);
 }

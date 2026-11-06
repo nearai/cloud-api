@@ -87,20 +87,7 @@ async fn test_score_usage_recording() {
     let api_key = get_api_key_for_org(&server, org.id.clone()).await;
 
     // Before: Get organization usage (balance includes total_tokens)
-    let balance_response = server
-        .get(&format!("/v1/organizations/{}/usage/balance", org.id))
-        .add_header("Authorization", format!("Bearer rt_{}", MOCK_USER_ID))
-        .add_header("User-Agent", MOCK_USER_AGENT)
-        .await;
-
-    assert_eq!(
-        balance_response.status_code(),
-        200,
-        "Failed to get organization balance"
-    );
-
-    let balance_before = balance_response.json::<serde_json::Value>();
-    let total_tokens_before = balance_before["total_tokens"].as_i64().unwrap_or(0);
+    let total_tokens_before = seeding::organization_balance(&org.id).await.total_tokens;
 
     // Test: Make score request
     let response = server
@@ -125,20 +112,7 @@ async fn test_score_usage_recording() {
     assert!(tokens_used > 0, "Response should have token count");
 
     // After: Get organization usage balance
-    let balance_response_after = server
-        .get(&format!("/v1/organizations/{}/usage/balance", org.id))
-        .add_header("Authorization", format!("Bearer rt_{}", MOCK_USER_ID))
-        .add_header("User-Agent", MOCK_USER_AGENT)
-        .await;
-
-    assert_eq!(
-        balance_response_after.status_code(),
-        200,
-        "Failed to get organization balance after request"
-    );
-
-    let balance_after = balance_response_after.json::<serde_json::Value>();
-    let total_tokens_after = balance_after["total_tokens"].as_i64().unwrap_or(0);
+    let total_tokens_after = seeding::organization_balance(&org.id).await.total_tokens;
 
     // Verify usage was recorded
     assert!(

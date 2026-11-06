@@ -11,6 +11,7 @@ pub mod fake_ita;
 pub mod ita_evidence;
 pub mod ita_server;
 pub mod seeding;
+pub mod usage_views;
 
 pub use db_setup::MOCK_USER_ID;
 pub use encryption_jobs::EncryptionJobsCleanup;

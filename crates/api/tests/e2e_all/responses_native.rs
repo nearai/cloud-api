@@ -273,16 +273,7 @@ async fn native_stateless_responses_preserve_protocol_and_isolate_legacy_routes(
     // Poll async streaming usage; native records must not point at stored response rows.
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
-            let history = server
-                .get(&format!(
-                    "/v1/organizations/{}/usage/history?limit=100",
-                    org.id
-                ))
-                .add_header("Authorization", format!("Bearer {}", get_session_id()))
-                .add_header("User-Agent", MOCK_USER_AGENT)
-                .await;
-            assert_eq!(history.status_code(), 200, "{}", history.text());
-            let history: api::routes::usage::UsageHistoryResponse = history.json();
+            let history = seeding::usage_history(&org.id, 100, 0).await;
             let native: Vec<_> = history
                 .data
                 .iter()

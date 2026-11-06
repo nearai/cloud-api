@@ -17,10 +17,7 @@ use crate::ohttp_gateway::{OhttpAttestation, OhttpGateway};
 use crate::routes::mcp_server::{handle_mcp_request, McpRouteState};
 use crate::routes::ohttp::{ohttp_config, ohttp_relay};
 use crate::{
-    middleware::{
-        auth::{auth_middleware_with_api_key, auth_middleware_with_reporting_token},
-        auth_middleware, AuthState,
-    },
+    middleware::{auth::auth_middleware_with_api_key, auth_middleware, AuthState},
     openapi::ApiDoc,
     routes::{
         api::{build_management_router, AppState},
@@ -269,13 +266,6 @@ pub fn init_auth_services(database: Arc<Database>, config: &ApiConfig) -> AuthCo
         oauth_manager_arc.clone(),
         auth_service.clone(),
         workspace_repository.clone(),
-        Arc::new(
-            services::reporting_tokens::OrganizationReportingTokenServiceImpl::new(Arc::new(
-                database::repositories::OrganizationReportingTokenRepository::new(
-                    database.pool().clone(),
-                ),
-            )),
-        ) as Arc<dyn services::reporting_tokens::OrganizationReportingTokenService>,
         admin_access_token_repository,
         config.auth.admin_emails.clone(),
         config.auth.encoding_key.clone(),
@@ -1159,14 +1149,6 @@ pub fn build_app_with_config_and_options(
     config: Arc<ApiConfig>,
     build_options: AppBuildOptions,
 ) -> Router {
-    // Create analytics service (shared between user and admin routes)
-    let analytics_repository = Arc::new(database::repositories::PgAnalyticsRepository::new(
-        database.pool().clone(),
-    ));
-    let analytics_service = Arc::new(services::admin::AnalyticsService::new(
-        analytics_repository as Arc<dyn services::admin::AnalyticsRepository>,
-    ));
-
     // Initialize OHTTP gateway (RFC 9458) if OHTTP_ENABLED=true.
     // The gateway key is deterministically derived from the same dstack KMS Ed25519 seed
     // used for chat-completion signing — all instances share the same HPKE public key.
@@ -1209,20 +1191,11 @@ pub fn build_app_with_config_and_options(
         attestation_service: domain_services.attestation_service.clone(),
         usage_service: domain_services.usage_service.clone(),
         service_usage_service: domain_services.service_usage_service.clone(),
-        reporting_token_service: Arc::new(
-            services::reporting_tokens::OrganizationReportingTokenServiceImpl::new(Arc::new(
-                database::repositories::OrganizationReportingTokenRepository::new(
-                    database.pool().clone(),
-                ),
-            )),
-        )
-            as Arc<dyn services::reporting_tokens::OrganizationReportingTokenService>,
         user_service: domain_services.user_service.clone(),
         contact_email_service: domain_services.contact_email_service.clone(),
         files_service: domain_services.files_service.clone(),
         inference_provider_pool: domain_services.inference_provider_pool.clone(),
         metrics_service: domain_services.metrics_service.clone(),
-        analytics_service: analytics_service.clone(),
         staking_farm_service: domain_services.staking_farm_service.clone(),
         aml_service: domain_services.aml_service.clone(),
         config: config.clone(),
@@ -1297,15 +1270,6 @@ pub fn build_app_with_config_and_options(
         &auth_components.auth_state_middleware,
     );
 
-    let organization_credit_service = build_organization_credit_service(&database, &config);
-    let transfer_routes = crate::routes::credit_transfers::routes(
-        organization_credit_service.clone(),
-        auth_components.auth_state_middleware.clone(),
-    );
-    let organization_credential_routes = crate::routes::organization_credentials::routes(
-        organization_credit_service,
-        auth_components.auth_state_middleware.clone(),
-    );
     let management_routes = build_management_router(
         app_state.clone(),
         auth_components.auth_state_middleware.clone(),
@@ -1332,7 +1296,6 @@ pub fn build_app_with_config_and_options(
         AdminRouteServices {
             object_encryption_state: domain_services.object_encryption_state.clone(),
             inference_provider_pool: app_state.inference_provider_pool.clone(),
-            analytics_service,
             staking_farm_service: app_state.staking_farm_service.clone(),
             aml_service: app_state.aml_service.clone(),
             models_service: cloud_platform::invalidating_models_service(
@@ -1366,28 +1329,6 @@ pub fn build_app_with_config_and_options(
         domain_services.usage_service.clone(),
         &auth_components.auth_state_middleware,
     );
-    let reporting_usage_routes = if config.usage_reporting.enabled {
-        let summary_repository = Arc::new(
-            database::repositories::PostgresReportingUsageSummaryRepository::with_statement_timeout(
-                database.pool().clone(),
-                config.usage_reporting.database_statement_timeout(),
-            ),
-        )
-            as Arc<dyn services::reporting_usage::ReportingUsageSummaryRepository>;
-        let summary_service = Arc::new(services::reporting_usage::ReportingUsageService::new(
-            summary_repository,
-        ));
-        build_reporting_usage_routes(
-            domain_services.usage_service.clone(),
-            domain_services.service_usage_service.clone(),
-            summary_service,
-            middleware::ReportingGuardState::from_config(&config.usage_reporting),
-            &auth_components.auth_state_middleware,
-        )
-    } else {
-        tracing::info!("Programmatic usage reporting routes are disabled");
-        Router::new()
-    };
 
     // Build OpenAPI and documentation routes
     let openapi_routes = build_openapi_routes();
@@ -1427,8 +1368,6 @@ pub fn build_app_with_config_and_options(
                 .merge(unsupported_openai_routes)
                 .merge(conversation_routes)
                 .merge(management_routes)
-                .merge(transfer_routes)
-                .merge(organization_credential_routes)
                 .merge(workspace_routes)
                 .merge(attestation_routes.clone())
                 .merge(model_routes)
@@ -1438,7 +1377,6 @@ pub fn build_app_with_config_and_options(
                 .merge(files_routes)
                 .merge(feature_request_routes)
                 .merge(billing_routes)
-                .merge(reporting_usage_routes)
                 .merge(gateway_routes)
                 .merge(internal_routes)
                 .merge(health_routes)
@@ -2013,10 +1951,6 @@ pub fn build_workspace_routes(app_state: AppState, auth_state_middleware: &AuthS
             "/workspaces/{workspace_id}/api-keys/{key_id}/spend-limit",
             axum::routing::patch(update_api_key_spend_limit),
         )
-        .route(
-            "/workspaces/{workspace_id}/api-keys/{key_id}/usage/history",
-            get(crate::routes::usage::get_api_key_usage_history),
-        )
         .with_state(app_state)
         .layer(from_fn_with_state(
             auth_state_middleware.clone(),
@@ -2084,6 +2018,22 @@ where
         .nest("/files/", descendants)
 }
 
+/// Build billing routes with API key auth (HuggingFace billing integration)
+pub fn build_billing_routes(
+    usage_service: Arc<dyn services::usage::UsageServiceTrait + Send + Sync>,
+    auth_state_middleware: &AuthState,
+) -> Router {
+    let billing_state = BillingRouteState { usage_service };
+
+    Router::new()
+        .route("/billing/costs", post(get_billing_costs))
+        .with_state(billing_state)
+        .layer(from_fn_with_state(
+            auth_state_middleware.clone(),
+            middleware::auth::auth_middleware_with_workspace_context,
+        ))
+}
+
 /// Build feature request routes for user submissions and admin aggregation.
 pub fn build_feature_request_routes(
     pool: database::DbPool,
@@ -2113,70 +2063,6 @@ pub fn build_feature_request_routes(
         ));
 
     Router::new().merge(user_routes).merge(admin_routes)
-}
-
-/// Build billing routes with API key auth (HuggingFace billing integration)
-pub fn build_billing_routes(
-    usage_service: Arc<dyn services::usage::UsageServiceTrait + Send + Sync>,
-    auth_state_middleware: &AuthState,
-) -> Router {
-    let billing_state = BillingRouteState { usage_service };
-
-    Router::new()
-        .route("/billing/costs", post(get_billing_costs))
-        .with_state(billing_state)
-        .layer(from_fn_with_state(
-            auth_state_middleware.clone(),
-            middleware::auth::auth_middleware_with_workspace_context,
-        ))
-}
-
-pub fn build_reporting_usage_routes(
-    usage_service: Arc<dyn services::usage::UsageServiceTrait + Send + Sync>,
-    service_usage_service: Arc<dyn services::service_usage::ServiceUsageServiceTrait + Send + Sync>,
-    summary_service: Arc<services::reporting_usage::ReportingUsageService>,
-    guard_state: middleware::ReportingGuardState,
-    auth_state_middleware: &AuthState,
-) -> Router {
-    let export_state = crate::routes::reporting_usage::ReportingUsageExportState::new(
-        usage_service,
-        service_usage_service,
-    );
-    let summary_state =
-        crate::routes::reporting_usage::ReportingUsageSummaryState::new(summary_service);
-    let export_router = Router::new()
-        .route(
-            "/organizations/{org_id}/usage/export",
-            get(crate::routes::reporting_usage::export_usage),
-        )
-        .with_state(export_state);
-    let summary_router = Router::new()
-        .route(
-            "/organizations/{org_id}/usage/summary",
-            get(crate::routes::reporting_usage::summary_usage),
-        )
-        .with_state(summary_state);
-    let router = Router::new().merge(export_router).merge(summary_router);
-
-    #[cfg(debug_assertions)]
-    let router = router.route(
-        "/organizations/{org_id}/usage/reporting-token-auth-probe",
-        get(crate::routes::reporting_usage::reporting_token_auth_probe),
-    );
-
-    router
-        .layer(from_fn_with_state(
-            guard_state.clone(),
-            middleware::reporting_token_guard_middleware,
-        ))
-        .layer(from_fn_with_state(
-            auth_state_middleware.clone(),
-            auth_middleware_with_reporting_token,
-        ))
-        .layer(from_fn_with_state(
-            guard_state,
-            middleware::reporting_global_guard_middleware,
-        ))
 }
 
 /// Build gateway routes for external model gateways to validate API keys.
@@ -2342,7 +2228,6 @@ fn cache_control_layer(value: &'static str) -> CacheControlLayer {
 pub struct AdminRouteServices {
     pub object_encryption_state: object_encryption::ObjectEncryptionState,
     pub inference_provider_pool: Arc<services::inference_provider_pool::InferenceProviderPool>,
-    pub analytics_service: Arc<services::admin::AnalyticsService>,
     pub staking_farm_service: Arc<services::staking_farm::StakingFarmService>,
     pub aml_service: Arc<services::aml::AmlService>,
     /// Invalidated by admin writes: see `cloud_platform::invalidating_models_service`.
@@ -2382,24 +2267,16 @@ fn build_admin_routes_with_options(
         batch_upsert_models, cancel_model_pricing_change, confirm_model_deprecation,
         confirm_model_pricing_changes, create_admin_access_token, create_service,
         delete_admin_access_token, delete_aml_allowlist_entry, delete_model, deprecate_model,
-        erase_user, get_admin_organization_balance, get_admin_setting, get_billing_summary,
-        get_infra_summary, get_model_consumption_timeseries, get_model_history, get_model_revenue,
-        get_org_revenue, get_organization as get_admin_organization,
+        erase_user, get_admin_setting, get_infra_summary, get_model_history,
         get_organization_concurrent_limit, get_organization_fallback,
-        get_organization_limits_history, get_organization_metrics, get_organization_priority,
-        get_organization_timeseries, get_performance_timeseries, get_platform_metrics,
-        get_platform_timeseries, get_revenue_density, list_admin_access_tokens,
-        list_admin_settings, list_aml_allowlist, list_aml_reports, list_api_keys,
+        get_organization_limits_history, get_organization_priority, list_admin_access_tokens,
+        list_admin_settings, list_aml_allowlist, list_aml_reports,
         list_invitation_email_deliveries, list_model_pricing_changes,
-        list_models as admin_list_models, list_organization_members, list_organizations,
-        list_users, lookup_user_erasures, preview_model_deprecation, preview_model_pricing_changes,
-        preview_user_erasure, resend_invitation_email, update_admin_setting,
-        update_aml_report_status, update_organization_concurrent_limit,
+        list_models as admin_list_models, lookup_user_erasures, preview_model_deprecation,
+        preview_model_pricing_changes, preview_user_erasure, resend_invitation_email,
+        update_admin_setting, update_aml_report_status, update_organization_concurrent_limit,
         update_organization_fallback, update_organization_limits, update_organization_member_role,
         update_organization_priority, update_service, upsert_aml_allowlist_entry, AdminAppState,
-    };
-    use crate::routes::staking_farm::{
-        get_admin_organization_staking_farm, sync_admin_organization_staking_farm,
     };
     use database::repositories::{AdminAccessTokenRepository, AdminCompositeRepository};
     use services::admin::AdminServiceImpl;
@@ -2444,7 +2321,6 @@ fn build_admin_routes_with_options(
 
     let admin_app_state = AdminAppState {
         admin_service,
-        analytics_service: services.analytics_service,
         organization_service: services.organization_service,
         auth_service: auth_state_middleware.auth_service.clone(),
         usage_service: services.usage_service,
@@ -2534,18 +2410,6 @@ fn build_admin_routes_with_options(
             "/admin/organizations/{org_id}/limits/history",
             axum::routing::get(get_organization_limits_history),
         )
-        .route(
-            "/admin/organizations/{org_id}/usage/balance",
-            axum::routing::get(get_admin_organization_balance),
-        )
-        .route(
-            "/admin/organizations/{org_id}/staking/farm",
-            axum::routing::get(get_admin_organization_staking_farm),
-        )
-        .route(
-            "/admin/organizations/{org_id}/staking/farm/sync",
-            axum::routing::post(sync_admin_organization_staking_farm),
-        )
         .route("/admin/aml/reports", axum::routing::get(list_aml_reports))
         .route(
             "/admin/aml/reports/{report_id}/status",
@@ -2573,34 +2437,6 @@ fn build_admin_routes_with_options(
             axum::routing::get(get_organization_fallback).patch(update_organization_fallback),
         )
         .route(
-            "/admin/organizations/{org_id}/metrics",
-            axum::routing::get(get_organization_metrics),
-        )
-        .route(
-            "/admin/organizations/{org_id}/metrics/timeseries",
-            axum::routing::get(get_organization_timeseries),
-        )
-        .route(
-            "/admin/platform/metrics",
-            axum::routing::get(get_platform_metrics),
-        )
-        .route(
-            "/admin/platform/metrics/timeseries",
-            axum::routing::get(get_platform_timeseries),
-        )
-        .route(
-            "/admin/platform/billing-summary",
-            axum::routing::get(get_billing_summary),
-        )
-        .route(
-            "/admin/platform/model-revenue",
-            axum::routing::get(get_model_revenue),
-        )
-        .route(
-            "/admin/platform/org-revenue",
-            axum::routing::get(get_org_revenue),
-        )
-        .route(
             "/admin/platform/infra-summary",
             axum::routing::get(get_infra_summary),
         )
@@ -2610,18 +2446,6 @@ fn build_admin_routes_with_options(
             axum::routing::get(get_admin_setting).patch(update_admin_setting),
         )
         .route(
-            "/admin/platform/model-consumption-timeseries",
-            axum::routing::get(get_model_consumption_timeseries),
-        )
-        .route(
-            "/admin/platform/performance-timeseries",
-            axum::routing::get(get_performance_timeseries),
-        )
-        .route(
-            "/admin/platform/revenue-density",
-            axum::routing::get(get_revenue_density),
-        )
-        .route(
             "/admin/invitation-email-deliveries",
             axum::routing::get(list_invitation_email_deliveries),
         )
@@ -2629,7 +2453,6 @@ fn build_admin_routes_with_options(
             "/admin/invitation-email-deliveries/{invitation_id}/resend",
             axum::routing::post(resend_invitation_email),
         )
-        .route("/admin/users", axum::routing::get(list_users))
         .route(
             "/admin/users/{user_id}/erasure/preview",
             axum::routing::post(preview_user_erasure),
@@ -2641,19 +2464,6 @@ fn build_admin_routes_with_options(
         .route(
             "/admin/user-erasures/lookup",
             axum::routing::post(lookup_user_erasures),
-        )
-        .route(
-            "/admin/organizations",
-            axum::routing::get(list_organizations),
-        )
-        .route("/admin/api-keys", axum::routing::get(list_api_keys))
-        .route(
-            "/admin/organizations/{org_id}",
-            axum::routing::get(get_admin_organization),
-        )
-        .route(
-            "/admin/organizations/{org_id}/members",
-            axum::routing::get(list_organization_members),
         )
         .route(
             "/admin/organizations/{org_id}/members/{user_id}",
@@ -2671,56 +2481,7 @@ fn build_admin_routes_with_options(
             "/admin/access-tokens/{token_id}",
             axum::routing::delete(delete_admin_access_token),
         )
-        .with_state(admin_app_state)
-        .merge(
-            Router::new()
-                .route(
-                    "/admin/organizations/{org_id}/policy",
-                    get(crate::routes::organization_policy::get_policy)
-                        .put(crate::routes::organization_policy::put_policy),
-                )
-                .route("/admin/organizations/{org_id}/credit/transfer/reconciliation", get(crate::routes::credit_transfers::reconciliation))
-                .layer(axum::Extension(
-                    build_organization_credit_service(&database, &config),
-                ))
-        )
-        .merge(
-            Router::new()
-                .route(
-                    "/admin/organizations/{org_id}/credit/reconciliations",
-                    axum::routing::post(
-                        crate::routes::admin_credit_reconciliation::reconcile_organization_credits,
-                    ),
-                )
-                .layer(axum::Extension(
-                    database::repositories::credit_reconciliation::CreditReconciliationRepository::new(
-                        database.pool().clone(),
-                    ),
-                ))
-        )
-        .merge(
-            Router::new()
-                .route("/admin/organizations/{org_id}/usage-discount",
-                    axum::routing::get(crate::routes::admin_usage_discount::get_usage_discount)
-                        .put(crate::routes::admin_usage_discount::put_usage_discount))
-                .layer(axum::Extension(database::repositories::organization_usage_discount::OrganizationUsageDiscountRepository::new(database.pool().clone())))
-        )
-        .merge(
-            Router::new()
-                .route(
-                    "/admin/usage-hourly/recompute",
-                    axum::routing::post(crate::routes::admin_usage_hourly::recompute_usage_hourly),
-                )
-                .layer(axum::Extension(
-                    crate::routes::admin_usage_hourly::UsageHourlyRepairState {
-                        repository: Arc::new(
-                            database::repositories::UsageHourlyRepositoryImpl::new(
-                                database.pool().clone(),
-                            ),
-                        ),
-                    },
-                )),
-        );
+        .with_state(admin_app_state);
 
     let admin_routes = if let Some(database_encryption_state) = database_encryption_state {
         if build_options.start_database_encryption_recovery {
@@ -2836,25 +2597,6 @@ async fn swagger_ui_handler() -> Html<String> {
     )
 }
 
-fn build_organization_credit_service(
-    database: &database::Database,
-    config: &ApiConfig,
-) -> Arc<dyn services::organization_credits::OrganizationCreditServiceTrait> {
-    use database::repositories::credit_transfers::CreditTransferRepository;
-    use database::repositories::organization_credentials::OrganizationCredentialRepository;
-    use services::organization_credits::OrganizationCreditService;
-
-    let transfers = Arc::new(CreditTransferRepository::new(
-        database.pool().clone(),
-        &config.credit_allocation,
-    ));
-    let credentials = Arc::new(OrganizationCredentialRepository::new(
-        database.pool().clone(),
-    ));
-
-    Arc::new(OrganizationCreditService::new(transfers, credentials))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2926,51 +2668,6 @@ mod tests {
         assert!(components.security_schemes.contains_key("session_token"));
         assert!(components.security_schemes.contains_key("refresh_token"));
         assert!(components.security_schemes.contains_key("api_key"));
-        assert!(components.security_schemes.contains_key("reporting_token"));
-
-        let spec_json = serde_json::to_value(&spec).unwrap();
-        assert_reporting_path_security(
-            &spec_json,
-            "/v1/organizations/{org_id}/reporting-tokens",
-            "post",
-            "session_token",
-        );
-        assert_reporting_path_security(
-            &spec_json,
-            "/v1/organizations/{org_id}/reporting-tokens",
-            "get",
-            "session_token",
-        );
-        assert_reporting_path_security(
-            &spec_json,
-            "/v1/organizations/{org_id}/reporting-tokens/{token_id}",
-            "delete",
-            "session_token",
-        );
-        assert_reporting_path_security(
-            &spec_json,
-            "/v1/organizations/{org_id}/usage/export",
-            "get",
-            "reporting_token",
-        );
-        assert_reporting_path_security(
-            &spec_json,
-            "/v1/organizations/{org_id}/usage/summary",
-            "get",
-            "reporting_token",
-        );
-        println!(
-            "OPENAPI_REPORTING_CONTRACT={}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "reporting_tokens": spec_json["paths"]["/v1/organizations/{org_id}/reporting-tokens"],
-                "reporting_token_revoke": spec_json["paths"]["/v1/organizations/{org_id}/reporting-tokens/{token_id}"],
-                "usage_export": spec_json["paths"]["/v1/organizations/{org_id}/usage/export"],
-                "usage_summary": spec_json["paths"]["/v1/organizations/{org_id}/usage/summary"],
-                "reporting_token_scheme": spec_json["components"]["securitySchemes"]["reporting_token"],
-            }))
-            .unwrap()
-        );
-
         // Verify servers are not hardcoded (will be set dynamically on client)
         assert!(spec.servers.is_none() || spec.servers.as_ref().unwrap().is_empty());
     }
@@ -3076,24 +2773,6 @@ mod tests {
         assert_eq!(
             schemas["OutputTokensDetails"]["required"],
             serde_json::json!(["reasoning_tokens"])
-        );
-    }
-
-    fn assert_reporting_path_security(
-        spec: &serde_json::Value,
-        path: &str,
-        method: &str,
-        scheme: &str,
-    ) {
-        let operation = &spec["paths"][path][method];
-        assert!(
-            operation.is_object(),
-            "missing OpenAPI operation: {method} {path}"
-        );
-        assert_eq!(
-            operation["security"],
-            serde_json::json!([{ scheme: [] }]),
-            "{method} {path} must use only {scheme} security"
         );
     }
 

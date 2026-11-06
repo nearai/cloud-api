@@ -239,7 +239,7 @@ async fn test_external_model_appears_in_models_list() {
 
 #[tokio::test]
 async fn test_external_provider_billing_recorded() {
-    let (server, inference_pool, mock_provider, _) = setup_test_server_with_pool().await;
+    let (server, inference_pool, mock_provider, database) = setup_test_server_with_pool().await;
 
     // Setup external model
     let model_name = setup_external_openai_model(&server).await;
@@ -288,24 +288,21 @@ async fn test_external_provider_billing_recorded() {
     // Wait for async usage recording
     tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
 
-    // Query billing costs
-    let billing_response = server
-        .post("/v1/billing/costs")
-        .add_header("Authorization", format!("Bearer {api_key}"))
-        .json(&serde_json::json!({
-            "requestIds": [inference_uuid]
-        }))
-        .await;
-
-    assert_eq!(billing_response.status_code(), 200);
-
-    let body: serde_json::Value = billing_response.json();
-    let requests = body["requests"].as_array().unwrap();
-    assert_eq!(requests.len(), 1, "Should return 1 cost entry");
-
-    let cost_entry = &requests[0];
+    // The recorded usage row is the subject; read its cost by inference id.
+    let total_cost: i64 = database
+        .pool()
+        .get()
+        .await
+        .expect("failed to get database connection")
+        .query_one(
+            "SELECT total_cost FROM organization_usage_log WHERE inference_id = $1",
+            &[&inference_uuid],
+        )
+        .await
+        .expect("External provider completion should record a usage row")
+        .get(0);
     assert!(
-        cost_entry["costNanoUsd"].as_i64().unwrap() > 0,
+        total_cost > 0,
         "External provider completion should have positive cost"
     );
 }
@@ -591,19 +588,10 @@ async fn test_external_model_completion_tracks_usage() {
     tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
 
     // Check organization usage was updated (requires session auth, not API key auth)
-    let session_id = get_session_id();
-    let usage_response = server
-        .get(format!("/v1/organizations/{}/usage/balance", org.id).as_str())
-        .add_header("Authorization", format!("Bearer {session_id}"))
-        .add_header("User-Agent", MOCK_USER_AGENT)
-        .await;
-
-    assert_eq!(usage_response.status_code(), 200);
-
-    let usage: serde_json::Value = usage_response.json();
+    let usage = seeding::organization_balance(&org.id).await;
 
     // Verify usage was tracked
-    let total_tokens = usage["total_tokens"].as_i64().unwrap_or(0);
+    let total_tokens = usage.total_tokens;
     assert!(
         total_tokens > 0,
         "Should have recorded token usage after completions"
@@ -1038,7 +1026,7 @@ async fn gemini_thinking_completion(
     stream: bool,
 ) -> (
     serde_json::Value,
-    api::routes::usage::UsageHistoryEntryResponse,
+    crate::common::usage_views::UsageHistoryEntryResponse,
 ) {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -1150,16 +1138,7 @@ async fn gemini_thinking_completion(
 
     // Usage is recorded asynchronously.
     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-    let history = server
-        .get(&format!(
-            "/v1/organizations/{}/usage/history?limit=1&offset=0",
-            org.id
-        ))
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
-        .add_header("User-Agent", MOCK_USER_AGENT)
-        .await;
-    assert_eq!(history.status_code(), 200, "usage history should succeed");
-    let history: api::routes::usage::UsageHistoryResponse = history.json();
+    let history = seeding::usage_history(&org.id, 1, 0).await;
     let entry = history
         .data
         .into_iter()

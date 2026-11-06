@@ -65,8 +65,8 @@ async fn test_delete_organization_removes_its_workspaces_from_users_me() {
 }
 
 /// Every credential under a deleted organization must stop working. The cascade
-/// marks persisted credentials revoked, while the API-key and reporting-token
-/// validation paths also require an active parent as defense in depth.
+/// marks persisted credentials revoked, while the API-key validation path
+/// also requires an active parent as defense in depth.
 #[tokio::test]
 async fn test_delete_organization_revokes_its_credentials() {
     let (server, database) = setup_test_server_with_database().await;
@@ -80,7 +80,26 @@ async fn test_delete_organization_revokes_its_credentials() {
         .id
         .clone();
     let api_key = get_api_key_for_org_with_session(&server, org.id.clone(), &session_id).await;
-    let reporting_token = create_reporting_token(&server, &org.id, &session_id).await;
+
+    // Reporting tokens are issued by cloud-platform; seed one the cascade must revoke.
+    let token_hash = format!("{:064x}", uuid::Uuid::new_v4().as_u128());
+    database
+        .pool()
+        .get()
+        .await
+        .expect("failed to get database connection")
+        .execute(
+            "INSERT INTO organization_reporting_tokens \
+             (organization_id, name, token_hash, token_prefix, created_by_user_id) \
+             VALUES ($1, 'seeded-reporting-token', $2, 'rpt-seeded', $3)",
+            &[
+                &uuid::Uuid::parse_str(&org.id).unwrap(),
+                &token_hash,
+                &seeding::user_id_for_session(&session_id),
+            ],
+        )
+        .await
+        .expect("failed to seed reporting token");
 
     // Exercise a route that accepts only an API key before deleting the org.
     // The same key-only path must fail once the parent is gone.
@@ -154,26 +173,6 @@ async fn test_delete_organization_revokes_its_credentials() {
     assert_eq!(
         active_workspaces, 0,
         "workspaces under a deleted org must be deactivated"
-    );
-
-    // The delete cascade revokes the persisted token, while validation also
-    // requires its organization to remain active as defense in depth.
-    let response = server
-        .get(
-            format!(
-                "/v1/organizations/{}/usage/reporting-token-auth-probe",
-                org.id
-            )
-            .as_str(),
-        )
-        .add_header("Authorization", format!("Bearer {reporting_token}"))
-        .add_header("User-Agent", MOCK_USER_AGENT)
-        .await;
-    assert_eq!(
-        response.status_code(),
-        401,
-        "reporting token of a deleted org must not authenticate: {}",
-        response.text()
     );
 
     let unrevoked_tokens: i64 = client
@@ -341,7 +340,6 @@ async fn test_child_creation_serializes_with_organization_deletion() {
         .expect("new org should have a default workspace")
         .id
         .clone();
-    let existing_reporting_token = create_reporting_token(&server, &org.id, &session_id).await;
 
     let organization_id = uuid::Uuid::parse_str(&org.id).expect("organization id");
     let workspace_id = uuid::Uuid::parse_str(&workspace_id).expect("workspace id");
@@ -369,7 +367,7 @@ async fn test_child_creation_serializes_with_organization_deletion() {
         .await
         .expect("failed to lock active organization");
 
-    let start = std::sync::Arc::new(tokio::sync::Barrier::new(4));
+    let start = std::sync::Arc::new(tokio::sync::Barrier::new(3));
 
     let workspace_task = {
         let pool = database.pool().clone();
@@ -406,26 +404,6 @@ async fn test_child_creation_serializes_with_organization_deletion() {
         })
     };
 
-    let reporting_token_task = {
-        let pool = database.pool().clone();
-        let start = start.clone();
-        tokio::spawn(async move {
-            start.wait().await;
-            let repository =
-                database::repositories::OrganizationReportingTokenRepository::new(pool);
-            services::reporting_tokens::OrganizationReportingTokenRepository::create(
-                &repository,
-                services::reporting_tokens::CreateOrganizationReportingTokenRequest {
-                    organization_id,
-                    name: "raced-reporting-token".to_string(),
-                    created_by_user_id: user_id,
-                    expires_at: None,
-                },
-            )
-            .await
-        })
-    };
-
     // Release all creates while the deletion transaction holds FOR UPDATE.
     start.wait().await;
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
@@ -437,11 +415,6 @@ async fn test_child_creation_serializes_with_organization_deletion() {
         !api_key_task.is_finished(),
         "API-key insert must wait on the organization deletion lock"
     );
-    assert!(
-        !reporting_token_task.is_finished(),
-        "reporting-token insert must wait on the organization deletion lock"
-    );
-
     transaction
         .execute(
             "UPDATE organizations SET is_active = false WHERE id = $1",
@@ -467,56 +440,6 @@ async fn test_child_creation_serializes_with_organization_deletion() {
             .expect("API-key task should not panic")
             .is_err(),
         "API-key insert must reject an organization deleted while it waited"
-    );
-    assert!(
-        reporting_token_task
-            .await
-            .expect("reporting-token task should not panic")
-            .is_err(),
-        "reporting-token insert must reject an organization deleted while it waited"
-    );
-
-    // This test deactivated the organization directly to isolate lock behavior,
-    // so the pre-existing token remains unrevoked. Validation must still fail
-    // closed on the inactive parent.
-    let client = database
-        .pool()
-        .get()
-        .await
-        .expect("failed to get validation connection");
-    let unrevoked_tokens: i64 = client
-        .query_one(
-            "SELECT COUNT(*) FROM organization_reporting_tokens \
-             WHERE organization_id = $1 AND revoked_at IS NULL",
-            &[&organization_id],
-        )
-        .await
-        .expect("failed to count unrevoked reporting tokens")
-        .get(0);
-    assert_eq!(
-        unrevoked_tokens, 1,
-        "the direct state change intentionally bypasses the delete cascade"
-    );
-
-    let response = server
-        .get(
-            format!(
-                "/v1/organizations/{}/usage/reporting-token-auth-probe",
-                org.id
-            )
-            .as_str(),
-        )
-        .add_header(
-            "Authorization",
-            format!("Bearer {existing_reporting_token}"),
-        )
-        .add_header("User-Agent", MOCK_USER_AGENT)
-        .await;
-    assert_eq!(
-        response.status_code(),
-        401,
-        "an unrevoked token of an inactive org must not authenticate: {}",
-        response.text()
     );
 }
 
@@ -790,25 +713,4 @@ async fn list_members(
         .as_array()
         .expect("members array")
         .clone()
-}
-
-async fn create_reporting_token(
-    server: &axum_test::TestServer,
-    org_id: &str,
-    session_id: &str,
-) -> String {
-    let response = server
-        .post(format!("/v1/organizations/{org_id}/reporting-tokens").as_str())
-        .add_header("Authorization", format!("Bearer {session_id}"))
-        .add_header("User-Agent", MOCK_USER_AGENT)
-        .json(&serde_json::json!({
-            "name": "org deletion cascade",
-            "expires_at": (chrono::Utc::now() + chrono::Duration::days(30)).to_rfc3339(),
-        }))
-        .await;
-    assert_eq!(response.status_code(), 201, "{}", response.text());
-    response.json::<serde_json::Value>()["token"]
-        .as_str()
-        .expect("create response should include the raw token once")
-        .to_string()
 }

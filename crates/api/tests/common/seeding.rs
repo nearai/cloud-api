@@ -11,12 +11,16 @@
 
 use super::db_setup::{self, MOCK_USER_ID};
 use api::models::{
-    ApiKeyResponse, DecimalPrice, OrganizationResponse, SpendLimit,
+    AdminModelWithPricing, ApiKeyResponse, BatchUpdateModelApiRequest, Datacenter, DecimalPrice,
+    ModelArchitecture, ModelMetadata, ModelWithPricing, OrganizationResponse, SpendLimit,
     UpdateOrganizationLimitsResponse,
 };
 use api::routes::workspaces::WorkspaceResponse;
 use chrono::{DateTime, Utc};
+use database::models::UpdateModelPricingRequest;
 use database::repositories::credit_allocation::settle_unfunded_usage;
+use database::repositories::model::ModelRepository;
+use database::repositories::model_alias::ModelAliasRepository;
 use database::repositories::CreditAllocationPolicy;
 use database::Database;
 use std::sync::Arc;
@@ -290,4 +294,326 @@ pub async fn seed_api_key(workspace_id: &str, name: String, session_id: &str) ->
         deleted_at: api_key.deleted_at,
         usage: Some(price(api_key.usage)),
     }
+}
+
+fn usd_price(amount: i64) -> DecimalPrice {
+    DecimalPrice {
+        amount,
+        scale: 9,
+        currency: "USD".to_string(),
+    }
+}
+
+/// Whole-hour UTC instant, or a bare date that means 13:00 UTC on that day.
+fn parse_deprecation_date(value: &str) -> Option<DateTime<Utc>> {
+    use chrono::Timelike;
+    if let Ok(parsed) = DateTime::parse_from_rfc3339(value) {
+        let utc = parsed.with_timezone(&Utc);
+        if parsed.offset().local_minus_utc() != 0
+            || utc.minute() != 0
+            || utc.second() != 0
+            || utc.nanosecond() != 0
+        {
+            return None;
+        }
+        return Some(utc);
+    }
+    chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d")
+        .ok()?
+        .and_hms_opt(13, 0, 0)
+        .map(|naive| DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc))
+}
+
+/// Merge a providerConfig write into the stored config: keys sent replace stored keys and
+/// `null` removes a key. On a new model the write is the config.
+fn merge_provider_config(
+    stored: Option<serde_json::Value>,
+    patch: serde_json::Value,
+) -> serde_json::Value {
+    match (stored, patch) {
+        (Some(serde_json::Value::Object(mut merged)), serde_json::Value::Object(patch)) => {
+            for (key, value) in patch {
+                if value.is_null() {
+                    merged.remove(&key);
+                } else {
+                    merged.insert(key, value);
+                }
+            }
+            serde_json::Value::Object(merged)
+        }
+        (_, patch) => patch,
+    }
+}
+
+const MODEL_COLUMNS: &str = "m.id, m.model_name, m.model_display_name, m.model_description,
+    m.model_icon, m.input_cost_per_token, m.output_cost_per_token, m.cost_per_image,
+    m.cache_read_cost_per_token, m.text_pricing, m.context_length, m.verifiable, m.is_active,
+    m.owned_by, m.created_at, m.updated_at, m.provider_type, m.provider_config,
+    m.attestation_supported, m.input_modalities, m.output_modalities, m.inference_url,
+    m.hugging_face_id, m.quantization, m.max_output_length, m.supported_sampling_parameters,
+    m.supported_features, m.datacenters, m.is_ready, m.deprecation_date,
+    m.successor_model_name, m.openrouter_slug, m.allow_free, m.is_listed";
+
+fn modalities(row: &tokio_postgres::Row, column: &str) -> Option<Vec<String>> {
+    row.get::<_, Option<serde_json::Value>>(column)
+        .and_then(|value| serde_json::from_value(value).ok())
+}
+
+fn model_from_row(row: &tokio_postgres::Row, aliases: Vec<String>) -> database::models::Model {
+    database::models::Model {
+        id: row.get("id"),
+        model_name: row.get("model_name"),
+        model_display_name: row.get("model_display_name"),
+        model_description: row.get("model_description"),
+        model_icon: row.get("model_icon"),
+        input_cost_per_token: row.get("input_cost_per_token"),
+        output_cost_per_token: row.get("output_cost_per_token"),
+        cost_per_image: row.get("cost_per_image"),
+        cache_read_cost_per_token: row.get("cache_read_cost_per_token"),
+        text_pricing: row.get("text_pricing"),
+        context_length: row.get("context_length"),
+        verifiable: row.get("verifiable"),
+        aliases,
+        provider_type: row.get("provider_type"),
+        provider_config: row.get("provider_config"),
+        attestation_supported: row.get("attestation_supported"),
+        input_modalities: modalities(row, "input_modalities"),
+        output_modalities: modalities(row, "output_modalities"),
+        inference_url: row.get("inference_url"),
+        hugging_face_id: row.get("hugging_face_id"),
+        quantization: row.get("quantization"),
+        max_output_length: row.get("max_output_length"),
+        supported_sampling_parameters: row.get("supported_sampling_parameters"),
+        supported_features: row.get("supported_features"),
+        datacenters: row.get("datacenters"),
+        is_ready: row.get("is_ready"),
+        deprecation_date: row.get("deprecation_date"),
+        successor_model_name: row.get("successor_model_name"),
+        openrouter_slug: row.get("openrouter_slug"),
+        is_active: row.get("is_active"),
+        allow_free: row.get("allow_free"),
+        is_listed: row.get("is_listed"),
+        owned_by: row.get("owned_by"),
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+    }
+}
+
+fn model_metadata(model: database::models::Model) -> ModelMetadata {
+    ModelMetadata {
+        verifiable: model.verifiable,
+        context_length: model.context_length,
+        model_display_name: model.model_display_name,
+        model_description: model.model_description,
+        model_icon: model.model_icon,
+        owned_by: model.owned_by,
+        aliases: model.aliases,
+        provider_type: model.provider_type,
+        provider_config: api::routes::common::redact_provider_config(model.provider_config),
+        attestation_supported: model.attestation_supported,
+        architecture: ModelArchitecture::from_options(
+            model.input_modalities,
+            model.output_modalities,
+        ),
+        inference_url: model.inference_url,
+        hugging_face_id: model.hugging_face_id,
+        quantization: model.quantization,
+        max_output_length: model.max_output_length,
+        supported_sampling_parameters: model.supported_sampling_parameters,
+        supported_features: model.supported_features,
+        datacenters: Datacenter::from_codes(model.datacenters),
+        is_ready: model.is_ready,
+        deprecation_date: model
+            .deprecation_date
+            .map(|date| date.format("%Y-%m-%dT%H:00:00Z").to_string()),
+        successor_model_id: model.successor_model_name,
+        openrouter_slug: model.openrouter_slug,
+        is_listed: Some(model.is_listed),
+    }
+}
+
+/// Create or update catalog models (and their aliases and history rows) the way the admin
+/// batch update did, without validation: setup calls are expected to be well formed.
+///
+/// The running provider pool is not touched. A model that must route needs to be among the
+/// mock pool's registered names, or be picked up by the provider refresh.
+pub async fn seed_models(
+    models: BatchUpdateModelApiRequest,
+    session_id: &str,
+) -> Vec<ModelWithPricing> {
+    let database = seed_database().await;
+    let model_repo = ModelRepository::new(database.pool().clone());
+    let alias_repo = ModelAliasRepository::new(database.pool().clone());
+    let changed_by = user_id_for_session(session_id);
+    let mut out = Vec::new();
+
+    for (model_name, request) in models {
+        let text_pricing = request.text_pricing.as_ref().map(|inner| {
+            inner.as_ref().map(|value| {
+                services::usage::TextPricingProfile::from_json(value.clone())
+                    .expect("textPricing must be a valid profile")
+            })
+        });
+        let projection = text_pricing
+            .as_ref()
+            .and_then(|profile| profile.as_ref())
+            .map(|profile| profile.legacy_projection().expect("textPricing projection"));
+
+        let provider_config = match request.provider_config.clone() {
+            Some(patch) => {
+                let stored = database
+                    .pool()
+                    .get()
+                    .await
+                    .expect("Failed to get database connection")
+                    .query_opt(
+                        "SELECT provider_config FROM models WHERE model_name = $1",
+                        &[&model_name],
+                    )
+                    .await
+                    .expect("read stored provider config")
+                    .and_then(|row| row.get::<_, Option<serde_json::Value>>(0));
+                Some(merge_provider_config(stored, patch))
+            }
+            None => None,
+        };
+
+        let db_request = UpdateModelPricingRequest {
+            input_cost_per_token: projection
+                .map(|(input, _, _)| input)
+                .or_else(|| request.input_cost_per_token.as_ref().map(|p| p.amount)),
+            output_cost_per_token: projection
+                .map(|(_, _, output)| output)
+                .or_else(|| request.output_cost_per_token.as_ref().map(|p| p.amount)),
+            cost_per_image: request.cost_per_image.as_ref().map(|p| p.amount),
+            cache_read_cost_per_token: projection.map(|(_, cached, _)| Some(cached)).or_else(
+                || {
+                    request
+                        .cache_read_cost_per_token
+                        .as_ref()
+                        .map(|inner| inner.as_ref().map(|p| p.amount))
+                },
+            ),
+            text_pricing: text_pricing.map(|inner| {
+                inner.map(|profile| serde_json::to_value(profile).expect("text pricing serializes"))
+            }),
+            model_display_name: request.model_display_name.clone(),
+            model_description: request.model_description.clone(),
+            model_icon: request.model_icon.clone(),
+            context_length: request.context_length,
+            verifiable: request.verifiable,
+            is_active: request.is_active,
+            allow_free: request.allow_free,
+            is_listed: request.is_listed,
+            aliases: request.aliases.clone(),
+            owned_by: request.owned_by.clone(),
+            provider_type: request.provider_type.clone(),
+            provider_config,
+            expected_provider_config: None,
+            attestation_supported: request.attestation_supported,
+            input_modalities: request.input_modalities.clone(),
+            output_modalities: request.output_modalities.clone(),
+            inference_url: request.inference_url.clone(),
+            hugging_face_id: request.hugging_face_id.clone(),
+            quantization: request.quantization.clone(),
+            max_output_length: request.max_output_length,
+            supported_sampling_parameters: request.supported_sampling_parameters.clone(),
+            supported_features: request.supported_features.clone(),
+            datacenters: Datacenter::to_codes(request.datacenters.clone()),
+            is_ready: request.is_ready,
+            deprecation_date: request.deprecation_date.as_ref().map(|inner| {
+                inner
+                    .as_deref()
+                    .map(|value| parse_deprecation_date(value).expect("valid deprecationDate"))
+            }),
+            successor_model_name: request
+                .successor_model_id
+                .as_ref()
+                .map(|inner| inner.as_ref().map(|name| name.trim().to_string())),
+            openrouter_slug: request.openrouter_slug.clone(),
+            change_reason: request.change_reason.clone(),
+            changed_by_user_id: Some(changed_by),
+            changed_by_user_email: Some(MOCK_ADMIN_EMAIL.to_string()),
+        };
+
+        let model = model_repo
+            .upsert_model_pricing(&model_name, &db_request)
+            .await
+            .expect("Failed to seed model");
+        if let Some(alias_names) = &request.aliases {
+            alias_repo
+                .upsert_aliases_for_model(&model.id, alias_names)
+                .await
+                .expect("Failed to seed model aliases");
+        }
+
+        out.push(ModelWithPricing {
+            upcoming_pricing: None,
+            model_id: model_name,
+            input_cost_per_token: usd_price(model.input_cost_per_token),
+            output_cost_per_token: usd_price(model.output_cost_per_token),
+            cost_per_image: usd_price(model.cost_per_image),
+            cache_read_cost_per_token: model.cache_read_cost_per_token.map(usd_price),
+            text_pricing: model.text_pricing.clone(),
+            metadata: model_metadata(model),
+        });
+    }
+    out
+}
+
+/// One page of the admin model listing, ordered by name, with the active aliases of each.
+pub async fn seed_list_models_page(
+    include_inactive: bool,
+    limit: i64,
+    offset: i64,
+) -> (Vec<AdminModelWithPricing>, i64) {
+    let database = seed_database().await;
+    let client = database
+        .pool()
+        .get()
+        .await
+        .expect("Failed to get database connection");
+    let total: i64 = client
+        .query_one(
+            "SELECT COUNT(*) FROM models WHERE ($1 OR is_active = true)",
+            &[&include_inactive],
+        )
+        .await
+        .expect("count models")
+        .get(0);
+    let rows = client
+        .query(
+            &format!(
+                "SELECT {MODEL_COLUMNS},
+                        COALESCE(array_agg(a.alias_name) FILTER (WHERE a.alias_name IS NOT NULL), '{{}}') AS aliases
+                 FROM models m
+                 LEFT JOIN model_aliases a ON a.canonical_model_id = m.id AND a.is_active = true
+                 WHERE ($1 OR m.is_active = true)
+                 GROUP BY m.id
+                 ORDER BY m.model_name ASC
+                 LIMIT $2 OFFSET $3"
+            ),
+            &[&include_inactive, &limit, &offset],
+        )
+        .await
+        .expect("list models");
+    let models = rows
+        .iter()
+        .map(|row| {
+            let model = model_from_row(row, row.get("aliases"));
+            AdminModelWithPricing {
+                model_id: model.model_name.clone(),
+                input_cost_per_token: usd_price(model.input_cost_per_token),
+                output_cost_per_token: usd_price(model.output_cost_per_token),
+                cost_per_image: usd_price(model.cost_per_image),
+                cache_read_cost_per_token: model.cache_read_cost_per_token.map(usd_price),
+                text_pricing: model.text_pricing.clone(),
+                is_active: model.is_active,
+                created_at: model.created_at,
+                updated_at: model.updated_at,
+                metadata: model_metadata(model),
+            }
+        })
+        .collect();
+    (models, total)
 }

@@ -1133,23 +1133,11 @@ pub fn create_test_audio_base64() -> String {
 }
 
 pub async fn admin_batch_upsert_models(
-    server: &axum_test::TestServer,
+    _server: &axum_test::TestServer,
     models: BatchUpdateModelApiRequest,
     session_id: String,
 ) -> Vec<api::models::ModelWithPricing> {
-    let response = server
-        .patch("/v1/admin/models")
-        .add_header("Authorization", format!("Bearer {session_id}"))
-        .add_header("User-Agent", MOCK_USER_AGENT)
-        .json(&models)
-        .await;
-
-    assert_eq!(
-        response.status_code(),
-        200,
-        "Admin batch upsert should succeed"
-    );
-    response.json::<Vec<api::models::ModelWithPricing>>()
+    seeding::seed_models(models, &session_id).await
 }
 
 pub async fn list_models(
@@ -1268,28 +1256,16 @@ where
 /// matching complete scans make assertions on test-owned model IDs independent
 /// of those transient offset shifts.
 pub async fn list_all_admin_models(
-    server: &axum_test::TestServer,
+    _server: &axum_test::TestServer,
     include_inactive: bool,
 ) -> Vec<api::models::AdminModelWithPricing> {
     collect_stable_offset_pages(
         1000,
         std::time::Duration::from_secs(10),
         |offset, limit| async move {
-            let response = server
-                .get(&format!(
-                    "/v1/admin/models?limit={limit}&offset={offset}&include_inactive={include_inactive}"
-                ))
-                .add_header("Authorization", format!("Bearer {}", get_session_id()))
-                .add_header("User-Agent", MOCK_USER_AGENT)
-                .await;
-            assert_eq!(response.status_code(), 200, "{}", response.text());
-            let page = response.json::<api::models::AdminModelListResponse>();
-            assert_eq!(page.limit, limit, "admin model page limit changed");
-            assert_eq!(page.offset, offset, "admin model page offset changed");
-            OffsetPage {
-                items: page.models,
-                total: page.total,
-            }
+            let (items, total) =
+                seeding::seed_list_models_page(include_inactive, limit, offset).await;
+            OffsetPage { items, total }
         },
         |model| model.model_id.clone(),
     )

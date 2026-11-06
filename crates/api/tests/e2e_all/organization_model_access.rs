@@ -817,7 +817,7 @@ fn every_registered_route_has_a_model_access_decision() {
         ("GET", "/ohttp/config"),
         ("GET", "/docs"),
         ("GET", "/api-docs/openapi.json"),
-        // Sign-in and invitations.
+        // Sign-in.
         ("POST", "/near"),
         ("GET", "/login"),
         ("GET", "/github"),
@@ -825,8 +825,6 @@ fn every_registered_route_has_a_model_access_decision() {
         ("GET", "/callback"),
         ("GET", "/user"),
         ("POST", "/logout"),
-        ("GET", "/{token}"),
-        ("POST", "/{token}/accept"),
         // Retired response history always returns authenticated 410.
         ("ANY", "/responses/{response_id}"),
         ("ANY", "/responses/{response_id}/cancel"),
@@ -843,19 +841,6 @@ fn every_registered_route_has_a_model_access_decision() {
         ("ANY", "/conversations/{conversation_id}/{*legacy_path}"),
         // Looked up by chat id. The `model` query parameter is not read.
         ("GET", "/signature/{chat_id}"),
-        ("GET", "/organizations/{org_id}/workspaces"),
-        ("POST", "/organizations/{org_id}/workspaces"),
-        ("GET", "/workspaces/{workspace_id}"),
-        ("PUT", "/workspaces/{workspace_id}"),
-        ("DELETE", "/workspaces/{workspace_id}"),
-        ("GET", "/workspaces/{workspace_id}/api-keys"),
-        ("POST", "/workspaces/{workspace_id}/api-keys"),
-        ("DELETE", "/workspaces/{workspace_id}/api-keys/{key_id}"),
-        ("PATCH", "/workspaces/{workspace_id}/api-keys/{key_id}"),
-        (
-            "PATCH",
-            "/workspaces/{workspace_id}/api-keys/{key_id}/spend-limit",
-        ),
         ("ANY", "/files"),
         ("ANY", "/files/"),
         ("ANY", "/files/{file_id}"),

@@ -248,3 +248,56 @@ async fn test_api_key_authentication() {
 
     println!("✓ API key authentication working correctly");
 }
+
+// ============================================
+// API Key Expiration Tests
+// ============================================
+
+#[tokio::test]
+async fn test_expired_api_key_is_rejected_and_future_expiry_is_accepted() {
+    let server = setup_test_server().await;
+    let org = setup_org_with_credits(&server, 10000000000i64).await;
+    let workspaces = list_workspaces(&server, org.id.clone()).await;
+    let workspace = workspaces.first().unwrap();
+    let expiring =
+        create_api_key_in_workspace(&server, workspace.id.clone(), "Expiring".to_string()).await;
+    let expiring_key = expiring.key.clone().unwrap();
+
+    let set_expiry = |offset: &'static str| {
+        let id = uuid::Uuid::parse_str(&expiring.id).expect("api key id");
+        async move {
+            seeding::seed_database()
+                .await
+                .pool()
+                .get()
+                .await
+                .unwrap()
+                .execute(
+                    &format!("UPDATE api_keys SET expires_at = NOW() + INTERVAL '{offset}' WHERE id = $1"),
+                    &[&id],
+                )
+                .await
+                .expect("Failed to set API key expiry");
+        }
+    };
+    let status = |key: String| {
+        let server = &server;
+        async move {
+            server
+                .get("/v1/files?limit=1")
+                .add_header("Authorization", format!("Bearer {key}"))
+                .await
+                .status_code()
+        }
+    };
+
+    set_expiry("1 day").await;
+    assert_eq!(status(expiring_key.clone()).await, 200);
+
+    set_expiry("-1 minute").await;
+    assert_eq!(
+        status(expiring_key).await,
+        401,
+        "an expired API key must be rejected"
+    );
+}

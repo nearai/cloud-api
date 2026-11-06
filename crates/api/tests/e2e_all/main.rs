@@ -42,6 +42,7 @@ mod function_tools;
 mod general;
 mod glm52_tier_routing;
 mod health;
+mod inactive_user_guards;
 mod ita_attestation;
 mod mcp_server;
 mod message_metadata;

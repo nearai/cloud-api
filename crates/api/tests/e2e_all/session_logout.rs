@@ -7,6 +7,7 @@
 
 use crate::common::*;
 use database::repositories::SessionRepository;
+use services::auth::{AuthServiceTrait, MockAuthService, SessionId, UserId};
 use std::sync::Arc;
 
 /// Browser-like User-Agent; the session repository normalizes version
@@ -60,6 +61,33 @@ async fn create_session(
     (session.id, refresh_token)
 }
 
+/// Mint a session-bound access token for `session_id`. The token endpoint was removed, so
+/// sign it with the key the test servers use, as the handler did (`sid` claim set).
+fn session_access_token(user_id: uuid::Uuid, session_id: Option<uuid::Uuid>) -> String {
+    MockAuthService {
+        apikey_repository: Arc::new(database::repositories::ApiKeyRepository::new(
+            database::DbPool::uninitialized(),
+        )),
+    }
+    .create_session_access_token(
+        UserId(user_id),
+        session_id.map(SessionId),
+        test_config().auth.encoding_key,
+        1,
+    )
+    .expect("Failed to mint access token")
+}
+
+/// Status of a session-authenticated route that stayed after the identity routes went.
+async fn me_status(server: &axum_test::TestServer, access_token: &str) -> u16 {
+    server
+        .get("/v1/auth/user")
+        .add_header("Authorization", format!("Bearer {access_token}"))
+        .await
+        .status_code()
+        .as_u16()
+}
+
 async fn logout_status(server: &axum_test::TestServer, refresh_token: &str) -> u16 {
     server
         .post("/v1/auth/logout")
@@ -91,6 +119,138 @@ async fn cleanup_user(database: &Arc<database::Database>, user_id: uuid::Uuid) {
         .execute("DELETE FROM users WHERE id = $1", &[&user_id])
         .await
         .expect("Failed to clean up test user");
+}
+
+#[tokio::test]
+async fn test_logout_invalidates_access_and_refresh_tokens() {
+    let (server, database) = real_auth_server().await;
+    let user_id = create_real_user(&database).await;
+    let (session_id, refresh_token) = create_session(&database, user_id).await;
+    let access_token = session_access_token(user_id, Some(session_id));
+
+    assert_eq!(me_status(&server, &access_token).await, 200);
+
+    assert_eq!(logout_status(&server, &refresh_token).await, 200);
+
+    assert_eq!(
+        me_status(&server, &access_token).await,
+        401,
+        "access token must be invalid after logout"
+    );
+    assert_eq!(
+        logout_status(&server, &refresh_token).await,
+        401,
+        "refresh token must be invalid after logout"
+    );
+    assert!(
+        !session_row_exists(&database, session_id).await,
+        "refresh-token session row must be gone after logout"
+    );
+
+    cleanup_user(&database, user_id).await;
+}
+
+#[tokio::test]
+async fn test_logout_revokes_only_the_current_session() {
+    let (server, database) = real_auth_server().await;
+    let user_id = create_real_user(&database).await;
+    let (session_a_id, refresh_a) = create_session(&database, user_id).await;
+    let (session_b_id, refresh_b) = create_session(&database, user_id).await;
+    let access_a = session_access_token(user_id, Some(session_a_id));
+    let access_b = session_access_token(user_id, Some(session_b_id));
+
+    assert_eq!(logout_status(&server, &refresh_a).await, 200);
+
+    assert_eq!(me_status(&server, &access_a).await, 401);
+    assert!(!session_row_exists(&database, session_a_id).await);
+
+    assert_eq!(me_status(&server, &access_b).await, 200);
+    assert!(session_row_exists(&database, session_b_id).await);
+    // The refresh token of the other session still authenticates.
+    assert_eq!(logout_status(&server, &refresh_b).await, 200);
+    assert_eq!(me_status(&server, &access_b).await, 401);
+
+    cleanup_user(&database, user_id).await;
+}
+
+#[tokio::test]
+async fn test_fresh_login_after_logout_creates_independent_session() {
+    let (server, database) = real_auth_server().await;
+    let user_id = create_real_user(&database).await;
+    let (session_id, refresh_token) = create_session(&database, user_id).await;
+    let access_token = session_access_token(user_id, Some(session_id));
+
+    assert_eq!(logout_status(&server, &refresh_token).await, 200);
+    assert_eq!(me_status(&server, &access_token).await, 401);
+
+    let (new_session_id, new_refresh) = create_session(&database, user_id).await;
+    let new_access = session_access_token(user_id, Some(new_session_id));
+    assert_eq!(me_status(&server, &new_access).await, 200);
+
+    assert_eq!(me_status(&server, &access_token).await, 401);
+    assert_eq!(logout_status(&server, &new_refresh).await, 200);
+    assert_eq!(me_status(&server, &new_access).await, 401);
+    assert!(!session_row_exists(&database, new_session_id).await);
+
+    cleanup_user(&database, user_id).await;
+}
+
+#[tokio::test]
+async fn test_legacy_access_token_without_sid_follows_compat_flag() {
+    let (server, database) = real_auth_server().await;
+    let user_id = create_real_user(&database).await;
+    let legacy_token = session_access_token(user_id, None);
+
+    // Default (compat window): legacy tokens still validate.
+    assert_eq!(me_status(&server, &legacy_token).await, 200);
+
+    // With the cutover flag on, tokens that cannot be tied to a live session are rejected...
+    let (strict_server, strict_database) = setup_test_server_with_config_and_database(|c| {
+        c.auth.mock = false;
+        c.auth.require_session_bound_access_tokens = true;
+    })
+    .await;
+    assert_eq!(me_status(&strict_server, &legacy_token).await, 401);
+
+    // ...while session-bound tokens keep working.
+    let strict_user_id = create_real_user(&strict_database).await;
+    let (strict_session_id, _) = create_session(&strict_database, strict_user_id).await;
+    let strict_token = session_access_token(strict_user_id, Some(strict_session_id));
+    assert_eq!(me_status(&strict_server, &strict_token).await, 200);
+
+    cleanup_user(&database, user_id).await;
+    cleanup_user(&strict_database, strict_user_id).await;
+}
+
+#[tokio::test]
+async fn test_logout_rejects_user_agent_mismatch_and_keeps_the_session() {
+    let (server, database) = real_auth_server().await;
+    let user_id = create_real_user(&database).await;
+    let (session_id, refresh_token) = create_session(&database, user_id).await;
+
+    let response = server
+        .post("/v1/auth/logout")
+        .add_header("Authorization", format!("Bearer {refresh_token}"))
+        .add_header("User-Agent", "Completely Different Agent/9.9")
+        .await;
+    assert_eq!(response.status_code(), 401);
+    assert!(session_row_exists(&database, session_id).await);
+
+    cleanup_user(&database, user_id).await;
+}
+
+#[tokio::test]
+async fn test_refresh_token_is_not_an_access_token() {
+    let (server, database) = real_auth_server().await;
+    let user_id = create_real_user(&database).await;
+    let (_, refresh_token) = create_session(&database, user_id).await;
+
+    assert_eq!(me_status(&server, &refresh_token).await, 401);
+    assert_eq!(me_status(&server, "not-a-token").await, 401);
+    let missing = server.get("/v1/auth/user").await;
+    assert_eq!(missing.status_code(), 401);
+
+    cleanup_user(&database, user_id).await;
 }
 
 #[tokio::test]

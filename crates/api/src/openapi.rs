@@ -134,48 +134,14 @@ Operations marked deprecated (account, organization, workspace, invitation, API 
         // Usage endpoints
         // Staking farm endpoints
         // Customer reporting endpoints
-        // Feature request endpoints
-        crate::routes::feature_requests::submit_feature_request,
-        crate::routes::feature_requests::list_admin_feature_requests,
         // Gateway endpoints (model gateway integration)
         crate::routes::gateway::check_api_key,
         // Billing endpoints (HuggingFace integration)
         // Admin endpoints (less frequently used)
-        crate::routes::admin::list_models,
-        crate::routes::admin::batch_upsert_models,
-        crate::routes::admin::delete_model,
-        crate::routes::admin::deprecate_model,
-        crate::routes::admin::preview_model_deprecation,
-        crate::routes::admin::confirm_model_deprecation,
-        crate::routes::admin::preview_model_pricing_changes,
         crate::routes::admin::preview_user_erasure,
         crate::routes::admin::erase_user,
         crate::routes::admin::lookup_user_erasures,
-        crate::routes::admin::confirm_model_pricing_changes,
-        crate::routes::admin::list_model_pricing_changes,
-        crate::routes::admin::cancel_model_pricing_change,
-        crate::routes::admin::get_model_history,
-        crate::routes::admin_model_access::get_model_access,
-        crate::routes::admin_model_access::grant_model_access,
-        crate::routes::admin_model_access::revoke_model_access,
-        crate::routes::admin_model_access::list_organization_model_access,
-        crate::routes::admin::update_organization_limits,
-        crate::routes::admin::get_organization_limits_history,
-        crate::routes::admin::list_aml_reports,
-        crate::routes::admin::update_aml_report_status,
-        crate::routes::admin::list_aml_allowlist,
-        crate::routes::admin::upsert_aml_allowlist_entry,
-        crate::routes::admin::delete_aml_allowlist_entry,
-        crate::routes::admin::update_organization_concurrent_limit,
-        crate::routes::admin::get_organization_concurrent_limit,
-        crate::routes::admin::get_organization_fallback,
-        crate::routes::admin::get_organization_priority,
-        crate::routes::admin::update_organization_priority,
-        crate::routes::admin::update_organization_fallback,
         crate::routes::admin::get_infra_summary,
-        crate::routes::admin::list_admin_settings,
-        crate::routes::admin::get_admin_setting,
-        crate::routes::admin::update_admin_setting,
         crate::routes::admin::list_invitation_email_deliveries,
         crate::routes::admin::resend_invitation_email,
         crate::routes::admin::update_organization_member_role,
@@ -184,8 +150,6 @@ Operations marked deprecated (account, organization, workspace, invitation, API 
         crate::routes::admin::delete_admin_access_token,
         crate::routes::services::list_services,
         crate::routes::services::get_service_by_name,
-        crate::routes::admin::create_service,
-        crate::routes::admin::update_service,
         // Health check endpoint
         crate::routes::health::health_check,
         // Attestation endpoints
@@ -224,11 +188,7 @@ Operations marked deprecated (account, organization, workspace, invitation, API 
             UpdateOrganizationRequest, CreateApiKeyRequest, ApiKeyResponse,
             UpdateApiKeySpendLimitRequest, UpdateApiKeyRequest,
             // usage_hourly repair models
-            crate::routes::admin_model_access::ModelAccessResponse,
-            crate::routes::admin_model_access::ModelAccessGrantResponse,
-            crate::routes::admin_model_access::OrganizationModelAccessResponse,
-            crate::routes::admin_model_access::OrganizationModelAccessEntry,
-            // Workspace models
+                            // Workspace models
             crate::routes::workspaces::CreateWorkspaceRequest,
             crate::routes::workspaces::UpdateWorkspaceRequest,
             crate::routes::workspaces::WorkspaceResponse,
@@ -319,21 +279,11 @@ Operations marked deprecated (account, organization, workspace, invitation, API 
             CreateAdminAccessTokenRequest, AdminAccessTokenResponse,
             AdminAccessTokenPermission, AdminAccessTokenListEntry, ListAdminAccessTokensResponse,
             // Admin settings models
-            crate::routes::admin::AdminSettingResponse,
-            crate::routes::admin::ListAdminSettingsResponse,
             // Usage tracking models
             crate::routes::internal_usage::RecordUsageResponse,
             // Staking farm models
             // Customer reporting models
-            // Feature request models
-            crate::routes::feature_requests::FeatureRequestKind,
-            crate::routes::feature_requests::SubmitFeatureRequest,
-            crate::routes::feature_requests::SubmitFeatureRequestResponse,
-            crate::routes::feature_requests::FeatureRequestTargetResponse,
-            crate::routes::feature_requests::FeatureRequestVoteResponse,
-            crate::routes::feature_requests::AdminFeatureRequestSummaryResponse,
-            crate::routes::feature_requests::AdminFeatureRequestListResponse,
-            // Gateway models
+                                        // Gateway models
             crate::routes::gateway::CheckApiKeyResponse,
             // Billing models (HuggingFace integration)
             // Organization metrics (admin)

@@ -88,5 +88,3 @@ pub mod organization_usage_discount;
 
 pub mod staking_wallet_binding;
 pub use staking_wallet_binding::PostgresStakingBindingRepository;
-
-

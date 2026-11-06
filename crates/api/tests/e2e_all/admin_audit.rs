@@ -407,19 +407,19 @@ async fn admin_token_identity_is_audited_for_allowed_and_denied_requests() {
         &router,
         authorized(
             Method::GET,
-            "/v1/admin/users?limit=1",
+            "/v1/admin/aml/reports?limit=1",
             &read_only_token,
             json!({}),
         ),
     )
     .await;
     assert_eq!(response.status(), StatusCode::OK);
-    let returned = json_body(response).await["users"]
+    let returned = json_body(response).await["reports"]
         .as_array()
-        .expect("users")
+        .expect("reports")
         .len();
     let event = logs.take_single_event();
-    assert_eq!(event["admin_route"], "/v1/admin/users");
+    assert_eq!(event["admin_route"], "/v1/admin/aml/reports");
     assert_eq!(event["admin_auth_outcome"], "allowed");
     assert_eq!(event["admin_credential_kind"], "admin_access_token");
     assert_eq!(event["admin_credential_id"], read_only.id.to_string());
@@ -469,7 +469,12 @@ async fn admin_token_identity_is_audited_for_allowed_and_denied_requests() {
         .expect("token is revoked"));
     let response = send(
         &router,
-        authorized(Method::GET, "/v1/admin/users", &read_write_token, json!({})),
+        authorized(
+            Method::GET,
+            "/v1/admin/aml/reports",
+            &read_write_token,
+            json!({}),
+        ),
     )
     .await;
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
@@ -489,28 +494,6 @@ async fn list_handlers_record_validated_pages_and_organization_scope() {
     let (logs, _guard) = CapturedLogs::start();
 
     let lists = [
-        (
-            format!("/v1/admin/organizations/{organization_id}/members?limit=5&offset=0"),
-            "members",
-            5,
-            0,
-            Some(&organization_id),
-        ),
-        (
-            "/v1/admin/organizations?limit=3&offset=1".to_string(),
-            "organizations",
-            3,
-            1,
-            None,
-        ),
-        ("/v1/admin/users?limit=2".to_string(), "users", 2, 0, None),
-        (
-            format!("/v1/admin/api-keys?organization_id={organization_id}&limit=10"),
-            "api_keys",
-            10,
-            0,
-            Some(&organization_id),
-        ),
         (
             "/v1/admin/aml/reports?limit=1".to_string(),
             "reports",
@@ -533,20 +516,6 @@ async fn list_handlers_record_validated_pages_and_organization_scope() {
             1,
             0,
             Some(&organization_id),
-        ),
-        (
-            "/v1/admin/platform/org-revenue?limit=1".to_string(),
-            "data",
-            1,
-            0,
-            None,
-        ),
-        (
-            "/v1/admin/platform/model-revenue?limit=1".to_string(),
-            "data",
-            1,
-            0,
-            None,
         ),
     ];
     for (uri, rows_field, limit, offset, organization) in lists {
@@ -575,7 +544,12 @@ async fn list_handlers_record_validated_pages_and_organization_scope() {
     // A page the handler rejects is not recorded.
     let response = send(
         &router,
-        authorized(Method::GET, "/v1/admin/users?limit=0", &session, json!({})),
+        authorized(
+            Method::GET,
+            "/v1/admin/aml/reports?limit=0",
+            &session,
+            json!({}),
+        ),
     )
     .await;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);

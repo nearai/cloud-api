@@ -1,305 +1,11 @@
-use crate::admin_provider_attribution_support::setup_platform_provider_usage_fixture;
+use crate::admin_provider_attribution_support::{
+    setup_platform_provider_usage_fixture, PlatformProviderUsageFixture,
+};
 use crate::common::*;
 use chrono::Utc;
-use serde_json::{json, Value};
+use database::repositories::PgAnalyticsRepository;
+use services::admin::{AnalyticsRepository, OrganizationMetrics, TimeSeriesMetrics};
 use uuid::Uuid;
-
-#[tokio::test]
-async fn admin_metrics_credit_type_uses_saved_allocations() {
-    let fixture = setup_platform_provider_usage_fixture().await;
-    let client = fixture.database.pool().get().await.unwrap();
-    let org = fixture.organization_id;
-    let mut limits = std::collections::HashMap::new();
-    for kind in ["grant", "payment", "postpay"] {
-        // Deliberately expired and with no current capacity: attribution must
-        // come from the immutable ledger, not current credit configuration.
-        let id: Uuid = client.query_one(
-            "INSERT INTO organization_limits_history (organization_id, credit_type, spend_limit, effective_until)
-             VALUES ($1, $2, 0, NOW() - INTERVAL '1 day') RETURNING id",
-            &[&org, &kind],
-        ).await.unwrap().get(0);
-        limits.insert(kind, id);
-    }
-    let mut ids = Vec::new();
-    for (date, dollars) in [
-        ("2026-09-01T00:00:00Z", 10_i64),
-        ("2026-09-02T00:00:00Z", 5),
-        ("2026-09-03T00:00:00Z", 7),   // historical, no attribution
-        ("2026-09-04T00:00:00Z", 0),   // zero-cost request
-        ("2026-09-05T00:00:00Z", 6),   // payment only
-        ("2026-09-22T00:00:00Z", 100), // exclusive end
-        ("2026-08-31T23:59:59Z", 100), // before start
-    ] {
-        let id = Uuid::new_v4();
-        let created_at = chrono::DateTime::parse_from_rfc3339(date)
-            .unwrap()
-            .with_timezone(&Utc);
-        let cost = dollars * 1_000_000_000;
-        client
-            .execute(
-                "INSERT INTO organization_usage_log
-             (id, organization_id, workspace_id, api_key_id, model_id, model_name,
-              input_tokens, output_tokens, cache_read_tokens, total_tokens,
-              input_cost, output_cost, total_cost, request_type, created_at)
-             VALUES ($1,$2,$3,$4,$5,$6,100,20,10,120,$7,0,$7,'chat_completion',$8)",
-                &[
-                    &id,
-                    &org,
-                    &fixture.workspace_id,
-                    &fixture.api_key_id,
-                    &fixture.model_id,
-                    &fixture.model_name,
-                    &cost,
-                    &created_at,
-                ],
-            )
-            .await
-            .unwrap();
-        ids.push(id);
-    }
-    for (index, kind, dollars, phase) in [
-        (0, "grant", 3_i64, "posting"),
-        (0, "payment", 2, "posting"),
-        (0, "postpay", 1, "posting"),
-        (0, "postpay", 4, "overage_settlement"),
-        (1, "postpay", 5, "overage_settlement"),
-        (4, "payment", 6, "posting"),
-        (5, "postpay", 100, "posting"),
-        (6, "postpay", 100, "posting"),
-    ] {
-        client
-            .execute(
-                "INSERT INTO usage_credit_allocations
-             (organization_id, inference_usage_id, credit_type, amount, organization_limit_id,
-              policy_version, priority_position, allocation_phase, created_at)
-             VALUES ($1,$2,$3,$4,$5,'test',0,$6,'2026-10-01')",
-                &[
-                    &org,
-                    &ids[index],
-                    &kind,
-                    &(dollars * 1_000_000_000),
-                    &limits[kind],
-                    &phase,
-                ],
-            )
-            .await
-            .unwrap();
-    }
-    for (index, funded, unfunded) in [
-        (0, 6_i64, 4_i64),
-        (1, 0, 5),
-        (3, 0, 0),
-        (4, 6, 0),
-        (5, 100, 0),
-        (6, 100, 0),
-    ] {
-        client
-            .execute(
-                "UPDATE organization_usage_log SET funded_amount = $2, unfunded_amount = $3,
-             allocation_policy_version = 'test' WHERE id = $1",
-                &[
-                    &ids[index],
-                    &(funded * 1_000_000_000),
-                    &(unfunded * 1_000_000_000),
-                ],
-            )
-            .await
-            .unwrap();
-    }
-    // Platform-service allocations must not expand the existing inference-only scope.
-    let service: Uuid = client
-        .query_one(
-            "INSERT INTO services (service_name, display_name, unit, cost_per_unit)
-         VALUES ($1,'Credit metrics fixture','request',1000000000) RETURNING id",
-            &[&format!("credit-metrics-{}", Uuid::new_v4())],
-        )
-        .await
-        .unwrap()
-        .get(0);
-    let service_usage: Uuid = client
-        .query_one(
-            "INSERT INTO organization_service_usage_log
-         (organization_id,workspace_id,api_key_id,service_id,quantity,total_cost,created_at)
-         VALUES ($1,$2,$3,$4,1,1000000000,'2026-09-02') RETURNING id",
-            &[&org, &fixture.workspace_id, &fixture.api_key_id, &service],
-        )
-        .await
-        .unwrap()
-        .get(0);
-    client.execute(
-        "INSERT INTO usage_credit_allocations
-         (organization_id,service_usage_id,credit_type,amount,organization_limit_id,policy_version,priority_position)
-         VALUES ($1,$2,'postpay',1000000000,$3,'test',0)",
-        &[&org, &service_usage, &limits["postpay"]],
-    ).await.unwrap();
-    // Unfiltered reports read usage_hourly (spec §6.2): recompute every seeded hour, from
-    // the "before start" row through the "exclusive end" row, in one pass.
-    let hour = |t: &str| {
-        chrono::DateTime::parse_from_rfc3339(t)
-            .unwrap()
-            .with_timezone(&Utc)
-    };
-    crate::usage_hourly::recompute_usage_hours(
-        hour("2026-08-31T23:00:00Z"),
-        hour("2026-09-22T01:00:00Z"),
-    )
-    .await;
-    // Two sources for postpay, but only two matching inference requests.
-    let range = "start=2026-09-01T00:00:00Z&end=2026-09-22T00:00:00Z";
-    for (filter, cost, requests, days) in [
-        ("", 28.0, 5_i64, 5_usize),
-        ("&credit_type=postpay", 10.0, 2, 2),
-        ("&credit_type=POSTPAY", 10.0, 2, 2),
-        ("&credit_type=grant", 3.0, 1, 1),
-        ("&credit_type=payment", 8.0, 2, 2),
-        ("&credit_type=staking_farm", 0.0, 0, 0),
-    ] {
-        let response = fixture
-            .server
-            .get(&format!(
-                "/v1/admin/organizations/{org}/metrics?{range}{filter}"
-            ))
-            .add_header("Authorization", format!("Bearer {}", get_session_id()))
-            .await;
-        assert_eq!(response.status_code(), 200, "{}", response.text());
-        let metrics: Value = response.json();
-        assert_eq!(metrics["summary"]["total_cost_usd"], cost, "{filter}");
-        assert_eq!(metrics["summary"]["total_requests"], requests, "{filter}");
-        assert_eq!(metrics["summary"]["total_input_tokens"], requests * 100);
-        assert_eq!(metrics["summary"]["total_output_tokens"], requests * 20);
-        assert_eq!(metrics["summary"]["total_cache_read_tokens"], requests * 10);
-        assert_eq!(
-            metrics["summary"]["unique_api_keys"],
-            i64::from(requests > 0)
-        );
-        for dimension in ["by_workspace", "by_api_key", "by_model"] {
-            let rows = metrics[dimension].as_array().unwrap();
-            assert_eq!(
-                rows.iter()
-                    .map(|row| row["cost_usd"].as_f64().unwrap())
-                    .sum::<f64>(),
-                cost
-            );
-            assert_eq!(
-                rows.iter()
-                    .map(|row| row["requests"].as_i64().unwrap())
-                    .sum::<i64>(),
-                requests
-            );
-        }
-        for granularity in ["hour", "day", "week"] {
-            let response = fixture.server.get(&format!("/v1/admin/organizations/{org}/metrics/timeseries?{range}{filter}&granularity={granularity}"))
-                .add_header("Authorization", format!("Bearer {}", get_session_id())).await;
-            assert_eq!(response.status_code(), 200, "{}", response.text());
-            let metrics: Value = response.json();
-            let points = metrics["data"].as_array().unwrap();
-            if granularity == "day" {
-                assert_eq!(points.len(), days);
-            }
-            assert_eq!(
-                points
-                    .iter()
-                    .map(|p| p["cost_usd"].as_f64().unwrap())
-                    .sum::<f64>(),
-                cost
-            );
-            assert_eq!(
-                points
-                    .iter()
-                    .map(|p| p["requests"].as_i64().unwrap())
-                    .sum::<i64>(),
-                requests
-            );
-            for (field, per_request) in [
-                ("input_tokens", 100),
-                ("output_tokens", 20),
-                ("cache_read_tokens", 10),
-            ] {
-                assert_eq!(
-                    points
-                        .iter()
-                        .map(|p| p[field].as_i64().unwrap())
-                        .sum::<i64>(),
-                    requests * per_request
-                );
-            }
-        }
-    }
-    for suffix in ["", "/timeseries"] {
-        let path = format!("/v1/admin/organizations/{org}/metrics{suffix}");
-        for invalid in ["unknown", "", "post-pay", "postpay%20"] {
-            let response = fixture
-                .server
-                .get(&format!("{path}?{range}&credit_type={invalid}"))
-                .add_header("Authorization", format!("Bearer {}", get_session_id()))
-                .await;
-            assert_eq!(response.status_code(), 400, "{}", response.text());
-            assert!(response.json::<Value>()["error"]["message"]
-                .as_str()
-                .unwrap()
-                .contains("invalid credit_type"));
-        }
-        let response = fixture
-            .server
-            .get(&format!("{path}?{range}&credit_type=postpay"))
-            .await;
-        assert_eq!(response.status_code(), 401);
-    }
-}
-
-#[tokio::test]
-async fn admin_metrics_credit_type_allows_read_only_tokens() {
-    let (server, _db) = setup_test_server_with_config_and_database(|config| {
-        config.auth.admin_read_only_tokens_enabled = true;
-    })
-    .await;
-    let org = create_org(&server).await;
-    let response = server.post("/v1/admin/access-tokens")
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
-        .add_header("User-Agent", MOCK_USER_AGENT)
-        .json(&json!({"name":"credit-metrics", "reason":"test", "expires_in_hours":24, "permission":"read_only"})).await;
-    assert_eq!(response.status_code(), 200, "{}", response.text());
-    let token = response
-        .json::<api::models::AdminAccessTokenResponse>()
-        .access_token;
-    for suffix in ["", "/timeseries"] {
-        let response = server
-            .get(&format!(
-                "/v1/admin/organizations/{}/metrics{suffix}?credit_type=postpay",
-                org.id
-            ))
-            .add_header("Authorization", format!("Bearer {token}"))
-            .add_header("User-Agent", MOCK_USER_AGENT)
-            .await;
-        assert_eq!(response.status_code(), 200, "{}", response.text());
-    }
-}
-
-#[test]
-fn admin_metrics_credit_type_is_documented() {
-    use utoipa::OpenApi;
-    let spec = serde_json::to_value(api::openapi::ApiDoc::openapi()).unwrap();
-    let mut descriptions = Vec::new();
-    for path in [
-        "/v1/admin/organizations/{org_id}/metrics",
-        "/v1/admin/organizations/{org_id}/metrics/timeseries",
-    ] {
-        let parameter = spec["paths"][path]["get"]["parameters"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|p| p["name"] == "credit_type")
-            .expect("credit_type parameter");
-        assert_eq!(parameter["in"], "query");
-        assert_eq!(parameter["required"], false);
-        descriptions.push(parameter["description"].clone());
-        assert!(parameter["description"]
-            .as_str()
-            .unwrap()
-            .contains("settlements"));
-    }
-    assert_eq!(descriptions[0], descriptions[1]);
-}
 
 #[tokio::test]
 async fn admin_metrics_credit_type_timeout_is_shared_and_transaction_local() {
@@ -437,6 +143,37 @@ fn url_time(t: chrono::DateTime<Utc>) -> String {
     t.to_rfc3339().replace('+', "%2B")
 }
 
+async fn org_metrics(
+    fixture: &PlatformProviderUsageFixture,
+    start: chrono::DateTime<Utc>,
+    end: chrono::DateTime<Utc>,
+    credit_type: Option<&str>,
+) -> OrganizationMetrics {
+    PgAnalyticsRepository::new(fixture.database.pool().clone())
+        .get_organization_metrics(fixture.organization_id, start, end, credit_type)
+        .await
+        .expect("organization metrics")
+}
+
+async fn org_series(
+    fixture: &PlatformProviderUsageFixture,
+    start: chrono::DateTime<Utc>,
+    end: chrono::DateTime<Utc>,
+    granularity: &str,
+    credit_type: Option<&str>,
+) -> TimeSeriesMetrics {
+    PgAnalyticsRepository::new(fixture.database.pool().clone())
+        .get_organization_timeseries(
+            fixture.organization_id,
+            start,
+            end,
+            granularity,
+            credit_type,
+        )
+        .await
+        .expect("organization timeseries")
+}
+
 async fn session_json<T: serde::de::DeserializeOwned>(
     server: &axum_test::TestServer,
     path: &str,
@@ -457,7 +194,6 @@ fn assert_close(actual: Option<f64>, expected: f64) {
 
 #[tokio::test]
 async fn org_reports_read_usage_hourly_over_whole_hours() {
-    use services::admin::{OrganizationMetrics, TimeSeriesMetrics};
     let fixture = setup_platform_provider_usage_fixture().await;
     let org = fixture.organization_id;
     let hour = chrono::Duration::hours(1);
@@ -479,21 +215,13 @@ async fn org_reports_read_usage_hourly_over_whole_hours() {
     let range = format!("start={}&end={}", url_time(h), url_time(h + hour * 2));
 
     // Settled hours not recomputed yet (the late-row case the repair endpoint covers): empty.
-    let before: OrganizationMetrics = session_json(
-        &fixture.server,
-        &format!("/v1/admin/organizations/{org}/metrics?{range}"),
-    )
-    .await;
+    let before: OrganizationMetrics = org_metrics(&fixture, h, h + hour * 2, None).await;
     assert_eq!((before.period_start, before.period_end), (h, h + hour * 2));
     assert_eq!(before.summary.total_requests, 0);
 
     crate::usage_hourly::recompute_usage_hours(h, h + hour * 2).await;
 
-    let metrics: OrganizationMetrics = session_json(
-        &fixture.server,
-        &format!("/v1/admin/organizations/{org}/metrics?{range}"),
-    )
-    .await;
+    let metrics: OrganizationMetrics = org_metrics(&fixture, h, h + hour * 2, None).await;
     assert_eq!(
         (metrics.period_start, metrics.period_end),
         (h, h + hour * 2)
@@ -519,11 +247,7 @@ async fn org_reports_read_usage_hourly_over_whole_hours() {
     // Review Focus 2: no ITL samples at all stays null, not zero.
     assert_eq!((model.avg_itl_ms, model.p95_itl_ms), (None, None));
 
-    let series: TimeSeriesMetrics = session_json(
-        &fixture.server,
-        &format!("/v1/admin/organizations/{org}/metrics/timeseries?{range}&granularity=hour"),
-    )
-    .await;
+    let series: TimeSeriesMetrics = org_series(&fixture, h, h + hour * 2, "hour", None).await;
     assert_eq!((series.period_start, series.period_end), (h, h + hour * 2));
     let points: Vec<(String, i64)> = series
         .data
@@ -560,9 +284,8 @@ async fn org_reports_read_usage_hourly_over_whole_hours() {
 /// equals the sum of its parts.
 #[tokio::test]
 async fn org_metrics_count_ttft_under_thresholds() {
-    use services::admin::{MetricsSummary, ModelMetrics, OrganizationMetrics};
+    use services::admin::{MetricsSummary, ModelMetrics};
     let fixture = setup_platform_provider_usage_fixture().await;
-    let org = fixture.organization_id;
     let hour = chrono::Duration::hours(1);
     let (h, _) = crate::admin_provider_attribution_support::isolated_usage_hours(&fixture, 2).await;
     let minutes = chrono::Duration::minutes;
@@ -597,13 +320,7 @@ async fn org_metrics_count_ttft_under_thresholds() {
         ]
     }
     let get = |from: chrono::DateTime<Utc>, to: chrono::DateTime<Utc>| {
-        let path = format!(
-            "/v1/admin/organizations/{org}/metrics?start={}&end={}",
-            url_time(from),
-            url_time(to)
-        );
-        let server = &fixture.server;
-        async move { session_json::<OrganizationMetrics>(server, &path).await }
+        org_metrics(&fixture, from, to, None)
     };
 
     // Whole hours: served from usage_hourly.
@@ -632,7 +349,6 @@ async fn org_metrics_count_ttft_under_thresholds() {
 /// requested range.
 #[tokio::test]
 async fn org_credit_type_reports_stay_raw_live_and_exact() {
-    use services::admin::{OrganizationMetrics, TimeSeriesMetrics};
     let fixture = setup_platform_provider_usage_fixture().await;
     let org = fixture.organization_id;
     // An hour no other test recomputes, so "not recomputed yet" is deterministic.
@@ -686,13 +402,8 @@ async fn org_credit_type_reports_stay_raw_live_and_exact() {
     }
     // Nothing is recomputed. [h, h + 30m) holds four rows: 5000 ms, NULL, 10000 ms and 60000 ms.
     let end = h + chrono::Duration::minutes(30);
-    let range = format!("start={}&end={}", url_time(h), url_time(end));
 
-    let filtered: OrganizationMetrics = session_json(
-        &fixture.server,
-        &format!("/v1/admin/organizations/{org}/metrics?{range}&credit_type=postpay"),
-    )
-    .await;
+    let filtered: OrganizationMetrics = org_metrics(&fixture, h, end, Some("postpay")).await;
     assert_eq!(
         (filtered.period_start, filtered.period_end),
         (h, end),
@@ -723,19 +434,11 @@ async fn org_credit_type_reports_stay_raw_live_and_exact() {
         [3, 0, 1, 2]
     );
 
-    let series: TimeSeriesMetrics = session_json(
-        &fixture.server,
-        &format!("/v1/admin/organizations/{org}/metrics/timeseries?{range}&credit_type=postpay&granularity=hour"),
-    )
-    .await;
+    let series: TimeSeriesMetrics = org_series(&fixture, h, end, "hour", Some("postpay")).await;
     assert_eq!((series.period_start, series.period_end), (h, end));
     assert_eq!(series.data.iter().map(|p| p.requests).sum::<i64>(), 4);
 
-    let unfiltered: OrganizationMetrics = session_json(
-        &fixture.server,
-        &format!("/v1/admin/organizations/{org}/metrics?{range}"),
-    )
-    .await;
+    let unfiltered: OrganizationMetrics = org_metrics(&fixture, h, end, None).await;
     // A sub-hour range reads raw rows, so it is exact without a recompute.
     assert_eq!((unfiltered.period_start, unfiltered.period_end), (h, end));
     assert_eq!(unfiltered.summary.total_requests, 4);
@@ -757,7 +460,7 @@ async fn org_hourly_reports_are_cancelled_at_the_statement_budget() {
     use services::{admin::AnalyticsRepository, common::RepositoryError};
     let fixture = setup_platform_provider_usage_fixture().await;
     let (pool, original_timeout) =
-        crate::admin_analytics_statement_budget::pool_with_slow_tables(&["usage_hourly"], 0.5)
+        crate::admin_provider_attribution_support::pool_with_slow_tables(&["usage_hourly"], 0.5)
             .await;
     let repo = database::repositories::PgAnalyticsRepository::with_statement_timeout(
         pool.clone(),
@@ -787,29 +490,4 @@ async fn org_hourly_reports_are_cancelled_at_the_statement_budget() {
         .unwrap()
         .get(0);
     assert_eq!(timeout, original_timeout);
-}
-
-#[test]
-fn admin_org_metrics_ttft_thresholds_are_documented() {
-    use utoipa::OpenApi;
-    let spec = serde_json::to_value(api::openapi::ApiDoc::openapi()).unwrap();
-    let body = &spec["paths"]["/v1/admin/organizations/{org_id}/metrics"]["get"]["responses"]
-        ["200"]["content"]["application/json"]["schema"]["$ref"];
-    assert_eq!(body, "#/components/schemas/OrganizationMetrics");
-    for schema in ["MetricsSummary", "ModelMetrics"] {
-        let props = &spec["components"]["schemas"][schema]["properties"];
-        for field in [
-            "ttft_measured_requests",
-            "ttft_under_5s_requests",
-            "ttft_under_10s_requests",
-            "ttft_under_60s_requests",
-        ] {
-            assert!(props[field].is_object(), "{schema}.{field} is undocumented");
-        }
-    }
-    let measured = spec["components"]["schemas"]["ModelMetrics"]["properties"]
-        ["ttft_measured_requests"]["description"]
-        .as_str()
-        .unwrap();
-    assert!(measured.contains("Denominator"), "{measured}");
 }

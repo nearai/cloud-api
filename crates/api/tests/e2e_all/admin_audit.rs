@@ -47,8 +47,6 @@ const MOUNTED_ADMIN_ROUTES: &[(&str, &str)] = &[
     ("PATCH", "/admin/organizations/{org_id}/limits"),
     ("GET", "/admin/organizations/{org_id}/limits/history"),
     ("GET", "/admin/organizations/{org_id}/usage/balance"),
-    ("GET", "/admin/organizations/{org_id}/staking/farm"),
-    ("POST", "/admin/organizations/{org_id}/staking/farm/sync"),
     ("GET", "/admin/aml/reports"),
     ("PATCH", "/admin/aml/reports/{report_id}/status"),
     ("GET", "/admin/aml/allowlist"),
@@ -60,32 +58,19 @@ const MOUNTED_ADMIN_ROUTES: &[(&str, &str)] = &[
     ("PATCH", "/admin/organizations/{org_id}/priority"),
     ("GET", "/admin/organizations/{org_id}/fallback"),
     ("PATCH", "/admin/organizations/{org_id}/fallback"),
-    ("GET", "/admin/organizations/{org_id}/metrics"),
-    ("GET", "/admin/organizations/{org_id}/metrics/timeseries"),
-    ("GET", "/admin/platform/metrics"),
-    ("GET", "/admin/platform/metrics/timeseries"),
-    ("GET", "/admin/platform/billing-summary"),
-    ("GET", "/admin/platform/model-revenue"),
-    ("GET", "/admin/platform/org-revenue"),
     ("GET", "/admin/platform/infra-summary"),
     ("GET", "/admin/settings"),
     ("GET", "/admin/settings/{key}"),
     ("PATCH", "/admin/settings/{key}"),
-    ("GET", "/admin/platform/model-consumption-timeseries"),
-    ("GET", "/admin/platform/performance-timeseries"),
-    ("GET", "/admin/platform/revenue-density"),
     ("GET", "/admin/invitation-email-deliveries"),
     (
         "POST",
         "/admin/invitation-email-deliveries/{invitation_id}/resend",
     ),
-    ("GET", "/admin/users"),
     ("POST", "/admin/users/{user_id}/erasure/preview"),
     ("POST", "/admin/users/{user_id}/erasure"),
     ("POST", "/admin/user-erasures/lookup"),
-    ("GET", "/admin/organizations"),
     ("GET", "/admin/api-keys"),
-    ("GET", "/admin/organizations/{org_id}"),
     ("GET", "/admin/organizations/{org_id}/members"),
     ("PUT", "/admin/organizations/{org_id}/members/{user_id}"),
     ("POST", "/admin/access-tokens"),
@@ -101,8 +86,6 @@ const MOUNTED_ADMIN_ROUTES: &[(&str, &str)] = &[
         "POST",
         "/admin/organizations/{org_id}/credit/reconciliations",
     ),
-    ("GET", "/admin/organizations/{org_id}/usage-discount"),
-    ("PUT", "/admin/organizations/{org_id}/usage-discount"),
     ("POST", "/admin/usage-hourly/recompute"),
     ("POST", "/admin/database-encryption/scan"),
     ("POST", "/admin/database-encryption/jobs"),
@@ -270,12 +253,8 @@ const KNOWN_PAGINATED_ADMIN_LISTS: &[&str] = &[
     "/admin/models",
     "/admin/models/pricing-changes",
     "/admin/models/{model_name}/history",
-    "/admin/organizations",
     "/admin/organizations/{org_id}/limits/history",
     "/admin/organizations/{org_id}/members",
-    "/admin/platform/model-revenue",
-    "/admin/platform/org-revenue",
-    "/admin/users",
 ];
 
 /// Admin GET routes documented with `limit` and `offset` query parameters.
@@ -444,19 +423,19 @@ async fn admin_token_identity_is_audited_for_allowed_and_denied_requests() {
         &router,
         authorized(
             Method::GET,
-            "/v1/admin/users?limit=1",
+            "/v1/admin/api-keys?limit=1",
             &read_only_token,
             json!({}),
         ),
     )
     .await;
     assert_eq!(response.status(), StatusCode::OK);
-    let returned = json_body(response).await["users"]
+    let returned = json_body(response).await["api_keys"]
         .as_array()
-        .expect("users")
+        .expect("api_keys")
         .len();
     let event = logs.take_single_event();
-    assert_eq!(event["admin_route"], "/v1/admin/users");
+    assert_eq!(event["admin_route"], "/v1/admin/api-keys");
     assert_eq!(event["admin_auth_outcome"], "allowed");
     assert_eq!(event["admin_credential_kind"], "admin_access_token");
     assert_eq!(event["admin_credential_id"], read_only.id.to_string());
@@ -506,7 +485,12 @@ async fn admin_token_identity_is_audited_for_allowed_and_denied_requests() {
         .expect("token is revoked"));
     let response = send(
         &router,
-        authorized(Method::GET, "/v1/admin/users", &read_write_token, json!({})),
+        authorized(
+            Method::GET,
+            "/v1/admin/api-keys",
+            &read_write_token,
+            json!({}),
+        ),
     )
     .await;
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
@@ -533,14 +517,6 @@ async fn list_handlers_record_validated_pages_and_organization_scope() {
             0,
             Some(&organization_id),
         ),
-        (
-            "/v1/admin/organizations?limit=3&offset=1".to_string(),
-            "organizations",
-            3,
-            1,
-            None,
-        ),
-        ("/v1/admin/users?limit=2".to_string(), "users", 2, 0, None),
         (
             format!("/v1/admin/api-keys?organization_id={organization_id}&limit=10"),
             "api_keys",
@@ -571,20 +547,6 @@ async fn list_handlers_record_validated_pages_and_organization_scope() {
             0,
             Some(&organization_id),
         ),
-        (
-            "/v1/admin/platform/org-revenue?limit=1".to_string(),
-            "data",
-            1,
-            0,
-            None,
-        ),
-        (
-            "/v1/admin/platform/model-revenue?limit=1".to_string(),
-            "data",
-            1,
-            0,
-            None,
-        ),
     ];
     for (uri, rows_field, limit, offset, organization) in lists {
         let response = send(&router, authorized(Method::GET, &uri, &session, json!({}))).await;
@@ -612,7 +574,12 @@ async fn list_handlers_record_validated_pages_and_organization_scope() {
     // A page the handler rejects is not recorded.
     let response = send(
         &router,
-        authorized(Method::GET, "/v1/admin/users?limit=0", &session, json!({})),
+        authorized(
+            Method::GET,
+            "/v1/admin/api-keys?limit=0",
+            &session,
+            json!({}),
+        ),
     )
     .await;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
@@ -656,7 +623,7 @@ async fn audit_events_exclude_request_content_on_the_real_router() {
     let (logs, _guard) = CapturedLogs::start();
 
     for uri in [
-        format!("/v1/admin/users?search={EMAIL}&limit=1"),
+        format!("/v1/admin/api-keys?search={EMAIL}&limit=1"),
         format!("/v1/admin/users/{EMAIL}/lookup"),
     ] {
         let response = send(

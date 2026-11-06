@@ -8,7 +8,8 @@ use crate::admin_provider_attribution_support::{
 use crate::common::*;
 use crate::usage_hourly::recompute_usage_hours;
 use chrono::{DateTime, Duration, Utc};
-use services::admin::PlatformMetrics;
+use database::repositories::PgAnalyticsRepository;
+use services::admin::AnalyticsRepository;
 
 fn seed(created_at: DateTime<Utc>) -> ProviderUsageSeedRow<'static> {
     ProviderUsageSeedRow {
@@ -28,18 +29,13 @@ async fn platform_requests(
     start: DateTime<Utc>,
     end: DateTime<Utc>,
 ) -> i64 {
-    let response = fixture
-        .server
-        .get(&format!(
-            "/v1/admin/platform/metrics?start={}&end={}",
-            start.to_rfc3339().replace('+', "%2B"),
-            end.to_rfc3339().replace('+', "%2B")
-        ))
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
-        .add_header("User-Agent", MOCK_USER_AGENT)
-        .await;
-    assert_eq!(response.status_code(), 200, "{}", response.text());
-    response.json::<PlatformMetrics>().total_requests
+    // The window is isolated to the fixture's organization.
+    PgAnalyticsRepository::new(fixture.database.pool().clone())
+        .get_organization_metrics(fixture.organization_id, start, end, None)
+        .await
+        .expect("organization metrics")
+        .summary
+        .total_requests
 }
 
 async fn repair(

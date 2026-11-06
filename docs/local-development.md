@@ -72,6 +72,12 @@ The image is private. Run `docker login ghcr.io` with a token that can read
 `nearai/cloud-platform` packages before the first `up`. Check the schema step
 with `docker compose logs schema`.
 
+For companion PR tests against a schema that has not merged, `scripts/apply-schema.sh`
+accepts `CLOUD_PLATFORM_TEST_IMAGE=ghcr.io/nearai/cloud-platform@sha256:<digest>`.
+Use the private image digest recorded by that platform PR's Docker CI job. The helper
+runs the selected migrator for each test database and fails if it cannot apply it;
+the normal schema pin and Compose default are unchanged.
+
 `make seed` runs the seed binary only. It loads its settings as the API does
 (`.env`, the environment, `DATABASE_PASSWORD_FILE`) and seeds that database. It
 does not apply the schema, so the schema must already be there. `make dev` does

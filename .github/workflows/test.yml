@@ -208,8 +208,13 @@ jobs:
     runs-on: ${{ (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","ci-cloud-api"]') || 'ubuntu-latest' }}
     permissions:
       contents: read
-      # Pulls the cloud-platform schema image (scripts/cloud-platform-schema.env).
+      # Pulls the normal schema image or the private companion test image.
       packages: read
+
+    env:
+      # Companion schema from nearai/cloud-platform#113, head 16b9d2bbe9093819bb17218707d5d93f1df10d3f.
+      # PR tests can validate V0099 before merge; main still requires a published normal pin.
+      CLOUD_PLATFORM_TEST_IMAGE: ${{ github.event_name == 'pull_request' && 'ghcr.io/nearai/cloud-platform@sha256:e30d25a5d4c0a474ff98e49b10f5a0c4fc03986b5994a095bcd1f6d6254759e9' || '' }}
 
     services:
       postgres:

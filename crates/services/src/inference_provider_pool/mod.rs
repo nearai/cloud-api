@@ -440,6 +440,13 @@ pub trait ExternalModelsSource: Send + Sync {
     async fn fetch_inference_url_models(
         &self,
     ) -> Result<Vec<(String, String, Option<u32>)>, String>;
+
+    /// Fetch the routing columns of the active catalog rows named in `names`.
+    /// Returns (model_name, provider_type, has_inference_url) triples.
+    async fn fetch_model_routing(
+        &self,
+        names: &[String],
+    ) -> Result<Vec<(String, String, bool)>, String>;
 }
 
 /// Result of an attestation-discovery pass against a model URL.
@@ -1886,6 +1893,34 @@ impl InferenceProviderPool {
             fallback_providers.remove(model_id);
         } else {
             fallback_providers.insert(model_id.to_string(), fallbacks);
+        }
+    }
+
+    /// Re-read the catalog rows of pinned models and reclassify their providers,
+    /// so role edits made elsewhere reach this process without a restart. A
+    /// failed read leaves the current roles in place.
+    async fn refresh_pinned_roles_from_source(&self, source: &dyn ExternalModelsSource) {
+        let names: Vec<String> = self
+            .pinned_providers
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .cloned()
+            .collect();
+        if names.is_empty() {
+            return;
+        }
+        match source.fetch_model_routing(&names).await {
+            Ok(rows) => {
+                for (name, provider_type, has_inference_url) in rows {
+                    self.refresh_pinned_provider_roles_from_catalog(
+                        &name,
+                        &provider_type,
+                        has_inference_url,
+                    );
+                }
+            }
+            Err(e) => warn!(error = %e, "Failed to refresh pinned provider roles"),
         }
     }
 
@@ -6586,6 +6621,8 @@ impl InferenceProviderPool {
                     {
                         warn!(error = %e, "Failed to sync external providers");
                     }
+
+                    pool.refresh_pinned_roles_from_source(source.as_ref()).await;
                 }
             }
         });
@@ -9353,6 +9390,8 @@ mod tests {
     struct CountingSource {
         models: Vec<(String, String, Option<u32>)>,
         fetches: std::sync::atomic::AtomicUsize,
+        /// Routing rows served for pinned models.
+        routing: Vec<(String, String, bool)>,
         /// When set, every catalog read fails.
         fail: std::sync::atomic::AtomicBool,
     }
@@ -9379,6 +9418,16 @@ mod tests {
             }
             Ok(self.models.clone())
         }
+
+        async fn fetch_model_routing(
+            &self,
+            _names: &[String],
+        ) -> Result<Vec<(String, String, bool)>, String> {
+            if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err("catalog unavailable".to_string());
+            }
+            Ok(self.routing.clone())
+        }
     }
 
     /// A count change re-runs discovery for just its model, from the
@@ -9394,6 +9443,7 @@ mod tests {
                 ("m-b".to_string(), b_url.clone(), None),
             ],
             fetches: Default::default(),
+            routing: Vec::new(),
             fail: Default::default(),
         };
         assert!(pool.rediscover_model(&source, "m-a").await);
@@ -13493,6 +13543,57 @@ mod tests {
             .expect("registered model");
         assert_eq!(standalone_again.len(), 1);
         assert!(Arc::ptr_eq(&standalone_again[0], &pinned_provider));
+    }
+
+    #[tokio::test]
+    async fn periodic_refresh_reclassifies_pinned_roles_and_survives_failure() {
+        use inference_providers::mock::MockProvider;
+        use inference_providers::{ProviderSource, ProviderTier};
+
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+        let model_id = "policy/periodic-role".to_string();
+        let pinned = Arc::new(
+            MockProvider::new_accept_all()
+                .with_tier(ProviderTier::Attested3p)
+                .with_provider_source(ProviderSource::Chutes),
+        );
+        pool.register_pinned_provider(
+            model_id.clone(),
+            pinned as Arc<InferenceProviderTrait>,
+            None,
+            ProviderPoolRole::Primary,
+        )
+        .await;
+        let disabled = ChatRoutingHints {
+            fallback_disabled: true,
+            ..Default::default()
+        };
+        let source = CountingSource {
+            models: Vec::new(),
+            fetches: Default::default(),
+            routing: vec![(model_id.clone(), "chutes".to_string(), true)],
+            fail: Default::default(),
+        };
+
+        // A failed read keeps the current role.
+        source.fail.store(true, std::sync::atomic::Ordering::SeqCst);
+        pool.refresh_pinned_roles_from_source(&source).await;
+        let kept = pool
+            .get_providers_with_fallback(&model_id, None, &disabled)
+            .await
+            .expect("registered model");
+        assert_eq!(kept.len(), 1);
+
+        // A successful read applies the catalog's inference URL: now a fallback.
+        source
+            .fail
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        pool.refresh_pinned_roles_from_source(&source).await;
+        let refreshed = pool
+            .get_providers_with_fallback(&model_id, None, &disabled)
+            .await
+            .expect("registered model");
+        assert!(refreshed.is_empty());
     }
 
     #[tokio::test]

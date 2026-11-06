@@ -1734,6 +1734,44 @@ impl services::inference_provider_pool::ExternalModelsSource for ModelRepository
             .await
             .map_err(|e| format!("Failed to fetch inference_url models: {e}"))
     }
+
+    async fn fetch_model_routing(
+        &self,
+        names: &[String],
+    ) -> Result<Vec<(String, String, bool)>, String> {
+        let rows = retry_db!("fetch_model_routing", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
+
+            client
+                .query(
+                    r#"
+                    SELECT model_name, provider_type, inference_url IS NOT NULL AS has_inference_url
+                    FROM models
+                    WHERE is_active = true AND model_name = ANY($1)
+                    "#,
+                    &[&names],
+                )
+                .await
+                .map_err(map_db_error)
+        })
+        .map_err(|e| format!("Failed to fetch model routing: {e}"))?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                (
+                    row.get("model_name"),
+                    row.get("provider_type"),
+                    row.get("has_inference_url"),
+                )
+            })
+            .collect())
+    }
 }
 
 impl ModelRepository {

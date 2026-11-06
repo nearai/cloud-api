@@ -2,6 +2,7 @@
 use super::*;
 
 pub(super) struct PrivacyIdentity {
+    pub budget_id: Option<Uuid>,
     pub response_id: Option<String>,
     pub inference_id: Uuid,
 }
@@ -23,6 +24,7 @@ impl PrivacyIdentity {
             .map(hash_inference_id_to_uuid)
             .unwrap_or_else(Uuid::new_v4);
         Self {
+            budget_id: None,
             response_id,
             inference_id,
         }

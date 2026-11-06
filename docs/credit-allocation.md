@@ -53,30 +53,65 @@ For example, September postpay consumption can be queried with
 `/v1/admin/organizations/{org_id}/metrics?start=2026-09-01T00:00:00Z&end=2026-10-01T00:00:00Z&credit_type=postpay`.
 This reports consumed usage, not invoices, payment status, or cash received.
 
-If a completed request costs more than all available capacity, the full charge
-is retained with an `unfunded_amount`. Admission checks block subsequent usage
-until that debt is resolved. When capacity is later added or re-enabled from
-any source, it automatically funds the oldest overage first in the configured
-priority order. Settlement appends immutable allocation rows with the current
-limit, source, and policy version; it never edits the original posting-time
-allocations. If the added capacity exceeds the debt, the remainder is
-immediately available for new usage. No admin API call is required.
+## Monetary admission
+
+Every organization and API key reserves credit before billable execution. Admission
+checks settled spend plus outstanding reservations under the same organization lock
+used by inference, platform services and transfers. A successful authentication or
+rate-limit check alone does not authorize spending. Insufficient funds return 402;
+unavailable accounting fails closed before sending work to a provider.
+
+Reservations freeze the model price, organization discount, execution bounds and
+funding sources. Text quotes conservatively cover the catalog context window and
+an enforced output ceiling, including multiple choices and cache pricing. They do
+not estimate prompt tokens, so even a short prompt may require more available credit
+than its final cost. Successful final usage settles once and releases the unused
+remainder. This covers Chat/Completions, native Responses and Messages, embeddings,
+rerank, score, privacy classification/auto-redaction, images, audio, SystemOne and
+metered platform searches. Vendor fees outside the catalog's current metering
+contract require a separate metered service.
+
+A retry that may execute again gets a separate reservation. Client disconnects,
+partial SSE usage, timeouts and process crashes retain the dispatched hold; no TTL
+refund treats uncertain work as free. Replay an authoritative final receipt with its
+original id to settle after restart. If no final receipt exists, recovering it from
+the provider remains an operator responsibility. Only work that never acquired a
+dispatch claim can be released without such a receipt. Public response/signature
+ids remain separate from reservation ids.
+
+Audio admission decodes and normalizes uploads with FFmpeg before dispatch (mono
+16 kHz FLAC, bounded to 25 MB, one hour and a 30-second decode deadline). The
+reservation covers rounded decoded duration; malformed or oversized media is
+rejected locally. FFmpeg is included in the runtime image and required for local
+audio tests.
+
+Legacy unreserved receipts remain accepted while old executors drain. If legacy
+usage exceeds capacity, its full charge retains an `unfunded_amount` and blocks
+new admission until funding resolves it. Adding capacity funds the oldest debt
+without spending credit held for current executions.
 
 ## Rollout notes
 
-- Deploy every inference, service, limit, and staking writer together. They
-  coordinate through the same per-organization database lock.
-- Inference usage posts through `record_organization_usage` (V0096) in one database
-  statement; the organization lock is held only during server-side accounting.
-  Platform-service usage still uses the Rust transaction path and the same lock.
-- Existing unattributed usage remains unknown and continues reducing aggregate
-  admission capacity. Its amount is snapshotted during the allocation-ledger
-  migration so usage posting does not rescan lifetime history. Establish
-  reviewed starting limits rather than backfilling speculative per-type
-  allocations.
-- Monitor allocation reconciliation and unfunded balances before expanding the
-  rollout. Allocation rows and their parent usage/balance update commit in one
-  transaction.
+1. Apply cloud-platform migration V0099 and deploy every inference, service, limit,
+   staking and transfer writer with reservation-aware accounting. They share the
+   per-organization lock; no network work holds that transaction.
+2. Update `scripts/cloud-platform-schema.env` to a published image built from the
+   merged schema change. Deploy Cloud API and inference-proxy together. Direct
+   cloud-key proxies require `/v1/internal/budget` and the internal usage token,
+   including when final receipts use SQS.
+3. Drain old executors and receipt queues before reopening traffic on the updated
+   fleet. Mixed old executors can still start unreserved work. Check ordinary
+   organizations, exhausted keys, retry receipts and pending reservations.
+4. To roll back, stop new inference intake first. Preserve the reservation tables
+   and accounting writers while receipts drain; do not restore writers that ignore
+   outstanding holds.
+
+New inference usage posts and settles through `record_organization_usage` in one
+transaction; platform services use the same lock and settlement function. Existing
+unattributed consumption still reduces aggregate capacity. Allocation rows,
+settlement and balance updates commit together. Monitor outstanding rows in
+`usage_budget_reservations` (`reserved` / `dispatched`), reconciliation failures and
+unfunded balances. Do not release pending work merely because it is old.
 
 ## Reconciling legacy consumption when moving to postpay
 

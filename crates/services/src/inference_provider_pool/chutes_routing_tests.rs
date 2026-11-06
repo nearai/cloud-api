@@ -181,6 +181,7 @@ async fn pinned_chat(pool: &InferenceProviderPool, streaming: bool) -> Result<()
 
 #[tokio::test]
 async fn pinned_retries_refresh_matching_nonces_without_falling_back_to_near() {
+    crate::test_utils::with_test_budget(async {
     for streaming in [false, true] {
         for initial_status in [503, 403] {
             let server = MockServer::start().await;
@@ -213,29 +214,34 @@ async fn pinned_retries_refresh_matching_nonces_without_falling_back_to_near() {
             assert!(near.last_chat_params().await.is_none());
         }
     }
+
+        }).await;
 }
 
 #[tokio::test]
 async fn unknown_and_rotated_keys_fail_closed_even_when_near_is_healthy() {
-    for streaming in [false, true] {
-        for unknown in [false, true] {
-            let server = MockServer::start().await;
-            let (pool, near, _) = pool_with_chutes(&server).await;
-            mount_discovery(&server, true, unknown).await;
-            Mock::given(method("POST"))
-                .and(path("/e2e/invoke"))
-                .respond_with(|request: &Request| {
-                    assert_eq!(request.headers["X-Instance-Id"], "pinned");
-                    ResponseTemplate::new(503)
-                })
-                .expect(if unknown { 0 } else { 1 })
-                .mount(&server)
-                .await;
-            assert!(matches!(
-                pinned_chat(&pool, streaming).await,
-                Err(CompletionError::NoPubKeyProvider(_))
-            ));
-            assert!(near.last_chat_params().await.is_none());
+    crate::test_utils::with_test_budget(async {
+        for streaming in [false, true] {
+            for unknown in [false, true] {
+                let server = MockServer::start().await;
+                let (pool, near, _) = pool_with_chutes(&server).await;
+                mount_discovery(&server, true, unknown).await;
+                Mock::given(method("POST"))
+                    .and(path("/e2e/invoke"))
+                    .respond_with(|request: &Request| {
+                        assert_eq!(request.headers["X-Instance-Id"], "pinned");
+                        ResponseTemplate::new(503)
+                    })
+                    .expect(if unknown { 0 } else { 1 })
+                    .mount(&server)
+                    .await;
+                assert!(matches!(
+                    pinned_chat(&pool, streaming).await,
+                    Err(CompletionError::NoPubKeyProvider(_))
+                ));
+                assert!(near.last_chat_params().await.is_none());
+            }
         }
-    }
+    })
+    .await;
 }

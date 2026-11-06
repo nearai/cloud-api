@@ -217,6 +217,11 @@ fn map_mcp_service_error(id: Option<Value>, error: WebSearchServiceError) -> Res
         WebSearchServiceError::ProviderFailure(message) => {
             error_response(id, MCP_ERR_TOOL_EXECUTION_FAILED, message)
         }
+        WebSearchServiceError::BudgetExceeded => error_response(
+            id,
+            MCP_ERR_TOOL_EXECUTION_FAILED,
+            "Insufficient available budget for web search",
+        ),
         WebSearchServiceError::UsageRecordingFailed | WebSearchServiceError::Internal => {
             error_response(id, JSONRPC_INTERNAL_ERROR, "Internal server error")
         }

@@ -177,9 +177,29 @@ pub async fn embeddings(
     insert_encryption_headers(&encryption_headers, &mut extra);
     insert_request_id_header(correlation, &mut extra);
 
-    match app_state
-        .completion_service
-        .try_embeddings(organization_id, model_id, &model_name, body, extra)
+    let budget = match billing::budget_execution(
+        &app_state,
+        &api_key,
+        &model,
+        services::usage::InferenceType::Embedding,
+        match billing::batch_input_bound(&body, model.context_length) {
+            Ok(n) => n,
+            Err(r) => return *r,
+        },
+        0,
+        0,
+    ) {
+        Ok(budget) => budget,
+        Err(response) => return *response,
+    };
+    match budget
+        .run(app_state.completion_service.try_embeddings(
+            organization_id,
+            model_id,
+            &model_name,
+            body,
+            extra,
+        ))
         .await
     {
         Ok(response_bytes) => {
@@ -220,10 +240,15 @@ pub async fn embeddings(
                 Err(response) => return *response,
             };
 
-            let inference_id = uuid::Uuid::new_v4();
+            let budget_id = match billing::budget_id(&budget).await {
+                Ok(id) => id,
+                Err(response) => return *response,
+            };
+            let inference_id = Uuid::new_v4();
             let usage_request = services::usage::RecordUsageServiceRequest {
                 input_tokens: token_count,
                 inference_id: Some(inference_id),
+                budget_id: Some(budget_id),
                 stop_reason: Some(services::usage::StopReason::Completed),
                 ..services::usage::RecordUsageServiceRequest::base(
                     services::usage::BillingIdentity {

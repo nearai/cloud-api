@@ -68,6 +68,8 @@ pub enum WebSearchServiceError {
     NotConfigured,
     #[error("Web search request failed: {0}")]
     ProviderFailure(String),
+    #[error("Insufficient available budget for web search")]
+    BudgetExceeded,
     #[error("Failed to record service usage")]
     UsageRecordingFailed,
     #[error("Internal server error")]
@@ -122,6 +124,31 @@ impl WebSearchService {
             return Err(WebSearchServiceError::NotConfigured);
         };
 
+        let mut charge = RecordServiceUsageWithPricingParams {
+            organization_id: usage.organization_id,
+            workspace_id: usage.workspace_id,
+            api_key_id: usage.api_key_id,
+            service_id,
+            cost_per_unit,
+            quantity: 1,
+            inference_id: None,
+        };
+        let reservation = self
+            .service_usage_service
+            .reserve_service(&charge)
+            .await
+            .map_err(|error| {
+                if matches!(
+                    error.downcast_ref::<crate::usage::UsageError>(),
+                    Some(crate::usage::UsageError::LimitExceeded(_))
+                ) {
+                    WebSearchServiceError::BudgetExceeded
+                } else {
+                    WebSearchServiceError::UsageRecordingFailed
+                }
+            })?;
+        charge.inference_id = Some(reservation);
+
         let results = self
             .provider
             .search(WebSearchParams {
@@ -155,15 +182,7 @@ impl WebSearchService {
             })?;
 
         self.service_usage_service
-            .record_service_usage_with_pricing(&RecordServiceUsageWithPricingParams {
-                organization_id: usage.organization_id,
-                workspace_id: usage.workspace_id,
-                api_key_id: usage.api_key_id,
-                service_id,
-                cost_per_unit,
-                quantity: 1,
-                inference_id: None,
-            })
+            .record_service_usage_with_pricing(&charge)
             .await
             .map_err(|err| match err {
                 ServiceUsageError::InternalError(_) | ServiceUsageError::ReportingTimeout => {

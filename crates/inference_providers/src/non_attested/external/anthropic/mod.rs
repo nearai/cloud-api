@@ -229,6 +229,14 @@ fn map_raw_transport_error(error: AnthropicRawError) -> CompletionError {
             "Anthropic Messages transport is unavailable".to_string(),
         ),
         AnthropicRawError::Transport(message) => CompletionError::CompletionError(message),
+        AnthropicRawError::Budget {
+            status_code,
+            message,
+        } => CompletionError::HttpError {
+            status_code,
+            message,
+            is_external: false,
+        },
     }
 }
 

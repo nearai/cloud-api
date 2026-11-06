@@ -13,7 +13,9 @@ pub(super) async fn maybe_redact(
     headers: &header::HeaderMap,
     service_request: &mut ServiceCompletionRequest,
     pool: &services::inference_provider_pool::InferenceProviderPool,
-) -> Result<(bool, RedactionMap, i64), AutoRedactError> {
+    state: &AppState,
+    key: &AuthenticatedApiKey,
+) -> Result<(bool, RedactionMap, i64, Option<Uuid>), AutoRedactError> {
     let header_values: Vec<&str> = headers
         .get_all(auto_redact::AUTO_REDACT_HEADER)
         .iter()
@@ -29,16 +31,44 @@ pub(super) async fn maybe_redact(
     auto_redact::strip_body_field(&mut service_request.extra);
 
     if !enabled {
-        return Ok((false, RedactionMap::new(), 0));
+        return Ok((false, RedactionMap::new(), 0, None));
     }
 
-    let (map, classify_tokens) = auto_redact::redact_messages(
-        &mut service_request.messages,
-        auto_redact::DEFAULT_PII_MODEL,
-        pool,
+    let (_, texts) = auto_redact::collect_text_fragments(&service_request.messages);
+    if texts.is_empty() {
+        return Ok((true, RedactionMap::new(), 0, None));
+    }
+    let model = state
+        .models_service
+        .get_model_by_name(auto_redact::DEFAULT_PII_MODEL, ModelCaller::Trusted)
+        .await
+        .map_err(|_| AutoRedactError::DetectorUnavailable("Cannot resolve privacy model".into()))?;
+    let bytes = serde_json::to_vec(&serde_json::json!({"input": texts}))
+        .map_err(|_| AutoRedactError::Internal("Cannot measure privacy input".into()))?;
+    let bound = billing::batch_input_bound(&bytes, model.context_length)
+        .map_err(|_| AutoRedactError::Internal("Invalid privacy input bound".into()))?;
+    let budget = billing::budget_execution(
+        state,
+        key,
+        &model,
+        services::usage::InferenceType::PrivacyClassify,
+        bound,
+        0,
+        0,
     )
-    .await?;
-    Ok((true, map, classify_tokens))
+    .map_err(|_| AutoRedactError::Internal("Invalid privacy billing context".into()))?;
+    let (map, classify_tokens) = budget
+        .run(auto_redact::redact_messages(
+            &mut service_request.messages,
+            auto_redact::DEFAULT_PII_MODEL,
+            pool,
+        ))
+        .await?;
+    let id = budget
+        .id()
+        .await
+        .map_err(|_| AutoRedactError::Internal("Missing privacy reservation".into()))?;
+    Ok((true, map, classify_tokens, Some(id)))
 }
 
 /// Convert an [`AutoRedactError`] into the user-facing error response.
@@ -90,6 +120,7 @@ pub(super) async fn bill_auto_redact_classify(
     app_state: &AppState,
     api_key: &crate::middleware::auth::AuthenticatedApiKey,
     classify_tokens: i64,
+    budget_id: Option<Uuid>,
 ) {
     if classify_tokens <= 0 {
         return; // nothing to bill
@@ -142,6 +173,7 @@ pub(super) async fn bill_auto_redact_classify(
     let usage_request = services::usage::RecordUsageServiceRequest {
         input_tokens,
         inference_id: Some(Uuid::new_v4()),
+        budget_id,
         stop_reason: Some(services::usage::StopReason::Completed),
         ..services::usage::RecordUsageServiceRequest::base(
             services::usage::BillingIdentity {

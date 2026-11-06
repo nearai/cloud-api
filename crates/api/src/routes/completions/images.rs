@@ -132,9 +132,24 @@ pub async fn image_generations(
     };
 
     // Call the inference provider pool
-    match app_state
-        .inference_provider_pool
-        .image_generation_with_attribution(params, body_hash.hash.clone())
+    let budget = match billing::budget_execution(
+        &app_state,
+        &api_key,
+        &model,
+        services::usage::InferenceType::ImageGeneration,
+        0,
+        0,
+        i64::from(request.n.unwrap_or(1)),
+    ) {
+        Ok(budget) => budget,
+        Err(response) => return *response,
+    };
+    match budget
+        .run(
+            app_state
+                .inference_provider_pool
+                .image_generation_with_attribution(params, body_hash.hash.clone()),
+        )
         .await
     {
         Ok(attributed_response) => {
@@ -191,7 +206,7 @@ pub async fn image_generations(
                 }
             };
 
-            let usage_request = build_image_usage_request(ImageUsageRecord {
+            let mut usage_request = build_image_usage_request(ImageUsageRecord {
                 organization_id,
                 workspace_id,
                 api_key_id,
@@ -200,6 +215,10 @@ pub async fn image_generations(
                 image_count,
                 provider_attribution,
                 inference_type: services::usage::InferenceType::ImageGeneration,
+            });
+            usage_request.budget_id = Some(match billing::budget_id(&budget).await {
+                Ok(id) => id,
+                Err(response) => return *response,
             });
             record_usage_with_sync_fallback(usage_service, usage_request, "Image generation").await;
 
@@ -534,9 +553,24 @@ pub async fn image_edits(
     };
 
     // Call the inference provider pool
-    match app_state
-        .inference_provider_pool
-        .image_edit_with_attribution(params, body_hash.hash.clone())
+    let budget = match billing::budget_execution(
+        &app_state,
+        &api_key,
+        &model,
+        services::usage::InferenceType::ImageEdit,
+        0,
+        0,
+        1,
+    ) {
+        Ok(budget) => budget,
+        Err(response) => return *response,
+    };
+    match budget
+        .run(
+            app_state
+                .inference_provider_pool
+                .image_edit_with_attribution(params, body_hash.hash.clone()),
+        )
         .await
     {
         Ok(attributed_response) => {
@@ -593,7 +627,7 @@ pub async fn image_edits(
                 }
             };
 
-            let usage_request = build_image_usage_request(ImageUsageRecord {
+            let mut usage_request = build_image_usage_request(ImageUsageRecord {
                 organization_id,
                 workspace_id,
                 api_key_id,
@@ -602,6 +636,10 @@ pub async fn image_edits(
                 image_count,
                 provider_attribution,
                 inference_type: services::usage::InferenceType::ImageEdit,
+            });
+            usage_request.budget_id = Some(match billing::budget_id(&budget).await {
+                Ok(id) => id,
+                Err(response) => return *response,
             });
             record_usage_with_sync_fallback(usage_service, usage_request, "Image edit").await;
 

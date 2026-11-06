@@ -207,10 +207,36 @@ pub async fn audio_transcriptions(
         _ => request.response_format.clone(),
     };
 
+    let (audio_bytes, duration_bound) =
+        match super::audio_budget::normalize(request.file_bytes).await {
+            Ok(audio) => audio,
+            Err(message) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    ResponseJson(ErrorResponse::new(
+                        message.into(),
+                        "invalid_request_error".into(),
+                    )),
+                )
+                    .into_response()
+            }
+        };
+    let budget = match billing::budget_execution(
+        &app_state,
+        &api_key,
+        &model,
+        services::usage::InferenceType::AudioTranscription,
+        i64::from(duration_bound),
+        0,
+        0,
+    ) {
+        Ok(budget) => budget,
+        Err(response) => return *response,
+    };
     let params = inference_providers::AudioTranscriptionParams {
         model: model_name.clone(),
-        file_bytes: request.file_bytes,
-        filename: request.filename,
+        file_bytes: audio_bytes,
+        filename: "audio.flac".into(),
         language: request
             .language
             .map(|language| crate::models::normalize_audio_transcription_language(&language)),
@@ -221,15 +247,14 @@ pub async fn audio_transcriptions(
     };
 
     // Call completion service which handles concurrent request limiting
-    match app_state
-        .completion_service
-        .audio_transcription(
+    match budget
+        .run(app_state.completion_service.audio_transcription(
             organization_id,
             model_id,
             &model_name,
             params,
             body_hash.hash.clone(),
-        )
+        ))
         .await
     {
         Ok(response) => {
@@ -264,10 +289,15 @@ pub async fn audio_transcriptions(
                 }
             };
 
-            let inference_id = uuid::Uuid::new_v4();
+            let budget_id = match billing::budget_id(&budget).await {
+                Ok(id) => id,
+                Err(response) => return *response,
+            };
+            let inference_id = Uuid::new_v4();
             let usage_request = services::usage::RecordUsageServiceRequest {
                 input_tokens: duration_seconds, // Bill by duration in seconds
                 inference_id: Some(inference_id),
+                budget_id: Some(budget_id),
                 stop_reason: Some(services::usage::StopReason::Completed),
                 ..services::usage::RecordUsageServiceRequest::base(
                     services::usage::BillingIdentity {

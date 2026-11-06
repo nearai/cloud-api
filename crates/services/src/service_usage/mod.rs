@@ -34,6 +34,13 @@ impl ServiceUsageService {
 
 #[async_trait::async_trait]
 impl ServiceUsageServiceTrait for ServiceUsageService {
+    async fn reserve_service(
+        &self,
+        params: &RecordServiceUsageWithPricingParams,
+    ) -> anyhow::Result<Uuid> {
+        self.repo.reserve_service(params).await
+    }
+
     /// Check if a service is configured and active (for pricing). Returns Some((id, cost_per_unit)) or None.
     async fn get_active_service_pricing(
         &self,

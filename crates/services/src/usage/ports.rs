@@ -222,6 +222,28 @@ impl std::fmt::Display for StopReason {
 
 #[async_trait::async_trait]
 pub trait UsageServiceTrait: Send + Sync {
+    async fn admit_external(
+        &self,
+        _identity: BillingIdentity,
+        _bounds: super::budget::UsageBounds,
+        _report_id: Uuid,
+    ) -> Result<(), UsageError> {
+        Err(UsageError::InternalError(
+            "external monetary admission is unavailable".into(),
+        ))
+    }
+
+    /// Reserve the worst permitted cost and claim this execution exactly once.
+    async fn admit(
+        &self,
+        _identity: BillingIdentity,
+        _bounds: super::budget::UsageBounds,
+    ) -> Result<Uuid, UsageError> {
+        Err(UsageError::InternalError(
+            "monetary admission is unavailable".into(),
+        ))
+    }
+
     /// Record usage after an API call completes
     async fn record_usage(
         &self,
@@ -329,6 +351,22 @@ pub trait UsageServiceTrait: Send + Sync {
 
 #[async_trait::async_trait]
 pub trait UsageRepository: Send + Sync {
+    async fn reserve_and_dispatch(
+        &self,
+        _reservation: &super::budget::BudgetReservation,
+    ) -> Result<(), UsageError> {
+        Err(UsageError::InternalError(
+            "monetary admission is unavailable".into(),
+        ))
+    }
+    async fn budget_snapshot(
+        &self,
+        _organization_id: Uuid,
+        _id: Uuid,
+    ) -> anyhow::Result<Option<super::budget::BudgetSnapshot>> {
+        Ok(None)
+    }
+
     /// Record usage and update balance atomically
     async fn record_usage(&self, request: RecordUsageDbRequest) -> anyhow::Result<UsageLogEntry>;
 
@@ -514,6 +552,14 @@ pub enum RecordUsageApiRequest {
         #[serde(flatten)]
         provider_attribution: ProviderAttribution,
     },
+    /// Audio duration, in rounded-up seconds. Used by the HTTP reporter.
+    AudioTranscription {
+        model: String,
+        duration_seconds: i32,
+        id: String,
+        #[serde(flatten)]
+        provider_attribution: ProviderAttribution,
+    },
     /// Image generation or editing
     ImageGeneration {
         /// Model name to look up pricing
@@ -583,6 +629,8 @@ pub struct CacheWriteBilling {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct RecordUsageServiceRequest {
+    /// Monetary reservation, distinct from the public provider-derived inference id.
+    pub budget_id: Option<Uuid>,
     pub organization_id: Uuid,
     pub workspace_id: Uuid,
     pub api_key_id: Uuid,
@@ -660,6 +708,7 @@ impl RecordUsageServiceRequest {
             model_id,
         } = identity;
         Self {
+            budget_id: None,
             organization_id,
             workspace_id,
             api_key_id,
@@ -885,7 +934,7 @@ pub struct RecordUsageDbRequest {
 
 /// Model pricing information
 /// All costs use fixed scale of 9 (nano-dollars) and USD currency
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelPricing {
     pub id: Uuid,
     pub model_name: String, // Canonical model name

@@ -1,3 +1,4 @@
+pub mod budget;
 pub mod hourly_scheduler;
 pub mod ports;
 mod pricing;
@@ -199,6 +200,31 @@ pub struct UsageServiceImpl {
 }
 
 impl UsageServiceImpl {
+    async fn reserve_budget(
+        &self,
+        id: Uuid,
+        identity: BillingIdentity,
+        bounds: budget::UsageBounds,
+    ) -> Result<Uuid, UsageError> {
+        let pricing = self
+            .model_repository
+            .get_model_by_id(identity.model_id)
+            .await
+            .map_err(|e| UsageError::InternalError(e.to_string()))?
+            .ok_or_else(|| UsageError::ModelNotFound(identity.model_id.to_string()))?;
+        let reservation = budget::BudgetReservation {
+            id,
+            amount: bounds.quote(&pricing)?,
+            identity,
+            bounds,
+            pricing,
+        };
+        self.usage_repository
+            .reserve_and_dispatch(&reservation)
+            .await?;
+        Ok(id)
+    }
+
     pub fn new(
         usage_repository: Arc<dyn UsageRepository>,
         model_repository: Arc<dyn ModelRepository>,
@@ -218,20 +244,63 @@ impl UsageServiceImpl {
 
 #[async_trait::async_trait]
 impl UsageServiceTrait for UsageServiceImpl {
+    async fn admit(
+        &self,
+        identity: BillingIdentity,
+        bounds: budget::UsageBounds,
+    ) -> Result<Uuid, UsageError> {
+        self.reserve_budget(Uuid::new_v4(), identity, bounds).await
+    }
+
+    async fn admit_external(
+        &self,
+        identity: BillingIdentity,
+        bounds: budget::UsageBounds,
+        report_id: Uuid,
+    ) -> Result<(), UsageError> {
+        let id = Uuid::new_v5(
+            &EXTERNAL_USAGE_ID_NAMESPACE,
+            report_id.to_string().as_bytes(),
+        );
+        self.reserve_budget(id, identity, bounds).await.map(|_| ())
+    }
     /// Record usage after an API call completes
     async fn record_usage(
         &self,
-        request: RecordUsageServiceRequest,
+        mut request: RecordUsageServiceRequest,
     ) -> Result<UsageLogEntry, UsageError> {
-        // Look up the model to get pricing (model_id is already a UUID)
-        let model = self
-            .model_repository
-            .get_model_by_id(request.model_id)
-            .await
-            .map_err(|e| UsageError::InternalError(format!("Failed to get model: {e}")))?
-            .ok_or_else(|| {
-                UsageError::ModelNotFound(format!("Model with ID '{}' not found", request.model_id))
-            })?;
+        // A reservation fixes the tariff for the lifetime of this execution, including retries
+        // of its final usage report after a catalog edit or a gateway restart.
+        let snapshot = if let Some(id) = request.budget_id.or(request.inference_id) {
+            self.usage_repository
+                .budget_snapshot(request.organization_id, id)
+                .await
+                .map_err(|e| UsageError::InternalError(e.to_string()))?
+        } else {
+            None
+        };
+        let model = if let Some(snapshot) = snapshot {
+            snapshot.bounds.validate_actual(&request)?;
+            if snapshot.pricing.id != request.model_id {
+                return Err(UsageError::ValidationError(
+                    "reservation model mismatch".into(),
+                ));
+            }
+            if let Some(write) = &mut request.cache_write {
+                write.cost_per_token =
+                    five_minute_cache_write_rate(snapshot.pricing.input_cost_per_token)
+                        .ok_or_else(|| {
+                            UsageError::CostCalculationOverflow("cache-write snapshot".into())
+                        })?;
+            }
+            snapshot.pricing
+        } else {
+            self.model_repository
+                .get_model_by_id(request.model_id)
+                .await
+                .map_err(|e| UsageError::InternalError(e.to_string()))?
+                .ok_or_else(|| UsageError::ModelNotFound(request.model_id.to_string()))?
+        };
 
         let pricing::PricedUsage {
             cache_read_tokens,
@@ -243,6 +312,14 @@ impl UsageServiceTrait for UsageServiceImpl {
             service_tier,
             context_band,
         } = pricing::price_usage(&request, &model, self.metrics_service.as_ref())?;
+
+        let billing_details = if let Some(id) = request.budget_id {
+            let mut details = billing_details.unwrap_or_else(|| serde_json::json!({}));
+            details["budget_reservation_id"] = serde_json::json!(id);
+            Some(details)
+        } else {
+            billing_details
+        };
 
         // Create database request with model UUID and name (denormalized).
         // Note: `cache_read_tokens` is persisted for observability across all inference types,
@@ -412,6 +489,24 @@ impl UsageServiceTrait for UsageServiceImpl {
                     *provider_attribution,
                 )
             }
+            RecordUsageApiRequest::AudioTranscription {
+                model,
+                duration_seconds,
+                id,
+                provider_attribution,
+            } => {
+                validate_input_only_usage(id, *duration_seconds)?;
+                (
+                    model.clone(),
+                    *duration_seconds,
+                    0,
+                    0,
+                    None,
+                    InferenceType::AudioTranscription,
+                    id.clone(),
+                    *provider_attribution,
+                )
+            }
             RecordUsageApiRequest::ImageGeneration {
                 model,
                 image_count,
@@ -513,28 +608,32 @@ impl UsageServiceTrait for UsageServiceImpl {
             }
         };
 
-        // Look up model by name to get pricing and UUID
-        let model = self
-            .model_repository
-            .get_model_by_name(&model_name)
-            .await
-            .map_err(|e| UsageError::InternalError(format!("Failed to look up model: {e}")))?
-            .ok_or_else(|| {
-                UsageError::ModelNotFound(format!("Model '{}' not found", model_name))
-            })?;
-
-        // Derive inference tracking fields from the required external `id`.
-        // The raw value is stored verbatim as `provider_request_id`, but
-        // hashed under a dedicated UUID v5 namespace into `inference_id` so
-        // externally-submitted records live in a disjoint id space from the
-        // internal pipeline (which hashes the raw provider id under
-        // `NAMESPACE_DNS`). Idempotency within this endpoint is preserved
-        // because v5 is deterministic for a given (namespace, name) pair.
         let provider_request_id = Some(external_id.clone());
-        let inference_id = Some(Uuid::new_v5(
-            &EXTERNAL_USAGE_ID_NAMESPACE,
-            external_id.as_bytes(),
-        ));
+        let external_inference_id =
+            Uuid::new_v5(&EXTERNAL_USAGE_ID_NAMESPACE, external_id.as_bytes());
+        let inference_id = Some(external_inference_id);
+        // Admission snapshots remain authoritative after a catalog price change or retirement.
+        let snapshot = self
+            .usage_repository
+            .budget_snapshot(organization_id, external_inference_id)
+            .await
+            .map_err(|e| UsageError::InternalError(format!("Failed to load admission: {e}")))?;
+        let model = if let Some(snapshot) = snapshot {
+            if snapshot.pricing.model_name != model_name {
+                return Err(UsageError::ValidationError(
+                    "Model differs from reservation".into(),
+                ));
+            }
+            snapshot.pricing
+        } else {
+            self.model_repository
+                .get_model_by_name(&model_name)
+                .await
+                .map_err(|e| UsageError::InternalError(format!("Failed to look up model: {e}")))?
+                .ok_or_else(|| {
+                    UsageError::ModelNotFound(format!("Model '{}' not found", model_name))
+                })?
+        };
 
         // Build internal request and delegate.
         // Internal metrics (ttft_ms, avg_itl_ms, stop_reason) are not exposed

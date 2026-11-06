@@ -133,6 +133,13 @@ pub struct ServiceUsageReportEntry {
 /// Port for the service usage service. Implemented by ServiceUsageService.
 #[async_trait]
 pub trait ServiceUsageServiceTrait: Send + Sync {
+    async fn reserve_service(
+        &self,
+        _params: &RecordServiceUsageWithPricingParams,
+    ) -> anyhow::Result<Uuid> {
+        anyhow::bail!("service monetary admission is unavailable")
+    }
+
     /// Check if a service is configured and active (for pricing). Returns Some((id, cost_per_unit)) or None.
     async fn get_active_service_pricing(
         &self,
@@ -166,6 +173,13 @@ pub trait ServiceUsageServiceTrait: Send + Sync {
 /// Implemented by database layer; used by ServiceUsageService.
 #[async_trait]
 pub trait ServiceUsageRepositoryTrait: Send + Sync {
+    async fn reserve_service(
+        &self,
+        _params: &RecordServiceUsageWithPricingParams,
+    ) -> anyhow::Result<Uuid> {
+        anyhow::bail!("service monetary admission is unavailable")
+    }
+
     /// Returns (service_id, cost_per_unit) for active service or None if not found.
     async fn get_active_service_pricing(
         &self,

@@ -47,7 +47,8 @@ pub use models::*;
 pub use text::*;
 
 mod audio;
-mod billing;
+mod audio_budget;
+pub(crate) mod billing;
 mod embeddings;
 mod images;
 mod privacy;

@@ -29,7 +29,7 @@ pub struct RecordServiceUsageRequest {
 pub struct OrganizationServiceUsageRepository {
     pub(crate) pool: DbPool,
     reporting_statement_timeout: Duration,
-    allocation_policy: CreditAllocationPolicy,
+    pub(crate) allocation_policy: CreditAllocationPolicy,
 }
 
 impl OrganizationServiceUsageRepository {

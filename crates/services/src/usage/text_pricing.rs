@@ -135,6 +135,37 @@ struct ParsedRates {
 }
 
 impl TextPricingProfile {
+    /// Upper bound across every configured tier, context band and input token class.
+    pub fn maximum_cost(&self, input: i32, output: i32) -> Result<i64, UsageError> {
+        self.validate()?;
+        if input < 0 || output < 0 {
+            return Err(UsageError::ValidationError("negative usage bound".into()));
+        }
+        let rates = self.highest_rates()?.parse()?;
+        let input_rate = rates
+            .uncached_input
+            .max(rates.cached_input)
+            .max(rates.cache_write.unwrap_or(0));
+        let numerator = i128::from(input)
+            .checked_mul(input_rate)
+            .and_then(|v| {
+                i128::from(output)
+                    .checked_mul(rates.output)
+                    .and_then(|o| v.checked_add(o))
+            })
+            .ok_or_else(|| UsageError::CostCalculationOverflow("profile budget quote".into()))?;
+        // parse_rate uses nano-USD per million tokens; round upward for admission.
+        i64::try_from(
+            numerator
+                .checked_add(TOKENS_PER_PRICING_UNIT - 1)
+                .ok_or_else(|| {
+                    UsageError::CostCalculationOverflow("profile budget rounding".into())
+                })?
+                / TOKENS_PER_PRICING_UNIT,
+        )
+        .map_err(|_| UsageError::CostCalculationOverflow("profile budget quote".into()))
+    }
+
     pub fn from_json(value: serde_json::Value) -> Result<Self, UsageError> {
         let profile: Self = serde_json::from_value(value).map_err(|error| {
             UsageError::ValidationError(format!("invalid textPricing profile: {error}"))

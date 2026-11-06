@@ -543,7 +543,7 @@ async fn multiline_events_keep_signature_and_billing_ids_in_sync_and_ignore_trai
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn signed_stream_disconnect_and_error_still_bill_without_creating_receipts() {
+async fn signed_stream_disconnect_and_error_retain_reservations_without_receipts() {
     for disconnect in [true, false] {
         let store = Arc::new(ReceiptStore::default());
         let usage = Arc::new(RecordingUsageService::default());
@@ -574,29 +574,13 @@ async fn signed_stream_disconnect_and_error_still_bill_without_creating_receipts
             assert!(body.next().await.unwrap().is_err());
         }
         drop(body);
-        let recorded = wait_for_recorded_usage(&usage).await;
-        assert_eq!(
-            recorded.inference_id,
-            Some(services::completions::hash_inference_id_to_uuid(
-                "msg_receipt"
-            ))
-        );
-        assert_eq!(recorded.input_tokens, 3);
-        assert_eq!(
-            recorded.stop_reason,
-            Some(if disconnect {
-                services::usage::StopReason::ClientDisconnect
-            } else {
-                services::usage::StopReason::ProviderError
-            })
-        );
         assert!(usage.records.lock().unwrap().is_empty());
         assert_eq!(store.attempts.load(Ordering::SeqCst), 0);
     }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn disconnect_preserves_usage_already_peeked_in_a_partial_event() {
+async fn disconnect_does_not_settle_usage_peeked_in_a_partial_event() {
     let store = Arc::new(ReceiptStore::default());
     let usage = Arc::new(RecordingUsageService::default());
     // The provider delivered usage in the same chunk as message_start, but
@@ -625,13 +609,7 @@ async fn disconnect_preserves_usage_already_peeked_in_a_partial_event() {
     let mut body = response.into_body().into_data_stream();
     assert_eq!(body.next().await.unwrap().unwrap(), START);
     drop(body);
-    let recorded = wait_for_recorded_usage(&usage).await;
-    assert_eq!(recorded.input_tokens, 3);
-    assert_eq!(recorded.output_tokens, 9);
-    assert_eq!(
-        recorded.stop_reason,
-        Some(services::usage::StopReason::ClientDisconnect)
-    );
+    assert!(usage.records.lock().unwrap().is_empty());
     assert_eq!(store.attempts.load(Ordering::SeqCst), 0);
 }
 

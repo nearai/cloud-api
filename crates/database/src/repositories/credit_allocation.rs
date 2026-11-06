@@ -81,12 +81,30 @@ pub async fn allocate_usage(
 
     lock_organization_accounting(transaction, organization_id).await?;
 
+    // A dispatched reservation already owns its funding. Settle it in the usage transaction.
+    let (inference_id, service_id) = match parent {
+        UsageAllocationParent::Inference(id) => (Some(id), None),
+        UsageAllocationParent::Service(id) => (None, Some(id)),
+    };
+    let reserved: Option<serde_json::Value> = transaction.query_one(
+        "SELECT settle_usage_budget($1, COALESCE(            (SELECT inference_id FROM organization_usage_log WHERE id = $2),             (SELECT inference_id FROM organization_service_usage_log WHERE id = $3)), $2, $3, $4)",
+        &[&organization_id, &inference_id, &service_id, &total_cost],
+    ).await.map_err(map_db_error)?.get(0);
+    if let Some(allocations) = reserved {
+        return Ok(AllocationResult {
+            allocations: serde_json::from_value(allocations)
+                .map_err(|e| RepositoryError::ValidationFailed(e.to_string()))?,
+            funded_amount: total_cost,
+            unfunded_amount: 0,
+        });
+    }
+
     let rows = transaction
         .query(
             r#"
             SELECT active.id, active.credit_type, active.source,
                    active.effective_capacity AS spend_limit,
-                   COALESCE(consumed.amount, 0)::BIGINT AS consumed
+                   (COALESCE(consumed.amount, 0) + reserved_credit($1, active.credit_type))::BIGINT AS consumed
             FROM unnest($2::TEXT[]) WITH ORDINALITY AS wanted(credit_type, position)
             JOIN organization_credit_capacities active
               ON active.organization_id = $1
@@ -258,7 +276,7 @@ pub async fn settle_unfunded_usage(
             r#"
             SELECT active.id, active.credit_type, active.source,
                    active.effective_capacity AS spend_limit,
-                   COALESCE(consumed.amount, 0)::BIGINT AS consumed
+                   (COALESCE(consumed.amount, 0) + reserved_credit($1, active.credit_type))::BIGINT AS consumed
             FROM unnest($2::TEXT[]) WITH ORDINALITY AS wanted(credit_type, position)
             JOIN organization_credit_capacities active
               ON active.organization_id = $1

@@ -10,11 +10,20 @@ use std::sync::Mutex;
 /// Captures the persisted request and echoes it back as an inserted row.
 #[derive(Default)]
 struct CapturingUsageRepository {
+    snapshot: Option<super::budget::BudgetSnapshot>,
     requests: Mutex<Vec<RecordUsageDbRequest>>,
 }
 
 #[async_trait::async_trait]
 impl UsageRepository for CapturingUsageRepository {
+    async fn budget_snapshot(
+        &self,
+        _: Uuid,
+        _: Uuid,
+    ) -> anyhow::Result<Option<super::budget::BudgetSnapshot>> {
+        Ok(self.snapshot.clone())
+    }
+
     async fn record_usage(&self, request: RecordUsageDbRequest) -> anyhow::Result<UsageLogEntry> {
         let entry = UsageLogEntry {
             id: Uuid::new_v4(),
@@ -185,6 +194,7 @@ fn profile_without_cache_write() -> TextPricingProfile {
 /// pricing shows up.
 fn request(inference_type: InferenceType) -> RecordUsageServiceRequest {
     RecordUsageServiceRequest {
+        budget_id: None,
         organization_id: Uuid::new_v4(),
         workspace_id: Uuid::new_v4(),
         api_key_id: Uuid::new_v4(),
@@ -452,4 +462,46 @@ async fn passthrough_fields_reach_the_repository_unchanged() {
     assert_eq!(db.stop_reason, Some(StopReason::Completed));
     assert_eq!(db.image_count, Some(4));
     assert_eq!(db.provider_attribution, expected.provider_attribution);
+}
+
+#[tokio::test]
+async fn external_receipt_uses_admission_price_without_resolving_live_catalog() {
+    let pricing = model();
+    let repo = Arc::new(CapturingUsageRepository {
+        snapshot: Some(super::budget::BudgetSnapshot {
+            pricing: pricing.clone(),
+            bounds: super::budget::UsageBounds::text(100, 20, 1).unwrap(),
+        }),
+        ..Default::default()
+    });
+    let mut live = pricing.clone();
+    live.input_cost_per_token = 9999;
+    let service = UsageServiceImpl::new(
+        repo.clone(),
+        Arc::new(FixedModelRepository(live)),
+        Arc::new(UnusedLimitsRepository),
+        Arc::new(MockWorkspaceServiceTrait::new()),
+        Arc::new(CapturingMetricsService::new()),
+    );
+    service
+        .record_usage_from_api(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            RecordUsageApiRequest::ChatCompletion {
+                model: pricing.model_name.clone(),
+                id: "admitted-receipt".into(),
+                input_tokens: Some(2),
+                output_tokens: Some(1),
+                cache_read_tokens: None,
+                provider_attribution: Default::default(),
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    let saved = repo.requests.lock().unwrap();
+    assert_eq!(saved.len(), 1);
+    assert_eq!(saved[0].input_cost, 6);
+    assert_eq!(saved[0].output_cost, 7);
 }

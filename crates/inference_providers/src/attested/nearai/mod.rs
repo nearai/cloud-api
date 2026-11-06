@@ -1107,6 +1107,7 @@ impl Fleet {
                     continue;
                 }
             };
+            crate::retry_admission::before_retry().await?;
             let send_res = client
                 .post(&url)
                 .headers(headers.clone())
@@ -1236,6 +1237,7 @@ impl Fleet {
                     continue;
                 }
             };
+            crate::retry_admission::before_retry().await?;
             // Capture the send instant for the per-backend TTFT measurement.
             let started = std::time::Instant::now();
             let response = match self
@@ -1502,7 +1504,10 @@ impl InferenceProvider for Fleet {
         };
         let timeout_seconds = self.config.completion_timeout_seconds.max(1) as u64;
         let mut last_error = None;
-        for index in indices {
+        for (attempt_index, index) in indices.into_iter().enumerate() {
+            if attempt_index > 0 {
+                crate::retry_admission::before_retry().await?;
+            }
             let _lease = lease.take().or_else(|| {
                 index
                     .zip(route_key)
@@ -2036,6 +2041,7 @@ impl InferenceProvider for Fleet {
                 // clear the index client and re-verify with a fresh attestation.
                 self.clear_index(index);
                 let fresh = self.get_or_verify_index_client(index).await?;
+                crate::retry_admission::before_retry().await?;
                 self.send_streaming_request(&url, primary_headers, &streaming_params, Some(&fresh))
                     .await
             }
@@ -2256,6 +2262,7 @@ impl InferenceProvider for Fleet {
             {
                 self.clear_index(index);
                 let fresh = self.get_or_verify_index_client(index).await?;
+                crate::retry_admission::before_retry().await?;
                 send(&fresh, primary_headers).await.map_err(map_send_err)?
             }
             Err(e) => return Err(map_send_err(e)),

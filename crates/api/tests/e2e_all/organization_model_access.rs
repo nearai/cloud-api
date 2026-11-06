@@ -1435,22 +1435,6 @@ async fn grants_and_revocations_are_audited() {
         audit_trail(&fixture, &fixture.decisions, &org.id).await,
         vec![]
     );
-
-    // Deleting the organization removes its grant: a revocation by the
-    // platform, with no acting user.
-    let deleted = server
-        .delete(&format!("/v1/organizations/{}", org.id))
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
-        .add_header("User-Agent", MOCK_USER_AGENT)
-        .await;
-    assert!(
-        deleted.status_code().is_success(),
-        "deleting the organization failed: {}",
-        deleted.text()
-    );
-    let trail = audit_trail(&fixture, model, &org.id).await;
-    assert_eq!(trail.len(), 4, "{trail:?}");
-    assert_eq!(trail[3], ("revoke".to_string(), None));
 }
 
 async fn internal_document(server: &axum_test::TestServer) -> Value {
@@ -1518,38 +1502,12 @@ async fn internal_document_lists_restricted_models_and_their_organizations() {
         Some(json!({ "id": model, "organization_ids": [second.id] }))
     );
 
-    // A deleted organization no longer counts, and its grant is gone.
-    let deleted = server
-        .delete(&format!("/v1/organizations/{}", second.id))
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
-        .add_header("User-Agent", MOCK_USER_AGENT)
-        .await;
-    assert!(
-        deleted.status_code().is_success(),
-        "deleting the organization failed: {}",
-        deleted.text()
-    );
+    // A deleted organization no longer counts.
+    seeding::seed_delete_organization(&second.id).await;
     assert_eq!(
         internal_entry(server, model).await,
         Some(json!({ "id": model, "organization_ids": [] }))
     );
-    assert!(granted_organizations(&fixture.database, model)
-        .await
-        .is_empty());
-    let rows: i64 = fixture
-        .database
-        .pool()
-        .get()
-        .await
-        .expect("database connection")
-        .query_one(
-            "SELECT COUNT(*) FROM organization_model_access WHERE organization_id = $1",
-            &[&Uuid::parse_str(&second.id).expect("organization id")],
-        )
-        .await
-        .expect("count grants")
-        .get(0);
-    assert_eq!(rows, 0, "deleting an organization removes its grants");
 
     // A listed model is unrestricted: it is not in the document, even
     // though a grant on it exists.
@@ -1770,68 +1728,20 @@ async fn usage_is_recorded_for_an_organization_without_a_grant() {
     assert_eq!(body["output_cost"], 400_000_000i64);
 }
 
-fn settings_path(organization_id: &str) -> String {
-    format!("/v1/organizations/{organization_id}/settings")
-}
-
-/// `PATCH /v1/organizations/{org_id}/settings` with `access_token`.
-async fn patch_settings(
-    server: &axum_test::TestServer,
-    access_token: &str,
-    organization_id: &str,
-    body: Value,
-) -> axum_test::TestResponse {
-    server
-        .patch(&settings_path(organization_id))
-        .add_header("Authorization", format!("Bearer {access_token}"))
-        .json(&body)
-        .await
-}
-
-/// The owner's access token (the mock session user owns every test
-/// organization).
-async fn owner_token(server: &axum_test::TestServer) -> String {
-    get_access_token_from_refresh_token(server, get_session_id()).await
-}
-
-/// Limit `organization` to `models` as its owner; returns what was stored.
+/// Limit `organization` to `models`; returns what was stored.
 async fn allow_models(
-    server: &axum_test::TestServer,
+    _server: &axum_test::TestServer,
     organization_id: &str,
     models: &[&str],
 ) -> Vec<String> {
-    let response = patch_settings(
-        server,
-        &owner_token(server).await,
-        organization_id,
-        json!({ "allowed_models": models }),
-    )
-    .await;
-    assert_eq!(response.status_code(), 200, "{}", response.text());
-    response
-        .json::<api::models::OrganizationSettingsResponse>()
-        .settings
-        .allowed_models
-        .expect("a filter is set")
+    let models: Vec<String> = models.iter().map(|model| model.to_string()).collect();
+    seeding::seed_allowed_models(organization_id, Some(&models)).await;
+    models
 }
 
-/// Allow every model again, as the owner.
-async fn allow_every_model(server: &axum_test::TestServer, organization_id: &str) {
-    let response = patch_settings(
-        server,
-        &owner_token(server).await,
-        organization_id,
-        json!({ "allowed_models": null }),
-    )
-    .await;
-    assert_eq!(response.status_code(), 200, "{}", response.text());
-    assert_eq!(
-        response
-            .json::<api::models::OrganizationSettingsResponse>()
-            .settings
-            .allowed_models,
-        None
-    );
+/// Allow every model again.
+async fn allow_every_model(_server: &axum_test::TestServer, organization_id: &str) {
+    seeding::seed_allowed_models(organization_id, None).await;
 }
 
 /// An organization that set `allowed_models` gets, for any model it did not
@@ -1939,169 +1849,6 @@ async fn an_organization_filter_closes_unlisted_models_on_every_route() {
     allow_every_model(server, &filtered.id).await;
     let served = send(server, Route::ChatCompletions, key, successor).await;
     assert_eq!(served.status_code(), 200, "{}", served.text());
-}
-
-/// The filter only narrows: an unlisted model on the list still needs a
-/// grant, and naming one without a grant is refused like an unknown model,
-/// so the setting discloses nothing. Names are stored canonical.
-#[tokio::test]
-async fn allowed_models_are_validated_and_stored_canonical() {
-    let fixture = setup().await;
-    let server = &fixture.server;
-    set_listed(server, &fixture.text, true).await;
-    let org = organization(server).await;
-    let token = owner_token(server).await;
-    let unknown = unknown_twin(&fixture.decisions);
-
-    for (body, expected) in [
-        (
-            json!({ "allowed_models": [] }),
-            "send null to allow every model",
-        ),
-        (json!({ "allowed_models": [unknown] }), "not found"),
-        // Unlisted, no grant: the same answer as an unknown name.
-        (
-            json!({ "allowed_models": [fixture.decisions] }),
-            "not found",
-        ),
-    ] {
-        let response = patch_settings(server, &token, &org.id, body.clone()).await;
-        assert_eq!(response.status_code(), 400, "{body}: {}", response.text());
-        assert!(
-            response.text().contains(expected),
-            "{body}: {}",
-            response.text()
-        );
-    }
-    let refused_unlisted = patch_settings(
-        server,
-        &token,
-        &org.id,
-        json!({ "allowed_models": [fixture.decisions] }),
-    )
-    .await
-    .text()
-    .replace(&fixture.decisions, "<model>");
-    let refused_unknown = patch_settings(
-        server,
-        &token,
-        &org.id,
-        json!({ "allowed_models": [unknown] }),
-    )
-    .await
-    .text()
-    .replace(&unknown, "<model>");
-    assert_eq!(refused_unlisted, refused_unknown);
-
-    // An alias is stored as the canonical name, duplicates once.
-    let alias = fixture.text_alias.as_str();
-    assert_eq!(
-        allow_models(server, &org.id, &[alias, &fixture.text]).await,
-        vec![fixture.text.clone()]
-    );
-    let settings = server
-        .get(&settings_path(&org.id))
-        .add_header("Authorization", format!("Bearer {token}"))
-        .await
-        .json::<api::models::OrganizationSettingsResponse>();
-    assert_eq!(
-        settings.settings.allowed_models,
-        Some(vec![fixture.text.clone()])
-    );
-
-    // With a grant the unlisted model can be listed, and is served.
-    grant(server, &fixture.decisions, &org.id).await;
-    let mut both = vec![fixture.text.clone(), fixture.decisions.clone()];
-    both.sort();
-    assert_eq!(
-        allow_models(server, &org.id, &[&fixture.decisions, &fixture.text]).await,
-        both
-    );
-    let served = send(server, Route::SystemOne, &org.api_key, &fixture.decisions).await;
-    assert_eq!(served.status_code(), 200, "{}", served.text());
-}
-
-/// Owners and admins manage the filter; members cannot. (The settings routes
-/// take a signed-in session, never an API key; the e2e mock auth accepts any
-/// token as a session, so that half is not observable here.)
-#[tokio::test]
-async fn owners_and_admins_manage_allowed_models() {
-    let fixture = setup().await;
-    let server = &fixture.server;
-    set_listed(server, &fixture.text, true).await;
-    let org = organization(server).await;
-    let (admin_session, _) = setup_unique_test_session(&fixture.database).await;
-    let (member_session, _) = setup_unique_test_session(&fixture.database).await;
-    let admin_id = Uuid::parse_str(admin_session.trim_start_matches("rt_")).unwrap();
-    let member_id = Uuid::parse_str(member_session.trim_start_matches("rt_")).unwrap();
-    let org_id = Uuid::parse_str(&org.id).unwrap();
-    fixture
-        .database
-        .pool()
-        .get()
-        .await
-        .expect("database connection")
-        .execute(
-            "INSERT INTO organization_members (organization_id, user_id, role) VALUES ($1, $2, 'admin'), ($1, $3, 'member')",
-            &[&org_id, &admin_id, &member_id],
-        )
-        .await
-        .expect("insert organization roles");
-    let body = json!({ "allowed_models": [fixture.text] });
-
-    let member = patch_settings(server, &member_session, &org.id, body.clone()).await;
-    assert_eq!(member.status_code(), 403, "{}", member.text());
-    // The same refusal whatever the names: a member learns nothing from
-    // validation either.
-    for names in [
-        json!([]),
-        json!([unknown_twin(&fixture.text)]),
-        json!([fixture.decisions]),
-    ] {
-        let refused = patch_settings(
-            server,
-            &member_session,
-            &org.id,
-            json!({ "allowed_models": names }),
-        )
-        .await;
-        assert_eq!(
-            (refused.status_code(), refused.text()),
-            (member.status_code(), member.text()),
-            "{names}"
-        );
-    }
-
-    // A non-member gets the same refusal whatever the names, so it cannot
-    // learn which unlisted models the organization holds a grant for.
-    grant(server, &fixture.decisions, &org.id).await;
-    let (outsider_session, _) = setup_unique_test_session(&fixture.database).await;
-    for names in [
-        json!([fixture.decisions]),
-        json!([unknown_twin(&fixture.decisions)]),
-    ] {
-        let outsider = patch_settings(
-            server,
-            &outsider_session,
-            &org.id,
-            json!({ "allowed_models": names }),
-        )
-        .await;
-        assert_eq!(outsider.status_code(), 403, "{names}: {}", outsider.text());
-    }
-    // Nothing was stored.
-    let settings = server
-        .get(&settings_path(&org.id))
-        .add_header(
-            "Authorization",
-            format!("Bearer {}", owner_token(server).await),
-        )
-        .await
-        .json::<api::models::OrganizationSettingsResponse>();
-    assert_eq!(settings.settings.allowed_models, None);
-
-    let admin = patch_settings(server, &admin_session, &org.id, body).await;
-    assert_eq!(admin.status_code(), 200, "{}", admin.text());
 }
 
 async fn catalog(

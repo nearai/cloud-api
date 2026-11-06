@@ -1266,9 +1266,6 @@ pub fn build_app_with_config_and_options(
         &auth_components.auth_state_middleware,
     );
 
-    let workspace_routes =
-        build_workspace_routes(app_state.clone(), &auth_components.auth_state_middleware);
-
     let attestation_routes = build_attestation_routes(
         app_state.clone(),
         &auth_components.auth_state_middleware,
@@ -1329,7 +1326,6 @@ pub fn build_app_with_config_and_options(
                 .merge(response_routes)
                 .merge(unsupported_openai_routes)
                 .merge(conversation_routes)
-                .merge(workspace_routes)
                 .merge(attestation_routes.clone())
                 .merge(model_routes)
                 .merge(services_routes)
@@ -1856,42 +1852,6 @@ pub fn build_attestation_routes(
         .merge(authenticated_routes)
         .merge(optional_key_routes)
         .merge(public_routes)
-}
-
-/// Build workspace routes with auth
-pub fn build_workspace_routes(app_state: AppState, auth_state_middleware: &AuthState) -> Router {
-    use crate::routes::workspaces::*;
-
-    Router::new()
-        // Workspace management routes
-        .route(
-            "/organizations/{org_id}/workspaces",
-            get(list_organization_workspaces).post(create_workspace),
-        )
-        .route(
-            "/workspaces/{workspace_id}",
-            get(get_workspace)
-                .put(update_workspace)
-                .delete(delete_workspace),
-        )
-        // Workspace API key management
-        .route(
-            "/workspaces/{workspace_id}/api-keys",
-            get(list_workspace_api_keys).post(create_workspace_api_key),
-        )
-        .route(
-            "/workspaces/{workspace_id}/api-keys/{key_id}",
-            axum::routing::delete(revoke_workspace_api_key).patch(update_workspace_api_key),
-        )
-        .route(
-            "/workspaces/{workspace_id}/api-keys/{key_id}/spend-limit",
-            axum::routing::patch(update_api_key_spend_limit),
-        )
-        .with_state(app_state)
-        .layer(from_fn_with_state(
-            auth_state_middleware.clone(),
-            auth_middleware,
-        ))
 }
 
 /// Build the temporary Files API migration surface.

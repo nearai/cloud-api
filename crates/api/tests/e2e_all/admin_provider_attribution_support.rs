@@ -2,10 +2,9 @@ use crate::common::*;
 use std::sync::OnceLock;
 
 static HARNESS_ENV: OnceLock<()> = OnceLock::new();
-type ProviderUsageWindow = (chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>);
 
 pub(super) struct PlatformProviderUsageFixture {
-    pub(super) server: axum_test::TestServer,
+    pub(super) _server: axum_test::TestServer,
     pub(super) database: std::sync::Arc<database::Database>,
     pub(super) organization_id: uuid::Uuid,
     pub(super) workspace_id: uuid::Uuid,
@@ -55,7 +54,7 @@ pub(super) async fn setup_platform_provider_usage_fixture() -> PlatformProviderU
     drop(client);
 
     PlatformProviderUsageFixture {
-        server,
+        _server: server,
         database,
         organization_id,
         workspace_id,
@@ -70,64 +69,4 @@ pub(super) fn ensure_platform_provider_usage_harness_env() {
         std::env::set_var("DEV", "1");
         std::env::set_var("BRAVE_SEARCH_PRO_API_KEY", "test");
     });
-}
-
-/// `hours` (at most `SLOT_HOURS`) whole far-past UTC hours that no other test reads or
-/// recomputes, starting on a slot boundary.
-pub(super) async fn isolated_usage_hours(
-    fixture: &PlatformProviderUsageFixture,
-    hours: i64,
-) -> ProviderUsageWindow {
-    // Invariant: only this allocator hands out 1900s hours, one slot per caller, and every
-    // other usage_hourly recompute stays outside the 1900s (random_past_hour and day parity:
-    // 2001-2021; live and fixed-date tests: 2026; serial tests: +4000 days).
-    //
-    // Allocate whole, non-overlapping far-past slots from PostgreSQL's cluster-wide
-    // transaction counter. Reports read usage_hourly at hour grain (spec §6.1), so a test's
-    // cohort must own its entire hours, including "not yet aggregated" assertions.
-    //
-    // The occupancy check also handles a restored database, transaction-ID wrap,
-    // and rows retained from older versions of this test helper.
-    const MAX_ATTEMPTS: usize = 64;
-    const SLOT_HOURS: i64 = 2;
-    const SLOT_COUNT: i64 = 438_000; // 2-hour slots from 1900-01-01, all before 2000
-    assert!(
-        (1..=SLOT_HOURS).contains(&hours),
-        "at most {SLOT_HOURS} hours"
-    );
-    let base = chrono::DateTime::parse_from_rfc3339("1900-01-01T00:00:00Z")
-        .expect("provider usage window base is valid")
-        .with_timezone(&chrono::Utc);
-    let client = fixture.database.pool().get().await.expect("db connection");
-
-    for _ in 0..MAX_ATTEMPTS {
-        let allocation_id: i64 = client
-            .query_one("SELECT txid_current()", &[])
-            .await
-            .expect("allocate provider usage window")
-            .get(0);
-        let slot = allocation_id.rem_euclid(SLOT_COUNT);
-        let start = base + chrono::Duration::hours(slot * SLOT_HOURS);
-        let slot_end = start + chrono::Duration::hours(SLOT_HOURS);
-        let occupied: bool = client
-            .query_one(
-                r#"
-                SELECT EXISTS (
-                    SELECT 1
-                    FROM organization_usage_log
-                    WHERE created_at >= $1 AND created_at < $2
-                )
-                "#,
-                &[&start, &slot_end],
-            )
-            .await
-            .expect("check provider usage window occupancy")
-            .get(0);
-
-        if !occupied {
-            return (start, start + chrono::Duration::hours(hours));
-        }
-    }
-
-    panic!("failed to allocate an empty provider usage window after {MAX_ATTEMPTS} attempts")
 }

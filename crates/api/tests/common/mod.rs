@@ -177,26 +177,6 @@ pub fn get_session_id() -> String {
     format!("rt_{MOCK_USER_ID}")
 }
 
-pub async fn get_access_token_from_refresh_token(
-    server: &axum_test::TestServer,
-    refresh_token: String,
-) -> String {
-    let response = server
-        .post("/v1/users/me/access-tokens")
-        .add_header("Authorization", format!("Bearer {refresh_token}"))
-        .add_header("User-Agent", MOCK_USER_AGENT)
-        .await;
-
-    assert_eq!(
-        response.status_code(),
-        200,
-        "Failed to refresh access token"
-    );
-
-    let refresh_response = response.json::<api::models::AccessAndRefreshTokenResponse>();
-    refresh_response.access_token
-}
-
 pub fn use_real_providers() -> bool {
     std::env::var("USE_REAL_PROVIDERS")
         .map(|v| v == "true" || v == "1")
@@ -846,7 +826,7 @@ pub async fn add_credits_with_type(
 pub async fn list_workspaces(
     server: &axum_test::TestServer,
     org_id: String,
-) -> Vec<api::routes::workspaces::WorkspaceResponse> {
+) -> Vec<seeding::WorkspaceResponse> {
     list_workspaces_with_session(server, org_id, &get_session_id()).await
 }
 
@@ -854,7 +834,7 @@ pub async fn list_workspaces_with_session(
     _server: &axum_test::TestServer,
     org_id: String,
     _session_id: &str,
-) -> Vec<api::routes::workspaces::WorkspaceResponse> {
+) -> Vec<seeding::WorkspaceResponse> {
     seeding::seed_list_workspaces(&org_id).await
 }
 

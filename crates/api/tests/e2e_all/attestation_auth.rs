@@ -139,15 +139,7 @@ async fn test_attestation_report_revoked_key_returns_401() {
     let api_key = api_key_resp.key.clone().unwrap();
 
     // Revoke the key before it is ever used.
-    let delete_response = server
-        .delete(&format!(
-            "/v1/workspaces/{}/api-keys/{}",
-            workspace.id, api_key_resp.id
-        ))
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
-        .add_header("User-Agent", MOCK_USER_AGENT)
-        .await;
-    assert_eq!(delete_response.status_code(), 204);
+    seeding::seed_revoke_api_key(&api_key_resp.id).await;
 
     let response = server
         .get(&report_url(&model))

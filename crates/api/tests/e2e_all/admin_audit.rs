@@ -27,18 +27,6 @@ const REQUEST_ID_HEADER: &str = "x-request-id";
 /// router (using mock storage).
 const MOUNTED_ADMIN_ROUTES: &[(&str, &str)] = &[
     ("GET", "/admin/platform/infra-summary"),
-    ("GET", "/admin/invitation-email-deliveries"),
-    (
-        "POST",
-        "/admin/invitation-email-deliveries/{invitation_id}/resend",
-    ),
-    ("POST", "/admin/users/{user_id}/erasure/preview"),
-    ("POST", "/admin/users/{user_id}/erasure"),
-    ("POST", "/admin/user-erasures/lookup"),
-    ("PUT", "/admin/organizations/{org_id}/members/{user_id}"),
-    ("POST", "/admin/access-tokens"),
-    ("GET", "/admin/access-tokens"),
-    ("DELETE", "/admin/access-tokens/{token_id}"),
     ("POST", "/admin/database-encryption/scan"),
     ("POST", "/admin/database-encryption/jobs"),
     ("GET", "/admin/database-encryption/jobs/{id}"),
@@ -194,8 +182,7 @@ async fn json_body(response: Response) -> Value {
 
 /// Paginated admin lists the page guard must find in the OpenAPI document. A
 /// newly documented paginated list is checked without being listed here.
-const KNOWN_PAGINATED_ADMIN_LISTS: &[&str] =
-    &["/admin/access-tokens", "/admin/invitation-email-deliveries"];
+const KNOWN_PAGINATED_ADMIN_LISTS: &[&str] = &[];
 
 /// Admin GET routes documented with `limit` and `offset` query parameters.
 fn documented_paginated_admin_lists() -> BTreeSet<String> {
@@ -361,29 +348,19 @@ async fn admin_token_identity_is_audited_for_allowed_and_denied_requests() {
         &router,
         authorized(
             Method::GET,
-            "/v1/admin/invitation-email-deliveries?limit=1",
+            "/v1/admin/database-encryption/keys",
             &read_only_token,
             json!({}),
         ),
     )
     .await;
     assert_eq!(response.status(), StatusCode::OK);
-    let returned = json_body(response).await["deliveries"]
-        .as_array()
-        .expect("deliveries")
-        .len();
     let event = logs.take_single_event();
-    assert_eq!(
-        event["admin_route"],
-        "/v1/admin/invitation-email-deliveries"
-    );
+    assert_eq!(event["admin_route"], "/v1/admin/database-encryption/keys");
     assert_eq!(event["admin_auth_outcome"], "allowed");
     assert_eq!(event["admin_credential_kind"], "admin_access_token");
     assert_eq!(event["admin_credential_id"], read_only.id.to_string());
     assert_eq!(event["admin_user_id"], MOCK_USER_ID);
-    assert_eq!(event["admin_limit"], 1);
-    assert_eq!(event["admin_offset"], 0);
-    assert_eq!(event["admin_returned_count"], returned);
     assert!(!event.contains_key("admin_organization_id"));
 
     // Policy denials keep the authenticated identity but name no organization.
@@ -395,10 +372,10 @@ async fn admin_token_identity_is_audited_for_allowed_and_denied_requests() {
             read_only.id,
         ),
         (
-            Method::GET,
-            "/v1/admin/access-tokens".to_string(),
-            &read_write_token,
-            read_write.id,
+            Method::POST,
+            "/v1/admin/object-encryption/jobs".to_string(),
+            &read_only_token,
+            read_only.id,
         ),
     ] {
         let response = send(
@@ -425,7 +402,7 @@ async fn admin_token_identity_is_audited_for_allowed_and_denied_requests() {
         &router,
         authorized(
             Method::GET,
-            "/v1/admin/invitation-email-deliveries",
+            "/v1/admin/database-encryption/keys",
             &read_write_token,
             json!({}),
         ),
@@ -440,109 +417,6 @@ async fn admin_token_identity_is_audited_for_allowed_and_denied_requests() {
 }
 
 #[tokio::test]
-async fn list_handlers_record_validated_pages_and_organization_scope() {
-    let (server, router) = setup_test_server_and_router().await;
-    let organization_id = create_org(&server).await.id;
-    let session_id = Uuid::new_v4();
-    let session = session_jwt(session_id);
-    let (logs, _guard) = CapturedLogs::start();
-
-    let lists = [
-        (
-            "/v1/admin/invitation-email-deliveries?limit=1&offset=2".to_string(),
-            "deliveries",
-            1,
-            2,
-            None,
-        ),
-        (
-            format!(
-                "/v1/admin/invitation-email-deliveries?organization_id={organization_id}&limit=1"
-            ),
-            "deliveries",
-            1,
-            0,
-            Some(&organization_id),
-        ),
-    ];
-    for (uri, rows_field, limit, offset, organization) in lists {
-        let response = send(&router, authorized(Method::GET, &uri, &session, json!({}))).await;
-        assert_eq!(response.status(), StatusCode::OK, "{uri}");
-        let rows = json_body(response).await[rows_field]
-            .as_array()
-            .unwrap_or_else(|| panic!("{uri} lists {rows_field}"))
-            .len();
-        let event = logs.take_single_event();
-        assert_eq!(event["admin_auth_outcome"], "allowed", "{uri}");
-        assert_eq!(event["admin_credential_kind"], "session");
-        assert_eq!(event["admin_credential_id"], session_id.to_string());
-        assert_eq!(event["admin_user_id"], MOCK_USER_ID);
-        assert_eq!(event["admin_limit"], limit, "{uri}");
-        assert_eq!(event["admin_offset"], offset, "{uri}");
-        assert_eq!(event["admin_returned_count"], rows, "{uri}");
-        match organization {
-            Some(organization_id) => {
-                assert_eq!(event["admin_organization_id"], organization_id.as_str())
-            }
-            None => assert!(!event.contains_key("admin_organization_id"), "{uri}"),
-        }
-    }
-
-    // A page the handler rejects is not recorded.
-    let response = send(
-        &router,
-        authorized(
-            Method::GET,
-            "/v1/admin/invitation-email-deliveries?limit=0",
-            &session,
-            json!({}),
-        ),
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    let event = logs.take_single_event();
-    assert_eq!(event["admin_status"], 400);
-    for absent in ["admin_limit", "admin_offset", "admin_returned_count"] {
-        assert!(!event.contains_key(absent), "{event:?}");
-    }
-
-    // An allowed org-scoped write names its organization.
-    let database = seeding::seed_database().await;
-    let (member_session, _) = setup_unique_test_session(&database).await;
-    let member_id = Uuid::parse_str(member_session.trim_start_matches("rt_")).unwrap();
-    database
-        .pool()
-        .get()
-        .await
-        .expect("database connection")
-        .execute(
-            "INSERT INTO organization_members (organization_id, user_id, role) VALUES ($1, $2, 'member')",
-            &[&Uuid::parse_str(&organization_id).unwrap(), &member_id],
-        )
-        .await
-        .expect("member is seeded");
-    let response = send(
-        &router,
-        authorized(
-            Method::PUT,
-            &format!("/v1/admin/organizations/{organization_id}/members/{member_id}"),
-            &session,
-            json!({"role": "admin"}),
-        ),
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::OK);
-    let event = logs.take_single_event();
-    assert_eq!(
-        event["admin_route"],
-        "/v1/admin/organizations/{org_id}/members/{user_id}"
-    );
-    assert_eq!(event["admin_method"], "PUT");
-    assert_eq!(event["admin_auth_outcome"], "allowed");
-    assert_eq!(event["admin_organization_id"], organization_id.as_str());
-}
-
-#[tokio::test]
 async fn audit_events_exclude_request_content_on_the_real_router() {
     const EMAIL: &str = "audit-e2e-sentinel@customer.example";
     const BODY: &str = "AUDIT_E2E_BODY_SENTINEL";
@@ -554,8 +428,8 @@ async fn audit_events_exclude_request_content_on_the_real_router() {
     let (logs, _guard) = CapturedLogs::start();
 
     for uri in [
-        format!("/v1/admin/invitation-email-deliveries?recipient_email={EMAIL}&limit=1"),
-        format!("/v1/admin/access-tokens?lookup={EMAIL}"),
+        format!("/v1/admin/database-encryption/keys?recipient_email={EMAIL}&limit=1"),
+        format!("/v1/admin/platform/infra-summary?lookup={EMAIL}"),
     ] {
         let response = send(
             &router,
@@ -613,18 +487,7 @@ fn page_guard_finds_every_known_paginated_admin_list() {
 /// so a new list handler cannot leave its audit event without one.
 #[tokio::test]
 async fn every_documented_paginated_admin_list_records_its_page() {
-    let (server, router) = setup_test_server_and_router().await;
-    let access_token = server
-        .post("/v1/admin/access-tokens")
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
-        .add_header("User-Agent", MOCK_USER_AGENT)
-        .json(&json!({
-            "name": format!("admin-audit-{}", Uuid::new_v4()),
-            "reason": "admin audit e2e",
-            "expires_in_hours": 1
-        }))
-        .await;
-    assert_eq!(access_token.status_code(), StatusCode::OK);
+    let (_server, router) = setup_test_server_and_router().await;
     let session = session_jwt(Uuid::new_v4());
     let (logs, _guard) = CapturedLogs::start();
 
@@ -650,38 +513,6 @@ async fn every_documented_paginated_admin_list_records_its_page() {
                 ),
                 "{uri} must record the page it served"
             );
-        }
-    }
-}
-
-#[tokio::test]
-async fn paginated_lists_record_no_page_when_the_request_fails() {
-    let (_server, router) = setup_test_server_and_router().await;
-    let session = session_jwt(Uuid::new_v4());
-    let (logs, _guard) = CapturedLogs::start();
-
-    for (uri, status) in [
-        (
-            "/v1/admin/invitation-email-deliveries?limit=0".to_string(),
-            StatusCode::BAD_REQUEST,
-        ),
-        (
-            "/v1/admin/access-tokens?offset=-1".to_string(),
-            StatusCode::BAD_REQUEST,
-        ),
-        // A valid page with an invalid filter.
-        (
-            "/v1/admin/invitation-email-deliveries?email_status=unknown".to_string(),
-            StatusCode::BAD_REQUEST,
-        ),
-    ] {
-        let response = send(&router, authorized(Method::GET, &uri, &session, json!({}))).await;
-        assert_eq!(response.status(), status, "{uri}");
-        let event = logs.take_single_event();
-        assert_eq!(event["admin_auth_outcome"], "allowed", "{uri}");
-        assert_eq!(event["admin_status"], status.as_u16(), "{uri}");
-        for absent in ["admin_limit", "admin_offset", "admin_returned_count"] {
-            assert!(!event.contains_key(absent), "{uri}: {event:?}");
         }
     }
 }

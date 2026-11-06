@@ -18,6 +18,5 @@ pub mod responses;
 pub mod services;
 pub mod systemone;
 pub mod unsupported;
-pub mod workspaces;
 
 mod responses_native;

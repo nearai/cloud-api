@@ -2197,35 +2197,11 @@ fn build_admin_routes_with_options(
         AdminAppState,
     };
 
-    use database::repositories::{AdminAccessTokenRepository, AdminCompositeRepository};
-    use services::admin::AdminServiceImpl;
-
-    // Create composite admin repository (handles models, organization limits, and users)
-    let admin_repository = Arc::new(AdminCompositeRepository::with_accounting_config(
-        database.pool().clone(),
-        &config.credit_allocation,
-    ));
+    use database::repositories::AdminAccessTokenRepository;
 
     // Create admin access token repository
     let admin_access_token_repository =
         Arc::new(AdminAccessTokenRepository::new(database.pool().clone()));
-    // Create admin service with composite repository.
-    //
-    // The admin service holds a reference to the `models_service` so it can
-    // invalidate the public `/v1/model/list` cache after admin writes
-    // (`upsert`, `delete`, `deprecate`) that mutate the `models` or
-    // `model_aliases` tables. It also holds the `completion_service` so it
-    // can invalidate the per-org concurrent-limit cache after a PATCH to
-    // `/v1/admin/organizations/{org_id}/concurrent-limit`.
-    let admin_service = Arc::new(AdminServiceImpl::new(
-        admin_repository as Arc<dyn services::admin::AdminRepository>,
-        services.models_service,
-        services.completion_service.clone()
-            as Arc<dyn services::completions::CompletionServiceTrait>,
-        services::email::sender_from_config(&config.invitation_email)
-            .expect("Failed to initialize admin email sender"),
-    )) as Arc<dyn services::admin::AdminService + Send + Sync>;
-
     let infra_service = Arc::new(services::admin::InfraService::new(
         config.infra.machines_url.clone(),
         config.infra.cost_per_host_usd_month,
@@ -2236,7 +2212,6 @@ fn build_admin_routes_with_options(
     ));
 
     let admin_app_state = AdminAppState {
-        admin_service,
         organization_service: services.organization_service,
         auth_service: auth_state_middleware.auth_service.clone(),
         config: config.clone(),

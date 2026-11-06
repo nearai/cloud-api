@@ -22,7 +22,6 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use config::ApiConfig;
-use services::admin::AdminService;
 use services::auth::{AuthServiceTrait, UserId};
 use std::sync::Arc;
 use tracing::{debug, error};
@@ -38,7 +37,6 @@ pub(crate) fn format_deprecation_date(dt: &DateTime<Utc>) -> String {
 
 #[derive(Clone)]
 pub struct AdminAppState {
-    pub admin_service: Arc<dyn AdminService + Send + Sync>,
     pub organization_service:
         Arc<dyn services::organization::OrganizationServiceTrait + Send + Sync>,
     pub auth_service: Arc<dyn AuthServiceTrait>,

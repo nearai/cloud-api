@@ -50,6 +50,15 @@ Operations marked deprecated (account, organization, workspace, invitation, API 
         (name = "Services", description = "Public platform services (e.g. web_search pricing)"),
     ),
     paths(
+        crate::database_encryption::get_keys,
+        crate::object_encryption::get_keys,
+        crate::object_encryption::scan,
+        crate::object_encryption::create_job,
+        crate::object_encryption::get_job,
+        crate::object_encryption::cancel_job,
+        crate::object_encryption::verify,
+        crate::database_encryption::create_job,
+        crate::database_encryption::verify,
         // Chat completion endpoints (most important for users)
         crate::routes::completions::chat_completions,
         crate::routes::completions::image_generations,
@@ -380,7 +389,7 @@ Operations marked deprecated (account, organization, workspace, invitation, API 
             crate::routes::usage::UsageByModelEntryResponse,
             crate::routes::usage::ServiceUsageHistoryResponse,
             crate::routes::usage::ServiceUsageEntryResponse,
-            crate::routes::usage::RecordUsageResponse,
+            crate::routes::internal_usage::RecordUsageResponse,
             crate::routes::usage::UserOrganizationMetrics,
             crate::routes::usage::UserMetricsSummary,
             crate::routes::usage::UserModelMetrics,
@@ -637,6 +646,120 @@ impl Modify for SecurityAddon {
 mod admin_token_permission_tests {
     use super::*;
     use serde_json::{json, Value};
+
+    #[test]
+    fn database_encryption_schema_exposes_rotation_requests_and_keys() {
+        let doc = serde_json::to_value(ApiDoc::openapi()).unwrap();
+        let schemas = &doc["components"]["schemas"];
+        for (path, schema) in [
+            ("/v1/admin/database-encryption/jobs", "CreateJobRequest"),
+            ("/v1/admin/database-encryption/verify", "VerifyRequest"),
+        ] {
+            assert_eq!(
+                doc["paths"][path]["post"]["requestBody"]["content"]["application/json"]["schema"]
+                    ["$ref"],
+                format!("#/components/schemas/{schema}")
+            );
+            assert_eq!(
+                schemas[schema]["properties"]["scope"]["$ref"],
+                "#/components/schemas/Scope"
+            );
+            assert!(doc["paths"][path]["post"]["security"]
+                .as_array()
+                .unwrap()
+                .contains(&json!({"admin_token": []})));
+        }
+        for schema in ["CreateJobRequest", "VerifyRequest", "JobOptions"] {
+            let delay = &schemas[schema]["properties"]["batch_delay_ms"];
+            assert_eq!(delay["minimum"].as_f64(), Some(0.0));
+            assert_eq!(delay["maximum"].as_f64(), Some(10000.0));
+        }
+        assert_eq!(
+            schemas["CreateJobRequest"]["properties"]["actions"]["items"]["type"],
+            "string"
+        );
+        assert_eq!(
+            schemas["Scope"]["properties"]["options"]["$ref"],
+            "#/components/schemas/JobOptions"
+        );
+        assert_eq!(
+            doc["paths"]["/v1/admin/database-encryption/keys"]["get"]["responses"]["200"]
+                ["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/KeysResponse"
+        );
+        let keys = &schemas["KeysResponse"];
+        assert_eq!(keys["properties"]["write_key_id"]["type"], "string");
+        assert_eq!(keys["properties"]["read_key_ids"]["type"], "array");
+        assert_eq!(
+            keys["properties"]["read_key_ids"]["items"]["type"],
+            "string"
+        );
+        assert_eq!(keys["properties"]["fingerprints"]["type"], "object");
+        assert_eq!(
+            keys["properties"]["fingerprints"]["additionalProperties"]["type"],
+            "string"
+        );
+        assert_eq!(keys["properties"]["write_enabled"]["type"], "boolean");
+        for field in [
+            "write_key_id",
+            "read_key_ids",
+            "fingerprints",
+            "write_enabled",
+        ] {
+            assert!(keys["required"].as_array().unwrap().contains(&json!(field)));
+        }
+    }
+
+    #[test]
+    fn object_encryption_schema_keeps_permissions_and_job_shapes_distinct() {
+        let doc = serde_json::to_value(ApiDoc::openapi()).unwrap();
+        for (path, method) in [
+            ("keys", "get"),
+            ("scan", "post"),
+            ("jobs", "post"),
+            ("jobs/{id}", "get"),
+            ("jobs/{id}/cancel", "post"),
+            ("verify", "post"),
+        ] {
+            let operation = &doc["paths"][format!("/v1/admin/object-encryption/{path}")][method];
+            assert!(operation.is_object(), "missing {method} {path}");
+            assert!(operation["security"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| value.get("session_token").is_some()));
+            assert!(operation["security"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| value.get("admin_token").is_some()));
+        }
+        for schema in [
+            "ObjectCreateJobRequest",
+            "ObjectVerifyRequest",
+            "ObjectEncryptionOptions",
+        ] {
+            let delay = &doc["components"]["schemas"][schema]["properties"]["batch_delay_ms"];
+            assert_eq!(delay["minimum"].as_f64(), Some(0.0));
+            assert_eq!(delay["maximum"].as_f64(), Some(10000.0));
+        }
+        assert!(doc["components"]["schemas"]["JobResponse"].is_object());
+        assert!(doc["components"]["schemas"]["ObjectJobResponse"].is_object());
+        let scan_response = &doc["paths"]["/v1/admin/object-encryption/scan"]["post"]["responses"]
+            ["200"]["content"]["application/json"]["schema"];
+        assert_eq!(
+            scan_response["$ref"],
+            "#/components/schemas/ObjectScanResponse"
+        );
+        assert_eq!(
+            doc["components"]["schemas"]["ObjectScanResponse"]["properties"]["cursor"]["$ref"],
+            "#/components/schemas/SignedScanCursor"
+        );
+        let scan_cursor = &doc["components"]["schemas"]["SignedScanCursor"];
+        for field in ["version", "key_id", "state", "tag"] {
+            assert!(scan_cursor["properties"][field].is_object());
+        }
+    }
 
     #[test]
     fn permission_request_defaults_only_when_omitted() {

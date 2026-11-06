@@ -847,8 +847,12 @@ impl OrganizationRepository for PgOrganizationRepository {
         let system_prompt = patch.system_prompt.flatten();
         let has_fallback_enabled = patch.fallback_enabled.is_some();
         let fallback_enabled = patch.fallback_enabled.flatten();
+        let has_allowed_models = patch.allowed_models.is_some();
+        let allowed_models = patch.allowed_models.flatten().map(|names| {
+            serde_json::Value::Array(names.into_iter().map(serde_json::Value::String).collect())
+        });
 
-        // Apply both supported keys in one statement. PostgreSQL takes the row
+        // Apply every supported key in one statement. PostgreSQL takes the row
         // lock for the UPDATE, so concurrent patches to different keys always
         // start from the latest committed settings instead of overwriting one
         // another with stale read-modify-write snapshots.
@@ -883,7 +887,7 @@ impl OrganizationRepository for PgOrganizationRepository {
                     .map_err(map_db_error)?
                     .map(|row| row.get::<_, String>("role"));
                 let can_manage = matches!(actor_role.as_deref(), Some("owner" | "admin"));
-                if has_system_prompt && !can_manage {
+                if (has_system_prompt || has_allowed_models) && !can_manage {
                     return Err(RepositoryError::ValidationFailed(
                         "Insufficient permissions to manage organization settings".to_string(),
                     ));
@@ -924,11 +928,20 @@ impl OrganizationRepository for PgOrganizationRepository {
                             ELSE value
                         END AS value
                         FROM prompt_patched
+                    ), models_patched AS (
+                        SELECT CASE
+                            WHEN $6::boolean AND $7::jsonb IS NULL
+                                THEN value - 'allowed_models'
+                            WHEN $6::boolean
+                                THEN jsonb_set(value, '{allowed_models}', $7::jsonb, true)
+                            ELSE value
+                        END AS value
+                        FROM fully_patched
                     )
                     UPDATE organizations AS organization
-                    SET settings = fully_patched.value,
+                    SET settings = models_patched.value,
                         updated_at = NOW()
-                    FROM fully_patched
+                    FROM models_patched
                     WHERE organization.id = $1 AND organization.is_active = true
                     RETURNING organization.*
                     "#,
@@ -938,6 +951,8 @@ impl OrganizationRepository for PgOrganizationRepository {
                         &system_prompt,
                         &has_fallback_enabled,
                         &fallback_enabled,
+                        &has_allowed_models,
+                        &allowed_models,
                     ],
                 )
                 .await

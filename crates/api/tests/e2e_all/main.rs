@@ -128,6 +128,7 @@ mod user_erasure;
 mod user_erasure_lookup;
 mod vpc_login_removed;
 mod web_context_search;
+mod workspace_change_permissions;
 /// Run by nextest's setup script after this E2E binary has already been built.
 /// Keeping bootstrap in the same binary avoids a second cold compile/link in CI.
 #[tokio::test]

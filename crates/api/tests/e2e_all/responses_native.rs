@@ -23,7 +23,7 @@ async fn native_stateless_responses_reject_image_output_models() {
         }))
         .unwrap(),
     );
-    admin_batch_upsert_models(&server, batch, get_session_id()).await;
+    seed_models(&server, batch, get_session_id()).await;
 
     let org = setup_org_with_credits(&server, 10_000_000_000).await;
     let key = get_api_key_for_org(&server, org.id).await;
@@ -56,7 +56,7 @@ async fn openai_responses_without_native_provider_never_fall_back_to_chat() {
         }))
         .unwrap(),
     );
-    admin_batch_upsert_models(&server, batch, get_session_id()).await;
+    seed_models(&server, batch, get_session_id()).await;
     let provider = Arc::new(MockProvider::new_accept_all());
     pool.register_provider(model.clone(), provider.clone())
         .await;
@@ -112,7 +112,7 @@ async fn native_stateless_responses_preserve_protocol_and_isolate_legacy_routes(
             .unwrap(),
         );
     }
-    admin_batch_upsert_models(&server, batch, get_session_id()).await;
+    seed_models(&server, batch, get_session_id()).await;
     pool.register_provider(model.clone(), provider.clone())
         .await;
     pool.register_provider(other.clone(), provider.clone())

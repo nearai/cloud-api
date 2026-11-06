@@ -105,8 +105,8 @@ pub fn create_pool_with_native_tls(
 #[derive(Clone)]
 pub struct DbPool {
     inner: std::sync::Arc<std::sync::RwLock<Option<Pool>>>,
-    encryption_key: std::sync::Arc<std::sync::RwLock<Option<[u8; 32]>>>,
-    encryption_key_id: std::sync::Arc<std::sync::RwLock<String>>,
+    encryption_state:
+        std::sync::Arc<std::sync::RwLock<Option<std::sync::Arc<crate::field_encryption::KeyRing>>>>,
     encryption_write_enabled: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -115,10 +115,7 @@ impl DbPool {
     pub fn new(pool: Pool) -> Self {
         Self {
             inner: std::sync::Arc::new(std::sync::RwLock::new(Some(pool))),
-            encryption_key: std::sync::Arc::new(std::sync::RwLock::new(None)),
-            encryption_key_id: std::sync::Arc::new(std::sync::RwLock::new(
-                crate::field_encryption::DEFAULT_KEY_ID.to_string(),
-            )),
+            encryption_state: std::sync::Arc::new(std::sync::RwLock::new(None)),
             encryption_write_enabled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
                 false,
             )),
@@ -130,10 +127,7 @@ impl DbPool {
     pub fn uninitialized() -> Self {
         Self {
             inner: std::sync::Arc::new(std::sync::RwLock::new(None)),
-            encryption_key: std::sync::Arc::new(std::sync::RwLock::new(None)),
-            encryption_key_id: std::sync::Arc::new(std::sync::RwLock::new(
-                crate::field_encryption::DEFAULT_KEY_ID.to_string(),
-            )),
+            encryption_state: std::sync::Arc::new(std::sync::RwLock::new(None)),
             encryption_write_enabled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
                 false,
             )),
@@ -154,32 +148,29 @@ impl DbPool {
         self.inner.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
-    pub fn set_encryption_key(&self, key: [u8; 32]) {
-        *self
-            .encryption_key
+    pub fn set_encryption_ring(&self, ring: crate::field_encryption::KeyRing) {
+        let mut state = self
+            .encryption_state
             .write()
-            .unwrap_or_else(|e| e.into_inner()) = Some(key);
+            .unwrap_or_else(|e| e.into_inner());
+        *state = Some(std::sync::Arc::new(ring));
     }
 
-    pub fn encryption_key(&self) -> Option<[u8; 32]> {
-        *self
-            .encryption_key
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-    }
-
-    pub fn set_encryption_key_id(&self, key_id: String) {
-        *self
-            .encryption_key_id
-            .write()
-            .unwrap_or_else(|e| e.into_inner()) = key_id;
-    }
-
-    pub fn encryption_key_id(&self) -> String {
-        self.encryption_key_id
+    pub fn encryption_ring(&self) -> Option<std::sync::Arc<crate::field_encryption::KeyRing>> {
+        self.encryption_state
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
+    }
+
+    pub fn encryption_key(&self) -> Option<[u8; 32]> {
+        self.encryption_ring().map(|ring| *ring.write_key())
+    }
+
+    pub fn encryption_key_id(&self) -> String {
+        self.encryption_ring()
+            .map(|ring| ring.write_id().to_string())
+            .unwrap_or_else(|| crate::field_encryption::DEFAULT_KEY_ID.to_string())
     }
 
     pub fn set_encryption_write_enabled(&self, enabled: bool) {
@@ -199,8 +190,8 @@ impl DbPool {
     }
 
     pub fn encryption_context(&self) -> Option<([u8; 32], String)> {
-        self.encryption_key()
-            .map(|key| (key, self.encryption_key_id()))
+        self.encryption_ring()
+            .map(|ring| (*ring.write_key(), ring.write_id().to_string()))
     }
 
     pub fn encryption_write_context(&self) -> Option<([u8; 32], String)> {
@@ -246,7 +237,9 @@ mod tests {
     #[test]
     fn encryption_writes_are_disabled_until_explicitly_enabled() {
         let pool = DbPool::uninitialized();
-        pool.set_encryption_key([7; 32]);
+        pool.set_encryption_ring(
+            crate::field_encryption::KeyRing::new("db-v1".into(), [7; 32], vec![]).unwrap(),
+        );
 
         assert_eq!(pool.encryption_key(), Some([7; 32]));
         assert_eq!(pool.encryption_write_key(), None);
@@ -254,6 +247,60 @@ mod tests {
         pool.set_encryption_write_enabled(true);
         assert_eq!(pool.encryption_write_key(), Some([7; 32]));
     }
+    #[test]
+    fn encryption_ring_exposes_write_pair_and_previous_reads() {
+        let pool = DbPool::uninitialized();
+        pool.set_encryption_ring(
+            crate::field_encryption::KeyRing::new(
+                "db-v2".into(),
+                [9; 32],
+                vec![("db-v1".into(), [7; 32])],
+            )
+            .unwrap(),
+        );
+        assert_eq!(pool.encryption_context(), Some(([9; 32], "db-v2".into())));
+        assert_eq!(
+            pool.encryption_ring().unwrap().lookup("db-v1"),
+            Some(&[7; 32])
+        );
+        assert!(pool.encryption_write_context().is_none());
+        pool.set_encryption_write_enabled(true);
+        assert_eq!(pool.encryption_write_context(), pool.encryption_context());
+        let snapshot = pool.encryption_ring().unwrap();
+        pool.set_encryption_ring(
+            crate::field_encryption::KeyRing::new(
+                "db-v3".into(),
+                [8; 32],
+                vec![("db-v2".into(), [9; 32]), ("db-v1".into(), [7; 32])],
+            )
+            .unwrap(),
+        );
+        assert_eq!(snapshot.lookup("db-v1"), Some(&[7; 32]));
+        assert_eq!(snapshot.write_id(), "db-v2");
+        assert_eq!(
+            pool.encryption_ring().unwrap().read_ids(),
+            vec!["db-v3", "db-v2", "db-v1"]
+        );
+        assert_eq!(pool.encryption_context(), Some(([8; 32], "db-v3".into())));
+    }
+
+    #[test]
+    fn single_entry_ring_sets_key_and_id_together() {
+        let pool = DbPool::uninitialized();
+        assert_eq!(
+            pool.encryption_key_id(),
+            crate::field_encryption::DEFAULT_KEY_ID
+        );
+        assert!(pool.encryption_context().is_none());
+        assert!(pool.encryption_ring().is_none());
+        pool.set_encryption_ring(
+            crate::field_encryption::KeyRing::new("db-v2".into(), [9; 32], vec![]).unwrap(),
+        );
+        assert_eq!(pool.encryption_context(), Some(([9; 32], "db-v2".into())));
+        assert_eq!(pool.encryption_key_id(), "db-v2");
+        assert_eq!(pool.encryption_key(), Some([9; 32]));
+    }
+
     fn lazy_pool(max_size: usize) -> Pool {
         // deadpool creates connections lazily, so building a pool against an
         // unreachable host is fine as long as no connection is acquired.

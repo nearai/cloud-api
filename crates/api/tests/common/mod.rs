@@ -10,6 +10,7 @@ mod encryption_jobs;
 pub mod fake_ita;
 pub mod ita_evidence;
 pub mod ita_server;
+pub mod seeding;
 
 pub use db_setup::MOCK_USER_ID;
 pub use encryption_jobs::EncryptionJobsCleanup;
@@ -773,21 +774,10 @@ pub async fn create_org(server: &axum_test::TestServer) -> api::models::Organiza
 }
 
 pub async fn create_org_with_session(
-    server: &axum_test::TestServer,
+    _server: &axum_test::TestServer,
     session_id: &str,
 ) -> api::models::OrganizationResponse {
-    let request = api::models::CreateOrganizationRequest {
-        name: uuid::Uuid::new_v4().to_string(),
-        description: Some("A test organization".to_string()),
-    };
-    let response = server
-        .post("/v1/organizations")
-        .add_header("Authorization", format!("Bearer {session_id}"))
-        .add_header("User-Agent", MOCK_USER_AGENT)
-        .json(&serde_json::json!(request))
-        .await;
-    assert_eq!(response.status_code(), 200);
-    response.json::<api::models::OrganizationResponse>()
+    seeding::seed_organization(session_id).await
 }
 
 pub async fn setup_org_with_credits(
@@ -818,31 +808,23 @@ pub async fn setup_org_with_credits_and_session_and_email(
     email: &str,
 ) -> api::models::OrganizationResponse {
     let org = create_org_with_session(server, session_id).await;
-
-    let update_request = serde_json::json!({
-        "type": "payment",
-        "spendLimit": {
-            "amount": amount_nano_dollars,
-            "currency": "USD"
-        },
-        "changedBy": email,
-        "changeReason": "Test credits"
-    });
-
-    let response = server
-        .patch(format!("/v1/admin/organizations/{}/limits", org.id).as_str())
-        .add_header("Authorization", format!("Bearer {session_id}"))
-        .add_header("User-Agent", MOCK_USER_AGENT)
-        .json(&update_request)
-        .await;
-
-    assert_eq!(response.status_code(), 200, "Failed to set credits");
+    seeding::seed_credit_limit(
+        session_id,
+        &org.id,
+        "payment",
+        None,
+        amount_nano_dollars,
+        "USD",
+        email,
+        "Test credits",
+    )
+    .await;
     org
 }
 
 /// Add credits with specific type and source to an organization
 pub async fn add_credits_with_type(
-    server: &axum_test::TestServer,
+    _server: &axum_test::TestServer,
     org_id: &str,
     credit_type: &str,
     source: Option<&str>,
@@ -850,35 +832,17 @@ pub async fn add_credits_with_type(
     currency: &str,
     session_id: &str,
 ) -> api::models::UpdateOrganizationLimitsResponse {
-    let mut update_request = serde_json::json!({
-        "type": credit_type,
-        "spendLimit": {
-            "amount": amount_nano_dollars,
-            "currency": currency
-        },
-        "changedBy": "admin@test.com",
-        "changeReason": format!("Test {} credits", credit_type)
-    });
-
-    if let Some(src) = source {
-        update_request["source"] = serde_json::Value::String(src.to_string());
-    }
-
-    let response = server
-        .patch(format!("/v1/admin/organizations/{}/limits", org_id).as_str())
-        .add_header("Authorization", format!("Bearer {session_id}"))
-        .add_header("User-Agent", MOCK_USER_AGENT)
-        .json(&update_request)
-        .await;
-
-    assert_eq!(
-        response.status_code(),
-        200,
-        "Failed to add {} credits: {}",
+    seeding::seed_credit_limit(
+        session_id,
+        org_id,
         credit_type,
-        response.text()
-    );
-    response.json::<api::models::UpdateOrganizationLimitsResponse>()
+        source,
+        amount_nano_dollars,
+        currency,
+        "admin@test.com",
+        &format!("Test {credit_type} credits"),
+    )
+    .await
 }
 
 pub async fn list_workspaces(
@@ -889,18 +853,11 @@ pub async fn list_workspaces(
 }
 
 pub async fn list_workspaces_with_session(
-    server: &axum_test::TestServer,
+    _server: &axum_test::TestServer,
     org_id: String,
-    session_id: &str,
+    _session_id: &str,
 ) -> Vec<api::routes::workspaces::WorkspaceResponse> {
-    let response = server
-        .get(format!("/v1/organizations/{org_id}/workspaces").as_str())
-        .add_header("Authorization", format!("Bearer {session_id}"))
-        .add_header("User-Agent", MOCK_USER_AGENT)
-        .await;
-    assert_eq!(response.status_code(), 200);
-    let list_response = response.json::<api::routes::workspaces::ListWorkspacesResponse>();
-    list_response.workspaces
+    seeding::seed_list_workspaces(&org_id).await
 }
 
 pub async fn create_api_key_in_workspace(
@@ -912,24 +869,12 @@ pub async fn create_api_key_in_workspace(
 }
 
 pub async fn create_api_key_in_workspace_with_session(
-    server: &axum_test::TestServer,
+    _server: &axum_test::TestServer,
     workspace_id: String,
     name: String,
     session_id: &str,
 ) -> api::models::ApiKeyResponse {
-    let request = api::models::CreateApiKeyRequest {
-        name,
-        expires_at: Some(Utc::now() + chrono::Duration::days(90)),
-        spend_limit: None,
-    };
-    let response = server
-        .post(format!("/v1/workspaces/{workspace_id}/api-keys").as_str())
-        .add_header("Authorization", format!("Bearer {session_id}"))
-        .add_header("User-Agent", MOCK_USER_AGENT)
-        .json(&serde_json::json!(request))
-        .await;
-    assert_eq!(response.status_code(), 201);
-    response.json::<api::models::ApiKeyResponse>()
+    seeding::seed_api_key(&workspace_id, name, session_id).await
 }
 
 pub async fn get_api_key_for_org(server: &axum_test::TestServer, org_id: String) -> String {

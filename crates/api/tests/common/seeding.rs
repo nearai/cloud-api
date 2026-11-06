@@ -661,9 +661,11 @@ pub async fn seed_models(
             pool.load_inference_url_models(url_models, true).await;
         }
         if !external_models.is_empty() {
-            pool.load_external_providers(external_models.clone())
-                .await
-                .expect("Failed to register seeded external providers");
+            // The route only warned: a model without a usable key (the e2e config has
+            // none) is simply not registered.
+            if let Err(error) = pool.load_external_providers(external_models.clone()).await {
+                tracing::warn!(%error, "Failed to register some seeded external providers");
+            }
         }
     }
     for models_service in registered_models_services() {

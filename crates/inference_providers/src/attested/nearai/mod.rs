@@ -5509,6 +5509,42 @@ mod tests {
         assert_eq!(provider.fleet.select_index(&msgs, None), Some(peer));
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn expired_slow_mark_returns_conversations_home() {
+        use super::fleet::{TTFT_STAT_TTL, TTFT_WARMUP_SAMPLES};
+
+        let provider = rotation_provider(2);
+        let conversation = vec![
+            role_msg(crate::MessageRole::System, "shared system prefix"),
+            user_msg("synthetic conversation one"),
+            role_msg(crate::MessageRole::Assistant, "synthetic answer one"),
+            user_msg("synthetic follow-up two"),
+        ];
+        let home = (provider
+            .fleet
+            .prefix_router
+            .route_conversation(&conversation)
+            % 2) as usize;
+        let peer = 1 - home;
+        for _ in 0..TTFT_WARMUP_SAMPLES {
+            provider.fleet.record_ttft(home, 2000.0);
+            provider.fleet.record_ttft(peer, 100.0);
+        }
+        let turn = |provider: &Provider| {
+            provider
+                .fleet
+                .acquire_index(&conversation, None)
+                .expect("rotation active")
+                .index()
+        };
+        assert_eq!(turn(&provider), peer, "a slow home is skipped");
+
+        // Conversation homes are not exempt from expiry: otherwise a host
+        // marked slow would never get its conversations back.
+        tokio::time::advance(TTFT_STAT_TTL).await;
+        assert_eq!(turn(&provider), home);
+    }
+
     #[test]
     fn record_ttft_ema_warmup_then_stable() {
         let provider = rotation_provider(4);

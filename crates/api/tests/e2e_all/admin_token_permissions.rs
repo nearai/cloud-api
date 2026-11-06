@@ -148,7 +148,7 @@ async fn issuance_gate_does_not_relax_existing_token_permissions() {
         .await
         .unwrap();
     assert_eq!(
-        call(&server, Method::GET, "/v1/admin/users", &token, json!({}))
+        call(&server, Method::GET, "/v1/admin/models", &token, json!({}))
             .await
             .status_code(),
         StatusCode::OK
@@ -229,12 +229,9 @@ async fn read_only_reads_and_mixed_method_mutations_have_no_side_effects() {
     assert_eq!(fallback.json::<Value>(), fallback_before);
 
     for route in [
-        "/v1/admin/users",
-        "/v1/admin/organizations",
         "/v1/admin/models",
         "/v1/admin/feature-requests",
         "/v1/admin/aml/allowlist",
-        "/v1/admin/api-keys",
     ] {
         assert_eq!(
             call(&server, Method::GET, route, &read_only, json!({}))
@@ -585,14 +582,14 @@ async fn permissions_preserve_expiration_revocation_user_agent_and_admin_eligibi
             .await
             .unwrap();
         assert_eq!(
-            call(&server, Method::GET, "/v1/admin/users", &token, json!({}))
+            call(&server, Method::GET, "/v1/admin/models", &token, json!({}))
                 .await
                 .status_code(),
             StatusCode::OK
         );
         for user_agent in [None, Some("different client")] {
             let mut request = server
-                .get("/v1/admin/users")
+                .get("/v1/admin/models")
                 .add_header("Authorization", format!("Bearer {token}"));
             if let Some(ua) = user_agent {
                 request = request.add_header("User-Agent", ua);
@@ -608,7 +605,7 @@ async fn permissions_preserve_expiration_revocation_user_agent_and_admin_eligibi
             .await
             .unwrap();
         assert_forbidden(
-            &call(&server, Method::GET, "/v1/admin/users", &token, json!({})).await,
+            &call(&server, Method::GET, "/v1/admin/models", &token, json!({})).await,
             "forbidden",
         );
         client
@@ -624,7 +621,7 @@ async fn permissions_preserve_expiration_revocation_user_agent_and_admin_eligibi
             .await
             .unwrap());
         assert_eq!(
-            call(&server, Method::GET, "/v1/admin/users", &token, json!({}))
+            call(&server, Method::GET, "/v1/admin/models", &token, json!({}))
                 .await
                 .status_code(),
             StatusCode::UNAUTHORIZED
@@ -641,9 +638,15 @@ async fn permissions_preserve_expiration_revocation_user_agent_and_admin_eligibi
             .await
             .unwrap();
         assert_eq!(
-            call(&server, Method::GET, "/v1/admin/users", &expired, json!({}))
-                .await
-                .status_code(),
+            call(
+                &server,
+                Method::GET,
+                "/v1/admin/models",
+                &expired,
+                json!({})
+            )
+            .await
+            .status_code(),
             StatusCode::UNAUTHORIZED
         );
     }
@@ -651,7 +654,7 @@ async fn permissions_preserve_expiration_revocation_user_agent_and_admin_eligibi
         call(
             &server,
             Method::GET,
-            "/v1/admin/users",
+            "/v1/admin/models",
             "adm_invalid",
             json!({})
         )
@@ -683,7 +686,7 @@ async fn existing_service_tokens_follow_the_creator_email_allowlist() {
     let response = call(
         &allowed_server,
         Method::GET,
-        "/v1/admin/users",
+        "/v1/admin/models",
         &token,
         json!({}),
     )
@@ -702,7 +705,7 @@ async fn existing_service_tokens_follow_the_creator_email_allowlist() {
             let response = call(
                 &denied_server,
                 Method::GET,
-                "/v1/admin/users",
+                "/v1/admin/models",
                 credential,
                 json!({}),
             )
@@ -727,7 +730,7 @@ async fn existing_service_tokens_follow_the_creator_email_allowlist() {
     let response = call(
         &allowed_server,
         Method::GET,
-        "/v1/admin/users",
+        "/v1/admin/models",
         &token,
         json!({}),
     )

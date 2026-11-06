@@ -887,9 +887,9 @@ fn every_registered_route_has_a_model_access_decision() {
 
     let mut registered = registered_routes(include_str!("../../src/lib.rs"));
     // Router builders that `src/lib.rs` calls from other modules.
-    for source in [include_str!("../../src/routes/attestation.rs")] {
-        registered.extend(registered_routes(source));
-    }
+    registered.extend(registered_routes(include_str!(
+        "../../src/routes/attestation.rs"
+    )));
     assert!(
         registered.len() >= 100,
         "found too few routes, the scan is broken: {registered:?}"

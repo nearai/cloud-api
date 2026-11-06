@@ -593,8 +593,8 @@ async fn audit_events_exclude_request_content_on_the_real_router() {
     let (logs, _guard) = CapturedLogs::start();
 
     for uri in [
-        format!("/v1/admin/users?search={EMAIL}&limit=1"),
-        format!("/v1/admin/users/{EMAIL}/lookup"),
+        format!("/v1/admin/models?search={EMAIL}&limit=1"),
+        format!("/v1/admin/settings?lookup={EMAIL}"),
     ] {
         let response = send(
             &router,

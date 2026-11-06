@@ -15,6 +15,7 @@ mod admin_invitation_email_deliveries;
 mod admin_list_models;
 mod admin_pricing_changes;
 mod admin_provider_attribution_support;
+mod admin_retired_routes;
 mod admin_routing_policy;
 mod admin_services;
 mod admin_settings;

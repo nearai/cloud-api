@@ -1,0 +1,1 @@
+`session_vectors.json`: golden vectors for the MPP `session` intent (TIP-1034 channels), produced with the official ox/viem/mppx libraries. The keys in it (`payerKey`, `payeeKey`) are the public Hardhat test accounts #1 and #2; they are test-only and hold no value.

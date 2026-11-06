@@ -6,6 +6,8 @@ pub mod conversions;
 pub mod database_encryption;
 pub mod middleware;
 pub mod models;
+#[cfg(test)]
+mod mpp_startup_tests;
 pub mod object_encryption;
 mod object_storage;
 pub mod ohttp_gateway;
@@ -188,6 +190,130 @@ pub async fn init_database(db_config: &config::DatabaseConfig) -> Arc<Database> 
     });
 
     database
+}
+
+/// Build the Machine Payments Protocol service when `MPP_ENABLED=true`, and start the hourly
+/// purge of its claim table. A construction failure leaves MPP off (the safe state: no
+/// payment is accepted) and is logged; the settings were validated at startup, so it is not
+/// expected.
+fn init_mpp_service(
+    pool: database::DbPool,
+    config: &ApiConfig,
+) -> Option<Arc<services::mpp::MppService>> {
+    let settings = config.mpp.settings()?;
+    let claims = Arc::new(database::repositories::MppPaymentClaimRepository::new(pool));
+    match services::mpp::MppService::from_settings(settings, claims.clone()) {
+        Ok(service) => {
+            services::mpp::retention::spawn_purge_task(claims);
+            tracing::info!(
+                realm = %settings.realm,
+                chain_id = settings.tempo.chain_id,
+                priced_models = settings.model_prices.len(),
+                "MPP payments enabled"
+            );
+            Some(Arc::new(service))
+        }
+        Err(error) => {
+            tracing::error!(
+                outcome = error.kind(),
+                "MPP enabled but the service could not be built; MPP is off"
+            );
+            None
+        }
+    }
+}
+
+/// Build session ports only when per-token pricing is configured. The auth wrapper owns
+/// the service; background tasks retain the same ledger, RPC and signer.
+fn init_mpp_session(
+    pool: database::DbPool,
+    config: &config::MppConfig,
+) -> Result<Option<Arc<services::mpp::SessionService>>, services::mpp::MppError> {
+    use services::mpp::{
+        session_chain::PayeeChain,
+        session_settlement::{spawn_settlement_task, SettlementConfig},
+        session_supervision::{spawn_supervision_task, SupervisionConfig},
+        HttpTempoRpc, LocalSigner, MppError, SessionService, SessionServiceConfig,
+    };
+    use std::time::Duration;
+    let Some(settings) = config.settings() else {
+        return Ok(None);
+    };
+    let Some(session) = settings.session.as_ref() else {
+        return Ok(None);
+    };
+    let build = || -> Result<_, MppError> {
+        let signer = Arc::new(
+            LocalSigner::from_hex(session.signer_key.as_deref().ok_or(MppError::Config)?)
+                .map_err(|_| MppError::Config)?,
+        );
+        let rpc = Arc::new(
+            HttpTempoRpc::new(
+                &settings.tempo.rpc_url,
+                Duration::from_secs(settings.tempo.rpc_timeout_secs),
+            )
+            .map_err(|_| MppError::Config)?,
+        );
+        let repo = Arc::new(database::repositories::MppChannelRepository::new(pool));
+        let address = |raw: &str| -> Result<[u8; 20], MppError> {
+            hex::decode(raw.strip_prefix("0x").ok_or(MppError::Config)?)
+                .map_err(|_| MppError::Config)?
+                .try_into()
+                .map_err(|_| MppError::Config)
+        };
+        let chain = PayeeChain {
+            chain_id: settings.tempo.chain_id,
+            escrow: address("0x4d50500000000000000000000000000000000000")?,
+            fee_token: address(&settings.tempo.currency)?,
+        };
+        let service = SessionService::new(
+            SessionServiceConfig {
+                settings: session.clone(),
+                model_prices: settings.model_prices.clone(),
+                realm: settings.realm.clone(),
+                secret_key: settings.secret_key.as_bytes().to_vec(),
+                challenge_ttl: Duration::from_secs(settings.challenge_ttl_secs),
+                chain_id: chain.chain_id,
+                escrow: chain.escrow,
+                currency: chain.fee_token,
+            },
+            repo.clone(),
+            rpc.clone(),
+            signer.clone(),
+        )?;
+        Ok((service, repo, rpc, signer, chain))
+    };
+    match build() {
+        Ok((service, repo, rpc, signer, chain)) => {
+            spawn_settlement_task(
+                repo.clone(),
+                rpc.clone(),
+                signer.clone(),
+                chain,
+                SettlementConfig {
+                    interval: Duration::from_secs(session.settle_interval_secs),
+                    amount: session.settle_amount,
+                    ..Default::default()
+                },
+            );
+            spawn_supervision_task(
+                repo.clone(),
+                rpc,
+                signer,
+                chain,
+                SupervisionConfig {
+                    every: Duration::from_secs(session.close_supervision_secs),
+                    ..Default::default()
+                },
+            );
+            services::mpp::retention::spawn_channel_purge_task(repo);
+            Ok(Some(Arc::new(service)))
+        }
+        Err(error) => {
+            tracing::error!(outcome = error.kind(), "MPP session initialization failed");
+            Err(error)
+        }
+    }
 }
 
 /// Initialize authentication services and middleware
@@ -1141,7 +1267,7 @@ pub fn build_app_with_config(
     auth_components: AuthComponents,
     domain_services: DomainServices,
     config: Arc<ApiConfig>,
-) -> Router {
+) -> Result<Router, services::mpp::MppError> {
     build_app_with_config_and_options(
         database,
         auth_components,
@@ -1158,7 +1284,10 @@ pub fn build_app_with_config_and_options(
     domain_services: DomainServices,
     config: Arc<ApiConfig>,
     build_options: AppBuildOptions,
-) -> Router {
+) -> Result<Router, services::mpp::MppError> {
+    // Validate configured session ports before constructing a router. A broken session
+    // configuration must fail startup even if another MPP component is disabled.
+    let mpp_session = init_mpp_session(database.pool().clone(), &config.mpp)?;
     // Create analytics service (shared between user and admin routes)
     let analytics_repository = Arc::new(database::repositories::PgAnalyticsRepository::new(
         database.pool().clone(),
@@ -1229,6 +1358,7 @@ pub fn build_app_with_config_and_options(
         ohttp_gateway,
         ohttp_attestation,
         http_client: reqwest::Client::new(),
+        mpp_service: init_mpp_service(database.pool().clone(), &config),
     };
 
     // Create usage state for middleware
@@ -1260,6 +1390,7 @@ pub fn build_app_with_config_and_options(
         &auth_components.auth_state_middleware,
         usage_state.clone(),
         rate_limit_state.clone(),
+        mpp_session,
     );
 
     let gateway_routes = build_gateway_routes(
@@ -1452,7 +1583,7 @@ pub fn build_app_with_config_and_options(
         .merge(mcp_routes)
         .merge(ohttp_root_routes);
 
-    with_app_fallbacks_and_layers(router, metrics_state, cors)
+    Ok(with_app_fallbacks_and_layers(router, metrics_state, cors))
 }
 
 /// Wrap the assembled routes in the app-wide fallbacks and middleware.
@@ -1569,11 +1700,38 @@ pub fn build_auth_routes(
 }
 
 /// Build completion routes with auth and usage tracking
+/// The API-key admission layers of the text inference routes, between authentication and the
+/// handler. `/chat/completions` and the text group both apply them through
+/// [`with_inference_admission`], so their stacks cannot drift apart.
+struct InferenceAdmission {
+    model_deprecation: middleware::ModelDeprecationState,
+    usage: middleware::UsageState,
+    rate_limit: middleware::RateLimitState,
+}
+
+/// Rate limit, then usage check, then model deprecation (outermost first), around `router`.
+fn with_inference_admission(router: Router, admission: &InferenceAdmission) -> Router {
+    router
+        .layer(from_fn_with_state(
+            admission.model_deprecation.clone(),
+            middleware::model_deprecation_middleware,
+        ))
+        .layer(from_fn_with_state(
+            admission.usage.clone(),
+            middleware::usage_check_middleware,
+        ))
+        .layer(from_fn_with_state(
+            admission.rate_limit.clone(),
+            middleware::api_key_rate_limit_middleware,
+        ))
+}
+
 pub fn build_completion_routes(
     app_state: AppState,
     auth_state_middleware: &AuthState,
     usage_state: middleware::UsageState,
     rate_limit_state: middleware::RateLimitState,
+    mpp_session: Option<Arc<services::mpp::SessionService>>,
 ) -> Router {
     // Announces a planned model deprecation in response headers. Innermost
     // layer: it only sees requests that passed auth, rate and usage checks.
@@ -1638,10 +1796,48 @@ pub fn build_completion_routes(
         Router::new()
     };
 
-    // Text-based inference routes (chat/completions, image generation, audio transcription, rerank, score).
+    let admission = InferenceAdmission {
+        model_deprecation: model_deprecation_state.clone(),
+        usage: usage_state.clone(),
+        rate_limit: rate_limit_state.clone(),
+    };
+
+    // POST /chat/completions has its own router so Machine Payments Protocol (HTTP 402) can
+    // sit in front of it without touching the other inference routes. The layers are the text
+    // group's, with the MPP auth wrapper in place of the API-key middleware and the MPP
+    // settlement layer innermost. With MPP off (the default) both hold `None` and behave
+    // exactly like the API-key middleware and a pass-through.
+    let chat_completions_routes = with_inference_admission(
+        Router::new()
+            .route("/chat/completions", post(chat_completions))
+            .with_state(app_state.clone())
+            .layer(from_fn_with_state(
+                middleware::MppSettleState {
+                    mpp: app_state.mpp_service.clone(),
+                },
+                middleware::mpp_settle_middleware,
+            )),
+        &admission,
+    )
+    .layer(from_fn_with_state(
+        middleware::MppAuthState {
+            auth: auth_state_middleware.clone(),
+            mpp: app_state.mpp_service.clone(),
+            session: mpp_session,
+        },
+        middleware::mpp_auth_middleware,
+    ))
+    .layer(from_fn_with_state(
+        middleware::BodyHashLimit(AUDIO_TRANSCRIPTION_MAX_BODY_SIZE),
+        middleware::body_hash_middleware,
+    ))
+    // Outermost, so the MPP pre-flight (which parses the buffered body as the handler
+    // will) sees the same limit the handler's extractor does.
+    .layer(DefaultBodyLimit::max(AUDIO_TRANSCRIPTION_MAX_BODY_SIZE));
+
+    // Text-based inference routes (image generation, audio transcription, rerank, score, ...).
     // The shared 25 MiB cap accommodates inline multimodal JSON payloads.
     let text_inference_routes = Router::new()
-        .route("/chat/completions", post(chat_completions))
         .route("/completions", post(completions))
         .route("/images/generations", post(image_generations))
         .route("/audio/transcriptions", post(audio_transcriptions))
@@ -1662,19 +1858,8 @@ pub fn build_completion_routes(
             post(privacy_redact).layer(DefaultBodyLimit::max(PRIVACY_CLASSIFY_MAX_BODY_SIZE)),
         )
         .layer(DefaultBodyLimit::max(AUDIO_TRANSCRIPTION_MAX_BODY_SIZE))
-        .with_state(app_state.clone())
-        .layer(from_fn_with_state(
-            model_deprecation_state.clone(),
-            middleware::model_deprecation_middleware,
-        ))
-        .layer(from_fn_with_state(
-            usage_state.clone(),
-            middleware::usage_check_middleware,
-        ))
-        .layer(from_fn_with_state(
-            rate_limit_state.clone(),
-            middleware::api_key_rate_limit_middleware,
-        ))
+        .with_state(app_state.clone());
+    let text_inference_routes = with_inference_admission(text_inference_routes, &admission)
         .layer(from_fn_with_state(
             auth_state_middleware.clone(),
             middleware::auth::auth_middleware_with_workspace_context,
@@ -1731,6 +1916,7 @@ pub fn build_completion_routes(
         ));
 
     Router::new()
+        .merge(chat_completions_routes)
         .merge(text_inference_routes)
         .merge(file_inference_routes)
         .merge(metadata_routes)
@@ -3612,6 +3798,7 @@ mod tests {
             credit_allocation: config::CreditAllocationConfig::default(),
             ita: config::ItaAttestationConfig::default(),
             placement: config::PlacementConfig::default(),
+            mpp: config::MppConfig::default(),
         };
 
         // Initialize services
@@ -3739,6 +3926,7 @@ mod tests {
             credit_allocation: config::CreditAllocationConfig::default(),
             ita: config::ItaAttestationConfig::default(),
             placement: config::PlacementConfig::default(),
+            mpp: config::MppConfig::default(),
         };
 
         let auth_components = init_auth_services(database.clone(), &config);

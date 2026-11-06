@@ -124,6 +124,8 @@ pub struct ApiConfig {
     pub credit_allocation: CreditAllocationConfig,
     pub ita: ItaAttestationConfig,
     pub placement: PlacementConfig,
+    /// Machine Payments Protocol (HTTP 402 payments). Off by default.
+    pub mpp: crate::mpp::MppConfig,
 }
 
 impl ApiConfig {
@@ -210,6 +212,7 @@ impl ApiConfig {
             usage_reporting: UsageReportingConfig::from_env()?,
             credit_allocation: CreditAllocationConfig::from_env()?,
             placement: PlacementConfig::from_env()?,
+            mpp: crate::mpp::MppConfig::from_env()?,
         })
     }
 }

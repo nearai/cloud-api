@@ -85,12 +85,18 @@ async fn main() {
     let config = Arc::new(config);
 
     // Build application router with config
-    let app = build_app_with_config(
+    let app = match build_app_with_config(
         database.clone(),
         auth_components,
         domain_services.clone(),
         config.clone(),
-    );
+    ) {
+        Ok(app) => app,
+        Err(error) => {
+            tracing::error!(outcome = error.kind(), "Application initialization failed");
+            std::process::exit(1);
+        }
+    };
 
     // Start the scheduled-pricing-change apply task. Safe to run on every
     // instance: due rows are claimed atomically (FOR UPDATE SKIP LOCKED).

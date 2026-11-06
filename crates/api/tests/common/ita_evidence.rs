@@ -73,13 +73,6 @@ impl ItaCompatibleModelEvidenceProvider {
 
 #[async_trait]
 impl inference_providers::InferenceProvider for ItaCompatibleModelEvidenceProvider {
-    async fn count_input_tokens(
-        &self,
-        request: &inference_providers::input_tokens::InputTokenRequest,
-    ) -> Result<i32, inference_providers::CompletionError> {
-        inference_providers::InferenceProvider::count_input_tokens(&*self.inner, request).await
-    }
-
     async fn models(
         &self,
     ) -> Result<

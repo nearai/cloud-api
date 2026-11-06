@@ -614,7 +614,11 @@ async fn handle_request(
                 "max_tokens exceeds model output bounds",
             );
         }
-        let bounds = match services::usage::budget::UsageBounds::text(0, max_output as i32, 1) {
+        let bounds = match services::usage::budget::UsageBounds::text(
+            model.context_length,
+            max_output as i32,
+            1,
+        ) {
             Ok(bounds) => bounds,
             Err(_) => {
                 return anthropic_error(

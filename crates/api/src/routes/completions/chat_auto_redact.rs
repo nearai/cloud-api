@@ -43,12 +43,16 @@ pub(super) async fn maybe_redact(
         .get_model_by_name(auto_redact::DEFAULT_PII_MODEL, ModelCaller::Trusted)
         .await
         .map_err(|_| AutoRedactError::DetectorUnavailable("Cannot resolve privacy model".into()))?;
+    let bytes = serde_json::to_vec(&serde_json::json!({"input": texts}))
+        .map_err(|_| AutoRedactError::Internal("Cannot measure privacy input".into()))?;
+    let bound = billing::batch_input_bound(&bytes, model.context_length)
+        .map_err(|_| AutoRedactError::Internal("Invalid privacy input bound".into()))?;
     let budget = billing::budget_execution(
         state,
         key,
         &model,
         services::usage::InferenceType::PrivacyClassify,
-        0,
+        bound,
         0,
         0,
     )

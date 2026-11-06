@@ -118,10 +118,6 @@ async fn assert_signatures(
 #[tokio::test]
 async fn systemone_external_catalog_alias_billing_and_gateway_signatures() {
     let upstream = MockServer::start().await;
-    Mock::given(path("/v1/systemone/count_tokens"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"input_tokens":10})))
-        .mount(&upstream)
-        .await;
     let raw = serde_json::to_string_pretty(&result(None)).unwrap();
     Mock::given(method("POST"))
         .and(path("/v1/systemone"))
@@ -212,10 +208,6 @@ async fn systemone_external_catalog_alias_billing_and_gateway_signatures() {
 #[tokio::test]
 async fn systemone_openrouter_box_preserves_images_billing_and_receipts() {
     let upstream = MockServer::start().await;
-    Mock::given(path("/api/v1/systemone/count_tokens"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"input_tokens":10})))
-        .mount(&upstream)
-        .await;
     let (server, _, _, database) = setup_test_server_with_pool().await;
     let (model, _) = catalog(
         &server,
@@ -307,10 +299,6 @@ async fn systemone_openrouter_box_preserves_images_billing_and_receipts() {
 #[tokio::test]
 async fn systemone_external_generation_header_indexes_gateway_signatures() {
     let upstream = MockServer::start().await;
-    Mock::given(path("/v1/systemone/count_tokens"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"input_tokens":10})))
-        .mount(&upstream)
-        .await;
     let upstream_id = format!("gen:decision.{}/result", uuid::Uuid::new_v4());
     let raw = serde_json::to_string_pretty(&result(None)).unwrap();
     Mock::given(method("POST"))
@@ -676,10 +664,6 @@ async fn typed_responses_prioritizes_systemone_for_dual_capability_models() {
 async fn systemone_enforces_credit_and_concurrency_limits_and_releases_slot() {
     use tower::ServiceExt;
     let upstream = MockServer::start().await;
-    Mock::given(path("/v1/systemone/count_tokens"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"input_tokens":10})))
-        .mount(&upstream)
-        .await;
     let started = Arc::new(tokio::sync::Notify::new());
     let signal = started.clone();
     Mock::given(method("POST"))

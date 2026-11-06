@@ -3522,34 +3522,6 @@ impl InferenceProviderPool {
         F: Fn(Arc<InferenceProviderTrait>) -> Fut,
         Fut: std::future::Future<Output = Result<T, CompletionError>>,
     {
-        self.retry_with_fallback_caps_counted(
-            model_id,
-            operation_name,
-            model_pub_key,
-            needs_client_e2ee,
-            hints,
-            None,
-            provider_fn,
-        )
-        .await
-    }
-
-    // CLIPPY-ALLOW: preserve the existing routing contract while supplying its per-attempt count input.
-    #[allow(clippy::too_many_arguments)]
-    async fn retry_with_fallback_caps_counted<T, F, Fut>(
-        &self,
-        model_id: &str,
-        operation_name: &str,
-        model_pub_key: Option<&str>,
-        needs_client_e2ee: bool,
-        hints: &ChatRoutingHints,
-        input: Option<&inference_providers::input_tokens::InputTokenRequest>,
-        provider_fn: F,
-    ) -> Result<ServedProviderResult<T>, CompletionError>
-    where
-        F: Fn(Arc<InferenceProviderTrait>) -> Fut,
-        Fut: std::future::Future<Output = Result<T, CompletionError>>,
-    {
         let providers = match self
             .get_providers_with_fallback(model_id, model_pub_key, hints)
             .await
@@ -3811,13 +3783,9 @@ impl InferenceProviderPool {
                     retry_count
                 );
 
-                if let Some(input) = input {
-                    crate::usage::budget::before_counted_attempt(provider.as_ref(), input).await?;
-                } else {
-                    crate::usage::budget::before_attempt()
-                        .await
-                        .map_err(crate::usage::budget::completion_error)?;
-                }
+                crate::usage::budget::before_attempt()
+                    .await
+                    .map_err(crate::usage::budget::completion_error)?;
                 match provider_fn(provider.clone()).await {
                     Ok(result) => {
                         // Reset failure counter on success
@@ -4493,16 +4461,13 @@ impl InferenceProviderPool {
             "Starting chat completion stream request"
         );
 
-        let input =
-            inference_providers::input_tokens::InputTokenRequest::chat(&params_for_provider)?;
         let served = self
-            .retry_with_fallback_caps_counted(
+            .retry_with_fallback_caps(
                 &model_id,
                 "chat_completion_stream",
                 model_pub_key,
                 needs_client_e2ee,
                 &hints,
-                Some(&input),
                 |provider| {
                     let params = params_for_provider.clone();
                     let request_hash = request_hash.clone();
@@ -4697,16 +4662,13 @@ impl InferenceProviderPool {
         let mut params_for_provider = params.clone();
         reinsert_pubkey_pin(&mut params_for_provider, model_pub_key_str.as_deref());
 
-        let input =
-            inference_providers::input_tokens::InputTokenRequest::chat(&params_for_provider)?;
         let served = self
-            .retry_with_fallback_caps_counted(
+            .retry_with_fallback_caps(
                 &model_id,
                 "chat_completion",
                 model_pub_key,
                 needs_client_e2ee,
                 &hints,
-                Some(&input),
                 |provider| {
                     let params = params_for_provider.clone();
                     let request_hash = request_hash.clone();
@@ -4760,20 +4722,13 @@ impl InferenceProviderPool {
             fallback_disabled,
             ..Default::default()
         };
-        let input = inference_providers::input_tokens::InputTokenRequest::json(
-            inference_providers::input_tokens::InputKind::Decisions,
-            serde_json::to_value(&request)
-                .map_err(|_| inference_providers::input_tokens::unavailable())?,
-            std::collections::HashMap::new(),
-        );
         let served = self
-            .retry_with_fallback_caps_counted(
+            .retry_with_fallback_caps(
                 &request.model,
                 "systemone",
                 model_pub_key,
                 false,
                 &hints,
-                Some(&input),
                 |provider| {
                     let request = request.clone();
                     let request_hash = request_hash.clone();
@@ -5082,32 +5037,16 @@ impl InferenceProviderPool {
         // Try reranking with each provider (with fallback)
         let mut last_error = None;
         for provider in providers {
-            crate::usage::budget::before_counted_attempt(
-                provider.as_ref(),
-                &inference_providers::input_tokens::InputTokenRequest::json(
-                    inference_providers::input_tokens::InputKind::Rerank,
-                    serde_json::to_value(&params).map_err(|_| RerankError::HttpError {
-                        status_code: 400,
-                        message: "Invalid input for token counting".into(),
-                    })?,
-                    params.extra.clone(),
-                ),
-            )
-            .await
-            .map_err(|e| RerankError::HttpError {
-                status_code: if matches!(
-                    e,
-                    CompletionError::HttpError {
-                        status_code: 402,
-                        ..
-                    }
-                ) {
-                    402
-                } else {
-                    503
-                },
-                message: e.to_string(),
-            })?;
+            crate::usage::budget::before_attempt()
+                .await
+                .map_err(|e| RerankError::HttpError {
+                    status_code: if matches!(e, crate::usage::UsageError::LimitExceeded(_)) {
+                        402
+                    } else {
+                        503
+                    },
+                    message: e.to_string(),
+                })?;
             match provider.rerank(params.clone()).await {
                 Ok(response) => {
                     tracing::info!(
@@ -5160,33 +5099,15 @@ impl InferenceProviderPool {
         // Try with each provider (with fallback)
         let mut last_error = None;
         for provider in providers {
-            crate::usage::budget::before_counted_attempt(
-                provider.as_ref(),
-                &inference_providers::input_tokens::InputTokenRequest::json(
-                    inference_providers::input_tokens::InputKind::Embedding,
-                    serde_json::from_slice(&body).map_err(|_| {
-                        inference_providers::EmbeddingError::HttpError {
-                            status_code: 400,
-                            message: "Invalid input for token counting".into(),
-                        }
-                    })?,
-                    extra.clone(),
-                ),
-            )
-            .await
-            .map_err(|e| inference_providers::EmbeddingError::HttpError {
-                status_code: if matches!(
-                    e,
-                    CompletionError::HttpError {
-                        status_code: 402,
-                        ..
-                    }
-                ) {
-                    402
-                } else {
-                    503
-                },
-                message: e.to_string(),
+            crate::usage::budget::before_attempt().await.map_err(|e| {
+                inference_providers::EmbeddingError::HttpError {
+                    status_code: if matches!(e, crate::usage::UsageError::LimitExceeded(_)) {
+                        402
+                    } else {
+                        503
+                    },
+                    message: e.to_string(),
+                }
             })?;
             match provider.embeddings_raw(body.clone(), extra.clone()).await {
                 Ok(response) => {
@@ -5259,15 +5180,9 @@ impl InferenceProviderPool {
             provider.as_ref(),
             self.is_registered_fallback_provider(model, &provider),
         );
-        crate::usage::budget::before_counted_attempt(
-            provider.as_ref(),
-            &inference_providers::input_tokens::InputTokenRequest::json(
-                inference_providers::input_tokens::InputKind::Responses,
-                body.clone(),
-                Default::default(),
-            ),
-        )
-        .await?;
+        crate::usage::budget::before_attempt()
+            .await
+            .map_err(crate::usage::budget::completion_error)?;
         let response = provider.responses_raw(body).await?;
         Ok((response, attribution))
     }
@@ -5292,28 +5207,16 @@ impl InferenceProviderPool {
 
         let provider_attribution = served_provider_attribution(provider.as_ref(), false);
         if request.endpoint == inference_providers::AnthropicRawEndpoint::Messages {
-            let mut input = inference_providers::input_tokens::InputTokenRequest::json(
-                inference_providers::input_tokens::InputKind::Messages,
-                request.body.clone(),
-                Default::default(),
-            );
-            input.anthropic = Some(request.clone());
-            crate::usage::budget::before_counted_attempt(provider.as_ref(), &input)
-                .await
-                .map_err(|e| AnthropicRawError::Budget {
-                    status_code: if matches!(
-                        e,
-                        CompletionError::HttpError {
-                            status_code: 402,
-                            ..
-                        }
-                    ) {
+            crate::usage::budget::before_attempt().await.map_err(|e| {
+                AnthropicRawError::Budget {
+                    status_code: if matches!(e, crate::usage::UsageError::LimitExceeded(_)) {
                         402
                     } else {
                         503
                     },
                     message: e.to_string(),
-                })?;
+                }
+            })?;
         }
         let response = provider.anthropic_raw(request).await?;
 
@@ -5345,33 +5248,15 @@ impl InferenceProviderPool {
 
         let mut last_error = None;
         for provider in providers {
-            crate::usage::budget::before_counted_attempt(
-                provider.as_ref(),
-                &inference_providers::input_tokens::InputTokenRequest::json(
-                    inference_providers::input_tokens::InputKind::Privacy,
-                    serde_json::from_slice(&body).map_err(|_| {
-                        inference_providers::PrivacyClassifyError::HttpError {
-                            status_code: 400,
-                            message: "Invalid input for token counting".into(),
-                        }
-                    })?,
-                    extra.clone(),
-                ),
-            )
-            .await
-            .map_err(|e| inference_providers::PrivacyClassifyError::HttpError {
-                status_code: if matches!(
-                    e,
-                    CompletionError::HttpError {
-                        status_code: 402,
-                        ..
-                    }
-                ) {
-                    402
-                } else {
-                    503
-                },
-                message: e.to_string(),
+            crate::usage::budget::before_attempt().await.map_err(|e| {
+                inference_providers::PrivacyClassifyError::HttpError {
+                    status_code: if matches!(e, crate::usage::UsageError::LimitExceeded(_)) {
+                        402
+                    } else {
+                        503
+                    },
+                    message: e.to_string(),
+                }
             })?;
             match provider
                 .privacy_classify_raw(body.clone(), extra.clone())
@@ -5444,33 +5329,15 @@ impl InferenceProviderPool {
         // Try scoring with each provider (with fallback)
         let mut last_error = None;
         for provider in providers {
-            crate::usage::budget::before_counted_attempt(
-                provider.as_ref(),
-                &inference_providers::input_tokens::InputTokenRequest::json(
-                    inference_providers::input_tokens::InputKind::Score,
-                    serde_json::to_value(&params).map_err(|_| {
-                        inference_providers::ScoreError::HttpError {
-                            status_code: 400,
-                            message: "Invalid input for token counting".into(),
-                        }
-                    })?,
-                    params.extra.clone(),
-                ),
-            )
-            .await
-            .map_err(|e| inference_providers::ScoreError::HttpError {
-                status_code: if matches!(
-                    e,
-                    CompletionError::HttpError {
-                        status_code: 402,
-                        ..
-                    }
-                ) {
-                    402
-                } else {
-                    503
-                },
-                message: e.to_string(),
+            crate::usage::budget::before_attempt().await.map_err(|e| {
+                inference_providers::ScoreError::HttpError {
+                    status_code: if matches!(e, crate::usage::UsageError::LimitExceeded(_)) {
+                        402
+                    } else {
+                        503
+                    },
+                    message: e.to_string(),
+                }
             })?;
             match provider.score(params.clone(), request_hash.clone()).await {
                 Ok(response) => {
@@ -13884,20 +13751,12 @@ mod tests {
             pool.register_pinned_secondary_provider(model.into(), fallback.clone(), None)
                 .await;
             assert!(pool
-                .responses_raw(
-                    model,
-                    serde_json::json!({"store":false,"input":"hello"}),
-                    false
-                )
+                .responses_raw(model, serde_json::json!({"store":false}), false)
                 .await
                 .is_err());
             assert_eq!(calls.load(Ordering::SeqCst), 0);
             let (_, attribution) = pool
-                .responses_raw(
-                    model,
-                    serde_json::json!({"store":false,"input":"hello"}),
-                    true,
-                )
+                .responses_raw(model, serde_json::json!({"store":false}), true)
                 .await
                 .unwrap();
             assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -13905,11 +13764,7 @@ mod tests {
             pool.register_provider("native/primary".into(), fallback)
                 .await;
             let (_, attribution) = pool
-                .responses_raw(
-                    "native/primary",
-                    serde_json::json!({"store":false,"input":"hello"}),
-                    false,
-                )
+                .responses_raw("native/primary", serde_json::json!({"store":false}), false)
                 .await
                 .unwrap();
             assert!(!attribution.served_via_fallback);

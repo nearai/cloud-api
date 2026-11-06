@@ -92,7 +92,7 @@ pub async fn score(
         &api_key,
         &model,
         services::usage::InferenceType::Score,
-        0,
+        i64::from(model.context_length),
         0,
         0,
     ) {

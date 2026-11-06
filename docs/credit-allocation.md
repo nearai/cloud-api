@@ -62,36 +62,14 @@ rate-limit check alone does not authorize spending. Insufficient funds return 40
 unavailable accounting fails closed before sending work to a provider.
 
 Reservations freeze the model price, organization discount, execution bounds and
-funding sources. Text quotes use the selected provider's count of this request's
-normalized input plus its enforced maximum output, including choices, batches and
-cache pricing. Input includes system instructions, tool definitions, tool results,
-structured-output schemas and supported media. The context window is a validity
-limit, not the input reservation. An omitted output limit still uses the catalog's
-maximum output; specifying a smaller limit reduces the hold.
-
-NEAR gateways count after E2EE decryption and normalization inside the trusted
-inference process. Only counts and billing metadata leave that boundary. Native
-Anthropic, Gemini and Responses providers use their counting APIs. Text-only
-providers without a counter (including Chutes and Tinfoil) use a conservative
-request-sized UTF-8/framing estimate; opaque media cannot use this fallback.
-SystemOne probes `/systemone/count_tokens`; image requests require that counting
-contract from their backend and fail closed if it is unavailable. Provider counts and estimates
-are not a proof of arbitrary vendor billing behavior. Missing, invalid or failed
-counts stop execution; reported usage outside the admitted bounds retains the
-hold for reconciliation instead of releasing funds on an undercount.
-
-Successful final usage settles once and releases the unused remainder. This
-covers Chat/Completions, native Responses and Messages, embeddings, rerank, score,
-privacy classification/auto-redaction, images, decoded audio duration, SystemOne
-and metered platform searches. Vendor fees outside the catalog's metering
+funding sources. Text quotes conservatively cover the catalog context window and
+an enforced output ceiling, including multiple choices and cache pricing. They do
+not estimate prompt tokens, so even a short prompt may require more available credit
+than its final cost. Successful final usage settles once and releases the unused
+remainder. This covers Chat/Completions, native Responses and Messages, embeddings,
+rerank, score, privacy classification/auto-redaction, images, audio, SystemOne and
+metered platform searches. Vendor fees outside the catalog's current metering
 contract require a separate metered service.
-
-Server-side search loops and Fusion delegate billing to a capability-checked
-trusted proxy. Every actual inference call counts its current input and reserves
-separately, including new tool results and retries. Cloud API keeps aggregate
-public usage for these requests and does not bill it again. Only trusted gateway
-credentials can pass the delegated organization, workspace and key identity;
-public request headers cannot select a different payer.
 
 A retry that may execute again gets a separate reservation. Client disconnects,
 partial SSE usage, timeouts and process crashes retain the dispatched hold; no TTL
@@ -120,10 +98,7 @@ without spending credit held for current executions.
 2. Update `scripts/cloud-platform-schema.env` to a published image built from the
    merged schema change. Deploy Cloud API and inference-proxy together. Direct
    cloud-key proxies require `/v1/internal/budget` and the internal usage token,
-   including when final receipts use SQS. Trusted proxies also require these
-   settings when executing delegated search loops or Fusion. Deploy the counting
-   endpoint and per-attempt billing capability before enabling the new Cloud API;
-   old proxies fail admission rather than falling back to unreserved work.
+   including when final receipts use SQS.
 3. Drain old executors and receipt queues before reopening traffic on the updated
    fleet. Mixed old executors can still start unreserved work. Check ordinary
    organizations, exhausted keys, retry receipts and pending reservations.

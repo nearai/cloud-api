@@ -1331,16 +1331,6 @@ const UNSUPPORTED: &str =
 
 #[async_trait]
 impl InferenceProvider for Provider {
-    async fn count_input_tokens(
-        &self,
-        request: &crate::input_tokens::InputTokenRequest,
-    ) -> Result<i32, CompletionError> {
-        if let Some(params) = &request.chat {
-            reject_client_e2ee(params)?;
-        }
-        crate::input_tokens::text_input_bound(&request.body)
-    }
-
     async fn models(&self) -> Result<ModelsResponse, ListModelsError> {
         // The model set is configured explicitly; advertise just this one, under the
         // CANONICAL id (never the upstream `-TEE` chute slug).

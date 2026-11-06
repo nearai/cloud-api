@@ -179,13 +179,7 @@ async fn partial_external_config_update_reloads_the_live_provider() {
         .unwrap();
 
     assert!(old_upstream.received_requests().await.unwrap().is_empty());
-    let requests: Vec<_> = new_upstream
-        .received_requests()
-        .await
-        .unwrap()
-        .into_iter()
-        .filter(|r| r.url.path() != "/tokenize")
-        .collect();
+    let requests = new_upstream.received_requests().await.unwrap();
     assert_eq!(requests.len(), 1);
     let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
     assert_eq!(body["provider"], policy);
@@ -316,13 +310,7 @@ async fn provider_config_writes_keep_the_stored_key_and_routing_policy() {
     with_pool_test_budget(pool.chat_completion(params, "synthetic-request".into()))
         .await
         .unwrap();
-    let requests: Vec<_> = upstream
-        .received_requests()
-        .await
-        .unwrap()
-        .into_iter()
-        .filter(|r| r.url.path() != "/tokenize")
-        .collect();
+    let requests = upstream.received_requests().await.unwrap();
     assert_eq!(requests.len(), 1);
     assert_eq!(
         requests[0].headers.get("authorization").unwrap(),

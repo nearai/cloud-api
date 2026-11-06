@@ -69,13 +69,6 @@ async fn mount_tier(server: &MockServer, model: &str, tag: &str) {
 }
 
 async fn mount_models(server: &MockServer, model: &str) {
-    Mock::given(method("POST"))
-        .and(path("/v1/internal/input-tokens"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_json(serde_json::json!({"input_tokens":10})),
-        )
-        .mount(server)
-        .await;
     Mock::given(method("GET"))
         .and(path("/v1/models"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({

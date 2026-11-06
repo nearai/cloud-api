@@ -2038,17 +2038,14 @@ pub async fn reserve_usage_internal(
     };
     let bounds = services::usage::budget::UsageBounds {
         inference_type: request.inference_type,
-        // Only a trusted executor supplies this count after normalization/decryption.
-        // Missing input metadata must never silently turn into a full-context quote.
         input_units: request
             .input_units
-            .filter(|n| *n >= 0)
-            .ok_or_else(|| {
-                failure(
-                    StatusCode::BAD_REQUEST,
-                    "Nonnegative counted input units are required",
-                )
-            })?
+            .unwrap_or(
+                execution_model
+                    .context_length
+                    .checked_mul(request.batch_items)
+                    .ok_or_else(overflow)?,
+            )
             .checked_mul(if text { request.choices } else { 1 })
             .and_then(|n| n.checked_mul(request.executions))
             .ok_or_else(overflow)?,

@@ -182,7 +182,10 @@ pub async fn embeddings(
         &api_key,
         &model,
         services::usage::InferenceType::Embedding,
-        0,
+        match billing::batch_input_bound(&body, model.context_length) {
+            Ok(n) => n,
+            Err(r) => return *r,
+        },
         0,
         0,
     ) {

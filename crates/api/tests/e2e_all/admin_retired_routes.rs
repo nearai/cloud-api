@@ -15,6 +15,10 @@ fn retired_routes() -> Vec<(Method, String)> {
         (Method::GET, format!("{org}/reporting-tokens")),
         (Method::POST, format!("{org}/reporting-tokens")),
         (Method::DELETE, format!("{org}/reporting-tokens/{ID}")),
+        (
+            Method::GET,
+            format!("{org}/usage/reporting-token-auth-probe"),
+        ),
         (Method::GET, format!("{org}/usage/export")),
         (Method::GET, format!("{org}/usage/summary")),
         // Usage console
@@ -44,7 +48,7 @@ fn retired_routes() -> Vec<(Method, String)> {
         (Method::GET, format!("{admin_org}/usage/balance")),
         (Method::GET, format!("{admin_org}/usage-discount")),
         (Method::PUT, format!("{admin_org}/usage-discount")),
-        (Method::GET, format!("{admin_org}/credit/reconciliations")),
+        (Method::POST, format!("{admin_org}/credit/reconciliations")),
         (
             Method::GET,
             format!("{admin_org}/credit/transfer/reconciliation"),

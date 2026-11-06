@@ -39,10 +39,6 @@ Operations marked deprecated (account, organization, workspace, invitation, API 
         (name = "Workspaces", description = "Workspace and API key management"),
         (name = "Users", description = "User profile and token management"),
         (name = "Invitations", description = "Token-based invitation handling"),
-        (name = "Usage", description = "Usage tracking and billing information"),
-        (name = "Reporting", description = "Read-only customer usage reporting"),
-        (name = "Billing", description = "Billing costs endpoint (HuggingFace integration)"),
-        (name = "Staking Farm", description = "House of Stake farm credit configuration and synchronization"),
         (name = "Health", description = "Health check endpoints"),
         (name = "Attestation", description = "Attestation and verification endpoints"),
         (name = "Gateway", description = "Model gateway integration endpoints"),
@@ -131,15 +127,11 @@ Operations marked deprecated (account, organization, workspace, invitation, API 
         // Invitation endpoints (token-based)
         crate::routes::users::get_invitation_by_token,
         crate::routes::users::accept_invitation_by_token,
-        // Usage endpoints
-        // Staking farm endpoints
-        // Customer reporting endpoints
         // Feature request endpoints
         crate::routes::feature_requests::submit_feature_request,
         crate::routes::feature_requests::list_admin_feature_requests,
         // Gateway endpoints (model gateway integration)
         crate::routes::gateway::check_api_key,
-        // Billing endpoints (HuggingFace integration)
         // Admin endpoints (less frequently used)
         crate::routes::admin::list_models,
         crate::routes::admin::batch_upsert_models,
@@ -323,8 +315,6 @@ Operations marked deprecated (account, organization, workspace, invitation, API 
             crate::routes::admin::ListAdminSettingsResponse,
             // Usage tracking models
             crate::routes::internal_usage::RecordUsageResponse,
-            // Staking farm models
-            // Customer reporting models
             // Feature request models
             crate::routes::feature_requests::FeatureRequestKind,
             crate::routes::feature_requests::SubmitFeatureRequest,
@@ -335,8 +325,6 @@ Operations marked deprecated (account, organization, workspace, invitation, API 
             crate::routes::feature_requests::AdminFeatureRequestListResponse,
             // Gateway models
             crate::routes::gateway::CheckApiKeyResponse,
-            // Billing models (HuggingFace integration)
-            // Organization metrics (admin)
             // Platform Stats analytics models
             services::admin::InfraSummary,
             services::admin::ModelGpuAllocation,

@@ -41,35 +41,15 @@ pub(crate) fn admin_operation(method: &Method, matched_path: &str) -> AdminOpera
                 | "/admin/models/{model_name}/access"
                 | "/admin/organizations/{org_id}/model-access"
                 | "/admin/organizations/{org_id}/limits/history"
-                | "/admin/organizations/{org_id}/usage/balance"
-                | "/admin/organizations/{org_id}/usage-discount"
-                | "/admin/organizations/{org_id}/policy"
-                | "/admin/organizations/{org_id}/credit/transfer/reconciliation"
-                | "/admin/organizations/{org_id}/staking/farm"
                 | "/admin/aml/reports"
                 | "/admin/aml/allowlist"
                 | "/admin/organizations/{org_id}/concurrent-limit"
                 | "/admin/organizations/{org_id}/fallback"
                 | "/admin/organizations/{org_id}/priority"
-                | "/admin/organizations/{org_id}/metrics"
-                | "/admin/organizations/{org_id}/metrics/timeseries"
-                | "/admin/platform/metrics"
-                | "/admin/platform/metrics/timeseries"
-                | "/admin/platform/billing-summary"
-                | "/admin/platform/model-revenue"
-                | "/admin/platform/org-revenue"
                 | "/admin/platform/infra-summary"
                 | "/admin/settings"
                 | "/admin/settings/{key}"
-                | "/admin/platform/model-consumption-timeseries"
-                | "/admin/platform/performance-timeseries"
-                | "/admin/platform/revenue-density"
                 | "/admin/invitation-email-deliveries"
-                | "/admin/users"
-                | "/admin/api-keys"
-                | "/admin/organizations"
-                | "/admin/organizations/{org_id}"
-                | "/admin/organizations/{org_id}/members"
                 | "/admin/feature-requests"
                 | "/admin/database-encryption/jobs/{id}"
                 | "/admin/database-encryption/keys"
@@ -209,11 +189,17 @@ mod tests {
     }
 
     #[test]
-    fn api_keys_get_is_read() {
-        for path in ["/v1/admin/api-keys", "/admin/api-keys"] {
-            assert_eq!(admin_operation(&Method::GET, path), AdminOperation::Read);
-            assert_eq!(admin_operation(&Method::HEAD, path), AdminOperation::Read);
-            assert_eq!(admin_operation(&Method::POST, path), AdminOperation::Write);
+    fn retired_admin_routes_are_not_reads() {
+        // Routes that moved to cloud-platform must not keep a Read classification:
+        // a route re-added at one of these paths is a Write until it is audited.
+        for path in [
+            "/v1/admin/api-keys",
+            "/v1/admin/users",
+            "/v1/admin/organizations",
+            "/v1/admin/organizations/{org_id}/usage/balance",
+            "/v1/admin/platform/metrics",
+        ] {
+            assert_eq!(admin_operation(&Method::GET, path), AdminOperation::Write);
         }
     }
 }

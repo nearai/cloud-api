@@ -81,6 +81,26 @@ async fn test_delete_organization_revokes_its_credentials() {
         .clone();
     let api_key = get_api_key_for_org_with_session(&server, org.id.clone(), &session_id).await;
 
+    // Reporting tokens are issued by cloud-platform; seed one the cascade must revoke.
+    let token_hash = format!("{:064x}", uuid::Uuid::new_v4().as_u128());
+    database
+        .pool()
+        .get()
+        .await
+        .expect("failed to get database connection")
+        .execute(
+            "INSERT INTO organization_reporting_tokens \
+             (organization_id, name, token_hash, token_prefix, created_by_user_id) \
+             VALUES ($1, 'seeded-reporting-token', $2, 'rpt-seeded', $3)",
+            &[
+                &uuid::Uuid::parse_str(&org.id).unwrap(),
+                &token_hash,
+                &seeding::user_id_for_session(&session_id),
+            ],
+        )
+        .await
+        .expect("failed to seed reporting token");
+
     // Exercise a route that accepts only an API key before deleting the org.
     // The same key-only path must fail once the parent is gone.
     let response = server
@@ -153,6 +173,20 @@ async fn test_delete_organization_revokes_its_credentials() {
     assert_eq!(
         active_workspaces, 0,
         "workspaces under a deleted org must be deactivated"
+    );
+
+    let unrevoked_tokens: i64 = client
+        .query_one(
+            "SELECT COUNT(*) FROM organization_reporting_tokens \
+             WHERE organization_id = $1 AND revoked_at IS NULL",
+            &[&uuid::Uuid::parse_str(&org.id).unwrap()],
+        )
+        .await
+        .expect("failed to count reporting tokens")
+        .get(0);
+    assert_eq!(
+        unrevoked_tokens, 0,
+        "reporting tokens under a deleted org must be revoked"
     );
 }
 

@@ -1,0 +1,916 @@
+//! The discount worker and repository stay in cloud-api until the jobs PR removes
+//! them. These tests drive the repository and the kept usage paths directly; the
+//! admin route that saved rules has moved, so rules are saved with `save` and read
+//! back through the repository and `seeding`. Delete this module with the worker.
+//! This module owns the global hourly lock and runs serially.
+use crate::common::*;
+use chrono::{DateTime, Duration, Utc};
+use database::{
+    models::RecordUsageRequest,
+    repositories::{
+        organization_usage_discount::OrganizationUsageDiscountRepository,
+        OrganizationUsageRepository,
+    },
+};
+use serde_json::{json, Value};
+use std::sync::Arc;
+use uuid::Uuid;
+
+const INTERNAL_TOKEN: &str = "synthetic-org-discount-reporter";
+const BASIS_POINTS: i32 = 2500;
+
+struct Fixture {
+    server: axum_test::TestServer,
+    db: Arc<database::Database>,
+    org: Uuid,
+    workspace: Uuid,
+    key: Uuid,
+    model: Uuid,
+    model_name: String,
+}
+
+async fn fixture() -> Fixture {
+    let (server, db) = setup_test_server_with_config_and_database(|config| {
+        config.internal_usage_token = Some(INTERNAL_TOKEN.into());
+        config.auth.admin_read_only_tokens_enabled = true;
+    })
+    .await;
+    let org = create_org(&server).await;
+    let workspace = list_workspaces(&server, org.id.clone()).await[0].id.clone();
+    let key =
+        create_api_key_in_workspace(&server, workspace.clone(), "discount fixture".into()).await;
+    let model_name = format!("synthetic/discount-{}", Uuid::new_v4());
+    let model = db
+        .pool()
+        .get()
+        .await
+        .unwrap()
+        .query_one(
+            "INSERT INTO models (model_name, model_display_name, model_description,
+          input_cost_per_token, output_cost_per_token, context_length, max_output_length,
+          verifiable, is_active, provider_type, attestation_supported)
+         VALUES ($1, $1, 'Synthetic discount fixture', 1000000, 2000000, 4096, 1024,
+                 false, true, 'external', false) RETURNING id",
+            &[&model_name],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    Fixture {
+        server,
+        db,
+        org: Uuid::parse_str(&org.id).unwrap(),
+        workspace: Uuid::parse_str(&workspace).unwrap(),
+        key: Uuid::parse_str(&key.id).unwrap(),
+        model,
+        model_name,
+    }
+}
+
+async fn save(f: &Fixture, since: Option<DateTime<Utc>>) {
+    OrganizationUsageDiscountRepository::new(f.db.pool().clone())
+        .save(
+            f.org,
+            BASIS_POINTS,
+            since,
+            Uuid::parse_str(MOCK_USER_ID).unwrap(),
+        )
+        .await
+        .unwrap();
+}
+
+async fn rule(
+    f: &Fixture,
+) -> Option<database::repositories::organization_usage_discount::OrganizationUsageDiscount> {
+    OrganizationUsageDiscountRepository::new(f.db.pool().clone())
+        .get(f.org)
+        .await
+        .unwrap()
+}
+
+async fn total_spent(f: &Fixture) -> i64 {
+    seeding::organization_balance(&f.org.to_string())
+        .await
+        .total_spent
+}
+
+async fn credits(f: &Fixture, kind: &str, amount: i64) {
+    add_credits_with_type(
+        &f.server,
+        &f.org.to_string(),
+        kind,
+        None,
+        amount,
+        "USD",
+        &get_session_id(),
+    )
+    .await;
+}
+
+fn request(f: &Fixture, cost: i64) -> RecordUsageRequest {
+    let inference = Uuid::new_v4();
+    RecordUsageRequest {
+        organization_id: f.org,
+        workspace_id: f.workspace,
+        api_key_id: f.key,
+        model_id: f.model,
+        model_name: f.model_name.clone(),
+        input_tokens: 100,
+        output_tokens: 50,
+        input_cost: cost / 2,
+        output_cost: cost - cost / 2,
+        total_cost: cost,
+        inference_type: "chat_completion".into(),
+        ttft_ms: None,
+        avg_itl_ms: None,
+        inference_id: Some(inference),
+        provider_request_id: Some(format!("synthetic-{inference}")),
+        stop_reason: None,
+        response_id: None,
+        image_count: None,
+        cache_read_tokens: 0,
+        cache_write_tokens: 0,
+        billing_details: None,
+        service_tier: None,
+        context_band: None,
+        served_provider_tier: None,
+        served_provider_type: None,
+        served_via_fallback: false,
+        dedupe_on_conflict: true,
+    }
+}
+
+/// Legacy rows deliberately bypass today's allocator; all other fixtures use the
+/// actual posting path or explicitly seed a balanced historical ledger.
+async fn legacy(f: &Fixture, at: DateTime<Utc>, request: &RecordUsageRequest) -> Uuid {
+    f.db.pool()
+        .get()
+        .await
+        .unwrap()
+        .query_one(
+            "INSERT INTO organization_usage_log
+         (organization_id, workspace_id, api_key_id, model_id, model_name,
+          input_tokens, output_tokens, total_tokens, input_cost, output_cost, total_cost,
+          inference_type, inference_id, provider_request_id, created_at)
+         VALUES ($1,$2,$3,$4,$5,100,50,150,$6,$7,$8,'chat_completion',$9,$10,$11) RETURNING id",
+            &[
+                &f.org,
+                &f.workspace,
+                &f.key,
+                &f.model,
+                &f.model_name,
+                &request.input_cost,
+                &request.output_cost,
+                &request.total_cost,
+                &request.inference_id,
+                &request.provider_request_id,
+                &at,
+            ],
+        )
+        .await
+        .unwrap()
+        .get(0)
+}
+
+async fn seed_balance(f: &Fixture, legacy: i64) {
+    f.db.pool().get().await.unwrap().execute(
+        "INSERT INTO organization_balance (organization_id,total_spent,total_requests,total_tokens,
+          legacy_unattributed_amount,updated_at)
+         SELECT $1,SUM(total_cost)::BIGINT,COUNT(*),SUM(total_tokens)::BIGINT,$2,NOW()
+         FROM organization_usage_log WHERE organization_id=$1
+         ON CONFLICT (organization_id) DO UPDATE SET total_spent=EXCLUDED.total_spent,
+           total_requests=EXCLUDED.total_requests,total_tokens=EXCLUDED.total_tokens,
+           legacy_unattributed_amount=EXCLUDED.legacy_unattributed_amount",
+        &[&f.org, &legacy],
+    ).await.unwrap();
+}
+
+async fn finish(f: &Fixture) {
+    let repo = OrganizationUsageDiscountRepository::new(f.db.pool().clone());
+    for _ in 0..5 {
+        if repo.get(f.org).await.unwrap().unwrap().status == "active" {
+            return;
+        }
+        assert!(repo.apply_batch(f.org).await.unwrap());
+    }
+    panic!("small synthetic history did not finish");
+}
+
+async fn report(f: &Fixture, id: &str, input_tokens: i32) -> axum_test::TestResponse {
+    f.server
+        .post("/v1/internal/usage")
+        .add_header("Authorization", format!("Bearer {INTERNAL_TOKEN}"))
+        .json(
+            &json!({"organization_id":f.org,"workspace_id":f.workspace,"api_key_id":f.key,
+            "type":"chat_completion","model":f.model_name,"id":id,
+            "input_tokens":input_tokens,"output_tokens":50,"discount_to_user":0.2}),
+        )
+        .await
+}
+
+#[tokio::test]
+async fn forward_discount_composes_with_reporter_price_and_retries_once() {
+    let f = fixture().await;
+    credits(&f, "grant", 2_000_000_000).await;
+    let old = report(&f, "synthetic-before-rule", 100).await;
+    old.assert_status_ok();
+    let old: Value = old.json();
+    assert_eq!(old["total_cost"], 160_000_000);
+    save(&f, None).await;
+    let retry = report(&f, "synthetic-before-rule", 100).await;
+    retry.assert_status_ok();
+    assert_eq!(retry.json::<Value>()["total_cost"], 160_000_000);
+    assert_eq!(retry.json::<Value>()["id"], old["id"]);
+
+    let fresh = report(&f, "synthetic-after-rule", 100).await;
+    fresh.assert_status_ok();
+    let fresh: Value = fresh.json();
+    assert_eq!(fresh["input_cost"], 60_000_000);
+    assert_eq!(fresh["output_cost"], 60_000_000);
+    assert_eq!(fresh["total_cost"], 120_000_000);
+    let retry = report(&f, "synthetic-after-rule", 100).await;
+    retry.assert_status_ok();
+    assert_eq!(retry.json::<Value>()["id"], fresh["id"]);
+    assert_eq!(retry.json::<Value>()["total_cost"], 120_000_000);
+    assert!(!report(&f, "synthetic-after-rule", 101)
+        .await
+        .status_code()
+        .is_success());
+    let fresh_id: Uuid = fresh["id"].as_str().unwrap().parse().unwrap();
+    let row =
+        f.db.pool()
+            .get()
+            .await
+            .unwrap()
+            .query_one(
+                "SELECT billing_details, funded_amount FROM organization_usage_log WHERE id=$1",
+                &[&fresh_id],
+            )
+            .await
+            .unwrap();
+    let details: Value = row.get("billing_details");
+    assert_eq!(details["discount"]["list_total_cost"], 200_000_000);
+    assert_eq!(details["contract_discount"]["total_cost"], 160_000_000);
+    assert_eq!(
+        row.get::<_, Option<i64>>("funded_amount"),
+        Some(120_000_000)
+    );
+    assert_eq!(total_spent(&f).await, 280_000_000);
+    let client = f.db.pool().get().await.unwrap();
+    let totals = client.query_one("SELECT COUNT(*) AS count,SUM(amount)::BIGINT AS amount FROM usage_credit_allocations WHERE organization_id=$1", &[&f.org]).await.unwrap();
+    assert_eq!(totals.get::<_, i64>("count"), 2);
+    assert_eq!(totals.get::<_, i64>("amount"), 280_000_000);
+}
+
+#[tokio::test]
+async fn history_corrects_legacy_and_split_funding_with_reporting_parity() {
+    let f = fixture().await;
+    credits(&f, "grant", 300_000_000).await;
+    credits(&f, "postpay", 900_000_000).await;
+    let hour = crate::usage_hourly::random_past_hour();
+    let before = request(&f, 100_000_000);
+    legacy(&f, hour - Duration::microseconds(1), &before).await;
+    let old = request(&f, 100_000_000);
+    let legacy_id = legacy(&f, hour, &old).await;
+    let split = request(&f, 200_000_000);
+    let split_id = legacy(&f, hour + Duration::minutes(1), &split).await;
+    let paid = request(&f, 200_000_000);
+    let paid_id = legacy(&f, hour + Duration::minutes(2), &paid).await;
+    let client = f.db.pool().get().await.unwrap();
+    for (id, kind, amount, priority) in [
+        (split_id, "grant", 150_000_000_i64, 0_i32),
+        (split_id, "postpay", 50_000_000, 1),
+        (paid_id, "postpay", 200_000_000, 1),
+    ] {
+        client.execute("INSERT INTO usage_credit_allocations (organization_id,inference_usage_id,credit_type,amount,organization_limit_id,policy_version,priority_position)
+         SELECT $1,$2,$3::VARCHAR,$4,id,'synthetic', $5::INTEGER FROM organization_limits_history WHERE organization_id=$1 AND credit_type=$3::VARCHAR AND effective_until IS NULL", &[&f.org,&id,&kind,&amount,&priority]).await.unwrap();
+    }
+    client.execute("UPDATE organization_usage_log SET funded_amount=total_cost,unfunded_amount=0,allocation_policy_version='synthetic' WHERE id=ANY($1)",&[&vec![split_id,paid_id]]).await.unwrap();
+    for (kind, amount) in [("grant", 150_000_000_i64), ("postpay", 250_000_000_i64)] {
+        client.execute("INSERT INTO organization_credit_consumption (organization_id,credit_type,amount) VALUES ($1,$2,$3)",&[&f.org,&kind,&amount]).await.unwrap();
+    }
+    drop(client);
+    seed_balance(&f, 200_000_000).await;
+    crate::usage_hourly::recompute_usage_hours(
+        hour - Duration::hours(1),
+        hour + Duration::hours(1),
+    )
+    .await;
+    save(&f, Some(hour)).await;
+    let usage = OrganizationUsageRepository::new(f.db.pool().clone());
+    let old_retry = usage.record_usage(old.clone()).await.unwrap();
+    assert!(!old_retry.was_inserted);
+    assert_eq!(old_retry.total_cost, 100_000_000);
+    finish(&f).await;
+    let corrected_retry = usage.record_usage(old.clone()).await.unwrap();
+    assert!(!corrected_retry.was_inserted);
+    assert_eq!(corrected_retry.total_cost, 75_000_000);
+    assert_eq!(
+        usage.record_usage(before).await.unwrap().total_cost,
+        100_000_000
+    );
+    let mut changed = old;
+    changed.input_cost += 1;
+    changed.total_cost += 1;
+    assert!(
+        usage.record_usage(changed).await.is_err(),
+        "changed original payload must not become a retry after rounding"
+    );
+    assert_eq!(usage.get_api_key_spend(f.key).await.unwrap(), 475_000_000);
+
+    let client = f.db.pool().get().await.unwrap();
+    let audit = client.query_one("SELECT COUNT(*),SUM(original_total_cost)::BIGINT FROM usage_discount_adjustments WHERE usage_id=ANY($1)",&[&vec![legacy_id,split_id,paid_id]]).await.unwrap();
+    assert_eq!(
+        (audit.get::<_, i64>(0), audit.get::<_, i64>(1)),
+        (3, 500_000_000)
+    );
+    let allocations = client
+        .query_one(
+            "SELECT SUM(amount)::BIGINT FROM usage_credit_allocations WHERE organization_id=$1",
+            &[&f.org],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        allocations.get::<_, i64>(0),
+        400_000_000,
+        "original allocations remain immutable"
+    );
+    let balances = client.query_one("SELECT total_spent,legacy_unattributed_amount,total_requests,total_tokens FROM organization_balance WHERE organization_id=$1", &[&f.org]).await.unwrap();
+    assert_eq!(
+        (
+            balances.get::<_, i64>(0),
+            balances.get::<_, i64>(1),
+            balances.get::<_, i64>(2),
+            balances.get::<_, i64>(3)
+        ),
+        (475_000_000, 175_000_000, 4, 600)
+    );
+    let hourly = client.query_one("SELECT SUM(total_cost)::BIGINT,SUM(request_count)::BIGINT FROM usage_hourly WHERE organization_id=$1", &[&f.org]).await.unwrap();
+    assert_eq!(
+        (hourly.get::<_, i64>(0), hourly.get::<_, i64>(1)),
+        (475_000_000, 4)
+    );
+    let split_funding = client.query("SELECT credit_type,amount FROM effective_usage_credit_allocations WHERE inference_usage_id=$1 ORDER BY credit_type", &[&split_id]).await.unwrap();
+    assert_eq!(split_funding.len(), 1);
+    assert_eq!(
+        (
+            split_funding[0].get::<_, String>(0),
+            split_funding[0].get::<_, i64>(1)
+        ),
+        ("grant".into(), 150_000_000)
+    );
+    drop(client);
+    let balance = seeding::organization_balance(&f.org.to_string()).await;
+    assert_eq!(balance.total_spent, 475_000_000);
+    assert_eq!(balance.total_requests, 4);
+    assert_eq!(balance.remaining, Some(725_000_000));
+    assert_eq!(rule(&f).await.unwrap().processed_count, 3);
+}
+
+#[tokio::test]
+async fn historical_batches_rollback_resume_and_never_compound() {
+    let f = fixture().await;
+    let hour = crate::usage_hourly::random_past_hour();
+    let client = f.db.pool().get().await.unwrap();
+    client
+        .execute(
+            "INSERT INTO organization_usage_log
+        (organization_id,workspace_id,api_key_id,model_id,model_name,input_tokens,output_tokens,
+         total_tokens,input_cost,output_cost,total_cost,inference_type,created_at)
+        SELECT $1,$2,$3,$4,$5,1,1,2,2,4,6,'chat_completion',$6 FROM generate_series(1,503)",
+            &[&f.org, &f.workspace, &f.key, &f.model, &f.model_name, &hour],
+        )
+        .await
+        .unwrap();
+    drop(client);
+    seed_balance(&f, 3018).await;
+    crate::usage_hourly::recompute_usage_hours(hour, hour + Duration::hours(1)).await;
+    save(&f, Some(hour)).await;
+    let repo = OrganizationUsageDiscountRepository::new(f.db.pool().clone());
+    let mut lock_client = f.db.pool().get().await.unwrap();
+    let lock = lock_client.transaction().await.unwrap();
+    lock.query_one(
+        "SELECT id FROM organizations WHERE id=$1 FOR UPDATE",
+        &[&f.org],
+    )
+    .await
+    .unwrap();
+    assert!(
+        !repo.apply_batch(f.org).await.unwrap(),
+        "busy org is skipped without consuming the cursor"
+    );
+    lock.rollback().await.unwrap();
+    drop(lock_client);
+    // Simulate a reconciliation failure after work has begun inside the transaction.
+    let client = f.db.pool().get().await.unwrap();
+    client
+        .execute(
+            "UPDATE organization_balance SET legacy_unattributed_amount=0 WHERE organization_id=$1",
+            &[&f.org],
+        )
+        .await
+        .unwrap();
+    drop(client);
+    assert!(repo.apply_batch(f.org).await.is_err());
+    let client = f.db.pool().get().await.unwrap();
+    let rollback = client.query_one("SELECT (SELECT COUNT(*) FROM usage_discount_adjustments j JOIN organization_usage_log u ON u.id=j.usage_id WHERE u.organization_id=$1),
+        (SELECT SUM(total_cost)::BIGINT FROM organization_usage_log WHERE organization_id=$1),
+        (SELECT SUM(total_cost)::BIGINT FROM usage_hourly WHERE organization_id=$1)", &[&f.org]).await.unwrap();
+    assert_eq!(
+        (
+            rollback.get::<_, i64>(0),
+            rollback.get::<_, i64>(1),
+            rollback.get::<_, i64>(2)
+        ),
+        (0, 3018, 3018)
+    );
+    assert_eq!(repo.get(f.org).await.unwrap().unwrap().processed_count, 0);
+    client.execute("UPDATE organization_balance SET legacy_unattributed_amount=3018 WHERE organization_id=$1", &[&f.org]).await.unwrap();
+    drop(client);
+    assert!(repo.apply_batch(f.org).await.unwrap());
+    let progress = repo.get(f.org).await.unwrap().unwrap();
+    assert_eq!(
+        (progress.status.as_str(), progress.processed_count),
+        ("applying", 500)
+    );
+    // Half-up rounding on each component: 2 * .75 -> 2; 4 * .75 -> 3.
+    assert_eq!(total_spent(&f).await, 2518);
+    // A fresh repository represents worker restart; the persisted composite cursor
+    // must distinguish the 503 rows even though every timestamp is identical.
+    let restarted = OrganizationUsageDiscountRepository::new(f.db.pool().clone());
+    assert!(restarted.apply_batch(f.org).await.unwrap());
+    finish(&f).await;
+    assert!(!restarted.apply_batch(f.org).await.unwrap());
+    let final_rule = restarted.get(f.org).await.unwrap().unwrap();
+    assert_eq!(final_rule.processed_count, 503);
+    save(&f, Some(hour)).await;
+    let client = f.db.pool().get().await.unwrap();
+    let totals = client.query_one("SELECT b.total_spent,b.legacy_unattributed_amount,
+        (SELECT SUM(total_cost)::BIGINT FROM usage_hourly WHERE organization_id=$1),
+        (SELECT COUNT(*) FROM usage_discount_adjustments j JOIN organization_usage_log u ON u.id=j.usage_id WHERE u.organization_id=$1)
+        FROM organization_balance b WHERE organization_id=$1", &[&f.org]).await.unwrap();
+    assert_eq!(
+        (
+            totals.get::<_, i64>(0),
+            totals.get::<_, i64>(1),
+            totals.get::<_, i64>(2),
+            totals.get::<_, i64>(3)
+        ),
+        (2515, 2515, 2515, 503)
+    );
+}
+
+#[tokio::test]
+async fn unsupported_history_rejects_before_persisting_terms() {
+    for settled in [false, true] {
+        let f = fixture().await;
+        let hour = crate::usage_hourly::random_past_hour();
+        let usage = OrganizationUsageRepository::new(f.db.pool().clone());
+        // No capacity means an actual posting creates unfunded usage.
+        let row = usage.record_usage(request(&f, 200)).await.unwrap();
+        assert_eq!(row.unfunded_amount, Some(200));
+        let client = f.db.pool().get().await.unwrap();
+        client
+            .execute(
+                "UPDATE organization_usage_log SET created_at=$2 WHERE id=$1",
+                &[&row.id, &hour],
+            )
+            .await
+            .unwrap();
+        drop(client);
+        if settled {
+            // Adding capacity invokes the real settlement path, preserving its
+            // overage_settlement provenance rather than faking a posting entry.
+            credits(&f, "grant", 400).await;
+            let client = f.db.pool().get().await.unwrap();
+            let count: i64 = client.query_one("SELECT COUNT(*) FROM usage_credit_allocations WHERE inference_usage_id=$1 AND allocation_phase='overage_settlement'", &[&row.id]).await.unwrap().get(0);
+            assert_eq!(count, 1);
+        }
+        let refused = OrganizationUsageDiscountRepository::new(f.db.pool().clone())
+            .save(
+                f.org,
+                BASIS_POINTS,
+                Some(hour),
+                Uuid::parse_str(MOCK_USER_ID).unwrap(),
+            )
+            .await;
+        assert!(refused.is_err(), "settled={settled}");
+        assert!(rule(&f).await.is_none());
+        let stored = usage.get_balance(f.org).await.unwrap().unwrap();
+        assert_eq!(stored.total_spent, 200);
+    }
+}
+
+#[tokio::test]
+async fn platform_services_stay_outside_forward_and_historical_discount() {
+    use database::repositories::organization_service_usage::{
+        OrganizationServiceUsageRepository, RecordServiceUsageRequest,
+    };
+    let f = fixture().await;
+    credits(&f, "grant", 1000).await;
+    let client = f.db.pool().get().await.unwrap();
+    let service: Uuid = client
+        .query_one(
+            "INSERT INTO services (service_name,display_name,unit,cost_per_unit)
+         VALUES ($1,'Synthetic service','request',80) RETURNING id",
+            &[&format!("synthetic-discount-service-{}", Uuid::new_v4())],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    drop(client);
+    let services = OrganizationServiceUsageRepository::new(f.db.pool().clone());
+    let mut service_request = RecordServiceUsageRequest {
+        organization_id: f.org,
+        workspace_id: f.workspace,
+        api_key_id: f.key,
+        service_id: service,
+        quantity: 1,
+        total_cost: 80,
+        inference_id: Some(Uuid::new_v4()),
+    };
+    let service_usage = services.record_usage(&service_request).await.unwrap();
+    let inference = OrganizationUsageRepository::new(f.db.pool().clone());
+    let mut original = request(&f, 6);
+    original.input_cost = 2;
+    original.output_cost = 4;
+    let row = inference.record_usage(original.clone()).await.unwrap();
+    let hour = crate::usage_hourly::random_past_hour();
+    let client = f.db.pool().get().await.unwrap();
+    client
+        .execute(
+            "UPDATE organization_usage_log SET created_at=$2 WHERE id=$1",
+            &[&row.id, &hour],
+        )
+        .await
+        .unwrap();
+    client
+        .execute(
+            "UPDATE organization_service_usage_log SET created_at=$2 WHERE id=$1",
+            &[&service_usage.id, &hour],
+        )
+        .await
+        .unwrap();
+    drop(client);
+    crate::usage_hourly::recompute_usage_hours(hour, hour + Duration::hours(1)).await;
+    save(&f, Some(hour)).await;
+    finish(&f).await;
+    assert_eq!(
+        inference
+            .record_usage(original.clone())
+            .await
+            .unwrap()
+            .total_cost,
+        5
+    );
+    // Both inputs round to the same discounted cost, but the original billable
+    // payload changed, so this must still be rejected as an incompatible retry.
+    let mut changed = original;
+    changed.input_cost = 3;
+    changed.total_cost = 7;
+    assert!(inference.record_usage(changed).await.is_err());
+    let unchanged = services.record_usage(&service_request).await.unwrap();
+    assert_eq!(unchanged.total_cost, 80);
+    service_request.inference_id = Some(Uuid::new_v4());
+    assert_eq!(
+        services
+            .record_usage(&service_request)
+            .await
+            .unwrap()
+            .total_cost,
+        80
+    );
+    assert_eq!(total_spent(&f).await, 165);
+    assert_eq!(rule(&f).await.unwrap().processed_count, 1);
+}
+
+#[tokio::test]
+async fn full_discount_zeroes_funding_and_nanosecond_cutoff_retries_are_idempotent() {
+    let f = fixture().await;
+    credits(&f, "grant", 200).await;
+    let usage = OrganizationUsageRepository::new(f.db.pool().clone());
+    let original = request(&f, 100);
+    let row = usage.record_usage(original.clone()).await.unwrap();
+    let hour = crate::usage_hourly::random_past_hour();
+    let at = hour + Duration::minutes(1);
+    f.db.pool()
+        .get()
+        .await
+        .unwrap()
+        .execute(
+            "UPDATE organization_usage_log SET created_at=$2 WHERE id=$1",
+            &[&row.id, &at],
+        )
+        .await
+        .unwrap();
+    crate::usage_hourly::recompute_usage_hours(hour, hour + Duration::hours(1)).await;
+    let since = hour + Duration::nanoseconds(123_456_789);
+    let creator = Uuid::parse_str(MOCK_USER_ID).unwrap();
+    let repo = OrganizationUsageDiscountRepository::new(f.db.pool().clone());
+    let saved = repo
+        .save(f.org, 10_000, Some(since), creator)
+        .await
+        .unwrap();
+    let retry = repo
+        .save(f.org, 10_000, Some(since), creator)
+        .await
+        .unwrap();
+    assert_eq!(retry.id, saved.id);
+    assert_eq!(retry.apply_since, saved.apply_since);
+    finish(&f).await;
+    let corrected = usage.record_usage(original).await.unwrap();
+    assert_eq!(
+        (
+            corrected.total_cost,
+            corrected.funded_amount,
+            corrected.unfunded_amount
+        ),
+        (0, Some(0), Some(0))
+    );
+    assert!(corrected.credit_allocations.unwrap().is_empty());
+    let forward = usage.record_usage(request(&f, 100)).await.unwrap();
+    assert_eq!((forward.total_cost, forward.funded_amount), (0, Some(0)));
+    let client = f.db.pool().get().await.unwrap();
+    let ledger = client.query_one(
+        "SELECT (SELECT SUM(amount)::BIGINT FROM usage_credit_allocations WHERE organization_id=$1),
+                (SELECT COUNT(*) FROM effective_usage_credit_allocations WHERE organization_id=$1),
+                (SELECT amount FROM organization_credit_consumption WHERE organization_id=$1 AND credit_type='grant'),
+                (SELECT SUM(total_cost)::BIGINT FROM usage_hourly WHERE organization_id=$1)", &[&f.org],
+    ).await.unwrap();
+    assert_eq!(
+        (
+            ledger.get::<_, i64>(0),
+            ledger.get::<_, i64>(1),
+            ledger.get::<_, i64>(2),
+            ledger.get::<_, i64>(3)
+        ),
+        (100, 0, 0, 0)
+    );
+    drop(client);
+    let balance = seeding::organization_balance(&f.org.to_string()).await;
+    assert_eq!(balance.total_spent, 0);
+    assert_eq!(balance.remaining, Some(200));
+    assert_eq!(balance.total_requests, 2);
+    repo.save(f.org, 10_000, Some(since), creator)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn worker_claims_recover_after_crash_and_fence_stale_workers() {
+    let f = fixture().await;
+    save(&f, Some(Utc::now() - Duration::days(1))).await;
+    let repo = OrganizationUsageDiscountRepository::new(f.db.pool().clone());
+    let (left, right) = tokio::join!(repo.claim_next(), repo.claim_next());
+    let mut claims: Vec<_> = [left.unwrap(), right.unwrap()]
+        .into_iter()
+        .flatten()
+        .collect();
+    assert_eq!(
+        claims.len(),
+        1,
+        "concurrent replicas must claim an organization once"
+    );
+    let claim = claims.pop().unwrap();
+    assert_eq!(claim.organization_id, f.org);
+    assert!(repo.claim_next().await.unwrap().is_none());
+    let client = f.db.pool().get().await.unwrap();
+    client.execute("UPDATE organization_usage_discounts SET lease_until=clock_timestamp()-INTERVAL '1 second' WHERE organization_id=$1", &[&f.org]).await.unwrap();
+    drop(client);
+    let replacement = repo.claim_next().await.unwrap().unwrap();
+    assert_eq!(replacement.organization_id, f.org);
+    assert!(!repo.run_claimed(claim).await.unwrap());
+    assert!(
+        repo.claim_next().await.unwrap().is_none(),
+        "stale worker must not clear replacement lease"
+    );
+
+    // Verification has an independent lock: even an expired live process cannot
+    // overlap the replacement's verification scan.
+    let mut client = f.db.pool().get().await.unwrap();
+    let tx = client.transaction().await.unwrap();
+    tx.query_one(
+        "SELECT pg_advisory_xact_lock(hashtextextended($1::UUID::TEXT,$2))",
+        &[&f.org, &0x555344495343_i64],
+    )
+    .await
+    .unwrap();
+    assert!(!repo.run_claimed(replacement).await.unwrap());
+    tx.rollback().await.unwrap();
+    let state = client.query_one("SELECT attempts,worker_token,last_error FROM organization_usage_discounts WHERE organization_id=$1", &[&f.org]).await.unwrap();
+    assert_eq!(state.get::<_, i32>("attempts"), 0);
+    assert_eq!(state.get::<_, Option<Uuid>>("worker_token"), None);
+    assert_eq!(state.get::<_, Option<String>>("last_error"), None);
+    client.execute("UPDATE organization_usage_discounts SET next_attempt_at=clock_timestamp() WHERE organization_id=$1", &[&f.org]).await.unwrap();
+    drop(client);
+    let restarted = OrganizationUsageDiscountRepository::new(f.db.pool().clone());
+    assert!(restarted
+        .run_claimed(restarted.claim_next().await.unwrap().unwrap())
+        .await
+        .unwrap());
+    assert_eq!(
+        restarted.get(f.org).await.unwrap().unwrap().status,
+        "active"
+    );
+}
+
+#[tokio::test]
+async fn worker_failures_back_off_show_safe_diagnostics_and_clear_after_repair() {
+    let f = fixture().await;
+    save(&f, Some(Utc::now() - Duration::days(1))).await;
+    // Synthetic drift in the correction's own records: a batch counted with no adjustments.
+    f.db.pool()
+        .get()
+        .await
+        .unwrap()
+        .execute(
+            "UPDATE organization_usage_discounts SET processed_count=1 WHERE organization_id=$1",
+            &[&f.org],
+        )
+        .await
+        .unwrap();
+    let repo = OrganizationUsageDiscountRepository::new(f.db.pool().clone());
+    for (attempts, expected_delay) in [(0_i32, 30_i64), (1, 60), (16, 1800)] {
+        let client = f.db.pool().get().await.unwrap();
+        client.execute("UPDATE organization_usage_discounts SET attempts=$2,next_attempt_at=clock_timestamp() WHERE organization_id=$1", &[&f.org,&attempts]).await.unwrap();
+        drop(client);
+        let claim = repo.claim_next().await.unwrap().unwrap();
+        assert_eq!(claim.organization_id, f.org);
+        assert!(repo.run_claimed(claim).await.is_err());
+        let state = rule(&f).await.unwrap();
+        assert_eq!(state.status, "applying");
+        assert_eq!(
+            state.last_error.as_deref(),
+            Some("Accounting verification failed. Reconcile organization balances before retry.")
+        );
+        let delay = (state.next_retry_at.unwrap() - Utc::now()).num_seconds();
+        assert!(
+            (expected_delay - 5..=expected_delay).contains(&delay),
+            "{delay}"
+        );
+        assert!(
+            repo.claim_next().await.unwrap().is_none(),
+            "backoff must prevent another verification"
+        );
+    }
+    let client = f.db.pool().get().await.unwrap();
+    client.execute("UPDATE organization_usage_discounts SET processed_count=0,next_attempt_at=clock_timestamp() WHERE organization_id=$1", &[&f.org]).await.unwrap();
+    drop(client);
+    assert!(repo
+        .run_claimed(repo.claim_next().await.unwrap().unwrap())
+        .await
+        .unwrap());
+    let state = rule(&f).await.unwrap();
+    assert_eq!(state.status, "active");
+    assert_eq!(state.last_error, None);
+    assert_eq!(state.next_retry_at, None);
+}
+
+#[tokio::test]
+async fn ledger_drift_outside_the_correction_does_not_block_activation() {
+    let f = fixture().await;
+    // Pre-existing drift the correction did not cause: the balance disagrees with usage.
+    let drifted = f
+        .db
+        .pool()
+        .get()
+        .await
+        .unwrap()
+        .execute(
+            "INSERT INTO organization_balance (organization_id,total_spent,total_requests,total_tokens,
+               legacy_unattributed_amount,updated_at) VALUES ($1,1,0,0,0,NOW())
+             ON CONFLICT (organization_id) DO UPDATE SET total_spent=organization_balance.total_spent+1",
+            &[&f.org],
+        )
+        .await
+        .unwrap();
+    assert_eq!(drifted, 1);
+    save(&f, Some(Utc::now() - Duration::days(1))).await;
+    let repo = OrganizationUsageDiscountRepository::new(f.db.pool().clone());
+    let claim = repo.claim_next().await.unwrap().unwrap();
+    assert_eq!(claim.organization_id, f.org);
+    let result = repo.run_claimed(claim).await;
+    let rule = repo.get(f.org).await.unwrap().unwrap();
+    // Delete before asserting, so a regression cannot leave due work in the global queue.
+    f.db.pool()
+        .get()
+        .await
+        .unwrap()
+        .execute(
+            "DELETE FROM organization_usage_discounts WHERE organization_id=$1",
+            &[&f.org],
+        )
+        .await
+        .unwrap();
+    assert!(matches!(result, Ok(true)), "{result:?}");
+    assert_eq!(
+        (rule.status.as_str(), rule.last_error),
+        ("active", None),
+        "drift outside the correction must not hold the rule in applying"
+    );
+}
+
+#[tokio::test]
+async fn verification_fails_when_credit_notes_miss_part_of_the_funded_reduction() {
+    let f = fixture().await;
+    credits(&f, "postpay", 900_000_000).await;
+    let hour = crate::usage_hourly::random_past_hour();
+    let paid_id = legacy(&f, hour, &request(&f, 200_000_000)).await;
+    let client = f.db.pool().get().await.unwrap();
+    client.execute("INSERT INTO usage_credit_allocations (organization_id,inference_usage_id,credit_type,amount,organization_limit_id,policy_version,priority_position)
+     SELECT $1,$2,'postpay',200000000,id,'synthetic',0 FROM organization_limits_history WHERE organization_id=$1 AND credit_type='postpay' AND effective_until IS NULL", &[&f.org,&paid_id]).await.unwrap();
+    client.execute("UPDATE organization_usage_log SET funded_amount=total_cost,unfunded_amount=0,allocation_policy_version='synthetic' WHERE id=$1",&[&paid_id]).await.unwrap();
+    client.execute("INSERT INTO organization_credit_consumption (organization_id,credit_type,amount) VALUES ($1,'postpay',200000000)",&[&f.org]).await.unwrap();
+    drop(client);
+    seed_balance(&f, 0).await;
+    crate::usage_hourly::recompute_usage_hours(hour, hour + Duration::hours(1)).await;
+    save(&f, Some(hour)).await;
+    let repo = OrganizationUsageDiscountRepository::new(f.db.pool().clone());
+    assert!(repo.apply_batch(f.org).await.unwrap(), "corrects the row");
+    // The credit note now covers one nano-dollar less than the row's reduction.
+    let changed = f.db.pool().get().await.unwrap().execute(
+        "UPDATE usage_credit_allocation_reversals r SET amount=r.amount-1 FROM usage_credit_allocations a
+         WHERE a.id=r.allocation_id AND a.inference_usage_id=$1", &[&paid_id]).await.unwrap();
+    assert_eq!(changed, 1);
+    let error = repo
+        .apply_batch(f.org)
+        .await
+        .err()
+        .map(|error| error.to_string());
+    let status = repo.get(f.org).await.unwrap().unwrap().status;
+    // Delete before asserting, so neither outcome leaves due work in the global queue.
+    f.db.pool()
+        .get()
+        .await
+        .unwrap()
+        .execute(
+            "DELETE FROM organization_usage_discounts WHERE organization_id=$1",
+            &[&f.org],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        error.as_deref(),
+        Some("Accounting verification failed. Reconcile organization balances before retry.")
+    );
+    assert_eq!(status, "applying");
+}
+
+#[tokio::test]
+async fn worker_queue_reaches_newer_orgs_behind_more_than_32_failures() {
+    let f = fixture().await;
+    let client = f.db.pool().get().await.unwrap();
+    let user = Uuid::parse_str(MOCK_USER_ID).unwrap();
+    // processed_count=1 with no adjustments makes each rule fail verification.
+    let rows = client.query("WITH org AS (INSERT INTO organizations (name) SELECT 'synthetic-discount-queue-'||uuid_generate_v4() FROM generate_series(1,34) RETURNING id)
+        INSERT INTO organization_usage_discounts (organization_id,discount_basis_points,apply_since,saved_at,created_by,status,processed_count,next_attempt_at)
+        SELECT id,2500,clock_timestamp()-INTERVAL '2 days',clock_timestamp()-INTERVAL '1 day',$1,'applying',1,clock_timestamp()-INTERVAL '1 day' FROM org RETURNING organization_id", &[&user]).await.unwrap();
+    let ids: Vec<Uuid> = rows.iter().map(|row| row.get(0)).collect();
+    drop(client);
+    let repo = OrganizationUsageDiscountRepository::new(f.db.pool().clone());
+    let mut seen = std::collections::HashSet::new();
+    for _ in 0..34 {
+        let claim = repo.claim_next().await.unwrap().unwrap();
+        assert!(ids.contains(&claim.organization_id));
+        assert!(
+            seen.insert(claim.organization_id),
+            "old failures must yield to every due organization"
+        );
+        assert!(repo.run_claimed(claim).await.is_err());
+    }
+    assert!(repo.claim_next().await.unwrap().is_none());
+    // Keep this global-queue test's failed jobs isolated from later tests.
+    f.db.pool()
+        .get()
+        .await
+        .unwrap()
+        .execute("DELETE FROM organizations WHERE id=ANY($1)", &[&ids])
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn deleting_discount_creator_preserves_rule_and_clears_audit_reference() {
+    let f = fixture().await;
+    let creator = Uuid::new_v4();
+    let client = f.db.pool().get().await.unwrap();
+    client.execute("INSERT INTO users (id,email,username,auth_provider,provider_user_id) VALUES ($1,$2,$3::VARCHAR,'test',$3::VARCHAR)", &[&creator,&format!("{creator}@example.test"),&creator.to_string()]).await.unwrap();
+    drop(client);
+    let repo = OrganizationUsageDiscountRepository::new(f.db.pool().clone());
+    repo.save(f.org, BASIS_POINTS, None, creator).await.unwrap();
+    let client = f.db.pool().get().await.unwrap();
+    client
+        .execute("DELETE FROM users WHERE id=$1", &[&creator])
+        .await
+        .unwrap();
+    let row = client
+        .query_one(
+            "SELECT created_by,status FROM organization_usage_discounts WHERE organization_id=$1",
+            &[&f.org],
+        )
+        .await
+        .unwrap();
+    assert_eq!(row.get::<_, Option<Uuid>>(0), None);
+    assert_eq!(row.get::<_, String>(1), "active");
+}

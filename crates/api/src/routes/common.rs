@@ -196,122 +196,6 @@ pub fn default_limit() -> i64 {
     100
 }
 
-/// Map an analytics granularity string to the PostgreSQL `DATE_TRUNC` literal.
-///
-/// Returns a `&'static str` — the only values that can reach `format!()` are the
-/// four hardcoded literals below. Callers cannot pass user-controlled strings through
-/// to the SQL even if the allowlist check is accidentally skipped elsewhere.
-pub fn allowlisted_date_trunc(
-    granularity: &str,
-) -> Result<&'static str, (StatusCode, ResponseJson<ErrorResponse>)> {
-    match granularity {
-        "hour" => Ok("hour"),
-        "day" => Ok("day"),
-        "week" => Ok("week"),
-        "month" => Ok("month"),
-        other => Err((
-            StatusCode::BAD_REQUEST,
-            ResponseJson(ErrorResponse::new(
-                format!("Invalid granularity '{other}'; expected one of: hour, day, week, month"),
-                "invalid_granularity".to_string(),
-            )),
-        )),
-    }
-}
-
-/// Parse + validate an analytics `start`/`end` window.
-///
-/// Unlike the old "parse-or-default" behavior, a malformed `start`/`end` is a
-/// hard error (a typo must not silently return a polished but wrong chart):
-/// - missing `end` defaults to now; missing `start` defaults to `end - 30d`
-/// - a present-but-unparseable value → 400
-/// - `start >= end` → 400
-/// - per-granularity absolute caps prevent unbounded full-table scans:
-///   - `hour`  → max `max_hour_days` days (caller-specified)
-///   - `day`   → max `max_day_days` days
-///   - `week`  → max 3 years (1096 days)
-///   - `month` → max 5 years (1826 days)
-///   - `None`  → max `max_day_days` days (non-timeseries endpoints)
-#[allow(clippy::type_complexity)]
-pub fn parse_metrics_range(
-    start: Option<&str>,
-    end: Option<&str>,
-    granularity: Option<&str>,
-    max_hour_days: i64,
-    max_day_days: i64,
-) -> Result<
-    (chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>),
-    (StatusCode, ResponseJson<ErrorResponse>),
-> {
-    let bad = |field: &str| {
-        (
-            StatusCode::BAD_REQUEST,
-            ResponseJson(ErrorResponse::new(
-                format!("Invalid '{field}': expected an ISO 8601 / RFC 3339 timestamp"),
-                "invalid_parameter".to_string(),
-            )),
-        )
-    };
-    let range_err = |msg: String| {
-        (
-            StatusCode::BAD_REQUEST,
-            ResponseJson(ErrorResponse::new(msg, "invalid_parameter".to_string())),
-        )
-    };
-
-    let end = match end {
-        Some(s) => chrono::DateTime::parse_from_rfc3339(s)
-            .map(|dt| dt.with_timezone(&chrono::Utc))
-            .map_err(|_| bad("end"))?,
-        None => chrono::Utc::now(),
-    };
-    let start = match start {
-        Some(s) => chrono::DateTime::parse_from_rfc3339(s)
-            .map(|dt| dt.with_timezone(&chrono::Utc))
-            .map_err(|_| bad("start"))?,
-        None => end - chrono::Duration::days(30),
-    };
-
-    if start >= end {
-        return Err(range_err("'start' must be before 'end'".to_string()));
-    }
-
-    let window = end - start;
-    match granularity {
-        Some("hour") => {
-            if window > chrono::Duration::days(max_hour_days) {
-                return Err(range_err(format!(
-                    "'hour' granularity is limited to {max_hour_days} days; use a coarser granularity or a shorter range"
-                )));
-            }
-        }
-        Some("week") => {
-            if window > chrono::Duration::days(1096) {
-                return Err(range_err(
-                    "'week' granularity is limited to 3 years".to_string(),
-                ));
-            }
-        }
-        Some("month") => {
-            if window > chrono::Duration::days(1826) {
-                return Err(range_err(
-                    "'month' granularity is limited to 5 years".to_string(),
-                ));
-            }
-        }
-        // "day" or None: caller-configured cap for non-hour ranges.
-        _ => {
-            if window > chrono::Duration::days(max_day_days) {
-                return Err(range_err(format!(
-                    "'day' granularity is limited to {max_day_days} days"
-                )));
-            }
-        }
-    }
-
-    Ok((start, end))
-}
-
 /// Basic non-empty string validation helper
 pub fn validate_non_empty_field(value: &str, field: &str) -> Result<(), String> {
     if value.is_empty() {
@@ -649,40 +533,6 @@ pub fn map_organization_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 ResponseJson(ErrorResponse::new(
                     "Internal server error".to_string(),
-                    "internal_server_error".to_string(),
-                )),
-            )
-        }
-    }
-}
-
-/// Maps an analytics service error to its HTTP response (spec §6.3). A statement-budget
-/// cancellation is a 504 with a structured body, like `reporting_request_timeout`. Every
-/// other error is a 500: admins see the internal error text, customers see only `failure`.
-pub fn analytics_error_response(
-    error: services::admin::AdminError,
-    failure: &str,
-    include_detail: bool,
-) -> (StatusCode, ResponseJson<ErrorResponse>) {
-    tracing::error!(error = %error, "{failure}");
-    match error {
-        services::admin::AdminError::Timeout => (
-            StatusCode::GATEWAY_TIMEOUT,
-            ResponseJson(ErrorResponse::new(
-                "Analytics request timed out".to_string(),
-                "analytics_request_timeout".to_string(),
-            )),
-        ),
-        other => {
-            let message = if include_detail {
-                format!("{failure}: {other}")
-            } else {
-                failure.to_string()
-            };
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                ResponseJson(ErrorResponse::new(
-                    message,
                     "internal_server_error".to_string(),
                 )),
             )
@@ -1099,33 +949,5 @@ mod tests {
             mirror_reasoning_usage(&mut body);
             assert_eq!(body, before);
         }
-    }
-
-    #[test]
-    fn analytics_timeout_maps_to_gateway_timeout() {
-        let (status, body) = analytics_error_response(
-            services::admin::AdminError::Timeout,
-            "Failed to retrieve platform metrics",
-            true,
-        );
-        assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
-        assert_eq!(body.0.error.r#type, "analytics_request_timeout");
-    }
-
-    #[test]
-    fn analytics_internal_errors_hide_detail_from_customers() {
-        let failure = || services::admin::AdminError::InternalError("db down".to_string());
-        let (status, customer) =
-            analytics_error_response(failure(), "Failed to retrieve organization metrics", false);
-        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-        assert_eq!(
-            customer.0.error.message,
-            "Failed to retrieve organization metrics"
-        );
-        let (_, admin) = analytics_error_response(failure(), "Failed to retrieve metrics", true);
-        assert_eq!(
-            admin.0.error.message,
-            "Failed to retrieve metrics: Internal error: db down"
-        );
     }
 }

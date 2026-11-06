@@ -94,35 +94,34 @@ pub fn build_management_router(app_state: AppState, auth_state: AuthState) -> Ro
         .route(
             "/{id}/members/{user_id}",
             put(update_organization_member).delete(remove_organization_member),
-        )
-        // // MCP Connector management
-        // .route(
-        //     "/{id}/mcp-connectors",
-        //     get(list_mcp_connectors).post(create_mcp_connector),
-        // )
-        // .route(
-        //     "/{id}/mcp-connectors/{connector_id}",
-        //     get(get_mcp_connector)
-        //         .put(update_mcp_connector)
-        //         .delete(delete_mcp_connector),
-        // )
-        // .route(
-        //     "/{id}/mcp-connectors/{connector_id}/test",
-        //     post(test_mcp_connector),
-        // )
-        // .route(
-        //     "/{id}/mcp-connectors/{connector_id}/tools",
-        //     get(list_mcp_tools),
-        // )
-        // .route(
-        //     "/{id}/mcp-connectors/{connector_id}/tools/call",
-        //     post(call_mcp_tool),
-        // )
-        // .route(
-        //     "/{id}/mcp-connectors/{connector_id}/usage",
-        //     get(get_mcp_usage_logs),
-        // )
-;
+        );
+    // // MCP Connector management
+    // .route(
+    //     "/{id}/mcp-connectors",
+    //     get(list_mcp_connectors).post(create_mcp_connector),
+    // )
+    // .route(
+    //     "/{id}/mcp-connectors/{connector_id}",
+    //     get(get_mcp_connector)
+    //         .put(update_mcp_connector)
+    //         .delete(delete_mcp_connector),
+    // )
+    // .route(
+    //     "/{id}/mcp-connectors/{connector_id}/test",
+    //     post(test_mcp_connector),
+    // )
+    // .route(
+    //     "/{id}/mcp-connectors/{connector_id}/tools",
+    //     get(list_mcp_tools),
+    // )
+    // .route(
+    //     "/{id}/mcp-connectors/{connector_id}/tools/call",
+    //     post(call_mcp_tool),
+    // )
+    // .route(
+    //     "/{id}/mcp-connectors/{connector_id}/usage",
+    //     get(get_mcp_usage_logs),
+    // )
 
     // User routes (require access token authentication)
     let user_routes = Router::new()

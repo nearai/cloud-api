@@ -39,10 +39,6 @@ Operations marked deprecated (account, organization, workspace, invitation, API 
         (name = "Workspaces", description = "Workspace and API key management"),
         (name = "Users", description = "User profile and token management"),
         (name = "Invitations", description = "Token-based invitation handling"),
-        (name = "Usage", description = "Usage tracking and billing information"),
-        (name = "Reporting", description = "Read-only customer usage reporting"),
-        (name = "Billing", description = "Billing costs endpoint (HuggingFace integration)"),
-        (name = "Staking Farm", description = "House of Stake farm credit configuration and synchronization"),
         (name = "Health", description = "Health check endpoints"),
         (name = "Attestation", description = "Attestation and verification endpoints"),
         (name = "Gateway", description = "Model gateway integration endpoints"),
@@ -131,12 +127,8 @@ Operations marked deprecated (account, organization, workspace, invitation, API 
         // Invitation endpoints (token-based)
         crate::routes::users::get_invitation_by_token,
         crate::routes::users::accept_invitation_by_token,
-        // Usage endpoints
-        // Staking farm endpoints
-        // Customer reporting endpoints
         // Gateway endpoints (model gateway integration)
         crate::routes::gateway::check_api_key,
-        // Billing endpoints (HuggingFace integration)
         // Admin endpoints (less frequently used)
         crate::routes::admin::preview_user_erasure,
         crate::routes::admin::erase_user,
@@ -260,15 +252,10 @@ Operations marked deprecated (account, organization, workspace, invitation, API 
             // Admin access token models
             CreateAdminAccessTokenRequest, AdminAccessTokenResponse,
             AdminAccessTokenPermission, AdminAccessTokenListEntry, ListAdminAccessTokensResponse,
-            // Admin settings models
             // Usage tracking models
             crate::routes::internal_usage::RecordUsageResponse,
-            // Staking farm models
-            // Customer reporting models
-                                        // Gateway models
+            // Gateway models
             crate::routes::gateway::CheckApiKeyResponse,
-            // Billing models (HuggingFace integration)
-            // Organization metrics (admin)
             // Platform Stats analytics models
             services::admin::InfraSummary,
             services::admin::ModelGpuAllocation,

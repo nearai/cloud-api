@@ -17,7 +17,8 @@ use api::models::{
 };
 use api::routes::workspaces::WorkspaceResponse;
 use chrono::{DateTime, Utc};
-use database::models::UpdateModelPricingRequest;
+use database::models::{AdminAccessTokenPermission, UpdateModelPricingRequest};
+use database::repositories::admin_access_token::AdminAccessTokenRepository;
 use database::repositories::credit_allocation::settle_unfunded_usage;
 use database::repositories::model::ModelRepository;
 use database::repositories::model_alias::ModelAliasRepository;
@@ -658,4 +659,54 @@ pub async fn seed_web_search_service() -> ServiceResponse {
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),
     }
+}
+
+/// An `adm_` admin access token for the user with this email, which must be on the test
+/// `AUTH_ADMIN_EMAILS`. The user is created when absent. The token row is written by
+/// `AdminAccessTokenRepository`, the code that hashes and validates admin tokens.
+///
+/// The shared mock user already holds `admin@test.com`, the default allowlisted email, so
+/// that email reuses it. The token has no User-Agent binding and read-write permission.
+pub async fn seed_admin_access_token(email: &str) -> String {
+    let database = seed_database().await;
+    let client = database
+        .pool()
+        .get()
+        .await
+        .expect("Failed to get database connection");
+    let user_id = Uuid::new_v4();
+    client
+        .execute(
+            "INSERT INTO users (id, email, username, display_name, auth_provider,
+                                provider_user_id, created_at, updated_at)
+             VALUES ($1, $2, $3, $4, 'mock', $5, NOW(), NOW())
+             ON CONFLICT (email) DO NOTHING",
+            &[
+                &user_id,
+                &email,
+                &format!("admin-{user_id}"),
+                &Some("Test Admin".to_string()),
+                &format!("mock_admin-{user_id}"),
+            ],
+        )
+        .await
+        .expect("Failed to seed admin user");
+    let created_by: Uuid = client
+        .query_one("SELECT id FROM users WHERE email = $1", &[&email])
+        .await
+        .expect("admin user must exist after seeding")
+        .get(0);
+
+    let (_row, token) = AdminAccessTokenRepository::new(database.pool().clone())
+        .create(
+            created_by,
+            format!("e2e-{}", Uuid::new_v4()),
+            "e2e test".to_string(),
+            Utc::now() + chrono::Duration::days(1),
+            None,
+            AdminAccessTokenPermission::ReadWrite,
+        )
+        .await
+        .expect("Failed to seed admin access token");
+    token
 }

@@ -357,8 +357,9 @@ pub async fn seed_admin_setting(key: &str, patch: serde_json::Value) {
 }
 
 /// Set the organization's concurrent request limit, as the admin concurrent-limit update
-/// did. Does not invalidate the completion service's per-organization cache, so call it
-/// before the organization's first completion request.
+/// did, minus its cache invalidation: the completion service caches the limit per
+/// organization for 5 minutes and nothing here clears that entry. Call it before the
+/// organization's first completion request; afterwards the old limit stays in force.
 pub async fn seed_concurrent_limit(org_id: &str, concurrent_limit: Option<i32>) {
     let database = seed_database().await;
     let organization_id = Uuid::parse_str(org_id).expect("organization id must be a UUID");
@@ -828,6 +829,149 @@ pub async fn seed_deprecation(model_id: &str, successor_model_id: &str, change_r
     for models_service in registered_models_services() {
         models_service.invalidate_models_cache().await;
     }
+}
+
+/// Set or clear a model's planned deprecation, as the admin catalog update did: the date and
+/// successor are stored as given and the models caches cleared. The handler cleared the
+/// successor together with the date, so pass `(None, None)` to clear both and
+/// `(Some(date), None)` to clear only the successor. Planned deprecation is announced in
+/// response headers only; it does not deactivate the model (see `seed_deprecation` for that).
+pub async fn seed_planned_deprecation(
+    model_name: &str,
+    deprecation_date: Option<DateTime<Utc>>,
+    successor_model_name: Option<&str>,
+) {
+    let database = seed_database().await;
+    let client = database.pool().get().await.expect("database connection");
+    let updated = client
+        .execute(
+            "UPDATE models SET deprecation_date = $2, successor_model_name = $3, updated_at = NOW()
+             WHERE model_name = $1",
+            &[&model_name, &deprecation_date, &successor_model_name],
+        )
+        .await
+        .expect("Failed to seed planned deprecation");
+    assert_eq!(updated, 1, "model not found: {model_name}");
+    for models_service in registered_models_services() {
+        models_service.invalidate_models_cache().await;
+    }
+}
+
+/// Schedule a pricing change for a model, as `POST /v1/admin/models/pricing-changes/confirm`
+/// did, and return its id. The old prices are the model's current ones; unset new prices stay
+/// as they are. Skips the lead-time and open-change validation of the route, but the open
+/// change unique index still applies (one pending change per model). At least one flat new
+/// price is required by the table, as the route derived them from a text pricing profile. Clears the models caches
+/// so notices see the pending row.
+pub async fn seed_pricing_change(
+    model_name: &str,
+    effective_at: DateTime<Utc>,
+    new_input_cost_per_token: Option<i64>,
+    new_output_cost_per_token: Option<i64>,
+    new_cache_read_cost_per_token: Option<i64>,
+    new_text_pricing: Option<serde_json::Value>,
+) -> Uuid {
+    let database = seed_database().await;
+    let client = database.pool().get().await.expect("database connection");
+    let row = client
+        .query_one(
+            "SELECT id, model_display_name, input_cost_per_token, output_cost_per_token,
+                    cache_read_cost_per_token, cost_per_image, text_pricing
+             FROM models WHERE model_name = $1",
+            &[&model_name],
+        )
+        .await
+        .unwrap_or_else(|e| panic!("model {model_name} not found: {e}"));
+    let old_text_pricing: Option<serde_json::Value> = row.get("text_pricing");
+    let parse = |value: serde_json::Value| {
+        serde_json::from_value::<services::usage::TextPricingProfile>(value)
+            .expect("text pricing profile")
+    };
+    let change = services::admin::ScheduledPricingChangeInsert {
+        model_id: row.get("id"),
+        model_name: model_name.to_string(),
+        model_display_name: row.get("model_display_name"),
+        new_input_cost_per_token,
+        new_output_cost_per_token,
+        new_cache_read_cost_per_token,
+        new_cost_per_image: None,
+        old_input_cost_per_token: row.get("input_cost_per_token"),
+        old_output_cost_per_token: row.get("output_cost_per_token"),
+        old_cache_read_cost_per_token: row.get("cache_read_cost_per_token"),
+        old_cost_per_image: row.get("cost_per_image"),
+        old_text_pricing: old_text_pricing.map(parse),
+        new_text_pricing: new_text_pricing.map(parse),
+        effective_at,
+    };
+    let repo = AdminCompositeRepository::new(database.pool().clone());
+    let inserted = repo
+        .insert_scheduled_pricing_changes(
+            Uuid::new_v4(),
+            vec![change],
+            Some(user_id_for_session(&super::get_session_id())),
+            Some(MOCK_ADMIN_EMAIL.to_string()),
+            Some("e2e seed".to_string()),
+        )
+        .await
+        .expect("Failed to seed pricing change");
+    for models_service in registered_models_services() {
+        models_service.invalidate_models_cache().await;
+    }
+    inserted[0].id
+}
+
+/// Overwrite the new text pricing of a scheduled change with a raw value, bypassing the
+/// profile validation of `seed_pricing_change`: what a newer writer or an out-of-band edit
+/// leaves behind. Calling it again with a valid profile puts the row right.
+pub async fn seed_pricing_change_raw_text_pricing(change_id: Uuid, profile: &serde_json::Value) {
+    let database = seed_database().await;
+    let client = database.pool().get().await.expect("database connection");
+    let updated = client
+        .execute(
+            "UPDATE scheduled_model_pricing_changes SET new_text_pricing = $2 WHERE id = $1",
+            &[&change_id, profile],
+        )
+        .await
+        .expect("Failed to overwrite pending text pricing");
+    assert_eq!(updated, 1, "scheduled pricing change {change_id} not found");
+    for models_service in registered_models_services() {
+        models_service.invalidate_models_cache().await;
+    }
+}
+
+/// Make a pending scheduled pricing change due, so the next scheduler pass applies it.
+pub async fn seed_pricing_change_due(change_id: Uuid) {
+    let database = seed_database().await;
+    let client = database.pool().get().await.expect("database connection");
+    let updated = client
+        .execute(
+            "UPDATE scheduled_model_pricing_changes
+             SET effective_at = NOW() - interval '1 minute'
+             WHERE id = $1 AND status = 'pending'",
+            &[&change_id],
+        )
+        .await
+        .expect("Failed to make pricing change due");
+    assert_eq!(updated, 1, "pending pricing change {change_id} not found");
+}
+
+/// Set an organization's scheduler request priority (`organizations.request_priority`,
+/// -1000..=1000, default 0), as the admin priority update did. The API key's organization is
+/// read when the key is first used and cached for 30 s by the real auth service, so call it
+/// before the organization's first request, or give each priority its own organization.
+pub async fn seed_request_priority(org_id: &str, priority: i32) {
+    let database = seed_database().await;
+    let organization_id = Uuid::parse_str(org_id).expect("organization id must be a UUID");
+    let client = database.pool().get().await.expect("database connection");
+    let updated = client
+        .execute(
+            "UPDATE organizations SET request_priority = $2, updated_at = NOW()
+             WHERE id = $1 AND is_active = true",
+            &[&organization_id, &priority],
+        )
+        .await
+        .expect("Failed to seed request priority");
+    assert_eq!(updated, 1, "Organization not found: {organization_id}");
 }
 
 async fn model_id_by_name(model_name: &str) -> Uuid {

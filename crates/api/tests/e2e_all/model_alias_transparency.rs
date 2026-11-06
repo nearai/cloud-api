@@ -59,7 +59,7 @@ async fn setup_deprecated_alias_with_mock() -> (
         }))
         .unwrap(),
     );
-    admin_batch_upsert_models(&server, batch, get_session_id()).await;
+    seed_models(&server, batch, get_session_id()).await;
 
     let mock_provider_trait: std::sync::Arc<
         dyn inference_providers::InferenceProvider + Send + Sync,
@@ -538,7 +538,7 @@ async fn test_alias_to_external_model_with_upstream_name_override_warns() {
         }))
         .unwrap(),
     );
-    admin_batch_upsert_models(&server, batch, get_session_id()).await;
+    seed_models(&server, batch, get_session_id()).await;
 
     let resp = server
         .post("/v1/admin/models/deprecate")
@@ -638,7 +638,7 @@ async fn test_alias_equal_to_upstream_override_still_warns() {
         }))
         .unwrap(),
     );
-    admin_batch_upsert_models(&server, batch, get_session_id()).await;
+    seed_models(&server, batch, get_session_id()).await;
 
     // Mock echoes the upstream (== alias) name.
     mock_provider

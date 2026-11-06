@@ -357,7 +357,7 @@ async fn create_input_billed_model(
     }
     let mut batch = api::models::BatchUpdateModelApiRequest::new();
     batch.insert(model.to_string(), serde_json::from_value(config).unwrap());
-    admin_batch_upsert_models(&f.server, batch, get_session_id()).await;
+    seed_models(&f.server, batch, get_session_id()).await;
 }
 
 async fn create_audio_model(f: &Fixture, model: &str) {
@@ -766,7 +766,7 @@ async fn systemone_fixture(fail_next: usize) -> (Fixture, wiremock::MockServer, 
         }))
         .unwrap(),
     );
-    admin_batch_upsert_models(&f.server, batch, get_session_id()).await;
+    seed_models(&f.server, batch, get_session_id()).await;
     (f, upstream, model)
 }
 

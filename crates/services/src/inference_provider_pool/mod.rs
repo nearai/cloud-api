@@ -13496,6 +13496,114 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reclassified_pinned_provider_still_serves_with_fallback_disabled() {
+        use inference_providers::mock::{MockProvider, RequestMatcher, ResponseTemplate};
+        use inference_providers::{ProviderSource, ProviderTier};
+
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+        let model_id = "policy/reclassified-pin".to_string();
+        let pinned = Arc::new(
+            MockProvider::new_accept_all()
+                .with_tier(ProviderTier::Attested3p)
+                .with_provider_source(ProviderSource::Chutes),
+        );
+        pinned
+            .when(RequestMatcher::Any)
+            .respond_with(ResponseTemplate::new("served-by-live-primary"))
+            .await;
+        pool.register_pinned_secondary_provider(model_id.clone(), pinned, None)
+            .await;
+        assert!(pool.has_provider(&model_id).await);
+        assert!(pool.is_pinned(&model_id));
+
+        // The catalog row names Chutes and has no inference URL: the standalone
+        // pin becomes the primary, so a request that refuses fallbacks is served by it.
+        pool.refresh_pinned_provider_roles_from_catalog(&model_id, "chutes", false);
+        let served = pool
+            .chat_completion_with_attribution_and_hints(
+                fallback_params(&model_id),
+                "live-catalog-role".to_string(),
+                ChatRoutingHints {
+                    fallback_disabled: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("the live catalog update must reclassify the standalone pin as primary");
+        assert!(
+            String::from_utf8_lossy(&served.response.raw_bytes).contains("served-by-live-primary")
+        );
+        assert!(pool.has_provider(&model_id).await);
+        assert!(pool.is_pinned(&model_id));
+    }
+
+    #[tokio::test]
+    async fn reloaded_external_config_replaces_the_live_provider_and_enforces_policy() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let pool = InferenceProviderPool::new(
+            None,
+            ExternalProvidersConfig {
+                timeout_seconds: 5,
+                ..Default::default()
+            },
+        );
+        let old_upstream = MockServer::start().await;
+        let new_upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "synthetic", "object": "chat.completion", "created": 0,
+                "model": "synthetic/upstream",
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": "42"},
+                    "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+            })))
+            .expect(1)
+            .mount(&new_upstream)
+            .await;
+
+        let model_name = "external/partial-policy".to_string();
+        pool.load_external_providers(vec![(
+            model_name.clone(),
+            serde_json::json!({"backend": "openai_compatible", "base_url": old_upstream.uri(),
+                "api_key": "synthetic-test-key"}),
+        )])
+        .await
+        .unwrap();
+        assert!(pool.has_provider(&model_name).await);
+
+        let policy = serde_json::json!({
+            "only": ["novita/fp8"], "allow_fallbacks": false,
+            "zdr": true, "data_collection": "deny"
+        });
+        pool.load_external_providers(vec![(
+            model_name.clone(),
+            serde_json::json!({"backend": "openai_compatible", "base_url": new_upstream.uri(),
+                "api_key": "synthetic-test-key", "enforced_request_body": {"provider": policy}}),
+        )])
+        .await
+        .unwrap();
+
+        let mut params = fallback_params(&model_name);
+        params.extra.insert(
+            "provider".to_string(),
+            serde_json::json!({"only": ["forbidden"], "allow_fallbacks": true,
+                "zdr": false, "data_collection": "allow"}),
+        );
+        pool.chat_completion(params, "synthetic-request".into())
+            .await
+            .unwrap();
+
+        assert!(old_upstream.received_requests().await.unwrap().is_empty());
+        let requests = new_upstream.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(body["provider"], policy);
+    }
+
+    #[tokio::test]
     async fn native_responses_honors_fallback_policy_and_attribution() {
         use inference_providers::{
             mock::MockProvider, responses_raw::ResponsesRawResponse, ProviderTier,

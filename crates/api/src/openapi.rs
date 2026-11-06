@@ -12,7 +12,7 @@ use utoipa::{Modify, OpenApi};
 
 ## Deprecations
 
-Operations marked deprecated (account, organization, workspace, invitation, API key, usage, billing, service pricing, staking, feature request, admin and catalog-administration endpoints) are moving to cloud-platform at the same path. The cloud-platform base URL has not been published yet, and behaviour may differ in edge cases. Inference and content endpoints (chat completions, responses, conversations, embeddings, images, audio, files, attestation) are unaffected.",
+Operations marked deprecated (account, organization, workspace, invitation, API key, usage, service pricing, staking, feature request, admin and catalog-administration endpoints) are moving to cloud-platform at the same path. The cloud-platform base URL has not been published yet, and behaviour may differ in edge cases. Inference and content endpoints (chat completions, responses, conversations, embeddings, images, audio, files, attestation) are unaffected.",
         version = "1.0.0",
         contact(
             name = "NEAR AI Team",
@@ -37,6 +37,7 @@ Operations marked deprecated (account, organization, workspace, invitation, API 
         (name = "Organizations", description = "Organization management"),
         (name = "Organization Members", description = "Organization member and invitation management"),
         (name = "Workspaces", description = "Workspace and API key management"),
+        (name = "Billing", description = "Billing costs endpoint (HuggingFace integration)"),
         (name = "Users", description = "User profile and token management"),
         (name = "Invitations", description = "Token-based invitation handling"),
         (name = "Health", description = "Health check endpoints"),

@@ -12,8 +12,8 @@
 use super::db_setup::{self, MOCK_USER_ID};
 use api::models::{
     AdminModelWithPricing, ApiKeyResponse, BatchUpdateModelApiRequest, Datacenter, DecimalPrice,
-    ModelArchitecture, ModelMetadata, ModelWithPricing, OrganizationResponse, SpendLimit,
-    UpdateOrganizationLimitsResponse,
+    ModelArchitecture, ModelMetadata, ModelWithPricing, OrganizationResponse, ServiceResponse,
+    SpendLimit, UpdateOrganizationLimitsResponse,
 };
 use api::routes::workspaces::WorkspaceResponse;
 use chrono::{DateTime, Utc};
@@ -616,4 +616,46 @@ pub async fn seed_list_models_page(
         })
         .collect();
     (models, total)
+}
+
+/// The `web_search` platform service. Created with `cost_per_unit` = 1_000_000 nano-USD per
+/// request when absent; an existing row is never overwritten.
+pub async fn seed_web_search_service() -> ServiceResponse {
+    let database = seed_database().await;
+    let client = database
+        .pool()
+        .get()
+        .await
+        .expect("Failed to get database connection");
+    let service_name = services::service_usage::ports::SERVICE_NAME_WEB_SEARCH;
+    client
+        .execute(
+            "INSERT INTO services (service_name, display_name, description, unit, cost_per_unit)
+             VALUES ($1, 'Web Search', 'Brave web search API', 'request', 1000000)
+             ON CONFLICT (service_name) DO NOTHING",
+            &[&service_name],
+        )
+        .await
+        .expect("Failed to seed web_search service");
+    let row = client
+        .query_one(
+            "SELECT id, service_name, display_name, description, unit, cost_per_unit,
+                    is_active, created_at, updated_at
+             FROM services WHERE service_name = $1",
+            &[&service_name],
+        )
+        .await
+        .expect("web_search service must exist after seeding");
+    ServiceResponse {
+        id: row.get("id"),
+        service_name: row.get("service_name"),
+        display_name: row.get("display_name"),
+        description: row.get("description"),
+        unit: serde_json::from_value(serde_json::Value::String(row.get("unit")))
+            .expect("service unit must be a known unit"),
+        cost_per_unit: row.get("cost_per_unit"),
+        is_active: row.get("is_active"),
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+    }
 }

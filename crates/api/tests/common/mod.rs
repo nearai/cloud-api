@@ -18,8 +18,7 @@ pub use ita_evidence::setup_test_server_with_config_and_ita_model_evidence;
 pub use ita_server::{setup_ita_server, setup_ita_server_with_env_policy, ItaServerMode};
 
 use api::{
-    build_app_with_config_and_options, init_auth_services,
-    models::{BatchUpdateModelApiRequest, CreateServiceRequest},
+    build_app_with_config_and_options, init_auth_services, models::BatchUpdateModelApiRequest,
     AppBuildOptions,
 };
 use async_trait::async_trait;
@@ -1034,41 +1033,12 @@ pub async fn setup_glm_model(_server: &axum_test::TestServer) -> String {
     E2E_GLM_MODEL_NAME.to_string()
 }
 
-/// Get or create web_search platform service via admin API (for E2E tests).
+/// Get or create the web_search platform service (for E2E tests).
 /// Uses cost_per_unit = 1_000_000 nano-USD per request when created.
 pub async fn get_or_create_web_search_service(
-    server: &axum_test::TestServer,
+    _server: &axum_test::TestServer,
 ) -> api::models::ServiceResponse {
-    let request = CreateServiceRequest {
-        service_name: services::service_usage::ports::SERVICE_NAME_WEB_SEARCH.to_string(),
-        display_name: "Web Search".to_string(),
-        description: Some("Brave web search API".to_string()),
-        unit: services::service_usage::ports::ServiceUnit::Request,
-        cost_per_unit: 1_000_000,
-    };
-    let response = server
-        .post("/v1/admin/services")
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
-        .add_header("User-Agent", MOCK_USER_AGENT)
-        .json(&request)
-        .await;
-    if response.status_code() == 200 {
-        return response.json::<api::models::ServiceResponse>();
-    }
-
-    // If creation failed (e.g., because the service already exists from a previous test),
-    // fall back to the public GET /v1/services/{service_name} and return the existing web_search service if present.
-    let get_resp = server
-        .get("/v1/services/web_search")
-        .add_header("User-Agent", MOCK_USER_AGENT)
-        .await;
-    assert_eq!(
-        get_resp.status_code(),
-        200,
-        "Failed to get existing web_search service after create_web_search_service failure: {}",
-        get_resp.text()
-    );
-    get_resp.json::<api::models::ServiceResponse>()
+    seeding::seed_web_search_service().await
 }
 
 pub async fn setup_deepseek_model(_server: &axum_test::TestServer) -> String {

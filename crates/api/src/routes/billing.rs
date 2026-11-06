@@ -91,7 +91,7 @@ pub async fn get_billing_costs(
     Extension(api_key): Extension<AuthenticatedApiKey>,
     Json(request): Json<BillingCostsRequest>,
 ) -> Result<ResponseJson<BillingCostsResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
-    tracing::debug!(
+    tracing::info!(
         "Billing costs request for {} inference IDs from organization: {}",
         request.request_ids.len(),
         api_key.organization.id

@@ -681,6 +681,31 @@ mod tests {
     }
 
     #[test]
+    fn admission_covers_priority_long_context_cache_writes() {
+        // 300k inputs at $25/M and 20k outputs at $90/M: $9.30.
+        assert_eq!(
+            profile().maximum_cost(300_000, 20_000).unwrap(),
+            9_300_000_000
+        );
+        let mut tiny = profile();
+        tiny.long_context_threshold = None;
+        tiny.tiers.flex = None;
+        tiny.tiers.priority = None;
+        tiny.tiers.default.long = None;
+        tiny.tiers.default.short = TextTokenRates {
+            uncached_input: "0.0001".into(),
+            cached_input: "0.0001".into(),
+            cache_write: None,
+            output: "0.0001".into(),
+        };
+        assert_eq!(
+            tiny.maximum_cost(1, 1).unwrap(),
+            1,
+            "round up sub-nano bounds"
+        );
+    }
+
+    #[test]
     fn normalizes_tier_aliases() {
         assert_eq!(
             TextServiceTier::parse_request(Some("auto")).unwrap(),

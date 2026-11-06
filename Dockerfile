@@ -47,7 +47,7 @@ RUN cargo build --release --locked --bin api
 
 
 # Runtime stage
-FROM debian:bookworm-slim@sha256:78d2f66e0fec9e5a39fb2c72ea5e052b548df75602b5215ed01a17171529f706 AS runtime
+FROM debian:bookworm-slim@sha256:78d2f66e0fec9e5a39fb2c72ea5e052b548df75602b5215ed01a17171529f706 AS runtime-deps
 
 # Install pinned apt dependencies
 # eMudhra intermediate CA key compromise (2026-10-20): bookworm has no fixed
@@ -82,6 +82,8 @@ RUN --mount=type=bind,source=pinned-packages-runtime.txt,target=/tmp/pinned-pack
     test ! -e /etc/ssl/certs/emSign_ECC_Root_CA_-_G3.pem && \
     test ! -e /etc/ssl/certs/Comodo_AAA_Services_root.pem && \
     rm -rf /var/lib/apt/lists/* /var/log/* /var/cache/ldconfig/aux-cache
+
+FROM runtime-deps AS runtime
 
 # Create app user
 # Normalize /etc/shadow file last password change date to 0 for app user

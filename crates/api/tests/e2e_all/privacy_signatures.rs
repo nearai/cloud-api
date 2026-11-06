@@ -317,7 +317,7 @@ async fn usage_timeout_returns_success_and_retries_with_the_same_billing_id() {
             let mut blocker = fixture.database.pool().get().await.unwrap();
             let tx = blocker.transaction().await.unwrap();
             tx.query_one(
-                "SELECT id FROM organizations WHERE id=$1 FOR UPDATE",
+                "SELECT organization_id FROM organization_balance WHERE organization_id=$1 FOR UPDATE",
                 &[&fixture.org_id],
             )
             .await
@@ -431,7 +431,7 @@ async fn finalization_survives_disconnect_during_usage_settlement() {
         // a receipt INSERT would be insufficient: PostgreSQL can finish an
         // already-sent statement even after its Rust future is dropped.
         tx.query_one(
-            "SELECT id FROM organizations WHERE id=$1 FOR UPDATE",
+            "SELECT organization_id FROM organization_balance WHERE organization_id=$1 FOR UPDATE",
             &[&fixture.org_id],
         )
         .await

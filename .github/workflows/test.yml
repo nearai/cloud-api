@@ -143,7 +143,7 @@ jobs:
         cache-key: unit
 
     - name: Install audio test decoder
-      run: command -v ffmpeg || (sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg)
+      run: bash scripts/setup-ci-audio.sh
 
     - name: Run unit tests
       run: cargo nextest run --lib --bins
@@ -253,7 +253,7 @@ jobs:
 
     - name: Run typed-query, credit, analytics, session, and binding regressions
       run: |
-        cargo test --locked -p database --test hot_path_typed_queries --test billing_typed_queries --test credit_allocation --test session_rotation --test staking_wallet_binding --test organization_credit_metrics -- --test-threads=4
+        cargo test --locked -p database --test hot_path_typed_queries --test billing_typed_queries --test usage_budget --test credit_allocation --test session_rotation --test staking_wallet_binding --test organization_credit_metrics -- --test-threads=4
         # Fault injection changes shared table constraints; isolate this binary.
         cargo test --locked -p database --test credit_transfers -- --test-threads=1
       env:
@@ -262,6 +262,9 @@ jobs:
         PGDATABASE: platform_api
         PGUSER: postgres
         PGPASSWORD: postgres
+
+    - name: Install audio test decoder
+      run: bash scripts/setup-ci-audio.sh
 
     - name: Run e2e tests
       run: cargo nextest run --test e2e_all

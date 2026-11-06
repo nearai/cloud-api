@@ -16,9 +16,24 @@ use crate::common::*;
 use api::models::BatchUpdateModelApiRequest;
 use std::sync::Arc;
 
-/// Helper to create mock audio file bytes
-fn create_mock_audio_file(size_kb: usize) -> Vec<u8> {
-    vec![0u8; size_kb * 1024]
+/// Valid PCM audio: monetary admission decodes the media before calling the mock provider.
+pub(super) fn create_mock_audio_file(size_kb: usize) -> Vec<u8> {
+    let samples = (size_kb * 1024 / 2) as u32;
+    let mut bytes = Vec::new();
+    bytes.extend(b"RIFF");
+    bytes.extend((36 + samples * 2).to_le_bytes());
+    bytes.extend(b"WAVEfmt ");
+    bytes.extend(16_u32.to_le_bytes());
+    bytes.extend(1_u16.to_le_bytes());
+    bytes.extend(1_u16.to_le_bytes());
+    bytes.extend(16000_u32.to_le_bytes());
+    bytes.extend(32000_u32.to_le_bytes());
+    bytes.extend(2_u16.to_le_bytes());
+    bytes.extend(16_u16.to_le_bytes());
+    bytes.extend(b"data");
+    bytes.extend((samples * 2).to_le_bytes());
+    bytes.resize(44 + samples as usize * 2, 0);
+    bytes
 }
 
 /// Create a per-test audio model and bind it to the same mock provider returned
@@ -199,7 +214,7 @@ async fn test_audio_transcription_text_response_format_returns_plain_text() {
         .to_str()
         .unwrap();
     assert_eq!(content_type, "text/plain; charset=utf-8");
-    assert_eq!(response.text(), "Mock transcription for file: test.mp3");
+    assert_eq!(response.text(), "Mock transcription for file: audio.flac");
 }
 
 /// Test that very large files are rejected

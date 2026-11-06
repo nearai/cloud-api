@@ -59,6 +59,14 @@ impl RecordingUsageService {
 
 #[async_trait::async_trait]
 impl UsageServiceTrait for RecordingUsageService {
+    async fn admit(
+        &self,
+        identity: services::usage::BillingIdentity,
+        bounds: services::usage::budget::UsageBounds,
+    ) -> Result<Uuid, UsageError> {
+        self.inner.admit(identity, bounds).await
+    }
+
     async fn record_usage(
         &self,
         request: RecordUsageServiceRequest,
@@ -322,10 +330,12 @@ async fn post_audio(f: &Fixture, model: &str) -> axum_test::TestResponse {
             axum_test::multipart::MultipartForm::new()
                 .add_part(
                     "file",
-                    // 100 KB → mock duration 10.0s
-                    axum_test::multipart::Part::bytes(vec![0u8; 100 * 1024])
-                        .file_name("test.mp3")
-                        .mime_type("audio/mpeg"),
+                    // Valid audio is normalized before the mock receives it.
+                    axum_test::multipart::Part::bytes(
+                        super::audio_transcriptions::create_mock_audio_file(100),
+                    )
+                    .file_name("test.mp3")
+                    .mime_type("audio/mpeg"),
                 )
                 .add_text("model", model),
         )
@@ -485,9 +495,11 @@ async fn audio_records_duration_seconds_with_random_id() {
 
     assert_common_shape(record, f.org_id);
     assert_eq!(record.inference_type, InferenceType::AudioTranscription);
-    // MockProvider reports duration as file_size_kb * 0.1 s
-    // (inference_providers/src/mock.rs): 100 KB → 10 s.
-    assert_eq!(record.input_tokens, 10, "billed by ceil(duration seconds)");
+    // The provider receives compressed FLAC, and its final duration drives billing.
+    assert_eq!(
+        record.input_tokens, 1,
+        "billed by ceil(provider duration seconds)"
+    );
     assert_eq!(record.output_tokens, 0);
     assert!(record.image_count.is_none());
     assert_random_v4(record);

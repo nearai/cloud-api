@@ -66,12 +66,13 @@ pub const E2E_DEEPSEEK_MODEL_NAME: &str = "deepseek-ai/DeepSeek-V3.1";
 pub const E2E_QWEN_OMNI_MODEL_NAME: &str = "Qwen/Qwen3-Omni-30B-A3B-Instruct";
 pub const E2E_QWEN_IMAGE_MODEL_NAME: &str = "Qwen/Qwen-Image-2512";
 pub const E2E_QWEN_RERANKER_MODEL_NAME: &str = "Qwen/Qwen3-Reranker-0.6B";
-pub const E2E_QWEN_INPUT_COST_PER_TOKEN: i64 = 1_000_000;
-pub const E2E_QWEN_OUTPUT_COST_PER_TOKEN: i64 = 2_000_000;
+// Catalog-scale fixture prices let $10 grants reserve the full context window.
+pub const E2E_QWEN_INPUT_COST_PER_TOKEN: i64 = 1_000;
+pub const E2E_QWEN_OUTPUT_COST_PER_TOKEN: i64 = 2_000;
 /// Cache-read cost when setup_qwen_model is used (cache pricing disabled).
 pub const E2E_QWEN_CACHE_READ_COST_NO_CACHE: Option<i64> = None;
 /// Cache-read cost when setup_qwen_model_with_cache_pricing is used.
-pub const E2E_QWEN_CACHE_READ_COST_WITH_CACHE: i64 = 500_000;
+pub const E2E_QWEN_CACHE_READ_COST_WITH_CACHE: i64 = 500;
 
 pub fn test_config() -> ApiConfig {
     let _ = dotenvy::dotenv();

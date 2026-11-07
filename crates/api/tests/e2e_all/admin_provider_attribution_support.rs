@@ -1,5 +1,4 @@
 use crate::common::*;
-use services::admin::{ModelRevenueReport, PlatformMetrics};
 use std::sync::OnceLock;
 
 static HARNESS_ENV: OnceLock<()> = OnceLock::new();
@@ -132,62 +131,6 @@ pub(super) async fn insert_platform_provider_usage_row(
         .expect("insert usage row");
 }
 
-pub(super) fn provider_type_usage<'a>(
-    metrics: &'a PlatformMetrics,
-    provider_type: Option<&str>,
-) -> &'a services::admin::ProviderTypeUsage {
-    metrics
-        .provider_usage
-        .by_provider_type
-        .iter()
-        .find(|usage| usage.provider_type.as_deref() == provider_type)
-        .unwrap_or_else(|| panic!("provider type usage not found for: {provider_type:?}"))
-}
-
-pub(super) fn provider_tier_usage<'a>(
-    metrics: &'a PlatformMetrics,
-    provider_tier: Option<&str>,
-) -> &'a services::admin::ProviderTierUsage {
-    metrics
-        .provider_usage
-        .by_provider_tier
-        .iter()
-        .find(|usage| usage.provider_tier.as_deref() == provider_tier)
-        .unwrap_or_else(|| panic!("provider tier usage not found for: {provider_tier:?}"))
-}
-
-pub(super) fn model_revenue_entry<'a>(
-    report: &'a ModelRevenueReport,
-    model_name: &str,
-) -> &'a services::admin::ModelRevenueEntry {
-    report
-        .data
-        .iter()
-        .find(|entry| entry.model_name == model_name)
-        .unwrap_or_else(|| panic!("model revenue entry not found for: {model_name}"))
-}
-
-pub(super) fn model_provider_breakdown<'a>(
-    entry: &'a services::admin::ModelRevenueEntry,
-    provider_type: Option<&str>,
-    provider_tier: Option<&str>,
-    served_via_fallback: bool,
-) -> &'a services::admin::ModelProviderRevenueBreakdown {
-    entry
-        .served_provider_breakdown
-        .iter()
-        .find(|breakdown| {
-            breakdown.provider_type.as_deref() == provider_type
-                && breakdown.provider_tier.as_deref() == provider_tier
-                && breakdown.served_via_fallback == served_via_fallback
-        })
-        .unwrap_or_else(|| {
-            panic!(
-                "model provider breakdown not found for provider_type={provider_type:?}, provider_tier={provider_tier:?}, served_via_fallback={served_via_fallback}"
-            )
-        })
-}
-
 pub(super) async fn isolated_provider_usage_window(
     fixture: &PlatformProviderUsageFixture,
 ) -> ProviderUsageWindow {
@@ -252,4 +195,32 @@ pub(super) async fn isolated_usage_hours(
     }
 
     panic!("failed to allocate an empty provider usage window after {MAX_ATTEMPTS} attempts")
+}
+
+/// A one-connection pool whose session reads each of `tables` through a temp view that
+/// sleeps `seconds` per scan. The sleep is a one-time filter, so it runs before the scan
+/// even when no row matches. Returns the pool and the connection's `statement_timeout`.
+pub(crate) async fn pool_with_slow_tables(
+    tables: &[&str],
+    seconds: f64,
+) -> (database::pool::DbPool, String) {
+    let pool = crate::common::db_setup::create_test_pool().await;
+    pool.current().unwrap().resize(1);
+    let client = pool.get().await.unwrap();
+    let original_timeout: String = client
+        .query_one("SHOW statement_timeout", &[])
+        .await
+        .unwrap()
+        .get(0);
+    for table in tables {
+        client
+            .batch_execute(&format!(
+                "CREATE TEMP VIEW {table} AS SELECT t.* FROM public.{table} t \
+                 WHERE (SELECT true FROM pg_sleep({seconds}))"
+            ))
+            .await
+            .unwrap();
+    }
+    drop(client);
+    (pool, original_timeout)
 }

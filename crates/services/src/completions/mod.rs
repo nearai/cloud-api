@@ -1321,7 +1321,6 @@ impl CompletionServiceImpl {
                         %organization_id,
                         model,
                         status_code,
-                        provider_message = %message,
                         "Auth error during {}",
                         operation
                     );
@@ -1337,7 +1336,6 @@ impl CompletionServiceImpl {
                         %organization_id,
                         model,
                         status_code,
-                        provider_message = %message,
                         "External provider not found during {}",
                         operation
                     );
@@ -1358,7 +1356,6 @@ impl CompletionServiceImpl {
                         %organization_id,
                         model,
                         status_code,
-                        provider_message = %message,
                         "Provider timeout during {}",
                         operation
                     );
@@ -1400,7 +1397,6 @@ impl CompletionServiceImpl {
                         %organization_id,
                         model,
                         status_code,
-                        provider_message = %message,
                         "Provider error during {}",
                         operation
                     );
@@ -1416,7 +1412,6 @@ impl CompletionServiceImpl {
                         %organization_id,
                         model,
                         status_code,
-                        provider_message = %message,
                         "External provider error during {}",
                         operation
                     );
@@ -1453,10 +1448,10 @@ impl CompletionServiceImpl {
                         .to_string(),
                 )
             }
-            inference_providers::CompletionError::NoPubKeyProvider(msg) => {
+            inference_providers::CompletionError::NoPubKeyProvider(_) => {
                 tracing::warn!(
                     model,
-                    provider_message = %msg,
+                    error_kind = "no_pubkey_provider",
                     "E2EE pubkey routing failed during {} (stale attestation?)",
                     operation
                 );
@@ -1472,7 +1467,7 @@ impl CompletionServiceImpl {
                     tracing::error!(
                         %organization_id,
                         model,
-                        provider_message = %msg,
+                        error_kind = "completion_error",
                         "Provider error during {}",
                         operation
                     );
@@ -1483,11 +1478,11 @@ impl CompletionServiceImpl {
                     }
                 }
             }
-            inference_providers::CompletionError::InvalidResponse(msg) => {
+            inference_providers::CompletionError::InvalidResponse(_) => {
                 tracing::error!(
                     %organization_id,
                     model,
-                    provider_message = %msg,
+                    error_kind = "invalid_response",
                     "Invalid response during {}",
                     operation
                 );
@@ -1497,11 +1492,11 @@ impl CompletionServiceImpl {
                         .to_string(),
                 }
             }
-            inference_providers::CompletionError::Unknown(msg) => {
+            inference_providers::CompletionError::Unknown(_) => {
                 tracing::error!(
                     %organization_id,
                     model,
-                    provider_message = %msg,
+                    error_kind = "unknown",
                     "Unknown error during {}",
                     operation
                 );
@@ -3603,6 +3598,48 @@ mod tests {
             0,
             "Counter should be 0 after stream dropped"
         );
+    }
+
+    #[test]
+    fn test_map_provider_error_logs_exclude_upstream_content() {
+        use crate::test_utils::CapturedLogs;
+        use inference_providers::CompletionError as ProviderError;
+
+        let message = "PROVIDER_BODY_SENTINEL";
+        let http_error = |status_code, is_external| ProviderError::HttpError {
+            status_code,
+            message: message.to_owned(),
+            is_external,
+        };
+        for (error, diagnostic) in [
+            (http_error(401, false), "Auth error"),
+            (http_error(404, true), "External provider not found"),
+            (http_error(408, false), "Provider timeout"),
+            (http_error(418, true), "External provider error"),
+            (
+                ProviderError::NoPubKeyProvider(message.to_owned()),
+                "E2EE pubkey routing failed",
+            ),
+            (
+                ProviderError::CompletionError(message.to_owned()),
+                "Provider error",
+            ),
+            (
+                ProviderError::InvalidResponse(message.to_owned()),
+                "Invalid response",
+            ),
+            (ProviderError::Unknown(message.to_owned()), "Unknown error"),
+        ] {
+            let logs = CapturedLogs::default();
+            tracing::subscriber::with_default(logs.subscriber(), || {
+                CompletionServiceImpl::map_provider_error("test-model", &error, "test", Uuid::nil())
+            });
+
+            let captured = logs.contents();
+            assert!(captured.contains(diagnostic), "{captured}");
+            assert!(captured.contains("test-model"), "{captured}");
+            assert!(!captured.contains(message), "{captured}");
+        }
     }
 
     // ============================================

@@ -59,6 +59,24 @@ fn request_error_category(error: &reqwest::Error) -> &'static str {
     }
 }
 
+fn parse_response<T: serde::de::DeserializeOwned>(
+    body: &str,
+    endpoint: &'static str,
+    started_at: Instant,
+) -> Result<T, WebSearchError> {
+    serde_json::from_str(body).map_err(|error| {
+        tracing::error!(
+            endpoint,
+            error_category = ?error.classify(),
+            line = error.line(),
+            column = error.column(),
+            elapsed_ms = started_at.elapsed().as_millis() as u64,
+            "Failed to parse Brave response"
+        );
+        WebSearchError::WebSearchResponseParsingFailed(format!("JSON parsing error: {error}"))
+    })
+}
+
 /// Root response from Brave Search API
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BraveSearchResponse {
@@ -272,16 +290,7 @@ impl WebSearchProviderTrait for BraveWebSearchProvider {
 
         // Parse JSON
         let brave_response: BraveSearchResponse =
-            serde_json::from_str(&response_text).map_err(|e| {
-                // serde_json::Error Display contains category and location only, not the body.
-                tracing::error!(
-                    endpoint = "web_search",
-                    error = %e,
-                    elapsed_ms = started_at.elapsed().as_millis() as u64,
-                    "Failed to parse Brave response"
-                );
-                WebSearchError::WebSearchResponseParsingFailed(format!("JSON parsing error: {e}"))
-            })?;
+            parse_response(&response_text, "web_search", started_at)?;
 
         // Extract web results and convert to our internal format
         let results: Vec<WebSearchResult> = brave_response
@@ -422,16 +431,7 @@ impl WebContextSearchProviderTrait for BraveWebSearchProvider {
         })?;
 
         let context_response: BraveContextResponse =
-            serde_json::from_str(&response_text).map_err(|e| {
-                // serde_json::Error Display contains category and location only, not the body.
-                tracing::error!(
-                    endpoint = "llm_context",
-                    error = %e,
-                    elapsed_ms = started_at.elapsed().as_millis() as u64,
-                    "Failed to parse Brave response"
-                );
-                WebSearchError::WebSearchResponseParsingFailed(format!("JSON parsing error: {e}"))
-            })?;
+            parse_response(&response_text, "llm_context", started_at)?;
 
         let results = context_response_to_web_results(context_response);
         let (snippet_count, total_snippet_chars) = super::web_search_result_stats(&results);
@@ -461,6 +461,47 @@ impl WebContextSearchProviderTrait for BraveWebSearchProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parsing_logs_keep_diagnostics_without_response_content() {
+        let logs = crate::test_utils::CapturedLogs::default();
+        let errors = tracing::subscriber::with_default(logs.subscriber(), || {
+            [
+                parse_response::<BraveSearchResponse>(
+                    r#"{"web":{"results":"SEARCH_BODY_SENTINEL"}}"#,
+                    "web_search",
+                    Instant::now(),
+                )
+                .unwrap_err(),
+                parse_response::<BraveContextResponse>(
+                    r#"{"grounding":{"generic":"CONTEXT_BODY_SENTINEL"}}"#,
+                    "llm_context",
+                    Instant::now(),
+                )
+                .unwrap_err(),
+            ]
+        });
+
+        // These are typed data errors whose Display includes the offending value.
+        // Preserve the internal error; only its log representation is restricted.
+        let captured = logs.contents();
+        for (error, sentinel) in errors
+            .iter()
+            .zip(["SEARCH_BODY_SENTINEL", "CONTEXT_BODY_SENTINEL"])
+        {
+            assert!(matches!(
+                error,
+                WebSearchError::WebSearchResponseParsingFailed(_)
+            ));
+            assert!(error.to_string().contains(sentinel));
+            assert!(!captured.contains(sentinel), "{captured}");
+        }
+        assert!(captured.contains("endpoint=\"web_search\""), "{captured}");
+        assert!(captured.contains("endpoint=\"llm_context\""), "{captured}");
+        assert_eq!(captured.matches("error_category=Data").count(), 2);
+        assert_eq!(captured.matches("line=1").count(), 2);
+        assert_eq!(captured.matches("column=").count(), 2);
+    }
 
     #[test]
     fn context_response_to_web_results_joins_snippets_and_uses_source_title() {

@@ -1318,7 +1318,10 @@ fn test_sse_error_frame_is_valid_json() {
 
     for e in &cases {
         let frame = sse_error_frame(e);
-        let text = std::str::from_utf8(&frame).expect("frame is utf-8");
+        let raw = std::str::from_utf8(&frame).expect("frame is utf-8");
+        let text = raw
+            .strip_prefix("\n\n")
+            .unwrap_or_else(|| panic!("frame missing leading SSE separator: {raw:?}"));
         assert!(
             text.starts_with("data: "),
             "frame missing 'data: ' prefix: {text:?}"
@@ -1344,6 +1347,56 @@ fn test_sse_error_frame_is_valid_json() {
             .and_then(|v| v.as_str())
             .is_some_and(|s| !s.is_empty()));
     }
+}
+
+#[test]
+fn stream_error_is_separate_from_an_upstream_data_line_without_a_separator() {
+    let error = inference_providers::CompletionError::CompletionError("upstream closed".into());
+    for upstream in ["data: {\"choices\": []}\n", "data: {\"choices\": []}\r\n"] {
+        let wire = format!(
+            "{upstream}{}",
+            std::str::from_utf8(&sse_error_frame(&error)).unwrap()
+        )
+        .replace("\r\n", "\n");
+        let events: Vec<serde_json::Value> = wire
+            .split("\n\n")
+            .filter_map(|event| {
+                let data = event
+                    .lines()
+                    .filter_map(|line| line.strip_prefix("data: "))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                (!data.is_empty()).then(|| {
+                    serde_json::from_str(&data).expect("each SSE event must parse independently")
+                })
+            })
+            .collect();
+        assert_eq!(events.len(), 2);
+        assert!(events[0].get("choices").is_some());
+        assert!(events[1].get("error").is_some());
+    }
+}
+
+#[test]
+fn synthesized_done_is_separate_from_a_finish_line_without_a_separator() {
+    let wire = format!(
+        "data: {{\"choices\":[{{\"finish_reason\":\"stop\"}}]}}\n{}",
+        std::str::from_utf8(SYNTHESIZED_DONE_FRAME).unwrap()
+    );
+    let data: Vec<_> = wire
+        .split("\n\n")
+        .filter_map(|event| {
+            let data = event
+                .lines()
+                .filter_map(|line| line.strip_prefix("data: "))
+                .collect::<Vec<_>>()
+                .join("\n");
+            (!data.is_empty()).then_some(data)
+        })
+        .collect();
+    assert_eq!(data.len(), 2);
+    assert!(serde_json::from_str::<serde_json::Value>(&data[0]).is_ok());
+    assert_eq!(data[1], "[DONE]");
 }
 
 #[test]

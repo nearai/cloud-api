@@ -74,7 +74,7 @@ pub trait SSEEventParser: Send + Unpin {
     /// Whether the upstream wire format is OpenAI-format SSE that clients can
     /// consume directly. When true, the parser is lossless: control lines
     /// (blank separators, comments, `[DONE]`, non-data fields) and any
-    /// trailing unterminated bytes are emitted as chunk-less [`SSEEvent`]s so
+    /// trailing unterminated non-data bytes are emitted as chunk-less [`SSEEvent`]s so
     /// concatenating every event's `raw_bytes` reproduces the upstream byte
     /// stream exactly — required for byte-exact TEE signature verification
     /// through the gateway (issue #701). When false (Gemini, Anthropic
@@ -251,10 +251,21 @@ where
                     // Stream ended - flush or report any remaining incomplete data
                     if !this.bytes_buffer.is_empty() {
                         if P::passthrough_raw() {
-                            // A trailing line without a final newline is part
-                            // of the signed upstream byte stream — emit it as
-                            // a control event so byte-exact reassembly holds
-                            // (mirrors inference-proxy's transformer flush).
+                            // Do not expose an unfinished data line as a raw
+                            // control event: it can swallow a subsequent SSE
+                            // error frame and make a truncated response look
+                            // successful. Keep the existing EOF-only [DONE]
+                            // exception and lossless non-data control bytes.
+                            let line = String::from_utf8_lossy(&this.bytes_buffer);
+                            let line = line.trim();
+                            let data = line
+                                .strip_prefix("data:")
+                                .or_else(|| (line == "data").then_some(""));
+                            if data.is_some_and(|data| data.trim() != "[DONE]") {
+                                return Poll::Ready(Some(Err(CompletionError::InvalidResponse(
+                                    "Incomplete SSE data line at stream end".into(),
+                                ))));
+                            }
                             let leftover = Bytes::from(std::mem::take(&mut this.bytes_buffer));
                             return Poll::Ready(Some(Ok(SSEEvent {
                                 raw_bytes: leftover,
@@ -612,6 +623,99 @@ mod tests {
         assert_eq!(events.len(), 2, "Expected 2 events, got {}", events.len());
         assert!(events[0].is_ok());
         assert!(events[0].as_ref().unwrap().chunk.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_sse_parser_unterminated_data_line_is_error() {
+        let complete_event = "data: {\"id\":\"1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"test\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"},\"finish_reason\":null}]}\n\n";
+        for tail in [
+            "data: {\"id\":",
+            "data:{\"id\":",
+            "data",
+            "data:",
+            // Complete JSON still does not complete an unterminated data line.
+            complete_event.trim_end(),
+        ] {
+            let upstream = futures_util::stream::iter(vec![
+                Ok::<_, reqwest::Error>(Bytes::from_static(complete_event.as_bytes())),
+                Ok(Bytes::copy_from_slice(tail.as_bytes())),
+            ]);
+            let mut parser = new_sse_parser(upstream, true);
+            let events: Vec<_> = parser.by_ref().collect().await;
+
+            assert_eq!(events.len(), 3, "tail: {tail}");
+            assert!(events[0].as_ref().unwrap().chunk.is_some());
+            assert!(matches!(
+                &events[2],
+                Err(CompletionError::InvalidResponse(message))
+                    if message == "Incomplete SSE data line at stream end"
+            ));
+            let forwarded: Vec<u8> = events
+                .iter()
+                .filter_map(|event| event.as_ref().ok())
+                .flat_map(|event| event.raw_bytes.iter().copied())
+                .collect();
+            assert_eq!(forwarded, complete_event.as_bytes(), "tail: {tail}");
+            assert!(parser.next().await.is_none(), "error must be terminal");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_sse_parser_preserves_unterminated_done_marker() {
+        for wire in ["data: [DONE]", "data:[DONE]", "data: [DONE]\r"] {
+            let upstream = futures_util::stream::iter(vec![Ok::<_, reqwest::Error>(
+                Bytes::from_static(wire.as_bytes()),
+            )]);
+            let events: Vec<_> = new_sse_parser(upstream, true).collect().await;
+
+            assert_eq!(events.len(), 1);
+            let event = events[0].as_ref().unwrap();
+            assert!(event.is_done_marker());
+            assert_eq!(event.raw_bytes.as_ref(), wire.as_bytes());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_sse_parser_preserves_unterminated_non_data_controls() {
+        for wire in [
+            ": keepalive",
+            " \t\r",
+            "event: ping",
+            "id: 1",
+            "unknown-field",
+        ] {
+            let upstream = futures_util::stream::iter(vec![Ok::<_, reqwest::Error>(
+                Bytes::from_static(wire.as_bytes()),
+            )]);
+            let events: Vec<_> = new_sse_parser(upstream, true).collect().await;
+
+            assert_eq!(events.len(), 1);
+            let event = events[0].as_ref().unwrap();
+            assert!(event.chunk.is_none());
+            assert_eq!(event.raw_bytes.as_ref(), wire.as_bytes());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_sse_parser_transport_error_drops_unfinished_data_line() {
+        let upstream = futures_util::stream::iter(vec![
+            Ok(Bytes::from_static(b"data: {\"id\":")),
+            Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "upstream disconnected",
+            )),
+        ]);
+        let parser = BufferedSSEParser::<_, OpenAIEventParser, std::io::Error>::new(
+            upstream,
+            OpenAIParserState::new(true),
+        );
+        let events: Vec<_> = parser.collect().await;
+
+        assert!(matches!(
+            &events[..],
+            [Err(CompletionError::CompletionError(message))]
+                if message == "upstream disconnected"
+        ));
     }
 
     #[tokio::test]

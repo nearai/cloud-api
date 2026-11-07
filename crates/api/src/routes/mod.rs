@@ -25,6 +25,7 @@ pub mod reporting_tokens;
 pub mod reporting_usage;
 pub mod responses;
 pub mod services;
+pub mod staking_farm;
 pub mod systemone;
 pub mod unsupported;
 pub mod usage;

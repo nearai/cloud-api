@@ -7,21 +7,12 @@ use axum::http::{Method, StatusCode};
 const ORG: &str = "00000000-0000-0000-0000-000000000001";
 
 fn retired_routes() -> Vec<(Method, String)> {
-    let org = format!("/v1/organizations/{ORG}");
     let admin_org = format!("/v1/admin/organizations/{ORG}");
     vec![
-        // Staking farm
-        (Method::GET, "/v1/staking/farm/config".into()),
-        (Method::GET, format!("{org}/staking/farm")),
-        (Method::POST, format!("{org}/staking/farm/bind")),
-        (Method::POST, format!("{org}/staking/farm/sync")),
-        (Method::GET, format!("{admin_org}/staking/farm")),
-        (Method::POST, format!("{admin_org}/staking/farm/sync")),
         // Usage discount admin route
         (Method::GET, format!("{admin_org}/usage-discount")),
         (Method::PUT, format!("{admin_org}/usage-discount")),
-        // Organization metrics and platform reports
-        (Method::GET, format!("{admin_org}/metrics")),
+        // Organization metrics timeseries and platform reports
         (Method::GET, format!("{admin_org}/metrics/timeseries")),
         (Method::GET, "/v1/admin/platform/metrics".into()),
         (Method::GET, "/v1/admin/platform/metrics/timeseries".into()),

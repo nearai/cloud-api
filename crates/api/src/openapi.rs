@@ -140,6 +140,10 @@ Operations marked deprecated (account, organization, workspace, invitation, API 
         crate::routes::usage::get_user_organization_metrics,
         crate::routes::usage::get_user_organization_timeseries,
         // Staking farm endpoints
+        crate::routes::staking_farm::get_staking_farm_config,
+        crate::routes::staking_farm::get_organization_staking_farm,
+        crate::routes::staking_farm::bind_organization_staking_farm,
+        crate::routes::staking_farm::sync_organization_staking_farm,
         // Customer reporting endpoints
         crate::routes::reporting_tokens::create_reporting_token,
         crate::routes::reporting_tokens::list_reporting_tokens,
@@ -175,6 +179,8 @@ Operations marked deprecated (account, organization, workspace, invitation, API 
         crate::routes::admin::get_admin_organization_balance,
         crate::routes::admin::update_organization_limits,
         crate::routes::admin::get_organization_limits_history,
+        crate::routes::staking_farm::get_admin_organization_staking_farm,
+        crate::routes::staking_farm::sync_admin_organization_staking_farm,
         crate::routes::admin::list_aml_reports,
         crate::routes::admin::update_aml_report_status,
         crate::routes::admin::list_aml_allowlist,
@@ -186,6 +192,7 @@ Operations marked deprecated (account, organization, workspace, invitation, API 
         crate::routes::admin::get_organization_priority,
         crate::routes::admin::update_organization_priority,
         crate::routes::admin::update_organization_fallback,
+        crate::routes::admin::get_organization_metrics,
         crate::routes::admin_usage_hourly::recompute_usage_hourly,
         crate::routes::admin_credit_reconciliation::reconcile_organization_credits,
         crate::routes::credit_transfers::create,
@@ -372,6 +379,11 @@ Operations marked deprecated (account, organization, workspace, invitation, API 
             crate::routes::usage::UserTimeSeriesMetrics,
             crate::routes::usage::UserTimeSeriesPoint,
             // Staking farm models
+            crate::routes::staking_farm::StakingFarmConfigResponse,
+            crate::routes::staking_farm::StakingFarmStateResponse,
+            crate::routes::staking_farm::OrganizationStakingState,
+            crate::routes::staking_farm::BindRequest,
+            crate::routes::staking_farm::BindResponse,
             // Customer reporting models
             services::reporting_tokens::ReportingTokenScope,
             crate::routes::reporting_tokens::CreateReportingTokenRequest,
@@ -406,6 +418,12 @@ Operations marked deprecated (account, organization, workspace, invitation, API 
             crate::routes::billing::BillingCostsRequest,
             crate::routes::billing::BillingCostsResponse,
             crate::routes::billing::RequestCost,
+            // Organization metrics (admin)
+            services::admin::OrganizationMetrics,
+            services::admin::MetricsSummary,
+            services::admin::WorkspaceMetrics,
+            services::admin::ApiKeyMetrics,
+            services::admin::ModelMetrics,
             services::admin::InfraSummary,
             services::admin::ModelGpuAllocation,
         ),

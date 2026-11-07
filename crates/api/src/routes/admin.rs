@@ -41,7 +41,7 @@ use axum::{
 };
 use chrono::{DateTime, Timelike, Utc};
 use config::ApiConfig;
-use services::admin::{AdminService, UpdateModelAdminRequest};
+use services::admin::{AdminService, AnalyticsService, UpdateModelAdminRequest};
 use services::aml::{AmlAllowlistEntry, AmlError, AmlReport};
 use services::auth::{AuthServiceTrait, UserId};
 use services::github_dispatch::GitHubDispatcher;
@@ -184,10 +184,12 @@ pub(crate) fn is_valid_openrouter_slug(slug: &str) -> bool {
 #[derive(Clone)]
 pub struct AdminAppState {
     pub admin_service: Arc<dyn AdminService + Send + Sync>,
+    pub analytics_service: Arc<AnalyticsService>,
     pub organization_service:
         Arc<dyn services::organization::OrganizationServiceTrait + Send + Sync>,
     pub auth_service: Arc<dyn AuthServiceTrait>,
     pub usage_service: Arc<dyn UsageServiceTrait + Send + Sync>,
+    pub staking_farm_service: Arc<services::staking_farm::StakingFarmService>,
     pub aml_service: Arc<services::aml::AmlService>,
     pub config: Arc<ApiConfig>,
     pub admin_access_token_repository: Arc<database::repositories::AdminAccessTokenRepository>,
@@ -3553,6 +3555,118 @@ pub struct OrgLimitsHistoryQueryParams {
     pub limit: i64,
     #[serde(default)]
     pub offset: i64,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct MetricsQueryParams {
+    /// Start of time range (ISO 8601 format). Defaults to 30 days ago.
+    pub start: Option<String>,
+    /// End of time range (ISO 8601 format). Defaults to now.
+    pub end: Option<String>,
+}
+
+const CREDIT_TYPE_QUERY_DESCRIPTION: &str = "Filter consumed inference usage by grant, staking_farm, transfer, payment, or postpay. Costs include only saved matching allocations, including settlements. Each matching request and its full tokens count once; counts are not additive across credit types. Unattributed historical usage is excluded. Period totals may increase until outstanding unfunded usage is settled. Omit for all usage.";
+
+#[derive(Debug, serde::Deserialize)]
+pub struct OrganizationMetricsQueryParams {
+    #[serde(flatten)]
+    pub metrics: MetricsQueryParams,
+    /// Optional saved credit allocation type: grant, staking_farm, transfer, payment, or postpay.
+    pub credit_type: Option<String>,
+}
+
+fn parse_metrics_credit_type(
+    value: Option<&str>,
+) -> Result<Option<String>, (StatusCode, ResponseJson<ErrorResponse>)> {
+    value
+        .map(|value| {
+            value
+                .parse::<CreditType>()
+                .map(|kind| kind.as_str().to_string())
+                .map_err(|_| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        ResponseJson(ErrorResponse::new(
+                            format!("invalid credit_type: {value}"),
+                            "invalid_request".to_string(),
+                        )),
+                    )
+                })
+        })
+        .transpose()
+}
+
+/// Get organization metrics (Admin only)
+///
+/// Returns usage metrics for an organization including summary totals,
+/// and breakdowns by workspace, API key, and model.
+///
+/// Percentiles across hours are approximate (sample-weighted means of hourly percentiles).
+/// TTFT threshold counts are exact; divide them by `ttft_measured_requests`, not `requests` / `total_requests`.
+#[utoipa::path(
+    get,
+    path = "/v1/admin/organizations/{org_id}/metrics",
+    tag = "Admin",
+    params(
+        ("org_id" = String, Path, description = "Organization ID to get metrics for"),
+        ("start" = Option<String>, Query, description = "Start of time range (ISO 8601). Defaults to 30 days ago. Window may not exceed 366 days."),
+        ("end" = Option<String>, Query, description = "End of time range (ISO 8601). Defaults to now. Window may not exceed 366 days."),
+        ("credit_type" = Option<CreditType>, Query, description = CREDIT_TYPE_QUERY_DESCRIPTION)
+    ),
+    responses(
+        (status = 200, description = "Organization metrics retrieved successfully", body = services::admin::OrganizationMetrics),
+        (status = 400, description = "Invalid request", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 504, description = "Analytics statement budget exceeded", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("session_token" = [])
+    )
+)]
+pub async fn get_organization_metrics(
+    State(app_state): State<AdminAppState>,
+    Path(org_id): Path<String>,
+    Query(params): Query<OrganizationMetricsQueryParams>,
+    Extension(_admin_user): Extension<AdminUser>,
+) -> Result<
+    ResponseJson<services::admin::OrganizationMetrics>,
+    (StatusCode, ResponseJson<ErrorResponse>),
+> {
+    let credit_type = parse_metrics_credit_type(params.credit_type.as_deref())?;
+
+    debug!(
+        credit_type = ?credit_type,
+        "Get organization metrics request for org_id: {}, start: {:?}, end: {:?}",
+        org_id, params.metrics.start, params.metrics.end
+    );
+
+    // Parse organization ID
+    let organization_id = uuid::Uuid::parse_str(&org_id).map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            ResponseJson(ErrorResponse::new(
+                "Invalid organization ID format".to_string(),
+                "invalid_id".to_string(),
+            )),
+        )
+    })?;
+
+    let (start, end) = crate::routes::common::parse_metrics_range(
+        params.metrics.start.as_deref(),
+        params.metrics.end.as_deref(),
+        None,
+        0,
+        366,
+    )?;
+
+    let metrics = app_state
+        .analytics_service
+        .get_organization_metrics(organization_id, start, end, credit_type.as_deref())
+        .await
+        .map_err(|e| analytics_error_response(e, "Failed to retrieve metrics", true))?;
+
+    Ok(ResponseJson(metrics))
 }
 
 /// Get the platform infrastructure / fleet burn summary (Admin only)

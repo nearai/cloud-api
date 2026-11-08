@@ -972,7 +972,10 @@ impl ResponseServiceImpl {
                     "Failed to serialize custom function choice: {e}"
                 ))
             })?;
-            extra.insert("tool_choice".to_string(), tool_choice);
+            // Strict Chat providers reject "auto" without tools, even though it is a no-op.
+            if !tools.is_empty() || tool_choice != "auto" {
+                extra.insert("tool_choice".to_string(), tool_choice);
+            }
         }
         if let Some(effort) = Self::reasoning_effort_for_completion(
             process_context.reasoning_effort,

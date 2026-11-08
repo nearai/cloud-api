@@ -333,13 +333,48 @@ async fn shutdown_signal() {
     }
 }
 
+/// Dependencies whose debug output carries query parameters or request
+/// credentials. They are capped at `info` unless a directive for them is set
+/// explicitly, so a debug-level deployment does not write those values to logs.
+const CAPPED_DEPENDENCY_TARGETS: &[&str] = &["tokio_postgres", "aws_smithy_runtime", "aws_sigv4"];
+
+/// Build the `EnvFilter` directive string from the logging configuration.
+fn build_log_filter(logging_config: &LoggingConfig) -> String {
+    let mut directives = Vec::new();
+    if !logging_config.level.trim().is_empty() {
+        directives.push(logging_config.level.clone());
+    }
+    for (module, level) in &logging_config.modules {
+        directives.push(format!("{module}={level}"));
+    }
+    for target in CAPPED_DEPENDENCY_TARGETS {
+        let explicit = directives
+            .iter()
+            .flat_map(|directive| directive.split(','))
+            .any(|directive| directive_sets_target(directive, target));
+        if !explicit {
+            directives.push(format!("{target}=info"));
+        }
+    }
+    directives.join(",")
+}
+
+/// Whether `directive` (`target[span{field=value}]=level`) sets a level for
+/// `target` or one of its submodules.
+fn directive_sets_target(directive: &str, target: &str) -> bool {
+    let Some((selector, _level)) = directive.trim().rsplit_once('=') else {
+        return false;
+    };
+    let selector = selector.split('[').next().unwrap_or_default().trim();
+    selector == target
+        || selector
+            .strip_prefix(target)
+            .is_some_and(|rest| rest.starts_with("::"))
+}
+
 /// Initialize tracing/logging based on configuration
 fn init_tracing(logging_config: &LoggingConfig) {
-    // Build the filter string from the logging configuration
-    let mut filter = logging_config.level.clone();
-    for (module, level) in &logging_config.modules {
-        filter.push_str(&format!(",{module}={level}"));
-    }
+    let filter = build_log_filter(logging_config);
 
     // Initialize tracing based on the format specified in config
     match logging_config.format.as_str() {
@@ -375,5 +410,121 @@ fn init_tracing(logging_config: &LoggingConfig) {
                 .with_span_list(false)
                 .init();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+
+    fn logging(level: &str, modules: &[(&str, &str)]) -> LoggingConfig {
+        LoggingConfig {
+            level: level.to_string(),
+            format: "json".to_string(),
+            modules: modules
+                .iter()
+                .map(|(module, level)| (module.to_string(), level.to_string()))
+                .collect::<HashMap<_, _>>(),
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct Captured(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("captured logs mutex should not poison")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Emit one debug event per target under `filter` and return what was written.
+    fn emitted_under(filter: &str) -> String {
+        let captured = Captured::default();
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::debug!(target: "tokio_postgres::query", "dependency-postgres-debug");
+            tracing::debug!(
+                target: "aws_smithy_runtime::client::orchestrator::endpoints",
+                "dependency-aws-runtime-debug"
+            );
+            tracing::debug!(target: "aws_sigv4::http_request", "dependency-aws-sigv4-debug");
+            tracing::info!(target: "tokio_postgres::query", "dependency-postgres-info");
+            tracing::debug!(target: "api::routes", "application-debug");
+        });
+        let bytes = captured
+            .0
+            .lock()
+            .expect("captured logs mutex should not poison")
+            .clone();
+        String::from_utf8(bytes).expect("logs should be UTF-8")
+    }
+
+    #[test]
+    fn filter_caps_dependencies_by_default() {
+        assert_eq!(
+            build_log_filter(&logging("info", &[])),
+            "info,tokio_postgres=info,aws_smithy_runtime=info,aws_sigv4=info"
+        );
+    }
+
+    #[test]
+    fn debug_level_keeps_app_debug_and_drops_dependency_debug() {
+        let filter = build_log_filter(&logging("debug", &[("api", "debug")]));
+        let output = emitted_under(&filter);
+        assert!(output.contains("application-debug"), "{output}");
+        assert!(output.contains("dependency-postgres-info"), "{output}");
+        assert!(!output.contains("dependency-postgres-debug"), "{output}");
+        assert!(!output.contains("dependency-aws-runtime-debug"), "{output}");
+        assert!(!output.contains("dependency-aws-sigv4-debug"), "{output}");
+    }
+
+    #[test]
+    fn explicit_directive_for_a_dependency_is_respected() {
+        let filter = build_log_filter(&logging("debug,tokio_postgres::query=debug", &[]));
+        assert_eq!(
+            filter,
+            "debug,tokio_postgres::query=debug,aws_smithy_runtime=info,aws_sigv4=info"
+        );
+        let output = emitted_under(&filter);
+        assert!(output.contains("dependency-postgres-debug"), "{output}");
+        assert!(!output.contains("dependency-aws-runtime-debug"), "{output}");
+    }
+
+    #[test]
+    fn directive_target_matching() {
+        assert!(directive_sets_target(
+            "tokio_postgres=debug",
+            "tokio_postgres"
+        ));
+        assert!(directive_sets_target(
+            " tokio_postgres::query=trace",
+            "tokio_postgres"
+        ));
+        assert!(directive_sets_target(
+            "tokio_postgres[span{name=x}]=debug",
+            "tokio_postgres"
+        ));
+        assert!(!directive_sets_target(
+            "tokio_postgres_ext=debug",
+            "tokio_postgres"
+        ));
+        assert!(!directive_sets_target("debug", "tokio_postgres"));
+        assert!(!directive_sets_target("api=debug", "tokio_postgres"));
     }
 }

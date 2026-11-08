@@ -10,6 +10,7 @@ use services::inference_provider_pool::InferenceProviderPool;
 use services::metrics::{MetricsServiceTrait, OtlpMetricsService};
 use std::sync::Arc;
 use std::time::Duration;
+use tracing::level_filters::LevelFilter;
 
 mod telemetry;
 
@@ -334,42 +335,43 @@ async fn shutdown_signal() {
 }
 
 /// Dependencies whose debug output carries query parameters or request
-/// credentials. They are capped at `info` unless a directive for them is set
-/// explicitly, so a debug-level deployment does not write those values to logs.
+/// credentials. When the default level is more verbose than `info`, they are
+/// capped at `info`, so a debug-level deployment does not write those values
+/// to logs.
 const CAPPED_DEPENDENCY_TARGETS: &[&str] = &["tokio_postgres", "aws_smithy_runtime", "aws_sigv4"];
 
 /// Build the `EnvFilter` directive string from the logging configuration.
+///
+/// The caps go first. `EnvFilter` replaces an earlier directive with a later
+/// one for the same target and prefers more specific targets, so a directive
+/// the operator sets for one of these crates or its submodules still applies.
+/// A stricter default level (`warn`, `error`, `off`) already silences them, so
+/// no cap is added and that level is kept.
 fn build_log_filter(logging_config: &LoggingConfig) -> String {
     let mut directives = Vec::new();
+    if default_level(&logging_config.level).is_some_and(|level| level > LevelFilter::INFO) {
+        directives.extend(
+            CAPPED_DEPENDENCY_TARGETS
+                .iter()
+                .map(|target| format!("{target}=info")),
+        );
+    }
     if !logging_config.level.trim().is_empty() {
         directives.push(logging_config.level.clone());
     }
     for (module, level) in &logging_config.modules {
         directives.push(format!("{module}={level}"));
     }
-    for target in CAPPED_DEPENDENCY_TARGETS {
-        let explicit = directives
-            .iter()
-            .flat_map(|directive| directive.split(','))
-            .any(|directive| directive_sets_target(directive, target));
-        if !explicit {
-            directives.push(format!("{target}=info"));
-        }
-    }
     directives.join(",")
 }
 
-/// Whether `directive` (`target[span{field=value}]=level`) sets a level for
-/// `target` or one of its submodules.
-fn directive_sets_target(directive: &str, target: &str) -> bool {
-    let Some((selector, _level)) = directive.trim().rsplit_once('=') else {
-        return false;
-    };
-    let selector = selector.split('[').next().unwrap_or_default().trim();
-    selector == target
-        || selector
-            .strip_prefix(target)
-            .is_some_and(|rest| rest.starts_with("::"))
+/// The default level a filter string sets: its last bare level directive.
+fn default_level(filter: &str) -> Option<LevelFilter> {
+    filter
+        .rsplit(',')
+        .map(str::trim)
+        .filter(|directive| !directive.is_empty())
+        .find_map(|directive| directive.parse::<LevelFilter>().ok())
 }
 
 /// Initialize tracing/logging based on configuration
@@ -475,12 +477,33 @@ mod tests {
         String::from_utf8(bytes).expect("logs should be UTF-8")
     }
 
+    const CAPS: &str = "tokio_postgres=info,aws_smithy_runtime=info,aws_sigv4=info";
+
     #[test]
-    fn filter_caps_dependencies_by_default() {
+    fn debug_default_gets_caps_before_configured_directives() {
         assert_eq!(
-            build_log_filter(&logging("info", &[])),
-            "info,tokio_postgres=info,aws_smithy_runtime=info,aws_sigv4=info"
+            build_log_filter(&logging("debug", &[])),
+            format!("{CAPS},debug")
         );
+        assert_eq!(
+            build_log_filter(&logging("trace", &[("api", "debug")])),
+            format!("{CAPS},trace,api=debug")
+        );
+    }
+
+    #[test]
+    fn info_or_stricter_default_is_left_unchanged() {
+        for level in [
+            "info",
+            "warn",
+            "error",
+            "off",
+            "info,api=debug",
+            "api=debug",
+            "",
+        ] {
+            assert_eq!(build_log_filter(&logging(level, &[])), level, "{level}");
+        }
     }
 
     #[test]
@@ -495,36 +518,57 @@ mod tests {
     }
 
     #[test]
-    fn explicit_directive_for_a_dependency_is_respected() {
-        let filter = build_log_filter(&logging("debug,tokio_postgres::query=debug", &[]));
-        assert_eq!(
-            filter,
-            "debug,tokio_postgres::query=debug,aws_smithy_runtime=info,aws_sigv4=info"
-        );
-        let output = emitted_under(&filter);
-        assert!(output.contains("dependency-postgres-debug"), "{output}");
-        assert!(!output.contains("dependency-aws-runtime-debug"), "{output}");
+    fn stricter_default_still_silences_dependency_info() {
+        let output = emitted_under(&build_log_filter(&logging("warn", &[])));
+        assert!(!output.contains("dependency-postgres-info"), "{output}");
+        let output = emitted_under(&build_log_filter(&logging("off", &[])));
+        assert!(output.is_empty(), "{output}");
     }
 
     #[test]
-    fn directive_target_matching() {
-        assert!(directive_sets_target(
-            "tokio_postgres=debug",
-            "tokio_postgres"
-        ));
-        assert!(directive_sets_target(
-            " tokio_postgres::query=trace",
-            "tokio_postgres"
-        ));
-        assert!(directive_sets_target(
-            "tokio_postgres[span{name=x}]=debug",
-            "tokio_postgres"
-        ));
-        assert!(!directive_sets_target(
-            "tokio_postgres_ext=debug",
-            "tokio_postgres"
-        ));
-        assert!(!directive_sets_target("debug", "tokio_postgres"));
-        assert!(!directive_sets_target("api=debug", "tokio_postgres"));
+    fn explicit_directive_for_a_dependency_is_respected() {
+        for level in [
+            "debug,tokio_postgres=debug",
+            "debug,tokio_postgres::query=debug",
+            // A bare target enables every level for it.
+            "debug,tokio_postgres",
+        ] {
+            let output = emitted_under(&build_log_filter(&logging(level, &[])));
+            assert!(
+                output.contains("dependency-postgres-debug"),
+                "{level}: {output}"
+            );
+            assert!(
+                !output.contains("dependency-aws-runtime-debug"),
+                "{level}: {output}"
+            );
+        }
+    }
+
+    #[test]
+    fn scoped_or_invalid_dependency_directive_keeps_the_cap() {
+        for level in [
+            // Covers another submodule, not the query logger.
+            "debug,tokio_postgres::connection=debug",
+            // EnvFilter drops a directive with an unknown level.
+            "debug,tokio_postgres=verbose",
+        ] {
+            let output = emitted_under(&build_log_filter(&logging(level, &[])));
+            assert!(
+                !output.contains("dependency-postgres-debug"),
+                "{level}: {output}"
+            );
+        }
+    }
+
+    #[test]
+    fn default_level_is_the_last_bare_level() {
+        assert_eq!(default_level("debug"), Some(LevelFilter::DEBUG));
+        assert_eq!(default_level("TRACE"), Some(LevelFilter::TRACE));
+        assert_eq!(default_level("info,api=debug"), Some(LevelFilter::INFO));
+        assert_eq!(default_level("debug,warn"), Some(LevelFilter::WARN));
+        assert_eq!(default_level("debug, "), Some(LevelFilter::DEBUG));
+        assert_eq!(default_level("api=debug"), None);
+        assert_eq!(default_level(""), None);
     }
 }

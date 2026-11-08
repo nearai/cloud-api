@@ -1619,11 +1619,20 @@ impl ResponseServiceImpl {
                         | models::ResponseInputItem::FunctionCallOutput { .. } => {}
                     }
                 }
-                Self::flush_replayed_function_calls(
-                    &mut messages,
-                    &mut pending_assistant_message,
-                    &mut pending_function_calls,
-                );
+                // A retry after an interrupted stream may end in reasoning alone.
+                // Only emit a final assistant turn if the client supplied a message or call.
+                let last_turn_item = items
+                    .iter()
+                    .rfind(|item| !matches!(item, models::ResponseInputItem::Reasoning { .. }));
+                if !pending_function_calls.is_empty()
+                    || last_turn_item.and_then(models::ResponseInputItem::role) == Some("assistant")
+                {
+                    Self::flush_replayed_function_calls(
+                        &mut messages,
+                        &mut pending_assistant_message,
+                        &mut pending_function_calls,
+                    );
+                }
             }
             None => {}
         }

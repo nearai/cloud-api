@@ -119,3 +119,56 @@ async fn replayed_reasoning_is_context_only_and_never_new_output() {
         .unwrap()
         .is_empty());
 }
+
+#[tokio::test]
+async fn interrupted_replay_ends_at_the_last_tool_result() {
+    let reasoning =
+        json!({"type": "reasoning", "summary": [{"type": "summary_text", "text": "thinking"}]});
+    let input = json!([
+        {"role": "user", "content": "Check the weather"},
+        reasoning,
+        {"type": "function_call", "call_id": "weather", "name": "lookup", "arguments": "{}"},
+        {"type": "function_call_output", "call_id": "weather", "output": "22 C"},
+        reasoning,
+        reasoning
+    ]);
+    let messages = replay_to_chat(input).await;
+    let roles: Vec<_> = messages.iter().map(|m| m.role.as_str()).collect();
+    assert_eq!(roles, ["system", "user", "assistant", "tool"]);
+    assert_eq!(messages[2].reasoning_content.as_deref(), Some("thinking"));
+    assert_eq!(messages[2].tool_calls.as_ref().unwrap()[0].id, "weather");
+    assert_eq!(messages[3].tool_call_id.as_deref(), Some("weather"));
+}
+
+#[tokio::test]
+async fn replay_preserves_an_explicit_final_assistant_message_with_reasoning() {
+    let reasoning =
+        json!({"type": "reasoning", "content": [{"type": "reasoning_text", "text": "thinking"}]});
+    for text in ["", "The answer is 42."] {
+        let assistant = json!({"role": "assistant", "content": text});
+        for tail in [json!([reasoning, assistant]), json!([assistant, reasoning])] {
+            let messages = replay_to_chat(tail).await;
+            let last = messages.last().unwrap();
+            assert_eq!(last.role, "assistant");
+            assert_eq!(last.content, text);
+            assert_eq!(last.reasoning_content.as_deref(), Some("thinking"));
+        }
+    }
+}
+
+async fn replay_to_chat(
+    input: serde_json::Value,
+) -> Vec<crate::completions::ports::CompletionMessage> {
+    let mut org = crate::organization::MockOrganizationServiceTrait::new();
+    org.expect_get_system_prompt().returning(|_, _| Ok(None));
+    let org: Arc<dyn crate::organization::OrganizationServiceTrait> = Arc::new(org);
+    let request = serde_json::from_value(json!({"model": "test", "input": input})).unwrap();
+    ResponseServiceImpl::build_stateless_messages(
+        &request,
+        Uuid::nil(),
+        crate::UserId(Uuid::nil()),
+        &org,
+    )
+    .await
+    .unwrap()
+}

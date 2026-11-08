@@ -116,7 +116,6 @@ pub struct DomainServices {
     pub response_service: Arc<services::ResponseService>,
     pub completion_service: Arc<services::CompletionServiceImpl>,
     pub models_service: Arc<services::models::ModelsServiceImpl>,
-    pub mcp_manager: Arc<services::mcp::McpClientManager>,
     pub inference_provider_pool: Arc<services::inference_provider_pool::InferenceProviderPool>,
     pub attestation_service: Arc<services::attestation::AttestationService>,
     pub organization_service:
@@ -514,9 +513,6 @@ pub async fn init_domain_services_with_pool(
         ),
     );
 
-    // Create MCP client manager
-    let mcp_manager = Arc::new(services::mcp::McpClientManager::new());
-
     // Create workspace service with API key management (needs organization_service)
     let workspace_repository = Arc::new(database::repositories::WorkspaceRepository::new(
         database.pool().clone(),
@@ -738,7 +734,6 @@ pub async fn init_domain_services_with_pool(
         response_service,
         completion_service,
         models_service,
-        mcp_manager,
         inference_provider_pool,
         attestation_service,
         organization_service,
@@ -755,31 +750,6 @@ pub async fn init_domain_services_with_pool(
         service_usage_service,
         admin_settings_service,
     }
-}
-
-/// Initialize domain services for legacy MCP tests.
-///
-/// Remote MCP tools are no longer supported by Responses. Keep this helper's
-/// signature temporarily so downstream test setup still compiles, but do not
-/// inject or construct an MCP client for the Responses service.
-#[allow(clippy::too_many_arguments)]
-pub async fn init_domain_services_with_mcp_factory(
-    database: Arc<Database>,
-    config: &ApiConfig,
-    organization_service: Arc<dyn services::organization::OrganizationServiceTrait + Send + Sync>,
-    inference_provider_pool: Arc<services::inference_provider_pool::InferenceProviderPool>,
-    metrics_service: Arc<dyn services::metrics::MetricsServiceTrait>,
-    _mcp_client_factory: Arc<dyn services::responses::tools::McpClientFactory>,
-) -> DomainServices {
-    init_domain_services_with_pool(
-        database,
-        config,
-        organization_service,
-        inference_provider_pool,
-        metrics_service,
-        None,
-    )
-    .await
 }
 
 /// Inject a web search provider into the standalone MCP route and hosted Responses search.
@@ -1202,7 +1172,6 @@ pub fn build_app_with_config_and_options(
     let app_state = AppState {
         organization_service: domain_services.organization_service.clone(),
         workspace_service: domain_services.workspace_service.clone(),
-        mcp_manager: domain_services.mcp_manager.clone(),
         completion_service: domain_services.completion_service.clone(),
         models_service: domain_services.models_service.clone(),
         auth_service: auth_components.auth_service.clone(),

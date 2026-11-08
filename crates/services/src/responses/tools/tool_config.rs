@@ -57,9 +57,6 @@ pub fn get_tool_names(request: &CreateResponseRequest) -> Vec<String> {
                 ResponseTool::Computer {} => {
                     names.push(COMPUTER_TOOL_NAME.to_string());
                 }
-                // MCP tools are dynamically discovered - we don't know actual tool names
-                // until the MCP server is queried asynchronously later
-                ResponseTool::Mcp { .. } => {}
             }
         }
     }
@@ -231,11 +228,6 @@ pub fn prepare_tools(request: &CreateResponseRequest) -> Vec<inference_providers
                             }),
                         },
                     });
-                }
-                ResponseTool::Mcp { .. } => {
-                    // MCP tools are handled separately via McpToolExecutor
-                    // Tool definitions are dynamically discovered from the MCP server
-                    // and added to the request in process_response_stream
                 }
             }
         }
@@ -621,7 +613,7 @@ pub fn convert_tool_calls(
         };
 
         // Check if this is a tool that doesn't use the 'query' parameter:
-        // - MCP tools (format: "server_label:tool_name")
+        // - names containing ':' (prefixed tool names)
         // - code_interpreter (uses "code" parameter)
         // - computer (uses "action" parameter)
         // - Custom function tools (use their own parameter schemas)
@@ -1023,7 +1015,7 @@ mod tests {
     }
 
     #[test]
-    fn test_convert_tool_calls_mcp_tool() {
+    fn test_convert_tool_calls_prefixed_tool() {
         let mut accumulator = HashMap::new();
         accumulator.insert(
             0,
@@ -1039,7 +1031,7 @@ mod tests {
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].id, Some("toolu_xyz".to_string()));
         assert_eq!(result[0].tool_type, "server:tool_name");
-        assert!(result[0].query.is_empty()); // MCP tools don't require query
+        assert!(result[0].query.is_empty()); // prefixed tools don't require query
     }
 
     #[test]

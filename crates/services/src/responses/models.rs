@@ -350,23 +350,6 @@ pub enum ResponseTool {
     CodeInterpreter {},
     #[serde(rename = "computer")]
     Computer {},
-    /// Remote MCP server tool
-    #[serde(rename = "mcp")]
-    Mcp {
-        server_label: String,
-        /// HTTPS endpoint for the remote MCP server
-        server_url: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        server_description: Option<String>,
-        /// Authorization header for the MCP server (never serialized in responses for security)
-        #[serde(skip_serializing)]
-        authorization: Option<String>,
-        /// Tool approval requirement (default: "always")
-        #[serde(default)]
-        require_approval: McpApprovalRequirement,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        allowed_tools: Option<Vec<String>>,
-    },
 }
 
 /// Tool shapes accepted by the typed stateless Responses adapter.
@@ -458,42 +441,6 @@ pub struct UserLocation {
 // ============================================
 // MCP (Model Context Protocol) Types
 // ============================================
-
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-#[serde(untagged)]
-pub enum McpApprovalRequirement {
-    Simple(McpApprovalMode),
-    Granular { never: McpToolNameFilter },
-}
-
-impl Default for McpApprovalRequirement {
-    fn default() -> Self {
-        McpApprovalRequirement::Simple(McpApprovalMode::Always)
-    }
-}
-
-impl McpApprovalRequirement {
-    /// Check if a specific tool requires approval
-    pub fn requires_approval(&self, tool_name: &str) -> bool {
-        match self {
-            McpApprovalRequirement::Simple(mode) => matches!(mode, McpApprovalMode::Always),
-            McpApprovalRequirement::Granular { never } => !never.tool_names.contains(tool_name),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, Default, PartialEq)]
-#[serde(rename_all = "lowercase")]
-pub enum McpApprovalMode {
-    #[default]
-    Always,
-    Never,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct McpToolNameFilter {
-    pub tool_names: HashSet<String>,
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct McpDiscoveredTool {
@@ -1576,12 +1523,6 @@ impl CreateResponseRequest {
                                 .to_string(),
                         );
                     }
-                    ResponseTool::Mcp { .. } => {
-                        return Err(
-                            "The stateless Responses API does not support remote mcp tools."
-                                .to_string(),
-                        );
-                    }
                 }
             }
             if function_names
@@ -2620,20 +2561,6 @@ mod tests {
             .validate_stateless()
             .unwrap_err()
             .contains("computer"));
-
-        let mut mcp_tool = stateless_request();
-        mcp_tool.tools = Some(vec![ResponseTool::Mcp {
-            server_label: "test".to_string(),
-            server_url: "https://example.com/mcp".to_string(),
-            server_description: None,
-            authorization: None,
-            require_approval: McpApprovalRequirement::Simple(McpApprovalMode::Always),
-            allowed_tools: None,
-        }]);
-        assert!(mcp_tool
-            .validate_stateless()
-            .unwrap_err()
-            .contains("does not support remote mcp"));
     }
 
     #[test]

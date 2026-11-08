@@ -1957,48 +1957,6 @@ pub enum ResponseTool {
     CodeInterpreter {},
     #[serde(rename = "computer")]
     Computer {},
-    #[serde(rename = "mcp")]
-    Mcp {
-        server_label: String,
-        server_url: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        server_description: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        authorization: Option<String>,
-        #[serde(default)]
-        require_approval: McpApprovalRequirement,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        allowed_tools: Option<Vec<String>>,
-    },
-}
-
-/// Approval requirement for MCP tool calls
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-#[serde(untagged)]
-pub enum McpApprovalRequirement {
-    Simple(McpApprovalMode),
-    Granular { never: McpToolNameFilter },
-}
-
-impl Default for McpApprovalRequirement {
-    fn default() -> Self {
-        Self::Simple(McpApprovalMode::Always)
-    }
-}
-
-/// Simple MCP approval mode
-#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "lowercase")]
-pub enum McpApprovalMode {
-    #[default]
-    Always,
-    Never,
-}
-
-/// Filter for tool names that don't require approval
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct McpToolNameFilter {
-    pub tool_names: std::collections::HashSet<String>,
 }
 
 /// Tool choice configuration

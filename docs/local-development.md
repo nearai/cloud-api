@@ -440,9 +440,11 @@ on the upstream provider; Cloud preserves source/citation fields rather than
 stripping them to make different providers return the same shape.
 
 Native hosted tools are limited to `web_search`; `web_context_search` uses the
-typed adapter. File search, code interpreter, computer use, remote MCP tools,
-and image-generation/editing models remain unsupported by Responses. The
-separate `POST /mcp` search tool and `/v1/images/*` endpoints remain available.
+typed adapter. File search, code interpreter, computer use, and
+image-generation/editing models remain unsupported by Responses. MCP tools are
+no longer supported: a request that declares an `mcp` tool returns 400
+(`invalid_request_error`, `param: "tools"`). The separate `POST /mcp` search
+tool and `/v1/images/*` endpoints remain available.
 
 Responses itself rejects conversation linkage, response history, and file
 input. During the temporary migration/export window, the authenticated,

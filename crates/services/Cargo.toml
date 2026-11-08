@@ -37,11 +37,6 @@ url = "2.5"
 urlencoding = "2.1"
 bytes = "1.11"
 tokio-stream = "0.1"
-# MCP protocol
-rmcp = { version = "1.5", features = [
-    "client",
-    "transport-streamable-http-client-reqwest",
-] }
 hex = "0.4"
 zeroize = "1.8.2"
 # NEAR wallet authentication (NEP-413)

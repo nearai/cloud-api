@@ -12,7 +12,9 @@ use axum::{
 use bytes::Bytes;
 use futures::stream::StreamExt;
 use services::attestation::ports::AttestationServiceTrait;
-use services::responses::client_tools::{normalize_request, ClientToolAdapter};
+use services::responses::client_tools::{
+    contains_mcp_tool, normalize_request, ClientToolAdapter, MCP_TOOLS_UNSUPPORTED,
+};
 use services::responses::errors::ResponseError as ServiceResponseError;
 use services::responses::models::*;
 use services::responses::ports::ResponseServiceTrait;
@@ -262,15 +264,6 @@ fn map_response_error_to_status(error: &ServiceResponseError) -> StatusCode {
         ServiceResponseError::StreamInterrupted => StatusCode::INTERNAL_SERVER_ERROR,
         ServiceResponseError::ConversationNotFound => StatusCode::NOT_FOUND,
         ServiceResponseError::PreviousResponseNotFound => StatusCode::NOT_FOUND,
-        ServiceResponseError::McpConnectionFailed(_) => StatusCode::BAD_GATEWAY,
-        ServiceResponseError::McpToolDiscoveryFailed(_) => StatusCode::BAD_GATEWAY,
-        ServiceResponseError::McpToolExecutionFailed(_) => StatusCode::BAD_GATEWAY,
-        ServiceResponseError::McpServerLimitExceeded { .. } => StatusCode::BAD_REQUEST,
-        ServiceResponseError::McpToolLimitExceeded { .. } => StatusCode::BAD_REQUEST,
-        ServiceResponseError::McpInsecureUrl => StatusCode::BAD_REQUEST,
-        ServiceResponseError::McpPrivateIpBlocked => StatusCode::BAD_REQUEST,
-        ServiceResponseError::McpApprovalRequired { .. } => StatusCode::BAD_REQUEST,
-        ServiceResponseError::McpApprovalRequestNotFound(_) => StatusCode::NOT_FOUND,
         ServiceResponseError::FunctionCallRequired { .. } => StatusCode::BAD_REQUEST,
         ServiceResponseError::FunctionCallNotFound(_) => StatusCode::NOT_FOUND,
     }
@@ -319,46 +312,6 @@ impl From<ServiceResponseError> for ErrorResponse {
             ),
             ServiceResponseError::PreviousResponseNotFound => ErrorResponse::new(
                 "Previous response not found".to_string(),
-                "not_found_error".to_string(),
-            ),
-            ServiceResponseError::McpConnectionFailed(msg) => ErrorResponse::new(
-                format!("MCP connection failed: {msg}"),
-                "mcp_error".to_string(),
-            ),
-            ServiceResponseError::McpToolDiscoveryFailed(msg) => ErrorResponse::new(
-                format!("MCP tool discovery failed: {msg}"),
-                "mcp_error".to_string(),
-            ),
-            ServiceResponseError::McpToolExecutionFailed(msg) => ErrorResponse::new(
-                format!("MCP tool execution failed: {msg}"),
-                "mcp_error".to_string(),
-            ),
-            ServiceResponseError::McpServerLimitExceeded { max } => ErrorResponse::new(
-                format!("MCP server limit exceeded: max {max} servers per request"),
-                "invalid_request_error".to_string(),
-            ),
-            ServiceResponseError::McpToolLimitExceeded { server, count, max } => {
-                ErrorResponse::new(
-                    format!(
-                        "MCP tool limit exceeded: server '{server}' has {count} tools, max {max}"
-                    ),
-                    "invalid_request_error".to_string(),
-                )
-            }
-            ServiceResponseError::McpInsecureUrl => ErrorResponse::new(
-                "MCP server URL must use HTTPS".to_string(),
-                "invalid_request_error".to_string(),
-            ),
-            ServiceResponseError::McpPrivateIpBlocked => ErrorResponse::new(
-                "MCP private IP addresses not allowed".to_string(),
-                "invalid_request_error".to_string(),
-            ),
-            ServiceResponseError::McpApprovalRequired { server, tool } => ErrorResponse::new(
-                format!("MCP approval required for tool '{tool}' on server '{server}'"),
-                "mcp_approval_required".to_string(),
-            ),
-            ServiceResponseError::McpApprovalRequestNotFound(msg) => ErrorResponse::new(
-                format!("MCP approval request not found: {msg}"),
                 "not_found_error".to_string(),
             ),
             ServiceResponseError::FunctionCallRequired { name, call_id } => ErrorResponse::new(
@@ -647,14 +600,15 @@ pub async fn response_history_gone() -> axum::response::Response {
 /// Other models use the typed adapter, which can execute `web_search` and
 /// `web_context_search` in a bounded, request-scoped inference loop. Both paths
 /// normalize omitted or null `store` to `false` and keep no response/item history.
-/// Client-managed tools are returned to the caller; remote MCP tools remain unsupported.
+/// Client-managed tools are returned to the caller. MCP tools are no longer
+/// supported and return 400.
 #[utoipa::path(
     post,
     path = "/v1/responses",
     tag = "Responses",
     request_body(
         content = serde_json::Value,
-        description = "Polymorphic stateless JSON request. After alias resolution, canonical openai/ models accept validated provider-native Responses fields. Other models use the typed StatelessCreateResponseRequestSchema component. Both paths normalize omitted or null store to false and reject store: true. The typed adapter supports hosted web_search and web_context_search with request-scoped context. Native Responses accepts client-managed tools and top-level web_search, executed upstream in one provider request; complete web_search_call replay items and include are forwarded unchanged. File tools and remote MCP tools are unsupported."
+        description = "Polymorphic stateless JSON request. After alias resolution, canonical openai/ models accept validated provider-native Responses fields. Other models use the typed StatelessCreateResponseRequestSchema component. Both paths normalize omitted or null store to false and reject store: true. The typed adapter supports hosted web_search and web_context_search with request-scoped context. Native Responses accepts client-managed tools and top-level web_search, executed upstream in one provider request; complete web_search_call replay items and include are forwarded unchanged. File tools are unsupported. MCP tools are no longer supported and return 400 with param tools."
     ),
     responses(
         (
@@ -689,6 +643,19 @@ pub async fn create_response(
     };
     if let Some(model) = body.get("model").and_then(|model| model.as_str()) {
         requested_model.set(model);
+    }
+    // MCP tools are deprecated. Reject them on every transport before model
+    // resolution or any provider work.
+    if contains_mcp_tool(&body) {
+        return (
+            StatusCode::BAD_REQUEST,
+            ResponseJson(ErrorResponse::with_param(
+                MCP_TOOLS_UNSUPPORTED.to_string(),
+                "invalid_request_error".to_string(),
+                "tools".to_string(),
+            )),
+        )
+            .into_response();
     }
     let native = match state
         .native_service

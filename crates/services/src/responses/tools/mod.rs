@@ -2,7 +2,6 @@ pub mod brave;
 pub mod executor;
 pub mod file_search;
 pub mod function;
-pub mod mcp;
 pub mod ports;
 pub mod tool_config;
 pub mod web_context_search;
@@ -55,15 +54,6 @@ pub use web_search::{
     web_search_parameters_schema, FormattedWebSearchResult, WebSearchToolExecutor,
     CITATION_INSTRUCTION, WEB_SEARCH_TOOL_NAME,
 };
-
-// MCP
-pub use mcp::{
-    setup_mcp, McpClientFactory, McpSetupResult, McpToolExecutor, MAX_MCP_SERVERS_PER_REQUEST,
-    MAX_TOOLS_PER_SERVER,
-};
-
-#[cfg(any(test, feature = "test-mocks"))]
-pub use mcp::{MockMcpClient, MockMcpClientFactory};
 
 // Provider traits and types
 pub use ports::{

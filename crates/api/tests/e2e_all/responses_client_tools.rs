@@ -224,7 +224,7 @@ async fn namespaced_functions_keep_distinct_names_and_raw_arguments() {
 }
 
 #[tokio::test]
-async fn auto_tool_choice_follows_current_tools_during_replay() {
+async fn tool_choice_follows_current_tools_during_replay() {
     let (server, _pool, mock, _database) = setup_test_server_with_pool().await;
     let model = setup_qwen_model(&server).await;
     let org = setup_org_with_credits(&server, 10_000_000_000).await;
@@ -234,7 +234,7 @@ async fn auto_tool_choice_follows_current_tools_during_replay() {
 
     let checkpoint = json!({
         "model": model, "store": false, "stream": true,
-        "tool_choice": "auto", "parallel_tool_calls": false,
+        "parallel_tool_calls": false,
         "input": [
             {"role": "user", "content": "Read the fixture."},
             {"type": "function_call", "call_id": "call_1", "name": "lookup", "arguments": "{}"},
@@ -242,13 +242,36 @@ async fn auto_tool_choice_follows_current_tools_during_replay() {
             {"role": "user", "content": "Summarize progress."}
         ]
     });
-    let lookup = json!({"type": "function", "name": "lookup", "parameters": {"type": "object"}});
-    for (tools, has_current_tool) in [
-        (None, false),
-        (Some(json!([])), false),
-        (Some(json!([lookup])), true),
-    ] {
+    let mut required = checkpoint.clone();
+    required["tools"] = json!([]);
+    required["tool_choice"] = json!("required");
+    let rejected = server
+        .post("/v1/responses")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&required)
+        .await;
+    assert_eq!(rejected.status_code(), 400, "{}", rejected.text());
+    let error = &rejected.json::<Value>()["error"];
+    assert_eq!(error["type"], "invalid_request_error");
+    assert_eq!(
+        error["message"],
+        "tool_choice 'required' requires at least one declared tool"
+    );
+    assert_eq!(mock.chat_completion_call_count(), 0);
+
+    let lookup = json!([{"type": "function", "name": "lookup", "parameters": {"type": "object"}}]);
+    for (index, (tools, choice, expected_choice)) in [
+        (None, "auto", None),
+        (Some(json!([])), "auto", None),
+        (Some(lookup.clone()), "auto", Some("auto")),
+        (Some(json!([])), "none", None),
+        (Some(lookup), "none", Some("none")),
+    ]
+    .into_iter()
+    .enumerate()
+    {
         let mut request = checkpoint.clone();
+        request["tool_choice"] = json!(choice);
         if let Some(tools) = tools {
             request["tools"] = tools;
         }
@@ -263,6 +286,7 @@ async fn auto_tool_choice_follows_current_tools_during_replay() {
             "Checkpoint saved."
         );
 
+        assert_eq!(mock.chat_completion_call_count(), index + 1);
         let upstream = serde_json::to_value(mock.last_chat_params().await.unwrap()).unwrap();
         assert!(upstream["messages"]
             .as_array()
@@ -271,12 +295,14 @@ async fn auto_tool_choice_follows_current_tools_during_replay() {
             .any(|message| message["role"] == "tool"
                 && message["tool_call_id"] == "call_1"
                 && message["content"] == "Fixture read."));
-        if has_current_tool {
+        assert_eq!(
+            upstream.get("tool_choice"),
+            expected_choice.map(|choice| json!(choice)).as_ref()
+        );
+        if expected_choice == Some("auto") {
             assert_eq!(upstream["tools"][0]["function"]["name"], "lookup");
-            assert_eq!(upstream["tool_choice"], "auto");
         } else {
             assert!(upstream.get("tools").is_none());
-            assert!(upstream.get("tool_choice").is_none());
         }
     }
 }

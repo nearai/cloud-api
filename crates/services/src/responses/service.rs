@@ -966,15 +966,18 @@ impl ResponseServiceImpl {
             })?;
             extra.insert("tools".to_string(), tools);
         }
-        if let Some(tool_choice) = tool_choice {
-            let tool_choice = serde_json::to_value(tool_choice).map_err(|e| {
-                errors::ResponseError::InternalError(format!(
-                    "Failed to serialize custom function choice: {e}"
-                ))
-            })?;
-            // Strict Chat providers reject "auto" without tools, even though it is a no-op.
-            if !tools.is_empty() || tool_choice != "auto" {
-                extra.insert("tool_choice".to_string(), tool_choice);
+        if let Some(choice) = tool_choice {
+            // An empty round has nothing to select or forbid. Strict Chat providers
+            // can reject an explicit choice without tool definitions.
+            let is_noop = tools.is_empty()
+                && matches!(choice, inference_providers::ToolChoice::String(mode) if mode == "auto" || mode == "none");
+            if !is_noop {
+                let choice = serde_json::to_value(choice).map_err(|e| {
+                    errors::ResponseError::InternalError(format!(
+                        "Failed to serialize custom function choice: {e}"
+                    ))
+                })?;
+                extra.insert("tool_choice".to_string(), choice);
             }
         }
         if let Some(effort) = Self::reasoning_effort_for_completion(

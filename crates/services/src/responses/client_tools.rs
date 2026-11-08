@@ -512,6 +512,9 @@ pub fn normalize_request(mut body: Value) -> Result<(Value, ClientToolAdapter), 
 
     if let Some(choice) = body.get_mut("tool_choice").filter(|value| !value.is_null()) {
         if let Some(mode) = choice.as_str() {
+            if mode == "required" && normalized.is_empty() {
+                return Err("tool_choice 'required' requires at least one declared tool".into());
+            }
             if !matches!(mode, "auto" | "none" | "required") {
                 return Err(
                     "tool_choice must be auto, none, required, or a client tool choice".into(),

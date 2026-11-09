@@ -6,6 +6,8 @@ pub mod conversions;
 pub mod database_encryption;
 pub mod middleware;
 pub mod models;
+pub mod object_encryption;
+mod object_storage;
 pub mod ohttp_gateway;
 pub mod openapi;
 pub mod openapi_deprecation;
@@ -87,6 +89,15 @@ const OHTTP_MAX_BODY_SIZE: usize = 32 * 1024 * 1024; // 32 MB
 // is its effective limit. body_hash_middleware needs it as an explicit cap.
 const RESPONSES_MAX_BODY_SIZE: usize = 2 * 1024 * 1024; // 2 MB
 
+/// POST /v1/images/edits accepts a single `image` multipart part plus small text
+/// fields. body_hash_middleware buffers the body before auth, so this is the
+/// pre-auth memory bound per request. 50 MiB is a chosen bound for that buffering,
+/// not a verified upstream limit. It applies to the whole multipart body, so the image
+/// itself must be somewhat smaller. It is independent of `MAX_FILE_SIZE`, which
+/// only bounds the file-upload handler (writes return 410 and that router has no
+/// body-limit layer).
+pub const MAX_IMAGE_EDIT_BODY_SIZE: usize = 50 * 1024 * 1024; // 50 MiB
+
 /// Service initialization components
 #[derive(Clone)]
 pub struct AuthComponents {
@@ -105,7 +116,6 @@ pub struct DomainServices {
     pub response_service: Arc<services::ResponseService>,
     pub completion_service: Arc<services::CompletionServiceImpl>,
     pub models_service: Arc<services::models::ModelsServiceImpl>,
-    pub mcp_manager: Arc<services::mcp::McpClientManager>,
     pub inference_provider_pool: Arc<services::inference_provider_pool::InferenceProviderPool>,
     pub attestation_service: Arc<services::attestation::AttestationService>,
     pub organization_service:
@@ -115,6 +125,7 @@ pub struct DomainServices {
     pub user_service: Arc<dyn services::user::UserServiceTrait + Send + Sync>,
     pub contact_email_service: Arc<services::contact_email::ContactEmailService>,
     pub files_service: Arc<dyn services::files::FileServiceTrait + Send + Sync>,
+    pub object_encryption_state: object_encryption::ObjectEncryptionState,
     pub metrics_service: Arc<dyn services::metrics::MetricsServiceTrait>,
     pub staking_farm_service: Arc<services::staking_farm::StakingFarmService>,
     pub aml_service: Arc<services::aml::AmlService>,
@@ -265,7 +276,7 @@ pub fn init_auth_services(database: Arc<Database>, config: &ApiConfig) -> AuthCo
             )),
         ) as Arc<dyn services::reporting_tokens::OrganizationReportingTokenService>,
         admin_access_token_repository,
-        config.auth.admin_domains.clone(),
+        config.auth.admin_emails.clone(),
         config.auth.encoding_key.clone(),
     );
 
@@ -354,18 +365,40 @@ pub async fn init_domain_services_with_pool(
     metrics_service: Arc<dyn services::metrics::MetricsServiceTrait>,
     admin_settings: Option<Arc<services::admin_settings::AdminSettingsService>>,
 ) -> DomainServices {
-    let database_encryption_key = database::field_encryption::parse_key(
-        &config.database_encryption_key,
-    )
-    .unwrap_or_else(|_| {
-        panic!("configured database encryption key is invalid");
-    });
-    database::field_encryption::validate_key_id(&config.database_encryption_key_id)
+    if let Some(specs) = &config.database_encryption_keys {
+        // Use the SDK default guest-agent endpoint, same as attestation signing keys.
+        let keys = services::encryption_keys::resolve_key_ring(specs, None)
+            .await
+            .unwrap_or_else(|class| {
+                panic!("configured database encryption keys are invalid: {class}")
+            });
+        let mut keys = keys.iter().map(|(id, key)| (id.clone(), *key));
+        let (write_id, write_key) = keys
+            .next()
+            .unwrap_or_else(|| panic!("configured database encryption keys are invalid: empty"));
+        let ring = database::field_encryption::KeyRing::new(write_id, write_key, keys.collect())
+            .unwrap_or_else(|class| {
+                panic!("configured database encryption keys are invalid: {class}")
+            });
+        database.pool().set_encryption_ring(ring);
+    } else {
+        let database_encryption_key = database::field_encryption::parse_key(
+            &config.database_encryption_key,
+        )
+        .unwrap_or_else(|_| {
+            panic!("configured database encryption key is invalid");
+        });
+        let ring = database::field_encryption::KeyRing::new(
+            config.database_encryption_key_id.clone(),
+            database_encryption_key,
+            vec![],
+        )
         .unwrap_or_else(|_| panic!("configured database encryption key id is invalid"));
-    database.pool().set_encryption_key(database_encryption_key);
-    database
-        .pool()
-        .set_encryption_key_id(config.database_encryption_key_id.clone());
+        database.pool().set_encryption_ring(ring);
+    }
+    if let Some(ring) = database.pool().encryption_ring() {
+        tracing::info!(write_key_id = ring.write_id(), read_key_ids = ?ring.read_ids(), "database encryption keys configured");
+    }
     database
         .pool()
         .set_encryption_write_enabled(config.database_encryption_write_enabled);
@@ -433,13 +466,22 @@ pub async fn init_domain_services_with_pool(
         database::repositories::OrganizationUsageRepository::new(database.pool().clone()),
     ) as Arc<dyn services::usage::UsageRepository>;
 
-    // Create models service. It owns the model-resolve cache (models and
-    // access decisions on unlisted models) that the attestation and completion
-    // services below share, so its invalidation reaches all three.
-    let models_service = Arc::new(services::models::ModelsServiceImpl::new(
-        inference_provider_pool.clone(),
-        catalog_models.clone(),
-    ));
+    // Create models service. It owns the model-resolve cache (models, access
+    // decisions on unlisted models, organization model filters) that the
+    // attestation and completion services below share, so its invalidation
+    // reaches all three. The filter source is attached before the cache is
+    // handed out.
+    let models_service = Arc::new(
+        services::models::ModelsServiceImpl::new(
+            inference_provider_pool.clone(),
+            catalog_models.clone(),
+        )
+        .with_organization_model_filter(Arc::new(
+            services::organization_model_filter::OrganizationSettingsModelFilter(Arc::new(
+                database::repositories::PgOrganizationRepository::new(database.pool().clone()),
+            )),
+        )),
+    );
 
     // Create attestation service
     let attestation_service = Arc::new(
@@ -470,9 +512,6 @@ pub async fn init_domain_services_with_pool(
             &config.credit_allocation,
         ),
     );
-
-    // Create MCP client manager
-    let mcp_manager = Arc::new(services::mcp::McpClientManager::new());
 
     // Create workspace service with API key management (needs organization_service)
     let workspace_repository = Arc::new(database::repositories::WorkspaceRepository::new(
@@ -558,22 +597,35 @@ pub async fn init_domain_services_with_pool(
 
     // Create S3 storage and FileService for temporary authenticated read views
     // and retained per-file delete operations.
+    let object_key_ring = object_storage::resolve_object_ring(&config.s3)
+        .await
+        .expect("Invalid S3 encryption key configuration");
     let s3_storage: Arc<dyn services::files::storage::StorageTrait> = if config.s3.mock {
         tracing::info!("Using mock S3 storage for temporary file views and deletes");
-        Arc::new(services::files::storage::MockStorage::new(
-            config.s3.encryption_key.clone(),
+        Arc::new(services::files::storage::MockStorage::new_with_ring(
+            object_key_ring.clone(),
         ))
     } else {
         tracing::info!("Using real S3 storage for temporary file views and deletes");
         let s3_config = aws_config::load_from_env().await;
         let s3_client = aws_sdk_s3::Client::new(&s3_config);
 
-        Arc::new(services::files::storage::S3Storage::new(
+        Arc::new(services::files::storage::S3Storage::new_with_ring(
             s3_client,
             config.s3.bucket.clone(),
-            config.s3.encryption_key.clone(),
+            object_key_ring.clone(),
         ))
     };
+
+    let object_encryption_state = object_encryption::ObjectEncryptionState::new(
+        database.pool().clone(),
+        s3_storage.clone(),
+        object_key_ring,
+    )
+    .with_job_options(
+        config.s3.object_rewrap_max_bytes,
+        config.s3.object_encryption_write_enabled,
+    );
 
     let file_repository = Arc::new(database::repositories::FileRepository::new(
         database.pool().clone(),
@@ -683,7 +735,6 @@ pub async fn init_domain_services_with_pool(
         response_service,
         completion_service,
         models_service,
-        mcp_manager,
         inference_provider_pool,
         attestation_service,
         organization_service,
@@ -692,6 +743,7 @@ pub async fn init_domain_services_with_pool(
         user_service,
         contact_email_service,
         files_service,
+        object_encryption_state,
         metrics_service,
         staking_farm_service,
         aml_service,
@@ -699,31 +751,6 @@ pub async fn init_domain_services_with_pool(
         service_usage_service,
         admin_settings_service,
     }
-}
-
-/// Initialize domain services for legacy MCP tests.
-///
-/// Remote MCP tools are no longer supported by Responses. Keep this helper's
-/// signature temporarily so downstream test setup still compiles, but do not
-/// inject or construct an MCP client for the Responses service.
-#[allow(clippy::too_many_arguments)]
-pub async fn init_domain_services_with_mcp_factory(
-    database: Arc<Database>,
-    config: &ApiConfig,
-    organization_service: Arc<dyn services::organization::OrganizationServiceTrait + Send + Sync>,
-    inference_provider_pool: Arc<services::inference_provider_pool::InferenceProviderPool>,
-    metrics_service: Arc<dyn services::metrics::MetricsServiceTrait>,
-    _mcp_client_factory: Arc<dyn services::responses::tools::McpClientFactory>,
-) -> DomainServices {
-    init_domain_services_with_pool(
-        database,
-        config,
-        organization_service,
-        inference_provider_pool,
-        metrics_service,
-        None,
-    )
-    .await
 }
 
 /// Inject a web search provider into the standalone MCP route and hosted Responses search.
@@ -1031,9 +1058,7 @@ fn build_cors_layer(cors_config: config::CorsConfig) -> CorsLayer {
     CorsLayer::new()
         .allow_origin(AllowOrigin::predicate(
             move |origin: &HeaderValue, request_parts: &axum::http::request::Parts| {
-                let path = request_parts.uri.path();
-                let is_admin_route = path == "/v1/admin" || path.starts_with("/v1/admin/");
-                if !is_admin_route {
+                if !middleware::admin_audit::is_admin_path(request_parts.uri.path()) {
                     return true;
                 }
 
@@ -1148,7 +1173,6 @@ pub fn build_app_with_config_and_options(
     let app_state = AppState {
         organization_service: domain_services.organization_service.clone(),
         workspace_service: domain_services.workspace_service.clone(),
-        mcp_manager: domain_services.mcp_manager.clone(),
         completion_service: domain_services.completion_service.clone(),
         models_service: domain_services.models_service.clone(),
         auth_service: auth_components.auth_service.clone(),
@@ -1276,6 +1300,7 @@ pub fn build_app_with_config_and_options(
         config.clone(),
         build_options,
         AdminRouteServices {
+            object_encryption_state: domain_services.object_encryption_state.clone(),
             inference_provider_pool: app_state.inference_provider_pool.clone(),
             analytics_service,
             staking_farm_service: app_state.staking_farm_service.clone(),
@@ -1298,8 +1323,6 @@ pub fn build_app_with_config_and_options(
 
     let invitation_routes =
         build_invitation_routes(app_state.clone(), &auth_components.auth_state_middleware);
-
-    let auth_vpc_routes = build_auth_vpc_routes(app_state.clone());
 
     let files_routes =
         build_files_routes(app_state.clone(), &auth_components.auth_state_middleware);
@@ -1364,7 +1387,7 @@ pub fn build_app_with_config_and_options(
         .route("/.well-known/ohttp-gateway", get(ohttp_config))
         .with_state(app_state.clone());
 
-    Router::new()
+    let router = Router::new()
         .nest(
             "/v1",
             Router::new()
@@ -1382,7 +1405,6 @@ pub fn build_app_with_config_and_options(
                 .merge(services_routes)
                 .merge(admin_routes)
                 .merge(invitation_routes)
-                .merge(auth_vpc_routes)
                 .merge(files_routes)
                 .merge(feature_request_routes)
                 .merge(billing_routes)
@@ -1398,7 +1420,21 @@ pub fn build_app_with_config_and_options(
         )
         .merge(openapi_routes)
         .merge(mcp_routes)
-        .merge(ohttp_root_routes)
+        .merge(ohttp_root_routes);
+
+    with_app_fallbacks_and_layers(router, metrics_state, cors)
+}
+
+/// Wrap the assembled routes in the app-wide fallbacks and middleware.
+///
+/// Layers added later wrap earlier ones, so a request passes them bottom-up.
+/// All of them run after Axum routing, so `MatchedPath` is available.
+fn with_app_fallbacks_and_layers(
+    router: Router,
+    metrics_state: middleware::MetricsState,
+    cors: CorsLayer,
+) -> Router {
+    router
         // Requests matching no route (or no method on a matched route) get a
         // stable generic JSON envelope instead of Axum's default empty-body
         // 404/405 (nearai/infra#192).
@@ -1419,22 +1455,16 @@ pub fn build_app_with_config_and_options(
         // endpoints) sign the *request* body hash, not the HTTP response body,
         // so compression is safe for them as well.
         .layer(CompressionLayer::new())
+        // One audit event per /v1/admin/* request, including CORS preflights
+        // and unmatched admin paths: after routing (MatchedPath), outside
+        // CORS, and inside request correlation, whose request id it reuses.
+        .layer(from_fn(middleware::admin_audit_middleware))
         .layer(from_fn(middleware::request_correlation_middleware))
         // Outermost response pass: every client-facing 429 gets a
         // machine-readable Retry-After header (SDK backoff honors it).
         // Sites that set their own value (per-key limiter window, upstream
         // ITA propagation) are left untouched.
         .layer(map_response(middleware::retry_after_middleware))
-}
-
-/// Build VPC authentication routes
-pub fn build_auth_vpc_routes(app_state: AppState) -> Router {
-    use crate::routes::auth_vpc::vpc_login;
-    use axum::routing::post;
-
-    Router::new()
-        .route("/auth/vpc/login", post(vpc_login))
-        .with_state(app_state)
 }
 
 /// Build invitation routes with selective auth
@@ -1515,8 +1545,6 @@ pub fn build_completion_routes(
     usage_state: middleware::UsageState,
     rate_limit_state: middleware::RateLimitState,
 ) -> Router {
-    use crate::routes::files::MAX_FILE_SIZE;
-
     // Announces a planned model deprecation in response headers. Innermost
     // layer: it only sees requests that passed auth, rate and usage checks.
     let model_deprecation_state = middleware::ModelDeprecationState {
@@ -1630,7 +1658,7 @@ pub fn build_completion_routes(
         ));
 
     // File-based inference routes (image edits)
-    // Apply 512 MB limit only to endpoints that accept file uploads.
+    // Apply MAX_IMAGE_EDIT_BODY_SIZE only to endpoints that accept file uploads.
     // body_hash_middleware buffers before auth, so it is capped at the same limit.
     let file_inference_routes = Router::new()
         .route("/images/edits", post(image_edits))
@@ -1652,18 +1680,24 @@ pub fn build_completion_routes(
             middleware::auth::auth_middleware_with_workspace_context,
         ))
         .layer(from_fn_with_state(
-            middleware::BodyHashLimit(MAX_FILE_SIZE),
+            middleware::BodyHashLimit(MAX_IMAGE_EDIT_BODY_SIZE),
             middleware::body_hash_middleware,
         ))
-        .layer(DefaultBodyLimit::max(MAX_FILE_SIZE));
+        .layer(DefaultBodyLimit::max(MAX_IMAGE_EDIT_BODY_SIZE));
 
     let metadata_routes = Router::new()
         .route("/models", get(models))
         .with_state(app_state)
         // Public, OpenAI-compatible model catalog. The response is identical for
-        // all clients and changes only when an admin updates the catalog.
+        // all clients and changes only when an admin updates the catalog, except
+        // for an organization that set `allowed_models`, whose answer sets its
+        // own `private, no-store`.
         .layer(cache_control_layer(
             "public, max-age=30, stale-while-revalidate=120",
+        ))
+        .layer(from_fn_with_state(
+            auth_state_middleware.clone(),
+            middleware::auth::filtered_catalog_middleware,
         ));
 
     Router::new()
@@ -2171,7 +2205,7 @@ pub fn build_internal_routes(app_state: AppState) -> Router {
     Router::new()
         .route(
             "/internal/usage",
-            post(crate::routes::usage::record_usage_internal),
+            post(crate::routes::internal_usage::record_usage_internal),
         )
         .route(
             "/internal/models",
@@ -2276,6 +2310,7 @@ fn cache_control_layer(value: &'static str) -> CacheControlLayer {
 
 /// Build admin routes (authenticated endpoints)
 pub struct AdminRouteServices {
+    pub object_encryption_state: object_encryption::ObjectEncryptionState,
     pub inference_provider_pool: Arc<services::inference_provider_pool::InferenceProviderPool>,
     pub analytics_service: Arc<services::admin::AnalyticsService>,
     pub staking_farm_service: Arc<services::staking_farm::StakingFarmService>,
@@ -2394,18 +2429,15 @@ fn build_admin_routes_with_options(
         user_erasure_service: services.user_erasure_service,
     };
 
-    let database_encryption_state = crate::database_encryption::DatabaseEncryptionState::new(
-        database.pool().clone(),
-        &config.database_encryption_key,
-        &config.database_encryption_key_id,
-    )
-    .map_err(|_| {
-        tracing::error!(
-            error_class = "invalid_database_encryption_key",
-            "Database encryption admin routes are disabled"
-        );
-    })
-    .ok();
+    let database_encryption_state =
+        crate::database_encryption::DatabaseEncryptionState::new(database.pool().clone())
+            .map_err(|_| {
+                tracing::error!(
+                    error_class = "missing_database_encryption_ring",
+                    "Database encryption admin routes are disabled"
+                );
+            })
+            .ok();
 
     // Classify read operations in middleware::admin_policy when adding admin routes.
     let admin_routes = Router::new()
@@ -2667,6 +2699,10 @@ fn build_admin_routes_with_options(
         admin_routes.merge(
             Router::new()
                 .route(
+                    "/admin/database-encryption/keys",
+                    axum::routing::get(crate::database_encryption::get_keys),
+                )
+                .route(
                     "/admin/database-encryption/scan",
                     axum::routing::post(crate::database_encryption::scan),
                 )
@@ -2691,6 +2727,15 @@ fn build_admin_routes_with_options(
     } else {
         admin_routes
     };
+
+    let object_encryption_state = if build_options.start_database_encryption_recovery {
+        services.object_encryption_state.recover_jobs();
+        services.object_encryption_state
+    } else {
+        services.object_encryption_state.with_job_scoped_leases()
+    };
+    let admin_routes = admin_routes
+        .merge(object_encryption::router().layer(axum::Extension(object_encryption_state)));
 
     admin_routes
         // Admin middleware handles both authentication and authorization
@@ -3027,9 +3072,11 @@ mod tests {
         let spec = serde_json::to_value(ApiDoc::openapi()).unwrap();
         let models_get = &spec["paths"]["/v1/models"]["get"];
 
+        // Public, with an optional API key: the key of an organization that
+        // set `allowed_models` gets its own catalog.
         assert_eq!(
             models_get["security"],
-            serde_json::json!([{}]),
+            serde_json::json!([{}, { "api_key": [] }]),
             "/v1/models must explicitly override global OpenAPI security"
         );
     }
@@ -3484,7 +3531,7 @@ mod tests {
                 github: None,
                 google: None,
                 near: config::NearConfig::default(),
-                admin_domains: vec![],
+                admin_emails: vec![],
                 admin_read_only_tokens_enabled: false,
                 require_session_bound_access_tokens: false,
             },
@@ -3506,9 +3553,13 @@ mod tests {
             },
             database_encryption_key:
                 "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789".to_string(),
+            database_encryption_keys: None,
             database_encryption_key_id: "test-db-v1".to_string(),
             database_encryption_write_enabled: false,
             s3: config::S3Config {
+                object_rewrap_max_bytes: 268_435_456,
+                object_encryption_write_enabled: true,
+                encryption_keys: None,
                 mock: true,
                 bucket: "test-bucket".to_string(),
                 region: "us-east-1".to_string(),
@@ -3608,7 +3659,7 @@ mod tests {
                 github: None,
                 google: None,
                 near: config::NearConfig::default(),
-                admin_domains: vec![],
+                admin_emails: vec![],
                 admin_read_only_tokens_enabled: false,
                 require_session_bound_access_tokens: false,
             },
@@ -3630,9 +3681,13 @@ mod tests {
             },
             database_encryption_key:
                 "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789".to_string(),
+            database_encryption_keys: None,
             database_encryption_key_id: "test-db-v1".to_string(),
             database_encryption_write_enabled: false,
             s3: config::S3Config {
+                object_rewrap_max_bytes: 268_435_456,
+                object_encryption_write_enabled: true,
+                encryption_keys: None,
                 mock: true,
                 bucket: "test-bucket".to_string(),
                 region: "us-east-1".to_string(),

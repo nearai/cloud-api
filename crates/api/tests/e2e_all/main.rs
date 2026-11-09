@@ -13,6 +13,7 @@ mod admin_analytics;
 mod admin_analytics_range_hygiene;
 mod admin_analytics_statement_budget;
 mod admin_api_keys;
+mod admin_audit;
 mod admin_consumption_hourly;
 mod admin_credit_reconciliation;
 mod admin_deprecate_model;
@@ -125,8 +126,9 @@ mod usage_recording;
 mod usage_responses;
 mod user_erasure;
 mod user_erasure_lookup;
-mod vpc_login;
+mod vpc_login_removed;
 mod web_context_search;
+mod workspace_change_permissions;
 /// Run by nextest's setup script after this E2E binary has already been built.
 /// Keeping bootstrap in the same binary avoids a second cold compile/link in CI.
 #[tokio::test]

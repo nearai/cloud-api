@@ -3,7 +3,7 @@ use std::sync::Arc;
 use config::ItaAttestationConfig;
 
 use super::{
-    environment::{load_tls_cert_fingerprint, load_vpc_info, load_vpc_shared_secret},
+    environment::{load_tls_cert_fingerprint, load_vpc_info},
     ita::{ita_client_error_class, ItaClient, ProviderPoolModelAttestationCollector},
     AttestationError, AttestationRepository, AttestationService, DstackGatewayQuoteCollector,
     InferenceProviderPool, MetricsServiceTrait, ModelResolveCache, ModelsRepository,
@@ -36,13 +36,7 @@ impl AttestationService {
         }
 
         let vpc_info = load_vpc_info();
-        let vpc_shared_secret = load_vpc_shared_secret();
         let tls_cert_fingerprint = load_tls_cert_fingerprint();
-        if vpc_shared_secret.is_none() {
-            tracing::warn!(
-                "Cannot load VPC shared secret. VPC-based authentication will be disabled"
-            );
-        }
 
         let (ed25519_signing_key, ed25519_verifying_key, ecdsa_signing_key, ecdsa_verifying_key) =
             match Self::derive_signing_keys_from_dstack().await {
@@ -134,7 +128,6 @@ impl AttestationService {
             metrics_service,
             usage_repository,
             vpc_info,
-            vpc_shared_secret,
             tls_cert_fingerprint,
             ed25519_signing_key: Arc::new(ed25519_signing_key),
             ed25519_verifying_key: Arc::new(ed25519_verifying_key),

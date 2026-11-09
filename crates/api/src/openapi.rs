@@ -33,7 +33,7 @@ Operations marked deprecated (account, organization, workspace, invitation, API 
         (name = "Models", description = "Public model catalog and information"),
         (name = "Conversations", description = "Temporary authenticated, workspace-scoped migration access for export and account deletion. Only `POST /v1/conversations/batch`, `GET /v1/conversations/{conversation_id}`, `GET /v1/conversations/{conversation_id}/items`, and `DELETE /v1/conversations/{conversation_id}` are available. Conversation creation and every other mutation return `410 Gone`; this surface will be removed after data migration. Migration responses use `Cache-Control: no-store`."),
         (name = "Files", description = "Temporary authenticated, workspace-scoped migration access for export and account deletion. Only `GET /v1/files`, `GET /v1/files/{file_id}`, `GET /v1/files/{file_id}/content`, and `DELETE /v1/files/{file_id}` are available. Upload and every other mutation return `410 Gone`; this surface will be removed after data migration. Migration responses use `Cache-Control: no-store`."),
-        (name = "Responses", description = "Stateless response inference. Both paths normalize omitted or null `store` to `false` and reject `store: true`. Raw request/response content, response items, and history are not persisted. Clients must include any prior context in each request. Canonical `openai/` models use one upstream native Responses request after alias resolution. Other models use the typed adapter, with bounded request-scoped inference rounds when hosted search is requested.\n\nBoth paths accept client-managed `function` and `custom` tools, including tools grouped in a `namespace`, and leading developer `additional_tools` declarations. Cloud returns calls without executing them; clients replay each `function_call` or `custom_tool_call` with its matching output and caller-managed history. Preserve `call_id`, names, namespaces, raw arguments or custom input, and provider metadata such as `thought_signature`. The typed replay path accepts assistant `output_text` parts and plaintext `reasoning` items, using reasoning content or its summary as prior assistant context. Encrypted-only reasoning requires a native Responses backend. The typed adapter supports text custom tools and the Codex `exec` Lark source grammar; other grammars require a native backend.\n\nEach generated item has its own `output_index`. Tool calls finish with `response.output_item.done`; a successful model turn ends with `response.completed`, including when tools await client execution. Reasoning uses `response.reasoning_text.delta`; failures expose `response.error` in `response.failed` and preserve partial usage.\n\nThe typed adapter executes `web_search` and `web_context_search` using a bounded request-scoped loop, emits search lifecycle events and URL citations, and accumulates usage across inference rounds without storing history. Optional `web_search.count` (0–20) overrides model-selected counts; 0 skips the search provider. If a model emits client tool calls and searches in the same round, client calls are returned without executing that round's searches. On the typed path, completed search output markers may accompany replayed assistant text, but raw search results are not restored across requests. Native Responses also accepts top-level `web_search`, executed by the upstream provider without a Cloud search loop. Complete native `web_search_call` replay items, search configuration, and `include` are forwarded unchanged; provider-returned search citations and sources retain their native shape. `file_search`, `code_interpreter`, `computer`, and remote `mcp` are unsupported. Image-generation/editing models are rejected on both paths. The separate `POST /mcp` endpoint exposes its `web_search` tool independently of Responses; use `/v1/images/*` for image generation/editing. Existing completed-response gateway attestation is preserved best-effort: when the signature write succeeds, `GET /v1/signature/resp_*` retrieves signatures over SHA-256 request/response digests, never raw content. Interrupted streams create no `resp_*` attestation record or legacy disconnect fallback. Responses rejects conversation linkage, response history, and file input; the separate Conversation and File endpoints are not part of Responses inference."),
+        (name = "Responses", description = "Stateless response inference. Both paths normalize omitted or null `store` to `false` and reject `store: true`. Raw request/response content, response items, and history are not persisted. Clients must include any prior context in each request. Canonical `openai/` models use one upstream native Responses request after alias resolution. Other models use the typed adapter, with bounded request-scoped inference rounds when hosted search is requested.\n\nBoth paths accept client-managed `function` and `custom` tools, including tools grouped in a `namespace`, and leading developer `additional_tools` declarations. Cloud returns calls without executing them; clients replay each `function_call` or `custom_tool_call` with its matching output and caller-managed history. Preserve `call_id`, names, namespaces, raw arguments or custom input, and provider metadata such as `thought_signature`. The typed replay path accepts assistant `output_text` parts and plaintext `reasoning` items, using reasoning content or its summary as prior assistant context. Encrypted-only reasoning requires a native Responses backend. The typed adapter supports text custom tools and the Codex `exec` Lark source grammar; other grammars require a native backend.\n\nEach generated item has its own `output_index`. Tool calls finish with `response.output_item.done`; a successful model turn ends with `response.completed`, including when tools await client execution. Reasoning uses `response.reasoning_text.delta`; failures expose `response.error` in `response.failed` and preserve partial usage.\n\nThe typed adapter executes `web_search` and `web_context_search` using a bounded request-scoped loop, emits search lifecycle events and URL citations, and accumulates usage across inference rounds without storing history. Optional `web_search.count` (0–20) overrides model-selected counts; 0 skips the search provider. If a model emits client tool calls and searches in the same round, client calls are returned without executing that round's searches. On the typed path, completed search output markers may accompany replayed assistant text, but raw search results are not restored across requests. Native Responses also accepts top-level `web_search`, executed by the upstream provider without a Cloud search loop. Complete native `web_search_call` replay items, search configuration, and `include` are forwarded unchanged; provider-returned search citations and sources retain their native shape. `file_search`, `code_interpreter`, and `computer` are unsupported. MCP tools are no longer supported: a request that declares an `mcp` tool returns 400 with `param: \"tools\"`. Image-generation/editing models are rejected on both paths. The separate `POST /mcp` endpoint exposes its `web_search` tool independently of Responses; use `/v1/images/*` for image generation/editing. Existing completed-response gateway attestation is preserved best-effort: when the signature write succeeds, `GET /v1/signature/resp_*` retrieves signatures over SHA-256 request/response digests, never raw content. Interrupted streams create no `resp_*` attestation record or legacy disconnect fallback. Responses rejects conversation linkage, response history, and file input; the separate Conversation and File endpoints are not part of Responses inference."),
         (name = "Organizations", description = "Organization management"),
         (name = "Organization Members", description = "Organization member and invitation management"),
         (name = "Workspaces", description = "Workspace and API key management"),
@@ -50,6 +50,15 @@ Operations marked deprecated (account, organization, workspace, invitation, API 
         (name = "Services", description = "Public platform services (e.g. web_search pricing)"),
     ),
     paths(
+        crate::database_encryption::get_keys,
+        crate::object_encryption::get_keys,
+        crate::object_encryption::scan,
+        crate::object_encryption::create_job,
+        crate::object_encryption::get_job,
+        crate::object_encryption::cancel_job,
+        crate::object_encryption::verify,
+        crate::database_encryption::create_job,
+        crate::database_encryption::verify,
         // Chat completion endpoints (most important for users)
         crate::routes::completions::chat_completions,
         crate::routes::completions::image_generations,
@@ -380,7 +389,7 @@ Operations marked deprecated (account, organization, workspace, invitation, API 
             crate::routes::usage::UsageByModelEntryResponse,
             crate::routes::usage::ServiceUsageHistoryResponse,
             crate::routes::usage::ServiceUsageEntryResponse,
-            crate::routes::usage::RecordUsageResponse,
+            crate::routes::internal_usage::RecordUsageResponse,
             crate::routes::usage::UserOrganizationMetrics,
             crate::routes::usage::UserMetricsSummary,
             crate::routes::usage::UserModelMetrics,
@@ -637,6 +646,120 @@ impl Modify for SecurityAddon {
 mod admin_token_permission_tests {
     use super::*;
     use serde_json::{json, Value};
+
+    #[test]
+    fn database_encryption_schema_exposes_rotation_requests_and_keys() {
+        let doc = serde_json::to_value(ApiDoc::openapi()).unwrap();
+        let schemas = &doc["components"]["schemas"];
+        for (path, schema) in [
+            ("/v1/admin/database-encryption/jobs", "CreateJobRequest"),
+            ("/v1/admin/database-encryption/verify", "VerifyRequest"),
+        ] {
+            assert_eq!(
+                doc["paths"][path]["post"]["requestBody"]["content"]["application/json"]["schema"]
+                    ["$ref"],
+                format!("#/components/schemas/{schema}")
+            );
+            assert_eq!(
+                schemas[schema]["properties"]["scope"]["$ref"],
+                "#/components/schemas/Scope"
+            );
+            assert!(doc["paths"][path]["post"]["security"]
+                .as_array()
+                .unwrap()
+                .contains(&json!({"admin_token": []})));
+        }
+        for schema in ["CreateJobRequest", "VerifyRequest", "JobOptions"] {
+            let delay = &schemas[schema]["properties"]["batch_delay_ms"];
+            assert_eq!(delay["minimum"].as_f64(), Some(0.0));
+            assert_eq!(delay["maximum"].as_f64(), Some(10000.0));
+        }
+        assert_eq!(
+            schemas["CreateJobRequest"]["properties"]["actions"]["items"]["type"],
+            "string"
+        );
+        assert_eq!(
+            schemas["Scope"]["properties"]["options"]["$ref"],
+            "#/components/schemas/JobOptions"
+        );
+        assert_eq!(
+            doc["paths"]["/v1/admin/database-encryption/keys"]["get"]["responses"]["200"]
+                ["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/KeysResponse"
+        );
+        let keys = &schemas["KeysResponse"];
+        assert_eq!(keys["properties"]["write_key_id"]["type"], "string");
+        assert_eq!(keys["properties"]["read_key_ids"]["type"], "array");
+        assert_eq!(
+            keys["properties"]["read_key_ids"]["items"]["type"],
+            "string"
+        );
+        assert_eq!(keys["properties"]["fingerprints"]["type"], "object");
+        assert_eq!(
+            keys["properties"]["fingerprints"]["additionalProperties"]["type"],
+            "string"
+        );
+        assert_eq!(keys["properties"]["write_enabled"]["type"], "boolean");
+        for field in [
+            "write_key_id",
+            "read_key_ids",
+            "fingerprints",
+            "write_enabled",
+        ] {
+            assert!(keys["required"].as_array().unwrap().contains(&json!(field)));
+        }
+    }
+
+    #[test]
+    fn object_encryption_schema_keeps_permissions_and_job_shapes_distinct() {
+        let doc = serde_json::to_value(ApiDoc::openapi()).unwrap();
+        for (path, method) in [
+            ("keys", "get"),
+            ("scan", "post"),
+            ("jobs", "post"),
+            ("jobs/{id}", "get"),
+            ("jobs/{id}/cancel", "post"),
+            ("verify", "post"),
+        ] {
+            let operation = &doc["paths"][format!("/v1/admin/object-encryption/{path}")][method];
+            assert!(operation.is_object(), "missing {method} {path}");
+            assert!(operation["security"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| value.get("session_token").is_some()));
+            assert!(operation["security"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| value.get("admin_token").is_some()));
+        }
+        for schema in [
+            "ObjectCreateJobRequest",
+            "ObjectVerifyRequest",
+            "ObjectEncryptionOptions",
+        ] {
+            let delay = &doc["components"]["schemas"][schema]["properties"]["batch_delay_ms"];
+            assert_eq!(delay["minimum"].as_f64(), Some(0.0));
+            assert_eq!(delay["maximum"].as_f64(), Some(10000.0));
+        }
+        assert!(doc["components"]["schemas"]["JobResponse"].is_object());
+        assert!(doc["components"]["schemas"]["ObjectJobResponse"].is_object());
+        let scan_response = &doc["paths"]["/v1/admin/object-encryption/scan"]["post"]["responses"]
+            ["200"]["content"]["application/json"]["schema"];
+        assert_eq!(
+            scan_response["$ref"],
+            "#/components/schemas/ObjectScanResponse"
+        );
+        assert_eq!(
+            doc["components"]["schemas"]["ObjectScanResponse"]["properties"]["cursor"]["$ref"],
+            "#/components/schemas/SignedScanCursor"
+        );
+        let scan_cursor = &doc["components"]["schemas"]["SignedScanCursor"];
+        for field in ["version", "key_id", "state", "tag"] {
+            assert!(scan_cursor["properties"][field].is_object());
+        }
+    }
 
     #[test]
     fn permission_request_defaults_only_when_omitted() {

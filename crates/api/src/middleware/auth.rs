@@ -1,3 +1,4 @@
+use super::admin_audit::{AdminAudit, AdminCredentialKind};
 use axum::{
     extract::{MatchedPath, Request, State},
     http::StatusCode,
@@ -293,6 +294,44 @@ pub async fn optional_auth_middleware_with_workspace_context(
     auth_middleware_with_workspace_context(State(state), request, next).await
 }
 
+/// Authentication for the public model catalog (`GET /v1/models`), which
+/// answers an organization that set `allowed_models` with those models only.
+///
+/// It never rejects a request. A request goes on with an `AuthenticatedApiKey`
+/// extension only when it carries a valid API key of an organization with a
+/// filter. Anything else is served the public catalog as before: no header, a
+/// session token, a key that does not authenticate, or a key of an
+/// organization without a filter.
+///
+/// A key that fails to authenticate falls back to the public catalog, so a
+/// lookup error can show a filtered organization the public list. That is a
+/// listing only: every route that serves a model checks the filter itself.
+pub async fn filtered_catalog_middleware(
+    State(state): State<AuthState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    // Either header form: Anthropic SDK clients send the key as `x-api-key`.
+    let token = anthropic_auth_token(request.headers())
+        .ok()
+        .filter(|token| token.starts_with("sk-"))
+        .map(str::to_owned);
+    let Some(token) = token else {
+        return next.run(request).await;
+    };
+    // Authenticating the key counts as using it, like any other call with it:
+    // a key-cache miss updates `last_used_at`.
+    match authenticate_api_key_with_context(&state, &token).await {
+        Ok(api_key) if api_key.organization.allowed_models().is_some() => {
+            let caller_token = caller_key(Some(&token));
+            let mut request = request;
+            request.extensions_mut().insert(api_key);
+            with_caller_key(caller_token, next.run(request)).await
+        }
+        _ => next.run(request).await,
+    }
+}
+
 /// Native Anthropic auth accepts the SDK's `x-api-key` header as well as the
 /// Cloud API Bearer form, while keeping Cloud API as the credential authority.
 pub async fn anthropic_auth_middleware_with_workspace_context(
@@ -358,7 +397,7 @@ pub async fn auth_middleware(
     };
 
     match auth_result {
-        Ok(user) => {
+        Ok((user, _session_id)) => {
             // Clone request to add extension
             let mut request = request;
             request.extensions_mut().insert(AuthenticatedUser(user));
@@ -418,7 +457,7 @@ pub async fn auth_middleware_with_reporting_token(
 }
 
 /// Admin authentication middleware - verifies user is authenticated AND has admin access
-/// Supports both access tokens (with admin domain check) and admin access tokens
+/// Supports both access tokens (with admin email allowlist check) and admin access tokens
 pub async fn admin_middleware(
     State(state): State<AuthState>,
     request: Request,
@@ -440,6 +479,7 @@ pub async fn admin_middleware(
         authorization_present = auth_header.is_some(),
         "Admin auth middleware"
     );
+    let audit = AdminAudit::from_extensions(request.extensions());
 
     let auth_result = if let Some(auth_value) = auth_header {
         debug!("Found Authorization header");
@@ -449,12 +489,17 @@ pub async fn admin_middleware(
             // Check if this looks like an admin access token (starts with "adm_")
             // Admin access tokens should ONLY be validated as admin tokens, no fallback
             if token.starts_with("adm_") {
+                audit.record_credential(AdminCredentialKind::AdminAccessToken, None);
                 match authenticate_admin_access_token(&state, token, user_agent.as_deref()).await {
                     Ok(admin_token) => {
                         debug!(
                             admin_access_token_id = %admin_token.id,
                             authenticated = true,
                             "Authenticated via admin access token"
+                        );
+                        audit.record_credential(
+                            AdminCredentialKind::AdminAccessToken,
+                            Some(admin_token.id),
                         );
 
                         // Query the actual admin user from database
@@ -496,9 +541,13 @@ pub async fn admin_middleware(
             } else {
                 // Not an admin access token, try as session token
                 debug!("Token does not appear to be an admin access token, trying session token");
+                audit.record_credential(AdminCredentialKind::Session, None);
                 authenticate_session_access(&state, token.to_string())
                     .await
-                    .map(|user| (user, AdminAuthContext::Session))
+                    .map(|(user, session_id)| {
+                        audit.record_credential(AdminCredentialKind::Session, session_id);
+                        (user, AdminAuthContext::Session)
+                    })
             }
         } else {
             debug!("Authorization header uses unsupported scheme");
@@ -522,11 +571,13 @@ pub async fn admin_middleware(
 
     match auth_result {
         Ok((user, context)) => {
-            // Check if user has admin access based on email domain
+            audit.record_authenticated(user.id);
+            // Check if user has admin access against the email allowlist
             let is_admin = check_admin_access(&state, &user);
 
             if !is_admin {
                 tracing::warn!("User attempted admin action without admin privileges");
+                audit.record_denied();
                 return Err((
                     StatusCode::FORBIDDEN,
                     axum::Json(crate::models::ErrorResponse::new(
@@ -536,9 +587,10 @@ pub async fn admin_middleware(
                 ));
             }
 
-            authorize_admin_operation(context, &request)?;
+            authorize_admin_operation(context, &request).inspect_err(|_| audit.record_denied())?;
 
             debug!(admin_user_id = %user.id, authenticated = true, "Admin access granted");
+            audit.record_allowed();
 
             // Add both AuthenticatedUser and AdminUser extensions
             let mut request = request;
@@ -549,25 +601,34 @@ pub async fn admin_middleware(
             request.extensions_mut().insert(context);
             Ok(next.run(request).await)
         }
-        Err(status) => Err(status),
+        Err(status) => {
+            audit.record_denied();
+            Err(status)
+        }
     }
 }
 
-/// Check if a user has admin access based on their email domain
+/// Auth provider recorded for users created by the retired VPC login route.
+/// Such users remain in the database and must never be treated as admins.
+pub const VPC_AUTH_PROVIDER: &str = "vpc";
+pub const VPC_PROVIDER_USER_ID_PREFIX: &str = "vpc:";
+
+/// Check if a user has admin access against the explicit email allowlist
 fn check_admin_access(state: &AuthState, user: &DbUser) -> bool {
-    if state.admin_domains.is_empty() {
+    is_admin_user(&state.admin_emails, user)
+}
+
+fn is_admin_user(admin_emails: &[String], user: &DbUser) -> bool {
+    if user.auth_provider == VPC_AUTH_PROVIDER
+        || user
+            .provider_user_id
+            .starts_with(VPC_PROVIDER_USER_ID_PREFIX)
+    {
+        tracing::warn!(user_id = %user.id, "VPC-provisioned user attempted admin action");
         return false;
     }
 
-    // Extract domain from email (everything after @)
-    if let Some(domain) = user.email.split('@').nth(1) {
-        state
-            .admin_domains
-            .iter()
-            .any(|admin_domain| domain.eq_ignore_ascii_case(admin_domain))
-    } else {
-        false
-    }
+    config::email_matches_admin_allowlist(admin_emails, &user.email)
 }
 
 /// Authenticate admin access token
@@ -617,10 +678,11 @@ async fn authenticate_admin_access_token(
     }
 }
 
+/// The authenticated user and the session (`sid` claim) the token is bound to.
 async fn authenticate_session_access(
     state: &AuthState,
     token: String, // jwt
-) -> Result<DbUser, (StatusCode, axum::Json<crate::models::ErrorResponse>)> {
+) -> Result<(DbUser, Option<uuid::Uuid>), (StatusCode, axum::Json<crate::models::ErrorResponse>)> {
     if token.starts_with(REPORTING_TOKEN_PREFIX) {
         debug!("Reporting token rejected by session middleware");
         return Err((
@@ -642,9 +704,12 @@ async fn authenticate_session_access(
             .validate_session_access(token, state.encoding_key.clone())
             .await
         {
-            Ok(user) => {
-                debug!(user_id = %user.id.0, authenticated = true, "Authenticated user via session");
-                return Ok(convert_user_to_db_user(user));
+            Ok(session) => {
+                debug!(user_id = %session.user.id.0, authenticated = true, "Authenticated user via session");
+                return Ok((
+                    convert_user_to_db_user(session.user),
+                    session.session_id.map(|session_id| session_id.0),
+                ));
             }
             Err(AuthError::SessionNotFound) | Err(AuthError::UserNotFound) => {
                 debug!("Session not found in auth service, trying OAuth manager");
@@ -940,7 +1005,7 @@ pub struct AuthState {
     pub reporting_token_service:
         Arc<dyn services::reporting_tokens::OrganizationReportingTokenService>,
     pub admin_access_token_repository: Arc<database::repositories::AdminAccessTokenRepository>,
-    pub admin_domains: Vec<String>,
+    pub admin_emails: Vec<String>,
     pub encoding_key: String,
 }
 
@@ -953,7 +1018,7 @@ impl AuthState {
             dyn services::reporting_tokens::OrganizationReportingTokenService,
         >,
         admin_access_token_repository: Arc<database::repositories::AdminAccessTokenRepository>,
-        admin_domains: Vec<String>,
+        admin_emails: Vec<String>,
         encoding_key: String,
     ) -> Self {
         Self {
@@ -962,7 +1027,7 @@ impl AuthState {
             workspace_repository,
             reporting_token_service,
             admin_access_token_repository,
-            admin_domains,
+            admin_emails,
             encoding_key,
         }
     }
@@ -993,6 +1058,74 @@ fn convert_user_to_db_user(user: services::auth::User) -> DbUser {
 mod tests {
     use super::*;
     use axum::http::{HeaderMap, HeaderValue};
+
+    fn admin_test_user(auth_provider: &str, email: &str) -> DbUser {
+        DbUser {
+            id: uuid::Uuid::nil(),
+            email: email.to_string(),
+            username: "admin-probe".to_string(),
+            display_name: None,
+            avatar_url: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            last_login_at: None,
+            is_active: true,
+            auth_provider: auth_provider.to_string(),
+            provider_user_id: "probe".to_string(),
+            tokens_revoked_at: None,
+            contact_email: None,
+            contact_email_verified_at: None,
+            email_opt_in_at: None,
+        }
+    }
+
+    #[test]
+    fn vpc_and_malformed_email_never_grant_admin_access() {
+        let admin_emails = vec!["admin@near.ai".to_string()];
+
+        assert!(is_admin_user(
+            &admin_emails,
+            &admin_test_user("google", "admin@near.ai")
+        ));
+        assert!(!is_admin_user(
+            &admin_emails,
+            &admin_test_user("vpc", "admin@near.ai")
+        ));
+
+        let mut google_vpc_user = admin_test_user("google", "admin@near.ai");
+        google_vpc_user.provider_user_id = "vpc:legacy".to_string();
+
+        assert!(!is_admin_user(&admin_emails, &google_vpc_user));
+
+        for email in [
+            "x@near.ai@vpc.internal.near.ai",
+            "x@evil.com@near.ai",
+            "x@near.ai.",
+        ] {
+            assert!(
+                !is_admin_user(&admin_emails, &admin_test_user("google", email)),
+                "{email:?} must not be admin"
+            );
+        }
+        assert!(!is_admin_user(
+            &[],
+            &admin_test_user("google", "admin@near.ai")
+        ));
+    }
+
+    #[test]
+    fn admin_access_requires_the_stored_account_email() {
+        let admin_emails = vec!["admin@near.ai".to_string()];
+        let mut user = admin_test_user("google", "other@near.ai");
+        user.contact_email = Some("admin@near.ai".to_string());
+        user.contact_email_verified_at = Some(chrono::Utc::now());
+
+        assert!(!is_admin_user(&admin_emails, &user));
+
+        user.email = "ADMIN@NEAR.AI".to_string();
+
+        assert!(is_admin_user(&admin_emails, &user));
+    }
 
     #[test]
     fn missing_route_metadata_never_grants_read_permission() {

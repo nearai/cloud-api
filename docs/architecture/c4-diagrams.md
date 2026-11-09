@@ -503,8 +503,9 @@ null `store` to `false`, reject `store: true`, and keep no conversation linkage 
 response/item history. Custom tools run in the client. Native replay forwards
 complete `web_search_call` items and `include` unchanged, preserving the
 upstream provider's source/citation fields. Native hosted tools are limited to
-`web_search`; file search, code interpreter, computer use, remote MCP tools, and
-image-generation/editing models are unsupported by both paths.
+`web_search`; file search, code interpreter, computer use, and
+image-generation/editing models are unsupported by both paths. MCP tools are no
+longer supported and return 400 on both paths.
 The diagram below describes the typed adapter for non-OpenAI models.
 
 ```mermaid

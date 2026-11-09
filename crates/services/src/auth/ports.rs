@@ -92,6 +92,25 @@ pub struct User {
     pub email_opt_in_at: Option<DateTime<Utc>>,
 }
 
+/// A session access token that passed validation.
+#[derive(Clone)]
+pub struct ValidatedSessionAccess {
+    pub user: User,
+    /// The `sid` claim: the refresh-token session the token is bound to.
+    /// `None` for legacy tokens issued before session binding.
+    pub session_id: Option<SessionId>,
+}
+
+impl std::fmt::Debug for ValidatedSessionAccess {
+    // Manual: `User`'s derived `Debug` prints its email and names; print ids only.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ValidatedSessionAccess")
+            .field("user_id", &self.user.id)
+            .field("session_id", &self.session_id)
+            .finish_non_exhaustive()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum UserRole {
@@ -332,7 +351,7 @@ pub trait AuthServiceTrait: Send + Sync {
         &self,
         access_token: String,
         encoding_key: String,
-    ) -> Result<User, AuthError>;
+    ) -> Result<ValidatedSessionAccess, AuthError>;
 
     /// Validate a session token and return the session
     async fn validate_session_refresh_token(
@@ -584,20 +603,26 @@ impl AuthServiceTrait for MockAuthService {
         &self,
         access_token: String,
         encoding_key: String,
-    ) -> Result<User, AuthError> {
+    ) -> Result<ValidatedSessionAccess, AuthError> {
         // First try to decode as JWT
         match self.validate_session_access_token(access_token.clone(), encoding_key) {
             Ok(Some(claims)) => {
                 let user = Self::create_mock_user_with_id(claims.sub);
                 tracing::debug!(user_id = %user.id.0, "MockAuthService returning mock user");
-                Ok(user)
+                Ok(ValidatedSessionAccess {
+                    user,
+                    session_id: claims.sid,
+                })
             }
             Ok(None) => {
                 // JWT decoding failed - try to extract user ID from rt_ token format
                 let user_id = Self::extract_user_id_from_token(&access_token);
                 let user = Self::create_mock_user_with_id(user_id);
                 tracing::debug!(user_id = %user.id.0, "MockAuthService returning mock user");
-                Ok(user)
+                Ok(ValidatedSessionAccess {
+                    user,
+                    session_id: None,
+                })
             }
             Err(_) => Err(AuthError::SessionNotFound),
         }

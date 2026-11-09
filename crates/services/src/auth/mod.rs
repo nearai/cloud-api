@@ -128,7 +128,7 @@ impl AuthServiceTrait for AuthService {
         &self,
         access_token: String,
         encoding_key: String,
-    ) -> Result<User, AuthError> {
+    ) -> Result<ValidatedSessionAccess, AuthError> {
         let claims = self
             .validate_session_access_token(access_token, encoding_key)?
             .ok_or(AuthError::SessionNotFound)?;
@@ -162,11 +162,11 @@ impl AuthServiceTrait for AuthService {
         // immediately. This is a single primary-key lookup per request; it is
         // deliberately uncached because any cache TTL would re-open the exact
         // revocation window this check closes.
-        match claims.sid {
+        match &claims.sid {
             Some(session_id) => {
                 let session = self
                     .session_repository
-                    .get_by_id(session_id)
+                    .get_by_id(session_id.clone())
                     .await
                     .map_err(|e| AuthError::InternalError(format!("Failed to get session: {e}")))?
                     .ok_or(AuthError::SessionNotFound)?;
@@ -188,7 +188,10 @@ impl AuthServiceTrait for AuthService {
             }
         }
 
-        Ok(user)
+        Ok(ValidatedSessionAccess {
+            user,
+            session_id: claims.sid,
+        })
     }
 
     async fn validate_session_refresh_token(
@@ -1753,12 +1756,44 @@ mod tests {
             .unwrap();
         assert_eq!(claims.sid.as_ref().map(|s| s.0), Some(session.id.0));
 
-        // And it validates while the session is live.
+        // And it validates while the session is live, reporting that session.
         let validated = service
             .validate_session_access(access_token, TEST_ENCODING_KEY.to_string())
             .await
             .unwrap();
-        assert_eq!(validated.id, user.id);
+        assert_eq!(validated.user.id, user.id);
+        assert_eq!(validated.session_id.map(|s| s.0), Some(session.id.0));
+    }
+
+    #[test]
+    fn validated_session_access_debug_prints_ids_but_no_profile_fields() {
+        let mut user = make_user("debug-email@example.com", "google");
+        user.username = "debug-username".to_string();
+        user.display_name = Some("Debug Display Name".to_string());
+        user.avatar_url = Some("https://avatars.example.com/debug-avatar".to_string());
+        user.contact_email = Some("debug-contact@example.net".to_string());
+        let session_id = Uuid::new_v4();
+        let access = ValidatedSessionAccess {
+            user: user.clone(),
+            session_id: Some(SessionId(session_id)),
+        };
+
+        let debug = format!("{access:?}");
+
+        assert!(debug.contains(&user.id.0.to_string()), "{debug}");
+        assert!(debug.contains(&session_id.to_string()), "{debug}");
+        for profile_value in [
+            "debug-email",
+            "debug-username",
+            "Debug Display Name",
+            "debug-avatar",
+            "debug-contact",
+        ] {
+            assert!(
+                !debug.contains(profile_value),
+                "Debug output contains {profile_value}: {debug}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1878,10 +1913,12 @@ mod tests {
         let legacy_token = service
             .create_session_access_token(user.id.clone(), None, TEST_ENCODING_KEY.to_string(), 1)
             .unwrap();
-        assert!(service
+        let validated = service
             .validate_session_access(legacy_token.clone(), TEST_ENCODING_KEY.to_string())
             .await
-            .is_ok());
+            .unwrap();
+        assert_eq!(validated.user.id, user.id);
+        assert!(validated.session_id.is_none());
 
         // Flag on: tokens that cannot be tied to a live session are rejected.
         let strict_service = build_auth_service_with_sessions(

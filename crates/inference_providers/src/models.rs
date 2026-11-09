@@ -1264,7 +1264,7 @@ pub struct ImageEditParams {
     /// Text prompt describing the edits to make
     pub prompt: String,
     /// Image bytes to edit (raw PNG/JPEG data)
-    /// Wrapped in Arc to avoid cloning large data (up to 512MB) during retry attempts.
+    /// Wrapped in Arc to avoid cloning large data (up to 50 MiB) during retry attempts.
     /// Cloning ImageEditParams is now cheap (clones only the Arc pointer, not the data).
     pub image: Arc<Vec<u8>>,
     /// Size of the generated images in WxH format (e.g., "1024x1024", "512x512")

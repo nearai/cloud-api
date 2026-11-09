@@ -68,6 +68,17 @@ struct EventLogData {
 
 /// dstack runtime event type constant (0x08000001).
 const DSTACK_RUNTIME_EVENT_TYPE: u32 = 0x08000001;
+/// Runtime event dstack emits once the OS finished booting, before any workload runs.
+const DSTACK_SYSTEM_READY_EVENT: &str = "system-ready";
+
+/// An RTMR3 event whose name and payload are cryptographically bound by the
+/// replay (a runtime event whose digest was recomputed from them). Only
+/// `verify_rtmr3_and_extract`'s replay constructs these, so anything that
+/// consumes `BoundEvent`s cannot read unbound (relabellable) log fields.
+struct BoundEvent {
+    name: String,
+    payload_hex: String,
+}
 
 /// An entry from the TDX event log.
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -240,18 +251,7 @@ impl AttestationVerifier {
         //    allowlist. For NEAR an empty allowlist skips the check (historical
         //    behavior); for an attested third party the empty case was already
         //    rejected by `assert_enforceable()` above, so the check is enforced.
-        if let Some(ref hash) = event_log_data.os_image_hash {
-            if self.policy.enforces_image_hash() && !self.policy.allows_image_hash(hash) {
-                return Err(AttestationVerificationError::ImageHashMismatch(format!(
-                    "os_image_hash '{}' from RTMR3-verified event log not in allowed list",
-                    hash
-                )));
-            }
-        } else if self.policy.enforces_image_hash() {
-            return Err(AttestationVerificationError::ImageHashMismatch(
-                "ALLOWED_IMAGE_HASHES configured but no os-image-hash in event log".to_string(),
-            ));
-        }
+        self.check_os_image_hash(event_log_data.os_image_hash.as_deref())?;
 
         // 5. Verify GPU evidence (best-effort — skip if not present)
         let gpu_verdict = self
@@ -378,6 +378,7 @@ impl AttestationVerifier {
         use sha2::Sha384;
         let mut rtmr3 = [0u8; 48];
         let mut rtmr3_event_count = 0u32;
+        let mut bound_events: Vec<BoundEvent> = Vec::new();
         for event in &events {
             if event.imr != 3 {
                 continue;
@@ -417,14 +418,19 @@ impl AttestationVerifier {
                         )));
                     }
                 }
+                bound_events.push(BoundEvent {
+                    name: event.event.clone(),
+                    payload_hex: event.event_payload.clone(),
+                });
                 computed.to_vec()
             } else {
-                // Non-runtime events: use stored digest directly
-                hex::decode(&event.digest).map_err(|e| {
-                    AttestationVerificationError::InvalidFormat(format!(
-                        "event digest hex decode: {e}"
-                    ))
-                })?
+                // A non-runtime digest is chained as-is and its name/payload
+                // are unbound, so it could be a demoted copy of a genuine
+                // runtime event. Prod logs contain only runtime events in
+                // RTMR3; reject anything else.
+                return Err(AttestationVerificationError::InvalidFormat(
+                    "non-runtime event in RTMR3".to_string(),
+                ));
             };
 
             // RTMR extension: RTMR = SHA-384(RTMR || digest)
@@ -451,41 +457,62 @@ impl AttestationVerifier {
             )));
         }
 
-        // Event log is verified — extract os-image-hash, compose-hash, and
-        // the replica report signing key. Iterated in log order; a later
-        // valid replica-report-key event overwrites an earlier one, but an
-        // invalid later event is ignored and does NOT clear a valid earlier
-        // one (last VALID event wins).
+        // Event log is verified. Every RTMR3 event is a runtime event, so
+        // name and payload are bound by the replay (`bound_events`).
+        //
+        // Boot window: bound events before the FIRST `system-ready`. dstack
+        // emits the boot measurements (os-image-hash, compose-hash) from the
+        // OS before any workload container starts. They are extracted only
+        // from that window, exactly once each: a duplicate inside it is an
+        // error, while same-named events after `system-ready` are ignored so
+        // a post-boot workload can neither inject nor suppress measurements.
+        // A missing measurement stays `None` (the image check then fails when
+        // an allowlist is enforced).
+        //
+        // The replica report key is emitted post-boot by inference-proxy, so
+        // it is taken only from events AFTER `system-ready` (last VALID event
+        // wins; an invalid later event does not clear an earlier valid one).
+        // This relies on only inference-proxy mounting dstack.sock; revisit
+        // if that changes.
+        //
+        // Note: the extracted os-image-hash only gates verification when
+        // ALLOWED_IMAGE_HASHES is set (see `check_os_image_hash`).
+        let ready_idx = bound_events
+            .iter()
+            .position(|e| e.name == DSTACK_SYSTEM_READY_EVENT)
+            .ok_or_else(|| {
+                AttestationVerificationError::InvalidFormat(
+                    "no system-ready event in RTMR3".to_string(),
+                )
+            })?;
         let mut os_image_hash = None;
         let mut compose_hash = None;
         let mut replica_report_key = None;
-        for event in &events {
-            if event.imr != 3 {
-                continue;
-            }
-            match event.event.as_str() {
+        for (idx, event) in bound_events.iter().enumerate() {
+            let post_boot = idx > ready_idx;
+            match event.name.as_str() {
+                "os-image-hash" | "compose-hash" if post_boot => {
+                    tracing::debug!(event = %event.name, "ignoring post-boot measurement event");
+                }
                 "os-image-hash" => {
-                    os_image_hash = Some(event.event_payload.clone());
+                    if os_image_hash.replace(event.payload_hex.clone()).is_some() {
+                        return Err(AttestationVerificationError::InvalidFormat(
+                            "duplicate os-image-hash runtime event in RTMR3".to_string(),
+                        ));
+                    }
                 }
                 "compose-hash" => {
-                    compose_hash = Some(event.event_payload.clone());
+                    if compose_hash.replace(event.payload_hex.clone()).is_some() {
+                        return Err(AttestationVerificationError::InvalidFormat(
+                            "duplicate compose-hash runtime event in RTMR3".to_string(),
+                        ));
+                    }
+                }
+                placement::consts::KEY_EVENT if !post_boot => {
+                    tracing::debug!("replica report key event before system-ready: ignored");
                 }
                 placement::consts::KEY_EVENT => {
-                    // Only a runtime event's name and payload are bound into
-                    // RTMR3 by the replay above (the digest-validation branch
-                    // keyed on `DSTACK_RUNTIME_EVENT_TYPE`); a non-runtime
-                    // event's stored digest is chained as-is, with no check
-                    // that it actually corresponds to this name/payload. So
-                    // without this gate, an attacker could keep a genuine
-                    // non-runtime event's digest, relabel it as `KEY_EVENT`,
-                    // and supply an arbitrary key that would still pass
-                    // replay and self-validate via `key_id == hash(pk)`.
-                    if event.event_type != DSTACK_RUNTIME_EVENT_TYPE {
-                        tracing::debug!("replica report key event: not a runtime event");
-                    } else if let Some(key) = parse_replica_report_key(&event.event_payload) {
-                        // Last valid event wins. Safe because only the inference-proxy
-                        // container mounts dstack.sock, so no other workload on the CVM
-                        // can emit a competing runtime event; revisit if that changes.
+                    if let Some(key) = parse_replica_report_key(&event.payload_hex) {
                         replica_report_key = Some(key);
                     }
                 }
@@ -498,6 +525,28 @@ impl AttestationVerifier {
             compose_hash,
             replica_report_key,
         })
+    }
+
+    /// Check the RTMR3-verified `os-image-hash` against the policy allowlist.
+    /// Only takes effect when an allowlist is configured (ALLOWED_IMAGE_HASHES
+    /// for NEAR); with an empty allowlist this check is skipped.
+    fn check_os_image_hash(
+        &self,
+        os_image_hash: Option<&str>,
+    ) -> Result<(), AttestationVerificationError> {
+        if let Some(hash) = os_image_hash {
+            if self.policy.enforces_image_hash() && !self.policy.allows_image_hash(hash) {
+                return Err(AttestationVerificationError::ImageHashMismatch(format!(
+                    "os_image_hash '{}' from RTMR3-verified event log not in allowed list",
+                    hash
+                )));
+            }
+        } else if self.policy.enforces_image_hash() {
+            return Err(AttestationVerificationError::ImageHashMismatch(
+                "ALLOWED_IMAGE_HASHES configured but no os-image-hash in event log".to_string(),
+            ));
+        }
+        Ok(())
     }
 
     /// Verify GPU evidence via NVIDIA NRAS.
@@ -1261,6 +1310,7 @@ mod tests {
         let events = vec![
             runtime_event("os-image-hash", &hex::encode(b"image-hash-value")),
             runtime_event("compose-hash", &hex::encode(b"compose-hash-value")),
+            ready(),
             // Digest set to the computed value, so the stored-digest-matches
             // check runs alongside the key event, not just the computed one.
             runtime_event_with_digest(placement::consts::KEY_EVENT, &hex_payload(&stale)),
@@ -1275,30 +1325,197 @@ mod tests {
         assert_eq!(result.replica_report_key, Some(current));
     }
 
-    #[test]
-    fn non_runtime_key_event_is_ignored() {
-        // Only a runtime event's name/payload are bound by the replay; a
-        // non-runtime event's stored digest is chained as-is. An attacker
-        // who keeps a genuine non-runtime event's digest but relabels its
-        // name/payload as a KEY_EVENT must NOT have that key accepted.
-        let vk = test_signing_key(7).verifying_key();
-        let key = replica_report_key_payload(&vk, "boot-1");
-        let payload_hex = hex_payload(&key);
-        // An arbitrary stored digest — as would appear for a genuine
-        // non-runtime event this attacker payload is riding along with.
-        let digest_hex = hex::encode(b"some-genuine-non-runtime-digest");
-        let events = vec![non_runtime_event(
-            placement::consts::KEY_EVENT,
-            &payload_hex,
-            &digest_hex,
-        )];
-        let rtmr3 = replay_rtmr3(&events);
-        let report = event_log_report(&events);
+    fn ready() -> EventLogEntry {
+        runtime_event("system-ready", "")
+    }
 
-        let result = verifier()
-            .verify_rtmr3_and_extract(&report, &rtmr3)
+    fn extract_err(events: &[EventLogEntry]) -> AttestationVerificationError {
+        verifier()
+            .verify_rtmr3_and_extract(&event_log_report(events), &replay_rtmr3(events))
+            .err()
+            .expect("expected rejection")
+    }
+
+    fn extract_ok(events: &[EventLogEntry]) -> EventLogData {
+        verifier()
+            .verify_rtmr3_and_extract(&event_log_report(events), &replay_rtmr3(events))
+            .unwrap()
+    }
+
+    fn hexb(b: &[u8]) -> String {
+        hex::encode(b)
+    }
+
+    #[test]
+    fn non_runtime_rtmr3_event_is_rejected() {
+        let events = vec![
+            runtime_event("os-image-hash", &hexb(b"image")),
+            non_runtime_event("anything", &hexb(b"x"), &hexb(b"digest")),
+            ready(),
+        ];
+        let err = extract_err(&events);
+        assert!(
+            matches!(&err, AttestationVerificationError::InvalidFormat(m)
+            if m.contains("non-runtime event in RTMR3")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn demoted_boot_event_plus_injected_event_is_rejected() {
+        // Genuine boot event demoted to non-runtime (digest kept) while a
+        // runtime event with an allowlisted value is appended.
+        let genuine = compute_runtime_digest(
+            DSTACK_RUNTIME_EVENT_TYPE,
+            "os-image-hash",
+            &hexb(b"real-image"),
+        );
+        let events = vec![
+            non_runtime_event("os-image-hash", &hexb(b"real-image"), &hex::encode(genuine)),
+            ready(),
+            runtime_event("os-image-hash", &hexb(b"allowlisted-image")),
+        ];
+        let err = extract_err(&events);
+        assert!(
+            matches!(&err, AttestationVerificationError::InvalidFormat(m)
+            if m.contains("non-runtime event in RTMR3")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn post_ready_measurement_events_are_ignored() {
+        let events = vec![
+            runtime_event("os-image-hash", &hexb(b"image-hash-value")),
+            runtime_event("compose-hash", &hexb(b"compose-hash-value")),
+            ready(),
+            runtime_event("os-image-hash", &hexb(b"attacker-image")),
+            runtime_event("compose-hash", &hexb(b"attacker-compose")),
+        ];
+        let r = extract_ok(&events);
+        assert_eq!(r.os_image_hash, Some(hexb(b"image-hash-value")));
+        assert_eq!(r.compose_hash, Some(hexb(b"compose-hash-value")));
+    }
+
+    #[test]
+    fn post_ready_measurement_without_boot_value_stays_none() {
+        // A post-boot workload cannot supply a missing boot measurement.
+        let r = extract_ok(&[ready(), runtime_event("os-image-hash", &hexb(b"x"))]);
+        assert_eq!(r.os_image_hash, None);
+    }
+
+    #[test]
+    fn duplicate_os_image_hash_in_boot_window_is_rejected() {
+        let err = extract_err(&[
+            runtime_event("os-image-hash", &hexb(b"a")),
+            runtime_event("os-image-hash", &hexb(b"b")),
+            ready(),
+        ]);
+        assert!(
+            matches!(&err, AttestationVerificationError::InvalidFormat(m)
+            if m.contains("duplicate os-image-hash")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn duplicate_compose_hash_in_boot_window_is_rejected() {
+        let err = extract_err(&[
+            runtime_event("compose-hash", &hexb(b"a")),
+            runtime_event("compose-hash", &hexb(b"b")),
+            ready(),
+        ]);
+        assert!(
+            matches!(&err, AttestationVerificationError::InvalidFormat(m)
+            if m.contains("duplicate compose-hash")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn identical_duplicate_boot_measurements_are_rejected() {
+        // Strict at-most-once: even byte-identical payloads are rejected.
+        for name in ["os-image-hash", "compose-hash"] {
+            let err = extract_err(&[
+                runtime_event(name, &hexb(b"same")),
+                runtime_event(name, &hexb(b"same")),
+                ready(),
+            ]);
+            assert!(
+                matches!(&err, AttestationVerificationError::InvalidFormat(m)
+                if m.contains(&format!("duplicate {name}"))),
+                "{name}: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn missing_system_ready_is_rejected() {
+        let err = extract_err(&[runtime_event("os-image-hash", &hexb(b"a"))]);
+        assert!(
+            matches!(&err, AttestationVerificationError::InvalidFormat(m)
+            if m.contains("no system-ready event in RTMR3")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn key_event_before_system_ready_is_ignored() {
+        let key = replica_report_key_payload(&test_signing_key(7).verifying_key(), "boot-1");
+        let r = extract_ok(&[
+            runtime_event(placement::consts::KEY_EVENT, &hex_payload(&key)),
+            ready(),
+        ]);
+        assert_eq!(r.replica_report_key, None);
+    }
+
+    #[test]
+    fn missing_boot_image_hash_fails_enforced_allowlist() {
+        let allowed = hexb(b"allowlisted-image-hash");
+        let v = AttestationVerifier::new(HashSet::from([allowed.clone()]), None, false);
+        // Only a post-boot (ignored) event carries the allowlisted value.
+        let events = vec![ready(), runtime_event("os-image-hash", &allowed)];
+        let data = v
+            .verify_rtmr3_and_extract(&event_log_report(&events), &replay_rtmr3(&events))
             .unwrap();
-        assert_eq!(result.replica_report_key, None);
+        let err = v
+            .check_os_image_hash(data.os_image_hash.as_deref())
+            .unwrap_err();
+        assert!(
+            matches!(&err, AttestationVerificationError::ImageHashMismatch(m)
+                if m.contains("no os-image-hash in event log")),
+            "unexpected error: {err:?}"
+        );
+
+        // A genuine boot-window event with the same payload passes.
+        let events = vec![runtime_event("os-image-hash", &allowed), ready()];
+        let data = v
+            .verify_rtmr3_and_extract(&event_log_report(&events), &replay_rtmr3(&events))
+            .unwrap();
+        v.check_os_image_hash(data.os_image_hash.as_deref())
+            .unwrap();
+    }
+
+    #[test]
+    fn realistic_prod_ordered_log_passes() {
+        let key = replica_report_key_payload(&test_signing_key(7).verifying_key(), "boot-1");
+        let events = vec![
+            runtime_event("system-preparing", ""),
+            runtime_event("app-id", &hexb(b"app")),
+            runtime_event("compose-hash", &hexb(b"compose-hash-value")),
+            runtime_event("instance-id", &hexb(b"inst")),
+            runtime_event("boot-mr-done", ""),
+            runtime_event("mr-kms", &hexb(b"kms")),
+            runtime_event("os-image-hash", &hexb(b"image-hash-value")),
+            runtime_event("key-provider", &hexb(b"kp")),
+            runtime_event("storage-fs", &hexb(b"zfs")),
+            ready(),
+            runtime_event_with_digest(placement::consts::KEY_EVENT, &hex_payload(&key)),
+        ];
+        let r = extract_ok(&events);
+        assert_eq!(r.os_image_hash, Some(hexb(b"image-hash-value")));
+        assert_eq!(r.compose_hash, Some(hexb(b"compose-hash-value")));
+        assert_eq!(r.replica_report_key, Some(key));
     }
 
     #[test]
@@ -1310,7 +1527,7 @@ mod tests {
         // At least one imr==3 event is required for replay to succeed.
         let os_event = runtime_event("os-image-hash", &hex::encode(b"image-hash-value"));
 
-        let events = vec![imr2_key_event, os_event];
+        let events = vec![imr2_key_event, os_event, ready()];
         let rtmr3 = replay_rtmr3(&events);
         let report = event_log_report(&events);
 
@@ -1329,6 +1546,7 @@ mod tests {
             runtime_event("os-image-hash", &hex::encode(b"image-hash-value")),
             runtime_event("compose-hash", &hex::encode(b"compose-hash-value")),
             runtime_event("some-unrecognized-future-event", &hex::encode(b"anything")),
+            ready(),
             runtime_event(placement::consts::KEY_EVENT, &hex_payload(&key)),
         ];
         let rtmr3 = replay_rtmr3(&events);
@@ -1357,6 +1575,7 @@ mod tests {
         blank_boot.boot_id.clear();
 
         let events = vec![
+            ready(),
             runtime_event(placement::consts::KEY_EVENT, &hex_payload(&valid)),
             // Later event: valid hex, but not valid JSON for ReplicaReportKey.
             runtime_event(placement::consts::KEY_EVENT, &hex::encode(b"not json")),
@@ -1409,10 +1628,10 @@ mod tests {
             },
         ];
 
-        let mut events = vec![runtime_event(
-            placement::consts::KEY_EVENT,
-            &hex_payload(&valid),
-        )];
+        let mut events = vec![
+            ready(),
+            runtime_event(placement::consts::KEY_EVENT, &hex_payload(&valid)),
+        ];
         for m in &malformed {
             assert_eq!(parse_replica_report_key(&hex_payload(m)), None);
             events.push(runtime_event(placement::consts::KEY_EVENT, &hex_payload(m)));

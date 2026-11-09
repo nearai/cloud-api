@@ -112,7 +112,7 @@ async fn setup_tiered_model(
         }))
         .unwrap(),
     );
-    let updated = admin_batch_upsert_models(server, batch, get_session_id()).await;
+    let updated = seed_models(server, batch, get_session_id()).await;
     assert_eq!(updated.len(), 1, "tiered model should upsert");
     model
 }

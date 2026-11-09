@@ -25,7 +25,7 @@ async fn create_model(server: &axum_test::TestServer, name: &str) {
         name.to_string(),
         serde_json::from_value(minimal_model_upsert()).unwrap(),
     );
-    let updated = admin_batch_upsert_models(server, batch, get_session_id()).await;
+    let updated = seed_models(server, batch, get_session_id()).await;
     assert_eq!(updated.len(), 1, "Model should be created");
 }
 

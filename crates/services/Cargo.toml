@@ -37,12 +37,8 @@ url = "2.5"
 urlencoding = "2.1"
 bytes = "1.11"
 tokio-stream = "0.1"
-# MCP protocol
-rmcp = { version = "1.5", features = [
-    "client",
-    "transport-streamable-http-client-reqwest",
-] }
 hex = "0.4"
+zeroize = "1.8.2"
 # NEAR wallet authentication (NEP-413)
 near-kit = { version = "0.18.3", default-features = false, features = ["rpc"] }
 dstack-sdk = "0.1.3"
@@ -62,7 +58,7 @@ aws-sdk-s3 = { version = "1.134", default-features = false, features = [
 ] }
 # Encryption for file storage
 aes-gcm = "0.10"
-# HMAC for VPC signature verification
+# HMAC for session token signing and affinity keys
 hmac = "0.13"
 # HKDF for deriving the placement affinity/pin secrets
 hkdf = "0.13"

@@ -95,6 +95,18 @@ fn ita_debug_format_redacts_api_key_material() {
 }
 
 #[test]
+fn ita_base_url_debug_redacts_userinfo() {
+    let url = ItaBaseUrl::parse(
+        "https://ops:sentinel-ita-password@api.example.test",
+        "ITA_API_BASE_URL",
+    )
+    .unwrap();
+    let debug = format!("{url:?}");
+    assert!(!debug.contains("sentinel-ita-password"));
+    assert_eq!(debug, r#"ItaBaseUrl("https://REDACTED@api.example.test/")"#);
+}
+
+#[test]
 #[serial]
 fn ita_empty_key_is_absent_and_error_does_not_print_secret_material() {
     // Given: ITA is enabled with an empty direct key and a separate secret-like value nearby.

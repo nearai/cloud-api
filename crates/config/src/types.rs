@@ -31,6 +31,67 @@ fn redact_opt(secret: &Option<String>) -> Option<&'static str> {
     secret.as_ref().map(|_| "<redacted>")
 }
 
+/// Debug stand-in for a value that cannot be shown safely as a URL.
+const REDACTED_URL: &str = "<redacted: not a valid URL>";
+
+/// Debug view of a configured URL: userinfo, query and fragment are replaced
+/// with `REDACTED` (`scheme://REDACTED@host/path?REDACTED`); scheme, host,
+/// port and path still print. A value with no `@`, `?` or `#` has none of
+/// those parts and prints unchanged. A value that has one of them but does not
+/// parse as a URL with a host is replaced entirely, never echoed. For a URL
+/// whose provider may put a key in the path, use [`redact_url_and_path`].
+pub(crate) fn redact_url(raw: &str) -> std::borrow::Cow<'_, str> {
+    redact_url_parts(raw, false)
+}
+
+/// [`redact_url`] that also replaces a non-root path with `/REDACTED`, for
+/// URLs whose providers commonly carry an API key in the path
+/// (`https://rpc.example/v2/<key>`). A value that does not parse is replaced
+/// entirely.
+fn redact_url_and_path(raw: &str) -> std::borrow::Cow<'_, str> {
+    redact_url_parts(raw, true)
+}
+
+fn redact_url_parts(raw: &str, hide_path: bool) -> std::borrow::Cow<'_, str> {
+    if !hide_path && !raw.contains(['@', '?', '#']) {
+        return raw.into();
+    }
+    let Ok(mut url) = url::Url::parse(raw) else {
+        return REDACTED_URL.into();
+    };
+    if url.cannot_be_a_base() {
+        return REDACTED_URL.into();
+    }
+    let mut changed = false;
+    if !url.username().is_empty() || url.password().is_some() {
+        if url.set_password(None).is_err() || url.set_username("REDACTED").is_err() {
+            return REDACTED_URL.into();
+        }
+        changed = true;
+    }
+    if url.query().is_some() {
+        url.set_query(Some("REDACTED"));
+        changed = true;
+    }
+    if url.fragment().is_some() {
+        url.set_fragment(Some("REDACTED"));
+        changed = true;
+    }
+    if hide_path && !matches!(url.path(), "" | "/") {
+        url.set_path("/REDACTED");
+        changed = true;
+    }
+    // An `@` left in the path can be malformed userinfo (an unescaped `/` in
+    // a username moves the rest of it into the path).
+    if url.path().contains('@') {
+        return REDACTED_URL.into();
+    }
+    if !changed {
+        return raw.into();
+    }
+    String::from(url).into()
+}
+
 /// Parse ordered `<key_id>=file:...|dstack:...|hex:...` entries.
 pub fn parse_key_source_specs(raw: &str) -> Result<Vec<KeySourceSpec>, String> {
     parse_key_source_specs_for(raw, "DB_ENCRYPTION_KEYS")
@@ -379,33 +440,39 @@ pub struct AmlConfig {
 
 impl std::fmt::Debug for AmlConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            enabled,
+            lukka_base_url,
+            lukka_bearer_token,
+            refresh_window_days,
+            memory_cache_ttl_seconds,
+            unknown_cache_ttl_seconds,
+            request_timeout_seconds,
+            blocked_risk_levels,
+            score_block_threshold,
+            high_risk_slack_webhook_url,
+            high_risk_slack_timeout_ms,
+            high_risk_slack_dedupe_seconds,
+        } = self;
         f.debug_struct("AmlConfig")
-            .field("enabled", &self.enabled)
-            .field("lukka_base_url", &self.lukka_base_url)
-            .field(
-                "lukka_bearer_token",
-                &self.lukka_bearer_token.as_ref().map(|_| "<redacted>"),
-            )
-            .field("refresh_window_days", &self.refresh_window_days)
-            .field("memory_cache_ttl_seconds", &self.memory_cache_ttl_seconds)
-            .field("unknown_cache_ttl_seconds", &self.unknown_cache_ttl_seconds)
-            .field("request_timeout_seconds", &self.request_timeout_seconds)
-            .field("blocked_risk_levels", &self.blocked_risk_levels)
-            .field("score_block_threshold", &self.score_block_threshold)
+            .field("enabled", enabled)
+            .field("lukka_base_url", &redact_url(lukka_base_url))
+            .field("lukka_bearer_token", &redact_opt(lukka_bearer_token))
+            .field("refresh_window_days", refresh_window_days)
+            .field("memory_cache_ttl_seconds", memory_cache_ttl_seconds)
+            .field("unknown_cache_ttl_seconds", unknown_cache_ttl_seconds)
+            .field("request_timeout_seconds", request_timeout_seconds)
+            .field("blocked_risk_levels", blocked_risk_levels)
+            .field("score_block_threshold", score_block_threshold)
+            // The whole webhook URL is the credential, so none of it prints.
             .field(
                 "high_risk_slack_webhook_url",
-                &self
-                    .high_risk_slack_webhook_url
-                    .as_ref()
-                    .map(|_| "<redacted>"),
+                &redact_opt(high_risk_slack_webhook_url),
             )
-            .field(
-                "high_risk_slack_timeout_ms",
-                &self.high_risk_slack_timeout_ms,
-            )
+            .field("high_risk_slack_timeout_ms", high_risk_slack_timeout_ms)
             .field(
                 "high_risk_slack_dedupe_seconds",
-                &self.high_risk_slack_dedupe_seconds,
+                high_risk_slack_dedupe_seconds,
             )
             .finish()
     }
@@ -750,16 +817,24 @@ pub struct InfraConfig {
 
 impl std::fmt::Debug for InfraConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            machines_url,
+            cost_per_host_usd_month,
+            prometheus_url,
+            prometheus_bearer_token,
+            prometheus_environment,
+            cost_per_gpu_hour_usd,
+        } = self;
         f.debug_struct("InfraConfig")
-            .field("machines_url", &self.machines_url)
-            .field("cost_per_host_usd_month", &self.cost_per_host_usd_month)
-            .field("prometheus_url", &self.prometheus_url)
+            .field("machines_url", &machines_url.as_deref().map(redact_url))
+            .field("cost_per_host_usd_month", cost_per_host_usd_month)
+            .field("prometheus_url", &prometheus_url.as_deref().map(redact_url))
             .field(
                 "prometheus_bearer_token",
-                &self.prometheus_bearer_token.as_ref().map(|_| "<redacted>"),
+                &redact_opt(prometheus_bearer_token),
             )
-            .field("prometheus_environment", &self.prometheus_environment)
-            .field("cost_per_gpu_hour_usd", &self.cost_per_gpu_hour_usd)
+            .field("prometheus_environment", prometheus_environment)
+            .field("cost_per_gpu_hour_usd", cost_per_gpu_hour_usd)
             .finish()
     }
 }
@@ -1248,9 +1323,18 @@ impl Default for LoggingConfig {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct DstackClientConfig {
     pub url: String,
+}
+
+impl std::fmt::Debug for DstackClientConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self { url } = self;
+        f.debug_struct("DstackClientConfig")
+            .field("url", &redact_url(url))
+            .finish()
+    }
 }
 
 impl DstackClientConfig {
@@ -1457,7 +1541,7 @@ impl std::fmt::Debug for GitHubOAuthConfig {
         f.debug_struct("GitHubOAuthConfig")
             .field("client_id", client_id)
             .field("client_secret", &"<redacted>")
-            .field("redirect_url", redirect_url)
+            .field("redirect_url", &redact_url(redirect_url))
             .finish()
     }
 }
@@ -1479,17 +1563,34 @@ impl std::fmt::Debug for GoogleOAuthConfig {
         f.debug_struct("GoogleOAuthConfig")
             .field("client_id", client_id)
             .field("client_secret", &"<redacted>")
-            .field("redirect_url", redirect_url)
+            .field("redirect_url", &redact_url(redirect_url))
             .finish()
     }
 }
 
 /// NEAR wallet authentication configuration
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct NearConfig {
     pub rpc_url: String,
     pub network_id: String,
     pub expected_recipient: String,
+}
+
+impl std::fmt::Debug for NearConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            rpc_url,
+            network_id,
+            expected_recipient,
+        } = self;
+        f.debug_struct("NearConfig")
+            // RPC providers often put the API key in the path, so the path
+            // is hidden as well.
+            .field("rpc_url", &redact_url_and_path(rpc_url))
+            .field("network_id", network_id)
+            .field("expected_recipient", expected_recipient)
+            .finish()
+    }
 }
 
 const NEAR_DEFAULT_NETWORK_ID: &str = "mainnet";
@@ -1536,7 +1637,7 @@ impl std::fmt::Debug for OAuthProviderConfig {
         f.debug_struct("OAuthProviderConfig")
             .field("client_id", client_id)
             .field("client_secret", &"<redacted>")
-            .field("redirect_uri", redirect_uri)
+            .field("redirect_uri", &redact_url(redirect_uri))
             .finish()
     }
 }
@@ -1591,12 +1692,13 @@ pub struct PlacementConfig {
 
 impl std::fmt::Debug for PlacementConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            redis_password,
+            redis_endpoint,
+        } = self;
         f.debug_struct("PlacementConfig")
-            .field(
-                "redis_password",
-                &self.redis_password.as_ref().map(|_| "<redacted>"),
-            )
-            .field("redis_endpoint", &self.redis_endpoint)
+            .field("redis_password", &redact_opt(redis_password))
+            .field("redis_endpoint", redis_endpoint)
             .finish()
     }
 }
@@ -1642,11 +1744,17 @@ pub struct PlacementRedisEndpoint {
 
 impl std::fmt::Debug for PlacementRedisEndpoint {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            host,
+            port,
+            tls,
+            ca_pem,
+        } = self;
         f.debug_struct("PlacementRedisEndpoint")
-            .field("host", &self.host)
-            .field("port", &self.port)
-            .field("tls", &self.tls)
-            .field("ca_pem", &self.ca_pem.as_ref().map(|_| "<set>"))
+            .field("host", host)
+            .field("port", port)
+            .field("tls", tls)
+            .field("ca_pem", &ca_pem.as_ref().map(|_| "<set>"))
             .finish()
     }
 }
@@ -1760,7 +1868,10 @@ impl std::fmt::Debug for InvitationEmailConfig {
             .field("from_email", from_email)
             .field("reply_to", reply_to)
             .field("resend_api_key", &redact_opt(resend_api_key))
-            .field("frontend_base_url", frontend_base_url)
+            .field(
+                "frontend_base_url",
+                &frontend_base_url.as_deref().map(redact_url),
+            )
             .finish()
     }
 }
@@ -2661,6 +2772,7 @@ mod tests {
 
     #[test]
     fn api_config_debug_redacts_all_secrets() {
+        let hex_key = "c0ffee00".repeat(8);
         let config = ApiConfig {
             server: ServerConfig {
                 host: "127.0.0.1".to_string(),
@@ -2679,7 +2791,10 @@ mod tests {
             auth: sample_auth_config(),
             database: sample_database_config(),
             database_encryption_key: "sentinel-database-encryption-key".to_string(),
-            database_encryption_keys: None,
+            database_encryption_keys: Some(vec![KeySourceSpec {
+                key_id: "db-key-1".to_string(),
+                source: KeySource::Hex(hex_key.clone()),
+            }]),
             database_encryption_key_id: "db-key-1".to_string(),
             database_encryption_write_enabled: false,
             s3: S3Config {
@@ -2687,7 +2802,10 @@ mod tests {
                 bucket: "bucket".to_string(),
                 region: "us-west-2".to_string(),
                 encryption_key: "sentinel-s3-encryption-key".to_string(),
-                encryption_keys: None,
+                encryption_keys: Some(vec![KeySourceSpec {
+                    key_id: "s3-key-1".to_string(),
+                    source: KeySource::Hex(hex_key.clone()),
+                }]),
                 object_rewrap_max_bytes: 1024,
                 object_encryption_write_enabled: false,
             },
@@ -2696,7 +2814,8 @@ mod tests {
                 ..InvitationEmailConfig::default()
             },
             otlp: OtlpConfig {
-                endpoint: "http://localhost:4317".to_string(),
+                endpoint: "http://collector:sentinel-otlp-password@otel.example.test:4317"
+                    .to_string(),
                 protocol: "grpc".to_string(),
                 instance_id: None,
             },
@@ -2746,12 +2865,207 @@ mod tests {
             "sentinel-prometheus-token",
             "sentinel-lukka-token",
             "sentinel-redis-password",
+            "sentinel-otlp-password",
+            &hex_key,
         ] {
             assert!(!debug.contains(secret), "Debug output leaked {secret}");
         }
         assert!(debug.contains("db-key-1"));
         assert!(debug.contains("cloud_user"));
         assert!(debug.contains("github-client-id"));
+        // Hex key sources keep their shape, with only the key material hidden.
+        assert!(debug.contains(
+            r#"database_encryption_keys: Some([KeySourceSpec { key_id: "db-key-1", source: Hex("<redacted>") }])"#
+        ));
+        assert!(debug.contains(
+            r#"encryption_keys: Some([KeySourceSpec { key_id: "s3-key-1", source: Hex("<redacted>") }])"#
+        ));
+        assert!(debug.contains(r#"endpoint: "http://REDACTED@otel.example.test:4317/""#));
+    }
+
+    #[test]
+    fn redact_url_hides_userinfo_query_and_fragment() {
+        for (raw, expected) in [
+            // Nothing to hide: printed unchanged, without normalization.
+            ("http://localhost:4317", "http://localhost:4317"),
+            ("https://rpc.example.test", "https://rpc.example.test"),
+            ("/var/run/dstack.sock", "/var/run/dstack.sock"),
+            (
+                "https://user:secret@db.example.test:5432/cloud",
+                "https://REDACTED@db.example.test:5432/cloud",
+            ),
+            (
+                "postgres://user:secret@db.example.test:5432/cloud?sslmode=require",
+                "postgres://REDACTED@db.example.test:5432/cloud?REDACTED",
+            ),
+            (
+                "https://secret@rpc.example.test",
+                "https://REDACTED@rpc.example.test/",
+            ),
+            (
+                "https://:secret@rpc.example.test/v1",
+                "https://REDACTED@rpc.example.test/v1",
+            ),
+            (
+                "https://rpc.example.test/?apiKey=secret",
+                "https://rpc.example.test/?REDACTED",
+            ),
+            (
+                "https://app.example.test/callback#token=secret",
+                "https://app.example.test/callback#REDACTED",
+            ),
+            (
+                "https://user:secret@api.example.test/v1?key=secret#secret",
+                "https://REDACTED@api.example.test/v1?REDACTED#REDACTED",
+            ),
+            // Not a URL with a host, or malformed userinfo: nothing is echoed.
+            ("user:secret@db.example.test", REDACTED_URL),
+            ("not a url?key=secret", REDACTED_URL),
+            ("https://user:sec?ret@api.example.test", REDACTED_URL),
+            ("https://us/er:secret@api.example.test", REDACTED_URL),
+        ] {
+            assert_eq!(redact_url(raw), expected, "input {raw}");
+        }
+    }
+
+    #[test]
+    fn redact_url_and_path_also_hides_the_path() {
+        for (raw, expected) in [
+            // No path and nothing else to hide: printed unchanged.
+            ("https://rpc.example.test", "https://rpc.example.test"),
+            ("https://rpc.example.test/", "https://rpc.example.test/"),
+            (
+                "https://rpc.example.test/v2/secret",
+                "https://rpc.example.test/REDACTED",
+            ),
+            (
+                "https://user:secret@rpc.example.test:8443/v2/secret?key=secret",
+                "https://REDACTED@rpc.example.test:8443/REDACTED?REDACTED",
+            ),
+            ("rpc.example.test/v2/secret", REDACTED_URL),
+        ] {
+            assert_eq!(redact_url_and_path(raw), expected, "input {raw}");
+        }
+
+        let near = NearConfig {
+            rpc_url: "https://rpc.example.test/v2/sentinel-rpc-key?apiKey=sentinel-rpc-query"
+                .to_string(),
+            ..NearConfig::default()
+        };
+        let debug = format!("{near:?}");
+        assert!(!debug.contains("sentinel-rpc-key") && !debug.contains("sentinel-rpc-query"));
+        assert!(debug.contains(r#"rpc_url: "https://rpc.example.test/REDACTED?REDACTED""#));
+        assert!(format!("{:?}", NearConfig::default())
+            .contains(&format!("rpc_url: \"{NEAR_DEFAULT_RPC_URL}\"")));
+    }
+
+    #[test]
+    fn url_fields_debug_redact_userinfo_and_query() {
+        const URL: &str =
+            "https://ops:sentinel-url-password@svc.example.test/v1?key=sentinel-url-query";
+        const SHOWN: &str = "https://REDACTED@svc.example.test/v1?REDACTED";
+        let check = |name: &str, debug: String| {
+            assert!(
+                !debug.contains("sentinel-url-password") && !debug.contains("sentinel-url-query"),
+                "{name} Debug output leaked a URL credential"
+            );
+            assert!(debug.contains(SHOWN), "{name} Debug output lost the URL");
+        };
+
+        check(
+            "AmlConfig",
+            format!(
+                "{:?}",
+                AmlConfig {
+                    lukka_base_url: URL.to_string(),
+                    ..AmlConfig::default()
+                }
+            ),
+        );
+        let infra = format!(
+            "{:?}",
+            InfraConfig {
+                machines_url: Some(URL.to_string()),
+                prometheus_url: Some(URL.to_string()),
+                ..InfraConfig::default()
+            }
+        );
+        assert!(infra.contains(&format!("machines_url: Some(\"{SHOWN}\")")));
+        assert!(infra.contains(&format!("prometheus_url: Some(\"{SHOWN}\")")));
+        check("InfraConfig", infra);
+        check(
+            "DstackClientConfig",
+            format!(
+                "{:?}",
+                DstackClientConfig {
+                    url: URL.to_string()
+                }
+            ),
+        );
+        check(
+            "GitHubOAuthConfig",
+            format!(
+                "{:?}",
+                GitHubOAuthConfig {
+                    client_id: "id".to_string(),
+                    client_secret: "secret".to_string(),
+                    redirect_url: URL.to_string(),
+                }
+            ),
+        );
+        check(
+            "GoogleOAuthConfig",
+            format!(
+                "{:?}",
+                GoogleOAuthConfig {
+                    client_id: "id".to_string(),
+                    client_secret: "secret".to_string(),
+                    redirect_url: URL.to_string(),
+                }
+            ),
+        );
+        check(
+            "OAuthProviderConfig",
+            format!(
+                "{:?}",
+                OAuthProviderConfig {
+                    client_id: "id".to_string(),
+                    client_secret: "secret".to_string(),
+                    redirect_uri: URL.to_string(),
+                }
+            ),
+        );
+        check(
+            "InvitationEmailConfig",
+            format!(
+                "{:?}",
+                InvitationEmailConfig {
+                    frontend_base_url: Some(URL.to_string()),
+                    ..InvitationEmailConfig::default()
+                }
+            ),
+        );
+        check(
+            "ExternalProvidersConfig",
+            format!(
+                "{:?}",
+                ExternalProvidersConfig {
+                    pccs_url: Some(URL.to_string()),
+                    ..ExternalProvidersConfig::default()
+                }
+            ),
+        );
+        check(
+            "OtlpConfig",
+            format!(
+                "{:?}",
+                OtlpConfig {
+                    endpoint: URL.to_string(),
+                    protocol: "grpc".to_string(),
+                    instance_id: None,
+                }
+            ),
+        );
     }
 
     #[test]
@@ -4032,7 +4346,7 @@ impl std::fmt::Debug for ExternalProvidersConfig {
             .field("tinfoil_api_key", &redact(tinfoil_api_key))
             .field("tinfoil_models", tinfoil_models)
             .field("chutes_enable_streaming", chutes_enable_streaming)
-            .field("pccs_url", pccs_url)
+            .field("pccs_url", &pccs_url.as_deref().map(redact_url))
             .finish()
     }
 }
@@ -4197,11 +4511,26 @@ impl ExternalProvidersConfig {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct OtlpConfig {
     pub endpoint: String,
     pub protocol: String,
     pub instance_id: Option<String>,
+}
+
+impl std::fmt::Debug for OtlpConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            endpoint,
+            protocol,
+            instance_id,
+        } = self;
+        f.debug_struct("OtlpConfig")
+            .field("endpoint", &redact_url(endpoint))
+            .field("protocol", protocol)
+            .field("instance_id", instance_id)
+            .finish()
+    }
 }
 
 impl OtlpConfig {

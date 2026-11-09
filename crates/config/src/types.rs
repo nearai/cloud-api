@@ -159,6 +159,7 @@ impl std::fmt::Debug for ApiConfig {
             staking_farm,
             aml,
             usage_reporting,
+            usage_estimate_incomplete_streams,
             credit_allocation,
             ita,
             placement,
@@ -189,6 +190,10 @@ impl std::fmt::Debug for ApiConfig {
             .field("staking_farm", staking_farm)
             .field("aml", aml)
             .field("usage_reporting", usage_reporting)
+            .field(
+                "usage_estimate_incomplete_streams",
+                usage_estimate_incomplete_streams,
+            )
             .field("credit_allocation", credit_allocation)
             .field("ita", ita)
             .field("placement", placement)
@@ -2749,6 +2754,7 @@ mod tests {
                 ..AmlConfig::default()
             },
             usage_reporting: UsageReportingConfig::default(),
+            usage_estimate_incomplete_streams: true,
             credit_allocation: CreditAllocationConfig::default(),
             ita: ItaAttestationConfig::default(),
             placement: PlacementConfig {

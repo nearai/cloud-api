@@ -19,8 +19,8 @@ prior `tool_calls`, and a fixed 1,024 tokens per non-text content part by
 default (`CONTEXT_ROUTE_MEDIA_PART_TOKENS` can override that fixed amount).
 The output estimate includes streamed text, reasoning text, and tool-call
 name and argument deltas. Text uses a UTF-8 bytes/4 heuristic, so CJK and
-emoji counts are approximate. Estimated cached tokens are zero, so the entire
-estimated input is charged at the full input rate.
+emoji counts are approximate. When no usage was reported, cached tokens are
+zero and the estimated input is charged at the full input rate.
 
 Estimated records debit credits and count toward spend limits in the same way
 as exact records. A client retry after a cut stream is a separate request

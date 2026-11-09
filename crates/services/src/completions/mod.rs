@@ -3205,6 +3205,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn completed_stream_with_partial_start_usage_records_incomplete() {
+        use crate::test_utils::CapturingUsageService;
+
+        let usage_service = Arc::new(CapturingUsageService::new());
+        let metrics_service = Arc::new(CapturingMetricsService::new());
+        let mut stream = terminal_test_stream(vec![
+            Ok(usage_test_chunk(
+                None,
+                None,
+                Some(TokenUsage::new(42, 0)),
+                None,
+            )),
+            Ok(usage_test_chunk(Some("hello world"), None, None, None)),
+        ]);
+        stream.usage_service = usage_service.clone();
+        stream.metrics_service = metrics_service.clone();
+        let _ = stream.collect::<Vec<_>>().await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let requests = usage_service.get_requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].input_tokens, 42);
+        assert_eq!(requests[0].output_tokens, 2);
+        assert_eq!(
+            requests[0].stop_reason,
+            Some(crate::usage::StopReason::Incomplete)
+        );
+        assert_eq!(
+            metrics_service
+                .get_metrics()
+                .iter()
+                .filter(|metric| metric.name == METRIC_ESTIMATED_STREAM_USAGE)
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn incomplete_stream_completed_without_usage_records_incomplete() {
         use crate::test_utils::CapturingUsageService;
 

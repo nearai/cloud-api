@@ -311,15 +311,40 @@ where
             chat_id,
             estimated_usage,
         ) = match (&self.last_usage_stats, &self.last_chat_id) {
-            (Some(usage), Some(chat_id)) => (
-                usage.prompt_tokens,
-                usage.completion_tokens,
-                usage.cached_tokens(),
-                usage.cache_creation_tokens(),
-                usage.cache_write_tokens(),
-                chat_id.clone(),
-                false,
-            ),
+            (Some(usage), Some(chat_id)) => {
+                // Some providers report prompt usage at stream start with zero
+                // completion tokens and send the completion total only in the
+                // final event. If output was streamed but the last usage seen
+                // still has zero completion tokens, keep the reported prompt and
+                // cache values and estimate the output from the streamed bytes.
+                let estimate_output = self.usage_estimate_incomplete_streams
+                    && self.last_error.is_none()
+                    && usage.completion_tokens == 0
+                    && self.streamed_output_bytes > 0;
+                let output_tokens = if estimate_output {
+                    let estimated =
+                        i32::try_from(estimate_tokens_from_bytes(self.streamed_output_bytes))
+                            .unwrap_or(i32::MAX);
+                    tracing::info!(
+                        input_tokens = usage.prompt_tokens,
+                        estimated_output_tokens = estimated,
+                        observed_chunks = self.observed_chunk_count,
+                        "Recording estimated output for stream with partial provider usage"
+                    );
+                    estimated
+                } else {
+                    usage.completion_tokens
+                };
+                (
+                    usage.prompt_tokens,
+                    output_tokens,
+                    usage.cached_tokens(),
+                    usage.cache_creation_tokens(),
+                    usage.cache_write_tokens(),
+                    chat_id.clone(),
+                    estimate_output,
+                )
+            }
             (None, None) => {
                 // Distinguish client disconnect / provider error from truly unexpected cases.
                 // Client disconnects and provider errors are expected — usage is only sent
@@ -366,12 +391,22 @@ where
                     i32::try_from(estimate_tokens_from_bytes(self.streamed_output_bytes))
                         .unwrap_or(i32::MAX)
                 };
-                tracing::info!(
-                    estimated_input_tokens = input_tokens,
-                    estimated_output_tokens = output_tokens,
-                    observed_chunks = self.observed_chunk_count,
-                    "Recording estimated usage for stream without provider usage"
-                );
+                if self.stream_completed {
+                    // A stream that finished normally should carry a usage
+                    // summary, so its absence points at the provider.
+                    tracing::warn!(%chat_id, %organization_id, %model_id, model = %self.model_name,
+                        estimated_input_tokens = input_tokens,
+                        estimated_output_tokens = output_tokens,
+                        observed_chunks = self.observed_chunk_count,
+                        "Stream completed without provider usage; recording estimated usage");
+                } else {
+                    tracing::info!(
+                        estimated_input_tokens = input_tokens,
+                        estimated_output_tokens = output_tokens,
+                        observed_chunks = self.observed_chunk_count,
+                        "Recording estimated usage for stream without provider usage"
+                    );
+                }
                 (input_tokens, output_tokens, 0, 0, 0, chat_id.clone(), true)
             }
             (Some(usage), None) => {
@@ -455,8 +490,6 @@ where
         let input_bucket = get_input_bucket(input_tokens);
         let mut metric_tags = self.metric_tags.clone();
         metric_tags.push(format!("{TAG_INPUT_BUCKET}:{input_bucket}"));
-        let estimated_metric_tag =
-            estimated_usage.then(|| format!("{TAG_MODEL}:{}", self.model_name));
 
         // Keep metrics on the blocking thread and run the database write independently
         // so the two-second wait cannot cancel an in-flight billing transaction.
@@ -555,12 +588,8 @@ where
                         metrics_service.record_latency(METRIC_LATENCY_TOTAL, e2e_duration, &tags);
                     }
 
-                    if let Some(model_tag) = estimated_metric_tag {
-                        metrics_service.record_count(
-                            METRIC_ESTIMATED_STREAM_USAGE,
-                            1,
-                            &[model_tag.as_str()],
-                        );
+                    if estimated_usage {
+                        metrics_service.record_count(METRIC_ESTIMATED_STREAM_USAGE, 1, &tags);
                     }
 
                     if let Some(first_token_instant) = first_token_time.filter(|_| !estimated_usage)
@@ -934,7 +963,7 @@ fn compute_prefix_hash(messages: &[inference_providers::ChatMessage]) -> u64 {
 }
 
 fn estimate_tokens_from_bytes(bytes: usize) -> u32 {
-    (bytes / 4).max(1) as u32
+    u32::try_from(bytes / 4).unwrap_or(u32::MAX).max(1)
 }
 
 fn estimate_text_input_tokens(params: &inference_providers::ChatCompletionParams) -> u32 {
@@ -2922,7 +2951,14 @@ mod tests {
             .filter(|metric| metric.name == METRIC_ESTIMATED_STREAM_USAGE)
             .collect();
         assert_eq!(estimate_metrics.len(), 1);
-        assert_eq!(estimate_metrics[0].tags, vec!["model:test-model"]);
+        let estimate_tags = &estimate_metrics[0].tags;
+        assert!(estimate_tags.iter().any(|tag| tag == "model:test-model"));
+        assert!(estimate_tags
+            .iter()
+            .any(|tag| tag.starts_with("environment:")));
+        assert!(estimate_tags
+            .iter()
+            .any(|tag| tag.starts_with("input_bucket:")));
         assert!(!metrics
             .iter()
             .any(|metric| metric.name == METRIC_TOKENS_PER_SECOND));
@@ -3266,6 +3302,121 @@ mod tests {
         assert_eq!(estimate_tokens_from_bytes(0), 1);
         assert_eq!(estimate_tokens_from_bytes(4), 1);
         assert_eq!(estimate_tokens_from_bytes(9), 2);
+        #[cfg(target_pointer_width = "64")]
+        assert_eq!(
+            estimate_tokens_from_bytes((u32::MAX as usize + 1) * 4),
+            u32::MAX
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_with_partial_start_usage_estimates_output() {
+        use crate::test_utils::CapturingUsageService;
+
+        let usage_service = Arc::new(CapturingUsageService::new());
+        let metrics_service = Arc::new(CapturingMetricsService::new());
+        let mut stream = terminal_test_stream(vec![
+            Ok(usage_test_chunk(
+                None,
+                None,
+                Some(TokenUsage::new_with_cache(42, 0, 30)),
+                None,
+            )),
+            Ok(usage_test_chunk(Some("hello world"), None, None, None)),
+        ]);
+        stream.usage_service = usage_service.clone();
+        stream.metrics_service = metrics_service.clone();
+        assert!(stream.next().await.is_some());
+        assert!(stream.next().await.is_some());
+        drop(stream);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let requests = usage_service.get_requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].input_tokens, 42);
+        assert_eq!(requests[0].output_tokens, 2);
+        assert_eq!(requests[0].cache_read_tokens, 30);
+        assert_eq!(
+            requests[0].stop_reason,
+            Some(crate::usage::StopReason::ClientDisconnect)
+        );
+        assert!(requests[0].avg_itl_ms.is_none());
+        assert_eq!(
+            metrics_service
+                .get_metrics()
+                .iter()
+                .filter(|metric| metric.name == METRIC_ESTIMATED_STREAM_USAGE)
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_with_partial_start_usage_and_final_usage_records_exact_usage() {
+        use crate::test_utils::CapturingUsageService;
+
+        let usage_service = Arc::new(CapturingUsageService::new());
+        let metrics_service = Arc::new(CapturingMetricsService::new());
+        let mut stream = terminal_test_stream(vec![
+            Ok(usage_test_chunk(
+                None,
+                None,
+                Some(TokenUsage::new(42, 0)),
+                None,
+            )),
+            Ok(usage_test_chunk(Some("hello world"), None, None, None)),
+            Ok(usage_test_chunk(
+                None,
+                None,
+                Some(TokenUsage::new(42, 11)),
+                Some(FinishReason::Stop),
+            )),
+        ]);
+        stream.usage_service = usage_service.clone();
+        stream.metrics_service = metrics_service.clone();
+        let _ = stream.by_ref().collect::<Vec<_>>().await;
+        drop(stream);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let requests = usage_service.get_requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].input_tokens, 42);
+        assert_eq!(requests[0].output_tokens, 11);
+        assert_eq!(
+            requests[0].stop_reason,
+            Some(crate::usage::StopReason::Stop)
+        );
+        assert!(!metrics_service
+            .get_metrics()
+            .iter()
+            .any(|metric| metric.name == METRIC_ESTIMATED_STREAM_USAGE));
+    }
+
+    #[tokio::test]
+    async fn stream_with_partial_start_usage_kill_switch_keeps_provider_usage() {
+        use crate::test_utils::CapturingUsageService;
+
+        let usage_service = Arc::new(CapturingUsageService::new());
+        let mut stream = terminal_test_stream(vec![
+            Ok(usage_test_chunk(
+                None,
+                None,
+                Some(TokenUsage::new(42, 0)),
+                None,
+            )),
+            Ok(usage_test_chunk(Some("hello world"), None, None, None)),
+        ]);
+        stream.usage_service = usage_service.clone();
+        stream.usage_estimate_incomplete_streams = false;
+        assert!(stream.next().await.is_some());
+        assert!(stream.next().await.is_some());
+        drop(stream);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let requests = usage_service.get_requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].input_tokens, 42);
+        assert_eq!(requests[0].output_tokens, 0);
     }
 
     #[tokio::test]

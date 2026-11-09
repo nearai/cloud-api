@@ -986,8 +986,10 @@ fn estimate_text_input_tokens(params: &inference_providers::ChatCompletionParams
     estimate_tokens_from_bytes(chars)
 }
 
+/// Input-token estimate for a usage row. Prior-turn reasoning is not counted
+/// because some adapters drop it before the request is sent.
 fn estimate_input_tokens(params: &inference_providers::ChatCompletionParams) -> u32 {
-    let estimate = super::inference_provider_pool::estimate_input(params);
+    let estimate = super::inference_provider_pool::estimate_input_with(params, false);
     u32::try_from(
         estimate
             .countable_tokens
@@ -1352,6 +1354,36 @@ impl CompletionServiceImpl {
         ]
         .iter()
         .any(|key| extra.get(*key).and_then(|v| v.as_str()).is_some())
+    }
+
+    /// Whether `extra` carries a client encryption header. Mirrors the route's
+    /// `e2ee_requested`: `MODEL_PUB_KEY` alone only pins routing and does not
+    /// make the request or response encrypted.
+    fn extra_has_client_encryption(
+        extra: &std::collections::HashMap<String, serde_json::Value>,
+    ) -> bool {
+        use crate::common::encryption_headers as eh;
+        [
+            eh::SIGNING_ALGO,
+            eh::CLIENT_PUB_KEY,
+            eh::ENCRYPTION_VERSION,
+            eh::ENCRYPT_ALL_FIELDS,
+        ]
+        .iter()
+        .any(|key| extra.get(*key).and_then(|v| v.as_str()).is_some())
+    }
+
+    /// Whether a byte-based usage estimate may be recorded for this stream. It
+    /// is skipped only when the payload can be ciphertext: a client-encrypted
+    /// request served by NEAR AI's own fleet. Every other provider receives
+    /// plaintext whatever headers the client sent, so the headers alone never
+    /// turn estimates off.
+    fn usage_estimate_allowed(
+        client_encryption: bool,
+        attribution: &crate::usage::ProviderAttribution,
+    ) -> bool {
+        !(client_encryption
+            && attribution.served_provider_type == Some(crate::usage::ServedProviderType::Vllm))
     }
 
     /// Reject `n > 1` requests for models that don't support multiple completions
@@ -1829,7 +1861,7 @@ impl CompletionServiceImpl {
         inference_type: crate::usage::ports::InferenceType,
         service_start_time: Instant,
         provider_start_time: Instant,
-        estimated_input_tokens: u32,
+        estimated_input_tokens: Option<u32>,
         concurrent_counter: Option<Arc<AtomicU32>>,
         response_id: Option<ResponseId>,
         attestation_supported: bool,
@@ -1874,9 +1906,11 @@ impl CompletionServiceImpl {
             metric_tags,
             concurrent_counter,
             last_usage_stats: None,
-            estimated_input_tokens,
+            estimated_input_tokens: estimated_input_tokens.unwrap_or(0),
             streamed_output_bytes: 0,
-            usage_estimate_incomplete_streams: self.usage_estimate_incomplete_streams,
+            // No input estimate means no estimate of any kind for this stream.
+            usage_estimate_incomplete_streams: self.usage_estimate_incomplete_streams
+                && estimated_input_tokens.is_some(),
             last_chat_id: None,
             stream_completed: false,
             saw_upstream_done_marker: false,
@@ -2056,6 +2090,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
 
         // Compute routing hints from the request messages for adaptive load balancing.
         let estimated_input_tokens = estimate_input_tokens(&chat_params);
+        let client_encryption = Self::extra_has_client_encryption(&chat_params.extra);
         let routing_hints = super::inference_provider_pool::ChatRoutingHints {
             prefix_hash: Some(compute_prefix_hash(&chat_params.messages)),
             estimated_tokens: Some(estimate_text_input_tokens(&chat_params)),
@@ -2089,6 +2124,9 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         let llm_stream = attributed_stream.stream;
         let provider_attribution = attributed_stream.provider_attribution;
         let latency_reporter = attributed_stream.latency_reporter;
+        let estimated_input_tokens =
+            Self::usage_estimate_allowed(client_encryption, &provider_attribution)
+                .then_some(estimated_input_tokens);
 
         // Transfer counter ownership to InterceptStream (which decrements on drop)
         let counter = guard.disarm();
@@ -3321,6 +3359,92 @@ mod tests {
             estimate_text_input_tokens(&base)
         );
         assert!(estimate_input_tokens(&with_tools) > estimate_input_tokens(&base));
+    }
+
+    #[test]
+    fn client_encryption_markers_exclude_the_routing_pin() {
+        for key in [
+            crate::common::encryption_headers::SIGNING_ALGO,
+            crate::common::encryption_headers::CLIENT_PUB_KEY,
+            crate::common::encryption_headers::ENCRYPTION_VERSION,
+            crate::common::encryption_headers::ENCRYPT_ALL_FIELDS,
+        ] {
+            let mut extra = std::collections::HashMap::new();
+            extra.insert(key.to_string(), serde_json::json!("value"));
+            assert!(
+                CompletionServiceImpl::extra_has_client_encryption(&extra),
+                "{key} alone must count as client encryption"
+            );
+        }
+
+        let mut pin_only = std::collections::HashMap::new();
+        pin_only.insert(
+            crate::common::encryption_headers::MODEL_PUB_KEY.to_string(),
+            serde_json::json!("value"),
+        );
+        assert!(!CompletionServiceImpl::extra_has_client_encryption(
+            &pin_only
+        ));
+        assert!(!CompletionServiceImpl::extra_has_client_encryption(
+            &std::collections::HashMap::new()
+        ));
+    }
+
+    #[test]
+    fn usage_estimate_is_skipped_only_for_encrypted_requests_on_the_near_fleet() {
+        use crate::usage::{ProviderAttribution, ServedProviderType};
+
+        let served = |served_provider_type| ProviderAttribution {
+            served_provider_type,
+            ..Default::default()
+        };
+        assert!(!CompletionServiceImpl::usage_estimate_allowed(
+            true,
+            &served(Some(ServedProviderType::Vllm))
+        ));
+        for served_type in [
+            Some(ServedProviderType::Vllm),
+            Some(ServedProviderType::External),
+            Some(ServedProviderType::Chutes),
+            Some(ServedProviderType::Tinfoil),
+            None,
+        ] {
+            assert!(
+                CompletionServiceImpl::usage_estimate_allowed(false, &served(served_type)),
+                "plaintext requests are always estimated"
+            );
+        }
+        for served_type in [
+            Some(ServedProviderType::External),
+            Some(ServedProviderType::Chutes),
+            Some(ServedProviderType::Tinfoil),
+            None,
+        ] {
+            assert!(
+                CompletionServiceImpl::usage_estimate_allowed(true, &served(served_type)),
+                "encryption headers must not switch estimates off on other providers"
+            );
+        }
+    }
+
+    #[test]
+    fn estimate_input_tokens_ignores_prior_reasoning() {
+        let base: inference_providers::ChatCompletionParams =
+            serde_json::from_value(serde_json::json!({
+                "model": "m",
+                "messages": [
+                    {"role": "user", "content": "hello"},
+                    {"role": "assistant", "content": "hi"}
+                ]
+            }))
+            .unwrap();
+        let mut with_reasoning = base.clone();
+        with_reasoning.messages[1].reasoning_content = Some("x".repeat(4_000));
+
+        assert_eq!(
+            estimate_input_tokens(&with_reasoning),
+            estimate_input_tokens(&base)
+        );
     }
 
     #[tokio::test]

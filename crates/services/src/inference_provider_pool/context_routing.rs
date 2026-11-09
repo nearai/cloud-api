@@ -110,6 +110,17 @@ pub(crate) struct InputEstimate {
 /// serialized tool-calls/definitions as text, flat media cost, and
 /// per-message template overhead.
 pub(crate) fn estimate_input(params: &ChatCompletionParams) -> InputEstimate {
+    estimate_input_with(params, true)
+}
+
+/// As [`estimate_input`]; `include_prior_reasoning` selects whether prior-turn
+/// `reasoning_content` counts. Routing counts it (the engine renders it); a
+/// billing estimate leaves it out because some adapters drop it before the
+/// request is sent.
+pub(crate) fn estimate_input_with(
+    params: &ChatCompletionParams,
+    include_prior_reasoning: bool,
+) -> InputEstimate {
     let mut bytes: usize = 0;
     let mut media_parts: u64 = 0;
     for m in &params.messages {
@@ -129,8 +140,10 @@ pub(crate) fn estimate_input(params: &ChatCompletionParams) -> InputEstimate {
             bytes += serde_json::to_string(tool_calls).map_or(0, |s| s.len());
         }
         // Prior-turn reasoning is part of the prompt the engine renders.
-        if let Some(reasoning) = &m.reasoning_content {
-            bytes += reasoning.len();
+        if include_prior_reasoning {
+            if let Some(reasoning) = &m.reasoning_content {
+                bytes += reasoning.len();
+            }
         }
     }
     if let Some(tools) = &params.tools {

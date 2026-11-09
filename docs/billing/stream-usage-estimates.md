@@ -9,6 +9,11 @@ a completed stream records an estimate with stop reason `incomplete`. A
 provider or transport error (`last_error`) records no usage when no summary
 arrived.
 
+Some providers report prompt usage at stream start with zero completion
+tokens and send the completion total only in the final event. If output was
+streamed but the last usage seen still has zero completion tokens, the record
+keeps the reported prompt and cache tokens and uses the output estimate below.
+
 The input estimate includes message text, tool definitions, `tool_choice`,
 prior `tool_calls`, and a fixed 1,024 tokens per non-text content part by
 default (`CONTEXT_ROUTE_MEDIA_PART_TOKENS` can override that fixed amount).

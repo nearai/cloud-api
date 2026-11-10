@@ -1175,7 +1175,7 @@ async fn budget_admission_settles_once_without_resizing_estimate() {
         .unwrap();
     let amount: i64 = before.get(0);
     assert!(amount > 0 && amount < 200_000_000);
-    assert_eq!(before.get::<_, String>(1), "dispatched");
+    assert_eq!(before.get::<_, String>(1), "active");
     let org_id = uuid::Uuid::parse_str(&identity.org_id).unwrap();
     let spent: i64 = client
         .query_one(

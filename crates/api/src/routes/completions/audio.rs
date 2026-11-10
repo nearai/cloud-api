@@ -330,7 +330,7 @@ pub async fn audio_transcriptions(
                 );
             } else {
                 tracing::warn!(%organization_id, %workspace_id,
-                    "Audio transcription duration unavailable; actual usage needs reconciliation before admission expiry");
+                    "Audio transcription duration unavailable; actual usage unavailable; reservation remains until expiry");
             }
 
             if requested_response_format.as_deref() == Some("text") {

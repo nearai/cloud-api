@@ -359,7 +359,7 @@ pub trait UsageRepository: Send + Sync {
     async fn expire_budgets(&self) -> anyhow::Result<u64> {
         Ok(0)
     }
-    async fn reserve_and_dispatch(
+    async fn admit_budget(
         &self,
         _reservation: &super::budget::BudgetReservation,
     ) -> Result<(), UsageError> {
@@ -367,15 +367,8 @@ pub trait UsageRepository: Send + Sync {
             "monetary admission is unavailable".into(),
         ))
     }
-    async fn budget_snapshot(
-        &self,
-        _organization_id: Uuid,
-        _id: Uuid,
-    ) -> anyhow::Result<Option<super::budget::BudgetSnapshot>> {
-        Ok(None)
-    }
 
-    /// Record usage and update balance atomically
+    /// Record usage and update balance atomically.
     async fn record_usage(&self, request: RecordUsageDbRequest) -> anyhow::Result<UsageLogEntry>;
 
     /// Get current balance for an organization
@@ -942,7 +935,7 @@ pub struct RecordUsageDbRequest {
 
 /// Model pricing information
 /// All costs use fixed scale of 9 (nano-dollars) and USD currency
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct ModelPricing {
     pub id: Uuid,
     pub model_name: String, // Canonical model name

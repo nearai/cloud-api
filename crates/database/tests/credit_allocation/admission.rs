@@ -1,7 +1,7 @@
 //! Shared admission survives process replacement; usage settles once and expiry never bills an estimate.
 use super::*;
-use services::usage::budget::{BudgetReservation, UsageFeatures};
-use services::usage::{BillingIdentity, ModelPricing, RecordUsageDbRequest, UsageRepository};
+use services::usage::budget::BudgetReservation;
+use services::usage::{BillingIdentity, RecordUsageDbRequest, UsageRepository};
 
 fn quote(org: &OrgFixture, model: &ModelFixture) -> BudgetReservation {
     BudgetReservation {
@@ -13,34 +13,20 @@ fn quote(org: &OrgFixture, model: &ModelFixture) -> BudgetReservation {
             model_id: model.id,
         },
         amount: 10,
-        pricing: ModelPricing {
-            id: model.id,
-            model_name: model.name.clone(),
-            input_cost_per_token: 1,
-            output_cost_per_token: 1,
-            cost_per_image: 0,
-            cache_read_cost_per_token: None,
-            text_pricing: None,
-        },
-        estimate: UsageFeatures::from_json(
-            InferenceType::ChatCompletion,
-            &serde_json::json!({"max_tokens":1}),
-        )
-        .unwrap()
-        .estimate(&Default::default(), &model.name)
-        .unwrap(),
+        inference_type: InferenceType::ChatCompletion,
+        estimator_version: 1,
         organization_max_unsettled: 200,
         key_max_unsettled: 200,
         reservation_ttl_seconds: 7200,
     }
 }
-fn receipt(q: &BudgetReservation) -> RecordUsageDbRequest {
+fn receipt(q: &BudgetReservation, model: &ModelFixture) -> RecordUsageDbRequest {
     RecordUsageDbRequest {
         organization_id: q.identity.organization_id,
         workspace_id: q.identity.workspace_id,
         api_key_id: q.identity.api_key_id,
         model_id: q.identity.model_id,
-        model_name: q.pricing.model_name.clone(),
+        model_name: model.name.clone(),
         input_tokens: 20,
         output_tokens: 10,
         cache_read_tokens: 0,
@@ -78,11 +64,11 @@ async fn settlement_survives_response_erasure_and_lost_ack() -> anyhow::Result<(
     .await?;
     let q = quote(&org, &model);
     let original = OrganizationUsageRepository::new(pool.clone());
-    original.reserve_and_dispatch(&q).await?;
+    original.admit_budget(&q).await?;
     let response_id = Uuid::new_v4();
     let client = pool.get().await?;
     client.execute("INSERT INTO responses(id,workspace_id,api_key_id,model,status) VALUES($1,$2,$3,$4,'completed')", &[&response_id,&org.workspace_a_id,&org.api_key_a_id,&model.name]).await?;
-    let mut req = receipt(&q);
+    let mut req = receipt(&q, &model);
     req.response_id = Some(response_id.into());
     drop(original);
     client
@@ -125,7 +111,7 @@ async fn expiry_releases_unknown_work_without_billing_and_late_reports_still_set
     let repo = OrganizationUsageRepository::new(pool.clone());
     let mut q = quote(&org, &model);
     q.reservation_ttl_seconds = 1234;
-    repo.reserve_and_dispatch(&q).await?;
+    repo.admit_budget(&q).await?;
     let client = pool.get().await?;
     let ttl: f64 = client.query_one("SELECT EXTRACT(EPOCH FROM expires_at-created_at)::FLOAT8 FROM usage_budget_reservations WHERE id=$1", &[&q.id]).await?.get(0);
     assert!((ttl - 1234.0).abs() < 1.0);
@@ -138,7 +124,7 @@ async fn expiry_releases_unknown_work_without_billing_and_late_reports_still_set
             )
             .await?
             .get::<_, String>(0),
-        "dispatched"
+        "active"
     );
     client.execute("UPDATE usage_budget_reservations SET expires_at=clock_timestamp()-interval '1 second' WHERE id=$1", &[&q.id]).await?;
     drop(repo);
@@ -148,12 +134,12 @@ async fn expiry_releases_unknown_work_without_billing_and_late_reports_still_set
     assert_eq!(row.get::<_, String>(0), "released");
     assert_eq!((row.get::<_, i64>(1), row.get::<_, i64>(2)), (0, 0));
     assert!(
-        UsageRepository::record_usage(&restarted, receipt(&q))
+        UsageRepository::record_usage(&restarted, receipt(&q, &model))
             .await?
             .was_inserted
     );
     assert!(
-        !UsageRepository::record_usage(&restarted, receipt(&q))
+        !UsageRepository::record_usage(&restarted, receipt(&q, &model))
             .await?
             .was_inserted
     );

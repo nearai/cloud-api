@@ -18,7 +18,7 @@ impl services::usage::ports::UsageRepository for OrganizationUsageRepository {
             .await?
             .query(
                 "SELECT organization_id FROM usage_budget_reservations
-             WHERE state IN ('reserved','dispatched') AND expires_at <= clock_timestamp()
+             WHERE state = 'active' AND expires_at <= clock_timestamp()
              GROUP BY organization_id ORDER BY MIN(expires_at),organization_id LIMIT 100",
                 &[],
             )
@@ -38,7 +38,7 @@ impl services::usage::ports::UsageRepository for OrganizationUsageRepository {
         Ok(expired)
     }
 
-    async fn reserve_and_dispatch(
+    async fn admit_budget(
         &self,
         r: &services::usage::budget::BudgetReservation,
     ) -> Result<(), services::usage::UsageError> {
@@ -48,10 +48,8 @@ impl services::usage::ports::UsageRepository for OrganizationUsageRepository {
             let tx = client.transaction().await?;
             tx.batch_execute("SET LOCAL statement_timeout = '10s'; SET LOCAL lock_timeout = '5s'")
                 .await?;
-            let pricing = serde_json::to_value(&r.pricing)?;
-            let estimate = serde_json::to_value(&r.estimate)?;
             tx.query_one(
-                "SELECT id FROM reserve_usage_budget($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)",
+                "SELECT admit_usage_budget($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)",
                 &[
                     &r.id,
                     &r.identity.organization_id,
@@ -59,8 +57,8 @@ impl services::usage::ports::UsageRepository for OrganizationUsageRepository {
                     &r.identity.api_key_id,
                     &r.identity.model_id,
                     &r.amount,
-                    &pricing,
-                    &estimate,
+                    &r.inference_type.as_str(),
+                    &i64::from(r.estimator_version),
                     &self.allocation_policy.priority,
                     &self.allocation_policy.version,
                     &r.organization_max_unsettled,
@@ -69,14 +67,6 @@ impl services::usage::ports::UsageRepository for OrganizationUsageRepository {
                 ],
             )
             .await?;
-            let claimed: bool = tx
-                .query_one(
-                    "SELECT dispatch_usage_budget($1,$2)",
-                    &[&r.identity.organization_id, &r.id],
-                )
-                .await?
-                .get(0);
-            anyhow::ensure!(claimed, "reservation is already dispatched");
             tx.commit().await?;
             Ok(())
         }
@@ -101,22 +91,6 @@ impl services::usage::ports::UsageRepository for OrganizationUsageRepository {
                 _ => UsageError::InternalError(format!("Budget admission failed: {error}")),
             }
         })
-    }
-
-    async fn budget_snapshot(
-        &self,
-        organization_id: Uuid,
-        id: Uuid,
-    ) -> anyhow::Result<Option<services::usage::budget::BudgetSnapshot>> {
-        let client = self.pool.get().await?;
-        let row = client.query_opt("SELECT pricing, estimate FROM usage_budget_reservations WHERE organization_id = $1 AND id = $2", &[&organization_id, &id]).await?;
-        row.map(|row| {
-            Ok(services::usage::budget::BudgetSnapshot {
-                pricing: serde_json::from_value(row.get(0))?,
-                estimate: serde_json::from_value(row.get(1))?,
-            })
-        })
-        .transpose()
     }
 
     async fn record_usage(

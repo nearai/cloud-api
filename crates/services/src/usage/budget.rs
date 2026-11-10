@@ -1,19 +1,17 @@
 //! Monetary admission metadata, containing counts and prices only.
 use super::{BillingIdentity, InferenceType, ModelPricing, UsageError};
-use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 mod estimate;
 pub use estimate::UsageFeatures;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct UsageEstimate {
     pub features: UsageFeatures,
     pub input_units: i32,
     pub output_tokens: i32,
     pub images: i32,
     pub policy: config::admission::EstimatePolicy,
-    pub config_version: u32,
 }
 
 impl UsageEstimate {
@@ -62,47 +60,26 @@ impl UsageEstimate {
             .map_err(|_| overflow())?
             .max(self.policy.minimum_nano_usd))
     }
-
-    pub fn validate_actual(
-        &self,
-        request: &super::RecordUsageServiceRequest,
-    ) -> Result<(), UsageError> {
-        // Estimates do not constrain valid actual usage, including receipts arriving after expiry.
-        if request.input_tokens < 0
-            || request.output_tokens < 0
-            || request.image_count.is_some_and(|n| n < 0)
-        {
-            return Err(UsageError::ValidationError("negative actual usage".into()));
-        }
-        if request.input_tokens == 0
-            && request.output_tokens == 0
-            && request.image_count.unwrap_or(0) == 0
-        {
-            return Err(UsageError::ValidationError(
-                "billable usage missing; reservation retained".into(),
-            ));
-        }
-        let kind = self.features.inference_type;
-        let compatible = request.inference_type == kind
-            || matches!(
-                (kind, request.inference_type),
-                (
-                    InferenceType::ChatCompletion,
-                    InferenceType::ChatCompletionStream
-                ) | (
-                    InferenceType::ChatCompletionStream,
-                    InferenceType::ChatCompletion
-                ) | (InferenceType::ImageEdit, InferenceType::ImageGeneration)
-            );
-        if !compatible {
-            return Err(UsageError::ValidationError(
-                "usage kind differs from admission".into(),
-            ));
-        }
-        Ok(())
-    }
 }
 
+pub fn validate_actual(request: &super::RecordUsageServiceRequest) -> Result<(), UsageError> {
+    // Estimates do not constrain valid actual usage, including receipts arriving after expiry.
+    if request.input_tokens < 0
+        || request.output_tokens < 0
+        || request.image_count.is_some_and(|n| n < 0)
+    {
+        return Err(UsageError::ValidationError("negative actual usage".into()));
+    }
+    if request.input_tokens == 0
+        && request.output_tokens == 0
+        && request.image_count.unwrap_or(0) == 0
+    {
+        return Err(UsageError::ValidationError(
+            "billable usage missing; reservation retained".into(),
+        ));
+    }
+    Ok(())
+}
 fn overflow() -> UsageError {
     UsageError::CostCalculationOverflow("admission estimate overflow".into())
 }
@@ -112,17 +89,11 @@ pub struct BudgetReservation {
     pub id: Uuid,
     pub identity: BillingIdentity,
     pub amount: i64,
-    pub pricing: ModelPricing,
-    pub estimate: UsageEstimate,
+    pub inference_type: InferenceType,
+    pub estimator_version: u32,
     pub organization_max_unsettled: i32,
     pub key_max_unsettled: i32,
     pub reservation_ttl_seconds: i32,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BudgetSnapshot {
-    pub pricing: ModelPricing,
-    pub estimate: UsageEstimate,
 }
 
 use std::sync::Arc;

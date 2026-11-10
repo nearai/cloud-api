@@ -223,15 +223,13 @@ impl UsageServiceImpl {
             id,
             amount: estimate.quote(&pricing)?,
             identity,
-            estimate,
-            pricing,
+            inference_type: bounds.inference_type,
+            estimator_version: self.admission_config.version,
             organization_max_unsettled: self.admission_config.organization_max_unsettled,
             key_max_unsettled: self.admission_config.key_max_unsettled,
             reservation_ttl_seconds: self.admission_config.reservation_ttl_seconds,
         };
-        self.usage_repository
-            .reserve_and_dispatch(&reservation)
-            .await?;
+        self.usage_repository.admit_budget(&reservation).await?;
         Ok(id)
     }
 
@@ -283,43 +281,17 @@ impl UsageServiceTrait for UsageServiceImpl {
     /// Record usage after an API call completes
     async fn record_usage(
         &self,
-        mut request: RecordUsageServiceRequest,
+        request: RecordUsageServiceRequest,
     ) -> Result<UsageLogEntry, UsageError> {
-        // A reservation fixes the tariff for the lifetime of this execution, including retries
-        // of its final usage report after a catalog edit or a gateway restart.
-        let snapshot = if let Some(id) = request.budget_id.or(request.inference_id) {
-            self.usage_repository
-                .budget_snapshot(request.organization_id, id)
-                .await
-                .map_err(|e| UsageError::InternalError(e.to_string()))?
-        } else {
-            None
-        };
-        if request.budget_id.is_some() && snapshot.is_none() {
-            return Err(UsageError::ValidationError("Admission not found".into()));
+        if request.budget_id.is_some() {
+            budget::validate_actual(&request)?;
         }
-        let model = if let Some(snapshot) = snapshot {
-            snapshot.estimate.validate_actual(&request)?;
-            if snapshot.pricing.id != request.model_id {
-                return Err(UsageError::ValidationError(
-                    "reservation model mismatch".into(),
-                ));
-            }
-            if let Some(write) = &mut request.cache_write {
-                write.cost_per_token =
-                    five_minute_cache_write_rate(snapshot.pricing.input_cost_per_token)
-                        .ok_or_else(|| {
-                            UsageError::CostCalculationOverflow("cache-write snapshot".into())
-                        })?;
-            }
-            snapshot.pricing
-        } else {
-            self.model_repository
-                .get_model_by_id(request.model_id)
-                .await
-                .map_err(|e| UsageError::InternalError(e.to_string()))?
-                .ok_or_else(|| UsageError::ModelNotFound(request.model_id.to_string()))?
-        };
+        let model = self
+            .model_repository
+            .get_model_by_id(request.model_id)
+            .await
+            .map_err(|e| UsageError::InternalError(e.to_string()))?
+            .ok_or_else(|| UsageError::ModelNotFound(request.model_id.to_string()))?;
 
         let pricing::PricedUsage {
             cache_read_tokens,
@@ -632,34 +604,14 @@ impl UsageServiceTrait for UsageServiceImpl {
         let external_inference_id =
             Uuid::new_v5(&EXTERNAL_USAGE_ID_NAMESPACE, external_id.as_bytes());
         let inference_id = Some(admission_id.unwrap_or(external_inference_id));
-        // Admission snapshots remain authoritative after a catalog price change or retirement.
-        let snapshot = if let Some(id) = admission_id {
-            Some(
-                self.usage_repository
-                    .budget_snapshot(organization_id, id)
-                    .await
-                    .map_err(|_| UsageError::InternalError("Failed to load admission".into()))?
-                    .ok_or_else(|| UsageError::ValidationError("Admission not found".into()))?,
-            )
-        } else {
-            None
-        };
-        let model = if let Some(snapshot) = snapshot {
-            if snapshot.pricing.model_name != model_name {
-                return Err(UsageError::ValidationError(
-                    "Model differs from reservation".into(),
-                ));
-            }
-            snapshot.pricing
-        } else {
-            self.model_repository
-                .get_model_by_name(&model_name)
-                .await
-                .map_err(|e| UsageError::InternalError(format!("Failed to look up model: {e}")))?
-                .ok_or_else(|| {
-                    UsageError::ModelNotFound(format!("Model '{}' not found", model_name))
-                })?
-        };
+        let model = self
+            .model_repository
+            .get_model_by_name(&model_name)
+            .await
+            .map_err(|e| UsageError::InternalError(format!("Failed to look up model: {e}")))?
+            .ok_or_else(|| {
+                UsageError::ModelNotFound(format!("Model '{}' not found", model_name))
+            })?;
 
         // Build internal request and delegate.
         // Internal metrics (ttft_ms, avg_itl_ms, stop_reason) are not exposed

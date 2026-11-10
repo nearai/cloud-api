@@ -10,20 +10,11 @@ use std::sync::Mutex;
 /// Captures the persisted request and echoes it back as an inserted row.
 #[derive(Default)]
 struct CapturingUsageRepository {
-    snapshot: Option<super::budget::BudgetSnapshot>,
     requests: Mutex<Vec<RecordUsageDbRequest>>,
 }
 
 #[async_trait::async_trait]
 impl UsageRepository for CapturingUsageRepository {
-    async fn budget_snapshot(
-        &self,
-        _: Uuid,
-        _: Uuid,
-    ) -> anyhow::Result<Option<super::budget::BudgetSnapshot>> {
-        Ok(self.snapshot.clone())
-    }
-
     async fn record_usage(&self, request: RecordUsageDbRequest) -> anyhow::Result<UsageLogEntry> {
         let entry = UsageLogEntry {
             id: Uuid::new_v4(),
@@ -137,8 +128,8 @@ struct FixedModelRepository(ModelPricing);
 
 #[async_trait::async_trait]
 impl ModelRepository for FixedModelRepository {
-    async fn get_model_by_name(&self, _: &str) -> anyhow::Result<Option<ModelPricing>> {
-        unimplemented!()
+    async fn get_model_by_name(&self, name: &str) -> anyhow::Result<Option<ModelPricing>> {
+        Ok((self.0.model_name == name).then(|| self.0.clone()))
     }
 
     async fn get_model_by_id(&self, _: Uuid) -> anyhow::Result<Option<ModelPricing>> {
@@ -465,24 +456,9 @@ async fn passthrough_fields_reach_the_repository_unchanged() {
 }
 
 #[tokio::test]
-async fn external_receipt_uses_admission_price_without_resolving_live_catalog() {
+async fn admitted_external_receipt_uses_existing_catalog_pricing() {
     let pricing = model();
-    let repo = Arc::new(CapturingUsageRepository {
-        snapshot: Some(super::budget::BudgetSnapshot {
-            pricing: pricing.clone(),
-            estimate: super::budget::UsageFeatures::from_json(
-                InferenceType::ChatCompletion,
-                &serde_json::json!({"max_tokens":20}),
-            )
-            .unwrap()
-            .estimate(
-                &config::admission::AdmissionConfig::default(),
-                &pricing.model_name,
-            )
-            .unwrap(),
-        }),
-        ..Default::default()
-    });
+    let repo = Arc::new(CapturingUsageRepository::default());
     let mut live = pricing.clone();
     live.input_cost_per_token = 9999;
     let service = UsageServiceImpl::new(
@@ -512,6 +488,6 @@ async fn external_receipt_uses_admission_price_without_resolving_live_catalog() 
         .unwrap();
     let saved = repo.requests.lock().unwrap();
     assert_eq!(saved.len(), 1);
-    assert_eq!(saved[0].input_cost, 6);
+    assert_eq!(saved[0].input_cost, 19_998);
     assert_eq!(saved[0].output_cost, 7);
 }

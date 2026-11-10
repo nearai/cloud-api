@@ -70,12 +70,18 @@ organization. Admission atomically checks both organization capacity and a key's
 optional spend limit. A key without a limit still shares the organization budget.
 The actual balance is unchanged; spendable capacity excludes active holds. Final
 settlement posts the full actual charge and deactivates the hold in the same
-transaction. The original estimate is never resized, debited or refunded.
+transaction. The original estimate is never resized, debited or refunded. Admission
+creates an active hold in one operation; there is no separate dispatch or manual
+release operation. It stores the amount, inference type and estimator version with
+billing identity and expiry, without persisting full input features or estimator policies.
+Actual pricing and organization discounts follow the existing settlement path;
+admission does not freeze them. A duplicate report with unchanged usage facts
+returns the recorded charge even when live prices or discounts have since changed.
 
 `USAGE_ADMISSION_CONFIG` is a validated JSON setting read at startup. `models`
 (canonical catalog names) overrides `kinds` (inference-type names), then `default`.
 Each selected policy is a complete policy: omitted fields use built-in defaults,
-not fields from another override. `version` identifies the estimator snapshot;
+not fields from another override. `version` identifies the estimator configuration;
 `organization_max_unsettled` and `key_max_unsettled` default to 64 and 16.
 `reservation_ttl_seconds` defaults to 7200 (two hours) and must be positive.
 
@@ -133,7 +139,7 @@ log the missing usage, and retain the hold until expiry.
 
 Direct proxy requests use the internal admission endpoint with numeric metadata
 and a separate `admission_id` in the final HTTP/SQS usage receipt. Admission also
-claims execution once: replaying a dispatched ID does not authorize another
+authorizes execution once: replaying an admitted ID does not authorize another
 inference. A lost admission response leaves a hold until expiry; each new upstream
 attempt needs a fresh ID and reservation. Cloud API-mediated
 requests reserve locally and are not reserved again by the proxy. Embedding,

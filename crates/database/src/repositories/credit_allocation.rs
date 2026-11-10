@@ -81,7 +81,7 @@ pub async fn allocate_usage(
 
     lock_organization_accounting(transaction, organization_id).await?;
 
-    // A dispatched reservation already owns its funding. Settle it in the usage transaction.
+    // An active reservation already owns its funding. Settle it in the usage transaction.
     let reserved: Option<serde_json::Value> = match parent {
         UsageAllocationParent::Inference(id) => transaction
             .query_one(

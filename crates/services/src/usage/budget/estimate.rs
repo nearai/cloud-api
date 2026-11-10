@@ -236,7 +236,6 @@ impl UsageFeatures {
             output_tokens: i32::try_from(output).map_err(|_| overflow())?,
             images: i32::try_from(images).map_err(|_| overflow())?,
             policy,
-            config_version: config.version,
         })
     }
 }

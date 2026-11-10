@@ -165,6 +165,7 @@ fn build_record_usage_response(entry: services::usage::UsageLogEntry) -> RecordU
 /// in the public OpenAPI doc anyway.
 #[derive(Debug, Deserialize)]
 pub struct RecordUsageInternalRequest {
+    pub admission_id: Option<Uuid>,
     /// UUID of the organization to bill. **Trusted as provided** —
     /// `record_usage_from_api` does not cross-validate that this org
     /// owns the supplied `workspace_id` or `api_key_id`, matching the
@@ -323,6 +324,7 @@ pub async fn record_usage_internal(
             api_key_id,
             request.usage,
             discount,
+            request.admission_id,
         )
         .await
         .map_err(|e| match &e {
@@ -355,6 +357,99 @@ pub async fn record_usage_internal(
         })?;
 
     Ok(ResponseJson(build_record_usage_response(entry)))
+}
+
+/// Metadata-only admission for trusted execution gateways. It remains mandatory when their
+/// usage receipts travel by SQS: cached key authorization never authorizes monetary spending.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReserveUsageRequest {
+    execution_model: Option<String>,
+    id: Uuid,
+    organization_id: Uuid,
+    workspace_id: Uuid,
+    api_key_id: Uuid,
+    model: String,
+    features: services::usage::budget::UsageFeatures,
+}
+
+pub async fn reserve_usage_internal(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<ResponseJson<serde_json::Value>, UsageError> {
+    verify_internal_usage_token(&headers, state.config.internal_usage_token.as_deref())?;
+    let failure = |status, message: &str| {
+        (
+            status,
+            ResponseJson(ErrorResponse::new(
+                message.into(),
+                "budget_admission_error".into(),
+            )),
+        )
+    };
+    let request: ReserveUsageRequest = serde_json::from_slice(&body)
+        .map_err(|_| failure(StatusCode::BAD_REQUEST, "Invalid admission metadata"))?;
+    if request.id.is_nil() {
+        return Err(failure(StatusCode::BAD_REQUEST, "Invalid execution id"));
+    }
+    let model = state
+        .models_service
+        .resolve_and_get_model(
+            &request.model,
+            services::models::ModelCaller::Organization(request.organization_id),
+        )
+        .await
+        .map_err(|_| failure(StatusCode::BAD_REQUEST, "Model unavailable"))?;
+    // Fusion child endpoints may use model IDs outside this catalog. Their optional
+    // metadata affects only the estimate; the outer billed model remains authorized.
+    let output_hint = if let Some(name) = request.execution_model.as_deref() {
+        state
+            .models_service
+            .resolve_and_get_model(
+                name,
+                services::models::ModelCaller::Organization(request.organization_id),
+            )
+            .await
+            .ok()
+            .and_then(|model| model.max_output_length)
+    } else {
+        model.max_output_length
+    };
+    let features = request.features.with_model_output(output_hint);
+    state
+        .usage_service
+        .admit_external(
+            services::usage::BillingIdentity {
+                organization_id: request.organization_id,
+                workspace_id: request.workspace_id,
+                api_key_id: request.api_key_id,
+                model_id: model.id,
+            },
+            features,
+            request.id,
+        )
+        .await
+        .map_err(|error| match error {
+            services::usage::UsageError::LimitExceeded(_) => failure(
+                StatusCode::PAYMENT_REQUIRED,
+                "Insufficient available budget",
+            ),
+            services::usage::UsageError::Unauthorized(_) => {
+                failure(StatusCode::FORBIDDEN, "Billing identity unavailable")
+            }
+            services::usage::UsageError::ValidationError(_)
+            | services::usage::UsageError::CostCalculationOverflow(_) => {
+                failure(StatusCode::BAD_REQUEST, "Invalid admission estimate")
+            }
+            _ => failure(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Budget admission unavailable",
+            ),
+        })?;
+    Ok(ResponseJson(
+        serde_json::json!({"id": request.id, "model": model.model_name}),
+    ))
 }
 
 #[cfg(test)]

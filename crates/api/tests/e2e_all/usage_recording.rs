@@ -1130,3 +1130,121 @@ async fn test_internal_usage_rejects_discount_above_ceiling() {
     assert_eq!(body["output_cost"], 90_000_000i64);
     assert_eq!(body["total_cost"], 180_000_000i64);
 }
+
+#[tokio::test]
+async fn budget_admission_settles_once_without_resizing_estimate() {
+    let server = enable_internal_usage_server().await;
+    setup_qwen_model(&server).await;
+    let identity = provision_identity(&server).await;
+    let execution_id = uuid::Uuid::new_v4();
+    let features = services::usage::budget::UsageFeatures::from_json(
+        services::usage::InferenceType::ChatCompletion,
+        &serde_json::json!({"messages":[], "max_tokens":8}),
+    )
+    .unwrap();
+    let request = internal_usage_body(
+        &identity,
+        serde_json::json!({
+            "id": execution_id, "model":"Qwen/Qwen3-30B-A3B-Instruct-2507",
+            "execution_model":"fusion-child-not-in-catalog", "features": features
+        }),
+    );
+    let denied = server.post("/v1/internal/budget").json(&request).await;
+    assert_eq!(denied.status_code(), 401);
+    for expected_status in [200, 503] {
+        let admitted = server
+            .post("/v1/internal/budget")
+            .add_header("Authorization", format!("Bearer {INTERNAL_USAGE_TOKEN}"))
+            .json(&request)
+            .await;
+        assert_eq!(
+            admitted.status_code(),
+            expected_status,
+            "{}",
+            admitted.text()
+        );
+    }
+    let pool = crate::common::db_setup::create_test_pool().await;
+    let client = pool.get().await.unwrap();
+    let before = client
+        .query_one(
+            "SELECT amount, state FROM usage_budget_reservations WHERE id=$1",
+            &[&execution_id],
+        )
+        .await
+        .unwrap();
+    let amount: i64 = before.get(0);
+    assert!(amount > 0 && amount < 200_000_000);
+    assert_eq!(before.get::<_, String>(1), "dispatched");
+    let org_id = uuid::Uuid::parse_str(&identity.org_id).unwrap();
+    let spent: i64 = client
+        .query_one(
+            "SELECT total_spent FROM organization_balance WHERE organization_id=$1",
+            &[&org_id],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(spent, 0, "admission does not debit actual balance");
+    for _ in 0..2 {
+        let receipt = post_internal_usage(
+            &server,
+            &identity,
+            serde_json::json!({
+                "type":"chat_completion", "model":"Qwen/Qwen3-30B-A3B-Instruct-2507",
+                "input_tokens":100, "output_tokens":50, "id":"provider-receipt",
+                "admission_id":execution_id
+            }),
+        )
+        .await;
+        assert_eq!(receipt.status_code(), 200, "{}", receipt.text());
+    }
+    let after = client
+        .query_one(
+            "SELECT amount, state, actual_cost FROM usage_budget_reservations WHERE id=$1",
+            &[&execution_id],
+        )
+        .await
+        .unwrap();
+    assert_eq!(after.get::<_, i64>(0), amount);
+    assert_eq!(after.get::<_, String>(1), "settled");
+    assert_eq!(after.get::<_, i64>(2), 200_000_000);
+    let spent: i64 = client
+        .query_one(
+            "SELECT total_spent FROM organization_balance WHERE organization_id=$1",
+            &[&org_id],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(
+        spent, 200_000_000,
+        "actual usage is billed once, including overage"
+    );
+}
+
+#[tokio::test]
+async fn budget_admission_concurrency_is_bounded_for_key_without_spend_limit() {
+    let server = enable_internal_usage_server().await;
+    setup_qwen_model(&server).await;
+    let identity = provision_identity(&server).await;
+    let features = services::usage::budget::UsageFeatures::from_json(
+        services::usage::InferenceType::ChatCompletion,
+        &serde_json::json!({"messages":[], "max_tokens":1}),
+    )
+    .unwrap();
+    let requests = (0..32).map(|_| {
+        let request = internal_usage_body(&identity, serde_json::json!({
+            "id":uuid::Uuid::new_v4(), "model":"Qwen/Qwen3-30B-A3B-Instruct-2507", "features":features
+        }));
+        let server = &server;
+        async move {
+            server.post("/v1/internal/budget")
+                .add_header("Authorization", format!("Bearer {INTERNAL_USAGE_TOKEN}"))
+                .json(&request).await.status_code()
+        }
+    });
+    let statuses = futures::future::join_all(requests).await;
+    assert_eq!(statuses.iter().filter(|status| **status == 200).count(), 16);
+    assert_eq!(statuses.iter().filter(|status| **status == 503).count(), 16);
+}

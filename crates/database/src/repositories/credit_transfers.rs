@@ -218,7 +218,7 @@ impl CreditTransferRepository {
 
         let source = tx
             .query_opt(
-                r#"SELECT c.id, c.effective_capacity, COALESCE(u.amount, 0)::BIGINT AS consumed
+                r#"SELECT c.id, c.effective_capacity, (COALESCE(u.amount, 0) + reserved_credit(c.organization_id, c.credit_type))::BIGINT AS consumed
                FROM organization_credit_capacities c
                LEFT JOIN organization_credit_consumption u
                  ON u.organization_id = c.organization_id AND u.credit_type = c.credit_type
@@ -715,7 +715,7 @@ async fn snapshot(tx: &Transaction<'_>, org: Uuid) -> anyhow::Result<Value> {
             'gross_limit', c.spend_limit,
             'transferred_out', c.transferred_out, 'effective_capacity', c.effective_capacity,
             'consumed', COALESCE(u.amount, 0),
-            'available', GREATEST(c.effective_capacity - COALESCE(u.amount, 0), 0)
+            'available', GREATEST(c.effective_capacity - COALESCE(u.amount, 0) - reserved_credit(c.organization_id, c.credit_type), 0)
         ) ORDER BY c.credit_type), '[]'::JSONB)
         FROM organization_credit_capacities c
         LEFT JOIN organization_credit_consumption u

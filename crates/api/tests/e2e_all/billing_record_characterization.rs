@@ -59,6 +59,14 @@ impl RecordingUsageService {
 
 #[async_trait::async_trait]
 impl UsageServiceTrait for RecordingUsageService {
+    async fn admit(
+        &self,
+        identity: services::usage::BillingIdentity,
+        features: services::usage::budget::UsageFeatures,
+    ) -> Result<Uuid, UsageError> {
+        self.inner.admit(identity, features).await
+    }
+
     async fn record_usage(
         &self,
         request: RecordUsageServiceRequest,
@@ -84,9 +92,17 @@ impl UsageServiceTrait for RecordingUsageService {
         api_key_id: Uuid,
         request: services::usage::RecordUsageApiRequest,
         discount: Option<services::usage::UsageDiscount>,
+        admission_id: Option<Uuid>,
     ) -> Result<services::usage::UsageLogEntry, UsageError> {
         self.inner
-            .record_usage_from_api(organization_id, workspace_id, api_key_id, request, discount)
+            .record_usage_from_api(
+                organization_id,
+                workspace_id,
+                api_key_id,
+                request,
+                discount,
+                admission_id,
+            )
             .await
     }
 

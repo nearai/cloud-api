@@ -82,6 +82,12 @@ pub trait SSEEventParser: Send + Unpin {
     fn passthrough_raw() -> bool {
         false
     }
+
+    /// Native adapters may normalize their protocol's terminal usage event to
+    /// DONE only after a clean transport EOF. Partial usage is never terminal.
+    fn has_terminal_usage(_state: &Self::State) -> bool {
+        false
+    }
 }
 
 /// Generic buffered SSE parser with proper multi-event handling
@@ -264,7 +270,15 @@ where
                         }
                         if this.bytes_buffer.iter().any(|&b| !b.is_ascii_whitespace()) {
                             warn!("Incomplete SSE data in buffer at stream end");
+                            return Poll::Ready(None);
                         }
+                    }
+                    if !P::passthrough_raw() && P::has_terminal_usage(&this.state) {
+                        return Poll::Ready(Some(Ok(SSEEvent {
+                            raw_bytes: Bytes::from_static(b"data: [DONE]\n\n"),
+                            chunk: None,
+                            raw_passthrough: false,
+                        })));
                     }
                     return Poll::Ready(None);
                 }

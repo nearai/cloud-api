@@ -175,6 +175,7 @@ impl NativeUsage {
 
 #[derive(Clone)]
 struct NativeBillingContext {
+    budget_id: Uuid,
     usage_service: Arc<dyn UsageServiceTrait + Send + Sync>,
     organization_id: Uuid,
     workspace_id: Uuid,
@@ -364,6 +365,9 @@ impl NativeUsageStream {
             return;
         };
         let mut usage = self.parser.finish();
+        if !self.parser.finished || usage.stop_reason == Some(StopReason::ProviderError) {
+            return; // Unknown final usage must not release the reservation.
+        }
         let stop_reason = usage.stop_reason.take().unwrap_or(default_reason);
         spawn_native_usage_recording(self.runtime_handle.clone(), context, usage, stop_reason);
     }
@@ -600,18 +604,61 @@ async fn handle_request(
         None
     };
 
+    let budget = if let Some(seed) = &billing_seed {
+        let bounds = match services::usage::budget::UsageFeatures::from_json(
+            InferenceType::ChatCompletion,
+            &prepared.body,
+        )
+        .map(|features| features.with_model_output(model.max_output_length))
+        {
+            Ok(bounds) => bounds,
+            Err(_) => {
+                return anthropic_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "api_error",
+                    "Invalid model budget bounds",
+                )
+            }
+        };
+        Some(services::usage::budget::BudgetExecution::new(
+            app_state.usage_service.clone(),
+            services::usage::BillingIdentity {
+                organization_id: api_key.organization.id.0,
+                workspace_id: api_key.workspace.id.0,
+                api_key_id: seed.api_key_id,
+                model_id: model.id,
+            },
+            bounds,
+        ))
+    } else {
+        None
+    };
+
     let request = AnthropicRawRequest {
         endpoint,
         beta: prepared.beta_query,
         body: prepared.body,
         headers: prepared.headers,
     };
-    let served = match app_state
+    let call = app_state
         .inference_provider_pool
-        .anthropic_raw(&model.model_name, request)
-        .await
-    {
+        .anthropic_raw(&model.model_name, request);
+    let served = match if let Some(budget) = &budget {
+        budget.run(call).await
+    } else {
+        call.await
+    } {
         Ok(response) => response,
+        Err(AnthropicRawError::Budget {
+            status_code,
+            message,
+        }) => {
+            return anthropic_error(
+                StatusCode::from_u16(status_code).unwrap_or(StatusCode::SERVICE_UNAVAILABLE),
+                "api_error",
+                message,
+            );
+        }
         Err(AnthropicRawError::UnsupportedProvider) => {
             return anthropic_error(
                 StatusCode::BAD_REQUEST,
@@ -632,7 +679,21 @@ async fn handle_request(
         }
     };
 
+    let budget_id = match &budget {
+        Some(budget) => match budget.id().await {
+            Ok(id) => id,
+            Err(_) => {
+                return anthropic_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "api_error",
+                    "Missing budget reservation",
+                )
+            }
+        },
+        None => Uuid::nil(), // CountTokens has no billing context and performs no paid execution.
+    };
     let billing = billing_seed.map(|seed| NativeBillingContext {
+        budget_id,
         usage_service: app_state.usage_service,
         organization_id: api_key.organization.id.0,
         workspace_id: api_key.workspace.id.0,
@@ -1154,7 +1215,8 @@ async fn build_upstream_response(
     let body = if status.is_success() && endpoint == AnthropicRawEndpoint::Messages && stream {
         // Construct the billing-owning stream before the first await so a
         // client disconnect (or the peek timeout) during the peek still runs
-        // its Drop and records whatever usage the parser has seen.
+        // its Drop and settles authoritative final usage already seen. Partial
+        // counters leave the reservation held.
         let mut usage_stream = NativeUsageStream {
             // Observe usage before signature framing so cancellation cannot
             // lose usage in an upstream chunk or an incomplete SSE frame.
@@ -1250,6 +1312,7 @@ async fn record_native_usage(
     // upstream response carried no id.
     let inference_id = usage.inference_id().unwrap_or_else(Uuid::new_v4);
     let request = RecordUsageServiceRequest {
+        budget_id: Some(context.budget_id),
         input_tokens,
         output_tokens,
         cache_read_tokens: usage.cache_read_tokens_for_billing(),
@@ -1910,6 +1973,7 @@ redact-thinking-2026-02-12";
             _api_key_id: Uuid,
             _request: services::usage::RecordUsageApiRequest,
             _discount: Option<services::usage::UsageDiscount>,
+            _admission_id: Option<Uuid>,
         ) -> Result<services::usage::UsageLogEntry, services::usage::UsageError> {
             unimplemented!()
         }
@@ -2017,6 +2081,7 @@ redact-thinking-2026-02-12";
         usage_service: Arc<RecordingUsageService>,
     ) -> NativeBillingContext {
         NativeBillingContext {
+            budget_id: Uuid::new_v4(),
             usage_service,
             organization_id: Uuid::new_v4(),
             workspace_id: Uuid::new_v4(),
@@ -2059,6 +2124,7 @@ redact-thinking-2026-02-12";
                 Ok(Bytes::from_static(
                     b"data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":9}}\n\n",
                 )),
+                Ok(Bytes::from_static(b"data: {\"type\":\"message_stop\"}")),
             ],
             Some(billing_context(usage_service.clone())),
         );
@@ -2083,7 +2149,7 @@ redact-thinking-2026-02-12";
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn stream_ending_without_a_declared_stop_reason_is_billed_as_incomplete() {
+    async fn stream_ending_without_a_terminal_event_retains_its_reservation() {
         let usage_service = Arc::new(RecordingUsageService::default());
         let mut stream = usage_stream_over(
             vec![
@@ -2105,13 +2171,11 @@ redact-thinking-2026-02-12";
         }
         drop(stream);
 
-        let recorded = wait_for_recorded_usage(&usage_service).await;
-        assert_eq!(recorded.stop_reason, Some(StopReason::Incomplete));
-        assert_eq!(recorded.output_tokens, 9);
+        assert!(usage_service.records.lock().unwrap().is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn upstream_ending_before_a_parseable_id_is_billed_as_incomplete() {
+    async fn upstream_ending_before_a_parseable_id_retains_its_reservation() {
         let usage_service = Arc::new(RecordingUsageService::default());
         let leading = Bytes::from_static(
             b"data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_stream\",\"usage\":{\"input_tokens\":4}}}",
@@ -2130,17 +2194,15 @@ redact-thinking-2026-02-12";
         }
         drop(stream);
 
-        let recorded = wait_for_recorded_usage(&usage_service).await;
-        assert_eq!(recorded.stop_reason, Some(StopReason::Incomplete));
-        assert_eq!(recorded.input_tokens, 4);
+        assert!(usage_service.records.lock().unwrap().is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn upstream_error_during_peek_is_replayed_and_billed_as_provider_error() {
+    async fn upstream_error_during_peek_is_replayed_without_settling_partial_usage() {
         let usage_service = Arc::new(RecordingUsageService::default());
         // No trailing newline: the peek cannot parse the id from the
         // buffered line, so it keeps reading and captures the error;
-        // `finish()` still recovers the id and tokens for billing.
+        // `finish()` cannot authorize a settlement from partial usage.
         let leading = Bytes::from_static(
             b"data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_stream\",\"usage\":{\"input_tokens\":4}}}",
         );
@@ -2164,12 +2226,6 @@ redact-thinking-2026-02-12";
         assert!(stream.next().await.is_none());
         drop(stream);
 
-        let recorded = wait_for_recorded_usage(&usage_service).await;
-        assert_eq!(
-            recorded.inference_id,
-            Some(hash_inference_id_to_uuid("msg_stream"))
-        );
-        assert_eq!(recorded.stop_reason, Some(StopReason::ProviderError));
-        assert_eq!(recorded.input_tokens, 4);
+        assert!(usage_service.records.lock().unwrap().is_empty());
     }
 }

@@ -855,12 +855,18 @@ pub fn extract_response_content(
 /// Thin inference-provider wrapper around the pure compatibility state machine.
 pub struct AnthropicParserState {
     inner: anthropic_compat::StreamState,
+    saw_input_usage: bool,
+    saw_output_usage: bool,
+    stopped: bool,
 }
 
 impl AnthropicParserState {
     pub fn new(model: String) -> Self {
         Self {
             inner: anthropic_compat::StreamState::new(model, chrono::Utc::now().timestamp()),
+            saw_input_usage: false,
+            saw_output_usage: false,
+            stopped: false,
         }
     }
 
@@ -897,6 +903,17 @@ impl SSEEventParser for AnthropicEventParser {
                     CompletionError::InvalidResponse("Failed to convert event".to_string())
                 }
             })?;
+        match event["type"].as_str() {
+            Some("message_start") => {
+                state.saw_input_usage =
+                    event["message"]["usage"]["input_tokens"].as_u64().is_some();
+            }
+            Some("message_delta") => {
+                state.saw_output_usage |= event["usage"]["output_tokens"].as_u64().is_some();
+            }
+            Some("message_stop") => state.stopped = true,
+            _ => {}
+        }
         converted
             .map(|chunk| {
                 serde_json::from_value(chunk)
@@ -906,6 +923,10 @@ impl SSEEventParser for AnthropicEventParser {
                     })
             })
             .transpose()
+    }
+
+    fn has_terminal_usage(state: &Self::State) -> bool {
+        state.stopped && state.saw_input_usage && state.saw_output_usage
     }
 }
 

@@ -721,6 +721,7 @@ struct MockConfig {
     embedding_error_override: Option<EmbeddingError>,
     /// When set, all audio transcription calls return this error instead of a response.
     audio_transcription_error_override: Option<AudioTranscriptionError>,
+    omit_audio_duration: bool,
     /// When set, privacy classify calls return this instead of running the
     /// built-in shape-based detector.
     privacy_classify_override: Option<PrivacyClassifyOverride>,
@@ -886,6 +887,7 @@ impl MockProvider {
                 stream_error_override: None,
                 embedding_error_override: None,
                 audio_transcription_error_override: None,
+                omit_audio_duration: false,
                 privacy_classify_override: None,
             })),
             last_chat_params: Arc::new(Mutex::new(None)),
@@ -921,6 +923,7 @@ impl MockProvider {
                 stream_error_override: None,
                 embedding_error_override: None,
                 audio_transcription_error_override: None,
+                omit_audio_duration: false,
                 privacy_classify_override: None,
             })),
             last_chat_params: Arc::new(Mutex::new(None)),
@@ -954,6 +957,7 @@ impl MockProvider {
                 stream_error_override: None,
                 embedding_error_override: None,
                 audio_transcription_error_override: None,
+                omit_audio_duration: false,
                 privacy_classify_override: None,
             })),
             last_chat_params: Arc::new(Mutex::new(None)),
@@ -1120,6 +1124,11 @@ impl MockProvider {
     ) {
         let mut config = self.config.lock().await;
         config.audio_transcription_error_override = error;
+    }
+
+    /// Model providers whose JSON format has text but no duration receipt.
+    pub async fn omit_audio_duration(&self) {
+        self.config.lock().await.omit_audio_duration = true;
     }
 
     /// Override privacy classify responses (body or HTTP error). Pass `None`
@@ -1942,7 +1951,7 @@ impl crate::InferenceProvider for MockProvider {
 
         Ok(AudioTranscriptionResponse {
             text: mock_text.clone(),
-            duration: Some(mock_duration),
+            duration: (!self.config.lock().await.omit_audio_duration).then_some(mock_duration),
             language: params.language.or(Some("en".to_string())),
             segments: wants_segment_timestamps.then(|| {
                 vec![TranscriptionSegment {

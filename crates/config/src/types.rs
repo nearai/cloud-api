@@ -99,6 +99,7 @@ pub struct ApiConfig {
     /// below `(1 - ceiling)` of the list price, however a reporter is
     /// configured; `0` refuses every non-zero discount.
     pub internal_usage_max_discount: f64,
+    pub usage_admission: crate::admission::AdmissionConfig,
     pub logging: LoggingConfig,
     pub dstack_client: DstackClientConfig,
     pub auth: AuthConfig,
@@ -140,6 +141,7 @@ impl std::fmt::Debug for ApiConfig {
             inference_api_key,
             internal_usage_token,
             internal_usage_max_discount,
+            usage_admission,
             logging,
             dstack_client,
             auth,
@@ -167,6 +169,7 @@ impl std::fmt::Debug for ApiConfig {
             .field("inference_api_key", &redact_opt(inference_api_key))
             .field("internal_usage_token", &redact_opt(internal_usage_token))
             .field("internal_usage_max_discount", internal_usage_max_discount)
+            .field("usage_admission", usage_admission)
             .field("logging", logging)
             .field("dstack_client", dstack_client)
             .field("auth", auth)
@@ -254,6 +257,9 @@ impl ApiConfig {
                 .filter(|s| !s.is_empty()),
             internal_usage_max_discount: parse_internal_usage_max_discount(
                 non_empty_env(INTERNAL_USAGE_MAX_DISCOUNT_ENV).as_deref(),
+            )?,
+            usage_admission: crate::admission::AdmissionConfig::parse(
+                non_empty_env("USAGE_ADMISSION_CONFIG").as_deref(),
             )?,
             logging: LoggingConfig::from_env()?,
             dstack_client: DstackClientConfig::from_env()?,
@@ -2672,6 +2678,7 @@ mod tests {
             inference_api_key: Some("sentinel-inference-api-key".to_string()),
             internal_usage_token: Some("sentinel-internal-usage-token".to_string()),
             internal_usage_max_discount: DEFAULT_INTERNAL_USAGE_MAX_DISCOUNT,
+            usage_admission: Default::default(),
             logging: LoggingConfig::default(),
             dstack_client: DstackClientConfig {
                 url: "http://localhost:8000".to_string(),

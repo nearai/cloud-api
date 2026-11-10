@@ -50,6 +50,7 @@ pub struct NativeResponsesContext {
 pub enum NativeResponsesError {
     InvalidRequest(&'static str),
     RateLimited,
+    BudgetExceeded,
     Provider(&'static str),
     Internal(&'static str),
 }
@@ -151,15 +152,42 @@ impl NativeResponsesService {
                 format!("{prompt}\n\n{instructions}")
             });
         }
+        let budget = crate::usage::budget::BudgetExecution::new(
+            self.usage_service.clone(),
+            crate::usage::BillingIdentity {
+                organization_id: context.organization_id,
+                workspace_id: context.workspace_id,
+                api_key_id: context.api_key_id,
+                model_id: model.id,
+            },
+            crate::usage::budget::UsageFeatures::from_json(
+                crate::usage::InferenceType::ChatCompletion,
+                &body,
+            )
+            .map_err(|_| NativeResponsesError::Internal("Cannot estimate request"))?
+            .with_model_output(model.max_output_length),
+        );
         let stream = body["stream"] == true;
-        let (upstream, attribution) = self
-            .inference_provider_pool
-            .responses_raw(&model.model_name, body, context.fallback_enabled)
+        let (upstream, attribution) = budget
+            .run(self.inference_provider_pool.responses_raw(
+                &model.model_name,
+                body,
+                context.fallback_enabled,
+            ))
             .await
-            .map_err(|_| {
-                NativeResponsesError::Provider("Native OpenAI Responses request failed")
+            .map_err(|error| match error {
+                CompletionError::HttpError {
+                    status_code: 402,
+                    is_external: false,
+                    ..
+                } => NativeResponsesError::BudgetExceeded,
+                _ => NativeResponsesError::Provider("Native OpenAI Responses request failed"),
             })?;
         let billing = Billing {
+            budget_id: budget
+                .id()
+                .await
+                .map_err(|_| NativeResponsesError::Internal("Missing budget reservation"))?,
             service: self.clone(),
             request_hash: context.request_hash,
             organization_id: context.organization_id,
@@ -198,6 +226,7 @@ fn normalize_stateless_request(body: &mut Value) -> Result<(), NativeResponsesEr
 }
 
 struct Billing {
+    budget_id: Uuid,
     service: NativeResponsesService,
     request_hash: String,
     organization_id: Uuid,
@@ -336,7 +365,7 @@ impl Billing {
         digest: Option<String>,
     ) -> Result<(), ()> {
         let id = usage.id.clone();
-        if let Some(tokens) = usage.tokens {
+        if let Some(tokens) = usage.tokens.filter(|_| usage.terminal) {
             let request = RecordUsageServiceRequest {
                 input_tokens: tokens.prompt_tokens,
                 output_tokens: tokens.completion_tokens,
@@ -345,6 +374,7 @@ impl Billing {
                 requested_service_tier: Some(TextServiceTier::Default),
                 provider_service_tier: usage.tier,
                 inference_id: id.as_deref().map(hash_inference_id_to_uuid),
+                budget_id: Some(self.budget_id),
                 provider_request_id: id.clone(),
                 stop_reason: Some(reason),
                 provider_attribution: self.attribution,

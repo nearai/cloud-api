@@ -103,6 +103,49 @@ async fn test_audio_transcription_basic() {
     assert!(!body.text.is_empty());
 }
 
+/// Missing duration must preserve the successful supported JSON response and hold.
+#[tokio::test]
+async fn json_without_duration_returns_success_and_retains_admission() {
+    let (server, mock, model) = setup_whisper_model().await;
+    mock.omit_audio_duration().await;
+    let org = setup_org_with_credits(&server, 10_000_000_000).await;
+    let key = get_api_key_for_org(&server, org.id.clone()).await;
+    let response = server
+        .post("/v1/audio/transcriptions")
+        .add_header("Authorization", format!("Bearer {key}"))
+        .multipart(
+            axum_test::multipart::MultipartForm::new()
+                .add_part(
+                    "file",
+                    axum_test::multipart::Part::bytes(create_mock_audio_file(1))
+                        .file_name("sample.mp3")
+                        .mime_type("audio/mpeg"),
+                )
+                .add_text("model", model)
+                .add_text("response_format", "json"),
+        )
+        .await;
+    assert_eq!(response.status_code(), 200);
+    let body: serde_json::Value = response.json();
+    assert!(body["text"].as_str().is_some_and(|text| !text.is_empty()));
+    assert!(body["duration"].is_null());
+    let pool = crate::common::db_setup::create_test_pool().await;
+    let client = pool.get().await.unwrap();
+    let org_id = uuid::Uuid::parse_str(&org.id).unwrap();
+    let row = client.query_one("SELECT COUNT(*), COALESCE(SUM(amount),0)::BIGINT FROM usage_budget_reservations WHERE organization_id=$1 AND state='dispatched'", &[&org_id]).await.unwrap();
+    assert_eq!(row.get::<_, i64>(0), 1);
+    assert!(row.get::<_, i64>(1) > 0);
+    let spent: i64 = client
+        .query_one(
+            "SELECT total_spent FROM organization_balance WHERE organization_id=$1",
+            &[&org_id],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(spent, 0);
+}
+
 /// Test audio transcription with language parameter
 #[tokio::test]
 async fn test_audio_transcription_with_language() {

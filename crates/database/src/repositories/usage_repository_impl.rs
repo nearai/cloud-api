@@ -10,6 +10,140 @@ use uuid::Uuid;
 /// Trait implementation adapter for UsageRepository
 #[async_trait::async_trait]
 impl services::usage::ports::UsageRepository for OrganizationUsageRepository {
+    async fn persist_receipt(
+        &self,
+        id: Uuid,
+        request: &services::usage::RecordUsageDbRequest,
+    ) -> anyhow::Result<()> {
+        let client = self.pool.get().await?;
+        let body = serde_json::to_value(request)?;
+        let row = client.query_opt(
+            "UPDATE usage_budget_reservations SET receipt = CASE WHEN state = 'settled' THEN receipt ELSE $3 END, updated_at = clock_timestamp()
+             WHERE id=$1 AND organization_id=$2 AND api_key_id=$4 AND workspace_id=$5 AND model_id=$6
+             AND state IN ('dispatched','released','settled') AND (receipt IS NULL OR receipt=$3)
+             RETURNING id",
+            &[&id, &request.organization_id, &body, &request.api_key_id, &request.workspace_id, &request.model_id],
+        ).await?;
+        anyhow::ensure!(row.is_some(), "receipt identity or contents conflict");
+        Ok(())
+    }
+
+    async fn recover_receipts(&self) -> anyhow::Result<u64> {
+        let rows = self
+            .pool
+            .get()
+            .await?
+            .query(
+                "WITH pending AS (SELECT id FROM usage_budget_reservations
+                WHERE receipt IS NOT NULL AND receipt_version=1 ORDER BY updated_at,id
+                LIMIT 100 FOR UPDATE SKIP LOCKED)
+             UPDATE usage_budget_reservations r SET updated_at=clock_timestamp()
+             FROM pending WHERE r.id=pending.id RETURNING r.receipt",
+                &[],
+            )
+            .await?;
+        let mut recovered = 0;
+        for row in rows {
+            let request: services::usage::RecordUsageDbRequest =
+                match serde_json::from_value(row.get(0)) {
+                    Ok(request) => request,
+                    Err(_) => {
+                        tracing::error!("Invalid durable usage receipt");
+                        continue;
+                    }
+                };
+            if <Self as services::usage::UsageRepository>::record_usage(self, request)
+                .await
+                .is_ok()
+            {
+                recovered += 1;
+            } else {
+                tracing::warn!("Durable usage receipt remains pending");
+            }
+        }
+        Ok(recovered)
+    }
+
+    async fn reserve_and_dispatch(
+        &self,
+        r: &services::usage::budget::BudgetReservation,
+    ) -> Result<(), services::usage::UsageError> {
+        use services::usage::UsageError;
+        let result: anyhow::Result<()> = async {
+            let mut client = self.pool.get().await?;
+            let tx = client.transaction().await?;
+            tx.batch_execute("SET LOCAL statement_timeout = '10s'; SET LOCAL lock_timeout = '5s'")
+                .await?;
+            let pricing = serde_json::to_value(&r.pricing)?;
+            let estimate = serde_json::to_value(&r.estimate)?;
+            tx.query_one(
+                "SELECT id FROM reserve_usage_budget($1,$2,$3,$4,$5,NULL,$6,$7,$8,$9,$10,$11,$12)",
+                &[
+                    &r.id,
+                    &r.identity.organization_id,
+                    &r.identity.workspace_id,
+                    &r.identity.api_key_id,
+                    &r.identity.model_id,
+                    &r.amount,
+                    &pricing,
+                    &estimate,
+                    &self.allocation_policy.priority,
+                    &self.allocation_policy.version,
+                    &r.organization_max_unsettled,
+                    &r.key_max_unsettled,
+                ],
+            )
+            .await?;
+            let claimed: bool = tx
+                .query_one(
+                    "SELECT dispatch_usage_budget($1,$2)",
+                    &[&r.identity.organization_id, &r.id],
+                )
+                .await?
+                .get(0);
+            anyhow::ensure!(claimed, "reservation is already dispatched");
+            tx.commit().await?;
+            Ok(())
+        }
+        .await;
+        result.map_err(|error| {
+            match error
+                .downcast_ref::<tokio_postgres::Error>()
+                .and_then(|e| e.code())
+                .map(|c| c.code())
+            {
+                Some("NBKEX") => UsageError::LimitExceeded(
+                    "API key spend limit exceeded. Insufficient available budget for this request."
+                        .into(),
+                ),
+                Some("NBOEX") => UsageError::LimitExceeded(
+                    "Credit limit exceeded. Insufficient available budget for this request.".into(),
+                ),
+                Some("NBBUS") => UsageError::InternalError("Too many unsettled executions".into()),
+                Some("NBORG" | "NBKEY") => {
+                    UsageError::Unauthorized("Billing identity is unavailable".into())
+                }
+                _ => UsageError::InternalError(format!("Budget admission failed: {error}")),
+            }
+        })
+    }
+
+    async fn budget_snapshot(
+        &self,
+        organization_id: Uuid,
+        id: Uuid,
+    ) -> anyhow::Result<Option<services::usage::budget::BudgetSnapshot>> {
+        let client = self.pool.get().await?;
+        let row = client.query_opt("SELECT pricing, estimate FROM usage_budget_reservations WHERE organization_id = $1 AND id = $2", &[&organization_id, &id]).await?;
+        row.map(|row| {
+            Ok(services::usage::budget::BudgetSnapshot {
+                pricing: serde_json::from_value(row.get(0))?,
+                estimate: serde_json::from_value(row.get(1))?,
+            })
+        })
+        .transpose()
+    }
+
     async fn record_usage(
         &self,
         request: services::usage::ports::RecordUsageDbRequest,

@@ -62,11 +62,73 @@ limit, source, and policy version; it never edits the original posting-time
 allocations. If the added capacity exceeds the debt, the remainder is
 immediately available for new usage. No admin API call is required.
 
+## Estimated admission
+
+Chat/Completions, Responses, Messages, image generation/edit, audio transcription
+and SystemOne reserve a local cost estimate before upstream dispatch, for every
+organization. Admission atomically checks both organization capacity and a key's
+optional spend limit. A key without a limit still shares the organization budget.
+The actual balance is unchanged; spendable capacity excludes active holds. Final
+settlement posts the full actual charge and deactivates the hold in the same
+transaction. The original estimate is never resized, debited or refunded.
+
+`USAGE_ADMISSION_CONFIG` is a validated JSON setting read at startup. `models`
+(canonical catalog names) overrides `kinds` (inference-type names), then `default`.
+Each selected policy is a complete policy: omitted fields use built-in defaults,
+not fields from another override. `version` identifies the estimator snapshot;
+`organization_max_unsettled` and `key_max_unsettled` default to 64 and 16.
+
+| Estimate parameter | Default |
+|---|---:|
+| `multiplier_basis_points` | 20000 (2 times) |
+| `minimum_nano_usd` | 1000 |
+| `bytes_per_token` | 3 |
+| `default_output_tokens` | 4096 |
+| `image_input_tokens` / `audio_input_tokens` | 2048 / 8192 |
+| `video_input_tokens` / `unknown_input_tokens` | 16384 / 16384 |
+| `audio_bytes_per_second` / `default_audio_seconds` | 1024 / 60 |
+| `decision_output_tokens` | 128 per SystemOne question |
+
+Text estimates count local UTF-8 bytes, explicit token IDs, message overhead and
+media allowances, then add the requested output estimate. Without an explicit
+output limit, the configured fallback is bounded by a known catalog output limit.
+Batch/choice/attempt counts multiply the corresponding units. Images use requested
+image count and catalog price; transcription uses the larger of bytes/rate and
+the duration fallback. The multiplier is rounded upward in integer nano-USD, with
+the minimum applied only to nonzero estimated cost. Free prices remain free.
+Tiered models use the highest configured applicable unit rates for estimation.
+No provider token-count call, media download, transcoding, or additional output
+limit is introduced. Existing inference-side parameter handling remains in place,
+including native Responses' existing catalog output cap. E2EE follows the same
+admission path using locally visible sizes/counts; content is not sent to the ledger.
+
+These values control exposure, not the final bill or a guaranteed per-request
+maximum. Actual usage above the estimate is fully posted, with unfunded debt when
+needed. Funding a charge, transferring credits, replacing limits and reconciling
+older debt all protect other requests' active holds under the organization lock.
+
+Each actual retry gets its own reservation. Unknown dispatched work remains held;
+neither a timeout nor a process restart authorizes release. Cloud API persists a
+priced final receipt before posting and retries pending receipts every 30 seconds.
+Replays charge once even after a lost acknowledgement or deletion of the optional
+Responses record. Settled rows retain metadata for deduplication and audit but no
+longer reduce available capacity. Missing final usage requires reconciliation;
+there is no automatic reconstruction of upstream counters that were never received.
+
+Direct proxy requests use the internal admission endpoint with numeric metadata
+and a separate `admission_id` in the final HTTP/SQS usage receipt. Cloud API-mediated
+requests reserve locally and are not reserved again by the proxy. Embedding,
+rerank, privacy, score and standalone MCP search retain their prior admission
+flow; their ledger writes still respect active holds.
+
 ## Rollout notes
 
-- Deploy every inference, service, limit, and staking writer together. They
+- Apply V0100 through the normal cloud-platform migration/image release before
+  deploying admission callers. Deploy event consumers before producers of
+  `admission_id` or audio receipts. All inference, service, limit, and staking
+  writers must use the hold-aware versions before enabling admission. They
   coordinate through the same per-organization database lock.
-- Inference usage posts through `record_organization_usage` (V0096) in one database
+- Inference usage posts through `record_organization_usage` (V0100) in one database
   statement; the organization lock is held only during server-side accounting.
   Platform-service usage still uses the Rust transaction path and the same lock.
 - Existing unattributed usage remains unknown and continues reducing aggregate
@@ -393,9 +455,10 @@ Each transaction locks both organizations in UUID order. Current membership or
 credential authority is checked under a row lock; membership changes and
 credential revocation serialize against that check. Session authentication occurs
 at HTTP admission. Policy and organization lifecycle updates use the same durable
-organization locks. Existing inference admission does not reserve capacity: work
-admitted before distribution can finish afterwards with overage. Further sends
-are blocked once overage is posted. Prefer a dedicated distribution organization.
+organization locks. Covered inference endpoints reserve capacity before dispatch,
+and transfers exclude those active holds. Actual usage above an estimate and
+endpoints without admission can still post overage; further sends are blocked
+once overage is posted. Prefer a dedicated distribution organization.
 
 409 codes distinguish `insufficient_posted_capacity`, `sender_not_reconciled`,
 `idempotency_conflict`, `capacity_overflow`, `organization_transfer_limit_exceeded`,

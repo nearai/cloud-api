@@ -53,6 +53,7 @@ pub(super) const E2E_APP_BUILD_OPTIONS: AppBuildOptions = AppBuildOptions {
     // startup recovery is disabled so unrelated tests do not all scan and race
     // over the same global job queue.
     start_database_encryption_recovery: false,
+    start_usage_receipt_recovery: false,
 };
 
 /// Shared pricing constants for E2E tests that use the Qwen bootstrap fixtures.
@@ -94,6 +95,7 @@ pub fn test_config() -> ApiConfig {
             .or(Some("test_api_key".to_string())),
         internal_usage_token: None,
         internal_usage_max_discount: config::DEFAULT_INTERNAL_USAGE_MAX_DISCOUNT,
+        usage_admission: Default::default(),
         logging: config::LoggingConfig {
             level: "debug".to_string(),
             format: "compact".to_string(),

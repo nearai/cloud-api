@@ -1,3 +1,6 @@
+#[path = "credit_allocation/admission.rs"]
+mod admission;
+
 #[allow(dead_code)]
 mod support;
 

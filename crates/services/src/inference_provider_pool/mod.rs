@@ -6685,6 +6685,7 @@ impl InferenceProviderPool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_utils::with_test_budget;
 
     fn provider_model(
         model_id: &str,
@@ -8225,161 +8226,153 @@ mod tests {
 
     #[tokio::test]
     async fn test_streaming_chat_id_mapping_available_immediately() {
-        crate::test_utils::with_test_budget(async {
-            use futures_util::StreamExt;
-            use inference_providers::mock::MockProvider;
+        use futures_util::StreamExt;
+        use inference_providers::mock::MockProvider;
 
-            let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
 
-            let mock_provider = Arc::new(MockProvider::new());
-            let model_id = "Qwen/Qwen3-30B-A3B-Instruct-2507".to_string();
-            pool.register_provider(model_id.clone(), mock_provider)
-                .await;
+        let mock_provider = Arc::new(MockProvider::new());
+        let model_id = "Qwen/Qwen3-30B-A3B-Instruct-2507".to_string();
+        pool.register_provider(model_id.clone(), mock_provider)
+            .await;
 
-            let params = inference_providers::ChatCompletionParams {
-                placement: Default::default(),
-                request_priority: 0,
-                model: model_id,
-                messages: vec![inference_providers::ChatMessage {
-                    reasoning_content: None,
-                    role: inference_providers::MessageRole::User,
-                    content: Some(serde_json::Value::String("Hello".to_string())),
-                    name: None,
-                    tool_call_id: None,
-                    tool_calls: None,
-                }],
-                max_tokens: None,
-                temperature: None,
-                top_p: None,
-                stop: None,
-                stream: Some(true),
-                tools: None,
-                max_completion_tokens: None,
-                n: None,
-                frequency_penalty: None,
-                presence_penalty: None,
-                logit_bias: None,
-                logprobs: None,
-                top_logprobs: None,
-                user: None,
-                seed: None,
-                tool_choice: None,
-                parallel_tool_calls: None,
-                metadata: None,
-                store: None,
-                stream_options: None,
-                service_tier: None,
-                modalities: None,
-                original_request: None,
-                extra: std::collections::HashMap::new(),
-            };
+        let params = inference_providers::ChatCompletionParams {
+            placement: Default::default(),
+            request_priority: 0,
+            model: model_id,
+            messages: vec![inference_providers::ChatMessage {
+                reasoning_content: None,
+                role: inference_providers::MessageRole::User,
+                content: Some(serde_json::Value::String("Hello".to_string())),
+                name: None,
+                tool_call_id: None,
+                tool_calls: None,
+            }],
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            stop: None,
+            stream: Some(true),
+            tools: None,
+            max_completion_tokens: None,
+            n: None,
+            frequency_penalty: None,
+            presence_penalty: None,
+            logit_bias: None,
+            logprobs: None,
+            top_logprobs: None,
+            user: None,
+            seed: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+            metadata: None,
+            store: None,
+            stream_options: None,
+            service_tier: None,
+            modalities: None,
+            original_request: None,
+            extra: std::collections::HashMap::new(),
+        };
 
-            let mut stream = pool
-                .chat_completion_stream(
-                    params,
-                    "test-request-hash".to_string(),
-                    ChatRoutingHints::default(),
-                )
-                .await
-                .expect("Should create stream");
+        let mut stream = with_test_budget(pool.chat_completion_stream(
+            params,
+            "test-request-hash".to_string(),
+            ChatRoutingHints::default(),
+        ))
+        .await
+        .expect("Should create stream");
 
-            let first_event = stream.next().await.unwrap().unwrap();
-            let chat_id = match first_event.chunk {
-                Some(inference_providers::StreamChunk::Chat(chunk)) => chunk.id,
-                _ => panic!("Expected chat chunk"),
-            };
+        let first_event = stream.next().await.unwrap().unwrap();
+        let chat_id = match first_event.chunk {
+            Some(inference_providers::StreamChunk::Chat(chunk)) => chunk.id,
+            _ => panic!("Expected chat chunk"),
+        };
 
-            // Mapping must be available immediately (no race with spawn)
-            assert!(pool.get_provider_by_chat_id(&chat_id).await.is_some());
+        // Mapping must be available immediately (no race with spawn)
+        assert!(pool.get_provider_by_chat_id(&chat_id).await.is_some());
 
-            while stream.next().await.is_some() {}
-            assert!(pool.get_provider_by_chat_id(&chat_id).await.is_some());
-        })
-        .await;
+        while stream.next().await.is_some() {}
+        assert!(pool.get_provider_by_chat_id(&chat_id).await.is_some());
     }
 
     #[tokio::test]
     async fn test_first_stream_error_is_returned_before_stream() {
-        crate::test_utils::with_test_budget(async {
-            use inference_providers::mock::MockProvider;
+        use inference_providers::mock::MockProvider;
 
-            // Given
-            let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
-            let mock_provider = Arc::new(MockProvider::new());
-            let model_id = "Qwen/Qwen3-30B-A3B-Instruct-2507".to_string();
-            mock_provider
-                .set_stream_error_override(Some(CompletionError::HttpError {
-                    status_code: 400,
-                    message: "Grammar error: unsupported schema keyword".to_string(),
-                    is_external: true,
-                }))
-                .await;
-            pool.register_provider(model_id.clone(), mock_provider.clone())
-                .await;
-            let params = inference_providers::ChatCompletionParams {
-                placement: Default::default(),
-                request_priority: 0,
-                model: model_id,
-                messages: vec![inference_providers::ChatMessage {
-                    reasoning_content: None,
-                    role: inference_providers::MessageRole::User,
-                    content: Some(serde_json::Value::String("Hello".to_string())),
-                    name: None,
-                    tool_call_id: None,
-                    tool_calls: None,
-                }],
-                max_tokens: None,
-                temperature: None,
-                top_p: None,
-                stop: None,
-                stream: Some(true),
-                tools: None,
-                max_completion_tokens: None,
-                n: None,
-                frequency_penalty: None,
-                presence_penalty: None,
-                logit_bias: None,
-                logprobs: None,
-                top_logprobs: None,
-                user: None,
-                seed: None,
-                tool_choice: None,
-                parallel_tool_calls: None,
-                metadata: None,
-                store: None,
-                stream_options: None,
-                service_tier: None,
-                modalities: None,
-                original_request: None,
-                extra: std::collections::HashMap::new(),
-            };
+        // Given
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+        let mock_provider = Arc::new(MockProvider::new());
+        let model_id = "Qwen/Qwen3-30B-A3B-Instruct-2507".to_string();
+        mock_provider
+            .set_stream_error_override(Some(CompletionError::HttpError {
+                status_code: 400,
+                message: "Grammar error: unsupported schema keyword".to_string(),
+                is_external: true,
+            }))
+            .await;
+        pool.register_provider(model_id.clone(), mock_provider.clone())
+            .await;
+        let params = inference_providers::ChatCompletionParams {
+            placement: Default::default(),
+            request_priority: 0,
+            model: model_id,
+            messages: vec![inference_providers::ChatMessage {
+                reasoning_content: None,
+                role: inference_providers::MessageRole::User,
+                content: Some(serde_json::Value::String("Hello".to_string())),
+                name: None,
+                tool_call_id: None,
+                tool_calls: None,
+            }],
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            stop: None,
+            stream: Some(true),
+            tools: None,
+            max_completion_tokens: None,
+            n: None,
+            frequency_penalty: None,
+            presence_penalty: None,
+            logit_bias: None,
+            logprobs: None,
+            top_logprobs: None,
+            user: None,
+            seed: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+            metadata: None,
+            store: None,
+            stream_options: None,
+            service_tier: None,
+            modalities: None,
+            original_request: None,
+            extra: std::collections::HashMap::new(),
+        };
 
-            // When
-            let result = pool
-                .chat_completion_stream(
-                    params,
-                    "test-request-hash".to_string(),
-                    ChatRoutingHints::default(),
-                )
-                .await;
-
-            // Then
-            match result {
-                Err(CompletionError::HttpError {
-                    status_code,
-                    message,
-                    is_external,
-                }) => {
-                    assert_eq!(status_code, 400);
-                    assert_eq!(message, "Grammar error: unsupported schema keyword");
-                    assert!(is_external);
-                }
-                Err(other) => panic!("Expected HttpError, got {other:?}"),
-                Ok(_) => panic!("Expected the pool to return the first stream error"),
-            }
-            assert_eq!(mock_provider.unpinned_chat_ids(), vec![String::new()]);
-        })
+        // When
+        let result = with_test_budget(pool.chat_completion_stream(
+            params,
+            "test-request-hash".to_string(),
+            ChatRoutingHints::default(),
+        ))
         .await;
+
+        // Then
+        match result {
+            Err(CompletionError::HttpError {
+                status_code,
+                message,
+                is_external,
+            }) => {
+                assert_eq!(status_code, 400);
+                assert_eq!(message, "Grammar error: unsupported schema keyword");
+                assert!(is_external);
+            }
+            Err(other) => panic!("Expected HttpError, got {other:?}"),
+            Ok(_) => panic!("Expected the pool to return the first stream error"),
+        }
+        assert_eq!(mock_provider.unpinned_chat_ids(), vec![String::new()]);
     }
 
     // ==================== Provider Tests ====================
@@ -9879,7 +9872,6 @@ mod tests {
     /// retried the pubkey fetch, leaving E2EE permanently broken for that model.
     #[tokio::test]
     async fn test_reused_provider_missing_pubkeys_are_refetched() {
-        crate::test_utils::with_test_budget(async {
         use inference_providers::mock::MockProvider;
 
         let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
@@ -9942,15 +9934,12 @@ mod tests {
             "E2EE routing should work after pubkey recovery, got: {:?}",
             result.err()
         );
-
-        }).await;
     }
 
     /// Test that E2EE routing via pubkey works end-to-end after register_provider.
     /// This exercises: register_provider → fetch attestation → store pubkey → route by pubkey.
     #[tokio::test]
     async fn test_e2ee_pubkey_routing_after_register() {
-        crate::test_utils::with_test_budget(async {
         use inference_providers::mock::MockProvider;
 
         let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
@@ -9992,13 +9981,10 @@ mod tests {
             )
             .await;
         assert!(result.is_err(), "Routing with wrong pubkey should fail");
-
-        }).await;
     }
 
     #[tokio::test]
     async fn chat_completion_carries_model_pub_key_to_provider() {
-        crate::test_utils::with_test_budget(async {
         use inference_providers::mock::MockProvider;
 
         // Given: a registered provider and a request pinned to its ECDSA key.
@@ -10014,7 +10000,7 @@ mod tests {
         );
 
         // When: the request crosses the non-streaming pool boundary.
-        pool.chat_completion(params, "test-request-hash".to_string())
+        with_test_budget(pool.chat_completion(params, "test-request-hash".to_string()))
             .await
             .expect("provider was called");
 
@@ -10028,13 +10014,10 @@ mod tests {
             Some(pinned_key),
             "pin must reach the provider or backend-key affinity is inert",
         );
-
-        }).await;
     }
 
     #[tokio::test]
     async fn chat_completion_stream_carries_model_pub_key_to_provider() {
-        crate::test_utils::with_test_budget(async {
         use inference_providers::mock::MockProvider;
 
         // Given: a registered provider and a streaming request pinned to its ECDSA key.
@@ -10051,14 +10034,13 @@ mod tests {
         );
 
         // When: the request crosses the streaming pool boundary.
-        let _stream = pool
-            .chat_completion_stream(
-                params,
-                "test-request-hash".to_string(),
-                ChatRoutingHints::default(),
-            )
-            .await
-            .expect("provider was called");
+        let _stream = with_test_budget(pool.chat_completion_stream(
+            params,
+            "test-request-hash".to_string(),
+            ChatRoutingHints::default(),
+        ))
+        .await
+        .expect("provider was called");
 
         // Then: the dispatched clone still carries the routing pin.
         let received = mock.last_chat_params().await.expect("provider was called");
@@ -10070,8 +10052,6 @@ mod tests {
             Some(pinned_key),
             "pin must reach the provider or backend-key affinity is inert",
         );
-
-        }).await;
     }
 
     #[tokio::test]
@@ -10180,36 +10160,33 @@ mod tests {
 
     #[tokio::test]
     async fn test_4xx_error_does_not_retry() {
-        crate::test_utils::with_test_budget(async {
-            let (pool, model_id) = pool_with_mock_provider().await;
+        let (pool, model_id) = pool_with_mock_provider().await;
 
-            let result: Result<ServedProviderResult<()>, _> = pool
-                .retry_with_fallback(&model_id, "test_op", None, |_provider| async {
-                    Err(CompletionError::HttpError {
-                        status_code: 400,
-                        message: "Bad request".to_string(),
-                        is_external: false,
-                    })
+        let result: Result<ServedProviderResult<()>, _> = pool
+            .retry_with_fallback(&model_id, "test_op", None, |_provider| async {
+                Err(CompletionError::HttpError {
+                    status_code: 400,
+                    message: "Bad request".to_string(),
+                    is_external: false,
                 })
-                .await;
+            })
+            .await;
 
-            assert!(result.is_err());
-            let err = result.err().expect("Expected an error");
-            match err {
-                CompletionError::HttpError { status_code, .. } => {
-                    assert_eq!(status_code, 400);
-                }
-                other => panic!("Expected HttpError, got: {:?}", other),
+        assert!(result.is_err());
+        let err = result.err().expect("Expected an error");
+        match err {
+            CompletionError::HttpError { status_code, .. } => {
+                assert_eq!(status_code, 400);
             }
-            assert!(
-                pool.provider_failure_counts
-                    .read()
-                    .expect("provider failure counts lock")
-                    .is_empty(),
-                "client 4xx responses must not mark a provider unhealthy"
-            );
-        })
-        .await;
+            other => panic!("Expected HttpError, got: {:?}", other),
+        }
+        assert!(
+            pool.provider_failure_counts
+                .read()
+                .expect("provider failure counts lock")
+                .is_empty(),
+            "client 4xx responses must not mark a provider unhealthy"
+        );
     }
 
     /// Multi-provider, alternating-error test pinning Pierre's blocker: provider
@@ -10222,195 +10199,180 @@ mod tests {
     /// failure returns immediately and B is never tried.
     #[tokio::test(start_paused = true)]
     async fn test_client_media_error_short_circuits_across_providers() {
-        crate::test_utils::with_test_budget(async {
-            let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
-            let model_id = "Qwen/Qwen3-30B-A3B-Instruct-2507".to_string();
-            // Register two providers — Pierre's exact scenario shape.
-            for _ in 0..2 {
-                pool.register_provider(
-                    model_id.clone(),
-                    Arc::new(inference_providers::mock::MockProvider::new()),
-                )
-                .await;
-            }
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+        let model_id = "Qwen/Qwen3-30B-A3B-Instruct-2507".to_string();
+        // Register two providers — Pierre's exact scenario shape.
+        for _ in 0..2 {
+            pool.register_provider(
+                model_id.clone(),
+                Arc::new(inference_providers::mock::MockProvider::new()),
+            )
+            .await;
+        }
 
-            let attempt_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
-            let count_clone = attempt_count.clone();
+        let attempt_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let count_clone = attempt_count.clone();
 
-            let result: Result<ServedProviderResult<()>, _> = pool
-                .retry_with_fallback(&model_id, "test_op", None, move |_provider| {
-                    let count = count_clone.clone();
-                    async move {
-                        let n = count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        if n == 0 {
-                            // Provider A: non-retryable client-media 5xx.
-                            Err(CompletionError::HttpError {
-                                status_code: 500,
-                                message: "Internal server error: An exception occurred \
+        let result: Result<ServedProviderResult<()>, _> = pool
+            .retry_with_fallback(&model_id, "test_op", None, move |_provider| {
+                let count = count_clone.clone();
+                async move {
+                    let n = count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if n == 0 {
+                        // Provider A: non-retryable client-media 5xx.
+                        Err(CompletionError::HttpError {
+                            status_code: 500,
+                            message: "Internal server error: An exception occurred \
                                       while loading IMAGE data at index 0: cannot \
                                       identify image file <_io.BytesIO ...>"
-                                    .to_string(),
-                                is_external: false,
-                            })
-                        } else {
-                            // Provider B (and any further round) would be a transient 502.
-                            Err(CompletionError::HttpError {
-                                status_code: 502,
-                                message: "Bad gateway".to_string(),
-                                is_external: false,
-                            })
-                        }
+                                .to_string(),
+                            is_external: false,
+                        })
+                    } else {
+                        // Provider B (and any further round) would be a transient 502.
+                        Err(CompletionError::HttpError {
+                            status_code: 502,
+                            message: "Bad gateway".to_string(),
+                            is_external: false,
+                        })
                     }
-                })
-                .await;
+                }
+            })
+            .await;
 
-            assert!(result.is_err());
-            assert_eq!(
-                attempt_count.load(std::sync::atomic::Ordering::Relaxed),
-                1,
-                "client-media 5xx from the first provider must short-circuit immediately; \
+        assert!(result.is_err());
+        assert_eq!(
+            attempt_count.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "client-media 5xx from the first provider must short-circuit immediately; \
              the second provider must not be tried and the round must not retry"
-            );
-            // And the returned error must be the typed client-media verdict from the
-            // first provider (classified on its raw 500 body, carried so the status
-            // layer maps it to 400) — not a 502 from a later provider.
-            match result.err().expect("err") {
-                CompletionError::ClientMediaError(_) => {}
-                other => panic!("Expected ClientMediaError, got: {:?}", other),
-            }
-        })
-        .await;
+        );
+        // And the returned error must be the typed client-media verdict from the
+        // first provider (classified on its raw 500 body, carried so the status
+        // layer maps it to 400) — not a 502 from a later provider.
+        match result.err().expect("err") {
+            CompletionError::ClientMediaError(_) => {}
+            other => panic!("Expected ClientMediaError, got: {:?}", other),
+        }
     }
 
     #[tokio::test(start_paused = true)]
     async fn test_429_error_retries_with_exponential_backoff() {
-        crate::test_utils::with_test_budget(async {
-            let (pool, model_id) = pool_with_mock_provider().await;
+        let (pool, model_id) = pool_with_mock_provider().await;
 
-            let attempt_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
-            let count_clone = attempt_count.clone();
+        let attempt_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let count_clone = attempt_count.clone();
 
-            // 429 should retry with exponential backoff across all rounds
-            let result: Result<ServedProviderResult<()>, _> = pool
-                .retry_with_fallback(&model_id, "test_op", None, move |_provider| {
-                    let count = count_clone.clone();
-                    async move {
-                        count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        Err(CompletionError::HttpError {
-                            status_code: 429,
-                            message: "Rate limit exceeded".to_string(),
-                            is_external: false,
-                        })
-                    }
-                })
-                .await;
+        // 429 should retry with exponential backoff across all rounds
+        let result: Result<ServedProviderResult<()>, _> = pool
+            .retry_with_fallback(&model_id, "test_op", None, move |_provider| {
+                let count = count_clone.clone();
+                async move {
+                    count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    Err(CompletionError::HttpError {
+                        status_code: 429,
+                        message: "Rate limit exceeded".to_string(),
+                        is_external: false,
+                    })
+                }
+            })
+            .await;
 
-            assert!(result.is_err());
-            // Should have tried 4 times (1 provider × 4 rounds with exponential backoff)
-            assert_eq!(
-                attempt_count.load(std::sync::atomic::Ordering::Relaxed),
-                4,
-                "429 errors should be retried with exponential backoff across all rounds"
-            );
-            let err = result.err().expect("Expected an error");
-            let err_msg = err.to_string();
-            assert!(
-                err_msg.contains("Provider failed for model"),
-                "Expected sanitized error (went through retry path), got: {}",
-                err_msg
-            );
-        })
-        .await;
+        assert!(result.is_err());
+        // Should have tried 4 times (1 provider × 4 rounds with exponential backoff)
+        assert_eq!(
+            attempt_count.load(std::sync::atomic::Ordering::Relaxed),
+            4,
+            "429 errors should be retried with exponential backoff across all rounds"
+        );
+        let err = result.err().expect("Expected an error");
+        let err_msg = err.to_string();
+        assert!(
+            err_msg.contains("Provider failed for model"),
+            "Expected sanitized error (went through retry path), got: {}",
+            err_msg
+        );
     }
 
     #[tokio::test]
     async fn test_408_error_retries_with_fallback() {
-        crate::test_utils::with_test_budget(async {
-            let (pool, model_id) = pool_with_mock_provider().await;
+        let (pool, model_id) = pool_with_mock_provider().await;
 
-            // 408 should NOT short-circuit - it should fall through to the normal retry path
-            let result: Result<ServedProviderResult<()>, _> = pool
-                .retry_with_fallback(&model_id, "test_op", None, |_provider| async {
-                    Err(CompletionError::HttpError {
-                        status_code: 408,
-                        message: "Request timeout".to_string(),
-                        is_external: false,
-                    })
+        // 408 should NOT short-circuit - it should fall through to the normal retry path
+        let result: Result<ServedProviderResult<()>, _> = pool
+            .retry_with_fallback(&model_id, "test_op", None, |_provider| async {
+                Err(CompletionError::HttpError {
+                    status_code: 408,
+                    message: "Request timeout".to_string(),
+                    is_external: false,
                 })
-                .await;
+            })
+            .await;
 
-            assert!(result.is_err());
-            let err = result.err().expect("Expected an error");
-            let err_msg = err.to_string();
-            assert!(
-                err_msg.contains("Provider failed for model"),
-                "Expected sanitized error (went through retry path), got: {}",
-                err_msg
-            );
-        })
-        .await;
+        assert!(result.is_err());
+        let err = result.err().expect("Expected an error");
+        let err_msg = err.to_string();
+        assert!(
+            err_msg.contains("Provider failed for model"),
+            "Expected sanitized error (went through retry path), got: {}",
+            err_msg
+        );
     }
 
     #[tokio::test(start_paused = true)]
     async fn test_connection_error_retries_with_exponential_backoff() {
-        crate::test_utils::with_test_budget(async {
-            let (pool, model_id) = pool_with_mock_provider().await;
+        let (pool, model_id) = pool_with_mock_provider().await;
 
-            let attempt_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
-            let count_clone = attempt_count.clone();
+        let attempt_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let count_clone = attempt_count.clone();
 
-            let result: Result<ServedProviderResult<()>, _> = pool
-                .retry_with_fallback(&model_id, "test_op", None, move |_provider| {
-                    let count = count_clone.clone();
-                    async move {
-                        count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        Err(CompletionError::CompletionError(
-                            "error sending request: connection refused".to_string(),
-                        ))
-                    }
-                })
-                .await;
+        let result: Result<ServedProviderResult<()>, _> = pool
+            .retry_with_fallback(&model_id, "test_op", None, move |_provider| {
+                let count = count_clone.clone();
+                async move {
+                    count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    Err(CompletionError::CompletionError(
+                        "error sending request: connection refused".to_string(),
+                    ))
+                }
+            })
+            .await;
 
-            assert!(result.is_err());
-            // Should have tried 4 times (1 provider × 4 rounds with exponential backoff)
-            assert_eq!(
-                attempt_count.load(std::sync::atomic::Ordering::Relaxed),
-                4,
-                "Connection errors should be retried with exponential backoff"
-            );
-        })
-        .await;
+        assert!(result.is_err());
+        // Should have tried 4 times (1 provider × 4 rounds with exponential backoff)
+        assert_eq!(
+            attempt_count.load(std::sync::atomic::Ordering::Relaxed),
+            4,
+            "Connection errors should be retried with exponential backoff"
+        );
     }
 
     #[tokio::test]
     async fn test_non_connection_error_does_not_retry() {
-        crate::test_utils::with_test_budget(async {
-            let (pool, model_id) = pool_with_mock_provider().await;
+        let (pool, model_id) = pool_with_mock_provider().await;
 
-            let attempt_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
-            let count_clone = attempt_count.clone();
+        let attempt_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let count_clone = attempt_count.clone();
 
-            let result: Result<ServedProviderResult<()>, _> = pool
-                .retry_with_fallback(&model_id, "test_op", None, move |_provider| {
-                    let count = count_clone.clone();
-                    async move {
-                        count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        Err(CompletionError::CompletionError(
-                            "Failed to parse JSON response".to_string(),
-                        ))
-                    }
-                })
-                .await;
+        let result: Result<ServedProviderResult<()>, _> = pool
+            .retry_with_fallback(&model_id, "test_op", None, move |_provider| {
+                let count = count_clone.clone();
+                async move {
+                    count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    Err(CompletionError::CompletionError(
+                        "Failed to parse JSON response".to_string(),
+                    ))
+                }
+            })
+            .await;
 
-            assert!(result.is_err());
-            // Non-connection errors should NOT be retried
-            assert_eq!(
-                attempt_count.load(std::sync::atomic::Ordering::Relaxed),
-                1,
-                "Non-connection errors should not be retried"
-            );
-        })
-        .await;
+        assert!(result.is_err());
+        // Non-connection errors should NOT be retried
+        assert_eq!(
+            attempt_count.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "Non-connection errors should not be retried"
+        );
     }
 
     /// Per-call timeouts surface as `CompletionError::Timeout` and must NOT
@@ -10418,44 +10380,41 @@ mod tests {
     /// hits the same wall, and 4× a 600s timeout would be 40 minutes of waste.
     #[tokio::test]
     async fn test_timeout_error_does_not_retry() {
-        crate::test_utils::with_test_budget(async {
-            let (pool, model_id) = pool_with_mock_provider().await;
+        let (pool, model_id) = pool_with_mock_provider().await;
 
-            let attempt_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
-            let count_clone = attempt_count.clone();
+        let attempt_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let count_clone = attempt_count.clone();
 
-            let result: Result<ServedProviderResult<()>, _> = pool
-                .retry_with_fallback(&model_id, "test_op", None, move |_provider| {
-                    let count = count_clone.clone();
-                    async move {
-                        count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        Err(CompletionError::Timeout {
-                            operation: "chat_completion".to_string(),
-                            timeout_seconds: 600,
-                        })
-                    }
-                })
-                .await;
-
-            assert!(result.is_err());
-            assert_eq!(
-                attempt_count.load(std::sync::atomic::Ordering::Relaxed),
-                1,
-                "Timeout errors must short-circuit the retry loop"
-            );
-            // Variant must survive sanitization for the route handler to map it to 504.
-            match result.err().expect("Expected an error") {
-                CompletionError::Timeout {
-                    operation,
-                    timeout_seconds,
-                } => {
-                    assert_eq!(operation, "chat_completion");
-                    assert_eq!(timeout_seconds, 600);
+        let result: Result<ServedProviderResult<()>, _> = pool
+            .retry_with_fallback(&model_id, "test_op", None, move |_provider| {
+                let count = count_clone.clone();
+                async move {
+                    count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    Err(CompletionError::Timeout {
+                        operation: "chat_completion".to_string(),
+                        timeout_seconds: 600,
+                    })
                 }
-                other => panic!("Expected CompletionError::Timeout, got: {:?}", other),
+            })
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(
+            attempt_count.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "Timeout errors must short-circuit the retry loop"
+        );
+        // Variant must survive sanitization for the route handler to map it to 504.
+        match result.err().expect("Expected an error") {
+            CompletionError::Timeout {
+                operation,
+                timeout_seconds,
+            } => {
+                assert_eq!(operation, "chat_completion");
+                assert_eq!(timeout_seconds, 600);
             }
-        })
-        .await;
+            other => panic!("Expected CompletionError::Timeout, got: {:?}", other),
+        }
     }
 
     /// Connect-level timeouts surface as string-form errors containing both
@@ -10464,33 +10423,30 @@ mod tests {
     /// succeeding (different bucket, fresh attestation).
     #[tokio::test(start_paused = true)]
     async fn test_connect_timeout_string_is_retryable() {
-        crate::test_utils::with_test_budget(async {
-            let (pool, model_id) = pool_with_mock_provider().await;
+        let (pool, model_id) = pool_with_mock_provider().await;
 
-            let attempt_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
-            let count_clone = attempt_count.clone();
+        let attempt_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let count_clone = attempt_count.clone();
 
-            let result: Result<ServedProviderResult<()>, _> = pool
-                .retry_with_fallback(&model_id, "test_op", None, move |_provider| {
-                    let count = count_clone.clone();
-                    async move {
-                        count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        Err(CompletionError::CompletionError(
+        let result: Result<ServedProviderResult<()>, _> = pool
+            .retry_with_fallback(&model_id, "test_op", None, move |_provider| {
+                let count = count_clone.clone();
+                async move {
+                    count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    Err(CompletionError::CompletionError(
                         "error sending request for url (https://x): operation timed out (connect)"
                             .to_string(),
                     ))
-                    }
-                })
-                .await;
+                }
+            })
+            .await;
 
-            assert!(result.is_err());
-            assert_eq!(
-                attempt_count.load(std::sync::atomic::Ordering::Relaxed),
-                4,
-                "connect-timeout should retry the full 4 rounds (1 initial + 3 retries)"
-            );
-        })
-        .await;
+        assert!(result.is_err());
+        assert_eq!(
+            attempt_count.load(std::sync::atomic::Ordering::Relaxed),
+            4,
+            "connect-timeout should retry the full 4 rounds (1 initial + 3 retries)"
+        );
     }
 
     /// A timeout that arrives via `CompletionError::CompletionError(msg)` (e.g. an
@@ -10498,131 +10454,119 @@ mod tests {
     /// non-retryable — same logic applies regardless of which variant wraps it.
     #[tokio::test]
     async fn test_string_form_timeout_does_not_retry() {
-        crate::test_utils::with_test_budget(async {
-            let (pool, model_id) = pool_with_mock_provider().await;
+        let (pool, model_id) = pool_with_mock_provider().await;
 
-            let attempt_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
-            let count_clone = attempt_count.clone();
+        let attempt_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let count_clone = attempt_count.clone();
 
-            let result: Result<ServedProviderResult<()>, _> = pool
-                .retry_with_fallback(&model_id, "test_op", None, move |_provider| {
-                    let count = count_clone.clone();
-                    async move {
-                        count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        Err(CompletionError::CompletionError(
-                            "error sending request: operation timed out".to_string(),
-                        ))
-                    }
-                })
-                .await;
+        let result: Result<ServedProviderResult<()>, _> = pool
+            .retry_with_fallback(&model_id, "test_op", None, move |_provider| {
+                let count = count_clone.clone();
+                async move {
+                    count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    Err(CompletionError::CompletionError(
+                        "error sending request: operation timed out".to_string(),
+                    ))
+                }
+            })
+            .await;
 
-            assert!(result.is_err());
-            assert_eq!(
-                attempt_count.load(std::sync::atomic::Ordering::Relaxed),
-                1,
-                "String-form 'operation timed out' errors must not be retried"
-            );
-        })
-        .await;
+        assert!(result.is_err());
+        assert_eq!(
+            attempt_count.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "String-form 'operation timed out' errors must not be retried"
+        );
     }
 
     #[tokio::test(start_paused = true)]
     async fn test_5xx_error_retries_with_exponential_backoff() {
-        crate::test_utils::with_test_budget(async {
-            let (pool, model_id) = pool_with_mock_provider().await;
+        let (pool, model_id) = pool_with_mock_provider().await;
 
-            let attempt_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
-            let count_clone = attempt_count.clone();
+        let attempt_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let count_clone = attempt_count.clone();
 
-            let result: Result<ServedProviderResult<()>, _> = pool
-                .retry_with_fallback(&model_id, "test_op", None, move |_provider| {
-                    let count = count_clone.clone();
-                    async move {
-                        count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        Err(CompletionError::HttpError {
-                            status_code: 502,
-                            message: "Bad gateway".to_string(),
-                            is_external: false,
-                        })
-                    }
-                })
-                .await;
+        let result: Result<ServedProviderResult<()>, _> = pool
+            .retry_with_fallback(&model_id, "test_op", None, move |_provider| {
+                let count = count_clone.clone();
+                async move {
+                    count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    Err(CompletionError::HttpError {
+                        status_code: 502,
+                        message: "Bad gateway".to_string(),
+                        is_external: false,
+                    })
+                }
+            })
+            .await;
 
-            assert!(result.is_err());
-            // 5xx should be retried with exponential backoff (4 rounds)
-            assert_eq!(
-                attempt_count.load(std::sync::atomic::Ordering::Relaxed),
-                4,
-                "5xx errors should be retried with exponential backoff"
-            );
-        })
-        .await;
+        assert!(result.is_err());
+        // 5xx should be retried with exponential backoff (4 rounds)
+        assert_eq!(
+            attempt_count.load(std::sync::atomic::Ordering::Relaxed),
+            4,
+            "5xx errors should be retried with exponential backoff"
+        );
     }
 
     #[tokio::test(start_paused = true)]
     async fn test_retry_succeeds_on_second_attempt() {
-        crate::test_utils::with_test_budget(async {
-            let (pool, model_id) = pool_with_mock_provider().await;
+        let (pool, model_id) = pool_with_mock_provider().await;
 
-            let attempt_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
-            let count_clone = attempt_count.clone();
+        let attempt_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let count_clone = attempt_count.clone();
 
-            let result: Result<ServedProviderResult<()>, _> = pool
-                .retry_with_fallback(&model_id, "test_op", None, move |_provider| {
-                    let count = count_clone.clone();
-                    async move {
-                        let n = count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        if n == 0 {
-                            Err(CompletionError::CompletionError(
-                                "error sending request: connection refused".to_string(),
-                            ))
-                        } else {
-                            Ok(())
-                        }
+        let result: Result<ServedProviderResult<()>, _> = pool
+            .retry_with_fallback(&model_id, "test_op", None, move |_provider| {
+                let count = count_clone.clone();
+                async move {
+                    let n = count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if n == 0 {
+                        Err(CompletionError::CompletionError(
+                            "error sending request: connection refused".to_string(),
+                        ))
+                    } else {
+                        Ok(())
                     }
-                })
-                .await;
+                }
+            })
+            .await;
 
-            assert!(result.is_ok(), "Should succeed on retry");
-            assert_eq!(attempt_count.load(std::sync::atomic::Ordering::Relaxed), 2,);
-        })
-        .await;
+        assert!(result.is_ok(), "Should succeed on retry");
+        assert_eq!(attempt_count.load(std::sync::atomic::Ordering::Relaxed), 2,);
     }
 
     #[tokio::test]
     async fn test_4xx_error_is_sanitized() {
-        crate::test_utils::with_test_budget(async {
-            let (pool, model_id) = pool_with_mock_provider().await;
+        let (pool, model_id) = pool_with_mock_provider().await;
 
-            let result: Result<ServedProviderResult<()>, _> = pool
-                .retry_with_fallback(&model_id, "test_op", None, |_provider| async {
-                    Err(CompletionError::HttpError {
-                        status_code: 400,
-                        message: "Error at http://192.168.0.1:8000/v1/chat/completions".to_string(),
-                        is_external: false,
-                    })
+        let result: Result<ServedProviderResult<()>, _> = pool
+            .retry_with_fallback(&model_id, "test_op", None, |_provider| async {
+                Err(CompletionError::HttpError {
+                    status_code: 400,
+                    message: "Error at http://192.168.0.1:8000/v1/chat/completions".to_string(),
+                    is_external: false,
                 })
-                .await;
+            })
+            .await;
 
-            assert!(result.is_err());
-            let err = result.err().expect("Expected an error");
-            match err {
-                CompletionError::HttpError { message, .. } => {
-                    assert!(
-                        !message.contains("192.168.0.1"),
-                        "Error message should be sanitized, but contained IP: {}",
-                        message
-                    );
-                    assert!(
-                        message.contains("[URL_REDACTED]"),
-                        "Error message should contain redacted URL marker: {}",
-                        message
-                    );
-                }
-                other => panic!("Expected HttpError, got: {:?}", other),
+        assert!(result.is_err());
+        let err = result.err().expect("Expected an error");
+        match err {
+            CompletionError::HttpError { message, .. } => {
+                assert!(
+                    !message.contains("192.168.0.1"),
+                    "Error message should be sanitized, but contained IP: {}",
+                    message
+                );
+                assert!(
+                    message.contains("[URL_REDACTED]"),
+                    "Error message should contain redacted URL marker: {}",
+                    message
+                );
             }
-        })
-        .await;
+            other => panic!("Expected HttpError, got: {:?}", other),
+        }
     }
 
     /// Verify that when pubkey re-fetch fails for a reused provider (e.g., because
@@ -10988,83 +10932,75 @@ mod tests {
 
     #[tokio::test]
     async fn test_embeddings_preserves_http_error_status_code() {
-        crate::test_utils::with_test_budget(async {
-            // Upstream rejects an embedding request with HTTP 400 (e.g. unsupported
-            // `dimensions` param). The pool MUST preserve the HttpError variant so
-            // the route can return HTTP 400 — not collapse it to RequestFailed,
-            // which previously caused every upstream error to surface as HTTP 502.
-            use inference_providers::mock::MockProvider;
+        // Upstream rejects an embedding request with HTTP 400 (e.g. unsupported
+        // `dimensions` param). The pool MUST preserve the HttpError variant so
+        // the route can return HTTP 400 — not collapse it to RequestFailed,
+        // which previously caused every upstream error to surface as HTTP 502.
+        use inference_providers::mock::MockProvider;
 
-            let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
-            let model_id = "Qwen/Qwen3-Embedding-0.6B".to_string();
-            let mock = Arc::new(MockProvider::new_accept_all());
-            mock.set_embedding_error_override(Some(
-                inference_providers::EmbeddingError::HttpError {
-                    status_code: 400,
-                    message: "dimensions parameter is not supported for this model".to_string(),
-                },
-            ))
-            .await;
-            pool.register_provider(model_id.clone(), mock).await;
-
-            let body = bytes::Bytes::from(
-                r#"{"model":"Qwen/Qwen3-Embedding-0.6B","input":"hi","dimensions":256}"#,
-            );
-            let result = pool
-                .embeddings(&model_id, body, std::collections::HashMap::new())
-                .await;
-
-            match result {
-                Err(inference_providers::EmbeddingError::HttpError {
-                    status_code,
-                    message,
-                }) => {
-                    assert_eq!(status_code, 400);
-                    assert!(
-                        message.contains("dimensions parameter is not supported"),
-                        "Expected upstream message to be preserved, got: {message}"
-                    );
-                }
-                other => panic!("Expected HttpError(400, ...), got: {:?}", other),
-            }
-        })
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+        let model_id = "Qwen/Qwen3-Embedding-0.6B".to_string();
+        let mock = Arc::new(MockProvider::new_accept_all());
+        mock.set_embedding_error_override(Some(inference_providers::EmbeddingError::HttpError {
+            status_code: 400,
+            message: "dimensions parameter is not supported for this model".to_string(),
+        }))
         .await;
+        pool.register_provider(model_id.clone(), mock).await;
+
+        let body = bytes::Bytes::from(
+            r#"{"model":"Qwen/Qwen3-Embedding-0.6B","input":"hi","dimensions":256}"#,
+        );
+        let result = pool
+            .embeddings(&model_id, body, std::collections::HashMap::new())
+            .await;
+
+        match result {
+            Err(inference_providers::EmbeddingError::HttpError {
+                status_code,
+                message,
+            }) => {
+                assert_eq!(status_code, 400);
+                assert!(
+                    message.contains("dimensions parameter is not supported"),
+                    "Expected upstream message to be preserved, got: {message}"
+                );
+            }
+            other => panic!("Expected HttpError(400, ...), got: {:?}", other),
+        }
     }
 
     #[tokio::test]
     async fn test_embeddings_request_failed_stays_request_failed() {
-        crate::test_utils::with_test_budget(async {
-            // Non-HTTP errors (e.g. network/connection failure) should still
-            // surface as RequestFailed so the route maps them to 502.
-            use inference_providers::mock::MockProvider;
+        // Non-HTTP errors (e.g. network/connection failure) should still
+        // surface as RequestFailed so the route maps them to 502.
+        use inference_providers::mock::MockProvider;
 
-            let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
-            let model_id = "Qwen/Qwen3-Embedding-0.6B".to_string();
-            let mock = Arc::new(MockProvider::new_accept_all());
-            mock.set_embedding_error_override(Some(
-                inference_providers::EmbeddingError::RequestFailed(
-                    "connection reset by peer".to_string(),
-                ),
-            ))
-            .await;
-            pool.register_provider(model_id.clone(), mock).await;
-
-            let result = pool
-                .embeddings(
-                    &model_id,
-                    bytes::Bytes::from(r#"{"model":"x","input":"hi"}"#),
-                    std::collections::HashMap::new(),
-                )
-                .await;
-
-            match result {
-                Err(inference_providers::EmbeddingError::RequestFailed(msg)) => {
-                    assert!(msg.contains("connection reset"));
-                }
-                other => panic!("Expected RequestFailed, got: {:?}", other),
-            }
-        })
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+        let model_id = "Qwen/Qwen3-Embedding-0.6B".to_string();
+        let mock = Arc::new(MockProvider::new_accept_all());
+        mock.set_embedding_error_override(Some(
+            inference_providers::EmbeddingError::RequestFailed(
+                "connection reset by peer".to_string(),
+            ),
+        ))
         .await;
+        pool.register_provider(model_id.clone(), mock).await;
+
+        let result = pool
+            .embeddings(
+                &model_id,
+                bytes::Bytes::from(r#"{"model":"x","input":"hi"}"#),
+                std::collections::HashMap::new(),
+            )
+            .await;
+
+        match result {
+            Err(inference_providers::EmbeddingError::RequestFailed(msg)) => {
+                assert!(msg.contains("connection reset"));
+            }
+            other => panic!("Expected RequestFailed, got: {:?}", other),
+        }
     }
 
     // ==================== Per-request NEAR→Chutes fallback ====================
@@ -11123,23 +11059,257 @@ mod tests {
     /// before trying the next tier).
     #[tokio::test]
     async fn near_5xx_falls_back_to_chutes_within_one_request() {
-        crate::test_utils::with_test_budget(async {
-            use inference_providers::mock::{MockProvider, RequestMatcher, ResponseTemplate};
-            use inference_providers::{CompletionError, ProviderTier};
+        use inference_providers::mock::{MockProvider, RequestMatcher, ResponseTemplate};
+        use inference_providers::{CompletionError, ProviderTier};
 
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+        let model_id = "z-ai/glm-5.1".to_string();
+
+        // NEAR primary: always returns a retryable upstream 5xx.
+        let near = Arc::new(MockProvider::new_accept_all().with_tier(ProviderTier::Near));
+        near.set_error_override(Some(CompletionError::HttpError {
+            status_code: 503,
+            message: "backend overloaded".to_string(),
+            is_external: true,
+        }))
+        .await;
+
+        // Chutes fallback: healthy, returns a recognizable response.
+        let chutes = Arc::new(MockProvider::new_accept_all().with_tier(ProviderTier::Attested3p));
+        chutes
+            .when(RequestMatcher::Any)
+            .respond_with(ResponseTemplate::new("served-by-chutes-fallback"))
+            .await;
+
+        {
+            let mut m = pool.provider_mappings.write().await;
+            m.model_to_providers.insert(
+                model_id.clone(),
+                vec![
+                    near.clone() as Arc<InferenceProviderTrait>,
+                    chutes.clone() as Arc<InferenceProviderTrait>,
+                ],
+            );
+        }
+
+        let mut params = fallback_params(&model_id);
+        params.request_priority = -2;
+        let started = std::time::Instant::now();
+        let resp = with_test_budget(pool.chat_completion(params, "test-hash".to_string()))
+            .await
+            .expect("NEAR 5xx must fall back to Chutes, not fail the client request");
+        let elapsed = started.elapsed();
+
+        // NEAR was attempted first (primary tier), not skipped.
+        assert!(
+            near.last_chat_params().await.is_some(),
+            "NEAR (primary) must be attempted before falling back"
+        );
+        // Chutes actually served the request.
+        assert!(
+            chutes.last_chat_params().await.is_some(),
+            "Chutes must serve the fallback after the NEAR 5xx"
+        );
+        assert_eq!(near.last_chat_params().await.unwrap().request_priority, -2);
+        assert_eq!(
+            chutes.last_chat_params().await.unwrap().request_priority,
+            -2
+        );
+        let body = String::from_utf8_lossy(&resp.raw_bytes);
+        assert!(
+            body.contains("served-by-chutes-fallback"),
+            "response must be the Chutes one, got: {body}"
+        );
+        // Fallback is within the same round (next provider tried immediately) —
+        // no client-facing retry/backoff latency.
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "fallback should be immediate, took {elapsed:?}"
+        );
+    }
+
+    /// A Tinfoil 401/402/403 (our key or billing) is mapped by the provider to a
+    /// retryable external 503, so it never short-circuits past Chutes and the
+    /// client never sees an upstream auth error. This test injects the 503 the
+    /// provider produces; the real status -> 503 mapping is exercised by
+    /// `inference_providers::attested::tinfoil::tests::upstream_statuses_map_per_spec`.
+    #[tokio::test]
+    async fn tinfoil_auth_failure_falls_through_to_chutes() {
+        use inference_providers::mock::{MockProvider, RequestMatcher, ResponseTemplate};
+        use inference_providers::{CompletionError, ProviderSource, ProviderTier};
+
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+        let model_id = "z-ai/glm-5.1".to_string();
+
+        let unavailable = || CompletionError::HttpError {
+            status_code: 503,
+            message: "Tinfoil temporarily unavailable (upstream_auth)".to_string(),
+            is_external: true,
+        };
+        let near = Arc::new(MockProvider::new_accept_all().with_tier(ProviderTier::Near));
+        near.set_error_override(Some(CompletionError::HttpError {
+            status_code: 503,
+            message: "backend overloaded".to_string(),
+            is_external: true,
+        }))
+        .await;
+        let tinfoil = Arc::new(
+            MockProvider::new_accept_all()
+                .with_tier(ProviderTier::Attested3p)
+                .with_provider_source(ProviderSource::Tinfoil),
+        );
+        tinfoil.set_error_override(Some(unavailable())).await;
+        let chutes = Arc::new(
+            MockProvider::new_accept_all()
+                .with_tier(ProviderTier::Attested3p)
+                .with_provider_source(ProviderSource::Chutes),
+        );
+        chutes
+            .when(RequestMatcher::Any)
+            .respond_with(ResponseTemplate::new("served-by-chutes"))
+            .await;
+
+        {
+            let mut m = pool.provider_mappings.write().await;
+            m.model_to_providers.insert(
+                model_id.clone(),
+                vec![
+                    near.clone() as Arc<InferenceProviderTrait>,
+                    tinfoil.clone() as Arc<InferenceProviderTrait>,
+                    chutes.clone() as Arc<InferenceProviderTrait>,
+                ],
+            );
+        }
+
+        // Tinfoil's smaller window sorts it ahead of Chutes (best-fit precedes the
+        // Chutes-first source tie-break), so it is attempted first and must fall through.
+        pool.set_declared_ctx(&(tinfoil.clone() as Arc<InferenceProviderTrait>), 128_000);
+        pool.set_declared_ctx(&(chutes.clone() as Arc<InferenceProviderTrait>), 1_000_000);
+
+        let resp = with_test_budget(
+            pool.chat_completion(fallback_params(&model_id), "test-hash".to_string()),
+        )
+        .await
+        .expect("a Tinfoil auth failure must fall through to Chutes");
+        assert!(near.last_chat_params().await.is_some());
+        assert!(tinfoil.last_chat_params().await.is_some());
+        assert!(chutes.last_chat_params().await.is_some());
+        assert!(String::from_utf8_lossy(&resp.raw_bytes).contains("served-by-chutes"));
+    }
+
+    /// When the NEAR primary AND the Chutes fallback both fail with a retryable
+    /// 5xx, the error must SURFACE to the client — the pool must not invent a
+    /// false success once every provider is exhausted.
+    #[tokio::test]
+    async fn all_providers_5xx_surfaces_error() {
+        use inference_providers::mock::MockProvider;
+        use inference_providers::{CompletionError, ProviderTier};
+
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+        let model_id = "z-ai/glm-5.1".to_string();
+        let err = || CompletionError::HttpError {
+            status_code: 503,
+            message: "down".to_string(),
+            is_external: true,
+        };
+
+        let near = Arc::new(MockProvider::new_accept_all().with_tier(ProviderTier::Near));
+        near.set_error_override(Some(err())).await;
+        let chutes = Arc::new(MockProvider::new_accept_all().with_tier(ProviderTier::Attested3p));
+        chutes.set_error_override(Some(err())).await;
+
+        {
+            let mut m = pool.provider_mappings.write().await;
+            m.model_to_providers.insert(
+                model_id.clone(),
+                vec![
+                    near.clone() as Arc<InferenceProviderTrait>,
+                    chutes.clone() as Arc<InferenceProviderTrait>,
+                ],
+            );
+        }
+
+        let result = with_test_budget(
+            pool.chat_completion(fallback_params(&model_id), "test-hash".to_string()),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "all providers failing must surface an error, not a false success"
+        );
+        // Both tiers were genuinely attempted.
+        assert!(near.last_chat_params().await.is_some());
+        assert!(chutes.last_chat_params().await.is_some());
+    }
+
+    /// A healthy NEAR primary serves the request itself; the Chutes fallback must
+    /// NOT be invoked when the primary succeeds (no needless fallback / billing).
+    #[tokio::test]
+    async fn healthy_near_serves_without_invoking_chutes() {
+        use inference_providers::mock::{MockProvider, RequestMatcher, ResponseTemplate};
+        use inference_providers::ProviderTier;
+
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+        let model_id = "z-ai/glm-5.1".to_string();
+
+        let near = Arc::new(MockProvider::new_accept_all().with_tier(ProviderTier::Near));
+        near.when(RequestMatcher::Any)
+            .respond_with(ResponseTemplate::new("served-by-near-primary"))
+            .await;
+        let chutes = Arc::new(MockProvider::new_accept_all().with_tier(ProviderTier::Attested3p));
+
+        {
+            let mut m = pool.provider_mappings.write().await;
+            m.model_to_providers.insert(
+                model_id.clone(),
+                vec![
+                    near.clone() as Arc<InferenceProviderTrait>,
+                    chutes.clone() as Arc<InferenceProviderTrait>,
+                ],
+            );
+        }
+
+        let resp = with_test_budget(
+            pool.chat_completion(fallback_params(&model_id), "test-hash".to_string()),
+        )
+        .await
+        .expect("healthy NEAR must serve");
+        let body = String::from_utf8_lossy(&resp.raw_bytes);
+        assert!(
+            body.contains("served-by-near-primary"),
+            "NEAR must serve, got: {body}"
+        );
+        assert!(
+            chutes.last_chat_params().await.is_none(),
+            "Chutes must NOT be invoked when the NEAR primary succeeds"
+        );
+    }
+
+    /// nearai/cloud-api#797: a NEAR provider that returns a "model not found"
+    /// 4xx (OpenAI-compatible engines do this for an unrecognized model id, e.g.
+    /// a renamed canonical the backend hasn't picked up) must fall through to the
+    /// Chutes fallback — NOT fast-return as a client error. Both 404 and 400
+    /// phrasings are exercised.
+    #[tokio::test]
+    async fn near_model_not_found_falls_back_to_chutes() {
+        use inference_providers::mock::{MockProvider, RequestMatcher, ResponseTemplate};
+        use inference_providers::{CompletionError, ProviderTier};
+
+        for (status_code, message) in [
+            (404u16, "The model `z-ai/glm-5.1` does not exist."),
+            (400u16, "The model `z-ai/glm-5.1` does not exist."),
+        ] {
             let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
             let model_id = "z-ai/glm-5.1".to_string();
 
-            // NEAR primary: always returns a retryable upstream 5xx.
             let near = Arc::new(MockProvider::new_accept_all().with_tier(ProviderTier::Near));
             near.set_error_override(Some(CompletionError::HttpError {
-                status_code: 503,
-                message: "backend overloaded".to_string(),
+                status_code,
+                message: message.to_string(),
                 is_external: true,
             }))
             .await;
 
-            // Chutes fallback: healthy, returns a recognizable response.
             let chutes =
                 Arc::new(MockProvider::new_accept_all().with_tier(ProviderTier::Attested3p));
             chutes
@@ -11158,278 +11328,27 @@ mod tests {
                 );
             }
 
-            let mut params = fallback_params(&model_id);
-            params.request_priority = -2;
-            let started = std::time::Instant::now();
-            let resp = pool
-                .chat_completion(params, "test-hash".to_string())
-                .await
-                .expect("NEAR 5xx must fall back to Chutes, not fail the client request");
-            let elapsed = started.elapsed();
-
-            // NEAR was attempted first (primary tier), not skipped.
+            let resp = with_test_budget(
+                pool.chat_completion(fallback_params(&model_id), "test-hash".to_string()),
+            )
+            .await
+            .unwrap_or_else(|e| {
+                panic!("NEAR {status_code} model-not-found must fall back to Chutes, got: {e}")
+            });
             assert!(
                 near.last_chat_params().await.is_some(),
-                "NEAR (primary) must be attempted before falling back"
+                "NEAR must be attempted first ({status_code})"
             );
-            // Chutes actually served the request.
             assert!(
                 chutes.last_chat_params().await.is_some(),
-                "Chutes must serve the fallback after the NEAR 5xx"
-            );
-            assert_eq!(near.last_chat_params().await.unwrap().request_priority, -2);
-            assert_eq!(
-                chutes.last_chat_params().await.unwrap().request_priority,
-                -2
+                "Chutes must serve after NEAR model-not-found ({status_code})"
             );
             let body = String::from_utf8_lossy(&resp.raw_bytes);
             assert!(
                 body.contains("served-by-chutes-fallback"),
-                "response must be the Chutes one, got: {body}"
+                "response must be Chutes's ({status_code}), got: {body}"
             );
-            // Fallback is within the same round (next provider tried immediately) —
-            // no client-facing retry/backoff latency.
-            assert!(
-                elapsed < std::time::Duration::from_secs(5),
-                "fallback should be immediate, took {elapsed:?}"
-            );
-        })
-        .await;
-    }
-
-    /// A Tinfoil 401/402/403 (our key or billing) is mapped by the provider to a
-    /// retryable external 503, so it never short-circuits past Chutes and the
-    /// client never sees an upstream auth error. This test injects the 503 the
-    /// provider produces; the real status -> 503 mapping is exercised by
-    /// `inference_providers::attested::tinfoil::tests::upstream_statuses_map_per_spec`.
-    #[tokio::test]
-    async fn tinfoil_auth_failure_falls_through_to_chutes() {
-        crate::test_utils::with_test_budget(async {
-            use inference_providers::mock::{MockProvider, RequestMatcher, ResponseTemplate};
-            use inference_providers::{CompletionError, ProviderSource, ProviderTier};
-
-            let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
-            let model_id = "z-ai/glm-5.1".to_string();
-
-            let unavailable = || CompletionError::HttpError {
-                status_code: 503,
-                message: "Tinfoil temporarily unavailable (upstream_auth)".to_string(),
-                is_external: true,
-            };
-            let near = Arc::new(MockProvider::new_accept_all().with_tier(ProviderTier::Near));
-            near.set_error_override(Some(CompletionError::HttpError {
-                status_code: 503,
-                message: "backend overloaded".to_string(),
-                is_external: true,
-            }))
-            .await;
-            let tinfoil = Arc::new(
-                MockProvider::new_accept_all()
-                    .with_tier(ProviderTier::Attested3p)
-                    .with_provider_source(ProviderSource::Tinfoil),
-            );
-            tinfoil.set_error_override(Some(unavailable())).await;
-            let chutes = Arc::new(
-                MockProvider::new_accept_all()
-                    .with_tier(ProviderTier::Attested3p)
-                    .with_provider_source(ProviderSource::Chutes),
-            );
-            chutes
-                .when(RequestMatcher::Any)
-                .respond_with(ResponseTemplate::new("served-by-chutes"))
-                .await;
-
-            {
-                let mut m = pool.provider_mappings.write().await;
-                m.model_to_providers.insert(
-                    model_id.clone(),
-                    vec![
-                        near.clone() as Arc<InferenceProviderTrait>,
-                        tinfoil.clone() as Arc<InferenceProviderTrait>,
-                        chutes.clone() as Arc<InferenceProviderTrait>,
-                    ],
-                );
-            }
-
-            // Tinfoil's smaller window sorts it ahead of Chutes (best-fit precedes the
-            // Chutes-first source tie-break), so it is attempted first and must fall through.
-            pool.set_declared_ctx(&(tinfoil.clone() as Arc<InferenceProviderTrait>), 128_000);
-            pool.set_declared_ctx(&(chutes.clone() as Arc<InferenceProviderTrait>), 1_000_000);
-
-            let resp = pool
-                .chat_completion(fallback_params(&model_id), "test-hash".to_string())
-                .await
-                .expect("a Tinfoil auth failure must fall through to Chutes");
-            assert!(near.last_chat_params().await.is_some());
-            assert!(tinfoil.last_chat_params().await.is_some());
-            assert!(chutes.last_chat_params().await.is_some());
-            assert!(String::from_utf8_lossy(&resp.raw_bytes).contains("served-by-chutes"));
-        })
-        .await;
-    }
-
-    /// When the NEAR primary AND the Chutes fallback both fail with a retryable
-    /// 5xx, the error must SURFACE to the client — the pool must not invent a
-    /// false success once every provider is exhausted.
-    #[tokio::test]
-    async fn all_providers_5xx_surfaces_error() {
-        crate::test_utils::with_test_budget(async {
-            use inference_providers::mock::MockProvider;
-            use inference_providers::{CompletionError, ProviderTier};
-
-            let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
-            let model_id = "z-ai/glm-5.1".to_string();
-            let err = || CompletionError::HttpError {
-                status_code: 503,
-                message: "down".to_string(),
-                is_external: true,
-            };
-
-            let near = Arc::new(MockProvider::new_accept_all().with_tier(ProviderTier::Near));
-            near.set_error_override(Some(err())).await;
-            let chutes =
-                Arc::new(MockProvider::new_accept_all().with_tier(ProviderTier::Attested3p));
-            chutes.set_error_override(Some(err())).await;
-
-            {
-                let mut m = pool.provider_mappings.write().await;
-                m.model_to_providers.insert(
-                    model_id.clone(),
-                    vec![
-                        near.clone() as Arc<InferenceProviderTrait>,
-                        chutes.clone() as Arc<InferenceProviderTrait>,
-                    ],
-                );
-            }
-
-            let result = pool
-                .chat_completion(fallback_params(&model_id), "test-hash".to_string())
-                .await;
-            assert!(
-                result.is_err(),
-                "all providers failing must surface an error, not a false success"
-            );
-            // Both tiers were genuinely attempted.
-            assert!(near.last_chat_params().await.is_some());
-            assert!(chutes.last_chat_params().await.is_some());
-        })
-        .await;
-    }
-
-    /// A healthy NEAR primary serves the request itself; the Chutes fallback must
-    /// NOT be invoked when the primary succeeds (no needless fallback / billing).
-    #[tokio::test]
-    async fn healthy_near_serves_without_invoking_chutes() {
-        crate::test_utils::with_test_budget(async {
-            use inference_providers::mock::{MockProvider, RequestMatcher, ResponseTemplate};
-            use inference_providers::ProviderTier;
-
-            let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
-            let model_id = "z-ai/glm-5.1".to_string();
-
-            let near = Arc::new(MockProvider::new_accept_all().with_tier(ProviderTier::Near));
-            near.when(RequestMatcher::Any)
-                .respond_with(ResponseTemplate::new("served-by-near-primary"))
-                .await;
-            let chutes =
-                Arc::new(MockProvider::new_accept_all().with_tier(ProviderTier::Attested3p));
-
-            {
-                let mut m = pool.provider_mappings.write().await;
-                m.model_to_providers.insert(
-                    model_id.clone(),
-                    vec![
-                        near.clone() as Arc<InferenceProviderTrait>,
-                        chutes.clone() as Arc<InferenceProviderTrait>,
-                    ],
-                );
-            }
-
-            let resp = pool
-                .chat_completion(fallback_params(&model_id), "test-hash".to_string())
-                .await
-                .expect("healthy NEAR must serve");
-            let body = String::from_utf8_lossy(&resp.raw_bytes);
-            assert!(
-                body.contains("served-by-near-primary"),
-                "NEAR must serve, got: {body}"
-            );
-            assert!(
-                chutes.last_chat_params().await.is_none(),
-                "Chutes must NOT be invoked when the NEAR primary succeeds"
-            );
-        })
-        .await;
-    }
-
-    /// nearai/cloud-api#797: a NEAR provider that returns a "model not found"
-    /// 4xx (OpenAI-compatible engines do this for an unrecognized model id, e.g.
-    /// a renamed canonical the backend hasn't picked up) must fall through to the
-    /// Chutes fallback — NOT fast-return as a client error. Both 404 and 400
-    /// phrasings are exercised.
-    #[tokio::test]
-    async fn near_model_not_found_falls_back_to_chutes() {
-        crate::test_utils::with_test_budget(async {
-            use inference_providers::mock::{MockProvider, RequestMatcher, ResponseTemplate};
-            use inference_providers::{CompletionError, ProviderTier};
-
-            for (status_code, message) in [
-                (404u16, "The model `z-ai/glm-5.1` does not exist."),
-                (400u16, "The model `z-ai/glm-5.1` does not exist."),
-            ] {
-                let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
-                let model_id = "z-ai/glm-5.1".to_string();
-
-                let near = Arc::new(MockProvider::new_accept_all().with_tier(ProviderTier::Near));
-                near.set_error_override(Some(CompletionError::HttpError {
-                    status_code,
-                    message: message.to_string(),
-                    is_external: true,
-                }))
-                .await;
-
-                let chutes =
-                    Arc::new(MockProvider::new_accept_all().with_tier(ProviderTier::Attested3p));
-                chutes
-                    .when(RequestMatcher::Any)
-                    .respond_with(ResponseTemplate::new("served-by-chutes-fallback"))
-                    .await;
-
-                {
-                    let mut m = pool.provider_mappings.write().await;
-                    m.model_to_providers.insert(
-                        model_id.clone(),
-                        vec![
-                            near.clone() as Arc<InferenceProviderTrait>,
-                            chutes.clone() as Arc<InferenceProviderTrait>,
-                        ],
-                    );
-                }
-
-                let resp = pool
-                    .chat_completion(fallback_params(&model_id), "test-hash".to_string())
-                    .await
-                    .unwrap_or_else(|e| {
-                        panic!(
-                            "NEAR {status_code} model-not-found must fall back to Chutes, got: {e}"
-                        )
-                    });
-                assert!(
-                    near.last_chat_params().await.is_some(),
-                    "NEAR must be attempted first ({status_code})"
-                );
-                assert!(
-                    chutes.last_chat_params().await.is_some(),
-                    "Chutes must serve after NEAR model-not-found ({status_code})"
-                );
-                let body = String::from_utf8_lossy(&resp.raw_bytes);
-                assert!(
-                    body.contains("served-by-chutes-fallback"),
-                    "response must be Chutes's ({status_code}), got: {body}"
-                );
-            }
-        })
-        .await;
+        }
     }
 
     #[test]
@@ -11462,7 +11381,6 @@ mod tests {
     /// SGLang phrasings.
     #[tokio::test]
     async fn near_context_length_400_falls_through_to_bigger_provider() {
-        crate::test_utils::with_test_budget(async {
         use inference_providers::mock::{MockProvider, RequestMatcher, ResponseTemplate};
         use inference_providers::{CompletionError, ProviderTier};
 
@@ -11514,8 +11432,8 @@ mod tests {
                     .max_context_tokens = Some(1_048_576);
             }
 
-            let resp = pool
-                .chat_completion(fallback_params(&model_id), "test-hash".to_string())
+            let resp = with_test_budget(pool
+                .chat_completion(fallback_params(&model_id), "test-hash".to_string()))
                 .await
                 .unwrap_or_else(|e| {
                     panic!("context-length 400 must fall through to the bigger provider, got: {e} (message: {message})")
@@ -11537,8 +11455,6 @@ mod tests {
                 "context-length 400 must not bump the failure counter"
             );
         }
-
-        }).await;
     }
 
     /// Guard for existing models (e.g. GLM-5.1 + a Chutes fallback with no
@@ -11603,75 +11519,71 @@ mod tests {
     /// length" client error that would stop the caller from retrying.
     #[tokio::test]
     async fn context_400_fall_through_does_not_clobber_retryable_error() {
-        crate::test_utils::with_test_budget(async {
-            use inference_providers::mock::MockProvider;
-            use inference_providers::{CompletionError, ProviderTier};
+        use inference_providers::mock::MockProvider;
+        use inference_providers::{CompletionError, ProviderTier};
 
-            let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
-            let model_id = "z-ai/glm-5.2".to_string();
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+        let model_id = "z-ai/glm-5.2".to_string();
 
-            let long = Arc::new(MockProvider::new_accept_all().with_tier(ProviderTier::Near));
-            long.set_error_override(Some(CompletionError::HttpError {
-                status_code: 503,
-                message: "queue full".to_string(),
-                is_external: true,
-            }))
-            .await;
-            let base = Arc::new(MockProvider::new_accept_all().with_tier(ProviderTier::Near));
-            base.set_error_override(Some(CompletionError::HttpError {
-                status_code: 400,
-                message: "This model's maximum context length is 262144 tokens.".to_string(),
-                is_external: true,
-            }))
-            .await;
-
-            {
-                let mut m = pool.provider_mappings.write().await;
-                m.model_to_providers.insert(
-                    model_id.clone(),
-                    vec![
-                        base.clone() as Arc<InferenceProviderTrait>,
-                        long.clone() as Arc<InferenceProviderTrait>,
-                    ],
-                );
-            }
-            {
-                let mut states = pool
-                    .provider_load_state
-                    .write()
-                    .unwrap_or_else(|e| e.into_inner());
-                states
-                    .entry(Arc::as_ptr(&base) as *const () as usize)
-                    .or_default()
-                    .max_context_tokens = Some(262_144);
-                states
-                    .entry(Arc::as_ptr(&long) as *const () as usize)
-                    .or_default()
-                    .max_context_tokens = Some(1_048_576);
-            }
-
-            // ~1.2MB of text → the internally-computed requirement (~360k) puts
-            // the request in the long tier: order [long(503), base(400)].
-            let mut params = fallback_params(&model_id);
-            params.messages[0].content = Some(serde_json::Value::String("a".repeat(1_200_000)));
-
-            let err = pool
-                .chat_completion(params, "test-hash".to_string())
-                .await
-                .expect_err("both providers fail");
-            assert!(
-                base.last_chat_params().await.is_some(),
-                "base must have been tried via the fall-through"
-            );
-            match err {
-                CompletionError::HttpError { status_code, .. } => assert_eq!(
-                    status_code, 503,
-                    "the capable tier's retryable 503 must be the terminal error, not the base 400"
-                ),
-                other => panic!("expected the long tier's HttpError(503), got: {other}"),
-            }
-        })
+        let long = Arc::new(MockProvider::new_accept_all().with_tier(ProviderTier::Near));
+        long.set_error_override(Some(CompletionError::HttpError {
+            status_code: 503,
+            message: "queue full".to_string(),
+            is_external: true,
+        }))
         .await;
+        let base = Arc::new(MockProvider::new_accept_all().with_tier(ProviderTier::Near));
+        base.set_error_override(Some(CompletionError::HttpError {
+            status_code: 400,
+            message: "This model's maximum context length is 262144 tokens.".to_string(),
+            is_external: true,
+        }))
+        .await;
+
+        {
+            let mut m = pool.provider_mappings.write().await;
+            m.model_to_providers.insert(
+                model_id.clone(),
+                vec![
+                    base.clone() as Arc<InferenceProviderTrait>,
+                    long.clone() as Arc<InferenceProviderTrait>,
+                ],
+            );
+        }
+        {
+            let mut states = pool
+                .provider_load_state
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            states
+                .entry(Arc::as_ptr(&base) as *const () as usize)
+                .or_default()
+                .max_context_tokens = Some(262_144);
+            states
+                .entry(Arc::as_ptr(&long) as *const () as usize)
+                .or_default()
+                .max_context_tokens = Some(1_048_576);
+        }
+
+        // ~1.2MB of text → the internally-computed requirement (~360k) puts
+        // the request in the long tier: order [long(503), base(400)].
+        let mut params = fallback_params(&model_id);
+        params.messages[0].content = Some(serde_json::Value::String("a".repeat(1_200_000)));
+
+        let err = with_test_budget(pool.chat_completion(params, "test-hash".to_string()))
+            .await
+            .expect_err("both providers fail");
+        assert!(
+            base.last_chat_params().await.is_some(),
+            "base must have been tried via the fall-through"
+        );
+        match err {
+            CompletionError::HttpError { status_code, .. } => assert_eq!(
+                status_code, 503,
+                "the capable tier's retryable 503 must be the terminal error, not the base 400"
+            ),
+            other => panic!("expected the long tier's HttpError(503), got: {other}"),
+        }
     }
 
     /// Best-fit capacity ordering: for a model with two NEAR tiers (262k fleet
@@ -11890,92 +11802,88 @@ mod tests {
     /// priority and asserts the opposite: base IS tried.
     #[tokio::test]
     async fn low_priority_retry_does_not_fall_back_across_near_tiers() {
-        crate::test_utils::with_test_budget(async {
-            use inference_providers::mock::MockProvider;
-            use inference_providers::{CompletionError, ProviderTier};
+        use inference_providers::mock::MockProvider;
+        use inference_providers::{CompletionError, ProviderTier};
 
-            let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
-            let model_id = "z-ai/glm-5.2".to_string();
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+        let model_id = "z-ai/glm-5.2".to_string();
 
-            let long = Arc::new(MockProvider::new_accept_all().with_tier(ProviderTier::Near));
-            long.set_error_override(Some(CompletionError::HttpError {
-                status_code: 503,
-                message: "queue full".to_string(),
-                is_external: true,
-            }))
-            .await;
-            let base = Arc::new(MockProvider::new_accept_all().with_tier(ProviderTier::Near));
-            base.set_error_override(Some(CompletionError::HttpError {
-                status_code: 400,
-                message: "This model's maximum context length is 262144 tokens.".to_string(),
-                is_external: true,
-            }))
-            .await;
-
-            {
-                let mut m = pool.provider_mappings.write().await;
-                m.model_to_providers.insert(
-                    model_id.clone(),
-                    vec![
-                        base.clone() as Arc<InferenceProviderTrait>,
-                        long.clone() as Arc<InferenceProviderTrait>,
-                    ],
-                );
-            }
-            {
-                let mut states = pool
-                    .provider_load_state
-                    .write()
-                    .unwrap_or_else(|e| e.into_inner());
-                states
-                    .entry(Arc::as_ptr(&base) as *const () as usize)
-                    .or_default()
-                    .max_context_tokens = Some(262_144);
-                states
-                    .entry(Arc::as_ptr(&long) as *const () as usize)
-                    .or_default()
-                    .max_context_tokens = Some(1_048_576);
-            }
-
-            // Same ~1.2MB fixture as the priority-agnostic test above: the
-            // internally-computed requirement (~360k) selects the long tier.
-            let mut params = fallback_params(&model_id);
-            params.messages[0].content = Some(serde_json::Value::String("a".repeat(1_200_000)));
-
-            let result = pool
-                .chat_completion_with_attribution_and_hints(
-                    params,
-                    "test-hash".to_string(),
-                    ChatRoutingHints {
-                        request_priority: -2,
-                        ..Default::default()
-                    },
-                )
-                .await;
-            let err = match result {
-                Err(e) => e,
-                Ok(_) => panic!("the long tier's 503 must surface, not a base success"),
-            };
-
-            assert!(
-                long.last_chat_params().await.is_some(),
-                "the size-selected (long) tier must still be tried"
-            );
-            assert!(
-                base.last_chat_params().await.is_none(),
-                "negative priority: the base tier must NEVER be tried as a fallback"
-            );
-            match err {
-                CompletionError::HttpError { status_code, .. } => {
-                    assert_eq!(
-                        status_code, 503,
-                        "the long tier's retryable error must surface"
-                    )
-                }
-                other => panic!("expected the long tier's HttpError(503), got: {other}"),
-            }
-        })
+        let long = Arc::new(MockProvider::new_accept_all().with_tier(ProviderTier::Near));
+        long.set_error_override(Some(CompletionError::HttpError {
+            status_code: 503,
+            message: "queue full".to_string(),
+            is_external: true,
+        }))
         .await;
+        let base = Arc::new(MockProvider::new_accept_all().with_tier(ProviderTier::Near));
+        base.set_error_override(Some(CompletionError::HttpError {
+            status_code: 400,
+            message: "This model's maximum context length is 262144 tokens.".to_string(),
+            is_external: true,
+        }))
+        .await;
+
+        {
+            let mut m = pool.provider_mappings.write().await;
+            m.model_to_providers.insert(
+                model_id.clone(),
+                vec![
+                    base.clone() as Arc<InferenceProviderTrait>,
+                    long.clone() as Arc<InferenceProviderTrait>,
+                ],
+            );
+        }
+        {
+            let mut states = pool
+                .provider_load_state
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            states
+                .entry(Arc::as_ptr(&base) as *const () as usize)
+                .or_default()
+                .max_context_tokens = Some(262_144);
+            states
+                .entry(Arc::as_ptr(&long) as *const () as usize)
+                .or_default()
+                .max_context_tokens = Some(1_048_576);
+        }
+
+        // Same ~1.2MB fixture as the priority-agnostic test above: the
+        // internally-computed requirement (~360k) selects the long tier.
+        let mut params = fallback_params(&model_id);
+        params.messages[0].content = Some(serde_json::Value::String("a".repeat(1_200_000)));
+
+        let result = with_test_budget(pool.chat_completion_with_attribution_and_hints(
+            params,
+            "test-hash".to_string(),
+            ChatRoutingHints {
+                request_priority: -2,
+                ..Default::default()
+            },
+        ))
+        .await;
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("the long tier's 503 must surface, not a base success"),
+        };
+
+        assert!(
+            long.last_chat_params().await.is_some(),
+            "the size-selected (long) tier must still be tried"
+        );
+        assert!(
+            base.last_chat_params().await.is_none(),
+            "negative priority: the base tier must NEVER be tried as a fallback"
+        );
+        match err {
+            CompletionError::HttpError { status_code, .. } => {
+                assert_eq!(
+                    status_code, 503,
+                    "the long tier's retryable error must surface"
+                )
+            }
+            other => panic!("expected the long tier's HttpError(503), got: {other}"),
+        }
     }
 
     /// Regression test for review finding 1 on #1117: the negative-priority
@@ -11987,228 +11895,215 @@ mod tests {
     /// (`context_400_fall_through_does_not_clobber_retryable_error` above).
     #[tokio::test]
     async fn low_priority_context_400_still_falls_through_to_larger_near_tier() {
-        crate::test_utils::with_test_budget(async {
-            use inference_providers::mock::MockProvider;
-            use inference_providers::{CompletionError, ProviderTier};
+        use inference_providers::mock::MockProvider;
+        use inference_providers::{CompletionError, ProviderTier};
 
-            let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
-            let model_id = "z-ai/glm-5.2".to_string();
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+        let model_id = "z-ai/glm-5.2".to_string();
 
-            let base = Arc::new(MockProvider::new_accept_all().with_tier(ProviderTier::Near));
-            base.set_error_override(Some(CompletionError::HttpError {
+        let base = Arc::new(MockProvider::new_accept_all().with_tier(ProviderTier::Near));
+        base.set_error_override(Some(CompletionError::HttpError {
+            status_code: 400,
+            message: "This model's maximum context length is 262144 tokens.".to_string(),
+            is_external: true,
+        }))
+        .await;
+        // No error override: the long tier serves successfully.
+        let long = Arc::new(MockProvider::new_accept_all().with_tier(ProviderTier::Near));
+
+        {
+            let mut m = pool.provider_mappings.write().await;
+            m.model_to_providers.insert(
+                model_id.clone(),
+                vec![
+                    base.clone() as Arc<InferenceProviderTrait>,
+                    long.clone() as Arc<InferenceProviderTrait>,
+                ],
+            );
+        }
+        {
+            let mut states = pool
+                .provider_load_state
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            states
+                .entry(Arc::as_ptr(&base) as *const () as usize)
+                .or_default()
+                .max_context_tokens = Some(262_144);
+            states
+                .entry(Arc::as_ptr(&long) as *const () as usize)
+                .or_default()
+                .max_context_tokens = Some(1_048_576);
+        }
+        pool.provider_failure_counts
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(Arc::as_ptr(&base) as *const () as usize, 10);
+
+        // ~833KB of text -> internally-computed requirement is ~250k,
+        // comfortably inside base's 262144 window, so the pin selects base —
+        // but base still 400s on the actual (under-estimated) request.
+        let mut params = fallback_params(&model_id);
+        params.messages[0].content = Some(serde_json::Value::String("a".repeat(833_334)));
+
+        let result = with_test_budget(pool.chat_completion_with_attribution_and_hints(
+            params,
+            "test-hash".to_string(),
+            ChatRoutingHints {
+                request_priority: -2,
+                ..Default::default()
+            },
+        ))
+        .await;
+
+        match result {
+            Ok(_) => {}
+            Err(e) => panic!(
+                "the long provider must be attempted and serve the \
+                 context-400 fall-through, got error: {e}"
+            ),
+        }
+        assert!(
+            base.last_chat_params().await.is_some(),
+            "the pinned (base) tier must still be tried first"
+        );
+        assert!(
+            long.last_chat_params().await.is_some(),
+            "the larger declared NEAR sibling must be tried after the pinned \
+             tier's context-length 400, even at negative priority"
+        );
+    }
+
+    #[tokio::test]
+    async fn low_priority_model_not_found_can_fall_through_to_other_near_tier() {
+        use inference_providers::mock::MockProvider;
+        use inference_providers::{CompletionError, ProviderTier};
+
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+        let model_id = "z-ai/glm-5.2".to_string();
+        let base = Arc::new(MockProvider::new_accept_all().with_tier(ProviderTier::Near));
+        base.set_error_override(Some(CompletionError::HttpError {
+            status_code: 404,
+            message: "model not found".to_string(),
+            is_external: true,
+        }))
+        .await;
+        let long = Arc::new(MockProvider::new_accept_all().with_tier(ProviderTier::Near));
+        {
+            let mut mappings = pool.provider_mappings.write().await;
+            mappings.model_to_providers.insert(
+                model_id.clone(),
+                vec![
+                    base.clone() as Arc<InferenceProviderTrait>,
+                    long.clone() as Arc<InferenceProviderTrait>,
+                ],
+            );
+        }
+        {
+            let mut states = pool
+                .provider_load_state
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            states
+                .entry(Arc::as_ptr(&base) as *const () as usize)
+                .or_default()
+                .max_context_tokens = Some(262_144);
+            states
+                .entry(Arc::as_ptr(&long) as *const () as usize)
+                .or_default()
+                .max_context_tokens = Some(1_048_576);
+        }
+        let mut params = fallback_params(&model_id);
+        params.messages[0].content = Some(serde_json::Value::String("a".repeat(833_334)));
+        let result = with_test_budget(pool.chat_completion_with_attribution_and_hints(
+            params,
+            "test-hash".to_string(),
+            ChatRoutingHints {
+                request_priority: -2,
+                ..Default::default()
+            },
+        ))
+        .await;
+        if let Err(error) = result {
+            panic!("model-not-found fall-through should reach the other NEAR tier: {error}");
+        }
+        assert!(base.last_chat_params().await.is_some());
+        assert!(long.last_chat_params().await.is_some());
+    }
+
+    #[tokio::test]
+    async fn low_priority_context_400_survives_same_tier_retryable_failure() {
+        use inference_providers::mock::MockProvider;
+        use inference_providers::{CompletionError, ProviderTier};
+
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+        let model_id = "z-ai/glm-5.2".to_string();
+        let base_rejects = Arc::new(MockProvider::new_accept_all().with_tier(ProviderTier::Near));
+        base_rejects
+            .set_error_override(Some(CompletionError::HttpError {
                 status_code: 400,
                 message: "This model's maximum context length is 262144 tokens.".to_string(),
                 is_external: true,
             }))
             .await;
-            // No error override: the long tier serves successfully.
-            let long = Arc::new(MockProvider::new_accept_all().with_tier(ProviderTier::Near));
-
-            {
-                let mut m = pool.provider_mappings.write().await;
-                m.model_to_providers.insert(
-                    model_id.clone(),
-                    vec![
-                        base.clone() as Arc<InferenceProviderTrait>,
-                        long.clone() as Arc<InferenceProviderTrait>,
-                    ],
-                );
-            }
-            {
-                let mut states = pool
-                    .provider_load_state
-                    .write()
-                    .unwrap_or_else(|e| e.into_inner());
-                states
-                    .entry(Arc::as_ptr(&base) as *const () as usize)
-                    .or_default()
-                    .max_context_tokens = Some(262_144);
-                states
-                    .entry(Arc::as_ptr(&long) as *const () as usize)
-                    .or_default()
-                    .max_context_tokens = Some(1_048_576);
-            }
-            pool.provider_failure_counts
-                .write()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(Arc::as_ptr(&base) as *const () as usize, 10);
-
-            // ~833KB of text -> internally-computed requirement is ~250k,
-            // comfortably inside base's 262144 window, so the pin selects base —
-            // but base still 400s on the actual (under-estimated) request.
-            let mut params = fallback_params(&model_id);
-            params.messages[0].content = Some(serde_json::Value::String("a".repeat(833_334)));
-
-            let result = pool
-                .chat_completion_with_attribution_and_hints(
-                    params,
-                    "test-hash".to_string(),
-                    ChatRoutingHints {
-                        request_priority: -2,
-                        ..Default::default()
-                    },
-                )
-                .await;
-
-            match result {
-                Ok(_) => {}
-                Err(e) => panic!(
-                    "the long provider must be attempted and serve the \
-                 context-400 fall-through, got error: {e}"
-                ),
-            }
-            assert!(
-                base.last_chat_params().await.is_some(),
-                "the pinned (base) tier must still be tried first"
-            );
-            assert!(
-                long.last_chat_params().await.is_some(),
-                "the larger declared NEAR sibling must be tried after the pinned \
-             tier's context-length 400, even at negative priority"
-            );
-        })
-        .await;
-    }
-
-    #[tokio::test]
-    async fn low_priority_model_not_found_can_fall_through_to_other_near_tier() {
-        crate::test_utils::with_test_budget(async {
-            use inference_providers::mock::MockProvider;
-            use inference_providers::{CompletionError, ProviderTier};
-
-            let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
-            let model_id = "z-ai/glm-5.2".to_string();
-            let base = Arc::new(MockProvider::new_accept_all().with_tier(ProviderTier::Near));
-            base.set_error_override(Some(CompletionError::HttpError {
-                status_code: 404,
-                message: "model not found".to_string(),
+        let base_busy = Arc::new(MockProvider::new_accept_all().with_tier(ProviderTier::Near));
+        base_busy
+            .set_error_override(Some(CompletionError::HttpError {
+                status_code: 503,
+                message: "queue full".to_string(),
                 is_external: true,
             }))
             .await;
-            let long = Arc::new(MockProvider::new_accept_all().with_tier(ProviderTier::Near));
-            {
-                let mut mappings = pool.provider_mappings.write().await;
-                mappings.model_to_providers.insert(
-                    model_id.clone(),
-                    vec![
-                        base.clone() as Arc<InferenceProviderTrait>,
-                        long.clone() as Arc<InferenceProviderTrait>,
-                    ],
-                );
-            }
-            {
-                let mut states = pool
-                    .provider_load_state
-                    .write()
-                    .unwrap_or_else(|e| e.into_inner());
+        let long = Arc::new(MockProvider::new_accept_all().with_tier(ProviderTier::Near));
+        {
+            let mut mappings = pool.provider_mappings.write().await;
+            mappings.model_to_providers.insert(
+                model_id.clone(),
+                vec![
+                    base_rejects.clone() as Arc<InferenceProviderTrait>,
+                    base_busy.clone() as Arc<InferenceProviderTrait>,
+                    long.clone() as Arc<InferenceProviderTrait>,
+                ],
+            );
+        }
+        {
+            let mut states = pool
+                .provider_load_state
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            for provider in [&base_rejects, &base_busy] {
                 states
-                    .entry(Arc::as_ptr(&base) as *const () as usize)
+                    .entry(Arc::as_ptr(provider) as *const () as usize)
                     .or_default()
                     .max_context_tokens = Some(262_144);
-                states
-                    .entry(Arc::as_ptr(&long) as *const () as usize)
-                    .or_default()
-                    .max_context_tokens = Some(1_048_576);
             }
-            let mut params = fallback_params(&model_id);
-            params.messages[0].content = Some(serde_json::Value::String("a".repeat(833_334)));
-            let result = pool
-                .chat_completion_with_attribution_and_hints(
-                    params,
-                    "test-hash".to_string(),
-                    ChatRoutingHints {
-                        request_priority: -2,
-                        ..Default::default()
-                    },
-                )
-                .await;
-            if let Err(error) = result {
-                panic!("model-not-found fall-through should reach the other NEAR tier: {error}");
-            }
-            assert!(base.last_chat_params().await.is_some());
-            assert!(long.last_chat_params().await.is_some());
-        })
+            states
+                .entry(Arc::as_ptr(&long) as *const () as usize)
+                .or_default()
+                .max_context_tokens = Some(1_048_576);
+        }
+        pool.provider_failure_counts
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(Arc::as_ptr(&base_busy) as *const () as usize, 10);
+
+        let mut params = fallback_params(&model_id);
+        params.messages[0].content = Some(serde_json::Value::String("a".repeat(833_334)));
+        let result = with_test_budget(pool.chat_completion_with_attribution_and_hints(
+            params,
+            "test-hash".to_string(),
+            ChatRoutingHints {
+                request_priority: -2,
+                ..Default::default()
+            },
+        ))
         .await;
-    }
-
-    #[tokio::test]
-    async fn low_priority_context_400_survives_same_tier_retryable_failure() {
-        crate::test_utils::with_test_budget(async {
-            use inference_providers::mock::MockProvider;
-            use inference_providers::{CompletionError, ProviderTier};
-
-            let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
-            let model_id = "z-ai/glm-5.2".to_string();
-            let base_rejects =
-                Arc::new(MockProvider::new_accept_all().with_tier(ProviderTier::Near));
-            base_rejects
-                .set_error_override(Some(CompletionError::HttpError {
-                    status_code: 400,
-                    message: "This model's maximum context length is 262144 tokens.".to_string(),
-                    is_external: true,
-                }))
-                .await;
-            let base_busy = Arc::new(MockProvider::new_accept_all().with_tier(ProviderTier::Near));
-            base_busy
-                .set_error_override(Some(CompletionError::HttpError {
-                    status_code: 503,
-                    message: "queue full".to_string(),
-                    is_external: true,
-                }))
-                .await;
-            let long = Arc::new(MockProvider::new_accept_all().with_tier(ProviderTier::Near));
-            {
-                let mut mappings = pool.provider_mappings.write().await;
-                mappings.model_to_providers.insert(
-                    model_id.clone(),
-                    vec![
-                        base_rejects.clone() as Arc<InferenceProviderTrait>,
-                        base_busy.clone() as Arc<InferenceProviderTrait>,
-                        long.clone() as Arc<InferenceProviderTrait>,
-                    ],
-                );
-            }
-            {
-                let mut states = pool
-                    .provider_load_state
-                    .write()
-                    .unwrap_or_else(|e| e.into_inner());
-                for provider in [&base_rejects, &base_busy] {
-                    states
-                        .entry(Arc::as_ptr(provider) as *const () as usize)
-                        .or_default()
-                        .max_context_tokens = Some(262_144);
-                }
-                states
-                    .entry(Arc::as_ptr(&long) as *const () as usize)
-                    .or_default()
-                    .max_context_tokens = Some(1_048_576);
-            }
-            pool.provider_failure_counts
-                .write()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(Arc::as_ptr(&base_busy) as *const () as usize, 10);
-
-            let mut params = fallback_params(&model_id);
-            params.messages[0].content = Some(serde_json::Value::String("a".repeat(833_334)));
-            let result = pool
-                .chat_completion_with_attribution_and_hints(
-                    params,
-                    "test-hash".to_string(),
-                    ChatRoutingHints {
-                        request_priority: -2,
-                        ..Default::default()
-                    },
-                )
-                .await;
-            if let Err(error) = result {
-                panic!("context fall-through should survive a busy same-tier provider: {error}");
-            }
-            assert!(base_rejects.last_chat_params().await.is_some());
-            assert!(base_busy.last_chat_params().await.is_some());
-            assert!(long.last_chat_params().await.is_some());
-        })
-        .await;
+        if let Err(error) = result {
+            panic!("context fall-through should survive a busy same-tier provider: {error}");
+        }
+        assert!(base_rejects.last_chat_params().await.is_some());
+        assert!(base_busy.last_chat_params().await.is_some());
+        assert!(long.last_chat_params().await.is_some());
     }
 
     /// The requirement refinement only activates for models whose providers
@@ -12499,40 +12394,35 @@ mod tests {
     /// Attested3p backup, and the result must not be attributed as fallback.
     #[tokio::test]
     async fn chat_completion_keeps_slow_near_ahead_of_attested_backup() {
-        crate::test_utils::with_test_budget(async {
-            use inference_providers::mock::MockProvider;
-            use inference_providers::ProviderTier;
+        use inference_providers::mock::MockProvider;
+        use inference_providers::ProviderTier;
 
-            let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
-            let model_id = "m-e2e-slow-near".to_string();
-            let near = Arc::new(MockProvider::new_accept_all().with_tier(ProviderTier::Near));
-            let backup =
-                Arc::new(MockProvider::new_accept_all().with_tier(ProviderTier::Attested3p));
-            let near_dyn = as_trait(&near);
-            let backup_dyn = as_trait(&backup);
-            pool.register_provider(model_id.clone(), near_dyn.clone())
-                .await;
-            pool.register_pinned_secondary_provider(model_id.clone(), backup_dyn.clone(), None)
-                .await;
-            pool.seed_ttft(&near_dyn, 3000.0);
-            pool.seed_ttft(&backup_dyn, 100.0);
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+        let model_id = "m-e2e-slow-near".to_string();
+        let near = Arc::new(MockProvider::new_accept_all().with_tier(ProviderTier::Near));
+        let backup = Arc::new(MockProvider::new_accept_all().with_tier(ProviderTier::Attested3p));
+        let near_dyn = as_trait(&near);
+        let backup_dyn = as_trait(&backup);
+        pool.register_provider(model_id.clone(), near_dyn.clone())
+            .await;
+        pool.register_pinned_secondary_provider(model_id.clone(), backup_dyn.clone(), None)
+            .await;
+        pool.seed_ttft(&near_dyn, 3000.0);
+        pool.seed_ttft(&backup_dyn, 100.0);
 
-            let served = pool
-                .chat_completion_stream_with_attribution(
-                    fallback_params(&model_id),
-                    "slow-near".to_string(),
-                    ChatRoutingHints::default(),
-                )
-                .await
-                .expect("slow NEAR must still serve");
-            assert!(near.last_chat_params().await.is_some());
-            assert!(
-                backup.last_chat_params().await.is_none(),
-                "faster attested backup must not serve while NEAR is available"
-            );
-            assert!(!served.provider_attribution.served_via_fallback);
-        })
-        .await;
+        let served = with_test_budget(pool.chat_completion_stream_with_attribution(
+            fallback_params(&model_id),
+            "slow-near".to_string(),
+            ChatRoutingHints::default(),
+        ))
+        .await
+        .expect("slow NEAR must still serve");
+        assert!(near.last_chat_params().await.is_some());
+        assert!(
+            backup.last_chat_params().await.is_none(),
+            "faster attested backup must not serve while NEAR is available"
+        );
+        assert!(!served.provider_attribution.served_via_fallback);
     }
 
     #[tokio::test]
@@ -12623,95 +12513,94 @@ mod tests {
 
     #[tokio::test]
     async fn pool_sets_placement_context_for_two_tier_model() {
-        crate::test_utils::with_test_budget(async {
-            let model = "z-ai/glm-5.3-flash";
-            let (pool, providers) = capacity_pool(model, &[100_000, 1_048_576]).await;
-            let (base, long) = (&providers[0], &providers[1]);
+        let model = "z-ai/glm-5.3-flash";
+        let (pool, providers) = capacity_pool(model, &[100_000, 1_048_576]).await;
+        let (base, long) = (&providers[0], &providers[1]);
 
-            // Short: fits the base tier, so it is not heavy.
-            let mut short = sized_params(model, 4_000);
-            short.max_tokens = Some(2_000);
-            let _stream = pool
-                .chat_completion_stream(short, "h1".to_string(), ChatRoutingHints::default())
-                .await
-                .expect("served");
-            let ctx = served_placement(base).await;
-            assert_eq!(ctx.prompt_tokens, Some(heuristic_requirement(4_000)));
-            assert!(!ctx.prefill_heavy);
+        // Short: fits the base tier, so it is not heavy.
+        let mut short = sized_params(model, 4_000);
+        short.max_tokens = Some(2_000);
+        let _stream = with_test_budget(pool.chat_completion_stream(
+            short,
+            "h1".to_string(),
+            ChatRoutingHints::default(),
+        ))
+        .await
+        .expect("served");
+        let ctx = served_placement(base).await;
+        assert_eq!(ctx.prompt_tokens, Some(heuristic_requirement(4_000)));
+        assert!(!ctx.prefill_heavy);
 
-            // Heavy iff the prompt > base_capacity: 400k bytes → ~120k tokens of
-            // input, over the 100k base window.
-            let mut heavy = sized_params(model, 400_000);
-            heavy.max_tokens = Some(8_000);
-            let _stream = pool
-                .chat_completion_stream(heavy, "h2".to_string(), ChatRoutingHints::default())
-                .await
-                .expect("served");
-            let ctx = served_placement(long).await;
-            let prompt = heuristic_requirement(400_000);
-            assert_eq!(ctx.prompt_tokens, Some(prompt));
-            assert!(prompt > 100_000);
-            assert!(ctx.prefill_heavy);
-        })
-        .await;
+        // Heavy iff the prompt > base_capacity: 400k bytes → ~120k tokens of
+        // input, over the 100k base window.
+        let mut heavy = sized_params(model, 400_000);
+        heavy.max_tokens = Some(8_000);
+        let _stream = with_test_budget(pool.chat_completion_stream(
+            heavy,
+            "h2".to_string(),
+            ChatRoutingHints::default(),
+        ))
+        .await
+        .expect("served");
+        let ctx = served_placement(long).await;
+        let prompt = heuristic_requirement(400_000);
+        assert_eq!(ctx.prompt_tokens, Some(prompt));
+        assert!(prompt > 100_000);
+        assert!(ctx.prefill_heavy);
     }
 
     #[tokio::test]
     async fn single_tier_model_is_never_heavy() {
-        crate::test_utils::with_test_budget(async {
-            let model = "z-ai/glm-5.3-flash";
-            let (pool, providers) = capacity_pool(model, &[100_000]).await;
+        let model = "z-ai/glm-5.3-flash";
+        let (pool, providers) = capacity_pool(model, &[100_000]).await;
 
-            // Oversized for the only tier: still sized, never heavy.
-            let _stream = pool
-                .chat_completion_stream(
-                    sized_params(model, 600_000),
-                    "h".to_string(),
-                    ChatRoutingHints::default(),
-                )
-                .await
-                .expect("served");
-            let ctx = served_placement(&providers[0]).await;
-            assert_eq!(ctx.prompt_tokens, Some(heuristic_requirement(600_000)));
-            assert!(!ctx.prefill_heavy);
-        })
-        .await;
+        // Oversized for the only tier: still sized, never heavy.
+        let _stream = with_test_budget(pool.chat_completion_stream(
+            sized_params(model, 600_000),
+            "h".to_string(),
+            ChatRoutingHints::default(),
+        ))
+        .await
+        .expect("served");
+        let ctx = served_placement(&providers[0]).await;
+        assert_eq!(ctx.prompt_tokens, Some(heuristic_requirement(600_000)));
+        assert!(!ctx.prefill_heavy);
     }
 
     /// Output length never enters routing: a short prompt with a huge
     /// `max_tokens` stays on the base tier, and is not prefill-heavy.
     #[tokio::test]
     async fn max_tokens_does_not_change_tier() {
-        crate::test_utils::with_test_budget(async {
-            let model = "z-ai/glm-5.3-flash";
-            let (pool, providers) = capacity_pool(model, &[100_000, 1_048_576]).await;
-            let (base, long) = (&providers[0], &providers[1]);
+        let model = "z-ai/glm-5.3-flash";
+        let (pool, providers) = capacity_pool(model, &[100_000, 1_048_576]).await;
+        let (base, long) = (&providers[0], &providers[1]);
 
-            let mut params = sized_params(model, 4_000);
-            params.max_tokens = Some(900_000);
-            params.max_completion_tokens = Some(900_000);
-            let mut hints = ChatRoutingHints::default();
-            pool.apply_context_routing(model, &mut params, &mut hints)
-                .await;
-            let prompt = heuristic_requirement(4_000);
-            assert_eq!(hints.estimated_tokens.map(u64::from), Some(prompt));
-            assert_eq!(params.placement.prompt_tokens, Some(prompt));
-            assert!(!params.placement.prefill_heavy);
+        let mut params = sized_params(model, 4_000);
+        params.max_tokens = Some(900_000);
+        params.max_completion_tokens = Some(900_000);
+        let mut hints = ChatRoutingHints::default();
+        pool.apply_context_routing(model, &mut params, &mut hints)
+            .await;
+        let prompt = heuristic_requirement(4_000);
+        assert_eq!(hints.estimated_tokens.map(u64::from), Some(prompt));
+        assert_eq!(params.placement.prompt_tokens, Some(prompt));
+        assert!(!params.placement.prefill_heavy);
 
-            let _stream = pool
-                .chat_completion_stream(params, "h".to_string(), ChatRoutingHints::default())
-                .await
-                .expect("served");
-            assert!(
-                base.last_chat_params().await.is_some(),
-                "a short prompt sorts base first"
-            );
-            assert!(
-                long.last_chat_params().await.is_none(),
-                "max_tokens must not push a short prompt to the long tier"
-            );
-        })
-        .await;
+        let _stream = with_test_budget(pool.chat_completion_stream(
+            params,
+            "h".to_string(),
+            ChatRoutingHints::default(),
+        ))
+        .await
+        .expect("served");
+        assert!(
+            base.last_chat_params().await.is_some(),
+            "a short prompt sorts base first"
+        );
+        assert!(
+            long.last_chat_params().await.is_none(),
+            "max_tokens must not push a short prompt to the long tier"
+        );
     }
 
     /// Routing never asks a backend for a token count (the trait has no such
@@ -12736,48 +12625,41 @@ mod tests {
     /// Every model gets its placement context: there is no allow-list.
     #[tokio::test]
     async fn any_model_gets_placement_context() {
-        crate::test_utils::with_test_budget(async {
-            let model = "acme/any-new-model";
-            let (pool, providers) = capacity_pool(model, &[262_144, 1_048_576]).await;
+        let model = "acme/any-new-model";
+        let (pool, providers) = capacity_pool(model, &[262_144, 1_048_576]).await;
 
-            let _stream = pool
-                .chat_completion_stream(
-                    sized_params(model, 1_200_000),
-                    "h".to_string(),
-                    ChatRoutingHints::default(),
-                )
-                .await
-                .expect("served");
-            let ctx = served_placement(&providers[1]).await;
-            assert_eq!(ctx.prompt_tokens, Some(heuristic_requirement(1_200_000)));
-            assert!(ctx.prefill_heavy);
-        })
-        .await;
+        let _stream = with_test_budget(pool.chat_completion_stream(
+            sized_params(model, 1_200_000),
+            "h".to_string(),
+            ChatRoutingHints::default(),
+        ))
+        .await
+        .expect("served");
+        let ctx = served_placement(&providers[1]).await;
+        assert_eq!(ctx.prompt_tokens, Some(heuristic_requirement(1_200_000)));
+        assert!(ctx.prefill_heavy);
     }
 
     #[tokio::test]
     async fn non_streaming_path_sets_placement_context() {
-        crate::test_utils::with_test_budget(async {
-            let model = "z-ai/glm-5.3-flash";
-            let (pool, providers) = capacity_pool(model, &[100_000, 1_048_576]).await;
+        let model = "z-ai/glm-5.3-flash";
+        let (pool, providers) = capacity_pool(model, &[100_000, 1_048_576]).await;
 
-            let mut params = sized_params(model, 400_000);
-            // The service's affinity survives the pool's context.
-            params.placement.affinity = Some(placement::affinity::AffinityKey::from_bytes([1; 16]));
-            params.placement.affinity_source = placement::decision::AffinitySource::Header;
-            pool.chat_completion(params, "h".to_string())
-                .await
-                .expect("served");
-            let ctx = served_placement(&providers[1]).await;
-            assert_eq!(ctx.prompt_tokens, Some(heuristic_requirement(400_000)));
-            assert!(ctx.prefill_heavy);
-            assert!(ctx.affinity.is_some());
-            assert_eq!(
-                ctx.affinity_source,
-                placement::decision::AffinitySource::Header
-            );
-        })
-        .await;
+        let mut params = sized_params(model, 400_000);
+        // The service's affinity survives the pool's context.
+        params.placement.affinity = Some(placement::affinity::AffinityKey::from_bytes([1; 16]));
+        params.placement.affinity_source = placement::decision::AffinitySource::Header;
+        with_test_budget(pool.chat_completion(params, "h".to_string()))
+            .await
+            .expect("served");
+        let ctx = served_placement(&providers[1]).await;
+        assert_eq!(ctx.prompt_tokens, Some(heuristic_requirement(400_000)));
+        assert!(ctx.prefill_heavy);
+        assert!(ctx.affinity.is_some());
+        assert_eq!(
+            ctx.affinity_source,
+            placement::decision::AffinitySource::Header
+        );
     }
 
     /// An attested fallback with a smaller declared window than the NEAR
@@ -12926,195 +12808,41 @@ mod tests {
     /// record `provider_tier:near, fallback:false`.
     #[tokio::test]
     async fn provider_requests_metric_tags_tier_and_fallback() {
-        crate::test_utils::with_test_budget(async {
-            use crate::metrics::capturing::{CapturingMetricsService, MetricValue};
-            use crate::metrics::consts::METRIC_PROVIDER_REQUESTS;
-            use inference_providers::mock::{MockProvider, RequestMatcher, ResponseTemplate};
-            use inference_providers::{CompletionError, ProviderTier};
+        use crate::metrics::capturing::{CapturingMetricsService, MetricValue};
+        use crate::metrics::consts::METRIC_PROVIDER_REQUESTS;
+        use inference_providers::mock::{MockProvider, RequestMatcher, ResponseTemplate};
+        use inference_providers::{CompletionError, ProviderTier};
 
-            // Helper: run one request through a pool wired with capturing metrics and
-            // return the recorded provider-requests tag sets.
-            async fn served_tags(near_fails: bool) -> Vec<Vec<String>> {
-                let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
-                let metrics = Arc::new(CapturingMetricsService::new());
-                pool.set_metrics_service(metrics.clone());
-                let model_id = "z-ai/glm-5.1".to_string();
-
-                let near = Arc::new(MockProvider::new_accept_all().with_tier(ProviderTier::Near));
-                if near_fails {
-                    near.set_error_override(Some(CompletionError::HttpError {
-                        status_code: 503,
-                        message: "overloaded".to_string(),
-                        is_external: true,
-                    }))
-                    .await;
-                } else {
-                    near.when(RequestMatcher::Any)
-                        .respond_with(ResponseTemplate::new("near"))
-                        .await;
-                }
-                let chutes =
-                    Arc::new(MockProvider::new_accept_all().with_tier(ProviderTier::Attested3p));
-                chutes
-                    .when(RequestMatcher::Any)
-                    .respond_with(ResponseTemplate::new("chutes"))
-                    .await;
-                {
-                    let mut m = pool.provider_mappings.write().await;
-                    m.model_to_providers.insert(
-                        model_id.clone(),
-                        vec![
-                            near.clone() as Arc<InferenceProviderTrait>,
-                            chutes.clone() as Arc<InferenceProviderTrait>,
-                        ],
-                    );
-                }
-                pool.chat_completion(fallback_params(&model_id), "h".to_string())
-                    .await
-                    .expect("served");
-
-                metrics
-                    .get_metrics()
-                    .into_iter()
-                    .filter(|m| m.name == METRIC_PROVIDER_REQUESTS)
-                    .inspect(|m| assert!(matches!(m.value, MetricValue::Count(1))))
-                    .map(|m| m.tags)
-                    .collect()
-            }
-
-            let fb = served_tags(true).await;
-            assert_eq!(fb.len(), 1, "exactly one provider-requests metric");
-            assert_eq!(
-                fb[0],
-                vec![
-                    "model:z-ai/glm-5.1".to_string(),
-                    "provider_tier:attested_3p".to_string(),
-                    "fallback:true".to_string(),
-                    "operation:chat_completion".to_string(),
-                    // No declared capacities and no size constraint in this setup.
-                    "provider_ctx:unbounded".to_string(),
-                    "context_tier:default".to_string(),
-                ]
-            );
-
-            let primary = served_tags(false).await;
-            assert_eq!(primary.len(), 1, "exactly one provider-requests metric");
-            assert_eq!(
-                primary[0],
-                vec![
-                    "model:z-ai/glm-5.1".to_string(),
-                    "provider_tier:near".to_string(),
-                    "fallback:false".to_string(),
-                    "operation:chat_completion".to_string(),
-                    "provider_ctx:unbounded".to_string(),
-                    "context_tier:default".to_string(),
-                ]
-            );
-        })
-        .await;
-    }
-
-    #[tokio::test]
-    async fn provider_attempts_metric_records_success_attempt() {
-        crate::test_utils::with_test_budget(async {
-            use crate::metrics::capturing::{CapturingMetricsService, MetricValue};
-            use crate::metrics::consts::METRIC_PROVIDER_ATTEMPTS;
-            use inference_providers::mock::{MockProvider, RequestMatcher, ResponseTemplate};
-            use inference_providers::{ProviderSource, ProviderTier};
-
+        // Helper: run one request through a pool wired with capturing metrics and
+        // return the recorded provider-requests tag sets.
+        async fn served_tags(near_fails: bool) -> Vec<Vec<String>> {
             let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
             let metrics = Arc::new(CapturingMetricsService::new());
             pool.set_metrics_service(metrics.clone());
             let model_id = "z-ai/glm-5.1".to_string();
 
-            let near = Arc::new(
-                MockProvider::new_accept_all()
-                    .with_tier(ProviderTier::Near)
-                    .with_provider_source(ProviderSource::Vllm),
-            );
-            near.when(RequestMatcher::Any)
-                .respond_with(ResponseTemplate::new("near-success"))
+            let near = Arc::new(MockProvider::new_accept_all().with_tier(ProviderTier::Near));
+            if near_fails {
+                near.set_error_override(Some(CompletionError::HttpError {
+                    status_code: 503,
+                    message: "overloaded".to_string(),
+                    is_external: true,
+                }))
                 .await;
-
-            {
-                let mut mappings = pool.provider_mappings.write().await;
-                mappings.model_to_providers.insert(
-                    model_id.clone(),
-                    vec![near.clone() as Arc<InferenceProviderTrait>],
-                );
+            } else {
+                near.when(RequestMatcher::Any)
+                    .respond_with(ResponseTemplate::new("near"))
+                    .await;
             }
-
-            pool.chat_completion(fallback_params(&model_id), "h".to_string())
-                .await
-                .expect("NEAR primary should serve");
-
-            let attempt_metrics: Vec<_> = metrics
-                .get_metrics()
-                .into_iter()
-                .filter(|metric| metric.name == METRIC_PROVIDER_ATTEMPTS)
-                .inspect(|metric| assert!(matches!(metric.value, MetricValue::Count(1))))
-                .collect();
-            assert_eq!(
-                attempt_metrics.len(),
-                1,
-                "exactly one provider-attempt metric"
-            );
-            assert_eq!(
-                attempt_metrics[0].tags,
-                vec![
-                    "model:z-ai/glm-5.1".to_string(),
-                    "provider_tier:near".to_string(),
-                    "provider_type:vllm".to_string(),
-                    "fallback:false".to_string(),
-                    "operation:chat_completion".to_string(),
-                    "attempt_result:success".to_string(),
-                    "retry_decision:none".to_string(),
-                    "retry_round:0".to_string(),
-                    "attempt_index:1".to_string(),
-                ]
-            );
-        })
-        .await;
-    }
-
-    #[tokio::test]
-    async fn provider_attempts_metric_records_failed_retry_and_chutes_success() {
-        crate::test_utils::with_test_budget(async {
-            use crate::metrics::capturing::{CapturingMetricsService, MetricValue};
-            use crate::metrics::consts::METRIC_PROVIDER_ATTEMPTS;
-            use inference_providers::mock::{MockProvider, RequestMatcher, ResponseTemplate};
-            use inference_providers::{CompletionError, ProviderSource, ProviderTier};
-
-            let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
-            let metrics = Arc::new(CapturingMetricsService::new());
-            pool.set_metrics_service(metrics.clone());
-            let model_id = "z-ai/glm-5.1".to_string();
-
-            let near = Arc::new(
-                MockProvider::new_accept_all()
-                    .with_tier(ProviderTier::Near)
-                    .with_provider_source(ProviderSource::Vllm),
-            );
-            near.set_error_override(Some(CompletionError::HttpError {
-                status_code: 503,
-                message: "overloaded".to_string(),
-                is_external: true,
-            }))
-            .await;
-
-            let chutes = Arc::new(
-                MockProvider::new_accept_all()
-                    .with_tier(ProviderTier::Attested3p)
-                    .with_provider_source(ProviderSource::Chutes),
-            );
+            let chutes =
+                Arc::new(MockProvider::new_accept_all().with_tier(ProviderTier::Attested3p));
             chutes
                 .when(RequestMatcher::Any)
-                .respond_with(ResponseTemplate::new("chutes-success"))
+                .respond_with(ResponseTemplate::new("chutes"))
                 .await;
-
             {
-                let mut mappings = pool.provider_mappings.write().await;
-                mappings.model_to_providers.insert(
+                let mut m = pool.provider_mappings.write().await;
+                m.model_to_providers.insert(
                     model_id.clone(),
                     vec![
                         near.clone() as Arc<InferenceProviderTrait>,
@@ -13122,64 +12850,208 @@ mod tests {
                     ],
                 );
             }
-
-            pool.chat_completion(fallback_params(&model_id), "h".to_string())
+            with_test_budget(pool.chat_completion(fallback_params(&model_id), "h".to_string()))
                 .await
-                .expect("Chutes fallback should serve after retryable NEAR failure");
+                .expect("served");
 
-            let attempt_metrics: Vec<_> = metrics
+            metrics
                 .get_metrics()
                 .into_iter()
-                .filter(|metric| metric.name == METRIC_PROVIDER_ATTEMPTS)
-                .inspect(|metric| assert!(matches!(metric.value, MetricValue::Count(1))))
-                .collect();
-            assert_eq!(
-                attempt_metrics.len(),
-                2,
-                "exactly two provider-attempt metrics"
+                .filter(|m| m.name == METRIC_PROVIDER_REQUESTS)
+                .inspect(|m| assert!(matches!(m.value, MetricValue::Count(1))))
+                .map(|m| m.tags)
+                .collect()
+        }
+
+        let fb = served_tags(true).await;
+        assert_eq!(fb.len(), 1, "exactly one provider-requests metric");
+        assert_eq!(
+            fb[0],
+            vec![
+                "model:z-ai/glm-5.1".to_string(),
+                "provider_tier:attested_3p".to_string(),
+                "fallback:true".to_string(),
+                "operation:chat_completion".to_string(),
+                // No declared capacities and no size constraint in this setup.
+                "provider_ctx:unbounded".to_string(),
+                "context_tier:default".to_string(),
+            ]
+        );
+
+        let primary = served_tags(false).await;
+        assert_eq!(primary.len(), 1, "exactly one provider-requests metric");
+        assert_eq!(
+            primary[0],
+            vec![
+                "model:z-ai/glm-5.1".to_string(),
+                "provider_tier:near".to_string(),
+                "fallback:false".to_string(),
+                "operation:chat_completion".to_string(),
+                "provider_ctx:unbounded".to_string(),
+                "context_tier:default".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_attempts_metric_records_success_attempt() {
+        use crate::metrics::capturing::{CapturingMetricsService, MetricValue};
+        use crate::metrics::consts::METRIC_PROVIDER_ATTEMPTS;
+        use inference_providers::mock::{MockProvider, RequestMatcher, ResponseTemplate};
+        use inference_providers::{ProviderSource, ProviderTier};
+
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+        let metrics = Arc::new(CapturingMetricsService::new());
+        pool.set_metrics_service(metrics.clone());
+        let model_id = "z-ai/glm-5.1".to_string();
+
+        let near = Arc::new(
+            MockProvider::new_accept_all()
+                .with_tier(ProviderTier::Near)
+                .with_provider_source(ProviderSource::Vllm),
+        );
+        near.when(RequestMatcher::Any)
+            .respond_with(ResponseTemplate::new("near-success"))
+            .await;
+
+        {
+            let mut mappings = pool.provider_mappings.write().await;
+            mappings.model_to_providers.insert(
+                model_id.clone(),
+                vec![near.clone() as Arc<InferenceProviderTrait>],
             );
-            assert_eq!(
-                attempt_metrics[0].tags,
+        }
+
+        with_test_budget(pool.chat_completion(fallback_params(&model_id), "h".to_string()))
+            .await
+            .expect("NEAR primary should serve");
+
+        let attempt_metrics: Vec<_> = metrics
+            .get_metrics()
+            .into_iter()
+            .filter(|metric| metric.name == METRIC_PROVIDER_ATTEMPTS)
+            .inspect(|metric| assert!(matches!(metric.value, MetricValue::Count(1))))
+            .collect();
+        assert_eq!(
+            attempt_metrics.len(),
+            1,
+            "exactly one provider-attempt metric"
+        );
+        assert_eq!(
+            attempt_metrics[0].tags,
+            vec![
+                "model:z-ai/glm-5.1".to_string(),
+                "provider_tier:near".to_string(),
+                "provider_type:vllm".to_string(),
+                "fallback:false".to_string(),
+                "operation:chat_completion".to_string(),
+                "attempt_result:success".to_string(),
+                "retry_decision:none".to_string(),
+                "retry_round:0".to_string(),
+                "attempt_index:1".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_attempts_metric_records_failed_retry_and_chutes_success() {
+        use crate::metrics::capturing::{CapturingMetricsService, MetricValue};
+        use crate::metrics::consts::METRIC_PROVIDER_ATTEMPTS;
+        use inference_providers::mock::{MockProvider, RequestMatcher, ResponseTemplate};
+        use inference_providers::{CompletionError, ProviderSource, ProviderTier};
+
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+        let metrics = Arc::new(CapturingMetricsService::new());
+        pool.set_metrics_service(metrics.clone());
+        let model_id = "z-ai/glm-5.1".to_string();
+
+        let near = Arc::new(
+            MockProvider::new_accept_all()
+                .with_tier(ProviderTier::Near)
+                .with_provider_source(ProviderSource::Vllm),
+        );
+        near.set_error_override(Some(CompletionError::HttpError {
+            status_code: 503,
+            message: "overloaded".to_string(),
+            is_external: true,
+        }))
+        .await;
+
+        let chutes = Arc::new(
+            MockProvider::new_accept_all()
+                .with_tier(ProviderTier::Attested3p)
+                .with_provider_source(ProviderSource::Chutes),
+        );
+        chutes
+            .when(RequestMatcher::Any)
+            .respond_with(ResponseTemplate::new("chutes-success"))
+            .await;
+
+        {
+            let mut mappings = pool.provider_mappings.write().await;
+            mappings.model_to_providers.insert(
+                model_id.clone(),
                 vec![
-                    "model:z-ai/glm-5.1".to_string(),
-                    "provider_tier:near".to_string(),
-                    "provider_type:vllm".to_string(),
-                    "fallback:false".to_string(),
-                    "operation:chat_completion".to_string(),
-                    "attempt_result:failed".to_string(),
-                    "retry_decision:retryable_http_5xx".to_string(),
-                    "retry_round:0".to_string(),
-                    "attempt_index:1".to_string(),
-                ]
+                    near.clone() as Arc<InferenceProviderTrait>,
+                    chutes.clone() as Arc<InferenceProviderTrait>,
+                ],
             );
-            assert_eq!(
-                attempt_metrics[1].tags,
-                vec![
-                    "model:z-ai/glm-5.1".to_string(),
-                    "provider_tier:attested_3p".to_string(),
-                    "provider_type:chutes".to_string(),
-                    "fallback:true".to_string(),
-                    "operation:chat_completion".to_string(),
-                    "attempt_result:success".to_string(),
-                    "retry_decision:none".to_string(),
-                    "retry_round:0".to_string(),
-                    "attempt_index:2".to_string(),
-                ]
-            );
-            assert!(
+        }
+
+        with_test_budget(pool.chat_completion(fallback_params(&model_id), "h".to_string()))
+            .await
+            .expect("Chutes fallback should serve after retryable NEAR failure");
+
+        let attempt_metrics: Vec<_> = metrics
+            .get_metrics()
+            .into_iter()
+            .filter(|metric| metric.name == METRIC_PROVIDER_ATTEMPTS)
+            .inspect(|metric| assert!(matches!(metric.value, MetricValue::Count(1))))
+            .collect();
+        assert_eq!(
+            attempt_metrics.len(),
+            2,
+            "exactly two provider-attempt metrics"
+        );
+        assert_eq!(
+            attempt_metrics[0].tags,
+            vec![
+                "model:z-ai/glm-5.1".to_string(),
+                "provider_tier:near".to_string(),
+                "provider_type:vllm".to_string(),
+                "fallback:false".to_string(),
+                "operation:chat_completion".to_string(),
+                "attempt_result:failed".to_string(),
+                "retry_decision:retryable_http_5xx".to_string(),
+                "retry_round:0".to_string(),
+                "attempt_index:1".to_string(),
+            ]
+        );
+        assert_eq!(
+            attempt_metrics[1].tags,
+            vec![
+                "model:z-ai/glm-5.1".to_string(),
+                "provider_tier:attested_3p".to_string(),
+                "provider_type:chutes".to_string(),
+                "fallback:true".to_string(),
+                "operation:chat_completion".to_string(),
+                "attempt_result:success".to_string(),
+                "retry_decision:none".to_string(),
+                "retry_round:0".to_string(),
+                "attempt_index:2".to_string(),
+            ]
+        );
+        assert!(
             !attempt_metrics
                 .iter()
                 .flat_map(|metric| metric.tags.iter())
                 .any(|tag| tag.contains("overloaded")),
             "provider-attempt metric tags must not include raw provider errors: {attempt_metrics:?}"
         );
-        })
-        .await;
     }
 
     #[tokio::test]
     async fn provider_attempts_metric_records_all_failed_retries() {
-        crate::test_utils::with_test_budget(async {
         use crate::metrics::capturing::{CapturingMetricsService, MetricValue};
         use crate::metrics::consts::{METRIC_PROVIDER_ATTEMPTS, METRIC_PROVIDER_REQUESTS};
         use inference_providers::mock::MockProvider;
@@ -13226,9 +13098,9 @@ mod tests {
             );
         }
 
-        let result = pool
-            .chat_completion(fallback_params(&model_id), "h".to_string())
-            .await;
+        let result =
+            with_test_budget(pool.chat_completion(fallback_params(&model_id), "h".to_string()))
+                .await;
 
         assert!(
             result.is_err(),
@@ -13292,13 +13164,10 @@ mod tests {
                 .any(|metric| metric.name == METRIC_PROVIDER_REQUESTS),
             "provider-requests metric must remain served-only on total failure: {captured_metrics:?}"
         );
-
-        }).await;
     }
 
     #[tokio::test]
     async fn provider_attempts_metric_records_short_circuit_failures() {
-        crate::test_utils::with_test_budget(async {
         use crate::metrics::capturing::{CapturingMetricsService, MetricValue, RecordedMetric};
         use crate::metrics::consts::METRIC_PROVIDER_ATTEMPTS;
         use inference_providers::mock::{MockProvider, RequestMatcher, ResponseTemplate};
@@ -13383,9 +13252,10 @@ mod tests {
             );
         }
 
-        let genuine_4xx_result = genuine_4xx_pool
-            .chat_completion(fallback_params(&model_id), "h".to_string())
-            .await;
+        let genuine_4xx_result = with_test_budget(
+            genuine_4xx_pool.chat_completion(fallback_params(&model_id), "h".to_string()),
+        )
+        .await;
         assert!(
             genuine_4xx_result.is_err(),
             "genuine client 4xx must still return the provider error"
@@ -13448,9 +13318,10 @@ mod tests {
             );
         }
 
-        let client_media_result = client_media_pool
-            .chat_completion(fallback_params(&model_id), "h".to_string())
-            .await;
+        let client_media_result = with_test_budget(
+            client_media_pool.chat_completion(fallback_params(&model_id), "h".to_string()),
+        )
+        .await;
         assert!(
             matches!(
                 client_media_result,
@@ -13479,13 +13350,10 @@ mod tests {
             ]
         );
         assert_no_forbidden_attempt_labels(&client_media_attempts);
-
-        }).await;
     }
 
     #[tokio::test]
     async fn demoted_near_chutes_first_success_is_still_fallback_attribution() {
-        crate::test_utils::with_test_budget(async {
         use inference_providers::mock::{MockProvider, RequestMatcher, ResponseTemplate};
         use inference_providers::{ProviderSource, ProviderTier};
 
@@ -13524,10 +13392,11 @@ mod tests {
                 .insert(near_key, 10);
         }
 
-        let served = pool
-            .chat_completion_with_attribution(fallback_params(&model_id), "h".to_string())
-            .await
-            .expect("demoted NEAR should allow Chutes to serve");
+        let served = with_test_budget(
+            pool.chat_completion_with_attribution(fallback_params(&model_id), "h".to_string()),
+        )
+        .await
+        .expect("demoted NEAR should allow Chutes to serve");
 
         let body = String::from_utf8_lossy(&served.response.raw_bytes);
         assert!(
@@ -13554,13 +13423,10 @@ mod tests {
             served.provider_attribution.served_via_fallback,
             "Chutes/attested_3p service under a demoted NEAR primary must be fallback even at attempt index 0"
         );
-
-        }).await;
     }
 
     #[tokio::test]
     async fn pinned_only_chutes_preserves_fallback_attribution_after_near_disappears() {
-        crate::test_utils::with_test_budget(async {
         use inference_providers::mock::{MockProvider, RequestMatcher, ResponseTemplate};
         use inference_providers::{ProviderSource, ProviderTier};
         use std::collections::HashSet;
@@ -13588,10 +13454,11 @@ mod tests {
             .await;
         pool.prune_stale_pinned(&HashSet::new()).await;
 
-        let served = pool
-            .chat_completion_with_attribution(fallback_params(&model_id), "h".to_string())
-            .await
-            .expect("pinned Chutes should serve after NEAR disappears");
+        let served = with_test_budget(
+            pool.chat_completion_with_attribution(fallback_params(&model_id), "h".to_string()),
+        )
+        .await
+        .expect("pinned Chutes should serve after NEAR disappears");
 
         let body = String::from_utf8_lossy(&served.response.raw_bytes);
         assert!(
@@ -13610,61 +13477,52 @@ mod tests {
             served.provider_attribution.served_via_fallback,
             "a Chutes provider pinned for a former NEAR model must remain attributed as fallback after pruning"
         );
-
-        }).await;
     }
 
     #[tokio::test]
     async fn chutes_only_pinned_model_remains_primary_attribution() {
-        crate::test_utils::with_test_budget(async {
-            use inference_providers::mock::{MockProvider, RequestMatcher, ResponseTemplate};
-            use inference_providers::{ProviderSource, ProviderTier};
+        use inference_providers::mock::{MockProvider, RequestMatcher, ResponseTemplate};
+        use inference_providers::{ProviderSource, ProviderTier};
 
-            let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
-            let model_id = "chutes-only/model".to_string();
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+        let model_id = "chutes-only/model".to_string();
 
-            let chutes = Arc::new(
-                MockProvider::new_accept_all()
-                    .with_tier(ProviderTier::Attested3p)
-                    .with_provider_source(ProviderSource::Chutes),
-            );
-            chutes
-                .when(RequestMatcher::Any)
-                .respond_with(ResponseTemplate::new("served-by-primary-chutes"))
-                .await;
-
-            pool.register_pinned_provider(
-                model_id.clone(),
-                chutes,
-                None,
-                ProviderPoolRole::Primary,
-            )
+        let chutes = Arc::new(
+            MockProvider::new_accept_all()
+                .with_tier(ProviderTier::Attested3p)
+                .with_provider_source(ProviderSource::Chutes),
+        );
+        chutes
+            .when(RequestMatcher::Any)
+            .respond_with(ResponseTemplate::new("served-by-primary-chutes"))
             .await;
 
-            let served = pool
-                .chat_completion_with_attribution(fallback_params(&model_id), "h".to_string())
-                .await
-                .expect("Chutes-only model should serve");
+        pool.register_pinned_provider(model_id.clone(), chutes, None, ProviderPoolRole::Primary)
+            .await;
 
-            let body = String::from_utf8_lossy(&served.response.raw_bytes);
-            assert!(
-                body.contains("served-by-primary-chutes"),
-                "Chutes-only model should serve, got: {body}"
-            );
-            assert_eq!(
-                served.provider_attribution.served_provider_tier,
-                Some(crate::usage::ServedProviderTier::Attested3p)
-            );
-            assert_eq!(
-                served.provider_attribution.served_provider_type,
-                Some(crate::usage::ServedProviderType::Chutes)
-            );
-            assert!(
-                !served.provider_attribution.served_via_fallback,
-                "a true Chutes-only model should not be labeled as NEAR fallback"
-            );
-        })
-        .await;
+        let served = with_test_budget(
+            pool.chat_completion_with_attribution(fallback_params(&model_id), "h".to_string()),
+        )
+        .await
+        .expect("Chutes-only model should serve");
+
+        let body = String::from_utf8_lossy(&served.response.raw_bytes);
+        assert!(
+            body.contains("served-by-primary-chutes"),
+            "Chutes-only model should serve, got: {body}"
+        );
+        assert_eq!(
+            served.provider_attribution.served_provider_tier,
+            Some(crate::usage::ServedProviderTier::Attested3p)
+        );
+        assert_eq!(
+            served.provider_attribution.served_provider_type,
+            Some(crate::usage::ServedProviderType::Chutes)
+        );
+        assert!(
+            !served.provider_attribution.served_via_fallback,
+            "a true Chutes-only model should not be labeled as NEAR fallback"
+        );
     }
 
     #[tokio::test]
@@ -13731,114 +13589,114 @@ mod tests {
 
     #[tokio::test]
     async fn native_responses_honors_fallback_policy_and_attribution() {
-        crate::test_utils::with_test_budget(async {
-            use inference_providers::{
-                mock::MockProvider, responses_raw::ResponsesRawResponse, ProviderTier,
-            };
-            use std::sync::atomic::{AtomicUsize, Ordering};
-            let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
-            let calls = Arc::new(AtomicUsize::new(0));
-            let captured = calls.clone();
-            let primary =
-                Arc::new(MockProvider::new_accept_all().with_tier(ProviderTier::NonAttested));
-            let fallback = Arc::new(
-                MockProvider::new_accept_all()
-                    .with_tier(ProviderTier::NonAttested)
-                    .with_responses_handler(move |_| {
-                        captured.fetch_add(1, Ordering::SeqCst);
-                        ResponsesRawResponse {
-                            status: reqwest::StatusCode::OK,
-                            headers: Default::default(),
-                            body: Box::pin(futures::stream::empty()),
-                        }
-                    }),
-            );
-            let model = "native/policy";
-            pool.register_provider(model.into(), primary).await;
-            pool.register_pinned_secondary_provider(model.into(), fallback.clone(), None)
-                .await;
-            assert!(pool
-                .responses_raw(model, serde_json::json!({"store":false}), false)
-                .await
-                .is_err());
-            assert_eq!(calls.load(Ordering::SeqCst), 0);
-            let (_, attribution) = pool
-                .responses_raw(model, serde_json::json!({"store":false}), true)
-                .await
-                .unwrap();
-            assert_eq!(calls.load(Ordering::SeqCst), 1);
-            assert!(attribution.served_via_fallback);
-            pool.register_provider("native/primary".into(), fallback)
-                .await;
-            let (_, attribution) = pool
-                .responses_raw("native/primary", serde_json::json!({"store":false}), false)
+        use inference_providers::{
+            mock::MockProvider, responses_raw::ResponsesRawResponse, ProviderTier,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let captured = calls.clone();
+        let primary = Arc::new(MockProvider::new_accept_all().with_tier(ProviderTier::NonAttested));
+        let fallback = Arc::new(
+            MockProvider::new_accept_all()
+                .with_tier(ProviderTier::NonAttested)
+                .with_responses_handler(move |_| {
+                    captured.fetch_add(1, Ordering::SeqCst);
+                    ResponsesRawResponse {
+                        status: reqwest::StatusCode::OK,
+                        headers: Default::default(),
+                        body: Box::pin(futures::stream::empty()),
+                    }
+                }),
+        );
+        let model = "native/policy";
+        pool.register_provider(model.into(), primary).await;
+        pool.register_pinned_secondary_provider(model.into(), fallback.clone(), None)
+            .await;
+        assert!(with_test_budget(pool.responses_raw(
+            model,
+            serde_json::json!({"store":false}),
+            false
+        ))
+        .await
+        .is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let (_, attribution) =
+            with_test_budget(pool.responses_raw(model, serde_json::json!({"store":false}), true))
                 .await
                 .unwrap();
-            assert!(!attribution.served_via_fallback);
-        })
-        .await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(attribution.served_via_fallback);
+        pool.register_provider("native/primary".into(), fallback)
+            .await;
+        let (_, attribution) = with_test_budget(pool.responses_raw(
+            "native/primary",
+            serde_json::json!({"store":false}),
+            false,
+        ))
+        .await
+        .unwrap();
+        assert!(!attribution.served_via_fallback);
     }
 
     #[tokio::test]
     async fn request_policy_controls_registered_fallback_for_non_streaming_requests() {
-        crate::test_utils::with_test_budget(async {
-            use inference_providers::mock::{MockProvider, RequestMatcher, ResponseTemplate};
-            use inference_providers::{CompletionError, ProviderTier};
+        use inference_providers::mock::{MockProvider, RequestMatcher, ResponseTemplate};
+        use inference_providers::{CompletionError, ProviderTier};
 
-            let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
-            let model_id = "policy/non-streaming".to_string();
-            let primary = Arc::new(MockProvider::new_accept_all().with_tier(ProviderTier::Near));
-            primary
-                .set_error_override(Some(CompletionError::HttpError {
-                    status_code: 503,
-                    message: "primary unavailable".to_string(),
-                    is_external: true,
-                }))
-                .await;
-            let fallback =
-                Arc::new(MockProvider::new_accept_all().with_tier(ProviderTier::Attested3p));
-            fallback
-                .when(RequestMatcher::Any)
-                .respond_with(ResponseTemplate::new("served-by-registered-fallback"))
-                .await;
-
-            pool.register_provider(
-                model_id.clone(),
-                primary.clone() as Arc<InferenceProviderTrait>,
-            )
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+        let model_id = "policy/non-streaming".to_string();
+        let primary = Arc::new(MockProvider::new_accept_all().with_tier(ProviderTier::Near));
+        primary
+            .set_error_override(Some(CompletionError::HttpError {
+                status_code: 503,
+                message: "primary unavailable".to_string(),
+                is_external: true,
+            }))
             .await;
-            pool.register_pinned_secondary_provider(
-                model_id.clone(),
-                fallback.clone() as Arc<InferenceProviderTrait>,
-                None,
-            )
+        let fallback = Arc::new(MockProvider::new_accept_all().with_tier(ProviderTier::Attested3p));
+        fallback
+            .when(RequestMatcher::Any)
+            .respond_with(ResponseTemplate::new("served-by-registered-fallback"))
             .await;
 
-            let disabled = pool
-                .chat_completion_with_attribution_and_hints(
-                    fallback_params(&model_id),
-                    "disabled".to_string(),
-                    ChatRoutingHints {
-                        fallback_disabled: true,
-                        ..Default::default()
-                    },
-                )
-                .await;
-            assert!(disabled.is_err(), "the primary error must surface");
-            assert!(primary.last_chat_params().await.is_some());
-            assert!(
-                fallback.last_chat_params().await.is_none(),
-                "disabled policy must not invoke the registered fallback"
-            );
-
-            let enabled = pool
-                .chat_completion_with_attribution(fallback_params(&model_id), "enabled".to_string())
-                .await
-                .expect("default policy should allow the registered fallback");
-            assert!(fallback.last_chat_params().await.is_some());
-            assert!(enabled.provider_attribution.served_via_fallback);
-        })
+        pool.register_provider(
+            model_id.clone(),
+            primary.clone() as Arc<InferenceProviderTrait>,
+        )
         .await;
+        pool.register_pinned_secondary_provider(
+            model_id.clone(),
+            fallback.clone() as Arc<InferenceProviderTrait>,
+            None,
+        )
+        .await;
+
+        let disabled = with_test_budget(pool.chat_completion_with_attribution_and_hints(
+            fallback_params(&model_id),
+            "disabled".to_string(),
+            ChatRoutingHints {
+                fallback_disabled: true,
+                ..Default::default()
+            },
+        ))
+        .await;
+        assert!(disabled.is_err(), "the primary error must surface");
+        assert!(primary.last_chat_params().await.is_some());
+        assert!(
+            fallback.last_chat_params().await.is_none(),
+            "disabled policy must not invoke the registered fallback"
+        );
+
+        let enabled =
+            with_test_budget(pool.chat_completion_with_attribution(
+                fallback_params(&model_id),
+                "enabled".to_string(),
+            ))
+            .await
+            .expect("default policy should allow the registered fallback");
+        assert!(fallback.last_chat_params().await.is_some());
+        assert!(enabled.provider_attribution.served_via_fallback);
     }
 
     #[tokio::test]
@@ -13886,63 +13744,57 @@ mod tests {
 
     #[tokio::test]
     async fn request_policy_controls_registered_fallback_for_streaming_requests() {
-        crate::test_utils::with_test_budget(async {
-            use inference_providers::mock::MockProvider;
-            use inference_providers::{CompletionError, ProviderTier};
+        use inference_providers::mock::MockProvider;
+        use inference_providers::{CompletionError, ProviderTier};
 
-            let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
-            let model_id = "policy/streaming".to_string();
-            let primary = Arc::new(MockProvider::new_accept_all().with_tier(ProviderTier::Near));
-            primary
-                .set_stream_error_override(Some(CompletionError::HttpError {
-                    status_code: 503,
-                    message: "primary unavailable".to_string(),
-                    is_external: true,
-                }))
-                .await;
-            let fallback =
-                Arc::new(MockProvider::new_accept_all().with_tier(ProviderTier::Attested3p));
-
-            pool.register_provider(
-                model_id.clone(),
-                primary.clone() as Arc<InferenceProviderTrait>,
-            )
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+        let model_id = "policy/streaming".to_string();
+        let primary = Arc::new(MockProvider::new_accept_all().with_tier(ProviderTier::Near));
+        primary
+            .set_stream_error_override(Some(CompletionError::HttpError {
+                status_code: 503,
+                message: "primary unavailable".to_string(),
+                is_external: true,
+            }))
             .await;
-            pool.register_pinned_secondary_provider(
-                model_id.clone(),
-                fallback.clone() as Arc<InferenceProviderTrait>,
-                None,
-            )
-            .await;
+        let fallback = Arc::new(MockProvider::new_accept_all().with_tier(ProviderTier::Attested3p));
 
-            let disabled = pool
-                .chat_completion_stream_with_attribution(
-                    fallback_params(&model_id),
-                    "disabled".to_string(),
-                    ChatRoutingHints {
-                        fallback_disabled: true,
-                        ..Default::default()
-                    },
-                )
-                .await;
-            assert!(disabled.is_err(), "the primary stream error must surface");
-            assert!(
-                fallback.last_chat_params().await.is_none(),
-                "disabled policy must not invoke the registered fallback stream"
-            );
-
-            let enabled = pool
-                .chat_completion_stream_with_attribution(
-                    fallback_params(&model_id),
-                    "enabled".to_string(),
-                    ChatRoutingHints::default(),
-                )
-                .await
-                .expect("default policy should allow the registered fallback stream");
-            assert!(fallback.last_chat_params().await.is_some());
-            assert!(enabled.provider_attribution.served_via_fallback);
-        })
+        pool.register_provider(
+            model_id.clone(),
+            primary.clone() as Arc<InferenceProviderTrait>,
+        )
         .await;
+        pool.register_pinned_secondary_provider(
+            model_id.clone(),
+            fallback.clone() as Arc<InferenceProviderTrait>,
+            None,
+        )
+        .await;
+
+        let disabled = with_test_budget(pool.chat_completion_stream_with_attribution(
+            fallback_params(&model_id),
+            "disabled".to_string(),
+            ChatRoutingHints {
+                fallback_disabled: true,
+                ..Default::default()
+            },
+        ))
+        .await;
+        assert!(disabled.is_err(), "the primary stream error must surface");
+        assert!(
+            fallback.last_chat_params().await.is_none(),
+            "disabled policy must not invoke the registered fallback stream"
+        );
+
+        let enabled = with_test_budget(pool.chat_completion_stream_with_attribution(
+            fallback_params(&model_id),
+            "enabled".to_string(),
+            ChatRoutingHints::default(),
+        ))
+        .await
+        .expect("default policy should allow the registered fallback stream");
+        assert!(fallback.last_chat_params().await.is_some());
+        assert!(enabled.provider_attribution.served_via_fallback);
     }
 
     #[tokio::test]
@@ -14000,95 +13852,89 @@ mod tests {
 
     #[tokio::test]
     async fn disabled_policy_keeps_primary_peer_retry_and_single_provider_models() {
-        crate::test_utils::with_test_budget(async {
-            use inference_providers::mock::{MockProvider, RequestMatcher, ResponseTemplate};
-            use inference_providers::{CompletionError, ProviderTier};
+        use inference_providers::mock::{MockProvider, RequestMatcher, ResponseTemplate};
+        use inference_providers::{CompletionError, ProviderTier};
 
-            let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
-            let model_id = "policy/primary-peers".to_string();
-            let first = Arc::new(MockProvider::new_accept_all().with_tier(ProviderTier::Near));
-            first
-                .set_error_override(Some(CompletionError::HttpError {
-                    status_code: 503,
-                    message: "first primary unavailable".to_string(),
-                    is_external: true,
-                }))
-                .await;
-            let second = Arc::new(MockProvider::new_accept_all().with_tier(ProviderTier::Near));
-            second
-                .when(RequestMatcher::Any)
-                .respond_with(ResponseTemplate::new("served-by-primary-peer"))
-                .await;
-            let fallback =
-                Arc::new(MockProvider::new_accept_all().with_tier(ProviderTier::Attested3p));
-            {
-                let mut mappings = pool.provider_mappings.write().await;
-                mappings.model_to_providers.insert(
-                    model_id.clone(),
-                    vec![
-                        first.clone() as Arc<InferenceProviderTrait>,
-                        second.clone() as Arc<InferenceProviderTrait>,
-                    ],
-                );
-            }
-            pool.register_pinned_secondary_provider(
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+        let model_id = "policy/primary-peers".to_string();
+        let first = Arc::new(MockProvider::new_accept_all().with_tier(ProviderTier::Near));
+        first
+            .set_error_override(Some(CompletionError::HttpError {
+                status_code: 503,
+                message: "first primary unavailable".to_string(),
+                is_external: true,
+            }))
+            .await;
+        let second = Arc::new(MockProvider::new_accept_all().with_tier(ProviderTier::Near));
+        second
+            .when(RequestMatcher::Any)
+            .respond_with(ResponseTemplate::new("served-by-primary-peer"))
+            .await;
+        let fallback = Arc::new(MockProvider::new_accept_all().with_tier(ProviderTier::Attested3p));
+        {
+            let mut mappings = pool.provider_mappings.write().await;
+            mappings.model_to_providers.insert(
                 model_id.clone(),
-                fallback.clone() as Arc<InferenceProviderTrait>,
+                vec![
+                    first.clone() as Arc<InferenceProviderTrait>,
+                    second.clone() as Arc<InferenceProviderTrait>,
+                ],
+            );
+        }
+        pool.register_pinned_secondary_provider(
+            model_id.clone(),
+            fallback.clone() as Arc<InferenceProviderTrait>,
+            None,
+        )
+        .await;
+
+        let served = with_test_budget(pool.chat_completion_with_attribution_and_hints(
+            fallback_params(&model_id),
+            "primary-retry".to_string(),
+            ChatRoutingHints {
+                fallback_disabled: true,
+                ..Default::default()
+            },
+        ))
+        .await
+        .expect("a primary peer should serve after another primary fails");
+        assert!(first.last_chat_params().await.is_some());
+        assert!(second.last_chat_params().await.is_some());
+        assert!(fallback.last_chat_params().await.is_none());
+        assert_eq!(
+            served.provider_attribution.served_provider_tier,
+            Some(crate::usage::ServedProviderTier::Near)
+        );
+
+        let single_pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+        let single_model = "policy/single-provider".to_string();
+        let only_provider =
+            Arc::new(MockProvider::new_accept_all().with_tier(ProviderTier::Attested3p));
+        only_provider
+            .when(RequestMatcher::Any)
+            .respond_with(ResponseTemplate::new("served-by-only-provider"))
+            .await;
+        single_pool
+            .register_pinned_provider(
+                single_model.clone(),
+                only_provider.clone() as Arc<InferenceProviderTrait>,
                 None,
+                ProviderPoolRole::Primary,
             )
             .await;
 
-            let served = pool
-                .chat_completion_with_attribution_and_hints(
-                    fallback_params(&model_id),
-                    "primary-retry".to_string(),
-                    ChatRoutingHints {
-                        fallback_disabled: true,
-                        ..Default::default()
-                    },
-                )
-                .await
-                .expect("a primary peer should serve after another primary fails");
-            assert!(first.last_chat_params().await.is_some());
-            assert!(second.last_chat_params().await.is_some());
-            assert!(fallback.last_chat_params().await.is_none());
-            assert_eq!(
-                served.provider_attribution.served_provider_tier,
-                Some(crate::usage::ServedProviderTier::Near)
-            );
-
-            let single_pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
-            let single_model = "policy/single-provider".to_string();
-            let only_provider =
-                Arc::new(MockProvider::new_accept_all().with_tier(ProviderTier::Attested3p));
-            only_provider
-                .when(RequestMatcher::Any)
-                .respond_with(ResponseTemplate::new("served-by-only-provider"))
-                .await;
-            single_pool
-                .register_pinned_provider(
-                    single_model.clone(),
-                    only_provider.clone() as Arc<InferenceProviderTrait>,
-                    None,
-                    ProviderPoolRole::Primary,
-                )
-                .await;
-
-            let single = single_pool
-                .chat_completion_with_attribution_and_hints(
-                    fallback_params(&single_model),
-                    "single".to_string(),
-                    ChatRoutingHints {
-                        fallback_disabled: true,
-                        ..Default::default()
-                    },
-                )
-                .await
-                .expect("a model that has never had a primary peer remains directly usable");
-            assert!(only_provider.last_chat_params().await.is_some());
-            assert!(!single.provider_attribution.served_via_fallback);
-        })
-        .await;
+        let single = with_test_budget(single_pool.chat_completion_with_attribution_and_hints(
+            fallback_params(&single_model),
+            "single".to_string(),
+            ChatRoutingHints {
+                fallback_disabled: true,
+                ..Default::default()
+            },
+        ))
+        .await
+        .expect("a model that has never had a primary peer remains directly usable");
+        assert!(only_provider.last_chat_params().await.is_some());
+        assert!(!single.provider_attribution.served_via_fallback);
     }
 
     #[tokio::test]

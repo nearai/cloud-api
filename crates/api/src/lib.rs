@@ -146,12 +146,14 @@ pub struct DomainServices {
 #[derive(Clone, Copy, Debug)]
 pub struct AppBuildOptions {
     pub start_database_encryption_recovery: bool,
+    pub start_usage_receipt_recovery: bool,
 }
 
 impl Default for AppBuildOptions {
     fn default() -> Self {
         Self {
             start_database_encryption_recovery: true,
+            start_usage_receipt_recovery: true,
         }
     }
 }
@@ -530,13 +532,16 @@ pub async fn init_domain_services_with_pool(
         as Arc<dyn services::workspace::WorkspaceServiceTrait + Send + Sync>;
 
     // Now create usage service with workspace_service
-    let usage_service = Arc::new(services::usage::UsageServiceImpl::new(
-        usage_repository as Arc<dyn services::usage::UsageRepository>,
-        models_repo.clone() as Arc<dyn services::usage::ModelRepository>,
-        limits_repository_for_usage as Arc<dyn services::usage::OrganizationLimitsRepository>,
-        workspace_service.clone(),
-        metrics_service.clone(),
-    )) as Arc<dyn services::usage::UsageServiceTrait + Send + Sync>;
+    let usage_service = Arc::new(
+        services::usage::UsageServiceImpl::new(
+            usage_repository as Arc<dyn services::usage::UsageRepository>,
+            models_repo.clone() as Arc<dyn services::usage::ModelRepository>,
+            limits_repository_for_usage as Arc<dyn services::usage::OrganizationLimitsRepository>,
+            workspace_service.clone(),
+            metrics_service.clone(),
+        )
+        .with_admission_config(config.usage_admission.clone()),
+    ) as Arc<dyn services::usage::UsageServiceTrait + Send + Sync>;
 
     // Create organization limit repository for completion service rate limiting
     let org_limit_repository = Arc::new(database::repositories::PgOrganizationRepository::new(
@@ -1129,6 +1134,31 @@ pub fn build_app_with_config_and_options(
     config: Arc<ApiConfig>,
     build_options: AppBuildOptions,
 ) -> Router {
+    if build_options.start_usage_receipt_recovery {
+        // A receipt already persisted by another replica or an earlier process is safe to replay.
+        let receipt_service = domain_services.usage_service.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(20),
+                    receipt_service.recover_receipts(),
+                )
+                .await
+                {
+                    Ok(Ok(recovered)) => {
+                        if recovered > 0 {
+                            tracing::info!(recovered, "Recovered usage receipts");
+                        }
+                    }
+                    _ => tracing::warn!("Usage receipt recovery unavailable"),
+                }
+            }
+        });
+    }
     // Create analytics service (shared between user and admin routes)
     let analytics_repository = Arc::new(database::repositories::PgAnalyticsRepository::new(
         database.pool().clone(),
@@ -2205,6 +2235,10 @@ pub fn build_internal_routes(app_state: AppState) -> Router {
         .route(
             "/internal/usage",
             post(crate::routes::internal_usage::record_usage_internal),
+        )
+        .route(
+            "/internal/budget",
+            post(crate::routes::internal_usage::reserve_usage_internal),
         )
         .route(
             "/internal/models",
@@ -3516,6 +3550,7 @@ mod tests {
             inference_api_key: Some("test-key".to_string()),
             internal_usage_token: None,
             internal_usage_max_discount: config::DEFAULT_INTERNAL_USAGE_MAX_DISCOUNT,
+            usage_admission: Default::default(),
             logging: config::LoggingConfig {
                 level: "info".to_string(),
                 format: "compact".to_string(),
@@ -3643,6 +3678,7 @@ mod tests {
             inference_api_key: Some("test-key".to_string()),
             internal_usage_token: None,
             internal_usage_max_discount: config::DEFAULT_INTERNAL_USAGE_MAX_DISCOUNT,
+            usage_admission: Default::default(),
             logging: config::LoggingConfig {
                 level: "info".to_string(),
                 format: "compact".to_string(),

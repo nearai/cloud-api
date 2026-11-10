@@ -18,7 +18,7 @@ use uuid::Uuid;
 pub struct OrganizationUsageRepository {
     pub(crate) pool: DbPool,
     pub(crate) reporting_statement_timeout: Duration,
-    allocation_policy: CreditAllocationPolicy,
+    pub(crate) allocation_policy: CreditAllocationPolicy,
 }
 
 impl OrganizationUsageRepository {

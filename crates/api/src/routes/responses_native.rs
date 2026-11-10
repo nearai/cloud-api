@@ -74,6 +74,10 @@ pub(super) async fn handle(
             NativeResponsesError::InvalidRequest(message) => {
                 error(StatusCode::BAD_REQUEST, message)
             }
+            NativeResponsesError::BudgetExceeded => error(
+                StatusCode::PAYMENT_REQUIRED,
+                "Insufficient available budget",
+            ),
             NativeResponsesError::RateLimited => error(
                 StatusCode::TOO_MANY_REQUESTS,
                 "Concurrent request limit exceeded",

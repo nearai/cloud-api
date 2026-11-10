@@ -6,6 +6,7 @@ use inference_providers::{
     SystemOneResponseWithBytes,
 };
 use serde_json::{json, Value};
+use services::models::ModelsServiceTrait;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc,
@@ -813,10 +814,52 @@ async fn systemone_rejects_missing_tee_id_and_invalid_usage_without_billing() {
     }
 }
 
+async fn routing_budget() -> (
+    Arc<services::inference_provider_pool::InferenceProviderPool>,
+    String,
+    services::usage::budget::BudgetExecution,
+) {
+    let mut captured = None;
+    let (server, _) = setup_test_server_with_domain_services(|services, _| {
+        captured = Some((
+            services.inference_provider_pool.clone(),
+            services.usage_service.clone(),
+            services.models_service.clone(),
+        ));
+    })
+    .await;
+    let (pool, usage, models) = captured.unwrap();
+    let (model, _) = catalog(&server, None, true).await;
+    let org = setup_org_with_credits(&server, 10_000_000_000).await;
+    let workspace = list_workspaces(&server, org.id.clone()).await.remove(0);
+    let key =
+        create_api_key_in_workspace(&server, workspace.id.clone(), "routing-budget".into()).await;
+    let org_id = uuid::Uuid::parse_str(&org.id).unwrap();
+    let model_id = models
+        .resolve_and_get_model(&model, services::models::ModelCaller::Organization(org_id))
+        .await
+        .unwrap()
+        .id;
+    let budget = services::usage::budget::BudgetExecution::new(
+        usage,
+        services::usage::BillingIdentity {
+            organization_id: org_id,
+            workspace_id: uuid::Uuid::parse_str(&workspace.id).unwrap(),
+            api_key_id: uuid::Uuid::parse_str(&key.id).unwrap(),
+            model_id,
+        },
+        services::usage::budget::UsageFeatures::from_json(
+            services::usage::InferenceType::Decisions,
+            &request(&model),
+        )
+        .unwrap(),
+    );
+    (pool, model, budget)
+}
+
 #[tokio::test]
 async fn systemone_fallback_respects_trust_and_organization_policy() {
-    let (_, pool, _, _) = setup_test_server_with_pool().await;
-    let model = format!("systemone-fallback-{}", uuid::Uuid::new_v4());
+    let (pool, model, budget) = routing_budget().await;
     let primary = Arc::new(
         MockProvider::new_accept_all()
             .with_tier(ProviderTier::Near)
@@ -852,8 +895,8 @@ async fn systemone_fallback_respects_trust_and_organization_policy() {
     )
     .await;
     let req = serde_json::from_value(request(&model)).unwrap();
-    let served = pool
-        .systemone_with_attribution(req, "hash".into(), None, false)
+    let served = budget
+        .run(pool.systemone_with_attribution(req, "hash".into(), None, false))
         .await
         .unwrap();
     assert_eq!(
@@ -863,8 +906,8 @@ async fn systemone_fallback_respects_trust_and_organization_policy() {
     assert!(served.provider_attribution.served_via_fallback);
     assert_eq!(hits.load(Ordering::SeqCst), 1);
     let req = serde_json::from_value(request(&model)).unwrap();
-    assert!(pool
-        .systemone_with_attribution(req, "hash".into(), None, true)
+    assert!(budget
+        .run(pool.systemone_with_attribution(req, "hash".into(), None, true))
         .await
         .is_err());
     assert_eq!(hits.load(Ordering::SeqCst), 1);
@@ -872,9 +915,8 @@ async fn systemone_fallback_respects_trust_and_organization_policy() {
 
 #[tokio::test]
 async fn systemone_invalid_success_and_timeout_never_invoke_a_second_provider() {
-    let (_, pool, _, _) = setup_test_server_with_pool().await;
     for scenario in ["invalid_payload", "missing_receipt", "timeout"] {
-        let model = format!("systemone-no-replay-{}", uuid::Uuid::new_v4());
+        let (pool, model, budget) = routing_budget().await;
         let primary_calls = Arc::new(AtomicUsize::new(0));
         let calls = primary_calls.clone();
         pool.register_provider(
@@ -916,13 +958,13 @@ async fn systemone_invalid_success_and_timeout_never_invoke_a_second_provider() 
             None,
         )
         .await;
-        let error = pool
-            .systemone_with_attribution(
+        let error = budget
+            .run(pool.systemone_with_attribution(
                 serde_json::from_value(request(&model)).unwrap(),
                 "hash".into(),
                 None,
                 false,
-            )
+            ))
             .await
             .err()
             .expect("invalid System One responses must fail without fallback");

@@ -207,6 +207,19 @@ pub async fn audio_transcriptions(
         _ => request.response_format.clone(),
     };
 
+    let mut features = match services::usage::budget::UsageFeatures::from_json(
+        services::usage::InferenceType::AudioTranscription,
+        &serde_json::json!({}),
+    ) {
+        Ok(features) => features,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    features.media_bytes = request.file_bytes.len() as u64;
+    let budget =
+        match crate::routes::common::usage_execution(&app_state, &api_key, model_id, features) {
+            Ok(budget) => budget,
+            Err(response) => return response.into_response(),
+        };
     let params = inference_providers::AudioTranscriptionParams {
         model: model_name.clone(),
         file_bytes: request.file_bytes,
@@ -221,15 +234,14 @@ pub async fn audio_transcriptions(
     };
 
     // Call completion service which handles concurrent request limiting
-    match app_state
-        .completion_service
-        .audio_transcription(
+    match budget
+        .run(app_state.completion_service.audio_transcription(
             organization_id,
             model_id,
             &model_name,
             params,
             body_hash.hash.clone(),
-        )
+        ))
         .await
     {
         Ok(response) => {
@@ -266,6 +278,7 @@ pub async fn audio_transcriptions(
 
             let inference_id = uuid::Uuid::new_v4();
             let usage_request = services::usage::RecordUsageServiceRequest {
+                budget_id: budget.id().await.ok(),
                 input_tokens: duration_seconds, // Bill by duration in seconds
                 inference_id: Some(inference_id),
                 stop_reason: Some(services::usage::StopReason::Completed),
@@ -280,30 +293,35 @@ pub async fn audio_transcriptions(
                 )
             };
 
-            // Record usage synchronously - fail the request if usage recording fails
-            if let Err(e) = app_state.usage_service.record_usage(usage_request).await {
-                tracing::error!(
-                    error = %e,
+            if duration_seconds > 0 {
+                // Record usage synchronously - fail the request if usage recording fails
+                if let Err(e) = app_state.usage_service.record_usage(usage_request).await {
+                    tracing::error!(
+                        error = %e,
+                        %organization_id,
+                        %workspace_id,
+                        "Failed to record audio transcription usage"
+                    );
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        ResponseJson(ErrorResponse::new(
+                            "Failed to record usage - please retry".to_string(),
+                            "server_error".to_string(),
+                        )),
+                    )
+                        .into_response();
+                }
+
+                tracing::info!(
                     %organization_id,
                     %workspace_id,
-                    "Failed to record audio transcription usage"
+                    duration_seconds,
+                    "Audio transcription completed and usage recorded successfully"
                 );
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    ResponseJson(ErrorResponse::new(
-                        "Failed to record usage - please retry".to_string(),
-                        "server_error".to_string(),
-                    )),
-                )
-                    .into_response();
+            } else {
+                tracing::warn!(%organization_id, %workspace_id,
+                    "Audio transcription has no final duration; reservation retained for reconciliation");
             }
-
-            tracing::info!(
-                %organization_id,
-                %workspace_id,
-                duration_seconds,
-                "Audio transcription completed and usage recorded successfully"
-            );
 
             if requested_response_format.as_deref() == Some("text") {
                 (

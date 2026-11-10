@@ -215,6 +215,15 @@ pub async fn audio_transcriptions(
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
     features.media_bytes = request.file_bytes.len() as u64;
+    // Drop the metering copy before queuing inference, rather than retaining a
+    // second large upload throughout a long provider request.
+    let duration_file = request.file_bytes.clone();
+    let file_duration_seconds =
+        tokio::task::spawn_blocking(move || crate::audio_duration::seconds(duration_file))
+            .await
+            .ok()
+            .flatten();
+    features.audio_duration_seconds = file_duration_seconds.map(|n| n as u64);
     let budget =
         match crate::routes::common::usage_execution(&app_state, &api_key, model_id, features) {
             Ok(budget) => budget,
@@ -252,13 +261,14 @@ pub async fn audio_transcriptions(
             let workspace_id = api_key.workspace.id.0;
             let api_key_id_str = api_key.api_key.id.0.clone();
 
-            // Clamp duration to valid range [0, i32::MAX] to prevent overflow and negative values
+            // Ordinary JSON responses may omit duration. Meter the uploaded file locally
+            // in that case, leaving both provider parameters and client responses unchanged.
             let duration_seconds = response
                 .duration
-                .unwrap_or(0.0)
-                .max(0.0)
-                .min(i32::MAX as f64)
-                .ceil() as i32;
+                .filter(|n| n.is_finite() && *n > 0.0 && n.ceil() <= f64::from(i32::MAX))
+                .map(|n| n.ceil() as i32)
+                .or(file_duration_seconds)
+                .unwrap_or(0);
 
             // Parse API key ID to UUID
             let api_key_id = match uuid::Uuid::parse_str(&api_key_id_str) {
@@ -320,7 +330,7 @@ pub async fn audio_transcriptions(
                 );
             } else {
                 tracing::warn!(%organization_id, %workspace_id,
-                    "Audio transcription has no final duration; reservation retained for reconciliation");
+                    "Audio transcription duration unavailable; actual usage needs reconciliation before admission expiry");
             }
 
             if requested_response_format.as_deref() == Some("text") {

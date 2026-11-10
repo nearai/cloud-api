@@ -20,6 +20,8 @@ pub struct UsageFeatures {
     pub requested_output_tokens: Option<u64>,
     pub model_output_tokens: Option<u64>,
     pub media_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_duration_seconds: Option<u64>,
     pub requested_images: u64,
     pub questions: u64,
 }
@@ -56,6 +58,7 @@ impl UsageFeatures {
                 .or(positive("max_tokens")?),
             model_output_tokens: None,
             media_bytes: 0,
+            audio_duration_seconds: None,
             requested_images: positive("n")?.unwrap_or(1),
             questions: 0,
         };
@@ -65,9 +68,6 @@ impl UsageFeatures {
             "input",
             "instructions",
             "system",
-            "tools",
-            "functions",
-            "tool_choice",
             "state",
             "questions",
             "assets",
@@ -75,6 +75,23 @@ impl UsageFeatures {
             if let Some(value) = body.get(name) {
                 features.count(value)?;
             }
+        }
+        // Schemas are part of the model input. Count their serialized keys and values;
+        // the media walker intentionally skips fields such as `data`, `id`, and URLs.
+        for value in [
+            body.get("tools"),
+            body.get("functions"),
+            body.get("tool_choice"),
+            body.get("response_format"),
+            body.pointer("/text/format"),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            features.text_bytes = features
+                .text_bytes
+                .checked_add(value.to_string().len() as u64)
+                .ok_or_else(overflow)?;
         }
         if let Some(items) = body.get("prompt").and_then(Value::as_array) {
             if !items.iter().all(Value::is_number) {
@@ -189,9 +206,13 @@ impl UsageFeatures {
             }
             InferenceType::AudioTranscription => {
                 input = mul(
-                    self.media_bytes
-                        .div_ceil(u64::from(policy.audio_bytes_per_second))
-                        .max(policy.default_audio_seconds as u64),
+                    self.audio_duration_seconds
+                        .filter(|seconds| *seconds > 0)
+                        .unwrap_or_else(|| {
+                            self.media_bytes
+                                .div_ceil(u64::from(policy.audio_bytes_per_second))
+                                .max(policy.default_audio_seconds as u64)
+                        }),
                     self.executions,
                 )?;
                 output = 0;
@@ -268,6 +289,56 @@ mod tests {
                 .unwrap();
             assert_eq!((e.input_units, e.output_tokens, e.images), expected);
         }
+    }
+
+    #[test]
+    fn schema_keys_and_media_named_properties_count_as_model_input() {
+        use serde_json::json;
+        // Large keys and "data"/"id" properties used to be omitted by the media walker.
+        let schema = json!({"type": "object", "properties": {
+            "data": {"const": "x".repeat(120_000)},
+            "id": {"enum": ["y".repeat(60_000)]},
+            "z".repeat(10_000): {"type": "number"}
+        }});
+        for body in [
+            json!({"response_format": {"type": "json_schema", "json_schema": {"schema": schema}}}),
+            json!({"text": {"format": {"type": "json_schema", "schema": schema}}}),
+            json!({"tools": [{"type": "function", "function": {"parameters": schema}}]}),
+            json!({"tools": [{"name": "test", "input_schema": schema}]}),
+            json!({"functions": [{"parameters": schema}]}),
+        ] {
+            let original = body.clone();
+            let features = UsageFeatures::from_json(InferenceType::ChatCompletion, &body).unwrap();
+            assert!(features.text_bytes >= 190_000);
+            assert_eq!((features.images, features.unknown_media), (0, 0));
+            assert_eq!(body, original, "estimation must not alter inference");
+        }
+    }
+
+    #[test]
+    fn measured_audio_duration_prevents_compressed_uploads_from_under_reserving() {
+        let mut features =
+            UsageFeatures::from_json(InferenceType::AudioTranscription, &json!({})).unwrap();
+        features.media_bytes = 1024;
+        for (duration, expected) in [(None, 60), (Some(2), 2), (Some(3600), 3600)] {
+            features.audio_duration_seconds = duration;
+            assert_eq!(
+                features
+                    .estimate(&AdmissionConfig::default(), "audio")
+                    .unwrap()
+                    .input_units,
+                expected
+            );
+        }
+        let mut legacy = serde_json::to_value(&features).unwrap();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("audio_duration_seconds");
+        assert!(serde_json::from_value::<UsageFeatures>(legacy)
+            .unwrap()
+            .audio_duration_seconds
+            .is_none());
     }
 
     #[test]

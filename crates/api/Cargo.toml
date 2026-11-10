@@ -7,6 +7,10 @@ license.workspace = true
 description.workspace = true
 
 [dependencies]
+# Demux uploaded audio for duration-only billing when the provider omits duration.
+lofty = "0.25.5"
+matroska-demuxer = "0.8.1"
+mp3-duration = "0.1.10"
 axum = { version = "0.8", features = ["macros", "multipart"] }
 axum-extra = { version = "0.12", features = ["typed-header"] }
 serde = { version = "1", features = ["derive"] }

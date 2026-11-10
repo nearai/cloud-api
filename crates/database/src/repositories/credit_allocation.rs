@@ -82,14 +82,18 @@ pub async fn allocate_usage(
     lock_organization_accounting(transaction, organization_id).await?;
 
     // A dispatched reservation already owns its funding. Settle it in the usage transaction.
-    let (inference_id, service_id) = match parent {
-        UsageAllocationParent::Inference(id) => (Some(id), None),
-        UsageAllocationParent::Service(id) => (None, Some(id)),
+    let reserved: Option<serde_json::Value> = match parent {
+        UsageAllocationParent::Inference(id) => transaction
+            .query_one(
+                "SELECT settle_usage_budget($1,
+                (SELECT inference_id FROM organization_usage_log WHERE id = $2), $2, $3)",
+                &[&organization_id, &id, &total_cost],
+            )
+            .await
+            .map_err(map_db_error)?
+            .get(0),
+        UsageAllocationParent::Service(_) => None,
     };
-    let reserved: Option<serde_json::Value> = transaction.query_one(
-        "SELECT settle_usage_budget($1, COALESCE(            (SELECT inference_id FROM organization_usage_log WHERE id = $2),             (SELECT inference_id FROM organization_service_usage_log WHERE id = $3)), $2, $3, $4)",
-        &[&organization_id, &inference_id, &service_id, &total_cost],
-    ).await.map_err(map_db_error)?.get(0);
     if let Some(allocations) = reserved
         .map(serde_json::from_value::<Vec<CreditAllocation>>)
         .transpose()

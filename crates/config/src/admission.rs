@@ -42,6 +42,7 @@ pub struct AdmissionConfig {
     pub version: u32,
     pub organization_max_unsettled: i32,
     pub key_max_unsettled: i32,
+    pub reservation_ttl_seconds: i32,
     pub default: EstimatePolicy,
     pub kinds: BTreeMap<String, EstimatePolicy>,
     pub models: BTreeMap<String, EstimatePolicy>,
@@ -53,6 +54,7 @@ impl Default for AdmissionConfig {
             version: 1,
             organization_max_unsettled: 64,
             key_max_unsettled: 16,
+            reservation_ttl_seconds: 7200,
             default: EstimatePolicy::default(),
             kinds: BTreeMap::new(),
             models: BTreeMap::new(),
@@ -71,8 +73,9 @@ impl AdmissionConfig {
         if config.version == 0
             || config.organization_max_unsettled <= 0
             || config.key_max_unsettled <= 0
+            || config.reservation_ttl_seconds <= 0
         {
-            return Err("Admission version and unsettled limits must be positive".into());
+            return Err("Admission version, unsettled limits and TTL must be positive".into());
         }
         for policy in std::iter::once(&config.default)
             .chain(config.kinds.values())
@@ -112,6 +115,7 @@ mod tests {
     fn policy_validation_and_override_precedence() {
         for invalid in [
             r#"{"key_max_unsettled":0}"#,
+            r#"{"reservation_ttl_seconds":0}"#,
             r#"{"default":{"bytes_per_token":0}}"#,
             r#"{"unknown":1}"#,
         ] {

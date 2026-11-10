@@ -31,6 +31,7 @@ fn quote(org: &OrgFixture, model: &ModelFixture) -> BudgetReservation {
         .unwrap(),
         organization_max_unsettled: 200,
         key_max_unsettled: 200,
+        reservation_ttl_seconds: 7200,
     }
 }
 fn receipt(q: &BudgetReservation) -> RecordUsageDbRequest {
@@ -165,6 +166,49 @@ async fn failed_old_receipts_do_not_starve_later_receipts_and_unknown_executions
             .get::<_, String>(0),
         "dispatched"
     );
+    cleanup_usage_fixtures(&pool, &[org.org_id], &[model.id]).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn recovery_expires_unknown_work_and_late_receipts_still_settle() -> anyhow::Result<()> {
+    let pool = test_pool().await?;
+    let org = insert_org_fixture(&pool).await?;
+    let model = insert_model(&pool, "receipt-expiry").await?;
+    set_limit(
+        &OrganizationLimitsRepository::new(pool.clone()),
+        org.org_id,
+        "payment",
+        100,
+    )
+    .await?;
+    let repo = OrganizationUsageRepository::new(pool.clone());
+    let mut q = quote(&org, &model);
+    q.reservation_ttl_seconds = 1234;
+    repo.reserve_and_dispatch(&q).await?;
+    let client = pool.get().await?;
+    let ttl: f64 = client.query_one("SELECT EXTRACT(EPOCH FROM expires_at-created_at)::FLOAT8 FROM usage_budget_reservations WHERE id=$1", &[&q.id]).await?.get(0);
+    assert!((ttl - 1234.0).abs() < 1.0);
+    client.execute("UPDATE usage_budget_reservations SET expires_at=clock_timestamp()-interval '1 second' WHERE id=$1", &[&q.id]).await?;
+    drop(repo);
+    let restarted = OrganizationUsageRepository::new(pool.clone());
+    restarted.recover_receipts().await?;
+    let state: String = client
+        .query_one(
+            "SELECT state FROM usage_budget_reservations WHERE id=$1",
+            &[&q.id],
+        )
+        .await?
+        .get(0);
+    assert_eq!(state, "released");
+    restarted.persist_receipt(q.id, &receipt(&q)).await?;
+    restarted.recover_receipts().await?;
+    restarted.persist_receipt(q.id, &receipt(&q)).await?;
+    restarted.recover_receipts().await?;
+    let row = client.query_one("SELECT r.state,r.receipt,b.total_spent,reserved_credit(r.organization_id) FROM usage_budget_reservations r JOIN organization_balance b ON b.organization_id=r.organization_id WHERE r.id=$1", &[&q.id]).await?;
+    assert_eq!(row.get::<_, String>(0), "settled");
+    assert!(row.get::<_, Option<serde_json::Value>>(1).is_none());
+    assert_eq!((row.get::<_, i64>(2), row.get::<_, i64>(3)), (30, 0));
     cleanup_usage_fixtures(&pool, &[org.org_id], &[model.id]).await?;
     Ok(())
 }

@@ -1,5 +1,6 @@
 #[doc(hidden)]
 pub mod attested_3p_startup;
+mod audio_duration;
 pub mod cloud_platform;
 pub mod consts;
 pub mod conversions;

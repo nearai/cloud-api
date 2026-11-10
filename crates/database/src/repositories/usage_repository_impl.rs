@@ -61,6 +61,28 @@ impl services::usage::ports::UsageRepository for OrganizationUsageRepository {
                 tracing::warn!("Durable usage receipt remains pending");
             }
         }
+        // A completed receipt gets the first chance to settle. Expiry retains pending
+        // receipts and audit rows, so a late/replayed charge remains fully billable.
+        let organizations = self
+            .pool
+            .get()
+            .await?
+            .query(
+                "SELECT organization_id FROM usage_budget_reservations
+             WHERE state IN ('reserved','dispatched') AND expires_at <= clock_timestamp()
+             GROUP BY organization_id ORDER BY MIN(expires_at),organization_id LIMIT 100",
+                &[],
+            )
+            .await?;
+        for row in organizations {
+            let mut client = self.pool.get().await?;
+            let tx = client.transaction().await?;
+            tx.batch_execute("SET LOCAL statement_timeout = '10s'; SET LOCAL lock_timeout = '5s'")
+                .await?;
+            tx.query_one("SELECT expire_usage_budgets($1)", &[&row.get::<_, Uuid>(0)])
+                .await?;
+            tx.commit().await?;
+        }
         Ok(recovered)
     }
 
@@ -77,7 +99,7 @@ impl services::usage::ports::UsageRepository for OrganizationUsageRepository {
             let pricing = serde_json::to_value(&r.pricing)?;
             let estimate = serde_json::to_value(&r.estimate)?;
             tx.query_one(
-                "SELECT id FROM reserve_usage_budget($1,$2,$3,$4,$5,NULL,$6,$7,$8,$9,$10,$11,$12)",
+                "SELECT id FROM reserve_usage_budget($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)",
                 &[
                     &r.id,
                     &r.identity.organization_id,
@@ -91,6 +113,7 @@ impl services::usage::ports::UsageRepository for OrganizationUsageRepository {
                     &self.allocation_policy.version,
                     &r.organization_max_unsettled,
                     &r.key_max_unsettled,
+                    &r.reservation_ttl_seconds,
                 ],
             )
             .await?;

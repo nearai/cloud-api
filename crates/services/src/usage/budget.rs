@@ -67,7 +67,7 @@ impl UsageEstimate {
         &self,
         request: &super::RecordUsageServiceRequest,
     ) -> Result<(), UsageError> {
-        // Estimates do not constrain valid actual usage. Unknown usage never releases a hold.
+        // Estimates do not constrain valid actual usage, including receipts arriving after expiry.
         if request.input_tokens < 0
             || request.output_tokens < 0
             || request.image_count.is_some_and(|n| n < 0)
@@ -116,6 +116,7 @@ pub struct BudgetReservation {
     pub estimate: UsageEstimate,
     pub organization_max_unsettled: i32,
     pub key_max_unsettled: i32,
+    pub reservation_ttl_seconds: i32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

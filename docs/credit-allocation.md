@@ -77,6 +77,7 @@ transaction. The original estimate is never resized, debited or refunded.
 Each selected policy is a complete policy: omitted fields use built-in defaults,
 not fields from another override. `version` identifies the estimator snapshot;
 `organization_max_unsettled` and `key_max_unsettled` default to 64 and 16.
+`reservation_ttl_seconds` defaults to 7200 (two hours) and must be positive.
 
 | Estimate parameter | Default |
 |---|---:|
@@ -89,12 +90,14 @@ not fields from another override. `version` identifies the estimator snapshot;
 | `audio_bytes_per_second` / `default_audio_seconds` | 1024 / 60 |
 | `decision_output_tokens` | 128 per SystemOne question |
 
-Text estimates count local UTF-8 bytes, explicit token IDs, message overhead and
+Text estimates count local UTF-8 bytes, complete tool definitions and structured
+output schemas (including property names), explicit token IDs, message overhead and
 media allowances, then add the requested output estimate. Without an explicit
 output limit, the configured fallback is bounded by a known catalog output limit.
 Batch/choice/attempt counts multiply the corresponding units. Images use requested
-image count and catalog price; transcription uses the larger of bytes/rate and
-the duration fallback. The multiplier is rounded upward in integer nano-USD, with
+image count and catalog price; transcription prefers locally measured audio
+duration, falling back to the larger of bytes/rate and the duration allowance when
+duration is unavailable. The multiplier is rounded upward in integer nano-USD, with
 the minimum applied only to nonzero estimated cost. Free prices remain free.
 Tiered models use the highest configured applicable unit rates for estimation.
 No provider token-count call, media download, transcoding, or additional output
@@ -107,16 +110,32 @@ maximum. Actual usage above the estimate is fully posted, with unfunded debt whe
 needed. Funding a charge, transferring credits, replacing limits and reconciling
 older debt all protect other requests' active holds under the organization lock.
 
-Each actual retry gets its own reservation. Unknown dispatched work remains held;
-neither a timeout nor a process restart authorizes release. Cloud API persists a
-priced final receipt before posting and retries pending receipts every 30 seconds.
+Each actual retry gets its own reservation. Cloud API persists a priced final
+receipt before posting and retries pending receipts every 30 seconds. The same
+recovery loop releases expired holds; admission also reclaims expired holds for
+its organization. Expiry uses the fixed deadline stored at admission, without
+heartbeats or resizing. A client disconnect or transport timeout does not release
+the hold immediately. Expiry frees both reserved credit and the unsettled slot,
+preserving receipts and audit metadata. A late receipt still charges actual usage
+once, including overage. The TTL is an availability tradeoff: upstream work that
+outlives it may overlap newly admitted work.
 Replays charge once even after a lost acknowledgement or deletion of the optional
 Responses record. Settled rows retain metadata for deduplication and audit but no
 longer reduce available capacity. Missing final usage requires reconciliation;
 there is no automatic reconstruction of upstream counters that were never received.
 
+Audio settlement prefers the provider's final duration. If an ordinary JSON
+response omits it, local Rust parsers read frame/sample timing from the uploaded audio,
+rounded up to seconds. This does not change the uploaded bytes, response format,
+or encryption. The byte/rate estimate is never used as actual usage. If neither
+the provider nor the file supplies usable duration, return the existing response,
+log the missing usage for reconciliation, and retain the hold until expiry.
+
 Direct proxy requests use the internal admission endpoint with numeric metadata
-and a separate `admission_id` in the final HTTP/SQS usage receipt. Cloud API-mediated
+and a separate `admission_id` in the final HTTP/SQS usage receipt. Admission also
+claims execution once: replaying a dispatched ID does not authorize another
+inference. A lost admission response leaves a hold until expiry; each new upstream
+attempt needs a fresh ID and reservation. Cloud API-mediated
 requests reserve locally and are not reserved again by the proxy. Embedding,
 rerank, privacy, score and standalone MCP search retain their prior admission
 flow; their ledger writes still respect active holds.

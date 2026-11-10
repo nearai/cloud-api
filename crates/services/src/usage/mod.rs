@@ -227,6 +227,7 @@ impl UsageServiceImpl {
             pricing,
             organization_max_unsettled: self.admission_config.organization_max_unsettled,
             key_max_unsettled: self.admission_config.key_max_unsettled,
+            reservation_ttl_seconds: self.admission_config.reservation_ttl_seconds,
         };
         self.usage_repository
             .reserve_and_dispatch(&reservation)

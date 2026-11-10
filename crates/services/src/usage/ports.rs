@@ -222,8 +222,8 @@ impl std::fmt::Display for StopReason {
 
 #[async_trait::async_trait]
 pub trait UsageServiceTrait: Send + Sync {
-    /// Replay durable final receipts left by an interrupted accounting write.
-    async fn recover_receipts(&self) -> Result<u64, UsageError> {
+    /// Release expired reservations without charging their estimates.
+    async fn expire_budgets(&self) -> Result<u64, UsageError> {
         Ok(0)
     }
     async fn admit_external(
@@ -356,14 +356,7 @@ pub trait UsageServiceTrait: Send + Sync {
 
 #[async_trait::async_trait]
 pub trait UsageRepository: Send + Sync {
-    async fn persist_receipt(
-        &self,
-        _id: Uuid,
-        _request: &RecordUsageDbRequest,
-    ) -> anyhow::Result<()> {
-        anyhow::bail!("durable receipt storage unavailable")
-    }
-    async fn recover_receipts(&self) -> anyhow::Result<u64> {
+    async fn expire_budgets(&self) -> anyhow::Result<u64> {
         Ok(0)
     }
     async fn reserve_and_dispatch(
@@ -910,7 +903,7 @@ impl UsageDiscount {
 
 /// Request to record usage (database layer)
 /// All costs use fixed scale of 9 (nano-dollars) and USD currency
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct RecordUsageDbRequest {
     pub organization_id: Uuid,
     pub workspace_id: Uuid,

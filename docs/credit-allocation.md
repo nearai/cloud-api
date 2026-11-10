@@ -110,26 +110,26 @@ maximum. Actual usage above the estimate is fully posted, with unfunded debt whe
 needed. Funding a charge, transferring credits, replacing limits and reconciling
 older debt all protect other requests' active holds under the organization lock.
 
-Each actual retry gets its own reservation. Cloud API persists a priced final
-receipt before posting and retries pending receipts every 30 seconds. The same
-recovery loop releases expired holds; admission also reclaims expired holds for
-its organization. Expiry uses the fixed deadline stored at admission, without
-heartbeats or resizing. A client disconnect or transport timeout does not release
-the hold immediately. Expiry frees both reserved credit and the unsettled slot,
-preserving receipts and audit metadata. A late receipt still charges actual usage
-once, including overage. The TTL is an availability tradeoff: upstream work that
-outlives it may overlap newly admitted work.
-Replays charge once even after a lost acknowledgement or deletion of the optional
-Responses record. Settled rows retain metadata for deduplication and audit but no
-longer reduce available capacity. Missing final usage requires reconciliation;
-there is no automatic reconstruction of upstream counters that were never received.
+Each actual retry gets its own reservation. Actual usage follows the existing
+recording and retry paths; admission adds no durable receipt queue or background
+settlement replay. Cloud API releases expired holds every 30 seconds, and admission
+also reclaims expired holds for its organization. Expiry uses the fixed deadline
+stored at admission, without heartbeats or resizing. A client disconnect or transport
+timeout does not release the hold immediately. Expiry frees both reserved credit
+and the unsettled slot, preserving the identity needed for a late usage report.
+A late report still charges actual usage once, including overage. Work that outlives
+the TTL may overlap newly admitted work.
+Duplicate reports charge once even after a lost acknowledgement or deletion of the
+optional Responses record. Settled rows retain metadata for deduplication and audit
+but no longer reduce available capacity. If final usage is lost before it reaches
+the existing accounting path, expiry does not reconstruct it or charge the estimate.
 
 Audio settlement prefers the provider's final duration. If an ordinary JSON
 response omits it, local Rust parsers read frame/sample timing from the uploaded audio,
 rounded up to seconds. This does not change the uploaded bytes, response format,
 or encryption. The byte/rate estimate is never used as actual usage. If neither
 the provider nor the file supplies usable duration, return the existing response,
-log the missing usage for reconciliation, and retain the hold until expiry.
+log the missing usage, and retain the hold until expiry.
 
 Direct proxy requests use the internal admission endpoint with numeric metadata
 and a separate `admission_id` in the final HTTP/SQS usage receipt. Admission also

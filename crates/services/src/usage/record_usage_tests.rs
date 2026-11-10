@@ -24,10 +24,6 @@ impl UsageRepository for CapturingUsageRepository {
         Ok(self.snapshot.clone())
     }
 
-    async fn persist_receipt(&self, _: Uuid, _: &RecordUsageDbRequest) -> anyhow::Result<()> {
-        Ok(())
-    }
-
     async fn record_usage(&self, request: RecordUsageDbRequest) -> anyhow::Result<UsageLogEntry> {
         let entry = UsageLogEntry {
             id: Uuid::new_v4(),

@@ -1,4 +1,4 @@
-//! Real persistence boundaries: receipt committed, executor lost, and ledger ACK lost.
+//! Shared admission survives process replacement; usage settles once and expiry never bills an estimate.
 use super::*;
 use services::usage::budget::{BudgetReservation, UsageFeatures};
 use services::usage::{BillingIdentity, ModelPricing, RecordUsageDbRequest, UsageRepository};
@@ -65,11 +65,10 @@ fn receipt(q: &BudgetReservation) -> RecordUsageDbRequest {
 }
 
 #[tokio::test]
-async fn persisted_receipt_survives_executor_restart_response_erasure_and_lost_ack(
-) -> anyhow::Result<()> {
+async fn settlement_survives_response_erasure_and_lost_ack() -> anyhow::Result<()> {
     let pool = test_pool().await?;
     let org = insert_org_fixture(&pool).await?;
-    let model = insert_model(&pool, "durable-receipt").await?;
+    let model = insert_model(&pool, "admitted-settlement").await?;
     set_limit(
         &OrganizationLimitsRepository::new(pool.clone()),
         org.org_id,
@@ -85,96 +84,37 @@ async fn persisted_receipt_survives_executor_restart_response_erasure_and_lost_a
     client.execute("INSERT INTO responses(id,workspace_id,api_key_id,model,status) VALUES($1,$2,$3,$4,'completed')", &[&response_id,&org.workspace_a_id,&org.api_key_a_id,&model.name]).await?;
     let mut req = receipt(&q);
     req.response_id = Some(response_id.into());
-    original.persist_receipt(q.id, &req).await?;
-    drop(original); // No ledger post happened in this process.
+    drop(original);
     client
         .execute("DELETE FROM responses WHERE id=$1", &[&response_id])
         .await?;
     let restarted = OrganizationUsageRepository::new(pool.clone());
-    restarted.recover_receipts().await?;
-    // Re-send after a lost acknowledgement: same admission and no provider id.
-    restarted.persist_receipt(q.id, &req).await?;
+    assert!(
+        UsageRepository::record_usage(&restarted, req.clone())
+            .await?
+            .was_inserted
+    );
+    // The existing report transport can repeat a delivery after a lost acknowledgement.
     let replay = UsageRepository::record_usage(&restarted, req).await?;
     assert!(!replay.was_inserted);
     assert_eq!(replay.total_cost, 30);
     assert!(replay.response_id.is_none());
     assert_eq!(replay.inference_id, Some(q.id));
-    let row = client.query_one("SELECT r.amount,r.state,r.actual_cost,r.receipt,b.total_spent,reserved_credit(r.organization_id) FROM usage_budget_reservations r JOIN organization_balance b ON b.organization_id=r.organization_id WHERE r.id=$1", &[&q.id]).await?;
+    let row = client.query_one("SELECT r.amount,r.state,r.actual_cost,b.total_spent,reserved_credit(r.organization_id) FROM usage_budget_reservations r JOIN organization_balance b ON b.organization_id=r.organization_id WHERE r.id=$1", &[&q.id]).await?;
     assert_eq!(row.get::<_, i64>(0), 10, "the estimate is immutable");
     assert_eq!(row.get::<_, String>(1), "settled");
     assert_eq!(row.get::<_, i64>(2), 30);
-    assert!(row.get::<_, Option<serde_json::Value>>(3).is_none());
-    assert_eq!((row.get::<_, i64>(4), row.get::<_, i64>(5)), (30, 0));
+    assert_eq!((row.get::<_, i64>(3), row.get::<_, i64>(4)), (30, 0));
     cleanup_usage_fixtures(&pool, &[org.org_id], &[model.id]).await?;
     Ok(())
 }
 
 #[tokio::test]
-async fn failed_old_receipts_do_not_starve_later_receipts_and_unknown_executions_stay_held(
+async fn expiry_releases_unknown_work_without_billing_and_late_reports_still_settle(
 ) -> anyhow::Result<()> {
     let pool = test_pool().await?;
     let org = insert_org_fixture(&pool).await?;
-    let model = insert_model(&pool, "receipt-recovery-progress").await?;
-    set_limit(
-        &OrganizationLimitsRepository::new(pool.clone()),
-        org.org_id,
-        "payment",
-        10000,
-    )
-    .await?;
-    let repo = OrganizationUsageRepository::new(pool.clone());
-    let client = pool.get().await?;
-    for _ in 0..101 {
-        let q = quote(&org, &model);
-        repo.reserve_and_dispatch(&q).await?;
-        // A future/invalid payload remains held for investigation, but must not monopolize recovery.
-        client
-            .execute(
-                "UPDATE usage_budget_reservations SET receipt='{}'::jsonb WHERE id=$1",
-                &[&q.id],
-            )
-            .await?;
-    }
-    let unknown = quote(&org, &model);
-    repo.reserve_and_dispatch(&unknown).await?;
-    let q = quote(&org, &model);
-    repo.reserve_and_dispatch(&q).await?;
-    repo.persist_receipt(q.id, &receipt(&q)).await?;
-    for _ in 0..3 {
-        repo.recover_receipts().await?;
-    }
-    let row = client
-        .query_one(
-            "SELECT state, receipt FROM usage_budget_reservations WHERE id=$1",
-            &[&q.id],
-        )
-        .await?;
-    assert_eq!(row.get::<_, String>(0), "settled");
-    assert!(row.get::<_, Option<serde_json::Value>>(1).is_none());
-    let held: i64 = client
-        .query_one("SELECT reserved_credit($1)", &[&org.org_id])
-        .await?
-        .get(0);
-    assert_eq!(held, 1020);
-    assert_eq!(
-        client
-            .query_one(
-                "SELECT state FROM usage_budget_reservations WHERE id=$1",
-                &[&unknown.id]
-            )
-            .await?
-            .get::<_, String>(0),
-        "dispatched"
-    );
-    cleanup_usage_fixtures(&pool, &[org.org_id], &[model.id]).await?;
-    Ok(())
-}
-
-#[tokio::test]
-async fn recovery_expires_unknown_work_and_late_receipts_still_settle() -> anyhow::Result<()> {
-    let pool = test_pool().await?;
-    let org = insert_org_fixture(&pool).await?;
-    let model = insert_model(&pool, "receipt-expiry").await?;
+    let model = insert_model(&pool, "budget-expiry").await?;
     set_limit(
         &OrganizationLimitsRepository::new(pool.clone()),
         org.org_id,
@@ -189,26 +129,37 @@ async fn recovery_expires_unknown_work_and_late_receipts_still_settle() -> anyho
     let client = pool.get().await?;
     let ttl: f64 = client.query_one("SELECT EXTRACT(EPOCH FROM expires_at-created_at)::FLOAT8 FROM usage_budget_reservations WHERE id=$1", &[&q.id]).await?.get(0);
     assert!((ttl - 1234.0).abs() < 1.0);
+    repo.expire_budgets().await?;
+    assert_eq!(
+        client
+            .query_one(
+                "SELECT state FROM usage_budget_reservations WHERE id=$1",
+                &[&q.id]
+            )
+            .await?
+            .get::<_, String>(0),
+        "dispatched"
+    );
     client.execute("UPDATE usage_budget_reservations SET expires_at=clock_timestamp()-interval '1 second' WHERE id=$1", &[&q.id]).await?;
     drop(repo);
     let restarted = OrganizationUsageRepository::new(pool.clone());
-    restarted.recover_receipts().await?;
-    let state: String = client
-        .query_one(
-            "SELECT state FROM usage_budget_reservations WHERE id=$1",
-            &[&q.id],
-        )
-        .await?
-        .get(0);
-    assert_eq!(state, "released");
-    restarted.persist_receipt(q.id, &receipt(&q)).await?;
-    restarted.recover_receipts().await?;
-    restarted.persist_receipt(q.id, &receipt(&q)).await?;
-    restarted.recover_receipts().await?;
-    let row = client.query_one("SELECT r.state,r.receipt,b.total_spent,reserved_credit(r.organization_id) FROM usage_budget_reservations r JOIN organization_balance b ON b.organization_id=r.organization_id WHERE r.id=$1", &[&q.id]).await?;
+    restarted.expire_budgets().await?;
+    let row = client.query_one("SELECT r.state,b.total_spent,reserved_credit(r.organization_id) FROM usage_budget_reservations r JOIN organization_balance b ON b.organization_id=r.organization_id WHERE r.id=$1", &[&q.id]).await?;
+    assert_eq!(row.get::<_, String>(0), "released");
+    assert_eq!((row.get::<_, i64>(1), row.get::<_, i64>(2)), (0, 0));
+    assert!(
+        UsageRepository::record_usage(&restarted, receipt(&q))
+            .await?
+            .was_inserted
+    );
+    assert!(
+        !UsageRepository::record_usage(&restarted, receipt(&q))
+            .await?
+            .was_inserted
+    );
+    let row = client.query_one("SELECT r.state,b.total_spent,reserved_credit(r.organization_id) FROM usage_budget_reservations r JOIN organization_balance b ON b.organization_id=r.organization_id WHERE r.id=$1", &[&q.id]).await?;
     assert_eq!(row.get::<_, String>(0), "settled");
-    assert!(row.get::<_, Option<serde_json::Value>>(1).is_none());
-    assert_eq!((row.get::<_, i64>(2), row.get::<_, i64>(3)), (30, 0));
+    assert_eq!((row.get::<_, i64>(1), row.get::<_, i64>(2)), (30, 0));
     cleanup_usage_fixtures(&pool, &[org.org_id], &[model.id]).await?;
     Ok(())
 }

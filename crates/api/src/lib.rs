@@ -147,14 +147,14 @@ pub struct DomainServices {
 #[derive(Clone, Copy, Debug)]
 pub struct AppBuildOptions {
     pub start_database_encryption_recovery: bool,
-    pub start_usage_receipt_recovery: bool,
+    pub start_usage_budget_expiry: bool,
 }
 
 impl Default for AppBuildOptions {
     fn default() -> Self {
         Self {
             start_database_encryption_recovery: true,
-            start_usage_receipt_recovery: true,
+            start_usage_budget_expiry: true,
         }
     }
 }
@@ -1135,9 +1135,9 @@ pub fn build_app_with_config_and_options(
     config: Arc<ApiConfig>,
     build_options: AppBuildOptions,
 ) -> Router {
-    if build_options.start_usage_receipt_recovery {
-        // A receipt already persisted by another replica or an earlier process is safe to replay.
-        let receipt_service = domain_services.usage_service.clone();
+    if build_options.start_usage_budget_expiry {
+        // Release expired holds even when no new request arrives for their organization.
+        let budget_service = domain_services.usage_service.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1146,16 +1146,16 @@ pub fn build_app_with_config_and_options(
                 interval.tick().await;
                 match tokio::time::timeout(
                     std::time::Duration::from_secs(20),
-                    receipt_service.recover_receipts(),
+                    budget_service.expire_budgets(),
                 )
                 .await
                 {
-                    Ok(Ok(recovered)) => {
-                        if recovered > 0 {
-                            tracing::info!(recovered, "Recovered usage receipts");
+                    Ok(Ok(expired)) => {
+                        if expired > 0 {
+                            tracing::info!(expired, "Expired usage budgets");
                         }
                     }
-                    _ => tracing::warn!("Usage receipt recovery unavailable"),
+                    _ => tracing::warn!("Usage budget expiry unavailable"),
                 }
             }
         });

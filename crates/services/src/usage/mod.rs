@@ -255,11 +255,11 @@ impl UsageServiceImpl {
 
 #[async_trait::async_trait]
 impl UsageServiceTrait for UsageServiceImpl {
-    async fn recover_receipts(&self) -> Result<u64, UsageError> {
+    async fn expire_budgets(&self) -> Result<u64, UsageError> {
         self.usage_repository
-            .recover_receipts()
+            .expire_budgets()
             .await
-            .map_err(|_| UsageError::InternalError("Usage receipt recovery failed".into()))
+            .map_err(|_| UsageError::InternalError("Usage budget expiry failed".into()))
     }
 
     async fn admit(
@@ -298,9 +298,6 @@ impl UsageServiceTrait for UsageServiceImpl {
         if request.budget_id.is_some() && snapshot.is_none() {
             return Err(UsageError::ValidationError("Admission not found".into()));
         }
-        let reservation_id = snapshot
-            .as_ref()
-            .and(request.budget_id.or(request.inference_id));
         let model = if let Some(snapshot) = snapshot {
             snapshot.estimate.validate_actual(&request)?;
             if snapshot.pricing.id != request.model_id {
@@ -380,13 +377,7 @@ impl UsageServiceTrait for UsageServiceImpl {
             dedupe_on_conflict: request.dedupe_on_conflict,
         };
 
-        if let Some(id) = reservation_id {
-            self.usage_repository
-                .persist_receipt(id, &db_request)
-                .await
-                .map_err(|_| UsageError::InternalError("Failed to persist usage receipt".into()))?;
-        }
-        // Settlement clears the receipt and the active hold in the same ledger transaction.
+        // Actual usage and release of its hold commit in the same ledger transaction.
         let log = self
             .usage_repository
             .record_usage(db_request)

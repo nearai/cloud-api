@@ -10,59 +10,8 @@ use uuid::Uuid;
 /// Trait implementation adapter for UsageRepository
 #[async_trait::async_trait]
 impl services::usage::ports::UsageRepository for OrganizationUsageRepository {
-    async fn persist_receipt(
-        &self,
-        id: Uuid,
-        request: &services::usage::RecordUsageDbRequest,
-    ) -> anyhow::Result<()> {
-        let client = self.pool.get().await?;
-        let body = serde_json::to_value(request)?;
-        let row = client.query_opt(
-            "UPDATE usage_budget_reservations SET receipt = CASE WHEN state = 'settled' THEN receipt ELSE $3 END, updated_at = clock_timestamp()
-             WHERE id=$1 AND organization_id=$2 AND api_key_id=$4 AND workspace_id=$5 AND model_id=$6
-             AND state IN ('dispatched','released','settled') AND (receipt IS NULL OR receipt=$3)
-             RETURNING id",
-            &[&id, &request.organization_id, &body, &request.api_key_id, &request.workspace_id, &request.model_id],
-        ).await?;
-        anyhow::ensure!(row.is_some(), "receipt identity or contents conflict");
-        Ok(())
-    }
-
-    async fn recover_receipts(&self) -> anyhow::Result<u64> {
-        let rows = self
-            .pool
-            .get()
-            .await?
-            .query(
-                "WITH pending AS (SELECT id FROM usage_budget_reservations
-                WHERE receipt IS NOT NULL AND receipt_version=1 ORDER BY updated_at,id
-                LIMIT 100 FOR UPDATE SKIP LOCKED)
-             UPDATE usage_budget_reservations r SET updated_at=clock_timestamp()
-             FROM pending WHERE r.id=pending.id RETURNING r.receipt",
-                &[],
-            )
-            .await?;
-        let mut recovered = 0;
-        for row in rows {
-            let request: services::usage::RecordUsageDbRequest =
-                match serde_json::from_value(row.get(0)) {
-                    Ok(request) => request,
-                    Err(_) => {
-                        tracing::error!("Invalid durable usage receipt");
-                        continue;
-                    }
-                };
-            if <Self as services::usage::UsageRepository>::record_usage(self, request)
-                .await
-                .is_ok()
-            {
-                recovered += 1;
-            } else {
-                tracing::warn!("Durable usage receipt remains pending");
-            }
-        }
-        // A completed receipt gets the first chance to settle. Expiry retains pending
-        // receipts and audit rows, so a late/replayed charge remains fully billable.
+    async fn expire_budgets(&self) -> anyhow::Result<u64> {
+        let mut expired = 0;
         let organizations = self
             .pool
             .get()
@@ -79,11 +28,14 @@ impl services::usage::ports::UsageRepository for OrganizationUsageRepository {
             let tx = client.transaction().await?;
             tx.batch_execute("SET LOCAL statement_timeout = '10s'; SET LOCAL lock_timeout = '5s'")
                 .await?;
-            tx.query_one("SELECT expire_usage_budgets($1)", &[&row.get::<_, Uuid>(0)])
-                .await?;
+            let released: i64 = tx
+                .query_one("SELECT expire_usage_budgets($1)", &[&row.get::<_, Uuid>(0)])
+                .await?
+                .get(0);
             tx.commit().await?;
+            expired += u64::try_from(released)?;
         }
-        Ok(recovered)
+        Ok(expired)
     }
 
     async fn reserve_and_dispatch(

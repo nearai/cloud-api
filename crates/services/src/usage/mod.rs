@@ -197,15 +197,9 @@ pub struct UsageServiceImpl {
     limits_repository: Arc<dyn OrganizationLimitsRepository>,
     workspace_service: Arc<dyn crate::workspace::WorkspaceServiceTrait>,
     metrics_service: Arc<dyn MetricsServiceTrait>,
-    admission_config: config::admission::AdmissionConfig,
 }
 
 impl UsageServiceImpl {
-    pub fn with_admission_config(mut self, config: config::admission::AdmissionConfig) -> Self {
-        self.admission_config = config;
-        self
-    }
-
     async fn reserve_budget(
         &self,
         id: Uuid,
@@ -218,16 +212,16 @@ impl UsageServiceImpl {
             .await
             .map_err(|e| UsageError::InternalError(e.to_string()))?
             .ok_or_else(|| UsageError::ModelNotFound(identity.model_id.to_string()))?;
-        let estimate = bounds.estimate(&self.admission_config, &pricing.model_name)?;
+        let estimate = bounds.estimate()?;
         let reservation = budget::BudgetReservation {
             id,
             amount: estimate.quote(&pricing)?,
             identity,
             inference_type: bounds.inference_type,
-            estimator_version: self.admission_config.version,
-            organization_max_unsettled: self.admission_config.organization_max_unsettled,
-            key_max_unsettled: self.admission_config.key_max_unsettled,
-            reservation_ttl_seconds: self.admission_config.reservation_ttl_seconds,
+            estimator_version: budget::ESTIMATOR_VERSION,
+            organization_max_unsettled: budget::ORGANIZATION_MAX_UNSETTLED,
+            key_max_unsettled: budget::KEY_MAX_UNSETTLED,
+            reservation_ttl_seconds: budget::RESERVATION_TTL_SECONDS,
         };
         self.usage_repository.admit_budget(&reservation).await?;
         Ok(id)
@@ -246,7 +240,6 @@ impl UsageServiceImpl {
             limits_repository,
             workspace_service,
             metrics_service,
-            admission_config: Default::default(),
         }
     }
 }

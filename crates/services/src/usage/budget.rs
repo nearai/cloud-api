@@ -3,7 +3,11 @@ use super::{BillingIdentity, InferenceType, ModelPricing, UsageError};
 use uuid::Uuid;
 
 mod estimate;
+mod policy;
 pub use estimate::UsageFeatures;
+pub(super) use policy::{
+    ESTIMATOR_VERSION, KEY_MAX_UNSETTLED, ORGANIZATION_MAX_UNSETTLED, RESERVATION_TTL_SECONDS,
+};
 
 #[derive(Debug, Clone)]
 pub struct UsageEstimate {
@@ -11,7 +15,7 @@ pub struct UsageEstimate {
     pub input_units: i32,
     pub output_tokens: i32,
     pub images: i32,
-    pub policy: config::admission::EstimatePolicy,
+    policy: policy::EstimatePolicy,
 }
 
 impl UsageEstimate {
@@ -208,25 +212,23 @@ mod tests {
             cache_read_cost_per_token: Some(0),
             text_pricing: None,
         };
-        let mut config = config::admission::AdmissionConfig::default();
-        config.default.minimum_nano_usd = 1;
-        config.default.multiplier_basis_points = 15_000;
         for (kind, body, expected) in [
             (InferenceType::ImageGeneration, json!({"n":3}), 50),
             (InferenceType::ImageEdit, json!({"n":1}), 17),
             (InferenceType::AudioTranscription, json!({}), 270),
         ] {
-            let estimate = UsageFeatures::from_json(kind, &body)
+            let mut estimate = UsageFeatures::from_json(kind, &body)
                 .unwrap()
-                .estimate(&config, "test")
+                .estimate()
                 .unwrap();
+            estimate.policy.minimum_nano_usd = 1;
+            estimate.policy.multiplier_basis_points = 15_000;
             assert_eq!(estimate.quote(&pricing).unwrap(), expected);
         }
-        let mut estimate = UsageFeatures::from_json(InferenceType::ImageGeneration, &json!({}))
+        let estimate = UsageFeatures::from_json(InferenceType::ImageGeneration, &json!({}))
             .unwrap()
-            .estimate(&config, "test")
+            .estimate()
             .unwrap();
-        estimate.policy.minimum_nano_usd = 1000;
         assert_eq!(estimate.quote(&pricing).unwrap(), 1000);
         let mut free = pricing.clone();
         free.cost_per_image = 0;

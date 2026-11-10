@@ -10,7 +10,6 @@
 
 use thiserror::Error;
 
-pub mod admission;
 pub mod ita;
 pub mod types;
 

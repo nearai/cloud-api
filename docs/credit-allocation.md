@@ -78,12 +78,12 @@ Actual pricing and organization discounts follow the existing settlement path;
 admission does not freeze them. A duplicate report with unchanged usage facts
 returns the recorded charge even when live prices or discounts have since changed.
 
-`USAGE_ADMISSION_CONFIG` is a validated JSON setting read at startup. `models`
-(canonical catalog names) overrides `kinds` (inference-type names), then `default`.
-Each selected policy is a complete policy: omitted fields use built-in defaults,
-not fields from another override. `version` identifies the estimator configuration;
-`organization_max_unsettled` and `key_max_unsettled` default to 64 and 16.
-`reservation_ttl_seconds` defaults to 7200 (two hours) and must be positive.
+Admission parameters are defined in
+[`budget/policy.rs`](../crates/services/src/usage/budget/policy.rs) and ship with
+Cloud API. The policy sets at most 64 unsettled executions per organization and
+16 per key, with a reservation TTL of 7200 seconds (two hours).
+Adjustments go through code review and release; `ESTIMATOR_VERSION` identifies
+the policy used for a reservation and should advance when its parameters change.
 
 | Estimate parameter | Default |
 |---|---:|
@@ -99,7 +99,7 @@ not fields from another override. `version` identifies the estimator configurati
 Text estimates count local UTF-8 bytes, complete tool definitions and structured
 output schemas (including property names), explicit token IDs, message overhead and
 media allowances, then add the requested output estimate. Without an explicit
-output limit, the configured fallback is bounded by a known catalog output limit.
+output limit, the policy fallback is bounded by a known catalog output limit.
 Batch/choice/attempt counts multiply the corresponding units. Images use requested
 image count and catalog price; transcription prefers locally measured audio
 duration, falling back to the larger of bytes/rate and the duration allowance when

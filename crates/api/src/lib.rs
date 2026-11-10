@@ -533,16 +533,13 @@ pub async fn init_domain_services_with_pool(
         as Arc<dyn services::workspace::WorkspaceServiceTrait + Send + Sync>;
 
     // Now create usage service with workspace_service
-    let usage_service = Arc::new(
-        services::usage::UsageServiceImpl::new(
-            usage_repository as Arc<dyn services::usage::UsageRepository>,
-            models_repo.clone() as Arc<dyn services::usage::ModelRepository>,
-            limits_repository_for_usage as Arc<dyn services::usage::OrganizationLimitsRepository>,
-            workspace_service.clone(),
-            metrics_service.clone(),
-        )
-        .with_admission_config(config.usage_admission.clone()),
-    ) as Arc<dyn services::usage::UsageServiceTrait + Send + Sync>;
+    let usage_service = Arc::new(services::usage::UsageServiceImpl::new(
+        usage_repository as Arc<dyn services::usage::UsageRepository>,
+        models_repo.clone() as Arc<dyn services::usage::ModelRepository>,
+        limits_repository_for_usage as Arc<dyn services::usage::OrganizationLimitsRepository>,
+        workspace_service.clone(),
+        metrics_service.clone(),
+    )) as Arc<dyn services::usage::UsageServiceTrait + Send + Sync>;
 
     // Create organization limit repository for completion service rate limiting
     let org_limit_repository = Arc::new(database::repositories::PgOrganizationRepository::new(
@@ -3551,7 +3548,6 @@ mod tests {
             inference_api_key: Some("test-key".to_string()),
             internal_usage_token: None,
             internal_usage_max_discount: config::DEFAULT_INTERNAL_USAGE_MAX_DISCOUNT,
-            usage_admission: Default::default(),
             logging: config::LoggingConfig {
                 level: "info".to_string(),
                 format: "compact".to_string(),
@@ -3679,7 +3675,6 @@ mod tests {
             inference_api_key: Some("test-key".to_string()),
             internal_usage_token: None,
             internal_usage_max_discount: config::DEFAULT_INTERNAL_USAGE_MAX_DISCOUNT,
-            usage_admission: Default::default(),
             logging: config::LoggingConfig {
                 level: "info".to_string(),
                 format: "compact".to_string(),

@@ -1,5 +1,4 @@
 use super::{overflow, InferenceType, UsageError, UsageEstimate};
-use config::admission::AdmissionConfig;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -160,11 +159,7 @@ impl UsageFeatures {
         Ok(())
     }
 
-    pub fn estimate(
-        &self,
-        config: &AdmissionConfig,
-        model: &str,
-    ) -> Result<UsageEstimate, UsageError> {
+    pub fn estimate(&self) -> Result<UsageEstimate, UsageError> {
         if self.executions == 0
             || self.batch_items == 0
             || self.choices == 0
@@ -174,7 +169,7 @@ impl UsageFeatures {
                 "zero execution multiplier".into(),
             ));
         }
-        let policy = config.policy(model, self.inference_type.as_str()).clone();
+        let policy = super::policy::ESTIMATE_POLICY;
         let mul = |a: u64, b: u64| a.checked_mul(b).ok_or_else(overflow);
         let generations = mul(mul(self.batch_items, self.choices)?, self.executions)?;
         let mut input = self.text_bytes.div_ceil(u64::from(policy.bytes_per_token));
@@ -247,7 +242,6 @@ mod tests {
 
     #[test]
     fn estimates_do_not_modify_requests_or_fetch_media() {
-        let config = AdmissionConfig::default();
         for body in [
             json!({"messages":[{"role":"user","content":"hi"}]}),
             json!({"messages":[{"content":[{"type":"image_url","image_url":{"url":"https://example.invalid/image"}}]}],"max_tokens":42}),
@@ -255,7 +249,7 @@ mod tests {
         ] {
             let before = body.clone();
             let features = UsageFeatures::from_json(InferenceType::ChatCompletion, &body).unwrap();
-            let estimate = features.estimate(&config, "model").unwrap();
+            let estimate = features.estimate().unwrap();
             assert!(estimate.input_units > 0 && estimate.output_tokens > 0);
             assert_eq!(body, before);
             if body.get("max_tokens").is_none() {
@@ -283,9 +277,7 @@ mod tests {
         ] {
             let mut features = UsageFeatures::from_json(kind, &body).unwrap();
             features.media_bytes = bytes;
-            let e = features
-                .estimate(&AdmissionConfig::default(), "model")
-                .unwrap();
+            let e = features.estimate().unwrap();
             assert_eq!((e.input_units, e.output_tokens, e.images), expected);
         }
     }
@@ -321,13 +313,7 @@ mod tests {
         features.media_bytes = 1024;
         for (duration, expected) in [(None, 60), (Some(2), 2), (Some(3600), 3600)] {
             features.audio_duration_seconds = duration;
-            assert_eq!(
-                features
-                    .estimate(&AdmissionConfig::default(), "audio")
-                    .unwrap()
-                    .input_units,
-                expected
-            );
+            assert_eq!(features.estimate().unwrap().input_units, expected);
         }
         let mut legacy = serde_json::to_value(&features).unwrap();
         legacy
@@ -345,8 +331,6 @@ mod tests {
         let mut features =
             UsageFeatures::from_json(InferenceType::ChatCompletion, &json!({})).unwrap();
         features.executions = u64::MAX;
-        assert!(features
-            .estimate(&AdmissionConfig::default(), "model")
-            .is_err());
+        assert!(features.estimate().is_err());
     }
 }

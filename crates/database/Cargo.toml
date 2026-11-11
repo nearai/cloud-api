@@ -48,8 +48,8 @@ config = { path = "../config" }
 # For hashing API keys and session tokens
 sha2 = "0.11"
 hex = "0.4"
-aes-gcm = "0.10"
-base64 = "0.22"
+aes-gcm = "0.11"
+base64 = "0.23"
 zeroize = { version = "1.8.2", features = ["derive"] }
 rand = "0.10.1"
 

@@ -1,0 +1,19 @@
+# Fires the approval-guard handler. Holds no permissions and no secrets, and
+# does nothing itself. A PR branch can edit or delete this file; that only
+# means no check gets posted, and the required check then blocks the merge.
+name: approval-guard-trigger
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, edited, ready_for_review]
+  pull_request_review:
+    types: [submitted, dismissed]
+
+permissions: {}
+
+jobs:
+  trigger:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - run: "true"

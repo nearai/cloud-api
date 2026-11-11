@@ -1,0 +1,68 @@
+# Posts the required `approval-guard` check on a PR's head commit.
+#
+# Rule: the PR may merge only if someone who did NOT touch the PR approved its
+# current head commit. "Touched" = PR author, any commit author or committer,
+# anyone who pushed to the PR branch. Approvals from those people do not count.
+#
+# Safety:
+# - workflow_run always runs THIS file from the default branch, so a PR cannot
+#   change the rule. It never checks out or runs PR code.
+# - The App key lives in the `approval-guard` environment, which only the
+#   default branch can use. Branch workflows cannot read it.
+# - The check is posted by the approval-guard App. The required check must be
+#   pinned to that App, so a check with the same name posted any other way
+#   does not count.
+name: approval-guard
+
+on:
+  workflow_run: # zizmor: ignore[dangerous-triggers] Runs the default-branch copy only; never checks out or runs PR code, reads PR state via the API.
+    workflows: [approval-guard-trigger]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: PR number to re-evaluate
+        required: true
+        type: number
+
+permissions: {}
+
+# One queue per PR, shared by workflow_run and manual re-runs. Each run reads
+# live state, so a queued run replacing a pending one loses nothing.
+concurrency:
+  group: approval-guard-${{ github.event.workflow_run.pull_requests[0].number || inputs.pr || github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    environment: approval-guard
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the guard script from the default branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/approval-guard
+
+      - name: Get an App token for this repo
+        id: app
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ vars.APPROVAL_GUARD_CLIENT_ID }}
+          private-key: ${{ secrets.APPROVAL_GUARD_APP_KEY }}
+          repositories: ${{ github.event.repository.name }}
+          permission-checks: write
+          permission-pull-requests: read
+          permission-contents: read
+
+      - name: Evaluate and post the check
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          RUN_PRS: ${{ toJSON(github.event.workflow_run.pull_requests) }}
+          PR_HINT: ${{ inputs.pr }}
+        run: python3 .github/approval-guard/guard.py

@@ -89,6 +89,11 @@ mod tests {
         ] {
             assert_eq!(seconds(bytes.to_vec()), Some(2));
         }
+        // Valid audio can require provider usage instead of local metering.
+        assert_eq!(
+            seconds(include_bytes!("../tests/fixtures/audio/silence-vorbis.webm").to_vec()),
+            None
+        );
         for bytes in [vec![], vec![0; 4096], b"not audio".to_vec()] {
             assert_eq!(seconds(bytes), None);
         }

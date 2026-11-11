@@ -722,6 +722,7 @@ struct MockConfig {
     /// When set, all audio transcription calls return this error instead of a response.
     audio_transcription_error_override: Option<AudioTranscriptionError>,
     omit_audio_duration: bool,
+    audio_usage_seconds: Option<f64>,
     /// When set, privacy classify calls return this instead of running the
     /// built-in shape-based detector.
     privacy_classify_override: Option<PrivacyClassifyOverride>,
@@ -888,6 +889,7 @@ impl MockProvider {
                 embedding_error_override: None,
                 audio_transcription_error_override: None,
                 omit_audio_duration: false,
+                audio_usage_seconds: None,
                 privacy_classify_override: None,
             })),
             last_chat_params: Arc::new(Mutex::new(None)),
@@ -924,6 +926,7 @@ impl MockProvider {
                 embedding_error_override: None,
                 audio_transcription_error_override: None,
                 omit_audio_duration: false,
+                audio_usage_seconds: None,
                 privacy_classify_override: None,
             })),
             last_chat_params: Arc::new(Mutex::new(None)),
@@ -958,6 +961,7 @@ impl MockProvider {
                 embedding_error_override: None,
                 audio_transcription_error_override: None,
                 omit_audio_duration: false,
+                audio_usage_seconds: None,
                 privacy_classify_override: None,
             })),
             last_chat_params: Arc::new(Mutex::new(None)),
@@ -1129,6 +1133,11 @@ impl MockProvider {
     /// Model providers whose JSON format has text but no duration receipt.
     pub async fn omit_audio_duration(&self) {
         self.config.lock().await.omit_audio_duration = true;
+    }
+
+    /// Supply the duration normally carried by the provider's `usage.seconds`.
+    pub async fn set_audio_usage_seconds(&self, seconds: Option<f64>) {
+        self.config.lock().await.audio_usage_seconds = seconds;
     }
 
     /// Override privacy classify responses (body or HTTP error). Pass `None`
@@ -1949,9 +1958,11 @@ impl crate::InferenceProvider for MockProvider {
                 .as_deref()
                 .is_none_or(|granularities| granularities.iter().any(|value| value == "segment"));
 
+        let config = self.config.lock().await;
         Ok(AudioTranscriptionResponse {
             text: mock_text.clone(),
-            duration: (!self.config.lock().await.omit_audio_duration).then_some(mock_duration),
+            duration: (!config.omit_audio_duration).then_some(mock_duration),
+            usage_duration_seconds: config.audio_usage_seconds,
             language: params.language.or(Some("en".to_string())),
             segments: wants_segment_timestamps.then(|| {
                 vec![TranscriptionSegment {

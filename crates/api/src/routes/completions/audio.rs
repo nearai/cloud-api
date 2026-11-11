@@ -261,12 +261,9 @@ pub async fn audio_transcriptions(
             let workspace_id = api_key.workspace.id.0;
             let api_key_id_str = api_key.api_key.id.0.clone();
 
-            // Ordinary JSON responses may omit duration. Meter the uploaded file locally
-            // in that case, leaving both provider parameters and client responses unchanged.
+            // Prefer provider usage.seconds or verbose duration, then local file timing.
             let duration_seconds = response
-                .duration
-                .filter(|n| n.is_finite() && *n > 0.0 && n.ceil() <= f64::from(i32::MAX))
-                .map(|n| n.ceil() as i32)
+                .billable_duration_seconds()
                 .or(file_duration_seconds)
                 .unwrap_or(0);
 

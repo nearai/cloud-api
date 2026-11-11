@@ -130,9 +130,10 @@ optional Responses record. Settled rows retain metadata for deduplication and au
 but no longer reduce available capacity. If final usage is lost before it reaches
 the existing accounting path, expiry does not reconstruct it or charge the estimate.
 
-Audio settlement prefers the provider's final duration. If an ordinary JSON
-response omits it, local Rust parsers read frame/sample timing from the uploaded audio,
-rounded up to seconds. This does not change the uploaded bytes, response format,
+Audio settlement prefers the provider's duration-based `usage.seconds`, then
+verbose-response `duration`. If neither supplies a usable value, local Rust parsers
+read frame/sample timing from the uploaded audio, rounded up to seconds.
+This does not change the uploaded bytes, response format,
 or encryption. The byte/rate estimate is never used as actual usage. If neither
 the provider nor the file supplies usable duration, return the existing response,
 log the missing usage, and retain the hold until expiry.

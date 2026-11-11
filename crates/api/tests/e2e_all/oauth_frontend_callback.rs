@@ -539,6 +539,7 @@ async fn test_oauth_state_stores_frontend_callback_with_github() {
             provider.clone(),
             None,
             frontend_callback.clone(),
+            &Default::default(),
         )
         .await
         .unwrap();
@@ -575,6 +576,7 @@ async fn test_oauth_state_stores_frontend_callback_with_google() {
             provider.clone(),
             pkce_verifier.clone(),
             frontend_callback.clone(),
+            &Default::default(),
         )
         .await
         .unwrap();
@@ -602,7 +604,13 @@ async fn test_oauth_state_without_frontend_callback() {
 
     // Create OAuth state without frontend_callback (None)
     let created = repo
-        .create(state.clone(), provider.clone(), None, None)
+        .create(
+            state.clone(),
+            provider.clone(),
+            None,
+            None,
+            &Default::default(),
+        )
         .await
         .unwrap();
 
@@ -631,6 +639,7 @@ async fn test_oauth_callback_with_valid_state_and_frontend_callback() {
         "github".to_string(),
         None,
         Some(frontend_callback.to_string()),
+        &Default::default(),
     )
     .await
     .unwrap();
@@ -661,6 +670,7 @@ async fn test_multiple_oauth_states_with_different_frontend_callbacks() {
             "github".to_string(),
             None,
             Some(callback_url_1.to_string()),
+            &Default::default(),
         )
         .await
         .unwrap();
@@ -675,6 +685,7 @@ async fn test_multiple_oauth_states_with_different_frontend_callbacks() {
             "google".to_string(),
             Some("test-pkce".to_string()),
             Some(callback_url_2.to_string()),
+            &Default::default(),
         )
         .await
         .unwrap();
@@ -714,6 +725,7 @@ async fn test_frontend_callback_with_special_characters_in_path() {
             "github".to_string(),
             None,
             Some(callback_url.to_string()),
+            &Default::default(),
         )
         .await
         .unwrap();
@@ -742,6 +754,7 @@ async fn test_frontend_callback_url_can_store_any_valid_url() {
             "github".to_string(),
             None,
             Some(callback_url_with_params.to_string()),
+            &Default::default(),
         )
         .await
         .unwrap();
@@ -776,6 +789,7 @@ async fn test_oauth_state_replay_protection_with_frontend_callback() {
         "github".to_string(),
         None,
         frontend_callback.clone(),
+        &Default::default(),
     )
     .await
     .unwrap();

@@ -24,7 +24,13 @@ async fn test_create_and_get_oauth_state() {
 
     // Create state
     let created = repo
-        .create(state.clone(), provider.clone(), None, None)
+        .create(
+            state.clone(),
+            provider.clone(),
+            None,
+            None,
+            &Default::default(),
+        )
         .await
         .unwrap();
     assert_eq!(created.state, state);
@@ -81,7 +87,13 @@ async fn test_google_with_pkce_verifier() {
 
     // Create state with PKCE verifier
     let created = repo
-        .create(state.clone(), provider.clone(), verifier.clone(), None)
+        .create(
+            state.clone(),
+            provider.clone(),
+            verifier.clone(),
+            None,
+            &Default::default(),
+        )
         .await
         .unwrap();
     assert_eq!(created.pkce_verifier, verifier);
@@ -101,7 +113,7 @@ async fn test_state_replay_protection() {
     let provider = "github".to_string();
 
     // Create one state
-    repo.create(state.clone(), provider, None, None)
+    repo.create(state.clone(), provider, None, None, &Default::default())
         .await
         .unwrap();
 

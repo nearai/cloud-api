@@ -146,6 +146,7 @@ impl NearAuthService {
         ip_address: Option<String>,
         user_agent: String,
         encoding_key: String,
+        attribution: &super::attribution::SignupAttribution,
     ) -> anyhow::Result<(String, Session, String)> {
         let account_id = signed_message.account_id.to_string();
 
@@ -220,7 +221,7 @@ impl NearAuthService {
         };
         let user = self
             .auth_service
-            .get_or_create_oauth_user(oauth_info)
+            .get_or_create_oauth_user_with_attribution(oauth_info, attribution)
             .await
             .map_err(|e| anyhow::anyhow!(NearAuthError::InternalError(e.to_string())))?;
 

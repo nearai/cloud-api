@@ -9,6 +9,7 @@ use chrono::Utc;
 use config::ApiConfig;
 use database::repositories::OAuthStateRepository;
 use serde::{Deserialize, Serialize};
+use services::auth::attribution::SignupAttribution;
 use services::auth::near::NearAuthError;
 use services::auth::{AuthError, AuthServiceTrait, OAuthManager};
 use std::sync::Arc;
@@ -170,6 +171,20 @@ pub struct OAuthCallback {
 #[derive(Deserialize)]
 pub struct OAuthInitQuery {
     pub frontend_callback: Option<String>,
+    /// Signup attribution, recorded on the user only if this login creates it.
+    pub utm_source: Option<String>,
+    pub utm_medium: Option<String>,
+    pub utm_campaign: Option<String>,
+}
+
+impl OAuthInitQuery {
+    fn attribution(&self) -> SignupAttribution {
+        SignupAttribution::from_request(
+            self.utm_source.as_deref(),
+            self.utm_medium.as_deref(),
+            self.utm_campaign.as_deref(),
+        )
+    }
 }
 
 #[derive(Serialize)]
@@ -198,6 +213,13 @@ pub struct NearAuthRequest {
     pub signed_message: NearSignedMessageJson,
     /// The payload that was signed
     pub payload: NearPayloadJson,
+    /// Signup attribution, recorded on the user only if this login creates it.
+    #[serde(default)]
+    pub utm_source: Option<String>,
+    #[serde(default)]
+    pub utm_medium: Option<String>,
+    #[serde(default)]
+    pub utm_campaign: Option<String>,
 }
 
 /// Signed message from wallet (NEP-413 SignedMessage)
@@ -346,7 +368,9 @@ pub async fn github_login(
     Query(params): Query<OAuthInitQuery>,
     State((oauth, state_store, _auth_service, config)): State<AuthState>,
 ) -> Result<Redirect, StatusCode> {
+    let attribution = params.attribution();
     debug!(
+        attribution = !attribution.is_empty(),
         "Initiating GitHub OAuth flow - frontend_callback: {}",
         params.frontend_callback.is_some()
     );
@@ -373,6 +397,7 @@ pub async fn github_login(
             "github".to_string(),
             None,
             params.frontend_callback.clone(),
+            &attribution,
         )
         .await
         .map_err(|e| {
@@ -394,7 +419,9 @@ pub async fn google_login(
     Query(params): Query<OAuthInitQuery>,
     State((oauth, state_store, _auth_service, config)): State<AuthState>,
 ) -> Result<Redirect, StatusCode> {
+    let attribution = params.attribution();
     debug!(
+        attribution = !attribution.is_empty(),
         "Initiating Google OAuth flow - frontend_callback: {}",
         params.frontend_callback.is_some()
     );
@@ -421,6 +448,7 @@ pub async fn google_login(
             "google".to_string(),
             Some(pkce_verifier),
             params.frontend_callback.clone(),
+            &attribution,
         )
         .await
         .map_err(|e| {
@@ -562,7 +590,10 @@ pub async fn oauth_callback(
     };
 
     // Get or create user from OAuth info
-    let user = match auth_service.get_or_create_oauth_user(oauth_user_info).await {
+    let user = match auth_service
+        .get_or_create_oauth_user_with_attribution(oauth_user_info, &oauth_state_row.attribution)
+        .await
+    {
         Ok(user) => user,
         Err(e) => {
             return oauth_user_error_response(
@@ -709,6 +740,11 @@ pub async fn near_login(
     Json(auth_request): Json<NearAuthRequest>,
 ) -> Response {
     let account_id_str = auth_request.signed_message.account_id.clone();
+    let attribution = SignupAttribution::from_request(
+        auth_request.utm_source.as_deref(),
+        auth_request.utm_medium.as_deref(),
+        auth_request.utm_campaign.as_deref(),
+    );
     debug!(
         "NEAR authentication attempt for account: {}",
         account_id_str
@@ -769,6 +805,7 @@ pub async fn near_login(
             None, // ip_address
             user_agent_header.to_string(),
             config.auth.encoding_key.clone(),
+            &attribution,
         )
         .await;
 

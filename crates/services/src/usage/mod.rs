@@ -246,6 +246,12 @@ impl UsageServiceImpl {
 
 #[async_trait::async_trait]
 impl UsageServiceTrait for UsageServiceImpl {
+    async fn release_budget(&self, organization_id: Uuid, id: Uuid) -> Result<(), UsageError> {
+        self.usage_repository
+            .release_budget(organization_id, id)
+            .await
+            .map_err(|_| UsageError::InternalError("Budget release failed".into()))
+    }
     async fn expire_budgets(&self) -> Result<u64, UsageError> {
         self.usage_repository
             .expire_budgets()

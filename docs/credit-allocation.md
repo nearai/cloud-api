@@ -71,8 +71,8 @@ optional spend limit. A key without a limit still shares the organization budget
 The actual balance is unchanged; spendable capacity excludes active holds. Final
 settlement posts the full actual charge and deactivates the hold in the same
 transaction. The original estimate is never resized, debited or refunded. Admission
-creates an active hold in one operation; there is no separate dispatch or manual
-release operation. It stores the amount, inference type and estimator version with
+creates an active hold in one operation. The internal release operation only frees
+attempts confirmed not to have been dispatched. It stores the amount, inference type and estimator version with
 billing identity and expiry, without persisting full input features or estimator policies.
 Actual pricing and organization discounts follow the existing settlement path;
 admission does not freeze them. A duplicate report with unchanged usage facts
@@ -97,15 +97,17 @@ the policy used for a reservation and should advance when its parameters change.
 | `decision_output_tokens` | 128 per SystemOne question |
 
 Text estimates count local UTF-8 bytes, complete tool definitions and structured
-output schemas (including property names), explicit token IDs, message overhead and
-media allowances, then add the requested output estimate. Without an explicit
-output limit, the policy fallback is bounded by a known catalog output limit.
+output schemas (including property names), explicit token IDs, a flat 32-token overhead and
+media allowances, then add the requested output estimate capped by the known catalog
+output limit. Without an explicit limit, the quote uses min(catalog output limit,
+4096), or 4096 when the catalog has no limit. These are estimates, not hard ceilings
+on actual cost. Fixed per-item media allowances also apply to opaque or remote media;
+no downloads or remote counting are performed.
 Batch/choice/attempt counts multiply the corresponding units. Images use requested
-image count and catalog price; transcription prefers locally measured audio
-duration, falling back to the larger of bytes/rate and the duration allowance when
-duration is unavailable. The multiplier is rounded upward in integer nano-USD, with
+image count and catalog price; transcription uses the larger of the byte/rate floor
+and locally measured duration (or the 60-second allowance when duration is unavailable). The multiplier is rounded upward in integer nano-USD, with
 the minimum applied only to nonzero estimated cost. Free prices remain free.
-Tiered models use the highest configured applicable unit rates for estimation.
+Tiered models use the highest configured unit rates across tiers and cache classes for estimation.
 No provider token-count call, media download, transcoding, or additional output
 limit is introduced. Existing inference-side parameter handling remains in place,
 including native Responses' existing catalog output cap. E2EE follows the same
@@ -122,7 +124,9 @@ settlement replay. Cloud API releases expired holds every 30 seconds, and admiss
 also reclaims expired holds for its organization. Expiry uses the fixed deadline
 stored at admission, without heartbeats or resizing. A client disconnect or transport
 error still records any billable usage already received and settles the hold.
-When no billable usage is available, the hold stays until expiry; response
+A connection or request-construction failure known to precede dispatch releases the
+hold immediately. HTTP errors, post-connect timeouts and dropped futures retain it
+when no billable usage is available; response
 completeness remains a separate requirement for signing. Expiry frees both reserved credit
 and the unsettled slot, preserving the identity needed for a late usage report.
 A late report still charges actual usage once, including overage. Work that outlives
@@ -135,7 +139,9 @@ the existing accounting path, expiry does not reconstruct it or charge the estim
 Audio settlement prefers the provider's duration-based `usage.seconds`, then
 verbose-response `duration`. If neither supplies a usable value, local Rust parsers
 read frame/sample timing from the uploaded audio, rounded up to seconds.
-This does not change the uploaded bytes, response format,
+Local file metering has at most four workers and a one-second parsing budget; if it
+cannot complete, provider usage remains authoritative. MP3 metering counts complete
+frames instead of trusting summary frame counts. This does not change uploaded bytes, response format,
 or encryption. The byte/rate estimate is never used as actual usage. If neither
 the provider nor the file supplies usable duration, return the existing response,
 log the missing usage, and retain the hold until expiry.
@@ -152,8 +158,9 @@ flow; their ledger writes still respect active holds.
 ## Rollout notes
 
 - Apply V0100 through the normal cloud-platform migration/image release before
-  deploying admission callers. Deploy event consumers before producers of
-  `admission_id` or audio receipts. All inference, service, limit, and staking
+  deploying admission callers. Every event consumer must be upgraded before any
+  producer emits `admission_id` or audio receipts; mixed consumer versions are not
+  supported after that point. All inference, service, limit, and staking
   writers must use the hold-aware versions before enabling admission. They
   coordinate through the same per-organization database lock.
 - Inference usage posts through `record_organization_usage` (V0100) in one database

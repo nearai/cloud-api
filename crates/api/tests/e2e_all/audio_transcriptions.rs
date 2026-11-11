@@ -156,8 +156,8 @@ async fn json_audio_usage_and_local_fallback_settle_without_response_changes() {
         if usage_seconds.is_none() {
             assert_eq!(
                 row.get::<_, i64>(1),
-                4_000_000,
-                "two measured seconds with the default 2x multiplier"
+                80_000_000,
+                "the 40-second byte estimate floors the two measured seconds, then applies 2x"
             );
         }
         let spent: i64 = client

@@ -1,3 +1,57 @@
+#[derive(Clone, Copy)]
+enum BudgetOperation {
+    Chat,
+    Stream,
+    Image,
+    ImageEdit,
+    Audio,
+    SystemOne,
+    #[cfg(test)]
+    Test(&'static str),
+}
+impl BudgetOperation {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Chat => "chat_completion",
+            Self::Stream => "chat_completion_stream",
+            Self::Image => "image_generation",
+            Self::ImageEdit => "image_edit",
+            Self::Audio => "audio_transcription",
+            Self::SystemOne => "systemone",
+            #[cfg(test)]
+            Self::Test(name) => name,
+        }
+    }
+    fn requires_admission(self) -> bool {
+        match self {
+            Self::Chat
+            | Self::Stream
+            | Self::Image
+            | Self::ImageEdit
+            | Self::Audio
+            | Self::SystemOne => true,
+            #[cfg(test)]
+            Self::Test(_) => false,
+        }
+    }
+}
+
+// Existing routing-only tests use arbitrary labels; production dispatch requires the enum.
+#[cfg(test)]
+impl From<&'static str> for BudgetOperation {
+    fn from(name: &'static str) -> Self {
+        match name {
+            "chat_completion" => Self::Chat,
+            "chat_completion_stream" => Self::Stream,
+            "image_generation" => Self::Image,
+            "image_edit" => Self::ImageEdit,
+            "audio_transcription" => Self::Audio,
+            "systemone" => Self::SystemOne,
+            other => Self::Test(other),
+        }
+    }
+}
+
 use crate::attestation::{AttestationVerifier, BackendAttestationVerifier, ReplicaReportKey};
 use crate::common::encryption_headers;
 use config::ExternalProvidersConfig;
@@ -3482,7 +3536,7 @@ impl InferenceProviderPool {
     async fn retry_with_fallback<T, F, Fut>(
         &self,
         model_id: &str,
-        operation_name: &str,
+        operation: impl Into<BudgetOperation>,
         model_pub_key: Option<&str>,
         provider_fn: F,
     ) -> Result<ServedProviderResult<T>, CompletionError>
@@ -3492,7 +3546,7 @@ impl InferenceProviderPool {
     {
         self.retry_with_fallback_caps(
             model_id,
-            operation_name,
+            operation,
             model_pub_key,
             false,
             &ChatRoutingHints::default(),
@@ -3512,7 +3566,7 @@ impl InferenceProviderPool {
     async fn retry_with_fallback_caps<T, F, Fut>(
         &self,
         model_id: &str,
-        operation_name: &str,
+        operation: impl Into<BudgetOperation>,
         model_pub_key: Option<&str>,
         needs_client_e2ee: bool,
         hints: &ChatRoutingHints,
@@ -3522,6 +3576,8 @@ impl InferenceProviderPool {
         F: Fn(Arc<InferenceProviderTrait>) -> Fut,
         Fut: std::future::Future<Output = Result<T, CompletionError>>,
     {
+        let operation = operation.into();
+        let operation_name = operation.name();
         let providers = match self
             .get_providers_with_fallback(model_id, model_pub_key, hints)
             .await
@@ -3784,20 +3840,16 @@ impl InferenceProviderPool {
                 );
 
                 // Admission failures are local: do not retry them as provider failures.
-                if matches!(
-                    operation_name,
-                    "chat_completion"
-                        | "chat_completion_stream"
-                        | "image_generation"
-                        | "image_edit"
-                        | "audio_transcription"
-                        | "systemone"
-                ) {
+                if operation.requires_admission() {
                     crate::usage::budget::before_attempt()
                         .await
                         .map_err(crate::usage::budget::completion_error)?;
                 }
-                match provider_fn(provider.clone()).await {
+                let result = provider_fn(provider.clone()).await;
+                if result.is_err() {
+                    inference_providers::retry_admission::attempt_failed().await;
+                }
+                match result {
                     Ok(result) => {
                         // Reset failure counter on success
                         {
@@ -4475,7 +4527,7 @@ impl InferenceProviderPool {
         let served = self
             .retry_with_fallback_caps(
                 &model_id,
-                "chat_completion_stream",
+                BudgetOperation::Stream,
                 model_pub_key,
                 needs_client_e2ee,
                 &hints,
@@ -4676,7 +4728,7 @@ impl InferenceProviderPool {
         let served = self
             .retry_with_fallback_caps(
                 &model_id,
-                "chat_completion",
+                BudgetOperation::Chat,
                 model_pub_key,
                 needs_client_e2ee,
                 &hints,
@@ -4736,7 +4788,7 @@ impl InferenceProviderPool {
         let served = self
             .retry_with_fallback_caps(
                 &request.model,
-                "systemone",
+                BudgetOperation::SystemOne,
                 model_pub_key,
                 false,
                 &hints,
@@ -4819,16 +4871,21 @@ impl InferenceProviderPool {
         let cloned_params = params.clone();
 
         let served = self
-            .retry_with_fallback(&model_id, "image_generation", model_pub_key, |provider| {
-                let params = cloned_params.clone();
-                let request_hash = request_hash.clone();
-                async move {
-                    provider
-                        .image_generation(params, request_hash)
-                        .await
-                        .map_err(|e| CompletionError::CompletionError(e.to_string()))
-                }
-            })
+            .retry_with_fallback(
+                &model_id,
+                BudgetOperation::Image,
+                model_pub_key,
+                |provider| {
+                    let params = cloned_params.clone();
+                    let request_hash = request_hash.clone();
+                    async move {
+                        provider
+                            .image_generation(params, request_hash)
+                            .await
+                            .map_err(|e| CompletionError::CompletionError(e.to_string()))
+                    }
+                },
+            )
             .await
             .map_err(|e| match e {
                 CompletionError::HttpError {
@@ -4876,7 +4933,7 @@ impl InferenceProviderPool {
         );
 
         let served = self
-            .retry_with_fallback(&model_id, "audio_transcription", None, |provider| {
+            .retry_with_fallback(&model_id, BudgetOperation::Audio, None, |provider| {
                 let params = params.clone();
                 let request_hash = request_hash.clone();
                 async move {
@@ -4982,7 +5039,7 @@ impl InferenceProviderPool {
         let params = Arc::new(params);
 
         let served = self
-            .retry_with_fallback(&model_id, "image_edit", None, |provider| {
+            .retry_with_fallback(&model_id, BudgetOperation::ImageEdit, None, |provider| {
                 let params = params.clone();
                 let request_hash = request_hash.clone();
                 async move {
@@ -5174,7 +5231,11 @@ impl InferenceProviderPool {
         crate::usage::budget::before_attempt()
             .await
             .map_err(crate::usage::budget::completion_error)?;
-        let response = provider.responses_raw(body).await?;
+        let response = provider.responses_raw(body).await;
+        if response.is_err() {
+            inference_providers::retry_admission::attempt_failed().await;
+        }
+        let response = response?;
         Ok((response, attribution))
     }
 
@@ -5200,16 +5261,16 @@ impl InferenceProviderPool {
         if request.endpoint == inference_providers::AnthropicRawEndpoint::Messages {
             crate::usage::budget::before_attempt().await.map_err(|e| {
                 AnthropicRawError::Budget {
-                    status_code: if matches!(e, crate::usage::UsageError::LimitExceeded(_)) {
-                        402
-                    } else {
-                        503
-                    },
+                    status_code: crate::usage::budget::admission_status(&e),
                     message: e.to_string(),
                 }
             })?;
         }
-        let response = provider.anthropic_raw(request).await?;
+        let response = provider.anthropic_raw(request).await;
+        if response.is_err() {
+            inference_providers::retry_admission::attempt_failed().await;
+        }
+        let response = response?;
 
         Ok(AttributedAnthropicRawResponse {
             response,

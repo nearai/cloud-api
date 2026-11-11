@@ -218,12 +218,7 @@ pub async fn audio_transcriptions(
     // Meter a shared view of the upload; keep the original available even if the
     // blocking parser fails. Once it finishes, the provider reuses the same buffer.
     let file_bytes = bytes::Bytes::from(request.file_bytes);
-    let duration_file = file_bytes.clone();
-    let file_duration_seconds =
-        tokio::task::spawn_blocking(move || crate::audio_duration::seconds(&duration_file))
-            .await
-            .ok()
-            .flatten();
+    let file_duration_seconds = crate::audio_duration::measure(file_bytes.clone()).await;
     features.audio_duration_seconds = file_duration_seconds.map(|n| n as u64);
     let budget =
         match crate::routes::common::usage_execution(&app_state, &api_key, model_id, features) {

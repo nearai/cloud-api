@@ -110,7 +110,13 @@ pub struct BudgetExecution {
     service: Arc<dyn super::UsageServiceTrait>,
     identity: BillingIdentity,
     features: UsageFeatures,
-    last: Arc<Mutex<Option<Uuid>>>,
+    last: Arc<Mutex<Option<Attempt>>>,
+}
+
+#[derive(Clone, Copy)]
+struct Attempt {
+    id: Uuid,
+    dispatched: bool,
 }
 
 tokio::task_local! { static EXECUTION: BudgetExecution; }
@@ -142,6 +148,7 @@ impl BudgetExecution {
         self.last
             .lock()
             .await
+            .map(|attempt| attempt.id)
             .ok_or_else(|| UsageError::InternalError("execution has no admitted attempt".into()))
     }
 }
@@ -156,17 +163,16 @@ pub async fn before_attempt() -> Result<(), UsageError> {
         .service
         .admit(execution.identity, execution.features.clone())
         .await?;
-    *execution.last.lock().await = Some(id);
+    *execution.last.lock().await = Some(Attempt {
+        id,
+        dispatched: false,
+    });
     Ok(())
 }
 
 pub fn completion_error(error: UsageError) -> inference_providers::CompletionError {
     inference_providers::CompletionError::HttpError {
-        status_code: if matches!(error, UsageError::LimitExceeded(_)) {
-            402
-        } else {
-            503
-        },
+        status_code: admission_status(&error),
         message: error.to_string(),
         is_external: false,
     }
@@ -174,24 +180,65 @@ pub fn completion_error(error: UsageError) -> inference_providers::CompletionErr
 
 pub fn service_error(error: UsageError) -> crate::completions::ports::CompletionError {
     crate::completions::ports::CompletionError::ProviderError {
-        status_code: if matches!(error, UsageError::LimitExceeded(_)) {
-            402
-        } else {
-            503
-        },
+        status_code: admission_status(&error),
         message: error.to_string(),
+    }
+}
+
+pub fn admission_status(error: &UsageError) -> u16 {
+    match error {
+        UsageError::LimitExceeded(_) => 402,
+        UsageError::CapacityExceeded => 429,
+        UsageError::ValidationError(_) | UsageError::CostCalculationOverflow(_) => 400,
+        UsageError::Unauthorized(_) => 403,
+        _ => 503,
     }
 }
 
 #[async_trait::async_trait]
 impl inference_providers::retry_admission::RetryAdmission for BudgetExecution {
+    async fn mark_dispatched(&self) {
+        if let Some(attempt) = self.last.lock().await.as_mut() {
+            attempt.dispatched = true;
+        }
+    }
+
+    async fn attempt_failed(&self) {
+        let pending = self
+            .last
+            .lock()
+            .await
+            .is_some_and(|attempt| !attempt.dispatched);
+        if pending {
+            self.release_not_dispatched().await;
+        }
+    }
+
+    async fn release_not_dispatched(&self) {
+        let attempt = self.last.lock().await.take();
+        if let Some(Attempt { id, .. }) = attempt {
+            if self
+                .service
+                .release_budget(self.identity.organization_id, id)
+                .await
+                .is_err()
+            {
+                // Existing expiry remains the fallback; never turn release failure into a retry.
+                tracing::warn!(%id, "Undispatched budget release failed; awaiting expiry");
+            }
+        }
+    }
     async fn admit_retry(&self) -> Result<(), inference_providers::CompletionError> {
+        self.attempt_failed().await;
         let id = self
             .service
             .admit(self.identity, self.features.clone())
             .await
             .map_err(completion_error)?;
-        *self.last.lock().await = Some(id);
+        *self.last.lock().await = Some(Attempt {
+            id,
+            dispatched: false,
+        });
         Ok(())
     }
 }
@@ -200,6 +247,25 @@ impl inference_providers::retry_admission::RetryAdmission for BudgetExecution {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn admission_errors_preserve_client_statuses() {
+        for (error, expected) in [
+            (UsageError::CapacityExceeded, 429),
+            (UsageError::LimitExceeded("budget".into()), 402),
+            (UsageError::ValidationError("count".into()), 400),
+            (UsageError::CostCalculationOverflow("count".into()), 400),
+            (UsageError::InternalError("database".into()), 503),
+        ] {
+            assert_eq!(admission_status(&error), expected);
+            assert!(
+                matches!(completion_error(error.clone()), inference_providers::CompletionError::HttpError {status_code,..} if status_code==expected)
+            );
+            assert!(
+                matches!(service_error(error), crate::completions::ports::CompletionError::ProviderError {status_code,..} if status_code==expected)
+            );
+        }
+    }
 
     #[test]
     fn quote_rounds_up_uses_minimum_and_preserves_free_models_without_overflow() {
@@ -240,8 +306,10 @@ mod tests {
 
     #[tokio::test]
     async fn provider_retry_gets_a_new_hold_and_does_not_reuse_an_unknown_attempt() {
+        use inference_providers::retry_admission::RetryAdmission;
+        let service = Arc::new(crate::test_utils::CapturingUsageService::new());
         let execution = BudgetExecution::new(
-            Arc::new(crate::test_utils::MockUsageService),
+            service.clone(),
             BillingIdentity {
                 organization_id: Uuid::new_v4(),
                 workspace_id: Uuid::new_v4(),
@@ -256,11 +324,30 @@ mod tests {
             .run(async {
                 before_attempt().await.unwrap();
                 let first = execution.id().await.unwrap();
+                execution.mark_dispatched().await;
+                inference_providers::retry_admission::attempt_failed().await;
+                assert_eq!(execution.id().await.unwrap(), first);
                 inference_providers::retry_admission::before_retry()
                     .await
                     .unwrap();
                 let second = execution.id().await.unwrap();
                 assert_ne!(first, second);
+                assert!(service.releases.lock().unwrap().is_empty());
+                // Local preparation failed before transport; release once and recover the slot.
+                inference_providers::retry_admission::attempt_failed().await;
+                inference_providers::retry_admission::attempt_failed().await;
+                assert!(execution.id().await.is_err());
+                assert_eq!(*service.releases.lock().unwrap(), vec![second]);
+                for _ in 0..20 {
+                    before_attempt().await.unwrap();
+                    inference_providers::retry_admission::attempt_failed().await;
+                }
+                let released = service.releases.lock().unwrap();
+                assert_eq!(released.len(), 21);
+                assert!(
+                    !released.contains(&first),
+                    "unknown outcome must retain its hold"
+                );
             })
             .await;
     }

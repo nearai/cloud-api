@@ -10,6 +10,19 @@ use uuid::Uuid;
 /// Trait implementation adapter for UsageRepository
 #[async_trait::async_trait]
 impl services::usage::ports::UsageRepository for OrganizationUsageRepository {
+    async fn release_budget(&self, organization_id: Uuid, id: Uuid) -> anyhow::Result<()> {
+        let mut client = self.pool.get().await?;
+        let tx = client.transaction().await?;
+        tx.batch_execute("SET LOCAL statement_timeout = '10s'; SET LOCAL lock_timeout = '5s'")
+            .await?;
+        tx.query_one(
+            "SELECT release_usage_budget($1,$2)",
+            &[&organization_id, &id],
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
     async fn expire_budgets(&self) -> anyhow::Result<u64> {
         let mut expired = 0;
         let organizations = self
@@ -84,7 +97,7 @@ impl services::usage::ports::UsageRepository for OrganizationUsageRepository {
                 Some("NBOEX") => UsageError::LimitExceeded(
                     "Credit limit exceeded. Insufficient available budget for this request.".into(),
                 ),
-                Some("NBBUS") => UsageError::InternalError("Too many unsettled executions".into()),
+                Some("NBBUS") => UsageError::CapacityExceeded,
                 Some("NBORG" | "NBKEY") => {
                     UsageError::Unauthorized("Billing identity is unavailable".into())
                 }

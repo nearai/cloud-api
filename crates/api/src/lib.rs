@@ -2239,6 +2239,10 @@ pub fn build_internal_routes(app_state: AppState) -> Router {
             post(crate::routes::internal_usage::reserve_usage_internal),
         )
         .route(
+            "/internal/budget/release",
+            post(crate::routes::internal_usage::release_usage_internal),
+        )
+        .route(
             "/internal/models",
             get(crate::routes::completions::models_internal),
         )

@@ -26,12 +26,108 @@ pub struct UsageFeatures {
 }
 
 impl UsageFeatures {
+    /// Walk borrowed chat content so estimation does not duplicate inline media payloads.
+    pub fn from_chat(
+        params: &inference_providers::ChatCompletionParams,
+    ) -> Result<Self, UsageError> {
+        let mut features = Self::from_json(
+            InferenceType::ChatCompletion,
+            &serde_json::json!({
+                "n": params.n, "max_tokens":params.max_tokens,
+                "max_completion_tokens":params.max_completion_tokens,
+                "best_of":params.extra.get("best_of"), "max_output_tokens":params.extra.get("max_output_tokens"),
+            }),
+        )?;
+        for message in &params.messages {
+            if let Some(content) = &message.content {
+                features.count(content)?;
+            }
+            features.count(&serde_json::to_value(&message.role).map_err(|_| overflow())?)?;
+            for text in [
+                &message.name,
+                &message.tool_call_id,
+                &message.reasoning_content,
+            ]
+            .into_iter()
+            .flatten()
+            {
+                features.text_bytes = features
+                    .text_bytes
+                    .checked_add(text.len() as u64)
+                    .ok_or_else(overflow)?;
+            }
+            // Tool-call arguments are text; their protocol wrapper is small and has no media.
+            if let Some(calls) = &message.tool_calls {
+                features.count(&serde_json::to_value(calls).map_err(|_| overflow())?)?;
+            }
+        }
+        for name in [
+            "prompt",
+            "input",
+            "instructions",
+            "system",
+            "state",
+            "questions",
+            "assets",
+        ] {
+            if let Some(value) = params.extra.get(name) {
+                features.count(value)?;
+            }
+        }
+        if let Some(items) = params.extra.get("prompt").and_then(Value::as_array) {
+            if !items.iter().all(Value::is_number) {
+                features.batch_items = items.len().max(1) as u64;
+            }
+        }
+        features.questions = match params.extra.get("questions") {
+            Some(Value::Array(items)) => items.len().max(1) as u64,
+            Some(Value::Object(items)) => items.len().max(1) as u64,
+            _ => 1,
+        };
+        if let Some(tools) = &params.tools {
+            features.count_schema(tools)?;
+        }
+        if let Some(choice) = &params.tool_choice {
+            features.count_schema(choice)?;
+        }
+        for value in [
+            params.extra.get("functions"),
+            params.extra.get("response_format"),
+            params.extra.get("text").and_then(|v| v.get("format")),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            features.count_schema(value)?;
+        }
+        Ok(features)
+    }
+
+    fn count_schema(&mut self, value: &impl Serialize) -> Result<(), UsageError> {
+        struct Size(u64);
+        impl std::io::Write for Size {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0 = self
+                    .0
+                    .checked_add(bytes.len() as u64)
+                    .ok_or_else(|| std::io::Error::other("schema too large"))?;
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut size = Size(0);
+        serde_json::to_writer(&mut size, value).map_err(|_| overflow())?;
+        self.text_bytes = self.text_bytes.checked_add(size.0).ok_or_else(overflow)?;
+        Ok(())
+    }
     pub fn from_json(kind: InferenceType, body: &Value) -> Result<Self, UsageError> {
-        let positive = |name: &str| -> Result<Option<u64>, UsageError> {
+        let number = |name: &str, allow_zero: bool| -> Result<Option<u64>, UsageError> {
             body.get(name)
                 .filter(|v| !v.is_null())
                 .map(|v| {
-                    v.as_u64().filter(|n| *n > 0).ok_or_else(|| {
+                    v.as_u64().filter(|n| allow_zero || *n > 0).ok_or_else(|| {
                         UsageError::ValidationError(
                             "invalid generation count or output limit".into(),
                         )
@@ -48,17 +144,17 @@ impl UsageFeatures {
             video: 0,
             unknown_media: 0,
             batch_items: 1,
-            choices: positive("n")?
+            choices: number("n", false)?
                 .unwrap_or(1)
-                .max(positive("best_of")?.unwrap_or(1)),
+                .max(number("best_of", false)?.unwrap_or(1)),
             executions: 1,
-            requested_output_tokens: positive("max_completion_tokens")?
-                .or(positive("max_output_tokens")?)
-                .or(positive("max_tokens")?),
+            requested_output_tokens: number("max_completion_tokens", true)?
+                .or(number("max_output_tokens", true)?)
+                .or(number("max_tokens", true)?),
             model_output_tokens: None,
             media_bytes: 0,
             audio_duration_seconds: None,
-            requested_images: positive("n")?.unwrap_or(1),
+            requested_images: number("n", false)?.unwrap_or(1),
             questions: 0,
         };
         for name in [
@@ -87,10 +183,7 @@ impl UsageFeatures {
         .into_iter()
         .flatten()
         {
-            features.text_bytes = features
-                .text_bytes
-                .checked_add(value.to_string().len() as u64)
-                .ok_or_else(overflow)?;
+            features.count_schema(value)?;
         }
         if let Some(items) = body.get("prompt").and_then(Value::as_array) {
             if !items.iter().all(Value::is_number) {
@@ -138,18 +231,18 @@ impl UsageFeatures {
                     add(count, 1)?;
                 } else {
                     for (name, item) in fields {
-                        if !matches!(
-                            name.as_str(),
-                            "id" | "url"
-                                | "file_id"
-                                | "image_url"
-                                | "audio_url"
-                                | "data"
-                                | "b64_json"
-                        ) {
-                            self.count(item)?;
-                        } else if matches!(name.as_str(), "image_url" | "audio_url" | "file_id") {
-                            add(&mut self.unknown_media, 1)?;
+                        if item.is_null() {
+                            continue;
+                        }
+                        match name.as_str() {
+                            "image_url" | "input_image" | "image" => add(&mut self.images, 1)?,
+                            "audio_url" | "input_audio" | "audio" => add(&mut self.audio, 1)?,
+                            "video_url" | "input_video" | "video" => add(&mut self.video, 1)?,
+                            "file_id" | "file_url" | "file_data" | "url" | "data" | "b64_json" => {
+                                add(&mut self.unknown_media, 1)?
+                            }
+                            "id" => {}
+                            _ => self.count(item)?,
                         }
                     }
                 }
@@ -188,8 +281,10 @@ impl UsageFeatures {
             .model_output_tokens
             .unwrap_or(policy.default_output_tokens as u64)
             .min(policy.default_output_tokens as u64);
+        // This caps only the quote. The provider still receives the original request.
+        let requested_output = self.requested_output_tokens.unwrap_or(fallback_output);
         let mut output = mul(
-            self.requested_output_tokens.unwrap_or(fallback_output),
+            requested_output.min(self.model_output_tokens.unwrap_or(requested_output)),
             generations,
         )?;
         let mut images = 0;
@@ -203,11 +298,11 @@ impl UsageFeatures {
                 input = mul(
                     self.audio_duration_seconds
                         .filter(|seconds| *seconds > 0)
-                        .unwrap_or_else(|| {
+                        .unwrap_or(policy.default_audio_seconds as u64)
+                        .max(
                             self.media_bytes
-                                .div_ceil(u64::from(policy.audio_bytes_per_second))
-                                .max(policy.default_audio_seconds as u64)
-                        }),
+                                .div_ceil(u64::from(policy.audio_bytes_per_second)),
+                        ),
                     self.executions,
                 )?;
                 output = 0;
@@ -238,6 +333,34 @@ impl UsageFeatures {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn proxy_contract_fixtures_and_borrowed_chat_features_match() {
+        let cases: Vec<Value> = serde_json::from_str(include_str!("features.json")).unwrap();
+        for case in cases {
+            let features =
+                UsageFeatures::from_json(InferenceType::ChatCompletion, &case["body"]).unwrap();
+            assert_eq!(
+                serde_json::to_value(features).unwrap(),
+                case["expected"],
+                "{}",
+                case["name"]
+            );
+            if case["body"].get("messages").is_some() {
+                let mut body = case["body"].clone();
+                body["model"] = json!("test");
+                let params: inference_providers::ChatCompletionParams =
+                    serde_json::from_value(body).unwrap();
+                let serialized = serde_json::to_value(&params).unwrap();
+                let expected =
+                    UsageFeatures::from_json(InferenceType::ChatCompletion, &serialized).unwrap();
+                assert_eq!(
+                    serde_json::to_value(UsageFeatures::from_chat(&params).unwrap()).unwrap(),
+                    serde_json::to_value(expected).unwrap()
+                );
+            }
+        }
+    }
     use serde_json::json;
 
     #[test]
@@ -332,5 +455,36 @@ mod tests {
             UsageFeatures::from_json(InferenceType::ChatCompletion, &json!({})).unwrap();
         features.executions = u64::MAX;
         assert!(features.estimate().is_err());
+    }
+
+    #[test]
+    fn output_quote_respects_catalog_cap_without_changing_request_or_zero_limit() {
+        for (request, cap, expected) in [
+            (None, Some(128000), 4096),
+            (Some(u64::MAX), Some(8192), 8192),
+            (Some(0), Some(8192), 0),
+            (None, Some(1000), 1000),
+        ] {
+            let body = json!({"max_tokens":request});
+            let features = UsageFeatures::from_json(InferenceType::ChatCompletion, &body)
+                .unwrap()
+                .with_model_output(cap);
+            assert_eq!(features.estimate().unwrap().output_tokens, expected);
+            assert_eq!(features.requested_output_tokens, request);
+            assert_eq!(body["max_tokens"], json!(request));
+        }
+    }
+
+    #[test]
+    fn transcription_measurement_never_reduces_the_byte_floor() {
+        let mut features =
+            UsageFeatures::from_json(InferenceType::AudioTranscription, &json!({})).unwrap();
+        features.media_bytes = 120 * 1024 + 1;
+        for duration in [None, Some(0), Some(2), Some(120)] {
+            features.audio_duration_seconds = duration;
+            assert_eq!(features.estimate().unwrap().input_units, 121);
+        }
+        features.audio_duration_seconds = Some(3600);
+        assert_eq!(features.estimate().unwrap().input_units, 3600);
     }
 }

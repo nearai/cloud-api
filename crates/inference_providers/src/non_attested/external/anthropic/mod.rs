@@ -3,6 +3,7 @@
 //! This backend handles HTTP communication with Anthropic's Messages API.
 //! Format conversion is handled by the `anthropic_converter` module.
 
+use crate::retry_admission::RequestAdmissionExt;
 pub mod converter;
 
 use super::backend::{BackendConfig, ExternalBackend};
@@ -425,7 +426,7 @@ impl ExternalBackend for AnthropicBackend {
 
         let request_builder = self.client.post(url).headers(headers).json(&request.body);
         let response = if streaming {
-            tokio::time::timeout(timeout, request_builder.send())
+            tokio::time::timeout(timeout, request_builder.send_with_admission())
                 .await
                 .map_err(|_| {
                     AnthropicRawError::Transport(
@@ -436,7 +437,7 @@ impl ExternalBackend for AnthropicBackend {
         } else {
             request_builder
                 .timeout(timeout)
-                .send()
+                .send_with_admission()
                 .await
                 .map_err(|error| AnthropicRawError::Transport(error.without_url().to_string()))?
         };

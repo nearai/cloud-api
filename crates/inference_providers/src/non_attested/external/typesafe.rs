@@ -1,6 +1,7 @@
 //! TypeSafe-compatible System One transport. base_url includes the API version
 //! (https://api.typesafe.ai/v1, or https://openrouter.ai/api/v1).
 use super::backend::{BackendConfig, ExternalBackend};
+use crate::retry_admission::RequestAdmissionExt;
 use crate::{
     systemone, ChatCompletionParams, ChatCompletionResponseWithBytes, CompletionError,
     StreamingResult, SystemOneRequest, SystemOneResponseWithBytes,
@@ -58,7 +59,7 @@ impl ExternalBackend for TypeSafeBackend {
             .bearer_auth(&config.api_key)
             .timeout(Duration::from_secs(timeout_seconds))
             .json(&request)
-            .send()
+            .send_with_admission()
             .await
             .map_err(|error| systemone::transport_error(error, timeout_seconds))?;
         systemone::read_response(response, &request, true).await

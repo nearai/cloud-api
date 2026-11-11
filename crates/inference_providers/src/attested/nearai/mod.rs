@@ -1,3 +1,4 @@
+use crate::retry_admission::RequestAdmissionExt;
 mod fleet;
 mod placement_report;
 mod prefix_router;
@@ -1018,7 +1019,11 @@ impl Fleet {
         let ttfb_timeout_secs = self.config.control_timeout_seconds.max(0) as u64;
         let response = tokio::time::timeout(
             self.config.control_timeout(),
-            client.post(url).headers(headers).json(params).send(),
+            client
+                .post(url)
+                .headers(headers)
+                .json(params)
+                .send_with_admission(),
         )
         .await
         // TTFB stalls indicate the same backend is stuck — surface as
@@ -1113,7 +1118,7 @@ impl Fleet {
                 .headers(headers.clone())
                 .json(params)
                 .timeout(timeout)
-                .send()
+                .send_with_admission()
                 .await;
             let response = match send_res {
                 Ok(r) => r,
@@ -1538,7 +1543,7 @@ impl InferenceProvider for Fleet {
                     .headers(headers.clone())
                     .json(&request)
                     .timeout(Duration::from_secs(timeout_seconds))
-                    .send()
+                    .send_with_admission()
                     .await
                     .map_err(|e| crate::systemone::transport_error(e, timeout_seconds))?;
                 let response = crate::systemone::read_response(response, &request, false).await?;
@@ -2197,7 +2202,7 @@ impl InferenceProvider for Fleet {
                     .headers(headers.clone())
                     .json(&non_streaming_params)
                     .timeout(timeout)
-                    .send()
+                    .send_with_admission()
                     .await
                     .map_err(map_send_err)?;
                 if !response.status().is_success() {
@@ -2247,7 +2252,7 @@ impl InferenceProvider for Fleet {
                 .headers(hdrs)
                 .json(&non_streaming_params)
                 .timeout(timeout)
-                .send()
+                .send_with_admission()
         };
 
         let response = match send(&index_client, primary_headers.clone()).await {
@@ -2387,7 +2392,7 @@ impl InferenceProvider for Fleet {
             .headers(headers)
             .json(&params)
             .timeout(Duration::from_secs(180))
-            .send()
+            .send_with_admission()
             .await
             .map_err(to_image_gen_error)?;
 
@@ -2476,7 +2481,7 @@ impl InferenceProvider for Fleet {
             .headers(headers)
             .multipart(form)
             .timeout(self.config.completion_timeout())
-            .send()
+            .send_with_admission()
             .await
             .map_err(|e| {
                 tracing::debug!(
@@ -2592,7 +2597,7 @@ impl InferenceProvider for Fleet {
             .headers(headers)
             .multipart(form)
             .timeout(Duration::from_secs(180))
-            .send()
+            .send_with_admission()
             .await
             .map_err(|e| ImageEditError::EditError(format!("Request failed: {e}")))?;
 

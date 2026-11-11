@@ -1239,12 +1239,51 @@ async fn budget_admission_concurrency_is_bounded_for_key_without_spend_limit() {
         }));
         let server = &server;
         async move {
-            server.post("/v1/internal/budget")
+            let response = server.post("/v1/internal/budget")
                 .add_header("Authorization", format!("Bearer {INTERNAL_USAGE_TOKEN}"))
-                .json(&request).await.status_code()
+                .json(&request).await;
+            if response.status_code() == 429 { assert_eq!(response.header("retry-after"), "2"); }
+            response.status_code()
         }
     });
     let statuses = futures::future::join_all(requests).await;
     assert_eq!(statuses.iter().filter(|status| **status == 200).count(), 16);
-    assert_eq!(statuses.iter().filter(|status| **status == 503).count(), 16);
+    assert_eq!(statuses.iter().filter(|status| **status == 429).count(), 16);
+    let pool = crate::common::db_setup::create_test_pool().await;
+    let client = pool.get().await.unwrap();
+    let org_id = uuid::Uuid::parse_str(&identity.org_id).unwrap();
+    let id: uuid::Uuid = client.query_one("SELECT id FROM usage_budget_reservations WHERE organization_id=$1 AND state='active' LIMIT 1", &[&org_id]).await.unwrap().get(0);
+    let release = serde_json::json!({"organization_id":org_id,"id":id});
+    assert_eq!(
+        server
+            .post("/v1/internal/budget/release")
+            .json(&release)
+            .await
+            .status_code(),
+        401
+    );
+    for _ in 0..2 {
+        assert_eq!(
+            server
+                .post("/v1/internal/budget/release")
+                .add_header("Authorization", format!("Bearer {INTERNAL_USAGE_TOKEN}"))
+                .json(&release)
+                .await
+                .status_code(),
+            204
+        );
+    }
+    let request = internal_usage_body(
+        &identity,
+        serde_json::json!({"id":uuid::Uuid::new_v4(),"model":"Qwen/Qwen3-30B-A3B-Instruct-2507","features":features}),
+    );
+    assert_eq!(
+        server
+            .post("/v1/internal/budget")
+            .add_header("Authorization", format!("Bearer {INTERNAL_USAGE_TOKEN}"))
+            .json(&request)
+            .await
+            .status_code(),
+        200
+    );
 }

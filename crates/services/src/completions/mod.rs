@@ -1918,14 +1918,9 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             self.affinity_secret,
         );
 
-        let admission_body = serde_json::to_value(&chat_params)
-            .map_err(|_| ports::CompletionError::InvalidParams("Cannot estimate request".into()))?;
-        let features = crate::usage::budget::UsageFeatures::from_json(
-            crate::usage::InferenceType::ChatCompletion,
-            &admission_body,
-        )
-        .map_err(crate::usage::budget::service_error)?
-        .with_model_output(model.max_output_length);
+        let features = crate::usage::budget::UsageFeatures::from_chat(&chat_params)
+            .map_err(crate::usage::budget::service_error)?
+            .with_model_output(model.max_output_length);
         let budget = crate::usage::budget::BudgetExecution::new(
             self.usage_service.clone(),
             crate::usage::BillingIdentity {
@@ -2167,14 +2162,9 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             self.affinity_secret,
         );
 
-        let admission_body = serde_json::to_value(&chat_params)
-            .map_err(|_| ports::CompletionError::InvalidParams("Cannot estimate request".into()))?;
-        let features = crate::usage::budget::UsageFeatures::from_json(
-            crate::usage::InferenceType::ChatCompletion,
-            &admission_body,
-        )
-        .map_err(crate::usage::budget::service_error)?
-        .with_model_output(model.max_output_length);
+        let features = crate::usage::budget::UsageFeatures::from_chat(&chat_params)
+            .map_err(crate::usage::budget::service_error)?
+            .with_model_output(model.max_output_length);
         let budget = crate::usage::budget::BudgetExecution::new(
             self.usage_service.clone(),
             crate::usage::BillingIdentity {

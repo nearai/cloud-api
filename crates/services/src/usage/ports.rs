@@ -237,6 +237,13 @@ pub trait UsageServiceTrait: Send + Sync {
         ))
     }
 
+    /// Release only an attempt known not to have reached upstream execution.
+    async fn release_budget(&self, _organization_id: Uuid, _id: Uuid) -> Result<(), UsageError> {
+        Err(UsageError::InternalError(
+            "budget release is unavailable".into(),
+        ))
+    }
+
     /// Reserve an immutable local estimate and claim this execution exactly once.
     async fn admit(
         &self,
@@ -356,6 +363,9 @@ pub trait UsageServiceTrait: Send + Sync {
 
 #[async_trait::async_trait]
 pub trait UsageRepository: Send + Sync {
+    async fn release_budget(&self, _organization_id: Uuid, _id: Uuid) -> anyhow::Result<()> {
+        anyhow::bail!("budget release is unavailable")
+    }
     async fn expire_budgets(&self) -> anyhow::Result<u64> {
         Ok(0)
     }
@@ -1106,6 +1116,7 @@ pub enum UsageError {
     ModelNotFound(String),
     InternalError(String),
     LimitExceeded(String),
+    CapacityExceeded,
     Unauthorized(String),
     NotFound(String),
     CostCalculationOverflow(String),
@@ -1119,6 +1130,7 @@ impl std::fmt::Display for UsageError {
             UsageError::ModelNotFound(msg) => write!(f, "Model not found: {msg}"),
             UsageError::InternalError(msg) => write!(f, "Internal error: {msg}"),
             UsageError::LimitExceeded(msg) => write!(f, "Limit exceeded: {msg}"),
+            UsageError::CapacityExceeded => write!(f, "Too many unsettled executions"),
             UsageError::Unauthorized(msg) => write!(f, "Unauthorized: {msg}"),
             UsageError::NotFound(msg) => write!(f, "Not found: {msg}"),
             UsageError::CostCalculationOverflow(msg) => {

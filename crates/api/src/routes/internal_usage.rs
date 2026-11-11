@@ -5,7 +5,7 @@ use crate::{
 use axum::{
     extract::State,
     http::{HeaderMap, StatusCode},
-    response::Json as ResponseJson,
+    response::{IntoResponse, Json as ResponseJson, Response},
 };
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
@@ -377,16 +377,19 @@ pub async fn reserve_usage_internal(
     State(state): State<AppState>,
     headers: HeaderMap,
     body: axum::body::Bytes,
-) -> Result<ResponseJson<serde_json::Value>, UsageError> {
-    verify_internal_usage_token(&headers, state.config.internal_usage_token.as_deref())?;
+) -> Result<ResponseJson<serde_json::Value>, Response> {
+    verify_internal_usage_token(&headers, state.config.internal_usage_token.as_deref())
+        .map_err(IntoResponse::into_response)?;
     let failure = |status, message: &str| {
-        (
+        let response = (
             status,
             ResponseJson(ErrorResponse::new(
                 message.into(),
                 "budget_admission_error".into(),
             )),
         )
+            .into_response();
+        crate::middleware::rate_limit::with_retry_after(response)
     };
     let request: ReserveUsageRequest = serde_json::from_slice(&body)
         .map_err(|_| failure(StatusCode::BAD_REQUEST, "Invalid admission metadata"))?;
@@ -435,6 +438,10 @@ pub async fn reserve_usage_internal(
                 StatusCode::PAYMENT_REQUIRED,
                 "Insufficient available budget",
             ),
+            services::usage::UsageError::CapacityExceeded => failure(
+                StatusCode::TOO_MANY_REQUESTS,
+                "Too many unsettled executions",
+            ),
             services::usage::UsageError::Unauthorized(_) => {
                 failure(StatusCode::FORBIDDEN, "Billing identity unavailable")
             }
@@ -450,6 +457,43 @@ pub async fn reserve_usage_internal(
     Ok(ResponseJson(
         serde_json::json!({"id": request.id, "model": model.model_name}),
     ))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReleaseUsageRequest {
+    organization_id: Uuid,
+    id: Uuid,
+}
+
+pub async fn release_usage_internal(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<StatusCode, UsageError> {
+    verify_internal_usage_token(&headers, state.config.internal_usage_token.as_deref())?;
+    let failure = |status, message: &str| {
+        (
+            status,
+            ResponseJson(ErrorResponse::new(
+                message.into(),
+                "budget_admission_error".into(),
+            )),
+        )
+    };
+    let request: ReleaseUsageRequest = serde_json::from_slice(&body)
+        .map_err(|_| failure(StatusCode::BAD_REQUEST, "Invalid release metadata"))?;
+    state
+        .usage_service
+        .release_budget(request.organization_id, request.id)
+        .await
+        .map_err(|_| {
+            failure(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Budget release unavailable",
+            )
+        })?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[cfg(test)]

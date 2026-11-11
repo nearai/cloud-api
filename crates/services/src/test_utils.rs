@@ -356,6 +356,7 @@ impl UsageServiceTrait for MockUsageService {
 /// A usage service that captures requests for testing
 pub struct CapturingUsageService {
     pub admissions: std::sync::Mutex<Vec<Uuid>>,
+    pub releases: std::sync::Mutex<Vec<Uuid>>,
     pub admission_limit: Option<usize>,
     requests: std::sync::Mutex<Vec<RecordUsageServiceRequest>>,
 }
@@ -364,6 +365,7 @@ impl CapturingUsageService {
     pub fn new() -> Self {
         Self {
             admissions: std::sync::Mutex::new(Vec::new()),
+            releases: std::sync::Mutex::new(Vec::new()),
             admission_limit: None,
             requests: std::sync::Mutex::new(Vec::new()),
         }
@@ -376,6 +378,10 @@ impl CapturingUsageService {
 
 #[async_trait]
 impl UsageServiceTrait for CapturingUsageService {
+    async fn release_budget(&self, _: Uuid, id: Uuid) -> Result<(), UsageError> {
+        self.releases.lock().unwrap().push(id);
+        Ok(())
+    }
     async fn admit(
         &self,
         _: crate::usage::BillingIdentity,

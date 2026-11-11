@@ -33,7 +33,7 @@ jobs:
       packages: write
       attestations: write
       id-token: write
-    runs-on: [self-hosted, infra]
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -80,6 +80,15 @@ jobs:
               echo "ALSO_TAG_STAGING=true" >> "$GITHUB_ENV"
             fi
           fi
+
+      # This VM is disposable. Remove unrelated SDKs and preloaded images
+      # before the Rust build creates BuildKit layers and OCI archives.
+      - name: Free disk space for image builds
+        run: |
+          test "$RUNNER_ENVIRONMENT" = "github-hosted"
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
+          docker image prune --all --force
+          df -h /
 
       - name: Install build dependencies
         run: |

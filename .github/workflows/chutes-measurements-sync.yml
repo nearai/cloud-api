@@ -33,7 +33,7 @@ env:
 jobs:
   sync:
     name: Sync Chutes measurements
-    runs-on: [self-hosted, infra]
+    runs-on: ubuntu-latest
     timeout-minutes: 60
     concurrency:
       group: chutes-measurements-sync
@@ -163,7 +163,7 @@ jobs:
   # See crates/tinfoil_sync. PINS_FILE and BOT_BRANCH are overridden per job.
   tinfoil:
     name: Sync Tinfoil measurements
-    runs-on: [self-hosted, infra]
+    runs-on: ubuntu-latest
     timeout-minutes: 60
     # A Tinfoil failure must not fail the run: the Chutes job only reads
     # evidence from successful runs, so a red run would hide its artifacts.

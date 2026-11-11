@@ -39,14 +39,14 @@ jobs:
       group: chutes-measurements-sync
       cancel-in-progress: false
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: main
           fetch-depth: 0
           persist-credentials: false
 
       - name: Setup Rust CI
-        uses: ./.github/actions/setup-rust-ci
+        uses: ./.github/actions/setup-rust-ci # zizmor: ignore[self-repository] Intentionally use the checked-out main action, including manual runs from other refs.
         with:
           cache-key: chutes-sync
 
@@ -86,7 +86,7 @@ jobs:
 
       - name: Upload audit artifact
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: chutes-measurements-${{ github.run_id }}
           path: |
@@ -176,14 +176,14 @@ jobs:
       PINS_FILE: crates/services/src/attestation/tinfoil_golden_measurements.json
       BOT_BRANCH: bot/tinfoil-measurements
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: main
           fetch-depth: 0
           persist-credentials: false
 
       - name: Setup Rust CI
-        uses: ./.github/actions/setup-rust-ci
+        uses: ./.github/actions/setup-rust-ci # zizmor: ignore[self-repository] Intentionally use the checked-out main action, including manual runs from other refs.
         with:
           cache-key: tinfoil-sync
 
@@ -225,7 +225,7 @@ jobs:
 
       - name: Upload audit artifact
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: tinfoil-measurements-${{ github.run_id }}
           path: |

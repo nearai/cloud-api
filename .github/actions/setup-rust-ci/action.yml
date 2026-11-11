@@ -6,7 +6,8 @@ description: |
   self-hosted runner.
 
   Mold is installed via GitHub release binary (not apt) so concurrent jobs do
-  not contend on dpkg locks. It is placed on PATH at /usr/local/bin/mold.
+  not contend on dpkg locks. Its checksum-verified binaries are placed in a
+  job-specific directory on PATH; no sudo or shared-host installation is needed.
 
 inputs:
   cache-key:
@@ -21,7 +22,7 @@ runs:
   using: composite
   steps:
     - name: Install Rust
-      uses: actions-rust-lang/setup-rust-toolchain@v1
+      uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
       with:
         components: ${{ inputs.components }}
 
@@ -48,51 +49,45 @@ runs:
 
     - name: Install cargo-nextest
       if: steps.tools.outputs.nextest != 'true'
-      uses: taiki-e/install-action@v2
+      uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2
       with:
         tool: nextest@${{ steps.tools.outputs.nextest-version }}
 
     - name: Install sccache
       if: steps.tools.outputs.sccache != 'true'
-      uses: taiki-e/install-action@v2
+      uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2
       with:
         tool: sccache@${{ steps.tools.outputs.sccache-version }}
 
     - name: Install mold linker
       shell: bash
-      run: |
-        # Install mold via release binary to avoid dpkg lock contention when
-        # multiple jobs run in parallel on the same self-hosted runner.
-        #
-        # We install both `mold` and `ld.mold`. Rustc invokes the cc driver
-        # with -fuse-ld=mold (set via RUSTFLAGS in test.yml), which makes cc
-        # look for `ld.mold` on PATH. Rustc also passes its own
-        # -fuse-ld=lld + a -B path to its bundled lld; the last -fuse-ld
-        # flag wins, so -fuse-ld=mold takes effect and cc finds ld.mold.
-        if command -v mold >/dev/null 2>&1 && [ -x /usr/local/bin/ld.mold ]; then
-          echo "mold already installed: $(mold --version)"
-          exit 0
-        fi
+      run: | # zizmor: ignore[github-env] PATH receives only a local mktemp directory containing the checksum-verified linker.
+        set -euo pipefail
         MOLD_VERSION=2.41.0
         ARCH=$(uname -m)
+        # Release asset SHA256 values from rui314/mold v2.41.0.
         case "$ARCH" in
-          x86_64) TARBALL_ARCH=x86_64 ;;
-          aarch64) TARBALL_ARCH=aarch64 ;;
+          x86_64) SHA256=a3696680d99e692970590a178bc3a33d78d60d1c6dc9db7a11b557b02b751f5d ;;
+          aarch64) SHA256=946de2774b06a71346bd59b55fddba610b65b8d93c3a4a1559cc84e103472710 ;;
           *) echo "Unsupported arch for mold: $ARCH" >&2; exit 1 ;;
         esac
-        TARBALL="mold-${MOLD_VERSION}-${TARBALL_ARCH}-linux.tar.gz"
-        URL="https://github.com/rui314/mold/releases/download/v${MOLD_VERSION}/${TARBALL}"
-        curl -fsSL "$URL" -o "/tmp/${TARBALL}"
-        # Extract both mold and ld.mold into /usr/local/bin.
-        sudo tar -xzf "/tmp/${TARBALL}" -C /usr/local/bin --strip-components=2 \
-          "mold-${MOLD_VERSION}-${TARBALL_ARCH}-linux/bin/mold" \
-          "mold-${MOLD_VERSION}-${TARBALL_ARCH}-linux/bin/ld.mold"
-        rm -f "/tmp/${TARBALL}"
-        echo "Installed: $(mold --version)"
-        echo "ld.mold at: $(command -v ld.mold)"
+        ROOT="mold-${MOLD_VERSION}-${ARCH}-linux"
+        INSTALL_DIR=$(mktemp -d "${RUNNER_TEMP}/mold.XXXXXX")
+        ARCHIVE="${INSTALL_DIR}/mold.tar.gz"
+        curl --fail --silent --show-error --location --retry 3 \
+          "https://github.com/rui314/mold/releases/download/v${MOLD_VERSION}/${ROOT}.tar.gz" \
+          --output "$ARCHIVE"
+        printf '%s  %s\n' "$SHA256" "$ARCHIVE" | sha256sum --check --strict
+        # cc resolves -fuse-ld=mold through ld.mold on PATH. Extract only
+        # the linker and its alias, after validating the whole archive.
+        tar -xzf "$ARCHIVE" -C "$INSTALL_DIR" --strip-components=2 \
+          "$ROOT/bin/mold" "$ROOT/bin/ld.mold"
+        rm "$ARCHIVE"
+        "$INSTALL_DIR/mold" --version
+        printf '%s\n' "$INSTALL_DIR" >> "$GITHUB_PATH"
 
     - name: Cache Rust dependencies
-      uses: swatinem/rust-cache@v2
+      uses: swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       with:
         cache-on-failure: true
         key: ${{ inputs.cache-key }}

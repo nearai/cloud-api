@@ -15,19 +15,24 @@ concurrency:
   cancel-in-progress: true
 
 permissions:
-  issues: write
-  checks: write
+  contents: read
 
 jobs:
   security_audit:
     name: cargo audit
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write # rustsec/audit-check reports advisories as issues.
+      checks: write # rustsec/audit-check publishes its check result.
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
       - name: Install cargo-audit with locked dependencies
         run: cargo install cargo-audit --version 0.22.2 --locked
-      - uses: rustsec/audit-check@v2.0.0
+      - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
@@ -35,7 +40,9 @@ jobs:
     name: cargo deny advisories
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
       # Install the prebuilt cargo-deny binary from GitHub releases instead of
       # EmbarkStudios/cargo-deny-action, which builds a container from an
       # unauthenticated Docker Hub pull and fails on Docker Hub's rate limit.

@@ -64,21 +64,26 @@ jobs:
     outputs:
       rust: ${{ steps.detect.outputs.rust }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
+          persist-credentials: false
           fetch-depth: 0  # need history to diff the PR / push range
 
       - name: Detect Rust-relevant changes
         id: detect
+        env:
+          EVENT_PULL_REQUEST_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          EVENT_PULL_REQUEST_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          EVENT_BEFORE: ${{ github.event.before }}
         run: |
-          EVENT="${{ github.event_name }}"
+          EVENT="${GITHUB_EVENT_NAME}"
           CHANGED=""
           if [ "$EVENT" = "pull_request" ]; then
             CHANGED=$(git diff --name-only \
-              "${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }}" 2>/dev/null)
+              "${EVENT_PULL_REQUEST_BASE_SHA}...${EVENT_PULL_REQUEST_HEAD_SHA}" 2>/dev/null)
           elif [ "$EVENT" = "push" ] && \
-               [ "${{ github.event.before }}" != "0000000000000000000000000000000000000000" ]; then
-            CHANGED=$(git diff --name-only "${{ github.event.before }}" "${{ github.sha }}" 2>/dev/null)
+               [ "${EVENT_BEFORE}" != "0000000000000000000000000000000000000000" ]; then
+            CHANGED=$(git diff --name-only "${EVENT_BEFORE}" "${GITHUB_SHA}" 2>/dev/null)
           fi
           echo "Changed files:"
           echo "$CHANGED"
@@ -105,10 +110,12 @@ jobs:
     runs-on: ${{ (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","ci-cloud-api"]') || 'ubuntu-latest' }}
 
     steps:
-    - uses: actions/checkout@v7
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      with:
+        persist-credentials: false
 
     - name: Setup Rust CI
-      uses: ./.github/actions/setup-rust-ci
+      uses: $/.github/actions/setup-rust-ci
       with:
         cache-key: lint
         components: rustfmt, clippy
@@ -135,10 +142,12 @@ jobs:
     runs-on: ${{ (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","ci-cloud-api"]') || 'ubuntu-latest' }}
 
     steps:
-    - uses: actions/checkout@v7
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      with:
+        persist-credentials: false
 
     - name: Setup Rust CI
-      uses: ./.github/actions/setup-rust-ci
+      uses: $/.github/actions/setup-rust-ci
       with:
         cache-key: unit
 
@@ -176,10 +185,12 @@ jobs:
     runs-on: ${{ (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","ci-cloud-api"]') || 'ubuntu-latest' }}
 
     steps:
-    - uses: actions/checkout@v7
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      with:
+        persist-credentials: false
 
     - name: Setup Rust CI
-      uses: ./.github/actions/setup-rust-ci
+      uses: $/.github/actions/setup-rust-ci
       with:
         cache-key: integration
 
@@ -227,10 +238,12 @@ jobs:
           - 127.0.0.1::5432
 
     steps:
-    - uses: actions/checkout@v7
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      with:
+        persist-credentials: false
 
     - name: Setup Rust CI
-      uses: ./.github/actions/setup-rust-ci
+      uses: $/.github/actions/setup-rust-ci
       with:
         cache-key: e2e
 
@@ -287,7 +300,9 @@ jobs:
     name: Script tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
       - name: Test synthetic rollout verification
         run: python3 -B -m unittest discover -s scripts/tests -v
       - name: Test PR review comment formatter
@@ -306,29 +321,37 @@ jobs:
     if: always()
     steps:
       - name: Check all tests passed
+        env:
+          NEEDS_CHANGES_RESULT: ${{ needs.changes.result }}
+          NEEDS_SCRIPT_TEST_RESULT: ${{ needs.script-test.result }}
+          NEEDS_CHANGES_RUST: ${{ needs.changes.outputs.rust }}
+          NEEDS_LINT_RESULT: ${{ needs.lint.result }}
+          NEEDS_UNIT_TEST_RESULT: ${{ needs.unit-test.result }}
+          NEEDS_INTEGRATION_TEST_RESULT: ${{ needs.integration-test.result }}
+          NEEDS_E2E_TEST_RESULT: ${{ needs.e2e-test.result }}
         run: |
           # Fail closed if change detection itself failed — we can't safely
           # conclude tests were unnecessary.
-          if [[ "${{ needs.changes.result }}" != "success" ]]; then
-            echo "Change-detection job did not succeed (${{ needs.changes.result }}); failing closed."
+          if [[ "${NEEDS_CHANGES_RESULT}" != "success" ]]; then
+            echo "Change-detection job did not succeed (${NEEDS_CHANGES_RESULT}); failing closed."
             exit 1
           fi
 
-          if [[ "${{ needs.script-test.result }}" != "success" ]]; then
+          if [[ "${NEEDS_SCRIPT_TEST_RESULT}" != "success" ]]; then
             echo "Script tests did not succeed; failing closed."
             exit 1
           fi
 
-          if [[ "${{ needs.changes.outputs.rust }}" != "true" ]]; then
+          if [[ "${NEEDS_CHANGES_RUST}" != "true" ]]; then
             echo "No Rust-relevant changes — test jobs were skipped. Nothing to verify."
             exit 0
           fi
 
           failed=0
-          for jr in "Lint=${{ needs.lint.result }}" \
-                    "Unit tests=${{ needs.unit-test.result }}" \
-                    "Integration tests=${{ needs.integration-test.result }}" \
-                    "E2E tests=${{ needs.e2e-test.result }}"; do
+          for jr in "Lint=${NEEDS_LINT_RESULT}" \
+                    "Unit tests=${NEEDS_UNIT_TEST_RESULT}" \
+                    "Integration tests=${NEEDS_INTEGRATION_TEST_RESULT}" \
+                    "E2E tests=${NEEDS_E2E_TEST_RESULT}"; do
             name="${jr%%=*}"; res="${jr#*=}"
             if [[ "$res" != "success" ]]; then
               echo "FAIL  ${name}: ${res}"

@@ -197,34 +197,80 @@ pub struct UsageServiceImpl {
     limits_repository: Arc<dyn OrganizationLimitsRepository>,
     workspace_service: Arc<dyn crate::workspace::WorkspaceServiceTrait>,
     metrics_service: Arc<dyn MetricsServiceTrait>,
+    admission_settings: Option<Arc<crate::admin_settings::AdminSettingsService>>,
 }
 
 impl UsageServiceImpl {
+    fn admission_policy(&self, organization_id: Uuid) -> budget::policy::AdmissionPolicy {
+        self.admission_settings
+            .as_ref()
+            .map(|settings| settings.current::<budget::policy::UsageAdmissionKey>())
+            .unwrap_or_default()
+            .for_organization(organization_id)
+    }
+
+    pub fn with_admission_settings(
+        mut self,
+        settings: Arc<crate::admin_settings::AdminSettingsService>,
+    ) -> Self {
+        self.admission_settings = Some(settings);
+        self
+    }
+
     async fn reserve_budget(
         &self,
         id: Uuid,
         identity: BillingIdentity,
         bounds: budget::UsageFeatures,
-    ) -> Result<Uuid, UsageError> {
-        let pricing = self
-            .model_repository
-            .get_model_by_id(identity.model_id)
-            .await
-            .map_err(|e| UsageError::InternalError(e.to_string()))?
-            .ok_or_else(|| UsageError::ModelNotFound(identity.model_id.to_string()))?;
-        let estimate = bounds.estimate()?;
+        requested_mode: budget::policy::AdmissionMode,
+    ) -> Result<budget::BudgetAdmission, UsageError> {
+        use budget::policy::AdmissionMode;
+        let policy = self.admission_policy(identity.organization_id);
+        let mode = policy.mode.combined(requested_mode);
+        let mut result = budget::BudgetAdmission {
+            id: None,
+            mode,
+            estimated_amount: None,
+        };
+        if mode == AdmissionMode::Off {
+            return Ok(result);
+        }
+        let quote = async {
+            let pricing = self
+                .model_repository
+                .get_model_by_id(identity.model_id)
+                .await
+                .map_err(|e| UsageError::InternalError(e.to_string()))?
+                .ok_or_else(|| UsageError::ModelNotFound(identity.model_id.to_string()))?;
+            bounds.estimate()?.quote(&pricing)
+        }
+        .await;
+        let amount = match quote {
+            Ok(amount) => amount,
+            Err(error) if mode == AdmissionMode::Audit => {
+                tracing::warn!(organization_id = %identity.organization_id, model_id = %identity.model_id, error = %error, "Admission audit could not estimate usage");
+                return Ok(result);
+            }
+            Err(error) => return Err(error),
+        };
+        result.estimated_amount = Some(amount);
+        if mode == AdmissionMode::Audit {
+            tracing::info!(organization_id = %identity.organization_id, model_id = %identity.model_id, estimated_nano_usd = amount, "Admission audit estimate");
+            return Ok(result);
+        }
         let reservation = budget::BudgetReservation {
             id,
-            amount: estimate.quote(&pricing)?,
+            amount,
             identity,
             inference_type: bounds.inference_type,
             estimator_version: budget::ESTIMATOR_VERSION,
-            organization_max_unsettled: budget::ORGANIZATION_MAX_UNSETTLED,
-            key_max_unsettled: budget::KEY_MAX_UNSETTLED,
-            reservation_ttl_seconds: budget::RESERVATION_TTL_SECONDS,
+            organization_max_unsettled: policy.organization_max_unsettled,
+            key_max_unsettled: policy.key_max_unsettled,
+            reservation_ttl_seconds: policy.reservation_ttl_seconds,
         };
         self.usage_repository.admit_budget(&reservation).await?;
-        Ok(id)
+        result.id = Some(id);
+        Ok(result)
     }
 
     pub fn new(
@@ -240,45 +286,11 @@ impl UsageServiceImpl {
             limits_repository,
             workspace_service,
             metrics_service,
+            admission_settings: None,
         }
     }
-}
-
-#[async_trait::async_trait]
-impl UsageServiceTrait for UsageServiceImpl {
-    async fn release_budget(&self, organization_id: Uuid, id: Uuid) -> Result<(), UsageError> {
-        self.usage_repository
-            .release_budget(organization_id, id)
-            .await
-            .map_err(|_| UsageError::InternalError("Budget release failed".into()))
-    }
-    async fn expire_budgets(&self) -> Result<u64, UsageError> {
-        self.usage_repository
-            .expire_budgets()
-            .await
-            .map_err(|_| UsageError::InternalError("Usage budget expiry failed".into()))
-    }
-
-    async fn admit(
-        &self,
-        identity: BillingIdentity,
-        bounds: budget::UsageFeatures,
-    ) -> Result<Uuid, UsageError> {
-        self.reserve_budget(Uuid::new_v4(), identity, bounds).await
-    }
-
-    async fn admit_external(
-        &self,
-        identity: BillingIdentity,
-        bounds: budget::UsageFeatures,
-        report_id: Uuid,
-    ) -> Result<(), UsageError> {
-        self.reserve_budget(report_id, identity, bounds)
-            .await
-            .map(|_| ())
-    }
     /// Record usage after an API call completes
-    async fn record_usage(
+    async fn record_usage_inner(
         &self,
         request: RecordUsageServiceRequest,
     ) -> Result<UsageLogEntry, UsageError> {
@@ -415,6 +427,75 @@ impl UsageServiceTrait for UsageServiceImpl {
         }
 
         Ok(log)
+    }
+}
+
+#[async_trait::async_trait]
+impl UsageServiceTrait for UsageServiceImpl {
+    async fn mark_budget_unknown(&self, organization_id: Uuid, id: Uuid) -> Result<(), UsageError> {
+        let grace = self
+            .admission_policy(organization_id)
+            .unknown_outcome_ttl_seconds;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            self.usage_repository
+                .mark_budget_unknown(organization_id, id, grace),
+        )
+        .await
+        .map_err(|_| UsageError::InternalError("Budget outcome update timed out".into()))?
+        .map_err(|_| UsageError::InternalError("Budget outcome update failed".into()))
+    }
+    async fn release_budget(&self, organization_id: Uuid, id: Uuid) -> Result<(), UsageError> {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            self.usage_repository.release_budget(organization_id, id),
+        )
+        .await
+        .map_err(|_| UsageError::InternalError("Budget release timed out".into()))?
+        .map_err(|_| UsageError::InternalError("Budget release failed".into()))
+    }
+    async fn expire_budgets(&self) -> Result<u64, UsageError> {
+        self.usage_repository
+            .expire_budgets()
+            .await
+            .map_err(|_| UsageError::InternalError("Usage budget expiry failed".into()))
+    }
+
+    async fn admit(
+        &self,
+        identity: BillingIdentity,
+        bounds: budget::UsageFeatures,
+    ) -> Result<Option<Uuid>, UsageError> {
+        self.reserve_budget(
+            Uuid::new_v4(),
+            identity,
+            bounds,
+            budget::policy::AdmissionMode::Enforce,
+        )
+        .await
+        .map(|result| result.id)
+    }
+
+    async fn admit_external(
+        &self,
+        identity: BillingIdentity,
+        bounds: budget::UsageFeatures,
+        report_id: Uuid,
+        mode: budget::policy::AdmissionMode,
+    ) -> Result<budget::BudgetAdmission, UsageError> {
+        self.reserve_budget(report_id, identity, bounds, mode).await
+    }
+    async fn record_usage(
+        &self,
+        request: RecordUsageServiceRequest,
+    ) -> Result<UsageLogEntry, UsageError> {
+        let organization_id = request.organization_id;
+        let budget_id = request.budget_id;
+        let result = self.record_usage_inner(request).await;
+        if result.is_err() {
+            budget::unknown_outcome(self, organization_id, budget_id).await;
+        }
+        result
     }
 
     /// Record usage from the public API endpoint.

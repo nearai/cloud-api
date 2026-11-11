@@ -163,7 +163,7 @@ pub async fn systemone(
         let inference_id = hash_inference_id_to_uuid(decision_id);
         let usage = &served.response.response.usage;
         let usage_request = RecordUsageServiceRequest {
-            budget_id: budget.id().await.ok(),
+            budget_id: budget.id().await.ok().flatten(),
             input_tokens: usage.input_tokens,
             output_tokens: usage.output_tokens,
             inference_id: Some(inference_id),

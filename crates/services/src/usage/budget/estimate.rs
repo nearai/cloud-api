@@ -18,6 +18,8 @@ pub struct UsageFeatures {
     pub executions: u64,
     pub requested_output_tokens: Option<u64>,
     pub model_output_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_tier: Option<String>,
     pub media_bytes: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audio_duration_seconds: Option<u64>,
@@ -33,7 +35,7 @@ impl UsageFeatures {
         let mut features = Self::from_json(
             InferenceType::ChatCompletion,
             &serde_json::json!({
-                "n": params.n, "max_tokens":params.max_tokens,
+                "n": params.n, "max_tokens":params.max_tokens, "service_tier":params.service_tier,
                 "max_completion_tokens":params.max_completion_tokens,
                 "best_of":params.extra.get("best_of"), "max_output_tokens":params.extra.get("max_output_tokens"),
             }),
@@ -152,6 +154,12 @@ impl UsageFeatures {
                 .or(number("max_output_tokens", true)?)
                 .or(number("max_tokens", true)?),
             model_output_tokens: None,
+            service_tier: body.get("service_tier").and_then(Value::as_str).map(
+                |value| match value {
+                    "default" | "auto" | "priority" | "fast" | "flex" => value.to_owned(),
+                    _ => "unknown".into(),
+                },
+            ),
             media_bytes: 0,
             audio_duration_seconds: None,
             requested_images: number("n", false)?.unwrap_or(1),
@@ -279,8 +287,7 @@ impl UsageFeatures {
         input = mul(input, mul(self.choices, self.executions)?)?;
         let fallback_output = self
             .model_output_tokens
-            .unwrap_or(policy.default_output_tokens as u64)
-            .min(policy.default_output_tokens as u64);
+            .unwrap_or(policy.default_output_tokens as u64);
         // This caps only the quote. The provider still receives the original request.
         let requested_output = self.requested_output_tokens.unwrap_or(fallback_output);
         let mut output = mul(
@@ -460,7 +467,7 @@ mod tests {
     #[test]
     fn output_quote_respects_catalog_cap_without_changing_request_or_zero_limit() {
         for (request, cap, expected) in [
-            (None, Some(128000), 4096),
+            (None, Some(128000), 128000),
             (Some(u64::MAX), Some(8192), 8192),
             (Some(0), Some(8192), 0),
             (None, Some(1000), 1000),

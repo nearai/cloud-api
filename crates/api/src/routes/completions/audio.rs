@@ -281,7 +281,7 @@ pub async fn audio_transcriptions(
 
             let inference_id = uuid::Uuid::new_v4();
             let usage_request = services::usage::RecordUsageServiceRequest {
-                budget_id: budget.id().await.ok(),
+                budget_id: budget.id().await.ok().flatten(),
                 input_tokens: duration_seconds, // Bill by duration in seconds
                 inference_id: Some(inference_id),
                 stop_reason: Some(services::usage::StopReason::Completed),
@@ -323,7 +323,13 @@ pub async fn audio_transcriptions(
                 );
             } else {
                 tracing::warn!(%organization_id, %workspace_id,
-                    "Audio transcription duration unavailable; actual usage unavailable; reservation remains until expiry");
+                    "Audio transcription duration unavailable; awaiting late usage or expiry");
+                services::usage::budget::unknown_outcome(
+                    app_state.usage_service.as_ref(),
+                    organization_id,
+                    usage_request.budget_id,
+                )
+                .await;
             }
 
             if requested_response_format.as_deref() == Some("text") {

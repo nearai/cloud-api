@@ -226,7 +226,7 @@ pub async fn image_generations(
                 provider_attribution,
                 inference_type: services::usage::InferenceType::ImageGeneration,
             });
-            usage_request.budget_id = budget.id().await.ok();
+            usage_request.budget_id = budget.id().await.ok().flatten();
             record_usage_with_sync_fallback(usage_service, usage_request, "Image generation").await;
 
             // Return the exact bytes from the provider for hash verification
@@ -654,7 +654,7 @@ pub async fn image_edits(
                 provider_attribution,
                 inference_type: services::usage::InferenceType::ImageEdit,
             });
-            usage_request.budget_id = budget.id().await.ok();
+            usage_request.budget_id = budget.id().await.ok().flatten();
             record_usage_with_sync_fallback(usage_service, usage_request, "Image edit").await;
 
             // Return the exact bytes from the provider for hash verification

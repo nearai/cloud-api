@@ -226,7 +226,7 @@ fn normalize_stateless_request(body: &mut Value) -> Result<(), NativeResponsesEr
 }
 
 struct Billing {
-    budget_id: Uuid,
+    budget_id: Option<Uuid>,
     service: NativeResponsesService,
     request_hash: String,
     organization_id: Uuid,
@@ -374,7 +374,7 @@ impl Billing {
                 requested_service_tier: Some(TextServiceTier::Default),
                 provider_service_tier: usage.tier,
                 inference_id: id.as_deref().map(hash_inference_id_to_uuid),
-                budget_id: Some(self.budget_id),
+                budget_id: self.budget_id,
                 provider_request_id: id.clone(),
                 stop_reason: Some(reason),
                 provider_attribution: self.attribution,
@@ -392,6 +392,13 @@ impl Billing {
                 tracing::error!(error = %e, "Failed to record native Responses usage");
                 return Err(());
             }
+        } else {
+            crate::usage::budget::unknown_outcome(
+                self.service.usage_service.as_ref(),
+                self.organization_id,
+                self.budget_id,
+            )
+            .await;
         }
         if let (Some(id), Some(digest)) = (id, digest) {
             // Only digest material is retained, never response/input content.
@@ -414,6 +421,11 @@ async fn account(
     billing: Billing,
     guard: ConcurrentRequestGuard,
 ) -> Result<NativeResponse, NativeResponsesError> {
+    let mut outcome = crate::usage::budget::OutcomeGuard::new(
+        billing.service.usage_service.clone(),
+        billing.organization_id,
+        billing.budget_id,
+    );
     if !upstream.status.is_success() {
         return Ok(NativeResponse {
             upstream,
@@ -430,6 +442,7 @@ async fn account(
             runtime: tokio::runtime::Handle::current(),
             done: false,
         });
+        outcome.disarm(); // The stream observer now owns final usage/outcome handling.
         return Ok(NativeResponse {
             upstream,
             provider_response_id: None,
@@ -459,6 +472,7 @@ async fn account(
         .finish(usage, reason, Some(hex::encode(Sha256::digest(&bytes))))
         .await
         .map_err(|_| NativeResponsesError::Internal("Failed to record Responses usage"))?;
+    outcome.disarm();
     upstream.body = Box::pin(futures_util::stream::once(
         async move { Ok(Bytes::from(bytes)) },
     ));

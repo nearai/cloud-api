@@ -404,6 +404,59 @@ mod tests {
         (svc, repo, handle)
     }
 
+    #[tokio::test]
+    async fn usage_admission_policy_updates_are_published_and_invalid_values_do_not_replace_them() {
+        use crate::usage::budget::policy::{AdmissionMode, AdmissionSettings, UsageAdmissionKey};
+        let repo = Arc::new(FakeRepo::default());
+        let handle = Arc::new(ArcSwap::from_pointee(AdmissionSettings::default()));
+        let settings = AdminSettingsService::builder(repo.clone())
+            .register::<UsageAdmissionKey>(handle.clone())
+            .build();
+        let org = Uuid::new_v4();
+        let author = Uuid::new_v4();
+        settings.update("usage_admission",json!({"defaults":{"mode":"audit"},"organizations":{org.to_string():{"organization_max_unsettled":512,"key_max_unsettled":128}}}),author).await.unwrap();
+        assert_eq!(
+            settings.current::<UsageAdmissionKey>().defaults.mode,
+            AdmissionMode::Audit
+        );
+        assert_eq!(
+            handle
+                .load()
+                .for_organization(org)
+                .organization_max_unsettled,
+            512
+        );
+        assert!(settings
+            .update(
+                "usage_admission",
+                json!({"defaults":{"key_max_unsettled":0}}),
+                author
+            )
+            .await
+            .is_err());
+        assert_eq!(
+            settings.current::<UsageAdmissionKey>().defaults.mode,
+            AdmissionMode::Audit
+        );
+        settings
+            .update(
+                "usage_admission",
+                json!({"defaults":{"mode":"off"}}),
+                author,
+            )
+            .await
+            .unwrap();
+        assert_eq!(handle.load().defaults.mode, AdmissionMode::Off);
+        let row = repo
+            .rows
+            .lock()
+            .unwrap()
+            .get("usage_admission")
+            .unwrap()
+            .clone();
+        assert_eq!(row.updated_by_user_id, Some(author));
+    }
+
     #[test]
     fn attested_3p_parses_and_rejects_unknown_sources() {
         let ok = Attested3pKey::parse(&json!({"disabled_sources": ["tinfoil"]}), true).unwrap();

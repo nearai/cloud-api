@@ -78,12 +78,44 @@ Actual pricing and organization discounts follow the existing settlement path;
 admission does not freeze them. A duplicate report with unchanged usage facts
 returns the recorded charge even when live prices or discounts have since changed.
 
-Admission parameters are defined in
+Operator controls use the existing `usage_admission` admin setting, available through
+`GET/PATCH /v1/admin/settings/usage_admission`. The `defaults` policy applies to
+organizations absent from `organizations`; each UUID-keyed entry in that map is a
+complete override (omitted fields use built-in defaults). PATCH replaces each supplied
+top-level field, so retain other organization entries when updating the map.
+These settings require admin access and are separate from owner-editable organization settings.
+Changes apply immediately on the handling instance and at the existing ten-minute
+reload on other instances; this is not an instantaneous fleet-wide switch.
+
+```json
+{
+  "mode": "enforce",
+  "defaults": {
+    "mode": "enforce",
+    "organization_max_unsettled": 64,
+    "key_max_unsettled": 16,
+    "reservation_ttl_seconds": 7200,
+    "unknown_outcome_ttl_seconds": 300
+  },
+  "organizations": {}
+}
+```
+
+The top-level `mode` applies to every organization, including overrides. Setting it
+to `off` disables admission everywhere on each instance after that instance reloads.
+An organization/default mode can further relax enforcement (for example, a canary
+organization in enforce mode while other organizations use audit).
+
+`enforce` estimates and reserves, `audit` estimates and logs without creating a hold
+or rejecting on admission errors, and `off` skips admission. Existing authentication,
+credit checks and actual-usage billing still run in every mode. Audit/off intentionally
+disable the additional concurrent-spending protection. They do not undo existing holds.
+Limits must be positive; the normal TTL is 1–86400 seconds and the unknown-outcome
+TTL must be positive and no longer than the normal TTL. Invalid PATCH values are rejected.
+
+Estimator parameters live in
 [`budget/policy.rs`](../crates/services/src/usage/budget/policy.rs) and ship with
-Cloud API. The policy sets at most 64 unsettled executions per organization and
-16 per key, with a reservation TTL of 7200 seconds (two hours).
-Adjustments go through code review and release; `ESTIMATOR_VERSION` identifies
-the policy used for a reservation and should advance when its parameters change.
+Cloud API. `ESTIMATOR_VERSION` identifies their calculation; the current version is 2.
 
 | Estimate parameter | Default |
 |---|---:|
@@ -99,15 +131,17 @@ the policy used for a reservation and should advance when its parameters change.
 Text estimates count local UTF-8 bytes, complete tool definitions and structured
 output schemas (including property names), explicit token IDs, a flat 32-token overhead and
 media allowances, then add the requested output estimate capped by the known catalog
-output limit. Without an explicit limit, the quote uses min(catalog output limit,
-4096), or 4096 when the catalog has no limit. These are estimates, not hard ceilings
+output limit. Without an explicit limit, the quote uses the known catalog output limit,
+or 4096 only when the catalog has no limit. These are estimates, not hard ceilings
 on actual cost. Fixed per-item media allowances also apply to opaque or remote media;
 no downloads or remote counting are performed.
 Batch/choice/attempt counts multiply the corresponding units. Images use requested
 image count and catalog price; transcription uses the larger of the byte/rate floor
 and locally measured duration (or the 60-second allowance when duration is unavailable). The multiplier is rounded upward in integer nano-USD, with
 the minimum applied only to nonzero estimated cost. Free prices remain free.
-Tiered models use the highest configured unit rates across tiers and cache classes for estimation.
+Tiered models quote the requested service tier (default when omitted), using its highest
+context-band and cache-class rates. Unknown or unconfigured tiers conservatively use
+the highest configured rates; pricing fallback does not alter the upstream request.
 No provider token-count call, media download, transcoding, or additional output
 limit is introduced. Existing inference-side parameter handling remains in place,
 including native Responses' existing catalog output cap. E2EE follows the same
@@ -121,13 +155,17 @@ older debt all protect other requests' active holds under the organization lock.
 Each actual retry gets its own reservation. Actual usage follows the existing
 recording and retry paths; admission adds no durable receipt queue or background
 settlement replay. Cloud API releases expired holds every 30 seconds, and admission
-also reclaims expired holds for its organization. Expiry uses the fixed deadline
-stored at admission, without heartbeats or resizing. A client disconnect or transport
+also reclaims expired holds for its organization. There are no heartbeats or estimate resizing. A client disconnect or transport
 error still records any billable usage already received and settles the hold.
 A connection or request-construction failure known to precede dispatch releases the
-hold immediately. HTTP errors, post-connect timeouts and dropped futures retain it
-when no billable usage is available; response
-completeness remains a separate requirement for signing. Expiry frees both reserved credit
+hold immediately. HTTP errors, post-connect timeouts, cancellation and missing final usage
+mark the outcome unknown: the attempt leaves the running-slot count, while its money
+stays reserved until the earlier of its original expiry and the configured grace period
+(default five minutes). Duplicate notices never extend that deadline. The same treatment
+applies when actual-usage recording fails; existing receipt retries continue.
+Cancellation during initial dispatch uses a best-effort drop guard. Process crashes or
+failed lifecycle notifications still rely on the original TTL. Response completeness
+remains a separate requirement for signing. Expiry frees both reserved credit
 and the unsettled slot, preserving the identity needed for a late usage report.
 A late report still charges actual usage once, including overage. Work that outlives
 the TTL may overlap newly admitted work.
@@ -144,13 +182,17 @@ cannot complete, provider usage remains authoritative. MP3 metering counts compl
 frames instead of trusting summary frame counts. This does not change uploaded bytes, response format,
 or encryption. The byte/rate estimate is never used as actual usage. If neither
 the provider nor the file supplies usable duration, return the existing response,
-log the missing usage, and retain the hold until expiry.
+log the missing usage, and apply the unknown-outcome grace period.
 
-Direct proxy requests use the internal admission endpoint with numeric metadata
+Direct proxy requests use the internal admission endpoint with numeric metadata and a sanitized service-tier label
 and a separate `admission_id` in the final HTTP/SQS usage receipt. Admission also
 authorizes execution once: replaying an admitted ID does not authorize another
-inference. A lost admission response leaves a hold until expiry; each new upstream
-attempt needs a fresh ID and reservation. Cloud API-mediated
+inference. Direct proxies attempt release by their generated ID after a lost admission
+acknowledgement, before any inference dispatch. Cleanup racing an uncommitted admission
+can miss the row, so the TTL remains the fallback. Each new upstream attempt needs a
+fresh ID and reservation. Direct admission defaults to a two-second RPC deadline;
+the database admission transaction has a 1.5-second deadline (including pool wait),
+a one-second statement timeout and a 500ms lock timeout. Cloud API-mediated
 requests reserve locally and are not reserved again by the proxy. Embedding,
 rerank, privacy, score and standalone MCP search retain their prior admission
 flow; their ledger writes still respect active holds.

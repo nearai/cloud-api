@@ -364,6 +364,8 @@ pub async fn record_usage_internal(
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ReserveUsageRequest {
+    #[serde(default)]
+    mode: services::usage::budget::policy::AdmissionMode,
     execution_model: Option<String>,
     id: Uuid,
     organization_id: Uuid,
@@ -420,7 +422,7 @@ pub async fn reserve_usage_internal(
         model.max_output_length
     };
     let features = request.features.with_model_output(output_hint);
-    state
+    let admitted = state
         .usage_service
         .admit_external(
             services::usage::BillingIdentity {
@@ -431,6 +433,7 @@ pub async fn reserve_usage_internal(
             },
             features,
             request.id,
+            request.mode,
         )
         .await
         .map_err(|error| match error {
@@ -455,7 +458,7 @@ pub async fn reserve_usage_internal(
             ),
         })?;
     Ok(ResponseJson(
-        serde_json::json!({"id": request.id, "model": model.model_name}),
+        serde_json::json!({"id": admitted.id, "model": model.model_name, "mode": admitted.mode, "estimated_amount": admitted.estimated_amount}),
     ))
 }
 
@@ -467,9 +470,26 @@ struct ReleaseUsageRequest {
 }
 
 pub async fn release_usage_internal(
+    state: State<AppState>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<StatusCode, UsageError> {
+    finish_budget_internal(state, headers, body, false).await
+}
+
+pub async fn unknown_usage_internal(
+    state: State<AppState>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<StatusCode, UsageError> {
+    finish_budget_internal(state, headers, body, true).await
+}
+
+async fn finish_budget_internal(
     State(state): State<AppState>,
     headers: HeaderMap,
     body: axum::body::Bytes,
+    unknown: bool,
 ) -> Result<StatusCode, UsageError> {
     verify_internal_usage_token(&headers, state.config.internal_usage_token.as_deref())?;
     let failure = |status, message: &str| {
@@ -483,16 +503,23 @@ pub async fn release_usage_internal(
     };
     let request: ReleaseUsageRequest = serde_json::from_slice(&body)
         .map_err(|_| failure(StatusCode::BAD_REQUEST, "Invalid release metadata"))?;
-    state
-        .usage_service
-        .release_budget(request.organization_id, request.id)
-        .await
-        .map_err(|_| {
-            failure(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Budget release unavailable",
-            )
-        })?;
+    let result = if unknown {
+        state
+            .usage_service
+            .mark_budget_unknown(request.organization_id, request.id)
+            .await
+    } else {
+        state
+            .usage_service
+            .release_budget(request.organization_id, request.id)
+            .await
+    };
+    result.map_err(|_| {
+        failure(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Budget release unavailable",
+        )
+    })?;
     Ok(StatusCode::NO_CONTENT)
 }
 

@@ -251,7 +251,7 @@ async fn interrupted_stream_bills_observed_usage_against_its_reservation() {
             parser: EventUsage::default(),
             digest: Sha256::new(),
             billing: Some(Billing {
-                budget_id,
+                budget_id: Some(budget_id),
                 service,
                 request_hash: String::new(),
                 organization_id: Uuid::new_v4(),

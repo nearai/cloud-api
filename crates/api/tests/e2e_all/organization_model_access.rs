@@ -829,6 +829,7 @@ fn every_registered_route_has_a_model_access_decision() {
         // the model with that organization's grants before admission.
         ("POST", "/internal/budget"),
         ("POST", "/internal/budget/release"),
+        ("POST", "/internal/budget/unknown"),
     ];
     /// Routes that take no model name from the caller.
     const NO_MODEL_NAME: &[(&str, &str)] = &[

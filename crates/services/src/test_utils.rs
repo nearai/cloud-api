@@ -89,8 +89,8 @@ impl UsageServiceTrait for MockUsageService {
         &self,
         _: crate::usage::BillingIdentity,
         _: crate::usage::budget::UsageFeatures,
-    ) -> Result<Uuid, UsageError> {
-        Ok(Uuid::new_v4())
+    ) -> Result<Option<Uuid>, UsageError> {
+        Ok(Some(Uuid::new_v4()))
     }
 
     async fn record_usage(
@@ -357,6 +357,7 @@ impl UsageServiceTrait for MockUsageService {
 pub struct CapturingUsageService {
     pub admissions: std::sync::Mutex<Vec<Uuid>>,
     pub releases: std::sync::Mutex<Vec<Uuid>>,
+    pub unknown_outcomes: std::sync::Mutex<Vec<Uuid>>,
     pub admission_limit: Option<usize>,
     requests: std::sync::Mutex<Vec<RecordUsageServiceRequest>>,
 }
@@ -366,6 +367,7 @@ impl CapturingUsageService {
         Self {
             admissions: std::sync::Mutex::new(Vec::new()),
             releases: std::sync::Mutex::new(Vec::new()),
+            unknown_outcomes: std::sync::Mutex::new(Vec::new()),
             admission_limit: None,
             requests: std::sync::Mutex::new(Vec::new()),
         }
@@ -378,6 +380,10 @@ impl CapturingUsageService {
 
 #[async_trait]
 impl UsageServiceTrait for CapturingUsageService {
+    async fn mark_budget_unknown(&self, _: Uuid, id: Uuid) -> Result<(), UsageError> {
+        self.unknown_outcomes.lock().unwrap().push(id);
+        Ok(())
+    }
     async fn release_budget(&self, _: Uuid, id: Uuid) -> Result<(), UsageError> {
         self.releases.lock().unwrap().push(id);
         Ok(())
@@ -386,7 +392,7 @@ impl UsageServiceTrait for CapturingUsageService {
         &self,
         _: crate::usage::BillingIdentity,
         _: crate::usage::budget::UsageFeatures,
-    ) -> Result<Uuid, UsageError> {
+    ) -> Result<Option<Uuid>, UsageError> {
         let mut admissions = self.admissions.lock().unwrap();
         if self
             .admission_limit
@@ -398,7 +404,7 @@ impl UsageServiceTrait for CapturingUsageService {
         }
         let id = Uuid::new_v4();
         admissions.push(id);
-        Ok(id)
+        Ok(Some(id))
     }
 
     async fn record_usage(

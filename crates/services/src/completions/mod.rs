@@ -124,7 +124,7 @@ where
     metrics_service: Arc<dyn MetricsServiceTrait>,
     // IDs for usage tracking (database) and tracing
     request_id: Uuid,
-    budget_id: Uuid,
+    budget_id: Option<Uuid>,
     organization_id: Uuid,
     workspace_id: Uuid,
     api_key_id: Uuid,
@@ -297,6 +297,19 @@ where
         )
         .entered();
 
+        if self
+            .last_usage_stats
+            .as_ref()
+            .is_none_or(|usage| usage.prompt_tokens == 0 && usage.completion_tokens == 0)
+            || self.last_chat_id.is_none()
+        {
+            crate::usage::budget::spawn_unknown_outcome(
+                self.usage_service.clone(),
+                organization_id,
+                self.budget_id,
+            );
+        }
+
         let (
             input_tokens,
             output_tokens,
@@ -465,7 +478,7 @@ where
                         last_finish_reason.as_ref(),
                     ));
                     let usage_request = RecordUsageServiceRequest {
-                        budget_id: Some(budget_id),
+                        budget_id,
                         input_tokens,
                         output_tokens,
                         cache_read_tokens,
@@ -1690,7 +1703,7 @@ impl CompletionServiceImpl {
         &self,
         llm_stream: StreamingResult,
         request_id: Uuid,
-        budget_id: Uuid,
+        budget_id: Option<Uuid>,
         organization_id: Uuid,
         workspace_id: Uuid,
         api_key_id: Uuid,
@@ -2309,7 +2322,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
 
         usage_service
             .record_usage(RecordUsageServiceRequest {
-                budget_id: Some(budget_id),
+                budget_id,
                 input_tokens,
                 output_tokens,
                 cache_read_tokens,
@@ -2723,7 +2736,7 @@ mod tests {
             usage_service: Arc::new(MockUsageService),
             metrics_service: Arc::new(CapturingMetricsService::new()),
             request_id: Uuid::new_v4(),
-            budget_id: Uuid::new_v4(),
+            budget_id: Some(Uuid::new_v4()),
             organization_id: Uuid::new_v4(),
             workspace_id: Uuid::new_v4(),
             api_key_id: Uuid::new_v4(),
@@ -2813,7 +2826,7 @@ mod tests {
             let records = usage.get_requests();
             assert_eq!(records.len(), 1);
             let recorded = &records[0];
-            assert_eq!(recorded.budget_id, Some(budget_id));
+            assert_eq!(recorded.budget_id, budget_id);
             assert_eq!(recorded.input_tokens, 10);
             assert_eq!(recorded.output_tokens, 5);
             assert_eq!(recorded.cache_read_tokens, 2);
@@ -2998,7 +3011,7 @@ mod tests {
             usage_service,
             metrics_service: metrics_service.clone(),
             request_id: Uuid::new_v4(),
-            budget_id: Uuid::new_v4(),
+            budget_id: Some(Uuid::new_v4()),
             organization_id,
             workspace_id,
             api_key_id,
@@ -3173,7 +3186,7 @@ mod tests {
             usage_service: usage_service.clone(),
             metrics_service: metrics_service.clone(),
             request_id: Uuid::new_v4(),
-            budget_id: Uuid::new_v4(),
+            budget_id: Some(Uuid::new_v4()),
             organization_id: Uuid::new_v4(),
             workspace_id: Uuid::new_v4(),
             api_key_id: Uuid::new_v4(),
@@ -3329,7 +3342,7 @@ mod tests {
             usage_service: usage_service.clone(),
             metrics_service: metrics_service.clone(),
             request_id: Uuid::new_v4(),
-            budget_id: Uuid::new_v4(),
+            budget_id: Some(Uuid::new_v4()),
             organization_id,
             workspace_id,
             api_key_id,
@@ -3459,7 +3472,7 @@ mod tests {
             usage_service: usage_service.clone(),
             metrics_service: metrics_service.clone(),
             request_id: Uuid::new_v4(),
-            budget_id: Uuid::new_v4(),
+            budget_id: Some(Uuid::new_v4()),
             organization_id,
             workspace_id,
             api_key_id,
@@ -3671,7 +3684,7 @@ mod tests {
                 usage_service,
                 metrics_service,
                 request_id: Uuid::new_v4(),
-                budget_id: Uuid::new_v4(),
+                budget_id: Some(Uuid::new_v4()),
                 organization_id: Uuid::new_v4(),
                 workspace_id: Uuid::new_v4(),
                 api_key_id: Uuid::new_v4(),

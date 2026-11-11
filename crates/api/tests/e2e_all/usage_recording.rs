@@ -1224,6 +1224,87 @@ async fn budget_admission_settles_once_without_resizing_estimate() {
 }
 
 #[tokio::test]
+async fn budget_audit_and_off_do_not_hold_credit_and_unknown_outcomes_release_only_slots() {
+    let server = enable_internal_usage_server().await;
+    setup_qwen_model(&server).await;
+    let identity = provision_identity(&server).await;
+    let features = services::usage::budget::UsageFeatures::from_json(
+        services::usage::InferenceType::ChatCompletion,
+        &serde_json::json!({"max_tokens":1}),
+    )
+    .unwrap();
+    let pool = crate::common::db_setup::create_test_pool().await;
+    let client = pool.get().await.unwrap();
+    for mode in ["audit", "off"] {
+        let id = uuid::Uuid::new_v4();
+        let request = internal_usage_body(
+            &identity,
+            serde_json::json!({"id":id,"model":"Qwen/Qwen3-30B-A3B-Instruct-2507","features":features,"mode":mode}),
+        );
+        let response = server
+            .post("/v1/internal/budget")
+            .add_header("Authorization", format!("Bearer {INTERNAL_USAGE_TOKEN}"))
+            .json(&request)
+            .await;
+        assert_eq!(response.status_code(), 200, "{}", response.text());
+        let response: serde_json::Value = response.json();
+        assert!(response["id"].is_null());
+        assert_eq!(response["mode"], mode);
+        assert_eq!(
+            client
+                .query_one(
+                    "SELECT COUNT(*) FROM usage_budget_reservations WHERE id=$1",
+                    &[&id]
+                )
+                .await
+                .unwrap()
+                .get::<_, i64>(0),
+            0
+        );
+        assert_eq!(response["estimated_amount"].is_null(), mode == "off");
+    }
+    let id = uuid::Uuid::new_v4();
+    let request = internal_usage_body(
+        &identity,
+        serde_json::json!({"id":id,"model":"Qwen/Qwen3-30B-A3B-Instruct-2507","features":features}),
+    );
+    assert_eq!(
+        server
+            .post("/v1/internal/budget")
+            .add_header("Authorization", format!("Bearer {INTERNAL_USAGE_TOKEN}"))
+            .json(&request)
+            .await
+            .status_code(),
+        200
+    );
+    let notice = serde_json::json!({"organization_id":identity.org_id,"id":id});
+    assert_eq!(
+        server
+            .post("/v1/internal/budget/unknown")
+            .json(&notice)
+            .await
+            .status_code(),
+        401
+    );
+    for _ in 0..2 {
+        assert_eq!(
+            server
+                .post("/v1/internal/budget/unknown")
+                .add_header("Authorization", format!("Bearer {INTERNAL_USAGE_TOKEN}"))
+                .json(&notice)
+                .await
+                .status_code(),
+            204
+        );
+    }
+    let row = client.query_one("SELECT state,outcome_unknown_at IS NOT NULL,expires_at <= clock_timestamp()+interval '5 minutes',reserved_credit(organization_id)=amount FROM usage_budget_reservations WHERE id=$1", &[&id]).await.unwrap();
+    assert_eq!(row.get::<_, String>(0), "active");
+    for col in 1..4 {
+        assert!(row.get::<_, bool>(col));
+    }
+}
+
+#[tokio::test]
 async fn budget_admission_concurrency_is_bounded_for_key_without_spend_limit() {
     let server = enable_internal_usage_server().await;
     setup_qwen_model(&server).await;

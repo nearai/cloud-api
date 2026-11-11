@@ -141,7 +141,35 @@ impl TextPricingProfile {
         if input < 0 || output < 0 {
             return Err(UsageError::ValidationError("negative usage bound".into()));
         }
-        let rates = self.highest_rates()?.parse()?;
+        Self::quote_rates(self.highest_rates()?.parse()?, input, output)
+    }
+
+    /// Quote the requested tier, retaining the higher context-band/input-class allowance.
+    /// Unknown or unavailable tiers keep the existing conservative pricing fallback.
+    pub fn admission_cost(
+        &self,
+        input: i32,
+        output: i32,
+        requested_tier: Option<&str>,
+    ) -> Result<i64, UsageError> {
+        self.validate()?;
+        let Some(tier) = TextServiceTier::parse_request(requested_tier)
+            .ok()
+            .and_then(|tier| self.tier(tier))
+        else {
+            return self.maximum_cost(input, output);
+        };
+        let short = Self::quote_rates(tier.short.parse()?, input, output)?;
+        match &tier.long {
+            Some(long) => Ok(short.max(Self::quote_rates(long.parse()?, input, output)?)),
+            None => Ok(short),
+        }
+    }
+
+    fn quote_rates(rates: ParsedRates, input: i32, output: i32) -> Result<i64, UsageError> {
+        if input < 0 || output < 0 {
+            return Err(UsageError::ValidationError("negative usage bound".into()));
+        }
         let input_rate = rates
             .uncached_input
             .max(rates.cached_input)
@@ -703,6 +731,33 @@ mod tests {
             1,
             "round up sub-nano bounds"
         );
+    }
+
+    #[test]
+    fn admission_quotes_requested_tier_without_priority_markup() {
+        let profile = profile();
+        let default = profile.admission_cost(300_000, 20_000, None).unwrap();
+        let priority = profile
+            .admission_cost(300_000, 20_000, Some("priority"))
+            .unwrap();
+        let flex = profile
+            .admission_cost(300_000, 20_000, Some("flex"))
+            .unwrap();
+        assert!(flex < default && default < priority);
+        assert_eq!(priority, profile.maximum_cost(300_000, 20_000).unwrap());
+        assert_eq!(
+            default,
+            profile
+                .admission_cost(300_000, 20_000, Some("auto"))
+                .unwrap()
+        );
+        assert_eq!(
+            priority,
+            profile
+                .admission_cost(300_000, 20_000, Some("unknown-provider-tier"))
+                .unwrap()
+        );
+        assert!(profile.admission_cost(-1, 1, None).is_err());
     }
 
     #[test]

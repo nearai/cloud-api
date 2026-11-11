@@ -231,9 +231,21 @@ pub trait UsageServiceTrait: Send + Sync {
         _identity: BillingIdentity,
         _features: super::budget::UsageFeatures,
         _report_id: Uuid,
-    ) -> Result<(), UsageError> {
+        _mode: super::budget::policy::AdmissionMode,
+    ) -> Result<super::budget::BudgetAdmission, UsageError> {
         Err(UsageError::InternalError(
             "external monetary admission is unavailable".into(),
+        ))
+    }
+
+    /// Stop counting an abandoned attempt as running while temporarily retaining its funding.
+    async fn mark_budget_unknown(
+        &self,
+        _organization_id: Uuid,
+        _id: Uuid,
+    ) -> Result<(), UsageError> {
+        Err(UsageError::InternalError(
+            "unknown budget outcome is unavailable".into(),
         ))
     }
 
@@ -249,7 +261,7 @@ pub trait UsageServiceTrait: Send + Sync {
         &self,
         _identity: BillingIdentity,
         _features: super::budget::UsageFeatures,
-    ) -> Result<Uuid, UsageError> {
+    ) -> Result<Option<Uuid>, UsageError> {
         Err(UsageError::InternalError(
             "monetary admission is unavailable".into(),
         ))
@@ -363,6 +375,14 @@ pub trait UsageServiceTrait: Send + Sync {
 
 #[async_trait::async_trait]
 pub trait UsageRepository: Send + Sync {
+    async fn mark_budget_unknown(
+        &self,
+        _organization_id: Uuid,
+        _id: Uuid,
+        _grace_seconds: i32,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("unknown budget outcome is unavailable")
+    }
     async fn release_budget(&self, _organization_id: Uuid, _id: Uuid) -> anyhow::Result<()> {
         anyhow::bail!("budget release is unavailable")
     }

@@ -1,7 +1,7 @@
 name: Claude Code
 
 on:
-  issue_comment:
+  issue_comment: # zizmor: ignore[dangerous-triggers] Explicit write-permission check precedes checkout and Claude.
     types: [created]  # Listen for @claude in PR comments (non-review tasks)
   pull_request_review_comment:
     types: [created]  # Listen for @claude in inline code comments
@@ -25,14 +25,27 @@ jobs:
       id-token: write
       actions: read # Required for Claude to read CI results on PRs
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v7
+      - name: Require repository write permission
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
         with:
+          script: |
+            const { data: access } = await github.rest.repos.getCollaboratorPermissionLevel({
+              ...context.repo,
+              username: context.actor
+            });
+            if (!['admin', 'write', 'maintain'].includes(access.permission)) {
+              throw new Error('Code review requires repository write permission.');
+            }
+
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
           fetch-depth: 1
 
       - name: Run Claude Code
         id: claude
-        uses: anthropics/claude-code-action@v1
+        uses: anthropics/claude-code-action@4fa93a88de49bbef68b10eb15aabedf28ca0e1ed # v1
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
 

@@ -21,7 +21,7 @@ runs:
   using: composite
   steps:
     - name: Install Rust
-      uses: actions-rust-lang/setup-rust-toolchain@v1
+      uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
       with:
         components: ${{ inputs.components }}
 
@@ -48,13 +48,13 @@ runs:
 
     - name: Install cargo-nextest
       if: steps.tools.outputs.nextest != 'true'
-      uses: taiki-e/install-action@v2
+      uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2
       with:
         tool: nextest@${{ steps.tools.outputs.nextest-version }}
 
     - name: Install sccache
       if: steps.tools.outputs.sccache != 'true'
-      uses: taiki-e/install-action@v2
+      uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2
       with:
         tool: sccache@${{ steps.tools.outputs.sccache-version }}
 
@@ -92,7 +92,7 @@ runs:
         echo "ld.mold at: $(command -v ld.mold)"
 
     - name: Cache Rust dependencies
-      uses: swatinem/rust-cache@v2
+      uses: swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       with:
         cache-on-failure: true
         key: ${{ inputs.cache-key }}

@@ -3,7 +3,7 @@ name: Claude Code Review
 on:
   pull_request:
     types: [opened, ready_for_review]  # When PR is ready for review (not draft)
-  issue_comment:
+  issue_comment: # zizmor: ignore[dangerous-triggers] Explicit write-permission check precedes checkout and Claude.
     types: [created]  # Listen for @claude mentions in PR comments
 
 concurrency:
@@ -45,21 +45,33 @@ jobs:
       id-token: write
 
     steps:
-      # The workspace root is the trusted revision: the default branch for a
-      # comment trigger, the PR merge commit for pull_request. Everything
-      # executable (the formatter, repo rules, action config) comes from here.
-      - name: Checkout repository
-        uses: actions/checkout@v7
+      - name: Require repository write permission
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
         with:
+          script: |
+            const { data: access } = await github.rest.repos.getCollaboratorPermissionLevel({
+              ...context.repo,
+              username: context.actor
+            });
+            if (!['admin', 'write', 'maintain'].includes(access.permission)) {
+              throw new Error('Code review requires repository write permission.');
+            }
+
+      # Execute the formatter and load action configuration from the default branch.
+      # The PR checkout below is review data for both triggers.
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.repository.default_branch }}
           fetch-depth: 1
 
       # A comment can target a fork PR, so its code is review data only: it
       # lives in pr-head/ with no credentials and is never executed.
       - name: Checkout PR head as review data
-        if: github.event_name == 'issue_comment'
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: refs/pull/${{ github.event.issue.number }}/head
+          ref: refs/pull/${{ github.event.pull_request.number || github.event.issue.number }}/head
           path: pr-head
           fetch-depth: 1
           persist-credentials: false
@@ -78,7 +90,7 @@ jobs:
       # Review rules come from the base revision, so a PR that edits them is
       # still judged by the rules it is changing, not by its own edits.
       - name: Checkout review rules from the base revision
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: ${{ steps.pr-base.outputs.sha }}
           path: review-rules
@@ -163,12 +175,12 @@ jobs:
 
       - name: Run Claude Code Review
         id: claude-review
-        uses: anthropics/claude-code-action@v1
+        uses: anthropics/claude-code-action@4fa93a88de49bbef68b10eb15aabedf28ca0e1ed # v1
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           prompt: |
             Review pull request #${{ github.event.pull_request.number || github.event.issue.number }} in ${{ github.repository }}, a Rust
-            multi-tenant AI inference API that runs in a TEE. ${{ github.event_name == 'issue_comment' && 'The working directory is the trusted default branch; the PR head is checked out under ./pr-head. Read changed files and their callers from ./pr-head.' || 'The working directory is the PR merge commit (the PR merged into the base), so trust `gh pr diff` over the working tree for what this PR changes.' }} Deliver the review only as GitHub comments.
+            multi-tenant AI inference API that runs in a TEE. The working directory is the trusted default branch; the PR head is checked out under ./pr-head. Read changed files and their callers from ./pr-head. Deliver the review only as GitHub comments.
 
             <existing_discussion>
             ${{ steps.fetch-comments.outputs.context }}

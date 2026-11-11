@@ -1,5 +1,8 @@
 name: Verify Reproducible Build
 
+permissions:
+  contents: read
+
 on:
   workflow_dispatch:
   push:
@@ -34,7 +37,9 @@ jobs:
         instance: [1, 2]
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
 
       - name: Install build dependencies
         run: |
@@ -68,7 +73,7 @@ jobs:
           echo "Committed pins are satisfiable in the snapshot."
 
       - name: Upload digest artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: digest-${{ matrix.instance }}
           path: digest.txt
@@ -87,7 +92,9 @@ jobs:
       mismatch: ${{ steps.compare.outputs.mismatch }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
 
       - name: Install build dependencies
         run: |
@@ -145,7 +152,7 @@ jobs:
           fi
 
       - name: Upload digest artifacts
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: digest-sequential
           path: |
@@ -156,7 +163,7 @@ jobs:
       # Only upload OCI tars on mismatch to save disk space
       - name: Upload OCI archives on mismatch
         if: steps.compare.outputs.mismatch == 'true'
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: oci-tar-sequential-debug
           path: |
@@ -176,7 +183,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Download all digest artifacts
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           pattern: digest-*
           merge-multiple: false
@@ -269,12 +276,18 @@ jobs:
 
       - name: Generate summary
         if: always()
+        env:
+          STEP_VERIFY_DIGEST_CM1: ${{ steps.verify.outputs.digest_cm1 }}
+          STEP_VERIFY_DIGEST_CM2: ${{ steps.verify.outputs.digest_cm2 }}
+          STEP_VERIFY_DIGEST_SEQ_FIRST: ${{ steps.verify.outputs.digest_seq_first }}
+          STEP_VERIFY_DIGEST_SEQ_SECOND: ${{ steps.verify.outputs.digest_seq_second }}
+          STEP_VERIFY_RESULT: ${{ steps.verify.outputs.result }}
         run: |
-          DIGEST_CM1="${{ steps.verify.outputs.digest_cm1 }}"
-          DIGEST_CM2="${{ steps.verify.outputs.digest_cm2 }}"
-          DIGEST_FIRST="${{ steps.verify.outputs.digest_seq_first }}"
-          DIGEST_SECOND="${{ steps.verify.outputs.digest_seq_second }}"
-          RESULT="${{ steps.verify.outputs.result }}"
+          DIGEST_CM1="${STEP_VERIFY_DIGEST_CM1}"
+          DIGEST_CM2="${STEP_VERIFY_DIGEST_CM2}"
+          DIGEST_FIRST="${STEP_VERIFY_DIGEST_SEQ_FIRST}"
+          DIGEST_SECOND="${STEP_VERIFY_DIGEST_SEQ_SECOND}"
+          RESULT="${STEP_VERIFY_RESULT}"
 
           {
             echo "## Reproducible Build Verification"
@@ -310,6 +323,9 @@ jobs:
     steps:
       - name: Send Slack notification
         env:
+          NEEDS_BUILD_RESULT: ${{ needs.build.result }}
+          NEEDS_SEQUENTIAL_BUILDS_RESULT: ${{ needs.sequential-builds.result }}
+          NEEDS_VERIFY_RESULT: ${{ needs.verify.result }}
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
         run: |
           if [ -z "${SLACK_BOT_TOKEN}" ]; then
@@ -319,10 +335,10 @@ jobs:
 
           command -v jq >/dev/null 2>&1 || { sudo apt-get update || true; sudo apt-get install -y jq; }
 
-          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          MSG=":red_circle: *Reproducible build verification failed* on \`${{ github.repository }}\`
-          Branch: \`${{ github.ref_name }}\` · Commit: \`${GITHUB_SHA:0:7}\`
-          Jobs — build: \`${{ needs.build.result }}\` · sequential-builds: \`${{ needs.sequential-builds.result }}\` · verify: \`${{ needs.verify.result }}\`
+          RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          MSG=":red_circle: *Reproducible build verification failed* on \`${GITHUB_REPOSITORY}\`
+          Branch: \`${GITHUB_REF_NAME}\` · Commit: \`${GITHUB_SHA:0:7}\`
+          Jobs — build: \`${NEEDS_BUILD_RESULT}\` · sequential-builds: \`${NEEDS_SEQUENTIAL_BUILDS_RESULT}\` · verify: \`${NEEDS_VERIFY_RESULT}\`
 
           <${RUN_URL}|GitHub Actions run>"
 

@@ -26,5 +26,5 @@ jobs:
         with:
           tool: zizmor@1.32.0
           fallback: none
-      - name: Scan workflows and local actions
-        run: zizmor --offline --strict-collection --collect=workflows,actions --format=github .
+      - name: Scan workflows, local actions, and Dependabot
+        run: zizmor --offline --strict-collection --collect=workflows,actions,dependabot --format=github .

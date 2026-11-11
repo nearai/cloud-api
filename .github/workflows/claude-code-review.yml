@@ -173,10 +173,33 @@ jobs:
             echo "$delimiter"
           } >> "$GITHUB_OUTPUT"
 
+      # Keep the CLI version aligned with the pinned claude-code-action.
+      # SHA256 is from its signed release manifest (see code.claude.com/docs/en/setup).
+      - name: Install verified Claude CLI
+        id: claude-cli
+        env:
+          DISABLE_UPDATES: '1'
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = x86_64
+          version=2.1.322
+          sha256=bfb3703ad5380242328459bc62ada4bde8ae7ba57c6e1eeadb9c00e08874c478
+          install_dir=$(mktemp -d "${RUNNER_TEMP}/claude.XXXXXX")
+          curl --fail --silent --show-error --location --retry 3 \
+            "https://downloads.claude.ai/claude-code-releases/${version}/linux-x64/claude" \
+            --output "$install_dir/claude"
+          printf '%s  %s\n' "$sha256" "$install_dir/claude" | sha256sum --check --strict
+          chmod 755 "$install_dir/claude"
+          "$install_dir/claude" --version
+          printf 'path=%s/claude\n' "$install_dir" >> "$GITHUB_OUTPUT"
+
       - name: Run Claude Code Review
         id: claude-review
         uses: anthropics/claude-code-action@4fa93a88de49bbef68b10eb15aabedf28ca0e1ed # v1
+        env:
+          DISABLE_UPDATES: '1'
         with:
+          path_to_claude_code_executable: ${{ steps.claude-cli.outputs.path }}
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           prompt: |
             Review pull request #${{ github.event.pull_request.number || github.event.issue.number }} in ${{ github.repository }}, a Rust

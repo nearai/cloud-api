@@ -991,7 +991,6 @@ pub struct GeminiParserState {
     /// Usage from the latest event that reported it. Gemini restates
     /// cumulative counts, so the last report is the total for the request.
     pub usage: TokenUsage,
-    terminal_usage: bool,
 }
 
 impl GeminiParserState {
@@ -1002,7 +1001,6 @@ impl GeminiParserState {
             created: chrono::Utc::now().timestamp(),
             chunk_index: 0,
             usage: TokenUsage::default(),
-            terminal_usage: false,
         }
     }
 
@@ -1028,11 +1026,6 @@ impl SSEEventParser for GeminiEventParser {
             return Ok(None);
         }
 
-        state.terminal_usage |= response.usage_metadata.is_some()
-            && response
-                .candidates
-                .iter()
-                .all(|candidate| candidate.finish_reason.is_some());
         let candidate = &response.candidates[0];
         let ctx = state.chunk_context();
 
@@ -1097,10 +1090,6 @@ impl SSEEventParser for GeminiEventParser {
 
     fn handles_raw_json() -> bool {
         true
-    }
-
-    fn has_terminal_usage(state: &Self::State) -> bool {
-        state.terminal_usage
     }
 }
 

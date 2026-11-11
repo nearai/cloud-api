@@ -927,46 +927,8 @@ mod tests {
         let parser = new_gemini_sse_parser(mock_stream, "gemini-1.5-pro".to_string());
         let events: Vec<_> = parser.collect().await;
 
-        assert_eq!(events.len(), 2);
+        assert_eq!(events.len(), 1);
         assert!(events[0].is_ok());
-        let terminal = events[1].as_ref().unwrap();
-        assert!(terminal.is_done_marker());
-        assert!(!terminal.raw_passthrough);
-    }
-
-    #[tokio::test]
-    async fn native_terminal_requires_final_usage_and_clean_transport() {
-        use futures_util::StreamExt;
-        let complete = r#"{"candidates":[{"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":1,"totalTokenCount":11}}"#;
-        let partial = r#"{"candidates":[{"content":{"parts":[{"text":"partial"}]}}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":1,"totalTokenCount":11}}"#;
-        for (body, transport_error, expected) in [
-            (format!("data: {complete}\n\n"), false, true),
-            (format!("data: {partial}\n\n"), false, false),
-            (
-                "data: {\"candidates\":[{\"finishReason\":\"STOP\"}]}\n\n".into(),
-                false,
-                false,
-            ),
-            (format!("data: {complete}\n\ndata: {{"), false, false),
-            (format!("data: {complete}\n\n"), true, false),
-        ] {
-            let mut packets = vec![Ok(Bytes::from(body))];
-            if transport_error {
-                packets.push(Err(std::io::Error::other("connection reset")));
-            }
-            let parser = BufferedSSEParser::<_, GeminiEventParser, std::io::Error>::new(
-                futures_util::stream::iter(packets),
-                GeminiParserState::new("test".into()),
-            );
-            let events: Vec<_> = parser.collect().await;
-            assert_eq!(
-                events
-                    .iter()
-                    .filter_map(|event| event.as_ref().ok())
-                    .any(|event| event.is_done_marker()),
-                expected
-            );
-        }
     }
 
     // End-to-end conversion: a MAX_TOKENS-with-empty-content payload from Google

@@ -365,9 +365,6 @@ impl NativeUsageStream {
             return;
         };
         let mut usage = self.parser.finish();
-        if !self.parser.finished || usage.stop_reason == Some(StopReason::ProviderError) {
-            return; // Unknown final usage must not release the reservation.
-        }
         let stop_reason = usage.stop_reason.take().unwrap_or(default_reason);
         spawn_native_usage_recording(self.runtime_handle.clone(), context, usage, stop_reason);
     }
@@ -1215,8 +1212,7 @@ async fn build_upstream_response(
     let body = if status.is_success() && endpoint == AnthropicRawEndpoint::Messages && stream {
         // Construct the billing-owning stream before the first await so a
         // client disconnect (or the peek timeout) during the peek still runs
-        // its Drop and settles authoritative final usage already seen. Partial
-        // counters leave the reservation held.
+        // its Drop and records whatever usage the parser has seen.
         let mut usage_stream = NativeUsageStream {
             // Observe usage before signature framing so cancellation cannot
             // lose usage in an upstream chunk or an incomplete SSE frame.
@@ -2116,6 +2112,8 @@ redact-thinking-2026-02-12";
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn completed_stream_records_usage_under_the_derived_inference_id() {
         let usage_service = Arc::new(RecordingUsageService::default());
+        let context = billing_context(usage_service.clone());
+        let budget_id = context.budget_id;
         let mut stream = usage_stream_over(
             vec![
                 Ok(Bytes::from_static(
@@ -2124,9 +2122,8 @@ redact-thinking-2026-02-12";
                 Ok(Bytes::from_static(
                     b"data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":9}}\n\n",
                 )),
-                Ok(Bytes::from_static(b"data: {\"type\":\"message_stop\"}")),
             ],
-            Some(billing_context(usage_service.clone())),
+            Some(context),
         );
         stream.peek_message_id().await;
 
@@ -2138,6 +2135,7 @@ redact-thinking-2026-02-12";
         drop(stream);
 
         let recorded = wait_for_recorded_usage(&usage_service).await;
+        assert_eq!(recorded.budget_id, Some(budget_id));
         assert_eq!(
             recorded.inference_id,
             Some(hash_inference_id_to_uuid("msg_stream"))
@@ -2149,8 +2147,10 @@ redact-thinking-2026-02-12";
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn stream_ending_without_a_terminal_event_retains_its_reservation() {
+    async fn stream_ending_without_a_declared_stop_reason_is_billed_as_incomplete() {
         let usage_service = Arc::new(RecordingUsageService::default());
+        let context = billing_context(usage_service.clone());
+        let budget_id = context.budget_id;
         let mut stream = usage_stream_over(
             vec![
                 Ok(Bytes::from_static(
@@ -2160,7 +2160,7 @@ redact-thinking-2026-02-12";
                     b"data: {\"type\":\"message_delta\",\"delta\":{},\"usage\":{\"output_tokens\":9}}\n\n",
                 )),
             ],
-            Some(billing_context(usage_service.clone())),
+            Some(context),
         );
         stream.peek_message_id().await;
 
@@ -2171,19 +2171,21 @@ redact-thinking-2026-02-12";
         }
         drop(stream);
 
-        assert!(usage_service.records.lock().unwrap().is_empty());
+        let recorded = wait_for_recorded_usage(&usage_service).await;
+        assert_eq!(recorded.budget_id, Some(budget_id));
+        assert_eq!(recorded.stop_reason, Some(StopReason::Incomplete));
+        assert_eq!(recorded.output_tokens, 9);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn upstream_ending_before_a_parseable_id_retains_its_reservation() {
+    async fn upstream_ending_before_a_parseable_id_is_billed_as_incomplete() {
         let usage_service = Arc::new(RecordingUsageService::default());
+        let context = billing_context(usage_service.clone());
+        let budget_id = context.budget_id;
         let leading = Bytes::from_static(
             b"data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_stream\",\"usage\":{\"input_tokens\":4}}}",
         );
-        let mut stream = usage_stream_over(
-            vec![Ok(leading)],
-            Some(billing_context(usage_service.clone())),
-        );
+        let mut stream = usage_stream_over(vec![Ok(leading)], Some(context));
         stream.peek_message_id().await;
         assert!(stream.inner_done);
 
@@ -2194,15 +2196,20 @@ redact-thinking-2026-02-12";
         }
         drop(stream);
 
-        assert!(usage_service.records.lock().unwrap().is_empty());
+        let recorded = wait_for_recorded_usage(&usage_service).await;
+        assert_eq!(recorded.budget_id, Some(budget_id));
+        assert_eq!(recorded.stop_reason, Some(StopReason::Incomplete));
+        assert_eq!(recorded.input_tokens, 4);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn upstream_error_during_peek_is_replayed_without_settling_partial_usage() {
+    async fn upstream_error_during_peek_is_replayed_and_billed_as_provider_error() {
         let usage_service = Arc::new(RecordingUsageService::default());
+        let context = billing_context(usage_service.clone());
+        let budget_id = context.budget_id;
         // No trailing newline: the peek cannot parse the id from the
         // buffered line, so it keeps reading and captures the error;
-        // `finish()` cannot authorize a settlement from partial usage.
+        // `finish()` still recovers the id and tokens for billing.
         let leading = Bytes::from_static(
             b"data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_stream\",\"usage\":{\"input_tokens\":4}}}",
         );
@@ -2211,7 +2218,7 @@ redact-thinking-2026-02-12";
                 Ok(leading.clone()),
                 Err(AnthropicRawError::Transport("upstream died".to_string())),
             ],
-            Some(billing_context(usage_service.clone())),
+            Some(context),
         );
         stream.peek_message_id().await;
         assert!(stream.inner_done);
@@ -2226,6 +2233,13 @@ redact-thinking-2026-02-12";
         assert!(stream.next().await.is_none());
         drop(stream);
 
-        assert!(usage_service.records.lock().unwrap().is_empty());
+        let recorded = wait_for_recorded_usage(&usage_service).await;
+        assert_eq!(recorded.budget_id, Some(budget_id));
+        assert_eq!(
+            recorded.inference_id,
+            Some(hash_inference_id_to_uuid("msg_stream"))
+        );
+        assert_eq!(recorded.stop_reason, Some(StopReason::ProviderError));
+        assert_eq!(recorded.input_tokens, 4);
     }
 }

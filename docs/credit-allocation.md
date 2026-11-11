@@ -121,7 +121,9 @@ recording and retry paths; admission adds no durable receipt queue or background
 settlement replay. Cloud API releases expired holds every 30 seconds, and admission
 also reclaims expired holds for its organization. Expiry uses the fixed deadline
 stored at admission, without heartbeats or resizing. A client disconnect or transport
-timeout does not release the hold immediately. Expiry frees both reserved credit
+error still records any billable usage already received and settles the hold.
+When no billable usage is available, the hold stays until expiry; response
+completeness remains a separate requirement for signing. Expiry frees both reserved credit
 and the unsettled slot, preserving the identity needed for a late usage report.
 A late report still charges actual usage once, including overage. Work that outlives
 the TTL may overlap newly admitted work.

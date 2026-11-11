@@ -213,3 +213,81 @@ fn usage_observer_does_not_treat_truncation_as_completion() {
     let mut usage = Usage::default();
     assert!(usage.apply(&json!({"status":"completed","usage":{"input_tokens":-1,"output_tokens":1,"total_tokens":0}})).is_err());
 }
+
+#[tokio::test]
+async fn interrupted_stream_bills_observed_usage_against_its_reservation() {
+    use crate::test_utils::{CapturingUsageService, MockAttestationService};
+    use std::time::Duration;
+
+    for reason in [
+        StopReason::Incomplete,
+        StopReason::ProviderError,
+        StopReason::ClientDisconnect,
+    ] {
+        let usage = Arc::new(CapturingUsageService::new());
+        let budget_id = Uuid::new_v4();
+        let service = NativeResponsesService {
+            models_service: Arc::new(crate::models::ports::MockModelsServiceTrait::new()),
+            completion_service: Arc::new(
+                crate::completions::ports::MockCompletionServiceTrait::new(),
+            ),
+            inference_provider_pool: Arc::new(InferenceProviderPool::new(None, Default::default())),
+            usage_service: usage.clone(),
+            attestation_service: Arc::new(MockAttestationService),
+        };
+        let response = json!({"type":"response.in_progress","response":{
+            "id":"resp_partial","status":"in_progress",
+            "usage":{"input_tokens":10,"output_tokens":5,"total_tokens":15,
+                "input_tokens_details":{"cached_tokens":2,"cache_write_tokens":3}}
+        }});
+        let mut events = vec![Ok(Bytes::from(format!("data: {response}\n\n")))];
+        if reason == StopReason::ProviderError {
+            events.push(Err(CompletionError::CompletionError(
+                "upstream interrupted".into(),
+            )));
+        }
+        let mut stream = UsageStream {
+            inner: Box::pin(futures_util::stream::iter(events)),
+            parser: EventUsage::default(),
+            digest: Sha256::new(),
+            billing: Some(Billing {
+                budget_id,
+                service,
+                request_hash: String::new(),
+                organization_id: Uuid::new_v4(),
+                workspace_id: Uuid::new_v4(),
+                api_key_id: Uuid::new_v4(),
+                model_id: Uuid::new_v4(),
+                inference_type: InferenceType::ChatCompletionStream,
+                attribution: ProviderAttribution::default(),
+            }),
+            guard: None,
+            runtime: tokio::runtime::Handle::current(),
+            done: false,
+        };
+        assert!(stream.next().await.unwrap().is_ok());
+        assert!(!stream.parser.usage.terminal);
+        if reason != StopReason::ClientDisconnect {
+            assert!(stream.next().await.unwrap().is_err());
+            assert!(stream.next().await.is_none());
+        }
+        drop(stream);
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while usage.get_requests().is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("observed usage must be billed even without a terminal event");
+        let records = usage.get_requests();
+        assert_eq!(records.len(), 1);
+        let recorded = &records[0];
+        assert_eq!(recorded.budget_id, Some(budget_id));
+        assert_eq!(recorded.input_tokens, 10);
+        assert_eq!(recorded.output_tokens, 5);
+        assert_eq!(recorded.cache_read_tokens, 2);
+        assert_eq!(recorded.profiled_cache_write_tokens, 3);
+        assert_eq!(recorded.stop_reason, Some(reason));
+    }
+}

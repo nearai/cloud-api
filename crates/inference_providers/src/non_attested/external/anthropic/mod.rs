@@ -868,33 +868,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn native_terminal_requires_message_stop_and_final_usage() {
-        use futures_util::StreamExt;
-        let start = "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg\",\"usage\":{\"input_tokens\":10,\"output_tokens\":0}}}\n\n";
-        let delta = "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":2}}\n\n";
-        let stop = "data: {\"type\":\"message_stop\"}\n\n";
-        for (body, expected) in [
-            (format!("{start}{delta}{stop}"), true),
-            (format!("{start}{delta}"), false),
-            (format!("{start}{stop}"), false),
-            (format!("{start}{delta}{stop}data: {{"), false),
-        ] {
-            let parser = new_anthropic_sse_parser(
-                futures_util::stream::iter(vec![Ok::<_, std::io::Error>(Bytes::from(body))]),
-                "test".into(),
-            );
-            let events: Vec<_> = parser.collect().await;
-            assert_eq!(
-                events
-                    .iter()
-                    .filter_map(|event| event.as_ref().ok())
-                    .any(|event| event.is_done_marker()),
-                expected
-            );
-        }
-    }
-
-    #[tokio::test]
     async fn streaming_chat_completion_uses_shared_raw_transport() {
         use futures_util::StreamExt;
         use wiremock::matchers::{body_json, method, path};

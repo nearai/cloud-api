@@ -543,7 +543,7 @@ async fn multiline_events_keep_signature_and_billing_ids_in_sync_and_ignore_trai
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn signed_stream_disconnect_and_error_retain_unsettled_usage_without_receipts() {
+async fn signed_stream_disconnect_and_error_still_bill_without_creating_receipts() {
     for disconnect in [true, false] {
         let store = Arc::new(ReceiptStore::default());
         let usage = Arc::new(RecordingUsageService::default());
@@ -574,61 +574,65 @@ async fn signed_stream_disconnect_and_error_retain_unsettled_usage_without_recei
             assert!(body.next().await.unwrap().is_err());
         }
         drop(body);
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        let recorded = wait_for_recorded_usage(&usage).await;
+        assert_eq!(
+            recorded.inference_id,
+            Some(services::completions::hash_inference_id_to_uuid(
+                "msg_receipt"
+            ))
+        );
+        assert_eq!(recorded.input_tokens, 3);
+        assert_eq!(
+            recorded.stop_reason,
+            Some(if disconnect {
+                services::usage::StopReason::ClientDisconnect
+            } else {
+                services::usage::StopReason::ProviderError
+            })
+        );
         assert!(usage.records.lock().unwrap().is_empty());
         assert_eq!(store.attempts.load(Ordering::SeqCst), 0);
     }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn disconnect_settles_peeked_usage_only_after_terminal_event() {
-    for complete in [false, true] {
-        let store = Arc::new(ReceiptStore::default());
-        let usage = Arc::new(RecordingUsageService::default());
-        // The provider delivered usage in the same chunk as message_start, but
-        // the last event is incomplete and the client consumes only the start.
-        let mut raw = [
-            START,
-            b"data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":9}}",
-        ]
-        .concat();
-        if complete {
-            raw.extend_from_slice(b"\n\n");
-            raw.extend_from_slice(STOP);
-        }
-        let response = build_upstream_response(
-            AnthropicRawResponse {
-                status: StatusCode::OK,
-                headers: Default::default(),
-                body: Box::pin(
-                    raw_stream(vec![Ok(Bytes::from(raw))]).chain(futures_util::stream::pending()),
-                ),
-            },
-            AnthropicRawEndpoint::Messages,
-            true,
-            Some(billing_context(usage.clone())),
-            None,
-            None,
-            Some(receipt_context(&store)),
-        )
-        .await;
-        let mut body = response.into_body().into_data_stream();
-        assert_eq!(body.next().await.unwrap().unwrap(), START);
-        drop(body);
-        if complete {
-            let recorded = wait_for_recorded_usage(&usage).await;
-            assert_eq!(recorded.input_tokens, 3);
-            assert_eq!(recorded.output_tokens, 9);
-            assert_eq!(
-                recorded.stop_reason,
-                Some(services::usage::StopReason::Completed)
-            );
-        } else {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            assert!(usage.records.lock().unwrap().is_empty());
-        }
-        assert_eq!(store.attempts.load(Ordering::SeqCst), 0);
-    }
+async fn disconnect_preserves_usage_already_peeked_in_a_partial_event() {
+    let store = Arc::new(ReceiptStore::default());
+    let usage = Arc::new(RecordingUsageService::default());
+    // The provider delivered usage in the same chunk as message_start, but
+    // the last event is incomplete and the client consumes only the start.
+    let raw = [
+        START,
+        b"data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":9}}",
+    ]
+    .concat();
+    let response = build_upstream_response(
+        AnthropicRawResponse {
+            status: StatusCode::OK,
+            headers: Default::default(),
+            body: Box::pin(
+                raw_stream(vec![Ok(Bytes::from(raw))]).chain(futures_util::stream::pending()),
+            ),
+        },
+        AnthropicRawEndpoint::Messages,
+        true,
+        Some(billing_context(usage.clone())),
+        None,
+        None,
+        Some(receipt_context(&store)),
+    )
+    .await;
+    let mut body = response.into_body().into_data_stream();
+    assert_eq!(body.next().await.unwrap().unwrap(), START);
+    drop(body);
+    let recorded = wait_for_recorded_usage(&usage).await;
+    assert_eq!(recorded.input_tokens, 3);
+    assert_eq!(recorded.output_tokens, 9);
+    assert_eq!(
+        recorded.stop_reason,
+        Some(services::usage::StopReason::ClientDisconnect)
+    );
+    assert_eq!(store.attempts.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]

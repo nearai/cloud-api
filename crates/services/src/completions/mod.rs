@@ -278,11 +278,6 @@ where
 
     /// Record usage and metrics. Called from Drop to ensure it always runs.
     fn record_usage_and_metrics(&self) {
-        let may_settle = self.stream_completed
-            && self.saw_upstream_done_marker
-            && self.last_error.is_none()
-            && self.last_finish_reason.is_some();
-
         let request_id = self.request_id;
         let organization_id = self.organization_id;
         let workspace_id = self.workspace_id;
@@ -497,7 +492,6 @@ where
                             inference_type,
                         )
                     };
-                    if may_settle {
                     let usage_write = spawn_usage_write(
                         &write_handle,
                         async move { usage_service.record_usage(usage_request).await.map(|_| ()) }
@@ -517,8 +511,6 @@ where
                             );
                         }
                     }
-
-                    } // Interrupted streams keep their reservation; observed latency remains useful.
 
                     // Record metrics
                     let tags: Vec<&str> = metric_tags.iter().map(|s| s.as_str()).collect();
@@ -2785,6 +2777,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn interrupted_stream_bills_observed_usage_against_its_reservation() {
+        use crate::test_utils::CapturingUsageService;
+        use crate::usage::StopReason;
+
+        for reason in [
+            StopReason::Incomplete,
+            StopReason::ProviderError,
+            StopReason::ClientDisconnect,
+        ] {
+            let usage = Arc::new(CapturingUsageService::new());
+            let chunk = serde_json::from_value(serde_json::json!({
+                "id":"chat_partial", "object":"chat.completion.chunk", "created":0,
+                "model":"test-model", "choices":[],
+                "usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15,
+                    "prompt_tokens_details":{"cached_tokens":2,"cache_write_tokens":3}}
+            }))
+            .unwrap();
+            let mut events = vec![Ok(SSEEvent {
+                raw_bytes: Bytes::new(),
+                chunk: Some(StreamChunk::Chat(chunk)),
+                raw_passthrough: false,
+            })];
+            if reason == StopReason::ProviderError {
+                events.push(Err(inference_providers::CompletionError::CompletionError(
+                    "upstream interrupted".into(),
+                )));
+            }
+            let mut stream = terminal_test_stream(events);
+            stream.usage_service = usage.clone();
+            let budget_id = stream.budget_id;
+            assert!(stream.next().await.unwrap().is_ok());
+            if reason != StopReason::ClientDisconnect {
+                while stream.next().await.is_some() {}
+            }
+            drop(stream);
+
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while usage.get_requests().is_empty() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("observed usage must be billed even without a terminal event");
+            let records = usage.get_requests();
+            assert_eq!(records.len(), 1);
+            let recorded = &records[0];
+            assert_eq!(recorded.budget_id, Some(budget_id));
+            assert_eq!(recorded.input_tokens, 10);
+            assert_eq!(recorded.output_tokens, 5);
+            assert_eq!(recorded.cache_read_tokens, 2);
+            assert_eq!(recorded.profiled_cache_write_tokens, 3);
+            assert_eq!(recorded.stop_reason, Some(reason));
+        }
+    }
+
+    #[tokio::test]
     async fn complete_done_marker_stops_polling_the_upstream() {
         let trailing_error = inference_providers::CompletionError::CompletionError(
             "must not be observed after [DONE]".to_string(),
@@ -2950,11 +2998,6 @@ mod tests {
         };
 
         let stream = stream::iter(vec![Ok(content_chunk), Ok(usage_chunk)]);
-        let stream = stream.chain(stream::iter(vec![Ok(SSEEvent {
-            raw_bytes: Bytes::from_static(b"data: [DONE]\n\n"),
-            raw_passthrough: true,
-            chunk: None,
-        })]));
 
         let metric_tags = CompletionServiceImpl::create_metric_tags("test-model");
 
@@ -3013,7 +3056,6 @@ mod tests {
             .expect("stream usage should be captured");
         assert_eq!(captured_usage.cached_tokens(), 3);
         assert_eq!(captured_usage.cache_write_tokens(), 4);
-        assert!(intercept_stream.next().await.is_some()); // upstream [DONE]
         assert!(intercept_stream.next().await.is_none());
         drop(intercept_stream);
 
@@ -3135,11 +3177,6 @@ mod tests {
             })),
         };
         let stream = stream::iter(vec![Ok(usage_chunk)]);
-        let stream = stream.chain(stream::iter(vec![Ok(SSEEvent {
-            raw_bytes: Bytes::from_static(b"data: [DONE]\n\n"),
-            raw_passthrough: true,
-            chunk: None,
-        })]));
         let intercept_stream = InterceptStream {
             inner: stream,
             attestation_service: Arc::new(MockAttestationService),
@@ -3289,11 +3326,6 @@ mod tests {
 
         // Simulate a stream with delays between chunks
         let stream = stream::iter(vec![Ok(chunk1), Ok(chunk2), Ok(usage_chunk)]);
-        let stream = stream.chain(stream::iter(vec![Ok(SSEEvent {
-            raw_bytes: Bytes::from_static(b"data: [DONE]\n\n"),
-            raw_passthrough: true,
-            chunk: None,
-        })]));
 
         let metric_tags = CompletionServiceImpl::create_metric_tags("test-model");
 
@@ -3428,11 +3460,6 @@ mod tests {
         };
 
         let stream = stream::iter(vec![Ok(usage_chunk)]);
-        let stream = stream.chain(stream::iter(vec![Ok(SSEEvent {
-            raw_bytes: Bytes::from_static(b"data: [DONE]\n\n"),
-            raw_passthrough: true,
-            chunk: None,
-        })]));
         let metric_tags = CompletionServiceImpl::create_metric_tags("test-model");
 
         let now = Instant::now();

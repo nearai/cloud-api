@@ -365,7 +365,7 @@ impl Billing {
         digest: Option<String>,
     ) -> Result<(), ()> {
         let id = usage.id.clone();
-        if let Some(tokens) = usage.tokens.filter(|_| usage.terminal) {
+        if let Some(tokens) = usage.tokens {
             let request = RecordUsageServiceRequest {
                 input_tokens: tokens.prompt_tokens,
                 output_tokens: tokens.completion_tokens,

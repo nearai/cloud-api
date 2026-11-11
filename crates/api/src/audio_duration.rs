@@ -7,22 +7,22 @@ use lofty::{
 use matroska_demuxer::{Frame, MatroskaFile};
 use std::io::Cursor;
 
-pub(crate) fn seconds(bytes: Vec<u8>) -> Option<i32> {
+pub(crate) fn seconds(bytes: &[u8]) -> Option<i32> {
     if bytes.starts_with(&[0x1a, 0x45, 0xdf, 0xa3]) {
-        return webm_seconds(&bytes);
+        return webm_seconds(bytes);
     }
     let options = ParseOptions::new()
         .read_tags(false)
         .read_cover_art(false)
         .parsing_mode(ParsingMode::Strict);
-    let probe = Probe::new(Cursor::new(&bytes))
+    let probe = Probe::new(Cursor::new(bytes))
         .guess_file_type()
         .ok()?
         .options(options);
     let duration = match probe.file_type()? {
         // Scan MPEG frames (or their explicit Xing/Info frame count). Lofty's MPEG fallback
         // estimates duration from bitrate; such an estimate must not become an actual charge.
-        FileType::Mpeg => mp3_duration::from_read(&mut Cursor::new(&bytes)).ok()?,
+        FileType::Mpeg => mp3_duration::from_read(&mut Cursor::new(bytes)).ok()?,
         // These containers carry sample counts or media timestamps. Ignore arbitrary tags.
         FileType::Wav | FileType::Flac | FileType::Mp4 | FileType::Vorbis | FileType::Opus => {
             probe.read().ok()?.properties().duration()
@@ -87,15 +87,17 @@ mod tests {
             include_bytes!("../tests/fixtures/audio/silence.ogg").as_slice(),
             include_bytes!("../tests/fixtures/audio/silence.webm").as_slice(),
         ] {
-            assert_eq!(seconds(bytes.to_vec()), Some(2));
+            assert_eq!(seconds(bytes), Some(2));
         }
         // Valid audio can require provider usage instead of local metering.
         assert_eq!(
-            seconds(include_bytes!("../tests/fixtures/audio/silence-vorbis.webm").to_vec()),
+            seconds(include_bytes!(
+                "../tests/fixtures/audio/silence-vorbis.webm"
+            )),
             None
         );
         for bytes in [vec![], vec![0; 4096], b"not audio".to_vec()] {
-            assert_eq!(seconds(bytes), None);
+            assert_eq!(seconds(&bytes), None);
         }
     }
 

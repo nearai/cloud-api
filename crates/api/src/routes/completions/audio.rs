@@ -215,11 +215,12 @@ pub async fn audio_transcriptions(
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
     features.media_bytes = request.file_bytes.len() as u64;
-    // Drop the metering copy before queuing inference, rather than retaining a
-    // second large upload throughout a long provider request.
-    let duration_file = request.file_bytes.clone();
+    // Meter a shared view of the upload; keep the original available even if the
+    // blocking parser fails. Once it finishes, the provider reuses the same buffer.
+    let file_bytes = bytes::Bytes::from(request.file_bytes);
+    let duration_file = file_bytes.clone();
     let file_duration_seconds =
-        tokio::task::spawn_blocking(move || crate::audio_duration::seconds(duration_file))
+        tokio::task::spawn_blocking(move || crate::audio_duration::seconds(&duration_file))
             .await
             .ok()
             .flatten();
@@ -231,7 +232,7 @@ pub async fn audio_transcriptions(
         };
     let params = inference_providers::AudioTranscriptionParams {
         model: model_name.clone(),
-        file_bytes: request.file_bytes,
+        file_bytes: file_bytes.into(),
         filename: request.filename,
         language: request
             .language

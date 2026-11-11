@@ -47,7 +47,7 @@ urlencoding = "2.1"
 # Exact-pinned (`=`): Chutes' reference client uses 0.3.2; the 0.3.3 security
 # patch preserves its wire encoding, checked by the separately generated
 # 0.3.2 key/ciphertext/shared-secret fixture in the E2EE tests.
-ml-kem = { version = "=0.3.3", features = ["getrandom"] }
+ml-kem = { version = "=0.3.4", features = ["getrandom"] }
 hkdf = "0.13"
 chacha20poly1305 = { version = "0.11", features = ["zeroize"] }
 flate2 = "1"

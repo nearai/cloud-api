@@ -9,7 +9,7 @@ on:
     branches:
       - 'main'
 
-# Each run ties up three self-hosted runners for 12-24 minutes. Only the newest
+# Each run starts three hosted runner jobs. Only the newest
 # main commit needs verifying, so a new push cancels the in-flight push run.
 # Manual workflow_dispatch runs get a unique group (run_id) so routine pushes
 # never cancel a deliberate re-verification. This workflow only checks digests;
@@ -19,9 +19,8 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # Build in parallel on the self-hosted infra fleet. With roughly one runner
-  # per host, the two instances usually land on different machines, giving
-  # best-effort cross-machine reproducibility coverage.
+  # Build in parallel on two fresh GitHub-hosted VMs for cross-machine
+  # reproducibility coverage.
   #
   # The build is fully hermetic (pinned BuildKit image, base-image digests,
   # Debian apt snapshot, SOURCE_DATE_EPOCH=0, rewrite-timestamp), so the host OS
@@ -30,7 +29,7 @@ jobs:
   # already guarantees host-independence.
   build:
     name: Cross-machine build ${{ matrix.instance }}
-    runs-on: [self-hosted, infra]
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
@@ -40,6 +39,15 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
+
+      # This VM is disposable. Remove unrelated SDKs and preloaded images
+      # before the Rust build creates BuildKit layers and OCI archives.
+      - name: Free disk space for image builds
+        run: |
+          test "$RUNNER_ENVIRONMENT" = "github-hosted"
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
+          docker image prune --all --force
+          df -h /
 
       - name: Install build dependencies
         run: |
@@ -79,7 +87,7 @@ jobs:
           path: digest.txt
           retention-days: 1
 
-      # Free workspace disk on the shared host (oci.tar is large).
+      # Free workspace disk after recording the digest (oci.tar is large).
       - name: Clean up build artifacts
         if: always()
         run: rm -f oci.tar
@@ -87,7 +95,7 @@ jobs:
   # Sequential builds on the same runner to test build-to-build reproducibility.
   sequential-builds:
     name: Sequential Builds
-    runs-on: [self-hosted, infra]
+    runs-on: ubuntu-latest
     outputs:
       mismatch: ${{ steps.compare.outputs.mismatch }}
     steps:
@@ -95,6 +103,15 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
+
+      # This VM is disposable. Remove unrelated SDKs and preloaded images
+      # before the Rust build creates BuildKit layers and OCI archives.
+      - name: Free disk space for image builds
+        run: |
+          test "$RUNNER_ENVIRONMENT" = "github-hosted"
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
+          docker image prune --all --force
+          df -h /
 
       - name: Install build dependencies
         run: |
@@ -117,12 +134,9 @@ jobs:
           # Save first build artifact
           mv oci.tar oci-first.tar
 
-      # IMPORTANT: do NOT run `docker system prune` / `docker builder prune`
-      # here. These jobs run on shared production hosts (the infra fleet lives
-      # on the GPU inference machines), and a global prune would delete images
-      # and volumes belonging to other services. build-image.sh already builds
-      # with `--no-cache`, so the second build reuses no layers from the first
-      # regardless — that is what makes this a valid build-to-build test.
+      # build-image.sh uses a fresh builder and --no-cache, so the second
+      # build reuses no layers from the first. Keep the first archive for
+      # comparison and mismatch diagnostics.
 
       - name: Second build
         run: |
@@ -171,7 +185,7 @@ jobs:
             oci-second.tar
           retention-days: 1
 
-      # Free workspace disk on the shared host (oci tars are large).
+      # Free workspace disk after digest comparison (OCI tars are large).
       - name: Clean up build artifacts
         if: always()
         run: rm -f oci-first.tar oci-second.tar

@@ -6,48 +6,7 @@
 
 use crate::common::*;
 use api::models::BatchUpdateModelApiRequest;
-use services::inference_provider_pool::ChatRoutingHints;
 use std::sync::Arc;
-
-fn chat_params(model: &str) -> inference_providers::ChatCompletionParams {
-    inference_providers::ChatCompletionParams {
-        placement: Default::default(),
-        request_priority: 0,
-        model: model.to_string(),
-        messages: vec![inference_providers::ChatMessage {
-            reasoning_content: None,
-            role: inference_providers::MessageRole::User,
-            content: Some(serde_json::Value::String("hello".to_string())),
-            name: None,
-            tool_call_id: None,
-            tool_calls: None,
-        }],
-        max_tokens: None,
-        temperature: None,
-        top_p: None,
-        stop: None,
-        stream: Some(false),
-        tools: None,
-        max_completion_tokens: None,
-        n: None,
-        frequency_penalty: None,
-        presence_penalty: None,
-        logit_bias: None,
-        logprobs: None,
-        top_logprobs: None,
-        user: None,
-        seed: None,
-        tool_choice: None,
-        parallel_tool_calls: None,
-        metadata: None,
-        store: None,
-        stream_options: None,
-        service_tier: None,
-        modalities: None,
-        original_request: None,
-        extra: std::collections::HashMap::new(),
-    }
-}
 
 /// Blocking #1 (round-9): a PATCH with `provider_type: "chutes"` previously hit
 /// the admin handler's unregister loop (`has_type_change`) and removed the pinned
@@ -101,18 +60,26 @@ async fn admin_patch_with_provider_type_keeps_pinned_provider() {
     );
     assert!(pool.is_pinned(&model));
 
-    let served = pool
-        .chat_completion_with_attribution_and_hints(
-            chat_params(&model),
-            "live-catalog-role".to_string(),
-            ChatRoutingHints {
-                fallback_disabled: true,
-                ..Default::default()
-            },
-        )
+    let org = setup_org_with_credits(&server, 10_000_000_000).await;
+    server
+        .patch(&format!("/v1/organizations/{}/settings", org.id))
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .json(&serde_json::json!({"fallback_enabled": false}))
         .await
-        .expect("the live catalog update must reclassify the standalone pin as primary");
-    assert!(String::from_utf8_lossy(&served.response.raw_bytes).contains("served-by-live-primary"));
+        .assert_status_ok();
+    let key = get_api_key_for_org(&server, org.id).await;
+    let response = server
+        .post("/v1/chat/completions")
+        .add_header("Authorization", format!("Bearer {key}"))
+        .json(&serde_json::json!({
+            "model": model,
+            "messages": [{"role": "user", "content": "hello"}],
+            "stream": false
+        }))
+        .await;
+    response.assert_status_ok();
+    assert!(response.text().contains("served-by-live-primary"));
 }
 
 /// Blocking #2 (round-9): `ensure_chutes_catalog_row` uses `seed_model_if_absent`

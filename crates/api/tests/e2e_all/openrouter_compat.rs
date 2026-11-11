@@ -19,7 +19,8 @@ async fn setup() -> (
 ) {
     let (server, _pool, mock, _db) = setup_test_server_with_pool().await;
     let model = setup_qwen_model(&server).await;
-    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+    // Include the media allowance at this fixture's synthetic token prices.
+    let org = setup_org_with_credits(&server, 100_000_000_000i64).await;
     let api_key = get_api_key_for_org(&server, org.id).await;
     (server, mock, model, api_key)
 }
@@ -184,7 +185,7 @@ async fn test_undeclared_input_modality_is_400_before_dispatch() {
     mock.set_default_response(ResponseTemplate::new("described"))
         .await;
     pool.register_provider(model.clone(), mock.clone()).await;
-    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+    let org = setup_org_with_credits(&server, 100_000_000_000i64).await;
     let api_key = get_api_key_for_org(&server, org.id).await;
 
     let video = serde_json::json!({

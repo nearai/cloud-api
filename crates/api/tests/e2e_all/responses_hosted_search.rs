@@ -178,6 +178,9 @@ pub(super) async fn assert_no_history(database: &database::Database, response: &
     );
 }
 
+// Fund up to ten independently admitted rounds at the synthetic token prices.
+const SEARCH_TEST_CREDITS: i64 = 100_000_000_000;
+
 #[tokio::test]
 async fn request_web_search_count_overrides_the_model_and_zero_skips_the_provider() {
     for stream in [false, true] {
@@ -185,7 +188,7 @@ async fn request_web_search_count_overrides_the_model_and_zero_skips_the_provide
         let (server, database, mock) =
             setup_test_server_with_search_providers(provider.clone(), None).await;
         let model = setup_qwen_model(&server).await;
-        let org = setup_org_with_credits(&server, 10_000_000_000).await;
+        let org = setup_org_with_credits(&server, SEARCH_TEST_CREDITS).await;
         let api_key = get_api_key_for_org(&server, org.id).await;
         mock.when(RequestMatcher::ToolResultCount(0))
             .respond_with(
@@ -234,7 +237,7 @@ async fn multiple_search_rounds_accumulate_sources_usage_and_unique_output_ids()
     let (server, database, mock) =
         setup_test_server_with_search_providers(provider.clone(), None).await;
     let model = setup_qwen_model(&server).await;
-    let org = setup_org_with_credits(&server, 10_000_000_000).await;
+    let org = setup_org_with_credits(&server, SEARCH_TEST_CREDITS).await;
     let api_key = get_api_key_for_org(&server, org.id).await;
     for (round, query) in ["first", "second"].into_iter().enumerate() {
         mock.when(RequestMatcher::ToolResultCount(round))
@@ -362,7 +365,7 @@ async fn forced_search_choice_only_applies_until_the_search_has_executed() {
             setup_test_server_with_search_providers(provider.clone(), None).await;
         *provider.model_provider.lock().unwrap() = Some(mock.clone());
         let model = setup_qwen_model(&server).await;
-        let org = setup_org_with_credits(&server, 10_000_000_000).await;
+        let org = setup_org_with_credits(&server, SEARCH_TEST_CREDITS).await;
         let api_key = get_api_key_for_org(&server, org.id).await;
         mock.when(RequestMatcher::ToolResultCount(0))
             .respond_with(
@@ -416,7 +419,7 @@ async fn failed_search_emits_failure_with_usage_and_does_not_start_another_infer
         let (server, database, mock) =
             setup_test_server_with_search_providers(provider.clone(), Some(provider.clone())).await;
         let model = setup_qwen_model(&server).await;
-        let org = setup_org_with_credits(&server, 10_000_000_000).await;
+        let org = setup_org_with_credits(&server, SEARCH_TEST_CREDITS).await;
         let api_key = get_api_key_for_org(&server, org.id).await;
         mock.set_default_response(
             ResponseTemplate::new("")
@@ -468,7 +471,7 @@ async fn repeated_searches_stop_at_the_request_round_limit() {
     let (server, database, mock) =
         setup_test_server_with_search_providers(provider.clone(), None).await;
     let model = setup_qwen_model(&server).await;
-    let org = setup_org_with_credits(&server, 10_000_000_000).await;
+    let org = setup_org_with_credits(&server, SEARCH_TEST_CREDITS).await;
     let api_key = get_api_key_for_org(&server, org.id).await;
     mock.set_default_response(
         ResponseTemplate::new("")
@@ -499,7 +502,7 @@ async fn model_failure_after_search_retains_prior_usage_and_partial_output() {
     let (server, database, mock) =
         setup_test_server_with_search_providers(provider.clone(), None).await;
     let model = setup_qwen_model(&server).await;
-    let org = setup_org_with_credits(&server, 10_000_000_000).await;
+    let org = setup_org_with_credits(&server, SEARCH_TEST_CREDITS).await;
     let api_key = get_api_key_for_org(&server, org.id).await;
     mock.when(RequestMatcher::ToolResultCount(0))
         .respond_with(
@@ -570,7 +573,7 @@ async fn mixed_client_and_search_calls_return_control_without_executing_search()
     let (server, database, mock) =
         setup_test_server_with_search_providers(provider.clone(), None).await;
     let model = setup_qwen_model(&server).await;
-    let org = setup_org_with_credits(&server, 10_000_000_000).await;
+    let org = setup_org_with_credits(&server, SEARCH_TEST_CREDITS).await;
     let api_key = get_api_key_for_org(&server, org.id).await;
     let arguments = "{ \"path\" : \"notes.txt\" }";
     for stream in [false, true] {

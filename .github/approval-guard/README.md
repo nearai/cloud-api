@@ -24,7 +24,7 @@ Approvals from those people are shown in the check but don't count.
 1. **Create the GitHub App `approval-guard`.**
    - Org-owned, private, no webhook.
    - Repository permissions: Checks read/write, Pull requests read, Contents read, Metadata read.
-   - Install it on the pilot repo only at first.
+   - Install it on each repo that uses the check (*Only select repositories*). Without it the token step fails.
 2. **Generate one private key** for the App.
 
 ## Per repo (repo admin)
@@ -34,6 +34,8 @@ Approvals from those people are shown in the check but don't count.
    - Secret `APPROVAL_GUARD_APP_KEY`: the App's private key (PEM).
    - Variable `APPROVAL_GUARD_CLIENT_ID`: the App's Client ID.
    - Deployment-branch rule type must be **branch**, not tag.
+   - Admin bypass off: uncheck *Allow administrators to bypass configured protection rules*.
+   - Do this **before** merging step 2. A job that names a missing environment makes GitHub create it with no branch rule.
 2. **Merge the PR that adds the files above.**
 3. **Report-only period:** the check posts on every PR but is not required yet. Watch it for a few days; it should say `success` wherever a non-contributor approved.
 4. **Restrict review dismissal:** branch protection → *Require a pull request before merging* → *Restrict who can dismiss pull request reviews* with nobody added (admins only). Otherwise a writer can dismiss a reviewer's "changes requested" while stopping the guard's re-check, and merge on an earlier success.

@@ -454,7 +454,8 @@ fn client(
         .into_connection_info()
         .map_err(|e| format!("url:{:?}", e.kind()))?;
     if let Some(pw) = password.filter(|p| !p.is_empty()) {
-        info.redis.password = Some(pw);
+        let settings = info.redis_settings().clone().set_password(pw);
+        info = info.set_redis_settings(settings);
     }
     match ca_pem {
         Some(pem) => {
@@ -502,8 +503,8 @@ async fn connect(
     hosts: &Arc<ArcSwap<BackendHosts>>,
 ) -> Option<ConnectionManager> {
     let config = ConnectionManagerConfig::new()
-        .set_connection_timeout(Duration::from_secs(2))
-        .set_response_timeout(Duration::from_secs(1))
+        .set_connection_timeout(Some(Duration::from_secs(2)))
+        .set_response_timeout(Some(Duration::from_secs(1)))
         .set_number_of_retries(1);
     let mut delay = CONNECT_RETRY_MIN;
     let mut last_warn: Option<Instant> = None;
@@ -799,7 +800,7 @@ struct Accepted {
 fn decode_frame(v: redis::Value) -> Result<Option<String>, ()> {
     match v {
         redis::Value::Nil => Ok(None),
-        v => redis::from_owned_redis_value::<String>(v)
+        v => redis::from_redis_value::<String>(v)
             .map(Some)
             .map_err(|_| ()),
     }
@@ -811,7 +812,7 @@ fn routed_sum(hashes: impl IntoIterator<Item = redis::Value>) -> (u64, u64) {
     let mut req = 0u64;
     let mut tok = 0u64;
     for v in hashes {
-        let Ok(h) = redis::from_owned_redis_value::<HashMap<String, String>>(v) else {
+        let Ok(h) = redis::from_redis_value::<HashMap<String, String>>(v) else {
             continue;
         };
         req = req.saturating_add(h.get("req").and_then(|v| v.parse().ok()).unwrap_or(0));
@@ -1159,11 +1160,7 @@ fn pin_entries(ids: Vec<redis::streams::StreamId>) -> Vec<PinEntry> {
             fields: sid
                 .map
                 .into_iter()
-                .filter_map(|(k, v)| {
-                    redis::from_owned_redis_value::<String>(v)
-                        .ok()
-                        .map(|v| (k, v))
-                })
+                .filter_map(|(k, v)| redis::from_redis_value::<String>(v).ok().map(|v| (k, v)))
                 .collect(),
         })
         .collect()
@@ -1211,7 +1208,7 @@ fn read_pipeline(targets: &ReadTargets, last_id: &str, now_s: u64) -> redis::Pip
 /// A data-plane switch from an `EXISTS` reply: on when the key exists,
 /// whatever its value type.
 fn switch_from_exists(reply: redis::Value) -> redis::RedisResult<bool> {
-    Ok(redis::from_owned_redis_value::<i64>(reply)? > 0)
+    Ok(redis::from_redis_value::<i64>(reply)? > 0)
 }
 
 /// Issues one read pipeline. `read_ms` is this node's clock just before it
@@ -1230,7 +1227,10 @@ async fn fetch(
     let mut it = values.into_iter();
     let mut next = || {
         it.next().ok_or_else(|| {
-            redis::RedisError::from((redis::ErrorKind::TypeError, "short pipeline reply"))
+            redis::RedisError::from((
+                redis::ErrorKind::UnexpectedReturnType,
+                "short pipeline reply",
+            ))
         })
     };
 
@@ -1238,11 +1238,11 @@ async fn fetch(
     let frames: Vec<redis::Value> = if targets.hosts.is_empty() {
         Vec::new()
     } else {
-        redis::from_owned_redis_value(next()?)?
+        redis::from_redis_value(next()?)?
     };
     if frames.len() != targets.hosts.len() {
         return Err(redis::RedisError::from((
-            redis::ErrorKind::TypeError,
+            redis::ErrorKind::UnexpectedReturnType,
             "MGET reply length mismatch",
         )));
     }
@@ -1250,7 +1250,7 @@ async fn fetch(
     for _ in &targets.slots {
         routed.push(routed_sum([next()?, next()?]));
     }
-    let xread: Option<redis::streams::StreamReadReply> = redis::from_owned_redis_value(next()?)?;
+    let xread: Option<redis::streams::StreamReadReply> = redis::from_redis_value(next()?)?;
     let pins = xread
         .map(|r| {
             r.keys
@@ -1573,7 +1573,7 @@ mod tests {
 
         // A failed read keeps the old routed counts, and with them the old
         // read time.
-        let err = redis::RedisError::from((redis::ErrorKind::IoError, "down"));
+        let err = redis::RedisError::from((redis::ErrorKind::Io, "down"));
         assert!(publish_cycle(&mut state, &slot, Err(err), &reg, t0 + 500, &metrics).is_err());
         assert_eq!(slot.load().routed_read_ms, t0 - 300);
     }
@@ -1612,7 +1612,7 @@ mod tests {
         assert_eq!(acks.len(), WRITE_BATCH - 1);
 
         let failed: redis::RedisResult<()> =
-            Err(redis::RedisError::from((redis::ErrorKind::IoError, "down")));
+            Err(redis::RedisError::from((redis::ErrorKind::Io, "down")));
         acknowledge(&acks, &failed, 1_234);
         assert_eq!(a.acked_ms(), None);
         assert_eq!(b.acked_ms(), None);
@@ -1636,7 +1636,7 @@ mod tests {
         assert_eq!(acks[0].acked_ms(), None);
 
         let failed: redis::RedisResult<()> =
-            Err(redis::RedisError::from((redis::ErrorKind::IoError, "down")));
+            Err(redis::RedisError::from((redis::ErrorKind::Io, "down")));
         acknowledge(&acks, &failed, 1_234);
         assert!(acks.iter().all(|a| a.acked_ms().is_none()));
 
@@ -1668,7 +1668,7 @@ mod tests {
         ));
 
         // Valkey goes away: the previous snapshot is kept, not replaced.
-        let err = redis::RedisError::from((redis::ErrorKind::IoError, "down"));
+        let err = redis::RedisError::from((redis::ErrorKind::Io, "down"));
         assert!(publish_cycle(&mut state, &slot, Err(err), &reg, t0 + 500, &metrics).is_err());
         assert_eq!(slot.load().built_ms, t0);
         assert_eq!(metrics.total(METRIC_READ_ERRORS, None), 1);
@@ -2548,6 +2548,7 @@ mod tests {
             .map(|a| match a {
                 redis::Arg::Simple(b) => String::from_utf8_lossy(b).into_owned(),
                 redis::Arg::Cursor => "<cursor>".to_string(),
+                other => panic!("unsupported argument in command fixture: {other:?}"),
             })
             .collect()
     }
@@ -2675,6 +2676,31 @@ mod tests {
         assert!(endpoint_client(&endpoint(false, None), "pw".into()).is_ok());
     }
 
+    #[test]
+    fn password_override_preserves_acl_database_and_protocol() {
+        let configured = client(
+            "redis://router:old@203.0.113.7:6379/3?protocol=3",
+            None,
+            Some("new".into()),
+        )
+        .unwrap();
+        let settings = configured.get_connection_info().redis_settings();
+        assert_eq!(settings.username(), Some("router"));
+        assert_eq!(settings.password(), Some("new"));
+        assert_eq!(settings.db(), 3);
+        assert_eq!(settings.protocol(), redis::ProtocolVersion::RESP3);
+
+        let configured = client(
+            "redis://router:old@203.0.113.7:6379",
+            None,
+            Some(String::new()),
+        )
+        .unwrap();
+        let settings = configured.get_connection_info().redis_settings();
+        assert_eq!(settings.password(), Some("old"));
+        assert_eq!(settings.protocol(), redis::ProtocolVersion::RESP2);
+    }
+
     /// A bad CA is a config error (placement stays off), never a panic and
     /// never a fallback to the platform's trust roots.
     #[test]
@@ -2725,13 +2751,20 @@ mod tests {
             .map(|p| std::fs::read_to_string(p).unwrap());
         install_crypto_provider();
         let client = client(&url, ca.as_deref(), None).unwrap();
-        let held = Arc::new(ArcSwap::from_pointee(BackendHosts::default()));
-        let _owner = held.clone();
-        let mut conn = connect(&client, &held).await.expect("not orphaned");
-
-        // A host id unique to this run keeps the keys test-owned.
+        // A host id unique to this run keeps the keys test-owned. The
+        // connection stays idle until discovery supplies a publishing key.
         let host = format!("test-{}", uuid::Uuid::new_v4());
         let reg = registry_for(&[host.as_str()]);
+        let held = Arc::new(ArcSwap::from_pointee(BackendHosts {
+            keys: reg.clone(),
+            ..BackendHosts::default()
+        }));
+        let _owner = held.clone();
+        let mut conn = tokio::time::timeout(Duration::from_secs(10), connect(&client, &held))
+            .await
+            .expect("disposable Valkey must connect within 10 seconds")
+            .expect("not orphaned");
+
         let now = now_ms();
         let _: () = redis::cmd("SET")
             .arg(replica_key(&host))

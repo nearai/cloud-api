@@ -6,18 +6,19 @@
 //! orgs/workspaces/keys, not separate databases.
 
 pub mod db_setup;
+mod encryption_jobs;
 pub mod fake_ita;
 pub mod ita_evidence;
 pub mod ita_server;
+pub mod seeding;
 
 pub use db_setup::MOCK_USER_ID;
+pub use encryption_jobs::EncryptionJobsCleanup;
 pub use ita_evidence::setup_test_server_with_config_and_ita_model_evidence;
 pub use ita_server::{setup_ita_server, setup_ita_server_with_env_policy, ItaServerMode};
 
 use api::{
-    build_app_with_config_and_options, init_auth_services,
-    models::{BatchUpdateModelApiRequest, CreateServiceRequest},
-    AppBuildOptions,
+    init_auth_services, models::BatchUpdateModelApiRequest, AppBuildOptions, DomainServices,
 };
 use async_trait::async_trait;
 use base64::Engine;
@@ -43,6 +44,9 @@ use ed25519_dalek::{Signature as Ed25519Signature, VerifyingKey as Ed25519Verify
 use k256::ecdsa::{RecoveryId, Signature as EcdsaSignature, VerifyingKey};
 #[cfg(test)]
 use sha3::Keccak256;
+
+pub const ADMIN_ALLOWLIST_EMAIL: &str = "admin@test.com";
+pub const NON_ADMIN_ALLOWLIST_EMAIL: &str = "other@test.com";
 
 pub(super) const E2E_APP_BUILD_OPTIONS: AppBuildOptions = AppBuildOptions {
     // Individual encryption jobs still start from their request handler. Only
@@ -105,7 +109,7 @@ pub fn test_config() -> ApiConfig {
             github: None,
             google: None,
             near: config::NearConfig::default(),
-            admin_domains: vec!["test.com".to_string()],
+            admin_emails: vec![ADMIN_ALLOWLIST_EMAIL.to_string()],
             admin_read_only_tokens_enabled: false,
             require_session_bound_access_tokens: false,
         },
@@ -132,10 +136,14 @@ pub fn test_config() -> ApiConfig {
         // mock-storage and database-encryption behavior across processes.
         database_encryption_key: "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
             .to_string(),
+        database_encryption_keys: None,
         database_encryption_key_id: "e2e-db-v1".to_string(),
         // Preserve encrypted-write coverage in E2E tests; production defaults off.
         database_encryption_write_enabled: true,
         s3: config::S3Config {
+            object_rewrap_max_bytes: 268_435_456,
+            object_encryption_write_enabled: true,
+            encryption_keys: None,
             mock: true,
             bucket: "test-bucket".to_string(),
             region: "us-east-1".to_string(),
@@ -564,6 +572,35 @@ where
     )
 }
 
+/// Like [`setup_test_server_with_pool_and_config`], with the underlying
+/// router, for a test that also serves it on a real listener: the OHTTP
+/// gateway sends the request it decrypts to this API over a loopback
+/// connection on `config.server.port`.
+pub async fn setup_test_server_with_pool_config_and_router<F>(
+    mutate: F,
+) -> (
+    axum_test::TestServer,
+    axum::Router,
+    std::sync::Arc<services::inference_provider_pool::InferenceProviderPool>,
+    std::sync::Arc<inference_providers::mock::MockProvider>,
+    Arc<Database>,
+)
+where
+    F: FnOnce(&mut config::ApiConfig),
+{
+    let mut infra = setup_test_infrastructure().await;
+    mutate(&mut infra.config);
+    let (server, inference_provider_pool, mock_provider, router) =
+        build_test_server_components(infra.database.clone(), infra.config).await;
+    (
+        server,
+        router,
+        inference_provider_pool,
+        mock_provider,
+        infra.database,
+    )
+}
+
 /// Like `setup_test_server`, but also returns the underlying `axum::Router`,
 /// so a test can drive it in-process (`tower::ServiceExt::oneshot`) and poll
 /// the response body frame-by-frame. `axum_test` buffers whole response
@@ -644,47 +681,15 @@ async fn setup_test_infrastructure_for_real_providers() -> TestInfrastructure {
     TestInfrastructure { database, config }
 }
 
-pub async fn setup_test_server_with_mcp_factory(
-    mcp_client_factory: std::sync::Arc<dyn services::responses::tools::McpClientFactory>,
-) -> (
-    axum_test::TestServer,
-    std::sync::Arc<services::inference_provider_pool::InferenceProviderPool>,
-    std::sync::Arc<inference_providers::mock::MockProvider>,
-) {
-    let infra = setup_test_infrastructure().await;
-
-    assert_mock_user_in_db(&infra.database).await;
-
-    let auth_components = init_auth_services(infra.database.clone(), &infra.config);
-
-    let (inference_provider_pool, mock_provider) =
-        api::init_inference_providers_with_mocks(&infra.config).await;
-    let metrics_service = Arc::new(services::metrics::MockMetricsService);
-
-    let domain_services = api::init_domain_services_with_mcp_factory(
-        infra.database.clone(),
-        &infra.config,
-        auth_components.organization_service.clone(),
-        inference_provider_pool.clone(),
-        metrics_service,
-        mcp_client_factory,
-    )
-    .await;
-
-    let app = build_app_with_config_and_options(
-        infra.database.clone(),
-        auth_components,
-        domain_services,
-        Arc::new(infra.config),
-        E2E_APP_BUILD_OPTIONS,
-    );
-    let server = axum_test::TestServer::new(app);
-
-    (server, inference_provider_pool, mock_provider)
+pub async fn setup_unique_test_session(database: &Arc<Database>) -> (String, String) {
+    setup_unique_test_session_with_user_id(database, uuid::Uuid::new_v4()).await
 }
 
-pub async fn setup_unique_test_session(database: &Arc<Database>) -> (String, String) {
-    let user_id = uuid::Uuid::new_v4();
+/// Preselect an identity so real-auth admin tests can allowlist it before building the server.
+pub async fn setup_unique_test_session_with_user_id(
+    database: &Arc<Database>,
+    user_id: uuid::Uuid,
+) -> (String, String) {
     let user_id_str = user_id.to_string();
     // Session ID format: rt_{uuid} (with dashes so it can be parsed by MockAuthService)
     let session_id = format!("rt_{user_id_str}");
@@ -728,21 +733,10 @@ pub async fn create_org(server: &axum_test::TestServer) -> api::models::Organiza
 }
 
 pub async fn create_org_with_session(
-    server: &axum_test::TestServer,
+    _server: &axum_test::TestServer,
     session_id: &str,
 ) -> api::models::OrganizationResponse {
-    let request = api::models::CreateOrganizationRequest {
-        name: uuid::Uuid::new_v4().to_string(),
-        description: Some("A test organization".to_string()),
-    };
-    let response = server
-        .post("/v1/organizations")
-        .add_header("Authorization", format!("Bearer {session_id}"))
-        .add_header("User-Agent", MOCK_USER_AGENT)
-        .json(&serde_json::json!(request))
-        .await;
-    assert_eq!(response.status_code(), 200);
-    response.json::<api::models::OrganizationResponse>()
+    seeding::seed_organization(session_id).await
 }
 
 pub async fn setup_org_with_credits(
@@ -773,31 +767,23 @@ pub async fn setup_org_with_credits_and_session_and_email(
     email: &str,
 ) -> api::models::OrganizationResponse {
     let org = create_org_with_session(server, session_id).await;
-
-    let update_request = serde_json::json!({
-        "type": "payment",
-        "spendLimit": {
-            "amount": amount_nano_dollars,
-            "currency": "USD"
-        },
-        "changedBy": email,
-        "changeReason": "Test credits"
-    });
-
-    let response = server
-        .patch(format!("/v1/admin/organizations/{}/limits", org.id).as_str())
-        .add_header("Authorization", format!("Bearer {session_id}"))
-        .add_header("User-Agent", MOCK_USER_AGENT)
-        .json(&update_request)
-        .await;
-
-    assert_eq!(response.status_code(), 200, "Failed to set credits");
+    seeding::seed_credit_limit(
+        session_id,
+        &org.id,
+        "payment",
+        None,
+        amount_nano_dollars,
+        "USD",
+        email,
+        "Test credits",
+    )
+    .await;
     org
 }
 
 /// Add credits with specific type and source to an organization
 pub async fn add_credits_with_type(
-    server: &axum_test::TestServer,
+    _server: &axum_test::TestServer,
     org_id: &str,
     credit_type: &str,
     source: Option<&str>,
@@ -805,35 +791,17 @@ pub async fn add_credits_with_type(
     currency: &str,
     session_id: &str,
 ) -> api::models::UpdateOrganizationLimitsResponse {
-    let mut update_request = serde_json::json!({
-        "type": credit_type,
-        "spendLimit": {
-            "amount": amount_nano_dollars,
-            "currency": currency
-        },
-        "changedBy": "admin@test.com",
-        "changeReason": format!("Test {} credits", credit_type)
-    });
-
-    if let Some(src) = source {
-        update_request["source"] = serde_json::Value::String(src.to_string());
-    }
-
-    let response = server
-        .patch(format!("/v1/admin/organizations/{}/limits", org_id).as_str())
-        .add_header("Authorization", format!("Bearer {session_id}"))
-        .add_header("User-Agent", MOCK_USER_AGENT)
-        .json(&update_request)
-        .await;
-
-    assert_eq!(
-        response.status_code(),
-        200,
-        "Failed to add {} credits: {}",
+    seeding::seed_credit_limit(
+        session_id,
+        org_id,
         credit_type,
-        response.text()
-    );
-    response.json::<api::models::UpdateOrganizationLimitsResponse>()
+        source,
+        amount_nano_dollars,
+        currency,
+        "admin@test.com",
+        &format!("Test {credit_type} credits"),
+    )
+    .await
 }
 
 pub async fn list_workspaces(
@@ -844,18 +812,11 @@ pub async fn list_workspaces(
 }
 
 pub async fn list_workspaces_with_session(
-    server: &axum_test::TestServer,
+    _server: &axum_test::TestServer,
     org_id: String,
-    session_id: &str,
+    _session_id: &str,
 ) -> Vec<api::routes::workspaces::WorkspaceResponse> {
-    let response = server
-        .get(format!("/v1/organizations/{org_id}/workspaces").as_str())
-        .add_header("Authorization", format!("Bearer {session_id}"))
-        .add_header("User-Agent", MOCK_USER_AGENT)
-        .await;
-    assert_eq!(response.status_code(), 200);
-    let list_response = response.json::<api::routes::workspaces::ListWorkspacesResponse>();
-    list_response.workspaces
+    seeding::seed_list_workspaces(&org_id).await
 }
 
 pub async fn create_api_key_in_workspace(
@@ -867,24 +828,12 @@ pub async fn create_api_key_in_workspace(
 }
 
 pub async fn create_api_key_in_workspace_with_session(
-    server: &axum_test::TestServer,
+    _server: &axum_test::TestServer,
     workspace_id: String,
     name: String,
     session_id: &str,
 ) -> api::models::ApiKeyResponse {
-    let request = api::models::CreateApiKeyRequest {
-        name,
-        expires_at: Some(Utc::now() + chrono::Duration::days(90)),
-        spend_limit: None,
-    };
-    let response = server
-        .post(format!("/v1/workspaces/{workspace_id}/api-keys").as_str())
-        .add_header("Authorization", format!("Bearer {session_id}"))
-        .add_header("User-Agent", MOCK_USER_AGENT)
-        .json(&serde_json::json!(request))
-        .await;
-    assert_eq!(response.status_code(), 201);
-    response.json::<api::models::ApiKeyResponse>()
+    seeding::seed_api_key(&workspace_id, name, session_id).await
 }
 
 pub async fn get_api_key_for_org(server: &axum_test::TestServer, org_id: String) -> String {
@@ -1044,41 +993,12 @@ pub async fn setup_glm_model(_server: &axum_test::TestServer) -> String {
     E2E_GLM_MODEL_NAME.to_string()
 }
 
-/// Get or create web_search platform service via admin API (for E2E tests).
+/// Get or create the web_search platform service (for E2E tests).
 /// Uses cost_per_unit = 1_000_000 nano-USD per request when created.
 pub async fn get_or_create_web_search_service(
-    server: &axum_test::TestServer,
+    _server: &axum_test::TestServer,
 ) -> api::models::ServiceResponse {
-    let request = CreateServiceRequest {
-        service_name: services::service_usage::ports::SERVICE_NAME_WEB_SEARCH.to_string(),
-        display_name: "Web Search".to_string(),
-        description: Some("Brave web search API".to_string()),
-        unit: services::service_usage::ports::ServiceUnit::Request,
-        cost_per_unit: 1_000_000,
-    };
-    let response = server
-        .post("/v1/admin/services")
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
-        .add_header("User-Agent", MOCK_USER_AGENT)
-        .json(&request)
-        .await;
-    if response.status_code() == 200 {
-        return response.json::<api::models::ServiceResponse>();
-    }
-
-    // If creation failed (e.g., because the service already exists from a previous test),
-    // fall back to the public GET /v1/services/{service_name} and return the existing web_search service if present.
-    let get_resp = server
-        .get("/v1/services/web_search")
-        .add_header("User-Agent", MOCK_USER_AGENT)
-        .await;
-    assert_eq!(
-        get_resp.status_code(),
-        200,
-        "Failed to get existing web_search service after create_web_search_service failure: {}",
-        get_resp.text()
-    );
-    get_resp.json::<api::models::ServiceResponse>()
+    seeding::seed_web_search_service().await
 }
 
 pub async fn setup_deepseek_model(_server: &axum_test::TestServer) -> String {
@@ -1142,6 +1062,40 @@ pub fn create_test_audio_base64() -> String {
     base64::engine::general_purpose::STANDARD.encode(&wav_data)
 }
 
+/// `api::build_app_with_config_and_options`, registering the app's models service so
+/// seeding can invalidate its caches.
+pub(crate) fn build_app_with_config_and_options(
+    database: Arc<Database>,
+    auth_components: api::AuthComponents,
+    domain_services: DomainServices,
+    config: Arc<ApiConfig>,
+    build_options: AppBuildOptions,
+) -> axum::Router {
+    seeding::register_models_service(
+        &domain_services.models_service,
+        &domain_services.inference_provider_pool,
+    );
+    api::build_app_with_config_and_options(
+        database,
+        auth_components,
+        domain_services,
+        config,
+        build_options,
+    )
+}
+
+/// Setup: write catalog models straight to the database and invalidate the models caches.
+/// Skips the admin route's validation, provider pool changes and admin identity (see
+/// `seeding`). A test whose subject is the route calls `admin_batch_upsert_models`.
+pub async fn seed_models(
+    _server: &axum_test::TestServer,
+    models: BatchUpdateModelApiRequest,
+    session_id: String,
+) -> Vec<api::models::ModelWithPricing> {
+    seeding::seed_models(models, &session_id).await
+}
+
+/// The admin route itself: `PATCH /v1/admin/models` as an admin session.
 pub async fn admin_batch_upsert_models(
     server: &axum_test::TestServer,
     models: BatchUpdateModelApiRequest,
@@ -1278,28 +1232,16 @@ where
 /// matching complete scans make assertions on test-owned model IDs independent
 /// of those transient offset shifts.
 pub async fn list_all_admin_models(
-    server: &axum_test::TestServer,
+    _server: &axum_test::TestServer,
     include_inactive: bool,
 ) -> Vec<api::models::AdminModelWithPricing> {
     collect_stable_offset_pages(
         1000,
         std::time::Duration::from_secs(10),
         |offset, limit| async move {
-            let response = server
-                .get(&format!(
-                    "/v1/admin/models?limit={limit}&offset={offset}&include_inactive={include_inactive}"
-                ))
-                .add_header("Authorization", format!("Bearer {}", get_session_id()))
-                .add_header("User-Agent", MOCK_USER_AGENT)
-                .await;
-            assert_eq!(response.status_code(), 200, "{}", response.text());
-            let page = response.json::<api::models::AdminModelListResponse>();
-            assert_eq!(page.limit, limit, "admin model page limit changed");
-            assert_eq!(page.offset, offset, "admin model page offset changed");
-            OffsetPage {
-                items: page.models,
-                total: page.total,
-            }
+            let (items, total) =
+                seeding::seed_list_models_page(include_inactive, limit, offset).await;
+            OffsetPage { items, total }
         },
         |model| model.model_id.clone(),
     )

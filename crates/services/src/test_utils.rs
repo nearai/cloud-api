@@ -113,14 +113,6 @@ impl AttestationServiceTrait for MockAttestationService {
             "Not implemented".to_string(),
         ))
     }
-
-    async fn verify_vpc_signature(
-        &self,
-        _timestamp: i64,
-        _signature: String,
-    ) -> Result<bool, AttestationError> {
-        Ok(false)
-    }
 }
 
 pub struct MockUsageService;

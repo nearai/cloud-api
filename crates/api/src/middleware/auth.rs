@@ -294,6 +294,44 @@ pub async fn optional_auth_middleware_with_workspace_context(
     auth_middleware_with_workspace_context(State(state), request, next).await
 }
 
+/// Authentication for the public model catalog (`GET /v1/models`), which
+/// answers an organization that set `allowed_models` with those models only.
+///
+/// It never rejects a request. A request goes on with an `AuthenticatedApiKey`
+/// extension only when it carries a valid API key of an organization with a
+/// filter. Anything else is served the public catalog as before: no header, a
+/// session token, a key that does not authenticate, or a key of an
+/// organization without a filter.
+///
+/// A key that fails to authenticate falls back to the public catalog, so a
+/// lookup error can show a filtered organization the public list. That is a
+/// listing only: every route that serves a model checks the filter itself.
+pub async fn filtered_catalog_middleware(
+    State(state): State<AuthState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    // Either header form: Anthropic SDK clients send the key as `x-api-key`.
+    let token = anthropic_auth_token(request.headers())
+        .ok()
+        .filter(|token| token.starts_with("sk-"))
+        .map(str::to_owned);
+    let Some(token) = token else {
+        return next.run(request).await;
+    };
+    // Authenticating the key counts as using it, like any other call with it:
+    // a key-cache miss updates `last_used_at`.
+    match authenticate_api_key_with_context(&state, &token).await {
+        Ok(api_key) if api_key.organization.allowed_models().is_some() => {
+            let caller_token = caller_key(Some(&token));
+            let mut request = request;
+            request.extensions_mut().insert(api_key);
+            with_caller_key(caller_token, next.run(request)).await
+        }
+        _ => next.run(request).await,
+    }
+}
+
 /// Native Anthropic auth accepts the SDK's `x-api-key` header as well as the
 /// Cloud API Bearer form, while keeping Cloud API as the credential authority.
 pub async fn anthropic_auth_middleware_with_workspace_context(
@@ -419,7 +457,7 @@ pub async fn auth_middleware_with_reporting_token(
 }
 
 /// Admin authentication middleware - verifies user is authenticated AND has admin access
-/// Supports both access tokens (with admin domain check) and admin access tokens
+/// Supports both access tokens (with admin email allowlist check) and admin access tokens
 pub async fn admin_middleware(
     State(state): State<AuthState>,
     request: Request,
@@ -534,7 +572,7 @@ pub async fn admin_middleware(
     match auth_result {
         Ok((user, context)) => {
             audit.record_authenticated(user.id);
-            // Check if user has admin access based on email domain
+            // Check if user has admin access against the email allowlist
             let is_admin = check_admin_access(&state, &user);
 
             if !is_admin {
@@ -570,22 +608,27 @@ pub async fn admin_middleware(
     }
 }
 
-/// Check if a user has admin access based on their email domain
+/// Auth provider recorded for users created by the retired VPC login route.
+/// Such users remain in the database and must never be treated as admins.
+pub const VPC_AUTH_PROVIDER: &str = "vpc";
+pub const VPC_PROVIDER_USER_ID_PREFIX: &str = "vpc:";
+
+/// Check if a user has admin access against the explicit email allowlist
 fn check_admin_access(state: &AuthState, user: &DbUser) -> bool {
-    is_admin_user(&state.admin_domains, user)
+    is_admin_user(&state.admin_emails, user)
 }
 
-fn is_admin_user(admin_domains: &[String], user: &DbUser) -> bool {
-    if user.auth_provider == crate::routes::auth_vpc::VPC_AUTH_PROVIDER
+fn is_admin_user(admin_emails: &[String], user: &DbUser) -> bool {
+    if user.auth_provider == VPC_AUTH_PROVIDER
         || user
             .provider_user_id
-            .starts_with(crate::routes::auth_vpc::VPC_PROVIDER_USER_ID_PREFIX)
+            .starts_with(VPC_PROVIDER_USER_ID_PREFIX)
     {
         tracing::warn!(user_id = %user.id, "VPC-provisioned user attempted admin action");
         return false;
     }
 
-    config::email_matches_admin_domain(admin_domains, &user.email)
+    config::email_matches_admin_allowlist(admin_emails, &user.email)
 }
 
 /// Authenticate admin access token
@@ -962,7 +1005,7 @@ pub struct AuthState {
     pub reporting_token_service:
         Arc<dyn services::reporting_tokens::OrganizationReportingTokenService>,
     pub admin_access_token_repository: Arc<database::repositories::AdminAccessTokenRepository>,
-    pub admin_domains: Vec<String>,
+    pub admin_emails: Vec<String>,
     pub encoding_key: String,
 }
 
@@ -975,7 +1018,7 @@ impl AuthState {
             dyn services::reporting_tokens::OrganizationReportingTokenService,
         >,
         admin_access_token_repository: Arc<database::repositories::AdminAccessTokenRepository>,
-        admin_domains: Vec<String>,
+        admin_emails: Vec<String>,
         encoding_key: String,
     ) -> Self {
         Self {
@@ -984,7 +1027,7 @@ impl AuthState {
             workspace_repository,
             reporting_token_service,
             admin_access_token_repository,
-            admin_domains,
+            admin_emails,
             encoding_key,
         }
     }
@@ -1038,25 +1081,29 @@ mod tests {
 
     #[test]
     fn vpc_and_malformed_email_never_grant_admin_access() {
-        let admin_domains = vec!["near.ai".to_string()];
+        let admin_emails = vec!["admin@near.ai".to_string()];
+
         assert!(is_admin_user(
-            &admin_domains,
+            &admin_emails,
             &admin_test_user("google", "admin@near.ai")
         ));
         assert!(!is_admin_user(
-            &admin_domains,
+            &admin_emails,
             &admin_test_user("vpc", "admin@near.ai")
         ));
+
         let mut google_vpc_user = admin_test_user("google", "admin@near.ai");
         google_vpc_user.provider_user_id = "vpc:legacy".to_string();
-        assert!(!is_admin_user(&admin_domains, &google_vpc_user));
+
+        assert!(!is_admin_user(&admin_emails, &google_vpc_user));
+
         for email in [
             "x@near.ai@vpc.internal.near.ai",
             "x@evil.com@near.ai",
             "x@near.ai.",
         ] {
             assert!(
-                !is_admin_user(&admin_domains, &admin_test_user("google", email)),
+                !is_admin_user(&admin_emails, &admin_test_user("google", email)),
                 "{email:?} must not be admin"
             );
         }
@@ -1064,6 +1111,20 @@ mod tests {
             &[],
             &admin_test_user("google", "admin@near.ai")
         ));
+    }
+
+    #[test]
+    fn admin_access_requires_the_stored_account_email() {
+        let admin_emails = vec!["admin@near.ai".to_string()];
+        let mut user = admin_test_user("google", "other@near.ai");
+        user.contact_email = Some("admin@near.ai".to_string());
+        user.contact_email_verified_at = Some(chrono::Utc::now());
+
+        assert!(!is_admin_user(&admin_emails, &user));
+
+        user.email = "ADMIN@NEAR.AI".to_string();
+
+        assert!(is_admin_user(&admin_emails, &user));
     }
 
     #[test]

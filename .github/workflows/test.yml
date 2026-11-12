@@ -16,7 +16,7 @@ permissions:
   contents: read
 
 # A new push to a PR supersedes the previous run, so cancel it instead of letting
-# it hold self-hosted runners. Non-PR runs get a unique group (run_id): a shared
+# it consume runners unnecessarily. Non-PR runs get a unique group (run_id): a shared
 # group would serialize main/develop pushes and GitHub would cancel the pending
 # run whenever a third arrives, leaving that commit untested.
 concurrency:
@@ -27,12 +27,9 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
   CARGO_INCREMENTAL: 0  # Faster CI builds
-  # Use sccache to cache compiled artifacts across runs. Complements
-  # swatinem/rust-cache (which caches target/) by caching at the object-file
-  # granularity, so dependency recompiles after a Cargo.lock bump or a
-  # feature-flag change are served from cache. On a self-hosted runner the
-  # cache dir persists across runs on disk (the dedicated CI host sets
-  # SCCACHE_DIR per repo), so no actions/cache step is needed.
+  # sccache reuses object files within each job. swatinem/rust-cache restores
+  # Cargo dependencies and target/ between runs; the hosted runner's local
+  # sccache directory is discarded when the job ends.
   RUSTC_WRAPPER: sccache
   # Use the mold linker on Linux for much faster linking of the large test
   # binaries (5-crate workspace, ~400 deps). We pass -fuse-ld=mold through
@@ -56,29 +53,32 @@ jobs:
   # classify (new branch, detection error) is treated as "run the tests".
   changes:
     name: Detect changes
-    # Lightweight jobs run on GitHub-hosted runners (free for this public repo)
-    # so they never queue behind Rust builds for a self-hosted slot.
     runs-on: ubuntu-latest
     permissions:
       contents: read
     outputs:
       rust: ${{ steps.detect.outputs.rust }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
+          persist-credentials: false
           fetch-depth: 0  # need history to diff the PR / push range
 
       - name: Detect Rust-relevant changes
         id: detect
+        env:
+          EVENT_PULL_REQUEST_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          EVENT_PULL_REQUEST_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          EVENT_BEFORE: ${{ github.event.before }}
         run: |
-          EVENT="${{ github.event_name }}"
+          EVENT="${GITHUB_EVENT_NAME}"
           CHANGED=""
           if [ "$EVENT" = "pull_request" ]; then
             CHANGED=$(git diff --name-only \
-              "${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }}" 2>/dev/null)
+              "${EVENT_PULL_REQUEST_BASE_SHA}...${EVENT_PULL_REQUEST_HEAD_SHA}" 2>/dev/null)
           elif [ "$EVENT" = "push" ] && \
-               [ "${{ github.event.before }}" != "0000000000000000000000000000000000000000" ]; then
-            CHANGED=$(git diff --name-only "${{ github.event.before }}" "${{ github.sha }}" 2>/dev/null)
+               [ "${EVENT_BEFORE}" != "0000000000000000000000000000000000000000" ]; then
+            CHANGED=$(git diff --name-only "${EVENT_BEFORE}" "${GITHUB_SHA}" 2>/dev/null)
           fi
           echo "Changed files:"
           echo "$CHANGED"
@@ -97,18 +97,16 @@ jobs:
     timeout-minutes: 30
     needs: changes
     if: ${{ needs.changes.outputs.rust == 'true' }}
-    # Same-repo pushes/PRs run on the dedicated CI host (ci-build-1, no deploy
-    # credentials); fork PRs fall back to GitHub-hosted. A fork could edit this
-    # expression, so the enforcement on ci-build-1 is a root-owned job-started
-    # hook that refuses fork pull requests. Same expression on unit-test,
-    # integration-test and (with the infra label) e2e-test.
-    runs-on: ${{ (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","ci-cloud-api"]') || 'ubuntu-latest' }}
+    # Every event, including fork pull requests, uses a fresh hosted VM.
+    runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@v7
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      with:
+        persist-credentials: false
 
     - name: Setup Rust CI
-      uses: ./.github/actions/setup-rust-ci
+      uses: $/.github/actions/setup-rust-ci
       with:
         cache-key: lint
         components: rustfmt, clippy
@@ -116,8 +114,7 @@ jobs:
     - name: Run cargo fmt
       run: cargo fmt --all -- --check
 
-    # Clippy reuses the same target/ dir as tests, so this also warms the
-    # sccache + rust-cache for the parallel test jobs.
+    # Each hosted job restores its own Rust dependency cache.
     - name: Run cargo clippy
       run: cargo clippy --all-targets --all-features -- -D warnings
 
@@ -131,14 +128,15 @@ jobs:
     timeout-minutes: 45
     needs: changes
     if: ${{ needs.changes.outputs.rust == 'true' }}
-    # Fork guard: see the lint job.
-    runs-on: ${{ (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","ci-cloud-api"]') || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@v7
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      with:
+        persist-credentials: false
 
     - name: Setup Rust CI
-      uses: ./.github/actions/setup-rust-ci
+      uses: $/.github/actions/setup-rust-ci
       with:
         cache-key: unit
 
@@ -158,7 +156,7 @@ jobs:
         DATABASE_TLS_ENABLED: "false"
         MODEL_DISCOVERY_SERVER_URL: ""
         MODEL_DISCOVERY_API_KEY: ""
-        AUTH_ADMIN_DOMAINS: ""
+        AUTH_ADMIN_EMAILS: ""
         AUTH_ENCODING_KEY: ""
         BRAVE_SEARCH_PRO_API_KEY: ""
         DEV: "true"
@@ -172,14 +170,15 @@ jobs:
     timeout-minutes: 45
     needs: changes
     if: ${{ needs.changes.outputs.rust == 'true' }}
-    # Fork guard: see the lint job.
-    runs-on: ${{ (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","ci-cloud-api"]') || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@v7
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      with:
+        persist-credentials: false
 
     - name: Setup Rust CI
-      uses: ./.github/actions/setup-rust-ci
+      uses: $/.github/actions/setup-rust-ci
       with:
         cache-key: integration
 
@@ -199,10 +198,7 @@ jobs:
     timeout-minutes: 60
     needs: changes
     if: ${{ needs.changes.outputs.rust == 'true' }}
-    # Fork guard: see the lint job.
-    # Runs on the dedicated CI runners: on the shared infra (gpu) runners the schema
-    # migrator container cannot reach the postgres service.
-    runs-on: ${{ (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","ci-cloud-api"]') || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
     permissions:
       contents: read
       # Pulls the cloud-platform schema image (scripts/cloud-platform-schema.env).
@@ -227,10 +223,12 @@ jobs:
           - 127.0.0.1::5432
 
     steps:
-    - uses: actions/checkout@v7
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      with:
+        persist-credentials: false
 
     - name: Setup Rust CI
-      uses: ./.github/actions/setup-rust-ci
+      uses: $/.github/actions/setup-rust-ci
       with:
         cache-key: e2e
 
@@ -287,7 +285,9 @@ jobs:
     name: Script tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
       - name: Test synthetic rollout verification
         run: python3 -B -m unittest discover -s scripts/tests -v
       - name: Test PR review comment formatter
@@ -306,29 +306,37 @@ jobs:
     if: always()
     steps:
       - name: Check all tests passed
+        env:
+          NEEDS_CHANGES_RESULT: ${{ needs.changes.result }}
+          NEEDS_SCRIPT_TEST_RESULT: ${{ needs.script-test.result }}
+          NEEDS_CHANGES_RUST: ${{ needs.changes.outputs.rust }}
+          NEEDS_LINT_RESULT: ${{ needs.lint.result }}
+          NEEDS_UNIT_TEST_RESULT: ${{ needs.unit-test.result }}
+          NEEDS_INTEGRATION_TEST_RESULT: ${{ needs.integration-test.result }}
+          NEEDS_E2E_TEST_RESULT: ${{ needs.e2e-test.result }}
         run: |
           # Fail closed if change detection itself failed — we can't safely
           # conclude tests were unnecessary.
-          if [[ "${{ needs.changes.result }}" != "success" ]]; then
-            echo "Change-detection job did not succeed (${{ needs.changes.result }}); failing closed."
+          if [[ "${NEEDS_CHANGES_RESULT}" != "success" ]]; then
+            echo "Change-detection job did not succeed (${NEEDS_CHANGES_RESULT}); failing closed."
             exit 1
           fi
 
-          if [[ "${{ needs.script-test.result }}" != "success" ]]; then
+          if [[ "${NEEDS_SCRIPT_TEST_RESULT}" != "success" ]]; then
             echo "Script tests did not succeed; failing closed."
             exit 1
           fi
 
-          if [[ "${{ needs.changes.outputs.rust }}" != "true" ]]; then
+          if [[ "${NEEDS_CHANGES_RUST}" != "true" ]]; then
             echo "No Rust-relevant changes — test jobs were skipped. Nothing to verify."
             exit 0
           fi
 
           failed=0
-          for jr in "Lint=${{ needs.lint.result }}" \
-                    "Unit tests=${{ needs.unit-test.result }}" \
-                    "Integration tests=${{ needs.integration-test.result }}" \
-                    "E2E tests=${{ needs.e2e-test.result }}"; do
+          for jr in "Lint=${NEEDS_LINT_RESULT}" \
+                    "Unit tests=${NEEDS_UNIT_TEST_RESULT}" \
+                    "Integration tests=${NEEDS_INTEGRATION_TEST_RESULT}" \
+                    "E2E tests=${NEEDS_E2E_TEST_RESULT}"; do
             name="${jr%%=*}"; res="${jr#*=}"
             if [[ "$res" != "success" ]]; then
               echo "FAIL  ${name}: ${res}"

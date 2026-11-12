@@ -401,21 +401,19 @@ impl FileRepository {
         let mut filename: String = row.get("filename");
         let mut content_type: String = row.get("content_type");
         let mut storage_key: String = row.get("storage_key");
-        if let Some((key, key_id)) = self.pool.encryption_context() {
-            filename = crate::field_encryption::decrypt_if_encrypted_with_key_id(
-                &key, &key_id, "files", "filename", id, filename,
+        if let Some(ring) = self.pool.encryption_ring() {
+            filename = crate::field_encryption::decrypt_if_encrypted_with_ring(
+                &ring, "files", "filename", id, filename,
             )?;
-            content_type = crate::field_encryption::decrypt_if_encrypted_with_key_id(
-                &key,
-                &key_id,
+            content_type = crate::field_encryption::decrypt_if_encrypted_with_ring(
+                &ring,
                 "files",
                 "content_type",
                 id,
                 content_type,
             )?;
-            storage_key = crate::field_encryption::decrypt_if_encrypted_with_key_id(
-                &key,
-                &key_id,
+            storage_key = crate::field_encryption::decrypt_if_encrypted_with_ring(
+                &ring,
                 "files",
                 "storage_key",
                 id,

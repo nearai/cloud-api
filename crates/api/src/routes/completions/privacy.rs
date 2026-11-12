@@ -311,7 +311,6 @@ pub async fn privacy_classify(
     State(app_state): State<AppState>,
     Extension(api_key): Extension<AuthenticatedApiKey>,
     Extension(body_hash): Extension<RequestBodyHash>,
-    Extension(correlation): Extension<RequestCorrelation>,
     headers: header::HeaderMap,
     requested_model: RequestedModel,
     body: Bytes,
@@ -382,7 +381,6 @@ pub async fn privacy_classify(
     };
     let mut extra = std::collections::HashMap::new();
     insert_encryption_headers(&encryption_headers, &mut extra);
-    insert_request_id_header(correlation, &mut extra);
 
     match app_state
         .completion_service
@@ -490,7 +488,6 @@ pub async fn privacy_redact(
     State(app_state): State<AppState>,
     Extension(api_key): Extension<AuthenticatedApiKey>,
     Extension(body_hash): Extension<RequestBodyHash>,
-    Extension(correlation): Extension<RequestCorrelation>,
     headers: header::HeaderMap,
     requested_model: RequestedModel,
     body: Bytes,
@@ -634,7 +631,6 @@ pub async fn privacy_redact(
     };
     let mut extra = std::collections::HashMap::new();
     insert_encryption_headers(&encryption_headers, &mut extra);
-    insert_request_id_header(correlation, &mut extra);
 
     // Forward a normalized classify request to the upstream model. We
     // deliberately rebuild the body rather than passing the client body

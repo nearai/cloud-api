@@ -171,6 +171,42 @@ async fn with_caller_key(
     }
 }
 
+/// The authenticated request's ids, which the self-hosted inference calls
+/// made while serving it send upstream. Taken from the server-chosen request
+/// id and the authenticated key only, never from client headers or the body.
+fn tracing_context_for(
+    request: &Request,
+    api_key: &AuthenticatedApiKey,
+) -> Option<inference_providers::tracing_context::TracingContext> {
+    let correlation = request
+        .extensions()
+        .get::<super::request_correlation::RequestCorrelation>()?;
+    Some(inference_providers::tracing_context::TracingContext {
+        request_id: correlation.request_id,
+        org_id: api_key.organization.id.0,
+        workspace_id: api_key.workspace.id.0,
+    })
+}
+
+/// Runs the rest of an inference request with the caller's key and the
+/// request's tenant ids in scope.
+async fn with_inference_scope(
+    token: Option<String>,
+    tracing: Option<inference_providers::tracing_context::TracingContext>,
+    request: impl std::future::Future<Output = Response>,
+) -> Response {
+    match tracing {
+        Some(context) => {
+            inference_providers::tracing_context::with_tracing_context(
+                context,
+                with_caller_key(token, request),
+            )
+            .await
+        }
+        None => with_caller_key(token, request).await,
+    }
+}
+
 pub async fn auth_middleware_with_api_key(
     State(state): State<AuthState>,
     request: Request,
@@ -267,9 +303,10 @@ pub async fn auth_middleware_with_workspace_context(
         Ok(authenticated_api_key) => {
             debug!("Adding authenticated API key with workspace context to request");
             let caller_token = caller_key(bearer(auth_header));
+            let tracing = tracing_context_for(&request, &authenticated_api_key);
             let mut request = request;
             request.extensions_mut().insert(authenticated_api_key);
-            Ok(with_caller_key(caller_token, next.run(request)).await)
+            Ok(with_inference_scope(caller_token, tracing, next.run(request)).await)
         }
         Err(error) => Err(error),
     }
@@ -349,9 +386,10 @@ pub async fn anthropic_auth_middleware_with_workspace_context(
         })?;
 
     let caller_token = caller_key(Some(token));
+    let tracing = tracing_context_for(&request, &authenticated);
     let mut request = request;
     request.extensions_mut().insert(authenticated);
-    Ok(with_caller_key(caller_token, next.run(request)).await)
+    Ok(with_inference_scope(caller_token, tracing, next.run(request)).await)
 }
 
 /// Authentication middleware that validates session tokens only

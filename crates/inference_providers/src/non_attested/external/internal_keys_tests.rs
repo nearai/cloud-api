@@ -72,12 +72,29 @@ async fn image_generation_body_omits_internal_keys_on_the_wire() {
         extra: extra_with_internal_keys(),
     };
 
-    let _ = provider.image_generation(params, String::new()).await;
+    let context = crate::tracing_context::TracingContext {
+        request_id: uuid::Uuid::new_v4(),
+        org_id: uuid::Uuid::new_v4(),
+        workspace_id: uuid::Uuid::new_v4(),
+    };
+    let _ = crate::tracing_context::with_tracing_context(
+        context,
+        provider.image_generation(params, String::new()),
+    )
+    .await;
 
     let requests = server.received_requests().await.unwrap();
     assert_eq!(requests.len(), 1);
     let body: HashMap<String, Value> = serde_json::from_slice(&requests[0].body).unwrap();
     assert_stripped(&body, "image_generation");
+    // Made inside an authenticated request's scope, the call still carries
+    // no tenant ids: only self-hosted backends receive them.
+    for name in ["x-request-id", "x-org-id", "x-workspace-id"] {
+        assert!(
+            requests[0].headers.get(name).is_none(),
+            "{name} must never reach an external provider"
+        );
+    }
 }
 
 /// Records the `extra` map each operation hands to the backend.

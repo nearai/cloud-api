@@ -29,7 +29,6 @@ pub async fn audio_transcriptions(
     State(app_state): State<AppState>,
     Extension(api_key): Extension<AuthenticatedApiKey>,
     Extension(body_hash): Extension<RequestBodyHash>,
-    Extension(correlation): Extension<RequestCorrelation>,
     headers: header::HeaderMap,
     requested_model: RequestedModel,
     mut multipart: Multipart,
@@ -196,7 +195,6 @@ pub async fn audio_transcriptions(
     // Convert API request to provider params
     let mut extra = std::collections::HashMap::new();
     insert_encryption_headers(&encryption_headers, &mut extra);
-    insert_request_id_header(correlation, &mut extra);
 
     let requested_response_format = request.response_format.clone();
     let provider_response_format = match requested_response_format.as_deref() {

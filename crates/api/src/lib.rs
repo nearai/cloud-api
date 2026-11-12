@@ -1549,6 +1549,12 @@ pub fn build_completion_routes(
     let model_deprecation_state = middleware::ModelDeprecationState {
         models_service: app_state.models_service.clone(),
     };
+    // One log line per authenticated inference request; inside
+    // authentication so it can name the tenant, outside rate and usage
+    // checks so their rejections are logged too.
+    let inference_log_state = middleware::InferenceLogState {
+        models_service: app_state.models_service.clone(),
+    };
 
     // Native Anthropic Messages support is staging-gated and hard-off by
     // default. Keep it on its own router so enabling it cannot alter the
@@ -1573,6 +1579,10 @@ pub fn build_completion_routes(
             .layer(from_fn_with_state(
                 rate_limit_state.clone(),
                 middleware::rate_limit::anthropic_api_key_rate_limit_middleware,
+            ))
+            .layer(from_fn_with_state(
+                inference_log_state.clone(),
+                middleware::inference_log_middleware,
             ))
             .layer(from_fn_with_state(
                 auth_state_middleware.clone(),
@@ -1645,6 +1655,10 @@ pub fn build_completion_routes(
             middleware::api_key_rate_limit_middleware,
         ))
         .layer(from_fn_with_state(
+            inference_log_state.clone(),
+            middleware::inference_log_middleware,
+        ))
+        .layer(from_fn_with_state(
             auth_state_middleware.clone(),
             middleware::auth::auth_middleware_with_workspace_context,
         ))
@@ -1673,6 +1687,10 @@ pub fn build_completion_routes(
         .layer(from_fn_with_state(
             rate_limit_state.clone(),
             middleware::api_key_rate_limit_middleware,
+        ))
+        .layer(from_fn_with_state(
+            inference_log_state,
+            middleware::inference_log_middleware,
         ))
         .layer(from_fn_with_state(
             auth_state_middleware.clone(),
@@ -1718,6 +1736,9 @@ pub fn build_response_routes(
     let model_deprecation_state = middleware::ModelDeprecationState {
         models_service: native_app_state.models_service.clone(),
     };
+    let inference_log_state = middleware::InferenceLogState {
+        models_service: native_app_state.models_service.clone(),
+    };
     let route_state = responses::ResponseRouteState {
         native_service: services::responses::native::NativeResponsesService {
             models_service: native_app_state.models_service,
@@ -1744,6 +1765,10 @@ pub fn build_response_routes(
         .layer(from_fn_with_state(
             rate_limit_state.clone(),
             middleware::api_key_rate_limit_middleware,
+        ))
+        .layer(from_fn_with_state(
+            inference_log_state,
+            middleware::inference_log_middleware,
         ))
         .layer(from_fn_with_state(
             auth_state_middleware.clone(),

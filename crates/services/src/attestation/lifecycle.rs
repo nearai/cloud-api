@@ -49,7 +49,7 @@ impl AttestationService {
                                 "DEV mode: Unable to derive signing keys from dstack ({}); falling back to ephemeral keys",
                                 e
                             );
-                            Self::generate_ephemeral_signing_keys()
+                            Self::generate_ephemeral_signing_keys()?
                         } else {
                             tracing::error!(
                                 "Failed to derive signing keys from dstack ({}). \

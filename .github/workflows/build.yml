@@ -33,10 +33,12 @@ jobs:
       packages: write
       attestations: write
       id-token: write
-    runs-on: [self-hosted, infra]
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
 
       - name: Log in to Docker registry
         uses: docker/login-action@3864d6aed8ff134b2ed894ce00c87695c709c870
@@ -46,6 +48,8 @@ jobs:
           password: ${{ secrets.DOCKER_REGISTRY_TOKEN }}
 
       - name: Extract image tags from GitHub ref (branch or tag)
+        env:
+          INPUT_FORCE_STAGING: ${{ github.event.inputs.force_staging }}
         run: |
           if [[ "${GITHUB_REF_TYPE}" == 'tag' ]]; then
             TAG=${GITHUB_REF_NAME#v}
@@ -62,13 +66,13 @@ jobs:
             echo "Unable to parse image tag from ${GITHUB_REF_TYPE}: ${GITHUB_REF_NAME}" >&2
             exit 1
           fi
-          echo "IMAGE_REFERENCE=${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}:${TAG}" >> "$GITHUB_ENV"
+          echo "IMAGE_REFERENCE=${REGISTRY}/${IMAGE_REPOSITORY}:${TAG}" >> "$GITHUB_ENV"
 
           # On main branch, also promote to staging for continuous integration
           # Skip staging tag on Tuesday (2) and Wednesday (3) — staging is frozen
           # for prod-candidate testing until Thursday promotion
           if [[ "${GITHUB_REF_NAME}" == 'main' ]]; then
-            FORCE_STAGING="${{ github.event.inputs.force_staging }}"
+            FORCE_STAGING="${INPUT_FORCE_STAGING}"
             DAY_OF_WEEK=$(date -u +%u)
             if [[ "$DAY_OF_WEEK" -ge 2 && "$DAY_OF_WEEK" -le 3 ]] && [[ "$FORCE_STAGING" != 'true' ]]; then
               echo "Staging frozen (day $DAY_OF_WEEK) — skipping :staging tag (use force_staging to override)"
@@ -77,6 +81,15 @@ jobs:
             fi
           fi
 
+      # This VM is disposable. Remove unrelated SDKs and preloaded images
+      # before the Rust build creates BuildKit layers and OCI archives.
+      - name: Free disk space for image builds
+        run: |
+          test "$RUNNER_ENVIRONMENT" = "github-hosted"
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
+          docker image prune --all --force
+          df -h /
+
       - name: Install build dependencies
         run: |
           sudo apt-get update
@@ -84,7 +97,7 @@ jobs:
 
       - name: Build and push reproducible image
         run: |
-          ./build-image.sh --push "${{ env.IMAGE_REFERENCE }}"
+          ./build-image.sh --push "${IMAGE_REFERENCE}"
 
       - name: Get image digest
         run: |
@@ -96,27 +109,27 @@ jobs:
           echo "IMAGE_DIGEST=${DIGEST}" >> "$GITHUB_ENV"
 
       - name: Generate artifact attestation
-        uses: actions/attest-build-provenance@v4
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4
         with:
           subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}
           subject-digest: ${{ env.IMAGE_DIGEST }}
           push-to-registry: true
 
       - name: Install cosign
-        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6  # v4.1.2
+        uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532  # v4.1.3
 
       - name: Sign image with cosign (keyless)
         run: |
-          cosign sign --yes "${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}@${{ env.IMAGE_DIGEST }}"
+          cosign sign --yes "${REGISTRY}/${IMAGE_REPOSITORY}@${IMAGE_DIGEST}"
 
       - name: Tag staging for continuous integration
         if: env.ALSO_TAG_STAGING == 'true'
         run: |
-          STAGING_REF="${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}:staging"
+          STAGING_REF="${REGISTRY}/${IMAGE_REPOSITORY}:staging"
           # Immutable date+sha staging tag for rollback (format: staging-YYYYMMDD-<shortsha>)
           SHORT_SHA=$(echo "${GITHUB_SHA}" | cut -c1-7)
           STAMP=$(date -u +%Y%m%d)
-          STAGING_STAMPED_REF="${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}:staging-${STAMP}-${SHORT_SHA}"
+          STAGING_STAMPED_REF="${REGISTRY}/${IMAGE_REPOSITORY}:staging-${STAMP}-${SHORT_SHA}"
           skopeo copy oci-archive:./oci.tar "docker://${STAGING_REF}"
           skopeo copy oci-archive:./oci.tar "docker://${STAGING_STAMPED_REF}"
           echo "STAGING_REFERENCE=${STAGING_REF}" >> "$GITHUB_ENV"
@@ -145,11 +158,11 @@ jobs:
           {
             echo "## cloud-api docker image"
             echo ""
-            echo "- tag: \`${{ env.IMAGE_REFERENCE }}\`"
-            echo "- digest: \`${{ env.IMAGE_DIGEST }}\`"
-            echo "- sigstore: https://search.sigstore.dev/?hash=${{ env.IMAGE_DIGEST }}"
-            if [[ "${{ env.ALSO_TAG_STAGING }}" == 'true' ]]; then
-              echo "- staging: \`${{ env.STAGING_REFERENCE }}\`"
-              echo "- staging (stamped): \`${{ env.STAGING_STAMPED_REFERENCE }}\`"
+            echo "- tag: \`${IMAGE_REFERENCE}\`"
+            echo "- digest: \`${IMAGE_DIGEST}\`"
+            echo "- sigstore: https://search.sigstore.dev/?hash=${IMAGE_DIGEST}"
+            if [[ "${ALSO_TAG_STAGING}" == 'true' ]]; then
+              echo "- staging: \`${STAGING_REFERENCE}\`"
+              echo "- staging (stamped): \`${STAGING_STAMPED_REFERENCE}\`"
             fi
           } >> "$GITHUB_STEP_SUMMARY"

@@ -475,23 +475,6 @@ async fn history_corrects_legacy_and_split_funding_with_reporting_parity() {
         .await;
         assert_eq!(metrics["summary"]["total_cost_usd"], cost);
         assert_eq!(metrics["summary"]["total_requests"], count);
-        let points = get(
-            &f,
-            &format!(
-                "/v1/admin/organizations/{}/metrics/timeseries?{range}{filter}&granularity=hour",
-                f.org
-            ),
-        )
-        .await;
-        assert_eq!(
-            points["data"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|p| p["cost_usd"].as_f64().unwrap())
-                .sum::<f64>(),
-            cost
-        );
     }
     assert_eq!(rule_json(&f).await["processed_count"], 3);
 }

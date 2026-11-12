@@ -734,6 +734,8 @@ pub enum PrivacyClassifyOverride {
     Body(serde_json::Value),
     /// Fail as if the upstream returned this HTTP status.
     HttpError { status_code: u16, message: String },
+    /// Fail as if the upstream answered 503 with this `Retry-After` value.
+    Overloaded { retry_after_secs: Option<u64> },
 }
 
 /// Builder for configuring a single expectation
@@ -1772,10 +1774,14 @@ impl crate::InferenceProvider for MockProvider {
                 PrivacyClassifyOverride::HttpError {
                     status_code,
                     message,
-                } => Err(PrivacyClassifyError::HttpError {
+                } => Err(PrivacyClassifyError::from_upstream_status(
                     status_code,
+                    None,
                     message,
-                }),
+                )),
+                PrivacyClassifyOverride::Overloaded { retry_after_secs } => {
+                    Err(PrivacyClassifyError::Overloaded { retry_after_secs })
+                }
             };
         }
 

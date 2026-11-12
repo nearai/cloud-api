@@ -13,6 +13,10 @@
 // - the ITA attestation path propagates the upstream `Retry-After` when Intel
 //   Trust Authority supplies one, see `routes/attestation/errors.rs`.
 //
+// The privacy endpoints and chat auto-redact answer an overloaded privacy
+// filter with 503 and set `Retry-After` through [`retry_after_seconds`],
+// passing the filter's own value through when it sent one.
+//
 // Everything else — per-(org,model) concurrency-cap 429s, upstream provider
 // 429 passthrough, and `ServiceOverloaded` ("all backends exhausted") — is a
 // transient condition where a short retry hint is appropriate, so this layer
@@ -32,6 +36,19 @@ use axum::{
 /// exponentially, and the conditions behind these 429s (concurrency caps,
 /// transient overload) usually clear quickly.
 const DEFAULT_RETRY_AFTER_SECS: u64 = 2;
+
+/// Upper bound on a forwarded upstream `Retry-After`, so a misconfigured
+/// upstream cannot tell clients to stay away for minutes.
+const MAX_FORWARDED_RETRY_AFTER_SECS: u64 = 30;
+
+/// Seconds to send in `Retry-After` for an upstream overload: the upstream's
+/// delta-seconds when it gave one, else [`DEFAULT_RETRY_AFTER_SECS`], clamped
+/// to `1..=MAX_FORWARDED_RETRY_AFTER_SECS`.
+pub fn retry_after_seconds(upstream: Option<u64>) -> u64 {
+    upstream
+        .unwrap_or(DEFAULT_RETRY_AFTER_SECS)
+        .clamp(1, MAX_FORWARDED_RETRY_AFTER_SECS)
+}
 
 /// `map_response` layer: add a default `Retry-After` header to any 429 that
 /// does not already carry one. Never overrides a value set closer to the
@@ -105,5 +122,16 @@ mod tests {
                 "{status} must not get a Retry-After header"
             );
         }
+    }
+
+    #[test]
+    fn forwarded_retry_after_defaults_and_clamps() {
+        assert_eq!(retry_after_seconds(None), DEFAULT_RETRY_AFTER_SECS);
+        assert_eq!(retry_after_seconds(Some(0)), 1);
+        assert_eq!(retry_after_seconds(Some(7)), 7);
+        assert_eq!(
+            retry_after_seconds(Some(86_400)),
+            MAX_FORWARDED_RETRY_AFTER_SECS
+        );
     }
 }

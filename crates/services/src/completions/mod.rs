@@ -1540,7 +1540,8 @@ impl CompletionServiceImpl {
             ports::CompletionError::InvalidParams(_) => ERROR_TYPE_INVALID_PARAMS,
             ports::CompletionError::RateLimitExceeded(_) => ERROR_TYPE_RATE_LIMIT,
             ports::CompletionError::ProviderError { .. } => ERROR_TYPE_INFERENCE_ERROR,
-            ports::CompletionError::ServiceOverloaded(_) => ERROR_TYPE_SERVICE_OVERLOADED,
+            ports::CompletionError::ServiceOverloaded(_)
+            | ports::CompletionError::UpstreamOverloaded { .. } => ERROR_TYPE_SERVICE_OVERLOADED,
             ports::CompletionError::InternalError(_) => ERROR_TYPE_INTERNAL_ERROR,
         };
 
@@ -2500,6 +2501,9 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
                         message: msg,
                     }
                 }
+                inference_providers::PrivacyClassifyError::Overloaded { retry_after_secs } => {
+                    ports::CompletionError::UpstreamOverloaded { retry_after_secs }
+                }
                 inference_providers::PrivacyClassifyError::HttpError {
                     status_code,
                     message,
@@ -2512,7 +2516,14 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
                     429 => ports::CompletionError::RateLimitExceeded(
                         "Rate limit exceeded by upstream provider. Please retry with exponential backoff.".to_string(),
                     ),
-                    503 => ports::CompletionError::ServiceOverloaded(message),
+                    503 => ports::CompletionError::UpstreamOverloaded {
+                        retry_after_secs: None,
+                    },
+                    // Kept distinct so callers can report a timeout.
+                    504 => ports::CompletionError::ProviderError {
+                        status_code: 504,
+                        message,
+                    },
                     500..=599 => ports::CompletionError::ProviderError {
                         status_code: 502,
                         message,

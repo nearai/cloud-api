@@ -92,7 +92,7 @@ async fn upstream_body(mock: &inference_providers::mock::MockProvider, body: ser
 /// caused by the client's payload looked like an outage and invited retries.
 /// The pool now keeps the upstream status (with a sanitized message), and
 /// the handlers classify it as embeddings does.
-fn expected_for_upstream(status: u16, generic: &str) -> (u16, String, String) {
+fn expected_for_upstream(status: u16, generic: &str, timeout: &str) -> (u16, String, String) {
     let detector = format!("PII detector returned HTTP {status}");
     match status {
         400 | 422 => (status, "invalid_request_error".into(), detector),
@@ -104,24 +104,25 @@ fn expected_for_upstream(status: u16, generic: &str) -> (u16, String, String) {
                 .into(),
         ),
         503 => (
-            429,
+            503,
             "service_overloaded".into(),
             "All inference backends are overloaded. Please retry with exponential backoff.".into(),
         ),
+        504 => (504, "gateway_timeout".into(), timeout.into()),
         _ => (500, "server_error".into(), generic.into()),
     }
 }
 
-async fn assert_upstream_error_mapping(path: &str, generic: &str) {
+async fn assert_upstream_error_mapping(path: &str, generic: &str, timeout: &str) {
     let (server, mock, org_id, api_key) = setup().await;
-    for status in [400u16, 401, 403, 404, 422, 429, 500, 502, 503] {
+    for status in [400u16, 401, 403, 404, 422, 429, 500, 502, 503, 504] {
         upstream_http_error(&mock, status).await;
 
         let resp = post(&server, path, &api_key, serde_json::json!("hi")).await;
 
         assert_eq!(
             error_parts(&resp),
-            expected_for_upstream(status, generic),
+            expected_for_upstream(status, generic, timeout),
             "{path} upstream {status}"
         );
     }
@@ -133,6 +134,7 @@ async fn classify_upstream_http_error_mapping() {
     assert_upstream_error_mapping(
         CLASSIFY,
         "Privacy classify request failed. Please try again later.",
+        "Privacy classify request timed out. Please retry.",
     )
     .await;
 }
@@ -142,8 +144,99 @@ async fn redact_upstream_http_error_mapping() {
     assert_upstream_error_mapping(
         REDACT,
         "Privacy redact request failed. Please try again later.",
+        "Privacy redact request timed out. Please retry.",
     )
     .await;
+}
+
+// ---- overload, timeout and connection failures ----
+
+fn retry_after(resp: &axum_test::TestResponse) -> Option<String> {
+    resp.headers()
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+}
+
+/// An overloaded filter (503) reaches the caller as 503 with a
+/// `Retry-After`: the filter's own value when it sent one, else the default.
+#[tokio::test]
+async fn overloaded_filter_returns_503_with_retry_after() {
+    let (server, mock, org_id, api_key) = setup().await;
+    for path in [CLASSIFY, REDACT] {
+        for (upstream, expected) in [(Some(5u64), "5"), (None, "2")] {
+            mock.set_privacy_classify_override(Some(PrivacyClassifyOverride::Overloaded {
+                retry_after_secs: upstream,
+            }))
+            .await;
+
+            let resp = post(&server, path, &api_key, serde_json::json!("hi")).await;
+
+            assert_eq!(resp.status_code(), 503, "{path} {upstream:?}");
+            assert_eq!(
+                error_parts(&resp).1,
+                "service_overloaded",
+                "{path} {upstream:?}"
+            );
+            assert_eq!(
+                retry_after(&resp).as_deref(),
+                Some(expected),
+                "{path} {upstream:?}"
+            );
+        }
+    }
+    assert!(recorded_input_tokens(&server, &org_id).await.is_empty());
+}
+
+/// A 504 is reported as a timeout without a retry hint.
+#[tokio::test]
+async fn timed_out_filter_returns_504_without_retry_after() {
+    let (server, mock, _org_id, api_key) = setup().await;
+    upstream_http_error(&mock, 504).await;
+    for path in [CLASSIFY, REDACT] {
+        let resp = post(&server, path, &api_key, serde_json::json!("hi")).await;
+        assert_eq!(resp.status_code(), 504, "{path}");
+        assert_eq!(retry_after(&resp), None, "{path}");
+    }
+}
+
+/// A connection failure is still a generic 500, and the single registered
+/// filter receives each overloaded request exactly once.
+#[tokio::test]
+async fn unreachable_and_overloaded_single_filter_is_called_once() {
+    use inference_providers::PrivacyClassifyError;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let (server, pool, _mock, _db) = setup_test_server_with_pool().await;
+    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id).await;
+
+    for (overloaded, status) in [(false, 500u16), (true, 503)] {
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        pool.register_provider(
+            E2E_PRIVACY_FILTER_MODEL_NAME.to_string(),
+            std::sync::Arc::new(
+                inference_providers::mock::MockProvider::new_accept_all()
+                    .with_privacy_classify_handler(move |_body| {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        Err(if overloaded {
+                            PrivacyClassifyError::Overloaded {
+                                retry_after_secs: Some(3),
+                            }
+                        } else {
+                            PrivacyClassifyError::RequestFailed("connection refused".into())
+                        })
+                    }),
+            ),
+        )
+        .await;
+
+        let resp = post(&server, CLASSIFY, &api_key, serde_json::json!("hi")).await;
+
+        assert_eq!(resp.status_code(), status, "overloaded={overloaded}");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "overloaded={overloaded}");
+    }
 }
 
 // ---- usage settlement ----

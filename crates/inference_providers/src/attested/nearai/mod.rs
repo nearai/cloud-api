@@ -2755,14 +2755,29 @@ impl InferenceProvider for Fleet {
 
         if !response.status().is_success() {
             let status_code = response.status().as_u16();
+            let retry_after = response
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned);
+            if status_code == 503 {
+                // An overload answer carries nothing callers use beyond the
+                // status and Retry-After; skip reading the body.
+                return Err(PrivacyClassifyError::from_upstream_status(
+                    status_code,
+                    retry_after.as_deref(),
+                    String::new(),
+                ));
+            }
             let message = response
                 .text()
                 .await
                 .unwrap_or_else(|_| "Unknown error".to_string());
-            return Err(PrivacyClassifyError::HttpError {
+            return Err(PrivacyClassifyError::from_upstream_status(
                 status_code,
+                retry_after.as_deref(),
                 message,
-            });
+            ));
         }
 
         let raw_bytes = response.bytes().await.map_err(to_privacy_classify_error)?;
@@ -3014,6 +3029,107 @@ mod tests {
             timestamp_granularities: Some(vec!["word".to_string(), "segment".to_string()]),
             extra: Default::default(),
         }
+    }
+
+    async fn privacy_classify_against(response: ResponseTemplate) -> PrivacyClassifyError {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/privacy/classify"))
+            .respond_with(response)
+            .expect(1)
+            .mount(&server)
+            .await;
+        let provider = Provider::new(Config::new(
+            server.uri(),
+            Some("sk-test".to_string()),
+            Some(5),
+        ));
+        provider
+            .privacy_classify_raw(
+                bytes::Bytes::from_static(b"{}"),
+                std::collections::HashMap::new(),
+            )
+            .await
+            .expect_err("non-2xx must be an error")
+    }
+
+    #[tokio::test]
+    async fn privacy_classify_503_is_overloaded_with_retry_after() {
+        let err = privacy_classify_against(
+            ResponseTemplate::new(503)
+                .insert_header("retry-after", "3")
+                .set_body_string("upstream text"),
+        )
+        .await;
+        assert!(
+            matches!(
+                err,
+                PrivacyClassifyError::Overloaded {
+                    retry_after_secs: Some(3)
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn privacy_classify_503_without_usable_retry_after() {
+        for response in [
+            ResponseTemplate::new(503),
+            ResponseTemplate::new(503)
+                .insert_header("retry-after", "Wed, 21 Oct 2015 07:28:00 GMT"),
+            ResponseTemplate::new(503).insert_header("retry-after", "-1"),
+        ] {
+            let err = privacy_classify_against(response).await;
+            assert!(
+                matches!(
+                    err,
+                    PrivacyClassifyError::Overloaded {
+                        retry_after_secs: None
+                    }
+                ),
+                "{err:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn privacy_classify_other_statuses_keep_http_error() {
+        for status in [500u16, 504] {
+            let err = privacy_classify_against(
+                ResponseTemplate::new(status).insert_header("retry-after", "3"),
+            )
+            .await;
+            assert!(
+                matches!(err, PrivacyClassifyError::HttpError { status_code, .. } if status_code == status),
+                "{status}: {err:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn privacy_classify_connection_error_is_request_failed() {
+        // Bind then drop a listener so the port refuses connections.
+        let addr = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let provider = Provider::new(Config::new(
+            format!("http://{addr}"),
+            Some("sk-test".to_string()),
+            Some(5),
+        ));
+        let err = provider
+            .privacy_classify_raw(
+                bytes::Bytes::from_static(b"{}"),
+                std::collections::HashMap::new(),
+            )
+            .await
+            .expect_err("refused connection must be an error");
+        assert!(
+            matches!(err, PrivacyClassifyError::RequestFailed(_)),
+            "{err:?}"
+        );
     }
 
     #[tokio::test]

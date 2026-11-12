@@ -142,7 +142,15 @@ impl SettingKey for UsageAdmissionKey {
         }
         Ok(settings)
     }
-    fn publish(value: &Self::Value, _version: u64) -> Self::Published {
+    fn publish(value: &Self::Value, version: u64) -> Self::Published {
+        tracing::info!(
+            event = "usage_admission_config_applied",
+            version,
+            enabled = value.enabled,
+            default_mode = super::observation::mode_label(value.defaults.mode),
+            organization_overrides = value.organizations.len(),
+            "Admission configuration applied"
+        );
         value.clone()
     }
 }

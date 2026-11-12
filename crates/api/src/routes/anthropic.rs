@@ -176,6 +176,7 @@ impl NativeUsage {
 #[derive(Clone)]
 struct NativeBillingContext {
     budget_id: Option<Uuid>,
+    admission_observation_id: Option<Uuid>,
     usage_service: Arc<dyn UsageServiceTrait + Send + Sync>,
     organization_id: Uuid,
     workspace_id: Uuid,
@@ -689,7 +690,12 @@ async fn handle_request(
         },
         None => None, // CountTokens has no billing context and performs no paid execution.
     };
+    let admission_observation_id = match &budget {
+        Some(budget) => budget.observation_id().await,
+        None => None,
+    };
     let billing = billing_seed.map(|seed| NativeBillingContext {
+        admission_observation_id,
         budget_id,
         usage_service: app_state.usage_service,
         organization_id: api_key.organization.id.0,
@@ -1328,6 +1334,7 @@ async fn record_native_usage(
     let inference_id = usage.inference_id().unwrap_or_else(Uuid::new_v4);
     let request = RecordUsageServiceRequest {
         budget_id: context.budget_id,
+        admission_observation_id: context.admission_observation_id,
         input_tokens,
         output_tokens,
         cache_read_tokens: usage.cache_read_tokens_for_billing(),
@@ -2097,6 +2104,7 @@ redact-thinking-2026-02-12";
     ) -> NativeBillingContext {
         NativeBillingContext {
             budget_id: Some(Uuid::new_v4()),
+            admission_observation_id: Some(Uuid::from_u128(100)),
             usage_service,
             organization_id: Uuid::new_v4(),
             workspace_id: Uuid::new_v4(),
@@ -2155,6 +2163,10 @@ redact-thinking-2026-02-12";
 
         let recorded = wait_for_recorded_usage(&usage_service).await;
         assert_eq!(recorded.budget_id, budget_id);
+        assert_eq!(
+            recorded.admission_observation_id,
+            Some(Uuid::from_u128(100))
+        );
         assert_eq!(
             recorded.inference_id,
             Some(hash_inference_id_to_uuid("msg_stream"))

@@ -194,6 +194,7 @@ fn profile_without_cache_write() -> TextPricingProfile {
 fn request(inference_type: InferenceType) -> RecordUsageServiceRequest {
     RecordUsageServiceRequest {
         budget_id: None,
+        admission_observation_id: None,
         organization_id: Uuid::new_v4(),
         workspace_id: Uuid::new_v4(),
         api_key_id: Uuid::new_v4(),
@@ -537,12 +538,13 @@ async fn admission_uses_live_org_policy_and_audit_off_never_create_holds() {
     })))).register::<UsageAdmissionKey>(Arc::new(arc_swap::ArcSwap::from_pointee(AdmissionSettings::default()))).build());
     assert!(settings.reload().await);
     let repo = Arc::new(CapturingUsageRepository::default());
+    let metrics = Arc::new(CapturingMetricsService::new());
     let service = UsageServiceImpl::new(
         repo.clone(),
         Arc::new(FixedModelRepository(model())),
         Arc::new(UnusedLimitsRepository),
         Arc::new(MockWorkspaceServiceTrait::new()),
-        Arc::new(CapturingMetricsService::new()),
+        metrics.clone(),
     )
     .with_admission_settings(settings);
     for (org, expected) in [(enforced, true), (disabled, false), (Uuid::new_v4(), false)] {
@@ -558,7 +560,12 @@ async fn admission_uses_live_org_policy_and_audit_off_never_create_holds() {
         )
         .unwrap();
         assert_eq!(
-            service.admit(identity, features).await.unwrap().is_some(),
+            service
+                .admit(identity, features)
+                .await
+                .unwrap()
+                .id
+                .is_some(),
             expected
         );
         if !expected {
@@ -571,6 +578,7 @@ async fn admission_uses_live_org_policy_and_audit_off_never_create_holds() {
                 .admit(identity, overflowing)
                 .await
                 .unwrap()
+                .id
                 .is_none());
         }
     }
@@ -580,4 +588,78 @@ async fn admission_uses_live_org_policy_and_audit_off_never_create_holds() {
     assert_eq!(hold.organization_max_unsettled, 512);
     assert_eq!(hold.key_max_unsettled, 128);
     assert_eq!(hold.reservation_ttl_seconds, 900);
+    let metrics = metrics.get_metrics();
+    let decisions: Vec<_> = metrics
+        .iter()
+        .filter(|m| m.name == budget::observation::DECISIONS)
+        .collect();
+    assert_eq!(decisions.len(), 5);
+    for outcome in ["admitted", "off", "estimated", "estimate_failed"] {
+        assert!(decisions
+            .iter()
+            .any(|m| m.tags.contains(&format!("outcome:{outcome}"))));
+    }
+    assert_eq!(
+        metrics
+            .iter()
+            .filter(|m| m.tags.contains(&"stage:reserve".into()))
+            .count(),
+        1
+    );
+    assert_eq!(
+        metrics
+            .iter()
+            .filter(|m| m.tags.contains(&"stage:total".into()))
+            .count(),
+        5
+    );
+    assert!(metrics
+        .iter()
+        .all(|m| !m.tags.iter().any(|t| t.contains(&enforced.to_string()))));
+}
+
+#[tokio::test]
+async fn audit_samples_are_request_local_and_do_not_create_reservations() {
+    let repo = Arc::new(CapturingUsageRepository::default());
+    let metrics = Arc::new(CapturingMetricsService::new());
+    let service = UsageServiceImpl::new(
+        repo.clone(),
+        Arc::new(FixedModelRepository(model())),
+        Arc::new(UnusedLimitsRepository),
+        Arc::new(MockWorkspaceServiceTrait::new()),
+        metrics.clone(),
+    );
+    let identity = BillingIdentity {
+        organization_id: Uuid::new_v4(),
+        workspace_id: Uuid::new_v4(),
+        api_key_id: Uuid::new_v4(),
+        model_id: Uuid::new_v4(),
+    };
+    for (id, expected) in [(100, true), (101, false)] {
+        let admission = service
+            .admit_external(
+                identity,
+                budget::UsageFeatures::from_json(
+                    InferenceType::ChatCompletion,
+                    &serde_json::json!({}),
+                )
+                .unwrap(),
+                Uuid::from_u128(id),
+                budget::policy::AdmissionMode::Enforce,
+            )
+            .await
+            .unwrap();
+        assert_eq!(admission.observation_id.is_some(), expected);
+        assert!(admission.id.is_none());
+        assert!(admission.estimated_amount.is_some());
+        assert!(serde_json::to_value(admission)
+            .unwrap()
+            .get("observation_id")
+            .is_none());
+    }
+    assert!(repo.admissions.lock().unwrap().is_empty());
+    assert!(metrics
+        .get_metrics()
+        .iter()
+        .all(|m| m.tags.contains(&"path:direct_proxy".into())));
 }

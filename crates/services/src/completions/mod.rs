@@ -125,6 +125,7 @@ where
     // IDs for usage tracking (database) and tracing
     request_id: Uuid,
     budget_id: Option<Uuid>,
+    admission_observation_id: Option<Uuid>,
     organization_id: Uuid,
     workspace_id: Uuid,
     api_key_id: Uuid,
@@ -388,6 +389,7 @@ where
 
         let inference_id = hash_inference_id_to_uuid(&chat_id);
         let budget_id = self.budget_id;
+        let admission_observation_id = self.admission_observation_id;
 
         // Create span with full context for async task
         let span = tracing::info_span!(
@@ -479,6 +481,7 @@ where
                     ));
                     let usage_request = RecordUsageServiceRequest {
                         budget_id,
+                        admission_observation_id,
                         input_tokens,
                         output_tokens,
                         cache_read_tokens,
@@ -1704,6 +1707,7 @@ impl CompletionServiceImpl {
         llm_stream: StreamingResult,
         request_id: Uuid,
         budget_id: Option<Uuid>,
+        admission_observation_id: Option<Uuid>,
         organization_id: Uuid,
         workspace_id: Uuid,
         api_key_id: Uuid,
@@ -1739,6 +1743,7 @@ impl CompletionServiceImpl {
             metrics_service: self.metrics_service.clone(),
             request_id,
             budget_id,
+            admission_observation_id,
             organization_id,
             workspace_id,
             api_key_id,
@@ -2003,6 +2008,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
                     .id()
                     .await
                     .map_err(crate::usage::budget::service_error)?,
+                budget.observation_id().await,
                 organization_id,
                 workspace_id,
                 api_key_id,
@@ -2323,6 +2329,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         usage_service
             .record_usage(RecordUsageServiceRequest {
                 budget_id,
+                admission_observation_id: budget.observation_id().await,
                 input_tokens,
                 output_tokens,
                 cache_read_tokens,
@@ -2737,6 +2744,7 @@ mod tests {
             metrics_service: Arc::new(CapturingMetricsService::new()),
             request_id: Uuid::new_v4(),
             budget_id: Some(Uuid::new_v4()),
+            admission_observation_id: Some(Uuid::from_u128(100)),
             organization_id: Uuid::new_v4(),
             workspace_id: Uuid::new_v4(),
             api_key_id: Uuid::new_v4(),
@@ -2827,6 +2835,10 @@ mod tests {
             assert_eq!(records.len(), 1);
             let recorded = &records[0];
             assert_eq!(recorded.budget_id, budget_id);
+            assert_eq!(
+                recorded.admission_observation_id,
+                Some(Uuid::from_u128(100))
+            );
             assert_eq!(recorded.input_tokens, 10);
             assert_eq!(recorded.output_tokens, 5);
             assert_eq!(recorded.cache_read_tokens, 2);
@@ -3012,6 +3024,7 @@ mod tests {
             metrics_service: metrics_service.clone(),
             request_id: Uuid::new_v4(),
             budget_id: Some(Uuid::new_v4()),
+            admission_observation_id: Some(Uuid::from_u128(100)),
             organization_id,
             workspace_id,
             api_key_id,
@@ -3187,6 +3200,7 @@ mod tests {
             metrics_service: metrics_service.clone(),
             request_id: Uuid::new_v4(),
             budget_id: Some(Uuid::new_v4()),
+            admission_observation_id: Some(Uuid::from_u128(100)),
             organization_id: Uuid::new_v4(),
             workspace_id: Uuid::new_v4(),
             api_key_id: Uuid::new_v4(),
@@ -3343,6 +3357,7 @@ mod tests {
             metrics_service: metrics_service.clone(),
             request_id: Uuid::new_v4(),
             budget_id: Some(Uuid::new_v4()),
+            admission_observation_id: Some(Uuid::from_u128(100)),
             organization_id,
             workspace_id,
             api_key_id,
@@ -3473,6 +3488,7 @@ mod tests {
             metrics_service: metrics_service.clone(),
             request_id: Uuid::new_v4(),
             budget_id: Some(Uuid::new_v4()),
+            admission_observation_id: Some(Uuid::from_u128(100)),
             organization_id,
             workspace_id,
             api_key_id,
@@ -3685,6 +3701,7 @@ mod tests {
                 metrics_service,
                 request_id: Uuid::new_v4(),
                 budget_id: Some(Uuid::new_v4()),
+                admission_observation_id: Some(Uuid::from_u128(100)),
                 organization_id: Uuid::new_v4(),
                 workspace_id: Uuid::new_v4(),
                 api_key_id: Uuid::new_v4(),

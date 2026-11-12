@@ -282,6 +282,7 @@ pub async fn audio_transcriptions(
             let inference_id = uuid::Uuid::new_v4();
             let usage_request = services::usage::RecordUsageServiceRequest {
                 budget_id: budget.id().await.ok().flatten(),
+                admission_observation_id: budget.observation_id().await,
                 input_tokens: duration_seconds, // Bill by duration in seconds
                 inference_id: Some(inference_id),
                 stop_reason: Some(services::usage::StopReason::Completed),

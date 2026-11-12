@@ -164,6 +164,7 @@ pub async fn systemone(
         let usage = &served.response.response.usage;
         let usage_request = RecordUsageServiceRequest {
             budget_id: budget.id().await.ok().flatten(),
+            admission_observation_id: budget.observation_id().await,
             input_tokens: usage.input_tokens,
             output_tokens: usage.output_tokens,
             inference_id: Some(inference_id),

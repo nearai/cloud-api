@@ -261,7 +261,7 @@ pub trait UsageServiceTrait: Send + Sync {
         &self,
         _identity: BillingIdentity,
         _features: super::budget::UsageFeatures,
-    ) -> Result<Option<Uuid>, UsageError> {
+    ) -> Result<super::budget::BudgetAdmission, UsageError> {
         Err(UsageError::InternalError(
             "monetary admission is unavailable".into(),
         ))
@@ -662,6 +662,8 @@ pub struct CacheWriteBilling {
 pub struct RecordUsageServiceRequest {
     /// Monetary reservation, distinct from the public provider-derived inference id.
     pub budget_id: Option<Uuid>,
+    /// Sample correlation only; not persisted or used for charging.
+    pub admission_observation_id: Option<Uuid>,
     pub organization_id: Uuid,
     pub workspace_id: Uuid,
     pub api_key_id: Uuid,
@@ -740,6 +742,7 @@ impl RecordUsageServiceRequest {
         } = identity;
         Self {
             budget_id: None,
+            admission_observation_id: None,
             organization_id,
             workspace_id,
             api_key_id,

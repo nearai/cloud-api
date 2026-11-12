@@ -184,6 +184,7 @@ impl NativeResponsesService {
                 _ => NativeResponsesError::Provider("Native OpenAI Responses request failed"),
             })?;
         let billing = Billing {
+            admission_observation_id: budget.observation_id().await,
             budget_id: budget
                 .id()
                 .await
@@ -227,6 +228,7 @@ fn normalize_stateless_request(body: &mut Value) -> Result<(), NativeResponsesEr
 
 struct Billing {
     budget_id: Option<Uuid>,
+    admission_observation_id: Option<Uuid>,
     service: NativeResponsesService,
     request_hash: String,
     organization_id: Uuid,
@@ -375,6 +377,7 @@ impl Billing {
                 provider_service_tier: usage.tier,
                 inference_id: id.as_deref().map(hash_inference_id_to_uuid),
                 budget_id: self.budget_id,
+                admission_observation_id: self.admission_observation_id,
                 provider_request_id: id.clone(),
                 stop_reason: Some(reason),
                 provider_attribution: self.attribution,

@@ -681,45 +681,6 @@ async fn setup_test_infrastructure_for_real_providers() -> TestInfrastructure {
     TestInfrastructure { database, config }
 }
 
-pub async fn setup_test_server_with_mcp_factory(
-    mcp_client_factory: std::sync::Arc<dyn services::responses::tools::McpClientFactory>,
-) -> (
-    axum_test::TestServer,
-    std::sync::Arc<services::inference_provider_pool::InferenceProviderPool>,
-    std::sync::Arc<inference_providers::mock::MockProvider>,
-) {
-    let infra = setup_test_infrastructure().await;
-
-    assert_mock_user_in_db(&infra.database).await;
-
-    let auth_components = init_auth_services(infra.database.clone(), &infra.config);
-
-    let (inference_provider_pool, mock_provider) =
-        api::init_inference_providers_with_mocks(&infra.config).await;
-    let metrics_service = Arc::new(services::metrics::MockMetricsService);
-
-    let domain_services = api::init_domain_services_with_mcp_factory(
-        infra.database.clone(),
-        &infra.config,
-        auth_components.organization_service.clone(),
-        inference_provider_pool.clone(),
-        metrics_service,
-        mcp_client_factory,
-    )
-    .await;
-
-    let app = build_app_with_config_and_options(
-        infra.database.clone(),
-        auth_components,
-        domain_services,
-        Arc::new(infra.config),
-        E2E_APP_BUILD_OPTIONS,
-    );
-    let server = axum_test::TestServer::new(app);
-
-    (server, inference_provider_pool, mock_provider)
-}
-
 pub async fn setup_unique_test_session(database: &Arc<Database>) -> (String, String) {
     setup_unique_test_session_with_user_id(database, uuid::Uuid::new_v4()).await
 }

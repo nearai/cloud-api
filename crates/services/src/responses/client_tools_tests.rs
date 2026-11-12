@@ -408,6 +408,42 @@ fn native_keeps_custom_constraints_and_reasoning_while_promoting_lite_tools() {
 }
 
 #[test]
+fn mcp_tools_are_detected_wherever_tools_can_be_declared() {
+    let mcp =
+        json!({"type": "mcp", "server_label": "remote", "server_url": "https://mcp.invalid/"});
+    for body in [
+        request(vec![mcp.clone()]),
+        request(vec![function("lookup"), mcp.clone()]),
+        request(vec![namespace("client", vec![mcp.clone()])]),
+        request(vec![namespace(
+            "outer",
+            vec![namespace("inner", vec![mcp.clone()])],
+        )]),
+        json!({"model": "test", "input": [
+            {"type": "additional_tools", "role": "developer", "tools": [mcp.clone()]},
+            {"role": "user", "content": "Synthetic task."}
+        ]}),
+    ] {
+        assert!(contains_mcp_tool(&body), "{body}");
+    }
+    for body in [
+        request(vec![
+            function("mcp"),
+            custom("mcp"),
+            json!({"type": "web_search"}),
+        ]),
+        request(vec![namespace("mcp", vec![function("lookup")])]),
+        json!({"model": "test", "input": [
+            {"type": "mcp_list_tools", "tools": [{"type": "mcp"}]},
+            {"role": "user", "content": "mcp"}
+        ]}),
+        json!({"model": "test", "input": "Synthetic task.", "tools": null}),
+    ] {
+        assert!(!contains_mcp_tool(&body), "{body}");
+    }
+}
+
+#[test]
 fn unsupported_hosted_tools_remain_rejected_on_both_transports() {
     for kind in [
         "file_search",

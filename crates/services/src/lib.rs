@@ -18,7 +18,6 @@ pub mod github_dispatch;
 pub mod id_prefixes;
 pub mod inference_provider_pool;
 pub mod lifecycle;
-pub mod mcp;
 pub mod metrics;
 pub mod models;
 pub mod organization;

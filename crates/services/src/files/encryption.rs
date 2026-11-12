@@ -1,7 +1,8 @@
 use aes_gcm::{
-    aead::{rand_core::RngCore, Aead, KeyInit, OsRng},
+    aead::{Aead, KeyInit},
     Aes256Gcm, Nonce,
 };
+use rand::{rngs::SysRng, TryRng};
 use thiserror::Error;
 
 #[path = "encryption/key_ring.rs"]
@@ -43,7 +44,9 @@ pub fn encrypt_with_key(data: &[u8], key: &[u8; 32]) -> Result<Vec<u8>, Encrypti
 
     // Generate a random nonce
     let mut nonce_bytes = [0u8; NONCE_SIZE];
-    OsRng.fill_bytes(&mut nonce_bytes);
+    SysRng.try_fill_bytes(&mut nonce_bytes).map_err(|_| {
+        EncryptionError::EncryptionFailed("operating system randomness unavailable".into())
+    })?;
     let nonce = Nonce::from(nonce_bytes);
 
     // Encrypt the data
@@ -130,10 +133,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn reads_aes_256_gcm_known_ciphertext_with_legacy_nonce_prefix() {
+        // Independent OpenSSL AES-256-GCM fixture (Python cryptography), using
+        // key [7; 32], nonce 0..12, empty AAD, and a postfixed 16-byte tag.
+        let mut envelope = (0u8..12).collect::<Vec<_>>();
+        envelope.extend_from_slice(
+            &hex::decode("74e48e117e70f92a1ec28df9902c0982951cd0e760160243739c52d09f4f99286c68a6c72f7c1a6032")
+                .unwrap(),
+        );
+        assert_eq!(
+            decrypt_with_key(&envelope, &[7; 32]).unwrap(),
+            b"legacy ciphertext fixture"
+        );
+        *envelope.last_mut().unwrap() ^= 1;
+        assert!(decrypt_with_key(&envelope, &[7; 32]).is_err());
+    }
+
+    #[test]
     fn test_encrypt_decrypt() {
         // Generate a random 256-bit key (32 bytes)
         let mut key_bytes = [0u8; 32];
-        OsRng.fill_bytes(&mut key_bytes);
+        SysRng.try_fill_bytes(&mut key_bytes).unwrap();
         let key = hex::encode(key_bytes);
 
         let plaintext = b"Hello, World! This is a test message.";
@@ -163,7 +183,7 @@ mod tests {
     #[test]
     fn test_decrypt_invalid_ciphertext() {
         let mut key_bytes = [0u8; 32];
-        OsRng.fill_bytes(&mut key_bytes);
+        SysRng.try_fill_bytes(&mut key_bytes).unwrap();
         let key = hex::encode(key_bytes);
 
         // Too short to contain nonce
@@ -175,7 +195,7 @@ mod tests {
     #[test]
     fn test_decrypt_with_wrong_key() {
         let mut key_bytes = [0u8; 32];
-        OsRng.fill_bytes(&mut key_bytes);
+        SysRng.try_fill_bytes(&mut key_bytes).unwrap();
         let key = hex::encode(key_bytes);
 
         let plaintext = b"Secret message";
@@ -183,7 +203,7 @@ mod tests {
 
         // Try to decrypt with a different key
         let mut wrong_key_bytes = [0u8; 32];
-        OsRng.fill_bytes(&mut wrong_key_bytes);
+        SysRng.try_fill_bytes(&mut wrong_key_bytes).unwrap();
         let wrong_key = hex::encode(wrong_key_bytes);
 
         let result = decrypt(&encrypted, &wrong_key);

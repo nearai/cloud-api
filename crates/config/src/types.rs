@@ -26,6 +26,11 @@ pub struct KeySourceSpec {
     pub source: KeySource,
 }
 
+/// Debug stand-in for an optional secret: shows whether it is set, never its value.
+fn redact_opt(secret: &Option<String>) -> Option<&'static str> {
+    secret.as_ref().map(|_| "<redacted>")
+}
+
 /// Parse ordered `<key_id>=file:...|dstack:...|hex:...` entries.
 pub fn parse_key_source_specs(raw: &str) -> Result<Vec<KeySourceSpec>, String> {
     parse_key_source_specs_for(raw, "DB_ENCRYPTION_KEYS")
@@ -76,7 +81,7 @@ fn parse_key_source_specs_for(raw: &str, variable: &str) -> Result<Vec<KeySource
         .collect()
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ApiConfig {
     pub server: ServerConfig,
     /// API key for authenticating with inference backends (vLLM/SGLang via inference_url)
@@ -124,6 +129,70 @@ pub struct ApiConfig {
     pub credit_allocation: CreditAllocationConfig,
     pub ita: ItaAttestationConfig,
     pub placement: PlacementConfig,
+}
+
+impl std::fmt::Debug for ApiConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Exhaustive destructure (no `..`): adding a field is a compile error
+        // here until it is listed (and, if a secret, redacted).
+        let Self {
+            server,
+            inference_api_key,
+            internal_usage_token,
+            internal_usage_max_discount,
+            logging,
+            dstack_client,
+            auth,
+            database,
+            database_encryption_key: _,
+            database_encryption_keys,
+            database_encryption_key_id,
+            database_encryption_write_enabled,
+            s3,
+            invitation_email,
+            otlp,
+            cors,
+            external_providers,
+            github_dispatch,
+            infra,
+            staking_farm,
+            aml,
+            usage_reporting,
+            credit_allocation,
+            ita,
+            placement,
+        } = self;
+        f.debug_struct("ApiConfig")
+            .field("server", server)
+            .field("inference_api_key", &redact_opt(inference_api_key))
+            .field("internal_usage_token", &redact_opt(internal_usage_token))
+            .field("internal_usage_max_discount", internal_usage_max_discount)
+            .field("logging", logging)
+            .field("dstack_client", dstack_client)
+            .field("auth", auth)
+            .field("database", database)
+            .field("database_encryption_key", &"<redacted>")
+            .field("database_encryption_keys", database_encryption_keys)
+            .field("database_encryption_key_id", database_encryption_key_id)
+            .field(
+                "database_encryption_write_enabled",
+                database_encryption_write_enabled,
+            )
+            .field("s3", s3)
+            .field("invitation_email", invitation_email)
+            .field("otlp", otlp)
+            .field("cors", cors)
+            .field("external_providers", external_providers)
+            .field("github_dispatch", github_dispatch)
+            .field("infra", infra)
+            .field("staking_farm", staking_farm)
+            .field("aml", aml)
+            .field("usage_reporting", usage_reporting)
+            .field("credit_allocation", credit_allocation)
+            .field("ita", ita)
+            .field("placement", placement)
+            .finish()
+    }
 }
 
 impl ApiConfig {
@@ -824,7 +893,7 @@ pub const DEFAULT_GITHUB_DISPATCH_EVENT_TYPE: &str = "stg_model_loaded";
 /// models. When `enabled`, a successful `PATCH /v1/admin/models` fires a
 /// `repository_dispatch` event so downstream automation (validate / promote
 /// pipelines) can react. Intended to be enabled only on staging cloud-api.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct GitHubDispatchConfig {
     pub enabled: bool,
     /// Target repo in `owner/name` form.
@@ -834,6 +903,23 @@ pub struct GitHubDispatchConfig {
     pub event_type: String,
     /// Fine-grained PAT with `actions: write` scoped to `repo` only.
     pub pat: Option<String>,
+}
+
+impl std::fmt::Debug for GitHubDispatchConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            enabled,
+            repo,
+            event_type,
+            pat,
+        } = self;
+        f.debug_struct("GitHubDispatchConfig")
+            .field("enabled", enabled)
+            .field("repo", repo)
+            .field("event_type", event_type)
+            .field("pat", &redact_opt(pat))
+            .finish()
+    }
 }
 
 impl Default for GitHubDispatchConfig {
@@ -946,7 +1032,7 @@ impl std::str::FromStr for DatabaseRecyclingMethod {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct DatabaseConfig {
     pub connection_mode: DatabaseConnectionMode,
     pub primary_app_id: String,
@@ -968,6 +1054,43 @@ pub struct DatabaseConfig {
     pub refresh_interval: u64,
     /// Use mock database for testing (bypasses Patroni discovery and real database)
     pub mock: bool,
+}
+
+impl std::fmt::Debug for DatabaseConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            connection_mode,
+            primary_app_id,
+            gateway_subdomain,
+            host,
+            port,
+            database,
+            username,
+            password: _,
+            max_connections,
+            recycling_method,
+            tls_enabled,
+            tls_ca_cert_path,
+            refresh_interval,
+            mock,
+        } = self;
+        f.debug_struct("DatabaseConfig")
+            .field("connection_mode", connection_mode)
+            .field("primary_app_id", primary_app_id)
+            .field("gateway_subdomain", gateway_subdomain)
+            .field("host", host)
+            .field("port", port)
+            .field("database", database)
+            .field("username", username)
+            .field("password", &"<redacted>")
+            .field("max_connections", max_connections)
+            .field("recycling_method", recycling_method)
+            .field("tls_enabled", tls_enabled)
+            .field("tls_ca_cert_path", tls_ca_cert_path)
+            .field("refresh_interval", refresh_interval)
+            .field("mock", mock)
+            .finish()
+    }
 }
 
 impl DatabaseConfig {
@@ -1149,7 +1272,7 @@ pub struct DomainConfig {
 }
 
 // Simplified Authentication Configuration
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct AuthConfig {
     pub mock: bool,
     pub encoding_key: String,
@@ -1174,6 +1297,37 @@ pub struct AuthConfig {
     /// outstanding legacy tokens have expired to reject any token that cannot
     /// be tied to a live session.
     pub require_session_bound_access_tokens: bool,
+}
+
+impl std::fmt::Debug for AuthConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            mock,
+            encoding_key: _,
+            github,
+            google,
+            near,
+            admin_emails,
+            admin_read_only_tokens_enabled,
+            require_session_bound_access_tokens,
+        } = self;
+        f.debug_struct("AuthConfig")
+            .field("mock", mock)
+            .field("encoding_key", &"<redacted>")
+            .field("github", github)
+            .field("google", google)
+            .field("near", near)
+            .field("admin_emails", admin_emails)
+            .field(
+                "admin_read_only_tokens_enabled",
+                admin_read_only_tokens_enabled,
+            )
+            .field(
+                "require_session_bound_access_tokens",
+                require_session_bound_access_tokens,
+            )
+            .finish()
+    }
 }
 
 impl AuthConfig {
@@ -1286,18 +1440,48 @@ pub fn admin_email_domain(email: &str) -> Option<&str> {
     Some(domain)
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct GitHubOAuthConfig {
     pub client_id: String,
     pub client_secret: String,
     pub redirect_url: String,
 }
 
-#[derive(Debug, Clone)]
+impl std::fmt::Debug for GitHubOAuthConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            client_id,
+            client_secret: _,
+            redirect_url,
+        } = self;
+        f.debug_struct("GitHubOAuthConfig")
+            .field("client_id", client_id)
+            .field("client_secret", &"<redacted>")
+            .field("redirect_url", redirect_url)
+            .finish()
+    }
+}
+
+#[derive(Clone)]
 pub struct GoogleOAuthConfig {
     pub client_id: String,
     pub client_secret: String,
     pub redirect_url: String,
+}
+
+impl std::fmt::Debug for GoogleOAuthConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            client_id,
+            client_secret: _,
+            redirect_url,
+        } = self;
+        f.debug_struct("GoogleOAuthConfig")
+            .field("client_id", client_id)
+            .field("client_secret", &"<redacted>")
+            .field("redirect_url", redirect_url)
+            .finish()
+    }
 }
 
 /// NEAR wallet authentication configuration
@@ -1335,11 +1519,26 @@ impl NearConfig {
 }
 
 // Generic OAuth provider config for unified handling
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct OAuthProviderConfig {
     pub client_id: String,
     pub client_secret: String,
     pub redirect_uri: String,
+}
+
+impl std::fmt::Debug for OAuthProviderConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            client_id,
+            client_secret: _,
+            redirect_uri,
+        } = self;
+        f.debug_struct("OAuthProviderConfig")
+            .field("client_id", client_id)
+            .field("client_secret", &"<redacted>")
+            .field("redirect_uri", redirect_uri)
+            .finish()
+    }
 }
 
 impl From<GitHubOAuthConfig> for OAuthProviderConfig {
@@ -1522,7 +1721,7 @@ impl PlacementEndpoint {
 pub const DEFAULT_CONTACT_EMAIL_VERIFICATION_DAILY_CAP: u32 = 500;
 
 /// Email notification configuration for organization invitations.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct InvitationEmailConfig {
     pub enabled: bool,
     /// Lets NEAR wallet users add and verify a contact email. Switched on its
@@ -1535,6 +1734,35 @@ pub struct InvitationEmailConfig {
     pub reply_to: Option<String>,
     pub resend_api_key: Option<String>,
     pub frontend_base_url: Option<String>,
+}
+
+impl std::fmt::Debug for InvitationEmailConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            enabled,
+            contact_email_verification_enabled,
+            contact_email_verification_daily_cap,
+            from_email,
+            reply_to,
+            resend_api_key,
+            frontend_base_url,
+        } = self;
+        f.debug_struct("InvitationEmailConfig")
+            .field("enabled", enabled)
+            .field(
+                "contact_email_verification_enabled",
+                contact_email_verification_enabled,
+            )
+            .field(
+                "contact_email_verification_daily_cap",
+                contact_email_verification_daily_cap,
+            )
+            .field("from_email", from_email)
+            .field("reply_to", reply_to)
+            .field("resend_api_key", &redact_opt(resend_api_key))
+            .field("frontend_base_url", frontend_base_url)
+            .finish()
+    }
 }
 
 impl Default for InvitationEmailConfig {
@@ -2333,6 +2561,197 @@ mod tests {
         let debug = format!("{config:?}");
         assert!(debug.contains("<redacted>"));
         assert!(!debug.contains("grafana-secret-token"));
+    }
+
+    fn sample_database_config() -> DatabaseConfig {
+        DatabaseConfig {
+            connection_mode: DatabaseConnectionMode::Direct,
+            primary_app_id: "app".to_string(),
+            gateway_subdomain: "gateway".to_string(),
+            host: Some("db.internal".to_string()),
+            port: 5432,
+            database: "cloud".to_string(),
+            username: "cloud_user".to_string(),
+            password: "sentinel-db-password".to_string(),
+            max_connections: 4,
+            recycling_method: DatabaseRecyclingMethod::Fast,
+            tls_enabled: true,
+            tls_ca_cert_path: None,
+            refresh_interval: 30,
+            mock: false,
+        }
+    }
+
+    fn sample_auth_config() -> AuthConfig {
+        AuthConfig {
+            encoding_key: "sentinel-jwt-encoding-key".to_string(),
+            github: Some(GitHubOAuthConfig {
+                client_id: "github-client-id".to_string(),
+                client_secret: "sentinel-github-client-secret".to_string(),
+                redirect_url: "https://example.test/github".to_string(),
+            }),
+            google: Some(GoogleOAuthConfig {
+                client_id: "google-client-id".to_string(),
+                client_secret: "sentinel-google-client-secret".to_string(),
+                redirect_url: "https://example.test/google".to_string(),
+            }),
+            admin_emails: vec!["admin@example.test".to_string()],
+            ..AuthConfig::default()
+        }
+    }
+
+    #[test]
+    fn database_config_debug_redacts_password() {
+        let debug = format!("{:?}", sample_database_config());
+        assert!(!debug.contains("sentinel-db-password"));
+        assert!(debug.contains("password: \"<redacted>\""));
+        assert!(debug.contains("cloud_user"));
+        assert!(debug.contains("db.internal"));
+    }
+
+    #[test]
+    fn auth_config_debug_redacts_signing_key_and_client_secrets() {
+        let debug = format!("{:?}", sample_auth_config());
+        assert!(!debug.contains("sentinel-jwt-encoding-key"));
+        assert!(!debug.contains("sentinel-github-client-secret"));
+        assert!(!debug.contains("sentinel-google-client-secret"));
+        assert!(debug.contains("github-client-id"));
+        assert!(debug.contains("google-client-id"));
+        assert!(debug.contains("admin@example.test"));
+    }
+
+    #[test]
+    fn oauth_provider_config_debug_redacts_client_secret() {
+        let config = OAuthProviderConfig {
+            client_id: "provider-client-id".to_string(),
+            client_secret: "sentinel-provider-client-secret".to_string(),
+            redirect_uri: "https://example.test/callback".to_string(),
+        };
+        let debug = format!("{config:?}");
+        assert!(!debug.contains("sentinel-provider-client-secret"));
+        assert!(debug.contains("provider-client-id"));
+        assert!(debug.contains("https://example.test/callback"));
+    }
+
+    #[test]
+    fn github_dispatch_and_invitation_email_debug_redact_tokens() {
+        let dispatch = GitHubDispatchConfig {
+            enabled: true,
+            repo: Some("owner/repo".to_string()),
+            pat: Some("sentinel-github-pat".to_string()),
+            ..GitHubDispatchConfig::default()
+        };
+        let debug = format!("{dispatch:?}");
+        assert!(!debug.contains("sentinel-github-pat"));
+        assert!(debug.contains("owner/repo"));
+
+        let email = InvitationEmailConfig {
+            enabled: true,
+            resend_api_key: Some("sentinel-resend-key".to_string()),
+            from_email: Some("noreply@example.test".to_string()),
+            ..InvitationEmailConfig::default()
+        };
+        let debug = format!("{email:?}");
+        assert!(!debug.contains("sentinel-resend-key"));
+        assert!(debug.contains("noreply@example.test"));
+
+        let unset = format!("{:?}", GitHubDispatchConfig::default());
+        assert!(unset.contains("pat: None"));
+    }
+
+    #[test]
+    fn api_config_debug_redacts_all_secrets() {
+        let config = ApiConfig {
+            server: ServerConfig {
+                host: "127.0.0.1".to_string(),
+                port: 3000,
+                pricing_change_apply_interval_secs: 60,
+                usage_hourly_interval_secs: 3600,
+                ohttp_enabled: false,
+            },
+            inference_api_key: Some("sentinel-inference-api-key".to_string()),
+            internal_usage_token: Some("sentinel-internal-usage-token".to_string()),
+            internal_usage_max_discount: DEFAULT_INTERNAL_USAGE_MAX_DISCOUNT,
+            logging: LoggingConfig::default(),
+            dstack_client: DstackClientConfig {
+                url: "http://localhost:8000".to_string(),
+            },
+            auth: sample_auth_config(),
+            database: sample_database_config(),
+            database_encryption_key: "sentinel-database-encryption-key".to_string(),
+            database_encryption_keys: None,
+            database_encryption_key_id: "db-key-1".to_string(),
+            database_encryption_write_enabled: false,
+            s3: S3Config {
+                mock: true,
+                bucket: "bucket".to_string(),
+                region: "us-west-2".to_string(),
+                encryption_key: "sentinel-s3-encryption-key".to_string(),
+                encryption_keys: None,
+                object_rewrap_max_bytes: 1024,
+                object_encryption_write_enabled: false,
+            },
+            invitation_email: InvitationEmailConfig {
+                resend_api_key: Some("sentinel-resend-key".to_string()),
+                ..InvitationEmailConfig::default()
+            },
+            otlp: OtlpConfig {
+                endpoint: "http://localhost:4317".to_string(),
+                protocol: "grpc".to_string(),
+                instance_id: None,
+            },
+            cors: CorsConfig {
+                exact_matches: Vec::new(),
+                wildcard_suffixes: Vec::new(),
+            },
+            external_providers: ExternalProvidersConfig {
+                openai_api_key: Some("sentinel-openai-key".to_string()),
+                ..ExternalProvidersConfig::default()
+            },
+            github_dispatch: GitHubDispatchConfig {
+                pat: Some("sentinel-github-pat".to_string()),
+                ..GitHubDispatchConfig::default()
+            },
+            infra: InfraConfig {
+                prometheus_bearer_token: Some("sentinel-prometheus-token".to_string()),
+                ..InfraConfig::default()
+            },
+            staking_farm: StakingFarmConfig::default(),
+            aml: AmlConfig {
+                lukka_bearer_token: Some("sentinel-lukka-token".to_string()),
+                ..AmlConfig::default()
+            },
+            usage_reporting: UsageReportingConfig::default(),
+            credit_allocation: CreditAllocationConfig::default(),
+            ita: ItaAttestationConfig::default(),
+            placement: PlacementConfig {
+                redis_password: Some("sentinel-redis-password".to_string()),
+                ..PlacementConfig::default()
+            },
+        };
+
+        let debug = format!("{config:?}");
+        for secret in [
+            "sentinel-inference-api-key",
+            "sentinel-internal-usage-token",
+            "sentinel-jwt-encoding-key",
+            "sentinel-github-client-secret",
+            "sentinel-google-client-secret",
+            "sentinel-db-password",
+            "sentinel-database-encryption-key",
+            "sentinel-s3-encryption-key",
+            "sentinel-resend-key",
+            "sentinel-openai-key",
+            "sentinel-github-pat",
+            "sentinel-prometheus-token",
+            "sentinel-lukka-token",
+            "sentinel-redis-password",
+        ] {
+            assert!(!debug.contains(secret), "Debug output leaked {secret}");
+        }
+        assert!(debug.contains("db-key-1"));
+        assert!(debug.contains("cloud_user"));
+        assert!(debug.contains("github-client-id"));
     }
 
     #[test]

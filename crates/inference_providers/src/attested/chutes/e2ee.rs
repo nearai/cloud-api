@@ -14,8 +14,10 @@
 //! **The wire protocol is matched byte-for-byte to Chutes' own clients** — the
 //! `pqcrypto` Python reference (`chutes-api/scripts/test_e2e_client.py`) and,
 //! decisively, Chutes' own RustCrypto reference (`github.com/chutesai/e2ee-test`,
-//! `ml-kem` 0.3.2), which interoperates with their server. Sizes: ML-KEM-768
-//! pubkey 1184 B, ciphertext 1088 B, shared secret 32 B.
+//! `ml-kem` 0.3.2), which interoperates with their server. The 0.3.3 security
+//! patch preserves the 0.3.2 key, ciphertext, and shared-secret bytes, checked
+//! below against a deterministic fixture generated separately with 0.3.2.
+//! Sizes: ML-KEM-768 pubkey 1184 B, ciphertext 1088 B, shared secret 32 B.
 //!
 //! Request blob (raw bytes, POST to `api.chutes.ai/e2e/invoke`):
 //! ```text
@@ -127,26 +129,22 @@ fn derive_key(shared_secret: &[u8], mlkem_ct: &[u8], info: &[u8]) -> [u8; KEY_LE
     key
 }
 
-// `from_slice` is deprecated only as a generic-array 0.14→1.x migration nag
-// (pinned transitively by chacha20poly1305 0.10); the calls are correct.
-#[allow(deprecated)]
 fn aead_seal(key: &[u8; KEY_LEN], nonce: &[u8; NONCE_LEN], plaintext: &[u8]) -> Vec<u8> {
-    let cipher = ChaCha20Poly1305::new(Key::from_slice(key));
+    let cipher = ChaCha20Poly1305::new(&Key::from(*key));
     // ChaCha20Poly1305::encrypt returns ciphertext ‖ tag; AAD is empty.
     cipher
-        .encrypt(Nonce::from_slice(nonce), plaintext)
+        .encrypt(&Nonce::from(*nonce), plaintext)
         .expect("ChaCha20-Poly1305 seal is infallible for in-memory plaintext")
 }
 
-#[allow(deprecated)]
 fn aead_open(
     key: &[u8; KEY_LEN],
     nonce: &[u8; NONCE_LEN],
     ct_and_tag: &[u8],
 ) -> Result<Vec<u8>, E2eeError> {
-    let cipher = ChaCha20Poly1305::new(Key::from_slice(key));
+    let cipher = ChaCha20Poly1305::new(&Key::from(*key));
     cipher
-        .decrypt(Nonce::from_slice(nonce), ct_and_tag)
+        .decrypt(&Nonce::from(*nonce), ct_and_tag)
         .map_err(|_| E2eeError::AeadOpen)
 }
 
@@ -393,6 +391,77 @@ pub(super) mod test_support {
 mod tests {
     use super::test_support::*;
     use super::*;
+
+    #[test]
+    fn chacha_key_retains_zeroize_on_drop() {
+        fn assert_zeroizes_on_drop<T: zeroize::ZeroizeOnDrop>() {}
+        assert_zeroizes_on_drop::<ChaCha20Poly1305>();
+    }
+
+    #[test]
+    fn mlkem_security_patch_preserves_0_3_2_wire_vectors() {
+        use ml_kem::{DecapsulationKey768, Seed, B32};
+
+        // Generated in a separate exact-version ml-kem 0.3.2 program, not by
+        // this dependency graph. Both seeds are synthetic public test inputs.
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("mlkem_0_3_2_fixture.json")).unwrap();
+        let decode = |name: &str| hex::decode(fixture[name].as_str().unwrap()).unwrap();
+        let seed: [u8; 64] = decode("keygen_seed").try_into().unwrap();
+        let randomness: [u8; 32] = decode("encapsulation_randomness").try_into().unwrap();
+        let private_key = DecapsulationKey768::from_seed(Seed::from(seed));
+        let public_key_bytes = decode("encapsulation_key");
+        assert_eq!(public_key_bytes.len(), MLKEM_PK_LEN);
+        assert_eq!(
+            private_key.encapsulation_key().to_bytes().as_slice(),
+            public_key_bytes
+        );
+
+        // Import the old client's encoded public key through the production
+        // parsing path, and check that new encapsulation emits identical bytes.
+        let public_key = EncapsulationKey768::new_from_slice(&public_key_bytes).unwrap();
+        let (mut ciphertext, shared_secret) =
+            public_key.encapsulate_deterministic(&B32::from(randomness));
+        assert_eq!(ciphertext.len(), MLKEM_CT_LEN);
+        assert_eq!(ciphertext.as_slice(), decode("ciphertext"));
+        assert_eq!(shared_secret.as_slice(), decode("shared_secret"));
+        assert_eq!(
+            private_key
+                .decapsulate_slice(&decode("ciphertext"))
+                .unwrap(),
+            shared_secret
+        );
+
+        // FIPS 203 implicit rejection also depends on the SHAKE backend that
+        // changed in 0.3.3. Preserve the old version's deterministic output.
+        ciphertext[0] ^= 1;
+        let rejected = private_key.decapsulate(&ciphertext);
+        assert_eq!(rejected.as_slice(), decode("rejected_shared_secret"));
+        assert_ne!(rejected, shared_secret);
+    }
+
+    #[test]
+    fn chacha20_poly1305_matches_known_ciphertext_and_stream_frame() {
+        // Independent OpenSSL ChaCha20-Poly1305 fixture (Python cryptography),
+        // using key [7; 32], nonce 0..12, empty AAD, and a postfixed tag.
+        let nonce = std::array::from_fn(|index| index as u8);
+        let ciphertext = hex::decode(
+            "401096420fe28f4f7e0669afcd6e1e0d95f682989f4ea50d6b696c98341bfda11281deab0952b2ce9d",
+        )
+        .unwrap();
+        let plaintext = b"legacy ciphertext fixture";
+        assert_eq!(aead_seal(&[7; KEY_LEN], &nonce, plaintext), ciphertext);
+        assert_eq!(
+            aead_open(&[7; KEY_LEN], &nonce, &ciphertext).unwrap(),
+            plaintext
+        );
+        let mut frame = nonce.to_vec();
+        frame.extend_from_slice(&ciphertext);
+        let key = StreamKey([7; KEY_LEN]);
+        assert_eq!(key.decrypt_chunk(&frame).unwrap(), plaintext);
+        *frame.last_mut().unwrap() ^= 1;
+        assert!(key.decrypt_chunk(&frame).is_err());
+    }
 
     #[test]
     fn request_blob_has_expected_shape() {

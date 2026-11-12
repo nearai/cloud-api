@@ -236,6 +236,27 @@ fn tool_name(tool: &Value) -> Result<String, String> {
         .ok_or("Client-managed tools require a nonempty name".into())
 }
 
+/// Client-facing rejection for MCP tools, which are no longer supported.
+pub const MCP_TOOLS_UNSUPPORTED: &str = "MCP tools are no longer supported.";
+
+/// Whether a Responses request declares an `mcp` tool anywhere a tool can be
+/// declared: top-level `tools`, a `namespace`, or an `additional_tools` input.
+pub fn contains_mcp_tool(body: &Value) -> bool {
+    fn any_mcp(tools: &Value) -> bool {
+        tools.as_array().is_some_and(|tools| {
+            tools.iter().any(|tool| {
+                tool["type"] == "mcp" || tool["type"] == "namespace" && any_mcp(&tool["tools"])
+            })
+        })
+    }
+    any_mcp(&body["tools"])
+        || body["input"].as_array().is_some_and(|input| {
+            input
+                .iter()
+                .any(|item| item["type"] == "additional_tools" && any_mcp(&item["tools"]))
+        })
+}
+
 fn is_cloud_search(tool: &Value) -> bool {
     matches!(
         tool["type"].as_str(),
@@ -512,6 +533,9 @@ pub fn normalize_request(mut body: Value) -> Result<(Value, ClientToolAdapter), 
 
     if let Some(choice) = body.get_mut("tool_choice").filter(|value| !value.is_null()) {
         if let Some(mode) = choice.as_str() {
+            if mode == "required" && normalized.is_empty() {
+                return Err("tool_choice 'required' requires at least one declared tool".into());
+            }
             if !matches!(mode, "auto" | "none" | "required") {
                 return Err(
                     "tool_choice must be auto, none, required, or a client tool choice".into(),

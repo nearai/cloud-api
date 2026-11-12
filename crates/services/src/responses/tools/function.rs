@@ -1,7 +1,7 @@
 //! Function Tool Executor for External/Custom Functions
 //!
 //! This module handles external function tools defined by clients.
-//! Unlike built-in tools (web_search, file_search) or MCP tools,
+//! Unlike built-in tools (web_search, file_search),
 //! external functions are executed by the client, not the server.
 //!
 //! Flow:

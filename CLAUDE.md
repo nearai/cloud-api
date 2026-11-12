@@ -2,7 +2,7 @@
 
 ## Public repository disclosure rules
 
-Before writing to a repository, check its visibility with `gh repo view --json visibility`. Check the visibility of every repository you plan to mention.
+Before writing to a repository, identify the actual destination repository and verify its visibility. Independently verify the visibility of every repository you plan to mention.
 
 For public repositories, this rule covers all written content, including PR titles and bodies, commit messages, branch names, code and workflow comments, documentation, issues, and review replies. Include only what an outside reviewer needs to understand what the change does, any behavior change, and how it was tested.
 

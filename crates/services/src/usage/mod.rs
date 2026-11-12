@@ -223,54 +223,114 @@ impl UsageServiceImpl {
         identity: BillingIdentity,
         bounds: budget::UsageFeatures,
         requested_mode: budget::policy::AdmissionMode,
+        path: &'static str,
     ) -> Result<budget::BudgetAdmission, UsageError> {
-        use budget::policy::AdmissionMode;
+        use budget::{metrics, policy::AdmissionMode};
         let policy = self.admission_policy(identity.organization_id);
         let mode = policy.mode.combined(requested_mode);
-        let mut result = budget::BudgetAdmission {
-            id: None,
-            mode,
-            estimated_amount: None,
-        };
-        if mode == AdmissionMode::Off {
-            return Ok(result);
-        }
-        let quote = async {
-            let pricing = self
-                .model_repository
-                .get_model_by_id(identity.model_id)
-                .await
-                .map_err(|e| UsageError::InternalError(e.to_string()))?
-                .ok_or_else(|| UsageError::ModelNotFound(identity.model_id.to_string()))?;
-            bounds.estimate()?.quote(&pricing)
+        let started = std::time::Instant::now();
+        let mut audit_error = None;
+        let result = async {
+            let mut admission = budget::BudgetAdmission {
+                id: None,
+                mode,
+                estimated_amount: None,
+            };
+            if mode == AdmissionMode::Off {
+                return Ok(admission);
+            }
+            let quote_started = std::time::Instant::now();
+            let quote = async {
+                let pricing = self
+                    .model_repository
+                    .get_model_by_id(identity.model_id)
+                    .await
+                    .map_err(|e| UsageError::InternalError(e.to_string()))?
+                    .ok_or_else(|| UsageError::ModelNotFound(identity.model_id.to_string()))?;
+                bounds.estimate()?.quote(&pricing)
+            }
+            .await;
+            metrics::duration(
+                self.metrics_service.as_ref(),
+                path,
+                mode,
+                "estimate",
+                quote_started.elapsed(),
+            );
+            let amount = match quote {
+                Ok(amount) => amount,
+                Err(error) if mode == AdmissionMode::Audit => {
+                    audit_error = Some(metrics::error_reason(&error));
+                    return Ok(admission);
+                }
+                Err(error) => return Err(error),
+            };
+            admission.estimated_amount = Some(amount);
+            if id.as_u128().is_multiple_of(100) {
+                tracing::info!(event = "usage_admission_estimate",
+                    organization_id = %identity.organization_id, model_id = %identity.model_id,
+                    inference_type = bounds.inference_type.as_str(),
+                    mode = metrics::mode_label(mode), path, estimated_nano_usd = amount,
+                    estimator_version = budget::ESTIMATOR_VERSION, sample_rate = 0.01,
+                    "Admission estimate sample");
+            }
+            if mode == AdmissionMode::Audit {
+                return Ok(admission);
+            }
+            let reservation = budget::BudgetReservation {
+                id,
+                amount,
+                identity,
+                inference_type: bounds.inference_type,
+                estimator_version: budget::ESTIMATOR_VERSION,
+                organization_max_unsettled: policy.organization_max_unsettled,
+                key_max_unsettled: policy.key_max_unsettled,
+                reservation_ttl_seconds: policy.reservation_ttl_seconds,
+            };
+            let db_started = std::time::Instant::now();
+            let reserved = self.usage_repository.admit_budget(&reservation).await;
+            metrics::duration(
+                self.metrics_service.as_ref(),
+                path,
+                mode,
+                "reserve",
+                db_started.elapsed(),
+            );
+            reserved?;
+            admission.id = Some(id);
+            Ok(admission)
         }
         .await;
-        let amount = match quote {
-            Ok(amount) => amount,
-            Err(error) if mode == AdmissionMode::Audit => {
-                tracing::warn!(organization_id = %identity.organization_id, model_id = %identity.model_id, error = %error, "Admission audit could not estimate usage");
-                return Ok(result);
+        let (outcome, reason) = match &result {
+            Err(error) => ("rejected", metrics::error_reason(error)),
+            Ok(_) if audit_error.is_some() => {
+                ("estimate_failed", audit_error.unwrap_or("unavailable"))
             }
-            Err(error) => return Err(error),
+            Ok(_) => (
+                match mode {
+                    AdmissionMode::Off => "off",
+                    AdmissionMode::Audit => "estimated",
+                    AdmissionMode::Enforce => "admitted",
+                },
+                "none",
+            ),
         };
-        result.estimated_amount = Some(amount);
-        if mode == AdmissionMode::Audit {
-            tracing::info!(organization_id = %identity.organization_id, model_id = %identity.model_id, estimated_nano_usd = amount, "Admission audit estimate");
-            return Ok(result);
-        }
-        let reservation = budget::BudgetReservation {
-            id,
-            amount,
-            identity,
-            inference_type: bounds.inference_type,
-            estimator_version: budget::ESTIMATOR_VERSION,
-            organization_max_unsettled: policy.organization_max_unsettled,
-            key_max_unsettled: policy.key_max_unsettled,
-            reservation_ttl_seconds: policy.reservation_ttl_seconds,
-        };
-        self.usage_repository.admit_budget(&reservation).await?;
-        result.id = Some(id);
-        Ok(result)
+        metrics::decision(
+            self.metrics_service.as_ref(),
+            path,
+            mode,
+            &bounds,
+            outcome,
+            reason,
+        );
+        metrics::duration(
+            self.metrics_service.as_ref(),
+            path,
+            mode,
+            "total",
+            started.elapsed(),
+        );
+        result
     }
 
     pub fn new(
@@ -471,6 +531,7 @@ impl UsageServiceTrait for UsageServiceImpl {
             identity,
             bounds,
             budget::policy::AdmissionMode::Enforce,
+            "cloud_api",
         )
         .await
         .map(|result| result.id)
@@ -483,7 +544,8 @@ impl UsageServiceTrait for UsageServiceImpl {
         report_id: Uuid,
         mode: budget::policy::AdmissionMode,
     ) -> Result<budget::BudgetAdmission, UsageError> {
-        self.reserve_budget(report_id, identity, bounds, mode).await
+        self.reserve_budget(report_id, identity, bounds, mode, "direct_proxy")
+            .await
     }
     async fn record_usage(
         &self,

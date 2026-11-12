@@ -3,6 +3,7 @@ use super::{BillingIdentity, InferenceType, ModelPricing, UsageError};
 use uuid::Uuid;
 
 mod estimate;
+pub(crate) mod metrics;
 pub mod policy;
 pub use estimate::UsageFeatures;
 pub(super) use policy::ESTIMATOR_VERSION;

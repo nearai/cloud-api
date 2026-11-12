@@ -537,12 +537,13 @@ async fn admission_uses_live_org_policy_and_audit_off_never_create_holds() {
     })))).register::<UsageAdmissionKey>(Arc::new(arc_swap::ArcSwap::from_pointee(AdmissionSettings::default()))).build());
     assert!(settings.reload().await);
     let repo = Arc::new(CapturingUsageRepository::default());
+    let metrics = Arc::new(CapturingMetricsService::new());
     let service = UsageServiceImpl::new(
         repo.clone(),
         Arc::new(FixedModelRepository(model())),
         Arc::new(UnusedLimitsRepository),
         Arc::new(MockWorkspaceServiceTrait::new()),
-        Arc::new(CapturingMetricsService::new()),
+        metrics.clone(),
     )
     .with_admission_settings(settings);
     for (org, expected) in [(enforced, true), (disabled, false), (Uuid::new_v4(), false)] {
@@ -580,4 +581,29 @@ async fn admission_uses_live_org_policy_and_audit_off_never_create_holds() {
     assert_eq!(hold.organization_max_unsettled, 512);
     assert_eq!(hold.key_max_unsettled, 128);
     assert_eq!(hold.reservation_ttl_seconds, 900);
+    let recorded = metrics.get_metrics();
+    let decisions: Vec<_> = recorded
+        .iter()
+        .filter(|metric| metric.name == budget::metrics::DECISIONS)
+        .collect();
+    assert_eq!(decisions.len(), 5);
+    for outcome in ["admitted", "off", "estimated", "estimate_failed"] {
+        assert!(decisions
+            .iter()
+            .any(|metric| metric.tags.contains(&format!("outcome:{outcome}"))));
+    }
+    for (stage, expected) in [("reserve", 1), ("total", 5)] {
+        assert_eq!(
+            recorded
+                .iter()
+                .filter(|metric| metric.name == budget::metrics::DURATION
+                    && metric.tags.contains(&format!("stage:{stage}")))
+                .count(),
+            expected
+        );
+    }
+    assert!(recorded.iter().all(|metric| !metric
+        .tags
+        .iter()
+        .any(|tag| tag.contains(&enforced.to_string()))));
 }

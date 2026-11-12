@@ -4,24 +4,13 @@
 //! acquisition, transactions and timeouts; report SQL lives in one file per report family.
 //! Every report runs in one read-only transaction under one statement budget (spec §6.3).
 
-mod consumption;
 mod organization;
-mod pagination;
-mod platform;
-mod provider_attribution;
-mod revenue;
 
 use super::{reporting_query, utils::map_db_error};
 use crate::pool::DbPool;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use services::admin::{
-    AnalyticsRepository, BillingSummary, ModelConsumptionTimeseries,
-    ModelConsumptionTimeseriesQuery, ModelRevenueQuery, ModelRevenueReport, OrgRevenueQuery,
-    OrgRevenueReport, OrganizationMetrics, PerformanceTimeseries, PerformanceTimeseriesQuery,
-    PlatformMetrics, PlatformTimeSeriesMetrics, RevenueDensityQuery, RevenueDensityReport,
-    TimeSeriesMetrics,
-};
+use services::admin::{AnalyticsRepository, OrganizationMetrics, TimeSeriesMetrics};
 use services::common::RepositoryError;
 use std::time::{Duration, Instant};
 use tokio_postgres::Transaction;
@@ -29,10 +18,6 @@ use uuid::Uuid;
 
 /// Budget for one analytics report (spec §6.3), shared by all of its statements.
 const ANALYTICS_STATEMENT_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// Revenue density stays on raw per-minute buckets over up to 90 days (spec §8). This is a
-/// runaway guard, not a latency target, so it is a fixed constant rather than the seam.
-const REVENUE_DENSITY_STATEMENT_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// PostgreSQL implementation of the analytics repository
 pub struct PgAnalyticsRepository {
@@ -129,17 +114,6 @@ impl AnalyticsRepository for PgAnalyticsRepository {
         .await
     }
 
-    async fn get_platform_metrics(
-        &self,
-        start: DateTime<Utc>,
-        end: DateTime<Utc>,
-    ) -> Result<PlatformMetrics, RepositoryError> {
-        self.run_report(self.statement_timeout, async |tx, deadline| {
-            platform::get_platform_metrics(tx, deadline, start, end).await
-        })
-        .await
-    }
-
     async fn get_organization_timeseries(
         &self,
         org_id: Uuid,
@@ -157,75 +131,6 @@ impl AnalyticsRepository for PgAnalyticsRepository {
                 credit_type,
             )
             .await
-        })
-        .await
-    }
-
-    async fn get_platform_timeseries(
-        &self,
-        start: DateTime<Utc>,
-        end: DateTime<Utc>,
-        granularity: &str,
-    ) -> Result<PlatformTimeSeriesMetrics, RepositoryError> {
-        self.run_report(self.statement_timeout, async |tx, deadline| {
-            platform::get_platform_timeseries(tx, deadline, start, end, granularity).await
-        })
-        .await
-    }
-
-    async fn get_billing_summary(&self) -> Result<BillingSummary, RepositoryError> {
-        self.run_report(self.statement_timeout, async |tx, deadline| {
-            revenue::get_billing_summary(tx, deadline).await
-        })
-        .await
-    }
-
-    async fn get_model_revenue(
-        &self,
-        query: ModelRevenueQuery,
-    ) -> Result<ModelRevenueReport, RepositoryError> {
-        self.run_report(self.statement_timeout, async |tx, deadline| {
-            revenue::get_model_revenue(tx, deadline, query).await
-        })
-        .await
-    }
-
-    async fn get_org_revenue(
-        &self,
-        query: OrgRevenueQuery,
-    ) -> Result<OrgRevenueReport, RepositoryError> {
-        self.run_report(self.statement_timeout, async |tx, deadline| {
-            revenue::get_org_revenue(tx, deadline, query).await
-        })
-        .await
-    }
-
-    async fn get_model_consumption_timeseries(
-        &self,
-        query: ModelConsumptionTimeseriesQuery,
-    ) -> Result<ModelConsumptionTimeseries, RepositoryError> {
-        self.run_report(self.statement_timeout, async |tx, deadline| {
-            consumption::get_model_consumption_timeseries(tx, deadline, query).await
-        })
-        .await
-    }
-
-    async fn get_performance_timeseries(
-        &self,
-        query: PerformanceTimeseriesQuery,
-    ) -> Result<PerformanceTimeseries, RepositoryError> {
-        self.run_report(self.statement_timeout, async |tx, deadline| {
-            consumption::get_performance_timeseries(tx, deadline, query).await
-        })
-        .await
-    }
-
-    async fn get_revenue_density(
-        &self,
-        query: RevenueDensityQuery,
-    ) -> Result<RevenueDensityReport, RepositoryError> {
-        self.run_report(REVENUE_DENSITY_STATEMENT_TIMEOUT, async |tx, deadline| {
-            revenue::get_revenue_density(tx, deadline, query).await
         })
         .await
     }

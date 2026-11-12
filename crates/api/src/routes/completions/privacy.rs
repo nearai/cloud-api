@@ -57,14 +57,14 @@ fn privacy_error_parts(
                 tracing::warn!(
                     endpoint = label,
                     upstream_status = status_code,
-                    detail = %message,
+                    error_message_len = message.len(),
                     "Privacy request rejected by upstream with client error"
                 );
             } else {
                 tracing::error!(
                     endpoint = label,
                     upstream_status = status_code,
-                    detail = %message,
+                    error_message_len = message.len(),
                     "Privacy provider error"
                 );
             }

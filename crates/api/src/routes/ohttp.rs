@@ -122,7 +122,7 @@ async fn ohttp_relay_standard(
 
     let decap_ms = start.elapsed().as_millis();
 
-    let (request_builder, path_str) =
+    let (request_builder, log_path) =
         parse_bhttp_and_build_loopback(state, &bhttp_request, outer_authorization.as_ref())?;
 
     let loopback_response = send_loopback(request_builder).await?;
@@ -154,7 +154,7 @@ async fn ohttp_relay_standard(
         decap_ms,
         total_ms = start.elapsed().as_millis(),
         inner_status = response_status,
-        inner_path = path_str,
+        inner_path = log_path,
         "OHTTP standard request processed"
     );
 
@@ -194,7 +194,7 @@ async fn ohttp_relay_chunked(
 
     let decap_ms = start.elapsed().as_millis();
 
-    let (request_builder, path_str) =
+    let (request_builder, log_path) =
         parse_bhttp_and_build_loopback(state, &bhttp_request, outer_authorization.as_ref())?;
 
     let loopback_response = send_loopback(request_builder).await?;
@@ -214,7 +214,7 @@ async fn ohttp_relay_chunked(
     info!(
         decap_ms,
         inner_status = response_status,
-        inner_path = path_str,
+        inner_path = log_path,
         "Chunked OHTTP request processed"
     );
 
@@ -361,7 +361,8 @@ fn collect_response_headers(response: &reqwest::Response) -> Vec<(Vec<u8>, Vec<u
 // ── Shared helpers ───────────────────────────────────────────────────────────
 
 /// Parse a Binary HTTP request and build a loopback reqwest request targeting
-/// `http://127.0.0.1:{server_port}{inner_path}`.
+/// `http://127.0.0.1:{server_port}{inner_path}`. Also returns the route
+/// template of the inner path, used for logging.
 ///
 /// If `outer_authorization` is a Bearer token it overrides any `Authorization`
 /// inside the BHTTP payload and scrubs `X-Request-Hash` (trusted-gateway semantics).
@@ -369,9 +370,9 @@ fn parse_bhttp_and_build_loopback(
     state: &AppState,
     bhttp_request: &[u8],
     outer_authorization: Option<&HeaderValue>,
-) -> Result<(reqwest::RequestBuilder, String), OhttpError> {
+) -> Result<(reqwest::RequestBuilder, &'static str), OhttpError> {
     let inner_msg = bhttp::Message::read_bhttp(&mut Cursor::new(bhttp_request)).map_err(|e| {
-        warn!(error = %e, "Failed to parse Binary HTTP request");
+        warn!("Failed to parse Binary HTTP request");
         OhttpError::BadRequest(format!("Invalid Binary HTTP request: {e}"))
     })?;
 
@@ -431,7 +432,7 @@ fn parse_bhttp_and_build_loopback(
             }
             _ => {
                 warn!(
-                    name = %String::from_utf8_lossy(name_bytes),
+                    name_len = name_bytes.len(),
                     "Skipping invalid inner OHTTP header"
                 );
             }
@@ -447,7 +448,65 @@ fn parse_bhttp_and_build_loopback(
         request_builder = request_builder.body(inner_content);
     }
 
-    Ok((request_builder, path_str.to_string()))
+    Ok((request_builder, inner_route_for_log(path_str)))
+}
+
+/// Route templates reported for inner requests. `{...}` matches one segment.
+const INNER_ROUTES: &[&str] = &[
+    "/v1/chat/completions",
+    "/v1/completions",
+    "/v1/embeddings",
+    "/v1/rerank",
+    "/v1/score",
+    "/v1/images/generations",
+    "/v1/images/edits",
+    "/v1/audio/transcriptions",
+    "/v1/privacy/classify",
+    "/v1/privacy/redact",
+    "/v1/systemone",
+    "/v1/messages",
+    "/v1/messages/count_tokens",
+    "/v1/models",
+    "/v1/model/list",
+    "/v1/responses",
+    "/v1/responses/{response_id}",
+    "/v1/responses/{response_id}/cancel",
+    "/v1/responses/{response_id}/input_items",
+    "/v1/conversations",
+    "/v1/conversations/batch",
+    "/v1/conversations/{conversation_id}",
+    "/v1/conversations/{conversation_id}/items",
+    "/v1/files",
+    "/v1/files/{file_id}",
+    "/v1/files/{file_id}/content",
+    "/v1/signature/{chat_id}",
+    "/v1/attestation/report",
+    "/v1/attestation/ita-token",
+    "/v1/attestation/pins",
+];
+
+/// Route template for an inner path, or `other` when none matches.
+fn inner_route_for_log(path: &str) -> &'static str {
+    let path = path.split(['?', '#']).next().unwrap_or_default();
+    let matches = |route: &str| {
+        let mut segments = path.split('/');
+        let mut parts = route.split('/');
+        loop {
+            match (parts.next(), segments.next()) {
+                (None, None) => return true,
+                (Some(part), Some(segment)) if part == segment => {}
+                (Some(part), Some(segment)) if part.starts_with('{') && !segment.is_empty() => {}
+                _ => return false,
+            }
+        }
+    };
+    if let Some(route) = INNER_ROUTES.iter().copied().find(|route| matches(route)) {
+        return route;
+    }
+    match path.strip_prefix("/v1/model/") {
+        Some(rest) if !rest.is_empty() => "/v1/model/{model_name}",
+        _ => "other",
+    }
 }
 
 async fn send_loopback(
@@ -482,6 +541,27 @@ mod tests {
         let mut buf = FuturesCursor::new(Vec::new());
         bhttp_write_varint(&mut buf, v).await.unwrap();
         buf.into_inner()
+    }
+
+    #[test]
+    fn inner_route_for_log_uses_route_template() {
+        for (path, want) in [
+            ("/v1/chat/completions?a=1", "/v1/chat/completions"),
+            ("/v1/models", "/v1/models"),
+            ("/v1/conversations/batch", "/v1/conversations/batch"),
+            (
+                "/v1/conversations/item-1/items?limit=5",
+                "/v1/conversations/{conversation_id}/items",
+            ),
+            ("/v1/model/value-a/value-b", "/v1/model/{model_name}"),
+            ("/v1/model/list", "/v1/model/list"),
+            ("/v1/value-a", "other"),
+            ("/v1/files/item-1/value-a", "other"),
+            ("/v1/conversations//items", "other"),
+            ("/", "other"),
+        ] {
+            assert_eq!(inner_route_for_log(path), want, "{path}");
+        }
     }
 
     #[tokio::test]

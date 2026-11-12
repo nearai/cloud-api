@@ -201,7 +201,7 @@ pub async fn get_model_by_name(
     State(app_state): State<ModelsAppState>,
     Path(model_name): Path<String>,
 ) -> Result<ResponseJson<ModelWithPricing>, (StatusCode, ResponseJson<ErrorResponse>)> {
-    debug!("Get model request for: {}", model_name);
+    debug!(model_name_len = model_name.len(), "Get model request");
 
     let model = app_state
         .models_service
@@ -211,7 +211,7 @@ pub async fn get_model_by_name(
             services::models::ModelsError::NotFound(_) => {
                 // Routine 404 on a public, unauthenticated endpoint fed by arbitrary
                 // client input (scanners probe slug permutations) — not operational.
-                warn!("Model not found: '{}' (URL-decoded query)", model_name);
+                warn!(model_name_len = model_name.len(), "Model not found");
                 (
                     StatusCode::NOT_FOUND,
                     ResponseJson(ErrorResponse::new(
@@ -221,7 +221,16 @@ pub async fn get_model_by_name(
                 )
             }
             other => {
-                error!(error = %other, "Failed to get model '{}'", model_name);
+                let error_kind = match other {
+                    services::models::ModelsError::InternalError(_) => "internal",
+                    services::models::ModelsError::InvalidParams(_) => "invalid_params",
+                    services::models::ModelsError::NotFound(_) => "not_found",
+                };
+                error!(
+                    error_kind,
+                    model_name_len = model_name.len(),
+                    "Failed to get model"
+                );
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     ResponseJson(ErrorResponse::new(

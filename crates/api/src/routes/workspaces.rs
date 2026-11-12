@@ -231,8 +231,9 @@ pub async fn create_workspace(
     Json(request): Json<CreateWorkspaceRequest>,
 ) -> Result<(StatusCode, Json<WorkspaceResponse>), (StatusCode, Json<ErrorResponse>)> {
     debug!(
-        "Creating workspace: {} in organization: {} by user: {}",
-        request.name, org_id, user.0.id
+        organization_id = %org_id,
+        user_id = %user.0.id,
+        "Creating workspace"
     );
 
     if let Err(msg) = request.validate() {

@@ -67,6 +67,11 @@ pub enum CompletionError {
     #[error("Service overloaded: {0}")]
     ServiceOverloaded(String),
 
+    /// The upstream backend answered 503 at capacity. `retry_after_secs` is
+    /// its `Retry-After` delta-seconds, when it sent one.
+    #[error("Upstream overloaded")]
+    UpstreamOverloaded { retry_after_secs: Option<u64> },
+
     #[error("Internal error: {0}")]
     InternalError(String),
 }

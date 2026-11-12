@@ -163,6 +163,7 @@ dependencies = [
  "headers",
  "hex",
  "hmac 0.13.0",
+ "http-body 1.0.1",
  "http-body-util",
  "indexmap 2.14.2",
  "inference_providers",

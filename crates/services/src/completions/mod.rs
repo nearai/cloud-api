@@ -178,6 +178,10 @@ where
     /// Callback to report observed TTFT back to the provider pool for latency-aware
     /// routing. Called once with the backend TTFT (ms) from record_usage_and_metrics.
     latency_reporter: Option<super::inference_provider_pool::ProviderLatencyReporter>,
+    /// The request's tenant ids, captured when the stream is built. The
+    /// signature fetch runs while the response body is polled, after the
+    /// request's own scope has ended.
+    tracing_context: Option<inference_providers::tracing_context::TracingContext>,
 }
 
 impl<S> InterceptStream<S>
@@ -239,7 +243,7 @@ where
             });
         }
 
-        Box::pin(async move {
+        let store = async move {
             match tokio::time::timeout(
                 STREAM_SIGNATURE_STORE_TIMEOUT,
                 attestation_service.store_stream_chat_signature_from_provider(&chat_id),
@@ -266,7 +270,14 @@ where
                         .await;
                 }
             }
-        })
+        };
+        // Re-enter the request's ids so the fetch carries them upstream.
+        match self.tracing_context {
+            Some(context) => Box::pin(inference_providers::tracing_context::with_tracing_context(
+                context, store,
+            )),
+            None => Box::pin(store),
+        }
     }
 
     fn begin_finalizing(&mut self) {
@@ -867,33 +878,6 @@ fn estimate_input_tokens(messages: &[inference_providers::ChatMessage]) -> u32 {
 }
 
 impl CompletionServiceImpl {
-    /// Inject tracing correlation IDs into the `extra` map that is forwarded
-    /// to `ChatCompletionParams`. The inference provider reads these keys and
-    /// emits them as `X-Request-Id` / `X-Org-Id` / `X-Workspace-Id` HTTP
-    /// headers on the outbound call to the vLLM/SGLang backend.
-    ///
-    /// The key names must match the constants in
-    /// `inference_providers::attested::nearai::tracing_headers`.
-    fn inject_tracing_headers(
-        extra: &mut std::collections::HashMap<String, serde_json::Value>,
-        request_id: Uuid,
-        organization_id: Uuid,
-        workspace_id: Uuid,
-    ) {
-        extra.insert(
-            "x_request_id".to_string(),
-            serde_json::Value::String(request_id.to_string()),
-        );
-        extra.insert(
-            "x_org_id".to_string(),
-            serde_json::Value::String(organization_id.to_string()),
-        );
-        extra.insert(
-            "x_workspace_id".to_string(),
-            serde_json::Value::String(workspace_id.to_string()),
-        );
-    }
-
     pub fn new(
         inference_provider_pool: Arc<InferenceProviderPool>,
         attestation_service: Arc<dyn AttestationServiceTrait>,
@@ -1540,7 +1524,8 @@ impl CompletionServiceImpl {
             ports::CompletionError::InvalidParams(_) => ERROR_TYPE_INVALID_PARAMS,
             ports::CompletionError::RateLimitExceeded(_) => ERROR_TYPE_RATE_LIMIT,
             ports::CompletionError::ProviderError { .. } => ERROR_TYPE_INFERENCE_ERROR,
-            ports::CompletionError::ServiceOverloaded(_) => ERROR_TYPE_SERVICE_OVERLOADED,
+            ports::CompletionError::ServiceOverloaded(_)
+            | ports::CompletionError::UpstreamOverloaded { .. } => ERROR_TYPE_SERVICE_OVERLOADED,
             ports::CompletionError::InternalError(_) => ERROR_TYPE_INTERNAL_ERROR,
         };
 
@@ -1750,6 +1735,7 @@ impl CompletionServiceImpl {
             requested_service_tier,
             provider_service_tier: None,
             latency_reporter,
+            tracing_context: inference_providers::tracing_context::current_tracing_context(),
         };
         Box::pin(intercepted_stream)
     }
@@ -1794,10 +1780,6 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         let mut extra = request.extra.clone();
         let (tools, tool_choice) = Self::extract_tools_from_extra(&mut extra);
         let stream_options = Self::extract_stream_options_from_extra(&mut extra);
-
-        // Inject tracing correlation IDs into extra so the inference provider
-        // forwards them as X-Request-Id / X-Org-Id / X-Workspace-Id headers.
-        Self::inject_tracing_headers(&mut extra, request_id, organization_id, workspace_id);
 
         let mut chat_params = inference_providers::ChatCompletionParams {
             placement: Default::default(),
@@ -2003,19 +1985,12 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             None => crate::models::ModelCaller::Organization(request.organization_id),
         };
         let service_start_time = Instant::now();
-        let organization_id = request.organization_id;
-        let workspace_id = request.workspace_id;
-        let request_id = request.request_id;
         let chat_messages = Self::prepare_chat_messages(&request.messages);
 
         // Extract tools from extra if present (Responses API puts them there)
         let mut extra = request.extra.clone();
         let (tools, tool_choice) = Self::extract_tools_from_extra(&mut extra);
         let stream_options = Self::extract_stream_options_from_extra(&mut extra);
-
-        // Inject tracing correlation IDs into extra so the inference provider
-        // forwards them as X-Request-Id / X-Org-Id / X-Workspace-Id headers.
-        Self::inject_tracing_headers(&mut extra, request_id, organization_id, workspace_id);
 
         let mut chat_params = inference_providers::ChatCompletionParams {
             placement: Default::default(),
@@ -2178,7 +2153,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             let attestation_service = self.attestation_service.clone();
             let chat_id = response_with_bytes.response.id.clone();
             let model_name = model.model_name.clone();
-            tokio::spawn(
+            inference_providers::tracing_context::spawn_with_tracing_context(
                 async move {
                     match attestation_service
                         .store_chat_signature_from_provider(chat_id.as_str())
@@ -2500,6 +2475,9 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
                         message: msg,
                     }
                 }
+                inference_providers::PrivacyClassifyError::Overloaded { retry_after_secs } => {
+                    ports::CompletionError::UpstreamOverloaded { retry_after_secs }
+                }
                 inference_providers::PrivacyClassifyError::HttpError {
                     status_code,
                     message,
@@ -2512,7 +2490,14 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
                     429 => ports::CompletionError::RateLimitExceeded(
                         "Rate limit exceeded by upstream provider. Please retry with exponential backoff.".to_string(),
                     ),
-                    503 => ports::CompletionError::ServiceOverloaded(message),
+                    503 => ports::CompletionError::UpstreamOverloaded {
+                        retry_after_secs: None,
+                    },
+                    // Kept distinct so callers can report a timeout.
+                    504 => ports::CompletionError::ProviderError {
+                        status_code: 504,
+                        message,
+                    },
                     500..=599 => ports::CompletionError::ProviderError {
                         status_code: 502,
                         message,
@@ -2706,6 +2691,7 @@ mod tests {
             requested_service_tier: None,
             provider_service_tier: None,
             latency_reporter: None,
+            tracing_context: None,
         }
     }
 
@@ -2924,6 +2910,7 @@ mod tests {
             requested_service_tier: None,
             provider_service_tier: None,
             latency_reporter: None,
+            tracing_context: None,
         };
 
         // Consume both provider chunks, then verify the usage dimensions captured
@@ -3098,6 +3085,7 @@ mod tests {
             requested_service_tier: None,
             provider_service_tier: None,
             latency_reporter: None,
+            tracing_context: None,
         };
         let _ = intercept_stream.collect::<Vec<_>>().await;
         // Wait for the fire-and-forget usage/metrics task spawned in Drop to finish.
@@ -3253,6 +3241,7 @@ mod tests {
             requested_service_tier: None,
             provider_service_tier: None,
             latency_reporter: None,
+            tracing_context: None,
         };
 
         // Consume the stream
@@ -3382,6 +3371,7 @@ mod tests {
             requested_service_tier: None,
             provider_service_tier: None,
             latency_reporter: None,
+            tracing_context: None,
         };
 
         let _ = intercept_stream.collect::<Vec<_>>().await;
@@ -3593,6 +3583,7 @@ mod tests {
                 requested_service_tier: None,
                 provider_service_tier: None,
                 latency_reporter: None,
+                tracing_context: None,
             };
             // InterceptStream goes out of scope here and Drop is called
         }

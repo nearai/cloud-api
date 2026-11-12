@@ -69,6 +69,7 @@ pub mod spki_verifier;
 pub mod sse_parser;
 pub mod systemone;
 pub mod thought_signature;
+pub mod tracing_context;
 
 // Attested NEAR-AI fleet provider. Use the module path (`nearai::Provider`,
 // `nearai::Config`) rather than a bare re-export to keep the names unambiguous.

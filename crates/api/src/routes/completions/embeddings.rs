@@ -265,23 +265,19 @@ pub async fn embeddings(
                     status_code,
                     message,
                 } => {
-                    // `message` carries the provider-level detail (including the
-                    // upstream URL on connection failures, where `status_code` is
-                    // synthetic) — without it the log can't distinguish a backend
-                    // 5xx from an unreachable SNI.
                     let classified = classify_provider_error(status_code, message.clone());
                     if classified.0.is_client_error() {
                         tracing::warn!(
                             model = %model_name,
                             upstream_status = status_code,
-                            detail = %message,
+                            error_message_len = message.len(),
                             "Embeddings rejected by upstream with client error"
                         );
                     } else {
                         tracing::error!(
                             model = %model_name,
                             upstream_status = status_code,
-                            detail = %message,
+                            error_message_len = message.len(),
                             "Embeddings provider error"
                         );
                     }

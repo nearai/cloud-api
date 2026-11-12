@@ -113,7 +113,10 @@ pub async fn audio_transcriptions(
                 }
             }
             _ => {
-                tracing::debug!("Skipping unknown field: {}", field_name);
+                tracing::debug!(
+                    field_name_len = field_name.len(),
+                    "Skipping unknown multipart field"
+                );
             }
         }
     }
@@ -131,9 +134,9 @@ pub async fn audio_transcriptions(
     requested_model.set(&request.model);
 
     debug!(
-        "Audio transcription: model={}, filename={}, file_size_kb={}, org={}, workspace={}",
+        "Audio transcription: model={}, filename_len={}, file_size_kb={}, org={}, workspace={}",
         request.model,
-        request.filename,
+        request.filename.len(),
         request.file_bytes.len() / 1024,
         api_key.organization.id,
         api_key.workspace.id.0
@@ -349,7 +352,7 @@ pub async fn audio_transcriptions(
                             status_code,
                             %organization_id,
                             workspace_id = %api_key.workspace.id.0,
-                            detail = %message,
+                            error_message_len = message.len(),
                             "Audio transcription rejected by provider (client input)"
                         );
                         (
@@ -365,7 +368,7 @@ pub async fn audio_transcriptions(
                             status_code,
                             %organization_id,
                             workspace_id = %api_key.workspace.id.0,
-                            detail = %message,
+                            error_message_len = message.len(),
                             "Audio transcription provider error"
                         );
                         (

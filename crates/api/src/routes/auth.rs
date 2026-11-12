@@ -711,16 +711,13 @@ pub async fn near_login(
     Json(auth_request): Json<NearAuthRequest>,
 ) -> Response {
     let account_id_str = auth_request.signed_message.account_id.clone();
-    debug!(
-        "NEAR authentication attempt for account: {}",
-        account_id_str
-    );
+    debug!("NEAR authentication attempt");
 
     // Convert JSON types to internal types
     let signed_message = match auth_request.signed_message.try_into() {
         Ok(msg) => msg,
-        Err(e) => {
-            tracing::warn!("Failed to parse signed message: {}", e);
+        Err(_) => {
+            tracing::warn!("Failed to parse signed message");
             return (
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({
@@ -734,8 +731,8 @@ pub async fn near_login(
 
     let payload = match auth_request.payload.try_into() {
         Ok(p) => p,
-        Err(e) => {
-            tracing::warn!("Failed to parse payload: {}", e);
+        Err(_) => {
+            tracing::warn!("Failed to parse payload");
             return (
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({
@@ -776,7 +773,10 @@ pub async fn near_login(
 
     match result {
         Ok((access_token, refresh_session, refresh_token)) => {
-            debug!("NEAR authentication successful: {}", account_id_str);
+            debug!(
+                user_id = %refresh_session.user_id.0,
+                "NEAR authentication successful"
+            );
 
             let response = NearAuthResponse {
                 access_token,

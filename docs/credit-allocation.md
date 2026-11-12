@@ -87,16 +87,21 @@ Each organization entry is a complete override; omitted fields use built-in defa
 Creating holds requires an explicit `enforce` mode in the selected policy.
 PATCH replaces each supplied top-level field, including the organization map.
 
-The top-level `mode` is a global ceiling. Its default `enforce` permits the selected
-organization policy; it does not make the default policy enforce. Top-level `audit`
-forces every organization to audit, and `off` disables admission for every organization,
-including explicit overrides. Settings take effect through the existing reload mechanism.
+The top-level `enabled` switch defaults to `true`, which uses the selected organization
+policy. Setting it to `false` skips admission for every organization, including explicit
+overrides. Re-enabling restores those policies. Settings take effect through the existing
+reload mechanism. This switch does not cancel work or release existing holds.
 
 `enforce` estimates and reserves; `audit` estimates without holding credit; `off`
 skips admission. Authentication, existing credit checks and actual billing remain active.
 Changing a mode does not release previously created holds. Limits must be positive;
 the normal TTL is 1–86400 seconds and the unknown-outcome TTL must be positive and no
 longer than the normal TTL. Invalid settings are rejected.
+
+Audit still performs local feature measurement, reads model pricing, and records estimates.
+It avoids reservation writes and admission row locks. Feature collection precedes policy
+selection and remains on the request path when admission is disabled. Direct admission still
+makes its control request in audit mode, and a disabled policy still returns a response to it.
 
 Estimator parameters live in
 [`budget/policy.rs`](../crates/services/src/usage/budget/policy.rs) and ship with

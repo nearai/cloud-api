@@ -414,11 +414,31 @@ mod tests {
             .build();
         let org = Uuid::new_v4();
         let author = Uuid::new_v4();
-        settings.update("usage_admission",json!({"defaults":{"mode":"audit"},"organizations":{org.to_string():{"organization_max_unsettled":512,"key_max_unsettled":128}}}),author).await.unwrap();
+        settings.update("usage_admission",json!({"defaults":{"mode":"audit"},"organizations":{org.to_string():{"mode":"enforce","organization_max_unsettled":512,"key_max_unsettled":128}}}),author).await.unwrap();
         assert_eq!(
             settings.current::<UsageAdmissionKey>().defaults.mode,
             AdmissionMode::Audit
         );
+        for (enabled, expected) in [(false, AdmissionMode::Off), (true, AdmissionMode::Enforce)] {
+            settings
+                .update("usage_admission", json!({"enabled":enabled}), author)
+                .await
+                .unwrap();
+            assert_eq!(handle.load().for_organization(org).mode, expected);
+            let reader = AdminSettingsService::builder(repo.clone())
+                .register::<UsageAdmissionKey>(Arc::new(ArcSwap::from_pointee(
+                    AdmissionSettings::default(),
+                )))
+                .build();
+            assert!(reader.reload().await);
+            assert_eq!(
+                reader
+                    .current::<UsageAdmissionKey>()
+                    .for_organization(org)
+                    .mode,
+                expected
+            );
+        }
         assert_eq!(
             handle
                 .load()

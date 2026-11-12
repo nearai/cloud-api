@@ -112,7 +112,7 @@ async fn policy(server: &axum_test::TestServer, value: Value) {
 }
 
 #[tokio::test]
-async fn default_audit_org_enforcement_and_global_off_apply_to_direct_admission() {
+async fn global_disable_and_reenable_preserve_direct_admission_policy_and_existing_holds() {
     let (server, _, _, db) = server(AdmissionSettings::default()).await;
     setup_qwen_model(&server).await;
     let org = setup_org_with_credits(&server, 1_000_000_000).await;
@@ -126,14 +126,15 @@ async fn default_audit_org_enforcement_and_global_off_apply_to_direct_admission(
     .unwrap();
     let body = json!({"id":id,"organization_id":org.id,"workspace_id":ws.id,"api_key_id":key.id,
         "model":E2E_QWEN_MODEL_NAME,"features":features});
-    for (change, expected) in [
-        (json!({}), "audit"),
+    for (change, expected, expected_holds) in [
+        (json!({}), "audit", 0),
         (
             json!({"organizations":{org.id.clone():{"mode":"enforce"}}}),
             "enforce",
+            1,
         ),
-        (json!({"mode":"off"}), "off"),
-        (json!({"mode":"audit"}), "audit"),
+        (json!({"enabled":false}), "off", 1),
+        (json!({"enabled":true}), "enforce", 2),
     ] {
         policy(&server, change).await;
         let mut body = body.clone();
@@ -148,23 +149,20 @@ async fn default_audit_org_enforcement_and_global_off_apply_to_direct_admission(
         assert_eq!(response["mode"], expected);
         assert_eq!(response["id"].is_string(), expected == "enforce");
         assert_eq!(response["estimated_amount"].is_null(), expected == "off");
+        let count: i64 = db
+            .pool()
+            .get()
+            .await
+            .unwrap()
+            .query_one(
+                "SELECT COUNT(*) FROM usage_budget_reservations WHERE organization_id=$1 AND state='active'",
+                &[&Uuid::parse_str(&org.id).unwrap()],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(count, expected_holds, "disabling preserves existing holds");
     }
-    let count: i64 = db
-        .pool()
-        .get()
-        .await
-        .unwrap()
-        .query_one(
-            "SELECT COUNT(*) FROM usage_budget_reservations WHERE organization_id=$1",
-            &[&Uuid::parse_str(&org.id).unwrap()],
-        )
-        .await
-        .unwrap()
-        .get(0);
-    assert_eq!(
-        count, 1,
-        "only the explicitly enforced request creates a hold"
-    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -265,6 +263,8 @@ async fn ten_concurrent_requests_share_a_small_key_budget_and_settle_actual_spen
             .unwrap()
             .get(0);
         assert_eq!(spent, 0, "no actual bill is posted before responses finish");
+        // Stopping new admission must not prevent already admitted usage from settling.
+        policy(&server, json!({"enabled":false})).await;
         gate.add_permits(10);
         admitted
     };

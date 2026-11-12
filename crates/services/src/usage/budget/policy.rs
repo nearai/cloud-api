@@ -66,14 +66,24 @@ impl AdmissionPolicy {
     }
 }
 
-#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AdmissionSettings {
-    /// Global ceiling: off/audit override every organization; enforce permits its policy.
-    pub mode: AdmissionMode,
+    /// Stops new admissions without changing organization policies or existing holds.
+    pub enabled: bool,
     pub defaults: AdmissionPolicy,
     /// Complete overrides, held in operator settings rather than owner-editable org settings.
     pub organizations: BTreeMap<Uuid, AdmissionPolicy>,
+}
+
+impl Default for AdmissionSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            defaults: AdmissionPolicy::default(),
+            organizations: BTreeMap::new(),
+        }
+    }
 }
 
 impl AdmissionSettings {
@@ -83,7 +93,9 @@ impl AdmissionSettings {
             .get(&id)
             .unwrap_or(&self.defaults)
             .clone();
-        policy.mode = self.mode.combined(policy.mode);
+        if !self.enabled {
+            policy.mode = AdmissionMode::Off;
+        }
         policy
     }
 }
@@ -91,7 +103,7 @@ impl AdmissionSettings {
 pub struct UsageAdmissionKey;
 impl SettingKey for UsageAdmissionKey {
     const NAME: &'static str = "usage_admission";
-    const FIELDS: &'static [&'static str] = &["mode", "defaults", "organizations"];
+    const FIELDS: &'static [&'static str] = &["enabled", "defaults", "organizations"];
     type Value = AdmissionSettings;
     type Published = AdmissionSettings;
     fn default_value() -> Self::Value {
@@ -170,10 +182,11 @@ mod tests {
     use super::*;
     use serde_json::json;
     #[test]
-    fn defaults_audit_and_explicit_organizations_enforce_below_the_global_ceiling() {
+    fn global_disable_preserves_default_and_organization_policies_for_reenable() {
         let id = Uuid::new_v4();
         let ordinary = Uuid::new_v4();
-        let mut settings = AdmissionSettings::default();
+        let mut settings = UsageAdmissionKey::parse(&json!({}), true).unwrap();
+        assert!(settings.enabled);
         assert_eq!(
             settings.for_organization(ordinary).mode,
             AdmissionMode::Audit
@@ -190,12 +203,10 @@ mod tests {
             settings.for_organization(ordinary).mode,
             AdmissionMode::Audit
         );
-        for mode in [AdmissionMode::Audit, AdmissionMode::Off] {
-            settings.mode = mode;
-            assert_eq!(settings.for_organization(id).mode, mode);
-            assert_eq!(settings.for_organization(ordinary).mode, mode);
-        }
-        settings.mode = AdmissionMode::Enforce;
+        settings.enabled = false;
+        assert_eq!(settings.for_organization(id).mode, AdmissionMode::Off);
+        assert_eq!(settings.for_organization(ordinary).mode, AdmissionMode::Off);
+        settings.enabled = true;
         assert_eq!(settings.for_organization(id).mode, AdmissionMode::Enforce);
         assert_eq!(
             settings.for_organization(ordinary).mode,
@@ -224,11 +235,18 @@ mod tests {
             assert!(UsageAdmissionKey::parse(&json!({"defaults":invalid}), true).is_err());
         }
         let stopped = UsageAdmissionKey::parse(
-            &json!({"mode":"off","organizations":{id.to_string():{"mode":"enforce"}}}),
+            &json!({"enabled":false,"organizations":{id.to_string():{"mode":"enforce"}}}),
             true,
         )
         .unwrap();
         assert_eq!(stopped.for_organization(id).mode, AdmissionMode::Off);
+        for invalid in [
+            json!({"enabled":"false"}),
+            json!({"enabled":0}),
+            json!({"mode":"off"}),
+        ] {
+            assert!(UsageAdmissionKey::parse(&invalid, true).is_err());
+        }
         assert_eq!(
             AdmissionMode::Enforce.combined(AdmissionMode::Audit),
             AdmissionMode::Audit

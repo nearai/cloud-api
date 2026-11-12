@@ -18,9 +18,18 @@
 # Local development with compose gets the schema from the `schema` service (docker compose run
 # --rm schema, also run by `make dev`). Use this script for a non-compose local Postgres.
 #
+# APPLY_SCHEMA_SKIP=1 skips this script when the caller has already applied a schema.
+#
 # SCHEMA_DOCKER_NETWORK overrides the docker --network value (default: host). On Docker Desktop,
 # localhost is routed through a single-label alias to the host gateway instead.
 set -euo pipefail
+
+# The schema is already applied: cloud-platform CI migrates a database itself, then runs this
+# repo's database tests against it to check that a migration keeps these queries working.
+if [[ "${APPLY_SCHEMA_SKIP:-}" == 1 ]]; then
+  echo "apply-schema: APPLY_SCHEMA_SKIP=1, using the schema already in the database" >&2
+  exit 0
+fi
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 

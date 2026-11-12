@@ -247,7 +247,7 @@ async fn setup_non_attested_model(
         }))
         .unwrap(),
     );
-    let updated = admin_batch_upsert_models(server, batch, get_session_id()).await;
+    let updated = seed_models(server, batch, get_session_id()).await;
     assert_eq!(updated.len(), 1, "Should have configured 1 model");
     tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
     model_name

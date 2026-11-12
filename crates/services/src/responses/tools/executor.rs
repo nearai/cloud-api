@@ -87,7 +87,7 @@ impl<'a> ToolEventContext<'a> {
 /// (like updating the citation tracker for search results).
 #[derive(Debug, Clone)]
 pub enum ToolOutput {
-    /// Plain text response (MCP tools, errors, etc.)
+    /// Plain text response (tool results, errors, etc.)
     Text(String),
 
     /// Web search results with structured source data
@@ -135,7 +135,7 @@ pub struct ToolExecutionContext<'a> {
 
 /// Trait for tool executors
 ///
-/// Each tool type (web_search, file_search, MCP) implements this trait
+/// Each tool type (web_search, file_search) implements this trait
 /// to provide a consistent interface for tool execution.
 ///
 /// Executors should be stateless - they receive read-only context and
@@ -193,8 +193,6 @@ pub trait ToolExecutor: Send + Sync {
     /// Handle an error from tool execution.
     ///
     /// This allows each executor to handle its own errors in a custom way.
-    /// For example, MCP executor handles `McpApprovalRequired` by emitting
-    /// an approval request.
     ///
     /// Returns:
     /// - `Ok(Some(ToolOutput))` to convert error to output (e.g., error message for LLM)
@@ -356,7 +354,7 @@ impl ToolRegistry {
         let failure_count = self.increment_failure_count(&tool_call.tool_type);
         self.log_tool_error(&tool_call.tool_type, failure_count);
 
-        // Delegate to executor for custom handling (e.g., MCP approval)
+        // Delegate to executor for custom handling
         for executor in &self.executors {
             if executor.can_handle(&tool_call.tool_type) {
                 return executor.handle_error(error, tool_call, event_ctx).await;

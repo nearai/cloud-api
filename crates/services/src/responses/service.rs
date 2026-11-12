@@ -966,13 +966,19 @@ impl ResponseServiceImpl {
             })?;
             extra.insert("tools".to_string(), tools);
         }
-        if let Some(tool_choice) = tool_choice {
-            let tool_choice = serde_json::to_value(tool_choice).map_err(|e| {
-                errors::ResponseError::InternalError(format!(
-                    "Failed to serialize custom function choice: {e}"
-                ))
-            })?;
-            extra.insert("tool_choice".to_string(), tool_choice);
+        if let Some(choice) = tool_choice {
+            // An empty round has nothing to select or forbid. Strict Chat providers
+            // can reject an explicit choice without tool definitions.
+            let is_noop = tools.is_empty()
+                && matches!(choice, inference_providers::ToolChoice::String(mode) if mode == "auto" || mode == "none");
+            if !is_noop {
+                let choice = serde_json::to_value(choice).map_err(|e| {
+                    errors::ResponseError::InternalError(format!(
+                        "Failed to serialize custom function choice: {e}"
+                    ))
+                })?;
+                extra.insert("tool_choice".to_string(), choice);
+            }
         }
         if let Some(effort) = Self::reasoning_effort_for_completion(
             process_context.reasoning_effort,
@@ -1125,10 +1131,10 @@ impl ResponseServiceImpl {
     /// function calls without touching their argument bytes.
     ///
     /// Unlike `tools::convert_tool_calls`, this deliberately does not infer a
-    /// missing name, parse JSON, repair malformed JSON, or apply builtin
-    /// search-specific handling. The only checks are that the provider named a
-    /// declared custom function and supplied a usable call ID (or omitted one,
-    /// in which case Cloud creates the correlation ID once).
+    /// missing name, repair argument JSON, or apply builtin search handling.
+    /// Unknown names reach the client so it can return a tool error and continue
+    /// its loop. Name/call-ID structure and registered custom-tool input wrappers
+    /// are still validated.
     fn convert_client_function_calls(
         tool_call_accumulator: crate::responses::service_helpers::ToolCallAccumulator,
         request: &models::CreateResponseRequest,
@@ -1136,17 +1142,6 @@ impl ResponseServiceImpl {
         Vec<crate::responses::service_helpers::ClientManagedFunctionCall>,
         errors::ResponseError,
     > {
-        let declared_function_names: HashSet<&str> = request
-            .tools
-            .as_deref()
-            .unwrap_or_default()
-            .iter()
-            .filter_map(|tool| match tool {
-                models::ResponseTool::Function { name, .. } => Some(name.as_str()),
-                _ => None,
-            })
-            .collect();
-
         let mut entries: Vec<_> = tool_call_accumulator.into_iter().collect();
         entries.sort_by_key(|(index, _)| *index);
 
@@ -1163,12 +1158,6 @@ impl ResponseServiceImpl {
                         "Model returned an invalid custom function call at index {index}: missing function name."
                     )));
                 }
-                if !declared_function_names.contains(name.as_str()) {
-                    return Err(errors::ResponseError::InvalidParams(format!(
-                        "Model called unsupported custom function '{name}'."
-                    )));
-                }
-
                 request.client_tool_adapter.validate_arguments(&name, &entry.arguments)
                     .map_err(errors::ResponseError::InvalidParams)?;
 

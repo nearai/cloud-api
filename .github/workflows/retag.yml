@@ -29,7 +29,7 @@ env:
 jobs:
   retag:
     name: Re-tag ${{ inputs.target }} → ${{ inputs.source }}
-    runs-on: [self-hosted, infra]
+    runs-on: ubuntu-latest
     steps:
       - name: Validate inputs
         env:
@@ -96,10 +96,10 @@ jobs:
           set -euo pipefail
           case "$SOURCE" in
             sha256:*)
-              SOURCE_REF="${{ env.IMAGE }}@${SOURCE}"
+              SOURCE_REF="${IMAGE}@${SOURCE}"
               ;;
             *)
-              SOURCE_REF="${{ env.IMAGE }}:${SOURCE}"
+              SOURCE_REF="${IMAGE}:${SOURCE}"
               ;;
           esac
           # Don't mask skopeo failures: surface stderr so auth / rate-limit /
@@ -119,19 +119,26 @@ jobs:
           echo "Source ${SOURCE_REF} → ${DIGEST}"
 
       - name: Copy source digest → target tag
+        env:
+          STEP_RESOLVE_DIGEST: ${{ steps.resolve.outputs.digest }}
+          INPUT_TARGET: ${{ inputs.target }}
         run: |
           set -euo pipefail
           skopeo copy \
-            "docker://${{ env.IMAGE }}@${{ steps.resolve.outputs.digest }}" \
-            "docker://${{ env.IMAGE }}:${{ inputs.target }}"
+            "docker://${IMAGE}@${STEP_RESOLVE_DIGEST}" \
+            "docker://${IMAGE}:${INPUT_TARGET}"
 
       - name: Summary
+        env:
+          INPUT_TARGET: ${{ inputs.target }}
+          STEP_RESOLVE_SOURCE_REF: ${{ steps.resolve.outputs.source_ref }}
+          STEP_RESOLVE_DIGEST: ${{ steps.resolve.outputs.digest }}
         run: |
           {
-            echo "## Re-tag: :${{ inputs.target }} → ${{ steps.resolve.outputs.source_ref }}"
+            echo "## Re-tag: :${INPUT_TARGET} → ${STEP_RESOLVE_SOURCE_REF}"
             echo ""
-            echo "- source: \`${{ steps.resolve.outputs.source_ref }}\`"
-            echo "- target: \`${{ env.IMAGE }}:${{ inputs.target }}\`"
-            echo "- digest: \`${{ steps.resolve.outputs.digest }}\`"
-            echo "- sigstore: https://search.sigstore.dev/?hash=${{ steps.resolve.outputs.digest }}"
+            echo "- source: \`${STEP_RESOLVE_SOURCE_REF}\`"
+            echo "- target: \`${IMAGE}:${INPUT_TARGET}\`"
+            echo "- digest: \`${STEP_RESOLVE_DIGEST}\`"
+            echo "- sigstore: https://search.sigstore.dev/?hash=${STEP_RESOLVE_DIGEST}"
           } >> "$GITHUB_STEP_SUMMARY"

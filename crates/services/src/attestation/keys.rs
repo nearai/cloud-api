@@ -3,7 +3,8 @@ use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
 use k256::ecdsa::{SigningKey as EcdsaSigningKey, VerifyingKey as EcdsaVerifyingKey};
 #[cfg(debug_assertions)]
 use k256::elliptic_curve::Generate;
-use rand_core::OsRng;
+#[cfg(debug_assertions)]
+use rand::{rngs::SysRng, TryRng};
 use sha3::{Digest, Keccak256};
 
 use super::{AttestationError, AttestationService};
@@ -14,9 +15,13 @@ const GATEWAY_KEY_PATH_ECDSA: &str = "/signing-key/ecdsa";
 impl AttestationService {
     #[cfg(debug_assertions)]
     pub(in crate::attestation) fn generate_ephemeral_signing_keys(
-    ) -> (SigningKey, VerifyingKey, EcdsaSigningKey, EcdsaVerifyingKey) {
-        let mut csprng = OsRng;
-        let ed25519_signing_key = SigningKey::generate(&mut csprng);
+    ) -> Result<(SigningKey, VerifyingKey, EcdsaSigningKey, EcdsaVerifyingKey), AttestationError>
+    {
+        let mut seed = zeroize::Zeroizing::new([0u8; 32]);
+        SysRng.try_fill_bytes(seed.as_mut()).map_err(|_| {
+            AttestationError::InternalError("operating system randomness unavailable".into())
+        })?;
+        let ed25519_signing_key = SigningKey::from_bytes(&seed);
         let ed25519_verifying_key = ed25519_signing_key.verifying_key();
         let ed25519_address = hex::encode(ed25519_verifying_key.as_bytes());
         tracing::info!(
@@ -24,7 +29,10 @@ impl AttestationService {
             ed25519_address
         );
 
-        let ecdsa_signing_key = EcdsaSigningKey::generate();
+        let ecdsa_signing_key =
+            EcdsaSigningKey::try_generate_from_rng(&mut SysRng).map_err(|_| {
+                AttestationError::InternalError("operating system randomness unavailable".into())
+            })?;
         let ecdsa_verifying_key = *ecdsa_signing_key.verifying_key();
         let ecdsa_address_raw = Self::ecdsa_public_key_to_ethereum_address(&ecdsa_verifying_key);
         tracing::info!(
@@ -32,12 +40,12 @@ impl AttestationService {
             hex::encode(ecdsa_address_raw)
         );
 
-        (
+        Ok((
             ed25519_signing_key,
             ed25519_verifying_key,
             ecdsa_signing_key,
             ecdsa_verifying_key,
-        )
+        ))
     }
 
     pub(in crate::attestation) async fn derive_signing_keys_from_dstack(
@@ -163,5 +171,39 @@ impl AttestationService {
                 "Unknown signing algorithm: {signing_algo}"
             ))),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ed25519_seed_and_signature_match_rfc8032_vector() {
+        // RFC 8032 section 7.1, TEST 1. Pin the persisted seed/public-key and
+        // wire signature bytes across the Dalek v2 -> v3 dependency upgrade.
+        let seed: [u8; 32] =
+            hex::decode("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60")
+                .unwrap()
+                .try_into()
+                .unwrap();
+        let signing_key = SigningKey::from_bytes(&seed);
+        assert_eq!(signing_key.to_bytes(), seed);
+        assert_eq!(
+            hex::encode(signing_key.verifying_key().to_bytes()),
+            "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a"
+        );
+        let signature = signing_key.sign(b"");
+        assert_eq!(
+            hex::encode(signature.to_bytes()),
+            concat!(
+                "e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e06522490155",
+                "5fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b"
+            )
+        );
+        signing_key
+            .verifying_key()
+            .verify_strict(b"", &signature)
+            .unwrap();
     }
 }

@@ -29,9 +29,9 @@ use tower::ServiceExt;
 use tracing::subscriber::DefaultGuard;
 
 const ENCODING_KEY: &str = "admin-audit-test-encoding-key";
-const ADMIN_DOMAINS: &[&str] = &["test.com"];
+const ADMIN_EMAILS: &[&str] = &["admin@test.com"];
 /// The mock auth service authenticates every user as admin@test.com.
-const NO_ADMIN_DOMAINS: &[&str] = &["example.org"];
+const NO_ADMIN_EMAILS: &[&str] = &["other@test.com"];
 const PROBE_LIMIT: i64 = 2;
 const PROBE_OFFSET: i64 = 4;
 const PROBE_RETURNED: usize = 3;
@@ -149,7 +149,7 @@ impl CapturedLogs {
     }
 }
 
-fn auth_state(admin_domains: &[&str]) -> AuthState {
+fn auth_state(admin_emails: &[&str]) -> AuthState {
     let pool = database::DbPool::uninitialized();
     AuthState::new(
         Arc::new(services::auth::OAuthManager::new(None, None).expect("no OAuth providers")),
@@ -170,10 +170,7 @@ fn auth_state(admin_domains: &[&str]) -> AuthState {
         Arc::new(database::repositories::AdminAccessTokenRepository::new(
             pool,
         )),
-        admin_domains
-            .iter()
-            .map(|domain| domain.to_string())
-            .collect(),
+        admin_emails.iter().map(|email| email.to_string()).collect(),
         ENCODING_KEY.to_string(),
     )
 }
@@ -211,7 +208,7 @@ async fn api_keys_probe(audit: AdminAudit) -> &'static str {
     "ok"
 }
 
-fn app(admin_domains: &[&str], entered_slow_handler: Arc<Notify>) -> Router {
+fn app(admin_emails: &[&str], entered_slow_handler: Arc<Notify>) -> Router {
     let admin_routes = Router::new()
         .route("/admin/users", get(users_probe))
         .route("/admin/api-keys", get(api_keys_probe))
@@ -228,7 +225,7 @@ fn app(admin_domains: &[&str], entered_slow_handler: Arc<Notify>) -> Router {
             }),
         )
         .layer(from_fn_with_state(
-            auth_state(admin_domains),
+            auth_state(admin_emails),
             admin_middleware,
         ));
     let routes = Router::new().nest(
@@ -247,7 +244,7 @@ fn app(admin_domains: &[&str], entered_slow_handler: Arc<Notify>) -> Router {
 }
 
 fn admin_app() -> Router {
-    app(ADMIN_DOMAINS, Arc::new(Notify::new()))
+    app(ADMIN_EMAILS, Arc::new(Notify::new()))
 }
 
 fn request(method: Method, uri: &str) -> axum::http::request::Builder {
@@ -459,7 +456,7 @@ async fn global_reads_have_no_organization_unless_a_handler_records_a_filter() {
 #[tokio::test]
 async fn authenticated_user_denied_by_policy_keeps_identity_but_no_organization() {
     let (logs, _guard) = CapturedLogs::json();
-    let app = app(NO_ADMIN_DOMAINS, Arc::new(Notify::new()));
+    let app = app(NO_ADMIN_EMAILS, Arc::new(Notify::new()));
     let (user_id, session_id) = (Uuid::new_v4(), Uuid::new_v4());
 
     let response = send(
@@ -638,7 +635,7 @@ async fn non_admin_requests_are_not_audited() {
 async fn every_request_emits_exactly_one_event_with_its_own_id() {
     let (logs, _guard) = CapturedLogs::json();
     let allowed = admin_app();
-    let denied = app(NO_ADMIN_DOMAINS, Arc::new(Notify::new()));
+    let denied = app(NO_ADMIN_EMAILS, Arc::new(Notify::new()));
     let mut audit_ids = Vec::new();
 
     for (app, request) in [
@@ -705,7 +702,7 @@ async fn every_request_emits_exactly_one_event_with_its_own_id() {
 async fn request_dropped_before_a_response_is_audited_once_without_status() {
     let (logs, _guard) = CapturedLogs::json();
     let entered = Arc::new(Notify::new());
-    let app = app(ADMIN_DOMAINS, entered.clone());
+    let app = app(ADMIN_EMAILS, entered.clone());
     let user_id = Uuid::new_v4();
     let pending = send(
         &app,

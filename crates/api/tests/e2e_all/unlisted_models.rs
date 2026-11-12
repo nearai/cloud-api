@@ -32,7 +32,7 @@ async fn upsert_model(
         model_name.to_string(),
         serde_json::from_value(fields).expect("valid model update"),
     );
-    let updated = admin_batch_upsert_models(server, batch, get_session_id()).await;
+    let updated = seed_models(server, batch, get_session_id()).await;
     let model = updated
         .into_iter()
         .find(|model| model.model_id == model_name)

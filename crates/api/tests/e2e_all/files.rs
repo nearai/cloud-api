@@ -39,7 +39,8 @@ struct RetainedFileFixture {
 
 /// Prepare existing data directly; public uploads are disabled during migration.
 async fn retained_file_fixture() -> RetainedFileFixture {
-    let storage = Arc::new(MockStorage::new(test_config().s3.encryption_key));
+    let storage =
+        Arc::new(MockStorage::new(test_config().s3.encryption_key).expect("valid storage key"));
     let service_storage = storage.clone();
     let (server, database) =
         setup_test_server_with_domain_services(move |domain_services, database| {

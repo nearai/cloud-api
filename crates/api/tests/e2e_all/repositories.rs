@@ -367,12 +367,34 @@ mod database_encryption_at_rest {
         assert_eq!(fetched.content_type, "text/plain");
         assert_eq!(fetched.storage_key, "private/object/key");
 
-        let configured_key_id = database.pool().encryption_key_id();
-        database
-            .pool()
-            .set_encryption_key_id("wrong-db-key-id".to_string());
+        let configured_ring = database.pool().encryption_ring().expect("configured ring");
+        database.pool().set_encryption_ring(
+            database::field_encryption::KeyRing::new(
+                "wrong-db-key-id".to_string(),
+                *configured_ring.write_key(),
+                vec![],
+            )
+            .expect("valid test ring"),
+        );
         assert!(repository.get_by_id(created.id).await.is_err());
-        database.pool().set_encryption_key_id(configured_key_id);
+        database.pool().set_encryption_ring(
+            database::field_encryption::KeyRing::new(
+                configured_ring.write_id().to_string(),
+                *configured_ring.write_key(),
+                configured_ring
+                    .read_ids()
+                    .into_iter()
+                    .skip(1)
+                    .map(|id| {
+                        (
+                            id.to_string(),
+                            *configured_ring.lookup(id).expect("read key"),
+                        )
+                    })
+                    .collect(),
+            )
+            .expect("restore configured ring"),
+        );
 
         let client = database.pool().get().await.expect("database connection");
         client

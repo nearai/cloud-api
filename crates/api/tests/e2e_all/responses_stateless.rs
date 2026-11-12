@@ -3,6 +3,11 @@
 use crate::common::*;
 use api::models::BatchUpdateModelApiRequest;
 use axum::http::Method;
+use inference_providers::{mock::MockProvider, responses_raw::ResponsesRawResponse};
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
 
 fn assert_response_history_is_gone(response: axum_test::TestResponse) {
     assert_eq!(response.status_code(), 410);
@@ -103,8 +108,7 @@ async fn stateless_responses_reject_persistent_fields() {
 async fn stateless_responses_reject_unsupported_tools_before_provider_work() {
     // Request normalization must reject unsupported builtin types before the handler reaches
     // service validation or provider work. A mock makes that boundary
-    // observable. The MCP URL uses the reserved `.invalid` TLD so it cannot
-    // point to a real third party if this behavior ever regresses.
+    // observable.
     let (server, _pool, mock, _database) = setup_test_server_with_pool().await;
     let model = setup_qwen_model(&server).await;
     let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
@@ -117,15 +121,6 @@ async fn stateless_responses_reject_unsupported_tools_before_provider_work() {
             serde_json::json!({"type": "code_interpreter"}),
         ),
         ("computer", serde_json::json!({"type": "computer"})),
-        (
-            "mcp",
-            serde_json::json!({
-                "type": "mcp",
-                "server_label": "test",
-                "server_url": "https://mcp.invalid/tools",
-                "require_approval": "never"
-            }),
-        ),
     ];
 
     for (tool_type, tool) in rejected_tools {
@@ -165,6 +160,133 @@ async fn stateless_responses_reject_unsupported_tools_before_provider_work() {
 }
 
 #[tokio::test]
+async fn mcp_tools_are_rejected_before_model_resolution_or_provider_work() {
+    // MCP tools are no longer supported. Every transport must answer with the
+    // same 400 before model resolution or provider work, wherever the tool is
+    // declared. The URL uses the reserved `.invalid` TLD so it cannot point to
+    // a real server if this behavior ever regresses.
+    let (server, pool, mock, _database) = setup_test_server_with_pool().await;
+    let typed_model = setup_qwen_model(&server).await;
+
+    let native_model = format!("openai/mcp-rejection-{}", uuid::Uuid::new_v4());
+    let native_calls = Arc::new(AtomicUsize::new(0));
+    let calls = native_calls.clone();
+    let native_provider = Arc::new(MockProvider::new_accept_all().with_responses_handler(
+        move |_body: serde_json::Value| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            ResponsesRawResponse {
+                status: axum::http::StatusCode::OK,
+                headers: [(
+                    axum::http::header::CONTENT_TYPE,
+                    axum::http::HeaderValue::from_static("application/json"),
+                )]
+                .into_iter()
+                .collect(),
+                body: Box::pin(futures_util::stream::iter(vec![Ok(bytes::Bytes::from(
+                    r#"{"object":"response","status":"completed","output":[]}"#,
+                ))])),
+            }
+        },
+    ));
+    let mut batch = BatchUpdateModelApiRequest::new();
+    batch.insert(
+        native_model.clone(),
+        serde_json::from_value(serde_json::json!({
+            "inputCostPerToken": {"amount": 1000, "currency": "USD"},
+            "outputCostPerToken": {"amount": 2000, "currency": "USD"},
+            "modelDisplayName": "MCP rejection fixture",
+            "modelDescription": "Native Responses test",
+            "contextLength": 10000, "maxOutputLength": 1000, "isActive": true, "ownedBy": "openai",
+            "verifiable": false, "inputModalities": ["text"], "outputModalities": ["text"]
+        }))
+        .unwrap(),
+    );
+    seed_models(&server, batch, get_session_id()).await;
+    pool.register_provider(native_model.clone(), native_provider.clone())
+        .await;
+    let missing_model = format!("missing-model-{}", uuid::Uuid::new_v4());
+
+    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id).await;
+
+    let mcp = serde_json::json!({
+        "type": "mcp",
+        "server_label": "remote",
+        "server_url": "https://mcp.invalid/tools",
+        "require_approval": "never"
+    });
+    let placements = [
+        ("top-level", serde_json::json!({"tools": [mcp.clone()]})),
+        (
+            "alongside a function",
+            serde_json::json!({"tools": [
+                {"type": "function", "name": "lookup", "parameters": {"type": "object"}},
+                mcp.clone()
+            ]}),
+        ),
+        (
+            "namespace",
+            serde_json::json!({"tools": [{
+                "type": "namespace", "name": "client", "description": "Client tools.",
+                "tools": [mcp.clone()]
+            }]}),
+        ),
+        (
+            "additional_tools",
+            serde_json::json!({"input": [
+                {"type": "additional_tools", "role": "developer", "tools": [mcp.clone()]},
+                {"role": "user", "content": "Use the configured tool."}
+            ]}),
+        ),
+    ];
+
+    for model in [&typed_model, &native_model, &missing_model] {
+        for stream in [false, true] {
+            for (placement, fields) in &placements {
+                let mut body = serde_json::json!({
+                    "model": model,
+                    "input": "Use the configured tool.",
+                    "store": false,
+                    "stream": stream,
+                });
+                for (key, value) in fields.as_object().unwrap() {
+                    body[key] = value.clone();
+                }
+                let response = server
+                    .post("/v1/responses")
+                    .add_header("Authorization", format!("Bearer {api_key}"))
+                    .json(&body)
+                    .await;
+
+                let case = format!("model={model} stream={stream} placement={placement}");
+                assert_eq!(response.status_code(), 400, "{case}: {}", response.text());
+                let error = response.json::<api::models::ErrorResponse>();
+                assert_eq!(error.error.r#type, "invalid_request_error", "{case}");
+                assert_eq!(error.error.param.as_deref(), Some("tools"), "{case}");
+                assert_eq!(
+                    error.error.message, "MCP tools are no longer supported.",
+                    "{case}"
+                );
+            }
+        }
+    }
+
+    assert!(
+        mock.last_chat_params().await.is_none(),
+        "typed MCP requests must not reach the provider"
+    );
+    assert!(
+        native_provider.last_chat_params().await.is_none(),
+        "native MCP requests must not fall back to chat"
+    );
+    assert_eq!(
+        native_calls.load(Ordering::SeqCst),
+        0,
+        "native MCP requests must not reach the provider"
+    );
+}
+
+#[tokio::test]
 async fn stateless_responses_reject_image_output_model_aliases_before_provider_work() {
     let (server, _pool, mock, _database) = setup_test_server_with_pool().await;
 
@@ -193,7 +315,7 @@ async fn stateless_responses_reject_image_output_model_aliases_before_provider_w
         }))
         .expect("image-output model configuration must be valid"),
     );
-    let updated = admin_batch_upsert_models(&server, batch, get_session_id()).await;
+    let updated = seed_models(&server, batch, get_session_id()).await;
     assert_eq!(updated.len(), 1, "image-output model must be active");
     assert_eq!(
         updated[0]

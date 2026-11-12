@@ -96,14 +96,6 @@ impl services::attestation::ports::AttestationServiceTrait for HeldReportService
     ) -> Result<ItaTokenResponse, AttestationError> {
         Err(AttestationError::InternalError("unused".to_string()))
     }
-
-    async fn verify_vpc_signature(
-        &self,
-        _timestamp: i64,
-        _signature: String,
-    ) -> Result<bool, AttestationError> {
-        Ok(false)
-    }
 }
 
 /// The report route with no auth layer, so every request is anonymous.

@@ -7,9 +7,8 @@ use axum::{
 };
 use services::{
     attestation::ports::AttestationServiceTrait, auth::AuthServiceTrait,
-    completions::CompletionServiceTrait, files::FileServiceTrait, mcp::McpClientManager,
-    models::ModelsServiceTrait, organization::OrganizationServiceTrait,
-    workspace::WorkspaceServiceTrait,
+    completions::CompletionServiceTrait, files::FileServiceTrait, models::ModelsServiceTrait,
+    organization::OrganizationServiceTrait, workspace::WorkspaceServiceTrait,
 };
 use std::sync::Arc;
 
@@ -18,7 +17,6 @@ use std::sync::Arc;
 pub struct AppState {
     pub organization_service: Arc<dyn OrganizationServiceTrait + Send + Sync>,
     pub workspace_service: Arc<dyn WorkspaceServiceTrait + Send + Sync>,
-    pub mcp_manager: Arc<McpClientManager>,
     pub completion_service: Arc<dyn CompletionServiceTrait>,
     pub models_service: Arc<dyn ModelsServiceTrait>,
     pub auth_service: Arc<dyn AuthServiceTrait>,
@@ -102,33 +100,6 @@ pub fn build_management_router(app_state: AppState, auth_state: AuthState) -> Ro
             "/{id}/staking/farm/bind",
             post(crate::routes::staking_farm::bind_organization_staking_farm),
         )
-        // // MCP Connector management
-        // .route(
-        //     "/{id}/mcp-connectors",
-        //     get(list_mcp_connectors).post(create_mcp_connector),
-        // )
-        // .route(
-        //     "/{id}/mcp-connectors/{connector_id}",
-        //     get(get_mcp_connector)
-        //         .put(update_mcp_connector)
-        //         .delete(delete_mcp_connector),
-        // )
-        // .route(
-        //     "/{id}/mcp-connectors/{connector_id}/test",
-        //     post(test_mcp_connector),
-        // )
-        // .route(
-        //     "/{id}/mcp-connectors/{connector_id}/tools",
-        //     get(list_mcp_tools),
-        // )
-        // .route(
-        //     "/{id}/mcp-connectors/{connector_id}/tools/call",
-        //     post(call_mcp_tool),
-        // )
-        // .route(
-        //     "/{id}/mcp-connectors/{connector_id}/usage",
-        //     get(get_mcp_usage_logs),
-        // )
         // Usage tracking routes
         .route(
             "/{id}/usage/balance",

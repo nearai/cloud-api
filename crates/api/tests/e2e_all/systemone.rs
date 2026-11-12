@@ -75,7 +75,7 @@ async fn catalog_with_names_and_output_modalities(
     }
     let mut batch = BatchUpdateModelApiRequest::new();
     batch.insert(model.clone(), serde_json::from_value(config).unwrap());
-    admin_batch_upsert_models(server, batch, get_session_id()).await;
+    seed_models(server, batch, get_session_id()).await;
     (model, alias)
 }
 

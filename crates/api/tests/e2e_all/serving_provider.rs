@@ -318,7 +318,7 @@ async fn test_completions_stream_serving_provider_is_3p_source() {
         }))
         .unwrap(),
     );
-    admin_batch_upsert_models(&server, batch, get_session_id()).await;
+    seed_models(&server, batch, get_session_id()).await;
     let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
     let api_key = get_api_key_for_org(&server, org.id).await;
 

@@ -39,10 +39,9 @@ impl PgConversationRepository {
     }
 
     fn decrypt_metadata(&self, id: Uuid, metadata: serde_json::Value) -> Result<serde_json::Value> {
-        match self.pool.encryption_context() {
-            Some((key, key_id)) => crate::field_encryption::decrypt_json_if_encrypted_with_key_id(
-                &key,
-                &key_id,
+        match self.pool.encryption_ring() {
+            Some(ring) => crate::field_encryption::decrypt_json_if_encrypted_with_ring(
+                &ring,
                 "conversations",
                 "metadata",
                 id,
@@ -364,13 +363,12 @@ impl ConversationRepository for PgConversationRepository {
             let metadata: Option<serde_json::Value> = orig_row.try_get("metadata")?;
             let stored_root_flag: bool = orig_row.try_get("is_root_response")?;
             let (plain_instructions, plain_metadata) =
-                if let Some((key, key_id)) = self.pool.encryption_context() {
+                if let Some(ring) = self.pool.encryption_ring() {
                     (
                         instructions
                             .map(|value| {
-                                crate::field_encryption::decrypt_if_encrypted_with_key_id(
-                                    &key,
-                                    &key_id,
+                                crate::field_encryption::decrypt_if_encrypted_with_ring(
+                                    &ring,
                                     "responses",
                                     "instructions",
                                     old_response_id,
@@ -380,9 +378,8 @@ impl ConversationRepository for PgConversationRepository {
                             .transpose()?,
                         metadata
                             .map(|value| {
-                                crate::field_encryption::decrypt_json_if_encrypted_with_key_id(
-                                    &key,
-                                    &key_id,
+                                crate::field_encryption::decrypt_json_if_encrypted_with_ring(
+                                    &ring,
                                     "responses",
                                     "metadata",
                                     old_response_id,
@@ -546,10 +543,9 @@ impl ConversationRepository for PgConversationRepository {
                 .unwrap_or(old_response_id);
             let new_item_id = Uuid::new_v4();
 
-            if let Some((key, key_id)) = self.pool.encryption_context() {
-                item_json = crate::field_encryption::decrypt_json_if_encrypted_with_key_id(
-                    &key,
-                    &key_id,
+            if let Some(ring) = self.pool.encryption_ring() {
+                item_json = crate::field_encryption::decrypt_json_if_encrypted_with_ring(
+                    &ring,
                     "response_items",
                     "item",
                     old_item_id,

@@ -91,9 +91,6 @@ impl AttestationServiceTrait for ReceiptStore {
     ) -> Result<ItaTokenResponse, AttestationError> {
         unimplemented!()
     }
-    async fn verify_vpc_signature(&self, _: i64, _: String) -> Result<bool, AttestationError> {
-        unimplemented!()
-    }
 }
 
 fn raw_stream(items: Vec<Result<Bytes, AnthropicRawError>>) -> AnthropicRawBody {

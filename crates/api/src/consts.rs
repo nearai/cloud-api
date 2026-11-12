@@ -19,8 +19,5 @@ pub const MAX_SETTINGS_SIZE_BYTES: usize = 32 * 1024;
 /// Maximum number of invitations allowed in a single batch request
 pub const MAX_INVITATIONS_PER_REQUEST: usize = 100;
 
-/// Maximum length for signatures in VPC login or similar requests
-pub const MAX_SIGNATURE_LENGTH: usize = 4096;
-
 /// Maximum length for avatar URL fields
 pub const MAX_AVATAR_URL_LENGTH: usize = 1024 * 1024;

@@ -107,7 +107,10 @@ pub struct ModelWithPricing {
 ///
 /// - a listed model resolves for every caller;
 /// - an unlisted model resolves only for [`ModelCaller::Trusted`] and for an
-///   [`ModelCaller::Organization`] that holds a grant for it.
+///   [`ModelCaller::Organization`] that holds a grant for it;
+/// - an organization that set `allowed_models` resolves only the models it
+///   lists, on top of the two rules above (see
+///   `crate::organization_model_filter`).
 ///
 /// A model that does not resolve for the caller is reported exactly like a
 /// model that does not exist, so the caller cannot learn that it is there.
@@ -117,7 +120,8 @@ pub enum ModelCaller {
     /// models only.
     Anonymous,
     /// A request made on behalf of this organization. Listed models, plus the
-    /// unlisted models the organization holds a grant for.
+    /// unlisted models the organization holds a grant for, limited to its
+    /// `allowed_models` when it set them.
     Organization(Uuid),
     /// The platform itself: admin flows, usage recording, background jobs and
     /// work on a model the platform chose (see [`PlatformModel`]). Every
@@ -300,8 +304,9 @@ pub trait ModelsServiceTrait: Send + Sync {
 
     /// Whether `caller` may use `model`, a row this service returned.
     ///
-    /// A listed model costs nothing to check. Only an unlisted model asked
-    /// for by an organization consults the grants.
+    /// For an organization, its cached `allowed_models` filter is checked
+    /// first. Only an unlisted model asked for by an organization consults
+    /// the grants.
     ///
     /// The default knows of no grants: it opens an unlisted model to
     /// [`ModelCaller::Trusted`] only.
@@ -391,4 +396,9 @@ pub trait ModelsServiceTrait: Send + Sync {
     async fn invalidate_model_access(&self, _organization_id: Uuid, _model_id: Uuid) {
         self.invalidate_models_cache().await;
     }
+
+    /// Forget the cached `allowed_models` filter of one organization, after
+    /// its settings changed. The default does nothing, which is correct for
+    /// an implementor that applies no filters.
+    async fn invalidate_organization_model_filter(&self, _organization_id: Uuid) {}
 }

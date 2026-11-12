@@ -5,9 +5,9 @@ concurrency:
   cancel-in-progress: true
 
 on:
-  pull_request_target:
+  pull_request_target: # zizmor: ignore[dangerous-triggers] Write access is checked; tools run from the default branch and PR commits are diff data only.
     types: [opened, ready_for_review]
-  issue_comment:
+  issue_comment: # zizmor: ignore[dangerous-triggers] Same permission check and trusted workspace as the automatic review.
     types: [created]
 
 permissions:
@@ -23,62 +23,74 @@ jobs:
     steps:
       - name: Get PR context
         id: pr-context
-        if: github.event_name != 'pull_request_target'
-        uses: actions/github-script@v9
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
         with:
           script: |
+            const { data: access } = await github.rest.repos.getCollaboratorPermissionLevel({
+              ...context.repo,
+              username: context.actor
+            });
+            if (!['admin', 'write', 'maintain'].includes(access.permission)) {
+              throw new Error('Code review requires repository write permission.');
+            }
             const prNumber = context.issue.number;
             const { data: pullRequest } = await github.rest.pulls.get({
               owner: context.repo.owner,
               repo: context.repo.repo,
               pull_number: prNumber
             });
-            core.setOutput('base_ref', pullRequest.base.ref);
-            core.setOutput('head_ref', pullRequest.head.ref);
+            core.setOutput('base_sha', pullRequest.base.sha);
             core.setOutput('head_sha', pullRequest.head.sha);
 
-      - name: Checkout repository
-        uses: actions/checkout@v7
+      # Never load configuration or executable files from the PR checkout.
+      - name: Checkout trusted tools and configuration
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          fetch-depth: 0
-          ref: ${{ github.event.pull_request.head.sha || steps.pr-context.outputs.head_sha }}
+          persist-credentials: false
+          fetch-depth: 0 # OCR computes the merge base for the review range.
+          ref: ${{ github.event.repository.default_branch }}
 
-      - name: Fetch PR head ref
-        run: git fetch origin pull/${{ github.event.pull_request.number || github.event.issue.number }}/head
+      - name: Fetch review commits without checking them out
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASE_SHA: ${{ steps.pr-context.outputs.base_sha }}
+          HEAD_SHA: ${{ steps.pr-context.outputs.head_sha }}
+        run: git -c credential.helper= -c 'credential.helper=!gh auth git-credential' fetch --no-tags origin "$BASE_SHA" "$HEAD_SHA"
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v6
-        with:
-          node-version: '20'
-
-      - name: Install OpenCodeReview
-        run: npm install -g @alibaba-group/open-code-review
+      - name: Install OpenCodeReview 1.13.7
+        # Pin the native binary as well as its version; avoid npm lifecycle scripts.
+        run: |
+          mkdir -p "$RUNNER_TEMP/ocr-bin"
+          curl --fail --silent --show-error --location \
+            https://github.com/alibaba/open-code-review/releases/download/v1.13.7/opencodereview-linux-amd64 \
+            --output "$RUNNER_TEMP/ocr-bin/ocr"
+          echo "8c1ff786161b6dc0e8dcb06107f18bda8b6181b39ce573400add4a39f90cf19d  $RUNNER_TEMP/ocr-bin/ocr" | sha256sum --check
+          chmod +x "$RUNNER_TEMP/ocr-bin/ocr"
 
       - name: Configure OCR
+        env:
+          SECRET_OCR_LLM_URL: ${{ secrets.OCR_LLM_URL }}
+          SECRET_OCR_LLM_AUTH_TOKEN: ${{ secrets.OCR_LLM_AUTH_TOKEN }}
+          SECRET_OCR_LLM_MODEL: ${{ secrets.OCR_LLM_MODEL }}
         run: |
-          ocr config set llm.url "${{ secrets.OCR_LLM_URL }}"
-          ocr config set llm.auth_token "${{ secrets.OCR_LLM_AUTH_TOKEN }}"
-          ocr config set llm.model "${{ secrets.OCR_LLM_MODEL }}"
-          ocr config set llm.use_anthropic false
+          "$RUNNER_TEMP/ocr-bin/ocr" config set llm.url "${SECRET_OCR_LLM_URL}"
+          "$RUNNER_TEMP/ocr-bin/ocr" config set llm.auth_token "${SECRET_OCR_LLM_AUTH_TOKEN}"
+          "$RUNNER_TEMP/ocr-bin/ocr" config set llm.model "${SECRET_OCR_LLM_MODEL}"
+          "$RUNNER_TEMP/ocr-bin/ocr" config set llm.use_anthropic false
 
       - name: Test LLM connectivity
-        run: ocr llm test
+        run: '"$RUNNER_TEMP/ocr-bin/ocr" llm test'
 
       - name: Run OpenCodeReview
         id: review
+        env:
+          BASE_SHA: ${{ steps.pr-context.outputs.base_sha }}
+          HEAD_SHA: ${{ steps.pr-context.outputs.head_sha }}
         run: |
-          if [ "${{ github.event_name }}" = "pull_request_target" ]; then
-            BASE_REF="${{ github.event.pull_request.base.ref }}"
-            HEAD_SHA="${{ github.event.pull_request.head.sha }}"
-          else
-            BASE_REF="${{ steps.pr-context.outputs.base_ref }}"
-            HEAD_SHA="${{ steps.pr-context.outputs.head_sha }}"
-          fi
+          echo "Reviewing PR: ${HEAD_SHA} against ${BASE_SHA}"
 
-          echo "Reviewing PR: ${HEAD_SHA} against origin/${BASE_REF}"
-
-          ocr review \
-            --from "origin/${BASE_REF}" \
+          "$RUNNER_TEMP/ocr-bin/ocr" review \
+            --from "${BASE_SHA}" \
             --to "${HEAD_SHA}" \
             --format json \
             > /tmp/ocr-result.json 2>/tmp/ocr-stderr.log || true
@@ -87,7 +99,9 @@ jobs:
           cat /tmp/ocr-stderr.log || true
 
       - name: Post review comments to PR
-        uses: actions/github-script@v9
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+        env:
+          REVIEW_HEAD_SHA: ${{ steps.pr-context.outputs.head_sha }}
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
@@ -127,18 +141,7 @@ jobs:
             }
 
             const prNumber = context.issue.number;
-            let commitSha;
-
-            if (context.eventName === 'pull_request_target') {
-              commitSha = context.payload.pull_request.head.sha;
-            } else {
-              const { data: pullRequest } = await github.rest.pulls.get({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                pull_number: prNumber
-              });
-              commitSha = pullRequest.head.sha;
-            }
+            const commitSha = process.env.REVIEW_HEAD_SHA;
 
             const reviewComments = [];
             const commentsWithoutLine = [];

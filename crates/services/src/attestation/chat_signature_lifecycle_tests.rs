@@ -281,7 +281,7 @@ pub(super) fn lifecycle_service(
     pool: Arc<InferenceProviderPool>,
 ) -> AttestationService {
     let (ed25519_signing_key, ed25519_verifying_key, ecdsa_signing_key, ecdsa_verifying_key) =
-        AttestationService::generate_ephemeral_signing_keys();
+        AttestationService::generate_ephemeral_signing_keys().expect("ephemeral test keys");
     AttestationService {
         repository,
         inference_provider_pool: pool.clone(),
@@ -290,7 +290,6 @@ pub(super) fn lifecycle_service(
         metrics_service: Arc::new(NoopMetricsService),
         usage_repository: Arc::new(NoopUsageRepository),
         vpc_info: None,
-        vpc_shared_secret: None,
         tls_cert_fingerprint: None,
         ed25519_signing_key: Arc::new(ed25519_signing_key),
         ed25519_verifying_key: Arc::new(ed25519_verifying_key),

@@ -39,9 +39,7 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 use k256::ecdsa::{SigningKey as EcdsaSigningKey, VerifyingKey as EcdsaVerifyingKey};
 
 pub(crate) use chat_signatures::STREAM_SIGNATURE_STORE_TIMEOUT;
-pub use environment::{
-    compute_spki_hash, load_tls_cert_fingerprint, load_vpc_info, load_vpc_shared_secret,
-};
+pub use environment::{compute_spki_hash, load_tls_cert_fingerprint, load_vpc_info};
 pub use gateway_quote::{DstackGatewayQuoteCollector, GatewayQuoteCollector, GatewayQuoteInput};
 pub use ita::{ModelAttestationCollector, ModelAttestationInput};
 pub use measurement::MeasurementPolicy;
@@ -72,7 +70,6 @@ pub struct AttestationService {
     pub metrics_service: Arc<dyn MetricsServiceTrait>,
     pub usage_repository: Arc<dyn UsageRepository>,
     pub vpc_info: Option<VpcInfo>,
-    pub vpc_shared_secret: Option<String>,
     pub tls_cert_fingerprint: Option<String>,
     ed25519_signing_key: Arc<SigningKey>,
     ed25519_verifying_key: Arc<VerifyingKey>,

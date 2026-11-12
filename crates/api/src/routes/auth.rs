@@ -240,6 +240,8 @@ impl TryFrom<NearSignedMessageJson> for services::auth::near::SignedMessage {
         }
 
         let public_key: near_kit::signer::PublicKey = msg.public_key.parse()?;
+        // near-kit 0.19 parses lengths only; retain invalid-point rejection here.
+        public_key.validate()?;
 
         // Parse base64 signature and create Signature based on key type
         let sig_bytes = BASE64_STANDARD.decode(&msg.signature)?;
@@ -968,6 +970,35 @@ mod tests {
 
                 assert!(services::auth::near::SignedMessage::try_from(invalid).is_err());
             }
+        }
+    }
+
+    #[test]
+    fn near_wallet_signature_decoding_rejects_invalid_curve_points() {
+        use near_kit::signer::{ParseKeyError, PublicKey};
+
+        let mut invalid_ed25519 = [0u8; 32];
+        invalid_ed25519[0] = 2;
+        for (public_key, signature_length) in [
+            (PublicKey::Ed25519(invalid_ed25519), 64),
+            (PublicKey::Secp256k1([0; 64]), 65),
+        ] {
+            // Both fixtures decode under 0.19 but are not points on their curves.
+            assert!(public_key.validate().is_err());
+            let encoded_key = public_key.to_string();
+            assert!(encoded_key.parse::<PublicKey>().is_ok());
+            let request = NearSignedMessageJson {
+                account_id: "alice.near".into(),
+                public_key: encoded_key,
+                signature: BASE64_STANDARD.encode(vec![0; signature_length]),
+                state: None,
+            };
+
+            let error = services::auth::near::SignedMessage::try_from(request).unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<ParseKeyError>(),
+                Some(&ParseKeyError::InvalidCurvePoint)
+            );
         }
     }
 

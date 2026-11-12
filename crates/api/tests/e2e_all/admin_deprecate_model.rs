@@ -32,7 +32,7 @@ pub(crate) async fn create_model(
         name.to_string(),
         serde_json::from_value(minimal_model_upsert(aliases)).unwrap(),
     );
-    let updated = admin_batch_upsert_models(server, batch, get_session_id()).await;
+    let updated = seed_models(server, batch, get_session_id()).await;
     updated.into_iter().next().expect("Model should be created")
 }
 
@@ -420,7 +420,7 @@ async fn test_deprecate_inactive_successor_returns_404() {
         new.clone(),
         serde_json::from_value(serde_json::json!({ "isActive": false })).unwrap(),
     );
-    admin_batch_upsert_models(&server, batch, get_session_id()).await;
+    seed_models(&server, batch, get_session_id()).await;
 
     let resp = deprecate(
         &server,
@@ -449,7 +449,7 @@ async fn test_deprecate_preserves_datacenters_in_history() {
     let mut payload = minimal_model_upsert(&[]);
     payload["datacenters"] = serde_json::json!([{ "country_code": "US" }]);
     batch.insert(old.clone(), serde_json::from_value(payload).unwrap());
-    admin_batch_upsert_models(&server, batch, get_session_id()).await;
+    seed_models(&server, batch, get_session_id()).await;
     create_model(&server, &new, &[]).await;
 
     let resp = deprecate(

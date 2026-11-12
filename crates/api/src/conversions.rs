@@ -224,6 +224,11 @@ impl From<CompletionError> for crate::models::ErrorResponse {
             CompletionError::ServiceOverloaded(msg) => {
                 ErrorResponse::new(msg, "service_overloaded".to_string())
             }
+            CompletionError::UpstreamOverloaded { .. } => ErrorResponse::new(
+                "All inference backends are overloaded. Please retry with exponential backoff."
+                    .to_string(),
+                "service_overloaded".to_string(),
+            ),
             CompletionError::InternalError(msg) => ErrorResponse::new(
                 format!("Internal server error: {msg}"),
                 "internal_server_error".to_string(),

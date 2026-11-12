@@ -31,6 +31,8 @@ pub use context_routing::expand_inference_endpoints;
 mod channel_binding_tests;
 #[cfg(test)]
 mod chutes_routing_tests;
+#[cfg(test)]
+mod privacy_classify_tests;
 
 mod provider_attribution;
 use provider_attribution::{served_provider_attribution, ServedProviderResult};
@@ -3274,10 +3276,12 @@ impl InferenceProviderPool {
                 401 | 403 => "unauthorized",
                 429 => "rate_limited",
                 503 => "unavailable",
+                504 => "timeout",
                 500..=599 => "server_error",
                 400..=499 => "client_error",
                 _ => "http_other",
             },
+            E::Overloaded { .. } => "unavailable",
             E::RequestFailed(_) => "request_failed",
         }
     }
@@ -5277,7 +5281,16 @@ impl InferenceProviderPool {
             }
         };
 
+        // Each provider is tried at most once. An overloaded (503) provider
+        // did not process the request, so the next provider may serve it; if
+        // none does, the overload is reported (with its Retry-After) rather
+        // than a later provider's server or connection failure. A client 4xx
+        // still wins, since retrying the same payload cannot succeed. A 504
+        // means the work may still be running upstream, so it is returned
+        // without trying others.
         let mut last_error = None;
+        let mut overloaded = None;
+        let mut client_error = None;
         for provider in providers {
             match provider
                 .privacy_classify_raw(body.clone(), extra.clone())
@@ -5293,36 +5306,64 @@ impl InferenceProviderPool {
                     // A misbehaving filter that echoes its input would
                     // route customer PII straight to application logs.
                     // Log only the category + status code.
+                    let error_category = Self::privacy_classify_error_category(&e);
+                    match e {
+                        inference_providers::PrivacyClassifyError::HttpError {
+                            status_code: 504,
+                            ..
+                        } => {
+                            tracing::warn!(
+                                model = %model,
+                                error_category,
+                                "Privacy classify timed out upstream, not retrying"
+                            );
+                            return Err(Self::sanitize_privacy_classify_error(e));
+                        }
+                        inference_providers::PrivacyClassifyError::Overloaded { .. } => {
+                            overloaded = Some(e);
+                        }
+                        // Kept apart so a later provider's failure cannot
+                        // replace it.
+                        inference_providers::PrivacyClassifyError::HttpError {
+                            status_code: 400..=499,
+                            ..
+                        } => {
+                            client_error.get_or_insert(e);
+                        }
+                        _ => last_error = Some(e),
+                    }
                     tracing::warn!(
                         model = %model,
-                        error_category = %Self::privacy_classify_error_category(&e),
+                        error_category,
                         "Privacy classify failed with provider, trying next"
                     );
-                    last_error = Some(e);
                 }
             }
         }
 
-        // Final user-facing error: only the status code escapes; no
-        // upstream response body (a filter that echoes its input would leak
-        // customer PII). The status is kept as `HttpError` so callers can
-        // tell a client 4xx from an upstream outage.
-        Err(match last_error {
-            Some(inference_providers::PrivacyClassifyError::HttpError { status_code, .. }) => {
-                inference_providers::PrivacyClassifyError::HttpError {
-                    status_code,
-                    message: format!("PII detector returned HTTP {status_code}"),
-                }
-            }
-            Some(inference_providers::PrivacyClassifyError::RequestFailed(_)) => {
-                inference_providers::PrivacyClassifyError::RequestFailed(
-                    "PII detector unreachable".to_string(),
-                )
-            }
+        Err(match client_error.or(overloaded).or(last_error) {
+            Some(e) => Self::sanitize_privacy_classify_error(e),
             None => inference_providers::PrivacyClassifyError::RequestFailed(
                 "No providers available for privacy classify".to_string(),
             ),
         })
+    }
+
+    /// Final error for the caller: only the status code (and an overload's
+    /// Retry-After) is kept; the upstream response text is dropped. The status
+    /// stays an `HttpError` so callers can tell a client 4xx from an outage.
+    fn sanitize_privacy_classify_error(
+        err: inference_providers::PrivacyClassifyError,
+    ) -> inference_providers::PrivacyClassifyError {
+        use inference_providers::PrivacyClassifyError as E;
+        match err {
+            E::HttpError { status_code, .. } => E::HttpError {
+                status_code,
+                message: format!("PII detector returned HTTP {status_code}"),
+            },
+            E::RequestFailed(_) => E::RequestFailed("PII detector unreachable".to_string()),
+            overloaded @ E::Overloaded { .. } => overloaded,
+        }
     }
 
     pub async fn score(

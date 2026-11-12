@@ -165,56 +165,60 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
         let encryption_version_clone = encryption_version.clone();
 
         // The worker resolves the model again, which for an unlisted model may
-        // need the caller's key (cloud-platform model access).
-        crate::caller_credential::spawn_with_caller_credential(async move {
-            let usage_tracker = crate::responses::service_helpers::UsageTracker::new();
-            let mut search_tools = tools::ToolRegistry::new();
-            if let Some(provider) = web_search_provider {
-                search_tools.register(Arc::new(tools::WebSearchToolExecutor::new(provider)));
-            }
-            if let Some(provider) = web_context_search_provider {
-                search_tools.register(Arc::new(tools::WebContextSearchToolExecutor::new(provider)));
-            }
+        // need the caller's key (cloud-platform model access), and its
+        // inference calls carry the request's tenant ids.
+        crate::caller_credential::spawn_with_caller_credential(
+            inference_providers::tracing_context::scoped(async move {
+                let usage_tracker = crate::responses::service_helpers::UsageTracker::new();
+                let mut search_tools = tools::ToolRegistry::new();
+                if let Some(provider) = web_search_provider {
+                    search_tools.register(Arc::new(tools::WebSearchToolExecutor::new(provider)));
+                }
+                if let Some(provider) = web_context_search_provider {
+                    search_tools
+                        .register(Arc::new(tools::WebContextSearchToolExecutor::new(provider)));
+                }
 
-            let context = ProcessStreamContext {
-                request,
-                model,
-                reasoning_effort,
-                user_id,
-                request_id,
-                organization_id,
-                workspace_id,
-                fallback_enabled,
-                request_priority,
-                body_hash,
-                signing_algo: signing_algo_clone,
-                client_pub_key: client_pub_key_clone,
-                model_pub_key: model_pub_key_clone,
-                encryption_version: encryption_version_clone,
-                response_repository,
-                response_items_repository,
-                completion_service,
-                organization_service,
-                source_registry: None,
-                search_tools,
-            };
+                let context = ProcessStreamContext {
+                    request,
+                    model,
+                    reasoning_effort,
+                    user_id,
+                    request_id,
+                    organization_id,
+                    workspace_id,
+                    fallback_enabled,
+                    request_priority,
+                    body_hash,
+                    signing_algo: signing_algo_clone,
+                    client_pub_key: client_pub_key_clone,
+                    model_pub_key: model_pub_key_clone,
+                    encryption_version: encryption_version_clone,
+                    response_repository,
+                    response_items_repository,
+                    completion_service,
+                    organization_service,
+                    source_registry: None,
+                    search_tools,
+                };
 
-            if Self::process_response_stream(
-                tx,
-                context,
-                initial_response,
-                api_key_uuid,
-                usage_tracker,
-            )
-            .await
-            .is_err()
-            {
-                // The worker handles inference failures while its response
-                // and sequence state are still available. A remaining error
-                // means the receiver could not accept its terminal event.
-                tracing::debug!("Response stream receiver closed before terminal event");
-            }
-        });
+                if Self::process_response_stream(
+                    tx,
+                    context,
+                    initial_response,
+                    api_key_uuid,
+                    usage_tracker,
+                )
+                .await
+                .is_err()
+                {
+                    // The worker handles inference failures while its response
+                    // and sequence state are still available. A remaining error
+                    // means the receiver could not accept its terminal event.
+                    tracing::debug!("Response stream receiver closed before terminal event");
+                }
+            }),
+        );
 
         Ok(Box::pin(rx))
     }

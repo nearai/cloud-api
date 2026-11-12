@@ -31,6 +31,8 @@ pub mod openai_compatible;
 pub mod typesafe;
 
 #[cfg(test)]
+mod internal_keys_tests;
+#[cfg(test)]
 mod retention_tests;
 #[cfg(test)]
 mod routing_policy_tests;
@@ -56,10 +58,11 @@ pub use openai_compatible::OpenAiCompatibleBackend;
 pub use typesafe::TypeSafeBackend;
 
 /// Strip cloud-api internal keys from `extra` before forwarding params to
-/// external providers.
+/// external providers. Every operation whose params carry an `extra` map must
+/// call this before the request leaves the process.
 ///
-/// The tracing keys are injected by the completion service so the vLLM provider
-/// can forward them as HTTP headers. The model pubkey is routing-only. External
+/// The tracing keys are injected by the API layer so the vLLM provider can
+/// forward them as HTTP headers. The model pubkey is routing-only. External
 /// providers use `#[serde(flatten)]` on `extra`, so any remaining keys are
 /// serialised as top-level JSON body fields — unknown fields that strict
 /// providers (Anthropic, Gemini) may reject with a 400/422.
@@ -552,6 +555,7 @@ impl InferenceProvider for ExternalProvider {
         mut params: ImageGenerationParams,
         _request_hash: String,
     ) -> Result<ImageGenerationResponseWithBytes, ImageGenerationError> {
+        strip_internal_keys(&mut params.extra);
         self.inject_extra_request_body(&mut params.extra);
         self.backend
             .image_generation(&self.config, &self.model_name, params)
@@ -565,7 +569,7 @@ impl InferenceProvider for ExternalProvider {
     /// - Not supported by Anthropic or Gemini (will return error)
     async fn audio_transcription(
         &self,
-        params: AudioTranscriptionParams,
+        mut params: AudioTranscriptionParams,
         _request_hash: String,
     ) -> Result<AudioTranscriptionResponse, AudioTranscriptionError> {
         if !self.enforced_request_body.is_empty() {
@@ -573,6 +577,7 @@ impl InferenceProvider for ExternalProvider {
                 "Audio transcription does not support mandatory routing fields".into(),
             ));
         }
+        strip_internal_keys(&mut params.extra);
         self.backend
             .audio_transcription(&self.config, &self.model_name, params)
             .await
@@ -599,6 +604,7 @@ impl InferenceProvider for ExternalProvider {
         mut params: ScoreParams,
         _request_hash: String,
     ) -> Result<ScoreResponse, ScoreError> {
+        strip_internal_keys(&mut params.extra);
         self.inject_extra_request_body(&mut params.extra);
         self.backend
             .score(&self.config, &self.model_name, params)
@@ -606,6 +612,7 @@ impl InferenceProvider for ExternalProvider {
     }
 
     async fn rerank(&self, mut params: RerankParams) -> Result<RerankResponse, RerankError> {
+        strip_internal_keys(&mut params.extra);
         self.inject_extra_request_body(&mut params.extra);
         self.backend
             .rerank(&self.config, &self.model_name, params)
@@ -617,6 +624,7 @@ impl InferenceProvider for ExternalProvider {
         body: bytes::Bytes,
         mut extra: std::collections::HashMap<String, serde_json::Value>,
     ) -> Result<bytes::Bytes, EmbeddingError> {
+        strip_internal_keys(&mut extra);
         self.inject_extra_request_body(&mut extra);
         self.backend.embeddings_raw(&self.config, body, extra).await
     }
@@ -626,6 +634,7 @@ impl InferenceProvider for ExternalProvider {
         body: bytes::Bytes,
         mut extra: std::collections::HashMap<String, serde_json::Value>,
     ) -> Result<bytes::Bytes, PrivacyClassifyError> {
+        strip_internal_keys(&mut extra);
         self.inject_extra_request_body(&mut extra);
         self.backend
             .privacy_classify_raw(&self.config, body, extra)

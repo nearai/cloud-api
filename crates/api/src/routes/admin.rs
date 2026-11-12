@@ -2747,7 +2747,7 @@ fn member_role_from_db_str(role: &str, member_id: Uuid) -> MemberRole {
 /// List members of a specific organization (Admin only)
 ///
 /// Returns the members of the given organization with full user details
-/// (email, last login, active status), consistent with `/v1/admin/users`.
+/// (email, last login, active status).
 /// Only authenticated admins can perform this operation.
 #[utoipa::path(
     get,

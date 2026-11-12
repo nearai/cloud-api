@@ -55,8 +55,8 @@ async fn test_admin_list_organization_members_includes_owner() {
 #[tokio::test]
 async fn test_admin_list_organization_members_includes_inactive() {
     // Inactive (soft-deleted) users are deactivated in place (users.is_active =
-    // false). The admin member list must still surface them — matching
-    // /v1/admin/users — so totals don't silently disagree with the row set.
+    // false). The admin member list must still surface them, so totals don't
+    // silently disagree with the row set.
     let (server, database) = setup_test_server_with_database().await;
 
     // The mock admin user is the org owner (an active member).

@@ -1,5 +1,26 @@
 # CLAUDE.md
 
+## Public repository disclosure rules
+
+Before writing to a repository, check its visibility with `gh repo view --json visibility`. Check the visibility of every repository you plan to mention.
+
+For public repositories, this rule covers all written content, including PR titles and bodies, commit messages, branch names, code and workflow comments, documentation, issues, and review replies. Include only what an outside reviewer needs to understand what the change does, any behavior change, and how it was tested.
+
+Never include any of the following in public content.
+
+- Internal operations, including hosts, IPs, runners, deployments, rollout plans, capacity, and vendors.
+- Incidents, outages, how a problem was found, or how it could be exploited.
+- The reasons for past internal decisions or who made them.
+- Customer or partner names or links.
+- Secrets, token formats, example payloads or log lines, internal URLs, Slack or Notion links, or dashboards.
+- Private repository information in any form, including names, `owner/repo#123`, URLs, `Closes` or `Depends on` references, branch names, file paths, commit hashes, copied code, or wording that reveals a private repository exists.
+
+Put cross-references involving private repositories in the private PR only.
+
+Before creating or editing public content, reread it and remove every sentence an outside reviewer does not need to review the diff. If unsure whether information is internal, omit it and ask the user.
+
+PR description edits can remain in the edit history. Complete this check before first publication and tell the user immediately if internal information is published.
+
 Guidance for Claude Code and other agents working in this repository. Topic rules live in `.claude/rules/` and load automatically when you work on matching files (see the index below); review criteria live in `REVIEW.md`.
 
 ## Privacy comes first

@@ -204,7 +204,7 @@ pub async fn score(
                     tracing::error!(
                         model = %request.model,
                         upstream_status = status_code,
-                        detail = %message,
+                        error_message_len = message.len(),
                         "Score provider error"
                     );
                     let http_status = StatusCode::from_u16(status_code)

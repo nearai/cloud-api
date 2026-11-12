@@ -32,7 +32,7 @@ env:
 jobs:
   preflight:
     name: Validate confirmation
-    runs-on: [self-hosted, infra]
+    runs-on: ubuntu-latest
     steps:
       - name: Check confirm input
         env:
@@ -48,7 +48,7 @@ jobs:
     needs: preflight
     permissions:
       contents: write # Create the rollback audit release.
-    runs-on: [self-hosted, infra]
+    runs-on: ubuntu-latest
     environment: production
     outputs:
       target_tag: ${{ steps.resolve.outputs.target_tag }}
@@ -229,7 +229,7 @@ jobs:
     # ensuring a transient registry blip on the audit copy doesn't block the
     # redeploy. The :prod retag step has no continue-on-error, so a retag
     # failure correctly blocks the redeploy.
-    runs-on: [self-hosted, infra]
+    runs-on: ubuntu-latest
     steps:
       # cvm-ansible-playbooks `Update Cloud API Prod` re-reads :prod from
       # Docker Hub, which we just re-pointed at the rolled-back digest. We

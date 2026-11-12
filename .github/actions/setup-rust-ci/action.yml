@@ -1,13 +1,11 @@
 name: 'Setup Rust CI'
 description: |
   Sets up the Rust toolchain, sccache, the mold linker, cargo-nextest, and the
-  swatinem/rust-cache. Used by every job in test.yml to share setup logic and
-  to avoid apt lock contention from parallel jobs installing mold on the same
-  self-hosted runner.
+  swatinem/rust-cache. Used by Rust test and measurement-sync jobs on fresh
+  GitHub-hosted runners.
 
-  Mold is installed via GitHub release binary (not apt) so concurrent jobs do
-  not contend on dpkg locks. Its checksum-verified binaries are placed in a
-  job-specific directory on PATH; no sudo or shared-host installation is needed.
+  Mold's checksum-verified release binaries are placed in a job-specific
+  directory on PATH; no sudo or host-wide installation is needed.
 
 inputs:
   cache-key:
@@ -28,11 +26,9 @@ runs:
         # Preserve v1's default before Cargo 1.97; caller-provided RUSTFLAGS win.
         rustflags: "-D warnings"
 
-    # The dedicated CI runners are persistent and keep ~/.cargo/bin between jobs, so
-    # download these tools only when missing. Two runs on them failed inside
-    # taiki-e/install-action (truncated, then checksum-mismatched nextest download);
-    # versions are pinned so "already installed" is a well-defined check. The pins live
-    # only in this step's env; the install steps read them from its outputs.
+    # Hosted images can include cargo tools; download them only when the
+    # pinned version is missing. The pins live only in this step's env;
+    # the install steps read them from its outputs.
     - name: Check cached cargo tools
       id: tools
       shell: bash

@@ -252,7 +252,6 @@ async fn interrupted_stream_bills_observed_usage_against_its_reservation() {
             digest: Sha256::new(),
             billing: Some(Billing {
                 budget_id: Some(budget_id),
-                admission_observation_id: Some(Uuid::from_u128(100)),
                 service,
                 request_hash: String::new(),
                 organization_id: Uuid::new_v4(),
@@ -285,10 +284,6 @@ async fn interrupted_stream_bills_observed_usage_against_its_reservation() {
         assert_eq!(records.len(), 1);
         let recorded = &records[0];
         assert_eq!(recorded.budget_id, Some(budget_id));
-        assert_eq!(
-            recorded.admission_observation_id,
-            Some(Uuid::from_u128(100))
-        );
         assert_eq!(recorded.input_tokens, 10);
         assert_eq!(recorded.output_tokens, 5);
         assert_eq!(recorded.cache_read_tokens, 2);

@@ -63,7 +63,7 @@ impl UsageServiceTrait for RecordingUsageService {
         &self,
         identity: services::usage::BillingIdentity,
         features: services::usage::budget::UsageFeatures,
-    ) -> Result<services::usage::budget::BudgetAdmission, UsageError> {
+    ) -> Result<Option<Uuid>, UsageError> {
         self.inner.admit(identity, features).await
     }
 

@@ -3,19 +3,15 @@ use super::{BillingIdentity, InferenceType, ModelPricing, UsageError};
 use uuid::Uuid;
 
 mod estimate;
-pub mod observation;
 pub mod policy;
 pub use estimate::UsageFeatures;
 pub(super) use policy::ESTIMATOR_VERSION;
 
-#[derive(Debug, Clone, Copy, serde::Serialize)]
+#[derive(Debug, serde::Serialize)]
 pub struct BudgetAdmission {
     pub id: Option<Uuid>,
     pub mode: policy::AdmissionMode,
     pub estimated_amount: Option<i64>,
-    /// Request-local sample correlation; never a reservation or wire field.
-    #[serde(skip)]
-    pub observation_id: Option<Uuid>,
 }
 
 #[derive(Debug, Clone)]
@@ -129,7 +125,6 @@ pub struct BudgetExecution {
 #[derive(Clone, Copy)]
 struct Attempt {
     id: Option<Uuid>,
-    observation_id: Option<Uuid>,
     dispatched: bool,
 }
 
@@ -159,14 +154,6 @@ impl BudgetExecution {
             .await;
         guard.0 = None;
         output
-    }
-
-    pub async fn observation_id(&self) -> Option<Uuid> {
-        self.last
-            .lock()
-            .await
-            .as_ref()
-            .and_then(|attempt| attempt.observation_id)
     }
 
     pub async fn id(&self) -> Result<Option<Uuid>, UsageError> {
@@ -258,13 +245,12 @@ pub async fn before_attempt() -> Result<(), UsageError> {
     let execution = EXECUTION
         .try_with(Clone::clone)
         .map_err(|_| UsageError::InternalError("execution is missing monetary admission".into()))?;
-    let admission = execution
+    let id = execution
         .service
         .admit(execution.identity, execution.features.clone())
         .await?;
     *execution.last.lock().await = Some(Attempt {
-        id: admission.id,
-        observation_id: admission.observation_id,
+        id,
         dispatched: false,
     });
     Ok(())
@@ -305,20 +291,9 @@ impl inference_providers::retry_admission::RetryAdmission for BudgetExecution {
 
     async fn attempt_failed(&self) {
         let attempt = self.last.lock().await.take();
-        if let Some(attempt) = attempt {
-            observation::attempt_end(
-                attempt.observation_id,
-                if attempt.dispatched {
-                    "unknown"
-                } else {
-                    "not_executed"
-                },
-            );
-        }
         if let Some(Attempt {
             id: Some(id),
             dispatched,
-            ..
         }) = attempt
         {
             if dispatched {
@@ -341,7 +316,6 @@ impl inference_providers::retry_admission::RetryAdmission for BudgetExecution {
 
     async fn release_not_dispatched(&self) {
         let attempt = self.last.lock().await.take();
-        observation::attempt_end(attempt.and_then(|a| a.observation_id), "not_executed");
         if let Some(Attempt { id: Some(id), .. }) = attempt {
             if self
                 .service
@@ -356,14 +330,13 @@ impl inference_providers::retry_admission::RetryAdmission for BudgetExecution {
     }
     async fn admit_retry(&self) -> Result<(), inference_providers::CompletionError> {
         self.attempt_failed().await;
-        let admission = self
+        let id = self
             .service
             .admit(self.identity, self.features.clone())
             .await
             .map_err(completion_error)?;
         *self.last.lock().await = Some(Attempt {
-            id: admission.id,
-            observation_id: admission.observation_id,
+            id,
             dispatched: false,
         });
         Ok(())
@@ -507,11 +480,9 @@ mod tests {
             .run(async {
                 before_attempt().await.unwrap();
                 let first = execution.id().await.unwrap();
-                assert_eq!(execution.observation_id().await, first);
                 execution.mark_dispatched().await;
                 inference_providers::retry_admission::attempt_failed().await;
                 assert!(execution.id().await.is_err());
-                assert!(execution.observation_id().await.is_none());
                 assert_eq!(
                     *service.unknown_outcomes.lock().unwrap(),
                     vec![first.unwrap()]
@@ -520,7 +491,6 @@ mod tests {
                     .await
                     .unwrap();
                 let second = execution.id().await.unwrap();
-                assert_eq!(execution.observation_id().await, second);
                 assert_ne!(first, second);
                 assert!(service.releases.lock().unwrap().is_empty());
                 // Local preparation failed before transport; release once and recover the slot.

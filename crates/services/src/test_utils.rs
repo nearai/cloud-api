@@ -89,13 +89,8 @@ impl UsageServiceTrait for MockUsageService {
         &self,
         _: crate::usage::BillingIdentity,
         _: crate::usage::budget::UsageFeatures,
-    ) -> Result<crate::usage::budget::BudgetAdmission, UsageError> {
-        Ok(crate::usage::budget::BudgetAdmission {
-            id: Some(Uuid::new_v4()),
-            mode: crate::usage::budget::policy::AdmissionMode::Enforce,
-            estimated_amount: Some(1000),
-            observation_id: None,
-        })
+    ) -> Result<Option<Uuid>, UsageError> {
+        Ok(Some(Uuid::new_v4()))
     }
 
     async fn record_usage(
@@ -397,7 +392,7 @@ impl UsageServiceTrait for CapturingUsageService {
         &self,
         _: crate::usage::BillingIdentity,
         _: crate::usage::budget::UsageFeatures,
-    ) -> Result<crate::usage::budget::BudgetAdmission, UsageError> {
+    ) -> Result<Option<Uuid>, UsageError> {
         let mut admissions = self.admissions.lock().unwrap();
         if self
             .admission_limit
@@ -409,12 +404,7 @@ impl UsageServiceTrait for CapturingUsageService {
         }
         let id = Uuid::new_v4();
         admissions.push(id);
-        Ok(crate::usage::budget::BudgetAdmission {
-            id: Some(id),
-            mode: crate::usage::budget::policy::AdmissionMode::Enforce,
-            estimated_amount: Some(1000),
-            observation_id: Some(id),
-        })
+        Ok(Some(id))
     }
 
     async fn record_usage(

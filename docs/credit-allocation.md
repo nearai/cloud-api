@@ -103,25 +103,6 @@ It avoids reservation writes and admission row locks. Feature collection precede
 selection and remains on the request path when admission is disabled. Direct admission still
 makes its control request in audit mode, and a disabled policy still returns a response to it.
 
-Admission emits decision counts by path, mode, inference type, outcome and bounded error
-reason, plus duration histograms in seconds for estimation, reservation and the total.
-Estimation includes pricing lookup; reservation includes the full database operation.
-These timings start after request feature extraction; existing HTTP metrics cover the full request.
-Metric labels contain no organization, key or request identifiers.
-
-One percent of execution IDs produce an estimate sample and a later usage association.
-The sample identifier is request-local and does not change the reservation, usage event
-or ledger schema. Inference retries use separate samples; usage delivery retries preserve
-their original identity. Configuration application logs include the applied version.
-
-`scripts/analyze_admission.py` compares local JSON/JSONL log exports with committed usage
-history JSON pages or CSV. Run `python3 scripts/analyze_admission.py --help` for inputs.
-It produces a JSON summary and per-execution CSV, grouped by path, mode, model, inference
-type, input kind and estimator version. Costs are integer nano-USD. Missing or ambiguous
-matches retain unknown cost; repeated exports are deduplicated. Export complete log
-windows and every usage page, allowing for delayed settlement. Sample statistics do not
-estimate population spend or concurrent enforcement rejection rates.
-
 Estimator parameters live in
 [`budget/policy.rs`](../crates/services/src/usage/budget/policy.rs) and ship with
 Cloud API. `ESTIMATOR_VERSION` identifies their calculation; the current version is 2.

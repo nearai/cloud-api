@@ -182,7 +182,6 @@ impl MetricsServiceTrait for OtlpMetricsService {
                     "Per-request prefix-cache hit rate (cache-read / prompt tokens)",
                     "percent",
                 ),
-                crate::usage::budget::observation::DURATION => ("Admission stage duration", "s"),
                 consts::METRIC_USAGE_HOURLY_LAG_SECONDS => (
                     "Seconds from the oldest raw hour not yet in usage_hourly to the scheduler tick",
                     "s",
@@ -201,13 +200,7 @@ impl MetricsServiceTrait for OtlpMetricsService {
                 builder
             };
 
-            if name == crate::usage::budget::observation::DURATION {
-                builder
-                    .with_boundaries(vec![0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0])
-                    .build()
-            } else {
-                builder.build()
-            }
+            builder.build()
         });
 
         let kv_tags = Self::parse_tags(tags);

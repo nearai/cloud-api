@@ -223,108 +223,54 @@ impl UsageServiceImpl {
         identity: BillingIdentity,
         bounds: budget::UsageFeatures,
         requested_mode: budget::policy::AdmissionMode,
-        path: &'static str,
     ) -> Result<budget::BudgetAdmission, UsageError> {
-        use budget::{observation as obs, policy::AdmissionMode};
+        use budget::policy::AdmissionMode;
         let policy = self.admission_policy(identity.organization_id);
         let mode = policy.mode.combined(requested_mode);
-        let started = std::time::Instant::now();
-        let mut audit_error = None;
-        let result = async {
-            let mut admission = budget::BudgetAdmission {
-                id: None,
-                mode,
-                estimated_amount: None,
-                observation_id: None,
-            };
-            if mode == AdmissionMode::Off {
-                return Ok(admission);
-            }
-            let quote_started = std::time::Instant::now();
-            let quote = async {
-                let pricing = self.model_repository
-                    .get_model_by_id(identity.model_id)
-                    .await
-                    .map_err(|e| UsageError::InternalError(e.to_string()))?
-                    .ok_or_else(|| UsageError::ModelNotFound(identity.model_id.to_string()))?;
-                bounds.estimate()?.quote(&pricing)
-            }.await;
-            obs::duration(
-                self.metrics_service.as_ref(), path, mode, "estimate", quote_started.elapsed(),
-            );
-            let amount = match quote {
-                Ok(amount) => amount,
-                Err(error) if mode == AdmissionMode::Audit => {
-                    audit_error = Some(obs::error_reason(&error));
-                    return Ok(admission);
-                }
-                Err(error) => return Err(error),
-            };
-            admission.estimated_amount = Some(amount);
-            if obs::sampled(id) {
-                admission.observation_id = Some(id);
-                tracing::info!(event = "usage_admission_estimate", attempt_id = %id,
-                    organization_id = %identity.organization_id, model_id = %identity.model_id,
-                    inference_type = bounds.inference_type.as_str(), input_kind = obs::input_kind(&bounds),
-                    mode = obs::mode_label(mode), path, estimated_nano_usd = amount,
-                    estimator_version = budget::ESTIMATOR_VERSION, sample_rate = 0.01,
-                    "Admission estimate sample");
-            }
-            if mode == AdmissionMode::Audit {
-                return Ok(admission);
-            }
-            let reservation = budget::BudgetReservation {
-                id,
-                amount,
-                identity,
-                inference_type: bounds.inference_type,
-                estimator_version: budget::ESTIMATOR_VERSION,
-                organization_max_unsettled: policy.organization_max_unsettled,
-                key_max_unsettled: policy.key_max_unsettled,
-                reservation_ttl_seconds: policy.reservation_ttl_seconds,
-            };
-            let db_started = std::time::Instant::now();
-            let reserved = self.usage_repository.admit_budget(&reservation).await;
-            obs::duration(
-                self.metrics_service.as_ref(), path, mode, "reserve", db_started.elapsed(),
-            );
-            if reserved.is_err() {
-                obs::attempt_end(admission.observation_id, "not_executed");
-            }
-            reserved?;
-            admission.id = Some(id);
-            Ok(admission)
-        }.await;
-        let (outcome, reason) = match &result {
-            Err(error) => ("rejected", obs::error_reason(error)),
-            Ok(_) if audit_error.is_some() => {
-                ("estimate_failed", audit_error.unwrap_or("unavailable"))
-            }
-            Ok(_) => (
-                match mode {
-                    AdmissionMode::Off => "off",
-                    AdmissionMode::Audit => "estimated",
-                    AdmissionMode::Enforce => "admitted",
-                },
-                "none",
-            ),
+        let mut result = budget::BudgetAdmission {
+            id: None,
+            mode,
+            estimated_amount: None,
         };
-        obs::decision(
-            self.metrics_service.as_ref(),
-            path,
-            mode,
-            &bounds,
-            outcome,
-            reason,
-        );
-        obs::duration(
-            self.metrics_service.as_ref(),
-            path,
-            mode,
-            "total",
-            started.elapsed(),
-        );
-        result
+        if mode == AdmissionMode::Off {
+            return Ok(result);
+        }
+        let quote = async {
+            let pricing = self
+                .model_repository
+                .get_model_by_id(identity.model_id)
+                .await
+                .map_err(|e| UsageError::InternalError(e.to_string()))?
+                .ok_or_else(|| UsageError::ModelNotFound(identity.model_id.to_string()))?;
+            bounds.estimate()?.quote(&pricing)
+        }
+        .await;
+        let amount = match quote {
+            Ok(amount) => amount,
+            Err(error) if mode == AdmissionMode::Audit => {
+                tracing::warn!(organization_id = %identity.organization_id, model_id = %identity.model_id, error = %error, "Admission audit could not estimate usage");
+                return Ok(result);
+            }
+            Err(error) => return Err(error),
+        };
+        result.estimated_amount = Some(amount);
+        if mode == AdmissionMode::Audit {
+            tracing::info!(organization_id = %identity.organization_id, model_id = %identity.model_id, estimated_nano_usd = amount, "Admission audit estimate");
+            return Ok(result);
+        }
+        let reservation = budget::BudgetReservation {
+            id,
+            amount,
+            identity,
+            inference_type: bounds.inference_type,
+            estimator_version: budget::ESTIMATOR_VERSION,
+            organization_max_unsettled: policy.organization_max_unsettled,
+            key_max_unsettled: policy.key_max_unsettled,
+            reservation_ttl_seconds: policy.reservation_ttl_seconds,
+        };
+        self.usage_repository.admit_budget(&reservation).await?;
+        result.id = Some(id);
+        Ok(result)
     }
 
     pub fn new(
@@ -519,15 +465,15 @@ impl UsageServiceTrait for UsageServiceImpl {
         &self,
         identity: BillingIdentity,
         bounds: budget::UsageFeatures,
-    ) -> Result<budget::BudgetAdmission, UsageError> {
+    ) -> Result<Option<Uuid>, UsageError> {
         self.reserve_budget(
             Uuid::new_v4(),
             identity,
             bounds,
             budget::policy::AdmissionMode::Enforce,
-            "cloud_api",
         )
         .await
+        .map(|result| result.id)
     }
 
     async fn admit_external(
@@ -537,8 +483,7 @@ impl UsageServiceTrait for UsageServiceImpl {
         report_id: Uuid,
         mode: budget::policy::AdmissionMode,
     ) -> Result<budget::BudgetAdmission, UsageError> {
-        self.reserve_budget(report_id, identity, bounds, mode, "direct_proxy")
-            .await
+        self.reserve_budget(report_id, identity, bounds, mode).await
     }
     async fn record_usage(
         &self,
@@ -546,16 +491,7 @@ impl UsageServiceTrait for UsageServiceImpl {
     ) -> Result<UsageLogEntry, UsageError> {
         let organization_id = request.organization_id;
         let budget_id = request.budget_id;
-        let observation_id = request.admission_observation_id;
         let result = self.record_usage_inner(request).await;
-        if let Some(attempt_id) = observation_id {
-            match &result {
-                Ok(log) => tracing::info!(event = "usage_admission_usage", %attempt_id,
-                    organization_id = %log.organization_id, usage_id = %log.id,
-                    inference_id = ?log.inference_id, "Admission sample usage association"),
-                Err(_) => budget::observation::attempt_end(Some(attempt_id), "settlement_failed"),
-            }
-        }
         if result.is_err() {
             budget::unknown_outcome(self, organization_id, budget_id).await;
         }

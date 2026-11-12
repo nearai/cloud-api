@@ -531,7 +531,7 @@ async fn admission_uses_live_org_policy_and_audit_off_never_create_holds() {
     let disabled = Uuid::new_v4();
     let settings=Arc::new(AdminSettingsService::builder(Arc::new(SettingsRepo(serde_json::json!({
         "defaults":{"mode":"audit"},"organizations":{
-            enforced.to_string():{"organization_max_unsettled":512,"key_max_unsettled":128,"reservation_ttl_seconds":900,"unknown_outcome_ttl_seconds":60},
+            enforced.to_string():{"mode":"enforce","organization_max_unsettled":512,"key_max_unsettled":128,"reservation_ttl_seconds":900,"unknown_outcome_ttl_seconds":60},
             disabled.to_string():{"mode":"off"}
         }
     })))).register::<UsageAdmissionKey>(Arc::new(arc_swap::ArcSwap::from_pointee(AdmissionSettings::default()))).build());

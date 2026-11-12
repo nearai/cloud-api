@@ -538,7 +538,15 @@ mod tests {
                 .into_iter()
                 .map(|v| v.key)
                 .collect();
-            assert_eq!(keys, ["placement", "attested_3p", "tinfoil_trust"]);
+            assert_eq!(
+                keys,
+                [
+                    "placement",
+                    "attested_3p",
+                    "tinfoil_trust",
+                    "usage_admission"
+                ]
+            );
         }
         verifier.verify_router(&router_bundle()).map(|r| r.source)
     }

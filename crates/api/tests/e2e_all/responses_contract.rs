@@ -282,7 +282,8 @@ async fn test_responses_api_with_json_schema() {
 async fn assert_responses_budget_limit(stream: bool) {
     use services::usage::ports::UsageRepository;
 
-    let (server, _pool, mock, database) = setup_test_server_with_pool().await;
+    let (server, mock, _pool, database) =
+        super::usage_admission::server(super::usage_admission::enforcing_settings()).await;
     let org = setup_org_with_credits(&server, 1).await;
     let api_key = get_api_key_for_org(&server, org.id.clone()).await;
     let model = setup_qwen_model(&server).await;

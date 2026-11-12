@@ -1133,7 +1133,7 @@ async fn test_internal_usage_rejects_discount_above_ceiling() {
 
 #[tokio::test]
 async fn budget_admission_settles_once_without_resizing_estimate() {
-    let server = enable_internal_usage_server().await;
+    let server = super::usage_admission::enforcing_server().await;
     setup_qwen_model(&server).await;
     let identity = provision_identity(&server).await;
     let execution_id = uuid::Uuid::new_v4();
@@ -1225,7 +1225,7 @@ async fn budget_admission_settles_once_without_resizing_estimate() {
 
 #[tokio::test]
 async fn budget_audit_and_off_do_not_hold_credit_and_unknown_outcomes_release_only_slots() {
-    let server = enable_internal_usage_server().await;
+    let server = super::usage_admission::enforcing_server().await;
     setup_qwen_model(&server).await;
     let identity = provision_identity(&server).await;
     let features = services::usage::budget::UsageFeatures::from_json(
@@ -1306,7 +1306,7 @@ async fn budget_audit_and_off_do_not_hold_credit_and_unknown_outcomes_release_on
 
 #[tokio::test]
 async fn budget_admission_concurrency_is_bounded_for_key_without_spend_limit() {
-    let server = enable_internal_usage_server().await;
+    let server = super::usage_admission::enforcing_server().await;
     setup_qwen_model(&server).await;
     let identity = provision_identity(&server).await;
     let features = services::usage::budget::UsageFeatures::from_json(

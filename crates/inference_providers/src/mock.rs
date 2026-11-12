@@ -241,6 +241,7 @@ impl ToolCall {
 #[derive(Clone)]
 pub struct ResponseTemplate {
     content: String,
+    completion_gate: Option<Arc<tokio::sync::Semaphore>>,
     reasoning_content: Option<String>,
     /// Simulate client disconnect after N chunks (stream ends without final usage chunk)
     disconnect_after_chunks: Option<usize>,
@@ -268,6 +269,7 @@ impl ResponseTemplate {
     pub fn new(content: impl Into<String>) -> Self {
         Self {
             content: content.into(),
+            completion_gate: None,
             reasoning_content: None,
             disconnect_after_chunks: None,
             stream_error_after_chunks: None,
@@ -285,6 +287,21 @@ impl ResponseTemplate {
     pub fn with_model(mut self, model: impl Into<String>) -> Self {
         self.model_override = Some(model.into());
         self
+    }
+
+    /// Hold responses until a test releases permits, without delaying admission itself.
+    pub fn with_completion_gate(mut self, gate: Arc<tokio::sync::Semaphore>) -> Self {
+        self.completion_gate = Some(gate);
+        self
+    }
+
+    async fn wait_for_completion(&self) {
+        if let Some(gate) = &self.completion_gate {
+            gate.acquire()
+                .await
+                .expect("test gate remains open")
+                .forget();
+        }
     }
 
     /// Set cache_read_tokens for usage (prompt_tokens_details.cached_tokens) in non-stream and stream final chunk.
@@ -1383,6 +1400,8 @@ impl crate::InferenceProvider for MockProvider {
                 .unwrap_or_else(|| config.default_response.clone())
         };
 
+        response_template.wait_for_completion().await;
+
         // Calculate input tokens from messages (rough estimate: 1 word ≈ 1 token)
         let input_tokens: i32 = params
             .messages
@@ -1538,6 +1557,8 @@ impl crate::InferenceProvider for MockProvider {
             .sum();
         // Ensure at least some input tokens for very short messages
         let input_tokens = input_tokens.max(6);
+
+        response_template.wait_for_completion().await;
 
         // Keep a stable chat_id for both the response and signature registration.
         let response = response_template.generate_response(

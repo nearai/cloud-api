@@ -9,6 +9,7 @@ use uuid::Uuid;
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AdmissionMode {
+    // The wire default permits the server policy to decide; it does not enable holds.
     #[default]
     Enforce,
     Audit,
@@ -39,7 +40,7 @@ pub struct AdmissionPolicy {
 impl Default for AdmissionPolicy {
     fn default() -> Self {
         Self {
-            mode: AdmissionMode::Enforce,
+            mode: AdmissionMode::Audit,
             organization_max_unsettled: 64,
             key_max_unsettled: 16,
             reservation_ttl_seconds: 7200,
@@ -68,6 +69,7 @@ impl AdmissionPolicy {
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AdmissionSettings {
+    /// Global ceiling: off/audit override every organization; enforce permits its policy.
     pub mode: AdmissionMode,
     pub defaults: AdmissionPolicy,
     /// Complete overrides, held in operator settings rather than owner-editable org settings.
@@ -76,10 +78,13 @@ pub struct AdmissionSettings {
 
 impl AdmissionSettings {
     pub fn for_organization(&self, id: Uuid) -> AdmissionPolicy {
-        self.organizations
+        let mut policy = self
+            .organizations
             .get(&id)
             .unwrap_or(&self.defaults)
-            .clone()
+            .clone();
+        policy.mode = self.mode.combined(policy.mode);
+        policy
     }
 }
 
@@ -164,6 +169,39 @@ pub(super) const ESTIMATE_POLICY: EstimatePolicy = EstimatePolicy {
 mod tests {
     use super::*;
     use serde_json::json;
+    #[test]
+    fn defaults_audit_and_explicit_organizations_enforce_below_the_global_ceiling() {
+        let id = Uuid::new_v4();
+        let ordinary = Uuid::new_v4();
+        let mut settings = AdmissionSettings::default();
+        assert_eq!(
+            settings.for_organization(ordinary).mode,
+            AdmissionMode::Audit
+        );
+        settings.organizations.insert(
+            id,
+            AdmissionPolicy {
+                mode: AdmissionMode::Enforce,
+                ..Default::default()
+            },
+        );
+        assert_eq!(settings.for_organization(id).mode, AdmissionMode::Enforce);
+        assert_eq!(
+            settings.for_organization(ordinary).mode,
+            AdmissionMode::Audit
+        );
+        for mode in [AdmissionMode::Audit, AdmissionMode::Off] {
+            settings.mode = mode;
+            assert_eq!(settings.for_organization(id).mode, mode);
+            assert_eq!(settings.for_organization(ordinary).mode, mode);
+        }
+        settings.mode = AdmissionMode::Enforce;
+        assert_eq!(settings.for_organization(id).mode, AdmissionMode::Enforce);
+        assert_eq!(
+            settings.for_organization(ordinary).mode,
+            AdmissionMode::Audit
+        );
+    }
     #[test]
     fn policy_validates_modes_limits_ttls_and_org_overrides() {
         let id = Uuid::new_v4();

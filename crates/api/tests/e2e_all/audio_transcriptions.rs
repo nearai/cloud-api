@@ -28,7 +28,8 @@ async fn setup_whisper_model() -> (
     Arc<inference_providers::mock::MockProvider>,
     String,
 ) {
-    let (server, inference_pool, mock_provider, _database) = setup_test_server_with_pool().await;
+    let (server, mock_provider, inference_pool, _database) =
+        super::usage_admission::server(super::usage_admission::enforcing_settings()).await;
     let model_name = format!("test-audio-transcription/Whisper-{}", uuid::Uuid::new_v4());
 
     // Add model to database - it must exist in both database and provider pool

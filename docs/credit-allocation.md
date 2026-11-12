@@ -78,40 +78,25 @@ Actual pricing and organization discounts follow the existing settlement path;
 admission does not freeze them. A duplicate report with unchanged usage facts
 returns the recorded charge even when live prices or discounts have since changed.
 
-Operator controls use the existing `usage_admission` admin setting, available through
-`GET/PATCH /v1/admin/settings/usage_admission`. The `defaults` policy applies to
-organizations absent from `organizations`; each UUID-keyed entry in that map is a
-complete override (omitted fields use built-in defaults). PATCH replaces each supplied
-top-level field, so retain other organization entries when updating the map.
-These settings require admin access and are separate from owner-editable organization settings.
-Changes apply immediately on the handling instance and at the existing ten-minute
-reload on other instances; this is not an instantaneous fleet-wide switch.
+The administrator-only `usage_admission` setting controls admission. Its default
+organization policy is `audit`: estimates are recorded without creating holds or
+rejecting requests on admission errors. Actual usage is billed in every mode.
 
-```json
-{
-  "mode": "enforce",
-  "defaults": {
-    "mode": "enforce",
-    "organization_max_unsettled": 64,
-    "key_max_unsettled": 16,
-    "reservation_ttl_seconds": 7200,
-    "unknown_outcome_ttl_seconds": 300
-  },
-  "organizations": {}
-}
-```
+The `defaults` policy applies to organizations absent from `organizations`.
+Each organization entry is a complete override; omitted fields use built-in defaults.
+Creating holds requires an explicit `enforce` mode in the selected policy.
+PATCH replaces each supplied top-level field, including the organization map.
 
-The top-level `mode` applies to every organization, including overrides. Setting it
-to `off` disables admission everywhere on each instance after that instance reloads.
-An organization/default mode can further relax enforcement (for example, a canary
-organization in enforce mode while other organizations use audit).
+The top-level `mode` is a global ceiling. Its default `enforce` permits the selected
+organization policy; it does not make the default policy enforce. Top-level `audit`
+forces every organization to audit, and `off` disables admission for every organization,
+including explicit overrides. Settings take effect through the existing reload mechanism.
 
-`enforce` estimates and reserves, `audit` estimates and logs without creating a hold
-or rejecting on admission errors, and `off` skips admission. Existing authentication,
-credit checks and actual-usage billing still run in every mode. Audit/off intentionally
-disable the additional concurrent-spending protection. They do not undo existing holds.
-Limits must be positive; the normal TTL is 1–86400 seconds and the unknown-outcome
-TTL must be positive and no longer than the normal TTL. Invalid PATCH values are rejected.
+`enforce` estimates and reserves; `audit` estimates without holding credit; `off`
+skips admission. Authentication, existing credit checks and actual billing remain active.
+Changing a mode does not release previously created holds. Limits must be positive;
+the normal TTL is 1–86400 seconds and the unknown-outcome TTL must be positive and no
+longer than the normal TTL. Invalid settings are rejected.
 
 Estimator parameters live in
 [`budget/policy.rs`](../crates/services/src/usage/budget/policy.rs) and ship with
@@ -197,25 +182,13 @@ requests reserve locally and are not reserved again by the proxy. Embedding,
 rerank, privacy, score and standalone MCP search retain their prior admission
 flow; their ledger writes still respect active holds.
 
-## Rollout notes
+## Accounting compatibility
 
-- Apply V0100 through the normal cloud-platform migration/image release before
-  deploying admission callers. Every event consumer must be upgraded before any
-  producer emits `admission_id` or audio receipts; mixed consumer versions are not
-  supported after that point. All inference, service, limit, and staking
-  writers must use the hold-aware versions before enabling admission. They
-  coordinate through the same per-organization database lock.
-- Inference usage posts through `record_organization_usage` (V0100) in one database
-  statement; the organization lock is held only during server-side accounting.
-  Platform-service usage still uses the Rust transaction path and the same lock.
-- Existing unattributed usage remains unknown and continues reducing aggregate
-  admission capacity. Its amount is snapshotted during the allocation-ledger
-  migration so usage posting does not rescan lifetime history. Establish
-  reviewed starting limits rather than backfilling speculative per-type
-  allocations.
-- Monitor allocation reconciliation and unfunded balances before expanding the
-  rollout. Allocation rows and their parent usage/balance update commit in one
-  transaction.
+Admission and settlement require compatible reservation tables and accounting operations.
+All debit paths must respect active holds. Inference usage posts atomically through
+`record_organization_usage`; service usage retains its transaction path. Allocation rows
+and the parent usage/balance update commit together. Existing unattributed usage continues
+to reduce aggregate admission capacity.
 
 ## Reconciling legacy consumption when moving to postpay
 

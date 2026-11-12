@@ -116,6 +116,11 @@ pub struct CompletionRequest {
     #[serde(default, skip_serializing, skip_deserializing)]
     pub original_request: Option<serde_json::Value>,
 
+    /// Optional observer told the final token counts once the completion
+    /// finishes (see `usage_observer`). In-memory only, never serialized.
+    #[serde(skip)]
+    pub usage_observer: Option<std::sync::Arc<dyn super::usage_observer::UsageObserver>>,
+
     pub extra: std::collections::HashMap<String, serde_json::Value>,
 }
 

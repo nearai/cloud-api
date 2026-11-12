@@ -20,6 +20,7 @@ pub mod inference_provider_pool;
 pub mod lifecycle;
 pub mod metrics;
 pub mod models;
+pub mod mpp;
 pub mod organization;
 pub mod organization_model_filter;
 pub mod reporting_tokens;

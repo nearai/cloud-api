@@ -41,6 +41,8 @@ pub struct AppState {
     pub ohttp_attestation: Option<OhttpAttestation>,
     /// HTTP client used exclusively for OHTTP loopback requests to self.
     pub http_client: reqwest::Client,
+    /// Machine Payments Protocol (HTTP 402). `None` unless `MPP_ENABLED=true`.
+    pub mpp_service: Option<Arc<services::mpp::MppService>>,
 }
 
 // Import route handlers

@@ -1417,6 +1417,7 @@ dependencies = [
  "dotenvy",
  "rustls-pki-types",
  "serde",
+ "serde_json",
  "serial_test",
  "tempfile",
  "thiserror 2.0.21",

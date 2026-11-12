@@ -170,6 +170,7 @@ pub fn test_config() -> ApiConfig {
         credit_allocation: config::CreditAllocationConfig::default(),
         ita: config::ItaAttestationConfig::default(),
         placement: config::PlacementConfig::default(),
+        mpp: config::MppConfig::default(),
     }
 }
 
@@ -237,7 +238,8 @@ async fn build_test_server_components(
         domain_services,
         Arc::new(config),
         E2E_APP_BUILD_OPTIONS,
-    );
+    )
+    .expect("test application configuration");
     let server = axum_test::TestServer::new(app.clone());
 
     (server, inference_provider_pool, mock_provider, app)
@@ -275,7 +277,8 @@ async fn build_test_server_components_with_real_providers(
         domain_services,
         Arc::new(config),
         E2E_APP_BUILD_OPTIONS,
-    );
+    )
+    .expect("test application configuration");
     let server = axum_test::TestServer::new(app);
 
     (server, inference_provider_pool)
@@ -396,7 +399,8 @@ async fn build_test_server_components_with_search_providers(
         domain_services,
         Arc::new(config),
         E2E_APP_BUILD_OPTIONS,
-    );
+    )
+    .expect("test application configuration");
     (axum_test::TestServer::new(app), mock_provider)
 }
 
@@ -521,7 +525,8 @@ where
         domain_services,
         Arc::new(infra.config),
         E2E_APP_BUILD_OPTIONS,
-    );
+    )
+    .expect("test application configuration");
     (axum_test::TestServer::new(app), infra.database)
 }
 
@@ -1070,7 +1075,7 @@ pub(crate) fn build_app_with_config_and_options(
     domain_services: DomainServices,
     config: Arc<ApiConfig>,
     build_options: AppBuildOptions,
-) -> axum::Router {
+) -> Result<axum::Router, services::mpp::MppError> {
     seeding::register_models_service(
         &domain_services.models_service,
         &domain_services.inference_provider_pool,

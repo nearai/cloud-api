@@ -1035,6 +1035,7 @@ impl ResponseServiceImpl {
             body_hash: process_context.body_hash.clone(),
             response_id: None,
             skip_provider_chat_signature: false,
+            usage_observer: None,
             original_request: None,
             n: None,
             service_tier: Some(inference_providers::ChatServiceTier::Default),

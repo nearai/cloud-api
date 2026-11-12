@@ -190,7 +190,7 @@ fn session_token(user_id: Uuid, session_id: Option<Uuid>) -> String {
     .expect("mock auth signs session tokens")
 }
 
-async fn users_probe(headers: HeaderMap) -> &'static str {
+async fn probe(headers: HeaderMap) -> &'static str {
     if headers.contains_key(ADMIN_AUDIT_REQUEST_ID_HEADER) {
         "client audit id reached the handler"
     } else {
@@ -210,7 +210,7 @@ async fn api_keys_probe(audit: AdminAudit) -> &'static str {
 
 fn app(admin_emails: &[&str], entered_slow_handler: Arc<Notify>) -> Router {
     let admin_routes = Router::new()
-        .route("/admin/users", get(users_probe))
+        .route("/admin/probe", get(probe))
         .route("/admin/api-keys", get(api_keys_probe))
         .route("/admin/organizations/{org_id}", get(|| async { "ok" }))
         .route("/admin/organizations/{org_id}/members", get(members_probe))
@@ -302,18 +302,18 @@ fn admin_paths_are_the_admin_api_only() {
     for path in [
         "/v1/admin",
         "/v1/admin/",
-        "/v1/admin/users",
+        "/v1/admin/probe",
         "/v1/admin/x/y",
     ] {
         assert!(is_admin_path(path), "{path}");
     }
     for path in [
         "/v1/administrator",
-        "/v1/admin-users",
-        "/admin/users",
-        "/v2/admin/users",
+        "/v1/admin-probe",
+        "/admin/probe",
+        "/v2/admin/probe",
         "/v1/organizations/admin",
-        "/V1/ADMIN/users",
+        "/V1/ADMIN/probe",
     ] {
         assert!(!is_admin_path(path), "{path}");
     }
@@ -329,7 +329,7 @@ async fn audit_header_carries_the_server_request_id_never_a_client_value() {
     let response = send(
         &app,
         with_session(
-            request(Method::GET, "/v1/admin/users")
+            request(Method::GET, "/v1/admin/probe")
                 .header(REQUEST_ID_HEADER, &client_request_id)
                 .header(ADMIN_AUDIT_REQUEST_ID_HEADER, &spoofed_audit_id),
             Uuid::new_v4(),
@@ -354,7 +354,7 @@ async fn audit_header_carries_the_server_request_id_never_a_client_value() {
     let response = send(
         &app,
         with_session(
-            request(Method::GET, "/v1/admin/users"),
+            request(Method::GET, "/v1/admin/probe"),
             Uuid::new_v4(),
             None,
         ),
@@ -418,7 +418,7 @@ async fn global_reads_have_no_organization_unless_a_handler_records_a_filter() {
     // A legacy session token has no `sid` claim: the credential id is unknown.
     let response = send(
         &app,
-        with_session(request(Method::GET, "/v1/admin/users"), user_id, None),
+        with_session(request(Method::GET, "/v1/admin/probe"), user_id, None),
     )
     .await;
     assert_eq!(response.status(), StatusCode::OK);
@@ -545,7 +545,7 @@ async fn admin_requests_outside_admin_auth_are_audited_as_unknown() {
     let (logs, _guard) = CapturedLogs::json();
     let app = admin_app();
 
-    for path in ["/v1/admin/no-such-route", "/v1/admin", "/v1/admin/users/"] {
+    for path in ["/v1/admin/no-such-route", "/v1/admin", "/v1/admin/probe/"] {
         let response = send(
             &app,
             with_session(request(Method::GET, path), Uuid::new_v4(), None),
@@ -565,7 +565,7 @@ async fn admin_requests_outside_admin_auth_are_audited_as_unknown() {
 
     let response = send(
         &app,
-        request(Method::OPTIONS, "/v1/admin/users")
+        request(Method::OPTIONS, "/v1/admin/probe")
             .header(ORIGIN, "http://localhost:3000")
             .header(ACCESS_CONTROL_REQUEST_METHOD, "GET")
             .body(Body::empty())
@@ -577,7 +577,7 @@ async fn admin_requests_outside_admin_auth_are_audited_as_unknown() {
         .headers()
         .contains_key(ADMIN_AUDIT_REQUEST_ID_HEADER));
     let event = logs.take_single_event();
-    assert_eq!(event["admin_route"], "/v1/admin/users");
+    assert_eq!(event["admin_route"], "/v1/admin/probe");
     assert_eq!(event["admin_method"], "OPTIONS");
     assert_eq!(event["admin_auth_outcome"], "unknown");
     assert_eq!(event["admin_credential_kind"], "none");
@@ -591,7 +591,7 @@ async fn unsupported_method_on_an_admin_route_is_audited_once() {
     let response = send(
         &app,
         with_session(
-            request(Method::DELETE, "/v1/admin/users"),
+            request(Method::DELETE, "/v1/admin/probe"),
             Uuid::new_v4(),
             None,
         ),
@@ -600,7 +600,7 @@ async fn unsupported_method_on_an_admin_route_is_audited_once() {
 
     assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
     let event = logs.take_single_event();
-    assert_eq!(event["admin_route"], "/v1/admin/users");
+    assert_eq!(event["admin_route"], "/v1/admin/probe");
     assert_eq!(event["admin_method"], "DELETE");
     assert_eq!(event["admin_status"], 405);
 }
@@ -613,7 +613,7 @@ async fn non_admin_requests_are_not_audited() {
     for (path, status) in [
         ("/v1/health", StatusCode::OK),
         ("/v1/administrator", StatusCode::NOT_FOUND),
-        ("/v1/admin-users", StatusCode::NOT_FOUND),
+        ("/v1/admin-probe", StatusCode::NOT_FOUND),
     ] {
         let response = send(
             &app,
@@ -642,7 +642,7 @@ async fn every_request_emits_exactly_one_event_with_its_own_id() {
         (
             &allowed,
             with_session(
-                request(Method::GET, "/v1/admin/users"),
+                request(Method::GET, "/v1/admin/probe"),
                 Uuid::new_v4(),
                 None,
             ),
@@ -650,14 +650,14 @@ async fn every_request_emits_exactly_one_event_with_its_own_id() {
         (
             &denied,
             with_session(
-                request(Method::GET, "/v1/admin/users"),
+                request(Method::GET, "/v1/admin/probe"),
                 Uuid::new_v4(),
                 None,
             ),
         ),
         (
             &allowed,
-            request(Method::GET, "/v1/admin/users")
+            request(Method::GET, "/v1/admin/probe")
                 .body(Body::empty())
                 .expect("test request"),
         ),
@@ -759,12 +759,12 @@ async fn audit_events_exclude_credentials_content_and_client_controlled_values()
         ),
         sentinel_request(
             Method::GET,
-            format!("/v1/admin/users/{EMAIL}/{QUERY}"),
+            format!("/v1/admin/probe/{EMAIL}/{QUERY}"),
             &session,
         ),
         sentinel_request(
             Method::GET,
-            format!("/v1/admin/users?q={QUERY}"),
+            format!("/v1/admin/probe?q={QUERY}"),
             ADMIN_TOKEN,
         ),
     ] {
@@ -816,7 +816,7 @@ async fn audit_event_is_a_root_event_even_when_the_format_prints_spans() {
     send(
         &app,
         with_session(
-            request(Method::GET, &format!("/v1/admin/users/{email}"))
+            request(Method::GET, &format!("/v1/admin/probe/{email}"))
                 .header(REQUEST_ID_HEADER, &client_request_id),
             Uuid::new_v4(),
             None,

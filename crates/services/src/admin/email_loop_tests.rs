@@ -150,27 +150,6 @@ impl AdminRepository for CountingRepo {
         unimplemented!("not used by the email loop tests")
     }
 
-    async fn list_users(
-        &self,
-        limit: i64,
-        offset: i64,
-        search: Option<String>,
-        is_active: Option<bool>,
-    ) -> Result<(Vec<UserInfo>, i64), anyhow::Error> {
-        unimplemented!("not used by the email loop tests")
-    }
-
-    async fn list_users_with_organizations(
-        &self,
-        limit: i64,
-        offset: i64,
-        search: Option<String>,
-        is_active: Option<bool>,
-        search_by_name: Option<String>,
-    ) -> Result<(Vec<(UserInfo, Option<UserOrganizationInfo>)>, i64), anyhow::Error> {
-        unimplemented!("not used by the email loop tests")
-    }
-
     async fn list_models(
         &self,
         include_inactive: bool,
@@ -334,13 +313,6 @@ impl AdminRepository for CountingRepo {
         offset: i64,
         lifecycle: OrganizationLifecycleFilter,
     ) -> Result<Vec<AdminOrganizationInfo>, anyhow::Error> {
-        unimplemented!("not used by the email loop tests")
-    }
-
-    async fn count_all_organizations(
-        &self,
-        lifecycle: OrganizationLifecycleFilter,
-    ) -> Result<i64, anyhow::Error> {
         unimplemented!("not used by the email loop tests")
     }
 

@@ -2,15 +2,8 @@ pub mod analytics;
 pub mod ports;
 
 pub use analytics::{
-    AnalyticsRepository, AnalyticsService, ApiKeyMetrics, BillingSourceBreakdown, BillingSummary,
-    MetricsSummary, ModelConsumptionPoint, ModelConsumptionTimeseries,
-    ModelConsumptionTimeseriesQuery, ModelMetrics, ModelProviderRevenueBreakdown,
-    ModelRevenueEntry, ModelRevenueQuery, ModelRevenueReport, OrgRevenueEntry, OrgRevenueQuery,
-    OrgRevenueReport, OrganizationMetrics, PerformancePoint, PerformanceTimeseries,
-    PerformanceTimeseriesQuery, PlatformMetrics, PlatformProviderUsage, PlatformTimeSeriesMetrics,
-    PlatformTimeSeriesPoint, ProviderTierUsage, ProviderTypeUsage, ProviderUsageTotals,
-    RevenueDensityModelRow, RevenueDensityQuery, RevenueDensityReport, RevenueSort,
-    TimeSeriesMetrics, TimeSeriesPoint, TopModelMetrics, TopOrganizationMetrics, WorkspaceMetrics,
+    AnalyticsRepository, AnalyticsService, ApiKeyMetrics, MetricsSummary, ModelMetrics,
+    OrganizationMetrics, TimeSeriesMetrics, TimeSeriesPoint, WorkspaceMetrics,
 };
 pub mod infra;
 pub mod pricing_scheduler;
@@ -722,39 +715,6 @@ impl AdminService for AdminServiceImpl {
         Ok((history, total))
     }
 
-    async fn list_users(
-        &self,
-        limit: i64,
-        offset: i64,
-        search: Option<String>,
-        is_active: Option<bool>,
-    ) -> Result<(Vec<UserInfo>, i64), AdminError> {
-        let (users, total) = self
-            .repository
-            .list_users(limit, offset, search, is_active)
-            .await
-            .map_err(|e| AdminError::InternalError(e.to_string()))?;
-
-        Ok((users, total))
-    }
-
-    async fn list_users_with_organizations(
-        &self,
-        limit: i64,
-        offset: i64,
-        search: Option<String>,
-        is_active: Option<bool>,
-        search_by_name: Option<String>,
-    ) -> Result<(Vec<(UserInfo, Option<UserOrganizationInfo>)>, i64), AdminError> {
-        let (users_with_orgs, total) = self
-            .repository
-            .list_users_with_organizations(limit, offset, search, is_active, search_by_name)
-            .await
-            .map_err(|e| AdminError::InternalError(e.to_string()))?;
-
-        Ok((users_with_orgs, total))
-    }
-
     async fn list_models(
         &self,
         include_inactive: bool,
@@ -1330,26 +1290,6 @@ impl AdminService for AdminServiceImpl {
             })
     }
 
-    async fn list_organizations(
-        &self,
-        limit: i64,
-        offset: i64,
-        lifecycle: OrganizationLifecycleFilter,
-    ) -> Result<(Vec<AdminOrganizationInfo>, i64), AdminError> {
-        // Execute both queries in parallel for better performance
-        let (organizations_result, total_result) = tokio::join!(
-            self.repository
-                .list_all_organizations(limit, offset, lifecycle),
-            self.repository.count_all_organizations(lifecycle)
-        );
-
-        let organizations =
-            organizations_result.map_err(|e| AdminError::InternalError(e.to_string()))?;
-        let total = total_result.map_err(|e| AdminError::InternalError(e.to_string()))?;
-
-        Ok((organizations, total))
-    }
-
     async fn list_api_keys(
         &self,
         filters: AdminApiKeyFilters,
@@ -1375,17 +1315,6 @@ impl AdminService for AdminServiceImpl {
         let total = total_result.map_err(|e| AdminError::InternalError(e.to_string()))?;
 
         Ok((api_keys, total))
-    }
-
-    async fn get_organization(
-        &self,
-        organization_id: uuid::Uuid,
-    ) -> Result<AdminOrganizationInfo, AdminError> {
-        self.repository
-            .get_organization(organization_id)
-            .await
-            .map_err(|e| AdminError::InternalError(e.to_string()))?
-            .ok_or_else(|| AdminError::OrganizationNotFound(organization_id.to_string()))
     }
 
     async fn list_organization_members(

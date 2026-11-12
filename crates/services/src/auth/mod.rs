@@ -223,7 +223,7 @@ impl AuthServiceTrait for AuthService {
             .await?
             .ok_or(AuthError::SessionNotFound)?;
 
-        debug!("Session: {:?}", session);
+        debug!(user_id = %session.user_id.0, "Refresh session validated");
         // Check if session is expired (validation already handles this, but keep for clarity)
         if session.expires_at < Utc::now() {
             return Err(AuthError::SessionNotFound);
@@ -698,7 +698,10 @@ impl AuthService {
                     info!("Initialized bloom filter with {} keys", count);
                 }
                 Err(e) => {
-                    error!("Failed to initialize bloom filter; continuing without bloom optimization: {e}");
+                    error!(
+                        error_message_len = e.to_string().len(),
+                        "Failed to initialize bloom filter; continuing without bloom optimization"
+                    );
                 }
             }
 
@@ -716,7 +719,10 @@ impl AuthService {
                             last_sync = now;
                             info!("Rebuilt bloom filter with {} keys", count);
                         }
-                        Err(e) => warn!("Failed to rebuild bloom filter: {e}"),
+                        Err(e) => warn!(
+                            error_message_len = e.to_string().len(),
+                            "Failed to rebuild bloom filter"
+                        ),
                     }
                     continue;
                 }
@@ -736,7 +742,10 @@ impl AuthService {
                         }
                         last_sync = now;
                     }
-                    Err(e) => warn!("Failed to sync bloom filter: {e}"),
+                    Err(e) => warn!(
+                        error_message_len = e.to_string().len(),
+                        "Failed to sync bloom filter"
+                    ),
                 }
             }
         });

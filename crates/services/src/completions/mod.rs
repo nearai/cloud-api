@@ -1321,7 +1321,7 @@ impl CompletionServiceImpl {
                         %organization_id,
                         model,
                         status_code,
-                        provider_message = %message,
+                        error_message_len = message.len(),
                         "Auth error during {}",
                         operation
                     );
@@ -1337,7 +1337,7 @@ impl CompletionServiceImpl {
                         %organization_id,
                         model,
                         status_code,
-                        provider_message = %message,
+                        error_message_len = message.len(),
                         "External provider not found during {}",
                         operation
                     );
@@ -1358,7 +1358,7 @@ impl CompletionServiceImpl {
                         %organization_id,
                         model,
                         status_code,
-                        provider_message = %message,
+                        error_message_len = message.len(),
                         "Provider timeout during {}",
                         operation
                     );
@@ -1400,7 +1400,7 @@ impl CompletionServiceImpl {
                         %organization_id,
                         model,
                         status_code,
-                        provider_message = %message,
+                        error_message_len = message.len(),
                         "Provider error during {}",
                         operation
                     );
@@ -1416,7 +1416,7 @@ impl CompletionServiceImpl {
                         %organization_id,
                         model,
                         status_code,
-                        provider_message = %message,
+                        error_message_len = message.len(),
                         "External provider error during {}",
                         operation
                     );
@@ -1456,7 +1456,7 @@ impl CompletionServiceImpl {
             inference_providers::CompletionError::NoPubKeyProvider(msg) => {
                 tracing::warn!(
                     model,
-                    provider_message = %msg,
+                    error_message_len = msg.len(),
                     "E2EE pubkey routing failed during {} (stale attestation?)",
                     operation
                 );
@@ -1472,7 +1472,7 @@ impl CompletionServiceImpl {
                     tracing::error!(
                         %organization_id,
                         model,
-                        provider_message = %msg,
+                        error_message_len = msg.len(),
                         "Provider error during {}",
                         operation
                     );
@@ -1487,7 +1487,7 @@ impl CompletionServiceImpl {
                 tracing::error!(
                     %organization_id,
                     model,
-                    provider_message = %msg,
+                    error_message_len = msg.len(),
                     "Invalid response during {}",
                     operation
                 );
@@ -1501,7 +1501,7 @@ impl CompletionServiceImpl {
                 tracing::error!(
                     %organization_id,
                     model,
-                    provider_message = %msg,
+                    error_message_len = msg.len(),
                     "Unknown error during {}",
                     operation
                 );

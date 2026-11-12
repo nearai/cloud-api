@@ -342,7 +342,7 @@ pub async fn rerank(
                     tracing::error!(
                         model = %request.model,
                         upstream_status = status_code,
-                        detail = %message,
+                        error_message_len = message.len(),
                         "Rerank provider error"
                     );
                     let http_status = StatusCode::from_u16(status_code)

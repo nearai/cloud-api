@@ -326,6 +326,11 @@ impl OrganizationServiceImpl {
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_string),
             fallback_enabled: org.fallback_enabled(),
+            allowed_models: org.allowed_models().map(|names| {
+                let mut names: Vec<String> = names.into_iter().collect();
+                names.sort();
+                names
+            }),
         }
     }
 }
@@ -1619,7 +1624,9 @@ impl OrganizationServiceTrait for OrganizationServiceImpl {
 
         // Authorize every requested field before applying any of them. This
         // keeps mixed-field PATCH requests all-or-nothing at the service layer.
-        if patch.system_prompt.is_some() && !member.role.can_manage_organization() {
+        if (patch.system_prompt.is_some() || patch.allowed_models.is_some())
+            && !member.role.can_manage_organization()
+        {
             return Err(OrganizationError::Unauthorized(
                 "Insufficient permissions to manage organization settings".to_string(),
             ));
@@ -1630,7 +1637,10 @@ impl OrganizationServiceTrait for OrganizationServiceImpl {
             ));
         }
 
-        if patch.system_prompt.is_none() && patch.fallback_enabled.is_none() {
+        if patch.system_prompt.is_none()
+            && patch.fallback_enabled.is_none()
+            && patch.allowed_models.is_none()
+        {
             let org = self.get_organization(organization_id).await?;
             return Ok(Self::settings_from_organization(&org));
         }
@@ -1698,6 +1708,7 @@ impl OrganizationServiceTrait for OrganizationServiceImpl {
                 ports::PatchOrganizationSettings {
                     system_prompt: None,
                     fallback_enabled: Some(Some(fallback_enabled)),
+                    allowed_models: None,
                 },
                 None,
             )
@@ -1731,6 +1742,7 @@ impl OrganizationServiceTrait for OrganizationServiceImpl {
                 ports::PatchOrganizationSettings {
                     system_prompt: Some(system_prompt),
                     fallback_enabled: None,
+                    allowed_models: None,
                 },
             )
             .await?
@@ -2419,6 +2431,7 @@ mod tests {
                 ports::PatchOrganizationSettings {
                     system_prompt: None,
                     fallback_enabled: Some(Some(false)),
+                    allowed_models: None,
                 },
             )
             .await
@@ -2440,6 +2453,7 @@ mod tests {
                 ports::PatchOrganizationSettings {
                     system_prompt: None,
                     fallback_enabled: Some(Some(true)),
+                    allowed_models: None,
                 },
             )
             .await
@@ -2453,6 +2467,7 @@ mod tests {
                 ports::PatchOrganizationSettings {
                     system_prompt: None,
                     fallback_enabled: Some(None),
+                    allowed_models: None,
                 },
             )
             .await
@@ -2482,6 +2497,7 @@ mod tests {
                     ports::PatchOrganizationSettings {
                         system_prompt: Some(Some("must not be written".to_string())),
                         fallback_enabled: Some(Some(false)),
+                        allowed_models: None,
                     },
                 )
                 .await
@@ -3280,5 +3296,43 @@ mod tests {
 
         assert!(matches!(error, OrganizationError::Unauthorized(_)));
         assert_eq!(invitation_repo.records.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn allowed_models_parse_and_fail_closed() {
+        let org = |settings: serde_json::Value| Organization {
+            request_priority: 0,
+            id: OrganizationId(Uuid::new_v4()),
+            name: "Example Org".to_string(),
+            description: None,
+            owner_id: UserId(Uuid::new_v4()),
+            settings,
+            is_active: true,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        let set = |names: &[&str]| -> std::collections::HashSet<String> {
+            names.iter().map(|name| name.to_string()).collect()
+        };
+        assert_eq!(org(serde_json::json!({})).allowed_models(), None);
+        assert_eq!(
+            org(serde_json::json!({ "allowed_models": null })).allowed_models(),
+            None
+        );
+        assert_eq!(
+            org(serde_json::json!({ "allowed_models": ["a/b", "c/d"] })).allowed_models(),
+            Some(set(&["a/b", "c/d"]))
+        );
+        // Anything else allows no model.
+        for value in [
+            serde_json::json!("a/b"),
+            serde_json::json!(["a/b", 7]),
+            serde_json::json!({ "a/b": true }),
+        ] {
+            assert_eq!(
+                org(serde_json::json!({ "allowed_models": value })).allowed_models(),
+                Some(set(&[]))
+            );
+        }
     }
 }

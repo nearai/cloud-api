@@ -167,8 +167,9 @@ fn check_cert_binding(report_data: &[u8; 64], cert_der: &[u8]) -> Result<(), Rep
 ///
 /// The chain: the (separately DCAP-verified) quote binds the instance
 /// certificate (`report_data[32:64]`); that certificate's RSA key signs
-/// `attested_body`; the body carries our nonce and the same quote. Together
-/// these prove the quote is fresh and came from the certified instance.
+/// `attested_body`; the body carries our nonce and the same quote as `quote`
+/// (Chutes 1.5.0+) or `tdx_quote` (older images). Together these prove the
+/// quote is fresh and came from the certified instance.
 /// `report_data[0:32]` is `SHA256(nonce ‖ e2e_pubkey)`, which cannot be
 /// recomputed without the E2EE key; the caller uses those bytes as the GPU
 /// evidence nonce instead, which keeps the GPU evidence tied to this quote.
@@ -225,7 +226,10 @@ impl PublicEvidenceVerifier {
         }
         #[derive(serde::Deserialize)]
         struct SignedEvidence {
-            tdx_quote: String,
+            #[serde(default)]
+            quote: Option<String>,
+            #[serde(default)]
+            tdx_quote: Option<String>,
         }
         let signed: SignedBody = serde_json::from_slice(&body)
             .map_err(|e| ReportDataError::SignedBody(format!("attested_body json: {e}")))?;
@@ -234,7 +238,22 @@ impl PublicEvidenceVerifier {
                 "nonce differs from the one sent".to_string(),
             ));
         }
-        if signed.evidence.tdx_quote != quote_b64 {
+        if signed.evidence.quote.is_none() && signed.evidence.tdx_quote.is_none() {
+            return Err(ReportDataError::SignedBody(
+                "attested_body evidence has no quote".to_string(),
+            ));
+        }
+        if signed
+            .evidence
+            .quote
+            .as_deref()
+            .is_some_and(|quote| quote != quote_b64)
+            || signed
+                .evidence
+                .tdx_quote
+                .as_deref()
+                .is_some_and(|quote| quote != quote_b64)
+        {
             return Err(ReportDataError::SignedBodyMismatch(
                 "quote differs from the presented quote".to_string(),
             ));
@@ -259,6 +278,20 @@ mod tests {
     const PUB_OTHER_SIG_B64: &str = "SEpwyzB/uYjNnutDNa3HZxhmpCAWhH+sXR842KtM3AUZsxTlndxCr7NRrJZu23PSG8Y/x9wCwc5rUPFRoopPlF9k5EyLLXNTbCdzM2AT6uetb66Zw8N+kT/GhQB8W+xhZIclS6ZPN+R4hXw7TY4BZfZlFSNqwhBKBq94ZT6XPXNRA1jficZbwrd04ABe8e+o+vLRVH5P7ppgAXmeYP00d15t4TFI5VCHHLEyLhE73TKp7hFZHAzP+GiGhMK/TgfYuo72e78KiqeSulu4+ePrLm+dsVmghQ2Y9IIaoazmPmXNidJ/h1NfUTmWcbM4E5BZxWeD/SLjaZcW2smxe1LKtg==";
     const PUB_QUOTE_B64: &str = "BAACAIE=";
 
+    // Fixture made with openssl: a new self-signed RSA-2048 instance cert, and
+    // compact `attested_body` variants Q, BOTH, SPLIT, NONE signed with its key
+    // (PKCS#1 v1.5, SHA-256). SPKI_FP is the SHA-256 of its DER public key.
+    const PUB150_CERT_B64: &str = "MIIDJzCCAg+gAwIBAgIUW3X2ZP0tYwTkg0kPRDIJcTghaZYwDQYJKoZIhvcNAQELBQAwIzEhMB8GA1UEAwwYY2h1dGVzLXRlc3QtaW5zdGFuY2UtMTUwMB4XDTI2MTEwMzIzMzY1N1oXDTM2MTAzMTIzMzY1N1owIzEhMB8GA1UEAwwYY2h1dGVzLXRlc3QtaW5zdGFuY2UtMTUwMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAx9lnJiz9fzdoFWzeXWWeQyM0sSBYM9A/2nWggb0EgjZ0tlBRyc9FKodTVdXnN5WE4HbM0qrm+Bx1yzjTyJKw1DvqGgyyL4wozP+q84+rKqeIcjIqVs3FQT9hfHve8W6b2HUOk9xwevPjge5tjOl3DouZdHmrnmK2zZXzviYSlq0AqdkFexJNNwesZw8l56vvGYyUOkP5lasXaZQt5tstF97s/jYz9GJVBj45zrPFOSBQQjKdHbHoekugjzjiRs9c8fYq+bDOIKRS4ShzZiJ/Myy4BL4xhi5c1aIksTlfN5iDxJurOzdvgjk4/MerBy1ZyZz/Trp9CHn4s+7yrDBlNQIDAQABo1MwUTAdBgNVHQ4EFgQUbbNhpIzUKb4qkh0zb8/n0HVgYDcwHwYDVR0jBBgwFoAUbbNhpIzUKb4qkh0zb8/n0HVgYDcwDwYDVR0TAQH/BAUwAwEB/zANBgkqhkiG9w0BAQsFAAOCAQEASXBC2p4TZWO21acoiD3drOCWSlbd6Futw+ObDUfNm0TpMllbOblI8s3+rpYxylE+1r4G3GW0ecz4WeRJf02+NSrMbkONzS1JAAhiDIimeYrGaJTHt29JduH/IARwILkuq1ZERPhWOYfUFQl8AwCq4DUWSr9ogjLbyGMYBeswu9aYdWH2KCslSqcZr/wcC9PIPlrVT2rnelVMU682W/K2lRVUpvW3xK4j/FyqySxtge8WklfjhQGG/2sB2Isq/mH/WDXTHY7aHbw+xfz8rlXfZhhyVS5vhZbWaLIH9OqcDehcutCZ2nc+49sN8XPh8pOwaHP0Wr08w7F3/eRFjbFJug==";
+    const PUB150_SPKI_FP: &str = "d3a9bf411c84f69dec9c89cdefca89742822cb83291ddab2fa4b43c654f33976";
+    const PUB150_Q_BODY_B64: &str = "eyJldmlkZW5jZSI6eyJxdW90ZSI6IkJBQUNBSUU9IiwibnZ0cnVzdF9ldmlkZW5jZSI6W119LCJub25jZSI6ImFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWIifQ==";
+    const PUB150_Q_SIG_B64: &str = "Ke/+uKMivLw1EBo6Dn75DGxwOhO7kDVrteIHzgyDhOy+frqBmY8AQOpLaErJNogroa/BImQjOof+q5t0WIAlNk4FogF6WjcO5rG/ysN9jb0LEnwjhIZ1jmlqaaq2eYb1XrP6MJapy85ePTLXVmQCcvkWYjPXtTtGKee59isd3ZEBBRqS93wYWZZXFleveYx9FquQ/z1RKKgtsT4n+uNecA2223+avzTxJLG4veD+At8A0gU9O/U7EGl3qKWRbxY7M5DJseQqDHgbYInASdsUFNUKT25HWRxHY3PmAg/xo9a8InDGYkC6OaaOZ7ZcAX9gqm/hNmsbCK2/YqctVzPxVQ==";
+    const PUB150_BOTH_BODY_B64: &str = "eyJldmlkZW5jZSI6eyJxdW90ZSI6IkJBQUNBSUU9IiwidGR4X3F1b3RlIjoiQkFBQ0FJRT0iLCJudnRydXN0X2V2aWRlbmNlIjpbXX0sIm5vbmNlIjoiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYiJ9";
+    const PUB150_BOTH_SIG_B64: &str = "ps/8wMx2dxJwqN2o5+yuRbRqh01f+rBHpNPHRW4Hf11nvJ7dPiFqhx1Wn9n1oC+khPxWFERHoIXDurryEJxa/z0NLgohSNeuKRST8ElWORADUL09xUkdEhYzOE1VdJYjxnx09DDF/NbFQGrmfkxFmXszbuI9GB53xjSiR9KE13bB8uN1KMNMLYvGVEuS616y/ruIiF9Sk/zYf7xhfrYduYxPSby/DFp4QX3KRIYLq2n3Ntjj113oe3daN0x0yXu3djuj/SfVWKfHdVwrrsbEd/Jjpsl8GkQ3LVRmHNiE5IU3qQVmGQPia+Xyjfp+HIPPP/32CzbsuukEPQNPTKigRg==";
+    const PUB150_SPLIT_BODY_B64: &str = "eyJldmlkZW5jZSI6eyJxdW90ZSI6IkJBQUNBSUU9IiwidGR4X3F1b3RlIjoiQkFBQ0FJRj0iLCJudnRydXN0X2V2aWRlbmNlIjpbXX0sIm5vbmNlIjoiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYiJ9";
+    const PUB150_SPLIT_SIG_B64: &str = "IPezZk6+VHHkQ8n10xEOVPFRVrR9gWN8U9FSyLUBoccXkJ2OOUVO/2cAOfriAuQV5kopvDeUgaubrxnyi2yHBZMWCEKZ7yd4wTY3AVF48+rDwuId5BVuJ4UVEuzZ+Y1KisHn3eONwFGFrDaFHmqYHCSUDpPc8mJ+whpaD1sUk3I6I9q9DDMNUQ1A6ECraFVkZiVjiEVoT9FvHipUPpnTvYnyl8/ezzse5O5ov4HAPaup176YjjAxCImmQ+ZvQR5mYvVV8yeegwkVkh8tJ5RjJB7X9QY/KYi8DNk71I14Nb8QKyXhR/gZL7adM1lrRBssi8sYme2zCPmK/Y6UafJSPQ==";
+    const PUB150_NONE_BODY_B64: &str = "eyJldmlkZW5jZSI6eyJudnRydXN0X2V2aWRlbmNlIjpbXX0sIm5vbmNlIjoiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYiJ9";
+    const PUB150_NONE_SIG_B64: &str = "nKJJVOuznzpfII5uU34PWqmyrYe+nP4ecPCn+hNKR6m/tkK2oFBpwHufB7p4gpKaCSHkpOuJ1bid63CqOLfl02GhDrNbYi+fo64rbnK6/AZoxjh/q9Suznw5Y2U/moTgO3MTUSZwZpMozWJTTO6VH+nY94cZnndorTwNhRr3o25ArCypz7NpSI5ld9hVdK1vw37M0CA/izJ7Iu7vD5/f/wV1iqASD6HYHx4OxY3LZK6c0xrfvDqvUnS+KkdYDIcZHM3UQV+ymEAC/w9jx6dyQlR8YJL5AW/GyMoRcFyWEX7tsMjQUczjBMeaCyzz5HLGNKi8VR8c3eWRu4T8S5xkwQ==";
+
     fn pub_cert() -> Vec<u8> {
         use base64::Engine;
         base64::engine::general_purpose::STANDARD
@@ -280,6 +313,54 @@ mod tests {
         sig: &str,
     ) -> Result<(), ReportDataError> {
         PublicEvidenceVerifier.verify(rd, nonce, &pub_cert(), quote, body, sig)
+    }
+
+    fn verify_public150(quote: &str, body: &str, sig: &str) -> Result<(), ReportDataError> {
+        use base64::Engine;
+        let cert = base64::engine::general_purpose::STANDARD
+            .decode(PUB150_CERT_B64)
+            .unwrap();
+        let mut rd = [0u8; 64];
+        rd[32..].copy_from_slice(&hex::decode(PUB150_SPKI_FP).unwrap());
+        PublicEvidenceVerifier.verify(&rd, &"ab".repeat(32), &cert, quote, body, sig)
+    }
+
+    #[test]
+    fn public_evidence_with_the_1_5_quote_key_verifies() {
+        verify_public150(PUB_QUOTE_B64, PUB150_Q_BODY_B64, PUB150_Q_SIG_B64)
+            .expect("1.5.0 quote key fixture must verify");
+    }
+
+    #[test]
+    fn public_evidence_with_both_quote_keys_equal_verifies() {
+        verify_public150(PUB_QUOTE_B64, PUB150_BOTH_BODY_B64, PUB150_BOTH_SIG_B64)
+            .expect("equal quote keys fixture must verify");
+    }
+
+    #[test]
+    fn public_evidence_rejects_quote_keys_that_disagree() {
+        let err = verify_public150(PUB_QUOTE_B64, PUB150_SPLIT_BODY_B64, PUB150_SPLIT_SIG_B64)
+            .unwrap_err();
+        assert!(
+            matches!(err, ReportDataError::SignedBodyMismatch(_)),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn public_evidence_rejects_a_body_without_a_quote() {
+        let err =
+            verify_public150(PUB_QUOTE_B64, PUB150_NONE_BODY_B64, PUB150_NONE_SIG_B64).unwrap_err();
+        assert!(matches!(err, ReportDataError::SignedBody(_)), "{err}");
+    }
+
+    #[test]
+    fn public_evidence_1_5_rejects_a_quote_other_than_the_signed_one() {
+        let err = verify_public150("BAACAIF=", PUB150_Q_BODY_B64, PUB150_Q_SIG_B64).unwrap_err();
+        assert!(
+            matches!(err, ReportDataError::SignedBodyMismatch(_)),
+            "{err}"
+        );
     }
 
     #[test]

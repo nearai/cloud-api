@@ -21,9 +21,6 @@ pub const PREFIX_CONV: &str = "conv_";
 /// Prefix for secret/API key IDs
 pub const PREFIX_SK: &str = "sk-";
 
-/// Prefix for MCP approval request IDs
-pub const PREFIX_MCPR: &str = "mcpr_";
-
 /// Prefix for function call IDs
 pub const PREFIX_FC: &str = "fc_";
 

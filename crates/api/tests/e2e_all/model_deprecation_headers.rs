@@ -50,7 +50,7 @@ async fn setup() -> Fixture {
         successor.clone(),
         serde_json::from_value(model_upsert(&[])).unwrap(),
     );
-    admin_batch_upsert_models(&server, batch, get_session_id()).await;
+    seed_models(&server, batch, get_session_id()).await;
 
     let provider: std::sync::Arc<dyn inference_providers::InferenceProvider + Send + Sync> =
         mock_provider.clone();

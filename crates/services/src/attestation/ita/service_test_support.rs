@@ -74,7 +74,7 @@ fn service_with_collectors(
     model_collector: RecordingModelCollector,
 ) -> AttestationService {
     let (ed25519_signing_key, ed25519_verifying_key, ecdsa_signing_key, ecdsa_verifying_key) =
-        AttestationService::generate_ephemeral_signing_keys();
+        AttestationService::generate_ephemeral_signing_keys().expect("ephemeral test keys");
     AttestationService {
         repository: Arc::new(NoopAttestationRepository),
         inference_provider_pool: Arc::new(InferenceProviderPool::new(

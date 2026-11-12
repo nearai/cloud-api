@@ -1,7 +1,7 @@
 name: Rollback Image
 
 permissions:
-  contents: write
+  contents: read
 
 on:
   workflow_dispatch:
@@ -32,7 +32,7 @@ env:
 jobs:
   preflight:
     name: Validate confirmation
-    runs-on: [self-hosted, infra]
+    runs-on: ubuntu-latest
     steps:
       - name: Check confirm input
         env:
@@ -46,7 +46,9 @@ jobs:
   rollback-prod:
     name: Roll back :prod
     needs: preflight
-    runs-on: [self-hosted, infra]
+    permissions:
+      contents: write # Create the rollback audit release.
+    runs-on: ubuntu-latest
     environment: production
     outputs:
       target_tag: ${{ steps.resolve.outputs.target_tag }}
@@ -55,7 +57,9 @@ jobs:
       audit_tag: ${{ steps.resolve.outputs.audit_tag }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
 
       - name: Log in to Docker registry
         uses: docker/login-action@3864d6aed8ff134b2ed894ce00c87695c709c870
@@ -75,12 +79,13 @@ jobs:
       - name: Resolve target tag and digest
         id: resolve
         env:
+          VAR_DOCKER_REGISTRY_USER: ${{ vars.DOCKER_REGISTRY_USER }}
           TARGET_TAG_INPUT: ${{ inputs.target_tag }}
         run: |
           set -euo pipefail
           TARGET_TAG="$TARGET_TAG_INPUT"
 
-          CURRENT_DIGEST=$(skopeo inspect "docker://${{ env.IMAGE }}:prod" 2>/dev/null | jq -r '.Digest' || true)
+          CURRENT_DIGEST=$(skopeo inspect "docker://${IMAGE}:prod" 2>/dev/null | jq -r '.Digest' || true)
           if [ -z "$CURRENT_DIGEST" ] || [ "$CURRENT_DIGEST" = "null" ]; then
             echo "::error::Failed to inspect current :prod digest (tag may not exist)"
             exit 1
@@ -93,7 +98,7 @@ jobs:
             # Paginate Docker Hub tags. Bound iterations and per-call time so a
             # malformed cursor or stuck pagination can't hang the workflow.
             TAGS_JSON=""
-            PAGE_URL="https://hub.docker.com/v2/namespaces/${{ vars.DOCKER_REGISTRY_USER }}/repositories/${{ env.IMAGE_NAME }}/tags?page_size=100"
+            PAGE_URL="https://hub.docker.com/v2/namespaces/${VAR_DOCKER_REGISTRY_USER}/repositories/${IMAGE_NAME}/tags?page_size=100"
             MAX_PAGES=50
             PAGE_COUNT=0
             while [ -n "$PAGE_URL" ] && [ "$PAGE_URL" != "null" ] && [ "$PAGE_COUNT" -lt "$MAX_PAGES" ]; do
@@ -125,7 +130,7 @@ jobs:
             exit 1
           fi
 
-          TARGET_DIGEST=$(skopeo inspect "docker://${{ env.IMAGE }}:${TARGET_TAG}" 2>/dev/null | jq -r '.Digest' || true)
+          TARGET_DIGEST=$(skopeo inspect "docker://${IMAGE}:${TARGET_TAG}" 2>/dev/null | jq -r '.Digest' || true)
           if [ -z "$TARGET_DIGEST" ] || [ "$TARGET_DIGEST" = "null" ]; then
             echo "::error::Tag ${TARGET_TAG} not found on Docker Hub"
             exit 1
@@ -153,25 +158,35 @@ jobs:
       # this stage and the fleet must be redeployed regardless.
       - name: Re-tag :prod
         id: retag-prod
+        env:
+          STEP_RESOLVE_TARGET_DIGEST: ${{ steps.resolve.outputs.target_digest }}
         run: |
           set -euo pipefail
-          skopeo copy "docker://${{ env.IMAGE }}@${{ steps.resolve.outputs.target_digest }}" "docker://${{ env.IMAGE }}:prod"
+          skopeo copy "docker://${IMAGE}@${STEP_RESOLVE_TARGET_DIGEST}" "docker://${IMAGE}:prod"
 
       - name: Push audit tag
         continue-on-error: true
+        env:
+          STEP_RESOLVE_TARGET_DIGEST: ${{ steps.resolve.outputs.target_digest }}
+          STEP_RESOLVE_AUDIT_TAG: ${{ steps.resolve.outputs.audit_tag }}
         run: |
           set -euo pipefail
-          skopeo copy "docker://${{ env.IMAGE }}@${{ steps.resolve.outputs.target_digest }}" "docker://${{ env.IMAGE }}:${{ steps.resolve.outputs.audit_tag }}"
+          skopeo copy "docker://${IMAGE}@${STEP_RESOLVE_TARGET_DIGEST}" "docker://${IMAGE}:${STEP_RESOLVE_AUDIT_TAG}"
 
       - name: Output digest summary
+        env:
+          STEP_RESOLVE_TARGET_TAG: ${{ steps.resolve.outputs.target_tag }}
+          STEP_RESOLVE_TARGET_DIGEST: ${{ steps.resolve.outputs.target_digest }}
+          STEP_RESOLVE_PREVIOUS_DIGEST: ${{ steps.resolve.outputs.previous_digest }}
+          STEP_RESOLVE_AUDIT_TAG: ${{ steps.resolve.outputs.audit_tag }}
         run: |
           {
-            echo "## Rollback: :prod → ${{ steps.resolve.outputs.target_tag }}"
+            echo "## Rollback: :prod → ${STEP_RESOLVE_TARGET_TAG}"
             echo ""
-            echo "- target tag: \`${{ steps.resolve.outputs.target_tag }}\`"
-            echo "- target digest: \`${{ steps.resolve.outputs.target_digest }}\`"
-            echo "- previous :prod digest: \`${{ steps.resolve.outputs.previous_digest }}\`"
-            echo "- audit tag: \`${{ steps.resolve.outputs.audit_tag }}\`"
+            echo "- target tag: \`${STEP_RESOLVE_TARGET_TAG}\`"
+            echo "- target digest: \`${STEP_RESOLVE_TARGET_DIGEST}\`"
+            echo "- previous :prod digest: \`${STEP_RESOLVE_PREVIOUS_DIGEST}\`"
+            echo "- audit tag: \`${STEP_RESOLVE_AUDIT_TAG}\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
       # GH release tag mirrors the audit docker tag for easy correlation.
@@ -181,18 +196,22 @@ jobs:
       # promotion's release, not this one.
       - name: Create GitHub release
         env:
+          STEP_RESOLVE_AUDIT_TAG: ${{ steps.resolve.outputs.audit_tag }}
+          STEP_RESOLVE_TARGET_TAG: ${{ steps.resolve.outputs.target_tag }}
+          STEP_RESOLVE_TARGET_DIGEST: ${{ steps.resolve.outputs.target_digest }}
+          STEP_RESOLVE_PREVIOUS_DIGEST: ${{ steps.resolve.outputs.previous_digest }}
           GH_TOKEN: ${{ github.token }}
         run: |
-          TAG="${{ steps.resolve.outputs.audit_tag }}"
+          TAG="${STEP_RESOLVE_AUDIT_TAG}"
           NOTES=$(cat <<EOF
           ## Production Rollback
 
-          - **Image**: \`${{ env.IMAGE }}:prod\`
-          - **Rolled back to**: \`${{ env.IMAGE }}:${{ steps.resolve.outputs.target_tag }}\`
-          - **Audit tag**: \`${{ env.IMAGE }}:${TAG}\`
-          - **New :prod digest**: \`${{ steps.resolve.outputs.target_digest }}\`
-          - **Previous :prod digest**: \`${{ steps.resolve.outputs.previous_digest }}\`
-          - **Sigstore**: https://search.sigstore.dev/?hash=${{ steps.resolve.outputs.target_digest }}
+          - **Image**: \`${IMAGE}:prod\`
+          - **Rolled back to**: \`${IMAGE}:${STEP_RESOLVE_TARGET_TAG}\`
+          - **Audit tag**: \`${IMAGE}:${TAG}\`
+          - **New :prod digest**: \`${STEP_RESOLVE_TARGET_DIGEST}\`
+          - **Previous :prod digest**: \`${STEP_RESOLVE_PREVIOUS_DIGEST}\`
+          - **Sigstore**: https://search.sigstore.dev/?hash=${STEP_RESOLVE_TARGET_DIGEST}
           EOF
           )
           if gh release view "$TAG" >/dev/null 2>&1; then
@@ -200,7 +219,7 @@ jobs:
           else
             gh release create "$TAG" --title "Production Rollback ${TAG}" --notes "$NOTES"
           fi
-          echo "- release: [\`${TAG}\`](${{ github.server_url }}/${{ github.repository }}/releases/tag/${TAG})" >> "$GITHUB_STEP_SUMMARY"
+          echo "- release: [\`${TAG}\`](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases/tag/${TAG})" >> "$GITHUB_STEP_SUMMARY"
 
   trigger-redeploy:
     name: Trigger cvm-ansible-playbooks redeploy
@@ -210,7 +229,7 @@ jobs:
     # ensuring a transient registry blip on the audit copy doesn't block the
     # redeploy. The :prod retag step has no continue-on-error, so a retag
     # failure correctly blocks the redeploy.
-    runs-on: [self-hosted, infra]
+    runs-on: ubuntu-latest
     steps:
       # cvm-ansible-playbooks `Update Cloud API Prod` re-reads :prod from
       # Docker Hub, which we just re-pointed at the rolled-back digest. We
@@ -228,13 +247,17 @@ jobs:
             --ref main
 
       - name: Summary
+        env:
+          NEEDS_ROLLBACK_PROD_TARGET_TAG: ${{ needs.rollback-prod.outputs.target_tag }}
+          NEEDS_ROLLBACK_PROD_TARGET_DIGEST: ${{ needs.rollback-prod.outputs.target_digest }}
+          NEEDS_ROLLBACK_PROD_AUDIT_TAG: ${{ needs.rollback-prod.outputs.audit_tag }}
         run: |
           {
             echo "## Redeploy dispatched"
             echo ""
-            echo "- target tag: \`${{ needs.rollback-prod.outputs.target_tag }}\`"
-            echo "- target digest: \`${{ needs.rollback-prod.outputs.target_digest }}\`"
-            echo "- audit tag: \`${{ needs.rollback-prod.outputs.audit_tag }}\`"
+            echo "- target tag: \`${NEEDS_ROLLBACK_PROD_TARGET_TAG}\`"
+            echo "- target digest: \`${NEEDS_ROLLBACK_PROD_TARGET_DIGEST}\`"
+            echo "- audit tag: \`${NEEDS_ROLLBACK_PROD_AUDIT_TAG}\`"
             echo ""
             echo "Triggered \`Update Cloud API Prod\` on \`nearai/cvm-ansible-playbooks\`."
             echo "Track the deploy: https://github.com/nearai/cvm-ansible-playbooks/actions/workflows/update_cloud_api_prod.yml"

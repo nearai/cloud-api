@@ -30,9 +30,9 @@ impl McpConnectorRepository {
     }
 
     fn decrypt_text(&self, table: &str, column: &str, id: Uuid, value: String) -> Result<String> {
-        match self.pool.encryption_context() {
-            Some((key, key_id)) => crate::field_encryption::decrypt_if_encrypted_with_key_id(
-                &key, &key_id, table, column, id, value,
+        match self.pool.encryption_ring() {
+            Some(ring) => crate::field_encryption::decrypt_if_encrypted_with_ring(
+                &ring, table, column, id, value,
             ),
             None => Ok(value),
         }
@@ -60,9 +60,9 @@ impl McpConnectorRepository {
         id: Uuid,
         value: serde_json::Value,
     ) -> Result<serde_json::Value> {
-        match self.pool.encryption_context() {
-            Some((key, key_id)) => crate::field_encryption::decrypt_json_if_encrypted_with_key_id(
-                &key, &key_id, table, column, id, value,
+        match self.pool.encryption_ring() {
+            Some(ring) => crate::field_encryption::decrypt_json_if_encrypted_with_ring(
+                &ring, table, column, id, value,
             ),
             None => Ok(value),
         }

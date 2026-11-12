@@ -834,7 +834,7 @@ async fn test_admin_member_role_updates_require_authentication() {
 #[tokio::test]
 async fn test_admin_member_role_updates_reject_non_admin_users() {
     let server = setup_test_server_with_config(|config| {
-        config.auth.admin_domains = vec!["example.org".to_string()];
+        config.auth.admin_emails = vec![NON_ADMIN_ALLOWLIST_EMAIL.to_string()];
     })
     .await;
     let organization_id = uuid::Uuid::new_v4();

@@ -36,6 +36,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::Semaphore;
+use tokio::time::Instant;
 
 /// EMA smoothing for per-backend TTFT: fast warmup then stable.
 const TTFT_EWMA_ALPHA_WARMUP: f64 = 0.5;
@@ -46,6 +47,13 @@ pub(super) const TTFT_WARMUP_SAMPLES: u32 = 8;
 /// fastest peer's EMA AND the absolute floor below.
 const TTFT_SLOW_RATIO: f64 = 2.0;
 const TTFT_SLOW_FLOOR_MS: f64 = 500.0;
+/// Largest pool prompt estimate whose TTFT feeds the EMA (the `size:le8k`
+/// bucket): an uncached prefill this size costs about the slow floor, so a
+/// cache miss on a longer prompt cannot mark a healthy backend slow.
+const TTFT_LEARN_MAX_PROMPT_TOKENS: u64 = 8_000;
+/// A stat with no new sample for this long is discarded, as on a restart, so
+/// a backend that steering stopped sending traffic to is tried again.
+pub(super) const TTFT_STAT_TTL: Duration = Duration::from_secs(300);
 /// Keep a small first-turn burst for a reusable prefix on its deterministic
 /// primary before spilling overlapping requests to another backend. This
 /// preserves a single cache copy for ordinary traffic while preventing one hot
@@ -59,6 +67,21 @@ const UNKNOWN_KEY_WARN_INTERVAL_MS: u64 = 60_000;
 pub(super) struct BackendStat {
     pub(super) ttft_ewma_ms: f64,
     pub(super) samples: u32,
+    /// When the last sample was folded in; `None` before the first.
+    pub(super) last_sample: Option<Instant>,
+}
+
+impl BackendStat {
+    fn is_stale(&self, now: Instant) -> bool {
+        self.last_sample
+            .is_some_and(|at| now.saturating_duration_since(at) >= TTFT_STAT_TTL)
+    }
+}
+
+/// Whether a request's TTFT should feed the backend EMA. With no pool
+/// estimate (`None`) every request still feeds it.
+pub(super) fn learns_ttft(prompt_tokens: Option<u64>) -> bool {
+    prompt_tokens.is_none_or(|tokens| tokens <= TTFT_LEARN_MAX_PROMPT_TOKENS)
 }
 
 /// Fold a freshly observed TTFT sample into a backend's EMA. Shared by the
@@ -68,6 +91,13 @@ pub(super) fn update_ema(stat: &mut BackendStat, ttft_ms: f64) {
     if ttft_ms <= 0.0 {
         return;
     }
+    let now = Instant::now();
+    // Folding into a stale EMA at the stable alpha would re-mark the backend
+    // slow on its first new sample; warm it up again instead.
+    if stat.is_stale(now) {
+        *stat = BackendStat::default();
+    }
+    stat.last_sample = Some(now);
     let alpha = if stat.samples < TTFT_WARMUP_SAMPLES {
         TTFT_EWMA_ALPHA_WARMUP
     } else {
@@ -532,13 +562,16 @@ impl Fleet {
             ),
         };
         let stats = lock(&self.backend_stats);
-        // Warmed EMA for index `i`, or None if out of range / not yet warmed.
-        // `.get()` keeps this panic-free regardless of how `count` relates to
-        // the stats vec length (it is `MAX_FANOUT` by construction).
+        let now = Instant::now();
+        // Warmed EMA for index `i`, or None if out of range, not yet warmed,
+        // or stale. `.get()` keeps this panic-free regardless of how `count`
+        // relates to the stats vec length (it is `MAX_FANOUT` by construction).
         let ema = |i: usize| -> Option<f64> {
             stats
                 .get(i)
-                .filter(|s| s.samples >= TTFT_WARMUP_SAMPLES && s.ttft_ewma_ms > 0.0)
+                .filter(|s| {
+                    s.samples >= TTFT_WARMUP_SAMPLES && s.ttft_ewma_ms > 0.0 && !s.is_stale(now)
+                })
                 .map(|s| s.ttft_ewma_ms)
         };
         let min_warm = indices

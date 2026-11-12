@@ -85,9 +85,16 @@ change to those modules.
 New routes under `/v1/admin` are audited automatically. The e2e suite in
 `crates/api/tests/e2e_all/admin_audit.rs` checks that:
 
-- every route mounted in `crates/api/src/lib.rs` is listed in
+- every route mounted in `crates/api/src/lib.rs` and
+  `crates/api/src/object_encryption.rs` is listed in
   `MOUNTED_ADMIN_ROUTES` and logs one event;
 - every admin GET route documented with `limit` and `offset` query parameters
   records the page it served (`every_documented_paginated_admin_list_records_its_page`).
   A new paginated list is covered once its OpenAPI annotation documents both
   parameters; one without them is not.
+
+The object-encryption router's six operations use the same audit layer and
+authorization policy as the database-encryption routes. Reading keys or job status
+and scanning objects are reads; creating, cancelling and verifying jobs require
+write permission. The per-route audit test mounts this router with mock object
+storage and checks each operation's denied request and audit event.

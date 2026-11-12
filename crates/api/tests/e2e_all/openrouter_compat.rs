@@ -168,7 +168,7 @@ async fn register_text_image_model(server: &axum_test::TestServer) -> String {
         }))
         .unwrap(),
     );
-    admin_batch_upsert_models(server, batch, get_session_id()).await;
+    seed_models(server, batch, get_session_id()).await;
     model_name
 }
 

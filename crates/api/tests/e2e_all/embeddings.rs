@@ -32,7 +32,7 @@ async fn setup_embedding_model(server: &axum_test::TestServer) -> String {
         }))
         .unwrap(),
     );
-    let updated = admin_batch_upsert_models(server, batch, get_session_id()).await;
+    let updated = seed_models(server, batch, get_session_id()).await;
     assert_eq!(updated.len(), 1, "Should have updated 1 model");
     tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
     "Qwen/Qwen3-Embedding-0.6B".to_string()

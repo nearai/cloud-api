@@ -46,7 +46,7 @@ async fn setup_isolated_model_revenue_models(
         );
     }
 
-    let updated = admin_batch_upsert_models(&server, batch, get_session_id()).await;
+    let updated = seed_models(&server, batch, get_session_id()).await;
     assert_eq!(updated.len(), model_names.len());
 
     let provider: std::sync::Arc<dyn inference_providers::InferenceProvider + Send + Sync> =

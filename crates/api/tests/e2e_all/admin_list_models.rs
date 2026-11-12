@@ -72,7 +72,7 @@ async fn test_admin_list_models_with_models() {
         .unwrap(),
     );
 
-    let updated = admin_batch_upsert_models(&server, batch, get_session_id()).await;
+    let updated = seed_models(&server, batch, get_session_id()).await;
     assert_eq!(updated.len(), 1, "Should have created 1 model");
 
     let models = list_all_admin_models(&server, false).await;
@@ -431,7 +431,7 @@ async fn test_admin_list_models_include_inactive() {
         }))
         .unwrap(),
     );
-    admin_batch_upsert_models(&server, batch, get_session_id()).await;
+    seed_models(&server, batch, get_session_id()).await;
 
     // Create an inactive model
     let inactive_model_name = format!("inactive-model-{}", uuid::Uuid::new_v4());
@@ -450,7 +450,7 @@ async fn test_admin_list_models_include_inactive() {
         }))
         .unwrap(),
     );
-    admin_batch_upsert_models(&server, batch, get_session_id()).await;
+    seed_models(&server, batch, get_session_id()).await;
 
     // List models without include_inactive (default - should only show active)
     let active_models = list_all_admin_models(&server, false).await;
@@ -516,7 +516,7 @@ async fn test_admin_list_models_pagination() {
             }))
             .unwrap(),
         );
-        admin_batch_upsert_models(&server, batch, get_session_id()).await;
+        seed_models(&server, batch, get_session_id()).await;
     }
 
     // Test limit
@@ -574,7 +574,7 @@ async fn test_admin_list_models_has_timestamps() {
         }))
         .unwrap(),
     );
-    admin_batch_upsert_models(&server, batch, get_session_id()).await;
+    seed_models(&server, batch, get_session_id()).await;
 
     let models = list_all_admin_models(&server, false).await;
     let model = models
@@ -678,7 +678,7 @@ async fn test_admin_list_models_after_soft_delete() {
         }))
         .unwrap(),
     );
-    admin_batch_upsert_models(&server, batch, get_session_id()).await;
+    seed_models(&server, batch, get_session_id()).await;
 
     // Verify model exists in active list
     let active_models = list_all_admin_models(&server, false).await;
@@ -747,7 +747,7 @@ async fn test_admin_list_models_datacenters_round_trip() {
         }))
         .unwrap(),
     );
-    admin_batch_upsert_models(&server, batch, get_session_id()).await;
+    seed_models(&server, batch, get_session_id()).await;
 
     let models = list_all_admin_models(&server, false).await;
     let model = models
@@ -861,7 +861,7 @@ async fn test_admin_openrouter_slug_round_trip_and_clear() {
         }))
         .unwrap(),
     );
-    let updated = admin_batch_upsert_models(&server, batch, get_session_id()).await;
+    let updated = seed_models(&server, batch, get_session_id()).await;
     let model = updated
         .iter()
         .find(|m| m.model_id == model_name)
@@ -896,7 +896,7 @@ async fn test_admin_openrouter_slug_round_trip_and_clear() {
         model_name.clone(),
         serde_json::from_value(serde_json::json!({ "openrouterSlug": null })).unwrap(),
     );
-    let cleared = admin_batch_upsert_models(&server, clear_batch, get_session_id()).await;
+    let cleared = seed_models(&server, clear_batch, get_session_id()).await;
     let cleared_model = cleared
         .iter()
         .find(|m| m.model_id == model_name)
@@ -926,14 +926,14 @@ async fn test_admin_openrouter_slug_round_trip_and_clear() {
         serde_json::from_value(serde_json::json!({ "openrouterSlug": "qwen/qwen3.6-27b" }))
             .unwrap(),
     );
-    admin_batch_upsert_models(&server, reset_batch, get_session_id()).await;
+    seed_models(&server, reset_batch, get_session_id()).await;
 
     let mut unrelated_batch = BatchUpdateModelApiRequest::new();
     unrelated_batch.insert(
         model_name.clone(),
         serde_json::from_value(serde_json::json!({ "modelDescription": "touch" })).unwrap(),
     );
-    let touched = admin_batch_upsert_models(&server, unrelated_batch, get_session_id()).await;
+    let touched = seed_models(&server, unrelated_batch, get_session_id()).await;
     let touched_model = touched
         .iter()
         .find(|m| m.model_id == model_name)

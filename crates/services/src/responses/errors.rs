@@ -26,40 +26,6 @@ pub enum ResponseError {
     PreviousResponseNotFound,
 
     // ============================================
-    // MCP (Model Context Protocol) Errors
-    // ============================================
-    #[error("MCP connection failed: {0}")]
-    McpConnectionFailed(String),
-
-    #[error("MCP tool discovery failed: {0}")]
-    McpToolDiscoveryFailed(String),
-
-    #[error("MCP tool execution failed: {0}")]
-    McpToolExecutionFailed(String),
-
-    #[error("MCP server limit exceeded: max {max} servers per request")]
-    McpServerLimitExceeded { max: usize },
-
-    #[error("MCP tool limit exceeded: server '{server}' has {count} tools, max {max}")]
-    McpToolLimitExceeded {
-        server: String,
-        count: usize,
-        max: usize,
-    },
-
-    #[error("MCP server URL must use HTTPS")]
-    McpInsecureUrl,
-
-    #[error("MCP private IP addresses not allowed")]
-    McpPrivateIpBlocked,
-
-    #[error("MCP approval required for tool '{tool}' on server '{server}'")]
-    McpApprovalRequired { server: String, tool: String },
-
-    #[error("MCP approval request not found: {0}")]
-    McpApprovalRequestNotFound(String),
-
-    // ============================================
     // Function Tool Errors
     // ============================================
     #[error("Function call required: {name} (call_id: {call_id})")]
@@ -75,19 +41,10 @@ impl ResponseError {
             ResponseError::InvalidParams(_)
             | ResponseError::UnknownTool(_)
             | ResponseError::EmptyToolName
-            | ResponseError::McpServerLimitExceeded { .. }
-            | ResponseError::McpToolLimitExceeded { .. }
-            | ResponseError::McpInsecureUrl
-            | ResponseError::McpPrivateIpBlocked
-            | ResponseError::McpApprovalRequired { .. }
             | ResponseError::FunctionCallRequired { .. } => 400,
-            ResponseError::McpApprovalRequestNotFound(_)
-            | ResponseError::FunctionCallNotFound(_)
+            ResponseError::FunctionCallNotFound(_)
             | ResponseError::ConversationNotFound
             | ResponseError::PreviousResponseNotFound => 404,
-            ResponseError::McpConnectionFailed(_)
-            | ResponseError::McpToolDiscoveryFailed(_)
-            | ResponseError::McpToolExecutionFailed(_) => 502,
             ResponseError::Completion(error) => completion_http_status_code(error),
             ResponseError::InternalError(_) | ResponseError::StreamInterrupted => 500,
         }
@@ -106,12 +63,6 @@ impl ResponseError {
             ResponseError::InvalidParams(_)
             | ResponseError::UnknownTool(_)
             | ResponseError::EmptyToolName
-            | ResponseError::McpServerLimitExceeded { .. }
-            | ResponseError::McpToolLimitExceeded { .. }
-            | ResponseError::McpInsecureUrl
-            | ResponseError::McpPrivateIpBlocked
-            | ResponseError::McpApprovalRequired { .. }
-            | ResponseError::McpApprovalRequestNotFound(_)
             | ResponseError::FunctionCallRequired { .. }
             | ResponseError::FunctionCallNotFound(_)
             | ResponseError::ConversationNotFound
@@ -122,11 +73,7 @@ impl ResponseError {
                     | crate::completions::CompletionError::InvalidParams(_)
                     | crate::completions::CompletionError::RateLimitExceeded(_)
             ),
-            ResponseError::InternalError(_)
-            | ResponseError::StreamInterrupted
-            | ResponseError::McpConnectionFailed(_)
-            | ResponseError::McpToolDiscoveryFailed(_)
-            | ResponseError::McpToolExecutionFailed(_) => false,
+            ResponseError::InternalError(_) | ResponseError::StreamInterrupted => false,
         }
     }
 
@@ -157,47 +104,6 @@ impl ResponseError {
             }
             ResponseError::PreviousResponseNotFound => {
                 response_error("Previous response not found", "not_found", None)
-            }
-            ResponseError::McpConnectionFailed(msg) => {
-                response_error(&format!("MCP connection failed: {msg}"), "mcp_error", None)
-            }
-            ResponseError::McpToolDiscoveryFailed(msg) => response_error(
-                &format!("MCP tool discovery failed: {msg}"),
-                "mcp_error",
-                None,
-            ),
-            ResponseError::McpToolExecutionFailed(msg) => response_error(
-                &format!("MCP tool execution failed: {msg}"),
-                "mcp_error",
-                None,
-            ),
-            ResponseError::McpServerLimitExceeded { max } => response_error(
-                &format!("MCP server limit exceeded: max {max} servers per request"),
-                "invalid_request_error",
-                None,
-            ),
-            ResponseError::McpToolLimitExceeded { server, count, max } => response_error(
-                &format!("MCP tool limit exceeded: server '{server}' has {count} tools, max {max}"),
-                "invalid_request_error",
-                None,
-            ),
-            ResponseError::McpInsecureUrl => response_error(
-                "MCP server URL must use HTTPS",
-                "invalid_request_error",
-                None,
-            ),
-            ResponseError::McpPrivateIpBlocked => response_error(
-                "MCP private IP addresses not allowed",
-                "invalid_request_error",
-                None,
-            ),
-            ResponseError::McpApprovalRequired { server, tool } => response_error(
-                &format!("MCP approval required for tool '{tool}' on server '{server}'"),
-                "mcp_approval_required",
-                None,
-            ),
-            ResponseError::McpApprovalRequestNotFound(msg) => {
-                response_error(msg, "not_found", Some("approval_request_not_found"))
             }
             ResponseError::FunctionCallRequired { name, call_id } => response_error(
                 &format!("Function call required: {name} (call_id: {call_id})"),

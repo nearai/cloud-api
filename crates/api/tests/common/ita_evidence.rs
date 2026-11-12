@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
-use api::{build_app_with_config_and_options, init_auth_services};
+use super::build_app_with_config_and_options;
+use api::init_auth_services;
 use async_trait::async_trait;
 use base64::Engine;
 

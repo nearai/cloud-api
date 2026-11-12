@@ -39,11 +39,13 @@ jobs:
     if: >-
       github.event_name == 'schedule' ||
       (github.event_name == 'workflow_dispatch' && inputs.target == 'prod')
-    runs-on: [self-hosted, infra]
+    runs-on: ubuntu-latest
     environment: production
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
 
       - name: Log in to Docker registry
         uses: docker/login-action@3864d6aed8ff134b2ed894ce00c87695c709c870
@@ -63,20 +65,23 @@ jobs:
       # finding the matching staging-YYYYMMDD-<shortsha> tag pushed by build.yml.
       - name: Resolve source digest and SHA
         id: resolve
+        env:
+          INPUT_DIGEST: ${{ inputs.digest }}
+          VAR_DOCKER_REGISTRY_USER: ${{ vars.DOCKER_REGISTRY_USER }}
         run: |
           set -euo pipefail
-          DIGEST_INPUT="${{ inputs.digest }}"
+          DIGEST_INPUT="${INPUT_DIGEST}"
           if [ -n "$DIGEST_INPUT" ] && ! echo "$DIGEST_INPUT" | grep -qE '^sha256:[a-f0-9]{64}$'; then
             echo "::error::digest input must be 'sha256:<64 hex chars>', got: '${DIGEST_INPUT}'"
             exit 1
           fi
           if [ -n "$DIGEST_INPUT" ]; then
             echo "Promoting by digest: ${DIGEST_INPUT}"
-            SOURCE="${{ env.IMAGE }}@${DIGEST_INPUT}"
+            SOURCE="${IMAGE}@${DIGEST_INPUT}"
             DIGEST="$DIGEST_INPUT"
           else
             echo "Promoting :staging tag"
-            SOURCE="${{ env.IMAGE }}:staging"
+            SOURCE="${IMAGE}:staging"
             DIGEST=$(skopeo inspect "docker://${SOURCE}" | jq -r '.Digest')
           fi
           if [ -z "$DIGEST" ] || [ "$DIGEST" = "null" ]; then
@@ -91,7 +96,7 @@ jobs:
           # source git short-sha. Bounded by --max-time (per-call) and a max
           # iteration count to defend against malformed pagination cursors.
           SHORT_SHA="unknown"
-          PAGE_URL="https://hub.docker.com/v2/namespaces/${{ vars.DOCKER_REGISTRY_USER }}/repositories/${{ env.IMAGE_NAME }}/tags?page_size=100"
+          PAGE_URL="https://hub.docker.com/v2/namespaces/${VAR_DOCKER_REGISTRY_USER}/repositories/${IMAGE_NAME}/tags?page_size=100"
           MAX_PAGES=50
           PAGE_COUNT=0
           while [ -n "$PAGE_URL" ] && [ "$PAGE_URL" != "null" ] && [ "$PAGE_COUNT" -lt "$MAX_PAGES" ]; do
@@ -125,7 +130,7 @@ jobs:
           # bytes pushed to :prod and to the stamped tag are provably identical,
           # regardless of any concurrent staging push that might race the
           # :staging tag during this run.
-          skopeo copy "docker://${{ env.IMAGE }}@${IMAGE_DIGEST}" "docker://${{ env.IMAGE }}:prod"
+          skopeo copy "docker://${IMAGE}@${IMAGE_DIGEST}" "docker://${IMAGE}:prod"
 
       # Immutable rollback tag — format: prod-YYYYMMDD-<shortsha>.
       # Provides addressable history for cvm-ansible-playbooks rollback workflow.
@@ -136,8 +141,8 @@ jobs:
           set -euo pipefail
           STAMP=$(date -u +%Y%m%d)
           STAMPED_TAG="prod-${STAMP}-${SOURCE_SHORT_SHA}"
-          STAMPED_REF="${{ env.IMAGE }}:${STAMPED_TAG}"
-          skopeo copy "docker://${{ env.IMAGE }}@${IMAGE_DIGEST}" "docker://${STAMPED_REF}"
+          STAMPED_REF="${IMAGE}:${STAMPED_TAG}"
+          skopeo copy "docker://${IMAGE}@${IMAGE_DIGEST}" "docker://${STAMPED_REF}"
           echo "PROD_STAMPED_TAG=${STAMPED_TAG}" >> "$GITHUB_ENV"
           echo "PROD_STAMPED_REF=${STAMPED_REF}" >> "$GITHUB_ENV"
 
@@ -160,7 +165,7 @@ jobs:
           NOTES=$(cat <<EOF
           ## Production Promotion
 
-          - **Image**: \`${{ env.IMAGE }}:prod\`
+          - **Image**: \`${IMAGE}:prod\`
           - **Stamped image**: \`${PROD_STAMPED_REF}\`
           - **Digest**: \`${IMAGE_DIGEST}\`
           - **Promoted from**: \`${PROMOTE_SOURCE}\`
@@ -176,4 +181,4 @@ jobs:
           else
             gh release create "$TAG" --title "Production Release ${TAG}" --notes "$NOTES" --latest
           fi
-          echo "- release: [\`${TAG}\`](${{ github.server_url }}/${{ github.repository }}/releases/tag/${TAG})" >> "$GITHUB_STEP_SUMMARY"
+          echo "- release: [\`${TAG}\`](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases/tag/${TAG})" >> "$GITHUB_STEP_SUMMARY"

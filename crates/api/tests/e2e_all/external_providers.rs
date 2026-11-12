@@ -41,7 +41,7 @@ async fn setup_external_openai_model(server: &axum_test::TestServer) -> String {
         .unwrap(),
     );
 
-    let updated = admin_batch_upsert_models(server, batch, get_session_id()).await;
+    let updated = seed_models(server, batch, get_session_id()).await;
     assert_eq!(updated.len(), 1, "Should have created 1 model");
     assert_eq!(
         updated[0].metadata.provider_type, "external",
@@ -89,7 +89,7 @@ async fn setup_external_anthropic_model(server: &axum_test::TestServer) -> Strin
         .unwrap(),
     );
 
-    let updated = admin_batch_upsert_models(server, batch, get_session_id()).await;
+    let updated = seed_models(server, batch, get_session_id()).await;
     assert_eq!(updated.len(), 1, "Should have created 1 model");
 
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
@@ -128,7 +128,7 @@ async fn setup_external_gemini_model(server: &axum_test::TestServer) -> String {
         .unwrap(),
     );
 
-    let updated = admin_batch_upsert_models(server, batch, get_session_id()).await;
+    let updated = seed_models(server, batch, get_session_id()).await;
     assert_eq!(updated.len(), 1, "Should have created 1 model");
 
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
@@ -725,7 +725,7 @@ async fn test_update_external_provider_config() {
         }))
         .unwrap(),
     );
-    let created = admin_batch_upsert_models(&server, create_batch, get_session_id()).await;
+    let created = seed_models(&server, create_batch, get_session_id()).await;
     assert_eq!(created.len(), 1);
 
     // Update the provider config (e.g., change base_url)
@@ -742,7 +742,7 @@ async fn test_update_external_provider_config() {
         .unwrap(),
     );
 
-    let updated = admin_batch_upsert_models(&server, batch, get_session_id()).await;
+    let updated = seed_models(&server, batch, get_session_id()).await;
     assert_eq!(updated.len(), 1);
 
     // Verify the update
@@ -775,7 +775,8 @@ async fn test_deactivate_external_model() {
             "providerType": "external",
             "providerConfig": {
                 "backend": "openai_compatible",
-                "base_url": "https://api.openai.com/v1"
+                "base_url": "https://api.openai.com/v1",
+                "api_key": "synthetic-test-key"
             },
             "attestationSupported": false
         }))
@@ -784,6 +785,10 @@ async fn test_deactivate_external_model() {
     let created = admin_batch_upsert_models(&server, deactivate_batch, get_session_id()).await;
     assert_eq!(created.len(), 1);
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    assert!(
+        inference_pool.has_provider(&model_name).await,
+        "Provider should be registered before deactivation"
+    );
 
     // Verify model is initially active
     // External providers are registered but we just verify the model was created
@@ -849,7 +854,7 @@ async fn test_switch_model_from_vllm_to_external() {
         .unwrap(),
     );
 
-    let created = admin_batch_upsert_models(&server, batch, get_session_id()).await;
+    let created = seed_models(&server, batch, get_session_id()).await;
     assert_eq!(created[0].metadata.provider_type, "vllm");
     assert!(created[0].metadata.attestation_supported);
 
@@ -870,7 +875,7 @@ async fn test_switch_model_from_vllm_to_external() {
         .unwrap(),
     );
 
-    let updated = admin_batch_upsert_models(&server, batch, get_session_id()).await;
+    let updated = seed_models(&server, batch, get_session_id()).await;
     assert_eq!(updated[0].metadata.provider_type, "external");
     assert!(!updated[0].metadata.attestation_supported);
     assert!(!updated[0].metadata.verifiable);
@@ -937,7 +942,7 @@ async fn test_batch_create_multiple_external_providers() {
         .unwrap(),
     );
 
-    let updated = admin_batch_upsert_models(&server, batch, get_session_id()).await;
+    let updated = seed_models(&server, batch, get_session_id()).await;
     assert_eq!(updated.len(), 3, "Should have created 3 models");
 
     // Verify all are external
@@ -975,7 +980,7 @@ async fn test_external_model_history_records_provider_config() {
         }))
         .unwrap(),
     );
-    admin_batch_upsert_models(&server, create_batch, get_session_id()).await;
+    seed_models(&server, create_batch, get_session_id()).await;
 
     // Update it to change the config
     let mut batch = BatchUpdateModelApiRequest::new();
@@ -990,7 +995,7 @@ async fn test_external_model_history_records_provider_config() {
         }))
         .unwrap(),
     );
-    admin_batch_upsert_models(&server, batch, get_session_id()).await;
+    seed_models(&server, batch, get_session_id()).await;
 
     // Fetch model history
     let url = format!(
@@ -1103,7 +1108,7 @@ async fn gemini_thinking_completion(
         }))
         .unwrap(),
     );
-    admin_batch_upsert_models(&server, batch, get_session_id()).await;
+    seed_models(&server, batch, get_session_id()).await;
 
     let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
     let api_key = get_api_key_for_org(&server, org.id.clone()).await;

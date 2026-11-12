@@ -15,6 +15,7 @@ pub mod feature_requests;
 pub mod files;
 pub mod gateway;
 pub mod health;
+pub mod internal_usage;
 pub mod mcp_server;
 pub mod models;
 pub mod ohttp;

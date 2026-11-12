@@ -517,6 +517,13 @@ impl ModelsServiceTrait for InvalidatesCatalog {
             .invalidate_model_access(organization_id, model_id)
             .await;
     }
+
+    async fn invalidate_organization_model_filter(&self, organization_id: Uuid) {
+        // Organization settings are not cached by the catalog adapter.
+        self.inner
+            .invalidate_organization_model_filter(organization_id)
+            .await;
+    }
 }
 
 #[cfg(test)]

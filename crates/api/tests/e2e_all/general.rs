@@ -187,7 +187,7 @@ async fn test_admin_update_model() {
         }))
         .expect("admin update model fixture should deserialize"),
     );
-    let updated = admin_batch_upsert_models(&server, batch, get_session_id()).await;
+    let updated = seed_models(&server, batch, get_session_id()).await;
     assert_eq!(updated.len(), 1, "Should have updated 1 model");
 
     // Retrieve the model to verify the update
@@ -236,7 +236,7 @@ async fn test_get_model_by_name() {
         }))
         .unwrap(),
     );
-    admin_batch_upsert_models(&server, batch, get_session_id()).await;
+    seed_models(&server, batch, get_session_id()).await;
 
     // Test retrieving the model by name (public endpoint - no auth required)
     // Model names may contain forward slashes which must be URL-encoded
@@ -352,7 +352,7 @@ async fn test_admin_model_custom_owned_by() {
         .unwrap(),
     );
 
-    let created_models = admin_batch_upsert_models(&server, batch1, get_session_id()).await;
+    let created_models = seed_models(&server, batch1, get_session_id()).await;
     assert_eq!(created_models.len(), 1);
     let created_model = &created_models[0];
     assert_eq!(
@@ -387,7 +387,7 @@ async fn test_admin_model_custom_owned_by() {
         .unwrap(),
     );
 
-    let updated_models = admin_batch_upsert_models(&server, batch2, get_session_id()).await;
+    let updated_models = seed_models(&server, batch2, get_session_id()).await;
     assert_eq!(updated_models.len(), 1);
     assert_eq!(
         updated_models[0].metadata.owned_by, "openai",
@@ -408,7 +408,7 @@ async fn test_admin_model_custom_owned_by() {
         .unwrap(),
     );
 
-    let overridden_models = admin_batch_upsert_models(&server, batch3, get_session_id()).await;
+    let overridden_models = seed_models(&server, batch3, get_session_id()).await;
     assert_eq!(overridden_models.len(), 1);
     assert_eq!(
         overridden_models[0].metadata.owned_by, "anthropic",
@@ -457,7 +457,7 @@ async fn test_admin_model_default_owned_by() {
         .unwrap(),
     );
 
-    let created_models = admin_batch_upsert_models(&server, batch, get_session_id()).await;
+    let created_models = seed_models(&server, batch, get_session_id()).await;
     assert_eq!(created_models.len(), 1);
     assert_eq!(
         created_models[0].metadata.owned_by, DEFAULT_MODEL_OWNED_BY,
@@ -1264,7 +1264,7 @@ async fn test_admin_get_organization_balance_accepts_admin_access_token() {
 #[tokio::test]
 async fn test_admin_get_organization_balance_rejects_non_admin() {
     let server = setup_test_server_with_config(|config| {
-        config.auth.admin_domains = vec!["near.ai".to_string()];
+        config.auth.admin_emails = vec![NON_ADMIN_ALLOWLIST_EMAIL.to_string()];
     })
     .await;
     let org = create_org(&server).await;
@@ -1651,7 +1651,7 @@ async fn test_high_context_length_completion() {
         .unwrap(),
     );
 
-    let updated_models = admin_batch_upsert_models(&server, batch, get_session_id()).await;
+    let updated_models = seed_models(&server, batch, get_session_id()).await;
     println!("Updated Qwen3-30B model: {:?}", updated_models[0]);
     assert_eq!(updated_models[0].metadata.context_length, 262144);
 
@@ -1771,7 +1771,7 @@ async fn test_high_context_streaming() {
         .unwrap(),
     );
 
-    admin_batch_upsert_models(&server, batch, get_session_id()).await;
+    seed_models(&server, batch, get_session_id()).await;
 
     let api_key = get_api_key_for_org(&server, org.id).await;
 
@@ -1926,7 +1926,7 @@ async fn test_model_aliases() {
         .unwrap(),
     );
 
-    let updated_models = admin_batch_upsert_models(&server, batch, get_session_id()).await;
+    let updated_models = seed_models(&server, batch, get_session_id()).await;
     println!("Updated {} models with aliases", updated_models.len());
     assert_eq!(updated_models.len(), 2);
 
@@ -2097,7 +2097,7 @@ async fn test_model_alias_consistency() {
         .unwrap(),
     );
 
-    let updated_models = admin_batch_upsert_models(&server, batch, get_session_id()).await;
+    let updated_models = seed_models(&server, batch, get_session_id()).await;
     assert_eq!(updated_models.len(), 1);
     println!("Set up model with 2 aliases");
 
@@ -3072,7 +3072,7 @@ async fn test_admin_list_users_with_organizations_no_spend_limit() {
     let (unique_session, test_user_email) = setup_unique_test_session(&database).await;
 
     // Get access token from refresh token
-    let access_token = get_access_token_from_refresh_token(&server, unique_session.clone()).await;
+    let access_token = get_access_token_from_refresh_token(&server, get_session_id()).await;
 
     // Create an organization WITHOUT setting spend limit for a user owned by
     // this test. The shared admin user can already own organizations from
@@ -3178,7 +3178,7 @@ async fn test_admin_list_users_with_organization_usage() {
         loop {
             let response = server
                 .get(&users_path)
-                .add_header("Authorization", format!("Bearer {}", &unique_session))
+                .add_header("Authorization", format!("Bearer {}", get_session_id()))
                 .await;
             assert_eq!(response.status_code(), 200);
             let users = response.json::<api::models::ListUsersResponse>();

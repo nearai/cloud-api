@@ -86,7 +86,7 @@ async fn native_search_flow(stream: bool) {
         "contextLength":10000,"maxOutputLength":1000,"isActive":true,"ownedBy":"openai",
         "verifiable":false,"inputModalities":["text"],"outputModalities":["text"]
     })).unwrap());
-    admin_batch_upsert_models(&server, batch, get_session_id()).await;
+    seed_models(&server, batch, get_session_id()).await;
     pool.register_provider(model.clone(), provider.clone())
         .await;
     let org = setup_org_with_credits(&server, 10_000_000_000).await;

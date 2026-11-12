@@ -2,7 +2,86 @@ use crate::ita::ItaAttestationConfig;
 use rustls_pki_types::{pem::PemObject, CertificateDer};
 use std::{collections::HashMap, env};
 
-#[derive(Debug, Clone)]
+/// Source of one encryption key. Inline key material is redacted.
+#[derive(Clone)]
+pub enum KeySource {
+    File(std::path::PathBuf),
+    Dstack(String),
+    Hex(String),
+}
+
+impl std::fmt::Debug for KeySource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::File(path) => f.debug_tuple("File").field(path).finish(),
+            Self::Dstack(path) => f.debug_tuple("Dstack").field(path).finish(),
+            Self::Hex(_) => f.debug_tuple("Hex").field(&"<redacted>").finish(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct KeySourceSpec {
+    pub key_id: String,
+    pub source: KeySource,
+}
+
+/// Debug stand-in for an optional secret: shows whether it is set, never its value.
+fn redact_opt(secret: &Option<String>) -> Option<&'static str> {
+    secret.as_ref().map(|_| "<redacted>")
+}
+
+/// Parse ordered `<key_id>=file:...|dstack:...|hex:...` entries.
+pub fn parse_key_source_specs(raw: &str) -> Result<Vec<KeySourceSpec>, String> {
+    parse_key_source_specs_for(raw, "DB_ENCRYPTION_KEYS")
+}
+
+fn parse_key_source_specs_for(raw: &str, variable: &str) -> Result<Vec<KeySourceSpec>, String> {
+    let mut ids = std::collections::HashSet::new();
+    raw.split(',')
+        .enumerate()
+        .map(|(index, entry)| {
+            let error = |reason: &str| format!("{variable} entry {index}: {reason}");
+            let (key_id, source) = entry
+                .trim()
+                .split_once('=')
+                .ok_or_else(|| error("expected key_id=source"))?;
+            if key_id.is_empty()
+                || key_id.len() > 64
+                || !key_id
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+            {
+                return Err(error("invalid key id"));
+            }
+            if !ids.insert(key_id.to_string()) {
+                return Err(error("duplicate key id"));
+            }
+            let source =
+                if let Some(path) = source.strip_prefix("file:").filter(|path| !path.is_empty()) {
+                    KeySource::File(path.into())
+                } else if let Some(path) = source
+                    .strip_prefix("dstack:")
+                    .filter(|path| !path.is_empty())
+                {
+                    KeySource::Dstack(path.into())
+                } else if let Some(key) = source.strip_prefix("hex:") {
+                    if key.len() != 64 || !key.bytes().all(|b| b.is_ascii_hexdigit()) {
+                        return Err(error("hex key must contain 64 hexadecimal characters"));
+                    }
+                    KeySource::Hex(key.into())
+                } else {
+                    return Err(error("expected nonempty file:, dstack: or hex: source"));
+                };
+            Ok(KeySourceSpec {
+                key_id: key_id.into(),
+                source,
+            })
+        })
+        .collect()
+}
+
+#[derive(Clone)]
 pub struct ApiConfig {
     pub server: ServerConfig,
     /// API key for authenticating with inference backends (vLLM/SGLang via inference_url)
@@ -27,7 +106,10 @@ pub struct ApiConfig {
     /// Dedicated AES-256 key for confidential database fields. This must not
     /// reuse the object-storage encryption key.
     pub database_encryption_key: String,
-    /// Identifier embedded in and validated against every database envelope.
+    /// Ordered key sources; first writes and all entries read.
+    pub database_encryption_keys: Option<Vec<KeySourceSpec>>,
+    /// Identifier embedded in database envelopes. In ring mode the write id is
+    /// the first entry's id.
     pub database_encryption_key_id: String,
     /// Enables encryption for newly written confidential database fields.
     /// Defaults off so dual-read support can be deployed fleet-wide first.
@@ -49,10 +131,115 @@ pub struct ApiConfig {
     pub placement: PlacementConfig,
 }
 
+impl std::fmt::Debug for ApiConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Exhaustive destructure (no `..`): adding a field is a compile error
+        // here until it is listed (and, if a secret, redacted).
+        let Self {
+            server,
+            inference_api_key,
+            internal_usage_token,
+            internal_usage_max_discount,
+            logging,
+            dstack_client,
+            auth,
+            database,
+            database_encryption_key: _,
+            database_encryption_keys,
+            database_encryption_key_id,
+            database_encryption_write_enabled,
+            s3,
+            invitation_email,
+            otlp,
+            cors,
+            external_providers,
+            github_dispatch,
+            infra,
+            staking_farm,
+            aml,
+            usage_reporting,
+            credit_allocation,
+            ita,
+            placement,
+        } = self;
+        f.debug_struct("ApiConfig")
+            .field("server", server)
+            .field("inference_api_key", &redact_opt(inference_api_key))
+            .field("internal_usage_token", &redact_opt(internal_usage_token))
+            .field("internal_usage_max_discount", internal_usage_max_discount)
+            .field("logging", logging)
+            .field("dstack_client", dstack_client)
+            .field("auth", auth)
+            .field("database", database)
+            .field("database_encryption_key", &"<redacted>")
+            .field("database_encryption_keys", database_encryption_keys)
+            .field("database_encryption_key_id", database_encryption_key_id)
+            .field(
+                "database_encryption_write_enabled",
+                database_encryption_write_enabled,
+            )
+            .field("s3", s3)
+            .field("invitation_email", invitation_email)
+            .field("otlp", otlp)
+            .field("cors", cors)
+            .field("external_providers", external_providers)
+            .field("github_dispatch", github_dispatch)
+            .field("infra", infra)
+            .field("staking_farm", staking_farm)
+            .field("aml", aml)
+            .field("usage_reporting", usage_reporting)
+            .field("credit_allocation", credit_allocation)
+            .field("ita", ita)
+            .field("placement", placement)
+            .finish()
+    }
+}
+
 impl ApiConfig {
     /// Load configuration from environment variables
     pub fn from_env() -> Result<Self, String> {
         let auth = AuthConfig::from_env()?;
+        let database_encryption_keys = non_empty_env("DB_ENCRYPTION_KEYS")
+            .map(|raw| {
+                let specs = parse_key_source_specs(&raw)?;
+                if env::var("DB_ENCRYPTION_ALLOW_INLINE_KEYS").as_deref() != Ok("true") {
+                    if let Some(index) = specs
+                        .iter()
+                        .position(|spec| matches!(spec.source, KeySource::Hex(_)))
+                    {
+                        return Err(format!("DB_ENCRYPTION_KEYS entry {index}: hex sources require DB_ENCRYPTION_ALLOW_INLINE_KEYS=true (local development and tests only)"));
+                    }
+                }
+                Ok(specs)
+            })
+            .transpose()?;
+        let (database_encryption_key, database_encryption_key_id) = if let Some(specs) =
+            &database_encryption_keys
+        {
+            if [
+                "DB_ENCRYPTION_KEY_FILE",
+                "DB_ENCRYPTION_KEY",
+                "DB_ENCRYPTION_KEY_ID",
+            ]
+            .iter()
+            .any(|name| env::var_os(name).is_some())
+            {
+                eprintln!("WARN: DB_ENCRYPTION_KEY_FILE, DB_ENCRYPTION_KEY and DB_ENCRYPTION_KEY_ID are ignored when DB_ENCRYPTION_KEYS is set; the legacy key must be listed as a read entry if it is still needed");
+            }
+            (
+                String::new(),
+                specs
+                    .first()
+                    .ok_or("DB_ENCRYPTION_KEYS must contain at least one entry")?
+                    .key_id
+                    .clone(),
+            )
+        } else {
+            (
+                read_required_secret_env("DB_ENCRYPTION_KEY_FILE", "DB_ENCRYPTION_KEY")?,
+                non_empty_env("DB_ENCRYPTION_KEY_ID").unwrap_or_else(|| "db-v1".to_string()),
+            )
+        };
         Ok(Self {
             server: ServerConfig::from_env()?,
             inference_api_key: env::var("INFERENCE_API_KEY")
@@ -73,12 +260,9 @@ impl ApiConfig {
             staking_farm: StakingFarmConfig::from_env(&auth.near),
             auth,
             database: DatabaseConfig::from_env()?,
-            database_encryption_key: read_required_secret_env(
-                "DB_ENCRYPTION_KEY_FILE",
-                "DB_ENCRYPTION_KEY",
-            )?,
-            database_encryption_key_id: non_empty_env("DB_ENCRYPTION_KEY_ID")
-                .unwrap_or_else(|| "db-v1".to_string()),
+            database_encryption_key,
+            database_encryption_keys,
+            database_encryption_key_id,
             database_encryption_write_enabled: parse_bool_env(
                 "DB_ENCRYPTION_WRITE_ENABLED",
                 false,
@@ -709,7 +893,7 @@ pub const DEFAULT_GITHUB_DISPATCH_EVENT_TYPE: &str = "stg_model_loaded";
 /// models. When `enabled`, a successful `PATCH /v1/admin/models` fires a
 /// `repository_dispatch` event so downstream automation (validate / promote
 /// pipelines) can react. Intended to be enabled only on staging cloud-api.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct GitHubDispatchConfig {
     pub enabled: bool,
     /// Target repo in `owner/name` form.
@@ -719,6 +903,23 @@ pub struct GitHubDispatchConfig {
     pub event_type: String,
     /// Fine-grained PAT with `actions: write` scoped to `repo` only.
     pub pat: Option<String>,
+}
+
+impl std::fmt::Debug for GitHubDispatchConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            enabled,
+            repo,
+            event_type,
+            pat,
+        } = self;
+        f.debug_struct("GitHubDispatchConfig")
+            .field("enabled", enabled)
+            .field("repo", repo)
+            .field("event_type", event_type)
+            .field("pat", &redact_opt(pat))
+            .finish()
+    }
 }
 
 impl Default for GitHubDispatchConfig {
@@ -831,7 +1032,7 @@ impl std::str::FromStr for DatabaseRecyclingMethod {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct DatabaseConfig {
     pub connection_mode: DatabaseConnectionMode,
     pub primary_app_id: String,
@@ -853,6 +1054,43 @@ pub struct DatabaseConfig {
     pub refresh_interval: u64,
     /// Use mock database for testing (bypasses Patroni discovery and real database)
     pub mock: bool,
+}
+
+impl std::fmt::Debug for DatabaseConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            connection_mode,
+            primary_app_id,
+            gateway_subdomain,
+            host,
+            port,
+            database,
+            username,
+            password: _,
+            max_connections,
+            recycling_method,
+            tls_enabled,
+            tls_ca_cert_path,
+            refresh_interval,
+            mock,
+        } = self;
+        f.debug_struct("DatabaseConfig")
+            .field("connection_mode", connection_mode)
+            .field("primary_app_id", primary_app_id)
+            .field("gateway_subdomain", gateway_subdomain)
+            .field("host", host)
+            .field("port", port)
+            .field("database", database)
+            .field("username", username)
+            .field("password", &"<redacted>")
+            .field("max_connections", max_connections)
+            .field("recycling_method", recycling_method)
+            .field("tls_enabled", tls_enabled)
+            .field("tls_ca_cert_path", tls_ca_cert_path)
+            .field("refresh_interval", refresh_interval)
+            .field("mock", mock)
+            .finish()
+    }
 }
 
 impl DatabaseConfig {
@@ -1034,16 +1272,16 @@ pub struct DomainConfig {
 }
 
 // Simplified Authentication Configuration
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct AuthConfig {
     pub mock: bool,
     pub encoding_key: String,
     pub github: Option<GitHubOAuthConfig>,
     pub google: Option<GoogleOAuthConfig>,
     pub near: NearConfig,
-    /// Email domains that are granted platform admin access
-    /// Users with emails from these domains will have admin privileges
-    pub admin_domains: Vec<String>,
+    /// Explicit email addresses that are granted platform admin access
+    /// An empty list denies admin access; domain-wide grants are not supported.
+    pub admin_emails: Vec<String>,
     /// Enable only after all API instances enforce admin token permissions.
     /// Disabling issuance does not disable enforcement for existing tokens.
     pub admin_read_only_tokens_enabled: bool,
@@ -1059,6 +1297,37 @@ pub struct AuthConfig {
     /// outstanding legacy tokens have expired to reject any token that cannot
     /// be tied to a live session.
     pub require_session_bound_access_tokens: bool,
+}
+
+impl std::fmt::Debug for AuthConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            mock,
+            encoding_key: _,
+            github,
+            google,
+            near,
+            admin_emails,
+            admin_read_only_tokens_enabled,
+            require_session_bound_access_tokens,
+        } = self;
+        f.debug_struct("AuthConfig")
+            .field("mock", mock)
+            .field("encoding_key", &"<redacted>")
+            .field("github", github)
+            .field("google", google)
+            .field("near", near)
+            .field("admin_emails", admin_emails)
+            .field(
+                "admin_read_only_tokens_enabled",
+                admin_read_only_tokens_enabled,
+            )
+            .field(
+                "require_session_bound_access_tokens",
+                require_session_bound_access_tokens,
+            )
+            .finish()
+    }
 }
 
 impl AuthConfig {
@@ -1092,16 +1361,32 @@ impl AuthConfig {
             None
         };
 
-        let admin_domains = env::var("AUTH_ADMIN_DOMAINS")
+        if env::var_os("AUTH_ADMIN_DOMAINS").is_some() {
+            return Err(
+                "AUTH_ADMIN_DOMAINS is retired; remove it and configure AUTH_ADMIN_EMAILS with complete email addresses"
+                    .to_string(),
+            );
+        }
+
+        let admin_emails: Vec<String> = env::var("AUTH_ADMIN_EMAILS")
             .ok()
-            .map(|domains| {
-                domains
+            .map(|emails| {
+                emails
                     .split(',')
                     .map(|s| s.trim().to_string())
                     .filter(|s| !s.is_empty())
                     .collect()
             })
             .unwrap_or_default();
+
+        for (index, entry) in admin_emails.iter().enumerate() {
+            if admin_email_domain(entry).is_none() || entry.contains('*') {
+                return Err(format!(
+                    "AUTH_ADMIN_EMAILS entry {} is invalid; configure complete email addresses without wildcards",
+                    index + 1,
+                ));
+            }
+        }
 
         let near = NearConfig::from_env();
 
@@ -1115,7 +1400,7 @@ impl AuthConfig {
             github,
             google,
             near,
-            admin_domains,
+            admin_emails,
             admin_read_only_tokens_enabled: parse_bool_env(
                 "AUTH_ADMIN_READ_ONLY_TOKENS_ENABLED",
                 false,
@@ -1127,27 +1412,22 @@ impl AuthConfig {
         })
     }
 
-    /// Check if an email address belongs to an admin domain
+    /// Check if a complete email address is explicitly allowed admin access
     pub fn is_admin_email(&self, email: &str) -> bool {
-        email_matches_admin_domain(&self.admin_domains, email)
+        email_matches_admin_allowlist(&self.admin_emails, email)
     }
 }
 
-pub fn email_matches_admin_domain(admin_domains: &[String], email: &str) -> bool {
-    if admin_domains.is_empty() {
-        return false;
-    }
-
-    admin_email_domain(email).is_some_and(|domain| {
-        admin_domains
+pub fn email_matches_admin_allowlist(admin_emails: &[String], email: &str) -> bool {
+    admin_email_domain(email).is_some()
+        && admin_emails
             .iter()
-            .any(|admin_domain| domain.eq_ignore_ascii_case(admin_domain))
-    })
+            .any(|admin_email| email.eq_ignore_ascii_case(admin_email))
 }
 
 /// The domain of a well-formed email: exactly one `@`, a non-empty local part and a non-empty
 /// domain with no whitespace or control characters. Anything else is `None`, so an email such
-/// as `x@near.ai@vpc.internal.near.ai` can never match an admin domain.
+/// as `x@near.ai@vpc.internal.near.ai` can never pass the admin email allowlist.
 pub fn admin_email_domain(email: &str) -> Option<&str> {
     let (local_part, domain) = email.split_once('@')?;
     if local_part.is_empty()
@@ -1160,18 +1440,48 @@ pub fn admin_email_domain(email: &str) -> Option<&str> {
     Some(domain)
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct GitHubOAuthConfig {
     pub client_id: String,
     pub client_secret: String,
     pub redirect_url: String,
 }
 
-#[derive(Debug, Clone)]
+impl std::fmt::Debug for GitHubOAuthConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            client_id,
+            client_secret: _,
+            redirect_url,
+        } = self;
+        f.debug_struct("GitHubOAuthConfig")
+            .field("client_id", client_id)
+            .field("client_secret", &"<redacted>")
+            .field("redirect_url", redirect_url)
+            .finish()
+    }
+}
+
+#[derive(Clone)]
 pub struct GoogleOAuthConfig {
     pub client_id: String,
     pub client_secret: String,
     pub redirect_url: String,
+}
+
+impl std::fmt::Debug for GoogleOAuthConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            client_id,
+            client_secret: _,
+            redirect_url,
+        } = self;
+        f.debug_struct("GoogleOAuthConfig")
+            .field("client_id", client_id)
+            .field("client_secret", &"<redacted>")
+            .field("redirect_url", redirect_url)
+            .finish()
+    }
 }
 
 /// NEAR wallet authentication configuration
@@ -1209,11 +1519,26 @@ impl NearConfig {
 }
 
 // Generic OAuth provider config for unified handling
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct OAuthProviderConfig {
     pub client_id: String,
     pub client_secret: String,
     pub redirect_uri: String,
+}
+
+impl std::fmt::Debug for OAuthProviderConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            client_id,
+            client_secret: _,
+            redirect_uri,
+        } = self;
+        f.debug_struct("OAuthProviderConfig")
+            .field("client_id", client_id)
+            .field("client_secret", &"<redacted>")
+            .field("redirect_uri", redirect_uri)
+            .finish()
+    }
 }
 
 impl From<GitHubOAuthConfig> for OAuthProviderConfig {
@@ -1246,50 +1571,8 @@ impl From<ApiConfig> for DomainConfig {
     }
 }
 
-/// S3 configuration for file storage
-#[derive(Debug, Clone)]
-pub struct S3Config {
-    pub mock: bool,
-    pub bucket: String,
-    pub region: String,
-    pub encryption_key: String,
-}
-
-impl S3Config {
-    /// Load from environment variables
-    pub fn from_env() -> Result<Self, String> {
-        // Check if mock mode is enabled
-        let mock = env::var("S3_MOCK")
-            .ok()
-            .and_then(|v| v.parse::<bool>().ok())
-            .unwrap_or(false);
-
-        // Encryption key is read from a file: S3_ENCRYPTION_KEY_FILE.
-        // This file would be mounted as a secret in production deployments.
-        let encryption_key = if let Ok(path) = env::var("S3_ENCRYPTION_KEY_FILE") {
-            std::fs::read_to_string(path)
-                .map_err(|e| format!("Failed to read S3_ENCRYPTION_KEY_FILE: {e}"))?
-                .trim()
-                .to_string()
-        } else {
-            env::var("S3_ENCRYPTION_KEY").map_err(|_| {
-                "Either S3_ENCRYPTION_KEY_FILE or S3_ENCRYPTION_KEY environment variable must be set"
-                    .to_string()
-            })?
-        };
-
-        if encryption_key.is_empty() {
-            return Err("S3 encryption key cannot be empty".to_string());
-        }
-
-        Ok(Self {
-            mock,
-            bucket: env::var("AWS_S3_BUCKET").map_err(|_| "AWS_S3_BUCKET not set".to_string())?,
-            region: env::var("AWS_S3_REGION").map_err(|_| "AWS_S3_REGION not set".to_string())?,
-            encryption_key,
-        })
-    }
-}
+mod s3;
+pub use s3::S3Config;
 
 /// Smart placement. Its runtime inputs are the placement Valkey endpoint
 /// ([`PlacementEndpoint`]: host, port, TLS and CA, none of them secret) and
@@ -1438,7 +1721,7 @@ impl PlacementEndpoint {
 pub const DEFAULT_CONTACT_EMAIL_VERIFICATION_DAILY_CAP: u32 = 500;
 
 /// Email notification configuration for organization invitations.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct InvitationEmailConfig {
     pub enabled: bool,
     /// Lets NEAR wallet users add and verify a contact email. Switched on its
@@ -1451,6 +1734,35 @@ pub struct InvitationEmailConfig {
     pub reply_to: Option<String>,
     pub resend_api_key: Option<String>,
     pub frontend_base_url: Option<String>,
+}
+
+impl std::fmt::Debug for InvitationEmailConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            enabled,
+            contact_email_verification_enabled,
+            contact_email_verification_daily_cap,
+            from_email,
+            reply_to,
+            resend_api_key,
+            frontend_base_url,
+        } = self;
+        f.debug_struct("InvitationEmailConfig")
+            .field("enabled", enabled)
+            .field(
+                "contact_email_verification_enabled",
+                contact_email_verification_enabled,
+            )
+            .field(
+                "contact_email_verification_daily_cap",
+                contact_email_verification_daily_cap,
+            )
+            .field("from_email", from_email)
+            .field("reply_to", reply_to)
+            .field("resend_api_key", &redact_opt(resend_api_key))
+            .field("frontend_base_url", frontend_base_url)
+            .finish()
+    }
 }
 
 impl Default for InvitationEmailConfig {
@@ -1602,10 +1914,61 @@ fn read_optional_non_empty_file_env(
 }
 
 #[cfg(test)]
+#[path = "types/s3_tests.rs"]
+mod s3_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use serial_test::serial;
     use std::ffi::OsString;
+
+    #[test]
+    fn key_source_specs_preserve_order_and_redact_hex() {
+        let raw = format!(
+            " db-v2=dstack:/keys/v2, db-v1=file:/config/v1,db-v0=hex:{} ",
+            "AB".repeat(32)
+        );
+        let specs = parse_key_source_specs(&raw).unwrap();
+        assert_eq!(
+            specs
+                .iter()
+                .map(|spec| spec.key_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["db-v2", "db-v1", "db-v0"]
+        );
+        assert!(matches!(&specs[0].source, KeySource::Dstack(path) if path == "/keys/v2"));
+        assert!(
+            matches!(&specs[1].source, KeySource::File(path) if path == std::path::Path::new("/config/v1"))
+        );
+        assert_eq!(format!("{:?}", specs[2].source), "Hex(\"<redacted>\")");
+        assert!(!format!("{specs:?}").contains(&"AB".repeat(32)));
+    }
+
+    #[test]
+    fn key_source_specs_reject_malformed_entries_without_key_values() {
+        for raw in [
+            "",
+            " ",
+            "db-v1",
+            "=file:/key",
+            "bad id=file:/key",
+            "db-v1=unknown:/key",
+            "db-v1=file:",
+            "db-v1=dstack:",
+            "db-v1=hex:1234",
+            "db-v1=hex:zzzz",
+            "db-v1=file:/key,",
+            "db-v1=file:/one,db-v1=file:/two",
+        ] {
+            let error = parse_key_source_specs(raw).unwrap_err();
+            assert!(error.contains("entry "), "{error}");
+            assert!(!error.contains("1234") && !error.contains("zzzz"));
+        }
+        assert!(parse_key_source_specs(&format!("{}=file:/key", "a".repeat(65))).is_err());
+        let error = parse_key_source_specs("db-v2=file:/one,db-v1=hex:1234").unwrap_err();
+        assert!(error.contains("entry 1"));
+    }
 
     #[test]
     fn database_connection_mode_requires_exact_values() {
@@ -1932,6 +2295,80 @@ mod tests {
     }
 
     #[test]
+    #[serial]
+    fn admin_email_environment_has_no_domain_fallback() {
+        let keys = [
+            "AUTH_ADMIN_EMAILS",
+            "AUTH_ADMIN_DOMAINS",
+            "AUTH_ENCODING_KEY",
+        ];
+        let previous = keys.map(|key| (key, env::var_os(key)));
+
+        struct RestoreEnv([(&'static str, Option<std::ffi::OsString>); 3]);
+
+        impl Drop for RestoreEnv {
+            fn drop(&mut self) {
+                for (key, value) in &self.0 {
+                    match value {
+                        Some(value) => env::set_var(key, value),
+                        None => env::remove_var(key),
+                    }
+                }
+            }
+        }
+
+        let _restore = RestoreEnv(previous);
+        env::set_var("AUTH_ENCODING_KEY", "test-encoding-key");
+        env::set_var("AUTH_ADMIN_DOMAINS", "near.ai");
+        env::remove_var("AUTH_ADMIN_EMAILS");
+
+        let error = AuthConfig::from_env().unwrap_err();
+
+        assert!(error.contains("AUTH_ADMIN_DOMAINS is retired"));
+        assert!(error.contains("AUTH_ADMIN_EMAILS"));
+
+        // Even a populated replacement requires removal of the retired setting.
+        env::set_var("AUTH_ADMIN_EMAILS", "alice@near.ai");
+        assert!(AuthConfig::from_env().is_err());
+
+        env::set_var("AUTH_ADMIN_DOMAINS", "");
+        assert!(AuthConfig::from_env().is_err());
+
+        env::remove_var("AUTH_ADMIN_DOMAINS");
+        env::remove_var("AUTH_ADMIN_EMAILS");
+
+        let config = AuthConfig::from_env().unwrap();
+
+        assert!(config.admin_emails.is_empty());
+        assert!(!config.is_admin_email("alice@near.ai"));
+
+        env::set_var("AUTH_ADMIN_EMAILS", " , Alice@near.ai, bob@near.org, , ");
+
+        let config = AuthConfig::from_env().unwrap();
+
+        assert_eq!(config.admin_emails, ["Alice@near.ai", "bob@near.org"]);
+        assert!(config.is_admin_email("ALICE@NEAR.AI"));
+        assert!(!config.is_admin_email("other@near.ai"));
+
+        env::set_var("AUTH_ADMIN_EMAILS", " , , ");
+
+        let config = AuthConfig::from_env().unwrap();
+
+        assert!(config.admin_emails.is_empty());
+        assert!(!config.is_admin_email("alice@near.ai"));
+
+        for invalid in ["near.ai", "*@near.ai", "x y@near.ai", "x@evil.com@near.ai"] {
+            env::set_var("AUTH_ADMIN_EMAILS", format!("alice@near.ai,{invalid}"));
+
+            let error = AuthConfig::from_env().unwrap_err();
+
+            assert!(error.contains("AUTH_ADMIN_EMAILS entry 2 is invalid"));
+            assert!(!error.contains(invalid));
+            assert!(!error.contains("alice@near.ai"));
+        }
+    }
+
+    #[test]
     fn test_is_admin_email() {
         let config = AuthConfig {
             mock: false,
@@ -1939,17 +2376,17 @@ mod tests {
             github: None,
             google: None,
             near: NearConfig::default(),
-            admin_domains: vec!["near.ai".to_string(), "near.org".to_string()],
+            admin_emails: vec!["alice@near.ai".to_string(), "bob@near.org".to_string()],
             admin_read_only_tokens_enabled: false,
             require_session_bound_access_tokens: false,
         };
 
-        // Test admin domains
+        // Explicitly allowed addresses
         assert!(config.is_admin_email("alice@near.ai"));
         assert!(config.is_admin_email("bob@near.org"));
-        assert!(config.is_admin_email("admin@NEAR.AI")); // Case insensitive
+        assert!(config.is_admin_email("ALICE@NEAR.AI")); // Case insensitive
 
-        // Test non-admin domains
+        // Other addresses, including users in an allowed user's domain
         assert!(!config.is_admin_email("user@example.com"));
         assert!(!config.is_admin_email("attacker@near.ai.evil.com"));
         for email in [
@@ -1967,8 +2404,8 @@ mod tests {
         ] {
             assert!(!config.is_admin_email(email), "{email:?} must not be admin");
         }
-        assert!(config.is_admin_email("x@NEAR.AI"));
-        assert!(config.is_admin_email("x@near.ai"));
+        assert!(!config.is_admin_email("x@NEAR.AI"));
+        assert!(!config.is_admin_email("x@near.ai"));
         assert!(!config.is_admin_email("invalid-email"));
         assert!(!config.is_admin_email(""));
     }
@@ -1995,15 +2432,18 @@ mod tests {
     }
 
     #[test]
-    fn test_email_matches_admin_domain() {
-        let admin_domains = vec!["near.ai".to_string(), "near.org".to_string()];
-        for email in ["alice@near.ai", "bob@near.org", "admin@NEAR.AI"] {
+    fn test_email_matches_admin_allowlist() {
+        let admin_emails = vec!["alice@near.ai".to_string(), "bob@near.org".to_string()];
+
+        for email in ["alice@near.ai", "bob@near.org", "ALICE@NEAR.AI"] {
             assert!(
-                email_matches_admin_domain(&admin_domains, email),
+                email_matches_admin_allowlist(&admin_emails, email),
                 "{email:?}"
             );
         }
         for email in [
+            "other@near.ai",
+            "alice+other@near.ai",
             "user@example.com",
             "attacker@near.ai.evil.com",
             "x@near.ai@vpc.internal.near.ai",
@@ -2015,11 +2455,23 @@ mod tests {
             "",
         ] {
             assert!(
-                !email_matches_admin_domain(&admin_domains, email),
+                !email_matches_admin_allowlist(&admin_emails, email),
                 "{email:?}"
             );
         }
-        assert!(!email_matches_admin_domain(&[], "admin@near.ai"));
+
+        assert!(!email_matches_admin_allowlist(&[], "admin@near.ai"));
+        assert!(!email_matches_admin_allowlist(
+            &["*@near.ai".to_string()],
+            "admin@near.ai"
+        ));
+
+        for entry in ["near.ai", "x@evil.com@near.ai", "x y@near.ai"] {
+            let allowlist = vec![entry.to_string()];
+
+            assert!(!email_matches_admin_allowlist(&allowlist, "admin@near.ai"));
+            assert!(!email_matches_admin_allowlist(&allowlist, entry));
+        }
     }
 
     #[test]
@@ -2030,12 +2482,12 @@ mod tests {
             github: None,
             google: None,
             near: NearConfig::default(),
-            admin_domains: vec![],
+            admin_emails: vec![],
             admin_read_only_tokens_enabled: false,
             require_session_bound_access_tokens: false,
         };
 
-        // Should return false when no admin domains configured
+        // Should return false when no admin emails configured
         assert!(!config.is_admin_email("admin@near.ai"));
     }
 
@@ -2109,6 +2561,197 @@ mod tests {
         let debug = format!("{config:?}");
         assert!(debug.contains("<redacted>"));
         assert!(!debug.contains("grafana-secret-token"));
+    }
+
+    fn sample_database_config() -> DatabaseConfig {
+        DatabaseConfig {
+            connection_mode: DatabaseConnectionMode::Direct,
+            primary_app_id: "app".to_string(),
+            gateway_subdomain: "gateway".to_string(),
+            host: Some("db.internal".to_string()),
+            port: 5432,
+            database: "cloud".to_string(),
+            username: "cloud_user".to_string(),
+            password: "sentinel-db-password".to_string(),
+            max_connections: 4,
+            recycling_method: DatabaseRecyclingMethod::Fast,
+            tls_enabled: true,
+            tls_ca_cert_path: None,
+            refresh_interval: 30,
+            mock: false,
+        }
+    }
+
+    fn sample_auth_config() -> AuthConfig {
+        AuthConfig {
+            encoding_key: "sentinel-jwt-encoding-key".to_string(),
+            github: Some(GitHubOAuthConfig {
+                client_id: "github-client-id".to_string(),
+                client_secret: "sentinel-github-client-secret".to_string(),
+                redirect_url: "https://example.test/github".to_string(),
+            }),
+            google: Some(GoogleOAuthConfig {
+                client_id: "google-client-id".to_string(),
+                client_secret: "sentinel-google-client-secret".to_string(),
+                redirect_url: "https://example.test/google".to_string(),
+            }),
+            admin_emails: vec!["admin@example.test".to_string()],
+            ..AuthConfig::default()
+        }
+    }
+
+    #[test]
+    fn database_config_debug_redacts_password() {
+        let debug = format!("{:?}", sample_database_config());
+        assert!(!debug.contains("sentinel-db-password"));
+        assert!(debug.contains("password: \"<redacted>\""));
+        assert!(debug.contains("cloud_user"));
+        assert!(debug.contains("db.internal"));
+    }
+
+    #[test]
+    fn auth_config_debug_redacts_signing_key_and_client_secrets() {
+        let debug = format!("{:?}", sample_auth_config());
+        assert!(!debug.contains("sentinel-jwt-encoding-key"));
+        assert!(!debug.contains("sentinel-github-client-secret"));
+        assert!(!debug.contains("sentinel-google-client-secret"));
+        assert!(debug.contains("github-client-id"));
+        assert!(debug.contains("google-client-id"));
+        assert!(debug.contains("admin@example.test"));
+    }
+
+    #[test]
+    fn oauth_provider_config_debug_redacts_client_secret() {
+        let config = OAuthProviderConfig {
+            client_id: "provider-client-id".to_string(),
+            client_secret: "sentinel-provider-client-secret".to_string(),
+            redirect_uri: "https://example.test/callback".to_string(),
+        };
+        let debug = format!("{config:?}");
+        assert!(!debug.contains("sentinel-provider-client-secret"));
+        assert!(debug.contains("provider-client-id"));
+        assert!(debug.contains("https://example.test/callback"));
+    }
+
+    #[test]
+    fn github_dispatch_and_invitation_email_debug_redact_tokens() {
+        let dispatch = GitHubDispatchConfig {
+            enabled: true,
+            repo: Some("owner/repo".to_string()),
+            pat: Some("sentinel-github-pat".to_string()),
+            ..GitHubDispatchConfig::default()
+        };
+        let debug = format!("{dispatch:?}");
+        assert!(!debug.contains("sentinel-github-pat"));
+        assert!(debug.contains("owner/repo"));
+
+        let email = InvitationEmailConfig {
+            enabled: true,
+            resend_api_key: Some("sentinel-resend-key".to_string()),
+            from_email: Some("noreply@example.test".to_string()),
+            ..InvitationEmailConfig::default()
+        };
+        let debug = format!("{email:?}");
+        assert!(!debug.contains("sentinel-resend-key"));
+        assert!(debug.contains("noreply@example.test"));
+
+        let unset = format!("{:?}", GitHubDispatchConfig::default());
+        assert!(unset.contains("pat: None"));
+    }
+
+    #[test]
+    fn api_config_debug_redacts_all_secrets() {
+        let config = ApiConfig {
+            server: ServerConfig {
+                host: "127.0.0.1".to_string(),
+                port: 3000,
+                pricing_change_apply_interval_secs: 60,
+                usage_hourly_interval_secs: 3600,
+                ohttp_enabled: false,
+            },
+            inference_api_key: Some("sentinel-inference-api-key".to_string()),
+            internal_usage_token: Some("sentinel-internal-usage-token".to_string()),
+            internal_usage_max_discount: DEFAULT_INTERNAL_USAGE_MAX_DISCOUNT,
+            logging: LoggingConfig::default(),
+            dstack_client: DstackClientConfig {
+                url: "http://localhost:8000".to_string(),
+            },
+            auth: sample_auth_config(),
+            database: sample_database_config(),
+            database_encryption_key: "sentinel-database-encryption-key".to_string(),
+            database_encryption_keys: None,
+            database_encryption_key_id: "db-key-1".to_string(),
+            database_encryption_write_enabled: false,
+            s3: S3Config {
+                mock: true,
+                bucket: "bucket".to_string(),
+                region: "us-west-2".to_string(),
+                encryption_key: "sentinel-s3-encryption-key".to_string(),
+                encryption_keys: None,
+                object_rewrap_max_bytes: 1024,
+                object_encryption_write_enabled: false,
+            },
+            invitation_email: InvitationEmailConfig {
+                resend_api_key: Some("sentinel-resend-key".to_string()),
+                ..InvitationEmailConfig::default()
+            },
+            otlp: OtlpConfig {
+                endpoint: "http://localhost:4317".to_string(),
+                protocol: "grpc".to_string(),
+                instance_id: None,
+            },
+            cors: CorsConfig {
+                exact_matches: Vec::new(),
+                wildcard_suffixes: Vec::new(),
+            },
+            external_providers: ExternalProvidersConfig {
+                openai_api_key: Some("sentinel-openai-key".to_string()),
+                ..ExternalProvidersConfig::default()
+            },
+            github_dispatch: GitHubDispatchConfig {
+                pat: Some("sentinel-github-pat".to_string()),
+                ..GitHubDispatchConfig::default()
+            },
+            infra: InfraConfig {
+                prometheus_bearer_token: Some("sentinel-prometheus-token".to_string()),
+                ..InfraConfig::default()
+            },
+            staking_farm: StakingFarmConfig::default(),
+            aml: AmlConfig {
+                lukka_bearer_token: Some("sentinel-lukka-token".to_string()),
+                ..AmlConfig::default()
+            },
+            usage_reporting: UsageReportingConfig::default(),
+            credit_allocation: CreditAllocationConfig::default(),
+            ita: ItaAttestationConfig::default(),
+            placement: PlacementConfig {
+                redis_password: Some("sentinel-redis-password".to_string()),
+                ..PlacementConfig::default()
+            },
+        };
+
+        let debug = format!("{config:?}");
+        for secret in [
+            "sentinel-inference-api-key",
+            "sentinel-internal-usage-token",
+            "sentinel-jwt-encoding-key",
+            "sentinel-github-client-secret",
+            "sentinel-google-client-secret",
+            "sentinel-db-password",
+            "sentinel-database-encryption-key",
+            "sentinel-s3-encryption-key",
+            "sentinel-resend-key",
+            "sentinel-openai-key",
+            "sentinel-github-pat",
+            "sentinel-prometheus-token",
+            "sentinel-lukka-token",
+            "sentinel-redis-password",
+        ] {
+            assert!(!debug.contains(secret), "Debug output leaked {secret}");
+        }
+        assert!(debug.contains("db-key-1"));
+        assert!(debug.contains("cloud_user"));
+        assert!(debug.contains("github-client-id"));
     }
 
     #[test]

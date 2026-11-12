@@ -16,7 +16,7 @@ tokio-postgres = { version = "0.7.18", features = ["with-chrono-0_4", "with-uuid
 # Documentation: https://docs.rs/deadpool-postgres/latest/deadpool_postgres/
 # Crate: https://crates.io/crates/deadpool-postgres
 deadpool-postgres = { version = "0.14", features = ["rt_tokio_1"] }
-deadpool = "0.12"
+deadpool = "0.13"
 
 # TLS support for PostgreSQL connections (required for remote databases like DigitalOcean)
 # Documentation: https://docs.rs/tokio-postgres-rustls/latest/tokio_postgres_rustls/
@@ -48,8 +48,9 @@ config = { path = "../config" }
 # For hashing API keys and session tokens
 sha2 = "0.11"
 hex = "0.4"
-aes-gcm = "0.10"
-base64 = "0.22"
+aes-gcm = "0.11"
+base64 = "0.23"
+zeroize = { version = "1.8.2", features = ["derive"] }
 rand = "0.10.1"
 
 # For User-Agent normalization

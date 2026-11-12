@@ -42,10 +42,9 @@ impl PgResponseRepository {
         value: Option<String>,
     ) -> Result<Option<String>> {
         value
-            .map(|value| match self.pool.encryption_context() {
-                Some((key, key_id)) => crate::field_encryption::decrypt_if_encrypted_with_key_id(
-                    &key,
-                    &key_id,
+            .map(|value| match self.pool.encryption_ring() {
+                Some(ring) => crate::field_encryption::decrypt_if_encrypted_with_ring(
+                    &ring,
                     "responses",
                     column,
                     id,
@@ -76,17 +75,14 @@ impl PgResponseRepository {
         value: Option<serde_json::Value>,
     ) -> Result<Option<serde_json::Value>> {
         value
-            .map(|value| match self.pool.encryption_context() {
-                Some((key, key_id)) => {
-                    crate::field_encryption::decrypt_json_if_encrypted_with_key_id(
-                        &key,
-                        &key_id,
-                        "responses",
-                        "metadata",
-                        id,
-                        value,
-                    )
-                }
+            .map(|value| match self.pool.encryption_ring() {
+                Some(ring) => crate::field_encryption::decrypt_json_if_encrypted_with_ring(
+                    &ring,
+                    "responses",
+                    "metadata",
+                    id,
+                    value,
+                ),
                 None => Ok(value),
             })
             .transpose()
@@ -1002,5 +998,48 @@ impl ResponseRepositoryTrait for PgResponseRepository {
             .get_or_create_root(conversation_id.0, &workspace_id, &api_key_id)
             .await?;
         Ok(format!("resp_{}", root_uuid.simple()))
+    }
+}
+
+#[cfg(test)]
+mod key_rotation_tests {
+    use super::*;
+    use crate::field_encryption::{encrypt_json_with_key_id, encrypt_with_key_id, KeyRing};
+    use serde_json::json;
+
+    #[test]
+    fn previous_key_reads_and_current_key_writes() {
+        let pool = DbPool::uninitialized();
+        pool.set_encryption_ring(
+            KeyRing::new("db-v2".into(), [9; 32], vec![("db-v1".into(), [7; 32])]).unwrap(),
+        );
+        pool.set_encryption_write_enabled(true);
+        let repository = PgResponseRepository::new(pool);
+        let id = Uuid::new_v4();
+        let text = encrypt_with_key_id(
+            &[7; 32],
+            "db-v1",
+            "responses",
+            "instructions",
+            id,
+            "previous",
+        )
+        .unwrap();
+        assert_eq!(
+            repository
+                .decrypt_text(id, "instructions", Some(text))
+                .unwrap(),
+            Some("previous".into())
+        );
+        let metadata = json!({"nested": [1, 2]});
+        let encrypted =
+            encrypt_json_with_key_id(&[7; 32], "db-v1", "responses", "metadata", id, &metadata)
+                .unwrap();
+        assert_eq!(
+            repository.decrypt_metadata(id, Some(encrypted)).unwrap(),
+            Some(metadata.clone())
+        );
+        let current = repository.encrypt_metadata(id, &metadata).unwrap();
+        assert_eq!(current["key_id"], "db-v2");
     }
 }

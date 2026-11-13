@@ -55,15 +55,15 @@ impl ModelAttestationCollector for ProviderPoolModelAttestationCollector {
         input: ModelAttestationInput,
     ) -> Result<Vec<serde_json::Map<String, serde_json::Value>>, AttestationError> {
         self.inference_provider_pool
-            .get_attestation_report(
+            .get_single_attestation_report(
                 input.model,
                 input.signing_algo,
                 input.nonce,
                 input.signing_address,
                 input.include_tls_fingerprint,
-                None,
             )
             .await
+            .map(|report| vec![report])
             .map_err(|e| AttestationError::ProviderError(e.to_string()))
     }
 }

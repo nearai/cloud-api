@@ -137,8 +137,9 @@ pub struct AuthenticatedApiKey {
 }
 
 impl AuthenticatedApiKey {
-    /// The owner recorded with every signature this key creates, and the only
-    /// owner whose signatures this key can read.
+    /// The owner recorded with every signature this key creates. Signature
+    /// reads are not limited to it; it only scopes the `STREAM_DISCONNECTED`
+    /// check when no signature is stored.
     pub fn signature_owner(&self) -> services::attestation::SignatureOwner {
         services::attestation::SignatureOwner {
             organization_id: self.organization.id.0,

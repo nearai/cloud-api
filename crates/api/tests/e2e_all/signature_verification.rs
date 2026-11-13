@@ -790,7 +790,7 @@ async fn test_non_attested_chat_gateway_signature_hashes_exact_json() {
 }
 
 #[tokio::test]
-async fn test_signature_is_visible_only_to_the_creating_workspace() {
+async fn test_signature_is_verifiable_from_another_workspace() {
     let (server, _router, pool, _mock, _database) = setup_test_server_with_pool_and_router().await;
     let (model_name, _mock) = setup_non_attested_signature_model(&server, &pool).await;
     let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
@@ -820,17 +820,16 @@ async fn test_signature_is_visible_only_to_the_creating_workspace() {
     // The creating key reads it.
     assert_gateway_signatures(&server, &api_key, chat_id, &request_json, &response_text).await;
 
-    // A valid key of another organization gets the same answer as an unknown id.
-    for algorithm in ["ecdsa", "ed25519"] {
-        let response = server
-            .get(format!("/v1/signature/{chat_id}?signing_algo={algorithm}").as_str())
-            .add_header("Authorization", format!("Bearer {other_api_key}"))
-            .await;
-        assert_eq!(response.status_code(), 404, "{algorithm}");
-        let body = response.json::<serde_json::Value>();
-        assert!(body.get("signature").is_none());
-        assert!(body.get("text").is_none());
-    }
+    // A valid key of another organization reads the same signatures, so a
+    // third party can verify the response.
+    assert_gateway_signatures(
+        &server,
+        &other_api_key,
+        chat_id,
+        &request_json,
+        &response_text,
+    )
+    .await;
 }
 
 #[tokio::test]

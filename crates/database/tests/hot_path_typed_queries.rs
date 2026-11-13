@@ -293,9 +293,7 @@ async fn typed_hot_path_queries_repeat_on_one_pool() -> anyhow::Result<()> {
                 signature("ecdsa", text, Some(SignatureKind::Gateway)),
             )
             .await?;
-        let stored = attestation
-            .get_chat_signature(owner, &chat_id, "ecdsa")
-            .await?;
+        let stored = attestation.get_chat_signature(&chat_id, "ecdsa").await?;
         assert_eq!(stored.text, text);
         assert_eq!(stored.signature_kind, Some(SignatureKind::Gateway));
     }
@@ -315,9 +313,7 @@ async fn typed_hot_path_queries_repeat_on_one_pool() -> anyhow::Result<()> {
             ("ecdsa", Some(SignatureKind::ProviderTee)),
             ("ed25519", None),
         ] {
-            let stored = attestation
-                .get_chat_signature(owner, &batch_chat_id, algo)
-                .await?;
+            let stored = attestation.get_chat_signature(&batch_chat_id, algo).await?;
             assert_eq!(stored.text, text);
             assert_eq!(stored.signature_kind, kind);
         }
@@ -326,10 +322,11 @@ async fn typed_hot_path_queries_repeat_on_one_pool() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Needs the `chat_signatures.organization_id` / `workspace_id` columns, so it
-/// runs only once the pinned cloud-platform schema includes them.
+/// Needs nullable `organization_id` and `workspace_id` UUID columns on
+/// `chat_signatures`; test schema setup adds them if the pinned schema lacks them.
+/// Writes are owner-guarded; reads are global so any caller can verify.
 #[tokio::test]
-async fn chat_signatures_are_scoped_to_their_owner() -> anyhow::Result<()> {
+async fn chat_signatures_record_their_owner_and_read_globally() -> anyhow::Result<()> {
     let pool = test_pool().await?;
     let attestation = PgAttestationRepository::new(pool.clone());
     let suffix = Uuid::new_v4().simple().to_string();
@@ -340,13 +337,6 @@ async fn chat_signatures_are_scoped_to_their_owner() -> anyhow::Result<()> {
     let other_org = SignatureOwner {
         organization_id: Uuid::new_v4(),
         workspace_id: Uuid::new_v4(),
-    };
-    let other_workspace = SignatureOwner {
-        workspace_id: Uuid::new_v4(),
-        ..owner
-    };
-    let not_found = |result: Result<ChatSignature, AttestationError>| {
-        matches!(result, Err(AttestationError::SignatureNotFound(_)))
     };
 
     // The inserted row carries the writing owner.
@@ -380,20 +370,16 @@ async fn chat_signatures_are_scoped_to_their_owner() -> anyhow::Result<()> {
         ]
     );
 
-    // The owner reads it; another organization or workspace does not.
-    let mine = attestation
-        .get_chat_signature(owner, &chat_id, "ecdsa")
-        .await?;
-    assert_eq!(mine.text, "mine");
-    assert!(not_found(
+    // The read is not filtered by owner.
+    for algo in ["ecdsa", "ed25519"] {
+        let stored = attestation.get_chat_signature(&chat_id, algo).await?;
+        assert_eq!(stored.text, "mine");
+    }
+    assert!(matches!(
         attestation
-            .get_chat_signature(other_org, &chat_id, "ecdsa")
-            .await
-    ));
-    assert!(not_found(
-        attestation
-            .get_chat_signature(other_workspace, &chat_id, "ecdsa")
-            .await
+            .get_chat_signature(&format!("chatcmpl-missing-{suffix}"), "ecdsa")
+            .await,
+        Err(AttestationError::SignatureNotFound(_))
     ));
 
     // Another owner writing the same id fails and changes nothing.
@@ -405,18 +391,11 @@ async fn chat_signatures_are_scoped_to_their_owner() -> anyhow::Result<()> {
         )
         .await;
     assert!(matches!(conflict, Err(AttestationError::OwnerConflict)));
-    let still_mine = attestation
-        .get_chat_signature(owner, &chat_id, "ecdsa")
-        .await?;
+    let still_mine = attestation.get_chat_signature(&chat_id, "ecdsa").await?;
     assert_eq!(still_mine.text, "mine");
-    assert!(not_found(
-        attestation
-            .get_chat_signature(other_org, &chat_id, "ecdsa")
-            .await
-    ));
 
-    // A row stored before owners were recorded is visible to nobody and
-    // cannot be claimed by a later write.
+    // A row stored before owners were recorded is readable and cannot be
+    // claimed by a later write.
     let legacy_id = format!("chatcmpl-legacy-{suffix}");
     pool.get()
         .await?
@@ -425,11 +404,8 @@ async fn chat_signatures_are_scoped_to_their_owner() -> anyhow::Result<()> {
             &[&legacy_id],
         )
         .await?;
-    assert!(not_found(
-        attestation
-            .get_chat_signature(owner, &legacy_id, "ecdsa")
-            .await
-    ));
+    let legacy = attestation.get_chat_signature(&legacy_id, "ecdsa").await?;
+    assert_eq!(legacy.text, "legacy");
     let claim = attestation
         .add_chat_signature(
             owner,

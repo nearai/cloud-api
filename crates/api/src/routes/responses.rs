@@ -13,6 +13,13 @@ use axum::{
 use bytes::Bytes;
 use futures::stream::StreamExt;
 use services::attestation::{ports::AttestationServiceTrait, SignatureOwner};
+use services::metrics::{
+    consts::{
+        get_environment, METRIC_RESPONSES_USAGE_CONFIRMATION,
+        METRIC_RESPONSES_USAGE_CONFIRMATION_DURATION, TAG_ENVIRONMENT, TAG_REASON, TAG_RESULT,
+    },
+    MetricsServiceTrait,
+};
 use services::responses::billing::ResponseBilling;
 use services::responses::client_tools::{
     contains_mcp_tool, normalize_request, ClientToolAdapter, MCP_TOOLS_UNSUPPORTED,
@@ -351,6 +358,7 @@ pub struct ResponseRouteState {
     /// Its stored material is a response ID plus signatures over
     /// request/response digests, never raw response or item records.
     pub attestation_service: Arc<dyn AttestationServiceTrait>,
+    pub metrics_service: Arc<dyn MetricsServiceTrait>,
 }
 
 /// Request-local state used to sign the exact SSE bytes returned to a client.
@@ -508,13 +516,38 @@ struct UsageConfirmation {
     usage_service: Arc<dyn UsageServiceTrait + Send + Sync>,
     organization_id: Uuid,
     billing: ResponseBilling,
+    metrics_service: Arc<dyn MetricsServiceTrait>,
 }
 
 impl UsageConfirmation {
-    /// Return the billed inference IDs once each has a usage row. Rows are
-    /// written when each round's provider stream ends, so the lookup is
-    /// repeated with backoff until a bounded deadline.
+    /// Return the billed inference IDs once each has a usage row, and record
+    /// the outcome and time taken. Tags are constants and the environment only.
     async fn confirm(&self) -> Result<Vec<Uuid>, UsageNotConfirmed> {
+        let started = tokio::time::Instant::now();
+        let outcome = self.poll_usage_rows().await;
+        let mut tags = vec![format!("{TAG_ENVIRONMENT}:{}", get_environment())];
+        match &outcome {
+            Ok(_) => tags.push(format!("{TAG_RESULT}:confirmed")),
+            Err(failure_kind) => {
+                tags.push(format!("{TAG_RESULT}:failed"));
+                tags.push(format!("{TAG_REASON}:{failure_kind}"));
+            }
+        }
+        let tags: Vec<&str> = tags.iter().map(String::as_str).collect();
+        self.metrics_service
+            .record_count(METRIC_RESPONSES_USAGE_CONFIRMATION, 1, &tags);
+        self.metrics_service.record_latency(
+            METRIC_RESPONSES_USAGE_CONFIRMATION_DURATION,
+            started.elapsed(),
+            &tags,
+        );
+        outcome.map_err(|_| UsageNotConfirmed)
+    }
+
+    /// Rows are written when each round's provider stream ends, so the lookup
+    /// is repeated with backoff until a bounded deadline. A failure returns
+    /// its constant failure kind.
+    async fn poll_usage_rows(&self) -> Result<Vec<Uuid>, &'static str> {
         let organization_id = self.organization_id;
         let Ok(inference_ids) = self.billing.billed_inference_ids() else {
             tracing::error!(
@@ -522,7 +555,7 @@ impl UsageConfirmation {
                 failure_kind = "unreported_usage",
                 "Responses usage was not confirmed"
             );
-            return Err(UsageNotConfirmed);
+            return Err("unreported_usage");
         };
         let deadline = tokio::time::Instant::now() + RESPONSE_USAGE_CONFIRM_TIMEOUT;
         let mut delay = RESPONSE_USAGE_CONFIRM_FIRST_DELAY;
@@ -562,7 +595,7 @@ impl UsageConfirmation {
             failure_kind,
             "Responses usage was not confirmed"
         );
-        Err(UsageNotConfirmed)
+        Err(failure_kind)
     }
 }
 
@@ -1175,6 +1208,7 @@ async fn create_legacy_response(
                         usage_service: state.native_service.usage_service.clone(),
                         organization_id: api_key.organization.id.0,
                         billing,
+                        metrics_service: state.metrics_service.clone(),
                     }),
                 );
 
@@ -1250,6 +1284,7 @@ async fn create_legacy_response(
                         usage_service: state.native_service.usage_service.clone(),
                         organization_id: api_key.organization.id.0,
                         billing,
+                        metrics_service: state.metrics_service.clone(),
                     },
                 )
                 .await
@@ -1276,6 +1311,7 @@ mod tests {
         ita::{ItaTokenQuery, ItaTokenResponse},
         AttestationError, SignatureLookupResult,
     };
+    use services::metrics::capturing::{CapturingMetricsService, MetricValue};
     use std::sync::Mutex;
 
     #[test]
@@ -1961,11 +1997,46 @@ mod tests {
         organization_id: Uuid,
         billing: ResponseBilling,
     ) -> UsageConfirmation {
-        UsageConfirmation {
+        confirmation_with_metrics(usage_service, organization_id, billing).0
+    }
+
+    fn confirmation_with_metrics(
+        usage_service: Arc<CostLookupUsageService>,
+        organization_id: Uuid,
+        billing: ResponseBilling,
+    ) -> (UsageConfirmation, Arc<CapturingMetricsService>) {
+        let metrics = Arc::new(CapturingMetricsService::new());
+        let confirmation = UsageConfirmation {
             usage_service,
             organization_id,
             billing,
-        }
+            metrics_service: metrics.clone(),
+        };
+        (confirmation, metrics)
+    }
+
+    /// The tags of the confirmation counter and latency, which must match.
+    fn confirmation_metric_tags(metrics: &CapturingMetricsService) -> Vec<String> {
+        let recorded = metrics.get_metrics();
+        assert_eq!(recorded.len(), 2, "one counter and one latency");
+        let counter = recorded
+            .iter()
+            .find(|metric| metric.name == METRIC_RESPONSES_USAGE_CONFIRMATION)
+            .expect("confirmation counter");
+        assert!(matches!(counter.value, MetricValue::Count(1)));
+        let latency = recorded
+            .iter()
+            .find(|metric| metric.name == METRIC_RESPONSES_USAGE_CONFIRMATION_DURATION)
+            .expect("confirmation latency");
+        assert!(matches!(latency.value, MetricValue::Latency(_)));
+        assert_eq!(counter.tags, latency.tags);
+        let mut tags = counter.tags.clone();
+        tags.sort();
+        tags
+    }
+
+    fn environment_tag() -> String {
+        format!("{TAG_ENVIRONMENT}:{}", get_environment())
     }
 
     #[tokio::test(start_paused = true)]
@@ -1980,6 +2051,8 @@ mod tests {
         let attestation = RecordingAttestationService::default();
         let mut response = sample_response("resp_billed");
         response.usage = Usage::new(120, 26);
+        let (confirmation, metrics) =
+            confirmation_with_metrics(usage.clone(), organization_id, two_round_billing());
 
         let http_response = billed_non_streaming_response(
             response,
@@ -1987,11 +2060,14 @@ mod tests {
             &attestation,
             test_owner(),
             "request-digest".to_string(),
-            &confirmation(usage.clone(), organization_id, two_round_billing()),
+            &confirmation,
         )
         .await;
 
         assert_eq!(http_response.status(), StatusCode::OK);
+        let mut expected = vec![environment_tag(), format!("{TAG_RESULT}:confirmed")];
+        expected.sort();
+        assert_eq!(confirmation_metric_tags(&metrics), expected);
         assert_eq!(
             http_response.headers()[HEADER_INFERENCE_ID],
             ids[0].to_string().as_str()
@@ -2023,6 +2099,8 @@ mod tests {
         let usage =
             CostLookupUsageService::with_rows(vec![inference_id("chatcmpl-answer-round")], 0);
         let attestation = RecordingAttestationService::default();
+        let (confirmation, metrics) =
+            confirmation_with_metrics(usage.clone(), Uuid::new_v4(), two_round_billing());
 
         let started = tokio::time::Instant::now();
         let http_response = billed_non_streaming_response(
@@ -2031,11 +2109,18 @@ mod tests {
             &attestation,
             test_owner(),
             "request-digest".to_string(),
-            &confirmation(usage.clone(), Uuid::new_v4(), two_round_billing()),
+            &confirmation,
         )
         .await;
 
         assert_eq!(http_response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let mut expected = vec![
+            environment_tag(),
+            format!("{TAG_RESULT}:failed"),
+            format!("{TAG_REASON}:missing_rows"),
+        ];
+        expected.sort();
+        assert_eq!(confirmation_metric_tags(&metrics), expected);
         assert!(http_response.headers().get(HEADER_INFERENCE_ID).is_none());
         assert!(started.elapsed() <= RESPONSE_USAGE_CONFIRM_TIMEOUT);
         assert!(usage.lookups().len() > 1, "the lookup must be retried");
@@ -2055,6 +2140,8 @@ mod tests {
         billing.record_provider_id("chatcmpl-no-usage");
         let usage = CostLookupUsageService::with_rows(vec![inference_id("chatcmpl-no-usage")], 0);
         let attestation = RecordingAttestationService::default();
+        let (confirmation, metrics) =
+            confirmation_with_metrics(usage.clone(), Uuid::new_v4(), billing);
 
         let http_response = billed_non_streaming_response(
             sample_response("resp_no_usage"),
@@ -2062,11 +2149,18 @@ mod tests {
             &attestation,
             test_owner(),
             "request-digest".to_string(),
-            &confirmation(usage.clone(), Uuid::new_v4(), billing),
+            &confirmation,
         )
         .await;
 
         assert_eq!(http_response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let mut expected = vec![
+            environment_tag(),
+            format!("{TAG_RESULT}:failed"),
+            format!("{TAG_REASON}:unreported_usage"),
+        ];
+        expected.sort();
+        assert_eq!(confirmation_metric_tags(&metrics), expected);
         assert!(usage.lookups().is_empty());
         assert!(attestation.stored_response_signatures().is_empty());
     }

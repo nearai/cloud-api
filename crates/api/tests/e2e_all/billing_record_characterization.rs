@@ -200,6 +200,23 @@ struct Fixture {
 /// that many `record_usage` failures. `extra_models` are registered with the
 /// mock provider (per-test model names).
 async fn fixture(fail_next: usize, extra_models: &[&str]) -> Fixture {
+    let providers: Vec<_> = extra_models
+        .iter()
+        .map(|model| {
+            (
+                *model,
+                Arc::new(inference_providers::mock::MockProvider::new_accept_all()),
+            )
+        })
+        .collect();
+    fixture_with_providers(fail_next, &providers).await
+}
+
+/// [`fixture`] with each test-owned model served by the given mock provider.
+async fn fixture_with_providers(
+    fail_next: usize,
+    providers: &[(&str, Arc<inference_providers::mock::MockProvider>)],
+) -> Fixture {
     let mut recorder = None;
     let (server, _db) = setup_test_server_with_domain_services(|services, _db| {
         let wrapped = Arc::new(RecordingUsageService {
@@ -212,9 +229,9 @@ async fn fixture(fail_next: usize, extra_models: &[&str]) -> Fixture {
     })
     .await;
     let (recorder, pool) = recorder.expect("domain services mutator should run");
-    for model in extra_models {
+    for (model, provider) in providers {
         let provider: Arc<dyn inference_providers::InferenceProvider + Send + Sync> =
-            Arc::new(inference_providers::mock::MockProvider::new_accept_all());
+            provider.clone();
         pool.register_provider(model.to_string(), provider).await;
     }
     let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
@@ -341,6 +358,11 @@ async fn post_image_edit(f: &Fixture) -> axum_test::TestResponse {
 }
 
 async fn post_audio(f: &Fixture, model: &str) -> axum_test::TestResponse {
+    // 100 KB → mock duration 10.0s
+    post_audio_file(f, model, vec![0u8; 100 * 1024]).await
+}
+
+async fn post_audio_file(f: &Fixture, model: &str, file: Vec<u8>) -> axum_test::TestResponse {
     f.server
         .post("/v1/audio/transcriptions")
         .add_header("Authorization", format!("Bearer {}", f.api_key))
@@ -349,8 +371,7 @@ async fn post_audio(f: &Fixture, model: &str) -> axum_test::TestResponse {
             axum_test::multipart::MultipartForm::new()
                 .add_part(
                     "file",
-                    // 100 KB → mock duration 10.0s
-                    axum_test::multipart::Part::bytes(vec![0u8; 100 * 1024])
+                    axum_test::multipart::Part::bytes(file)
                         .file_name("test.mp3")
                         .mime_type("audio/mpeg"),
                 )
@@ -614,6 +635,69 @@ async fn embeddings_fails_closed_on_record_failure() {
     .await;
     assert_eq!(response.status_code(), 500, "{}", response.text());
     f.recorder.wait_for(1).await;
+}
+
+// ---------------------------------------------------------------- zero units
+
+/// A completed provider response that reports no billable units is a 502
+/// with no billing identifier, and nothing is recorded.
+async fn assert_zero_units_rejected(f: &Fixture, response: &axum_test::TestResponse) {
+    assert_eq!(response.status_code(), 502);
+    let body: serde_json::Value = response.json();
+    assert_eq!(body["error"]["type"], "server_error");
+    // The message ties the 502 to the zero-unit rule, not a provider error.
+    assert_eq!(
+        body["error"]["message"],
+        "Provider did not return billable usage"
+    );
+    assert!(
+        response.maybe_header("Inference-Id").is_none(),
+        "a response without billable usage must not advertise a billing ID"
+    );
+    f.recorder.wait_for(0).await;
+}
+
+/// Serve `model` from a mock whose embeddings and rerank report zero usage.
+async fn zero_usage_fixture(model: &str) -> Fixture {
+    let provider = Arc::new(inference_providers::mock::MockProvider::new_accept_all());
+    provider.set_report_zero_usage(true).await;
+    fixture_with_providers(0, &[(model, provider)]).await
+}
+
+#[tokio::test]
+async fn embeddings_with_zero_reported_tokens_is_not_a_success() {
+    let model = format!("billing-char/Embedding-{}", Uuid::new_v4());
+    let f = zero_usage_fixture(&model).await;
+    create_embedding_model(&f, &model).await;
+    let response = post_json(
+        &f,
+        "/v1/embeddings",
+        serde_json::json!({"model": model, "input": "Hello world"}),
+    )
+    .await;
+    assert_zero_units_rejected(&f, &response).await;
+}
+
+#[tokio::test]
+async fn rerank_with_zero_reported_tokens_is_not_a_success() {
+    let model = format!("billing-char/Reranker-{}", Uuid::new_v4());
+    let f = zero_usage_fixture(&model).await;
+    create_input_billed_model(&f, &model, "Billing characterization rerank", 32768, false).await;
+    let mut body = rerank_body();
+    body["model"] = serde_json::json!(model);
+    let response = post_json(&f, "/v1/rerank", body).await;
+    assert_zero_units_rejected(&f, &response).await;
+}
+
+#[tokio::test]
+async fn audio_with_zero_reported_duration_is_not_a_success() {
+    let model = format!("billing-char/Whisper-{}", Uuid::new_v4());
+    let f = fixture(0, &[&model]).await;
+    create_audio_model(&f, &model).await;
+    // MockProvider reports duration as whole KB * 0.1 s, so a file under
+    // 1 KB reports a zero duration.
+    let response = post_audio_file(&f, &model, vec![0u8; 512]).await;
+    assert_zero_units_rejected(&f, &response).await;
 }
 
 // ---------------------------------------------------------------- score

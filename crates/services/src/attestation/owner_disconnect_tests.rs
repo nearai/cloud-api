@@ -1,7 +1,9 @@
+//! A stored signature is returned to any caller, whichever workspace stored it.
 //! A missing signature is reported as `STREAM_DISCONNECTED` only when the
-//! caller's own usage row for that id ended with a client disconnect. The
-//! usage fake answers `ClientDisconnect` from every global stop-reason lookup,
-//! so a lookup that ignores the owner makes these tests fail.
+//! caller's own usage row for that id ended with a client disconnect; another
+//! workspace's disconnect is not found. The usage fake answers
+//! `ClientDisconnect` from every global stop-reason lookup, so a lookup that
+//! ignores the owner makes these tests fail.
 
 use std::sync::{Arc, Mutex};
 
@@ -102,20 +104,6 @@ impl UsageRepository for OwnerUsageRepository {
         _inference_ids: Vec<Uuid>,
     ) -> anyhow::Result<Vec<InferenceCost>> {
         Ok(Vec::new())
-    }
-
-    async fn get_stop_reason_by_response_id(
-        &self,
-        _response_id: Uuid,
-    ) -> anyhow::Result<Option<StopReason>> {
-        Ok(Some(StopReason::ClientDisconnect))
-    }
-
-    async fn get_stop_reason_by_provider_request_id(
-        &self,
-        _provider_request_id: &str,
-    ) -> anyhow::Result<Option<StopReason>> {
-        Ok(Some(StopReason::ClientDisconnect))
     }
 
     async fn has_client_disconnect_usage(
@@ -289,7 +277,7 @@ async fn usage_lookup_failure_is_not_found() {
 }
 
 #[tokio::test]
-async fn legacy_unowned_signature_with_another_owners_disconnect_is_not_found() {
+async fn legacy_unowned_signature_is_found_despite_another_owners_disconnect() {
     let chat_id = "chatcmpl-legacy-disconnect";
     let signatures = RecordingRepository::default();
     signatures.insert_legacy(
@@ -303,9 +291,44 @@ async fn legacy_unowned_signature_with_another_owners_disconnect_is_not_found() 
         },
     );
     let usage = OwnerUsageRepository::with_row(other_org(), chat_id, StopReason::ClientDisconnect);
-    let service = service(signatures, usage);
+    let service = service(signatures, usage.clone());
 
-    assert_not_found(service.get_chat_signature(owner(), chat_id, None).await);
+    match service.get_chat_signature(owner(), chat_id, None).await {
+        Ok(SignatureLookupResult::Found(signature)) => {
+            assert_eq!(signature.signature, "0xlegacy");
+        }
+        other => panic!("expected the legacy signature, got {other:?}"),
+    }
+    assert!(
+        usage.calls().is_empty(),
+        "usage is checked only after a miss"
+    );
+}
+
+#[tokio::test]
+async fn another_workspaces_signature_is_found_without_a_disconnect_check() {
+    let chat_id = "chatcmpl-cross-workspace-signed";
+    // The writer's own stream also has a disconnect row; neither caller
+    // should see it, because a signature is stored.
+    let usage = OwnerUsageRepository::with_row(owner(), chat_id, StopReason::ClientDisconnect);
+    let service = service(RecordingRepository::default(), usage.clone());
+    service
+        .store_chat_signature(owner(), chat_id, "req".to_string(), "resp".to_string())
+        .await
+        .expect("gateway signature stored");
+
+    for caller in [other_org(), sibling_workspace()] {
+        match service.get_chat_signature(caller, chat_id, None).await {
+            Ok(SignatureLookupResult::Found(signature)) => {
+                assert_eq!(signature.signature_kind, Some(SignatureKind::Gateway));
+            }
+            other => panic!("expected the stored signature, got {other:?}"),
+        }
+    }
+    assert!(
+        usage.calls().is_empty(),
+        "usage is checked only after a miss"
+    );
 }
 
 #[tokio::test]

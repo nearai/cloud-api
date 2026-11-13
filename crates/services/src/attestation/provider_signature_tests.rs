@@ -304,13 +304,10 @@ impl AttestationRepository for DelayedRepository {
     }
     async fn get_chat_signature(
         &self,
-        owner: SignatureOwner,
         chat_id: &str,
         signing_algo: &str,
     ) -> Result<ChatSignature, AttestationError> {
-        self.0
-            .get_chat_signature(owner, chat_id, signing_algo)
-            .await
+        self.0.get_chat_signature(chat_id, signing_algo).await
     }
 }
 

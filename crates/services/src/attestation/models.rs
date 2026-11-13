@@ -122,10 +122,12 @@ impl SignatureKind {
 /// The organization and workspace of the API key that created a signature.
 ///
 /// Taken only from the authenticated API key, never from request content.
-/// Every signature write stores it and every read is restricted to it, so a
-/// signature is visible only to the workspace that produced it. Rows stored
-/// before the owner was recorded have no owner and match no lookup. It is
-/// kept separate from [`ChatSignature`], which is returned to customers.
+/// Every signature write stores it, and only that owner may replace a stored
+/// signature. Reads are not restricted to it: any API key can verify a stored
+/// signature, including rows stored before the owner was recorded. On a read,
+/// the caller's owner only scopes the `STREAM_DISCONNECTED` check for a
+/// missing signature. It is kept separate from [`ChatSignature`], which is
+/// returned to customers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SignatureOwner {
     pub organization_id: uuid::Uuid,

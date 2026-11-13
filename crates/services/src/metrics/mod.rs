@@ -93,6 +93,9 @@ impl MetricsServiceTrait for OtlpMetricsService {
                     "Time to create and store gateway signatures"
                 }
                 consts::METRIC_HTTP_DURATION => "HTTP request processing time",
+                consts::METRIC_RESPONSES_USAGE_CONFIRMATION_DURATION => {
+                    "Time spent confirming Responses usage rows"
+                }
                 _ => "Latency measurement",
             };
 
@@ -130,6 +133,9 @@ impl MetricsServiceTrait for OtlpMetricsService {
                 }
                 consts::METRIC_ATTESTATION_REPORT_CACHE => {
                     "Attestation-report cache outcomes by result (hit|miss|bypass)"
+                }
+                consts::METRIC_RESPONSES_USAGE_CONFIRMATION => {
+                    "Responses usage confirmations by result and failure reason"
                 }
                 consts::METRIC_HTTP_REQUESTS => {
                     "Total HTTP requests by endpoint, method, and status"

@@ -361,20 +361,6 @@ pub trait UsageRepository: Send + Sync {
         inference_ids: Vec<Uuid>,
     ) -> anyhow::Result<Vec<InferenceCost>>;
 
-    /// Get the stop reason for a specific response ID
-    /// Used to check if a response was stopped due to client disconnect
-    async fn get_stop_reason_by_response_id(
-        &self,
-        response_id: Uuid,
-    ) -> anyhow::Result<Option<StopReason>>;
-
-    /// Get the stop reason for a specific provider request ID (e.g., chatcmpl-xxx)
-    /// Used to check if a chat completion was stopped due to client disconnect
-    async fn get_stop_reason_by_provider_request_id(
-        &self,
-        provider_request_id: &str,
-    ) -> anyhow::Result<Option<StopReason>>;
-
     /// Whether a usage row of `organization_id` and `workspace_id` for `id`
     /// ended with [`StopReason::ClientDisconnect`]. `id` matches the row's
     /// `provider_request_id`; a `resp_<uuid>` id also matches its `response_id`.

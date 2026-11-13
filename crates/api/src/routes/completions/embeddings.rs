@@ -87,7 +87,7 @@ pub(super) fn classify_provider_error_with(
     tag = "Embeddings",
     request_body = EmbeddingsRequestDoc,
     responses(
-        (status = 200, description = "Embeddings generated successfully", body = EmbeddingsResponseDoc),
+        (status = 200, description = "Embeddings generated successfully", body = EmbeddingsResponseDoc, headers(("Inference-Id" = String, description = "Billing UUID of the request, usable with /v1/billing/costs"))),
         (status = 400, description = "Invalid request", body = ErrorResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
         (status = 404, description = "Model not found", body = ErrorResponse),

@@ -23,8 +23,8 @@ use crate::{
     models::{ModelWithPricing, ModelsRepository},
     usage::{
         InferenceCost, InferenceUsageHistoryQuery, InferenceUsageReportRow,
-        OrganizationBalanceInfo, RecordUsageDbRequest, StopReason, UsageByModelEntry,
-        UsageLogEntry, UsageRepository,
+        OrganizationBalanceInfo, RecordUsageDbRequest, UsageByModelEntry, UsageLogEntry,
+        UsageRepository,
     },
 };
 
@@ -320,7 +320,6 @@ impl AttestationRepository for NoopAttestationRepository {
 
     async fn get_chat_signature(
         &self,
-        _owner: SignatureOwner,
         _chat_id: &str,
         _signing_algo: &str,
     ) -> Result<ChatSignature, AttestationError> {
@@ -380,20 +379,6 @@ impl UsageRepository for NoopUsageRepository {
         _inference_ids: Vec<Uuid>,
     ) -> anyhow::Result<Vec<InferenceCost>> {
         Ok(Vec::new())
-    }
-
-    async fn get_stop_reason_by_response_id(
-        &self,
-        _response_id: Uuid,
-    ) -> anyhow::Result<Option<StopReason>> {
-        Ok(None)
-    }
-
-    async fn get_stop_reason_by_provider_request_id(
-        &self,
-        _provider_request_id: &str,
-    ) -> anyhow::Result<Option<StopReason>> {
-        Ok(None)
     }
 
     async fn get_usage_by_model(

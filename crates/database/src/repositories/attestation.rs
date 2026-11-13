@@ -184,11 +184,10 @@ impl AttestationRepository for PgAttestationRepository {
         self.upsert(owner, chat_id, &signatures).await
     }
 
-    /// Rows with a NULL owner (stored before owners were recorded) never
-    /// match, so they are not found for any caller.
+    /// Not filtered by owner: any caller may verify a signature, including a
+    /// row stored before owners were recorded.
     async fn get_chat_signature(
         &self,
-        owner: SignatureOwner,
         chat_id: &str,
         signing_algo: &str,
     ) -> Result<ChatSignature, AttestationError> {
@@ -200,13 +199,8 @@ impl AttestationRepository for PgAttestationRepository {
 
         let row = client
             .query_opt(
-                "SELECT text, signature, signing_address, signing_algo, signature_kind FROM chat_signatures WHERE chat_id = $1 AND signing_algo = $2 AND organization_id = $3 AND workspace_id = $4",
-                &[
-                    &chat_id,
-                    &signing_algo,
-                    &owner.organization_id,
-                    &owner.workspace_id,
-                ],
+                "SELECT text, signature, signing_address, signing_algo, signature_kind FROM chat_signatures WHERE chat_id = $1 AND signing_algo = $2",
+                &[&chat_id, &signing_algo],
             )
             .await
             .map_err(|e| AttestationError::RepositoryError(e.to_string()))?

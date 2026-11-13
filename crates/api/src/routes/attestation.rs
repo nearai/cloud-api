@@ -7,7 +7,7 @@
 //! | Route                           | Auth    | Rationale |
 //! |---------------------------------|---------|-----------|
 //! | `GET /v1/attestation/report`    | Optional API key | Public so a client can verify the gateway before it sends a credential. Anonymous callers see listed models only; a key that is sent is validated, and its organization decides whether an unlisted model resolves. Anonymous requests can collect fresh evidence (a nonce or a report-cache miss), so only `ANONYMOUS_REPORT_CONCURRENCY` of them run at once per instance (429 beyond that). Retrieval is not billed and never creates usage records. |
-//! | `GET /v1/signature/{chat_id}`   | API key | Requires a valid API key, then looks up the response ID among the signatures stored for the key's organization and workspace. Signatures of any other owner, and signatures stored before owners were recorded, are not found. |
+//! | `GET /v1/signature/{chat_id}`   | API key | Requires a valid API key, then looks up the response ID among all stored signatures, whichever organization or workspace created them (including signatures stored before owners were recorded), so any key holder can verify a response. Only the `STREAM_DISCONNECTED` answer for a missing signature is scoped to the key's organization and workspace. |
 //! | `GET /v1/attestation/ita-token` | Public  | Deliberate exception — see `build_public_attestation_routes`. Listed models only. |
 //! | `GET /v1/attestation/pins` | Public | Deliberate exception — see `build_public_attestation_routes`. |
 

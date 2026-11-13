@@ -12,7 +12,7 @@ use super::*;
     tag = "Score",
     request_body = crate::models::ScoreRequest,
     responses(
-        (status = 200, description = "Successful score", body = crate::models::ScoreResponse),
+        (status = 200, description = "Successful score", body = crate::models::ScoreResponse, headers(("Inference-Id" = String, description = "Billing UUID of the request, usable with /v1/billing/costs"))),
         (status = 400, description = "Invalid request (empty texts, invalid model, etc.)", body = ErrorResponse),
         (status = 401, description = "Unauthorized (missing or invalid API key)", body = ErrorResponse),
         (status = 404, description = "Model not found", body = ErrorResponse),

@@ -61,11 +61,14 @@ pub struct SignatureUnavailableResponse {
 /// Get completion or Responses API signature
 ///
 /// Get a cryptographic signature for a chat completion or completed stateless
-/// `resp_*` response. Only signatures created with an API key of the same
-/// organization and workspace as the calling key are returned. When that
-/// workspace has no signature for the ID but its stream for that ID ended with
-/// a client disconnect, the response is 200 with `error_code`
-/// `STREAM_DISCONNECTED`. Any other ID is reported as not found.
+/// `resp_*` response. Any valid API key can read a stored signature, whichever
+/// organization or workspace created it, so that third parties can verify a
+/// response; this includes signatures stored before owners were recorded.
+/// When no signature is stored for the ID but the calling key's own workspace
+/// has a stream for that ID that ended with a client disconnect, the response
+/// is 200 with `error_code` `STREAM_DISCONNECTED`. Any other missing ID,
+/// including one whose disconnected stream belongs to another workspace, is
+/// reported as not found.
 #[utoipa::path(
     get,
     path = "/v1/signature/{chat_id}",
@@ -74,8 +77,8 @@ pub struct SignatureUnavailableResponse {
         SignatureQuery
     ),
     responses(
-        (status = 200, description = "Signature retrieved, or `STREAM_DISCONNECTED` for this workspace's disconnected stream", body = SignatureResponse),
-        (status = 404, description = "Signature not found for this workspace", body = ErrorResponse),
+        (status = 200, description = "Signature retrieved (from any workspace), or `STREAM_DISCONNECTED` for the calling workspace's disconnected stream", body = SignatureResponse),
+        (status = 404, description = "Signature not found", body = ErrorResponse),
         (status = 400, description = "Invalid parameters", body = ErrorResponse)
     ),
     security(

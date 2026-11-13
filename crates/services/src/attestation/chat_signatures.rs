@@ -24,11 +24,12 @@ pub(crate) const STREAM_DISCONNECTED: &str = "STREAM_DISCONNECTED";
 const STREAM_DISCONNECTED_MESSAGE: &str = "Verification not available due to disconnection.";
 
 impl AttestationService {
-    /// Only a row stored for `owner` is returned. When there is none, a usage
-    /// row of `owner` for `chat_id` that ended with a client disconnect gives
+    /// A stored row is returned whatever its owner, so any caller can verify
+    /// it. When there is none, a usage row of `owner` (the caller) for
+    /// `chat_id` that ended with a client disconnect gives
     /// [`SignatureLookupResult::Unavailable`] with [`STREAM_DISCONNECTED`].
-    /// Otherwise a missing row, a row of another owner and a row with no owner
-    /// all give the same `SignatureNotFound`, with no reason attached.
+    /// Another owner's disconnect is not reported: the miss is the same
+    /// `SignatureNotFound`, with no reason attached.
     pub(in crate::attestation) async fn get_chat_signature_impl(
         &self,
         owner: SignatureOwner,
@@ -41,7 +42,7 @@ impl AttestationService {
 
         match self
             .repository
-            .get_chat_signature(owner, chat_id, &signing_algo)
+            .get_chat_signature(chat_id, &signing_algo)
             .await
         {
             Ok(signature) => Ok(SignatureLookupResult::Found(signature)),

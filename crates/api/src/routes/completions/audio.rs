@@ -16,7 +16,7 @@ use super::*;
         (status = 200, description = "Successful transcription", content(
             (AudioTranscriptionResponse = "application/json"),
             (String = "text/plain")
-        )),
+        ), headers(("Inference-Id" = String, description = "Billing UUID of the request, usable with /v1/billing/costs"))),
         (status = 400, description = "Invalid request (empty file, unsupported format, file too large)", body = ErrorResponse),
         (status = 401, description = "Unauthorized (missing or invalid API key)", body = ErrorResponse),
         (status = 404, description = "Model not found", body = ErrorResponse),

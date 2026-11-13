@@ -2,9 +2,9 @@
 //! `CLOUD_PLATFORM_URL` and `CLOUD_PLATFORM_API_KEY_FILE` both unset, nothing
 //! here is constructed and every service keeps its local implementation. With
 //! both set, the catalog, the chat-signature read and `/v1/check_api_key` are
-//! served by the cloud-platform adapters. The chat-signature read uses an
-//! answer only when cloud-platform scoped it to the caller's owner; otherwise
-//! it reads locally (see `database::cp_client::signature`).
+//! served by the cloud-platform adapters. The chat-signature read falls back
+//! to the local read when cloud-platform cannot answer or no caller key is in
+//! scope (see `database::cp_client::signature`).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -250,7 +250,6 @@ mod tests {
         }
         async fn get_chat_signature(
             &self,
-            _: services::attestation::SignatureOwner,
             chat_id: &str,
             signing_algo: &str,
         ) -> Result<

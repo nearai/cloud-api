@@ -240,21 +240,6 @@ impl services::usage::ports::UsageRepository for OrganizationUsageRepository {
             .await
     }
 
-    async fn get_stop_reason_by_response_id(
-        &self,
-        response_id: Uuid,
-    ) -> anyhow::Result<Option<services::usage::StopReason>> {
-        self.get_stop_reason_by_response_id(response_id).await
-    }
-
-    async fn get_stop_reason_by_provider_request_id(
-        &self,
-        provider_request_id: &str,
-    ) -> anyhow::Result<Option<services::usage::StopReason>> {
-        self.get_stop_reason_by_provider_request_id(provider_request_id)
-            .await
-    }
-
     async fn has_client_disconnect_usage(
         &self,
         organization_id: Uuid,

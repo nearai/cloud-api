@@ -89,17 +89,6 @@ impl UsageRepository for CapturingUsageRepository {
         unimplemented!()
     }
 
-    async fn get_stop_reason_by_response_id(&self, _: Uuid) -> anyhow::Result<Option<StopReason>> {
-        unimplemented!()
-    }
-
-    async fn get_stop_reason_by_provider_request_id(
-        &self,
-        _: &str,
-    ) -> anyhow::Result<Option<StopReason>> {
-        unimplemented!()
-    }
-
     async fn get_usage_by_model(
         &self,
         _: Uuid,

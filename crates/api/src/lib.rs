@@ -1683,6 +1683,7 @@ pub fn build_response_routes(
         },
         response_service: response_service.clone(),
         attestation_service,
+        metrics_service: native_app_state.metrics_service,
     };
 
     let inference_routes = Router::new()

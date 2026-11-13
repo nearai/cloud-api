@@ -41,6 +41,11 @@ pub async fn request_correlation_middleware(mut request: Request<Body>, next: Ne
         client_request_id = client_request_id.map(tracing::field::display),
         method = %method,
         path = %path,
+        // Filled in by API-key authentication, so every line logged while
+        // serving the request names its tenant.
+        org_id = tracing::field::Empty,
+        workspace_id = tracing::field::Empty,
+        api_key_id = tracing::field::Empty,
     );
 
     // Calls to cloud-platform made while serving this request carry its id.
@@ -74,7 +79,7 @@ fn prevent_request_id_caching(headers: &mut HeaderMap) {
     headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
 }
 
-fn log_safe_path(path: &str) -> String {
+pub(crate) fn log_safe_path(path: &str) -> String {
     path.split('/')
         .map(|segment| {
             if should_redact_path_segment(segment) {

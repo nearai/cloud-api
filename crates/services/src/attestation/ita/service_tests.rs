@@ -260,6 +260,101 @@ fn query(model: Option<&str>) -> ItaTokenQuery {
     }
 }
 
+#[tokio::test]
+async fn model_flow_keeps_single_provider_evidence_with_mixed_arch_fleets() -> TestResult {
+    use std::sync::Arc;
+
+    use config::ExternalProvidersConfig;
+    use inference_providers::attested::nearai::{Config, Provider};
+    use wiremock::{
+        matchers::{method, path},
+        Mock, MockServer, Request, ResponseTemplate,
+    };
+
+    use super::ProviderPoolModelAttestationCollector;
+    use crate::inference_provider_pool::InferenceProviderPool;
+
+    let hopper = MockServer::start().await;
+    let blackwell = MockServer::start().await;
+    let pool = Arc::new(InferenceProviderPool::new(
+        None,
+        ExternalProvidersConfig::default(),
+    ));
+    let mut providers = Vec::new();
+    for (backend, arch) in [(&hopper, "HOPPER"), (&blackwell, "BLACKWELL")] {
+        Mock::given(method("GET"))
+            .and(path("/v1/attestation/report"))
+            .respond_with(move |request: &Request| {
+                let nonce = request
+                    .url
+                    .query_pairs()
+                    .find(|(key, _)| key == "nonce")
+                    .map(|(_, value)| value.into_owned())
+                    .unwrap_or_default();
+                let mut report = service_test_support::model_evidence(&nonce, arch);
+                report.insert("signing_public_key".into(), Value::String("11".repeat(32)));
+                report.insert("all_attestations".into(), serde_json::json!([{}]));
+                ResponseTemplate::new(200).set_body_json(report)
+            })
+            .mount(backend)
+            .await;
+        let provider: Arc<dyn inference_providers::InferenceProvider + Send + Sync> =
+            Arc::new(Provider::new(Config {
+                base_url: backend.uri(),
+                api_key: None,
+                completion_timeout_seconds: 5,
+                control_timeout_seconds: 5,
+            }));
+        providers.push(("canonical-model".to_string(), provider));
+    }
+    pool.register_providers(providers).await;
+
+    // Gateway reports still include both fleets; ITA must select one provider
+    // before building its single-architecture GPU evidence request.
+    let gateway_reports = pool
+        .get_attestation_report("canonical-model".into(), None, None, None, false, None)
+        .await?;
+    assert_eq!(gateway_reports.len(), 2);
+    let secondary_requests = blackwell.received_requests().await.unwrap().len();
+
+    let server = FakeIta::start(vec![
+        FakeStep::json(
+            200,
+            r#"{"val":"dmVyaWZpZXItdmFsdWU=","iat":"aWF0LWJ5dGVz","signature":"dmVyaWZpZXItc2lnbmF0dXJl"}"#,
+        ),
+        FakeStep::json(200, r#"{"token":"gateway.jwt"}"#),
+        FakeStep::json(200, r#"{"token":"model.jwt"}"#),
+    ])
+    .await?;
+    let mut service =
+        service_for_fake_ita(&server, 0, RecordingGatewayQuoteCollector::default(), None)?;
+    service.model_attestation_collector =
+        Arc::new(ProviderPoolModelAttestationCollector::new(pool));
+
+    let response = service
+        .get_ita_attestation_token(query(Some("canonical-model")))
+        .await?;
+    assert_eq!(response.models.len(), 1);
+    assert_eq!(response.models[0].attestation.token, "model.jwt");
+    let ita_requests = server.requests();
+    assert_eq!(ita_requests.len(), 3);
+    let model_body: Value = serde_json::from_slice(&ita_requests[2].body)?;
+    assert_eq!(model_body["nvgpu"]["arch"], "HOPPER");
+    assert_eq!(
+        model_body["nvgpu"]["evidence_list"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        blackwell.received_requests().await.unwrap().len(),
+        secondary_requests,
+        "ITA should stop after the first successful provider"
+    );
+    Ok(())
+}
+
 fn expected_ita_report_data(runtime_data: &[u8]) -> Vec<u8> {
     let mut hasher = Sha512::new();
     hasher.update(b"verifier-valueiat-bytes");

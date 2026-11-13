@@ -69,6 +69,7 @@ pub mod spki_verifier;
 pub mod sse_parser;
 pub mod systemone;
 pub mod thought_signature;
+pub mod tracing_context;
 
 // Attested NEAR-AI fleet provider. Use the module path (`nearai::Provider`,
 // `nearai::Config`) rather than a bare re-export to keep the names unambiguous.
@@ -702,6 +703,32 @@ pub trait InferenceProvider {
         signing_address: Option<String>,
         include_tls_fingerprint: bool,
     ) -> Result<serde_json::Map<String, serde_json::Value>, AttestationError>;
+
+    /// Reports for the serving backends behind this provider. Providers without
+    /// backend discovery retain their single-report contract. A fleet override
+    /// must not silently return a partial collection after a fetch failure.
+    /// Success must contain at least one report. Use `SigningAddressNotFound`
+    /// when no backend matches a requested signer, or `ProviderNotFound` when
+    /// the provider has no serving backends; an empty successful collection is
+    /// a contract violation and fails the whole source group.
+    async fn get_attestation_reports(
+        &self,
+        model: String,
+        signing_algo: Option<String>,
+        nonce: Option<String>,
+        signing_address: Option<String>,
+        include_tls_fingerprint: bool,
+    ) -> Result<Vec<serde_json::Map<String, serde_json::Value>>, AttestationError> {
+        self.get_attestation_report(
+            model,
+            signing_algo,
+            nonce,
+            signing_address,
+            include_tls_fingerprint,
+        )
+        .await
+        .map(|report| vec![report])
+    }
 
     /// Performs an audio transcription request
     ///

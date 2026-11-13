@@ -35,6 +35,23 @@ fn privacy_error_parts(
             (StatusCode::TOO_MANY_REQUESTS, "rate_limit_error", msg)
         }
         CompletionError::ProviderError {
+            status_code: 504, ..
+        } => {
+            // The detector passed its deadline; the work may still be
+            // running upstream, so this is not retried and is reported as a
+            // timeout rather than a generic failure.
+            tracing::warn!(endpoint = label, "Privacy request timed out upstream");
+            let message = match endpoint {
+                PrivacyEndpoint::Classify => "Privacy classify request timed out. Please retry.",
+                PrivacyEndpoint::Redact => "Privacy redact request timed out. Please retry.",
+            };
+            (
+                StatusCode::GATEWAY_TIMEOUT,
+                "gateway_timeout",
+                message.to_string(),
+            )
+        }
+        CompletionError::ProviderError {
             status_code,
             message,
         } => {
@@ -57,14 +74,14 @@ fn privacy_error_parts(
                 tracing::warn!(
                     endpoint = label,
                     upstream_status = status_code,
-                    detail = %message,
+                    error_message_len = message.len(),
                     "Privacy request rejected by upstream with client error"
                 );
             } else {
                 tracing::error!(
                     endpoint = label,
                     upstream_status = status_code,
-                    detail = %message,
+                    error_message_len = message.len(),
                     "Privacy provider error"
                 );
             }
@@ -74,7 +91,8 @@ fn privacy_error_parts(
             tracing::warn!(endpoint = label, "Privacy model not found");
             (StatusCode::NOT_FOUND, "not_found_error", msg)
         }
-        CompletionError::ServiceOverloaded(_) => {
+        CompletionError::ServiceOverloaded(_) | CompletionError::UpstreamOverloaded { .. } => {
+            // 429 + Retry-After (added by `privacy_error_response`).
             tracing::warn!(endpoint = label, "Privacy service overloaded");
             (
                 crate::routes::common::status_overloaded(),
@@ -102,12 +120,25 @@ fn privacy_error_response(
     endpoint: PrivacyEndpoint,
     e: services::completions::ports::CompletionError,
 ) -> axum::response::Response {
+    use services::completions::ports::CompletionError;
+    let retry_after = match &e {
+        CompletionError::UpstreamOverloaded { retry_after_secs } => Some(*retry_after_secs),
+        CompletionError::ServiceOverloaded(_) => Some(None),
+        _ => None,
+    }
+    .map(crate::middleware::retry_after::retry_after_seconds);
     let (status_code, error_type, message) = privacy_error_parts(endpoint, e);
-    (
+    let mut response = (
         status_code,
         ResponseJson(ErrorResponse::new(message, error_type.to_string())),
     )
-        .into_response()
+        .into_response();
+    if let Some(secs) = retry_after {
+        response
+            .headers_mut()
+            .insert(header::RETRY_AFTER, header::HeaderValue::from(secs));
+    }
+    response
 }
 
 /// The engine assigns its own request id: drop a client `rid` (SGLang) or
@@ -299,9 +330,10 @@ struct PrivacyClassifyResponseDoc {
         (status = 400, description = "Invalid request", body = ErrorResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
         (status = 404, description = "Model not found", body = ErrorResponse),
-        (status = 429, description = "Rate limited or overloaded — retry with backoff. Check error.type: rate_limit_exceeded or service_overloaded.", body = ErrorResponse),
+        (status = 429, description = "Rate limited or overloaded — retry with backoff. Check error.type: rate_limit_exceeded or service_overloaded.", body = ErrorResponse, headers(("Retry-After" = u64, description = "Seconds to wait before retrying"))),
         (status = "4XX", description = "Request rejected by the privacy-filter model; the upstream 4xx status is kept. error.type: invalid_request_error", body = ErrorResponse),
-        (status = 500, description = "Server error", body = ErrorResponse)
+        (status = 500, description = "Server error", body = ErrorResponse),
+        (status = 504, description = "The privacy-filter model did not finish in time. error.type: gateway_timeout", body = ErrorResponse)
     ),
     security(
         ("api_key" = [])
@@ -311,7 +343,6 @@ pub async fn privacy_classify(
     State(app_state): State<AppState>,
     Extension(api_key): Extension<AuthenticatedApiKey>,
     Extension(body_hash): Extension<RequestBodyHash>,
-    Extension(correlation): Extension<RequestCorrelation>,
     headers: header::HeaderMap,
     requested_model: RequestedModel,
     body: Bytes,
@@ -382,7 +413,6 @@ pub async fn privacy_classify(
     };
     let mut extra = std::collections::HashMap::new();
     insert_encryption_headers(&encryption_headers, &mut extra);
-    insert_request_id_header(correlation, &mut extra);
 
     match app_state
         .completion_service
@@ -478,9 +508,10 @@ struct PrivacyRedactResponseDoc {
         (status = 400, description = "Invalid request", body = ErrorResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
         (status = 404, description = "Model not found", body = ErrorResponse),
-        (status = 429, description = "Rate limited or overloaded — retry with backoff. Check error.type: rate_limit_exceeded or service_overloaded.", body = ErrorResponse),
+        (status = 429, description = "Rate limited or overloaded — retry with backoff. Check error.type: rate_limit_exceeded or service_overloaded.", body = ErrorResponse, headers(("Retry-After" = u64, description = "Seconds to wait before retrying"))),
         (status = "4XX", description = "Request rejected by the privacy-filter model; the upstream 4xx status is kept. error.type: invalid_request_error", body = ErrorResponse),
-        (status = 500, description = "Server error", body = ErrorResponse)
+        (status = 500, description = "Server error", body = ErrorResponse),
+        (status = 504, description = "The privacy-filter model did not finish in time. error.type: gateway_timeout", body = ErrorResponse)
     ),
     security(
         ("api_key" = [])
@@ -490,7 +521,6 @@ pub async fn privacy_redact(
     State(app_state): State<AppState>,
     Extension(api_key): Extension<AuthenticatedApiKey>,
     Extension(body_hash): Extension<RequestBodyHash>,
-    Extension(correlation): Extension<RequestCorrelation>,
     headers: header::HeaderMap,
     requested_model: RequestedModel,
     body: Bytes,
@@ -634,7 +664,6 @@ pub async fn privacy_redact(
     };
     let mut extra = std::collections::HashMap::new();
     insert_encryption_headers(&encryption_headers, &mut extra);
-    insert_request_id_header(correlation, &mut extra);
 
     // Forward a normalized classify request to the upstream model. We
     // deliberately rebuild the body rather than passing the client body
@@ -845,6 +874,75 @@ mod tests {
                         .to_string()
                 )
             );
+        }
+    }
+
+    /// The 429 carries a `Retry-After`: the upstream value when it gave one,
+    /// else the default, clamped to the maximum.
+    #[test]
+    fn overloaded_429_carries_retry_after_for_both_endpoints() {
+        for endpoint in [PrivacyEndpoint::Classify, PrivacyEndpoint::Redact] {
+            for (err, retry_after) in [
+                (
+                    CompletionError::UpstreamOverloaded {
+                        retry_after_secs: Some(4),
+                    },
+                    "4",
+                ),
+                (
+                    CompletionError::UpstreamOverloaded {
+                        retry_after_secs: None,
+                    },
+                    "2",
+                ),
+                (
+                    CompletionError::UpstreamOverloaded {
+                        retry_after_secs: Some(0),
+                    },
+                    "1",
+                ),
+                (
+                    CompletionError::UpstreamOverloaded {
+                        retry_after_secs: Some(86_400),
+                    },
+                    "30",
+                ),
+                (CompletionError::ServiceOverloaded("busy".into()), "2"),
+            ] {
+                let label = format!("{endpoint:?} {err:?}");
+                let response = privacy_error_response(endpoint, err);
+                assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS, "{label}");
+                assert_eq!(
+                    response.headers().get(header::RETRY_AFTER).unwrap(),
+                    retry_after,
+                    "{label}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn upstream_timeout_is_504_without_retry_after() {
+        for (endpoint, message) in [
+            (
+                PrivacyEndpoint::Classify,
+                "Privacy classify request timed out. Please retry.",
+            ),
+            (
+                PrivacyEndpoint::Redact,
+                "Privacy redact request timed out. Please retry.",
+            ),
+        ] {
+            let err = || CompletionError::ProviderError {
+                status_code: 504,
+                message: "PII detector returned HTTP 504".into(),
+            };
+            assert_eq!(
+                parts(endpoint, err()),
+                (504, "gateway_timeout", message.to_string())
+            );
+            let response = privacy_error_response(endpoint, err());
+            assert!(response.headers().get(header::RETRY_AFTER).is_none());
         }
     }
 

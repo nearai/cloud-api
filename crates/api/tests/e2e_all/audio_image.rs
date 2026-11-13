@@ -1513,7 +1513,7 @@ async fn test_audio_output_signature_verification() {
 }
 
 /// Helper function to create a minimal PNG image (1x1 pixel)
-fn create_test_png_image() -> Vec<u8> {
+pub(crate) fn create_test_png_image() -> Vec<u8> {
     // PNG magic bytes + minimal 1x1 PNG with alpha channel
     vec![
         0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, // PNG signature

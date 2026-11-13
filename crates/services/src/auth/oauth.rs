@@ -207,11 +207,7 @@ impl OAuthManager {
             avatar_url: user_info.avatar_url,
         };
 
-        debug!(
-            provider = "github",
-            provider_user_id = %oauth_info.provider_user_id,
-            "OAuth user authenticated"
-        );
+        debug!(provider = "github", "OAuth user authenticated");
         Ok((oauth_info, access_token.to_string()))
     }
 
@@ -261,11 +257,7 @@ impl OAuthManager {
             avatar_url: user_info.picture,
         };
 
-        debug!(
-            provider = "google",
-            provider_user_id = %oauth_info.provider_user_id,
-            "OAuth user authenticated"
-        );
+        debug!(provider = "google", "OAuth user authenticated");
         Ok((oauth_info, access_token.to_string()))
     }
 

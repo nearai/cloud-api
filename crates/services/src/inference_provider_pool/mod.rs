@@ -28,9 +28,13 @@ mod context_routing;
 pub use context_routing::expand_inference_endpoints;
 
 #[cfg(test)]
+mod attestation_tests;
+#[cfg(test)]
 mod channel_binding_tests;
 #[cfg(test)]
 mod chutes_routing_tests;
+#[cfg(test)]
+mod privacy_classify_tests;
 
 mod provider_attribution;
 use provider_attribution::{served_provider_attribution, ServedProviderResult};
@@ -1609,7 +1613,7 @@ impl InferenceProviderPool {
                     // route serving. Unknown or misspelled fields may represent
                     // a failed attempt to add a mandatory privacy restriction.
                     mappings.model_to_providers.remove(&model_name);
-                    warn!(model = %model_name, error = %e, "Failed to register external provider");
+                    warn!(model = %model_name, error_message_len = e.len(), "Failed to register external provider");
                     error_count += 1;
                 }
             }
@@ -2091,7 +2095,7 @@ impl InferenceProviderPool {
                             attempt = attempt + 1,
                             max_attempts = MAX_ATTEMPTS,
                             delay_ms = delay_ms,
-                            error = %e,
+                            error_kind = Self::attestation_error_kind(&e),
                             "Failed to fetch attestation report, retrying..."
                         );
                         tokio::time::sleep(Duration::from_millis(delay_ms)).await;
@@ -2100,7 +2104,7 @@ impl InferenceProviderPool {
                             model = %model_name,
                             url = %url,
                             attempts = MAX_ATTEMPTS,
-                            error = %e,
+                            error_kind = Self::attestation_error_kind(&e),
                             "Provider failed to return attestation report after retries, excluding from pool"
                         );
                     }
@@ -2278,7 +2282,7 @@ impl InferenceProviderPool {
             Err(e) => {
                 warn!(
                     model = %model,
-                    error = %e,
+                    error_message_len = e.len(),
                     "Failed to read inference_url models for count-change rediscovery"
                 );
                 false
@@ -2461,7 +2465,6 @@ impl InferenceProviderPool {
                                 model = %model,
                                 index = backend_index,
                                 algo = %algo,
-                                error = %e,
                                 "Failed to build discovery client"
                             );
                             return Err(format!("client_build: {e}"));
@@ -2498,14 +2501,6 @@ impl InferenceProviderPool {
                     let resp = match res {
                         Ok(Ok(r)) => r,
                         Ok(Err(e)) => {
-                            debug!(
-                                model = %model,
-                                index = backend_index,
-                                algo = %algo,
-                                elapsed_ms,
-                                error = %e,
-                                "Discovery call failed"
-                            );
                             let category = if e.is_connect() {
                                 "connect"
                             } else if e.is_timeout() {
@@ -2515,6 +2510,14 @@ impl InferenceProviderPool {
                             } else {
                                 "send"
                             };
+                            debug!(
+                                model = %model,
+                                index = backend_index,
+                                algo = %algo,
+                                elapsed_ms,
+                                error_kind = category,
+                                "Discovery call failed"
+                            );
                             // reqwest::Error's Display embeds the request URL,
                             // which includes our random per-call `nonce` query
                             // param. Stripping it keeps `failure_reasons` low-
@@ -2556,7 +2559,6 @@ impl InferenceProviderPool {
                                 model = %model,
                                 index = backend_index,
                                 algo = %algo,
-                                error = %e,
                                 "Discovery call returned malformed JSON"
                             );
                             return Err(format!("malformed_json: {}", e.without_url()));
@@ -2663,7 +2665,7 @@ impl InferenceProviderPool {
                         model = %model_name,
                         url = %url,
                         algo = %algo,
-                        error = %e,
+                        error_kind = Self::verification_error_kind(&e),
                         "Attestation verification failed for discovered backend"
                     );
                     failure_reasons.push(format!("verify: {e}"));
@@ -3276,11 +3278,75 @@ impl InferenceProviderPool {
                 401 | 403 => "unauthorized",
                 429 => "rate_limited",
                 503 => "unavailable",
+                504 => "timeout",
                 500..=599 => "server_error",
                 400..=499 => "client_error",
                 _ => "http_other",
             },
+            E::Overloaded { .. } => "unavailable",
             E::RequestFailed(_) => "request_failed",
+        }
+    }
+
+    /// Category label for a rerank, embeddings or score provider error,
+    /// derived from its HTTP status (`None` when the request itself failed).
+    fn provider_error_category(status_code: Option<u16>) -> &'static str {
+        match status_code {
+            Some(401 | 403) => "unauthorized",
+            Some(429) => "rate_limited",
+            Some(503) => "unavailable",
+            Some(500..=599) => "server_error",
+            Some(400..=499) => "client_error",
+            Some(_) => "http_other",
+            None => "request_failed",
+        }
+    }
+
+    /// Kind label for an attestation report error.
+    fn attestation_error_kind(error: &AttestationError) -> &'static str {
+        match error {
+            AttestationError::FetchError(_) => "fetch_error",
+            AttestationError::InvalidResponse(_) => "invalid_response",
+            AttestationError::SigningAddressNotFound(_) => "signing_address_not_found",
+            AttestationError::ProviderNotFound(_) => "provider_not_found",
+            AttestationError::Unknown(_) => "unknown",
+        }
+    }
+
+    /// Kind label for an attestation verification error.
+    fn verification_error_kind(
+        error: &crate::attestation::AttestationVerificationError,
+    ) -> &'static str {
+        use crate::attestation::AttestationVerificationError as E;
+        match error {
+            E::MissingField(_) => "missing_field",
+            E::InvalidFormat(_) => "invalid_format",
+            E::TdxVerificationFailed(_) => "tdx_verification_failed",
+            E::ReportDataMismatch(_) => "report_data_mismatch",
+            E::RtmrMismatch(_) => "rtmr_mismatch",
+            E::ImageHashMismatch(_) => "image_hash_mismatch",
+            E::GpuVerificationFailed(_) => "gpu_verification_failed",
+        }
+    }
+
+    /// HTTP status carried by a completion error, if any.
+    fn completion_error_status(error: &CompletionError) -> Option<u16> {
+        match error {
+            CompletionError::HttpError { status_code, .. } => Some(*status_code),
+            _ => None,
+        }
+    }
+
+    /// Length of the message a completion error carries.
+    fn completion_error_message_len(error: &CompletionError) -> usize {
+        match error {
+            CompletionError::HttpError { message, .. }
+            | CompletionError::CompletionError(message)
+            | CompletionError::InvalidResponse(message)
+            | CompletionError::Unknown(message)
+            | CompletionError::ClientMediaError(message)
+            | CompletionError::NoPubKeyProvider(message) => message.len(),
+            CompletionError::Timeout { .. } => 0,
         }
     }
 
@@ -3927,7 +3993,9 @@ impl InferenceProviderPool {
                                     model_id = %model_id,
                                     attempt = attempt + 1,
                                     status_code,
-                                    error_detail = %e,
+                                    error_kind = Self::classify_error_kind(&e),
+                                    retry_decision = "non_retryable_client_4xx",
+                                    error_message_len = message.len(),
                                     operation = operation_name,
                                     "Client error from provider, not retrying"
                                 );
@@ -4007,8 +4075,10 @@ impl InferenceProviderPool {
                             tracing::warn!(
                                 model_id = %model_id,
                                 attempt = attempt + 1,
+                                status_code = Self::completion_error_status(&e),
+                                error_kind = Self::classify_error_kind(&e),
                                 retry_decision,
-                                error_detail = %e,
+                                error_message_len = Self::completion_error_message_len(&e),
                                 operation = operation_name,
                                 "Client media-fetch failure, not retrying or trying other providers"
                             );
@@ -4069,15 +4139,16 @@ impl InferenceProviderPool {
                             *counter = counter.saturating_add(1);
                         }
 
-                        // Log the failure for debugging (before sanitization strips details)
+                        // Log the failure as bounded fields.
                         let error_kind = Self::classify_error_kind(&e);
                         tracing::warn!(
                             model_id = %model_id,
                             attempt = attempt + 1,
                             retry = retry_count,
+                            status_code = Self::completion_error_status(&e),
                             error_kind,
                             retry_decision,
-                            error_detail = %e,
+                            error_message_len = Self::completion_error_message_len(&e),
                             operation = operation_name,
                             "Provider failed, will try next provider if available"
                         );
@@ -4235,8 +4306,57 @@ impl InferenceProviderPool {
         }
     }
 
+    /// Collect one report from the first successful provider for ITA's single
+    /// GPU evidence set. Keep this separate from Gateway fleet collection:
+    /// different fleets may report different GPU architectures.
+    pub(crate) async fn get_single_attestation_report(
+        &self,
+        model: String,
+        signing_algo: Option<String>,
+        nonce: Option<String>,
+        signing_address: Option<String>,
+        include_tls_fingerprint: bool,
+    ) -> Result<serde_json::Map<String, serde_json::Value>, AttestationError> {
+        let providers = self
+            .get_providers_for_model(&model)
+            .await
+            .ok_or_else(|| AttestationError::ProviderNotFound(model.clone()))?;
+        let mut last_error = None;
+        for provider in self.drop_disabled_sources(providers) {
+            match provider
+                .get_attestation_report(
+                    model.clone(),
+                    signing_algo.clone(),
+                    nonce.clone(),
+                    signing_address.clone(),
+                    include_tls_fingerprint,
+                )
+                .await
+            {
+                Ok(mut report) => {
+                    report.remove("all_attestations");
+                    return Ok(report);
+                }
+                Err(error) => {
+                    debug!(
+                        model = %model,
+                        error_kind = Self::attestation_error_kind(&error),
+                        "Provider returned error for ITA attestation request, trying next"
+                    );
+                    last_error = Some(error);
+                }
+            }
+        }
+        Err(last_error
+            .map(|error| AttestationError::FetchError(error.to_string()))
+            .unwrap_or_else(|| AttestationError::ProviderNotFound(model)))
+    }
+
     /// `provider_filter`: when `Some`, only providers matching the filter (NEAR tier,
-    /// or attested 3P of the given source) are tried. `None` preserves the existing behaviour (first successful wins).
+    /// or attested 3P of the given source) are tried. NEAR reports cover every
+    /// registered NEAR fleet for the model; other sources retain first-success
+    /// selection. A failed NEAR collection can fall back to another source when
+    /// the filter permits it, but reports from different sources are never mixed.
     ///
     /// `signing_algo` is forwarded to each backend verbatim. Backends accept
     /// only lowercase `ecdsa` / `ed25519`, so callers must pass a normalized
@@ -4270,36 +4390,84 @@ impl InferenceProviderPool {
             return Err(AttestationError::ProviderNotFound(model));
         }
 
-        // Keys are KMS-root-derived, so replicas under different roots can
-        // return different reports. Returning one report is still correct:
-        // discovery registers every key and request-time backend affinity keeps
-        // a client-pinned key within the matching identity group.
-        // Try providers in order and return the first successful response.
+        // A model can have multiple NEAR inference URLs/context tiers, each
+        // backed by several CVMs. Collect the entire NEAR group at its first
+        // position in the existing provider order. Never merge a partial group
+        // with a fallback source, or collapse CVMs that share a signing key.
         let mut last_error = None;
-        for provider in providers {
-            match provider
-                .get_attestation_report(
+        let mut tried_near = false;
+        for provider in &providers {
+            let is_near = provider.tier() == inference_providers::ProviderTier::Near;
+            let targets = if is_near {
+                if tried_near {
+                    continue;
+                }
+                tried_near = true;
+                providers
+                    .iter()
+                    .filter(|p| p.tier() == inference_providers::ProviderTier::Near)
+                    .collect::<Vec<_>>()
+            } else {
+                vec![provider]
+            };
+            let mut reports = Vec::new();
+            let mut failure = None;
+            // Fleets come from model configuration. Collect them concurrently
+            // so their timeouts do not add up, retaining provider order in the
+            // response and in failure selection.
+            let collections = futures::future::join_all(targets.into_iter().map(|target| {
+                target.get_attestation_reports(
                     model.clone(),
                     signing_algo.clone(),
                     nonce.clone(),
                     signing_address.clone(),
                     include_tls_fingerprint,
                 )
-                .await
-            {
-                Ok(mut attestation) => {
-                    attestation.remove("all_attestations");
-                    return Ok(vec![attestation]);
-                }
-                Err(e) => {
-                    tracing::debug!(
-                        model = %model,
-                        error = %e,
-                        "Provider returned error for attestation request, trying next"
-                    );
-                    last_error = Some(e);
+            }))
+            .await;
+            for (fleet_index, result) in collections.into_iter().enumerate() {
+                match result {
+                    Ok(batch) if !batch.is_empty() => {
+                        reports.extend(batch.into_iter().map(|mut report| {
+                            report.remove("all_attestations");
+                            report
+                        }));
+                    }
+                    // A signer filter can legitimately exclude an entire fleet.
+                    Err(AttestationError::SigningAddressNotFound(_))
+                        if signing_address.is_some() =>
+                    {
+                        debug!(
+                            model = %model,
+                            fleet_index,
+                            "Attestation fleet excluded: no backend matches the signing address"
+                        );
+                    }
+                    result => {
+                        failure = Some(match result {
+                            Err(error) => error,
+                            Ok(_) => AttestationError::InvalidResponse(
+                                "Provider returned an empty attestation collection".to_string(),
+                            ),
+                        });
+                        break;
+                    }
                 }
             }
+            if failure.is_none() && !reports.is_empty() {
+                return Ok(reports);
+            }
+            let error = failure.unwrap_or_else(|| {
+                AttestationError::SigningAddressNotFound(
+                    signing_address.clone().unwrap_or_default(),
+                )
+            });
+            debug!(
+                model = %model,
+                error_kind = Self::attestation_error_kind(&error),
+                "Provider attestation collection failed, trying the next source"
+            );
+            last_error = Some(error);
         }
 
         Err(last_error
@@ -4846,7 +5014,7 @@ impl InferenceProviderPool {
 
         tracing::debug!(
             model = %model_id,
-            filename = %params.filename,
+            filename_len = params.filename.len(),
             file_size_kb = file_size_kb,
             "Starting audio transcription request"
         );
@@ -5024,9 +5192,18 @@ impl InferenceProviderPool {
                     return Ok(response);
                 }
                 Err(e) => {
+                    let (status_code, message) = match &e {
+                        RerankError::HttpError {
+                            status_code,
+                            message,
+                        } => (Some(*status_code), message),
+                        RerankError::GenerationError(message) => (None, message),
+                    };
                     tracing::warn!(
                         model = %model_id,
-                        error = %e,
+                        status_code,
+                        error_category = Self::provider_error_category(status_code),
+                        error_message_len = message.len(),
                         "Rerank failed with provider, trying next"
                     );
                     last_error = Some(e);
@@ -5072,7 +5249,22 @@ impl InferenceProviderPool {
                     return Ok(response);
                 }
                 Err(e) => {
-                    tracing::warn!(model = %model, error = %e, "Embeddings failed with provider, trying next");
+                    let (status_code, message) = match &e {
+                        inference_providers::EmbeddingError::HttpError {
+                            status_code,
+                            message,
+                        } => (Some(*status_code), message),
+                        inference_providers::EmbeddingError::RequestFailed(message) => {
+                            (None, message)
+                        }
+                    };
+                    tracing::warn!(
+                        model = %model,
+                        status_code,
+                        error_category = Self::provider_error_category(status_code),
+                        error_message_len = message.len(),
+                        "Embeddings failed with provider, trying next"
+                    );
                     last_error = Some(e);
                 }
             }
@@ -5188,7 +5380,16 @@ impl InferenceProviderPool {
             }
         };
 
+        // Each provider is tried at most once. An overloaded (503) provider
+        // did not process the request, so the next provider may serve it; if
+        // none does, the overload is reported (with its Retry-After) rather
+        // than a later provider's server or connection failure. A client 4xx
+        // still wins, since retrying the same payload cannot succeed. A 504
+        // means the work may still be running upstream, so it is returned
+        // without trying others.
         let mut last_error = None;
+        let mut overloaded = None;
+        let mut client_error = None;
         for provider in providers {
             match provider
                 .privacy_classify_raw(body.clone(), extra.clone())
@@ -5204,36 +5405,64 @@ impl InferenceProviderPool {
                     // A misbehaving filter that echoes its input would
                     // route customer PII straight to application logs.
                     // Log only the category + status code.
+                    let error_category = Self::privacy_classify_error_category(&e);
+                    match e {
+                        inference_providers::PrivacyClassifyError::HttpError {
+                            status_code: 504,
+                            ..
+                        } => {
+                            tracing::warn!(
+                                model = %model,
+                                error_category,
+                                "Privacy classify timed out upstream, not retrying"
+                            );
+                            return Err(Self::sanitize_privacy_classify_error(e));
+                        }
+                        inference_providers::PrivacyClassifyError::Overloaded { .. } => {
+                            overloaded = Some(e);
+                        }
+                        // Kept apart so a later provider's failure cannot
+                        // replace it.
+                        inference_providers::PrivacyClassifyError::HttpError {
+                            status_code: 400..=499,
+                            ..
+                        } => {
+                            client_error.get_or_insert(e);
+                        }
+                        _ => last_error = Some(e),
+                    }
                     tracing::warn!(
                         model = %model,
-                        error_category = %Self::privacy_classify_error_category(&e),
+                        error_category,
                         "Privacy classify failed with provider, trying next"
                     );
-                    last_error = Some(e);
                 }
             }
         }
 
-        // Final user-facing error: only the status code escapes; no
-        // upstream response body (a filter that echoes its input would leak
-        // customer PII). The status is kept as `HttpError` so callers can
-        // tell a client 4xx from an upstream outage.
-        Err(match last_error {
-            Some(inference_providers::PrivacyClassifyError::HttpError { status_code, .. }) => {
-                inference_providers::PrivacyClassifyError::HttpError {
-                    status_code,
-                    message: format!("PII detector returned HTTP {status_code}"),
-                }
-            }
-            Some(inference_providers::PrivacyClassifyError::RequestFailed(_)) => {
-                inference_providers::PrivacyClassifyError::RequestFailed(
-                    "PII detector unreachable".to_string(),
-                )
-            }
+        Err(match client_error.or(overloaded).or(last_error) {
+            Some(e) => Self::sanitize_privacy_classify_error(e),
             None => inference_providers::PrivacyClassifyError::RequestFailed(
                 "No providers available for privacy classify".to_string(),
             ),
         })
+    }
+
+    /// Final error for the caller: only the status code (and an overload's
+    /// Retry-After) is kept; the upstream response text is dropped. The status
+    /// stays an `HttpError` so callers can tell a client 4xx from an outage.
+    fn sanitize_privacy_classify_error(
+        err: inference_providers::PrivacyClassifyError,
+    ) -> inference_providers::PrivacyClassifyError {
+        use inference_providers::PrivacyClassifyError as E;
+        match err {
+            E::HttpError { status_code, .. } => E::HttpError {
+                status_code,
+                message: format!("PII detector returned HTTP {status_code}"),
+            },
+            E::RequestFailed(_) => E::RequestFailed("PII detector unreachable".to_string()),
+            overloaded @ E::Overloaded { .. } => overloaded,
+        }
     }
 
     pub async fn score(
@@ -5270,9 +5499,20 @@ impl InferenceProviderPool {
                     return Ok(response);
                 }
                 Err(e) => {
+                    let (status_code, message) = match &e {
+                        inference_providers::ScoreError::HttpError {
+                            status_code,
+                            message,
+                        } => (Some(*status_code), message),
+                        inference_providers::ScoreError::GenerationError(message) => {
+                            (None, message)
+                        }
+                    };
                     tracing::warn!(
                         model = %model_id,
-                        error = %e,
+                        status_code,
+                        error_category = Self::provider_error_category(status_code),
+                        error_message_len = message.len(),
                         "Score failed with provider, trying next"
                     );
                     last_error = Some(e);
@@ -5427,7 +5667,11 @@ impl InferenceProviderPool {
                 Err(error) => {
                     warn!(
                         model = %model_name,
-                        error = %error,
+                        error_kind = match &error {
+                            inference_providers::models::ListModelsError::FetchError(_) => "fetch_error",
+                            inference_providers::models::ListModelsError::InvalidResponse => "invalid_response",
+                            inference_providers::models::ListModelsError::Unknown => "unknown",
+                        },
                         "Failed to fetch backend model metadata"
                     );
                 }
@@ -6526,8 +6770,8 @@ impl InferenceProviderPool {
                         source.clone(),
                         client,
                     )))),
-                    Err(e) => {
-                        warn!(error = %e, "Backend count poll client failed to build; count poll disabled");
+                    Err(_) => {
+                        warn!("Backend count poll client failed to build; count poll disabled");
                         None
                     }
                 };
@@ -6546,7 +6790,10 @@ impl InferenceProviderPool {
                             pool.sync_inference_url_models(models).await;
                         }
                         Err(e) => {
-                            warn!(error = %e, "Failed to refresh inference_url models");
+                            warn!(
+                                error_message_len = e.len(),
+                                "Failed to refresh inference_url models"
+                            );
                             // On failure, keep all existing inference_url models
                             // (we don't know which are still valid)
                             let mappings = pool.provider_mappings.read().await;
@@ -6567,7 +6814,10 @@ impl InferenceProviderPool {
                             Some(models)
                         }
                         Err(e) => {
-                            warn!(error = %e, "Failed to refresh external providers");
+                            warn!(
+                                error_message_len = e.len(),
+                                "Failed to refresh external providers"
+                            );
                             // On failure, keep all existing providers
                             let mappings = pool.provider_mappings.read().await;
                             valid_model_names.extend(mappings.model_to_providers.keys().cloned());
@@ -6584,7 +6834,10 @@ impl InferenceProviderPool {
                         )
                         .await
                     {
-                        warn!(error = %e, "Failed to sync external providers");
+                        warn!(
+                            error_message_len = e.len(),
+                            "Failed to sync external providers"
+                        );
                     }
                 }
             }
@@ -7718,6 +7971,57 @@ mod tests {
                 InferenceProviderPool::classify_error_kind(err),
                 *want,
                 "wrong kind for {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn provider_error_fields_are_bounded() {
+        let text = "x".repeat(37);
+        let http = CompletionError::HttpError {
+            status_code: 400,
+            message: text.clone(),
+            is_external: false,
+        };
+        assert_eq!(
+            InferenceProviderPool::completion_error_status(&http),
+            Some(400)
+        );
+        assert_eq!(
+            InferenceProviderPool::completion_error_message_len(&http),
+            37
+        );
+
+        let media = CompletionError::ClientMediaError(text);
+        assert_eq!(InferenceProviderPool::completion_error_status(&media), None);
+        assert_eq!(
+            InferenceProviderPool::completion_error_message_len(&media),
+            37
+        );
+
+        let timeout = CompletionError::Timeout {
+            operation: String::new(),
+            timeout_seconds: 1,
+        };
+        assert_eq!(
+            InferenceProviderPool::completion_error_message_len(&timeout),
+            0
+        );
+
+        for (status, want) in [
+            (Some(401), "unauthorized"),
+            (Some(403), "unauthorized"),
+            (Some(429), "rate_limited"),
+            (Some(503), "unavailable"),
+            (Some(500), "server_error"),
+            (Some(422), "client_error"),
+            (Some(200), "http_other"),
+            (None, "request_failed"),
+        ] {
+            assert_eq!(
+                InferenceProviderPool::provider_error_category(status),
+                want,
+                "wrong category for {status:?}"
             );
         }
     }

@@ -186,3 +186,55 @@ async fn test_check_api_key_burst_above_per_key_rate_limit() {
         response.text()
     );
 }
+
+#[tokio::test]
+async fn fresh_key_validation_does_not_wait_for_last_used_row_locks() {
+    let (server, db) = setup_test_server_with_database().await;
+    let org = setup_org_with_credits(&server, 10_000_000_000).await;
+    let key = get_api_key_for_org(&server, org.id).await;
+    let repo = database::ApiKeyRepository::new(db.pool().clone());
+    let validated = repo.validate(&key).await.unwrap().unwrap();
+    let id = validated.id;
+    let mut client = db.pool().get().await.unwrap();
+    let first: chrono::DateTime<chrono::Utc> = client
+        .query_one("SELECT last_used_at FROM api_keys WHERE id=$1", &[&id])
+        .await
+        .unwrap()
+        .get(0);
+    repo.validate(&key).await.unwrap().unwrap();
+    let second: chrono::DateTime<chrono::Utc> = client
+        .query_one("SELECT last_used_at FROM api_keys WHERE id=$1", &[&id])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(first, second, "recent last-used metadata is not rewritten");
+    client
+        .execute(
+            "UPDATE api_keys SET last_used_at=NOW()-INTERVAL '2 minutes' WHERE id=$1",
+            &[&id],
+        )
+        .await
+        .unwrap();
+    let tx = client.transaction().await.unwrap();
+    tx.query_one("SELECT id FROM api_keys WHERE id=$1 FOR UPDATE", &[&id])
+        .await
+        .unwrap();
+    let result = tokio::time::timeout(std::time::Duration::from_secs(1), repo.validate(&key)).await;
+    tx.rollback().await.unwrap();
+    assert!(result
+        .expect("last-used tracking must skip a locked row")
+        .unwrap()
+        .is_some());
+    repo.validate(&key).await.unwrap().unwrap();
+    let refreshed: chrono::DateTime<chrono::Utc> = client
+        .query_one("SELECT last_used_at FROM api_keys WHERE id=$1", &[&id])
+        .await
+        .unwrap()
+        .get(0);
+    assert!(refreshed >= first);
+    client
+        .execute("UPDATE api_keys SET is_active=false WHERE id=$1", &[&id])
+        .await
+        .unwrap();
+    assert!(repo.validate(&key).await.unwrap().is_none());
+}

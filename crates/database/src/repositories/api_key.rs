@@ -154,7 +154,7 @@ impl ApiKeyRepository {
             client
                 .query_typed_opt(
                     r#"
-            SELECT ak.*
+            SELECT ak.*, (ak.last_used_at IS NULL OR ak.last_used_at < NOW() - INTERVAL '1 minute') AS touch_due
             FROM api_keys ak
             JOIN workspaces w ON w.id = ak.workspace_id
             JOIN organizations o ON o.id = w.organization_id
@@ -173,11 +173,14 @@ impl ApiKeyRepository {
 
         match row {
             Some(row) => {
+                let touch_due: bool = row.get("touch_due");
                 let api_key = self
                     .row_to_api_key(row)
                     .map_err(RepositoryError::DataConversionError)?;
-                // Update last used timestamp
-                let _ = self.update_last_used(api_key.id).await;
+                // Last-used metadata is approximate; authentication always uses the fresh row.
+                if touch_due {
+                    let _ = self.update_last_used(api_key.id).await;
+                }
                 Ok(Some(api_key))
             }
             None => Ok(None),
@@ -197,7 +200,13 @@ impl ApiKeyRepository {
             // One-shot typed query: one round trip, see repositories/mod.rs.
             client
                 .execute_typed(
-                    "UPDATE api_keys SET last_used_at = NOW() WHERE id = $1",
+                    // This statement locks only the key row, skipping any concurrent holder.
+                    r#"UPDATE api_keys SET last_used_at = NOW()
+                       WHERE id IN (
+                           SELECT id FROM api_keys
+                           WHERE id = $1 AND (last_used_at IS NULL OR last_used_at < NOW() - INTERVAL '1 minute')
+                           FOR UPDATE SKIP LOCKED
+                       )"#,
                     &[(&id, Type::UUID)],
                 )
                 .await

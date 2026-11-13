@@ -210,10 +210,6 @@ Operations marked deprecated (account, organization, workspace, invitation, API 
             UpdateOrganizationMemberRequest,
             OrganizationMemberResponse,
             PublicOrganizationMemberResponse,
-            AdminOrganizationMemberResponse,
-            ListAdminOrganizationMembersResponse,
-            AdminApiKeyResponse,
-            ListAdminApiKeysResponse,
             MemberRole,
             // Organization Invitation models
             InvitationStatus,

@@ -2426,18 +2426,14 @@ fn build_organization_credit_service(
     config: &ApiConfig,
 ) -> Arc<dyn services::organization_credits::OrganizationCreditServiceTrait> {
     use database::repositories::credit_transfers::CreditTransferRepository;
-    use database::repositories::organization_credentials::OrganizationCredentialRepository;
     use services::organization_credits::OrganizationCreditService;
 
     let transfers = Arc::new(CreditTransferRepository::new(
         database.pool().clone(),
         &config.credit_allocation,
     ));
-    let credentials = Arc::new(OrganizationCredentialRepository::new(
-        database.pool().clone(),
-    ));
 
-    Arc::new(OrganizationCreditService::new(transfers, credentials))
+    Arc::new(OrganizationCreditService::new(transfers))
 }
 
 #[cfg(test)]

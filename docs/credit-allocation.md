@@ -78,209 +78,40 @@ immediately available for new usage. No admin API call is required.
   rollout. Allocation rows and their parent usage/balance update commit in one
   transaction.
 
-## Reconciling legacy consumption when moving to postpay
-
-For an existing organization, review historical credit/payment/contract records
-before choosing a credit type for its pre-attribution consumption. Admins can
-reclassify a reviewed portion of `legacy_unattributed_amount` using:
-
-`POST /v1/admin/organizations/{org_id}/credit/reconciliations`
-
-```json
-{
-  "idempotency_key": "opening-review-2026-10",
-  "amounts": { "payment": 80000000000 },
-  "reason": "Verified $80 prepaid consumption against billing records",
-  "dry_run": true
-}
-```
-
-All amounts are positive integer nano-USD. Supported names are `grant`,
-`payment`, `staking_farm`, `transfer`, and `postpay`. Use `transfer` to attribute
-reviewed legacy consumption to received credits. Transfer adjustments cannot
-exceed the remaining unconsumed received-transfer capacity; reconciliation does
-not create received credits or change the transfer ledger.
-A nonempty reason (up to 2000 characters) and a per-organization idempotency key
-(up to 100 characters) are required.
-The endpoint requires an admin session or read-write admin access token;
-read-only tokens cannot preview or commit this operation.
-
-A dry run returns before/after per-type `spend_limit`, consumed and available amounts,
-legacy unknown consumption, unresolved overage, and aggregate available capacity.
-It stores nothing and does not reserve the key. Set `dry_run` to `false` (or omit
-it) to commit; accounting is revalidated under the organization lock, so a
-preview is not a reservation of its displayed position. Record the returned
-`reconciliation_id` with the reviewed evidence. Identical committed terms with
-an existing key return the original snapshots even after later usage; conflicting
-terms return HTTP 409. A preview using an already committed key also returns 409.
-Keys are trimmed once before lookup and storage, so whitespace around the key
-cannot create a second adjustment. Snapshots include `schema_version`; additive
-changes to persisted snapshot structs must use serde defaults and incompatible
-versions need an explicit replay adapter. Snapshots and API responses use
-`spend_limit`. Consumption without an active limit
-is included with `active: false`, zero limit and zero available capacity.
-
-The operation adds reviewed historical consumption to the existing per-type
-counters and removes exactly the same amount from the aggregate legacy
-consumption deduction. It preserves total spend, unresolved overage, current
-limits, and aggregate available capacity. Each selected type must have an
-active USD limit with enough remaining capacity; otherwise the operation
-returns 409 and the opening position needs further review. Never increase a
-limit merely to bypass this validation. The supplied amounts are increments,
-not absolute replacements for lifetime consumption.
-
-Use this order when moving an existing organization to postpay:
-
-1. Finish historical discount corrections and review which funding types paid
-   for the legacy consumption. Ensure the reconciliation-aware writers are deployed.
-2. Ensure every selected type has an active USD limit with enough remaining
-   capacity. If assigning history to `postpay`, create the approved postpay limit
-   first. Keep existing grant/payment limits in place until their history has
-   been reconciled; do not lower them first or inflate limits to bypass validation.
-3. Dry run the reviewed increments and inspect the before/after balances.
-4. Commit those same increments and reason with the same idempotency key, then
-   save the audit ID. If live usage causes a conflict, review fresh balances and
-   preview again before committing.
-5. Apply the remaining approved limit changes, including reducing old grant or
-   payment limits. Verify sufficient capacity remains for ongoing usage throughout
-   the transition; reconciliation itself neither creates nor removes capacity.
-
-For example, with a payment limit of $100, postpay limit of $200 and $80 of
-legacy unknown spend, reclassifying the $80 as payment-funded leaves payment
-capacity $20 and postpay capacity $200, with aggregate capacity unchanged at
-$220. New postings read the corrected counters using the configured priority.
-The endpoint does not change that priority or a contract's effective date.
-
-Adjustments are stored in a separate append-only audit ledger with the actor,
-reason, amounts and original before/after result. They do **not** rewrite old
-usage logs, create per-request allocations, or make a postpay-filtered historical
-report complete. Unreviewed amounts remain unknown; invoice settlement and
-historical request-level attribution are separate operations.
-Usage already allocated per request since the allocation ledger was introduced
-keeps its recorded credit type. For example, usage allocated to `grant` while a
-credit line was booked as a grant remains grant consumption after switching to
-postpay. This is intentional for this endpoint: it only assigns currently
-unattributed legacy consumption. Correcting previously attributed grant usage
-would require a separate audited reclassification operation and is outside this PR.
-
-Partial reconciliation preserves the remaining unknown deduction but cannot
-establish a fully verified per-type opening position. Resolve all relevant
-legacy consumption before relying on future allocations as verified funding.
-
-Finish historical discount corrections before reconciling. A reconciliation is
-rejected while a discount worker is applying. After a reconciliation exists,
-new historical discounts are rejected because aggregate opening classifications
-cannot safely be reversed against individual usage rows. Future-only discounts
-remain supported. Existing fully completed discount corrections can be followed
-by a reconciliation of their remaining legacy spend.
-
-Complete the rollout of every usage-discount/admin writer before performing any
-reconciliation. Old pods do not enforce the reconciliation guard and could
-still accept an incompatible historical discount during a rolling deployment.
-The audit retains the authenticated admin UUID without a users foreign key so
-account deletion does not erase or rewrite the original actor. Audit text and
-JSON fields are explicitly classified as restricted operational billing data,
-consistent with limit-change reasons and billing correction records.
-
-
 ## Reseller credit transfers
 
-An administrator explicitly enables each reseller with
-`PUT /v1/admin/organizations/{org_id}/policy`:
-
-```json
-{
-  "policy": {
-    "credentials": {"enabled": true},
-    "credits_transfer": {
-      "enabled": true,
-      "max_sends_per_minute": 60,
-      "constraints": {
-        "max_amount_per_transfer": 10000000000,
-        "max_total_amount": 500000000000,
-        "allowed_source_types": ["payment", "staking_farm"]
-      }
-    }
-  },
-  "reason": "Reviewed opening accounting"
-}
-```
-
-The policy uses named sections for future extension. PUT replaces the complete
-supported policy; unknown fields and permissions are rejected, never silently
-accepted. GET returns current policy and append-only audit. Read-only admin
-credentials may inspect policies and reconciliation but cannot change policies.
-No organization is enabled by migration. Disabling sends retains authorized
+Each reseller is enabled through its organization policy. No organization is
+enabled by migration. This service no longer exposes routes to create or change
+policies or organization credentials: policies and credentials that already exist
+stay in effect for the transfer routes below. Disabling sends retains authorized
 history and exact replay access. Organization-wide budgets include owner-session
 sends and all credentials, including revoked credentials.
 
 ### Organization credentials
 
-Owners manage organization-owned automation credentials. Administrators must
-first enable `policy.credentials.enabled` (default false). The server gates
-creation, configuration updates, and rotation; listing and revocation remain
-available when disabled so owners can still remove existing access. This flag
-does not revoke existing secrets or disable their use; use revocation or the
-separate transfer policy to stop sending.
-
-Cloud Admin UI exposes this organization policy alongside transfer settings.
-Credential management controls require both this policy flag and owner membership;
-being a platform admin alone does not grant permission to mint an organization's
-credentials.
-
-Endpoints:
-
-| Method | Path (under `/v1/organizations/{org_id}`) | Purpose |
-| --- | --- | --- |
-| POST | `/credentials` | Create; secret returned once |
-| GET | `/credentials` | List configuration, decimal-string lifetime transfer usage, and audit |
-| PUT | `/credentials/{id}` | Replace configuration; preserve identity and usage |
-| POST | `/credentials/{id}/rotate` | Replace secret immediately; preserve identity and usage |
-| DELETE | `/credentials/{id}` | Revoke; repeated revocation preserves timestamp and audit |
-
-Create or update with:
-
-```json
-{
-  "name": "Contributor payouts",
-  "permissions": ["credits:read", "credits:transfer"],
-  "constraints": {
-    "credits:transfer": {
-      "max_amount_per_transfer": 10000000000,
-      "max_total_amount": 500000000000,
-      "allowed_source_types": ["payment"]
-    }
-  },
-  "expires_at": "2027-01-01T00:00:00Z"
-}
-```
-
-Amounts are integer nano-USD: the example permits $10 per transfer and $500 over
-the credential's lifetime. `expires_at` must be in the next 366 days. Optional
-constraints are `max_amount_per_transfer`, `max_total_amount`,
+An organization credential authenticates transfer routes with
+`Authorization: Bearer oc_...`. Each has a name, permissions (`credits:read`,
+`credits:transfer`), optional constraints and an expiry within 366 days of
+creation. Optional constraints are `max_amount_per_transfer`, `max_total_amount`,
 `allowed_source_types`, and `allowed_recipient_ids` (at most 1,000 UUIDs).
-Omitting a constraint adds no restriction; an empty allowlist permits nothing,
+
+Amounts are integer nano-USD. Omitting a constraint adds no restriction; an empty allowlist permits nothing,
 and a zero monetary limit blocks new sends. Organization policy and credential
 constraints both apply. Postpay and received transfer credits can never be sources. Grant requires an
 explicit `grant` entry in the organization policy `allowed_source_types`; omitting
 that policy allowlist permits only payment and staking. Credential restrictions
 can narrow the policy but cannot enable a source the policy disallows.
-A per-credential limit bounds an integration, not the owners who can create more
-credentials; the organization policy is the aggregate budget boundary.
+A per-credential limit bounds an integration; the organization policy is the
+aggregate budget boundary.
 
-`credits:read` allows transfer history/detail and capacity reads. `credits:transfer`
+`credits:read` allows transfer history and capacity reads. `credits:transfer`
 allows sends and their original response replays; it does not implicitly grant
-history reads. Neither permission authorizes credential management, policy
-changes, or inference. Owners manage credentials using their sessions. Existing
-reporting tokens and workspace inference API keys remain unchanged.
+history reads. Neither permission authorizes inference. Workspace inference API
+keys are unchanged.
 
 Secrets have the `oc_` prefix; only their SHA-256 hashes and safe display prefixes
-are stored. Listing and audit never expose hashes or secrets. Unknown credential
-IDs return 404. Creation, configuration changes, rotation, and revocation are
-audited. Credentials belong to the organization: removing the creator does not
-revoke them. Other owners must review and revoke credentials during offboarding.
-Rotation immediately invalidates the old secret without resetting usage or expiry;
-update expiry separately if needed. A revoked credential cannot be reactivated.
+are stored. Credentials belong to the organization: removing the creator does not
+revoke them. A revoked credential cannot be reactivated.
 
 Lifetime usage is derived from the immutable transfer ledger under the same
 organization lock as sends. Failed operations and exact retries consume no budget.
@@ -367,8 +198,7 @@ after account erasure or organization deactivation.
 outgoing transfers, newest first, with a maximum page size of 100. Select
 `?direction=outgoing` or `?direction=incoming` to restrict the list. Pass both
 `before_time` and `before_id` from `next_cursor` for the next page. Use
-`?idempotency_key=...` for an outgoing lookup, or `/credit/transfers/{id}` for a
-single record. Sender responses contain its original snapshot and delivery
+`?idempotency_key=...` for an outgoing lookup. Sender responses contain its original snapshot and delivery
 confirmation; only recipient views contain its snapshot and debt settlement.
 `GET /v1/organizations/{org_id}/credit/transfer/capacity` requires `credits:read`
 or an owner session. It returns own credit positions, posted own staking earnings,
@@ -387,7 +217,7 @@ active sources. Aggregate legacy deductions still apply, and unreconciled or
 indebted senders cannot send. Transfers do not increase lifetime consumption,
 usage counts, gross own staking earnings, payment limits, or cash receipts.
 Received credits are system-owned and cannot be created by general limit updates
-or historical reconciliation. Consumption and reporting use type `transfer`.
+Consumption and reporting use type `transfer`.
 
 Each transaction locks both organizations in UUID order. Current membership or
 credential authority is checked under a row lock; membership changes and
@@ -407,7 +237,7 @@ allowed, configurable through organization policy (1–100,000); exact replays d
 Transient database/lock errors return 503; retry with the original key.
 `credit_transfer_operations` records bounded outcome labels, never user metadata.
 
-### Deployment and reconciliation
+### Deployment
 
 1. Ship the transfer-aware image and its five-type `CREDIT_USAGE_ORDER` together
    in the same deployment revision, with allocation policy version `v2` (or a new
@@ -422,18 +252,9 @@ Transient database/lock errors return 503; retry with the original key.
 3. Balance rendering can show gross, distributed, consumed, and available amounts.
    `effective_capacity` is a convenience field derived from gross minus outgoing;
    clients do not have to display it separately. This server PR does not deploy UI.
-4. Call `GET /v1/admin/organizations/{org_id}/credit/transfer/reconciliation`
-   using an admin session or read-only admin token. It returns `consistent`,
-   `checked_at`, and structured `findings` for ledger/projection mismatches,
-   incoming-limit mismatches, outgoing above gross source capacity, and transfer
-   consumption above incoming credits. Operators need no SQL access. This is a
-   single consistent database snapshot, not an automatic repair or a guarantee
-   against later manual changes. Investigate findings before enablement.
-   Corrections remain separate reviewed maintenance operations; never rewrite
-   completed transfers or historical usage allocations.
-5. Enable one reviewed, fully reconciled, debt-free reseller and check end-to-end
+4. Enable one reviewed, fully reconciled, debt-free reseller and check end-to-end
    delivery, consumption attribution, and staking sync before broadening access.
-6. Emergency rollback disables policies but retains transfer-aware accounting.
+5. Emergency rollback disables policies but retains transfer-aware accounting.
    Never roll back to binaries that ignore outgoing deductions or transfer credits.
 
 Reversals, chargebacks, fees, expiry, claims by email, bulk sends, automatic
@@ -449,7 +270,7 @@ existing historical allocations and the one-active-transfer-limit invariant.
 
 Source limit replacement rejects a gross limit below credits already distributed
 from that source. Reducing available capacity must retain that backing; external
-manual corruption is still detected by reconciliation. When setting a custom
+manual corruption is not repaired automatically. When setting a custom
 `CREDIT_ALLOCATION_POLICY_VERSION`, explicitly set `CREDIT_USAGE_ORDER` too so an
 old policy version cannot silently acquire the new five-type default order.
 
@@ -462,8 +283,7 @@ not require transfers to remain enabled or the original budgets to remain availa
 
 Transfer source backing is denominated in USD. A source with distributed credits
 cannot be replaced by a non-USD limit, even if its numeric amount is unchanged.
-Reconciliation reports `source_currency_mismatch` when non-USD capacity would
-otherwise conceal missing USD backing. Non-USD limits remain visible in balance
+Non-USD limits remain visible in balance
 snapshots but contribute zero to transfer capacity.
 
 Legacy organization/user aggregate `spend_limit` responses are bounded at

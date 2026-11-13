@@ -337,33 +337,6 @@ async fn management_enabled(tx: &Transaction<'_>, org: Uuid) -> anyhow::Result<b
         .get(0))
 }
 
-#[async_trait::async_trait]
-impl services::organization_credits::ports::OrganizationCredentialRepositoryPort
-    for OrganizationCredentialRepository
-{
-    async fn list_credentials(&self, org: Uuid, owner: Uuid) -> anyhow::Result<Value> {
-        OrganizationCredentialRepository::list(self, org, owner).await
-    }
-
-    async fn save_credential(
-        &self,
-        org: Uuid,
-        owner: Uuid,
-        id: Option<Uuid>,
-        request: &CredentialRequest,
-    ) -> anyhow::Result<Value> {
-        OrganizationCredentialRepository::save(self, org, owner, id, request).await
-    }
-
-    async fn revoke_credential(&self, org: Uuid, owner: Uuid, id: Uuid) -> anyhow::Result<Value> {
-        OrganizationCredentialRepository::revoke(self, org, owner, id).await
-    }
-
-    async fn rotate_credential(&self, org: Uuid, owner: Uuid, id: Uuid) -> anyhow::Result<Value> {
-        OrganizationCredentialRepository::rotate(self, org, owner, id).await
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

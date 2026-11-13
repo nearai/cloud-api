@@ -2,7 +2,9 @@
 
 Implements [House of Stake #228](https://github.com/nearai/house-of-stake-contracts/issues/228).
 
-`POST /v1/organizations/{org_id}/staking/farm/bind` accepts a `phase` discriminator:
+This service no longer serves the bind route, the staking farm configuration route, the farm state read routes or the admin farm routes (`POST /v1/organizations/{org_id}/staking/farm/bind` and its siblings). `POST /v1/organizations/{org_id}/staking/farm/sync` and the `staking_organization_id` field of `/v1/users/me` remain, and existing bindings stay in effect. The description below records the binding design.
+
+The bind route accepted a `phase` discriminator:
 
 - `prepare`: `{ "phase": "prepare", "near_account_id": "alice.near" }` returns a five-minute, actor/org/wallet-scoped NEP-413 challenge. No identity, source or membership is created.
 - `confirm`: send `challenge_id`, `signed_message` (camelCase NEP-413 wallet output), `acknowledged_terms_version`, and a UUID `idempotency_key`. The backend verifies the stored message and full-access public key, applies wallet AML policy and atomically commits the immutable source, verified NEAR Cloud identity, Admin membership, proof audit and retry result. It returns `source` and `wallet_membership`, without login tokens.
@@ -13,7 +15,7 @@ Binding ensures the active NEAR provider identity has an owned personal organiza
 
 Membership grants happen only once in binding, never in login, sync, or idempotent retries. Later demotion/removal remains effective. Wallet ownership and direct contract rights remain independent of Cloud membership. `/users/me` supplies `staking_organization_id` only for an authenticated NEAR identity that remains a member of the active bound organization; clients use it as a selection preference, without changing default membership ordering.
 
-GET farm state is member-readable. New clients request `?include_binding_state=true` to receive the capability envelope while the feature flag is off; legacy unbound callers retain 404 during staged deployment. With explicit binding enabled, unbound state is 200. The envelope returns explicit `binding_status`, nullable `source`, and caller capabilities. For bound sources the old top-level farm fields remain available for older consumers. Sync is owner/admin-only and uses the bound source's account, not the login wallet. Raw reward units and lifetime conversion remain authoritative; credited totals are monotonic even across concurrent replica updates. Read-only members do not receive wallet controls.
+Sync is owner/admin-only and uses the bound source's account, not the login wallet. Raw reward units and lifetime conversion remain authoritative; credited totals are monotonic even across concurrent replica updates. Read-only members do not receive wallet controls.
 
 ## Rollout
 

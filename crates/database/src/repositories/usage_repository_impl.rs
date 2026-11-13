@@ -242,19 +242,16 @@ impl services::usage::ports::UsageRepository for OrganizationUsageRepository {
 
     async fn get_stop_reason_by_response_id(
         &self,
-        workspace_id: uuid::Uuid,
         response_id: Uuid,
     ) -> anyhow::Result<Option<services::usage::StopReason>> {
-        self.get_stop_reason_by_response_id(workspace_id, response_id)
-            .await
+        self.get_stop_reason_by_response_id(response_id).await
     }
 
     async fn get_stop_reason_by_provider_request_id(
         &self,
-        workspace_id: uuid::Uuid,
         provider_request_id: &str,
     ) -> anyhow::Result<Option<services::usage::StopReason>> {
-        self.get_stop_reason_by_provider_request_id(workspace_id, provider_request_id)
+        self.get_stop_reason_by_provider_request_id(provider_request_id)
             .await
     }
 

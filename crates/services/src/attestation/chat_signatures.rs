@@ -37,8 +37,22 @@ impl AttestationService {
         {
             Ok(signature) => Ok(SignatureLookupResult::Found(signature)),
             Err(AttestationError::SignatureNotFound(_)) => {
-                self.check_fallback_conditions(workspace_id, chat_id, &signing_algo)
+                if let Some(provider) = self
+                    .inference_provider_pool
+                    .get_provider_by_chat_id(chat_id)
                     .await
+                {
+                    if !provider.supports_chat_signatures() {
+                        return Ok(SignatureLookupResult::Unavailable {
+                            error_code: "SIGNATURE_UNSUPPORTED".to_string(),
+                            message: "This model's responses are integrity-protected by an \
+                                      end-to-end encrypted channel, not a per-response signature; \
+                                      there is no signature to retrieve."
+                                .to_string(),
+                        });
+                    }
+                }
+                self.check_fallback_conditions(chat_id, &signing_algo).await
             }
             Err(e) => Err(e),
         }
@@ -258,7 +272,6 @@ impl AttestationService {
 
     async fn check_fallback_conditions(
         &self,
-        workspace_id: uuid::Uuid,
         chat_id: &str,
         signing_algo: &str,
     ) -> Result<SignatureLookupResult, AttestationError> {
@@ -274,33 +287,15 @@ impl AttestationService {
                 }
             };
             self.usage_repository
-                .get_stop_reason_by_response_id(workspace_id, response_uuid)
+                .get_stop_reason_by_response_id(response_uuid)
                 .await
                 .map_err(|e| AttestationError::RepositoryError(e.to_string()))?
         } else {
             self.usage_repository
-                .get_stop_reason_by_provider_request_id(workspace_id, chat_id)
+                .get_stop_reason_by_provider_request_id(chat_id)
                 .await
                 .map_err(|e| AttestationError::RepositoryError(e.to_string()))?
         };
-
-        if stop_reason.is_some() {
-            if let Some(provider) = self
-                .inference_provider_pool
-                .get_provider_by_chat_id(chat_id)
-                .await
-            {
-                if !provider.supports_chat_signatures() {
-                    return Ok(SignatureLookupResult::Unavailable {
-                        error_code: "SIGNATURE_UNSUPPORTED".to_string(),
-                        message: "This model's responses are integrity-protected by an \
-                                      end-to-end encrypted channel, not a per-response signature; \
-                                      there is no signature to retrieve."
-                            .to_string(),
-                    });
-                }
-            }
-        }
 
         match stop_reason {
             Some(StopReason::ClientDisconnect) => Ok(SignatureLookupResult::Unavailable {

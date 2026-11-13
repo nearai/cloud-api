@@ -235,7 +235,6 @@ impl UsageRepository for NoopUsageRepository {
 
     async fn get_stop_reason_by_response_id(
         &self,
-        _workspace_id: uuid::Uuid,
         _response_id: Uuid,
     ) -> anyhow::Result<Option<StopReason>> {
         Ok(None)
@@ -243,7 +242,6 @@ impl UsageRepository for NoopUsageRepository {
 
     async fn get_stop_reason_by_provider_request_id(
         &self,
-        _workspace_id: uuid::Uuid,
         _provider_request_id: &str,
     ) -> anyhow::Result<Option<StopReason>> {
         Ok(None)

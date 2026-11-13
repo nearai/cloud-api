@@ -18,16 +18,25 @@ pub struct S3Config {
 
 impl std::fmt::Debug for S3Config {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            mock,
+            bucket,
+            region,
+            encryption_key: _,
+            encryption_keys,
+            object_rewrap_max_bytes,
+            object_encryption_write_enabled,
+        } = self;
         f.debug_struct("S3Config")
-            .field("mock", &self.mock)
-            .field("bucket", &self.bucket)
-            .field("region", &self.region)
+            .field("mock", mock)
+            .field("bucket", bucket)
+            .field("region", region)
             .field("encryption_key", &"<redacted>")
-            .field("encryption_keys", &self.encryption_keys)
-            .field("object_rewrap_max_bytes", &self.object_rewrap_max_bytes)
+            .field("encryption_keys", encryption_keys)
+            .field("object_rewrap_max_bytes", object_rewrap_max_bytes)
             .field(
                 "object_encryption_write_enabled",
-                &self.object_encryption_write_enabled,
+                object_encryption_write_enabled,
             )
             .finish()
     }

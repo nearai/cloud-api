@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::{env, fmt};
 
 use crate::types::{
-    parse_bool_env, parse_u32_env, parse_u64_env, read_optional_secret_env_absent_empty,
+    parse_bool_env, parse_u32_env, parse_u64_env, read_optional_secret_env_absent_empty, redact_url,
 };
 
 mod policy;
@@ -15,9 +15,16 @@ pub const DEFAULT_ITA_TIMEOUT_SECONDS: u64 = 10;
 pub const DEFAULT_ITA_MAX_RETRIES: u32 = 2;
 pub const DEFAULT_ITA_RETRY_BACKOFF_MS: u64 = 250;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct ItaBaseUrl(String);
+
+impl fmt::Debug for ItaBaseUrl {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self(url) = self;
+        f.debug_tuple("ItaBaseUrl").field(&redact_url(url)).finish()
+    }
+}
 
 impl ItaBaseUrl {
     pub fn parse(raw: &str, field: &str) -> Result<Self, String> {
@@ -62,17 +69,31 @@ pub struct ItaAttestationConfig {
 
 impl fmt::Debug for ItaAttestationConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Exhaustive destructure (no `..`): adding a field is a compile error
+        // here until it is listed (and, if a secret, redacted).
+        let Self {
+            enabled,
+            api_base_url,
+            portal_base_url,
+            api_key,
+            timeout_seconds,
+            max_retries,
+            retry_backoff_ms,
+            policy_ids,
+            policy_must_match,
+            token_signing_alg,
+        } = self;
         f.debug_struct("ItaAttestationConfig")
-            .field("enabled", &self.enabled)
-            .field("api_base_url", &self.api_base_url)
-            .field("portal_base_url", &self.portal_base_url)
-            .field("api_key_configured", &self.api_key.is_some())
-            .field("timeout_seconds", &self.timeout_seconds)
-            .field("max_retries", &self.max_retries)
-            .field("retry_backoff_ms", &self.retry_backoff_ms)
-            .field("policy_ids", &self.policy_ids)
-            .field("policy_must_match", &self.policy_must_match)
-            .field("token_signing_alg", &self.token_signing_alg)
+            .field("enabled", enabled)
+            .field("api_base_url", api_base_url)
+            .field("portal_base_url", portal_base_url)
+            .field("api_key_configured", &api_key.is_some())
+            .field("timeout_seconds", timeout_seconds)
+            .field("max_retries", max_retries)
+            .field("retry_backoff_ms", retry_backoff_ms)
+            .field("policy_ids", policy_ids)
+            .field("policy_must_match", policy_must_match)
+            .field("token_signing_alg", token_signing_alg)
             .finish()
     }
 }

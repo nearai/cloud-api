@@ -379,24 +379,30 @@ async fn claim_authenticated_request(
         .ok_or_else(|| OhttpError::Internal("Cannot validate request".into()))?
         .build()
         .map_err(|_| OhttpError::BadRequest("Invalid inner request".into()))?;
-    let Some(key) = request
+    let bearer = request
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
-    else {
-        return Ok(());
-    };
-    match state.auth_service.validate_api_key(key.to_owned()).await {
-        Ok(_) => {}
-        Err(services::auth::AuthError::Unauthorized) => return Ok(()),
-        Err(_) => return Err(OhttpError::Internal("Unable to validate request".into())),
+        .and_then(|value| value.strip_prefix("Bearer "));
+    let sdk_key = request
+        .headers()
+        .get("x-api-key")
+        .and_then(|value| value.to_str().ok());
+    // Check both accepted credential forms. An unrelated invalid header must
+    // not hide a valid credential used by the inner route.
+    for key in [bearer, sdk_key].into_iter().flatten() {
+        match state.auth_service.validate_api_key(key.to_owned()).await {
+            Ok(_) => {}
+            Err(services::auth::AuthError::Unauthorized) => continue,
+            Err(_) => return Err(OhttpError::Internal("Unable to validate request".into())),
+        }
+        return match gateway.claim_request(encapsulated).await {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(OhttpError::Replayed),
+            Err(_) => Err(OhttpError::Internal("Replay protection unavailable".into())),
+        };
     }
-    match gateway.claim_request(encapsulated).await {
-        Ok(true) => Ok(()),
-        Ok(false) => Err(OhttpError::Replayed),
-        Err(_) => Err(OhttpError::Internal("Replay protection unavailable".into())),
-    }
+    Ok(())
 }
 
 // ── Shared helpers ───────────────────────────────────────────────────────────

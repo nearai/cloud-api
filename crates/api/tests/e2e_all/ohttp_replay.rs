@@ -123,6 +123,33 @@ async fn ohttp_duplicate_is_rejected_before_a_second_inference() {
         .bytes(chunked_bytes.into())
         .await;
     assert_eq!(duplicate.status_code(), 409);
+    let mut sdk_request = bhttp::Message::request(
+        b"GET".to_vec(),
+        b"https".to_vec(),
+        b"example.test".to_vec(),
+        b"/v1/models".to_vec(),
+    );
+    sdk_request.put_header(b"x-api-key".to_vec(), key.as_bytes().to_vec());
+    let mut sdk_bhttp = Vec::new();
+    sdk_request
+        .write_bhttp(bhttp::Mode::KnownLength, &mut sdk_bhttp)
+        .unwrap();
+    let (sdk_enc, _) = ohttp::ClientRequest::from_config(&mut config)
+        .unwrap()
+        .encapsulate(&sdk_bhttp)
+        .unwrap();
+    for expected in [200, 409] {
+        let result = server
+            .post("/ohttp")
+            .add_header("content-type", "message/ohttp-req")
+            .bytes(sdk_enc.clone().into())
+            .await;
+        assert_eq!(
+            result.status_code(),
+            expected,
+            "SDK credential form participates in replay protection"
+        );
+    }
     let org_id = uuid::Uuid::parse_str(&org.id).unwrap();
     let count: i64 = database
         .pool()

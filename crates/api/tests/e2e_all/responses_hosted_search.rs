@@ -564,6 +564,283 @@ async fn model_failure_after_search_retains_prior_usage_and_partial_output() {
     assert_eq!(provider.web_params.lock().unwrap().len(), 2);
 }
 
+fn search_calls(queries: &[String]) -> ResponseTemplate {
+    ResponseTemplate::new("").with_tool_calls(
+        queries
+            .iter()
+            .map(|query| ToolCall::new("web_search", json!({"query": query}).to_string()))
+            .collect(),
+    )
+}
+
+fn queries(prefix: &str, count: usize) -> Vec<String> {
+    (0..count)
+        .map(|index| format!("{prefix}-{index}"))
+        .collect()
+}
+
+fn executed_queries(provider: &RecordingSearchProvider) -> Vec<String> {
+    provider
+        .web_params
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|params| params.query.clone())
+        .collect()
+}
+
+fn output_search_queries(response: &Value) -> Vec<String> {
+    response["output"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|item| item["type"] == "web_search_call")
+        .map(|item| item["action"]["query"].as_str().unwrap().to_string())
+        .collect()
+}
+
+/// Tool-result messages the final inference received, in transcript order.
+async fn final_tool_results(mock: &MockProvider) -> Vec<String> {
+    mock.last_chat_params()
+        .await
+        .unwrap()
+        .messages
+        .iter()
+        .filter(|message| message.role == MessageRole::Tool)
+        .map(|message| {
+            message
+                .content
+                .as_ref()
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .to_string()
+        })
+        .collect()
+}
+
+const LIMIT_MESSAGE: &str = "hosted tool call limit for this response has been reached";
+
+#[tokio::test]
+async fn max_tool_calls_of_one_refuses_a_later_round_search() {
+    let provider = Arc::new(RecordingSearchProvider::default());
+    let (server, database, mock) =
+        setup_test_server_with_search_providers(provider.clone(), None).await;
+    let model = setup_qwen_model(&server).await;
+    let org = setup_org_with_credits(&server, 10_000_000_000).await;
+    let api_key = get_api_key_for_org(&server, org.id).await;
+    mock.when(RequestMatcher::ToolResultCount(0))
+        .respond_with(search_calls(&["first".to_string()]))
+        .await;
+    mock.when(RequestMatcher::ToolResultCount(1))
+        .respond_with(search_calls(&["second".to_string()]))
+        .await;
+    mock.set_default_response(ResponseTemplate::new("Answered within the limit."))
+        .await;
+
+    let result = server
+        .post("/v1/responses")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&json!({
+            "model": model,
+            "input": "Search twice if needed.",
+            "tools": [{"type": "web_search"}],
+            "max_tool_calls": 1,
+            "store": false,
+            "stream": true
+        }))
+        .await;
+    let response = completed_response(&result, true);
+    assert_eq!(output_text(&response)["text"], "Answered within the limit.");
+    assert_eq!(executed_queries(&provider), ["first"]);
+    assert_eq!(output_search_queries(&response), ["first"]);
+    assert_search_lifecycle(&events(&result.text()), &response);
+    let results = final_tool_results(&mock).await;
+    assert_eq!(results.len(), 2);
+    assert!(!results[0].contains(LIMIT_MESSAGE));
+    assert!(results[1].contains(LIMIT_MESSAGE));
+    assert_eq!(mock.chat_completion_call_count(), 3);
+    assert_no_history(&database, &response).await;
+}
+
+#[tokio::test]
+async fn max_tool_calls_counts_parallel_and_later_round_searches_together() {
+    let provider = Arc::new(RecordingSearchProvider::default());
+    let (server, database, mock) =
+        setup_test_server_with_search_providers(provider.clone(), None).await;
+    let model = setup_qwen_model(&server).await;
+    let org = setup_org_with_credits(&server, 10_000_000_000).await;
+    let api_key = get_api_key_for_org(&server, org.id).await;
+    mock.when(RequestMatcher::ToolResultCount(0))
+        .respond_with(search_calls(&queries("parallel", 2)))
+        .await;
+    mock.when(RequestMatcher::ToolResultCount(2))
+        .respond_with(search_calls(&["follow-up".to_string()]))
+        .await;
+    mock.set_default_response(ResponseTemplate::new("All three searches finished."))
+        .await;
+
+    let result = server
+        .post("/v1/responses")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&json!({
+            "model": model,
+            "input": "Search in parallel, then follow up.",
+            "tools": [{"type": "web_search"}],
+            "max_tool_calls": 3,
+            "store": false
+        }))
+        .await;
+    let response = completed_response(&result, false);
+    assert_eq!(
+        output_text(&response)["text"],
+        "All three searches finished."
+    );
+    let expected = ["parallel-0", "parallel-1", "follow-up"];
+    assert_eq!(executed_queries(&provider), expected);
+    assert_eq!(output_search_queries(&response), expected);
+    let results = final_tool_results(&mock).await;
+    assert_eq!(results.len(), 3);
+    assert!(results.iter().all(|result| !result.contains(LIMIT_MESSAGE)));
+    assert_eq!(mock.chat_completion_call_count(), 3);
+    assert_no_history(&database, &response).await;
+}
+
+#[tokio::test]
+async fn max_tool_calls_stops_parallel_searches_at_the_requested_budget() {
+    let provider = Arc::new(RecordingSearchProvider::default());
+    let (server, database, mock) =
+        setup_test_server_with_search_providers(provider.clone(), None).await;
+    let model = setup_qwen_model(&server).await;
+    let org = setup_org_with_credits(&server, 10_000_000_000).await;
+    let api_key = get_api_key_for_org(&server, org.id).await;
+    let requested = queries("parallel", 5);
+    mock.when(RequestMatcher::ToolResultCount(0))
+        .respond_with(search_calls(&requested))
+        .await;
+    mock.set_default_response(ResponseTemplate::new("Answered from two searches."))
+        .await;
+
+    let result = server
+        .post("/v1/responses")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&json!({
+            "model": model,
+            "input": "Search five ways at once.",
+            "tools": [{"type": "web_search"}],
+            "max_tool_calls": 2,
+            "store": false,
+            "stream": true
+        }))
+        .await;
+    let response = completed_response(&result, true);
+    assert_eq!(
+        output_text(&response)["text"],
+        "Answered from two searches."
+    );
+    assert_eq!(executed_queries(&provider), requested[..2]);
+    assert_eq!(output_search_queries(&response), requested[..2]);
+    let events = events(&result.text());
+    assert_search_lifecycle(&events, &response);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["type"] == "response.web_search_call.in_progress")
+            .count(),
+        2
+    );
+    // Every model call keeps a matching result; only the first two ran.
+    let results = final_tool_results(&mock).await;
+    assert_eq!(results.len(), 5);
+    assert!(results[..2]
+        .iter()
+        .all(|result| !result.contains(LIMIT_MESSAGE)));
+    assert!(results[2..]
+        .iter()
+        .all(|result| result.contains(LIMIT_MESSAGE)));
+    assert_eq!(mock.chat_completion_call_count(), 2);
+    assert_no_history(&database, &response).await;
+}
+
+#[tokio::test]
+async fn max_tool_calls_above_the_server_limit_is_clamped() {
+    use services::responses::models::MAX_HOSTED_TOOL_CALLS;
+
+    let provider = Arc::new(RecordingSearchProvider::default());
+    let (server, database, mock) =
+        setup_test_server_with_search_providers(provider.clone(), None).await;
+    let model = setup_qwen_model(&server).await;
+    let org = setup_org_with_credits(&server, 10_000_000_000).await;
+    let api_key = get_api_key_for_org(&server, org.id).await;
+    let requested = queries("bulk", MAX_HOSTED_TOOL_CALLS + 5);
+    mock.when(RequestMatcher::ToolResultCount(0))
+        .respond_with(search_calls(&requested))
+        .await;
+    mock.set_default_response(ResponseTemplate::new("Answered at the server limit."))
+        .await;
+
+    let result = server
+        .post("/v1/responses")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&json!({
+            "model": model,
+            "input": "Search as much as allowed.",
+            "tools": [{"type": "web_search"}],
+            "max_tool_calls": 1_000_000,
+            "store": false
+        }))
+        .await;
+    let response = completed_response(&result, false);
+    assert_eq!(
+        output_text(&response)["text"],
+        "Answered at the server limit."
+    );
+    assert_eq!(
+        executed_queries(&provider),
+        requested[..MAX_HOSTED_TOOL_CALLS]
+    );
+    assert_eq!(
+        output_search_queries(&response).len(),
+        MAX_HOSTED_TOOL_CALLS
+    );
+    let results = final_tool_results(&mock).await;
+    assert_eq!(results.len(), requested.len());
+    assert_eq!(
+        results
+            .iter()
+            .filter(|result| result.contains(LIMIT_MESSAGE))
+            .count(),
+        5
+    );
+    assert_eq!(mock.chat_completion_call_count(), 2);
+    assert_no_history(&database, &response).await;
+}
+
+#[tokio::test]
+async fn non_positive_max_tool_calls_is_rejected_before_inference() {
+    let provider = Arc::new(RecordingSearchProvider::default());
+    let (server, _, mock) = setup_test_server_with_search_providers(provider.clone(), None).await;
+    let model = setup_qwen_model(&server).await;
+    let org = setup_org_with_credits(&server, 10_000_000_000).await;
+    let api_key = get_api_key_for_org(&server, org.id).await;
+    for max_tool_calls in [0, -1] {
+        let result = server
+            .post("/v1/responses")
+            .add_header("Authorization", format!("Bearer {api_key}"))
+            .json(&json!({
+                "model": model,
+                "input": "Search.",
+                "tools": [{"type": "web_search"}],
+                "max_tool_calls": max_tool_calls,
+                "store": false
+            }))
+            .await;
+        assert_eq!(result.status_code(), 400, "{}", result.text());
+    }
+    assert_eq!(mock.chat_completion_call_count(), 0);
+    assert!(provider.web_params.lock().unwrap().is_empty());
+}
+
 #[tokio::test]
 async fn mixed_client_and_search_calls_return_control_without_executing_search() {
     let provider = Arc::new(RecordingSearchProvider::default());

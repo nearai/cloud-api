@@ -380,6 +380,12 @@ Place system/developer instructions before conversation history. The typed
 adapter combines the leading instruction messages in order, including the
 organization policy and request `instructions`, for models requiring one
 initial system message. User, assistant, and tool history retains its order.
+The organization policy and request `instructions` are forwarded unchanged. The adapter appends one short sentence asking the
+model to reply in the user's language unless instructed otherwise, and adds the
+current UTC date only when the request declares hosted `web_search` or
+`web_context_search`. Server-added instructions, tool definitions, and the
+provider's chat formatting all count toward provider input usage, so a
+Responses request can report more input tokens than its visible text.
 
 Existing completed-response gateway attestation is preserved on a best-effort
 basis. When its signature write succeeds, `GET /v1/signature/resp_*` can

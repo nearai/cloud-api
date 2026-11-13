@@ -790,6 +790,49 @@ async fn test_non_attested_chat_gateway_signature_hashes_exact_json() {
 }
 
 #[tokio::test]
+async fn test_signature_is_verifiable_from_another_workspace() {
+    let (server, _router, pool, _mock, _database) = setup_test_server_with_pool_and_router().await;
+    let (model_name, _mock) = setup_non_attested_signature_model(&server, &pool).await;
+    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id).await;
+    let other_org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+    let other_api_key = get_api_key_for_org(&server, other_org.id).await;
+
+    let request_json = serde_json::to_string(&serde_json::json!({
+        "model": model_name,
+        "messages": [{ "role": "user", "content": "Respond with two words." }]
+    }))
+    .expect("request should serialize");
+    let response = server
+        .post("/v1/chat/completions")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .content_type("application/json")
+        .bytes(Bytes::from(request_json.clone()))
+        .await;
+    assert_eq!(response.status_code(), 200, "{}", response.text());
+    let response_text = response.text();
+    let completion: serde_json::Value =
+        serde_json::from_str(&response_text).expect("completion should be JSON");
+    let chat_id = completion["id"]
+        .as_str()
+        .expect("completion should have an id");
+
+    // The creating key reads it.
+    assert_gateway_signatures(&server, &api_key, chat_id, &request_json, &response_text).await;
+
+    // A valid key of another organization reads the same signatures, so a
+    // third party can verify the response.
+    assert_gateway_signatures(
+        &server,
+        &other_api_key,
+        chat_id,
+        &request_json,
+        &response_text,
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn test_non_attested_gateway_signatures_ignore_empty_upstream_ids() {
     use inference_providers::{ExternalProvider, ExternalProviderConfig, ProviderConfig};
     use wiremock::matchers::{method, path};

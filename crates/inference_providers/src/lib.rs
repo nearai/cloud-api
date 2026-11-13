@@ -102,7 +102,7 @@ pub use models::{
     ModelInfo, PlacementContext, PrivacyClassifyError, RerankError, RerankParams, RerankResponse,
     RerankResult, RerankScore, RerankUsage, ScoreError, ScoreParams, ScoreResponse, ScoreResult,
     ScoreUsage, StreamChunk, StreamOptions, TokenUsage, ToolChoice, ToolDefinition,
-    TranscriptionSegment, TranscriptionWord,
+    TranscriptionSegment, TranscriptionWord, UpstreamCacheSalt, CACHE_SALT_FIELD,
 };
 pub use sse_parser::{
     new_external_sse_parser, new_sse_parser, BufferedSSEParser, SSEEvent, SSEEventParser, SSEParser,

@@ -167,7 +167,7 @@ mod rerank_response_options_tests {
     tag = "Rerank",
     request_body = crate::models::RerankRequest,
     responses(
-        (status = 200, description = "Successful rerank", body = crate::models::RerankResponse),
+        (status = 200, description = "Successful rerank", body = crate::models::RerankResponse, headers(("Inference-Id" = String, description = "Billing UUID of the request, usable with /v1/billing/costs"))),
         (status = 400, description = "Invalid request (empty documents, invalid model, etc.)", body = ErrorResponse),
         (status = 401, description = "Unauthorized (missing or invalid API key)", body = ErrorResponse),
         (status = 404, description = "Model not found", body = ErrorResponse),
@@ -223,8 +223,8 @@ pub async fn rerank(
             )
                 .into_response();
         }
-        Err(e) => {
-            tracing::error!(error = %e, "Failed to resolve model for rerank");
+        Err(_) => {
+            tracing::error!("Failed to resolve model for rerank");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 ResponseJson(ErrorResponse::new(
@@ -273,7 +273,7 @@ pub async fn rerank(
             let token_count = response
                 .usage
                 .as_ref()
-                .and_then(|u| u.total_tokens)
+                .map(|u| billing::reported_input_tokens(u.total_tokens, u.prompt_tokens))
                 .unwrap_or(0);
 
             // Validate token count is reasonable (prevent provider misreporting)
@@ -288,6 +288,10 @@ pub async fn rerank(
                     anomaly: "Token count anomaly: Provider data quality issue detected. Recommendation: Check provider logs and configuration.",
                 },
             );
+            let token_count = match billing::require_positive_units(token_count) {
+                Ok(count) => count,
+                Err(response) => return response,
+            };
 
             // Parse API key ID to UUID
             let api_key_id = match billing::billing_api_key_id(&api_key) {
@@ -313,8 +317,15 @@ pub async fn rerank(
 
             // Record usage synchronously - this is billing-critical and must succeed
             // If usage recording fails, we must fail the request to prevent revenue loss
-            if let Err(e) = app_state.usage_service.record_usage(usage_request).await {
-                tracing::error!(error = %e, "Failed to record rerank usage - blocking request to ensure billing accuracy");
+            if app_state
+                .usage_service
+                .record_usage(usage_request)
+                .await
+                .is_err()
+            {
+                tracing::error!(
+                    "Failed to record rerank usage - blocking request to ensure billing accuracy"
+                );
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     ResponseJson(ErrorResponse::new(
@@ -325,7 +336,10 @@ pub async fn rerank(
                     .into_response();
             }
 
-            (StatusCode::OK, ResponseJson(response)).into_response()
+            with_billing_inference_id(
+                (StatusCode::OK, ResponseJson(response)).into_response(),
+                inference_id,
+            )
         }
         Err(e) => {
             let (status_code, error_type, message) = match e {

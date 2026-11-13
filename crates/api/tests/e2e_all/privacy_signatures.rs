@@ -5,7 +5,10 @@ use bytes::Bytes;
 use inference_providers::{mock::MockProvider, PrivacyClassifyError, ProviderTier};
 use serde_json::{json, Value};
 use std::{
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
     time::Duration,
 };
 use tower::ServiceExt;
@@ -306,7 +309,7 @@ async fn signature_timeout_keeps_response_and_single_billing() {
 }
 
 #[tokio::test]
-async fn usage_timeout_returns_success_and_retries_with_the_same_billing_id() {
+async fn usage_timeout_retries_before_success_with_the_same_billing_id() {
     for path in ["/v1/privacy/classify", "/v1/privacy/redact"] {
         // The fallback UUID must also survive retries; only deriving a stable
         // ID for newer providers would leave the legacy path double-billed.
@@ -330,47 +333,48 @@ async fn usage_timeout_returns_success_and_retries_with_the_same_billing_id() {
             let client = fixture.database.pool().get().await.unwrap();
             let request = fixture.request(false);
             let started = std::time::Instant::now();
+            let response_finished = Arc::new(AtomicBool::new(false));
+            let response_done = response_finished.clone();
             let (response, ()) = tokio::join!(
                 async {
-                    tokio::time::timeout(Duration::from_secs(12), fixture.post(path, &request))
-                        .await
-                        .expect("billing must not indefinitely delay a completed inference")
+                    let response =
+                        tokio::time::timeout(Duration::from_secs(12), fixture.post(path, &request))
+                            .await
+                            .expect("billing must not indefinitely delay a completed inference");
+                    response_done.store(true, Ordering::SeqCst);
+                    response
                 },
-                async {
-                    let writer = tokio::time::timeout(Duration::from_secs(4), async {
+                async move {
+                    tokio::time::timeout(Duration::from_secs(4), async {
                         loop {
-                            let rows = client
-                                .query(
-                                    "SELECT pid FROM pg_stat_activity WHERE datname=current_database() AND $1 = ANY(pg_blocking_pids(pid))",
+                            let waiting: bool = client
+                                .query_one(
+                                    "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE datname=current_database() AND $1 = ANY(pg_blocking_pids(pid)))",
                                     &[&blocker_pid],
                                 )
                                 .await
-                                .unwrap();
-                            if let Some(row) = rows.first() {
-                                break row.get::<_, i32>(0);
+                                .unwrap()
+                                .get(0);
+                            if waiting {
+                                break;
                             }
                             tokio::time::sleep(Duration::from_millis(10)).await;
                         }
                     })
                     .await
                     .unwrap();
-                    // Cross the actual five-second deadline, then cancel only
-                    // this test's original statement. A later usage row must
-                    // come from the retry, not a write surviving future drop.
+                    // Hold past the first write deadline, then let the second
+                    // in-request attempt finish before its own deadline.
                     tokio::time::sleep(Duration::from_secs(6)).await;
-                    let cancelled: bool = client
-                        .query_one(
-                            "SELECT pg_cancel_backend(pid) FROM pg_stat_activity WHERE pid=$1 AND $2 = ANY(pg_blocking_pids(pid))",
-                            &[&writer, &blocker_pid],
-                        )
-                        .await
-                        .unwrap()
-                        .get(0);
-                    assert!(cancelled);
+                    assert!(
+                        !response_finished.load(Ordering::SeqCst),
+                        "response must wait for a durable usage row"
+                    );
+                    tx.rollback().await.unwrap();
                 }
             );
-            // Keep the lock until after the response, so the actual five-second
-            // settlement deadline expires. The old implementation returned 500.
+            // The response can advertise billing only after the retry has
+            // persisted the row under the same inference ID.
             assert_eq!(response.status_code(), 200, "{}", response.text());
             assert!(started.elapsed() >= Duration::from_secs(5));
             let inference_id =
@@ -384,36 +388,6 @@ async fn usage_timeout_returns_success_and_retries_with_the_same_billing_id() {
             } else {
                 assert_eq!(inference_id.get_version_num(), 4);
             }
-            let before: i64 = client
-                .query_one(
-                    "SELECT count(*) FROM organization_usage_log WHERE organization_id=$1",
-                    &[&fixture.org_id],
-                )
-                .await
-                .unwrap()
-                .get(0);
-            assert_eq!(before, 0);
-            tx.rollback().await.unwrap();
-            // The original statement was cancelled; the retry must persist the
-            // header's exact ID before we check both the usage row and balance.
-            tokio::time::timeout(Duration::from_secs(4), async {
-                loop {
-                    let recorded: i64 = client
-                        .query_one(
-                            "SELECT count(*) FROM organization_usage_log WHERE organization_id=$1",
-                            &[&fixture.org_id],
-                        )
-                        .await
-                        .unwrap()
-                        .get(0);
-                    if recorded > 0 {
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
-            })
-            .await
-            .unwrap();
             fixture.check_billing(inference_id, id.as_deref(), 7).await;
         }
     }

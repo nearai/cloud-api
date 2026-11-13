@@ -8,7 +8,7 @@ use inference_providers::{AnthropicRawEndpoint, AnthropicRawResponse, ProviderFi
 use services::attestation::{
     ita::{ItaTokenQuery, ItaTokenResponse},
     models::AttestationReport,
-    AttestationError, SignatureLookupResult,
+    AttestationError, SignatureLookupResult, SignatureOwner,
 };
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
@@ -21,9 +21,17 @@ const REQUEST: &[u8] = b"{ \"model\": \"anthropic/alias\", \"stream\": true }";
 const START: &[u8] = b"event: message_start\r\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_receipt\",\"usage\":{\"input_tokens\":3}}}\r\n\r\n";
 const STOP: &[u8] = b"event: message_stop\r\ndata: {\"type\":\"message_stop\"}\r\n\r\n";
 
+fn owner() -> SignatureOwner {
+    SignatureOwner {
+        organization_id: uuid::Uuid::from_u128(1),
+        workspace_id: uuid::Uuid::from_u128(2),
+    }
+}
+
 #[derive(Default)]
 struct ReceiptStore {
     records: Mutex<Vec<(String, String, String)>>,
+    owners: Mutex<Vec<SignatureOwner>>,
     attempts: AtomicUsize,
     started: Notify,
     gate: Option<Semaphore>,
@@ -34,10 +42,12 @@ struct ReceiptStore {
 impl AttestationServiceTrait for ReceiptStore {
     async fn store_chat_signature(
         &self,
+        owner: SignatureOwner,
         id: &str,
         request: String,
         response: String,
     ) -> Result<(), AttestationError> {
+        self.owners.lock().unwrap().push(owner);
         self.attempts.fetch_add(1, Ordering::SeqCst);
         self.started.notify_one();
         if let Some(gate) = &self.gate {
@@ -57,16 +67,22 @@ impl AttestationServiceTrait for ReceiptStore {
 
     async fn get_chat_signature(
         &self,
+        _: SignatureOwner,
         _: &str,
         _: Option<String>,
     ) -> Result<SignatureLookupResult, AttestationError> {
         unimplemented!()
     }
-    async fn store_chat_signature_from_provider(&self, _: &str) -> Result<(), AttestationError> {
+    async fn store_chat_signature_from_provider(
+        &self,
+        _: SignatureOwner,
+        _: &str,
+    ) -> Result<(), AttestationError> {
         unimplemented!()
     }
     async fn store_response_signature(
         &self,
+        _: SignatureOwner,
         _: &str,
         _: String,
         _: String,
@@ -106,7 +122,7 @@ async fn collect(mut stream: AnthropicRawBody) -> Vec<u8> {
 }
 
 fn receipt_context(store: &Arc<ReceiptStore>) -> MessageSigningContext {
-    MessageSigningContext::new(store.clone(), body_hash(REQUEST))
+    MessageSigningContext::new(store.clone(), owner(), body_hash(REQUEST))
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -246,7 +262,7 @@ async fn json_billing_errors_and_task_panics_keep_distinct_diagnostics() {
             assert!(!logs.contains("fixture usage panic"));
         } else {
             assert!(logs.contains("Failed to record native Anthropic usage"));
-            assert!(logs.contains("Internal error: recorded"));
+            assert!(logs.contains("usage_write_failed"));
         }
     }
 }
@@ -289,6 +305,7 @@ async fn raw_sse_hash_includes_prelude_tools_and_terminal_for_arbitrary_chunks()
             *store.records.lock().unwrap(),
             vec![("msg_receipt".into(), body_hash(REQUEST), body_hash(&raw))]
         );
+        assert_eq!(*store.owners.lock().unwrap(), vec![owner()]);
         assert_eq!(store.attempts.load(Ordering::SeqCst), 1);
     }
 }

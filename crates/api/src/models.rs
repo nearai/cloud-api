@@ -1018,6 +1018,8 @@ pub struct AudioTranscriptionResponse {
 
 impl From<inference_providers::AudioTranscriptionResponse> for AudioTranscriptionResponse {
     fn from(response: inference_providers::AudioTranscriptionResponse) -> Self {
+        // `usage.seconds` is billing data: the public body carries only the
+        // provider's own `duration`, as the requested format returned it.
         Self {
             text: response.text,
             duration: response.duration,
@@ -4785,6 +4787,7 @@ mod tests {
         let provider_response = inference_providers::AudioTranscriptionResponse {
             text: "hello".to_string(),
             duration: Some(1.0),
+            usage: None,
             language: Some("en".to_string()),
             segments: None,
             words: None,
@@ -4796,6 +4799,24 @@ mod tests {
 
         assert!(value.get("id").is_none());
         assert_eq!(value["text"], "hello");
+    }
+
+    #[test]
+    fn test_audio_transcription_response_keeps_usage_out_of_duration() {
+        let provider_response: inference_providers::AudioTranscriptionResponse =
+            serde_json::from_value(serde_json::json!({
+                "text": "ok",
+                "usage": {"type": "duration", "seconds": 2.5}
+            }))
+            .unwrap();
+        // Billing still sees the length...
+        assert_eq!(provider_response.billable_duration(), Some(2.5));
+        // ...but the plain-format body does not gain a `duration` field.
+        let value =
+            serde_json::to_value(AudioTranscriptionResponse::from(provider_response)).unwrap();
+        assert!(value.get("duration").is_none());
+        assert!(value.get("usage").is_none());
+        assert_eq!(value["text"], "ok");
     }
 
     // ── ImageGenerationRequest size validation ──

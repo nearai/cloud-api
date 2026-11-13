@@ -13,6 +13,8 @@ mod keys;
 mod lifecycle;
 pub mod measurement;
 pub mod models;
+#[cfg(test)]
+mod owner_disconnect_tests;
 pub mod pins_view;
 pub mod ports;
 #[cfg(test)]
@@ -43,7 +45,9 @@ pub use environment::{compute_spki_hash, load_tls_cert_fingerprint, load_vpc_inf
 pub use gateway_quote::{DstackGatewayQuoteCollector, GatewayQuoteCollector, GatewayQuoteInput};
 pub use ita::{ModelAttestationCollector, ModelAttestationInput};
 pub use measurement::MeasurementPolicy;
-pub use models::{AttestationError, ChatSignature, SignatureKind, SignatureLookupResult};
+pub use models::{
+    AttestationError, ChatSignature, SignatureKind, SignatureLookupResult, SignatureOwner,
+};
 pub(in crate::attestation) use report::{decode_nonce_hex, generate_nonce_hex};
 pub use report_data::{ReportDataVerifier, StrictBoundReportDataVerifier};
 pub use verification::{

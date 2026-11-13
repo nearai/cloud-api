@@ -12,6 +12,10 @@ use uuid::Uuid;
 
 const MAX_COMPLETION_ROUNDS: usize = 10;
 
+/// Tool result returned to the model for a hosted call that exceeds the
+/// response's `max_tool_calls` budget. The call is not executed.
+const TOOL_CALL_LIMIT_REACHED: &str = "ERROR: The hosted tool call limit for this response has been reached, so this call was not executed. Answer using the information already available.";
+
 /// Separate hosted search from client functions before parsing arguments. In
 /// particular, a client function named `web_search` is still a client function
 /// when the built-in tool was not declared.
@@ -94,6 +98,16 @@ pub(super) fn split_tool_calls(
     Ok((client_calls, search_calls))
 }
 
+/// Run inference rounds until the model answers, hands control to the client,
+/// or a limit is reached.
+///
+/// Hosted searches share one per-response budget from
+/// `CreateResponseRequest::hosted_tool_call_budget`. Each well-formed hosted
+/// call that Cloud starts consumes one unit, including parallel calls within a
+/// round. Calls beyond the budget are not executed and produce no output item;
+/// the model receives a fixed limit message as their tool result so every call
+/// in the transcript keeps a matching result. Malformed calls are not executed
+/// and do not consume the budget.
 pub(super) async fn run(
     ctx: &mut ResponseStreamContext,
     emitter: &mut EventEmitter,
@@ -102,6 +116,8 @@ pub(super) async fn run(
     definitions: &[inference_providers::ToolDefinition],
     tool_choice: &Option<inference_providers::ToolChoice>,
 ) -> Result<(), errors::ResponseError> {
+    let budget = context.request.hosted_tool_call_budget();
+    let mut remaining = budget;
     let mut malformed_rounds = 0;
     let mut round_tool_choice = tool_choice.clone();
     for _ in 0..MAX_COMPLETION_ROUNDS {
@@ -169,9 +185,21 @@ pub(super) async fn run(
             tool_calls: Some(calls),
         });
         let mut search_succeeded = false;
+        let mut refused = 0usize;
         for search in result.search_calls {
-            let (mut content, instruction) = execute(ctx, emitter, context, &search).await?;
-            search_succeeded |= search.call.tool_type != tools::tool_config::ERROR_TOOL_TYPE;
+            let malformed = search.call.tool_type == tools::tool_config::ERROR_TOOL_TYPE;
+            let (mut content, instruction) = if malformed {
+                execute(ctx, emitter, context, &search).await?
+            } else if remaining == 0 {
+                refused += 1;
+                (TOOL_CALL_LIMIT_REACHED.to_string(), None)
+            } else {
+                // Consume the budget before starting the call so a failed
+                // execution still counts against the limit.
+                remaining -= 1;
+                search_succeeded = true;
+                execute(ctx, emitter, context, &search).await?
+            };
             if let Some(instruction) = instruction {
                 content.push_str("\n\n");
                 content.push_str(&instruction);
@@ -187,10 +215,18 @@ pub(super) async fn run(
                 tool_calls: None,
             });
         }
-        // The initial choice is satisfied by a successful hosted search. Let
-        // the next inference answer or request more tools instead of forcing
-        // the same search until the request reaches its round limit.
-        if search_succeeded {
+        if refused > 0 {
+            tracing::debug!(
+                refused,
+                budget,
+                "Hosted tool calls exceeded the response budget and were not executed"
+            );
+        }
+        // The initial choice is satisfied by a successful hosted search, and
+        // cannot be satisfied once the budget is spent. Let the next inference
+        // answer or request client tools instead of forcing another search
+        // until the request reaches its round limit.
+        if search_succeeded || remaining == 0 {
             round_tool_choice = Some(inference_providers::ToolChoice::String("auto".to_string()));
         }
     }

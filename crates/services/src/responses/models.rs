@@ -1294,7 +1294,27 @@ pub struct OutputTokensDetails {
 // Validation implementations
 // ============================================
 
+/// Hosted tool calls allowed per response when `max_tool_calls` is omitted.
+pub const DEFAULT_MAX_HOSTED_TOOL_CALLS: usize = 10;
+
+/// Server-side ceiling on hosted tool calls per response. Larger requested
+/// values are accepted and clamped to this limit.
+pub const MAX_HOSTED_TOOL_CALLS: usize = 20;
+
 impl CreateResponseRequest {
+    /// Number of Cloud-executed hosted tool calls (`web_search`,
+    /// `web_context_search`) this response may start, across all inference
+    /// rounds. Client-managed function calls are returned to the caller and
+    /// are not counted.
+    pub fn hosted_tool_call_budget(&self) -> usize {
+        match self.max_tool_calls {
+            None => DEFAULT_MAX_HOSTED_TOOL_CALLS,
+            Some(requested) => usize::try_from(requested)
+                .unwrap_or(0)
+                .min(MAX_HOSTED_TOOL_CALLS),
+        }
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         use crate::common::MAX_METADATA_SIZE_BYTES;
 
@@ -1320,7 +1340,7 @@ impl CreateResponseRequest {
         }
 
         if let Some(max_calls) = self.max_tool_calls {
-            if max_calls == 0 {
+            if max_calls < 1 {
                 return Err("max_tool_calls must be greater than 0".to_string());
             }
         }
@@ -2011,6 +2031,41 @@ mod tests {
             request.max_output_tokens = max_output_tokens;
 
             assert!(request.validate().is_ok());
+        }
+    }
+
+    #[test]
+    fn max_tool_calls_rejects_non_positive_values_and_clamps_the_budget() {
+        let request = |max_tool_calls: Option<i64>| {
+            let mut value = serde_json::json!({"model": "test", "store": false});
+            if let Some(max) = max_tool_calls {
+                value["max_tool_calls"] = serde_json::json!(max);
+            }
+            serde_json::from_value::<CreateResponseRequest>(value).unwrap()
+        };
+
+        for rejected in [i64::MIN, -1, 0] {
+            assert_eq!(
+                request(Some(rejected)).validate().unwrap_err(),
+                "max_tool_calls must be greater than 0"
+            );
+        }
+
+        let cases = [
+            (None, DEFAULT_MAX_HOSTED_TOOL_CALLS),
+            (Some(1), 1),
+            (Some(3), 3),
+            (Some(MAX_HOSTED_TOOL_CALLS as i64), MAX_HOSTED_TOOL_CALLS),
+            (
+                Some(MAX_HOSTED_TOOL_CALLS as i64 + 1),
+                MAX_HOSTED_TOOL_CALLS,
+            ),
+            (Some(i64::MAX), MAX_HOSTED_TOOL_CALLS),
+        ];
+        for (requested, budget) in cases {
+            let request = request(requested);
+            assert!(request.validate().is_ok());
+            assert_eq!(request.hosted_tool_call_budget(), budget);
         }
     }
 

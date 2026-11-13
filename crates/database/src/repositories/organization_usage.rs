@@ -551,13 +551,21 @@ impl OrganizationUsageRepository {
         }
     }
 
-    /// Get the stop reason for a specific response ID
-    /// Used to check if a response was stopped due to client disconnect
-    pub async fn get_stop_reason_by_response_id(
+    /// Whether a usage row of the organization and workspace for `id` ended
+    /// with a client disconnect. `id` matches `provider_request_id`; a
+    /// `resp_<uuid>` id also matches `response_id`. Every subquery is
+    /// restricted to the organization and workspace.
+    pub async fn has_client_disconnect_usage(
         &self,
-        response_id: Uuid,
-    ) -> Result<Option<StopReason>> {
-        let row_opt = retry_db!("get_stop_reason_by_response_id", {
+        organization_id: Uuid,
+        workspace_id: Uuid,
+        id: &str,
+    ) -> Result<bool> {
+        let response_id: Option<Uuid> = id
+            .strip_prefix("resp_")
+            .and_then(|uuid| Uuid::parse_str(uuid).ok());
+        let stop_reason = StopReason::ClientDisconnect.as_str();
+        let row = retry_db!("has_client_disconnect_usage", {
             let client = self
                 .pool
                 .get()
@@ -566,47 +574,37 @@ impl OrganizationUsageRepository {
                 .map_err(RepositoryError::PoolError)?;
 
             client
-                .query_opt(
-                    r#"SELECT stop_reason FROM organization_usage_log WHERE response_id = $1"#,
-                    &[&response_id],
+                .query_one(
+                    r#"
+                    SELECT EXISTS (
+                        SELECT 1 FROM organization_usage_log
+                        WHERE organization_id = $1
+                          AND workspace_id = $2
+                          AND provider_request_id = $3
+                          AND stop_reason = $5
+                    ) OR (
+                        $4::uuid IS NOT NULL AND EXISTS (
+                            SELECT 1 FROM organization_usage_log
+                            WHERE organization_id = $1
+                              AND workspace_id = $2
+                              AND response_id = $4
+                              AND stop_reason = $5
+                        )
+                    ) AS disconnected
+                    "#,
+                    &[
+                        &organization_id,
+                        &workspace_id,
+                        &id,
+                        &response_id,
+                        &stop_reason,
+                    ],
                 )
                 .await
                 .map_err(map_db_error)
         })?;
 
-        Ok(row_opt.and_then(|row| {
-            let stop_reason_str: Option<String> = row.get("stop_reason");
-            stop_reason_str.as_deref().map(StopReason::parse)
-        }))
-    }
-
-    /// Get the stop reason for a specific provider request ID (e.g., chatcmpl-xxx)
-    /// Used to check if a chat completion was stopped due to client disconnect
-    pub async fn get_stop_reason_by_provider_request_id(
-        &self,
-        provider_request_id: &str,
-    ) -> Result<Option<StopReason>> {
-        let row_opt = retry_db!("get_stop_reason_by_provider_request_id", {
-            let client = self
-                .pool
-                .get()
-                .await
-                .context("Failed to get database connection")
-                .map_err(RepositoryError::PoolError)?;
-
-            client
-                .query_opt(
-                    r#"SELECT stop_reason FROM organization_usage_log WHERE provider_request_id = $1"#,
-                    &[&provider_request_id],
-                )
-                .await
-                .map_err(map_db_error)
-        })?;
-
-        Ok(row_opt.and_then(|row| {
-            let stop_reason_str: Option<String> = row.get("stop_reason");
-            stop_reason_str.as_deref().map(StopReason::parse)
-        }))
+        Ok(row.get("disconnected"))
     }
 
     /// Get costs by inference IDs (for HuggingFace billing integration)

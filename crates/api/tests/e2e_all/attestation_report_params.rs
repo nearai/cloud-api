@@ -11,6 +11,102 @@ fn report_url(model: &str) -> String {
     format!("/v1/attestation/report?model={encoded}")
 }
 
+/// Exercise the real HTTP handler, attestation service/cache, and provider pool.
+/// The provider represents three CVMs sharing one signer; the Gateway must keep
+/// each CVM's evidence instead of selecting one report or deduplicating the key.
+#[tokio::test]
+async fn test_attestation_report_returns_all_near_backends_with_original_envelope() {
+    use inference_providers::{mock::MockProvider, ProviderTier};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    let (server, _router, pool, _mock_provider, _database) =
+        setup_test_server_with_pool_and_router().await;
+    let model = setup_qwen_model(&server).await;
+    let backend_calls = Arc::new(AtomicUsize::new(0));
+    let recorded_calls = backend_calls.clone();
+    let expected_model = model.clone();
+    let cached_nonce = "00".repeat(32);
+    let expected_cached_nonce = cached_nonce.clone();
+    let provider = MockProvider::new()
+        .with_tier(ProviderTier::Near)
+        .with_attestation_reports_handler(move |model, algo, nonce, address, include_tls| {
+            assert_eq!(model, expected_model);
+            assert_eq!(algo.as_deref(), Some("ed25519"));
+            assert!(address.is_none());
+            assert!(!include_tls);
+            recorded_calls.fetch_add(1, Ordering::SeqCst);
+            let nonce = nonce.as_deref().unwrap_or(&cached_nonce);
+            Ok(["cvm-a", "cvm-b", "cvm-c"]
+                .into_iter()
+                .map(|instance| {
+                    serde_json::json!({
+                        "model_name": model,
+                        "instance_id": instance,
+                        "signing_algo": "ed25519",
+                        "signing_public_key": "shared-model-key",
+                        "request_nonce": nonce,
+                        "intel_quote": format!("mock-quote-{instance}"),
+                        "compose_manager_attestation": {
+                            "actions": [{"instance": instance}]
+                        },
+                        "all_attestations": [{"instance_id": instance}]
+                    })
+                    .as_object()
+                    .unwrap()
+                    .clone()
+                })
+                .collect())
+        });
+    // Registration replaces the model's default mock provider. Its singular
+    // key-discovery calls do not invoke the collection handler above.
+    pool.register_provider(model.clone(), Arc::new(provider))
+        .await;
+    assert_eq!(backend_calls.load(Ordering::SeqCst), 0);
+
+    let nonce = "deadbeef".repeat(8);
+    for (challenge, expected_calls) in [
+        (None, 1),
+        (None, 1),
+        (Some(nonce.as_str()), 2),
+        (Some(nonce.as_str()), 3),
+    ] {
+        let mut url = format!("{}&provider=near&signing_algo=ed25519", report_url(&model));
+        if let Some(challenge) = challenge {
+            url.push_str(&format!("&nonce={challenge}"));
+        }
+        let response = server.get(&url).await;
+        assert_eq!(response.status_code(), 200, "{url}: {}", response.text());
+        let body: serde_json::Value = response.json();
+        assert!(body["gateway_attestation"].is_object(), "{body}");
+        assert_eq!(body["gateway_attestation"]["signing_algo"], "ed25519");
+        if let Some(challenge) = challenge {
+            assert_eq!(body["gateway_attestation"]["request_nonce"], challenge);
+        }
+        assert!(body.get("all_attestations").is_none());
+
+        let reports = body["model_attestations"].as_array().unwrap();
+        assert_eq!(reports.len(), 3, "{body}");
+        for (report, instance) in reports.iter().zip(["cvm-a", "cvm-b", "cvm-c"]) {
+            assert_eq!(report["model_name"], model);
+            assert_eq!(report["instance_id"], instance);
+            assert_eq!(report["signing_public_key"], "shared-model-key");
+            assert_eq!(
+                report["request_nonce"],
+                challenge.unwrap_or(&expected_cached_nonce)
+            );
+            assert_eq!(
+                report["compose_manager_attestation"]["actions"][0]["instance"],
+                instance
+            );
+            assert!(report.get("all_attestations").is_none());
+        }
+        assert_eq!(backend_calls.load(Ordering::SeqCst), expected_calls);
+    }
+}
+
 #[tokio::test]
 async fn test_attestation_report_accepts_mixed_case_signing_algo() {
     let (server, _router, _pool, mock_provider, _database) =

@@ -175,6 +175,15 @@ fn auth_state(admin_emails: &[&str]) -> AuthState {
     )
 }
 
+fn admin_tokens_only_app(admin_tokens_only: bool) -> Router {
+    Router::new()
+        .route("/v1/admin/probe", get(probe))
+        .layer(from_fn_with_state(
+            auth_state(ADMIN_EMAILS).with_admin_tokens_only(admin_tokens_only),
+            admin_middleware,
+        ))
+}
+
 fn session_token(user_id: Uuid, session_id: Option<Uuid>) -> String {
     MockAuthService {
         apikey_repository: Arc::new(database::repositories::ApiKeyRepository::new(
@@ -834,4 +843,65 @@ async fn audit_event_is_a_root_event_even_when_the_format_prints_spans() {
     for span_value in [email, client_request_id.as_str(), "path="] {
         assert!(!audit_line.contains(span_value), "{audit_line}");
     }
+}
+
+#[tokio::test]
+async fn admin_tokens_only_refuses_session_tokens() {
+    let app = admin_tokens_only_app(true);
+
+    let response = send(
+        &app,
+        with_session(
+            request(Method::GET, "/v1/admin/probe"),
+            Uuid::new_v4(),
+            Some(Uuid::new_v4()),
+        ),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let body: Value = serde_json::from_str(&body_text(response).await).expect("JSON body");
+    assert_eq!(body["error"]["message"], "Admin access token required");
+    assert_eq!(body["error"]["type"], "unauthorized");
+}
+
+#[tokio::test]
+async fn admin_tokens_only_still_validates_admin_access_tokens() {
+    let app = admin_tokens_only_app(true);
+
+    // The token store is unavailable, so validation is reached and fails as a
+    // 500 rather than the session refusal.
+    let response = send(
+        &app,
+        request(Method::GET, "/v1/admin/probe")
+            .header(AUTHORIZATION, "Bearer adm_unvalidated_admin_token")
+            .body(Body::empty())
+            .expect("test request"),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let body: Value = serde_json::from_str(&body_text(response).await).expect("JSON body");
+    assert_eq!(
+        body["error"]["message"],
+        "Failed to validate admin access token"
+    );
+}
+
+#[tokio::test]
+async fn session_tokens_are_accepted_when_admin_tokens_only_is_off() {
+    let app = admin_tokens_only_app(false);
+
+    let response = send(
+        &app,
+        with_session(
+            request(Method::GET, "/v1/admin/probe"),
+            Uuid::new_v4(),
+            Some(Uuid::new_v4()),
+        ),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(body_text(response).await, "ok");
 }

@@ -173,6 +173,54 @@ async fn issuance_gate_does_not_relax_existing_token_permissions() {
 }
 
 #[tokio::test]
+async fn admin_tokens_only_accepts_admin_tokens_and_refuses_sessions() {
+    let (server, db) = setup_test_server_with_config_and_database(|config| {
+        config.auth.admin_tokens_only = true;
+    })
+    .await;
+    let repo = database::repositories::AdminAccessTokenRepository::new(db.pool().clone());
+    let (_, token) = repo
+        .create(
+            Uuid::parse_str(MOCK_USER_ID).unwrap(),
+            "admin tokens only".into(),
+            "test".into(),
+            chrono::Utc::now() + chrono::Duration::hours(1),
+            Some(MOCK_USER_AGENT.into()),
+            database::models::AdminAccessTokenPermission::ReadWrite,
+        )
+        .await
+        .unwrap();
+
+    let response = call(
+        &server,
+        Method::GET,
+        "/v1/admin/api-keys",
+        &token,
+        json!({}),
+    )
+    .await;
+    assert_eq!(response.status_code(), StatusCode::OK);
+
+    for (method, path) in [
+        (Method::GET, "/v1/admin/api-keys"),
+        (Method::POST, "/v1/admin/access-tokens"),
+    ] {
+        let response = call(
+            &server,
+            method,
+            path,
+            &get_session_id(),
+            json!({"name": "refused", "reason": "test", "expires_in_hours": 24}),
+        )
+        .await;
+        assert_eq!(response.status_code(), StatusCode::UNAUTHORIZED, "{path}");
+        let body = response.json::<Value>();
+        assert_eq!(body["error"]["message"], "Admin access token required");
+        assert_eq!(body["error"]["type"], "unauthorized");
+    }
+}
+
+#[tokio::test]
 async fn read_only_reads_and_mixed_method_mutations_have_no_side_effects() {
     let server = setup_test_server_with_config(|config| {
         config.auth.admin_read_only_tokens_enabled = true;

@@ -133,7 +133,11 @@ impl AuthServiceTrait for AuthService {
             .validate_session_access_token(access_token, encoding_key)?
             .ok_or(AuthError::SessionNotFound)?;
 
-        debug!("Claims: {:?}", claims);
+        debug!(
+            user_id = %claims.sub.0,
+            has_session_id = claims.sid.is_some(),
+            "Access token claims decoded"
+        );
 
         // Get the user
         let user = self

@@ -584,12 +584,25 @@ pub async fn admin_middleware(
                         }
                     }
                     Err(err) => {
-                        debug!("Admin access token validation failed: {:?}", err);
+                        debug!(
+                            status = err.0.as_u16(),
+                            "Admin access token validation failed"
+                        );
                         // Don't fall back to session token for admin access tokens
                         // If it looks like an admin token but validation fails, reject it
                         Err(err)
                     }
                 }
+            } else if state.admin_tokens_only {
+                debug!("Session token refused: admin access token required");
+                audit.record_credential(AdminCredentialKind::Session, None);
+                Err((
+                    StatusCode::UNAUTHORIZED,
+                    axum::Json(crate::models::ErrorResponse::new(
+                        "Admin access token required".to_string(),
+                        "unauthorized".to_string(),
+                    )),
+                ))
             } else {
                 // Not an admin access token, try as session token
                 debug!("Token does not appear to be an admin access token, trying session token");
@@ -1059,6 +1072,9 @@ pub struct AuthState {
     pub admin_access_token_repository: Arc<database::repositories::AdminAccessTokenRepository>,
     pub admin_emails: Vec<String>,
     pub encoding_key: String,
+    /// When true, admin routes accept only admin access tokens and refuse
+    /// session tokens. See `AuthConfig::admin_tokens_only`.
+    pub admin_tokens_only: bool,
 }
 
 impl AuthState {
@@ -1081,7 +1097,13 @@ impl AuthState {
             admin_access_token_repository,
             admin_emails,
             encoding_key,
+            admin_tokens_only: false,
         }
+    }
+
+    pub fn with_admin_tokens_only(mut self, admin_tokens_only: bool) -> Self {
+        self.admin_tokens_only = admin_tokens_only;
+        self
     }
 }
 

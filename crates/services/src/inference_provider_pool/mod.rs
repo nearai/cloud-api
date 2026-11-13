@@ -5914,7 +5914,7 @@ impl InferenceProviderPool {
                             successful_calls = outcome.successful_calls,
                             failed_calls = outcome.failed_calls,
                             verify_failures = outcome.verify_failures,
-                            failure_reasons = ?outcome.failure_reasons,
+                            failure_reason_count = outcome.failure_reasons.len(),
                             "No TLS fingerprints pinned during initial discovery — provider will reject connections until attestation succeeds"
                         );
                     } else {
@@ -5930,9 +5930,9 @@ impl InferenceProviderPool {
                             replaced_state = outcome.replaced_state,
                             distinct_keys = outcome.distinct_pubkeys().len(),
                             distinct_identities = outcome.distinct_identities().len(),
-                            divergent_algos = ?outcome.divergent_algos(),
-                            observed_fingerprints = ?outcome.observed_fingerprints,
-                            failure_reasons = ?outcome.failure_reasons,
+                            divergent_algo_count = outcome.divergent_algos().len(),
+                            observed_fingerprint_count = outcome.observed_fingerprints.len(),
+                            failure_reason_count = outcome.failure_reasons.len(),
                             "Initial attestation discovery complete"
                         );
                         // Pre-warm all bucket clients in the background so the
@@ -6225,8 +6225,8 @@ impl InferenceProviderPool {
                         total_pinned = outcome.total_pinned,
                         verify_failures = outcome.verify_failures,
                         replaced_state = outcome.replaced_state,
-                        observed_fingerprints = ?outcome.observed_fingerprints,
-                        failure_reasons = ?outcome.failure_reasons,
+                        observed_fingerprint_count = outcome.observed_fingerprints.len(),
+                        failure_reason_count = outcome.failure_reasons.len(),
                         "Cumulative discovery expanded pinned backend set"
                     );
                 } else {
@@ -6239,8 +6239,8 @@ impl InferenceProviderPool {
                         verify_failures = outcome.verify_failures,
                         total_pinned = outcome.total_pinned,
                         replaced_state = outcome.replaced_state,
-                        observed_fingerprints = ?outcome.observed_fingerprints,
-                        failure_reasons = ?outcome.failure_reasons,
+                        observed_fingerprint_count = outcome.observed_fingerprints.len(),
+                        failure_reason_count = outcome.failure_reasons.len(),
                         "Cumulative discovery cycle (no new fingerprints)"
                     );
                 }
@@ -8489,6 +8489,7 @@ mod tests {
             service_tier: None,
             modalities: None,
             original_request: None,
+            upstream_cache_salt: None,
             extra: std::collections::HashMap::new(),
         };
 
@@ -8566,6 +8567,7 @@ mod tests {
             service_tier: None,
             modalities: None,
             original_request: None,
+            upstream_cache_salt: None,
             extra: std::collections::HashMap::new(),
         };
 
@@ -11269,6 +11271,7 @@ mod tests {
             service_tier: None,
             modalities: None,
             original_request: None,
+            upstream_cache_salt: None,
             extra: std::collections::HashMap::new(),
         }
     }

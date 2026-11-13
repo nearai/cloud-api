@@ -7,10 +7,12 @@ use config::ExternalProvidersConfig;
 use inference_providers::{self as ip, mock::MockProvider, InferenceProvider};
 
 use super::{
-    chat_signature_lifecycle_tests::{lifecycle_service, FailingRepository, RecordingRepository},
+    chat_signature_lifecycle_tests::{
+        lifecycle_service, owner, FailingRepository, RecordingRepository,
+    },
     ports::{AttestationRepository, AttestationServiceTrait},
     AttestationError, AttestationService, ChatSignature, SignatureKind, SignatureLookupResult,
-    STREAM_SIGNATURE_STORE_TIMEOUT,
+    SignatureOwner, STREAM_SIGNATURE_STORE_TIMEOUT,
 };
 use crate::{
     inference_provider_pool::InferenceProviderPool,
@@ -220,10 +222,14 @@ async fn provider_success_stores_both_signatures_in_one_batch_and_unpins() {
     )
     .await;
     service
-        .store_stream_chat_signature_from_provider(chat_id)
+        .store_stream_chat_signature_from_provider(owner(), chat_id)
         .await
         .unwrap();
     assert_eq!(repository.batch_sizes(), vec![2]);
+    assert!(repository
+        .stored_rows()
+        .iter()
+        .all(|(row_owner, _, _)| *row_owner == Some(owner())));
     let stored = repository.stored();
     assert_eq!(
         stored
@@ -261,7 +267,7 @@ async fn provider_second_fetch_error_preserves_first_signature_and_unpins() {
     )
     .await;
     let result = service
-        .store_stream_chat_signature_from_provider(chat_id)
+        .store_stream_chat_signature_from_provider(owner(), chat_id)
         .await;
     assert!(matches!(result, Err(AttestationError::ProviderError(_))));
     assert_eq!(repository.batch_sizes(), vec![1]);
@@ -281,18 +287,20 @@ struct DelayedRepository(RecordingRepository);
 impl AttestationRepository for DelayedRepository {
     async fn add_chat_signature(
         &self,
+        owner: SignatureOwner,
         chat_id: &str,
         signature: ChatSignature,
     ) -> Result<(), AttestationError> {
-        self.0.add_chat_signature(chat_id, signature).await
+        self.0.add_chat_signature(owner, chat_id, signature).await
     }
     async fn add_chat_signatures(
         &self,
+        owner: SignatureOwner,
         chat_id: &str,
         signatures: Vec<ChatSignature>,
     ) -> Result<(), AttestationError> {
         tokio::time::sleep(Duration::from_millis(500)).await;
-        self.0.add_chat_signatures(chat_id, signatures).await
+        self.0.add_chat_signatures(owner, chat_id, signatures).await
     }
     async fn get_chat_signature(
         &self,
@@ -318,7 +326,7 @@ async fn provider_stalled_second_fetch_flushes_first_before_stream_timeout() {
     // partial write, even after ECDSA has used two seconds of the fetch budget.
     let result = tokio::time::timeout(
         STREAM_SIGNATURE_STORE_TIMEOUT,
-        service.store_stream_chat_signature_from_provider(chat_id),
+        service.store_stream_chat_signature_from_provider(owner(), chat_id),
     )
     .await
     .expect("partial signature must be flushed before stream finalization cancels it");
@@ -348,7 +356,7 @@ async fn provider_stalled_ecdsa_fetch_preserves_ed25519_signature() {
     .await;
     let result = tokio::time::timeout(
         STREAM_SIGNATURE_STORE_TIMEOUT,
-        service.store_stream_chat_signature_from_provider(chat_id),
+        service.store_stream_chat_signature_from_provider(owner(), chat_id),
     )
     .await
     .unwrap();
@@ -358,7 +366,7 @@ async fn provider_stalled_ecdsa_fetch_preserves_ed25519_signature() {
     assert_eq!(repository.batch_sizes(), vec![1]);
     assert_eq!(repository.stored()[0].1.signing_algo, "ed25519");
     let lookup = service
-        .get_chat_signature(chat_id, Some("ed25519".to_string()))
+        .get_chat_signature(owner(), chat_id, Some("ed25519".to_string()))
         .await
         .unwrap();
     assert!(matches!(
@@ -378,7 +386,7 @@ async fn provider_repository_error_is_metriced_and_unpins() {
     let (service, provider, metrics) =
         provider_service(chat_id, FetchBehavior::Success, Arc::new(FailingRepository)).await;
     let result = service
-        .store_stream_chat_signature_from_provider(chat_id)
+        .store_stream_chat_signature_from_provider(owner(), chat_id)
         .await;
     assert!(matches!(result, Err(AttestationError::RepositoryError(_))));
     assert_eq!(
@@ -400,7 +408,7 @@ async fn background_provider_fetch_keeps_its_existing_timeout() {
     .await;
     let started = tokio::time::Instant::now();
     service
-        .store_chat_signature_from_provider(chat_id)
+        .store_chat_signature_from_provider(owner(), chat_id)
         .await
         .unwrap();
     assert!(started.elapsed() >= Duration::from_secs(6));

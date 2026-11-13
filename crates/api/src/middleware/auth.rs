@@ -136,6 +136,17 @@ pub struct AuthenticatedApiKey {
     pub organization: services::organization::Organization,
 }
 
+impl AuthenticatedApiKey {
+    /// The owner recorded with every signature this key creates. Signature
+    /// reads are not limited to it; it only scopes the `STREAM_DISCONNECTED`
+    /// check when no signature is stored.
+    pub fn signature_owner(&self) -> services::attestation::SignatureOwner {
+        services::attestation::SignatureOwner {
+            organization_id: self.organization.id.0,
+            workspace_id: self.workspace.id.0,
+        }
+    }
+}
 /// The caller's API key to carry into cloud-platform reads. Copied only for a
 /// successful key, and only when some cloud-platform area is on.
 fn caller_key(token: Option<&str>) -> Option<String> {
@@ -525,7 +536,10 @@ pub async fn admin_middleware(
                         }
                     }
                     Err(err) => {
-                        debug!("Admin access token validation failed: {:?}", err);
+                        debug!(
+                            error_kind = "admin_token_validation",
+                            "Admin access token validation failed"
+                        );
                         // Don't fall back to session token for admin access tokens
                         // If it looks like an admin token but validation fails, reject it
                         Err(err)

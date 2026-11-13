@@ -361,19 +361,21 @@ pub trait UsageRepository: Send + Sync {
         inference_ids: Vec<Uuid>,
     ) -> anyhow::Result<Vec<InferenceCost>>;
 
-    /// Get the stop reason for a specific response ID
-    /// Used to check if a response was stopped due to client disconnect
-    async fn get_stop_reason_by_response_id(
+    /// Whether a usage row of `organization_id` and `workspace_id` for `id`
+    /// ended with [`StopReason::ClientDisconnect`]. `id` matches the row's
+    /// `provider_request_id`; a `resp_<uuid>` id also matches its `response_id`.
+    /// Rows of any other organization or workspace never match.
+    ///
+    /// The default answers `false`, so an implementation without the lookup
+    /// reports every missing signature as not found.
+    async fn has_client_disconnect_usage(
         &self,
-        response_id: Uuid,
-    ) -> anyhow::Result<Option<StopReason>>;
-
-    /// Get the stop reason for a specific provider request ID (e.g., chatcmpl-xxx)
-    /// Used to check if a chat completion was stopped due to client disconnect
-    async fn get_stop_reason_by_provider_request_id(
-        &self,
-        provider_request_id: &str,
-    ) -> anyhow::Result<Option<StopReason>>;
+        _organization_id: Uuid,
+        _workspace_id: Uuid,
+        _id: &str,
+    ) -> anyhow::Result<bool> {
+        Ok(false)
+    }
 
     /// Get per-model usage aggregation for an organization from `start_date` up to
     /// `end_date` (exclusive; open-ended when `None`).
@@ -512,6 +514,16 @@ pub enum RecordUsageApiRequest {
         /// hashed to a deterministic UUID v5 for `inference_id`.
         /// Duplicate calls with the same id within the same org
         /// return the existing record without double-charging.
+        id: String,
+        #[serde(flatten)]
+        provider_attribution: ProviderAttribution,
+    },
+    /// Audio transcription billed by whole seconds of input duration.
+    AudioTranscription {
+        model: String,
+        /// Positive duration rounded up to the nearest second.
+        duration_seconds: i32,
+        /// External idempotency key (see [`Self::ChatCompletion`]'s `id`)
         id: String,
         #[serde(flatten)]
         provider_attribution: ProviderAttribution,

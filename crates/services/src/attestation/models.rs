@@ -39,6 +39,33 @@ pub enum AttestationError {
 
     #[error("ITA evidence is invalid: {reason}")]
     ItaInvalidEvidence { reason: String },
+
+    /// A signature with the same id and algorithm is already stored for
+    /// another owner, or with no owner. The existing row is left unchanged.
+    #[error("Signature is already stored for another owner")]
+    OwnerConflict,
+}
+
+impl AttestationError {
+    /// A constant label for logs. The variants' messages can carry ids or
+    /// upstream error text, so logs use this instead of the error itself.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            AttestationError::SignatureNotFound(_) => "signature_not_found",
+            AttestationError::ProviderError(_) => "provider_error",
+            AttestationError::RepositoryError(_) => "repository_error",
+            AttestationError::ClientError(_) => "client_error",
+            AttestationError::InvalidParameter(_) => "invalid_parameter",
+            AttestationError::UnknownModel(_) => "unknown_model",
+            AttestationError::InternalError(_) => "internal_error",
+            AttestationError::ItaUnavailable { .. } => "ita_unavailable",
+            AttestationError::ItaRateLimited { .. } => "ita_rate_limited",
+            AttestationError::ItaTimeout => "ita_timeout",
+            AttestationError::ItaBadUpstream { .. } => "ita_bad_upstream",
+            AttestationError::ItaInvalidEvidence { .. } => "ita_invalid_evidence",
+            AttestationError::OwnerConflict => "owner_conflict",
+        }
+    }
 }
 
 /// Result of looking up a signature that includes fallback cases
@@ -90,6 +117,21 @@ impl SignatureKind {
             _ => None,
         }
     }
+}
+
+/// The organization and workspace of the API key that created a signature.
+///
+/// Taken only from the authenticated API key, never from request content.
+/// Every signature write stores it, and only that owner may replace a stored
+/// signature. Reads are not restricted to it: any API key can verify a stored
+/// signature, including rows stored before the owner was recorded. On a read,
+/// the caller's owner only scopes the `STREAM_DISCONNECTED` check for a
+/// missing signature. It is kept separate from [`ChatSignature`], which is
+/// returned to customers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SignatureOwner {
+    pub organization_id: uuid::Uuid,
+    pub workspace_id: uuid::Uuid,
 }
 
 /// Chat signature for cryptographic verification

@@ -66,6 +66,7 @@ pub(super) async fn finalize(
             let stored = tokio::time::timeout(
                 SIGNATURE_STORE_TIMEOUT,
                 state.attestation_service.store_chat_signature(
+                    api_key.signature_owner(),
                     id,
                     served.request_hash,
                     hex::encode(Sha256::digest(&served.body)),

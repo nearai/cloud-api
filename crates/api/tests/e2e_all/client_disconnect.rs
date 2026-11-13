@@ -1,14 +1,13 @@
 //! Client-disconnect coverage for the supported Chat Completions API.
 //!
-//! Stateless Responses preserve gateway attestation only after a completed
-//! response. A disconnected Responses stream creates no `resp_*` attestation
-//! record or legacy disconnect fallback because it has no persisted response
-//! ID, so this module keeps the supported Chat Completions fallback coverage.
+//! A missing signature of the caller's own disconnected stream is reported as
+//! `STREAM_DISCONNECTED`; for any other caller it is not found, with no reason
+//! attached.
 
 use crate::common::*;
 
 #[tokio::test]
-async fn chat_completion_signature_returns_stream_disconnected_on_client_disconnect() {
+async fn disconnected_chat_completion_without_signature_is_stream_disconnected_for_its_owner() {
     let (server, _pool, mock, database) = setup_test_server_with_pool().await;
     setup_qwen_model(&server).await;
     let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
@@ -49,13 +48,30 @@ async fn chat_completion_signature_returns_stream_disconnected_on_client_disconn
         })
         .expect("Should have completion_id from stream");
 
-    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-
     let client = database
         .pool()
         .get()
         .await
         .expect("Failed to get database connection");
+    // The usage row is written asynchronously after the stream ends.
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(10);
+    loop {
+        let updated = client
+            .execute(
+                "UPDATE organization_usage_log SET stop_reason = 'client_disconnect' WHERE provider_request_id = $1",
+                &[&completion_id],
+            )
+            .await
+            .expect("Failed to update stop_reason");
+        if updated > 0 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "usage row was not written"
+        );
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    }
     client
         .execute(
             "DELETE FROM chat_signatures WHERE chat_id = $1",
@@ -63,33 +79,35 @@ async fn chat_completion_signature_returns_stream_disconnected_on_client_disconn
         )
         .await
         .expect("Failed to delete signature");
-    client
-        .execute(
-            "UPDATE organization_usage_log SET stop_reason = 'client_disconnect' WHERE provider_request_id = $1",
-            &[&completion_id],
-        )
-        .await
-        .expect("Failed to update stop_reason");
 
     let signature_resp = server
         .get(&format!("/v1/signature/{completion_id}?signing_algo=ecdsa"))
         .add_header("Authorization", format!("Bearer {api_key}"))
         .await;
-
     assert_eq!(
         signature_resp.status_code(),
         200,
-        "Signature endpoint should return 200 for client disconnect on chat completion. Response: {}",
-        signature_resp.text()
+        "the caller's own disconnected stream reports why there is no signature"
     );
-
     let signature_json: serde_json::Value = signature_resp.json();
     assert_eq!(
-        signature_json.get("error_code").and_then(|v| v.as_str()),
+        signature_json
+            .get("error_code")
+            .and_then(|code| code.as_str()),
         Some("STREAM_DISCONNECTED")
     );
-    assert_eq!(
-        signature_json.get("message").and_then(|v| v.as_str()),
-        Some("Verification not available due to disconnection.")
+
+    // Another organization asking for the same id learns nothing.
+    let other_org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+    let other_api_key = get_api_key_for_org(&server, other_org.id).await;
+    let other_resp = server
+        .get(&format!("/v1/signature/{completion_id}?signing_algo=ecdsa"))
+        .add_header("Authorization", format!("Bearer {other_api_key}"))
+        .await;
+    assert_eq!(other_resp.status_code(), 404);
+    let other_json: serde_json::Value = other_resp.json();
+    assert!(
+        other_json.get("error_code").is_none(),
+        "no disconnect reason is reported to another organization"
     );
 }

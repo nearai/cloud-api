@@ -724,6 +724,8 @@ struct MockConfig {
     /// When set, privacy classify calls return this instead of running the
     /// built-in shape-based detector.
     privacy_classify_override: Option<PrivacyClassifyOverride>,
+    /// When set, embeddings and rerank responses report zero usage.
+    report_zero_usage: bool,
 }
 
 /// Scripted privacy-classify outcome for [`MockProvider::set_privacy_classify_override`].
@@ -956,6 +958,7 @@ impl MockProvider {
                 embedding_error_override: None,
                 audio_transcription_error_override: None,
                 privacy_classify_override: None,
+                report_zero_usage: false,
             })),
             last_chat_params: Arc::new(Mutex::new(None)),
             chat_request_priorities: Arc::new(Mutex::new(Vec::new())),
@@ -994,6 +997,7 @@ impl MockProvider {
                 embedding_error_override: None,
                 audio_transcription_error_override: None,
                 privacy_classify_override: None,
+                report_zero_usage: false,
             })),
             last_chat_params: Arc::new(Mutex::new(None)),
             chat_request_priorities: Arc::new(Mutex::new(Vec::new())),
@@ -1030,6 +1034,7 @@ impl MockProvider {
                 embedding_error_override: None,
                 audio_transcription_error_override: None,
                 privacy_classify_override: None,
+                report_zero_usage: false,
             })),
             last_chat_params: Arc::new(Mutex::new(None)),
             chat_request_priorities: Arc::new(Mutex::new(Vec::new())),
@@ -1228,6 +1233,13 @@ impl MockProvider {
     pub async fn set_privacy_classify_override(&self, outcome: Option<PrivacyClassifyOverride>) {
         let mut config = self.config.lock().await;
         config.privacy_classify_override = outcome;
+    }
+
+    /// Make embeddings and rerank responses report zero usage, for tests of
+    /// the zero-unit billing rule. Pass `false` to restore the fixed counts.
+    pub async fn set_report_zero_usage(&self, enabled: bool) {
+        let mut config = self.config.lock().await;
+        config.report_zero_usage = enabled;
     }
 
     /// Generate a completion ID
@@ -1829,13 +1841,18 @@ impl crate::InferenceProvider for MockProvider {
                 .unwrap()
         });
 
+        let total_tokens = if self.config.lock().await.report_zero_usage {
+            0
+        } else {
+            50
+        };
         let response = RerankResponse {
             id: format!("rerank-{}", self.generate_id()),
             model: params.model.clone(),
             results,
             usage: Some(RerankUsage {
                 prompt_tokens: None,
-                total_tokens: Some(50),
+                total_tokens: Some(total_tokens),
             }),
         };
 
@@ -1848,12 +1865,17 @@ impl crate::InferenceProvider for MockProvider {
         _extra: std::collections::HashMap<String, serde_json::Value>,
     ) -> Result<bytes::Bytes, EmbeddingError> {
         self.record_tracing("embeddings_raw");
-        {
+        let tokens = {
             let config = self.config.lock().await;
             if let Some(ref error) = config.embedding_error_override {
                 return Err(error.clone());
             }
-        }
+            if config.report_zero_usage {
+                0
+            } else {
+                10
+            }
+        };
         let embedding: Vec<f64> = vec![0.0; 384];
         let response_json = serde_json::json!({
             "object": "list",
@@ -1864,8 +1886,8 @@ impl crate::InferenceProvider for MockProvider {
             }],
             "model": "mock-embedding-model",
             "usage": {
-                "prompt_tokens": 10,
-                "total_tokens": 10
+                "prompt_tokens": tokens,
+                "total_tokens": tokens
             }
         });
         let bytes = serde_json::to_vec(&response_json)
@@ -2093,9 +2115,15 @@ impl crate::InferenceProvider for MockProvider {
                 .as_deref()
                 .is_none_or(|granularities| granularities.iter().any(|value| value == "segment"));
 
+        // Like the real servers: `verbose_json` carries `duration`, the plain
+        // format reports the length only under `usage`.
         Ok(AudioTranscriptionResponse {
             text: mock_text.clone(),
-            duration: Some(mock_duration),
+            duration: verbose_json.then_some(mock_duration),
+            usage: (!verbose_json).then(|| crate::models::AudioTranscriptionUsage {
+                usage_type: Some("duration".to_string()),
+                seconds: Some(mock_duration.ceil()),
+            }),
             language: params.language.or(Some("en".to_string())),
             segments: wants_segment_timestamps.then(|| {
                 vec![TranscriptionSegment {

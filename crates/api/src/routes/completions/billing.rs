@@ -15,8 +15,8 @@ pub(super) const MAX_REASONABLE_TOKENS: i32 = 1_000_000;
 /// Parse the authenticated key's id for a usage record. A malformed id fails
 /// the request instead of serving it unbilled.
 pub(super) fn billing_api_key_id(api_key: &AuthenticatedApiKey) -> Result<Uuid, Box<Response>> {
-    Uuid::parse_str(&api_key.api_key.id.0).map_err(|e| {
-        tracing::error!(error = %e, "Invalid API key ID for usage tracking");
+    Uuid::parse_str(&api_key.api_key.id.0).map_err(|_| {
+        tracing::error!("Invalid API key ID for usage tracking");
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             ResponseJson(ErrorResponse::new(
@@ -29,6 +29,71 @@ pub(super) fn billing_api_key_id(api_key: &AuthenticatedApiKey) -> Result<Uuid, 
     })
 }
 
+/// Prefer the provider's total input count, falling back to prompt tokens
+/// when a model reports only that OpenAI-compatible field.
+pub(super) fn reported_input_tokens(total: Option<i32>, prompt: Option<i32>) -> i32 {
+    total
+        .filter(|count| *count > 0)
+        .or_else(|| prompt.filter(|count| *count > 0))
+        .or(total)
+        .or(prompt)
+        .unwrap_or(0)
+}
+
+/// Score is priced by input tokens. Prefer the explicit prompt count; when
+/// only a total is available, remove a reported completion count before
+/// treating it as input work.
+pub(super) fn reported_score_input_tokens(
+    prompt: Option<i32>,
+    total: Option<i32>,
+    completion: Option<i32>,
+) -> i32 {
+    if let Some(input) = prompt.filter(|count| *count > 0) {
+        return input;
+    }
+    let fallback = match (total, completion) {
+        (Some(total), Some(completion)) if completion >= 0 && total >= completion => {
+            Some(total - completion)
+        }
+        (Some(total), None) => Some(total),
+        _ => None,
+    };
+    fallback
+        .filter(|count| *count > 0)
+        .or(prompt)
+        .or(fallback)
+        .unwrap_or(0)
+}
+
+/// Audio duration is billed in whole seconds; a missing or non-finite
+/// duration cannot establish the amount to charge.
+pub(super) fn reported_audio_seconds(duration: Option<f64>) -> i32 {
+    duration
+        .filter(|seconds| seconds.is_finite() && *seconds > 0.0)
+        .map(|seconds| seconds.min(i32::MAX as f64).ceil() as i32)
+        .unwrap_or(0)
+}
+
+/// A completed response with no billable units must not be returned as 200.
+#[allow(
+    clippy::result_large_err,
+    reason = "Shared route guard returns a complete HTTP error response"
+)]
+pub(super) fn require_positive_units(units: i32) -> Result<i32, Response> {
+    if units > 0 {
+        Ok(units)
+    } else {
+        Err((
+            StatusCode::BAD_GATEWAY,
+            ResponseJson(ErrorResponse::new(
+                "Provider did not return billable usage".to_string(),
+                "server_error".to_string(),
+            )),
+        )
+            .into_response())
+    }
+}
+
 /// Per-endpoint log messages for [`cap_reported_tokens`].
 pub(super) struct TokenAnomalyMessages {
     pub overflow: &'static str,
@@ -36,9 +101,9 @@ pub(super) struct TokenAnomalyMessages {
     pub anomaly: &'static str,
 }
 
-/// Cap a provider-reported token count at [`MAX_REASONABLE_TOKENS`], bill a
-/// negative count as zero, and flag a zero count, logging and emitting the
-/// provider-anomaly metrics tagged with `model`. Returns the count to bill.
+/// Cap a provider-reported token count at [`MAX_REASONABLE_TOKENS`], normalize
+/// a negative count to zero, and flag non-positive counts with provider-anomaly
+/// metrics tagged with `model`. Callers reject a non-positive result.
 pub(super) fn cap_reported_tokens(
     metrics: &dyn MetricsServiceTrait,
     model: &str,
@@ -70,7 +135,7 @@ pub(super) fn cap_reported_tokens(
             token_count = token_count,
             model = %model,
             organization_id = %organization_id,
-            "Provider returned negative token count - billing zero"
+            "Provider returned negative token count"
         );
         token_anomaly_detected = true;
         let model_tag = format!("model:{}", model);
@@ -155,7 +220,7 @@ mod tests {
     }
 
     #[test]
-    fn zero_is_billed_as_zero_and_flagged() {
+    fn zero_is_flagged_for_rejection() {
         assert_eq!(
             cap(0),
             (
@@ -173,7 +238,7 @@ mod tests {
     }
 
     #[test]
-    fn negative_counts_bill_zero_and_are_flagged() {
+    fn negative_counts_are_flagged_for_rejection() {
         assert_eq!(
             cap(-5),
             (
@@ -188,5 +253,47 @@ mod tests {
                 )]
             )
         );
+    }
+
+    #[test]
+    fn reported_input_tokens_accepts_both_provider_usage_shapes() {
+        assert_eq!(reported_input_tokens(Some(14), Some(10)), 14);
+        assert_eq!(reported_input_tokens(None, Some(10)), 10);
+        assert_eq!(reported_input_tokens(Some(0), Some(10)), 10);
+        assert_eq!(reported_input_tokens(None, None), 0);
+        assert_eq!(reported_input_tokens(Some(-1), None), -1);
+    }
+
+    #[test]
+    fn score_uses_prompt_tokens_or_a_valid_input_only_fallback() {
+        assert_eq!(reported_score_input_tokens(Some(8), Some(11), Some(3)), 8);
+        assert_eq!(reported_score_input_tokens(None, Some(11), Some(3)), 8);
+        assert_eq!(reported_score_input_tokens(None, Some(8), None), 8);
+        assert_eq!(reported_score_input_tokens(Some(0), Some(11), Some(3)), 8);
+        assert_eq!(reported_score_input_tokens(None, Some(3), Some(3)), 0);
+        assert_eq!(reported_score_input_tokens(None, Some(3), Some(4)), 0);
+    }
+
+    #[test]
+    fn completed_zero_usage_cannot_be_a_successful_response() {
+        assert_eq!(
+            require_positive_units(0).unwrap_err().status(),
+            StatusCode::BAD_GATEWAY
+        );
+        assert_eq!(
+            require_positive_units(-1).unwrap_err().status(),
+            StatusCode::BAD_GATEWAY
+        );
+        assert_eq!(require_positive_units(1).unwrap(), 1);
+    }
+
+    #[test]
+    fn audio_duration_requires_a_finite_positive_report() {
+        assert_eq!(reported_audio_seconds(Some(0.1)), 1);
+        assert_eq!(reported_audio_seconds(Some(10.1)), 11);
+        assert_eq!(reported_audio_seconds(None), 0);
+        assert_eq!(reported_audio_seconds(Some(0.0)), 0);
+        assert_eq!(reported_audio_seconds(Some(f64::NAN)), 0);
+        assert_eq!(reported_audio_seconds(Some(f64::INFINITY)), 0);
     }
 }

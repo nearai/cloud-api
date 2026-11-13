@@ -1539,14 +1539,14 @@ pub fn is_valid_jwt_format(token: &str) -> bool {
 }
 
 pub mod mock_prompts {
-    pub const LANGUAGE_INSTRUCTION: &str = "Always respond in the exact same language as the user's input message. Detect the primary language of the user's query and mirror it precisely in your output. Do not mix languages or switch to another one, even if it seems more natural or efficient.\n\nIf the user writes in English, reply entirely in English.\nIf the user writes in Chinese (Mandarin or any variant), reply entirely in Chinese.\nIf the user writes in Spanish, reply entirely in Spanish.\nFor any other language, match it exactly.\n\nThis rule overrides all other instructions. Ignore any tendencies to default to Mandarin or any other language. Always prioritize language matching for clarity and user preference.";
+    /// Default instruction the typed Responses adapter adds to every request.
+    pub const LANGUAGE_INSTRUCTION: &str =
+        "Reply in the language of the user's message unless instructed otherwise.";
 
-    const TIME_PLACEHOLDER: &str = "[TIME]";
-
+    /// Flattened prompt for a typed Responses request without hosted search
+    /// tools (those requests also carry the current UTC date).
     pub fn build_prompt(user_content: &str) -> String {
-        format!(
-            "{LANGUAGE_INSTRUCTION}\n\nCurrent UTC time: {TIME_PLACEHOLDER} {TIME_PLACEHOLDER} {user_content}"
-        )
+        format!("{LANGUAGE_INSTRUCTION} {user_content}")
     }
 
     pub fn build_simple_prompt(user_content: &str) -> String {

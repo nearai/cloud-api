@@ -78,6 +78,18 @@ fn to_privacy_classify_error<E: std::fmt::Display>(e: E) -> PrivacyClassifyError
 /// `source()` and is otherwise discarded when we convert to
 /// `CompletionError::CompletionError(String)`. Walk the chain so the
 /// transport-level reason ends up in logs.
+fn completion_error_kind(error: &CompletionError) -> &'static str {
+    match error {
+        CompletionError::CompletionError(_) => "completion_error",
+        CompletionError::HttpError { .. } => "http_error",
+        CompletionError::InvalidResponse(_) => "invalid_response",
+        CompletionError::Unknown(_) => "unknown",
+        CompletionError::ClientMediaError(_) => "client_media_error",
+        CompletionError::NoPubKeyProvider(_) => "no_pub_key_provider",
+        CompletionError::Timeout { .. } => "timeout",
+    }
+}
+
 fn format_error_chain<E: std::error::Error>(e: &E) -> String {
     let mut out = e.to_string();
     let mut source: Option<&dyn std::error::Error> = e.source();
@@ -468,7 +480,7 @@ impl Fleet {
                     Ok(_) => tracing::debug!(index, "Index pre-warm complete"),
                     Err(e) => tracing::warn!(
                         index,
-                        error = %e,
+                        error_kind = completion_error_kind(&e),
                         "Index pre-warm failed; will retry inline on first use"
                     ),
                 }
@@ -601,14 +613,18 @@ impl Fleet {
                             .unwrap_or_else(|e| e.into_inner()) = Some(tokio::time::Instant::now());
                         tracing::warn!(
                             index,
-                            error = %e,
+                            error_kind = "channel_binding",
                             backoff_secs = Self::CHANNEL_BINDING_BACKOFF.as_secs(),
                             "Inline backend verification failed the TLS channel binding check; not retrying"
                         );
                         last_err = Some(e);
                         break;
                     }
-                    tracing::warn!(index, error = %e, "Inline backend verification failed, retrying");
+                    tracing::warn!(
+                        index,
+                        error_kind = "backend_verification_failed",
+                        "Inline backend verification failed, retrying"
+                    );
                     last_err = Some(e);
                 }
             }
@@ -618,17 +634,28 @@ impl Fleet {
         // non-pinned client ONLY if a fingerprint is already pinned (its
         // verifier still rejects unknown SPKIs); in Bootstrap, fail closed to
         // avoid unauthenticated connections.
+        let error_kind = match &last_err {
+            Some(BackendVerifyError::ChannelBinding(_)) => "channel_binding",
+            Some(BackendVerifyError::Other(_)) => "backend_verification_failed",
+            None => "unknown",
+        };
         let err_msg = format!(
             "Inline backend verification failed after {attempts} attempt(s): {}",
             last_err.map(|e| e.to_string()).unwrap_or_default()
         );
         if self.pinned_fingerprint_count() > 0 {
-            tracing::warn!(index, error = %err_msg, "Inline backend verification failed; serving with fallback client");
+            tracing::warn!(
+                index,
+                attempts,
+                error_kind,
+                "Inline backend verification failed; serving with fallback client"
+            );
             Ok(self.fallback_client.clone())
         } else {
             tracing::warn!(
                 index,
-                error = %err_msg,
+                attempts,
+                error_kind,
                 "Inline backend verification failed in Bootstrap state; \
                  refusing fallback to prevent unauthenticated connections"
             );
@@ -650,10 +677,18 @@ impl Fleet {
             remaining.as_secs().max(1)
         );
         if self.pinned_fingerprint_count() > 0 {
-            tracing::debug!(index, error = %err_msg, "Serving with fallback client");
+            tracing::debug!(
+                index,
+                error_kind = "channel_binding_backoff",
+                "Serving with fallback client"
+            );
             Ok(self.fallback_client.clone())
         } else {
-            tracing::debug!(index, error = %err_msg, "Refusing fallback in Bootstrap state");
+            tracing::debug!(
+                index,
+                error_kind = "channel_binding_backoff",
+                "Refusing fallback in Bootstrap state"
+            );
             Err(CompletionError::CompletionError(err_msg))
         }
     }
@@ -1091,7 +1126,8 @@ impl Fleet {
                 Ok(c) => c,
                 Err(e) => {
                     tracing::debug!(
-                        index, error = %e,
+                        index,
+                        error_kind = completion_error_kind(&e),
                         "Fallback index client unavailable, trying next backend"
                     );
                     continue;
@@ -1114,7 +1150,8 @@ impl Fleet {
                     // We log the error but DON'T overwrite `last_error`:
                     // see the field comment above.
                     tracing::debug!(
-                        index, error = %format_error_chain(&e),
+                        index,
+                        error_kind = "transport",
                         is_timeout = e.is_timeout(),
                         is_connect = e.is_connect(),
                         "Fallback index chat_completion attempt errored, trying next backend"
@@ -1220,7 +1257,8 @@ impl Fleet {
                 Ok(c) => c,
                 Err(e) => {
                     tracing::debug!(
-                        index, error = %e,
+                        index,
+                        error_kind = completion_error_kind(&e),
                         "Fallback index stream client unavailable, trying next backend"
                     );
                     continue;
@@ -1245,9 +1283,10 @@ impl Fleet {
                     }
                     // Retryable HttpError (5xx/429/408) — update last_error
                     // so the trace label stays accurate at end-of-fallback.
-                    CompletionError::HttpError { .. } => {
+                    CompletionError::HttpError { status_code, .. } => {
                         tracing::debug!(
-                            index, error = %e,
+                            index,
+                            status = *status_code,
                             "Fallback index stream attempt returned 5xx/429/408, trying next backend"
                         );
                         last_error = e;
@@ -1262,7 +1301,7 @@ impl Fleet {
                     _ => {
                         tracing::debug!(
                             index,
-                            error = %e,
+                            error_kind = completion_error_kind(&e),
                             "Fallback index stream attempt failed transport, trying next backend"
                         );
                         continue;
@@ -1613,7 +1652,11 @@ impl InferenceProvider for Fleet {
                     match self.get_or_verify_index_client(index as usize).await {
                         Ok(client) => Some((index, url, client)),
                         Err(e) => {
-                            tracing::debug!(index, error = %e, "Signature index client unavailable");
+                            tracing::debug!(
+                                index,
+                                error_kind = completion_error_kind(&e),
+                                "Signature index client unavailable"
+                            );
                             None
                         }
                     }
@@ -1692,7 +1735,13 @@ impl InferenceProvider for Fleet {
                             "Rotation-SNI signature fetch transport error: {message}"
                         ));
                         retryable = false;
-                        tracing::debug!(index, error = %message, "Rotation-SNI signature fetch errored");
+                        tracing::debug!(
+                            index,
+                            error_kind = "transport",
+                            is_timeout = e.is_timeout(),
+                            is_connect = e.is_connect(),
+                            "Rotation-SNI signature fetch errored"
+                        );
                     }
                 }
             } else {
@@ -1717,7 +1766,9 @@ impl InferenceProvider for Fleet {
                             let message = format_error_chain(&e);
                             if idx + 1 < client_count {
                                 tracing::debug!(
-                                    error = %message,
+                                    error_kind = "transport",
+                                    is_timeout = e.is_timeout(),
+                                    is_connect = e.is_connect(),
                                     "Signature fetch transport error; trying next client"
                                 );
                                 last_error = Some(message);
@@ -1761,7 +1812,6 @@ impl InferenceProvider for Fleet {
             if retryable {
                 if let Some(backoff) = signature_fetch_backoff(attempt) {
                     tracing::debug!(
-                        %chat_id,
                         attempt = attempt + 1,
                         "Signature not yet present on backend (404); retrying after backoff"
                     );
@@ -1852,7 +1902,7 @@ impl InferenceProvider for Fleet {
         let rotation_count = self.rotation_count();
         let mut requests = Vec::with_capacity(rotation_count + 1);
         requests.push((
-            canonical_url.clone(),
+            false,
             ModelsRequest {
                 client: client.clone(),
                 headers: headers.clone(),
@@ -1864,7 +1914,7 @@ impl InferenceProvider for Fleet {
         requests.extend((0..rotation_count).filter_map(|index| {
             self.rotation_url(index as u64, "/v1/models").map(|url| {
                 (
-                    url.clone(),
+                    true,
                     ModelsRequest {
                         client: client.clone(),
                         headers: headers.clone(),
@@ -1875,22 +1925,28 @@ impl InferenceProvider for Fleet {
             })
         }));
 
-        let results = futures_util::future::join_all(
-            requests
-                .into_iter()
-                .map(|(url, request)| async move { (url, send_models_request(request).await) }),
-        )
-        .await;
+        let results =
+            futures_util::future::join_all(requests.into_iter().map(
+                |(is_rotation, request)| async move {
+                    (is_rotation, send_models_request(request).await)
+                },
+            ))
+            .await;
 
         let mut responses = Vec::with_capacity(results.len());
         let mut first_error = None;
-        for (url, result) in results {
+        for (is_rotation, result) in results {
             match result {
                 Ok(response) => responses.push(response),
                 Err(error) => {
+                    let error_kind = match &error {
+                        ListModelsError::FetchError(_) => "fetch",
+                        ListModelsError::InvalidResponse => "invalid_response",
+                        ListModelsError::Unknown => "unknown",
+                    };
                     tracing::warn!(
-                        url = %url,
-                        error = %error,
+                        is_rotation,
+                        error_kind,
                         "Failed to list models from backend"
                     );
                     if first_error.is_none() {
@@ -1930,6 +1986,7 @@ impl InferenceProvider for Fleet {
         headers.insert("X-Request-Hash", request_hash_value);
 
         Self::prepare_priority_header(&mut headers, &mut streaming_params);
+        streaming_params.apply_upstream_cache_salt();
         // The replica hint and its host are placement's choice alone: a
         // client-supplied key of either name never reaches the upstream body.
         for key in upstream_headers::ALL {
@@ -2103,6 +2160,7 @@ impl InferenceProvider for Fleet {
         headers.insert("X-Request-Hash", request_hash_value);
 
         Self::prepare_priority_header(&mut headers, &mut non_streaming_params);
+        non_streaming_params.apply_upstream_cache_salt();
         // The replica hint and its host are placement's choice alone: a
         // client-supplied key of either name never reaches the upstream body.
         for key in upstream_headers::ALL {
@@ -2473,7 +2531,8 @@ impl InferenceProvider for Fleet {
         let transcription_response: AudioTranscriptionResponse =
             response.json().await.map_err(|e| {
                 tracing::debug!(
-                    error_type = %e,
+                    error_kind = "deserialize",
+                    is_decode = e.is_decode(),
                     "Audio transcription response deserialization failed"
                 );
                 AudioTranscriptionError::TranscriptionError(e.to_string())
@@ -4409,6 +4468,7 @@ mod tests {
             service_tier: None,
             modalities: None,
             original_request: None,
+            upstream_cache_salt: None,
             extra: std::collections::HashMap::new(),
         };
 
@@ -8401,5 +8461,7 @@ mod tests {
     }
 }
 
+#[cfg(test)]
+mod cache_salt_tests;
 #[cfg(test)]
 mod priority_tests;

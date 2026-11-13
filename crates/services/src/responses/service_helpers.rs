@@ -80,6 +80,8 @@ pub struct ResponseStreamContext {
     /// Shared mirror of token counters so the outer error handler can read
     /// accumulated usage even after `ctx` is dropped.
     pub usage_tracker: Arc<UsageTracker>,
+    /// Per-round billing correlation shared with the HTTP adapter.
+    pub billing: crate::responses::billing::ResponseBilling,
 }
 
 impl ResponseStreamContext {
@@ -112,6 +114,7 @@ impl ResponseStreamContext {
             model,
             created_at,
             usage_tracker,
+            billing: Default::default(),
         }
     }
 
@@ -133,10 +136,12 @@ impl ResponseStreamContext {
         self.completed_input_tokens = self.total_input_tokens;
         self.completed_output_tokens = self.total_output_tokens;
         self.completed_cached_tokens = self.total_cached_tokens;
+        self.billing.begin_round();
     }
 
     /// Replace the current round's usage without counting repeated chunks twice.
     pub fn update_usage(&mut self, input_tokens: i32, output_tokens: i32, cached_tokens: i32) {
+        self.billing.record_usage(input_tokens, output_tokens);
         self.total_input_tokens = self.completed_input_tokens.saturating_add(input_tokens);
         self.total_output_tokens = self.completed_output_tokens.saturating_add(output_tokens);
         self.total_cached_tokens = self.completed_cached_tokens.saturating_add(cached_tokens);

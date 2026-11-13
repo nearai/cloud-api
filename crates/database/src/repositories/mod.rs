@@ -17,7 +17,6 @@ pub mod attestation;
 pub mod contact_email;
 pub mod conversation;
 pub mod credit_allocation;
-pub mod feature_request;
 pub mod file;
 pub mod lifecycle;
 pub mod mcp_connector;
@@ -63,10 +62,6 @@ pub use attestation::PgAttestationRepository;
 pub use contact_email::PgContactEmailRepository;
 pub use conversation::PgConversationRepository;
 pub use credit_allocation::CreditAllocationPolicy;
-pub use feature_request::{
-    FeatureRequestRepository, FeatureRequestSummary, FeatureRequestTarget,
-    FeatureRequestVoteSummary, SubmitFeatureRequestParams, SubmitFeatureRequestResult,
-};
 pub use file::FileRepository;
 pub use mcp_connector::McpConnectorRepository;
 pub use model::ModelRepository;

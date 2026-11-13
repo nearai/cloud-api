@@ -159,7 +159,6 @@ pub fn test_config() -> ApiConfig {
         },
         cors: config::CorsConfig::default(),
         external_providers: config::ExternalProvidersConfig::default(),
-        github_dispatch: config::GitHubDispatchConfig::default(),
         infra: config::InfraConfig::default(),
         staking_farm: config::StakingFarmConfig::default(),
         aml: config::AmlConfig::default(),

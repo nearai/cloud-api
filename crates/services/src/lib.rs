@@ -14,7 +14,6 @@ pub mod encryption_keys;
 mod key_fingerprint;
 pub use key_fingerprint::key_fingerprint;
 pub mod files;
-pub mod github_dispatch;
 pub mod id_prefixes;
 pub mod inference_provider_pool;
 pub mod lifecycle;

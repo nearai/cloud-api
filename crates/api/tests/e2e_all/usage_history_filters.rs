@@ -255,6 +255,15 @@ async fn reporting_token_shaped_bearer_is_rejected_with_401() {
         assert_eq!(response.status_code(), 401, "{path}: {}", response.text());
     }
 
+    // And: the refresh-token route rejects it as well. The auth double only
+    // accepts `rt_` refresh tokens, so this exercises a real rejection.
+    let response = server
+        .post("/v1/users/me/access-tokens")
+        .add_header("Authorization", "Bearer rpt-0123456789abcdef")
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .await;
+    assert_eq!(response.status_code(), 401, "{}", response.text());
+
     // And: a session-authenticated route never turns it into a server error
     // (the e2e session auth double accepts any bearer, so only the status
     // class is asserted there).

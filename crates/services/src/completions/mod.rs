@@ -243,10 +243,12 @@ where
             });
         }
 
+        let workspace_id = self.workspace_id;
         let store = async move {
             match tokio::time::timeout(
                 STREAM_SIGNATURE_STORE_TIMEOUT,
-                attestation_service.store_stream_chat_signature_from_provider(&chat_id),
+                attestation_service
+                    .store_stream_chat_signature_from_provider(workspace_id, &chat_id),
             )
             .await
             {
@@ -2152,11 +2154,12 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         if model.attestation_supported && !request.skip_provider_chat_signature {
             let attestation_service = self.attestation_service.clone();
             let chat_id = response_with_bytes.response.id.clone();
+            let workspace_id = request.workspace_id;
             let model_name = model.model_name.clone();
             inference_providers::tracing_context::spawn_with_tracing_context(
                 async move {
                     match attestation_service
-                        .store_chat_signature_from_provider(chat_id.as_str())
+                        .store_chat_signature_from_provider(workspace_id, chat_id.as_str())
                         .await
                     {
                         Err(e) => {

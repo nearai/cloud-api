@@ -487,7 +487,11 @@ pub async fn messages(
     requested_model: RequestedModel,
     body: Bytes,
 ) -> Response {
-    let signing = MessageSigningContext::new(app_state.attestation_service.clone(), body_hash.hash);
+    let signing = MessageSigningContext::new(
+        api_key.workspace.id.0,
+        app_state.attestation_service.clone(),
+        body_hash.hash,
+    );
     handle_request(
         app_state,
         api_key,

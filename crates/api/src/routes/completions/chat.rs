@@ -189,6 +189,7 @@ pub(super) async fn chat_completions_inner(
     request: ChatCompletionRequest,
     request_id: Uuid,
 ) -> axum::response::Response {
+    let workspace_id = api_key.workspace.id.0;
     let request_hash = body_hash.hash.clone();
 
     // Convert HTTP request to service parameters
@@ -1048,7 +1049,7 @@ pub(super) async fn chat_completions_inner(
                                         if let Some(chat_id) = chat_id {
                                             match tokio::time::timeout(
                                                 SIGNATURE_STORE_TIMEOUT,
-                                                attestation_service_for_chain.store_chat_signature(
+                                                attestation_service_for_chain.store_chat_signature(workspace_id,
                                                     &chat_id,
                                                     request_hash.clone(),
                                                     response_hash,
@@ -1096,7 +1097,7 @@ pub(super) async fn chat_completions_inner(
                                         };
                                         match tokio::time::timeout(
                                             SIGNATURE_STORE_TIMEOUT,
-                                            attestation_service_for_chain.store_chat_signature(
+                                            attestation_service_for_chain.store_chat_signature(workspace_id,
                                                 &chat_id,
                                                 request_hash.clone(),
                                                 response_hash,
@@ -1286,6 +1287,7 @@ pub(super) async fn chat_completions_inner(
                     if let Err(error) = app_state
                         .attestation_service
                         .store_chat_signature_and_unpin(
+                            workspace_id,
                             &response_with_bytes.response.id,
                             request_hash.clone(),
                             response_hash,

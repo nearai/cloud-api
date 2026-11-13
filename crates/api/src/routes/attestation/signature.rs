@@ -1,5 +1,7 @@
 use super::{errors::*, AttestationRouteState};
+use crate::middleware::auth::AuthenticatedApiKey;
 use crate::models::ErrorResponse;
+use axum::Extension;
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
@@ -81,6 +83,7 @@ pub struct SignatureUnavailableResponse {
     tag = "Attestation"
 )]
 pub async fn get_signature(
+    Extension(api_key): Extension<AuthenticatedApiKey>,
     Path(chat_id): Path<String>,
     Query(params): Query<SignatureQuery>,
     State(state): State<AttestationRouteState>,
@@ -90,7 +93,7 @@ pub async fn get_signature(
     let signing_algo = params.signing_algo;
     let result = state
         .attestation_service
-        .get_chat_signature(chat_id.as_str(), signing_algo)
+        .get_chat_signature(api_key.workspace.id.0, chat_id.as_str(), signing_algo)
         .await
         .map_err(signature_error_response)?;
 

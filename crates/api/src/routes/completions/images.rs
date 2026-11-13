@@ -140,10 +140,11 @@ pub async fn image_generations(
             let provider_attribution = attributed_response.provider_attribution;
             // Store attestation signature for image generation (same pattern as chat completions)
             let attestation_service = app_state.attestation_service.clone();
+            let workspace_id = api_key.workspace.id.0;
             let image_id_for_sig = response_with_bytes.response.id.clone();
             inference_providers::tracing_context::spawn_with_tracing_context(async move {
                 if let Err(e) = attestation_service
-                    .store_chat_signature_from_provider(&image_id_for_sig)
+                    .store_chat_signature_from_provider(workspace_id, &image_id_for_sig)
                     .await
                 {
                     tracing::debug!(error = %e, "Failed to store image generation signature");
@@ -542,10 +543,11 @@ pub async fn image_edits(
             let provider_attribution = attributed_response.provider_attribution;
             // Store attestation signature for image edit (same pattern as image generation)
             let attestation_service = app_state.attestation_service.clone();
+            let workspace_id = api_key.workspace.id.0;
             let image_id_for_sig = response_with_bytes.response.id.clone();
             inference_providers::tracing_context::spawn_with_tracing_context(async move {
                 if let Err(e) = attestation_service
-                    .store_chat_signature_from_provider(&image_id_for_sig)
+                    .store_chat_signature_from_provider(workspace_id, &image_id_for_sig)
                     .await
                 {
                     tracing::debug!(error = %e, "Failed to store image edit signature");

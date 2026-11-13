@@ -281,11 +281,14 @@ async fn typed_hot_path_queries_repeat_on_one_pool() -> anyhow::Result<()> {
     for text in ["first", "second"] {
         attestation
             .add_chat_signature(
+                uuid::Uuid::nil(),
                 &chat_id,
                 signature("ecdsa", text, Some(SignatureKind::Gateway)),
             )
             .await?;
-        let stored = attestation.get_chat_signature(&chat_id, "ecdsa").await?;
+        let stored = attestation
+            .get_chat_signature(uuid::Uuid::nil(), &chat_id, "ecdsa")
+            .await?;
         assert_eq!(stored.text, text);
         assert_eq!(stored.signature_kind, Some(SignatureKind::Gateway));
     }
@@ -293,6 +296,7 @@ async fn typed_hot_path_queries_repeat_on_one_pool() -> anyhow::Result<()> {
     for text in ["one", "two"] {
         attestation
             .add_chat_signatures(
+                uuid::Uuid::nil(),
                 &batch_chat_id,
                 vec![
                     signature("ecdsa", text, Some(SignatureKind::ProviderTee)),
@@ -304,7 +308,9 @@ async fn typed_hot_path_queries_repeat_on_one_pool() -> anyhow::Result<()> {
             ("ecdsa", Some(SignatureKind::ProviderTee)),
             ("ed25519", None),
         ] {
-            let stored = attestation.get_chat_signature(&batch_chat_id, algo).await?;
+            let stored = attestation
+                .get_chat_signature(uuid::Uuid::nil(), &batch_chat_id, algo)
+                .await?;
             assert_eq!(stored.text, text);
             assert_eq!(stored.signature_kind, kind);
         }

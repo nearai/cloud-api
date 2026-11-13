@@ -365,3 +365,83 @@ async fn test_ita_token_route_is_public_no_auth_rejection() {
         response.text()
     );
 }
+
+#[tokio::test]
+async fn signature_lookup_is_scoped_to_workspace_and_legacy_rows_stay_hidden() {
+    use services::attestation::{ports::AttestationRepository, ChatSignature};
+    let (server, database) = setup_test_server_with_database().await;
+    let org = setup_org_with_credits(&server, 10_000_000_000).await;
+    let key = get_api_key_for_org(&server, org.id.clone()).await;
+    let workspaces = list_workspaces(&server, org.id).await;
+    let owner = uuid::Uuid::parse_str(&workspaces[0].id).unwrap();
+    let other_org = setup_org_with_credits(&server, 10_000_000_000).await;
+    let other_key = get_api_key_for_org(&server, other_org.id).await;
+    let repo =
+        database::repositories::attestation::PgAttestationRepository::new(database.pool().clone());
+    let id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
+    let row = ChatSignature {
+        text: "test-digests".into(),
+        signature: "test-signature".into(),
+        signing_address: "test-address".into(),
+        signing_algo: "ecdsa".into(),
+        signature_kind: None,
+    };
+    repo.add_chat_signature(owner, &id, row.clone())
+        .await
+        .unwrap();
+    let url = format!("/v1/signature/{id}");
+    assert_eq!(
+        server
+            .get(&url)
+            .add_header("Authorization", format!("Bearer {key}"))
+            .await
+            .status_code(),
+        200
+    );
+    assert_eq!(
+        server
+            .get(&url)
+            .add_header("Authorization", format!("Bearer {other_key}"))
+            .await
+            .status_code(),
+        404
+    );
+    repo.add_chat_signature(uuid::Uuid::new_v4(), &id, row)
+        .await
+        .unwrap();
+    assert_eq!(
+        server
+            .get(&url)
+            .add_header("Authorization", format!("Bearer {key}"))
+            .await
+            .status_code(),
+        200
+    );
+    database
+        .pool()
+        .get()
+        .await
+        .unwrap()
+        .execute(
+            "UPDATE chat_signatures SET workspace_id = NULL WHERE chat_id = $1",
+            &[&id],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        server
+            .get(&url)
+            .add_header("Authorization", format!("Bearer {key}"))
+            .await
+            .status_code(),
+        404
+    );
+    assert_eq!(
+        server
+            .get(&url)
+            .add_header("Authorization", format!("Bearer {other_key}"))
+            .await
+            .status_code(),
+        404
+    );
+}

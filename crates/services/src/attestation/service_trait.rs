@@ -13,49 +13,55 @@ use inference_providers::ProviderFilter;
 impl ports::AttestationServiceTrait for AttestationService {
     async fn get_chat_signature(
         &self,
+        workspace_id: uuid::Uuid,
         chat_id: &str,
         signing_algo: Option<String>,
     ) -> Result<SignatureLookupResult, AttestationError> {
-        self.get_chat_signature_impl(chat_id, signing_algo).await
+        self.get_chat_signature_impl(workspace_id, chat_id, signing_algo)
+            .await
     }
 
     async fn store_chat_signature_from_provider(
         &self,
+        workspace_id: uuid::Uuid,
         chat_id: &str,
     ) -> Result<(), AttestationError> {
-        self.store_chat_signature_from_provider_impl(chat_id, None)
+        self.store_chat_signature_from_provider_impl(workspace_id, chat_id, None)
             .await
     }
 
     async fn store_stream_chat_signature_from_provider(
         &self,
+        workspace_id: uuid::Uuid,
         chat_id: &str,
     ) -> Result<(), AttestationError> {
         // Start the budget before provider lookup and share it across both
         // algorithms. Non-streaming/background callers retain their existing
         // provider timeouts, without this streaming-specific deadline.
         let deadline = tokio::time::Instant::now() + PROVIDER_SIGNATURE_FETCH_TIMEOUT;
-        self.store_chat_signature_from_provider_impl(chat_id, Some(deadline))
+        self.store_chat_signature_from_provider_impl(workspace_id, chat_id, Some(deadline))
             .await
     }
 
     async fn store_chat_signature(
         &self,
+        workspace_id: uuid::Uuid,
         chat_id: &str,
         request_hash: String,
         response_hash: String,
     ) -> Result<(), AttestationError> {
-        self.store_chat_signature_impl(chat_id, request_hash, response_hash)
+        self.store_chat_signature_impl(workspace_id, chat_id, request_hash, response_hash)
             .await
     }
 
     async fn store_chat_signature_and_unpin(
         &self,
+        workspace_id: uuid::Uuid,
         chat_id: &str,
         request_hash: String,
         response_hash: String,
     ) -> Result<(), AttestationError> {
-        self.store_chat_signature_and_unpin_impl(chat_id, request_hash, response_hash)
+        self.store_chat_signature_and_unpin_impl(workspace_id, chat_id, request_hash, response_hash)
             .await
     }
 
@@ -65,11 +71,12 @@ impl ports::AttestationServiceTrait for AttestationService {
 
     async fn store_response_signature(
         &self,
+        workspace_id: uuid::Uuid,
         response_id: &str,
         request_hash: String,
         response_hash: String,
     ) -> Result<(), AttestationError> {
-        self.store_response_signature_impl(response_id, request_hash, response_hash)
+        self.store_response_signature_impl(workspace_id, response_id, request_hash, response_hash)
             .await
     }
 

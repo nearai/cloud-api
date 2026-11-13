@@ -311,6 +311,7 @@ struct NoopAttestationRepository;
 impl AttestationRepository for NoopAttestationRepository {
     async fn add_chat_signature(
         &self,
+        _workspace_id: uuid::Uuid,
         _chat_id: &str,
         _signature: ChatSignature,
     ) -> Result<(), AttestationError> {
@@ -319,6 +320,7 @@ impl AttestationRepository for NoopAttestationRepository {
 
     async fn get_chat_signature(
         &self,
+        _workspace_id: uuid::Uuid,
         _chat_id: &str,
         _signing_algo: &str,
     ) -> Result<ChatSignature, AttestationError> {

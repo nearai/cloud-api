@@ -22,6 +22,7 @@ pub(in crate::attestation) const PROVIDER_SIGNATURE_FETCH_TIMEOUT: Duration =
 impl AttestationService {
     pub(in crate::attestation) async fn get_chat_signature_impl(
         &self,
+        workspace_id: uuid::Uuid,
         chat_id: &str,
         signing_algo: Option<String>,
     ) -> Result<SignatureLookupResult, AttestationError> {
@@ -31,7 +32,7 @@ impl AttestationService {
 
         match self
             .repository
-            .get_chat_signature(chat_id, &signing_algo)
+            .get_chat_signature(workspace_id, chat_id, &signing_algo)
             .await
         {
             Ok(signature) => Ok(SignatureLookupResult::Found(signature)),
@@ -59,6 +60,7 @@ impl AttestationService {
 
     pub(in crate::attestation) async fn store_chat_signature_from_provider_impl(
         &self,
+        workspace_id: uuid::Uuid,
         chat_id: &str,
         fetch_deadline: Option<tokio::time::Instant>,
     ) -> Result<(), AttestationError> {
@@ -162,7 +164,7 @@ impl AttestationService {
             Ok(())
         } else {
             self.repository
-                .add_chat_signatures(chat_id, signatures)
+                .add_chat_signatures(workspace_id, chat_id, signatures)
                 .await
                 .map_err(|e| {
                     tracing::error!(
@@ -199,11 +201,12 @@ impl AttestationService {
 
     pub(in crate::attestation) async fn store_chat_signature_impl(
         &self,
+        workspace_id: uuid::Uuid,
         chat_id: &str,
         request_hash: String,
         response_hash: String,
     ) -> Result<(), AttestationError> {
-        self.store_gateway_signature(chat_id, "chat", request_hash, response_hash)
+        self.store_gateway_signature(workspace_id, chat_id, "chat", request_hash, response_hash)
             .await
     }
 
@@ -217,13 +220,14 @@ impl AttestationService {
     /// future and leak the pin.
     pub(in crate::attestation) async fn store_chat_signature_and_unpin_impl(
         &self,
+        workspace_id: uuid::Uuid,
         chat_id: &str,
         request_hash: String,
         response_hash: String,
     ) -> Result<(), AttestationError> {
         let result = match tokio::time::timeout(
             STREAM_SIGNATURE_STORE_TIMEOUT,
-            self.store_chat_signature_impl(chat_id, request_hash, response_hash),
+            self.store_chat_signature_impl(workspace_id, chat_id, request_hash, response_hash),
         )
         .await
         {
@@ -251,12 +255,19 @@ impl AttestationService {
 
     pub(in crate::attestation) async fn store_response_signature_impl(
         &self,
+        workspace_id: uuid::Uuid,
         response_id: &str,
         request_hash: String,
         response_hash: String,
     ) -> Result<(), AttestationError> {
-        self.store_gateway_signature(response_id, "response", request_hash, response_hash)
-            .await
+        self.store_gateway_signature(
+            workspace_id,
+            response_id,
+            "response",
+            request_hash,
+            response_hash,
+        )
+        .await
     }
 
     async fn check_fallback_conditions(

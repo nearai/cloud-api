@@ -368,7 +368,7 @@ impl Billing {
             if let Err(e) = self
                 .service
                 .attestation_service
-                .store_response_signature(&id, self.request_hash, digest)
+                .store_response_signature(self.workspace_id, &id, self.request_hash, digest)
                 .await
             {
                 tracing::error!(error = %e, "Failed to record native Responses signature");

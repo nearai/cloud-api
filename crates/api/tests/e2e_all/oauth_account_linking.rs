@@ -88,6 +88,27 @@ async fn fixture() -> (
     )
 }
 
+async fn start_login(server: &axum_test::TestServer, provider: &str) -> (String, String) {
+    let response = server.get(&format!("/v1/auth/{provider}")).await;
+    assert_eq!(response.status_code(), 303);
+    let url = url::Url::parse(response.header("location").to_str().unwrap()).unwrap();
+    let state = url
+        .query_pairs()
+        .find(|(key, _)| key == "state")
+        .unwrap()
+        .1
+        .into_owned();
+    let cookie = response
+        .header("set-cookie")
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_owned();
+    (state, cookie)
+}
+
 async fn mock_identity(server: &MockServer, identity: &OAuthUserInfo) {
     Mock::given(method("POST")).and(path("/token")).respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"access_token":"local-provider-token","token_type":"Bearer","expires_in":3600}))).mount(server).await;
     let user = if identity.provider == "github" {
@@ -126,7 +147,7 @@ async fn identity_count(db: &database::Database, user: &User) -> i64 {
 #[tokio::test]
 async fn oauth_non_authoritative_google_email_returns_conflict_without_identity_or_session() {
     for (original, incoming) in [("github", "google"), ("google", "github")] {
-        let (server, db, auth, store, provider) = fixture().await;
+        let (server, db, auth, _store, provider) = fixture().await;
         let (user, mut original_info) = account(&auth, original).await;
         if original == "google" {
             original_info.email_authoritative = false;
@@ -152,19 +173,11 @@ async fn oauth_non_authoritative_google_email_returns_conflict_without_identity_
             .await
             .unwrap()
             .get(0);
-        let state = uuid::Uuid::new_v4().to_string();
-        store
-            .create(
-                state.clone(),
-                incoming.into(),
-                Some("local-verifier".into()),
-                None,
-            )
-            .await
-            .unwrap();
+        let (state, cookie) = start_login(&server, incoming).await;
         let response = server
             .get(&format!("/v1/auth/callback?state={state}&code=local-code"))
             .add_header("User-Agent", UA)
+            .add_header("cookie", cookie)
             .await;
         assert_eq!(response.status_code(), 409);
         let body = response.json::<serde_json::Value>();
@@ -199,25 +212,17 @@ async fn oauth_non_authoritative_google_email_returns_conflict_without_identity_
 async fn oauth_verified_email_callback_auto_links_and_signs_into_original_account() {
     for verified in [false, true] {
         for (original, incoming) in [("github", "google"), ("google", "github")] {
-            let (server, db, auth, store, provider) = fixture().await;
+            let (server, db, auth, _store, provider) = fixture().await;
             let (user, original_info) = account(&auth, original).await;
             let mut incoming_info = info(incoming, &original_info.email);
             incoming_info.email_verified = verified;
             mock_identity(&provider, &incoming_info).await;
             let before = counts(&db, &user).await;
-            let state = uuid::Uuid::new_v4().to_string();
-            store
-                .create(
-                    state.clone(),
-                    incoming.into(),
-                    Some("local-verifier".into()),
-                    None,
-                )
-                .await
-                .unwrap();
+            let (state, cookie) = start_login(&server, incoming).await;
             let response = server
                 .get(&format!("/v1/auth/callback?state={state}&code=local-code"))
                 .add_header("User-Agent", UA)
+                .add_header("cookie", cookie)
                 .await;
             let body = response.json::<serde_json::Value>();
             if verified {
@@ -252,26 +257,18 @@ async fn oauth_verified_email_callback_auto_links_and_signs_into_original_accoun
 
 #[tokio::test]
 async fn oauth_google_gmail_callback_auto_links_without_hosted_domain() {
-    let (server, db, auth, store, provider) = fixture().await;
+    let (server, db, auth, _store, provider) = fixture().await;
     let email = format!("link-{}@gmail.com", uuid::Uuid::new_v4());
     let original = info("github", &email);
     let user = auth.get_or_create_oauth_user(original).await.unwrap();
     let mut incoming = info("google", &email);
     incoming.email_authoritative = false; // The mock omits hd; Gmail itself supplies authority.
     mock_identity(&provider, &incoming).await;
-    let state = uuid::Uuid::new_v4().to_string();
-    store
-        .create(
-            state.clone(),
-            "google".into(),
-            Some("local-verifier".into()),
-            None,
-        )
-        .await
-        .unwrap();
+    let (state, cookie) = start_login(&server, "google").await;
     let response = server
         .get(&format!("/v1/auth/callback?state={state}&code=local-code"))
         .add_header("User-Agent", UA)
+        .add_header("cookie", cookie)
         .await;
     assert_eq!(response.status_code(), 200);
     let token = response.json::<serde_json::Value>()["access_token"]

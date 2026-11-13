@@ -15,23 +15,59 @@ use std::sync::Arc;
 use tracing::{debug, error, info};
 use url::Url;
 
-const OAUTH_STATE_COOKIE: &str = "__Host-oauth-state";
+fn oauth_cookie_secure(config: &config::AuthConfig) -> bool {
+    let callbacks: Vec<_> = config
+        .github
+        .iter()
+        .map(|p| p.redirect_url.as_str())
+        .chain(config.google.iter().map(|p| p.redirect_url.as_str()))
+        .collect();
+    // Only an explicitly configured, entirely loopback HTTP setup uses local cookies.
+    callbacks.is_empty()
+        || !callbacks.iter().all(|callback| {
+            Url::parse(callback).is_ok_and(|url| {
+                url.scheme() == "http"
+                    && matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"))
+            })
+        })
+}
+
+fn oauth_cookie_name(state: &str, secure: bool) -> String {
+    let prefix = if secure {
+        "__Host-oauth-state"
+    } else {
+        "oauth-state"
+    };
+    format!("{prefix}-{}", oauth_state_digest(state))
+}
+
+fn oauth_state_cookie(state: &str, secure: bool, max_age: u16) -> String {
+    let name = oauth_cookie_name(state, secure);
+    let value = if max_age == 0 {
+        String::new()
+    } else {
+        oauth_state_digest(state)
+    };
+    let security = if secure { "; Secure" } else { "" };
+    format!("{name}={value}; Path=/{security}; HttpOnly; SameSite=Lax; Max-Age={max_age}")
+}
 
 fn oauth_state_digest(state: &str) -> String {
     use sha2::{Digest, Sha256};
     hex::encode(Sha256::digest(state.as_bytes()))
 }
 
-fn oauth_state_cookie_matches(headers: &HeaderMap, state: &str) -> bool {
+fn oauth_state_cookie_matches(headers: &HeaderMap, state: &str, secure: bool) -> bool {
     use subtle::ConstantTimeEq;
     let expected = oauth_state_digest(state);
+    let expected_name = oauth_cookie_name(state, secure);
     let mut values = headers
         .get_all(axum::http::header::COOKIE)
         .iter()
         .filter_map(|value| value.to_str().ok())
         .flat_map(|value| value.split(';'))
         .filter_map(|part| part.trim().split_once('='))
-        .filter(|(name, _)| *name == OAUTH_STATE_COOKIE)
+        .filter(|(name, _)| *name == expected_name)
         .map(|(_, value)| value);
     match (values.next(), values.next()) {
         (Some(value), None) => bool::from(value.as_bytes().ct_eq(expected.as_bytes())),
@@ -39,12 +75,9 @@ fn oauth_state_cookie_matches(headers: &HeaderMap, state: &str) -> bool {
     }
 }
 
-fn oauth_login_redirect(url: &str, state: &str) -> Response {
+fn oauth_login_redirect(url: &str, state: &str, secure: bool) -> Response {
     let mut response = Redirect::to(url).into_response();
-    let cookie = format!(
-        "{OAUTH_STATE_COOKIE}={}; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=600",
-        oauth_state_digest(state)
-    );
+    let cookie = oauth_state_cookie(state, secure, 600);
     response.headers_mut().append(
         axum::http::header::SET_COOKIE,
         cookie.parse().expect("hex cookie"),
@@ -425,7 +458,11 @@ pub async fn github_login(
         state_present,
         state_len, "Redirecting to GitHub OAuth provider"
     );
-    Ok(oauth_login_redirect(&auth_url, &state))
+    Ok(oauth_login_redirect(
+        &auth_url,
+        &state,
+        oauth_cookie_secure(&config.auth),
+    ))
 }
 
 /// Initiate Google OAuth flow - redirects to Google
@@ -473,7 +510,11 @@ pub async fn google_login(
         state_present,
         state_len, "Redirecting to Google OAuth provider"
     );
-    Ok(oauth_login_redirect(&auth_url, &state))
+    Ok(oauth_login_redirect(
+        &auth_url,
+        &state,
+        oauth_cookie_secure(&config.auth),
+    ))
 }
 
 /// Handle OAuth callback - NEW frontend-centric flow
@@ -488,7 +529,8 @@ pub async fn oauth_callback(
     request: Request,
 ) -> Response {
     // Check browser binding before consuming the one-time server-side state.
-    if !oauth_state_cookie_matches(request.headers(), &params.state) {
+    let secure = oauth_cookie_secure(&state.3.auth);
+    if !oauth_state_cookie_matches(request.headers(), &params.state, secure) {
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
@@ -498,12 +540,11 @@ pub async fn oauth_callback(
         )
             .into_response();
     }
+    let clear_cookie = oauth_state_cookie(&params.state, secure, 0);
     let mut response = oauth_callback_bound(Query(params), State(state), request).await;
     response.headers_mut().append(
         axum::http::header::SET_COOKIE,
-        axum::http::HeaderValue::from_static(
-            "__Host-oauth-state=; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=0",
-        ),
+        clear_cookie.parse().expect("hex cookie"),
     );
     response
 }
@@ -1205,31 +1246,60 @@ mod browser_state_tests {
     fn callback_requires_one_matching_host_cookie() {
         let state = "test-state";
         let digest = oauth_state_digest(state);
+        let cookie_name = oauth_cookie_name(state, true);
         for (cookie, accepted) in [
             (String::new(), false),
-            (format!("{OAUTH_STATE_COOKIE}={digest}"), true),
+            (format!("{cookie_name}={digest}"), true),
+            (format!("unrelated=one; {cookie_name}={digest}"), true),
             (
-                format!("unrelated=one; {OAUTH_STATE_COOKIE}={digest}"),
-                true,
-            ),
-            (
-                format!("{OAUTH_STATE_COOKIE}={}", oauth_state_digest("other-state")),
+                format!("{cookie_name}={}", oauth_state_digest("other-state")),
                 false,
             ),
             (
-                format!("{OAUTH_STATE_COOKIE}={digest}; {OAUTH_STATE_COOKIE}={digest}"),
+                format!("{cookie_name}={digest}; {cookie_name}={digest}"),
                 false,
             ),
         ] {
             let mut headers = HeaderMap::new();
             headers.insert(axum::http::header::COOKIE, cookie.parse().unwrap());
-            assert_eq!(oauth_state_cookie_matches(&headers, state), accepted);
+            assert_eq!(oauth_state_cookie_matches(&headers, state, true), accepted);
         }
     }
 
     #[test]
+    fn insecure_cookie_is_confined_to_configured_loopback_http() {
+        let mut config = config::AuthConfig::default();
+        assert!(oauth_cookie_secure(&config));
+        for (callback, secure) in [
+            ("http://localhost:3000/v1/auth/callback", false),
+            ("http://127.0.0.1:3000/v1/auth/callback", false),
+            ("http://[::1]:3000/v1/auth/callback", false),
+            ("https://localhost:3000/v1/auth/callback", true),
+            ("http://localhost.example.test/v1/auth/callback", true),
+            ("http://example.test/v1/auth/callback", true),
+        ] {
+            config.github = Some(config::GitHubOAuthConfig {
+                client_id: "test".into(),
+                client_secret: "test".into(),
+                redirect_url: callback.into(),
+            });
+            assert_eq!(oauth_cookie_secure(&config), secure, "{callback}");
+        }
+        let cookie = oauth_state_cookie("local-state", false, 600);
+        assert!(cookie.starts_with("oauth-state-"));
+        assert!(!cookie.contains("Secure"));
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::COOKIE,
+            cookie.split(';').next().unwrap().parse().unwrap(),
+        );
+        assert!(oauth_state_cookie_matches(&headers, "local-state", false));
+        assert!(!oauth_state_cookie_matches(&headers, "local-state", true));
+    }
+
+    #[test]
     fn login_sets_a_bounded_host_only_browser_cookie() {
-        let response = oauth_login_redirect("https://example.test/authorize", "test-state");
+        let response = oauth_login_redirect("https://example.test/authorize", "test-state", true);
         let cookie = response.headers()[axum::http::header::SET_COOKIE]
             .to_str()
             .unwrap();

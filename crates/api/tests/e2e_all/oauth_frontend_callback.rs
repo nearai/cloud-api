@@ -887,3 +887,53 @@ async fn oauth_callback_requires_the_initiating_browser_before_consuming_state()
             .is_none());
     }
 }
+
+#[tokio::test]
+async fn concurrent_oauth_attempts_keep_independent_browser_bindings() {
+    let (server, _, _, _, _) = setup_test_server_with_pool_config_and_router(|config| {
+        config.auth.github = Some(config::GitHubOAuthConfig {
+            client_id: "test-client".into(),
+            client_secret: "test-only".into(),
+            redirect_url: "http://localhost:3000/v1/auth/callback".into(),
+        });
+        config.auth.google = Some(config::GoogleOAuthConfig {
+            client_id: "test-client".into(),
+            client_secret: "test-only".into(),
+            redirect_url: "http://localhost:3000/v1/auth/callback".into(),
+        });
+    })
+    .await;
+    let mut pending = Vec::new();
+    for provider in ["github", "google", "github"] {
+        let start = server.get(&format!("/v1/auth/{provider}")).await;
+        assert_eq!(start.status_code(), 303);
+        let url = url::Url::parse(start.header("location").to_str().unwrap()).unwrap();
+        let state = url
+            .query_pairs()
+            .find(|(key, _)| key == "state")
+            .unwrap()
+            .1
+            .into_owned();
+        let cookie = start.header("set-cookie").to_str().unwrap().to_owned();
+        assert!(!cookie.contains("Secure"));
+        pending.push((state, cookie.split(';').next().unwrap().to_owned()));
+    }
+    let cookie_header = pending
+        .iter()
+        .map(|(_, cookie)| cookie.as_str())
+        .collect::<Vec<_>>()
+        .join("; ");
+    for (state, cookie) in pending {
+        let finish = server
+            .get(&format!(
+                "/v1/auth/callback?state={state}&error=access_denied"
+            ))
+            .add_header("cookie", cookie_header.clone())
+            .add_header("user-agent", MOCK_USER_AGENT)
+            .await;
+        assert_eq!(finish.json::<serde_json::Value>()["error"], "access_denied");
+        let clear = finish.header("set-cookie").to_str().unwrap().to_owned();
+        assert!(clear.starts_with(cookie.split_once('=').unwrap().0));
+        assert!(clear.contains("Max-Age=0"));
+    }
+}

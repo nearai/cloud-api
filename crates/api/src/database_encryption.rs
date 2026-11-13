@@ -273,6 +273,14 @@ impl DatabaseEncryptionState {
         self
     }
 
+    #[doc(hidden)]
+    pub fn has_active_job(&self, id: Uuid) -> bool {
+        self.active_jobs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&id)
+    }
+
     pub fn recover_jobs(&self) {
         if self.recovery_started.swap(true, Ordering::AcqRel) {
             return;
@@ -510,7 +518,7 @@ fn normalize_scope(scope: &mut Scope) {
 }
 
 async fn classify_schema(
-    client: &tokio_postgres::Client,
+    client: &impl tokio_postgres::GenericClient,
 ) -> anyhow::Result<(Vec<Value>, Vec<Value>, Vec<Value>)> {
     let rows = client
         .query(
@@ -566,7 +574,7 @@ async fn schema_classification(
     state: &DatabaseEncryptionState,
 ) -> anyhow::Result<(Vec<Value>, Vec<Value>, Vec<Value>)> {
     let client = state.pool.get().await?;
-    classify_schema(&client).await
+    classify_schema(&**client).await
 }
 
 async fn counts(
@@ -942,65 +950,18 @@ async fn run_job(state: &DatabaseEncryptionState, id: Uuid) -> anyhow::Result<()
         .pool
         .encryption_ring()
         .ok_or_else(|| anyhow::anyhow!("database encryption ring is not configured"))?;
-    let job = client
-        .query_opt(
-            &format!("UPDATE database_encryption_jobs SET status='running',started_at=COALESCE(started_at,NOW()) WHERE {DATABASE_JOB_KIND_FILTER} AND id=$1 AND status IN ('queued','running') RETURNING mode,scope,batch_size,max_rows,cursor,progress,actions"),
+    let started = client
+        .execute(
+            &format!("UPDATE database_encryption_jobs SET status='running',started_at=COALESCE(started_at,NOW()) WHERE {DATABASE_JOB_KIND_FILTER} AND id=$1 AND status IN ('queued','running')"),
             &[&id],
         )
         .await?;
-    let Some(job) = job else {
-        return Ok(());
-    };
-    let mode: String = job.get("mode");
-    let persisted_mode: Mode = serde_json::from_value(json!(&mode))?;
-    let actions: Vec<String> = serde_json::from_value(job.get("actions"))?;
-    let action = job_action(persisted_mode, &actions)
-        .map_err(|_| anyhow::anyhow!("invalid persisted actions"))?;
-    if mode == "execute" && !state.pool.encryption_write_enabled() {
-        anyhow::bail!("execute jobs require DB_ENCRYPTION_WRITE_ENABLED=true");
-    }
-    let scope: Scope = serde_json::from_value(job.get("scope"))?;
-    validate_delay(scope.options.batch_delay_ms)
-        .map_err(|_| anyhow::anyhow!("invalid persisted batch delay"))?;
-    let fields = selected(&scope).map_err(|_| anyhow::anyhow!("invalid persisted scope"))?;
-    let batch: i64 = job.get("batch_size");
-    let max: Option<i64> = job.get("max_rows");
-    let cursor: Value = job.get("cursor");
-    let progress: Value = job.get("progress");
-    let mut field_index = cursor["field_index"].as_u64().unwrap_or(0) as usize;
-    let mut after_id = cursor["after_id"]
-        .as_str()
-        .and_then(|value| Uuid::parse_str(value).ok())
-        .unwrap_or(Uuid::nil());
-    let mut processed = progress["processed"].as_i64().unwrap_or(0);
-    let mut encrypted = progress["encrypted"].as_i64().unwrap_or(0);
-    let mut plaintext = progress["plaintext"].as_i64().unwrap_or(0);
-    let mut verified = progress["verified"].as_i64().unwrap_or(0);
-    let mut invalid_envelopes = progress["invalid_envelopes"].as_i64().unwrap_or(0);
-    let mut rewrapped = progress["rewrapped"].as_i64().unwrap_or(0);
-    let mut already_current = progress["already_current"].as_i64().unwrap_or(0);
-    let mut stale = progress["stale"].as_i64().unwrap_or(0);
-    let mut by_key_id: KeyCounts = match progress.get("by_key_id") {
-        Some(value) => serde_json::from_value(value.clone())?,
-        None => KeyCounts::default(),
-    };
-    by_key_id.retain_ring_keys(&ring);
-    let mut invalid_envelope_rows = progress["invalid_envelope_rows"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
-    let mut plaintext_rows = progress["plaintext_rows"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
-
     drop(client);
-    while field_index < fields.len() && max.is_none_or(|limit| processed < limit) {
+    if started == 0 {
+        return Ok(());
+    }
+    loop {
         let mut client = state.pool.get().await?;
-        let field = fields[field_index];
-        let cap = max
-            .map(|limit| (limit - processed).min(batch))
-            .unwrap_or(batch);
         let transaction = client.transaction().await?;
         transaction
             .batch_execute("SET LOCAL statement_timeout = '30s'")
@@ -1024,23 +985,105 @@ async fn run_job(state: &DatabaseEncryptionState, id: Uuid) -> anyhow::Result<()
             }
             continue;
         }
-        let cancelled: bool = transaction
+        // The advisory lock serializes the entire persisted read/modify/write,
+        // including recovery by another application replica.
+        let job = transaction
             .query_one(
-                &format!("SELECT cancel_requested_at IS NOT NULL FROM database_encryption_jobs WHERE {DATABASE_JOB_KIND_FILTER} AND id=$1"),
+                &format!("SELECT mode,scope,batch_size,max_rows,cursor,progress,actions,status,cancel_requested_at IS NOT NULL AS cancelled FROM database_encryption_jobs WHERE {DATABASE_JOB_KIND_FILTER} AND id=$1"),
                 &[&id],
             )
-            .await?
-            .get(0);
-        if cancelled {
+            .await?;
+        let status: String = job.get("status");
+        if !matches!(status.as_str(), "queued" | "running") {
+            return Ok(());
+        }
+        if job.get::<_, bool>("cancelled") {
             transaction
                 .execute(
-                    &format!("UPDATE database_encryption_jobs SET status='cancelled',completed_at=NOW() WHERE {DATABASE_JOB_KIND_FILTER} AND id=$1"),
+                    &format!("UPDATE database_encryption_jobs SET status='cancelled',completed_at=NOW() WHERE {DATABASE_JOB_KIND_FILTER} AND id=$1 AND status IN ('queued','running')"),
                     &[&id],
                 )
                 .await?;
             transaction.commit().await?;
             return Ok(());
         }
+        let mode: String = job.get("mode");
+        let persisted_mode: Mode = serde_json::from_value(json!(&mode))?;
+        let actions: Vec<String> = serde_json::from_value(job.get("actions"))?;
+        let action = job_action(persisted_mode, &actions)
+            .map_err(|_| anyhow::anyhow!("invalid persisted actions"))?;
+        if mode == "execute" && !state.pool.encryption_write_enabled() {
+            anyhow::bail!("execute jobs require DB_ENCRYPTION_WRITE_ENABLED=true");
+        }
+        let scope: Scope = serde_json::from_value(job.get("scope"))?;
+        validate_delay(scope.options.batch_delay_ms)
+            .map_err(|_| anyhow::anyhow!("invalid persisted batch delay"))?;
+        let fields = selected(&scope).map_err(|_| anyhow::anyhow!("invalid persisted scope"))?;
+        let batch: i64 = job.get("batch_size");
+        let max: Option<i64> = job.get("max_rows");
+        let cursor: Value = job.get("cursor");
+        let progress: Value = job.get("progress");
+        let mut field_index = cursor["field_index"].as_u64().unwrap_or(0) as usize;
+        let mut after_id = cursor["after_id"]
+            .as_str()
+            .and_then(|value| Uuid::parse_str(value).ok())
+            .unwrap_or(Uuid::nil());
+        let mut processed = progress["processed"].as_i64().unwrap_or(0);
+        let mut encrypted = progress["encrypted"].as_i64().unwrap_or(0);
+        let mut plaintext = progress["plaintext"].as_i64().unwrap_or(0);
+        let mut verified = progress["verified"].as_i64().unwrap_or(0);
+        let mut invalid_envelopes = progress["invalid_envelopes"].as_i64().unwrap_or(0);
+        let mut rewrapped = progress["rewrapped"].as_i64().unwrap_or(0);
+        let mut already_current = progress["already_current"].as_i64().unwrap_or(0);
+        let mut stale = progress["stale"].as_i64().unwrap_or(0);
+        let mut by_key_id: KeyCounts = match progress.get("by_key_id") {
+            Some(value) => serde_json::from_value(value.clone())?,
+            None => KeyCounts::default(),
+        };
+        by_key_id.retain_ring_keys(&ring);
+        let mut invalid_envelope_rows = progress["invalid_envelope_rows"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let mut plaintext_rows = progress["plaintext_rows"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+
+        if field_index >= fields.len() || max.is_some_and(|limit| processed >= limit) {
+            if mode == "verify" {
+                let (approved, excluded, unclassified) = classify_schema(&*transaction).await?;
+                let pass = field_index == fields.len()
+                    && plaintext == 0
+                    && invalid_envelopes == 0
+                    && stale == 0
+                    && unclassified.is_empty();
+                transaction
+                    .execute(
+                        &format!("UPDATE database_encryption_jobs SET status='completed',completed_at=NOW(),progress=progress || $2 WHERE {DATABASE_JOB_KIND_FILTER} AND id=$1 AND status IN ('queued','running')"),
+                        &[&id, &json!({
+                            "pass": pass,
+                            "approved_plaintext": approved,
+                            "excluded": excluded,
+                            "unclassified": unclassified,
+                        })],
+                    )
+                    .await?;
+            } else {
+                transaction
+                    .execute(
+                        &format!("UPDATE database_encryption_jobs SET status='completed',completed_at=NOW() WHERE {DATABASE_JOB_KIND_FILTER} AND id=$1 AND status IN ('queued','running')"),
+                        &[&id],
+                    )
+                    .await?;
+            }
+            transaction.commit().await?;
+            return Ok(());
+        }
+        let field = fields[field_index];
+        let cap = max
+            .map(|limit| (limit - processed).min(batch))
+            .unwrap_or(batch);
 
         let locking_clause = if mode == "execute" { " FOR UPDATE" } else { "" };
         let query = format!(
@@ -1170,7 +1213,7 @@ async fn run_job(state: &DatabaseEncryptionState, id: Uuid) -> anyhow::Result<()
 
         transaction
             .execute(
-                &format!("UPDATE database_encryption_jobs SET progress=$2,cursor=$3 WHERE {DATABASE_JOB_KIND_FILTER} AND id=$1"),
+                &format!("UPDATE database_encryption_jobs SET progress=$2,cursor=$3 WHERE {DATABASE_JOB_KIND_FILTER} AND id=$1 AND status IN ('queued','running')"),
                 &[
                     &id,
                     &json!({
@@ -1208,32 +1251,6 @@ async fn run_job(state: &DatabaseEncryptionState, id: Uuid) -> anyhow::Result<()
             return Ok(());
         }
     }
-
-    let client = state.pool.get().await?;
-    if mode == "verify" {
-        let (approved, excluded, unclassified) = classify_schema(&client).await?;
-        let pass =
-            plaintext == 0 && invalid_envelopes == 0 && stale == 0 && unclassified.is_empty();
-        client
-            .execute(
-                &format!("UPDATE database_encryption_jobs SET status='completed',completed_at=NOW(),progress=progress || $2 WHERE {DATABASE_JOB_KIND_FILTER} AND id=$1"),
-                &[&id, &json!({
-                    "pass": pass,
-                    "approved_plaintext": approved,
-                    "excluded": excluded,
-                    "unclassified": unclassified,
-                })],
-            )
-            .await?;
-    } else {
-        client
-            .execute(
-                &format!("UPDATE database_encryption_jobs SET status='completed',completed_at=NOW() WHERE {DATABASE_JOB_KIND_FILTER} AND id=$1"),
-                &[&id],
-            )
-            .await?;
-    }
-    Ok(())
 }
 
 pub async fn get_job(

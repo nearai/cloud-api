@@ -5557,7 +5557,7 @@ impl InferenceProviderPool {
             );
             return Err(
                 "providerConfig.api_key is the redaction placeholder \"***\", not a key; \
-                 set the real key with PATCH /v1/admin/models"
+                 set the real key with the admin API's PATCH /v1/admin/models"
                     .to_string(),
             );
         }

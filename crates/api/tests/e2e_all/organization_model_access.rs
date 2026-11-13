@@ -3,12 +3,11 @@
 // An unlisted model (`isListed: false`) is restricted: an organization may use
 // it through this API only while it holds a grant. Everyone else must get
 // exactly the answer a model that does not exist gets. Grants are managed by
-// admins (`/v1/admin/models/{model_name}/access`) and published to trusted
+// admins (seeded here by SQL; the admin routes moved to the admin API) and published to trusted
 // services (`GET /v1/internal/model-access`).
 
 use crate::common::{fake_ita::FakeIta, fake_ita::FakeItaMode, *};
 use api::models::BatchUpdateModelApiRequest;
-use axum::http::Method;
 use bytes::Bytes;
 use inference_providers::{
     mock::MockProvider, responses_raw::ResponsesRawResponse, SystemOneResponseWithBytes,
@@ -236,51 +235,35 @@ async fn organization(server: &axum_test::TestServer) -> Organization {
     }
 }
 
-fn access_path(model: &str) -> String {
-    format!("/v1/admin/models/{}/access", urlencoding::encode(model))
+async fn grant(_server: &axum_test::TestServer, model: &str, organization_id: &str) {
+    seeding::seed_model_access_grant(model, organization_id).await;
 }
 
-fn grant_path(model: &str, organization_id: &str) -> String {
-    format!("{}/{organization_id}", access_path(model))
+async fn revoke(_server: &axum_test::TestServer, model: &str, organization_id: &str) {
+    seeding::seed_model_access_revoke(model, organization_id).await;
 }
 
-async fn admin_call(
-    server: &axum_test::TestServer,
-    method: Method,
-    path: &str,
-    token: &str,
-) -> axum_test::TestResponse {
-    server
-        .method(method, path)
-        .add_header("Authorization", format!("Bearer {token}"))
-        .add_header("User-Agent", MOCK_USER_AGENT)
+/// Organizations holding a grant on the model, read from the grants table.
+async fn granted_organizations(database: &database::Database, model: &str) -> Vec<String> {
+    database
+        .pool()
+        .get()
         .await
+        .expect("database connection")
+        .query(
+            "SELECT a.organization_id FROM organization_model_access a \
+             JOIN models m ON m.id = a.model_id WHERE m.model_name = $1 \
+             ORDER BY a.created_at",
+            &[&model],
+        )
+        .await
+        .expect("read the grants")
+        .iter()
+        .map(|row| row.get::<_, Uuid>("organization_id").to_string())
+        .collect()
 }
 
-async fn grant(server: &axum_test::TestServer, model: &str, organization_id: &str) -> Value {
-    let response = admin_call(
-        server,
-        Method::PUT,
-        &grant_path(model, organization_id),
-        &get_session_id(),
-    )
-    .await;
-    assert_eq!(response.status_code(), 200, "{}", response.text());
-    response.json()
-}
-
-async fn revoke(server: &axum_test::TestServer, model: &str, organization_id: &str) {
-    let response = admin_call(
-        server,
-        Method::DELETE,
-        &grant_path(model, organization_id),
-        &get_session_id(),
-    )
-    .await;
-    assert_eq!(response.status_code(), 204, "{}", response.text());
-}
-
-/// `PATCH /v1/admin/models` for one model.
+/// Update one model by seeding.
 async fn set_listed(server: &axum_test::TestServer, model: &str, is_listed: bool) {
     upsert_models(server, vec![(model, json!({ "isListed": is_listed }))]).await;
 }
@@ -355,20 +338,20 @@ impl Route {
         }
     }
 
+    /// The method the route is registered with.
+    fn method(self) -> &'static str {
+        match self {
+            Route::AttestationReport | Route::AttestationReportWithNonce => "GET",
+            _ => "POST",
+        }
+    }
+
     fn model_kind(self) -> ModelKind {
         match self {
             Route::SystemOne => ModelKind::Decisions,
             Route::Messages | Route::MessagesCountTokens => ModelKind::Anthropic,
             Route::ResponsesNative => ModelKind::NativeResponses,
             _ => ModelKind::Text,
-        }
-    }
-
-    /// The method the route is registered with.
-    fn method(self) -> &'static str {
-        match self {
-            Route::AttestationReport | Route::AttestationReportWithNonce => "GET",
-            _ => "POST",
         }
     }
 
@@ -883,7 +866,6 @@ fn every_registered_route_has_a_model_access_decision() {
         ("ANY", "/files/{file_id}/"),
         ("ANY", "/files/{file_id}/content"),
         ("ANY", "/files/{file_id}/{*legacy_path}"),
-        ("POST", "/feature-requests"),
         // An organization's own usage and costs.
         ("POST", "/billing/costs"),
         ("GET", "/organizations/{org_id}/usage/export"),
@@ -917,7 +899,7 @@ fn every_registered_route_has_a_model_access_decision() {
         registered.extend(registered_routes(source));
     }
     assert!(
-        registered.len() >= 100,
+        registered.len() >= 60,
         "found too few routes, the scan is broken: {registered:?}"
     );
     let is_registered =
@@ -1512,17 +1494,25 @@ async fn a_grant_on_an_inactive_model_has_no_effect() {
             .status_code(),
         404
     );
-    // The grant is still there for the admin, with the reason it is idle.
-    let access: Value = admin_call(
-        server,
-        Method::GET,
-        &access_path(&fixture.text),
-        &get_session_id(),
-    )
-    .await
-    .json();
-    assert_eq!(access["isActive"], false);
-    assert_eq!(access["organizations"][0]["organizationId"], org.id);
+    // The grant is still there, with the reason it is idle.
+    let is_active: bool = fixture
+        .database
+        .pool()
+        .get()
+        .await
+        .expect("database connection")
+        .query_one(
+            "SELECT is_active FROM models WHERE model_name = $1",
+            &[&fixture.text],
+        )
+        .await
+        .expect("read the model")
+        .get("is_active");
+    assert!(!is_active);
+    assert_eq!(
+        granted_organizations(&fixture.database, &fixture.text).await[0],
+        org.id
+    );
     // The gateway document keeps the model, with its grants. A lane may
     // still be serving it, and a model that is missing from the document is
     // read as unrestricted.
@@ -1637,18 +1627,6 @@ async fn grants_and_revocations_are_audited() {
         vec![]
     );
 
-    // A request that is refused writes nothing.
-    let unknown_org = Uuid::new_v4().to_string();
-    let refused = admin_call(
-        server,
-        Method::PUT,
-        &grant_path(model, &unknown_org),
-        &get_session_id(),
-    )
-    .await;
-    assert_eq!(refused.status_code(), 404);
-    assert_eq!(audit_trail(&fixture, model, &unknown_org).await, vec![]);
-
     // Deleting the organization removes its grant: a revocation by the
     // platform, with no acting user.
     let deleted = server
@@ -1664,220 +1642,6 @@ async fn grants_and_revocations_are_audited() {
     let trail = audit_trail(&fixture, model, &org.id).await;
     assert_eq!(trail.len(), 4, "{trail:?}");
     assert_eq!(trail[3], ("revoke".to_string(), None));
-}
-
-/// (c) The admin routes: happy paths, idempotency and 404s.
-#[tokio::test]
-async fn admin_manages_grants() {
-    let fixture = setup().await;
-    let server = &fixture.server;
-    let session = get_session_id();
-    let first = organization(server).await;
-    let second = organization(server).await;
-    let model = &fixture.text;
-
-    // Nobody holds a grant yet.
-    let access = admin_call(server, Method::GET, &access_path(model), &session).await;
-    assert_eq!(access.status_code(), 200, "{}", access.text());
-    let access: Value = access.json();
-    assert_eq!(access["modelName"], model.as_str());
-    assert_eq!(access["isListed"], false);
-    assert_eq!(access["isActive"], true);
-    assert!(Uuid::parse_str(access["id"].as_str().expect("model id")).is_ok());
-    assert_eq!(access["organizations"], json!([]));
-
-    // Grant: the answer is the stored grant, with who made it.
-    let granted = grant(server, model, &first.id).await;
-    assert_eq!(granted["organizationId"], first.id);
-    assert!(granted["organizationName"].is_string());
-    assert_eq!(granted["grantedByUserId"], MOCK_USER_ID);
-    assert_eq!(granted["grantedByUserEmail"], "admin@test.com");
-    let granted_at = granted["grantedAt"]
-        .as_str()
-        .expect("grantedAt")
-        .to_string();
-
-    // Idempotent: a second PUT returns the same grant, not a newer one.
-    let again = grant(server, model, &first.id).await;
-    assert_eq!(again, granted);
-
-    grant(server, model, &second.id).await;
-    let access: Value = admin_call(server, Method::GET, &access_path(model), &session)
-        .await
-        .json();
-    let holders: Vec<&str> = access["organizations"]
-        .as_array()
-        .expect("organizations")
-        .iter()
-        .map(|grant| grant["organizationId"].as_str().expect("organizationId"))
-        .collect();
-    assert_eq!(holders, vec![first.id.as_str(), second.id.as_str()]);
-    assert_eq!(access["organizations"][0]["grantedAt"], granted_at.as_str());
-
-    // The organization's side of the same grants.
-    let path = format!("/v1/admin/organizations/{}/model-access", first.id);
-    let of_first = admin_call(server, Method::GET, &path, &session).await;
-    assert_eq!(of_first.status_code(), 200, "{}", of_first.text());
-    let of_first: Value = of_first.json();
-    assert_eq!(of_first["organizationId"], first.id);
-    assert_eq!(
-        of_first["models"],
-        json!([{
-            "id": access["id"],
-            "modelName": model,
-            "isListed": false,
-            "isActive": true,
-            "grantedAt": granted_at,
-            "grantedByUserId": MOCK_USER_ID,
-            "grantedByUserEmail": "admin@test.com"
-        }])
-    );
-
-    // Revoke, and revoke again: both succeed.
-    revoke(server, model, &first.id).await;
-    revoke(server, model, &first.id).await;
-    let access: Value = admin_call(server, Method::GET, &access_path(model), &session)
-        .await
-        .json();
-    assert_eq!(access["organizations"].as_array().unwrap().len(), 1);
-    assert_eq!(access["organizations"][0]["organizationId"], second.id);
-    let of_first: Value = admin_call(server, Method::GET, &path, &session)
-        .await
-        .json();
-    assert_eq!(of_first["models"], json!([]));
-
-    // Unknown model or organization: 404, and nothing is written.
-    let missing_model = unknown_twin(model);
-    let missing_org = Uuid::new_v4().to_string();
-    for (method, path, error_type) in [
-        (Method::GET, access_path(&missing_model), "model_not_found"),
-        (
-            Method::PUT,
-            grant_path(&missing_model, &first.id),
-            "model_not_found",
-        ),
-        (
-            Method::DELETE,
-            grant_path(&missing_model, &first.id),
-            "model_not_found",
-        ),
-        (
-            Method::PUT,
-            grant_path(model, &missing_org),
-            "organization_not_found",
-        ),
-        (
-            Method::DELETE,
-            grant_path(model, &missing_org),
-            "organization_not_found",
-        ),
-        (
-            Method::GET,
-            format!("/v1/admin/organizations/{missing_org}/model-access"),
-            "organization_not_found",
-        ),
-    ] {
-        let response = admin_call(server, method.clone(), &path, &session).await;
-        assert_eq!(response.status_code(), 404, "{method} {path}");
-        assert_eq!(
-            response.json::<Value>()["error"]["type"],
-            error_type,
-            "{method} {path}"
-        );
-    }
-    let malformed = admin_call(
-        server,
-        Method::PUT,
-        &grant_path(model, "not-a-uuid"),
-        &session,
-    )
-    .await;
-    assert_eq!(malformed.status_code(), 400);
-    assert_eq!(malformed.json::<Value>()["error"]["type"], "invalid_id");
-
-    // A model name with a slash that is not URL-encoded is not a route.
-    let unencoded = admin_call(
-        server,
-        Method::GET,
-        &format!("/v1/admin/models/{model}/access"),
-        &session,
-    )
-    .await;
-    assert_eq!(unencoded.status_code(), 404);
-}
-
-/// (c) Permissions: the routes need an admin, a read-only admin token can
-/// read grants but not change them.
-#[tokio::test]
-async fn admin_routes_follow_the_admin_token_permissions() {
-    let suffix = Uuid::new_v4();
-    let model = format!("access-permissions/model-{suffix}");
-    let (server, database) = setup_test_server_with_config_and_database(|config| {
-        config.auth.admin_read_only_tokens_enabled = true;
-    })
-    .await;
-    upsert_models(&server, vec![(&model, model_fields(json!({})))]).await;
-    let org = organization(&server).await;
-    let listing = access_path(&model);
-    let of_org = format!("/v1/admin/organizations/{}/model-access", org.id);
-    let one_grant = grant_path(&model, &org.id);
-
-    let repo = database::repositories::AdminAccessTokenRepository::new(database.pool().clone());
-    let mut tokens = Vec::new();
-    for permission in [
-        database::models::AdminAccessTokenPermission::ReadOnly,
-        database::models::AdminAccessTokenPermission::ReadWrite,
-    ] {
-        let (_, token) = repo
-            .create(
-                Uuid::parse_str(MOCK_USER_ID).unwrap(),
-                format!("model-access-{suffix}"),
-                "model access permission test".into(),
-                chrono::Utc::now() + chrono::Duration::hours(1),
-                Some(MOCK_USER_AGENT.into()),
-                permission,
-            )
-            .await
-            .unwrap();
-        tokens.push(token);
-    }
-    let (read_only, read_write) = (&tokens[0], &tokens[1]);
-
-    // No credentials, no answer.
-    for (method, path) in [
-        (Method::GET, &listing),
-        (Method::GET, &of_org),
-        (Method::PUT, &one_grant),
-        (Method::DELETE, &one_grant),
-    ] {
-        let anonymous = server.method(method.clone(), path).await;
-        assert_eq!(anonymous.status_code(), 401, "{method} {path}");
-    }
-
-    // Read-only: both listings, no writes.
-    for path in [&listing, &of_org] {
-        let response = admin_call(&server, Method::GET, path, read_only).await;
-        assert_eq!(response.status_code(), 200, "{path}: {}", response.text());
-    }
-    for method in [Method::PUT, Method::DELETE] {
-        let response = admin_call(&server, method.clone(), &one_grant, read_only).await;
-        assert_eq!(response.status_code(), 403, "{method}");
-        assert_eq!(
-            response.json::<Value>()["error"]["type"],
-            "insufficient_permissions"
-        );
-    }
-    let access: Value = admin_call(&server, Method::GET, &listing, read_only)
-        .await
-        .json();
-    assert_eq!(access["organizations"], json!([]));
-
-    // Read-write: grant and revoke.
-    let granted = admin_call(&server, Method::PUT, &one_grant, read_write).await;
-    assert_eq!(granted.status_code(), 200, "{}", granted.text());
-    assert_eq!(granted.json::<Value>()["grantedByUserId"], MOCK_USER_ID);
-    let revoked = admin_call(&server, Method::DELETE, &one_grant, read_write).await;
-    assert_eq!(revoked.status_code(), 204);
 }
 
 async fn internal_document(server: &axum_test::TestServer) -> Value {
@@ -1960,10 +1724,9 @@ async fn internal_document_lists_restricted_models_and_their_organizations() {
         internal_entry(server, model).await,
         Some(json!({ "id": model, "organization_ids": [] }))
     );
-    let access: Value = admin_call(server, Method::GET, &access_path(model), &get_session_id())
+    assert!(granted_organizations(&fixture.database, model)
         .await
-        .json();
-    assert_eq!(access["organizations"], json!([]));
+        .is_empty());
     let rows: i64 = fixture
         .database
         .pool()
@@ -2153,15 +1916,20 @@ async fn usage_is_recorded_for_an_organization_without_a_grant() {
     let key = create_api_key_in_workspace(server, workspace_id.clone(), "usage".to_string()).await;
 
     // The organization holds no grant: it cannot call the model here...
-    let access: Value = admin_call(
-        server,
-        Method::GET,
-        &format!("/v1/admin/organizations/{}/model-access", org.id),
-        &get_session_id(),
-    )
-    .await
-    .json();
-    assert_eq!(access["models"], json!([]));
+    let grants: i64 = fixture
+        .database
+        .pool()
+        .get()
+        .await
+        .expect("database connection")
+        .query_one(
+            "SELECT COUNT(*) FROM organization_model_access WHERE organization_id = $1",
+            &[&Uuid::parse_str(&org.id).expect("organization id")],
+        )
+        .await
+        .expect("count grants")
+        .get(0);
+    assert_eq!(grants, 0);
     let refused = send(
         server,
         Route::Embeddings,

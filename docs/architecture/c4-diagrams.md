@@ -1434,11 +1434,6 @@ erDiagram
 - `GET /v1/attestation/report` - Get TEE attestation report
 - `GET /v1/attestation/quote` - Get attestation quote
 
-### Admin Endpoints (Admin Session Auth)
-- `PATCH /v1/admin/models` - Batch upsert models
-- `GET /v1/admin/models/{model_name}/history` - Get complete model history (pricing, context length, etc.)
-- `PUT /v1/admin/organizations/{org_id}/limits` - Update organization limits
-
 ---
 
 ## Conclusion

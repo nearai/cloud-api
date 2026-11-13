@@ -290,36 +290,6 @@ VALUES (
 SQL
 ```
 
-### Option C — admin PATCH
-
-If you want to populate models the same way prod does, use
-`PATCH /v1/admin/models`. The body shape is
-`HashMap<model_id, UpdateModelApiRequest>` — note that `inferenceUrl`
-is **camelCase**; the snake_case form is silently ignored.
-
-Admin endpoints are gated by `AUTH_ADMIN_EMAILS`, which has no default (empty
-means nobody is an admin). Set it explicitly for local testing, including
-`admin@test.com` for the seeded mock user `admin@test.com`:
-
-```env
-AUTH_ADMIN_EMAILS=admin@test.com
-```
-
-Then:
-
-```bash
-curl -s "$BASE/v1/admin/models" "${AUTH[@]}" \
-  -X PATCH -H 'Content-Type: application/json' \
-  -d '{
-    "local/test-model": {
-      "modelDisplayName": "Local Test",
-      "modelDescription": "Local OpenAI-compatible backend",
-      "contextLength": 8192,
-      "inferenceUrl": "http://localhost:8002"
-    }
-  }' | jq .
-```
-
 Provider refresh runs every 300s by default
 (`EXTERNAL_PROVIDER_REFRESH_INTERVAL`). Lower it while iterating.
 
@@ -475,7 +445,7 @@ required for refresh-token endpoints (e.g. `POST /v1/users/me/access_tokens`).
 **403 on `/v1/admin/*` with mock auth**
 The seeded mock user is `admin@test.com`. `AUTH_ADMIN_EMAILS` has no default
 (empty means nobody is an admin); set it explicitly with `admin@test.com` in the
-list (see §5 Option C) and restart the server.
+list and restart the server.
 
 **401 on API-key endpoints right after creating the key**
 The API key cache refreshes asynchronously. Wait ~10 seconds and retry.

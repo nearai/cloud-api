@@ -15,8 +15,6 @@ use inference_providers::{mock::MockProvider, CompletionError, ProviderSource, P
 use serde_json::{json, Value};
 use std::sync::Arc;
 
-const SETTING_PATH: &str = "/v1/admin/settings/attested_3p";
-
 struct Fixture {
     server: axum_test::TestServer,
     database: Arc<database::Database>,
@@ -120,14 +118,7 @@ impl Fixture {
     }
 
     async fn set_disabled(&self, sources: Value) {
-        let r = self
-            .server
-            .patch(SETTING_PATH)
-            .add_header("Authorization", format!("Bearer {}", get_session_id()))
-            .add_header("User-Agent", MOCK_USER_AGENT)
-            .json(&json!({ "disabled_sources": sources }))
-            .await;
-        assert_eq!(r.status_code(), 200, "{}", r.text());
+        seeding::seed_admin_setting("attested_3p", json!({ "disabled_sources": sources })).await;
     }
 }
 
@@ -276,6 +267,63 @@ async fn serial_kill_switch_with_no_provider_left_errors_and_blocks_report() {
         tinfoil_report_calls, 0,
         "report must not reach a disabled source"
     );
+}
+
+/// With NEAR failing and Chutes as its fallback, switching the `chutes` source
+/// off stops traffic to it: the fallback is never invoked. (The kill switch is
+/// per source, so this is the same mechanism as the Tinfoil tests above, on the
+/// other attested source.)
+#[tokio::test]
+async fn serial_chutes_kill_switch_stops_serving_from_source() {
+    let (server, pool, _mock, _database) = setup_test_server_with_pool().await;
+    let (model_name, near, chutes) = crate::signature_verification::setup_chutes_signature_model(
+        &server,
+        &pool,
+        Some(false),
+        None,
+    )
+    .await;
+    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id).await;
+    let chat = |max_tokens: i64| {
+        server
+            .post("/v1/chat/completions")
+            .add_header("Authorization", format!("Bearer {api_key}"))
+            .json(&json!({
+                "model": model_name,
+                "messages": [{"role": "user", "content": "Hello"}],
+                "stream": false,
+                "max_tokens": max_tokens
+            }))
+    };
+
+    // Baseline: NEAR fails, so Chutes serves the request.
+    let response = chat(16).await;
+    assert_eq!(response.status_code(), 200, "{}", response.text());
+    assert_eq!(response.header("x-serving-provider"), "chutes");
+    assert_eq!(
+        chutes.last_chat_params().await.unwrap().max_tokens,
+        Some(16)
+    );
+
+    // Kill switch on: Chutes is never invoked again.
+    seeding::seed_admin_setting("attested_3p", json!({ "disabled_sources": ["chutes"] })).await;
+    let response = chat(17).await;
+    let status = response.status_code();
+    let body = response.text();
+    let chutes_last = chutes.last_chat_params().await.unwrap().max_tokens;
+
+    // Reset before asserting so a failure cannot leak the setting.
+    seeding::seed_admin_setting("attested_3p", json!({ "disabled_sources": null })).await;
+
+    assert_eq!(
+        chutes_last,
+        Some(16),
+        "a disabled source must not be invoked"
+    );
+    assert_eq!(near.last_chat_params().await.unwrap().max_tokens, Some(17));
+    // NEAR's 503 surfaces as service_overloaded.
+    assert_eq!(status.as_u16(), 429, "{body}");
 }
 
 // ---------------------------------------------------------------- registration

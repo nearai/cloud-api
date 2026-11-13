@@ -9,12 +9,13 @@ const BODY_BUDGET: usize = 60_000;
 /// Shown when the run produced admin pins. Fixed text, so it is not sanitised.
 const APPLY_SECTION: &str = "\n## Apply without a deploy\n\n\
 `tinfoil-admin-pins.json` in this run's audit artifact is a ready-to-PATCH body \
-for the model releases above that this run saw live, each carrying its Sigstore bundle (cloud-api \
-verifies every bundle at PATCH).\n\n\
+for the model releases above that this run saw live, each carrying its Sigstore bundle (the admin API \
+verifies every bundle at PATCH, and cloud-api verifies it again on load).\n\n\
 **The PATCH replaces the whole `model_pins` list.** Merge these rows with the \
-current value from `GET /v1/admin/settings/tinfoil_trust` first.\n\n\
+current value from `GET /v1/admin/settings/tinfoil_trust` first. `$ADMIN_API` is the \
+base URL of the admin API.\n\n\
 ```\n\
-curl -X PATCH \"$CLOUD_API/v1/admin/settings/tinfoil_trust\" -H \"Authorization: Bearer $ADMIN_TOKEN\" -H 'Content-Type: application/json' --data @tinfoil-admin-pins.json\n\
+curl -X PATCH \"$ADMIN_API/v1/admin/settings/tinfoil_trust\" -H \"Authorization: Bearer $ADMIN_TOKEN\" -H 'Content-Type: application/json' --data @tinfoil-admin-pins.json\n\
 ```\n";
 
 /// Keep only characters that can appear in slugs, repos, tags and hex, so
@@ -202,7 +203,7 @@ mod tests {
         assert!(md.contains("replaces the whole `model_pins` list"));
         assert!(md.contains("GET /v1/admin/settings/tinfoil_trust"));
         assert!(md.contains(
-            "curl -X PATCH \"$CLOUD_API/v1/admin/settings/tinfoil_trust\" -H \"Authorization: Bearer $ADMIN_TOKEN\" -H 'Content-Type: application/json' --data @tinfoil-admin-pins.json"
+            "curl -X PATCH \"$ADMIN_API/v1/admin/settings/tinfoil_trust\" -H \"Authorization: Bearer $ADMIN_TOKEN\" -H 'Content-Type: application/json' --data @tinfoil-admin-pins.json"
         ));
         let none = render_markdown(&[added(Some("m"), "v2")], &[], "2026-10-07", false);
         assert!(!none.contains("Apply without a deploy"));

@@ -47,11 +47,8 @@ token-like segments redacted, other segments as sent) and the client's
 ## Paginated lists
 
 Every paginated admin list records its validated `limit` and `offset` and the
-number of rows in its response, and only after it succeeds: users,
-organizations, organization members, organization limits history, API keys,
-admin access tokens, models, model history, scheduled pricing changes (whose
-page the service validates), AML reports, the AML allowlist, invitation-email
-deliveries, feature requests, and model and organization revenue. A rejected
+number of rows in its response, and only after it succeeds: organization
+members, API keys, admin access tokens and invitation-email deliveries. A rejected
 page, a failed lookup or an invalid filter records no page.
 
 ## OHTTP
@@ -77,8 +74,7 @@ coverage for those routes is a paired cloud-platform change, not described here.
 on the root router, after routing, inside request correlation and outside CORS.
 `admin_middleware` records the authentication facts; list handlers record their
 validated page through the `AdminAudit` extractor. Nothing reads bodies. The
-list handlers are in frozen route modules (`routes/admin.rs`,
-`routes/feature_requests.rs`), where the audit adds only the extractor and its
+list handlers are in a frozen route module (`routes/admin.rs`), where the audit adds only the extractor and its
 `record_*` calls; a new call there is paired with cloud-platform like any other
 change to those modules.
 

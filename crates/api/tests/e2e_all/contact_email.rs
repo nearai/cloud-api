@@ -1,9 +1,9 @@
 //! Contact email for NEAR wallet users: request a verification link, confirm it,
 //! and keep the address across later wallet logins.
 
-use crate::admin_deprecate_model::{create_model, seed_recent_usage};
 use crate::common::*;
 use crate::user_erasure::{erase, new_user, personal_org_id, signup};
+use api::models::BatchUpdateModelApiRequest;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use database::Database;
@@ -1458,14 +1458,85 @@ async fn the_unique_index_refuses_an_address_another_transaction_is_taking() {
     );
 }
 
+/// Build a minimal model upsert payload — enough to satisfy the "new model"
+/// required-field validation (modelDisplayName, modelDescription, contextLength).
+fn minimal_model_upsert(extra_aliases: &[&str]) -> serde_json::Value {
+    let mut v = serde_json::json!({
+        "inputCostPerToken":  { "amount": 1_000_000, "currency": "USD" },
+        "outputCostPerToken": { "amount": 2_000_000, "currency": "USD" },
+        "modelDisplayName":   "Deprecation Test Model",
+        "modelDescription":   "Synthetic model for deprecation e2e",
+        "contextLength":      4096,
+        "maxOutputLength": 1024,
+        "verifiable":         false,
+        "isActive":           true,
+    });
+    if !extra_aliases.is_empty() {
+        v["aliases"] = serde_json::json!(extra_aliases);
+    }
+    v
+}
+
+async fn create_model(
+    server: &axum_test::TestServer,
+    name: &str,
+    aliases: &[&str],
+) -> api::models::ModelWithPricing {
+    let mut batch = BatchUpdateModelApiRequest::new();
+    batch.insert(
+        name.to_string(),
+        serde_json::from_value(minimal_model_upsert(aliases)).unwrap(),
+    );
+    let updated = seed_models(server, batch, get_session_id()).await;
+    updated.into_iter().next().expect("Model should be created")
+}
+
+async fn seed_recent_usage(
+    database: &database::Database,
+    organization_id: uuid::Uuid,
+    workspace_id: uuid::Uuid,
+    api_key_id: uuid::Uuid,
+    model_name: &str,
+) {
+    let client = database.pool().get().await.unwrap();
+    let model_id: uuid::Uuid = client
+        .query_one(
+            "SELECT id FROM models WHERE model_name = $1",
+            &[&model_name],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    client
+        .execute(
+            r#"
+            INSERT INTO organization_usage_log (
+                id, organization_id, workspace_id, api_key_id,
+                model_id, model_name, input_tokens, output_tokens,
+                total_tokens, input_cost, output_cost, total_cost,
+                inference_type, created_at
+            ) VALUES ($1, $2, $3, $4, $5, $6, 10, 10, 20, 1, 1, 2,
+                      'chat_completion', NOW())
+            "#,
+            &[
+                &uuid::Uuid::new_v4(),
+                &organization_id,
+                &workspace_id,
+                &api_key_id,
+                &model_id,
+                &model_name,
+            ],
+        )
+        .await
+        .unwrap();
+}
+
 #[tokio::test]
 async fn notification_recipients_skip_placeholder_users_and_use_the_contact_email() {
     let (server, database, sender) = setup().await;
     let auth = real_auth(&database);
     let old = format!("test-contact-email-old-{}", Uuid::new_v4());
-    let successor = format!("test-contact-email-successor-{}", Uuid::new_v4());
     create_model(&server, &old, &[]).await;
-    create_model(&server, &successor, &[]).await;
 
     // Two organizations used the model: one owned by a wallet user, one by a
     // user who signs in with an email.
@@ -1493,19 +1564,6 @@ async fn notification_recipients_skip_placeholder_users_and_use_the_contact_emai
         .await;
     }
 
-    let preview = || async {
-        let response = server
-            .post(&format!("/v1/admin/models/{old}/deprecation/preview"))
-            .add_header("Authorization", format!("Bearer {}", get_session_id()))
-            .add_header("User-Agent", MOCK_USER_AGENT)
-            .json(&serde_json::json!({
-                "successorModelId": successor,
-                "deprecationDate": "2030-01-01"
-            }))
-            .await;
-        assert_eq!(response.status_code(), 200, "{}", response.text());
-        response.json::<serde_json::Value>()
-    };
     let repository = database::repositories::AdminCompositeRepository::new(database.pool().clone());
     let since = Utc::now() - chrono::Duration::days(30);
     let recipients = || async {
@@ -1528,9 +1586,6 @@ async fn notification_recipients_skip_placeholder_users_and_use_the_contact_emai
 
     // The wallet user has only a placeholder address: not a recipient.
     let only_email_user = vec![(email_user, login_address.clone())];
-    let before = preview().await;
-    assert_eq!(before["recipientCount"], 1, "{before}");
-    assert_eq!(before["organizationCount"], 1, "{before}");
     assert_eq!(
         recipients().await,
         (only_email_user.clone(), only_email_user)
@@ -1539,9 +1594,6 @@ async fn notification_recipients_skip_placeholder_users_and_use_the_contact_emai
     // Once the contact email is verified, it is the address used.
     let address = new_address();
     add_contact_email(&server, &sender, &wallet_session, &account_id, &address).await;
-    let after = preview().await;
-    assert_eq!(after["recipientCount"], 2, "{after}");
-    assert_eq!(after["organizationCount"], 2, "{after}");
     let (mut deprecation, mut pricing) = recipients().await;
     let mut expected = vec![(email_user, login_address), (wallet_user, address)];
     deprecation.sort();

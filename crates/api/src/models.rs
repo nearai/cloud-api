@@ -4151,7 +4151,7 @@ pub struct UpdateModelApiRequest {
     /// leaves the public model catalogs (`GET /v1/models`,
     /// `GET /v1/model/list`, `GET /v1/model/{name}`) and becomes restricted:
     /// only organizations that hold a grant
-    /// (`PUT /v1/admin/models/{model_name}/access/{org_id}`) may use it, and
+    /// (`PUT /v1/admin/models/{model_name}/access/{org_id}` on the admin API) may use it, and
     /// everyone else is answered as if the model did not exist. `true` lists
     /// it again and opens it to every caller. Omitted = leave unchanged (new
     /// models are listed).

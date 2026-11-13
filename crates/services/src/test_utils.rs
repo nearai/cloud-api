@@ -2,7 +2,7 @@
 use crate::{
     attestation::{
         ita::{ItaTokenQuery, ItaTokenResponse},
-        models::{AttestationReport, SignatureLookupResult},
+        models::{AttestationReport, SignatureLookupResult, SignatureOwner},
         ports::AttestationServiceTrait,
         AttestationError,
     },
@@ -23,6 +23,7 @@ pub struct MockAttestationService;
 impl AttestationServiceTrait for MockAttestationService {
     async fn get_chat_signature(
         &self,
+        _owner: SignatureOwner,
         _chat_id: &str,
         _signing_algo: Option<String>,
     ) -> Result<SignatureLookupResult, AttestationError> {
@@ -33,6 +34,7 @@ impl AttestationServiceTrait for MockAttestationService {
 
     async fn store_chat_signature_from_provider(
         &self,
+        _owner: SignatureOwner,
         _chat_id: &str,
     ) -> Result<(), AttestationError> {
         Ok(())
@@ -40,6 +42,7 @@ impl AttestationServiceTrait for MockAttestationService {
 
     async fn store_chat_signature(
         &self,
+        _owner: SignatureOwner,
         _chat_id: &str,
         _request_hash: String,
         _response_hash: String,
@@ -49,6 +52,7 @@ impl AttestationServiceTrait for MockAttestationService {
 
     async fn store_response_signature(
         &self,
+        _owner: SignatureOwner,
         _response_id: &str,
         _request_hash: String,
         _response_hash: String,

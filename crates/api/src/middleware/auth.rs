@@ -138,6 +138,17 @@ pub struct AuthenticatedApiKey {
     pub organization: services::organization::Organization,
 }
 
+impl AuthenticatedApiKey {
+    /// The owner recorded with every signature this key creates, and the only
+    /// owner whose signatures this key can read.
+    pub fn signature_owner(&self) -> services::attestation::SignatureOwner {
+        services::attestation::SignatureOwner {
+            organization_id: self.organization.id.0,
+            workspace_id: self.workspace.id.0,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct AuthenticatedReportingToken {
     pub id: uuid::Uuid,

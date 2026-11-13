@@ -125,6 +125,7 @@ impl From<ChatCompletionRequest> for ChatCompletionParams {
             service_tier: req.service_tier,
             modalities,
             original_request: None,
+            upstream_cache_salt: None,
             extra,
         }
     }

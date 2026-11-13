@@ -1,11 +1,10 @@
 use std::time::Duration;
 
-use uuid::Uuid;
-
 use super::{
     AttestationError, AttestationService, ChatSignature, SignatureKind, SignatureLookupResult,
+    SignatureOwner,
 };
-use crate::{metrics::consts::*, usage::StopReason};
+use crate::metrics::consts::*;
 
 /// Upper bound on signature finalization at end-of-stream. The client is
 /// still waiting for the held-back `[DONE]` while this runs, so it must be
@@ -19,9 +18,20 @@ pub(crate) const STREAM_SIGNATURE_STORE_TIMEOUT: Duration = Duration::from_secs(
 pub(in crate::attestation) const PROVIDER_SIGNATURE_FETCH_TIMEOUT: Duration =
     STREAM_SIGNATURE_STORE_TIMEOUT.saturating_sub(Duration::from_secs(1));
 
+/// `error_code` returned when the caller's own stream ended with a client
+/// disconnect and no signature was stored.
+pub(crate) const STREAM_DISCONNECTED: &str = "STREAM_DISCONNECTED";
+const STREAM_DISCONNECTED_MESSAGE: &str = "Verification not available due to disconnection.";
+
 impl AttestationService {
+    /// Only a row stored for `owner` is returned. When there is none, a usage
+    /// row of `owner` for `chat_id` that ended with a client disconnect gives
+    /// [`SignatureLookupResult::Unavailable`] with [`STREAM_DISCONNECTED`].
+    /// Otherwise a missing row, a row of another owner and a row with no owner
+    /// all give the same `SignatureNotFound`, with no reason attached.
     pub(in crate::attestation) async fn get_chat_signature_impl(
         &self,
+        owner: SignatureOwner,
         chat_id: &str,
         signing_algo: Option<String>,
     ) -> Result<SignatureLookupResult, AttestationError> {
@@ -31,34 +41,49 @@ impl AttestationService {
 
         match self
             .repository
-            .get_chat_signature(chat_id, &signing_algo)
+            .get_chat_signature(owner, chat_id, &signing_algo)
             .await
         {
             Ok(signature) => Ok(SignatureLookupResult::Found(signature)),
-            Err(AttestationError::SignatureNotFound(_)) => {
-                if let Some(provider) = self
-                    .inference_provider_pool
-                    .get_provider_by_chat_id(chat_id)
-                    .await
-                {
-                    if !provider.supports_chat_signatures() {
-                        return Ok(SignatureLookupResult::Unavailable {
-                            error_code: "SIGNATURE_UNSUPPORTED".to_string(),
-                            message: "This model's responses are integrity-protected by an \
-                                      end-to-end encrypted channel, not a per-response signature; \
-                                      there is no signature to retrieve."
-                                .to_string(),
-                        });
-                    }
+            Err(not_found @ AttestationError::SignatureNotFound(_)) => {
+                if self.owner_stream_disconnected(owner, chat_id).await {
+                    Ok(SignatureLookupResult::Unavailable {
+                        error_code: STREAM_DISCONNECTED.to_string(),
+                        message: STREAM_DISCONNECTED_MESSAGE.to_string(),
+                    })
+                } else {
+                    Err(not_found)
                 }
-                self.check_fallback_conditions(chat_id, &signing_algo).await
             }
-            Err(e) => Err(e),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Whether `owner` has a usage row for `chat_id` that ended with a client
+    /// disconnect. A lookup failure answers `false`, so the caller reports the
+    /// signature as not found.
+    async fn owner_stream_disconnected(&self, owner: SignatureOwner, chat_id: &str) -> bool {
+        match self
+            .usage_repository
+            .has_client_disconnect_usage(owner.organization_id, owner.workspace_id, chat_id)
+            .await
+        {
+            Ok(disconnected) => disconnected,
+            Err(_) => {
+                tracing::warn!(
+                    organization_id = %owner.organization_id,
+                    workspace_id = %owner.workspace_id,
+                    error_kind = "usage_lookup_failed",
+                    "Failed to check stop reason for a missing signature"
+                );
+                false
+            }
         }
     }
 
     pub(in crate::attestation) async fn store_chat_signature_from_provider_impl(
         &self,
+        owner: SignatureOwner,
         chat_id: &str,
         fetch_deadline: Option<tokio::time::Instant>,
     ) -> Result<(), AttestationError> {
@@ -68,7 +93,7 @@ impl AttestationService {
             .get_provider_by_chat_id(chat_id)
             .await
             .ok_or_else(|| {
-                AttestationError::ProviderError(format!("No provider found for chat_id: {chat_id}"))
+                AttestationError::ProviderError("No provider found for chat signature".to_string())
             })?;
 
         if !provider.supports_chat_signatures() {
@@ -121,14 +146,10 @@ impl AttestationService {
                     signature_kind: Some(SignatureKind::ProviderTee),
                 }),
                 Err(error) => {
-                    // The error string embeds the backend URL on connection
-                    // failures — without it (and chat_id) these events are
-                    // impossible to attribute to a model/backend.
                     tracing::error!(
-                        %chat_id,
-                        error = %error,
-                        "Failed to get chat signature from provider for algorithm: {}",
-                        algo
+                        signing_algo = algo,
+                        error_kind = error.kind(),
+                        "Failed to get chat signature from provider"
                     );
                     if fetch_error.is_none() {
                         fetch_error = Some(error);
@@ -162,12 +183,13 @@ impl AttestationService {
             Ok(())
         } else {
             self.repository
-                .add_chat_signatures(chat_id, signatures)
+                .add_chat_signatures(owner, chat_id, signatures)
                 .await
-                .map_err(|e| {
+                .inspect_err(|e| {
                     tracing::error!(
-                        %chat_id,
-                        error = %e,
+                        organization_id = %owner.organization_id,
+                        workspace_id = %owner.workspace_id,
+                        error_kind = e.kind(),
                         "Failed to store chat signatures in repository"
                     );
                     let duration = start_time.elapsed();
@@ -181,7 +203,6 @@ impl AttestationService {
                         duration,
                         &[&env_tag],
                     );
-                    AttestationError::RepositoryError(e.to_string())
                 })
         };
         let result = fetched.and(stored);
@@ -199,11 +220,12 @@ impl AttestationService {
 
     pub(in crate::attestation) async fn store_chat_signature_impl(
         &self,
+        owner: SignatureOwner,
         chat_id: &str,
         request_hash: String,
         response_hash: String,
     ) -> Result<(), AttestationError> {
-        self.store_gateway_signature(chat_id, "chat", request_hash, response_hash)
+        self.store_gateway_signature(owner, chat_id, "chat", request_hash, response_hash)
             .await
     }
 
@@ -217,20 +239,21 @@ impl AttestationService {
     /// future and leak the pin.
     pub(in crate::attestation) async fn store_chat_signature_and_unpin_impl(
         &self,
+        owner: SignatureOwner,
         chat_id: &str,
         request_hash: String,
         response_hash: String,
     ) -> Result<(), AttestationError> {
         let result = match tokio::time::timeout(
             STREAM_SIGNATURE_STORE_TIMEOUT,
-            self.store_chat_signature_impl(chat_id, request_hash, response_hash),
+            self.store_chat_signature_impl(owner, chat_id, request_hash, response_hash),
         )
         .await
         {
             Ok(result) => result,
-            Err(_) => Err(AttestationError::InternalError(format!(
-                "Timed out storing gateway chat signature for {chat_id}"
-            ))),
+            Err(_) => Err(AttestationError::InternalError(
+                "Timed out storing gateway chat signature".to_string(),
+            )),
         };
         self.release_chat_signature_pin_impl(chat_id).await;
         result
@@ -251,50 +274,12 @@ impl AttestationService {
 
     pub(in crate::attestation) async fn store_response_signature_impl(
         &self,
+        owner: SignatureOwner,
         response_id: &str,
         request_hash: String,
         response_hash: String,
     ) -> Result<(), AttestationError> {
-        self.store_gateway_signature(response_id, "response", request_hash, response_hash)
+        self.store_gateway_signature(owner, response_id, "response", request_hash, response_hash)
             .await
-    }
-
-    async fn check_fallback_conditions(
-        &self,
-        chat_id: &str,
-        signing_algo: &str,
-    ) -> Result<SignatureLookupResult, AttestationError> {
-        let stop_reason = if chat_id.starts_with("resp_") {
-            let uuid_str = chat_id.strip_prefix("resp_").unwrap_or(chat_id);
-            let response_uuid = match Uuid::parse_str(uuid_str) {
-                Ok(uuid) => uuid,
-                Err(_) => {
-                    return Err(AttestationError::SignatureNotFound(format!(
-                        "{}:{}",
-                        chat_id, signing_algo
-                    )));
-                }
-            };
-            self.usage_repository
-                .get_stop_reason_by_response_id(response_uuid)
-                .await
-                .map_err(|e| AttestationError::RepositoryError(e.to_string()))?
-        } else {
-            self.usage_repository
-                .get_stop_reason_by_provider_request_id(chat_id)
-                .await
-                .map_err(|e| AttestationError::RepositoryError(e.to_string()))?
-        };
-
-        match stop_reason {
-            Some(StopReason::ClientDisconnect) => Ok(SignatureLookupResult::Unavailable {
-                error_code: "STREAM_DISCONNECTED".to_string(),
-                message: "Verification not available due to disconnection.".to_string(),
-            }),
-            _ => Err(AttestationError::SignatureNotFound(format!(
-                "{}:{}",
-                chat_id, signing_algo
-            ))),
-        }
     }
 }

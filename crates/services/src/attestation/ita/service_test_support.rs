@@ -13,7 +13,7 @@ use uuid::Uuid;
 use super::super::{client::client_test_support::FakeIta, ItaClient};
 use crate::{
     attestation::{
-        models::{ChatSignature, DstackCpuQuote},
+        models::{ChatSignature, DstackCpuQuote, SignatureOwner},
         ports::AttestationRepository,
         AttestationError, AttestationService, GatewayQuoteCollector, GatewayQuoteInput,
         ModelAttestationCollector, ModelAttestationInput,
@@ -311,6 +311,7 @@ struct NoopAttestationRepository;
 impl AttestationRepository for NoopAttestationRepository {
     async fn add_chat_signature(
         &self,
+        _owner: SignatureOwner,
         _chat_id: &str,
         _signature: ChatSignature,
     ) -> Result<(), AttestationError> {
@@ -319,6 +320,7 @@ impl AttestationRepository for NoopAttestationRepository {
 
     async fn get_chat_signature(
         &self,
+        _owner: SignatureOwner,
         _chat_id: &str,
         _signing_algo: &str,
     ) -> Result<ChatSignature, AttestationError> {

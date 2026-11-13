@@ -254,6 +254,32 @@ impl std::fmt::Debug for PlacementContext {
     }
 }
 
+/// Request body field that selects an engine's prompt-cache namespace.
+pub const CACHE_SALT_FIELD: &str = "cache_salt";
+
+/// Server-derived prompt-cache namespace for engines that support
+/// `cache_salt`. Set in process on [`ChatCompletionParams::upstream_cache_salt`],
+/// never deserialized from a client body. The value is derived from tenant
+/// identity, so `Debug` never prints it.
+#[derive(Clone, PartialEq, Eq)]
+pub struct UpstreamCacheSalt(String);
+
+impl UpstreamCacheSalt {
+    pub fn new(value: String) -> Self {
+        Self(value)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for UpstreamCacheSalt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("UpstreamCacheSalt(<redacted>)")
+    }
+}
+
 /// Parameters for chat completion requests (matches OpenAI API)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatCompletionParams {
@@ -361,11 +387,45 @@ pub struct ChatCompletionParams {
     #[serde(default, skip_serializing, skip_deserializing)]
     pub original_request: Option<serde_json::Value>,
 
+    /// Organization-scoped prompt-cache namespace set by the completion
+    /// service. Never accepted from or serialized to JSON directly; providers
+    /// whose engines support `cache_salt` write it with
+    /// [`Self::apply_upstream_cache_salt`].
+    #[serde(skip)]
+    pub upstream_cache_salt: Option<UpstreamCacheSalt>,
+
     #[serde(flatten)]
     pub extra: std::collections::HashMap<String, serde_json::Value>,
 }
 
 impl ChatCompletionParams {
+    /// Remove a client `cache_salt` from `extra` and the original request
+    /// sidecar, returning the `extra` value. A client salt is an input to the
+    /// server namespace, never forwarded as is.
+    pub fn take_client_cache_salt(&mut self) -> Option<serde_json::Value> {
+        if let Some(original) = self
+            .original_request
+            .as_mut()
+            .and_then(|value| value.as_object_mut())
+        {
+            original.remove(CACHE_SALT_FIELD);
+        }
+        self.extra.remove(CACHE_SALT_FIELD)
+    }
+
+    /// Replace any body `cache_salt` with the server-derived namespace. With
+    /// no server namespace the body carries no `cache_salt` at all, so client
+    /// input can never select an engine cache namespace.
+    pub fn apply_upstream_cache_salt(&mut self) {
+        self.extra.remove(CACHE_SALT_FIELD);
+        if let Some(salt) = &self.upstream_cache_salt {
+            self.extra.insert(
+                CACHE_SALT_FIELD.to_string(),
+                serde_json::Value::String(salt.as_str().to_string()),
+            );
+        }
+    }
+
     /// Streaming fields on an upstream request are the server's to set. They
     /// leave `extra` as well: it serializes after the typed fields, so a copy
     /// there would replace them on the wire.

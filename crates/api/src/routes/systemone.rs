@@ -146,6 +146,7 @@ pub async fn systemone(
         };
     // Once inference succeeds, finalize billing and signature pins even if the
     // client disconnects while waiting for persistence.
+    let signature_owner = api_key.signature_owner();
     let finalize = tokio::spawn(without_tracing_context(async move {
         let _slot = slot;
         let decision_id = &served.decision_id;
@@ -174,13 +175,14 @@ pub async fn systemone(
                     SignatureKind::ProviderTee => {
                         state
                             .attestation_service
-                            .store_stream_chat_signature_from_provider(decision_id)
+                            .store_stream_chat_signature_from_provider(signature_owner, decision_id)
                             .await
                     }
                     SignatureKind::Gateway => {
                         state
                             .attestation_service
                             .store_chat_signature_and_unpin(
+                                signature_owner,
                                 decision_id,
                                 body_hash.hash,
                                 hex::encode(Sha256::digest(&served.response.raw_bytes)),
@@ -198,7 +200,7 @@ pub async fn systemone(
                 .release_chat_signature_pin(decision_id)
                 .await;
             if !matches!(result, Ok(Ok(()))) {
-                tracing::error!(decision_id = %decision_id, "System One signature finalization failed or timed out");
+                tracing::error!("System One signature finalization failed or timed out");
             }
         };
         let (_, billing_result) = tokio::join!(

@@ -19,7 +19,7 @@ use uuid::Uuid;
 use super::{
     chat_signatures::STREAM_SIGNATURE_STORE_TIMEOUT,
     ita::ProviderPoolModelAttestationCollector,
-    models::{ChatSignature, SignatureKind},
+    models::{ChatSignature, SignatureKind, SignatureLookupResult, SignatureOwner},
     ports::{AttestationRepository, AttestationServiceTrait},
     AttestationError, AttestationService, DstackGatewayQuoteCollector,
 };
@@ -34,20 +34,57 @@ use crate::{
     },
 };
 
-/// Repository that records stored signatures and succeeds.
+/// One stored row. `owner` is `None` for a row stored before owners were
+/// recorded.
+pub(super) type StoredRow = (Option<SignatureOwner>, String, ChatSignature);
+
+/// The workspace the tests sign for.
+pub(super) fn owner() -> SignatureOwner {
+    SignatureOwner {
+        organization_id: Uuid::from_u128(1),
+        workspace_id: Uuid::from_u128(2),
+    }
+}
+
+/// A workspace that did not produce the signature.
+fn other_owner() -> SignatureOwner {
+    SignatureOwner {
+        organization_id: Uuid::from_u128(3),
+        workspace_id: Uuid::from_u128(4),
+    }
+}
+
+/// Repository that records stored signatures and follows the database's owner
+/// rules: a row is keyed by id and algorithm, only its owner may replace it,
+/// and only its owner can read it.
 #[derive(Clone, Default)]
 pub(super) struct RecordingRepository {
-    stored: Arc<Mutex<Vec<(String, ChatSignature)>>>,
+    stored: Arc<Mutex<Vec<StoredRow>>>,
     batch_sizes: Arc<Mutex<Vec<usize>>>,
 }
 
 impl RecordingRepository {
     pub(super) fn stored(&self) -> Vec<(String, ChatSignature)> {
+        self.stored_rows()
+            .into_iter()
+            .map(|(_, chat_id, signature)| (chat_id, signature))
+            .collect()
+    }
+
+    pub(super) fn stored_rows(&self) -> Vec<StoredRow> {
         self.stored.lock().map(|s| s.clone()).unwrap_or_default()
     }
 
     pub(super) fn batch_sizes(&self) -> Vec<usize> {
         self.batch_sizes.lock().unwrap().clone()
+    }
+
+    /// Seed a row written before owners were recorded.
+    pub(super) fn insert_legacy(&self, chat_id: &str, signature: ChatSignature) {
+        self.stored
+            .lock()
+            .unwrap()
+            .push((None, chat_id.to_string(), signature));
     }
 }
 
@@ -55,30 +92,45 @@ impl RecordingRepository {
 impl AttestationRepository for RecordingRepository {
     async fn add_chat_signatures(
         &self,
+        owner: SignatureOwner,
         chat_id: &str,
         signatures: Vec<ChatSignature>,
     ) -> Result<(), AttestationError> {
         self.batch_sizes.lock().unwrap().push(signatures.len());
         for signature in signatures {
-            self.add_chat_signature(chat_id, signature).await?;
+            self.add_chat_signature(owner, chat_id, signature).await?;
         }
         Ok(())
     }
 
     async fn add_chat_signature(
         &self,
+        owner: SignatureOwner,
         chat_id: &str,
         signature: ChatSignature,
     ) -> Result<(), AttestationError> {
-        self.stored
+        let mut stored = self
+            .stored
             .lock()
-            .map_err(|_| AttestationError::InternalError("stored lock poisoned".to_string()))?
-            .push((chat_id.to_string(), signature));
-        Ok(())
+            .map_err(|_| AttestationError::InternalError("stored lock poisoned".to_string()))?;
+        match stored.iter_mut().find(|(_, stored_chat_id, existing)| {
+            stored_chat_id == chat_id && existing.signing_algo == signature.signing_algo
+        }) {
+            Some((Some(existing_owner), _, existing)) if *existing_owner == owner => {
+                *existing = signature;
+                Ok(())
+            }
+            Some(_) => Err(AttestationError::OwnerConflict),
+            None => {
+                stored.push((Some(owner), chat_id.to_string(), signature));
+                Ok(())
+            }
+        }
     }
 
     async fn get_chat_signature(
         &self,
+        owner: SignatureOwner,
         chat_id: &str,
         signing_algo: &str,
     ) -> Result<ChatSignature, AttestationError> {
@@ -86,10 +138,12 @@ impl AttestationRepository for RecordingRepository {
             .lock()
             .map_err(|_| AttestationError::InternalError("stored lock poisoned".to_string()))?
             .iter()
-            .find(|(stored_chat_id, signature)| {
-                stored_chat_id == chat_id && signature.signing_algo == signing_algo
+            .find(|(stored_owner, stored_chat_id, signature)| {
+                *stored_owner == Some(owner)
+                    && stored_chat_id == chat_id
+                    && signature.signing_algo == signing_algo
             })
-            .map(|(_, signature)| signature.clone())
+            .map(|(_, _, signature)| signature.clone())
             .ok_or_else(|| AttestationError::SignatureNotFound(format!("{chat_id}:{signing_algo}")))
     }
 }
@@ -101,6 +155,7 @@ pub(super) struct FailingRepository;
 impl AttestationRepository for FailingRepository {
     async fn add_chat_signature(
         &self,
+        _owner: SignatureOwner,
         _chat_id: &str,
         _signature: ChatSignature,
     ) -> Result<(), AttestationError> {
@@ -111,6 +166,7 @@ impl AttestationRepository for FailingRepository {
 
     async fn get_chat_signature(
         &self,
+        _owner: SignatureOwner,
         chat_id: &str,
         signing_algo: &str,
     ) -> Result<ChatSignature, AttestationError> {
@@ -127,6 +183,7 @@ struct HangingRepository;
 impl AttestationRepository for HangingRepository {
     async fn add_chat_signature(
         &self,
+        _owner: SignatureOwner,
         _chat_id: &str,
         _signature: ChatSignature,
     ) -> Result<(), AttestationError> {
@@ -135,6 +192,7 @@ impl AttestationRepository for HangingRepository {
 
     async fn get_chat_signature(
         &self,
+        _owner: SignatureOwner,
         chat_id: &str,
         signing_algo: &str,
     ) -> Result<ChatSignature, AttestationError> {
@@ -311,7 +369,12 @@ async fn store_and_unpin_stores_gateway_signature_and_releases_pin_on_success() 
     let service = lifecycle_service(Arc::new(repository.clone()), pool);
 
     let result = service
-        .store_chat_signature_and_unpin(chat_id, "req-hash".to_string(), "resp-hash".to_string())
+        .store_chat_signature_and_unpin(
+            owner(),
+            chat_id,
+            "req-hash".to_string(),
+            "resp-hash".to_string(),
+        )
         .await;
 
     assert!(result.is_ok(), "store should succeed: {result:?}");
@@ -336,7 +399,12 @@ async fn store_and_unpin_rejects_empty_id_without_storing_and_releases_pin() {
     let service = lifecycle_service(Arc::new(repository.clone()), pool);
 
     let result = service
-        .store_chat_signature_and_unpin("", "req-hash".to_string(), "resp-hash".to_string())
+        .store_chat_signature_and_unpin(
+            owner(),
+            "",
+            "req-hash".to_string(),
+            "resp-hash".to_string(),
+        )
         .await;
 
     assert!(matches!(result, Err(AttestationError::InvalidParameter(_))));
@@ -352,7 +420,12 @@ async fn store_and_unpin_releases_pin_when_store_fails() {
     let service = lifecycle_service(Arc::new(FailingRepository), pool);
 
     let result = service
-        .store_chat_signature_and_unpin(chat_id, "req-hash".to_string(), "resp-hash".to_string())
+        .store_chat_signature_and_unpin(
+            owner(),
+            chat_id,
+            "req-hash".to_string(),
+            "resp-hash".to_string(),
+        )
         .await;
 
     assert!(result.is_err(), "store failure must propagate");
@@ -373,7 +446,12 @@ async fn store_and_unpin_releases_pin_when_store_times_out() {
 
     let started = tokio::time::Instant::now();
     let result = service
-        .store_chat_signature_and_unpin(chat_id, "req-hash".to_string(), "resp-hash".to_string())
+        .store_chat_signature_and_unpin(
+            owner(),
+            chat_id,
+            "req-hash".to_string(),
+            "resp-hash".to_string(),
+        )
         .await;
 
     assert!(
@@ -429,7 +507,9 @@ async fn unsupported_provider_releases_pin_without_storing_a_signature() {
     let repository = RecordingRepository::default();
     let service = lifecycle_service(Arc::new(repository.clone()), pool);
 
-    let result = service.store_chat_signature_from_provider(chat_id).await;
+    let result = service
+        .store_chat_signature_from_provider(owner(), chat_id)
+        .await;
 
     assert!(
         result.is_ok(),
@@ -458,4 +538,165 @@ async fn release_chat_signature_pin_is_a_noop_without_a_mapping() {
     // No mapping for this chat_id — must not panic or store anything.
     service.release_chat_signature_pin("chatcmpl-unknown").await;
     assert!(repository.stored().is_empty());
+}
+
+fn service_without_pins(repository: &RecordingRepository) -> AttestationService {
+    let pool = Arc::new(InferenceProviderPool::new(
+        None,
+        ExternalProvidersConfig::default(),
+    ));
+    lifecycle_service(Arc::new(repository.clone()), pool)
+}
+
+async fn store_gateway(service: &AttestationService, owner: SignatureOwner, chat_id: &str) {
+    service
+        .store_chat_signature(
+            owner,
+            chat_id,
+            "req-hash".to_string(),
+            "resp-hash".to_string(),
+        )
+        .await
+        .expect("gateway signature stored");
+}
+
+fn assert_not_found(result: Result<SignatureLookupResult, AttestationError>) {
+    match result {
+        Err(AttestationError::SignatureNotFound(_)) => {}
+        other => panic!("expected SignatureNotFound, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn stored_signature_records_the_writing_owner() {
+    let chat_id = "chatcmpl-owner-persisted";
+    let repository = RecordingRepository::default();
+    let service = service_without_pins(&repository);
+
+    store_gateway(&service, owner(), chat_id).await;
+    service
+        .store_response_signature(owner(), "resp_owner", "a".to_string(), "b".to_string())
+        .await
+        .expect("response signature stored");
+
+    let rows = repository.stored_rows();
+    assert_eq!(rows.len(), 4, "two algorithms for each id");
+    assert!(
+        rows.iter()
+            .all(|(row_owner, _, _)| *row_owner == Some(owner())),
+        "every row must carry the owner it was written for"
+    );
+}
+
+#[tokio::test]
+async fn owner_can_read_its_signature() {
+    let chat_id = "chatcmpl-owner-read";
+    let repository = RecordingRepository::default();
+    let service = service_without_pins(&repository);
+    store_gateway(&service, owner(), chat_id).await;
+
+    for algo in ["ecdsa", "ed25519"] {
+        match service
+            .get_chat_signature(owner(), chat_id, Some(algo.to_string()))
+            .await
+        {
+            Ok(SignatureLookupResult::Found(signature)) => {
+                assert_eq!(signature.signing_algo, algo);
+                assert_eq!(signature.text, "req-hash:resp-hash");
+            }
+            other => panic!("expected the owner's signature, got {other:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn another_owner_cannot_read_the_signature() {
+    let chat_id = "chatcmpl-owner-other-read";
+    let repository = RecordingRepository::default();
+    let service = service_without_pins(&repository);
+    store_gateway(&service, owner(), chat_id).await;
+
+    assert_not_found(
+        service
+            .get_chat_signature(other_owner(), chat_id, None)
+            .await,
+    );
+    // Same organization, different workspace.
+    let sibling_workspace = SignatureOwner {
+        workspace_id: Uuid::from_u128(99),
+        ..owner()
+    };
+    assert_not_found(
+        service
+            .get_chat_signature(sibling_workspace, chat_id, None)
+            .await,
+    );
+}
+
+#[tokio::test]
+async fn legacy_signature_without_owner_is_not_readable() {
+    let chat_id = "chatcmpl-owner-legacy";
+    let repository = RecordingRepository::default();
+    repository.insert_legacy(
+        chat_id,
+        ChatSignature {
+            text: "legacy".to_string(),
+            signature: "0xlegacy".to_string(),
+            signing_address: "0xaddr".to_string(),
+            signing_algo: "ecdsa".to_string(),
+            signature_kind: None,
+        },
+    );
+    let service = service_without_pins(&repository);
+
+    assert_not_found(service.get_chat_signature(owner(), chat_id, None).await);
+}
+
+#[tokio::test]
+async fn another_owner_cannot_replace_a_stored_signature() {
+    let chat_id = "chatcmpl-owner-overwrite";
+    let repository = RecordingRepository::default();
+    let service = service_without_pins(&repository);
+    store_gateway(&service, owner(), chat_id).await;
+
+    let result = service
+        .store_chat_signature(
+            other_owner(),
+            chat_id,
+            "other-req".to_string(),
+            "other-resp".to_string(),
+        )
+        .await;
+
+    assert!(matches!(result, Err(AttestationError::OwnerConflict)));
+    let rows = repository.stored_rows();
+    assert_eq!(rows.len(), 2);
+    for (row_owner, _, signature) in rows {
+        assert_eq!(row_owner, Some(owner()), "ownership must not move");
+        assert_eq!(signature.text, "req-hash:resp-hash", "content unchanged");
+    }
+    assert_not_found(
+        service
+            .get_chat_signature(other_owner(), chat_id, None)
+            .await,
+    );
+}
+
+#[tokio::test]
+async fn miss_is_not_found_even_with_a_pinned_provider_without_signatures() {
+    let chat_id = "chatcmpl-owner-unsupported";
+    let pool = Arc::new(InferenceProviderPool::new(
+        None,
+        ExternalProvidersConfig::default(),
+    ));
+    let provider = Arc::new(MockProvider::new().with_chat_signature_support(false));
+    pool.store_chat_id_mapping(chat_id.to_string(), provider)
+        .await;
+    let service = lifecycle_service(Arc::new(RecordingRepository::default()), pool);
+
+    assert_not_found(
+        service
+            .get_chat_signature(other_owner(), chat_id, None)
+            .await,
+    );
 }

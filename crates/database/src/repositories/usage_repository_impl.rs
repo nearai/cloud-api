@@ -255,6 +255,16 @@ impl services::usage::ports::UsageRepository for OrganizationUsageRepository {
             .await
     }
 
+    async fn has_client_disconnect_usage(
+        &self,
+        organization_id: Uuid,
+        workspace_id: Uuid,
+        id: &str,
+    ) -> anyhow::Result<bool> {
+        self.has_client_disconnect_usage(organization_id, workspace_id, id)
+            .await
+    }
+
     async fn get_usage_by_model(
         &self,
         organization_id: Uuid,

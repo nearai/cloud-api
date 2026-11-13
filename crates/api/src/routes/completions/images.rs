@@ -140,15 +140,16 @@ pub async fn image_generations(
             // Store attestation signature for image generation (same pattern as chat completions)
             let attestation_service = app_state.attestation_service.clone();
             let image_id_for_sig = response_with_bytes.response.id.clone();
+            let signature_owner = api_key.signature_owner();
             inference_providers::tracing_context::spawn_with_tracing_context(async move {
                 if attestation_service
-                    .store_chat_signature_from_provider(&image_id_for_sig)
+                    .store_chat_signature_from_provider(signature_owner, &image_id_for_sig)
                     .await
                     .is_err()
                 {
                     tracing::warn!("Image generation: signature storage failed");
                 } else {
-                    tracing::debug!(image_id = %image_id_for_sig, "Stored signature for image generation");
+                    tracing::debug!("Stored signature for image generation");
                 }
             });
 
@@ -545,15 +546,16 @@ pub async fn image_edits(
             // Store attestation signature for image edit (same pattern as image generation)
             let attestation_service = app_state.attestation_service.clone();
             let image_id_for_sig = response_with_bytes.response.id.clone();
+            let signature_owner = api_key.signature_owner();
             inference_providers::tracing_context::spawn_with_tracing_context(async move {
                 if attestation_service
-                    .store_chat_signature_from_provider(&image_id_for_sig)
+                    .store_chat_signature_from_provider(signature_owner, &image_id_for_sig)
                     .await
                     .is_err()
                 {
                     tracing::warn!("Image edit: signature storage failed");
                 } else {
-                    tracing::debug!(image_id = %image_id_for_sig, "Stored signature for image edit");
+                    tracing::debug!("Stored signature for image edit");
                 }
             });
 

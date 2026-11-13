@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use services::attestation::{
-    ports::AttestationRepository, AttestationError, ChatSignature, SignatureKind,
+    ports::AttestationRepository, AttestationError, ChatSignature, SignatureKind, SignatureOwner,
 };
 use tokio_postgres::types::Type;
 
@@ -70,48 +70,47 @@ fn last_signature_per_algo(signatures: Vec<ChatSignature>) -> Vec<ChatSignature>
     deduped
 }
 
-#[async_trait]
-impl AttestationRepository for PgAttestationRepository {
-    async fn add_chat_signature(
-        &self,
-        chat_id: &str,
-        signature: ChatSignature,
-    ) -> Result<(), AttestationError> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .map_err(|e| AttestationError::RepositoryError(e.to_string()))?;
-        let signature_kind = signature.signature_kind.map(|kind| kind.as_str());
-        // One-shot typed query: one round trip, see repositories/mod.rs.
-        client
-            .execute_typed(
-                "INSERT INTO chat_signatures (chat_id, text, signature, signing_address, signing_algo, signature_kind) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (chat_id, signing_algo) DO UPDATE SET text = EXCLUDED.text, signature = EXCLUDED.signature, signing_address = EXCLUDED.signing_address, signature_kind = EXCLUDED.signature_kind, updated_at = NOW()",
-                &[
-                    (&chat_id, Type::VARCHAR),
-                    (&signature.text, Type::TEXT),
-                    (&signature.signature, Type::TEXT),
-                    (&signature.signing_address, Type::VARCHAR),
-                    (&signature.signing_algo, Type::VARCHAR),
-                    (&signature_kind, Type::VARCHAR),
-                ],
-            )
-            .await
-            .map_err(|e| AttestationError::RepositoryError(e.to_string()))?;
+/// Insert columns, in placeholder order.
+const INSERT_COLUMNS: &str = "INSERT INTO chat_signatures (chat_id, text, signature, signing_address, signing_algo, signature_kind, organization_id, workspace_id) VALUES ";
+const COLUMNS_PER_ROW: usize = 8;
 
-        Ok(())
+/// The unique key is still `(chat_id, signing_algo)` alone, which the previous
+/// release's statement names during a rolling deploy. The `WHERE` lets a row
+/// be replaced only by the owner it was stored for: a row of another owner,
+/// or a row with no owner (NULL never compares equal), is left unchanged and
+/// counts as not written. The owner columns are never in the `SET` list, so a
+/// write cannot move a row to another owner.
+const UPSERT_SUFFIX: &str = " ON CONFLICT (chat_id, signing_algo) DO UPDATE SET text = EXCLUDED.text, signature = EXCLUDED.signature, signing_address = EXCLUDED.signing_address, signature_kind = EXCLUDED.signature_kind, updated_at = NOW() WHERE chat_signatures.organization_id = EXCLUDED.organization_id AND chat_signatures.workspace_id = EXCLUDED.workspace_id";
+
+/// Build the upsert for `rows` signatures of one chat id.
+fn upsert_sql(rows: usize) -> String {
+    let mut sql = String::from(INSERT_COLUMNS);
+    for index in 0..rows {
+        if index > 0 {
+            sql.push_str(", ");
+        }
+        let base = index * COLUMNS_PER_ROW;
+        let placeholders: Vec<String> = (1..=COLUMNS_PER_ROW)
+            .map(|offset| format!("${}", base + offset))
+            .collect();
+        sql.push('(');
+        sql.push_str(&placeholders.join(", "));
+        sql.push(')');
     }
+    sql.push_str(UPSERT_SUFFIX);
+    sql
+}
 
-    /// One round trip for all signatures of a chat: the streaming path stores
-    /// an ecdsa and an ed25519 signature before the client sees `[DONE]`, and
-    /// on a replica far from the database each statement is a full network
-    /// round trip.
-    async fn add_chat_signatures(
+impl PgAttestationRepository {
+    /// Insert or replace `signatures` for `owner` in one statement. Fails with
+    /// `OwnerConflict` when any row was held by another owner or by no owner;
+    /// the rows that were this owner's are written.
+    async fn upsert(
         &self,
+        owner: SignatureOwner,
         chat_id: &str,
-        signatures: Vec<ChatSignature>,
+        signatures: &[ChatSignature],
     ) -> Result<(), AttestationError> {
-        let signatures = last_signature_per_algo(signatures);
         if signatures.is_empty() {
             return Ok(());
         }
@@ -125,48 +124,71 @@ impl AttestationRepository for PgAttestationRepository {
             .iter()
             .map(|signature| signature.signature_kind.map(|kind| kind.as_str()))
             .collect();
-        let mut sql = String::from(
-            "INSERT INTO chat_signatures (chat_id, text, signature, signing_address, signing_algo, signature_kind) VALUES ",
-        );
-        let mut params: Vec<(&(dyn tokio_postgres::types::ToSql + Sync), Type)> = Vec::new();
-        for (index, (signature, signature_kind)) in
-            signatures.iter().zip(signature_kinds.iter()).enumerate()
-        {
-            if index > 0 {
-                sql.push_str(", ");
-            }
-            let base = index * 6;
-            sql.push_str(&format!(
-                "(${}, ${}, ${}, ${}, ${}, ${})",
-                base + 1,
-                base + 2,
-                base + 3,
-                base + 4,
-                base + 5,
-                base + 6
-            ));
+        let sql = upsert_sql(signatures.len());
+        let mut params: Vec<(&(dyn tokio_postgres::types::ToSql + Sync), Type)> =
+            Vec::with_capacity(signatures.len() * COLUMNS_PER_ROW);
+        for (signature, signature_kind) in signatures.iter().zip(signature_kinds.iter()) {
             params.push((&chat_id, Type::VARCHAR));
             params.push((&signature.text, Type::TEXT));
             params.push((&signature.signature, Type::TEXT));
             params.push((&signature.signing_address, Type::VARCHAR));
             params.push((&signature.signing_algo, Type::VARCHAR));
             params.push((signature_kind, Type::VARCHAR));
+            params.push((&owner.organization_id, Type::UUID));
+            params.push((&owner.workspace_id, Type::UUID));
         }
-        sql.push_str(
-            " ON CONFLICT (chat_id, signing_algo) DO UPDATE SET text = EXCLUDED.text, signature = EXCLUDED.signature, signing_address = EXCLUDED.signing_address, signature_kind = EXCLUDED.signature_kind, updated_at = NOW()",
-        );
 
         // One-shot typed query: one round trip, see repositories/mod.rs.
-        client
+        let written = client
             .execute_typed(sql.as_str(), &params)
             .await
             .map_err(|e| AttestationError::RepositoryError(e.to_string()))?;
 
+        if written < signatures.len() as u64 {
+            tracing::warn!(
+                organization_id = %owner.organization_id,
+                workspace_id = %owner.workspace_id,
+                requested = signatures.len(),
+                written,
+                "Chat signature id already stored for another owner; not replaced"
+            );
+            return Err(AttestationError::OwnerConflict);
+        }
         Ok(())
     }
+}
 
+#[async_trait]
+impl AttestationRepository for PgAttestationRepository {
+    async fn add_chat_signature(
+        &self,
+        owner: SignatureOwner,
+        chat_id: &str,
+        signature: ChatSignature,
+    ) -> Result<(), AttestationError> {
+        self.upsert(owner, chat_id, std::slice::from_ref(&signature))
+            .await
+    }
+
+    /// One round trip for all signatures of a chat: the streaming path stores
+    /// an ecdsa and an ed25519 signature before the client sees `[DONE]`, and
+    /// on a replica far from the database each statement is a full network
+    /// round trip.
+    async fn add_chat_signatures(
+        &self,
+        owner: SignatureOwner,
+        chat_id: &str,
+        signatures: Vec<ChatSignature>,
+    ) -> Result<(), AttestationError> {
+        let signatures = last_signature_per_algo(signatures);
+        self.upsert(owner, chat_id, &signatures).await
+    }
+
+    /// Rows with a NULL owner (stored before owners were recorded) never
+    /// match, so they are not found for any caller.
     async fn get_chat_signature(
         &self,
+        owner: SignatureOwner,
         chat_id: &str,
         signing_algo: &str,
     ) -> Result<ChatSignature, AttestationError> {
@@ -177,21 +199,19 @@ impl AttestationRepository for PgAttestationRepository {
             .map_err(|e| AttestationError::RepositoryError(e.to_string()))?;
 
         let row = client
-            .query_one(
-                "SELECT * FROM chat_signatures WHERE chat_id = $1 AND signing_algo = $2",
-                &[&chat_id, &signing_algo],
+            .query_opt(
+                "SELECT text, signature, signing_address, signing_algo, signature_kind FROM chat_signatures WHERE chat_id = $1 AND signing_algo = $2 AND organization_id = $3 AND workspace_id = $4",
+                &[
+                    &chat_id,
+                    &signing_algo,
+                    &owner.organization_id,
+                    &owner.workspace_id,
+                ],
             )
             .await
-            .map_err(|e| {
-                // query_one returns RowNotFound when no rows are found
-                if e.to_string()
-                    .contains("query returned an unexpected number of rows")
-                {
-                    return AttestationError::SignatureNotFound(format!(
-                        "{chat_id}:{signing_algo}"
-                    ));
-                }
-                AttestationError::RepositoryError(e.to_string())
+            .map_err(|e| AttestationError::RepositoryError(e.to_string()))?
+            .ok_or_else(|| {
+                AttestationError::SignatureNotFound(format!("{chat_id}:{signing_algo}"))
             })?;
         self.row_to_chat_signature(row)
     }
@@ -235,5 +255,24 @@ mod tests {
     #[test]
     fn empty_input_stays_empty() {
         assert!(last_signature_per_algo(Vec::new()).is_empty());
+    }
+
+    #[test]
+    fn upsert_binds_the_owner_per_row_and_never_moves_it() {
+        let sql = upsert_sql(2);
+        assert!(sql.contains("($1, $2, $3, $4, $5, $6, $7, $8), "));
+        assert!(sql.contains("($9, $10, $11, $12, $13, $14, $15, $16)"));
+        assert!(!sql.contains("$17"));
+        // The update is guarded by the stored owner, and the owner columns
+        // are not assigned.
+        let (_, set_clause) = sql.split_once("DO UPDATE SET").unwrap();
+        assert!(set_clause.contains(
+            "WHERE chat_signatures.organization_id = EXCLUDED.organization_id AND chat_signatures.workspace_id = EXCLUDED.workspace_id"
+        ));
+        let assignments = set_clause.split(" WHERE ").next().unwrap();
+        assert!(!assignments.contains("organization_id"));
+        assert!(!assignments.contains("workspace_id"));
+        // Rolling compatibility: the arbiter is the key the previous release uses.
+        assert!(sql.contains("ON CONFLICT (chat_id, signing_algo)"));
     }
 }

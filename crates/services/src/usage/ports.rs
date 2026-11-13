@@ -383,6 +383,22 @@ pub trait UsageRepository: Send + Sync {
         provider_request_id: &str,
     ) -> anyhow::Result<Option<StopReason>>;
 
+    /// Whether a usage row of `organization_id` and `workspace_id` for `id`
+    /// ended with [`StopReason::ClientDisconnect`]. `id` matches the row's
+    /// `provider_request_id`; a `resp_<uuid>` id also matches its `response_id`.
+    /// Rows of any other organization or workspace never match.
+    ///
+    /// The default answers `false`, so an implementation without the lookup
+    /// reports every missing signature as not found.
+    async fn has_client_disconnect_usage(
+        &self,
+        _organization_id: Uuid,
+        _workspace_id: Uuid,
+        _id: &str,
+    ) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+
     /// Get per-model usage aggregation for an organization from `start_date` up to
     /// `end_date` (exclusive; open-ended when `None`).
     async fn get_usage_by_model(

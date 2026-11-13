@@ -12,7 +12,8 @@ const APPLY_SECTION: &str = "\n## Apply without a deploy\n\n\
 for the model releases above that this run saw live, each carrying its Sigstore bundle (the admin API \
 verifies every bundle at PATCH, and cloud-api verifies it again on load).\n\n\
 **The PATCH replaces the whole `model_pins` list.** Merge these rows with the \
-current value from `GET /v1/admin/settings/tinfoil_trust` first.\n\n\
+current value from `GET /v1/admin/settings/tinfoil_trust` first. `$ADMIN_API` is the \
+base URL of the admin API.\n\n\
 ```\n\
 curl -X PATCH \"$ADMIN_API/v1/admin/settings/tinfoil_trust\" -H \"Authorization: Bearer $ADMIN_TOKEN\" -H 'Content-Type: application/json' --data @tinfoil-admin-pins.json\n\
 ```\n";

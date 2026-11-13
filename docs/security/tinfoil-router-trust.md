@@ -11,7 +11,7 @@ In both cases the SNP report chain, the debug policy, the minimum TCB, the bindi
 
 ## Kill switch
 
-Operators can turn the Sigstore path off without a deploy. Routers are then trusted only through the compiled pins:
+Operators can turn the Sigstore path off without a deploy. Routers are then trusted only through the compiled pins. In the commands below, `$ADMIN_API` is the base URL of the admin API and `$ADMIN_TOKEN` an admin token for it:
 
 ```bash
 curl -X PATCH "$ADMIN_API/v1/admin/settings/tinfoil_trust" \

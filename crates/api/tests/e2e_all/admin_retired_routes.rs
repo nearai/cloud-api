@@ -133,6 +133,58 @@ fn retired_routes() -> Vec<(Method, String)> {
         (Method::POST, format!("{org}/staking/farm/bind")),
         (Method::GET, format!("{admin_org}/staking/farm")),
         (Method::POST, format!("{admin_org}/staking/farm/sync")),
+        // Organization read, update, delete and settings
+        (Method::GET, org.clone()),
+        (Method::PUT, org.clone()),
+        (Method::DELETE, org.clone()),
+        (Method::GET, format!("{org}/settings")),
+        (Method::PATCH, format!("{org}/settings")),
+        // Organization invitations and member changes
+        (Method::POST, format!("{org}/members/invite-by-email")),
+        (Method::GET, format!("{org}/members/invitations")),
+        (Method::DELETE, format!("{org}/members/invitations/{ID}")),
+        (Method::DELETE, format!("{org}/invitations/{ID}")),
+        (Method::PUT, format!("{org}/members/{ID}")),
+        (Method::DELETE, format!("{org}/members/{ID}")),
+        // Current user status, profile, contact email, invitations and tokens
+        (Method::GET, "/v1/users/me/status".into()),
+        (Method::PUT, "/v1/users/me/profile".into()),
+        (Method::POST, "/v1/users/me/contact-email".into()),
+        (Method::DELETE, "/v1/users/me/contact-email".into()),
+        (Method::GET, "/v1/users/me/invitations".into()),
+        (
+            Method::POST,
+            format!("/v1/users/me/invitations/{ID}/accept"),
+        ),
+        (
+            Method::POST,
+            format!("/v1/users/me/invitations/{ID}/decline"),
+        ),
+        (Method::DELETE, "/v1/users/me/tokens".into()),
+        (Method::POST, "/v1/users/contact-email/verify".into()),
+        // Token-based invitations
+        (Method::GET, format!("/v1/invitations/{ID}")),
+        (Method::POST, format!("/v1/invitations/{ID}/accept")),
+        // Workspace read, update and delete
+        (Method::GET, format!("/v1/workspaces/{ID}")),
+        (Method::PUT, format!("/v1/workspaces/{ID}")),
+        (Method::DELETE, format!("/v1/workspaces/{ID}")),
+        // Admin invitation delivery, user erasure, member role and access tokens
+        (Method::GET, "/v1/admin/invitation-email-deliveries".into()),
+        (
+            Method::POST,
+            format!("/v1/admin/invitation-email-deliveries/{ID}/resend"),
+        ),
+        (
+            Method::POST,
+            format!("/v1/admin/users/{ID}/erasure/preview"),
+        ),
+        (Method::POST, format!("/v1/admin/users/{ID}/erasure")),
+        (Method::POST, "/v1/admin/user-erasures/lookup".into()),
+        (Method::PUT, format!("{admin_org}/members/{ID}")),
+        (Method::POST, "/v1/admin/access-tokens".into()),
+        (Method::GET, "/v1/admin/access-tokens".into()),
+        (Method::DELETE, format!("/v1/admin/access-tokens/{ID}")),
     ]
 }
 

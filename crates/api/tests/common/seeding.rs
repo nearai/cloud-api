@@ -1134,6 +1134,11 @@ pub async fn seed_web_search_service() -> ServiceResponse {
 /// The shared mock user already holds `admin@test.com`, the default allowlisted email, so
 /// that email reuses it. The token has no User-Agent binding and read-write permission.
 pub async fn seed_admin_access_token(email: &str) -> String {
+    seed_admin_access_token_bound_to(email, None).await
+}
+
+/// Like [`seed_admin_access_token`], with the token bound to `user_agent` when given.
+pub async fn seed_admin_access_token_bound_to(email: &str, user_agent: Option<&str>) -> String {
     let database = seed_database().await;
     let client = database
         .pool()
@@ -1169,7 +1174,7 @@ pub async fn seed_admin_access_token(email: &str) -> String {
             format!("e2e-{}", Uuid::new_v4()),
             "e2e test".to_string(),
             Utc::now() + chrono::Duration::days(1),
-            None,
+            user_agent.map(str::to_string),
             AdminAccessTokenPermission::ReadWrite,
         )
         .await

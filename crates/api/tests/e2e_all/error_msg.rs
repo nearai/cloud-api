@@ -93,44 +93,6 @@ async fn test_organizations_duplicate_name_conflict_message() {
         err.error.message,
         "This organization name is already taken. Please choose a different name."
     );
-
-    let other = server
-        .post("/v1/organizations")
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
-        .json(&api::models::CreateOrganizationRequest {
-            name: format!("{org_name}-other"),
-            description: None,
-        })
-        .await;
-    assert_eq!(other.status_code(), 200);
-    let other = other.json::<api::models::OrganizationResponse>();
-
-    let rename = server
-        .put(&format!("/v1/organizations/{}", other.id))
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
-        .json(&serde_json::json!({ "name": org_name }))
-        .await;
-    assert_eq!(rename.status_code(), 409);
-    let rename_error = rename.json::<api::models::ErrorResponse>();
-    assert_eq!(rename_error.error.r#type, "conflict");
-    assert_eq!(rename_error.error.message, err.error.message);
-}
-
-#[tokio::test]
-async fn test_organizations_not_found() {
-    let server = setup_test_server().await;
-
-    let random_org_id = uuid::Uuid::new_v4();
-
-    let response = server
-        .get(format!("/v1/organizations/{random_org_id}").as_str())
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
-        .await;
-
-    assert_eq!(response.status_code(), 404);
-    let err = response.json::<api::models::ErrorResponse>();
-    assert_eq!(err.error.r#type, "not_found");
-    assert_eq!(err.error.message, "Organization not found");
 }
 
 // ============================================
@@ -188,29 +150,6 @@ async fn test_org_members_add_bad_request_invalid_user_id_message() {
     assert_eq!(err.error.message, "Invalid user ID");
 }
 
-#[tokio::test]
-async fn test_org_members_remove_not_found_message() {
-    let server = setup_test_server().await;
-    let org = create_org(&server).await;
-
-    let response = server
-        .delete(
-            format!(
-                "/v1/organizations/{}/members/{}",
-                org.id,
-                uuid::Uuid::new_v4()
-            )
-            .as_str(),
-        )
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
-        .await;
-
-    assert_eq!(response.status_code(), 404);
-    let err = response.json::<api::models::ErrorResponse>();
-    assert_eq!(err.error.r#type, "not_found");
-    assert_eq!(err.error.message, "Organization member not found");
-}
-
 // ============================================
 // Workspaces error message tests
 // ============================================
@@ -247,23 +186,6 @@ async fn test_workspaces_duplicate_name_conflict_message() {
         err.error.message,
         "Workspace name already exists in organization"
     );
-}
-
-#[tokio::test]
-async fn test_workspace_get_not_found_message() {
-    let server = setup_test_server().await;
-
-    let random_ws_id = uuid::Uuid::new_v4();
-
-    let response = server
-        .get(format!("/v1/workspaces/{random_ws_id}").as_str())
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
-        .await;
-
-    assert_eq!(response.status_code(), 404);
-    let err = response.json::<api::models::ErrorResponse>();
-    assert_eq!(err.error.r#type, "not_found");
-    assert_eq!(err.error.message, "Workspace not found");
 }
 
 #[tokio::test]

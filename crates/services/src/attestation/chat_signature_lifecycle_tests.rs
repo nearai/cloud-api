@@ -17,7 +17,7 @@ use inference_providers::mock::MockProvider;
 use uuid::Uuid;
 
 use super::{
-    chat_signatures::STREAM_SIGNATURE_STORE_TIMEOUT,
+    chat_signatures::{SIGNATURE_UNSUPPORTED, STREAM_SIGNATURE_STORE_TIMEOUT},
     ita::ProviderPoolModelAttestationCollector,
     models::{ChatSignature, SignatureKind, SignatureLookupResult, SignatureOwner},
     ports::{AttestationRepository, AttestationServiceTrait},
@@ -537,7 +537,7 @@ async fn store_gateway(service: &AttestationService, owner: SignatureOwner, chat
 fn assert_not_found(result: Result<SignatureLookupResult, AttestationError>) {
     match result {
         Err(AttestationError::SignatureNotFound(_)) => {}
-        other => panic!("expected SignatureNotFound, got {other:?}"),
+        _ => panic!("expected SignatureNotFound"),
     }
 }
 
@@ -678,8 +678,10 @@ async fn another_owner_cannot_replace_a_stored_signature() {
     );
 }
 
+/// A provider that never signs keeps the existing `SIGNATURE_UNSUPPORTED`
+/// answer for every caller, as signature reads are not owner-scoped.
 #[tokio::test]
-async fn miss_is_not_found_even_with_a_pinned_provider_without_signatures() {
+async fn pinned_provider_without_signatures_is_unsupported_for_any_caller() {
     let chat_id = "chatcmpl-owner-unsupported";
     let pool = Arc::new(InferenceProviderPool::new(
         None,
@@ -690,9 +692,33 @@ async fn miss_is_not_found_even_with_a_pinned_provider_without_signatures() {
         .await;
     let service = lifecycle_service(Arc::new(RecordingRepository::default()), pool);
 
-    assert_not_found(
-        service
-            .get_chat_signature(other_owner(), chat_id, None)
-            .await,
-    );
+    for caller in [owner(), other_owner()] {
+        match service.get_chat_signature(caller, chat_id, None).await {
+            Ok(SignatureLookupResult::Unavailable { error_code, .. }) => {
+                assert_eq!(error_code, SIGNATURE_UNSUPPORTED);
+            }
+            _ => panic!("expected SIGNATURE_UNSUPPORTED"),
+        }
+    }
+}
+
+/// A missing id stays `SignatureNotFound` when nothing pins it, or when the
+/// pinned provider does sign: only a non-signing provider is unsupported.
+#[tokio::test]
+async fn ordinary_miss_is_not_found() {
+    let pinned_chat_id = "chatcmpl-owner-signing-miss";
+    let pool = Arc::new(InferenceProviderPool::new(
+        None,
+        ExternalProvidersConfig::default(),
+    ));
+    let provider = Arc::new(MockProvider::new().with_chat_signature_support(true));
+    pool.store_chat_id_mapping(pinned_chat_id.to_string(), provider)
+        .await;
+    let service = lifecycle_service(Arc::new(RecordingRepository::default()), pool);
+
+    for chat_id in ["chatcmpl-owner-unknown", pinned_chat_id] {
+        for caller in [owner(), other_owner()] {
+            assert_not_found(service.get_chat_signature(caller, chat_id, None).await);
+        }
+    }
 }

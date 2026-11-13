@@ -261,7 +261,15 @@ async fn tinfoil_trust_round_trips_and_validates() {
         .iter()
         .map(|s| s["key"].as_str().unwrap())
         .collect();
-    assert_eq!(keys, ["placement", "attested_3p", "tinfoil_trust"]);
+    assert_eq!(
+        keys,
+        [
+            "placement",
+            "attested_3p",
+            "tinfoil_trust",
+            "usage_admission"
+        ]
+    );
 
     for body in [json!({"future": 1}), json!({"router_sigstore": "no"})] {
         let response = patch_as(&server, &token, path, body.clone()).await;

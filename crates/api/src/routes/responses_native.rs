@@ -74,6 +74,17 @@ pub(super) async fn handle(
             NativeResponsesError::InvalidRequest(message) => {
                 error(StatusCode::BAD_REQUEST, message)
             }
+            NativeResponsesError::AdmissionRejected(code) => {
+                let status = StatusCode::from_u16(code).unwrap_or(StatusCode::SERVICE_UNAVAILABLE);
+                let message = match status {
+                    StatusCode::BAD_REQUEST => "Invalid admission metadata",
+                    StatusCode::PAYMENT_REQUIRED => "Insufficient available budget",
+                    StatusCode::FORBIDDEN => "Usage admission is not permitted",
+                    StatusCode::TOO_MANY_REQUESTS => "Concurrent request limit exceeded",
+                    _ => "Usage admission unavailable",
+                };
+                error(status, message)
+            }
             NativeResponsesError::RateLimited => error(
                 StatusCode::TOO_MANY_REQUESTS,
                 "Concurrent request limit exceeded",

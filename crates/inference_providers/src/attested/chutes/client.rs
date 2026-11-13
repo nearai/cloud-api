@@ -12,6 +12,7 @@
 //! caller must verify an instance (see `services` `ChutesBackendVerifier`) before
 //! trusting any `e2e_pubkey` it returns.
 
+use crate::retry_admission::RequestAdmissionExt;
 use serde::Deserialize;
 
 use super::evidence::{EvidenceResponse, PublicEvidenceResponse};
@@ -317,7 +318,7 @@ impl ChutesClient {
         let resp = self
             .invoke_request(req)
             .timeout(std::time::Duration::from_secs(self.request_timeout_secs))
-            .send()
+            .send_with_admission()
             .await?;
         let resp = error_for_status(resp).await?;
         // Read the body *incrementally* with a cap so a chunked response without
@@ -331,7 +332,7 @@ impl ChutesClient {
         &self,
         req: &InvokeRequest<'_>,
     ) -> Result<reqwest::Response, ChutesClientError> {
-        let resp = self.invoke_request(req).send().await?;
+        let resp = self.invoke_request(req).send_with_admission().await?;
         error_for_status(resp).await
     }
 

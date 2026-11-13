@@ -346,7 +346,7 @@ fn metrics() -> Arc<dyn services::metrics::MetricsServiceTrait> {
 /// answered with the Tinfoil-unavailable 503 until a re-verify works (the HTTP
 /// layer maps a pool-wide retryable 503 to its 429 overload shape).
 #[tokio::test]
-async fn failed_first_verification_still_registers_and_answers_503() {
+async fn failed_first_verification_still_registers_and_returns_overload() {
     let (server, pool, _mock, database) = setup_test_server_with_pool().await;
     let model = format!("nearai/test-tinfoil-reg-{}", uuid::Uuid::new_v4());
     tinfoil_catalog_row(&server, &model).await;
@@ -371,27 +371,8 @@ async fn failed_first_verification_still_registers_and_answers_503() {
         "registered despite the failed first verification"
     );
 
-    // The pool sees the provider's own 503 and message ...
-    let params: inference_providers::ChatCompletionParams = serde_json::from_value(
-        json!({"model": model, "messages": [{"role":"user","content":"Hello"}], "max_tokens": 8}),
-    )
-    .unwrap();
-    match pool.chat_completion(params, "hash".to_string()).await {
-        Err(inference_providers::CompletionError::HttpError {
-            status_code,
-            message,
-            ..
-        }) => {
-            assert_eq!(status_code, 503);
-            assert!(
-                message.contains("Tinfoil temporarily unavailable"),
-                "{message}"
-            );
-        }
-        other => panic!("expected the Tinfoil 503, got {:?}", other.map(|_| ())),
-    }
-
-    // ... and the HTTP API surfaces the gateway's retryable overload shape.
+    // Use the HTTP entry point so the registered provider runs under monetary
+    // admission. Its unavailable 503 maps to the gateway's retryable overload shape.
     let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
     let api_key = get_api_key_for_org(&server, org.id).await;
     let r = server
@@ -406,7 +387,7 @@ async fn failed_first_verification_still_registers_and_answers_503() {
 
 /// Startup must not await network verification: with an ATC that accepts the
 /// connection and never answers, registration returns promptly, the provider is
-/// registered, and requests fail closed with the Tinfoil 503 meanwhile.
+/// registered, and the HTTP API reports overload until verification succeeds.
 #[tokio::test]
 async fn startup_does_not_wait_for_a_hanging_first_verification() {
     let (server, pool, _mock, database) = setup_test_server_with_pool().await;
@@ -444,16 +425,18 @@ async fn startup_does_not_wait_for_a_hanging_first_verification() {
         started.elapsed()
     );
     assert!(pool.has_provider(&model).await);
-    let params: inference_providers::ChatCompletionParams = serde_json::from_value(
-        json!({"model": model, "messages": [{"role":"user","content":"Hello"}], "max_tokens": 8}),
-    )
-    .unwrap();
-    match pool.chat_completion(params, "hash".to_string()).await {
-        Err(inference_providers::CompletionError::HttpError { status_code, .. }) => {
-            assert_eq!(status_code, 503)
-        }
-        other => panic!("expected the Tinfoil 503, got {:?}", other.map(|_| ())),
-    }
+    let org = setup_org_with_credits(&server, 10_000_000_000).await;
+    let api_key = get_api_key_for_org(&server, org.id).await;
+    let response = server
+        .post("/v1/chat/completions")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&json!({"model": model, "messages": [{"role":"user","content":"Hello"}], "max_tokens": 8}))
+        .await;
+    assert_eq!(response.status_code().as_u16(), 429, "{}", response.text());
+    assert_eq!(
+        response.json::<Value>()["error"]["type"],
+        "service_overloaded"
+    );
 }
 
 #[tokio::test]

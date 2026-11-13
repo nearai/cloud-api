@@ -1,5 +1,6 @@
 #[doc(hidden)]
 pub mod attested_3p_startup;
+mod audio_duration;
 pub mod cloud_platform;
 pub mod consts;
 pub mod conversions;
@@ -146,12 +147,14 @@ pub struct DomainServices {
 #[derive(Clone, Copy, Debug)]
 pub struct AppBuildOptions {
     pub start_database_encryption_recovery: bool,
+    pub start_usage_budget_expiry: bool,
 }
 
 impl Default for AppBuildOptions {
     fn default() -> Self {
         Self {
             start_database_encryption_recovery: true,
+            start_usage_budget_expiry: true,
         }
     }
 }
@@ -529,14 +532,35 @@ pub async fn init_domain_services_with_pool(
     ))
         as Arc<dyn services::workspace::WorkspaceServiceTrait + Send + Sync>;
 
+    // Admin settings: the production path builds and starts them in
+    // `init_inference_providers`, before their consumers register.
+    let admin_settings_service = match admin_settings {
+        Some(service) => service,
+        None => {
+            build_admin_settings(
+                Arc::new(
+                    database::repositories::PostgresAdminSettingsRepository::new(
+                        database.pool().clone(),
+                    ),
+                ),
+                &inference_provider_pool,
+                new_tinfoil_trust_handle(),
+            )
+            .await
+        }
+    };
+
     // Now create usage service with workspace_service
-    let usage_service = Arc::new(services::usage::UsageServiceImpl::new(
-        usage_repository as Arc<dyn services::usage::UsageRepository>,
-        models_repo.clone() as Arc<dyn services::usage::ModelRepository>,
-        limits_repository_for_usage as Arc<dyn services::usage::OrganizationLimitsRepository>,
-        workspace_service.clone(),
-        metrics_service.clone(),
-    )) as Arc<dyn services::usage::UsageServiceTrait + Send + Sync>;
+    let usage_service = Arc::new(
+        services::usage::UsageServiceImpl::new(
+            usage_repository as Arc<dyn services::usage::UsageRepository>,
+            models_repo.clone() as Arc<dyn services::usage::ModelRepository>,
+            limits_repository_for_usage as Arc<dyn services::usage::OrganizationLimitsRepository>,
+            workspace_service.clone(),
+            metrics_service.clone(),
+        )
+        .with_admission_settings(admin_settings_service.clone()),
+    ) as Arc<dyn services::usage::UsageServiceTrait + Send + Sync>;
 
     // Create organization limit repository for completion service rate limiting
     let org_limit_repository = Arc::new(database::repositories::PgOrganizationRepository::new(
@@ -708,24 +732,6 @@ pub async fn init_domain_services_with_pool(
         )
         .with_binding(staking_binding),
     );
-
-    // Admin settings: the production path builds and starts them in
-    // `init_inference_providers`, before their consumers register.
-    let admin_settings_service = match admin_settings {
-        Some(service) => service,
-        None => {
-            build_admin_settings(
-                Arc::new(
-                    database::repositories::PostgresAdminSettingsRepository::new(
-                        database.pool().clone(),
-                    ),
-                ),
-                &inference_provider_pool,
-                new_tinfoil_trust_handle(),
-            )
-            .await
-        }
-    };
 
     DomainServices {
         cloud_platform_check_api_key,
@@ -970,7 +976,7 @@ fn new_tinfoil_trust_handle() -> services::attestation::tinfoil_trust::TinfoilTr
 }
 
 /// Builds the admin settings service with every key registered in listing
-/// order (`placement`, `attested_3p`, `tinfoil_trust`), each publishing into
+/// order (`placement`, `attested_3p`, `tinfoil_trust`, `usage_admission`), each publishing into
 /// its owner's handle, then loads once and starts the periodic reload. A
 /// failing store keeps the defaults and never panics.
 pub(crate) async fn build_admin_settings(
@@ -985,6 +991,9 @@ pub(crate) async fn build_admin_settings(
             .register::<PlacementKey>(pool.placement_tuning())
             .register::<Attested3pKey>(pool.attested_3p_disabled())
             .register::<TinfoilTrustKey>(tinfoil_trust)
+            .register::<services::usage::budget::policy::UsageAdmissionKey>(Arc::new(
+                arc_swap::ArcSwap::from_pointee(Default::default()),
+            ))
             .build(),
     );
     service.clone().start().await;
@@ -1129,6 +1138,31 @@ pub fn build_app_with_config_and_options(
     config: Arc<ApiConfig>,
     build_options: AppBuildOptions,
 ) -> Router {
+    if build_options.start_usage_budget_expiry {
+        // Release expired holds even when no new request arrives for their organization.
+        let budget_service = domain_services.usage_service.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(20),
+                    budget_service.expire_budgets(),
+                )
+                .await
+                {
+                    Ok(Ok(expired)) => {
+                        if expired > 0 {
+                            tracing::info!(expired, "Expired usage budgets");
+                        }
+                    }
+                    _ => tracing::warn!("Usage budget expiry unavailable"),
+                }
+            }
+        });
+    }
     // Create analytics service (shared between user and admin routes)
     let analytics_repository = Arc::new(database::repositories::PgAnalyticsRepository::new(
         database.pool().clone(),
@@ -2230,6 +2264,18 @@ pub fn build_internal_routes(app_state: AppState) -> Router {
         .route(
             "/internal/usage",
             post(crate::routes::internal_usage::record_usage_internal),
+        )
+        .route(
+            "/internal/budget",
+            post(crate::routes::internal_usage::reserve_usage_internal),
+        )
+        .route(
+            "/internal/budget/unknown",
+            post(crate::routes::internal_usage::unknown_usage_internal),
+        )
+        .route(
+            "/internal/budget/release",
+            post(crate::routes::internal_usage::release_usage_internal),
         )
         .route(
             "/internal/models",

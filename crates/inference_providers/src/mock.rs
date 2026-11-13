@@ -241,6 +241,7 @@ impl ToolCall {
 #[derive(Clone)]
 pub struct ResponseTemplate {
     content: String,
+    completion_gate: Option<Arc<tokio::sync::Semaphore>>,
     reasoning_content: Option<String>,
     /// Simulate client disconnect after N chunks (stream ends without final usage chunk)
     disconnect_after_chunks: Option<usize>,
@@ -268,6 +269,7 @@ impl ResponseTemplate {
     pub fn new(content: impl Into<String>) -> Self {
         Self {
             content: content.into(),
+            completion_gate: None,
             reasoning_content: None,
             disconnect_after_chunks: None,
             stream_error_after_chunks: None,
@@ -285,6 +287,21 @@ impl ResponseTemplate {
     pub fn with_model(mut self, model: impl Into<String>) -> Self {
         self.model_override = Some(model.into());
         self
+    }
+
+    /// Hold responses until a test releases permits, without delaying admission itself.
+    pub fn with_completion_gate(mut self, gate: Arc<tokio::sync::Semaphore>) -> Self {
+        self.completion_gate = Some(gate);
+        self
+    }
+
+    async fn wait_for_completion(&self) {
+        if let Some(gate) = &self.completion_gate {
+            gate.acquire()
+                .await
+                .expect("test gate remains open")
+                .forget();
+        }
     }
 
     /// Set cache_read_tokens for usage (prompt_tokens_details.cached_tokens) in non-stream and stream final chunk.
@@ -721,6 +738,8 @@ struct MockConfig {
     embedding_error_override: Option<EmbeddingError>,
     /// When set, all audio transcription calls return this error instead of a response.
     audio_transcription_error_override: Option<AudioTranscriptionError>,
+    omit_audio_duration: bool,
+    audio_usage_seconds: Option<f64>,
     /// When set, privacy classify calls return this instead of running the
     /// built-in shape-based detector.
     privacy_classify_override: Option<PrivacyClassifyOverride>,
@@ -952,6 +971,8 @@ impl MockProvider {
                 stream_error_override: None,
                 embedding_error_override: None,
                 audio_transcription_error_override: None,
+                omit_audio_duration: false,
+                audio_usage_seconds: None,
                 privacy_classify_override: None,
             })),
             last_chat_params: Arc::new(Mutex::new(None)),
@@ -989,6 +1010,8 @@ impl MockProvider {
                 stream_error_override: None,
                 embedding_error_override: None,
                 audio_transcription_error_override: None,
+                omit_audio_duration: false,
+                audio_usage_seconds: None,
                 privacy_classify_override: None,
             })),
             last_chat_params: Arc::new(Mutex::new(None)),
@@ -1024,6 +1047,8 @@ impl MockProvider {
                 stream_error_override: None,
                 embedding_error_override: None,
                 audio_transcription_error_override: None,
+                omit_audio_duration: false,
+                audio_usage_seconds: None,
                 privacy_classify_override: None,
             })),
             last_chat_params: Arc::new(Mutex::new(None)),
@@ -1210,6 +1235,16 @@ impl MockProvider {
     ) {
         let mut config = self.config.lock().await;
         config.audio_transcription_error_override = error;
+    }
+
+    /// Model providers whose JSON format has text but no duration receipt.
+    pub async fn omit_audio_duration(&self) {
+        self.config.lock().await.omit_audio_duration = true;
+    }
+
+    /// Supply the duration normally carried by the provider's `usage.seconds`.
+    pub async fn set_audio_usage_seconds(&self, seconds: Option<f64>) {
+        self.config.lock().await.audio_usage_seconds = seconds;
     }
 
     /// Override privacy classify responses (body or HTTP error). Pass `None`
@@ -1457,6 +1492,8 @@ impl crate::InferenceProvider for MockProvider {
                 .unwrap_or_else(|| config.default_response.clone())
         };
 
+        response_template.wait_for_completion().await;
+
         // Calculate input tokens from messages (rough estimate: 1 word ≈ 1 token)
         let input_tokens: i32 = params
             .messages
@@ -1613,6 +1650,8 @@ impl crate::InferenceProvider for MockProvider {
             .sum();
         // Ensure at least some input tokens for very short messages
         let input_tokens = input_tokens.max(6);
+
+        response_template.wait_for_completion().await;
 
         // Keep a stable chat_id for both the response and signature registration.
         let response = response_template.generate_response(
@@ -2074,9 +2113,11 @@ impl crate::InferenceProvider for MockProvider {
                 .as_deref()
                 .is_none_or(|granularities| granularities.iter().any(|value| value == "segment"));
 
+        let config = self.config.lock().await;
         Ok(AudioTranscriptionResponse {
             text: mock_text.clone(),
-            duration: Some(mock_duration),
+            duration: (!config.omit_audio_duration).then_some(mock_duration),
+            usage_duration_seconds: config.audio_usage_seconds,
             language: params.language.or(Some("en".to_string())),
             segments: wants_segment_timestamps.then(|| {
                 vec![TranscriptionSegment {

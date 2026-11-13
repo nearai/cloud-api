@@ -1,3 +1,4 @@
+use crate::retry_admission::RequestAdmissionExt;
 mod attestation;
 mod fleet;
 mod placement_report;
@@ -1008,7 +1009,11 @@ impl Fleet {
         let ttfb_timeout_secs = self.config.control_timeout_seconds.max(0) as u64;
         let response = tokio::time::timeout(
             self.config.control_timeout(),
-            client.post(url).headers(headers).json(params).send(),
+            client
+                .post(url)
+                .headers(headers)
+                .json(params)
+                .send_with_admission(),
         )
         .await
         // TTFB stalls indicate the same backend is stuck — surface as
@@ -1097,12 +1102,13 @@ impl Fleet {
                     continue;
                 }
             };
+            crate::retry_admission::before_retry().await?;
             let send_res = client
                 .post(&url)
                 .headers(headers.clone())
                 .json(params)
                 .timeout(timeout)
-                .send()
+                .send_with_admission()
                 .await;
             let response = match send_res {
                 Ok(r) => r,
@@ -1226,6 +1232,7 @@ impl Fleet {
                     continue;
                 }
             };
+            crate::retry_admission::before_retry().await?;
             // Capture the send instant for the per-backend TTFT measurement.
             let started = std::time::Instant::now();
             let response = match self
@@ -1500,7 +1507,10 @@ impl InferenceProvider for Fleet {
         };
         let timeout_seconds = self.config.completion_timeout_seconds.max(1) as u64;
         let mut last_error = None;
-        for index in indices {
+        for (attempt_index, index) in indices.into_iter().enumerate() {
+            if attempt_index > 0 {
+                crate::retry_admission::before_retry().await?;
+            }
             let _lease = lease.take().or_else(|| {
                 index
                     .zip(route_key)
@@ -1523,7 +1533,7 @@ impl InferenceProvider for Fleet {
                     .headers(headers.clone())
                     .json(&request)
                     .timeout(Duration::from_secs(timeout_seconds))
-                    .send()
+                    .send_with_admission()
                     .await
                     .map_err(|e| crate::systemone::transport_error(e, timeout_seconds))?;
                 let response = crate::systemone::read_response(response, &request, false).await?;
@@ -2004,6 +2014,7 @@ impl InferenceProvider for Fleet {
                 // clear the index client and re-verify with a fresh attestation.
                 self.clear_index(index);
                 let fresh = self.get_or_verify_index_client(index).await?;
+                crate::retry_admission::before_retry().await?;
                 self.send_streaming_request(&url, primary_headers, &streaming_params, Some(&fresh))
                     .await
             }
@@ -2151,7 +2162,7 @@ impl InferenceProvider for Fleet {
                     .headers(headers.clone())
                     .json(&non_streaming_params)
                     .timeout(timeout)
-                    .send()
+                    .send_with_admission()
                     .await
                     .map_err(map_send_err)?;
                 if !response.status().is_success() {
@@ -2201,7 +2212,7 @@ impl InferenceProvider for Fleet {
                 .headers(hdrs)
                 .json(&non_streaming_params)
                 .timeout(timeout)
-                .send()
+                .send_with_admission()
         };
 
         let response = match send(&index_client, primary_headers.clone()).await {
@@ -2225,6 +2236,7 @@ impl InferenceProvider for Fleet {
             {
                 self.clear_index(index);
                 let fresh = self.get_or_verify_index_client(index).await?;
+                crate::retry_admission::before_retry().await?;
                 send(&fresh, primary_headers).await.map_err(map_send_err)?
             }
             Err(e) => return Err(map_send_err(e)),
@@ -2341,7 +2353,7 @@ impl InferenceProvider for Fleet {
             .headers(headers)
             .json(&params)
             .timeout(Duration::from_secs(180))
-            .send()
+            .send_with_admission()
             .await
             .map_err(to_image_gen_error)?;
 
@@ -2430,7 +2442,7 @@ impl InferenceProvider for Fleet {
             .headers(headers)
             .multipart(form)
             .timeout(self.config.completion_timeout())
-            .send()
+            .send_with_admission()
             .await
             .map_err(|e| {
                 tracing::debug!(
@@ -2547,7 +2559,7 @@ impl InferenceProvider for Fleet {
             .headers(headers)
             .multipart(form)
             .timeout(Duration::from_secs(180))
-            .send()
+            .send_with_admission()
             .await
             .map_err(|e| ImageEditError::EditError(format!("Request failed: {e}")))?;
 

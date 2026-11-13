@@ -825,6 +825,11 @@ fn every_registered_route_has_a_model_access_decision() {
         ("POST", "/internal/usage"),
         ("GET", "/internal/models"),
         ("GET", "/internal/model-access"),
+        // Service token: reserves for the supplied billing identity, resolving
+        // the model with that organization's grants before admission.
+        ("POST", "/internal/budget"),
+        ("POST", "/internal/budget/release"),
+        ("POST", "/internal/budget/unknown"),
     ];
     /// Routes that take no model name from the caller.
     const NO_MODEL_NAME: &[(&str, &str)] = &[

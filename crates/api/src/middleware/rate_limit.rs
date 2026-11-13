@@ -166,6 +166,17 @@ async fn check_rate_limit_for_api_key_in_scope(
     Ok(())
 }
 
+/// Short backoff for downstream capacity rejections; preserve any existing rate-window hint.
+pub(crate) fn with_retry_after(mut response: Response) -> Response {
+    if response.status() == StatusCode::TOO_MANY_REQUESTS {
+        response
+            .headers_mut()
+            .entry(RETRY_AFTER)
+            .or_insert(HeaderValue::from_static("2"));
+    }
+    response
+}
+
 pub async fn api_key_rate_limit_middleware(
     State(state): State<RateLimitState>,
     request: Request,
@@ -173,11 +184,11 @@ pub async fn api_key_rate_limit_middleware(
 ) -> Result<Response, RateLimitedResponse> {
     let auth_key = match request.extensions().get::<AuthenticatedApiKey>() {
         Some(key) => key.clone(),
-        None => return Ok(next.run(request).await),
+        None => return Ok(with_retry_after(next.run(request).await)),
     };
 
     check_rate_limit_for_api_key(&state, &auth_key).await?;
-    Ok(next.run(request).await)
+    Ok(with_retry_after(next.run(request).await))
 }
 
 pub async fn anthropic_api_key_rate_limit_middleware(
@@ -193,7 +204,7 @@ pub async fn anthropic_api_key_rate_limit_middleware(
     ),
 > {
     let Some(auth_key) = request.extensions().get::<AuthenticatedApiKey>().cloned() else {
-        return Ok(next.run(request).await);
+        return Ok(with_retry_after(next.run(request).await));
     };
 
     if let Err((status, headers, axum::Json(error))) =
@@ -209,7 +220,7 @@ pub async fn anthropic_api_key_rate_limit_middleware(
         ));
     }
 
-    Ok(next.run(request).await)
+    Ok(with_retry_after(next.run(request).await))
 }
 
 /// Anthropic rate-limits token counting separately from Messages creation.
@@ -228,7 +239,7 @@ pub async fn anthropic_count_tokens_rate_limit_middleware(
     ),
 > {
     let Some(auth_key) = request.extensions().get::<AuthenticatedApiKey>().cloned() else {
-        return Ok(next.run(request).await);
+        return Ok(with_retry_after(next.run(request).await));
     };
 
     if let Err((status, headers, axum::Json(error))) = check_rate_limit_for_api_key_in_scope(
@@ -249,7 +260,7 @@ pub async fn anthropic_count_tokens_rate_limit_middleware(
         ));
     }
 
-    Ok(next.run(request).await)
+    Ok(with_retry_after(next.run(request).await))
 }
 
 #[cfg(test)]

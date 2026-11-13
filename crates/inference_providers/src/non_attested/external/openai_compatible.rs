@@ -10,6 +10,7 @@
 //! - Any other OpenAI-compatible provider
 
 use super::backend::{BackendConfig, ExternalBackend};
+use crate::retry_admission::RequestAdmissionExt;
 use crate::{
     sse_parser::new_external_sse_parser, AudioTranscriptionError, AudioTranscriptionParams,
     AudioTranscriptionResponse, ChatCompletionParams, ChatCompletionResponse,
@@ -221,7 +222,7 @@ impl ExternalBackend for OpenAiCompatibleBackend {
                 config.timeout_seconds as u64,
             ))
             .json(&body)
-            .send()
+            .send_with_admission()
             .await
             .map_err(|e| CompletionError::CompletionError(e.to_string()))?;
         Ok(crate::responses_raw::ResponsesRawResponse {
@@ -284,7 +285,7 @@ impl ExternalBackend for OpenAiCompatibleBackend {
             .headers(headers)
             .timeout(timeout)
             .json(&streaming_params)
-            .send()
+            .send_with_admission()
             .await
             .map_err(|e| CompletionError::CompletionError(e.to_string()))?;
 
@@ -358,7 +359,7 @@ impl ExternalBackend for OpenAiCompatibleBackend {
             .headers(headers)
             .timeout(timeout)
             .json(&non_streaming_params)
-            .send()
+            .send_with_admission()
             .await
             .map_err(|e| CompletionError::CompletionError(e.to_string()))?;
 
@@ -425,7 +426,7 @@ impl ExternalBackend for OpenAiCompatibleBackend {
             .headers(headers)
             .timeout(timeout)
             .json(&generation_params)
-            .send()
+            .send_with_admission()
             .await
             .map_err(|e| ImageGenerationError::GenerationError(e.to_string()))?;
 
@@ -520,7 +521,7 @@ impl ExternalBackend for OpenAiCompatibleBackend {
             .headers(headers)
             .multipart(form)
             .timeout(timeout)
-            .send()
+            .send_with_admission()
             .await
             .map_err(|e| AudioTranscriptionError::TranscriptionError(e.to_string()))?;
 

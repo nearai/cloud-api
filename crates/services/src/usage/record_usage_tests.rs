@@ -10,11 +10,19 @@ use std::sync::Mutex;
 /// Captures the persisted request and echoes it back as an inserted row.
 #[derive(Default)]
 struct CapturingUsageRepository {
+    admissions: Mutex<Vec<budget::BudgetReservation>>,
     requests: Mutex<Vec<RecordUsageDbRequest>>,
 }
 
 #[async_trait::async_trait]
 impl UsageRepository for CapturingUsageRepository {
+    async fn admit_budget(
+        &self,
+        reservation: &budget::BudgetReservation,
+    ) -> Result<(), UsageError> {
+        self.admissions.lock().unwrap().push(reservation.clone());
+        Ok(())
+    }
     async fn record_usage(&self, request: RecordUsageDbRequest) -> anyhow::Result<UsageLogEntry> {
         let entry = UsageLogEntry {
             id: Uuid::new_v4(),
@@ -128,8 +136,8 @@ struct FixedModelRepository(ModelPricing);
 
 #[async_trait::async_trait]
 impl ModelRepository for FixedModelRepository {
-    async fn get_model_by_name(&self, _: &str) -> anyhow::Result<Option<ModelPricing>> {
-        unimplemented!()
+    async fn get_model_by_name(&self, name: &str) -> anyhow::Result<Option<ModelPricing>> {
+        Ok((self.0.model_name == name).then(|| self.0.clone()))
     }
 
     async fn get_model_by_id(&self, _: Uuid) -> anyhow::Result<Option<ModelPricing>> {
@@ -185,6 +193,7 @@ fn profile_without_cache_write() -> TextPricingProfile {
 /// pricing shows up.
 fn request(inference_type: InferenceType) -> RecordUsageServiceRequest {
     RecordUsageServiceRequest {
+        budget_id: None,
         organization_id: Uuid::new_v4(),
         workspace_id: Uuid::new_v4(),
         api_key_id: Uuid::new_v4(),
@@ -452,4 +461,149 @@ async fn passthrough_fields_reach_the_repository_unchanged() {
     assert_eq!(db.stop_reason, Some(StopReason::Completed));
     assert_eq!(db.image_count, Some(4));
     assert_eq!(db.provider_attribution, expected.provider_attribution);
+}
+
+#[tokio::test]
+async fn admitted_external_receipt_uses_existing_catalog_pricing() {
+    let pricing = model();
+    let repo = Arc::new(CapturingUsageRepository::default());
+    let mut live = pricing.clone();
+    live.input_cost_per_token = 9999;
+    let service = UsageServiceImpl::new(
+        repo.clone(),
+        Arc::new(FixedModelRepository(live)),
+        Arc::new(UnusedLimitsRepository),
+        Arc::new(MockWorkspaceServiceTrait::new()),
+        Arc::new(CapturingMetricsService::new()),
+    );
+    service
+        .record_usage_from_api(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            RecordUsageApiRequest::ChatCompletion {
+                model: pricing.model_name.clone(),
+                id: "admitted-receipt".into(),
+                input_tokens: Some(2),
+                output_tokens: Some(1),
+                cache_read_tokens: None,
+                provider_attribution: Default::default(),
+            },
+            None,
+            Some(Uuid::new_v4()),
+        )
+        .await
+        .unwrap();
+    let saved = repo.requests.lock().unwrap();
+    assert_eq!(saved.len(), 1);
+    assert_eq!(saved[0].input_cost, 19_998);
+    assert_eq!(saved[0].output_cost, 7);
+}
+
+#[tokio::test]
+async fn admission_uses_live_org_policy_and_audit_off_never_create_holds() {
+    use crate::admin_settings::{AdminSettingsRepository, AdminSettingsService, StoredSetting};
+    use budget::policy::{AdmissionSettings, UsageAdmissionKey};
+    struct SettingsRepo(serde_json::Value);
+    #[async_trait::async_trait]
+    impl AdminSettingsRepository for SettingsRepo {
+        async fn get_all(&self) -> anyhow::Result<Vec<StoredSetting>> {
+            Ok(vec![self.get("usage_admission").await?.unwrap()])
+        }
+        async fn get(&self, _: &str) -> anyhow::Result<Option<StoredSetting>> {
+            Ok(Some(StoredSetting {
+                key: "usage_admission".into(),
+                value: self.0.clone(),
+                updated_by_user_id: None,
+                updated_at: chrono::Utc::now(),
+            }))
+        }
+        async fn upsert(
+            &self,
+            _: &str,
+            _: serde_json::Value,
+            _: Uuid,
+        ) -> anyhow::Result<StoredSetting> {
+            unreachable!()
+        }
+    }
+    let enforced = Uuid::new_v4();
+    let disabled = Uuid::new_v4();
+    let settings=Arc::new(AdminSettingsService::builder(Arc::new(SettingsRepo(serde_json::json!({
+        "defaults":{"mode":"audit"},"organizations":{
+            enforced.to_string():{"mode":"enforce","organization_max_unsettled":512,"key_max_unsettled":128,"reservation_ttl_seconds":900,"unknown_outcome_ttl_seconds":60},
+            disabled.to_string():{"mode":"off"}
+        }
+    })))).register::<UsageAdmissionKey>(Arc::new(arc_swap::ArcSwap::from_pointee(AdmissionSettings::default()))).build());
+    assert!(settings.reload().await);
+    let repo = Arc::new(CapturingUsageRepository::default());
+    let metrics = Arc::new(CapturingMetricsService::new());
+    let service = UsageServiceImpl::new(
+        repo.clone(),
+        Arc::new(FixedModelRepository(model())),
+        Arc::new(UnusedLimitsRepository),
+        Arc::new(MockWorkspaceServiceTrait::new()),
+        metrics.clone(),
+    )
+    .with_admission_settings(settings);
+    for (org, expected) in [(enforced, true), (disabled, false), (Uuid::new_v4(), false)] {
+        let identity = BillingIdentity {
+            organization_id: org,
+            workspace_id: Uuid::new_v4(),
+            api_key_id: Uuid::new_v4(),
+            model_id: Uuid::new_v4(),
+        };
+        let features = budget::UsageFeatures::from_json(
+            InferenceType::ChatCompletion,
+            &serde_json::json!({"max_tokens":1}),
+        )
+        .unwrap();
+        assert_eq!(
+            service.admit(identity, features).await.unwrap().is_some(),
+            expected
+        );
+        if !expected {
+            let overflowing = budget::UsageFeatures::from_json(
+                InferenceType::ChatCompletion,
+                &serde_json::json!({"max_tokens":u64::MAX}),
+            )
+            .unwrap();
+            assert!(service
+                .admit(identity, overflowing)
+                .await
+                .unwrap()
+                .is_none());
+        }
+    }
+    let admissions = repo.admissions.lock().unwrap();
+    assert_eq!(admissions.len(), 1);
+    let hold = &admissions[0];
+    assert_eq!(hold.organization_max_unsettled, 512);
+    assert_eq!(hold.key_max_unsettled, 128);
+    assert_eq!(hold.reservation_ttl_seconds, 900);
+    let recorded = metrics.get_metrics();
+    let decisions: Vec<_> = recorded
+        .iter()
+        .filter(|metric| metric.name == budget::metrics::DECISIONS)
+        .collect();
+    assert_eq!(decisions.len(), 5);
+    for outcome in ["admitted", "off", "estimated", "estimate_failed"] {
+        assert!(decisions
+            .iter()
+            .any(|metric| metric.tags.contains(&format!("outcome:{outcome}"))));
+    }
+    for (stage, expected) in [("reserve", 1), ("total", 5)] {
+        assert_eq!(
+            recorded
+                .iter()
+                .filter(|metric| metric.name == budget::metrics::DURATION
+                    && metric.tags.contains(&format!("stage:{stage}")))
+                .count(),
+            expected
+        );
+    }
+    assert!(recorded.iter().all(|metric| !metric
+        .tags
+        .iter()
+        .any(|tag| tag.contains(&enforced.to_string()))));
 }

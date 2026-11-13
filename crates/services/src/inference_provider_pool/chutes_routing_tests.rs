@@ -168,15 +168,18 @@ async fn pinned_chat(pool: &InferenceProviderPool, streaming: bool) -> Result<()
         encryption_headers::MODEL_PUB_KEY.into(),
         json!(chutes_key(0)),
     );
-    if streaming {
-        pool.chat_completion_stream(params, "test".into(), ChatRoutingHints::default())
-            .await
-            .map(|_| ())
-    } else {
-        pool.chat_completion(params, "test".into())
-            .await
-            .map(|_| ())
-    }
+    crate::test_utils::with_test_budget(async {
+        if streaming {
+            pool.chat_completion_stream(params, "test".into(), ChatRoutingHints::default())
+                .await
+                .map(|_| ())
+        } else {
+            pool.chat_completion(params, "test".into())
+                .await
+                .map(|_| ())
+        }
+    })
+    .await
 }
 
 #[tokio::test]

@@ -62,21 +62,138 @@ limit, source, and policy version; it never edits the original posting-time
 allocations. If the added capacity exceeds the debt, the remainder is
 immediately available for new usage. No admin API call is required.
 
-## Rollout notes
+## Estimated admission
 
-- Deploy every inference, service, limit, and staking writer together. They
-  coordinate through the same per-organization database lock.
-- Inference usage posts through `record_organization_usage` (V0096) in one database
-  statement; the organization lock is held only during server-side accounting.
-  Platform-service usage still uses the Rust transaction path and the same lock.
-- Existing unattributed usage remains unknown and continues reducing aggregate
-  admission capacity. Its amount is snapshotted during the allocation-ledger
-  migration so usage posting does not rescan lifetime history. Establish
-  reviewed starting limits rather than backfilling speculative per-type
-  allocations.
-- Monitor allocation reconciliation and unfunded balances before expanding the
-  rollout. Allocation rows and their parent usage/balance update commit in one
-  transaction.
+Chat/Completions, Responses, Messages, image generation/edit, audio transcription
+and SystemOne reserve a local cost estimate before upstream dispatch, for every
+organization. Admission atomically checks both organization capacity and a key's
+optional spend limit. A key without a limit still shares the organization budget.
+The actual balance is unchanged; spendable capacity excludes active holds. Final
+settlement posts the full actual charge and deactivates the hold in the same
+transaction. The original estimate is never resized, debited or refunded. Admission
+creates an active hold in one operation. The internal release operation only frees
+attempts confirmed not to have been dispatched. It stores the amount, inference type and estimator version with
+billing identity and expiry, without persisting full input features or estimator policies.
+Actual pricing and organization discounts follow the existing settlement path;
+admission does not freeze them. A duplicate report with unchanged usage facts
+returns the recorded charge even when live prices or discounts have since changed.
+
+The administrator-only `usage_admission` setting controls admission. Its default
+organization policy is `audit`: estimates are recorded without creating holds or
+rejecting requests on admission errors. Actual usage is billed in every mode.
+
+The `defaults` policy applies to organizations absent from `organizations`.
+Each organization entry is a complete override; omitted fields use built-in defaults.
+Creating holds requires an explicit `enforce` mode in the selected policy.
+PATCH replaces each supplied top-level field, including the organization map.
+
+The top-level `enabled` switch defaults to `true`, which uses the selected organization
+policy. Setting it to `false` skips admission for every organization, including explicit
+overrides. Re-enabling restores those policies. Settings take effect through the existing
+reload mechanism. This switch does not cancel work or release existing holds.
+
+`enforce` estimates and reserves; `audit` estimates without holding credit; `off`
+skips admission. Authentication, existing credit checks and actual billing remain active.
+Changing a mode does not release previously created holds. Limits must be positive;
+the normal TTL is 1–86400 seconds and the unknown-outcome TTL must be positive and no
+longer than the normal TTL. Invalid settings are rejected.
+
+Audit still performs local feature measurement, reads model pricing, and records estimates.
+It avoids reservation writes and admission row locks. Feature collection precedes policy
+selection and remains on the request path when admission is disabled. Direct admission still
+makes its control request in audit mode, and a disabled policy still returns a response to it.
+
+Estimator parameters live in
+[`budget/policy.rs`](../crates/services/src/usage/budget/policy.rs) and ship with
+Cloud API. `ESTIMATOR_VERSION` identifies their calculation; the current version is 2.
+
+| Estimate parameter | Default |
+|---|---:|
+| `multiplier_basis_points` | 20000 (2 times) |
+| `minimum_nano_usd` | 1000 |
+| `bytes_per_token` | 3 |
+| `default_output_tokens` | 4096 |
+| `image_input_tokens` / `audio_input_tokens` | 2048 / 8192 |
+| `video_input_tokens` / `unknown_input_tokens` | 16384 / 16384 |
+| `audio_bytes_per_second` / `default_audio_seconds` | 1024 / 60 |
+| `decision_output_tokens` | 128 per SystemOne question |
+
+Text estimates count local UTF-8 bytes, complete tool definitions and structured
+output schemas (including property names), explicit token IDs, a flat 32-token overhead and
+media allowances, then add the requested output estimate capped by the known catalog
+output limit. Without an explicit limit, the quote uses the known catalog output limit,
+or 4096 only when the catalog has no limit. These are estimates, not hard ceilings
+on actual cost. Fixed per-item media allowances also apply to opaque or remote media;
+no downloads or remote counting are performed.
+Batch/choice/attempt counts multiply the corresponding units. Images use requested
+image count and catalog price; transcription uses the larger of the byte/rate floor
+and locally measured duration (or the 60-second allowance when duration is unavailable). The multiplier is rounded upward in integer nano-USD, with
+the minimum applied only to nonzero estimated cost. Free prices remain free.
+Tiered models quote the requested service tier (default when omitted), using its highest
+context-band and cache-class rates. Unknown or unconfigured tiers conservatively use
+the highest configured rates; pricing fallback does not alter the upstream request.
+No provider token-count call, media download, transcoding, or additional output
+limit is introduced. Existing inference-side parameter handling remains in place,
+including native Responses' existing catalog output cap. E2EE follows the same
+admission path using locally visible sizes/counts; content is not sent to the ledger.
+
+These values control exposure, not the final bill or a guaranteed per-request
+maximum. Actual usage above the estimate is fully posted, with unfunded debt when
+needed. Funding a charge, transferring credits, replacing limits and reconciling
+older debt all protect other requests' active holds under the organization lock.
+
+Each actual retry gets its own reservation. Actual usage follows the existing
+recording and retry paths; admission adds no durable receipt queue or background
+settlement replay. Cloud API releases expired holds every 30 seconds, and admission
+also reclaims expired holds for its organization. There are no heartbeats or estimate resizing. A client disconnect or transport
+error still records any billable usage already received and settles the hold.
+A connection or request-construction failure known to precede dispatch releases the
+hold immediately. HTTP errors, post-connect timeouts, cancellation and missing final usage
+mark the outcome unknown: the attempt leaves the running-slot count, while its money
+stays reserved until the earlier of its original expiry and the configured grace period
+(default five minutes). Duplicate notices never extend that deadline. The same treatment
+applies when actual-usage recording fails; existing receipt retries continue.
+Cancellation during initial dispatch uses a best-effort drop guard. Process crashes or
+failed lifecycle notifications still rely on the original TTL. Response completeness
+remains a separate requirement for signing. Expiry frees both reserved credit
+and the unsettled slot, preserving the identity needed for a late usage report.
+A late report still charges actual usage once, including overage. Work that outlives
+the TTL may overlap newly admitted work.
+Duplicate reports charge once even after a lost acknowledgement or deletion of the
+optional Responses record. Settled rows retain metadata for deduplication and audit
+but no longer reduce available capacity. If final usage is lost before it reaches
+the existing accounting path, expiry does not reconstruct it or charge the estimate.
+
+Audio settlement prefers the provider's duration-based `usage.seconds`, then
+verbose-response `duration`. If neither supplies a usable value, local Rust parsers
+read frame/sample timing from the uploaded audio, rounded up to seconds.
+Local file metering has at most four workers and a one-second parsing budget; if it
+cannot complete, provider usage remains authoritative. MP3 metering counts complete
+frames instead of trusting summary frame counts. This does not change uploaded bytes, response format,
+or encryption. The byte/rate estimate is never used as actual usage. If neither
+the provider nor the file supplies usable duration, return the existing response,
+log the missing usage, and apply the unknown-outcome grace period.
+
+Direct proxy requests use the internal admission endpoint with numeric metadata and a sanitized service-tier label
+and a separate `admission_id` in the final HTTP/SQS usage receipt. Admission also
+authorizes execution once: replaying an admitted ID does not authorize another
+inference. Direct proxies attempt release by their generated ID after a lost admission
+acknowledgement, before any inference dispatch. Cleanup racing an uncommitted admission
+can miss the row, so the TTL remains the fallback. Each new upstream attempt needs a
+fresh ID and reservation. Direct admission defaults to a two-second RPC deadline;
+the database admission transaction has a 1.5-second deadline (including pool wait),
+a one-second statement timeout and a 500ms lock timeout. Cloud API-mediated
+requests reserve locally and are not reserved again by the proxy. Embedding,
+rerank, privacy, score and standalone MCP search retain their prior admission
+flow; their ledger writes still respect active holds.
+
+## Accounting compatibility
+
+Admission and settlement require compatible reservation tables and accounting operations.
+All debit paths must respect active holds. Inference usage posts atomically through
+`record_organization_usage`; service usage retains its transaction path. Allocation rows
+and the parent usage/balance update commit together. Existing unattributed usage continues
+to reduce aggregate admission capacity.
 
 ## Reconciling legacy consumption when moving to postpay
 
@@ -393,9 +510,10 @@ Each transaction locks both organizations in UUID order. Current membership or
 credential authority is checked under a row lock; membership changes and
 credential revocation serialize against that check. Session authentication occurs
 at HTTP admission. Policy and organization lifecycle updates use the same durable
-organization locks. Existing inference admission does not reserve capacity: work
-admitted before distribution can finish afterwards with overage. Further sends
-are blocked once overage is posted. Prefer a dedicated distribution organization.
+organization locks. Covered inference endpoints reserve capacity before dispatch,
+and transfers exclude those active holds. Actual usage above an estimate and
+endpoints without admission can still post overage; further sends are blocked
+once overage is posted. Prefer a dedicated distribution organization.
 
 409 codes distinguish `insufficient_posted_capacity`, `sender_not_reconciled`,
 `idempotency_conflict`, `capacity_overflow`, `organization_transfer_limit_exceeded`,

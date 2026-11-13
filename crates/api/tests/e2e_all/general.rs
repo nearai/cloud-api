@@ -1624,7 +1624,8 @@ async fn test_organization_balance_with_limit_and_usage() {
 #[tokio::test]
 async fn test_high_context_length_completion() {
     let server = setup_test_server().await;
-    let org = setup_org_with_credits(&server, 100000000000i64).await; // $100.00 USD
+    // Fund the large-input reservation at this fixture's synthetic token prices.
+    let org = setup_org_with_credits(&server, 1_000_000_000_000i64).await;
     println!("Created organization: {}", org.id);
 
     // Use a test-specific catalog row so this metadata variant cannot mutate

@@ -208,9 +208,27 @@ pub async fn audio_transcriptions(
         _ => request.response_format.clone(),
     };
 
+    let mut features = match services::usage::budget::UsageFeatures::from_json(
+        services::usage::InferenceType::AudioTranscription,
+        &serde_json::json!({}),
+    ) {
+        Ok(features) => features,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    features.media_bytes = request.file_bytes.len() as u64;
+    // Meter a shared view of the upload; keep the original available even if the
+    // blocking parser fails. Once it finishes, the provider reuses the same buffer.
+    let file_bytes = bytes::Bytes::from(request.file_bytes);
+    let file_duration_seconds = crate::audio_duration::measure(file_bytes.clone()).await;
+    features.audio_duration_seconds = file_duration_seconds.map(|n| n as u64);
+    let budget =
+        match crate::routes::common::usage_execution(&app_state, &api_key, model_id, features) {
+            Ok(budget) => budget,
+            Err(response) => return response.into_response(),
+        };
     let params = inference_providers::AudioTranscriptionParams {
         model: model_name.clone(),
-        file_bytes: request.file_bytes,
+        file_bytes: file_bytes.into(),
         filename: request.filename,
         language: request
             .language
@@ -222,15 +240,14 @@ pub async fn audio_transcriptions(
     };
 
     // Call completion service which handles concurrent request limiting
-    match app_state
-        .completion_service
-        .audio_transcription(
+    match budget
+        .run(app_state.completion_service.audio_transcription(
             organization_id,
             model_id,
             &model_name,
             params,
             body_hash.hash.clone(),
-        )
+        ))
         .await
     {
         Ok(response) => {
@@ -241,13 +258,11 @@ pub async fn audio_transcriptions(
             let workspace_id = api_key.workspace.id.0;
             let api_key_id_str = api_key.api_key.id.0.clone();
 
-            // Clamp duration to valid range [0, i32::MAX] to prevent overflow and negative values
+            // Prefer provider usage.seconds or verbose duration, then local file timing.
             let duration_seconds = response
-                .duration
-                .unwrap_or(0.0)
-                .max(0.0)
-                .min(i32::MAX as f64)
-                .ceil() as i32;
+                .billable_duration_seconds()
+                .or(file_duration_seconds)
+                .unwrap_or(0);
 
             // Parse API key ID to UUID
             let api_key_id = match uuid::Uuid::parse_str(&api_key_id_str) {
@@ -267,6 +282,7 @@ pub async fn audio_transcriptions(
 
             let inference_id = uuid::Uuid::new_v4();
             let usage_request = services::usage::RecordUsageServiceRequest {
+                budget_id: budget.id().await.ok().flatten(),
                 input_tokens: duration_seconds, // Bill by duration in seconds
                 inference_id: Some(inference_id),
                 stop_reason: Some(services::usage::StopReason::Completed),
@@ -281,30 +297,41 @@ pub async fn audio_transcriptions(
                 )
             };
 
-            // Record usage synchronously - fail the request if usage recording fails
-            if let Err(e) = app_state.usage_service.record_usage(usage_request).await {
-                tracing::error!(
-                    error = %e,
+            if duration_seconds > 0 {
+                // Record usage synchronously - fail the request if usage recording fails
+                if let Err(e) = app_state.usage_service.record_usage(usage_request).await {
+                    tracing::error!(
+                        error = %e,
+                        %organization_id,
+                        %workspace_id,
+                        "Failed to record audio transcription usage"
+                    );
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        ResponseJson(ErrorResponse::new(
+                            "Failed to record usage - please retry".to_string(),
+                            "server_error".to_string(),
+                        )),
+                    )
+                        .into_response();
+                }
+
+                tracing::info!(
                     %organization_id,
                     %workspace_id,
-                    "Failed to record audio transcription usage"
+                    duration_seconds,
+                    "Audio transcription completed and usage recorded successfully"
                 );
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    ResponseJson(ErrorResponse::new(
-                        "Failed to record usage - please retry".to_string(),
-                        "server_error".to_string(),
-                    )),
+            } else {
+                tracing::warn!(%organization_id, %workspace_id,
+                    "Audio transcription duration unavailable; awaiting late usage or expiry");
+                services::usage::budget::unknown_outcome(
+                    app_state.usage_service.as_ref(),
+                    organization_id,
+                    usage_request.budget_id,
                 )
-                    .into_response();
+                .await;
             }
-
-            tracing::info!(
-                %organization_id,
-                %workspace_id,
-                duration_seconds,
-                "Audio transcription completed and usage recorded successfully"
-            );
 
             if requested_response_format.as_deref() == Some("text") {
                 (

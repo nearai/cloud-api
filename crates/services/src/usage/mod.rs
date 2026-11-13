@@ -1,3 +1,4 @@
+pub mod budget;
 pub mod hourly_scheduler;
 pub mod ports;
 mod pricing;
@@ -196,9 +197,142 @@ pub struct UsageServiceImpl {
     limits_repository: Arc<dyn OrganizationLimitsRepository>,
     workspace_service: Arc<dyn crate::workspace::WorkspaceServiceTrait>,
     metrics_service: Arc<dyn MetricsServiceTrait>,
+    admission_settings: Option<Arc<crate::admin_settings::AdminSettingsService>>,
 }
 
 impl UsageServiceImpl {
+    fn admission_policy(&self, organization_id: Uuid) -> budget::policy::AdmissionPolicy {
+        self.admission_settings
+            .as_ref()
+            .map(|settings| settings.current::<budget::policy::UsageAdmissionKey>())
+            .unwrap_or_default()
+            .for_organization(organization_id)
+    }
+
+    pub fn with_admission_settings(
+        mut self,
+        settings: Arc<crate::admin_settings::AdminSettingsService>,
+    ) -> Self {
+        self.admission_settings = Some(settings);
+        self
+    }
+
+    async fn reserve_budget(
+        &self,
+        id: Uuid,
+        identity: BillingIdentity,
+        bounds: budget::UsageFeatures,
+        requested_mode: budget::policy::AdmissionMode,
+        path: &'static str,
+    ) -> Result<budget::BudgetAdmission, UsageError> {
+        use budget::{metrics, policy::AdmissionMode};
+        let policy = self.admission_policy(identity.organization_id);
+        let mode = policy.mode.combined(requested_mode);
+        let started = std::time::Instant::now();
+        let mut audit_error = None;
+        let result = async {
+            let mut admission = budget::BudgetAdmission {
+                id: None,
+                mode,
+                estimated_amount: None,
+            };
+            if mode == AdmissionMode::Off {
+                return Ok(admission);
+            }
+            let quote_started = std::time::Instant::now();
+            let quote = async {
+                let pricing = self
+                    .model_repository
+                    .get_model_by_id(identity.model_id)
+                    .await
+                    .map_err(|e| UsageError::InternalError(e.to_string()))?
+                    .ok_or_else(|| UsageError::ModelNotFound(identity.model_id.to_string()))?;
+                bounds.estimate()?.quote(&pricing)
+            }
+            .await;
+            metrics::duration(
+                self.metrics_service.as_ref(),
+                path,
+                mode,
+                "estimate",
+                quote_started.elapsed(),
+            );
+            let amount = match quote {
+                Ok(amount) => amount,
+                Err(error) if mode == AdmissionMode::Audit => {
+                    audit_error = Some(metrics::error_reason(&error));
+                    return Ok(admission);
+                }
+                Err(error) => return Err(error),
+            };
+            admission.estimated_amount = Some(amount);
+            if id.as_u128().is_multiple_of(100) {
+                tracing::info!(event = "usage_admission_estimate",
+                    organization_id = %identity.organization_id, model_id = %identity.model_id,
+                    inference_type = bounds.inference_type.as_str(),
+                    mode = metrics::mode_label(mode), path, estimated_nano_usd = amount,
+                    estimator_version = budget::ESTIMATOR_VERSION, sample_rate = 0.01,
+                    "Admission estimate sample");
+            }
+            if mode == AdmissionMode::Audit {
+                return Ok(admission);
+            }
+            let reservation = budget::BudgetReservation {
+                id,
+                amount,
+                identity,
+                inference_type: bounds.inference_type,
+                estimator_version: budget::ESTIMATOR_VERSION,
+                organization_max_unsettled: policy.organization_max_unsettled,
+                key_max_unsettled: policy.key_max_unsettled,
+                reservation_ttl_seconds: policy.reservation_ttl_seconds,
+            };
+            let db_started = std::time::Instant::now();
+            let reserved = self.usage_repository.admit_budget(&reservation).await;
+            metrics::duration(
+                self.metrics_service.as_ref(),
+                path,
+                mode,
+                "reserve",
+                db_started.elapsed(),
+            );
+            reserved?;
+            admission.id = Some(id);
+            Ok(admission)
+        }
+        .await;
+        let (outcome, reason) = match &result {
+            Err(error) => ("rejected", metrics::error_reason(error)),
+            Ok(_) if audit_error.is_some() => {
+                ("estimate_failed", audit_error.unwrap_or("unavailable"))
+            }
+            Ok(_) => (
+                match mode {
+                    AdmissionMode::Off => "off",
+                    AdmissionMode::Audit => "estimated",
+                    AdmissionMode::Enforce => "admitted",
+                },
+                "none",
+            ),
+        };
+        metrics::decision(
+            self.metrics_service.as_ref(),
+            path,
+            mode,
+            &bounds,
+            outcome,
+            reason,
+        );
+        metrics::duration(
+            self.metrics_service.as_ref(),
+            path,
+            mode,
+            "total",
+            started.elapsed(),
+        );
+        result
+    }
+
     pub fn new(
         usage_repository: Arc<dyn UsageRepository>,
         model_repository: Arc<dyn ModelRepository>,
@@ -212,26 +346,23 @@ impl UsageServiceImpl {
             limits_repository,
             workspace_service,
             metrics_service,
+            admission_settings: None,
         }
     }
-}
-
-#[async_trait::async_trait]
-impl UsageServiceTrait for UsageServiceImpl {
     /// Record usage after an API call completes
-    async fn record_usage(
+    async fn record_usage_inner(
         &self,
         request: RecordUsageServiceRequest,
     ) -> Result<UsageLogEntry, UsageError> {
-        // Look up the model to get pricing (model_id is already a UUID)
+        if request.budget_id.is_some() {
+            budget::validate_actual(&request)?;
+        }
         let model = self
             .model_repository
             .get_model_by_id(request.model_id)
             .await
-            .map_err(|e| UsageError::InternalError(format!("Failed to get model: {e}")))?
-            .ok_or_else(|| {
-                UsageError::ModelNotFound(format!("Model with ID '{}' not found", request.model_id))
-            })?;
+            .map_err(|e| UsageError::InternalError(e.to_string()))?
+            .ok_or_else(|| UsageError::ModelNotFound(request.model_id.to_string()))?;
 
         let pricing::PricedUsage {
             cache_read_tokens,
@@ -243,6 +374,14 @@ impl UsageServiceTrait for UsageServiceImpl {
             service_tier,
             context_band,
         } = pricing::price_usage(&request, &model, self.metrics_service.as_ref())?;
+
+        let billing_details = if let Some(id) = request.budget_id {
+            let mut details = billing_details.unwrap_or_else(|| serde_json::json!({}));
+            details["budget_reservation_id"] = serde_json::json!(id);
+            Some(details)
+        } else {
+            billing_details
+        };
 
         // Create database request with model UUID and name (denormalized).
         // Note: `cache_read_tokens` is persisted for observability across all inference types,
@@ -281,7 +420,7 @@ impl UsageServiceTrait for UsageServiceImpl {
             dedupe_on_conflict: request.dedupe_on_conflict,
         };
 
-        // Record in database
+        // Actual usage and release of its hold commit in the same ledger transaction.
         let log = self
             .usage_repository
             .record_usage(db_request)
@@ -349,6 +488,77 @@ impl UsageServiceTrait for UsageServiceImpl {
 
         Ok(log)
     }
+}
+
+#[async_trait::async_trait]
+impl UsageServiceTrait for UsageServiceImpl {
+    async fn mark_budget_unknown(&self, organization_id: Uuid, id: Uuid) -> Result<(), UsageError> {
+        let grace = self
+            .admission_policy(organization_id)
+            .unknown_outcome_ttl_seconds;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            self.usage_repository
+                .mark_budget_unknown(organization_id, id, grace),
+        )
+        .await
+        .map_err(|_| UsageError::InternalError("Budget outcome update timed out".into()))?
+        .map_err(|_| UsageError::InternalError("Budget outcome update failed".into()))
+    }
+    async fn release_budget(&self, organization_id: Uuid, id: Uuid) -> Result<(), UsageError> {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            self.usage_repository.release_budget(organization_id, id),
+        )
+        .await
+        .map_err(|_| UsageError::InternalError("Budget release timed out".into()))?
+        .map_err(|_| UsageError::InternalError("Budget release failed".into()))
+    }
+    async fn expire_budgets(&self) -> Result<u64, UsageError> {
+        self.usage_repository
+            .expire_budgets()
+            .await
+            .map_err(|_| UsageError::InternalError("Usage budget expiry failed".into()))
+    }
+
+    async fn admit(
+        &self,
+        identity: BillingIdentity,
+        bounds: budget::UsageFeatures,
+    ) -> Result<Option<Uuid>, UsageError> {
+        self.reserve_budget(
+            Uuid::new_v4(),
+            identity,
+            bounds,
+            budget::policy::AdmissionMode::Enforce,
+            "cloud_api",
+        )
+        .await
+        .map(|result| result.id)
+    }
+
+    async fn admit_external(
+        &self,
+        identity: BillingIdentity,
+        bounds: budget::UsageFeatures,
+        report_id: Uuid,
+        mode: budget::policy::AdmissionMode,
+    ) -> Result<budget::BudgetAdmission, UsageError> {
+        self.reserve_budget(report_id, identity, bounds, mode, "direct_proxy")
+            .await
+    }
+    async fn record_usage(
+        &self,
+        request: RecordUsageServiceRequest,
+    ) -> Result<UsageLogEntry, UsageError> {
+        let organization_id = request.organization_id;
+        let budget_id = request.budget_id;
+        let result = self.record_usage_inner(request).await;
+        if result.is_err() {
+            budget::unknown_outcome(self, organization_id, budget_id).await;
+        }
+        result
+    }
 
     /// Record usage from the public API endpoint.
     /// Resolves model by name, validates per-variant fields, and delegates to `record_usage`.
@@ -359,6 +569,7 @@ impl UsageServiceTrait for UsageServiceImpl {
         api_key_id: Uuid,
         request: RecordUsageApiRequest,
         discount: Option<UsageDiscount>,
+        admission_id: Option<Uuid>,
     ) -> Result<UsageLogEntry, UsageError> {
         let (
             model_name,
@@ -408,6 +619,24 @@ impl UsageServiceTrait for UsageServiceImpl {
                     cache_read,
                     None,
                     InferenceType::ChatCompletion,
+                    id.clone(),
+                    *provider_attribution,
+                )
+            }
+            RecordUsageApiRequest::AudioTranscription {
+                model,
+                duration_seconds,
+                id,
+                provider_attribution,
+            } => {
+                validate_input_only_usage(id, *duration_seconds)?;
+                (
+                    model.clone(),
+                    *duration_seconds,
+                    0,
+                    0,
+                    None,
+                    InferenceType::AudioTranscription,
                     id.clone(),
                     *provider_attribution,
                 )
@@ -513,7 +742,10 @@ impl UsageServiceTrait for UsageServiceImpl {
             }
         };
 
-        // Look up model by name to get pricing and UUID
+        let provider_request_id = Some(external_id.clone());
+        let external_inference_id =
+            Uuid::new_v5(&EXTERNAL_USAGE_ID_NAMESPACE, external_id.as_bytes());
+        let inference_id = Some(admission_id.unwrap_or(external_inference_id));
         let model = self
             .model_repository
             .get_model_by_name(&model_name)
@@ -523,23 +755,11 @@ impl UsageServiceTrait for UsageServiceImpl {
                 UsageError::ModelNotFound(format!("Model '{}' not found", model_name))
             })?;
 
-        // Derive inference tracking fields from the required external `id`.
-        // The raw value is stored verbatim as `provider_request_id`, but
-        // hashed under a dedicated UUID v5 namespace into `inference_id` so
-        // externally-submitted records live in a disjoint id space from the
-        // internal pipeline (which hashes the raw provider id under
-        // `NAMESPACE_DNS`). Idempotency within this endpoint is preserved
-        // because v5 is deterministic for a given (namespace, name) pair.
-        let provider_request_id = Some(external_id.clone());
-        let inference_id = Some(Uuid::new_v5(
-            &EXTERNAL_USAGE_ID_NAMESPACE,
-            external_id.as_bytes(),
-        ));
-
         // Build internal request and delegate.
         // Internal metrics (ttft_ms, avg_itl_ms, stop_reason) are not exposed
         // via the public API — they are populated only by the inference pipeline.
         let service_request = RecordUsageServiceRequest {
+            budget_id: admission_id,
             input_tokens,
             output_tokens,
             cache_read_tokens,

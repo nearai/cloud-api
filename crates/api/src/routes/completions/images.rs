@@ -114,6 +114,28 @@ pub async fn image_generations(
         request.response_format.clone()
     };
 
+    let features = match services::usage::budget::UsageFeatures::from_json(
+        services::usage::InferenceType::ImageGeneration,
+        &serde_json::json!({"n": request.n}),
+    ) {
+        Ok(features) => features,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                ResponseJson(ErrorResponse::new(
+                    "Invalid admission metadata".into(),
+                    "invalid_request_error".into(),
+                )),
+            )
+                .into_response()
+        }
+    };
+    let budget =
+        match crate::routes::common::usage_execution(&app_state, &api_key, model.id, features) {
+            Ok(budget) => budget,
+            Err(response) => return response.into_response(),
+        };
+
     // Convert API request to provider params
     let mut extra = std::collections::HashMap::new();
     insert_encryption_headers(&encryption_headers, &mut extra);
@@ -130,9 +152,12 @@ pub async fn image_generations(
     };
 
     // Call the inference provider pool
-    match app_state
-        .inference_provider_pool
-        .image_generation_with_attribution(params, body_hash.hash.clone())
+    match budget
+        .run(
+            app_state
+                .inference_provider_pool
+                .image_generation_with_attribution(params, body_hash.hash.clone()),
+        )
         .await
     {
         Ok(attributed_response) => {
@@ -189,7 +214,7 @@ pub async fn image_generations(
                 }
             };
 
-            let usage_request = build_image_usage_request(ImageUsageRecord {
+            let mut usage_request = build_image_usage_request(ImageUsageRecord {
                 organization_id,
                 workspace_id,
                 api_key_id,
@@ -199,6 +224,7 @@ pub async fn image_generations(
                 provider_attribution,
                 inference_type: services::usage::InferenceType::ImageGeneration,
             });
+            usage_request.budget_id = budget.id().await.ok().flatten();
             record_usage_with_sync_fallback(usage_service, usage_request, "Image generation").await;
 
             // Return the exact bytes from the provider for hash verification
@@ -522,6 +548,28 @@ pub async fn image_edits(
         request.response_format.clone()
     };
 
+    let features = match services::usage::budget::UsageFeatures::from_json(
+        services::usage::InferenceType::ImageEdit,
+        &serde_json::json!({}),
+    ) {
+        Ok(features) => features,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                ResponseJson(ErrorResponse::new(
+                    "Invalid admission metadata".into(),
+                    "invalid_request_error".into(),
+                )),
+            )
+                .into_response()
+        }
+    };
+    let budget =
+        match crate::routes::common::usage_execution(&app_state, &api_key, model.id, features) {
+            Ok(budget) => budget,
+            Err(response) => return response.into_response(),
+        };
+
     // Convert API request to provider params
     let params = inference_providers::ImageEditParams {
         model: request.model.clone(),
@@ -532,9 +580,12 @@ pub async fn image_edits(
     };
 
     // Call the inference provider pool
-    match app_state
-        .inference_provider_pool
-        .image_edit_with_attribution(params, body_hash.hash.clone())
+    match budget
+        .run(
+            app_state
+                .inference_provider_pool
+                .image_edit_with_attribution(params, body_hash.hash.clone()),
+        )
         .await
     {
         Ok(attributed_response) => {
@@ -591,7 +642,7 @@ pub async fn image_edits(
                 }
             };
 
-            let usage_request = build_image_usage_request(ImageUsageRecord {
+            let mut usage_request = build_image_usage_request(ImageUsageRecord {
                 organization_id,
                 workspace_id,
                 api_key_id,
@@ -601,6 +652,7 @@ pub async fn image_edits(
                 provider_attribution,
                 inference_type: services::usage::InferenceType::ImageEdit,
             });
+            usage_request.budget_id = budget.id().await.ok().flatten();
             record_usage_with_sync_fallback(usage_service, usage_request, "Image edit").await;
 
             // Return the exact bytes from the provider for hash verification

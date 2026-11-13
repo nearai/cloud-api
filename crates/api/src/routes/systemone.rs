@@ -126,17 +126,33 @@ pub async fn systemone(
             )
         }
     };
+    let metadata = match serde_json::to_value(&request) {
+        Ok(value) => value,
+        Err(_) => return error(StatusCode::INTERNAL_SERVER_ERROR, "Cannot estimate request"),
+    };
+    let features = match services::usage::budget::UsageFeatures::from_json(
+        InferenceType::Decisions,
+        &metadata,
+    ) {
+        Ok(features) => features,
+        Err(_) => return error(StatusCode::BAD_REQUEST, "Invalid admission metadata"),
+    };
+    let budget = match common::usage_execution(&state, &api_key, model.id, features) {
+        Ok(budget) => budget,
+        Err(response) => return response.into_response(),
+    };
     // System One backends receive no tenant ids: the inference call and the
     // signature fetch in `finalize` both run with the tracing context cleared.
-    let served = match without_tracing_context(
-        state.inference_provider_pool.systemone_with_attribution(
-            request,
-            body_hash.hash.clone(),
-            encryption.model_pub_key.as_deref(),
-            !api_key.organization.fallback_enabled(),
-        ),
-    )
-    .await
+    let served = match budget
+        .run(without_tracing_context(
+            state.inference_provider_pool.systemone_with_attribution(
+                request,
+                body_hash.hash.clone(),
+                encryption.model_pub_key.as_deref(),
+                !api_key.organization.fallback_enabled(),
+            ),
+        ))
+        .await
     {
         Ok(response) => response,
         Err(err) => {
@@ -152,6 +168,7 @@ pub async fn systemone(
         let inference_id = hash_inference_id_to_uuid(decision_id);
         let usage = &served.response.response.usage;
         let usage_request = RecordUsageServiceRequest {
+            budget_id: budget.id().await.ok().flatten(),
             input_tokens: usage.input_tokens,
             output_tokens: usage.output_tokens,
             inference_id: Some(inference_id),

@@ -124,6 +124,7 @@ where
     metrics_service: Arc<dyn MetricsServiceTrait>,
     // IDs for usage tracking (database) and tracing
     request_id: Uuid,
+    budget_id: Option<Uuid>,
     organization_id: Uuid,
     workspace_id: Uuid,
     api_key_id: Uuid,
@@ -307,6 +308,19 @@ where
         )
         .entered();
 
+        if self
+            .last_usage_stats
+            .as_ref()
+            .is_none_or(|usage| usage.prompt_tokens == 0 && usage.completion_tokens == 0)
+            || self.last_chat_id.is_none()
+        {
+            crate::usage::budget::spawn_unknown_outcome(
+                self.usage_service.clone(),
+                organization_id,
+                self.budget_id,
+            );
+        }
+
         let (
             input_tokens,
             output_tokens,
@@ -384,6 +398,7 @@ where
         };
 
         let inference_id = hash_inference_id_to_uuid(&chat_id);
+        let budget_id = self.budget_id;
 
         // Create span with full context for async task
         let span = tracing::info_span!(
@@ -474,6 +489,7 @@ where
                         last_finish_reason.as_ref(),
                     ));
                     let usage_request = RecordUsageServiceRequest {
+                        budget_id,
                         input_tokens,
                         output_tokens,
                         cache_read_tokens,
@@ -488,8 +504,7 @@ where
                         stop_reason,
                         response_id,
                         provider_attribution,
-                        // Written once per served stream: a provider id seen
-                        // before is not a retry.
+                        // The durable reservation, not a reused provider id, deduplicates settlement.
                         dedupe_on_conflict: false,
                         ..RecordUsageServiceRequest::base(
                             crate::usage::BillingIdentity {
@@ -1266,7 +1281,10 @@ impl CompletionServiceImpl {
                 is_external,
             } => match (*status_code, *is_external) {
                 // --- Client errors that should be passed through (both internal and external) ---
-
+                (402, false) => ports::CompletionError::ProviderError {
+                    status_code: 402,
+                    message: message.clone(),
+                },
                 // 400 Bad Request = invalid params (context too long, bad format, etc.)
                 (400, _) => {
                     tracing::warn!(%organization_id, model, status_code, "Client error during {}", operation);
@@ -1670,6 +1688,7 @@ impl CompletionServiceImpl {
         &self,
         llm_stream: StreamingResult,
         request_id: Uuid,
+        budget_id: Option<Uuid>,
         organization_id: Uuid,
         workspace_id: Uuid,
         api_key_id: Uuid,
@@ -1704,6 +1723,7 @@ impl CompletionServiceImpl {
             usage_service: self.usage_service.clone(),
             metrics_service: self.metrics_service.clone(),
             request_id,
+            budget_id,
             organization_id,
             workspace_id,
             api_key_id,
@@ -1893,6 +1913,20 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             self.affinity_secret,
         );
 
+        let features = crate::usage::budget::UsageFeatures::from_chat(&chat_params)
+            .map_err(crate::usage::budget::service_error)?
+            .with_model_output(model.max_output_length);
+        let budget = crate::usage::budget::BudgetExecution::new(
+            self.usage_service.clone(),
+            crate::usage::BillingIdentity {
+                organization_id,
+                workspace_id: request.workspace_id,
+                api_key_id,
+                model_id: model.id,
+            },
+            features,
+        );
+
         let provider_start_time = Instant::now();
 
         // Compute routing hints from the request messages for adaptive load balancing.
@@ -1904,12 +1938,14 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         };
 
         // Get the LLM stream
-        let attributed_stream = match self
-            .inference_provider_pool
-            .chat_completion_stream_with_attribution(
-                chat_params,
-                request.body_hash.clone(),
-                routing_hints,
+        let attributed_stream = match budget
+            .run(
+                self.inference_provider_pool
+                    .chat_completion_stream_with_attribution(
+                        chat_params,
+                        request.body_hash.clone(),
+                        routing_hints,
+                    ),
             )
             .await
         {
@@ -1945,6 +1981,10 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             .handle_stream_with_context(
                 llm_stream,
                 request_id,
+                budget
+                    .id()
+                    .await
+                    .map_err(crate::usage::budget::service_error)?,
                 organization_id,
                 workspace_id,
                 api_key_id,
@@ -2110,19 +2150,35 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             self.affinity_secret,
         );
 
+        let features = crate::usage::budget::UsageFeatures::from_chat(&chat_params)
+            .map_err(crate::usage::budget::service_error)?
+            .with_model_output(model.max_output_length);
+        let budget = crate::usage::budget::BudgetExecution::new(
+            self.usage_service.clone(),
+            crate::usage::BillingIdentity {
+                organization_id,
+                workspace_id: request.workspace_id,
+                api_key_id,
+                model_id: model.id,
+            },
+            features,
+        );
+
         let provider_start_time = Instant::now();
         // Read before `chat_params` moves into the call below.
         let request_priority = chat_params.request_priority;
-        let result = self
-            .inference_provider_pool
-            .chat_completion_with_attribution_and_hints(
-                chat_params,
-                request.body_hash.clone(),
-                super::inference_provider_pool::ChatRoutingHints {
-                    fallback_disabled: !request.fallback_enabled,
-                    request_priority,
-                    ..Default::default()
-                },
+        let result = budget
+            .run(
+                self.inference_provider_pool
+                    .chat_completion_with_attribution_and_hints(
+                        chat_params,
+                        request.body_hash.clone(),
+                        super::inference_provider_pool::ChatRoutingHints {
+                            fallback_disabled: !request.fallback_enabled,
+                            request_priority,
+                            ..Default::default()
+                        },
+                    ),
             )
             .await;
 
@@ -2224,6 +2280,10 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         // Hash the full chat ID to UUID for storage
         let provider_request_id = response_with_bytes.response.id.clone();
         let inference_id = hash_inference_id_to_uuid(&provider_request_id);
+        let budget_id = budget
+            .id()
+            .await
+            .map_err(crate::usage::budget::service_error)?;
         let response_id = request.response_id;
 
         // Extract finish_reason from provider response
@@ -2237,6 +2297,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
 
         usage_service
             .record_usage(RecordUsageServiceRequest {
+                budget_id,
                 input_tokens,
                 output_tokens,
                 cache_read_tokens,
@@ -2257,7 +2318,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
                 provider_attribution,
                 // Written once per served request: a provider id seen
                 // before is not a retry.
-                dedupe_on_conflict: false,
+                dedupe_on_conflict: true,
                 ..RecordUsageServiceRequest::base(
                     crate::usage::BillingIdentity {
                         organization_id,
@@ -2660,6 +2721,7 @@ mod tests {
             usage_service: Arc::new(MockUsageService),
             metrics_service: Arc::new(CapturingMetricsService::new()),
             request_id: Uuid::new_v4(),
+            budget_id: Some(Uuid::new_v4()),
             organization_id: Uuid::new_v4(),
             workspace_id: Uuid::new_v4(),
             api_key_id: Uuid::new_v4(),
@@ -2700,6 +2762,62 @@ mod tests {
             raw_bytes: Bytes::from_static(raw_bytes),
             chunk: None,
             raw_passthrough: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn interrupted_stream_bills_observed_usage_against_its_reservation() {
+        use crate::test_utils::CapturingUsageService;
+        use crate::usage::StopReason;
+
+        for reason in [
+            StopReason::Incomplete,
+            StopReason::ProviderError,
+            StopReason::ClientDisconnect,
+        ] {
+            let usage = Arc::new(CapturingUsageService::new());
+            let chunk = serde_json::from_value(serde_json::json!({
+                "id":"chat_partial", "object":"chat.completion.chunk", "created":0,
+                "model":"test-model", "choices":[],
+                "usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15,
+                    "prompt_tokens_details":{"cached_tokens":2,"cache_write_tokens":3}}
+            }))
+            .unwrap();
+            let mut events = vec![Ok(SSEEvent {
+                raw_bytes: Bytes::new(),
+                chunk: Some(StreamChunk::Chat(chunk)),
+                raw_passthrough: false,
+            })];
+            if reason == StopReason::ProviderError {
+                events.push(Err(inference_providers::CompletionError::CompletionError(
+                    "upstream interrupted".into(),
+                )));
+            }
+            let mut stream = terminal_test_stream(events);
+            stream.usage_service = usage.clone();
+            let budget_id = stream.budget_id;
+            assert!(stream.next().await.unwrap().is_ok());
+            if reason != StopReason::ClientDisconnect {
+                while stream.next().await.is_some() {}
+            }
+            drop(stream);
+
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while usage.get_requests().is_empty() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("observed usage must be billed even without a terminal event");
+            let records = usage.get_requests();
+            assert_eq!(records.len(), 1);
+            let recorded = &records[0];
+            assert_eq!(recorded.budget_id, budget_id);
+            assert_eq!(recorded.input_tokens, 10);
+            assert_eq!(recorded.output_tokens, 5);
+            assert_eq!(recorded.cache_read_tokens, 2);
+            assert_eq!(recorded.profiled_cache_write_tokens, 3);
+            assert_eq!(recorded.stop_reason, Some(reason));
         }
     }
 
@@ -2879,6 +2997,7 @@ mod tests {
             usage_service,
             metrics_service: metrics_service.clone(),
             request_id: Uuid::new_v4(),
+            budget_id: Some(Uuid::new_v4()),
             organization_id,
             workspace_id,
             api_key_id,
@@ -3054,6 +3173,7 @@ mod tests {
             usage_service: usage_service.clone(),
             metrics_service: metrics_service.clone(),
             request_id: Uuid::new_v4(),
+            budget_id: Some(Uuid::new_v4()),
             organization_id: Uuid::new_v4(),
             workspace_id: Uuid::new_v4(),
             api_key_id: Uuid::new_v4(),
@@ -3210,6 +3330,7 @@ mod tests {
             usage_service: usage_service.clone(),
             metrics_service: metrics_service.clone(),
             request_id: Uuid::new_v4(),
+            budget_id: Some(Uuid::new_v4()),
             organization_id,
             workspace_id,
             api_key_id,
@@ -3340,6 +3461,7 @@ mod tests {
             usage_service: usage_service.clone(),
             metrics_service: metrics_service.clone(),
             request_id: Uuid::new_v4(),
+            budget_id: Some(Uuid::new_v4()),
             organization_id,
             workspace_id,
             api_key_id,
@@ -3552,6 +3674,7 @@ mod tests {
                 usage_service,
                 metrics_service,
                 request_id: Uuid::new_v4(),
+                budget_id: Some(Uuid::new_v4()),
                 organization_id: Uuid::new_v4(),
                 workspace_id: Uuid::new_v4(),
                 api_key_id: Uuid::new_v4(),

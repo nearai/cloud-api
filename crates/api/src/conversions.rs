@@ -214,6 +214,14 @@ impl From<CompletionError> for crate::models::ErrorResponse {
                 message,
             } => {
                 let error_type = match status_code {
+                    // Admission travels through the pool's existing HTTP error transport.
+                    // Recognize only our own stable limit prefixes, not arbitrary vendor 402s.
+                    402 if message.starts_with("Limit exceeded: API key spend limit exceeded.") => {
+                        "api_key_limit_exceeded"
+                    }
+                    402 if message.starts_with("Limit exceeded: Credit limit exceeded.") => {
+                        "insufficient_credits"
+                    }
                     502 => "bad_gateway",
                     503 => "service_overloaded",
                     504 => "gateway_timeout",
@@ -788,6 +796,21 @@ mod tests {
             None
         );
         assert_eq!(verified_contact_email(None, verified_at), None);
+    }
+
+    #[test]
+    fn admission_preserves_limit_error_types_without_relabeling_vendor_402() {
+        for (message, expected) in [
+            ("Limit exceeded: API key spend limit exceeded. Insufficient available budget for this request.", "api_key_limit_exceeded"),
+            ("Limit exceeded: Credit limit exceeded. Insufficient available budget for this request.", "insufficient_credits"),
+            ("Vendor payment required", "provider_error"),
+        ] {
+            let response = ErrorResponse::from(CompletionError::ProviderError {
+                status_code: 402, message: message.into(),
+            });
+            assert_eq!(response.error.r#type, expected);
+            assert_eq!(response.error.message, message);
+        }
     }
 
     #[test]

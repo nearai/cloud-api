@@ -1,5 +1,4 @@
 use crate::common::*;
-use inference_providers::ChatCompletionParams;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -167,16 +166,20 @@ async fn partial_external_config_update_reloads_the_live_provider() {
         .await;
     response.assert_status_ok();
 
-    let params: ChatCompletionParams = serde_json::from_value(serde_json::json!({
+    let params = serde_json::json!({
         "model": model_name,
         "messages": [{"role": "user", "content": "Reply only with 42"}],
         "provider": {"only": ["forbidden"], "allow_fallbacks": true,
             "zdr": false, "data_collection": "allow"}
-    }))
-    .unwrap();
-    pool.chat_completion(params, "synthetic-request".into())
+    });
+    let org = setup_org_with_credits(&server, 10_000_000_000).await;
+    let key = get_api_key_for_org(&server, org.id).await;
+    server
+        .post("/v1/chat/completions")
+        .add_header("Authorization", format!("Bearer {key}"))
+        .json(&params)
         .await
-        .unwrap();
+        .assert_status_ok();
 
     assert!(old_upstream.received_requests().await.unwrap().is_empty());
     let requests = new_upstream.received_requests().await.unwrap();
@@ -214,7 +217,7 @@ async fn stored_provider_config(
 
 #[tokio::test]
 async fn provider_config_writes_keep_the_stored_key_and_routing_policy() {
-    let (server, pool, _, database) = setup_test_server_with_pool_and_config(|config| {
+    let (server, _pool, _, database) = setup_test_server_with_pool_and_config(|config| {
         config.external_providers.timeout_seconds = 5;
     })
     .await;
@@ -302,14 +305,18 @@ async fn provider_config_writes_keep_the_stored_key_and_routing_policy() {
     );
 
     // The live provider was reloaded from the merged config.
-    let params: ChatCompletionParams = serde_json::from_value(serde_json::json!({
+    let params = serde_json::json!({
         "model": model_name,
         "messages": [{"role": "user", "content": "Reply only with 42"}]
-    }))
-    .unwrap();
-    pool.chat_completion(params, "synthetic-request".into())
+    });
+    let org = setup_org_with_credits(&server, 10_000_000_000).await;
+    let key = get_api_key_for_org(&server, org.id).await;
+    server
+        .post("/v1/chat/completions")
+        .add_header("Authorization", format!("Bearer {key}"))
+        .json(&params)
         .await
-        .unwrap();
+        .assert_status_ok();
     let requests = upstream.received_requests().await.unwrap();
     assert_eq!(requests.len(), 1);
     assert_eq!(

@@ -1484,6 +1484,11 @@ pub struct AudioTranscriptionResponse {
     #[serde(deserialize_with = "deserialize_duration")]
     pub duration: Option<f64>,
 
+    /// Actual duration reported in ordinary JSON `usage`; internal accounting only.
+    #[serde(default, rename = "usage", skip_serializing)]
+    #[serde(deserialize_with = "deserialize_audio_usage_duration")]
+    pub usage_duration_seconds: Option<f64>,
+
     /// Detected language code
     #[serde(skip_serializing_if = "Option::is_none")]
     pub language: Option<String>,
@@ -1499,6 +1504,28 @@ pub struct AudioTranscriptionResponse {
     /// Unique identifier for the transcription
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
+}
+
+impl AudioTranscriptionResponse {
+    /// Prefer the provider's billable usage over verbose-response metadata.
+    pub fn billable_duration_seconds(&self) -> Option<i32> {
+        [self.usage_duration_seconds, self.duration]
+            .into_iter()
+            .flatten()
+            .find(|n| n.is_finite() && *n > 0.0 && n.ceil() <= f64::from(i32::MAX))
+            .map(|n| n.ceil() as i32)
+    }
+}
+
+fn deserialize_audio_usage_duration<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let usage = serde_json::Value::deserialize(deserializer)?;
+    // Other usage kinds (such as token billing) do not provide an audio duration.
+    Ok((usage["type"] == "duration")
+        .then(|| usage["seconds"].as_f64())
+        .flatten())
 }
 
 /// Custom deserializer to handle duration as either string or number
@@ -1580,6 +1607,61 @@ pub fn detect_audio_content_type(filename: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn audio_transcription_reads_provider_usage_without_changing_response_fields() {
+        for (fields, expected) in [
+            (
+                serde_json::json!({"usage":{"type":"duration","seconds":91}}),
+                Some(91),
+            ),
+            (serde_json::json!({"duration":1.25}), Some(2)),
+            (serde_json::json!({"duration":"1.25"}), Some(2)),
+            (
+                serde_json::json!({"usage":{"type":"duration","seconds":4},"duration":1.25}),
+                Some(4),
+            ),
+            (
+                serde_json::json!({"usage":{"type":"tokens","input_tokens":91}}),
+                None,
+            ),
+            (serde_json::json!({}), None),
+        ] {
+            let mut wire = fields.clone();
+            wire["text"] = serde_json::json!("hello");
+            let response: AudioTranscriptionResponse = serde_json::from_value(wire).unwrap();
+            assert_eq!(response.billable_duration_seconds(), expected, "{fields}");
+            let serialized = serde_json::to_value(response).unwrap();
+            assert!(serialized.get("usage").is_none());
+            assert!(serialized.get("usage_duration_seconds").is_none());
+            if fields.get("duration").is_none() {
+                assert!(serialized.get("duration").is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn audio_transcription_invalid_usage_allows_duration_fallback() {
+        for usage in [
+            serde_json::json!({"type":"duration","seconds":0}),
+            serde_json::json!({"type":"duration","seconds":-1}),
+            serde_json::json!({"type":"duration","seconds":2147483648_u64}),
+            serde_json::json!({"type":"duration","seconds":"bad"}),
+            serde_json::json!({"type":"duration"}),
+            serde_json::json!({"type":"tokens","seconds":91}),
+            serde_json::json!(null),
+            serde_json::json!([]),
+        ] {
+            let mut wire = serde_json::json!({"text":"hello","usage":usage});
+            let response: AudioTranscriptionResponse =
+                serde_json::from_value(wire.clone()).unwrap();
+            assert_eq!(response.billable_duration_seconds(), None, "{wire}");
+            wire["duration"] = serde_json::json!(1.25);
+            let response: AudioTranscriptionResponse =
+                serde_json::from_value(wire.clone()).unwrap();
+            assert_eq!(response.billable_duration_seconds(), Some(2), "{wire}");
+        }
+    }
 
     #[test]
     fn set_stream_fields_is_the_only_copy_on_the_wire() {

@@ -5881,6 +5881,7 @@ mod tests {
         let provider_response = inference_providers::AudioTranscriptionResponse {
             text: "hello".to_string(),
             duration: Some(1.0),
+            usage_duration_seconds: Some(2.0),
             language: Some("en".to_string()),
             segments: None,
             words: None,
@@ -5891,6 +5892,9 @@ mod tests {
         let value = serde_json::to_value(response).unwrap();
 
         assert!(value.get("id").is_none());
+        assert!(value.get("usage").is_none());
+        assert!(value.get("usage_duration_seconds").is_none());
+        assert_eq!(value["duration"], 1.0);
         assert_eq!(value["text"], "hello");
     }
 

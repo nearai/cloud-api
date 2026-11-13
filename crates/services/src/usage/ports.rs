@@ -222,6 +222,51 @@ impl std::fmt::Display for StopReason {
 
 #[async_trait::async_trait]
 pub trait UsageServiceTrait: Send + Sync {
+    /// Release expired reservations without charging their estimates.
+    async fn expire_budgets(&self) -> Result<u64, UsageError> {
+        Ok(0)
+    }
+    async fn admit_external(
+        &self,
+        _identity: BillingIdentity,
+        _features: super::budget::UsageFeatures,
+        _report_id: Uuid,
+        _mode: super::budget::policy::AdmissionMode,
+    ) -> Result<super::budget::BudgetAdmission, UsageError> {
+        Err(UsageError::InternalError(
+            "external monetary admission is unavailable".into(),
+        ))
+    }
+
+    /// Stop counting an abandoned attempt as running while temporarily retaining its funding.
+    async fn mark_budget_unknown(
+        &self,
+        _organization_id: Uuid,
+        _id: Uuid,
+    ) -> Result<(), UsageError> {
+        Err(UsageError::InternalError(
+            "unknown budget outcome is unavailable".into(),
+        ))
+    }
+
+    /// Release only an attempt known not to have reached upstream execution.
+    async fn release_budget(&self, _organization_id: Uuid, _id: Uuid) -> Result<(), UsageError> {
+        Err(UsageError::InternalError(
+            "budget release is unavailable".into(),
+        ))
+    }
+
+    /// Reserve an immutable local estimate and claim this execution exactly once.
+    async fn admit(
+        &self,
+        _identity: BillingIdentity,
+        _features: super::budget::UsageFeatures,
+    ) -> Result<Option<Uuid>, UsageError> {
+        Err(UsageError::InternalError(
+            "monetary admission is unavailable".into(),
+        ))
+    }
+
     /// Record usage after an API call completes
     async fn record_usage(
         &self,
@@ -238,6 +283,7 @@ pub trait UsageServiceTrait: Send + Sync {
         api_key_id: Uuid,
         request: RecordUsageApiRequest,
         discount: Option<UsageDiscount>,
+        admission_id: Option<Uuid>,
     ) -> Result<UsageLogEntry, UsageError>;
 
     /// Check if organization can make an API call (pre-flight check)
@@ -329,7 +375,30 @@ pub trait UsageServiceTrait: Send + Sync {
 
 #[async_trait::async_trait]
 pub trait UsageRepository: Send + Sync {
-    /// Record usage and update balance atomically
+    async fn mark_budget_unknown(
+        &self,
+        _organization_id: Uuid,
+        _id: Uuid,
+        _grace_seconds: i32,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("unknown budget outcome is unavailable")
+    }
+    async fn release_budget(&self, _organization_id: Uuid, _id: Uuid) -> anyhow::Result<()> {
+        anyhow::bail!("budget release is unavailable")
+    }
+    async fn expire_budgets(&self) -> anyhow::Result<u64> {
+        Ok(0)
+    }
+    async fn admit_budget(
+        &self,
+        _reservation: &super::budget::BudgetReservation,
+    ) -> Result<(), UsageError> {
+        Err(UsageError::InternalError(
+            "monetary admission is unavailable".into(),
+        ))
+    }
+
+    /// Record usage and update balance atomically.
     async fn record_usage(&self, request: RecordUsageDbRequest) -> anyhow::Result<UsageLogEntry>;
 
     /// Get current balance for an organization
@@ -514,6 +583,14 @@ pub enum RecordUsageApiRequest {
         #[serde(flatten)]
         provider_attribution: ProviderAttribution,
     },
+    /// Audio duration, in rounded-up seconds. Used by the HTTP reporter.
+    AudioTranscription {
+        model: String,
+        duration_seconds: i32,
+        id: String,
+        #[serde(flatten)]
+        provider_attribution: ProviderAttribution,
+    },
     /// Image generation or editing
     ImageGeneration {
         /// Model name to look up pricing
@@ -583,6 +660,8 @@ pub struct CacheWriteBilling {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct RecordUsageServiceRequest {
+    /// Monetary reservation, distinct from the public provider-derived inference id.
+    pub budget_id: Option<Uuid>,
     pub organization_id: Uuid,
     pub workspace_id: Uuid,
     pub api_key_id: Uuid,
@@ -660,6 +739,7 @@ impl RecordUsageServiceRequest {
             model_id,
         } = identity;
         Self {
+            budget_id: None,
             organization_id,
             workspace_id,
             api_key_id,
@@ -1056,6 +1136,7 @@ pub enum UsageError {
     ModelNotFound(String),
     InternalError(String),
     LimitExceeded(String),
+    CapacityExceeded,
     Unauthorized(String),
     NotFound(String),
     CostCalculationOverflow(String),
@@ -1069,6 +1150,7 @@ impl std::fmt::Display for UsageError {
             UsageError::ModelNotFound(msg) => write!(f, "Model not found: {msg}"),
             UsageError::InternalError(msg) => write!(f, "Internal error: {msg}"),
             UsageError::LimitExceeded(msg) => write!(f, "Limit exceeded: {msg}"),
+            UsageError::CapacityExceeded => write!(f, "Too many unsettled executions"),
             UsageError::Unauthorized(msg) => write!(f, "Unauthorized: {msg}"),
             UsageError::NotFound(msg) => write!(f, "Not found: {msg}"),
             UsageError::CostCalculationOverflow(msg) => {

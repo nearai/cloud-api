@@ -5,7 +5,7 @@ use crate::{
 use axum::{
     extract::State,
     http::{HeaderMap, StatusCode},
-    response::Json as ResponseJson,
+    response::{IntoResponse, Json as ResponseJson, Response},
 };
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
@@ -165,6 +165,7 @@ fn build_record_usage_response(entry: services::usage::UsageLogEntry) -> RecordU
 /// in the public OpenAPI doc anyway.
 #[derive(Debug, Deserialize)]
 pub struct RecordUsageInternalRequest {
+    pub admission_id: Option<Uuid>,
     /// UUID of the organization to bill. **Trusted as provided** —
     /// `record_usage_from_api` does not cross-validate that this org
     /// owns the supplied `workspace_id` or `api_key_id`, matching the
@@ -323,6 +324,7 @@ pub async fn record_usage_internal(
             api_key_id,
             request.usage,
             discount,
+            request.admission_id,
         )
         .await
         .map_err(|e| match &e {
@@ -355,6 +357,170 @@ pub async fn record_usage_internal(
         })?;
 
     Ok(ResponseJson(build_record_usage_response(entry)))
+}
+
+/// Metadata-only admission for trusted execution gateways. It remains mandatory when their
+/// usage receipts travel by SQS: cached key authorization never authorizes monetary spending.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReserveUsageRequest {
+    #[serde(default)]
+    mode: services::usage::budget::policy::AdmissionMode,
+    execution_model: Option<String>,
+    id: Uuid,
+    organization_id: Uuid,
+    workspace_id: Uuid,
+    api_key_id: Uuid,
+    model: String,
+    features: services::usage::budget::UsageFeatures,
+}
+
+pub async fn reserve_usage_internal(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<ResponseJson<serde_json::Value>, Response> {
+    verify_internal_usage_token(&headers, state.config.internal_usage_token.as_deref())
+        .map_err(IntoResponse::into_response)?;
+    let failure = |status, message: &str| {
+        let response = (
+            status,
+            ResponseJson(ErrorResponse::new(
+                message.into(),
+                "budget_admission_error".into(),
+            )),
+        )
+            .into_response();
+        crate::middleware::rate_limit::with_retry_after(response)
+    };
+    let request: ReserveUsageRequest = serde_json::from_slice(&body)
+        .map_err(|_| failure(StatusCode::BAD_REQUEST, "Invalid admission metadata"))?;
+    if request.id.is_nil() {
+        return Err(failure(StatusCode::BAD_REQUEST, "Invalid execution id"));
+    }
+    let model = state
+        .models_service
+        .resolve_and_get_model(
+            &request.model,
+            services::models::ModelCaller::Organization(request.organization_id),
+        )
+        .await
+        .map_err(|_| failure(StatusCode::BAD_REQUEST, "Model unavailable"))?;
+    // Fusion child endpoints may use model IDs outside this catalog. Their optional
+    // metadata affects only the estimate; the outer billed model remains authorized.
+    let output_hint = if let Some(name) = request.execution_model.as_deref() {
+        state
+            .models_service
+            .resolve_and_get_model(
+                name,
+                services::models::ModelCaller::Organization(request.organization_id),
+            )
+            .await
+            .ok()
+            .and_then(|model| model.max_output_length)
+    } else {
+        model.max_output_length
+    };
+    let features = request.features.with_model_output(output_hint);
+    let admitted = state
+        .usage_service
+        .admit_external(
+            services::usage::BillingIdentity {
+                organization_id: request.organization_id,
+                workspace_id: request.workspace_id,
+                api_key_id: request.api_key_id,
+                model_id: model.id,
+            },
+            features,
+            request.id,
+            request.mode,
+        )
+        .await
+        .map_err(|error| match error {
+            services::usage::UsageError::LimitExceeded(_) => failure(
+                StatusCode::PAYMENT_REQUIRED,
+                "Insufficient available budget",
+            ),
+            services::usage::UsageError::CapacityExceeded => failure(
+                StatusCode::TOO_MANY_REQUESTS,
+                "Too many unsettled executions",
+            ),
+            services::usage::UsageError::Unauthorized(_) => {
+                failure(StatusCode::FORBIDDEN, "Billing identity unavailable")
+            }
+            services::usage::UsageError::ValidationError(_)
+            | services::usage::UsageError::CostCalculationOverflow(_) => {
+                failure(StatusCode::BAD_REQUEST, "Invalid admission estimate")
+            }
+            _ => failure(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Budget admission unavailable",
+            ),
+        })?;
+    Ok(ResponseJson(
+        serde_json::json!({"id": admitted.id, "model": model.model_name, "mode": admitted.mode, "estimated_amount": admitted.estimated_amount}),
+    ))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReleaseUsageRequest {
+    organization_id: Uuid,
+    id: Uuid,
+}
+
+pub async fn release_usage_internal(
+    state: State<AppState>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<StatusCode, UsageError> {
+    finish_budget_internal(state, headers, body, false).await
+}
+
+pub async fn unknown_usage_internal(
+    state: State<AppState>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<StatusCode, UsageError> {
+    finish_budget_internal(state, headers, body, true).await
+}
+
+async fn finish_budget_internal(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+    unknown: bool,
+) -> Result<StatusCode, UsageError> {
+    verify_internal_usage_token(&headers, state.config.internal_usage_token.as_deref())?;
+    let failure = |status, message: &str| {
+        (
+            status,
+            ResponseJson(ErrorResponse::new(
+                message.into(),
+                "budget_admission_error".into(),
+            )),
+        )
+    };
+    let request: ReleaseUsageRequest = serde_json::from_slice(&body)
+        .map_err(|_| failure(StatusCode::BAD_REQUEST, "Invalid release metadata"))?;
+    let result = if unknown {
+        state
+            .usage_service
+            .mark_budget_unknown(request.organization_id, request.id)
+            .await
+    } else {
+        state
+            .usage_service
+            .release_budget(request.organization_id, request.id)
+            .await
+    };
+    result.map_err(|_| {
+        failure(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Budget release unavailable",
+        )
+    })?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[cfg(test)]

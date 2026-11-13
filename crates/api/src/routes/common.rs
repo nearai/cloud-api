@@ -692,6 +692,37 @@ pub fn analytics_error_response(
     }
 }
 
+/// Build request-local admission state without changing provider parameters.
+pub(crate) fn usage_execution(
+    state: &crate::routes::api::AppState,
+    key: &crate::middleware::auth::AuthenticatedApiKey,
+    model_id: uuid::Uuid,
+    features: services::usage::budget::UsageFeatures,
+) -> Result<
+    services::usage::budget::BudgetExecution,
+    (StatusCode, axum::Json<crate::models::ErrorResponse>),
+> {
+    let api_key_id = uuid::Uuid::parse_str(&key.api_key.id.0).map_err(|_| {
+        (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            axum::Json(crate::models::ErrorResponse::new(
+                "Invalid billing identity".into(),
+                "server_error".into(),
+            )),
+        )
+    })?;
+    Ok(services::usage::budget::BudgetExecution::new(
+        state.usage_service.clone(),
+        services::usage::BillingIdentity {
+            organization_id: key.organization.id.0,
+            workspace_id: key.workspace.id.0,
+            api_key_id,
+            model_id,
+        },
+        features,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

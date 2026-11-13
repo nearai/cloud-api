@@ -14,7 +14,6 @@ use async_trait::async_trait;
 use bloomfilter::Bloom;
 use chrono::Utc;
 use hmac::{Hmac, KeyInit, Mac};
-use moka::future::Cache;
 use sha2::Sha256;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -23,8 +22,6 @@ use tokio::sync::RwLock;
 
 pub const MAX_USER_AGENT_LEN: usize = 4096;
 
-const API_KEY_CACHE_MAX_CAPACITY: u64 = 10_000;
-const API_KEY_CACHE_TTL_SECS: u64 = 30;
 const BLOOM_FILTER_ITEMS: usize = 10_000_000;
 const BLOOM_FILTER_FP_RATE: f64 = 0.001;
 const BLOOM_FILTER_SYNC_INTERVAL_SECS: u64 = 10;
@@ -452,10 +449,6 @@ impl AuthServiceTrait for AuthService {
 
         let key_hash = hash_api_key(&api_key);
 
-        if let Some(cached_key) = self.api_key_cache.get(&key_hash).await {
-            return Ok(cached_key);
-        }
-
         if self.bloom_filter_ready.load(Ordering::Acquire) {
             let bloom = self.api_key_bloom_filter.read().await;
             if !bloom.check(&key_hash) {
@@ -469,10 +462,6 @@ impl AuthServiceTrait for AuthService {
             .await
             .map_err(|e| AuthError::InternalError(format!("Failed to validate API key: {e}")))?
             .ok_or(AuthError::Unauthorized)?;
-
-        self.api_key_cache
-            .insert(key_hash, validated_key.clone())
-            .await;
 
         Ok(validated_key)
     }
@@ -626,11 +615,6 @@ impl AuthService {
         organization_service: Arc<dyn crate::organization::OrganizationServiceTrait>,
         auth_config: &config::AuthConfig,
     ) -> Self {
-        let api_key_cache: ApiKeyCache = Cache::builder()
-            .max_capacity(API_KEY_CACHE_MAX_CAPACITY)
-            .time_to_live(Duration::from_secs(API_KEY_CACHE_TTL_SECS))
-            .build();
-
         let bloom = Bloom::new_for_fp_rate(BLOOM_FILTER_ITEMS, BLOOM_FILTER_FP_RATE)
             .expect("bloom filter creation failed");
         let api_key_bloom_filter: ApiKeyBloomFilter = Arc::new(RwLock::new(bloom));
@@ -649,7 +633,6 @@ impl AuthService {
             organization_repository,
             workspace_repository,
             organization_service,
-            api_key_cache,
             api_key_bloom_filter,
             bloom_filter_ready,
             require_session_bound_access_tokens: auth_config.require_session_bound_access_tokens,
@@ -776,6 +759,62 @@ mod tests {
     use std::sync::Mutex;
     use tokio::sync::RwLock;
     use uuid::Uuid;
+
+    #[tokio::test]
+    async fn api_key_validation_observes_revocation_across_service_instances() {
+        let raw_key = crate::common::generate_api_key();
+        let repo = Arc::new(StubApiKeyRepo::default());
+        let key = ApiKey {
+            id: ApiKeyId(Uuid::new_v4().to_string()),
+            key: None,
+            key_prefix: String::new(),
+            name: String::new(),
+            workspace_id: WorkspaceId(Uuid::new_v4()),
+            created_by_user_id: UserId(Uuid::new_v4()),
+            created_at: Utc::now(),
+            expires_at: None,
+            last_used_at: None,
+            is_active: true,
+            deleted_at: None,
+            spend_limit: None,
+            usage: None,
+        };
+        *repo.key.lock().unwrap() = Some(key.clone());
+        let user = Arc::new(MockUserRepo::with_user(make_user(
+            "test@example.test",
+            "github",
+        )));
+        let mut first = build_auth_service(user.clone());
+        let mut second = build_auth_service(user);
+        first.api_key_repository = repo.clone();
+        second.api_key_repository = repo.clone();
+        // A stale positive Bloom entry must never authorize a revoked key.
+        for service in [&first, &second] {
+            service
+                .api_key_bloom_filter
+                .write()
+                .await
+                .set(&hash_api_key(&raw_key));
+            service.bloom_filter_ready.store(true, Ordering::Release);
+            assert!(service.validate_api_key(raw_key.clone()).await.is_ok());
+        }
+        *repo.key.lock().unwrap() = None;
+        for service in [&first, &second] {
+            assert!(matches!(
+                service.validate_api_key(raw_key.clone()).await,
+                Err(AuthError::Unauthorized)
+            ));
+        }
+        *repo.key.lock().unwrap() = Some(key);
+        assert!(first.validate_api_key(raw_key.clone()).await.is_ok());
+        repo.unavailable.store(true, Ordering::Release);
+        for service in [&first, &second] {
+            assert!(matches!(
+                service.validate_api_key(raw_key.clone()).await,
+                Err(AuthError::InternalError(_))
+            ));
+        }
+    }
 
     #[test]
     fn refresh_successor_is_stable_and_keyed() {
@@ -1150,11 +1189,18 @@ mod tests {
         }
     }
 
-    struct StubApiKeyRepo;
+    #[derive(Default)]
+    struct StubApiKeyRepo {
+        key: Mutex<Option<ApiKey>>,
+        unavailable: AtomicBool,
+    }
     #[async_trait]
     impl ApiKeyRepository for StubApiKeyRepo {
         async fn validate(&self, _: String) -> Result<Option<ApiKey>, RepositoryError> {
-            unimplemented!()
+            if self.unavailable.load(Ordering::Acquire) {
+                return Err(RepositoryError::QueryTimeout);
+            }
+            Ok(self.key.lock().unwrap().clone())
         }
         async fn create(&self, _: CreateApiKeyRequest) -> Result<ApiKey, RepositoryError> {
             unimplemented!()
@@ -1296,13 +1342,12 @@ mod tests {
         AuthService {
             user_repository: user_repo,
             session_repository: session_repo,
-            api_key_repository: Arc::new(StubApiKeyRepo),
+            api_key_repository: Arc::new(StubApiKeyRepo::default()),
             organization_repository: Arc::new(
                 crate::organization::MockOrganizationRepository::new(),
             ),
             workspace_repository: Arc::new(StubWorkspaceRepo),
             organization_service: Arc::new(crate::organization::MockOrganizationServiceTrait::new()),
-            api_key_cache: moka::future::Cache::builder().build(),
             api_key_bloom_filter: Arc::new(RwLock::new(bloom)),
             bloom_filter_ready: Arc::new(AtomicBool::new(false)),
             require_session_bound_access_tokens,

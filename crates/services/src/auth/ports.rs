@@ -1,7 +1,6 @@
 use async_trait::async_trait;
 use bloomfilter::Bloom;
 use chrono::{DateTime, Utc};
-use moka::future::Cache;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -11,7 +10,6 @@ use uuid::Uuid;
 use crate::organization::OrganizationRepository;
 use crate::workspace::{ApiKey, ApiKeyRepository, WorkspaceId, WorkspaceRepository};
 
-pub type ApiKeyCache = Cache<String, ApiKey>;
 pub type ApiKeyBloomFilter = Arc<RwLock<Bloom<String>>>;
 pub type BloomFilterReady = Arc<AtomicBool>;
 
@@ -412,7 +410,6 @@ pub struct AuthService {
     pub organization_repository: Arc<dyn OrganizationRepository>,
     pub workspace_repository: Arc<dyn WorkspaceRepository>,
     pub organization_service: Arc<dyn crate::organization::OrganizationServiceTrait>,
-    pub api_key_cache: ApiKeyCache,
     pub api_key_bloom_filter: ApiKeyBloomFilter,
     pub bloom_filter_ready: BloomFilterReady,
     /// Reject access tokens without a `sid` claim (legacy tokens issued

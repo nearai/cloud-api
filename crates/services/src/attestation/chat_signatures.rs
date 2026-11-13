@@ -23,9 +23,19 @@ pub(in crate::attestation) const PROVIDER_SIGNATURE_FETCH_TIMEOUT: Duration =
 pub(crate) const STREAM_DISCONNECTED: &str = "STREAM_DISCONNECTED";
 const STREAM_DISCONNECTED_MESSAGE: &str = "Verification not available due to disconnection.";
 
+/// `error_code` returned when no signature is stored and the provider that
+/// served `chat_id` does not expose per-response signatures.
+pub(crate) const SIGNATURE_UNSUPPORTED: &str = "SIGNATURE_UNSUPPORTED";
+const SIGNATURE_UNSUPPORTED_MESSAGE: &str = "This model's responses are integrity-protected by an \
+     end-to-end encrypted channel, not a per-response signature; there is no signature to \
+     retrieve.";
+
 impl AttestationService {
     /// A stored row is returned whatever its owner, so any caller can verify
-    /// it. When there is none, a usage row of `owner` (the caller) for
+    /// it. When there is none and the in-memory serving provider for `chat_id`
+    /// is known not to support per-response signatures, the result is
+    /// [`SignatureLookupResult::Unavailable`] with [`SIGNATURE_UNSUPPORTED`].
+    /// Otherwise a usage row of `owner` (the caller) for
     /// `chat_id` that ended with a client disconnect gives
     /// [`SignatureLookupResult::Unavailable`] with [`STREAM_DISCONNECTED`].
     /// Another owner's disconnect is not reported: the miss is the same
@@ -47,7 +57,12 @@ impl AttestationService {
         {
             Ok(signature) => Ok(SignatureLookupResult::Found(signature)),
             Err(not_found @ AttestationError::SignatureNotFound(_)) => {
-                if self.owner_stream_disconnected(owner, chat_id).await {
+                if self.serving_provider_lacks_signatures(chat_id).await {
+                    Ok(SignatureLookupResult::Unavailable {
+                        error_code: SIGNATURE_UNSUPPORTED.to_string(),
+                        message: SIGNATURE_UNSUPPORTED_MESSAGE.to_string(),
+                    })
+                } else if self.owner_stream_disconnected(owner, chat_id).await {
                     Ok(SignatureLookupResult::Unavailable {
                         error_code: STREAM_DISCONNECTED.to_string(),
                         message: STREAM_DISCONNECTED_MESSAGE.to_string(),
@@ -58,6 +73,15 @@ impl AttestationService {
             }
             Err(error) => Err(error),
         }
+    }
+
+    /// Whether the provider pool still maps `chat_id` to a provider that does
+    /// not expose per-response signatures. An unknown mapping answers `false`.
+    async fn serving_provider_lacks_signatures(&self, chat_id: &str) -> bool {
+        self.inference_provider_pool
+            .get_provider_by_chat_id(chat_id)
+            .await
+            .is_some_and(|provider| !provider.supports_chat_signatures())
     }
 
     /// Whether `owner` has a usage row for `chat_id` that ended with a client

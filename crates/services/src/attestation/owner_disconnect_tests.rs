@@ -14,7 +14,7 @@ use uuid::Uuid;
 
 use super::{
     chat_signature_lifecycle_tests::{lifecycle_service, owner, RecordingRepository},
-    chat_signatures::STREAM_DISCONNECTED,
+    chat_signatures::{SIGNATURE_UNSUPPORTED, STREAM_DISCONNECTED},
     models::{ChatSignature, SignatureKind, SignatureLookupResult, SignatureOwner},
     ports::AttestationServiceTrait,
     AttestationError, AttestationService,
@@ -355,18 +355,24 @@ async fn stored_signature_wins_over_a_disconnect_row() {
 }
 
 #[tokio::test]
-async fn pinned_provider_without_signatures_does_not_report_another_owners_disconnect() {
+async fn pinned_provider_without_signatures_is_unsupported_not_another_owners_disconnect() {
     let chat_id = "chatcmpl-pinned-unsupported-disconnect";
     let pool = empty_pool();
     let provider = Arc::new(MockProvider::new().with_chat_signature_support(false));
     pool.store_chat_id_mapping(chat_id.to_string(), provider)
         .await;
     let mut service = lifecycle_service(Arc::new(RecordingRepository::default()), pool);
-    service.usage_repository = Arc::new(OwnerUsageRepository::with_row(
-        owner(),
-        chat_id,
-        StopReason::ClientDisconnect,
-    ));
+    let usage = OwnerUsageRepository::with_row(owner(), chat_id, StopReason::ClientDisconnect);
+    service.usage_repository = Arc::new(usage.clone());
 
-    assert_not_found(service.get_chat_signature(other_org(), chat_id, None).await);
+    match service.get_chat_signature(other_org(), chat_id, None).await {
+        Ok(SignatureLookupResult::Unavailable { error_code, .. }) => {
+            assert_eq!(error_code, SIGNATURE_UNSUPPORTED);
+        }
+        _ => panic!("expected SIGNATURE_UNSUPPORTED"),
+    }
+    assert!(
+        usage.calls().is_empty(),
+        "an unsupported provider answers before any disconnect lookup"
+    );
 }

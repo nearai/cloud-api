@@ -202,7 +202,7 @@ impl ModelAttestationCollector for RecordingModelCollector {
         let gpu_nonce = input.nonce.ok_or_else(|| {
             AttestationError::InternalError("expected ITA GPU nonce for model evidence".to_string())
         })?;
-        Ok(vec![model_evidence(&gpu_nonce)])
+        Ok(vec![model_evidence(&gpu_nonce, "HOPPER")])
     }
 }
 
@@ -215,14 +215,14 @@ impl RecordingModelCollector {
     }
 }
 
-fn model_evidence(gpu_nonce: &str) -> Map<String, Value> {
+pub(super) fn model_evidence(gpu_nonce: &str, arch: &str) -> Map<String, Value> {
     let pem = format!(
         "-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n",
         STANDARD.encode(b"test-der-certificate-bytes")
     );
     let payload = json!({
         "gpu_nonce": gpu_nonce,
-        "arch": "HOPPER",
+        "arch": arch,
         "evidence_list": [{ "certificate": STANDARD.encode(pem), "evidence": "ZXZpZGVuY2U=" }]
     });
     let mut evidence = Map::new();

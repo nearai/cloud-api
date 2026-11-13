@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "component": "cloud-api",
+  "snapshot": "20260928T000000Z",
+  "architecture": "amd64",
+  "image": "nearaidev/apt-bundle-cloud-api@sha256:ecfed6536d176857f0c7f3199fac4b6cdba449a9155e8820817b8479351d522e",
+  "debian_manifest": "debian-packages.txt",
+  "docker_manifest": null,
+  "upstream_base_head": "dfd97d5f97cf4e486bacc8ccf3abd4be60fdabdf",
+  "publication_pending": true,
+  "helper_pending": false,
+  "helper_sha256": "20d710d30ff44ac93325a7c686366bdc110160c873409dc69affb9bded71eb34"
+}

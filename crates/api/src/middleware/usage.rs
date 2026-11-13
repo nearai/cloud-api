@@ -276,10 +276,9 @@ pub async fn anthropic_usage_check_middleware(
 mod tests {
     use super::*;
     use services::usage::{
-        InferenceCost, InferenceUsageHistoryQuery, InferenceUsageReportQuery,
-        InferenceUsageReportRow, OrganizationBalanceInfo, OrganizationCreditLimit,
-        OrganizationLimit, RecordUsageApiRequest, RecordUsageServiceRequest, UsageByModelEntry,
-        UsageError, UsageLogEntry,
+        InferenceCost, InferenceUsageHistoryQuery, InferenceUsageReportRow,
+        OrganizationBalanceInfo, OrganizationCreditLimit, OrganizationLimit, RecordUsageApiRequest,
+        RecordUsageServiceRequest, UsageByModelEntry, UsageError, UsageLogEntry,
     };
     use std::sync::Mutex;
     use uuid::Uuid;
@@ -419,13 +418,6 @@ mod tests {
             _end_date: Option<chrono::DateTime<chrono::Utc>>,
         ) -> Result<Vec<UsageByModelEntry>, UsageError> {
             unimplemented!()
-        }
-
-        async fn list_inference_usage_report(
-            &self,
-            _query: InferenceUsageReportQuery,
-        ) -> Result<Vec<InferenceUsageReportRow>, UsageError> {
-            Ok(vec![])
         }
 
         async fn list_inference_usage_history(

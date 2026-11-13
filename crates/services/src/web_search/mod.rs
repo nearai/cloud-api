@@ -166,9 +166,7 @@ impl WebSearchService {
             })
             .await
             .map_err(|err| match err {
-                ServiceUsageError::InternalError(_) | ServiceUsageError::ReportingTimeout => {
-                    WebSearchServiceError::Internal
-                }
+                ServiceUsageError::InternalError(_) => WebSearchServiceError::Internal,
                 ServiceUsageError::ServiceNotFound(_) | ServiceUsageError::CostOverflow => {
                     WebSearchServiceError::UsageRecordingFailed
                 }

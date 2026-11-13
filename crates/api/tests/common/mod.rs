@@ -163,10 +163,7 @@ pub fn test_config() -> ApiConfig {
         infra: config::InfraConfig::default(),
         staking_farm: config::StakingFarmConfig::default(),
         aml: config::AmlConfig::default(),
-        usage_reporting: config::UsageReportingConfig {
-            enabled: true,
-            ..config::UsageReportingConfig::default()
-        },
+        usage_reporting: config::UsageReportingConfig::default(),
         credit_allocation: config::CreditAllocationConfig::default(),
         ita: config::ItaAttestationConfig::default(),
         placement: config::PlacementConfig::default(),

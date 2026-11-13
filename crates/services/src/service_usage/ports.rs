@@ -145,21 +145,6 @@ pub trait ServiceUsageServiceTrait: Send + Sync {
         &self,
         params: &RecordServiceUsageWithPricingParams,
     ) -> Result<(), super::ServiceUsageError>;
-
-    /// List service usage logs for an organization, optionally filtered by service name.
-    async fn get_usage_history(
-        &self,
-        organization_id: Uuid,
-        service_name: Option<&str>,
-        credit_type: Option<&str>,
-        limit: i64,
-        offset: i64,
-    ) -> Result<(Vec<ServiceUsageLogEntry>, i64), super::ServiceUsageError>;
-
-    async fn get_usage_report(
-        &self,
-        filters: &ServiceUsageReportFilters,
-    ) -> Result<Vec<ServiceUsageReportEntry>, super::ServiceUsageError>;
 }
 
 /// Port for recording platform service usage (e.g. web_search).
@@ -174,19 +159,4 @@ pub trait ServiceUsageRepositoryTrait: Send + Sync {
 
     /// Insert usage row and update organization_balance. Idempotent when inference_id is set.
     async fn record_service_usage(&self, params: &RecordServiceUsageParams) -> anyhow::Result<()>;
-
-    /// List raw service usage rows for an organization, optionally filtered by service name.
-    async fn list_usage_logs(
-        &self,
-        organization_id: Uuid,
-        service_name: Option<&str>,
-        credit_type: Option<&str>,
-        limit: i64,
-        offset: i64,
-    ) -> anyhow::Result<(Vec<ServiceUsageLogEntry>, i64)>;
-
-    async fn list_usage_report(
-        &self,
-        filters: &ServiceUsageReportFilters,
-    ) -> anyhow::Result<Vec<ServiceUsageReportEntry>>;
 }

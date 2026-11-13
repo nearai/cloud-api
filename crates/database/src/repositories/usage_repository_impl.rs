@@ -2,8 +2,8 @@ use crate::models::RecordUsageRequest;
 use crate::repositories::OrganizationUsageRepository;
 use chrono::{DateTime, Utc};
 use services::usage::ports::{
-    InferenceCost, InferenceUsageHistoryQuery, InferenceUsageReportQuery, InferenceUsageReportRow,
-    OrganizationBalanceInfo, UsageByModelEntry, UsageLogEntry,
+    InferenceCost, InferenceUsageHistoryQuery, InferenceUsageReportRow, OrganizationBalanceInfo,
+    UsageByModelEntry, UsageLogEntry,
 };
 use uuid::Uuid;
 
@@ -276,13 +276,6 @@ impl services::usage::ports::UsageRepository for OrganizationUsageRepository {
                 request_count: r.request_count,
             })
             .collect())
-    }
-
-    async fn list_inference_usage_report(
-        &self,
-        query: InferenceUsageReportQuery,
-    ) -> anyhow::Result<Vec<InferenceUsageReportRow>> {
-        self.list_inference_usage_report(query).await
     }
 
     async fn list_inference_usage_history(

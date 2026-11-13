@@ -635,7 +635,6 @@ pub async fn init_domain_services_with_pool(
     let org_service_usage_repo = Arc::new(
         database::repositories::OrganizationServiceUsageRepository::with_accounting_config(
             database.pool().clone(),
-            reporting_statement_timeout,
             &config.credit_allocation,
         ),
     );

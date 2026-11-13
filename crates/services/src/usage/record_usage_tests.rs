@@ -109,13 +109,6 @@ impl UsageRepository for CapturingUsageRepository {
         unimplemented!()
     }
 
-    async fn list_inference_usage_report(
-        &self,
-        _: InferenceUsageReportQuery,
-    ) -> anyhow::Result<Vec<InferenceUsageReportRow>> {
-        unimplemented!()
-    }
-
     async fn list_inference_usage_history(
         &self,
         _: InferenceUsageHistoryQuery,

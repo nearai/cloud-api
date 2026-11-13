@@ -141,7 +141,7 @@ async fn test_mcp_tools_list_exposes_web_search() {
 
 #[tokio::test]
 async fn test_mcp_tool_call_records_web_search_usage() {
-    let (server, _database) = setup_test_server_with_mock_web_search().await;
+    let (server, database) = setup_test_server_with_mock_web_search().await;
 
     let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
     let api_key = get_api_key_for_org(&server, org.id.clone()).await;
@@ -192,23 +192,21 @@ async fn test_mcp_tool_call_records_web_search_usage() {
         json!("Mock Result")
     );
 
-    let history = server
-        .get(
-            format!(
-                "/v1/organizations/{}/service-usage/history?limit=10&serviceName=web_search",
-                org.id
-            )
-            .as_str(),
+    let client = database.pool().get().await.expect("database connection");
+    let rows = client
+        .query(
+            "SELECT usage_log.quantity, usage_log.total_cost \
+             FROM organization_service_usage_log usage_log \
+             JOIN services ON services.id = usage_log.service_id \
+             WHERE usage_log.organization_id = $1 AND services.service_name = 'web_search' \
+             ORDER BY usage_log.created_at DESC LIMIT 10",
+            &[&uuid::Uuid::parse_str(&org.id).unwrap()],
         )
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
-        .add_header("User-Agent", MOCK_USER_AGENT)
-        .await;
-
-    assert_eq!(history.status_code(), 200, "{}", history.text());
-    let history_body = history.json::<api::routes::usage::ServiceUsageHistoryResponse>();
-    assert!(!history_body.data.is_empty());
-    assert_eq!(history_body.data[0].quantity, 1);
-    assert_eq!(history_body.data[0].total_cost, created.cost_per_unit);
+        .await
+        .expect("service usage rows");
+    assert!(!rows.is_empty());
+    assert_eq!(rows[0].get::<_, i32>(0), 1);
+    assert_eq!(rows[0].get::<_, i64>(1), created.cost_per_unit);
 
     let final_balance = server
         .get(format!("/v1/organizations/{}/usage/balance", org.id).as_str())

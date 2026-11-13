@@ -770,26 +770,6 @@ impl OrganizationRepository for PgOrganizationRepository {
         }
     }
 
-    async fn set_request_priority(
-        &self,
-        id: Uuid,
-        priority: i32,
-    ) -> Result<Option<i32>, RepositoryError> {
-        let row = retry_db!("set_organization_request_priority", {
-            let client = self
-                .pool
-                .get()
-                .await
-                .context("Failed to get database connection")
-                .map_err(RepositoryError::PoolError)?;
-            client.query_opt(
-                "UPDATE organizations SET request_priority = $2, updated_at = NOW() WHERE id = $1 AND is_active = true RETURNING request_priority",
-                &[&id, &priority],
-            ).await.map_err(map_db_error)
-        })?;
-        Ok(row.map(|row| row.get("request_priority")))
-    }
-
     async fn get_by_name(&self, name: &str) -> Result<Option<Organization>, RepositoryError> {
         match self.get_by_name_internal(name).await? {
             Some(db_org) => Ok(Some(

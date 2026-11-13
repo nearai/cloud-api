@@ -198,29 +198,6 @@ pub fn default_limit() -> i64 {
     100
 }
 
-/// Map an analytics granularity string to the PostgreSQL `DATE_TRUNC` literal.
-///
-/// Returns a `&'static str` — the only values that can reach `format!()` are the
-/// four hardcoded literals below. Callers cannot pass user-controlled strings through
-/// to the SQL even if the allowlist check is accidentally skipped elsewhere.
-pub fn allowlisted_date_trunc(
-    granularity: &str,
-) -> Result<&'static str, (StatusCode, ResponseJson<ErrorResponse>)> {
-    match granularity {
-        "hour" => Ok("hour"),
-        "day" => Ok("day"),
-        "week" => Ok("week"),
-        "month" => Ok("month"),
-        other => Err((
-            StatusCode::BAD_REQUEST,
-            ResponseJson(ErrorResponse::new(
-                format!("Invalid granularity '{other}'; expected one of: hour, day, week, month"),
-                "invalid_granularity".to_string(),
-            )),
-        )),
-    }
-}
-
 /// Parse + validate an analytics `start`/`end` window.
 ///
 /// Unlike the old "parse-or-default" behavior, a malformed `start`/`end` is a

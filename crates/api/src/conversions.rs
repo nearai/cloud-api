@@ -755,20 +755,6 @@ pub fn services_invitation_resend_result_to_api(
     }
 }
 
-/// Lifecycle for admin user responses. `None` (with a warning) when the columns are
-/// inconsistent, so one corrupt row cannot fail a whole admin list.
-pub fn admin_user_lifecycle(
-    user_id: uuid::Uuid,
-    is_active: bool,
-    auth_provider: &str,
-) -> Option<services::lifecycle::UserLifecycle> {
-    services::lifecycle::UserLifecycle::from_columns(is_active, auth_provider)
-        .map_err(
-            |_| tracing::warn!(user_id = %user_id, "User row has inconsistent lifecycle columns"),
-        )
-        .ok()
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;

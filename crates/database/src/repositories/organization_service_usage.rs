@@ -9,8 +9,6 @@ use crate::retry_db;
 use anyhow::{Context, Result};
 use chrono::Utc;
 use services::common::RepositoryError;
-use services::service_usage::ports::{ServiceUsageReportEntry, ServiceUsageReportFilters};
-use std::time::Duration;
 use tokio_postgres::Row;
 use uuid::Uuid;
 
@@ -28,7 +26,6 @@ pub struct RecordServiceUsageRequest {
 #[derive(Debug, Clone)]
 pub struct OrganizationServiceUsageRepository {
     pub(crate) pool: DbPool,
-    reporting_statement_timeout: Duration,
     allocation_policy: CreditAllocationPolicy,
 }
 
@@ -36,245 +33,15 @@ impl OrganizationServiceUsageRepository {
     pub fn new(pool: DbPool) -> Self {
         Self {
             pool,
-            reporting_statement_timeout:
-                crate::repositories::reporting_query::DEFAULT_REPORTING_STATEMENT_TIMEOUT,
             allocation_policy: CreditAllocationPolicy::default(),
         }
     }
 
-    pub fn with_accounting_config(
-        pool: DbPool,
-        statement_timeout: Duration,
-        config: &config::CreditAllocationConfig,
-    ) -> Self {
+    pub fn with_accounting_config(pool: DbPool, config: &config::CreditAllocationConfig) -> Self {
         Self {
             pool,
-            reporting_statement_timeout: statement_timeout,
             allocation_policy: CreditAllocationPolicy::from(config),
         }
-    }
-
-    /// List service usage rows for an organization, optionally filtered by service_id.
-    /// Results are ordered by created_at DESC.
-    pub async fn list_for_org(
-        &self,
-        organization_id: Uuid,
-        service_id: Option<Uuid>,
-        credit_type: Option<&str>,
-        limit: i64,
-        offset: i64,
-    ) -> Result<(Vec<OrganizationServiceUsageLog>, i64)> {
-        let (rows, total) = retry_db!("list_service_usage", {
-            let client = self
-                .pool
-                .get()
-                .await
-                .context("Failed to get database connection")
-                .map_err(RepositoryError::PoolError)?;
-
-            if let Some(service_id) = service_id {
-                let total: i64 = client
-                    .query_one(
-                        r#"SELECT COUNT(*)::BIGINT FROM organization_service_usage_log usage_log
-                           WHERE organization_id = $1 AND service_id = $2
-                             AND ($3::TEXT IS NULL OR EXISTS (
-                                 SELECT 1 FROM effective_usage_credit_allocations a
-                                 WHERE a.service_usage_id = usage_log.id AND a.credit_type = $3))"#,
-                        &[&organization_id, &service_id, &credit_type],
-                    )
-                    .await
-                    .map_err(map_db_error)?
-                    .get(0);
-
-                let rows = client
-                    .query(
-                        r#"SELECT usage_log.id, usage_log.organization_id, usage_log.workspace_id,
-                            usage_log.api_key_id, usage_log.service_id, usage_log.quantity,
-                            CASE WHEN $3::TEXT IS NULL THEN usage_log.total_cost ELSE
-                                (SELECT COALESCE(SUM(a.amount), 0)::BIGINT
-                                 FROM effective_usage_credit_allocations a
-                                 WHERE a.service_usage_id = usage_log.id AND a.credit_type = $3)
-                            END AS total_cost,
-                            usage_log.inference_id, usage_log.created_at,
-                            usage_log.funded_amount, usage_log.unfunded_amount,
-                            usage_log.allocation_policy_version,
-                            CASE WHEN usage_log.funded_amount IS NULL THEN NULL ELSE
-                                COALESCE((SELECT jsonb_agg(jsonb_build_object(
-                                    'type', a.credit_type, 'amount', a.amount, 'source', a.source,
-                                    'organization_limit_id', a.organization_limit_id,
-                                    'policy_version', a.policy_version
-                                ) ORDER BY a.created_at, a.priority_position, a.id)
-                                FROM effective_usage_credit_allocations a
-                                WHERE a.service_usage_id = usage_log.id
-                                  AND ($3::TEXT IS NULL OR a.credit_type = $3)), '[]'::jsonb)
-                            END AS credit_allocations
-                           FROM organization_service_usage_log usage_log
-                           WHERE organization_id = $1 AND service_id = $2
-                             AND ($3::TEXT IS NULL OR EXISTS (
-                                 SELECT 1 FROM effective_usage_credit_allocations filter_allocation
-                                 WHERE filter_allocation.service_usage_id = usage_log.id
-                                   AND filter_allocation.credit_type = $3))
-                           ORDER BY created_at DESC LIMIT $4 OFFSET $5"#,
-                        &[&organization_id, &service_id, &credit_type, &limit, &offset],
-                    )
-                    .await
-                    .map_err(map_db_error)?;
-
-                Ok::<_, RepositoryError>((rows, total))
-            } else {
-                let total: i64 = client
-                    .query_one(
-                        r#"SELECT COUNT(*)::BIGINT FROM organization_service_usage_log usage_log
-                           WHERE organization_id = $1
-                             AND ($2::TEXT IS NULL OR EXISTS (
-                                 SELECT 1 FROM effective_usage_credit_allocations a
-                                 WHERE a.service_usage_id = usage_log.id AND a.credit_type = $2))"#,
-                        &[&organization_id, &credit_type],
-                    )
-                    .await
-                    .map_err(map_db_error)?
-                    .get(0);
-
-                let rows = client
-                    .query(
-                        r#"SELECT usage_log.id, usage_log.organization_id, usage_log.workspace_id,
-                            usage_log.api_key_id, usage_log.service_id, usage_log.quantity,
-                            CASE WHEN $2::TEXT IS NULL THEN usage_log.total_cost ELSE
-                                (SELECT COALESCE(SUM(a.amount), 0)::BIGINT
-                                 FROM effective_usage_credit_allocations a
-                                 WHERE a.service_usage_id = usage_log.id AND a.credit_type = $2)
-                            END AS total_cost,
-                            usage_log.inference_id, usage_log.created_at,
-                            usage_log.funded_amount, usage_log.unfunded_amount,
-                            usage_log.allocation_policy_version,
-                            CASE WHEN usage_log.funded_amount IS NULL THEN NULL ELSE
-                                COALESCE((SELECT jsonb_agg(jsonb_build_object(
-                                    'type', a.credit_type, 'amount', a.amount, 'source', a.source,
-                                    'organization_limit_id', a.organization_limit_id,
-                                    'policy_version', a.policy_version
-                                ) ORDER BY a.created_at, a.priority_position, a.id)
-                                FROM effective_usage_credit_allocations a
-                                WHERE a.service_usage_id = usage_log.id
-                                  AND ($2::TEXT IS NULL OR a.credit_type = $2)), '[]'::jsonb)
-                            END AS credit_allocations
-                           FROM organization_service_usage_log usage_log
-                           WHERE organization_id = $1
-                             AND ($2::TEXT IS NULL OR EXISTS (
-                                 SELECT 1 FROM effective_usage_credit_allocations filter_allocation
-                                 WHERE filter_allocation.service_usage_id = usage_log.id
-                                   AND filter_allocation.credit_type = $2))
-                           ORDER BY created_at DESC LIMIT $3 OFFSET $4"#,
-                        &[&organization_id, &credit_type, &limit, &offset],
-                    )
-                    .await
-                    .map_err(map_db_error)?;
-
-                Ok::<_, RepositoryError>((rows, total))
-            }
-        })?;
-
-        let logs = rows
-            .iter()
-            .map(|row| self.row_to_log(row, None))
-            .collect::<Result<Vec<_>>>()?;
-        Ok((logs, total))
-    }
-
-    pub async fn list_reporting_usage(
-        &self,
-        filters: &ServiceUsageReportFilters,
-    ) -> Result<Vec<ServiceUsageReportEntry>> {
-        if let (Some(start_time), Some(end_time)) = (filters.start_time, filters.end_time) {
-            anyhow::ensure!(end_time >= start_time, "invalid reporting date range");
-        }
-
-        let cursor_created_at = filters.cursor.map(|cursor| cursor.created_at);
-        let cursor_id = filters.cursor.map(|cursor| cursor.id);
-        let deadline = crate::repositories::reporting_query::reporting_deadline(
-            self.reporting_statement_timeout,
-            filters.deadline,
-        )?;
-        let rows = retry_db!("list_service_usage_report", {
-            let mut client = self
-                .pool
-                .get()
-                .await
-                .context("Failed to get database connection")
-                .map_err(RepositoryError::PoolError)?;
-
-            let transaction = client
-                .build_transaction()
-                .read_only(true)
-                .start()
-                .await
-                .map_err(map_db_error)?;
-            crate::repositories::reporting_query::configure_reporting_transaction(
-                &transaction,
-                crate::repositories::reporting_query::remaining_statement_timeout(deadline)?,
-            )
-            .await?;
-            let rows = transaction
-                .query(
-                    r#"
-                    SELECT
-                        usage_log.id, usage_log.organization_id, usage_log.workspace_id,
-                        usage_log.api_key_id, usage_log.service_id, services.service_name,
-                        usage_log.quantity,
-                        CASE WHEN $7::TEXT IS NULL THEN usage_log.total_cost ELSE
-                            (SELECT COALESCE(SUM(a.amount), 0)::BIGINT FROM effective_usage_credit_allocations a
-                             WHERE a.service_usage_id = usage_log.id AND a.credit_type = $7)
-                        END AS total_cost,
-                        usage_log.inference_id, usage_log.created_at,
-                        usage_log.funded_amount, usage_log.unfunded_amount,
-                        usage_log.allocation_policy_version,
-                        CASE WHEN usage_log.funded_amount IS NULL THEN NULL ELSE
-                            COALESCE((SELECT jsonb_agg(jsonb_build_object(
-                                'type', a.credit_type, 'amount', a.amount, 'source', a.source,
-                                'organization_limit_id', a.organization_limit_id,
-                                'policy_version', a.policy_version
-                            ) ORDER BY a.created_at, a.priority_position, a.id)
-                            FROM effective_usage_credit_allocations a
-                            WHERE a.service_usage_id = usage_log.id
-                              AND ($7::TEXT IS NULL OR a.credit_type = $7)), '[]'::jsonb)
-                        END AS credit_allocations
-                    FROM organization_service_usage_log AS usage_log
-                    INNER JOIN services ON services.id = usage_log.service_id
-                    WHERE usage_log.organization_id = $1
-                      AND ($2::TEXT IS NULL OR services.service_name = $2)
-                      AND ($3::UUID IS NULL OR usage_log.workspace_id = $3)
-                      AND ($4::UUID IS NULL OR usage_log.api_key_id = $4)
-                      AND ($5::TIMESTAMPTZ IS NULL OR usage_log.created_at >= $5)
-                      AND ($6::TIMESTAMPTZ IS NULL OR usage_log.created_at <= $6)
-                      AND ($7::TEXT IS NULL OR EXISTS (
-                          SELECT 1 FROM effective_usage_credit_allocations allocation_filter
-                          WHERE allocation_filter.service_usage_id = usage_log.id
-                            AND allocation_filter.credit_type = $7
-                      ))
-                      AND ($8::TIMESTAMPTZ IS NULL OR $9::UUID IS NULL
-                           OR (usage_log.created_at, usage_log.id) < ($8, $9))
-                    ORDER BY usage_log.created_at DESC, usage_log.id DESC
-                    LIMIT $10
-                    "#,
-                    &[
-                        &filters.organization_id,
-                        &filters.service_name,
-                        &filters.workspace_id,
-                        &filters.api_key_id,
-                        &filters.start_time,
-                        &filters.end_time,
-                        &filters.credit_type,
-                        &cursor_created_at,
-                        &cursor_id,
-                        &filters.limit,
-                    ],
-                )
-                .await
-                .map_err(map_db_error)?;
-            transaction.commit().await.map_err(map_db_error)?;
-            Ok::<_, RepositoryError>(rows)
-        })?;
-
-        rows.iter().map(Self::row_to_report_entry).collect()
     }
 
     /// Record service usage and update organization_balance. Idempotent when inference_id is set:
@@ -455,32 +222,6 @@ impl OrganizationServiceUsageRepository {
             service_id: row.get("service_id"),
             quantity: row.get("quantity"),
             total_cost,
-            inference_id: row.get("inference_id"),
-            created_at: row.get("created_at"),
-            credit_allocations,
-            funded_amount,
-            unfunded_amount,
-            allocation_policy_version: row.try_get("allocation_policy_version").ok().flatten(),
-        })
-    }
-
-    fn row_to_report_entry(row: &Row) -> Result<ServiceUsageReportEntry> {
-        let credit_allocations = row
-            .try_get::<_, Option<serde_json::Value>>("credit_allocations")?
-            .map(serde_json::from_value)
-            .transpose()?;
-        let total_cost = row.get("total_cost");
-        let (funded_amount, unfunded_amount) =
-            effective_funding(row, &credit_allocations, total_cost);
-        Ok(ServiceUsageReportEntry {
-            id: row.get("id"),
-            organization_id: row.get("organization_id"),
-            workspace_id: row.get("workspace_id"),
-            api_key_id: row.get("api_key_id"),
-            service_id: row.get("service_id"),
-            service_name: row.get("service_name"),
-            quantity: row.get("quantity"),
-            total_cost: row.get("total_cost"),
             inference_id: row.get("inference_id"),
             created_at: row.get("created_at"),
             credit_allocations,

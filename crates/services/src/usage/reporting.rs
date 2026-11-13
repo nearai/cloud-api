@@ -1,28 +1,6 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::time::Instant;
 use uuid::Uuid;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct InferenceUsageReportCursor {
-    pub created_at: DateTime<Utc>,
-    pub id: Uuid,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct InferenceUsageReportQuery {
-    pub organization_id: Uuid,
-    pub start_time: Option<DateTime<Utc>>,
-    pub end_time: Option<DateTime<Utc>>,
-    pub workspace_id: Option<Uuid>,
-    pub api_key_id: Option<Uuid>,
-    pub model: Option<String>,
-    pub inference_type: Option<String>,
-    pub credit_type: Option<String>,
-    pub limit: u16,
-    pub cursor: Option<InferenceUsageReportCursor>,
-    pub deadline: Option<Instant>,
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InferenceUsageHistoryQuery {
@@ -34,24 +12,6 @@ pub struct InferenceUsageHistoryQuery {
     pub credit_type: Option<String>,
     pub limit: i64,
     pub offset: i64,
-}
-
-impl InferenceUsageReportQuery {
-    pub const fn for_organization(organization_id: Uuid) -> Self {
-        Self {
-            organization_id,
-            start_time: None,
-            end_time: None,
-            workspace_id: None,
-            api_key_id: None,
-            model: None,
-            inference_type: None,
-            credit_type: None,
-            limit: 100,
-            cursor: None,
-            deadline: None,
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

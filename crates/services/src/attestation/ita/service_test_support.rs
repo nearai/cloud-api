@@ -22,9 +22,9 @@ use crate::{
     metrics::MetricsServiceTrait,
     models::{ModelWithPricing, ModelsRepository},
     usage::{
-        InferenceCost, InferenceUsageHistoryQuery, InferenceUsageReportQuery,
-        InferenceUsageReportRow, OrganizationBalanceInfo, RecordUsageDbRequest, StopReason,
-        UsageByModelEntry, UsageLogEntry, UsageRepository,
+        InferenceCost, InferenceUsageHistoryQuery, InferenceUsageReportRow,
+        OrganizationBalanceInfo, RecordUsageDbRequest, StopReason, UsageByModelEntry,
+        UsageLogEntry, UsageRepository,
     },
 };
 
@@ -400,13 +400,6 @@ impl UsageRepository for NoopUsageRepository {
         _start_date: chrono::DateTime<chrono::Utc>,
         _end_date: Option<chrono::DateTime<chrono::Utc>>,
     ) -> anyhow::Result<Vec<UsageByModelEntry>> {
-        Ok(Vec::new())
-    }
-
-    async fn list_inference_usage_report(
-        &self,
-        _query: InferenceUsageReportQuery,
-    ) -> anyhow::Result<Vec<InferenceUsageReportRow>> {
         Ok(Vec::new())
     }
 

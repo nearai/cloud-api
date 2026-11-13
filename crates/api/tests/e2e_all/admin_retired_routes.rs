@@ -9,6 +9,7 @@ const ID: &str = "00000000-0000-0000-0000-000000000002";
 
 fn retired_routes() -> Vec<(Method, String)> {
     let admin_org = format!("/v1/admin/organizations/{ORG}");
+    let org = format!("/v1/organizations/{ORG}");
     vec![
         // Usage discount admin route
         (Method::GET, format!("{admin_org}/usage-discount")),
@@ -93,6 +94,45 @@ fn retired_routes() -> Vec<(Method, String)> {
         (Method::PATCH, "/v1/admin/settings/placement".into()),
         (Method::POST, "/v1/feature-requests".into()),
         (Method::GET, "/v1/admin/feature-requests".into()),
+        // Reporting tokens and the usage reporting routes they authorized
+        (Method::GET, format!("{org}/reporting-tokens")),
+        (Method::POST, format!("{org}/reporting-tokens")),
+        (Method::DELETE, format!("{org}/reporting-tokens/{ID}")),
+        (
+            Method::GET,
+            format!("{org}/usage/reporting-token-auth-probe"),
+        ),
+        (Method::GET, format!("{org}/usage/export")),
+        (Method::GET, format!("{org}/usage/summary")),
+        // Service usage history
+        (Method::GET, format!("{org}/service-usage/history")),
+        // Admin balance, member list and API key list
+        (Method::GET, format!("{admin_org}/usage/balance")),
+        (Method::GET, format!("{admin_org}/members")),
+        (Method::GET, "/v1/admin/api-keys".into()),
+        // Credit transfer detail, reconciliation and policy
+        (Method::GET, format!("{org}/credit/transfers/{ID}")),
+        (
+            Method::GET,
+            format!("{admin_org}/credit/transfer/reconciliation"),
+        ),
+        (Method::POST, format!("{admin_org}/credit/reconciliations")),
+        (Method::GET, format!("{admin_org}/policy")),
+        (Method::PUT, format!("{admin_org}/policy")),
+        // Organization credentials
+        (Method::POST, format!("{org}/credentials")),
+        (Method::GET, format!("{org}/credentials")),
+        (Method::PUT, format!("{org}/credentials/{ID}")),
+        (Method::DELETE, format!("{org}/credentials/{ID}")),
+        (Method::POST, format!("{org}/credentials/{ID}/rotate")),
+        // Hourly usage recompute
+        (Method::POST, "/v1/admin/usage-hourly/recompute".into()),
+        // Staking farm configuration, state, binding and admin reads
+        (Method::GET, "/v1/staking/farm/config".into()),
+        (Method::GET, format!("{org}/staking/farm")),
+        (Method::POST, format!("{org}/staking/farm/bind")),
+        (Method::GET, format!("{admin_org}/staking/farm")),
+        (Method::POST, format!("{admin_org}/staking/farm/sync")),
     ]
 }
 

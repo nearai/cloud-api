@@ -2,8 +2,7 @@ pub mod ports;
 
 pub use ports::ServiceUsageServiceTrait;
 use ports::{
-    RecordServiceUsageParams, RecordServiceUsageWithPricingParams, ServiceUsageReportEntry,
-    ServiceUsageReportFilters, ServiceUsageRepositoryTrait,
+    RecordServiceUsageParams, RecordServiceUsageWithPricingParams, ServiceUsageRepositoryTrait,
 };
 use std::sync::Arc;
 use uuid::Uuid;
@@ -16,8 +15,6 @@ pub enum ServiceUsageError {
     CostOverflow,
     #[error("Internal error: {0}")]
     InternalError(String),
-    #[error("Usage reporting query timed out")]
-    ReportingTimeout,
 }
 
 /// Records platform-level service usage (e.g. web_search) and updates org balance.
@@ -66,32 +63,5 @@ impl ServiceUsageServiceTrait for ServiceUsageService {
             .map_err(|e| ServiceUsageError::InternalError(e.to_string()))?;
 
         Ok(())
-    }
-
-    async fn get_usage_history(
-        &self,
-        organization_id: Uuid,
-        service_name: Option<&str>,
-        credit_type: Option<&str>,
-        limit: i64,
-        offset: i64,
-    ) -> Result<(Vec<ports::ServiceUsageLogEntry>, i64), ServiceUsageError> {
-        self.repo
-            .list_usage_logs(organization_id, service_name, credit_type, limit, offset)
-            .await
-            .map_err(|e| ServiceUsageError::InternalError(e.to_string()))
-    }
-
-    async fn get_usage_report(
-        &self,
-        filters: &ServiceUsageReportFilters,
-    ) -> Result<Vec<ServiceUsageReportEntry>, ServiceUsageError> {
-        self.repo.list_usage_report(filters).await.map_err(|error| {
-            if crate::common::is_query_timeout(&error) {
-                ServiceUsageError::ReportingTimeout
-            } else {
-                ServiceUsageError::InternalError(error.to_string())
-            }
-        })
     }
 }

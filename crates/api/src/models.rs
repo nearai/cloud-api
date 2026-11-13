@@ -8,26 +8,6 @@ use utoipa::ToSchema;
 pub use services::responses::models::ResponseImageUrl;
 pub use services::service_usage::ports::ServiceUnit;
 
-// Streaming response models
-#[derive(Debug, Serialize, Deserialize)]
-pub struct StreamChunkResponse {
-    pub id: String,
-    pub object: String,
-    pub created: i64,
-    pub model: String,
-    pub choices: Vec<StreamChoice>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub usage: Option<CompletionUsage>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct StreamChoice {
-    pub index: i64,
-    pub delta: Delta,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub finish_reason: Option<String>,
-}
-
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Delta {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1519,53 +1499,6 @@ pub struct WebSearchResultItem {
     pub site_name: Option<String>,
 }
 
-/// Query parameters for GET /v1/web/search (aligned with Brave WebSearchParams).
-/// See Brave Search API docs for full parameter semantics: https://api-dashboard.search.brave.com/documentation/services/web-search
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, utoipa::IntoParams)]
-pub struct WebSearchQueryParams {
-    /// Search query (required)
-    pub q: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub country: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub search_lang: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ui_lang: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub count: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub offset: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub safesearch: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub freshness: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub text_decorations: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub spellcheck: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub units: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extra_snippets: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub summary: Option<bool>,
-    /// Comma-delimited result types: discussions, faq, infobox, news, query, summarizer, videos, web, locations
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub result_filter: Option<String>,
-    /// Goggles URL or inline definition for custom re-ranking
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub goggles: Option<String>,
-    /// Enable rich data (weather, stocks, etc.); forwarded to Brave as enable_rich_callback query param
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub enable_rich_callback: Option<bool>,
-    /// Include fetch metadata in response
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub include_fetch_metadata: Option<bool>,
-    /// Enable search operators interpretation in query
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub operators: Option<bool>,
-}
-
 fn default_n() -> Option<i64> {
     Some(1)
 }
@@ -2970,36 +2903,6 @@ pub struct OrganizationSettingsResponse {
     pub settings: OrganizationSettings,
 }
 
-/// Operator-controlled priority for the inference scheduler. Higher values run first.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct UpdateOrganizationPriorityRequest {
-    /// Inclusive range -1000..1000. Set 0 to restore the default.
-    #[schema(minimum = -1000, maximum = 1000)]
-    pub priority: i32,
-}
-
-/// Scheduler priority, available only through platform-admin endpoints.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct OrganizationPriorityResponse {
-    pub organization_id: uuid::Uuid,
-    pub priority: i32,
-}
-
-/// Admin request to update an organization's fallback policy.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct UpdateOrganizationFallbackRequest {
-    pub enabled: bool,
-}
-
-/// Effective fallback policy returned by admin organization endpoints.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct OrganizationFallbackResponse {
-    pub organization_id: uuid::Uuid,
-    pub enabled: bool,
-}
-
 /// Result of a single invitation attempt
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct InvitationResult {
@@ -3041,18 +2944,6 @@ pub struct ListOrganizationMembersResponse {
     pub total: i64,
     pub limit: i64,
     pub offset: i64,
-}
-
-/// Admin organization member response (for owners/admins)
-/// Contains member info with full user details including sensitive data
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct AdminOrganizationMemberResponse {
-    pub id: String,
-    pub organization_id: String,
-    pub role: MemberRole,
-    pub joined_at: DateTime<Utc>,
-    pub invited_by: Option<String>,
-    pub user: AdminUserResponse,
 }
 
 /// Public user response model (for regular members)
@@ -3284,105 +3175,6 @@ pub struct OrganizationMemberResponse {
     pub role: MemberRole,
     pub joined_at: DateTime<Utc>,
     pub invited_by: Option<String>,
-}
-
-/// Admin AML report audit entry.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct AdminAmlReportResponse {
-    pub id: String,
-    pub user_id: Option<String>,
-    pub flow: String,
-    pub provider: String,
-    pub account_id: String,
-    pub address_type: String,
-    pub risk_level: String,
-    pub score: Option<i32>,
-    pub report_id: Option<String>,
-    pub reason: Option<String>,
-    pub provider_report_time: Option<DateTime<Utc>>,
-    pub active: bool,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
-}
-
-/// Paginated admin AML reports response.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct ListAdminAmlReportsResponse {
-    pub reports: Vec<AdminAmlReportResponse>,
-    pub total: i64,
-    pub limit: i64,
-    pub offset: i64,
-}
-
-/// Admin AML report status update request.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct UpdateAmlReportStatusRequest {
-    pub active: bool,
-}
-
-/// Admin AML allowlist entry response.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct AdminAmlAllowlistEntryResponse {
-    pub account_id: String,
-    pub address_type: String,
-    pub reason: Option<String>,
-    pub created_by_user_id: Option<String>,
-    pub created_at: DateTime<Utc>,
-}
-
-/// Admin AML allowlist response.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct ListAdminAmlAllowlistResponse {
-    pub accounts: Vec<AdminAmlAllowlistEntryResponse>,
-    pub total: i64,
-    pub limit: i64,
-    pub offset: i64,
-}
-
-/// Admin AML allowlist upsert request.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct UpsertAmlAllowlistEntryRequest {
-    pub account_id: String,
-    pub reason: Option<String>,
-}
-
-/// API key metadata for admin listing. Never includes key material (raw key,
-/// hash, or prefix) or the user-supplied key name.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct AdminApiKeyResponse {
-    pub id: String,
-    pub organization_id: String,
-    pub organization_name: String,
-    pub workspace_id: String,
-    /// User who created the key
-    pub created_by_user_id: String,
-    pub created_at: DateTime<Utc>,
-    pub is_active: bool,
-    /// Set when the key was revoked
-    pub deleted_at: Option<DateTime<Utc>>,
-    /// True when the key's name matches the Cloud UI's managed Playground key
-    /// naming (`Playground-<uuid>-g<generation>`). Best-effort: derived from the
-    /// user-editable key name, not stored provenance.
-    pub is_managed_playground: bool,
-}
-
-/// List API keys response model (admin only)
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct ListAdminApiKeysResponse {
-    pub api_keys: Vec<AdminApiKeyResponse>,
-    pub total: i64,
-    pub limit: i64,
-    pub offset: i64,
-}
-
-/// List organization members response model (admin only).
-/// Exposes full user details (email, last login, active status) for each member.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct ListAdminOrganizationMembersResponse {
-    pub members: Vec<AdminOrganizationMemberResponse>,
-    pub total: i64,
-    pub limit: i64,
-    pub offset: i64,
 }
 
 /// Immutable admin-token permission across organizations. Read-only tokens can
@@ -3698,15 +3490,6 @@ pub struct ModelListResponse {
     pub total: i64,
 }
 
-/// Response for admin model list endpoint
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
-pub struct AdminModelListResponse {
-    pub models: Vec<AdminModelWithPricing>,
-    pub limit: i64,
-    pub offset: i64,
-    pub total: i64,
-}
-
 /// Platform service (admin CRUD) — single item
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct AdminServiceResponse {
@@ -3742,15 +3525,6 @@ impl From<services::admin::PlatformServiceInfo> for AdminServiceResponse {
             updated_at: info.updated_at,
         }
     }
-}
-
-/// Response for admin service list endpoint
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
-pub struct AdminServiceListResponse {
-    pub services: Vec<AdminServiceResponse>,
-    pub limit: i64,
-    pub offset: i64,
-    pub total: i64,
 }
 
 /// Platform service (public) — single item.
@@ -3800,33 +3574,6 @@ pub struct ServiceListResponse {
     pub limit: i64,
     pub offset: i64,
     pub total: i64,
-}
-
-/// Request to create a platform service (admin)
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
-pub struct CreateServiceRequest {
-    #[serde(rename = "serviceName")]
-    pub service_name: String,
-    #[serde(rename = "displayName")]
-    pub display_name: String,
-    pub description: Option<String>,
-    pub unit: ServiceUnit,
-    /// Price per unit in nano-USD (scale 9).
-    #[serde(rename = "costPerUnit")]
-    pub cost_per_unit: i64,
-}
-
-/// Request to update a platform service (admin; display_name, description, cost_per_unit, is_active)
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
-pub struct UpdateServiceRequest {
-    #[serde(rename = "displayName")]
-    pub display_name: Option<String>,
-    pub description: Option<String>,
-    /// Price per unit in nano-USD (scale 9).
-    #[serde(rename = "costPerUnit")]
-    pub cost_per_unit: Option<i64>,
-    #[serde(rename = "isActive")]
-    pub is_active: Option<bool>,
 }
 
 /// Model with pricing information for admin listing
@@ -4151,7 +3898,7 @@ pub struct UpdateModelApiRequest {
     /// leaves the public model catalogs (`GET /v1/models`,
     /// `GET /v1/model/list`, `GET /v1/model/{name}`) and becomes restricted:
     /// only organizations that hold a grant
-    /// (`PUT /v1/admin/models/{model_name}/access/{org_id}` on the admin API) may use it, and
+    /// (an access grant managed through the admin API) may use it, and
     /// everyone else is answered as if the model did not exist. `true` lists
     /// it again and opens it to every caller. Omitted = leave unchanged (new
     /// models are listed).
@@ -4281,145 +4028,6 @@ pub struct UpdateModelApiRequest {
 /// Batch update request format - Array of model name to update data
 pub type BatchUpdateModelApiRequest = std::collections::HashMap<String, UpdateModelApiRequest>;
 
-/// Delete model request - optional reason for deletion
-#[derive(Debug, Deserialize, Serialize, ToSchema)]
-pub struct DeleteModelRequest {
-    #[serde(rename = "changeReason", skip_serializing_if = "Option::is_none")]
-    pub change_reason: Option<String>,
-}
-
-/// Request to deprecate one model in favor of another.
-///
-/// Atomically:
-/// - adds `modelId` as an alias of `successorModelId` (so existing clients
-///   continue to work, with their request-side `model` rewritten to the
-///   successor at resolution time),
-/// - re-points any existing inbound aliases of `modelId` at the successor,
-/// - sets `modelId.isActive = false` so it is hidden from `GET /v1/models`
-///   and `GET /v1/admin/models` (unless `include_inactive` is set).
-#[derive(Debug, Deserialize, Serialize, ToSchema)]
-pub struct DeprecateModelRequest {
-    /// Canonical model_name of the model being deprecated.
-    #[serde(rename = "modelId")]
-    pub model_id: String,
-    /// Canonical model_name of the replacement model. Must be active.
-    #[serde(rename = "successorModelId")]
-    pub successor_model_id: String,
-    /// Optional reason recorded in the model history.
-    #[serde(rename = "changeReason", skip_serializing_if = "Option::is_none")]
-    pub change_reason: Option<String>,
-}
-
-/// Response from a deprecation operation.
-///
-/// Both sides use the public `ModelWithPricing` shape (no `isActive` /
-/// timestamps). Confirmation that the deprecation took effect is implicit:
-/// the deprecated model is hidden from `GET /v1/admin/models` (default
-/// listing) and from public `GET /v1/models`. To inspect `isActive`
-/// directly, call `GET /v1/admin/models?include_inactive=true`.
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
-pub struct DeprecateModelResponse {
-    /// State of the deprecated model after the operation (canonical name
-    /// echoed back in `modelId`; merged alias list reflects the moves).
-    pub deprecated: ModelWithPricing,
-    /// State of the successor model after the operation. Its `metadata.aliases`
-    /// includes the deprecated `modelId` plus any inbound aliases that were
-    /// re-pointed.
-    pub successor: ModelWithPricing,
-    /// Number of pre-existing **active** inbound aliases of the deprecated
-    /// model that were re-pointed at the successor. Does not include the
-    /// deprecated model's own canonical name (which is added unconditionally
-    /// as a new alias) and does not include inactive inbound aliases (which
-    /// are left untouched — see repository docs).
-    #[serde(rename = "aliasesCarried")]
-    pub aliases_carried: u32,
-}
-
-/// Request to mark an active model with a planned deprecation date and notify affected admins.
-#[derive(Debug, Deserialize, Serialize, ToSchema)]
-pub struct ModelDeprecationRequest {
-    /// Active replacement model to recommend in the email. Does not affect routing.
-    #[serde(rename = "successorModelId")]
-    pub successor_model_id: String,
-    /// Planned deprecation date (`YYYY-MM-DD` or `YYYY-MM-DDTHH:00:00Z`).
-    #[serde(rename = "deprecationDate")]
-    pub deprecation_date: String,
-    /// Optional reason recorded in model history.
-    #[serde(rename = "changeReason", skip_serializing_if = "Option::is_none")]
-    pub change_reason: Option<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
-pub struct ModelDeprecationPreviewResponse {
-    #[serde(rename = "recipientCount")]
-    pub recipient_count: i64,
-    #[serde(rename = "organizationCount")]
-    pub organization_count: i64,
-    #[serde(rename = "usageWindowDays")]
-    pub usage_window_days: i64,
-}
-
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
-pub struct ModelDeprecationConfirmResponse {
-    #[serde(rename = "modelId")]
-    pub model_id: String,
-    #[serde(rename = "successorModelId")]
-    pub successor_model_id: String,
-    #[serde(rename = "deprecationDate")]
-    pub deprecation_date: String,
-    #[serde(rename = "recipientCount")]
-    pub recipient_count: i64,
-    #[serde(rename = "organizationCount")]
-    pub organization_count: i64,
-    #[serde(rename = "sentCount")]
-    pub sent_count: i64,
-    #[serde(rename = "failedCount")]
-    pub failed_count: i64,
-    #[serde(rename = "skippedCount")]
-    pub skipped_count: i64,
-}
-
-/// One model's entry in a scheduled pricing change batch.
-/// Omitted pricing fields are left unchanged; at least one is required.
-#[derive(Debug, Deserialize, Serialize, ToSchema)]
-pub struct PricingChangeItemRequest {
-    #[serde(rename = "modelId")]
-    pub model_id: String,
-    /// When the new pricing takes effect (`YYYY-MM-DD`, defaults to 13:00
-    /// UTC, or a whole-hour UTC instant `YYYY-MM-DDTHH:00:00Z`). Must be at
-    /// least one hour in the future.
-    #[serde(rename = "effectiveAt")]
-    pub effective_at: String,
-    #[serde(rename = "inputCostPerToken", skip_serializing_if = "Option::is_none")]
-    pub input_cost_per_token: Option<DecimalPriceRequest>,
-    #[serde(rename = "outputCostPerToken", skip_serializing_if = "Option::is_none")]
-    pub output_cost_per_token: Option<DecimalPriceRequest>,
-    #[serde(
-        rename = "cacheReadCostPerToken",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub cache_read_cost_per_token: Option<DecimalPriceRequest>,
-    #[serde(rename = "costPerImage", skip_serializing_if = "Option::is_none")]
-    pub cost_per_image: Option<DecimalPriceRequest>,
-    #[serde(rename = "textPricing", skip_serializing_if = "Option::is_none")]
-    #[schema(value_type = Option<Object>)]
-    pub text_pricing: Option<serde_json::Value>,
-}
-
-/// Request to preview or confirm a batch of scheduled pricing changes.
-#[derive(Debug, Deserialize, Serialize, ToSchema)]
-pub struct PricingChangeBatchRequest {
-    /// Idempotency key for the batch. Generate once client-side and reuse on
-    /// retries so a re-confirm never sends duplicate emails. Confirm
-    /// generates one when omitted.
-    #[serde(rename = "batchId", skip_serializing_if = "Option::is_none")]
-    pub batch_id: Option<uuid::Uuid>,
-    pub changes: Vec<PricingChangeItemRequest>,
-    /// Optional reason recorded in model history when the change is applied.
-    #[serde(rename = "changeReason", skip_serializing_if = "Option::is_none")]
-    pub change_reason: Option<String>,
-}
-
 /// Full pricing snapshot. `cacheReadCostPerToken` is omitted when cache
 /// pricing was disabled at snapshot time.
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -4437,106 +4045,6 @@ pub struct PricingFields {
     pub cost_per_image: DecimalPrice,
     #[serde(rename = "textPricing", skip_serializing_if = "Option::is_none")]
     pub text_pricing: Option<serde_json::Value>,
-}
-
-/// Partial pricing update; omitted fields are unchanged.
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
-pub struct PricingFieldUpdates {
-    #[serde(rename = "inputCostPerToken", skip_serializing_if = "Option::is_none")]
-    pub input_cost_per_token: Option<DecimalPrice>,
-    #[serde(rename = "outputCostPerToken", skip_serializing_if = "Option::is_none")]
-    pub output_cost_per_token: Option<DecimalPrice>,
-    #[serde(
-        rename = "cacheReadCostPerToken",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub cache_read_cost_per_token: Option<DecimalPrice>,
-    #[serde(rename = "costPerImage", skip_serializing_if = "Option::is_none")]
-    pub cost_per_image: Option<DecimalPrice>,
-    #[serde(rename = "textPricing", skip_serializing_if = "Option::is_none")]
-    pub text_pricing: Option<serde_json::Value>,
-}
-
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
-pub struct PricingChangeModelPreviewDto {
-    #[serde(rename = "modelId")]
-    pub model_id: String,
-    #[serde(rename = "modelDisplayName")]
-    pub model_display_name: String,
-    #[serde(rename = "effectiveAt")]
-    pub effective_at: String,
-    #[serde(rename = "recipientCount")]
-    pub recipient_count: i64,
-    #[serde(rename = "organizationCount")]
-    pub organization_count: i64,
-    #[serde(rename = "oldPricing")]
-    pub old_pricing: PricingFields,
-    #[serde(rename = "newPricing")]
-    pub new_pricing: PricingFieldUpdates,
-}
-
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
-pub struct PricingChangePreviewResponse {
-    /// Distinct recipient emails across the whole batch.
-    #[serde(rename = "recipientCount")]
-    pub recipient_count: i64,
-    #[serde(rename = "organizationCount")]
-    pub organization_count: i64,
-    #[serde(rename = "usageWindowDays")]
-    pub usage_window_days: i64,
-    pub models: Vec<PricingChangeModelPreviewDto>,
-}
-
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
-pub struct ScheduledPricingChangeDto {
-    pub id: String,
-    #[serde(rename = "batchId")]
-    pub batch_id: String,
-    #[serde(rename = "modelId")]
-    pub model_id: String,
-    #[serde(rename = "modelDisplayName")]
-    pub model_display_name: String,
-    /// One of: pending, applying, applied, cancelled, failed.
-    pub status: String,
-    #[serde(rename = "effectiveAt")]
-    pub effective_at: String,
-    #[serde(rename = "oldPricing")]
-    pub old_pricing: PricingFields,
-    #[serde(rename = "newPricing")]
-    pub new_pricing: PricingFieldUpdates,
-    #[serde(rename = "appliedAt", skip_serializing_if = "Option::is_none")]
-    pub applied_at: Option<String>,
-    #[serde(rename = "lastError", skip_serializing_if = "Option::is_none")]
-    pub last_error: Option<String>,
-    #[serde(rename = "createdByUserEmail", skip_serializing_if = "Option::is_none")]
-    pub created_by_user_email: Option<String>,
-    #[serde(rename = "changeReason", skip_serializing_if = "Option::is_none")]
-    pub change_reason: Option<String>,
-    #[serde(rename = "createdAt")]
-    pub created_at: String,
-}
-
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
-pub struct PricingChangeConfirmResponse {
-    #[serde(rename = "batchId")]
-    pub batch_id: String,
-    #[serde(rename = "recipientCount")]
-    pub recipient_count: i64,
-    #[serde(rename = "organizationCount")]
-    pub organization_count: i64,
-    #[serde(rename = "sentCount")]
-    pub sent_count: i64,
-    #[serde(rename = "failedCount")]
-    pub failed_count: i64,
-    #[serde(rename = "skippedCount")]
-    pub skipped_count: i64,
-    pub changes: Vec<ScheduledPricingChangeDto>,
-}
-
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
-pub struct ListPricingChangesResponse {
-    pub changes: Vec<ScheduledPricingChangeDto>,
-    pub total: i64,
 }
 
 /// Model history entry - includes pricing, context length, and other model attributes
@@ -4635,17 +4143,6 @@ pub struct ModelHistoryEntry {
     pub is_listed: bool,
 }
 
-/// Model history response - complete history of model changes
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
-pub struct ModelHistoryResponse {
-    #[serde(rename = "modelName")]
-    pub model_name: String,
-    pub history: Vec<ModelHistoryEntry>,
-    pub total: i64,
-    pub limit: i64,
-    pub offset: i64,
-}
-
 // ============================================
 // Organization Limits API Models (Admin)
 // ============================================
@@ -4714,37 +4211,6 @@ impl std::str::FromStr for CreditType {
     }
 }
 
-/// Request to update organization limits (Admin only)
-#[derive(Debug, Deserialize, ToSchema)]
-pub struct UpdateOrganizationLimitsRequest {
-    #[serde(rename = "type")]
-    pub credit_type: CreditType,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub source: Option<String>,
-    #[serde(rename = "spendLimit")]
-    pub spend_limit: SpendLimitRequest,
-    #[serde(rename = "changedBy", skip_serializing_if = "Option::is_none")]
-    pub changed_by: Option<String>,
-    #[serde(rename = "changeReason", skip_serializing_if = "Option::is_none")]
-    pub change_reason: Option<String>,
-}
-
-/// Spend limit for API requests
-///
-/// The system internally uses a fixed scale of 9 (nano-dollars = 1 billionth of a dollar).
-/// Clients must provide amounts in nano-dollars.
-///
-/// Examples:
-///   $100.00 USD: amount=100000000000, currency="USD"
-///   $1.00 USD: amount=1000000000, currency="USD"
-///   $0.01 USD: amount=10000000, currency="USD"
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
-pub struct SpendLimitRequest {
-    /// Amount in nano-dollars (scale 9). For example, $1.00 = 1000000000 nano-dollars.
-    pub amount: i64,
-    pub currency: String,
-}
-
 /// Spend limit for API responses
 ///
 /// The system uses a fixed scale of 9 (nano-dollars = 1 billionth of a dollar).
@@ -4773,82 +4239,9 @@ pub struct UpdateOrganizationLimitsResponse {
     pub updated_at: String,
 }
 
-/// Organization limits history entry
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
-pub struct OrgLimitsHistoryEntry {
-    pub id: String,
-    #[serde(rename = "organizationId")]
-    pub organization_id: String,
-    #[serde(rename = "type")]
-    pub credit_type: CreditType,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub source: Option<String>,
-    #[serde(rename = "spendLimit")]
-    pub spend_limit: SpendLimit,
-    #[serde(rename = "effectiveFrom")]
-    pub effective_from: String,
-    #[serde(rename = "effectiveUntil")]
-    pub effective_until: Option<String>,
-    #[serde(rename = "changedBy")]
-    pub changed_by: Option<String>,
-    #[serde(rename = "changeReason")]
-    pub change_reason: Option<String>,
-    #[serde(rename = "changedByUserId")]
-    pub changed_by_user_id: Option<String>,
-    #[serde(rename = "changedByUserEmail")]
-    pub changed_by_user_email: Option<String>,
-    #[serde(rename = "createdAt")]
-    pub created_at: String,
-}
-
-/// Organization limits history response
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
-pub struct OrgLimitsHistoryResponse {
-    pub history: Vec<OrgLimitsHistoryEntry>,
-    pub total: i64,
-    pub limit: i64,
-    pub offset: i64,
-}
-
 // ============================================
 // Organization Concurrent Limit API Models (Admin)
 // ============================================
-
-/// Request to update organization concurrent request limit (Admin only)
-///
-/// The concurrent limit controls how many requests an organization can have
-/// in-flight simultaneously per model. Set to null to use the default (64).
-#[derive(Debug, Deserialize, ToSchema)]
-pub struct UpdateOrganizationConcurrentLimitRequest {
-    /// Concurrent request limit per model. Set to null to use default (64).
-    #[serde(rename = "concurrentLimit")]
-    pub concurrent_limit: Option<u32>,
-}
-
-/// Response after updating organization concurrent limit
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
-pub struct UpdateOrganizationConcurrentLimitResponse {
-    #[serde(rename = "organizationId")]
-    pub organization_id: String,
-    /// Current concurrent limit. Null means default (64) is used.
-    #[serde(rename = "concurrentLimit")]
-    pub concurrent_limit: Option<u32>,
-    #[serde(rename = "updatedAt")]
-    pub updated_at: String,
-}
-
-/// Response for getting organization concurrent limit
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
-pub struct GetOrganizationConcurrentLimitResponse {
-    #[serde(rename = "organizationId")]
-    pub organization_id: String,
-    /// Current concurrent limit. Null means default (64) is used.
-    #[serde(rename = "concurrentLimit")]
-    pub concurrent_limit: Option<u32>,
-    /// The effective limit (either custom or default)
-    #[serde(rename = "effectiveLimit")]
-    pub effective_limit: u32,
-}
 
 // ============================================
 // File Upload Models

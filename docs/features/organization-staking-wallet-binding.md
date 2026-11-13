@@ -17,12 +17,9 @@ Membership grants happen only once in binding, never in login, sync, or idempote
 
 Sync is owner/admin-only and uses the bound source's account, not the login wallet. Raw reward units and lifetime conversion remain authoritative; credited totals are monotonic even across concurrent replica updates. Read-only members do not receive wallet controls.
 
-## Rollout
+## Current state
 
-1. Apply V0092, which contains the binding schema and shared NEAR personal-organization provisioning with short names. V0092’s one-source-per-organization unique index deliberately refuses ambiguous legacy rows; reconcile these before retrying migration. Preflight with `SELECT organization_id, count(*) FROM organization_staking_farm_sources GROUP BY organization_id HAVING count(*) > 1;` using the deployment operator's approved production access. Do not delete financial history to bypass the constraint.
-2. Deploy backend and matching nearai-cloud-ui. Leave `STAKING_FARM_SELECTED_ORG_BINDING_ENABLED=false` until both are ready. Existing sources remain usable and bound responses preserve old field names.
-3. Enable the flag with staking enabled and configured. New source creation now requires explicit binding; unbound sync returns `staking_farm_not_bound`. Existing sources continue syncing regardless of member login provider.
-4. Verify a full-access NEP-413 wallet in the deployed environment. Fireblocks/contract multisig are not claimed as supported by this proof path.
+Existing bindings stay in effect, and sources keep syncing regardless of member login provider. Sync returns `staking_farm_not_bound` for an organization without a bound source. The schema (V0092) enforces one source per organization and keeps the shared NEAR personal-organization provisioning with short names. The full-access NEP-413 proof path is the only supported wallet proof; Fireblocks and contract multisig are not supported by it.
 
 Binding grants and source writes share the organization deletion/role-change lock. RPC sync happens separately after binding, so failure cannot undo the source or Admin membership. Retry confirmation with exactly the same proof and idempotency key after a lost response. Expired unconsumed challenges need a new prepare request. Challenge issuance is limited to ten per actor per ten minutes and proof verification to five attempts per challenge. Consumed challenge records retain the proof digest/key and previous/effective membership for audit; raw signatures are not persisted. Expired unconsumed challenges older than one day are pruned during the actor's next prepare; consumed audit records remain retained and indexed. Prepare rejects organizations with any existing source before signing, even across contract/network changes. Terms acknowledgment is compared with the version stored in the challenge.
 

@@ -220,11 +220,10 @@ fn documented_paginated_admin_lists() -> BTreeSet<String> {
 }
 
 /// A paginated list route with the test's fixtures as its parameters.
-fn fixture_list_path(route: &str, organization_id: &str) -> String {
+fn fixture_list_path(route: &str) -> String {
     let segments: Vec<&str> = route
         .split('/')
         .map(|segment| match segment {
-            "{org_id}" => organization_id,
             parameter if parameter.starts_with('{') => {
                 panic!("give {parameter} of {route} a fixture with at least two rows")
             }
@@ -616,7 +615,6 @@ fn page_guard_finds_every_known_paginated_admin_list() {
 #[tokio::test]
 async fn every_documented_paginated_admin_list_records_its_page() {
     let (server, router) = setup_test_server_and_router().await;
-    let organization_id = setup_org_with_credits(&server, 1_000_000_000).await.id;
     let access_token = server
         .post("/v1/admin/access-tokens")
         .add_header("Authorization", format!("Bearer {}", get_session_id()))
@@ -632,7 +630,7 @@ async fn every_documented_paginated_admin_list_records_its_page() {
     let (logs, _guard) = CapturedLogs::start();
 
     for route in documented_paginated_admin_lists() {
-        let path = fixture_list_path(&route, &organization_id);
+        let path = fixture_list_path(&route);
         for (limit, offset) in [(2, 0), (1, 1)] {
             let uri = format!("{path}?limit={limit}&offset={offset}");
             let response = send(&router, authorized(Method::GET, &uri, &session, json!({}))).await;
@@ -653,9 +651,6 @@ async fn every_documented_paginated_admin_list_records_its_page() {
                 ),
                 "{uri} must record the page it served"
             );
-            if route.contains("{org_id}") {
-                assert_eq!(event["admin_organization_id"], organization_id.as_str());
-            }
         }
     }
 }

@@ -1309,3 +1309,81 @@ pub async fn get_organization_usage_by_model(
         data,
     }))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ts(value: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(value)
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    #[test]
+    fn usage_history_time_parses_rfc3339_and_rejects_invalid_timestamps() {
+        // Given: RFC3339 start_time/end_time values, one with an offset.
+        let start = parse_usage_history_time(Some("2026-07-01T00:00:00Z")).unwrap();
+        let offset = parse_usage_history_time(Some("2026-07-01T02:00:00+02:00")).unwrap();
+
+        // Then: they parse to UTC instants and a missing value stays absent.
+        assert_eq!(start, Some(ts("2026-07-01T00:00:00Z")));
+        assert_eq!(offset, start);
+        assert_eq!(parse_usage_history_time(None).unwrap(), None);
+
+        // And: a malformed timestamp is a 400 with the reporting query error type.
+        let (status, body) = parse_usage_history_time(Some("not-a-time")).unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body.0.error.r#type, "invalid_reporting_usage_query");
+    }
+
+    #[test]
+    fn usage_history_range_normalizes_open_ended_ranges() {
+        // Given: open-ended queries that would otherwise be unbounded.
+        let before_default = Utc::now();
+        let (default_start, default_end) = normalize_usage_history_range(None, None).unwrap();
+        let after_default = Utc::now();
+        let explicit_end = ts("2026-07-01T00:00:00Z");
+        let recent_start = Utc::now() - Duration::days(1);
+
+        // When: only an end, only a start, or a stale start is supplied.
+        let end_only = normalize_usage_history_range(None, Some(explicit_end)).unwrap();
+        let start_only = normalize_usage_history_range(Some(recent_start), None).unwrap();
+        let stale_result =
+            normalize_usage_history_range(Some(Utc::now() - Duration::days(367)), None);
+
+        // Then: every accepted range is no wider than 366 days.
+        assert!(default_end >= before_default);
+        assert!(default_end <= after_default);
+        assert_eq!(default_end - default_start, Duration::days(366));
+        assert_eq!(end_only.1, explicit_end);
+        assert_eq!(end_only.0, explicit_end - Duration::days(366));
+        assert_eq!(start_only.0, recent_start);
+        assert!(start_only.1 >= recent_start);
+        assert!(matches!(
+            stale_result,
+            Err(UsageHistoryRangeError::TimeRangeTooLarge { max_days: 366 })
+        ));
+    }
+
+    #[test]
+    fn usage_history_range_rejects_inverted_and_too_wide_ranges() {
+        let inverted = normalize_usage_history_range(
+            Some(ts("2026-07-02T00:00:00Z")),
+            Some(ts("2026-07-01T00:00:00Z")),
+        );
+        let too_wide = normalize_usage_history_range(
+            Some(ts("2026-01-01T00:00:00Z")),
+            Some(ts("2027-01-03T00:00:00Z")),
+        );
+
+        assert!(matches!(
+            inverted,
+            Err(UsageHistoryRangeError::InvalidTimeRange)
+        ));
+        assert!(matches!(
+            too_wide,
+            Err(UsageHistoryRangeError::TimeRangeTooLarge { max_days: 366 })
+        ));
+    }
+}

@@ -30,7 +30,8 @@ The worker resumes its cursor after restart. A failed batch rolls back entirely;
 it retries without compounding discounts. Status becomes `active` only after
 accounting and reporting conservation checks pass. If progress stops, investigate
 the worker error before refreshing downstream historical snapshots. A historical
-aggregate mismatch is repaired by recomputing the affected hours with the same maintenance procedure used for other hourly corrections.
+aggregate mismatch is repaired by recomputing the affected hours through the
+admin API.
 
 Once the rule is active, refresh downstream billing snapshots and historical
 usage streams using their existing resync procedure. Compare matching measures

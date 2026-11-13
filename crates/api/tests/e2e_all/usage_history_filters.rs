@@ -41,6 +41,13 @@ async fn session_usage_history_filters() {
     assert_eq!(body.limit, 10);
     assert_eq!(body.offset, 0);
     assert_eq!(body.data.len(), 1);
+    // Cross-org exclusion: the other organization's row in the same window is absent.
+    assert!(
+        body.data
+            .iter()
+            .all(|row| row.provider_request_id.as_deref() != Some("provider-request-other-org")),
+        "another organization's usage must not appear"
+    );
     let row = &body.data[0];
     assert_eq!(row.workspace_id, fixture.workspace_id);
     assert_eq!(row.api_key_id, fixture.api_key_id);
@@ -64,7 +71,7 @@ async fn session_usage_history_filters() {
 
 #[tokio::test]
 async fn session_usage_history_workspace_and_api_key_filters_remain_unbounded() {
-    // Given: matching usage older than the reporting API's 366-day default window.
+    // Given: matching usage older than the 366-day default window used when no date range is given.
     let (server, database) = setup_test_server_with_database().await;
     let fixture = seed_session_history_fixture(&server, &database).await;
 
@@ -236,11 +243,16 @@ async fn session_usage_history_omitted_dates_default_to_last_366_days() {
     assert!(ids.contains(&"provider-request-recent"), "{ids:?}");
     assert!(!ids.contains(&"provider-request-stale"), "{ids:?}");
     assert!(!ids.contains(&"provider-request-300"), "{ids:?}");
+    assert!(!ids.contains(&"provider-request-other-org"), "{ids:?}");
 }
 
 #[tokio::test]
-async fn reporting_token_shaped_bearer_is_rejected_with_401() {
-    // Given: a bearer credential with the retired reporting-token prefix.
+async fn unknown_rpt_prefixed_bearer_is_rejected_with_401() {
+    // Regression guard: a bearer that merely starts with `rpt-` is an unknown
+    // credential. It must get a clean 401 on API-key and refresh-token routes
+    // and never a server error. This is not a token-type test.
+    //
+    // Given: an unknown bearer credential starting with `rpt-`.
     let (server, _database) = setup_test_server_with_database().await;
     let org = create_org(&server).await;
 
@@ -356,6 +368,34 @@ async fn seed_session_history_fixture(
             created_at: ts(2024, 1, 1),
             total_cost: 300,
             provider_request_id: "provider-request-300",
+        },
+    )
+    .await;
+
+    // Another organization with its own usage row inside the filtered window.
+    let other_org = create_org(server).await;
+    let other_org_workspaces = list_workspaces(server, other_org.id.clone()).await;
+    let other_org_workspace_id = other_org_workspaces
+        .first()
+        .expect("default workspace should exist")
+        .id
+        .clone();
+    let other_org_api_key = create_api_key_in_workspace(
+        server,
+        other_org_workspace_id.clone(),
+        "session history other org key".to_string(),
+    )
+    .await;
+    insert_inference_usage_row(
+        database,
+        &other_org.id,
+        &other_org_workspace_id,
+        &other_org_api_key.id,
+        &model,
+        SessionUsageRow {
+            created_at: ts(2026, 7, 2),
+            total_cost: 1000,
+            provider_request_id: "provider-request-other-org",
         },
     )
     .await;

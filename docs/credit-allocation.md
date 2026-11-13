@@ -30,7 +30,7 @@ cumulative contract limit and is kept separate from purchased payment
 credits. Replacing a limit does not reset consumption: changing 100 to 150
 adds 50 of capacity, while writing 150 again adds none.
 
-Both usage-history endpoints, the reporting export/summary, and admin organization
+Both usage-history endpoints and admin organization
 metrics (`/v1/admin/organizations/{org_id}/metrics`) accept a
 `credit_type` filter. Mixed charges are returned once; filtered cost is only the
 matching allocation amount, including later settlement allocations, while request
@@ -48,7 +48,7 @@ Filtered admin metrics share a 10-second database-query budget across their
 statements, using transaction-local timeouts. Unfiltered requests keep their
 existing timeout behavior.
 The optional filter accepts `grant`, `staking_farm`, `transfer`, `payment`, and `postpay`
-(case-insensitively, like reporting); unsupported values return HTTP 400.
+(case-insensitively); unsupported values return HTTP 400.
 For example, September postpay consumption can be queried with
 `/v1/admin/organizations/{org_id}/metrics?start=2026-09-01T00:00:00Z&end=2026-10-01T00:00:00Z&credit_type=postpay`.
 This reports consumed usage, not invoices, payment status, or cash received.

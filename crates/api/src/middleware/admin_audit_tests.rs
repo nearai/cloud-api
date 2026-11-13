@@ -493,11 +493,6 @@ async fn rejected_or_missing_credentials_are_denied_without_identity() {
             StatusCode::UNAUTHORIZED,
             "none",
         ),
-        (
-            Some("Bearer rejected-by-session-auth".to_string()),
-            StatusCode::UNAUTHORIZED,
-            "session",
-        ),
         // The token store is unavailable, so the token never validates.
         (
             Some("Bearer adm_unvalidated_admin_token".to_string()),

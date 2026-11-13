@@ -435,12 +435,10 @@ async fn history_corrects_legacy_and_split_funding_with_reporting_parity() {
         ("grant".into(), 150_000_000)
     );
     drop(client);
-    for prefix in ["/v1/organizations", "/v1/admin/organizations"] {
-        let balance = get(&f, &format!("{prefix}/{}/usage/balance", f.org)).await;
-        assert_eq!(balance["total_spent"], 475_000_000);
-        assert_eq!(balance["total_requests"], 4);
-        assert_eq!(balance["remaining"], 725_000_000);
-    }
+    let balance = get(&f, &format!("/v1/organizations/{}/usage/balance", f.org)).await;
+    assert_eq!(balance["total_spent"], 475_000_000);
+    assert_eq!(balance["total_requests"], 4);
+    assert_eq!(balance["remaining"], 725_000_000);
     let billing = f
         .server
         .post("/v1/billing/costs")

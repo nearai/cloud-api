@@ -134,7 +134,7 @@ graph TB
                 AuthRoutes["<b>Auth Routes</b><br/>OAuth flows,<br/>login, sessions"]
                 OrgRoutes["<b>Organization Routes</b><br/>CRUD operations"]
                 WorkspaceRoutes["<b>Workspace Routes</b><br/>Workspace & API key<br/>management"]
-                UserRoutes["<b>User Routes</b><br/>Profile, invitations,<br/>sessions"]
+                UserRoutes["<b>User Routes</b><br/>Profile,<br/>sessions"]
                 CompletionRoutes["<b>Completion Routes</b><br/>Chat & text<br/>completions"]
                 ConvRoutes["<b>Conversation Routes</b><br/>Temporary migration<br/>views and deletion"]
                 ResponseRoutes["<b>Response Routes</b><br/>Stateless request-scoped<br/>AI responses"]
@@ -308,7 +308,7 @@ graph TB
 | **Auth Routes** | OAuth flows, login, logout, session management | Public + Session |
 | **Organization Routes** | CRUD for organizations, member management | Session (OAuth) |
 | **Workspace Routes** | Workspace and API key management | Session (OAuth) |
-| **User Routes** | User profile, invitations, sessions | Session (OAuth) |
+| **User Routes** | User profile, sessions | Session (OAuth) |
 | **Completion Routes** | Chat & text completions (OpenAI-compatible) | API Key |
 | **Conversation Routes** | Temporary known-ID views and per-resource deletion; other paths return `410` | API Key |
 | **Response Routes** | Stateless request-scoped inference; response history returns `410` | API Key |
@@ -623,67 +623,7 @@ sequenceDiagram
     
 ```
 
-### 7. Organization Invitation Flow
-
-Inviting a new member to an organization via email.
-
-```mermaid
-sequenceDiagram
-    actor Admin
-    participant Browser
-    participant PlatformAPI
-    participant Database
-    participant EmailService
-    actor NewUser
-    
-    Admin->>Browser: Enter email to invite
-    Browser->>PlatformAPI: POST /v1/organizations/{id}/members/invite-by-email<br/>{ email: "user@example.com", role: "member" }
-    
-    PlatformAPI->>Database: Check admin permissions
-    Database-->>PlatformAPI: Admin confirmed
-    
-    PlatformAPI->>Database: Check if user already exists
-    alt User exists
-        Database-->>PlatformAPI: User found
-        PlatformAPI->>Database: Check if already member
-        alt Already member
-            PlatformAPI-->>Browser: Error: Already a member
-        else Not a member
-            PlatformAPI->>Database: INSERT organization_members
-            Database-->>PlatformAPI: Member added
-            PlatformAPI-->>Browser: Success: User added
-        end
-    else User doesn't exist
-        PlatformAPI->>Database: CREATE organization_invitation<br/>(email, org_id, role, token)
-        Database-->>PlatformAPI: Invitation created
-        
-        PlatformAPI->>EmailService: Send invitation email<br/>(with magic link)
-        EmailService-->>NewUser: Email with invitation link
-        
-        PlatformAPI-->>Browser: Success: Invitation sent
-    end
-    
-    NewUser->>Browser: Click invitation link
-    Browser->>PlatformAPI: GET /v1/invitations/{token}
-    PlatformAPI->>Database: Validate invitation token
-    Database-->>PlatformAPI: Invitation valid
-    PlatformAPI-->>Browser: Show invitation details page
-    
-    NewUser->>Browser: Click "Accept" or "Sign up & Accept"
-    Browser->>PlatformAPI: POST /v1/invitations/{token}/accept
-    
-    alt User not logged in
-        PlatformAPI-->>Browser: Redirect to OAuth login
-        Browser->>PlatformAPI: Complete OAuth flow
-    end
-    
-    PlatformAPI->>Database: INSERT organization_members
-    PlatformAPI->>Database: DELETE organization_invitation
-    
-    PlatformAPI-->>Browser: Redirect to organization dashboard
-```
-
-### 8. TEE Attestation Verification Flow
+### 7. TEE Attestation Verification Flow
 
 Client requests and verifies TEE attestation to ensure code is running in secure environment.
 
@@ -725,7 +665,7 @@ sequenceDiagram
     end
 ```
 
-### 9. Usage Tracking & Limit Enforcement
+### 8. Usage Tracking & Limit Enforcement
 
 How the platform tracks token usage and enforces organization limits.
 
@@ -774,7 +714,7 @@ sequenceDiagram
     Note over UsageMiddleware,Database: Usage tracked per request<br/>for billing and analytics
 ```
 
-### 10. Stateless Response Request Lifecycle
+### 9. Stateless Response Request Lifecycle
 
 Request-scoped states emitted while serving a single stateless Responses
 request. These are not durable response-history states.
@@ -808,7 +748,7 @@ stateDiagram-v2
     end note
 ```
 
-### 11. Authentication Decision Flow
+### 10. Authentication Decision Flow
 
 Decision flowchart for determining authentication requirements.
 
@@ -1346,23 +1286,14 @@ erDiagram
 **Organizations:**
 - `GET /v1/organizations` - List user's organizations
 - `POST /v1/organizations` - Create organization
-- `GET /v1/organizations/{id}` - Get organization details
-- `PUT /v1/organizations/{id}` - Update organization
-- `DELETE /v1/organizations/{id}` - Delete organization
 
 **Organization Members:**
 - `GET /v1/organizations/{id}/members` - List members
 - `POST /v1/organizations/{id}/members` - Add member
-- `POST /v1/organizations/{id}/members/invite-by-email` - Invite by email
-- `PUT /v1/organizations/{id}/members/{user_id}` - Update member role
-- `DELETE /v1/organizations/{id}/members/{user_id}` - Remove member
 
 **Workspaces:**
 - `GET /v1/organizations/{org_id}/workspaces` - List workspaces
 - `POST /v1/organizations/{org_id}/workspaces` - Create workspace
-- `GET /v1/workspaces/{workspace_id}` - Get workspace
-- `PUT /v1/workspaces/{workspace_id}` - Update workspace
-- `DELETE /v1/workspaces/{workspace_id}` - Delete workspace
 
 **API Keys:**
 - `GET /v1/workspaces/{workspace_id}/api-keys` - List API keys
@@ -1372,10 +1303,6 @@ erDiagram
 
 **Users:**
 - `GET /v1/users/me` - Get current user profile
-- `PUT /v1/users/me/profile` - Update profile
-- `GET /v1/users/me/invitations` - List invitations
-- `POST /v1/users/me/invitations/{id}/accept` - Accept invitation
-- `POST /v1/users/me/invitations/{id}/decline` - Decline invitation
 - `GET /v1/users/me/sessions` - List active sessions
 - `DELETE /v1/users/me/sessions` - Revoke all sessions
 - `DELETE /v1/users/me/sessions/{session_id}` - Revoke specific session

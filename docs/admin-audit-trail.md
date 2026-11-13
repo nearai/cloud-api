@@ -20,8 +20,7 @@ overwritten. `x-request-id` keeps echoing a valid client id.
 | `admin_credential_kind` | `session`, `admin_access_token` or `none` |
 | `admin_credential_id` | admin token id, or the session token's `sid` claim |
 | `admin_user_id` | user the credential authenticated, also when policy then denies |
-| `admin_organization_id` | `{org_id}` of an allowed org-scoped route, or the validated `organization_id` filter of the API-key and invitation-delivery lists |
-| `admin_limit`, `admin_offset`, `admin_returned_count` | validated page and rows returned by a paginated admin list (below) |
+| `admin_organization_id` | `{org_id}` of an allowed org-scoped route |
 | `admin_duration_ms` | time to the response head |
 
 Optional fields are omitted when unknown: a rejected credential has no user or
@@ -44,13 +43,6 @@ request, the audit event included, with the span's path (UUID and long
 token-like segments redacted, other segments as sent) and the client's
 `x-request-id`.
 
-## Paginated lists
-
-Every paginated admin list records its validated `limit` and `offset` and the
-number of rows in its response, and only after it succeeds: organization
-members, API keys, admin access tokens and invitation-email deliveries. A rejected
-page, a failed lookup or an invalid filter records no page.
-
 ## OHTTP
 
 `POST /ohttp` decapsulates its inner request and replays it to the API over
@@ -72,11 +64,8 @@ coverage for those routes is a paired cloud-platform change, not described here.
 
 `admin_audit_middleware` (`crates/api/src/middleware/admin_audit.rs`) runs once
 on the root router, after routing, inside request correlation and outside CORS.
-`admin_middleware` records the authentication facts; list handlers record their
-validated page through the `AdminAudit` extractor. Nothing reads bodies. The
-list handlers are in a frozen route module (`routes/admin.rs`), where the audit adds only the extractor and its
-`record_*` calls; a new call there is paired with cloud-platform like any other
-change to those modules.
+`admin_middleware` records the authentication facts through the `AdminAudit`
+extractor. Nothing reads bodies.
 
 New routes under `/v1/admin` are audited automatically. The e2e suite in
 `crates/api/tests/e2e_all/admin_audit.rs` checks that:
@@ -84,10 +73,6 @@ New routes under `/v1/admin` are audited automatically. The e2e suite in
 - every route mounted in `crates/api/src/lib.rs` and
   `crates/api/src/object_encryption.rs` is listed in
   `MOUNTED_ADMIN_ROUTES` and logs one event;
-- every admin GET route documented with `limit` and `offset` query parameters
-  records the page it served (`every_documented_paginated_admin_list_records_its_page`).
-  A new paginated list is covered once its OpenAPI annotation documents both
-  parameters; one without them is not.
 
 The object-encryption router's six operations use the same audit layer and
 authorization policy as the database-encryption routes. Reading keys or job status

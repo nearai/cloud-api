@@ -85,6 +85,7 @@ mod reasoning;
 mod reporting_usage;
 mod repositories;
 mod request_id_contract;
+mod request_priority;
 mod rerank;
 mod responses_client_tools;
 mod responses_contract;

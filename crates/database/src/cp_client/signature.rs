@@ -29,6 +29,8 @@ use super::client::{CallType, CpClient, CpError, Credential};
 #[derive(Debug, Deserialize)]
 struct SignatureLookupDto {
     #[serde(default)]
+    workspace_id: Option<uuid::Uuid>,
+    #[serde(default)]
     signature: Option<SignatureDto>,
 }
 
@@ -84,9 +86,12 @@ impl ChatSignatureReads {
 
     async fn remote(
         &self,
+        workspace_id: uuid::Uuid,
         chat_id: &str,
         signing_algo: &str,
     ) -> Result<Option<ChatSignature>, CpError> {
+        let credential =
+            super::client::current_caller_credential().ok_or(CpError::NoCallerCredential)?;
         let response = self
             .client
             .send(
@@ -94,7 +99,7 @@ impl ChatSignatureReads {
                 Method::GET,
                 &["v1", "internal", "chat-signatures", chat_id],
                 &[("signing_algo", signing_algo)],
-                Credential::Service,
+                Credential::Caller(&credential),
                 None,
             )
             .await?;
@@ -102,6 +107,9 @@ impl ChatSignatureReads {
             return Err(CpError::Status(response.status));
         }
         let lookup: SignatureLookupDto = response.json()?;
+        if lookup.workspace_id != Some(workspace_id) {
+            return Err(CpError::Status(StatusCode::BAD_GATEWAY));
+        }
         Ok(lookup.signature.map(SignatureDto::into_signature))
     }
 }
@@ -114,26 +122,33 @@ fn not_found(chat_id: &str, signing_algo: &str) -> AttestationError {
 impl AttestationRepository for ChatSignatureReads {
     async fn add_chat_signature(
         &self,
+        workspace_id: uuid::Uuid,
         chat_id: &str,
         signature: ChatSignature,
     ) -> Result<(), AttestationError> {
-        self.local.add_chat_signature(chat_id, signature).await
+        self.local
+            .add_chat_signature(workspace_id, chat_id, signature)
+            .await
     }
 
     async fn add_chat_signatures(
         &self,
+        workspace_id: uuid::Uuid,
         chat_id: &str,
         signatures: Vec<ChatSignature>,
     ) -> Result<(), AttestationError> {
-        self.local.add_chat_signatures(chat_id, signatures).await
+        self.local
+            .add_chat_signatures(workspace_id, chat_id, signatures)
+            .await
     }
 
     async fn get_chat_signature(
         &self,
+        workspace_id: uuid::Uuid,
         chat_id: &str,
         signing_algo: &str,
     ) -> Result<ChatSignature, AttestationError> {
-        match self.remote(chat_id, signing_algo).await {
+        match self.remote(workspace_id, chat_id, signing_algo).await {
             Ok(Some(signature)) => Ok(signature),
             Ok(None) => Err(not_found(chat_id, signing_algo)),
             // Both services read the same table, so an outage falls back to
@@ -143,7 +158,9 @@ impl AttestationRepository for ChatSignatureReads {
                     error_kind = error.kind(),
                     "cloud-platform signature read failed; reading locally"
                 );
-                self.local.get_chat_signature(chat_id, signing_algo).await
+                self.local
+                    .get_chat_signature(workspace_id, chat_id, signing_algo)
+                    .await
             }
         }
     }
@@ -166,6 +183,7 @@ mod tests {
     impl AttestationRepository for FakeLocal {
         async fn add_chat_signature(
             &self,
+            _workspace_id: uuid::Uuid,
             _: &str,
             _: ChatSignature,
         ) -> Result<(), AttestationError> {
@@ -173,6 +191,7 @@ mod tests {
         }
         async fn get_chat_signature(
             &self,
+            _workspace_id: uuid::Uuid,
             chat_id: &str,
             signing_algo: &str,
         ) -> Result<ChatSignature, AttestationError> {
@@ -182,11 +201,48 @@ mod tests {
         }
     }
 
-    fn reads(server: &MockServer, local: Option<ChatSignature>) -> ChatSignatureReads {
-        ChatSignatureReads::new(
+    struct ScopedReads(ChatSignatureReads);
+
+    impl ScopedReads {
+        async fn get_chat_signature(
+            &self,
+            workspace_id: uuid::Uuid,
+            id: &str,
+            algo: &str,
+        ) -> Result<ChatSignature, AttestationError> {
+            super::super::client::with_caller_credential(
+                "test-caller".into(),
+                self.0.get_chat_signature(workspace_id, id, algo),
+            )
+            .await
+        }
+    }
+
+    #[tokio::test]
+    async fn unscoped_or_wrong_workspace_remote_results_use_scoped_local_lookup() {
+        for owner in [None, Some(uuid::Uuid::new_v4())] {
+            let server = MockServer::start().await;
+            let mut body = found_body();
+            body["workspace_id"] = json!(owner);
+            Mock::given(method("GET"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(body))
+                .expect(1)
+                .mount(&server)
+                .await;
+            assert!(matches!(
+                reads(&server, None)
+                    .get_chat_signature(uuid::Uuid::nil(), "chatcmpl-1", "ecdsa")
+                    .await,
+                Err(AttestationError::SignatureNotFound(_))
+            ));
+        }
+    }
+
+    fn reads(server: &MockServer, local: Option<ChatSignature>) -> ScopedReads {
+        ScopedReads(ChatSignatureReads::new(
             Arc::new(FakeLocal { stored: local }),
             Arc::new(client(server)),
-        )
+        ))
     }
 
     fn found_body() -> serde_json::Value {
@@ -199,6 +255,7 @@ mod tests {
                 "signing_address": "0xaddr",
                 "signature_kind": "gateway"
             },
+            "workspace_id": uuid::Uuid::nil(),
             "stop_reason": null
         })
     }
@@ -214,7 +271,7 @@ mod tests {
             .mount(&server)
             .await;
         let signature = reads(&server, None)
-            .get_chat_signature("chatcmpl-1", "ecdsa")
+            .get_chat_signature(uuid::Uuid::nil(), "chatcmpl-1", "ecdsa")
             .await
             .unwrap();
         assert_eq!(signature.signature_kind, Some(SignatureKind::Gateway));
@@ -228,13 +285,14 @@ mod tests {
             .and(path("/v1/internal/chat-signatures/chatcmpl-9"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "signature": null,
-                "stop_reason": null
+                "workspace_id": uuid::Uuid::nil(),
+            "stop_reason": null
             })))
             .expect(1)
             .mount(&server)
             .await;
         let error = reads(&server, None)
-            .get_chat_signature("chatcmpl-9", "ecdsa")
+            .get_chat_signature(uuid::Uuid::nil(), "chatcmpl-9", "ecdsa")
             .await
             .unwrap_err();
         assert!(matches!(error, AttestationError::SignatureNotFound(_)));
@@ -250,7 +308,7 @@ mod tests {
             .mount(&server)
             .await;
         let signature = reads(&server, None)
-            .get_chat_signature("chatcmpl-1", "ecdsa")
+            .get_chat_signature(uuid::Uuid::nil(), "chatcmpl-1", "ecdsa")
             .await
             .unwrap();
         assert_eq!(signature.signature_kind, None);
@@ -266,11 +324,11 @@ mod tests {
             .await;
         let adapter = reads(&server, None);
         adapter
-            .get_chat_signature("chatcmpl-1", "ecdsa")
+            .get_chat_signature(uuid::Uuid::nil(), "chatcmpl-1", "ecdsa")
             .await
             .unwrap();
         adapter
-            .get_chat_signature("chatcmpl-1", "ecdsa")
+            .get_chat_signature(uuid::Uuid::nil(), "chatcmpl-1", "ecdsa")
             .await
             .unwrap();
     }
@@ -294,7 +352,7 @@ mod tests {
             .mount(&server)
             .await;
         let signature = reads(&server, Some(local_row()))
-            .get_chat_signature("chatcmpl-1", "ecdsa")
+            .get_chat_signature(uuid::Uuid::nil(), "chatcmpl-1", "ecdsa")
             .await
             .unwrap();
         assert_eq!(signature.signature, "0xlocal");
@@ -312,7 +370,7 @@ mod tests {
             .mount(&server)
             .await;
         let signature = reads(&server, Some(local_row()))
-            .get_chat_signature("chatcmpl-1", "ecdsa")
+            .get_chat_signature(uuid::Uuid::nil(), "chatcmpl-1", "ecdsa")
             .await
             .unwrap();
         assert_eq!(signature.signature, "0xlocal");
@@ -326,7 +384,7 @@ mod tests {
             .mount(&server)
             .await;
         let error = reads(&server, None)
-            .get_chat_signature("chatcmpl-1", "ecdsa")
+            .get_chat_signature(uuid::Uuid::nil(), "chatcmpl-1", "ecdsa")
             .await
             .unwrap_err();
         assert!(matches!(error, AttestationError::SignatureNotFound(_)));

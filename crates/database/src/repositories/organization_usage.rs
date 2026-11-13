@@ -555,6 +555,7 @@ impl OrganizationUsageRepository {
     /// Used to check if a response was stopped due to client disconnect
     pub async fn get_stop_reason_by_response_id(
         &self,
+        workspace_id: uuid::Uuid,
         response_id: Uuid,
     ) -> Result<Option<StopReason>> {
         let row_opt = retry_db!("get_stop_reason_by_response_id", {
@@ -567,8 +568,8 @@ impl OrganizationUsageRepository {
 
             client
                 .query_opt(
-                    r#"SELECT stop_reason FROM organization_usage_log WHERE response_id = $1"#,
-                    &[&response_id],
+                    r#"SELECT stop_reason FROM organization_usage_log WHERE response_id = $1 AND workspace_id = $2"#,
+                    &[&response_id, &workspace_id],
                 )
                 .await
                 .map_err(map_db_error)
@@ -584,6 +585,7 @@ impl OrganizationUsageRepository {
     /// Used to check if a chat completion was stopped due to client disconnect
     pub async fn get_stop_reason_by_provider_request_id(
         &self,
+        workspace_id: uuid::Uuid,
         provider_request_id: &str,
     ) -> Result<Option<StopReason>> {
         let row_opt = retry_db!("get_stop_reason_by_provider_request_id", {
@@ -596,8 +598,8 @@ impl OrganizationUsageRepository {
 
             client
                 .query_opt(
-                    r#"SELECT stop_reason FROM organization_usage_log WHERE provider_request_id = $1"#,
-                    &[&provider_request_id],
+                    r#"SELECT stop_reason FROM organization_usage_log WHERE provider_request_id = $1 AND workspace_id = $2"#,
+                    &[&provider_request_id, &workspace_id],
                 )
                 .await
                 .map_err(map_db_error)

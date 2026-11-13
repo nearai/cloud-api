@@ -146,6 +146,7 @@ pub async fn systemone(
     };
     // Once inference succeeds, finalize billing and signature pins even if the
     // client disconnects while waiting for persistence.
+    let workspace_id = api_key.workspace.id.0;
     let finalize = tokio::spawn(without_tracing_context(async move {
         let _slot = slot;
         let decision_id = &served.decision_id;
@@ -174,13 +175,14 @@ pub async fn systemone(
                     SignatureKind::ProviderTee => {
                         state
                             .attestation_service
-                            .store_stream_chat_signature_from_provider(decision_id)
+                            .store_stream_chat_signature_from_provider(workspace_id, decision_id)
                             .await
                     }
                     SignatureKind::Gateway => {
                         state
                             .attestation_service
                             .store_chat_signature_and_unpin(
+                                workspace_id,
                                 decision_id,
                                 body_hash.hash,
                                 hex::encode(Sha256::digest(&served.response.raw_bytes)),

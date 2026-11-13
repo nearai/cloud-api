@@ -74,6 +74,7 @@ fn last_signature_per_algo(signatures: Vec<ChatSignature>) -> Vec<ChatSignature>
 impl AttestationRepository for PgAttestationRepository {
     async fn add_chat_signature(
         &self,
+        workspace_id: uuid::Uuid,
         chat_id: &str,
         signature: ChatSignature,
     ) -> Result<(), AttestationError> {
@@ -86,7 +87,7 @@ impl AttestationRepository for PgAttestationRepository {
         // One-shot typed query: one round trip, see repositories/mod.rs.
         client
             .execute_typed(
-                "INSERT INTO chat_signatures (chat_id, text, signature, signing_address, signing_algo, signature_kind) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (chat_id, signing_algo) DO UPDATE SET text = EXCLUDED.text, signature = EXCLUDED.signature, signing_address = EXCLUDED.signing_address, signature_kind = EXCLUDED.signature_kind, updated_at = NOW()",
+                "INSERT INTO chat_signatures (chat_id, text, signature, signing_address, signing_algo, signature_kind, workspace_id) VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT (chat_id, signing_algo) DO UPDATE SET text = EXCLUDED.text, signature = EXCLUDED.signature, signing_address = EXCLUDED.signing_address, signature_kind = EXCLUDED.signature_kind, updated_at = NOW() WHERE chat_signatures.workspace_id = EXCLUDED.workspace_id",
                 &[
                     (&chat_id, Type::VARCHAR),
                     (&signature.text, Type::TEXT),
@@ -94,6 +95,7 @@ impl AttestationRepository for PgAttestationRepository {
                     (&signature.signing_address, Type::VARCHAR),
                     (&signature.signing_algo, Type::VARCHAR),
                     (&signature_kind, Type::VARCHAR),
+                    (&workspace_id, Type::UUID),
                 ],
             )
             .await
@@ -108,6 +110,7 @@ impl AttestationRepository for PgAttestationRepository {
     /// round trip.
     async fn add_chat_signatures(
         &self,
+        workspace_id: uuid::Uuid,
         chat_id: &str,
         signatures: Vec<ChatSignature>,
     ) -> Result<(), AttestationError> {
@@ -126,7 +129,7 @@ impl AttestationRepository for PgAttestationRepository {
             .map(|signature| signature.signature_kind.map(|kind| kind.as_str()))
             .collect();
         let mut sql = String::from(
-            "INSERT INTO chat_signatures (chat_id, text, signature, signing_address, signing_algo, signature_kind) VALUES ",
+            "INSERT INTO chat_signatures (chat_id, text, signature, signing_address, signing_algo, signature_kind, workspace_id) VALUES ",
         );
         let mut params: Vec<(&(dyn tokio_postgres::types::ToSql + Sync), Type)> = Vec::new();
         for (index, (signature, signature_kind)) in
@@ -135,15 +138,16 @@ impl AttestationRepository for PgAttestationRepository {
             if index > 0 {
                 sql.push_str(", ");
             }
-            let base = index * 6;
+            let base = index * 7;
             sql.push_str(&format!(
-                "(${}, ${}, ${}, ${}, ${}, ${})",
+                "(${}, ${}, ${}, ${}, ${}, ${}, ${})",
                 base + 1,
                 base + 2,
                 base + 3,
                 base + 4,
                 base + 5,
-                base + 6
+                base + 6,
+                base + 7
             ));
             params.push((&chat_id, Type::VARCHAR));
             params.push((&signature.text, Type::TEXT));
@@ -151,9 +155,10 @@ impl AttestationRepository for PgAttestationRepository {
             params.push((&signature.signing_address, Type::VARCHAR));
             params.push((&signature.signing_algo, Type::VARCHAR));
             params.push((signature_kind, Type::VARCHAR));
+            params.push((&workspace_id, Type::UUID));
         }
         sql.push_str(
-            " ON CONFLICT (chat_id, signing_algo) DO UPDATE SET text = EXCLUDED.text, signature = EXCLUDED.signature, signing_address = EXCLUDED.signing_address, signature_kind = EXCLUDED.signature_kind, updated_at = NOW()",
+            " ON CONFLICT (chat_id, signing_algo) DO UPDATE SET text = EXCLUDED.text, signature = EXCLUDED.signature, signing_address = EXCLUDED.signing_address, signature_kind = EXCLUDED.signature_kind, updated_at = NOW() WHERE chat_signatures.workspace_id = EXCLUDED.workspace_id",
         );
 
         // One-shot typed query: one round trip, see repositories/mod.rs.
@@ -167,6 +172,7 @@ impl AttestationRepository for PgAttestationRepository {
 
     async fn get_chat_signature(
         &self,
+        workspace_id: uuid::Uuid,
         chat_id: &str,
         signing_algo: &str,
     ) -> Result<ChatSignature, AttestationError> {
@@ -178,8 +184,8 @@ impl AttestationRepository for PgAttestationRepository {
 
         let row = client
             .query_one(
-                "SELECT * FROM chat_signatures WHERE chat_id = $1 AND signing_algo = $2",
-                &[&chat_id, &signing_algo],
+                "SELECT * FROM chat_signatures WHERE chat_id = $1 AND signing_algo = $2 AND workspace_id = $3",
+                &[&chat_id, &signing_algo, &workspace_id],
             )
             .await
             .map_err(|e| {

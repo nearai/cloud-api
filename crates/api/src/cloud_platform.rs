@@ -240,6 +240,7 @@ mod tests {
     impl AttestationRepository for NoAttestations {
         async fn add_chat_signature(
             &self,
+            _workspace_id: uuid::Uuid,
             _: &str,
             _: services::attestation::models::ChatSignature,
         ) -> Result<(), services::attestation::models::AttestationError> {
@@ -247,6 +248,7 @@ mod tests {
         }
         async fn get_chat_signature(
             &self,
+            _workspace_id: uuid::Uuid,
             chat_id: &str,
             signing_algo: &str,
         ) -> Result<

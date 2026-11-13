@@ -22,6 +22,7 @@ pub(in crate::attestation) const PROVIDER_SIGNATURE_FETCH_TIMEOUT: Duration =
 impl AttestationService {
     pub(in crate::attestation) async fn get_chat_signature_impl(
         &self,
+        workspace_id: uuid::Uuid,
         chat_id: &str,
         signing_algo: Option<String>,
     ) -> Result<SignatureLookupResult, AttestationError> {
@@ -31,27 +32,13 @@ impl AttestationService {
 
         match self
             .repository
-            .get_chat_signature(chat_id, &signing_algo)
+            .get_chat_signature(workspace_id, chat_id, &signing_algo)
             .await
         {
             Ok(signature) => Ok(SignatureLookupResult::Found(signature)),
             Err(AttestationError::SignatureNotFound(_)) => {
-                if let Some(provider) = self
-                    .inference_provider_pool
-                    .get_provider_by_chat_id(chat_id)
+                self.check_fallback_conditions(workspace_id, chat_id, &signing_algo)
                     .await
-                {
-                    if !provider.supports_chat_signatures() {
-                        return Ok(SignatureLookupResult::Unavailable {
-                            error_code: "SIGNATURE_UNSUPPORTED".to_string(),
-                            message: "This model's responses are integrity-protected by an \
-                                      end-to-end encrypted channel, not a per-response signature; \
-                                      there is no signature to retrieve."
-                                .to_string(),
-                        });
-                    }
-                }
-                self.check_fallback_conditions(chat_id, &signing_algo).await
             }
             Err(e) => Err(e),
         }
@@ -59,6 +46,7 @@ impl AttestationService {
 
     pub(in crate::attestation) async fn store_chat_signature_from_provider_impl(
         &self,
+        workspace_id: uuid::Uuid,
         chat_id: &str,
         fetch_deadline: Option<tokio::time::Instant>,
     ) -> Result<(), AttestationError> {
@@ -162,7 +150,7 @@ impl AttestationService {
             Ok(())
         } else {
             self.repository
-                .add_chat_signatures(chat_id, signatures)
+                .add_chat_signatures(workspace_id, chat_id, signatures)
                 .await
                 .map_err(|e| {
                     tracing::error!(
@@ -199,11 +187,12 @@ impl AttestationService {
 
     pub(in crate::attestation) async fn store_chat_signature_impl(
         &self,
+        workspace_id: uuid::Uuid,
         chat_id: &str,
         request_hash: String,
         response_hash: String,
     ) -> Result<(), AttestationError> {
-        self.store_gateway_signature(chat_id, "chat", request_hash, response_hash)
+        self.store_gateway_signature(workspace_id, chat_id, "chat", request_hash, response_hash)
             .await
     }
 
@@ -217,13 +206,14 @@ impl AttestationService {
     /// future and leak the pin.
     pub(in crate::attestation) async fn store_chat_signature_and_unpin_impl(
         &self,
+        workspace_id: uuid::Uuid,
         chat_id: &str,
         request_hash: String,
         response_hash: String,
     ) -> Result<(), AttestationError> {
         let result = match tokio::time::timeout(
             STREAM_SIGNATURE_STORE_TIMEOUT,
-            self.store_chat_signature_impl(chat_id, request_hash, response_hash),
+            self.store_chat_signature_impl(workspace_id, chat_id, request_hash, response_hash),
         )
         .await
         {
@@ -251,16 +241,24 @@ impl AttestationService {
 
     pub(in crate::attestation) async fn store_response_signature_impl(
         &self,
+        workspace_id: uuid::Uuid,
         response_id: &str,
         request_hash: String,
         response_hash: String,
     ) -> Result<(), AttestationError> {
-        self.store_gateway_signature(response_id, "response", request_hash, response_hash)
-            .await
+        self.store_gateway_signature(
+            workspace_id,
+            response_id,
+            "response",
+            request_hash,
+            response_hash,
+        )
+        .await
     }
 
     async fn check_fallback_conditions(
         &self,
+        workspace_id: uuid::Uuid,
         chat_id: &str,
         signing_algo: &str,
     ) -> Result<SignatureLookupResult, AttestationError> {
@@ -276,15 +274,33 @@ impl AttestationService {
                 }
             };
             self.usage_repository
-                .get_stop_reason_by_response_id(response_uuid)
+                .get_stop_reason_by_response_id(workspace_id, response_uuid)
                 .await
                 .map_err(|e| AttestationError::RepositoryError(e.to_string()))?
         } else {
             self.usage_repository
-                .get_stop_reason_by_provider_request_id(chat_id)
+                .get_stop_reason_by_provider_request_id(workspace_id, chat_id)
                 .await
                 .map_err(|e| AttestationError::RepositoryError(e.to_string()))?
         };
+
+        if stop_reason.is_some() {
+            if let Some(provider) = self
+                .inference_provider_pool
+                .get_provider_by_chat_id(chat_id)
+                .await
+            {
+                if !provider.supports_chat_signatures() {
+                    return Ok(SignatureLookupResult::Unavailable {
+                        error_code: "SIGNATURE_UNSUPPORTED".to_string(),
+                        message: "This model's responses are integrity-protected by an \
+                                      end-to-end encrypted channel, not a per-response signature; \
+                                      there is no signature to retrieve."
+                            .to_string(),
+                    });
+                }
+            }
+        }
 
         match stop_reason {
             Some(StopReason::ClientDisconnect) => Ok(SignatureLookupResult::Unavailable {

@@ -34,6 +34,7 @@ struct ReceiptStore {
 impl AttestationServiceTrait for ReceiptStore {
     async fn store_chat_signature(
         &self,
+        _workspace_id: uuid::Uuid,
         id: &str,
         request: String,
         response: String,
@@ -57,16 +58,22 @@ impl AttestationServiceTrait for ReceiptStore {
 
     async fn get_chat_signature(
         &self,
+        _workspace_id: uuid::Uuid,
         _: &str,
         _: Option<String>,
     ) -> Result<SignatureLookupResult, AttestationError> {
         unimplemented!()
     }
-    async fn store_chat_signature_from_provider(&self, _: &str) -> Result<(), AttestationError> {
+    async fn store_chat_signature_from_provider(
+        &self,
+        _workspace_id: uuid::Uuid,
+        _: &str,
+    ) -> Result<(), AttestationError> {
         unimplemented!()
     }
     async fn store_response_signature(
         &self,
+        _workspace_id: uuid::Uuid,
         _: &str,
         _: String,
         _: String,
@@ -106,7 +113,7 @@ async fn collect(mut stream: AnthropicRawBody) -> Vec<u8> {
 }
 
 fn receipt_context(store: &Arc<ReceiptStore>) -> MessageSigningContext {
-    MessageSigningContext::new(store.clone(), body_hash(REQUEST))
+    MessageSigningContext::new(uuid::Uuid::nil(), store.clone(), body_hash(REQUEST))
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

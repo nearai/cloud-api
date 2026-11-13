@@ -55,18 +55,21 @@ impl RecordingRepository {
 impl AttestationRepository for RecordingRepository {
     async fn add_chat_signatures(
         &self,
+        _workspace_id: uuid::Uuid,
         chat_id: &str,
         signatures: Vec<ChatSignature>,
     ) -> Result<(), AttestationError> {
         self.batch_sizes.lock().unwrap().push(signatures.len());
         for signature in signatures {
-            self.add_chat_signature(chat_id, signature).await?;
+            self.add_chat_signature(uuid::Uuid::nil(), chat_id, signature)
+                .await?;
         }
         Ok(())
     }
 
     async fn add_chat_signature(
         &self,
+        _workspace_id: uuid::Uuid,
         chat_id: &str,
         signature: ChatSignature,
     ) -> Result<(), AttestationError> {
@@ -79,6 +82,7 @@ impl AttestationRepository for RecordingRepository {
 
     async fn get_chat_signature(
         &self,
+        _workspace_id: uuid::Uuid,
         chat_id: &str,
         signing_algo: &str,
     ) -> Result<ChatSignature, AttestationError> {
@@ -101,6 +105,7 @@ pub(super) struct FailingRepository;
 impl AttestationRepository for FailingRepository {
     async fn add_chat_signature(
         &self,
+        _workspace_id: uuid::Uuid,
         _chat_id: &str,
         _signature: ChatSignature,
     ) -> Result<(), AttestationError> {
@@ -111,6 +116,7 @@ impl AttestationRepository for FailingRepository {
 
     async fn get_chat_signature(
         &self,
+        _workspace_id: uuid::Uuid,
         chat_id: &str,
         signing_algo: &str,
     ) -> Result<ChatSignature, AttestationError> {
@@ -127,6 +133,7 @@ struct HangingRepository;
 impl AttestationRepository for HangingRepository {
     async fn add_chat_signature(
         &self,
+        _workspace_id: uuid::Uuid,
         _chat_id: &str,
         _signature: ChatSignature,
     ) -> Result<(), AttestationError> {
@@ -135,6 +142,7 @@ impl AttestationRepository for HangingRepository {
 
     async fn get_chat_signature(
         &self,
+        _workspace_id: uuid::Uuid,
         chat_id: &str,
         signing_algo: &str,
     ) -> Result<ChatSignature, AttestationError> {
@@ -227,6 +235,7 @@ impl UsageRepository for NoopUsageRepository {
 
     async fn get_stop_reason_by_response_id(
         &self,
+        _workspace_id: uuid::Uuid,
         _response_id: Uuid,
     ) -> anyhow::Result<Option<StopReason>> {
         Ok(None)
@@ -234,6 +243,7 @@ impl UsageRepository for NoopUsageRepository {
 
     async fn get_stop_reason_by_provider_request_id(
         &self,
+        _workspace_id: uuid::Uuid,
         _provider_request_id: &str,
     ) -> anyhow::Result<Option<StopReason>> {
         Ok(None)
@@ -311,7 +321,12 @@ async fn store_and_unpin_stores_gateway_signature_and_releases_pin_on_success() 
     let service = lifecycle_service(Arc::new(repository.clone()), pool);
 
     let result = service
-        .store_chat_signature_and_unpin(chat_id, "req-hash".to_string(), "resp-hash".to_string())
+        .store_chat_signature_and_unpin(
+            uuid::Uuid::nil(),
+            chat_id,
+            "req-hash".to_string(),
+            "resp-hash".to_string(),
+        )
         .await;
 
     assert!(result.is_ok(), "store should succeed: {result:?}");
@@ -336,7 +351,12 @@ async fn store_and_unpin_rejects_empty_id_without_storing_and_releases_pin() {
     let service = lifecycle_service(Arc::new(repository.clone()), pool);
 
     let result = service
-        .store_chat_signature_and_unpin("", "req-hash".to_string(), "resp-hash".to_string())
+        .store_chat_signature_and_unpin(
+            uuid::Uuid::nil(),
+            "",
+            "req-hash".to_string(),
+            "resp-hash".to_string(),
+        )
         .await;
 
     assert!(matches!(result, Err(AttestationError::InvalidParameter(_))));
@@ -352,7 +372,12 @@ async fn store_and_unpin_releases_pin_when_store_fails() {
     let service = lifecycle_service(Arc::new(FailingRepository), pool);
 
     let result = service
-        .store_chat_signature_and_unpin(chat_id, "req-hash".to_string(), "resp-hash".to_string())
+        .store_chat_signature_and_unpin(
+            uuid::Uuid::nil(),
+            chat_id,
+            "req-hash".to_string(),
+            "resp-hash".to_string(),
+        )
         .await;
 
     assert!(result.is_err(), "store failure must propagate");
@@ -373,7 +398,12 @@ async fn store_and_unpin_releases_pin_when_store_times_out() {
 
     let started = tokio::time::Instant::now();
     let result = service
-        .store_chat_signature_and_unpin(chat_id, "req-hash".to_string(), "resp-hash".to_string())
+        .store_chat_signature_and_unpin(
+            uuid::Uuid::nil(),
+            chat_id,
+            "req-hash".to_string(),
+            "resp-hash".to_string(),
+        )
         .await;
 
     assert!(
@@ -429,7 +459,9 @@ async fn unsupported_provider_releases_pin_without_storing_a_signature() {
     let repository = RecordingRepository::default();
     let service = lifecycle_service(Arc::new(repository.clone()), pool);
 
-    let result = service.store_chat_signature_from_provider(chat_id).await;
+    let result = service
+        .store_chat_signature_from_provider(uuid::Uuid::nil(), chat_id)
+        .await;
 
     assert!(
         result.is_ok(),

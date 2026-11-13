@@ -175,6 +175,7 @@ pub(super) async fn completions_inner(
     request: CompletionRequest,
     request_id: Uuid,
 ) -> axum::response::Response {
+    let workspace_id = api_key.workspace.id.0;
     let request_hash = body_hash.hash.clone();
 
     // Reject E2E encryption: validate for parity (an invalid version still 400s
@@ -478,7 +479,7 @@ pub(super) async fn completions_inner(
                                 if let Some(chat_id) = chat_id {
                                     match tokio::time::timeout(
                                         SIGNATURE_STORE_TIMEOUT,
-                                        attestation_service.store_chat_signature(
+                                        attestation_service.store_chat_signature(workspace_id,
                                             &chat_id,
                                             request_hash,
                                             response_hash,
@@ -604,7 +605,12 @@ pub(super) async fn completions_inner(
                     let response_hash = hex::encode(Sha256::digest(&body_bytes));
                     if let Err(error) = app_state
                         .attestation_service
-                        .store_chat_signature_and_unpin(&chat_id, request_hash, response_hash)
+                        .store_chat_signature_and_unpin(
+                            workspace_id,
+                            &chat_id,
+                            request_hash,
+                            response_hash,
+                        )
                         .await
                     {
                         tracing::error!(

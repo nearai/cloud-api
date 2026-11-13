@@ -393,6 +393,7 @@ impl StreamingResponseAttestation {
 /// do not include provider/database error strings here: they may contain
 /// request-derived data or infrastructure details.
 async fn persist_response_attestation(
+    workspace_id: uuid::Uuid,
     attestation_service: &dyn AttestationServiceTrait,
     response_id: &str,
     request_hash: String,
@@ -400,7 +401,12 @@ async fn persist_response_attestation(
 ) {
     match tokio::time::timeout(
         RESPONSE_ATTESTATION_STORE_TIMEOUT,
-        attestation_service.store_response_signature(response_id, request_hash, response_hash),
+        attestation_service.store_response_signature(
+            workspace_id,
+            response_id,
+            request_hash,
+            response_hash,
+        ),
     )
     .await
     {
@@ -416,6 +422,7 @@ async fn persist_response_attestation(
 
 /// Store an attestation for a non-streaming response before sending it.
 async fn persist_non_streaming_response_attestation(
+    workspace_id: uuid::Uuid,
     attestation_service: &dyn AttestationServiceTrait,
     response_id: &str,
     response_bytes: &[u8],
@@ -423,6 +430,7 @@ async fn persist_non_streaming_response_attestation(
 ) {
     let response_hash = hex::encode(Sha256::digest(response_bytes));
     persist_response_attestation(
+        workspace_id,
         attestation_service,
         response_id,
         request_hash,
@@ -432,6 +440,7 @@ async fn persist_non_streaming_response_attestation(
 }
 
 async fn signed_non_streaming_response(
+    workspace_id: uuid::Uuid,
     response: ResponseObject,
     adapter: &ClientToolAdapter,
     attestation_service: &dyn AttestationServiceTrait,
@@ -457,6 +466,7 @@ async fn signed_non_streaming_response(
     // Serialize once: both the attestation and HTTP body use these exact bytes.
     let response_bytes = response_json.to_string().into_bytes();
     persist_non_streaming_response_attestation(
+        workspace_id,
         attestation_service,
         &response.id,
         &response_bytes,
@@ -514,6 +524,7 @@ fn client_tool_serialization_failure(
 /// A successful write is available for subsequent `resp_*` lookup; a failed or
 /// timed-out write does not change the inference result.
 fn signed_response_sse_stream(
+    workspace_id: uuid::Uuid,
     stream: Pin<Box<dyn futures::Stream<Item = ResponseStreamEvent> + Send>>,
     adapter: ClientToolAdapter,
     attestation_service: Arc<dyn AttestationServiceTrait>,
@@ -557,6 +568,7 @@ fn signed_response_sse_stream(
 
                 if let Some((response_id, response_hash)) = signature {
                     persist_response_attestation(
+                        workspace_id,
                         attestation_service.as_ref(),
                         &response_id,
                         request_hash,
@@ -835,6 +847,7 @@ async fn create_legacy_response(
                 );
 
                 let byte_stream = signed_response_sse_stream(
+                    api_key.workspace.id.0,
                     stream,
                     client_tool_adapter,
                     state.attestation_service.clone(),
@@ -1088,6 +1101,7 @@ async fn create_legacy_response(
                 // request/response digests, never the response body. Failures
                 // and timeouts leave the no-store inference response unchanged.
                 signed_non_streaming_response(
+                    api_key.workspace.id.0,
                     response,
                     &client_tool_adapter,
                     state.attestation_service.as_ref(),
@@ -1155,6 +1169,7 @@ mod tests {
     impl AttestationServiceTrait for RecordingAttestationService {
         async fn get_chat_signature(
             &self,
+            _workspace_id: uuid::Uuid,
             _chat_id: &str,
             _signing_algo: Option<String>,
         ) -> Result<SignatureLookupResult, AttestationError> {
@@ -1163,6 +1178,7 @@ mod tests {
 
         async fn store_chat_signature_from_provider(
             &self,
+            _workspace_id: uuid::Uuid,
             _chat_id: &str,
         ) -> Result<(), AttestationError> {
             Ok(())
@@ -1170,6 +1186,7 @@ mod tests {
 
         async fn store_chat_signature(
             &self,
+            _workspace_id: uuid::Uuid,
             _chat_id: &str,
             _request_hash: String,
             _response_hash: String,
@@ -1179,6 +1196,7 @@ mod tests {
 
         async fn store_response_signature(
             &self,
+            _workspace_id: uuid::Uuid,
             response_id: &str,
             request_hash: String,
             response_hash: String,
@@ -1284,6 +1302,7 @@ mod tests {
         });
         let failed = stream_event("response.failed", Some(response));
         let mut stream = signed_response_sse_stream(
+            uuid::Uuid::nil(),
             Box::pin(futures::stream::iter([failed])),
             ClientToolAdapter::default(),
             attestation_service.clone(),
@@ -1326,6 +1345,7 @@ mod tests {
             stream_event("response.completed", Some(sample_response(response_id))),
         ];
         let mut stream = signed_response_sse_stream(
+            uuid::Uuid::nil(),
             Box::pin(futures::stream::iter(events)),
             ClientToolAdapter::default(),
             attestation.clone(),
@@ -1362,6 +1382,7 @@ mod tests {
         let attestation = Arc::new(RecordingAttestationService::default());
         let response_id = "resp_22222222-2222-4222-8222-222222222222";
         let mut stream = signed_response_sse_stream(
+            uuid::Uuid::nil(),
             Box::pin(futures::stream::iter(vec![
                 stream_event("response.created", Some(sample_response(response_id))),
                 stream_event("response.output_text.delta", None),
@@ -1388,6 +1409,7 @@ mod tests {
         let response = sample_response("resp_33333333-3333-4333-8333-333333333333");
 
         let http_response = signed_non_streaming_response(
+            uuid::Uuid::nil(),
             response.clone(),
             &ClientToolAdapter::default(),
             &attestation,
@@ -1500,6 +1522,7 @@ mod tests {
         ];
         let attestation = Arc::new(RecordingAttestationService::default());
         let mut stream = signed_response_sse_stream(
+            uuid::Uuid::nil(),
             Box::pin(futures::stream::iter(events)),
             request.client_tool_adapter,
             attestation.clone(),
@@ -1557,6 +1580,7 @@ mod tests {
         )];
         let attestation = RecordingAttestationService::default();
         let http_response = signed_non_streaming_response(
+            uuid::Uuid::nil(),
             response,
             &request.client_tool_adapter,
             &attestation,
@@ -1602,6 +1626,7 @@ mod tests {
         malformed.sequence_number = Some(2);
         let attestation = Arc::new(RecordingAttestationService::default());
         let mut stream = signed_response_sse_stream(
+            uuid::Uuid::nil(),
             Box::pin(futures::stream::iter([
                 stream_event("response.created", Some(sample_response("resp_custom"))),
                 malformed,
@@ -1627,6 +1652,7 @@ mod tests {
         assert!(attestation.stored_response_signatures().is_empty());
 
         let http_response = signed_non_streaming_response(
+            uuid::Uuid::nil(),
             response,
             &request.client_tool_adapter,
             attestation.as_ref(),

@@ -22,13 +22,19 @@ pub(super) fn valid_message_id(id: &str) -> bool {
 pub(super) struct MessageSigningContext {
     service: Arc<dyn AttestationServiceTrait>,
     request_hash: String,
+    workspace_id: uuid::Uuid,
 }
 
 impl MessageSigningContext {
-    pub(super) fn new(service: Arc<dyn AttestationServiceTrait>, request_hash: String) -> Self {
+    pub(super) fn new(
+        workspace_id: uuid::Uuid,
+        service: Arc<dyn AttestationServiceTrait>,
+        request_hash: String,
+    ) -> Self {
         Self {
             service,
             request_hash,
+            workspace_id,
         }
     }
 
@@ -37,8 +43,12 @@ impl MessageSigningContext {
         // these bytes. Bound the database write as well as signature creation.
         let result = tokio::time::timeout(
             SIGNATURE_STORE_TIMEOUT,
-            self.service
-                .store_chat_signature(&id, self.request_hash, response_hash),
+            self.service.store_chat_signature(
+                self.workspace_id,
+                &id,
+                self.request_hash,
+                response_hash,
+            ),
         )
         .await;
         if !matches!(result, Ok(Ok(()))) {

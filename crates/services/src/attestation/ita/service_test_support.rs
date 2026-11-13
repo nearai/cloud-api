@@ -311,6 +311,7 @@ struct NoopAttestationRepository;
 impl AttestationRepository for NoopAttestationRepository {
     async fn add_chat_signature(
         &self,
+        _workspace_id: uuid::Uuid,
         _chat_id: &str,
         _signature: ChatSignature,
     ) -> Result<(), AttestationError> {
@@ -319,6 +320,7 @@ impl AttestationRepository for NoopAttestationRepository {
 
     async fn get_chat_signature(
         &self,
+        _workspace_id: uuid::Uuid,
         _chat_id: &str,
         _signing_algo: &str,
     ) -> Result<ChatSignature, AttestationError> {
@@ -382,6 +384,7 @@ impl UsageRepository for NoopUsageRepository {
 
     async fn get_stop_reason_by_response_id(
         &self,
+        _workspace_id: uuid::Uuid,
         _response_id: Uuid,
     ) -> anyhow::Result<Option<StopReason>> {
         Ok(None)
@@ -389,6 +392,7 @@ impl UsageRepository for NoopUsageRepository {
 
     async fn get_stop_reason_by_provider_request_id(
         &self,
+        _workspace_id: uuid::Uuid,
         _provider_request_id: &str,
     ) -> anyhow::Result<Option<StopReason>> {
         Ok(None)

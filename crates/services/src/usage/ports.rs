@@ -373,6 +373,7 @@ pub trait UsageRepository: Send + Sync {
     /// Used to check if a response was stopped due to client disconnect
     async fn get_stop_reason_by_response_id(
         &self,
+        workspace_id: uuid::Uuid,
         response_id: Uuid,
     ) -> anyhow::Result<Option<StopReason>>;
 
@@ -380,6 +381,7 @@ pub trait UsageRepository: Send + Sync {
     /// Used to check if a chat completion was stopped due to client disconnect
     async fn get_stop_reason_by_provider_request_id(
         &self,
+        workspace_id: uuid::Uuid,
         provider_request_id: &str,
     ) -> anyhow::Result<Option<StopReason>>;
 

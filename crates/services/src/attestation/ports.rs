@@ -13,6 +13,7 @@ pub trait AttestationServiceTrait: Send + Sync {
     /// Returns SignatureLookupResult which can be Found (signature) or Unavailable (client disconnect)
     async fn get_chat_signature(
         &self,
+        workspace_id: uuid::Uuid,
         chat_id: &str,
         signing_algo: Option<String>,
     ) -> Result<SignatureLookupResult, AttestationError>;
@@ -21,6 +22,7 @@ pub trait AttestationServiceTrait: Send + Sync {
     /// This should be called when a completion finishes
     async fn store_chat_signature_from_provider(
         &self,
+        workspace_id: uuid::Uuid,
         chat_id: &str,
     ) -> Result<(), AttestationError>;
 
@@ -29,9 +31,11 @@ pub trait AttestationServiceTrait: Send + Sync {
     /// to persist partial fetches; background callers use the method above.
     async fn store_stream_chat_signature_from_provider(
         &self,
+        workspace_id: uuid::Uuid,
         chat_id: &str,
     ) -> Result<(), AttestationError> {
-        self.store_chat_signature_from_provider(chat_id).await
+        self.store_chat_signature_from_provider(workspace_id, chat_id)
+            .await
     }
 
     /// Store a chat signature directly over gateway-emitted bytes.
@@ -39,6 +43,7 @@ pub trait AttestationServiceTrait: Send + Sync {
     /// and stores both ECDSA and ED25519 signatures.
     async fn store_chat_signature(
         &self,
+        workspace_id: uuid::Uuid,
         chat_id: &str,
         request_hash: String,
         response_hash: String,
@@ -51,12 +56,13 @@ pub trait AttestationServiceTrait: Send + Sync {
     /// rewrites; stream lifecycle cleanup is owned by `InterceptStream`.
     async fn store_chat_signature_and_unpin(
         &self,
+        workspace_id: uuid::Uuid,
         chat_id: &str,
         request_hash: String,
         response_hash: String,
     ) -> Result<(), AttestationError> {
         let result = self
-            .store_chat_signature(chat_id, request_hash, response_hash)
+            .store_chat_signature(workspace_id, chat_id, request_hash, response_hash)
             .await;
         self.release_chat_signature_pin(chat_id).await;
         result
@@ -73,6 +79,7 @@ pub trait AttestationServiceTrait: Send + Sync {
     /// Stores both ECDSA and ED25519 signatures
     async fn store_response_signature(
         &self,
+        workspace_id: uuid::Uuid,
         response_id: &str,
         request_hash: String,
         response_hash: String,
@@ -110,6 +117,7 @@ pub trait AttestationServiceTrait: Send + Sync {
 pub trait AttestationRepository: Send + Sync {
     async fn add_chat_signature(
         &self,
+        workspace_id: uuid::Uuid,
         chat_id: &str,
         signature: ChatSignature,
     ) -> Result<(), AttestationError>;
@@ -119,16 +127,19 @@ pub trait AttestationRepository: Send + Sync {
     /// one by one and stops at the first failure.
     async fn add_chat_signatures(
         &self,
+        workspace_id: uuid::Uuid,
         chat_id: &str,
         signatures: Vec<ChatSignature>,
     ) -> Result<(), AttestationError> {
         for signature in signatures {
-            self.add_chat_signature(chat_id, signature).await?;
+            self.add_chat_signature(workspace_id, chat_id, signature)
+                .await?;
         }
         Ok(())
     }
     async fn get_chat_signature(
         &self,
+        workspace_id: uuid::Uuid,
         chat_id: &str,
         signing_algo: &str,
     ) -> Result<ChatSignature, AttestationError>;

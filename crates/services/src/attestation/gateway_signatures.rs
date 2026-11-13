@@ -8,6 +8,7 @@ use crate::metrics::consts::*;
 impl AttestationService {
     pub(in crate::attestation) async fn store_gateway_signature(
         &self,
+        workspace_id: uuid::Uuid,
         signature_id: &str,
         id_label: &str,
         request_hash: String,
@@ -42,7 +43,7 @@ impl AttestationService {
         }
 
         self.repository
-            .add_chat_signatures(signature_id, signatures)
+            .add_chat_signatures(workspace_id, signature_id, signatures)
             .await
             .map_err(|e| {
                 tracing::error!(

@@ -112,6 +112,90 @@ async fn policy(server: &axum_test::TestServer, value: Value) {
 }
 
 #[tokio::test]
+async fn native_responses_preserve_capacity_and_unavailable_admission_statuses() {
+    let mut settings = enforcing_settings();
+    settings.defaults.key_max_unsettled = 1;
+    let (server, _, pool, db) = server(settings).await;
+    let model = format!("openai/admission-status-{}", Uuid::new_v4());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let called = calls.clone();
+    let provider = inference_providers::mock::MockProvider::new_accept_all()
+        .with_responses_handler(move |_| {
+            called.fetch_add(1, Ordering::SeqCst);
+            panic!("rejected admission must not dispatch native Responses")
+        });
+    pool.register_provider(model.clone(), Arc::new(provider))
+        .await;
+    let mut models = api::models::BatchUpdateModelApiRequest::new();
+    models.insert(model.clone(), serde_json::from_value(json!({
+        "inputCostPerToken":{"amount":1000,"currency":"USD"},
+        "outputCostPerToken":{"amount":2000,"currency":"USD"},
+        "modelDisplayName":"Admission status fixture", "modelDescription":"Native admission statuses",
+        "contextLength":4096, "maxOutputLength":128, "verifiable":false, "isActive":true,
+        "attestationSupported":false
+    })).unwrap());
+    seed_models(&server, models, get_session_id()).await;
+    let org = setup_org_with_credits(&server, 1_000_000_000).await;
+    let ws = list_workspaces(&server, org.id.clone()).await.remove(0);
+    let key = create_api_key_in_workspace(&server, ws.id.clone(), "admission-status".into()).await;
+    let id = Uuid::new_v4();
+    let features = services::usage::budget::UsageFeatures::from_json(
+        services::usage::InferenceType::ChatCompletion,
+        &json!({"max_output_tokens":8}),
+    )
+    .unwrap();
+    server
+        .post("/v1/internal/budget")
+        .add_header("Authorization", "Bearer test-internal-secret")
+        .json(
+            &json!({"id":id,"organization_id":org.id,"workspace_id":ws.id,"api_key_id":key.id,
+            "model":model,"features":features}),
+        )
+        .await
+        .assert_status_ok();
+
+    for expected in [
+        StatusCode::TOO_MANY_REQUESTS,
+        StatusCode::SERVICE_UNAVAILABLE,
+    ] {
+        let mut client = db.pool().get().await.unwrap();
+        let lock = client.transaction().await.unwrap();
+        if expected == StatusCode::SERVICE_UNAVAILABLE {
+            // Hold only this fixture's organization until admission's lock deadline expires.
+            lock.query_one(
+                "SELECT id FROM organizations WHERE id=$1 FOR UPDATE",
+                &[&Uuid::parse_str(&org.id).unwrap()],
+            )
+            .await
+            .unwrap();
+        }
+        for stream in [false, true] {
+            let response = server
+                .post("/v1/responses")
+                .add_header(
+                    "Authorization",
+                    format!("Bearer {}", key.key.as_ref().unwrap()),
+                )
+                .json(&json!({"model":model,"input":"test","max_output_tokens":8,"stream":stream}))
+                .await;
+            assert_eq!(response.status_code(), expected, "{}", response.text());
+            assert!(!response.text().contains("lock timeout"));
+            assert!(!response.text().contains("SQLSTATE"));
+        }
+        lock.rollback().await.unwrap();
+        if expected == StatusCode::TOO_MANY_REQUESTS {
+            server
+                .post("/v1/internal/budget/release")
+                .add_header("Authorization", "Bearer test-internal-secret")
+                .json(&json!({"organization_id":org.id,"id":id}))
+                .await
+                .assert_status(StatusCode::NO_CONTENT);
+        }
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
 async fn global_disable_and_reenable_preserve_direct_admission_policy_and_existing_holds() {
     let (server, _, _, db) = server(AdmissionSettings::default()).await;
     setup_qwen_model(&server).await;

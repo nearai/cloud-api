@@ -50,7 +50,7 @@ pub struct NativeResponsesContext {
 pub enum NativeResponsesError {
     InvalidRequest(&'static str),
     RateLimited,
-    BudgetExceeded,
+    AdmissionRejected(u16),
     Provider(&'static str),
     Internal(&'static str),
 }
@@ -177,10 +177,10 @@ impl NativeResponsesService {
             .await
             .map_err(|error| match error {
                 CompletionError::HttpError {
-                    status_code: 402,
+                    status_code,
                     is_external: false,
                     ..
-                } => NativeResponsesError::BudgetExceeded,
+                } => NativeResponsesError::AdmissionRejected(status_code),
                 _ => NativeResponsesError::Provider("Native OpenAI Responses request failed"),
             })?;
         let billing = Billing {

@@ -778,8 +778,11 @@ pub async fn create_access_token(
                 )),
             ))
         }
-        Err(e) => {
-            error!("Failed to create access token and rotate refresh token: {e}");
+        Err(_) => {
+            error!(
+                error_kind = "token_rotation_failed",
+                "Failed to create access token and rotate refresh token"
+            );
             Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse::new(

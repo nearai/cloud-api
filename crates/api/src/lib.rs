@@ -275,7 +275,8 @@ pub fn init_auth_services(database: Arc<Database>, config: &ApiConfig) -> AuthCo
         admin_access_token_repository,
         config.auth.admin_emails.clone(),
         config.auth.encoding_key.clone(),
-    );
+    )
+    .with_admin_tokens_only(config.auth.admin_tokens_only);
 
     // Create NEAR nonce repository
     let nonce_repository = Arc::new(database::PostgresNearNonceRepository::new(
@@ -3269,6 +3270,7 @@ mod tests {
                 admin_emails: vec![],
                 admin_read_only_tokens_enabled: false,
                 require_session_bound_access_tokens: false,
+                admin_tokens_only: false,
             },
             database: config::DatabaseConfig {
                 connection_mode: config::DatabaseConnectionMode::Patroni,
@@ -3395,6 +3397,7 @@ mod tests {
                 admin_emails: vec![],
                 admin_read_only_tokens_enabled: false,
                 require_session_bound_access_tokens: false,
+                admin_tokens_only: false,
             },
             database: config::DatabaseConfig {
                 connection_mode: config::DatabaseConnectionMode::Patroni,

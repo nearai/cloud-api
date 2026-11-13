@@ -61,6 +61,16 @@ Object encryption uses the same separation: `GET /v1/admin/object-encryption/key
 require Read permission. Creating, cancelling, or verifying object encryption jobs
 requires Write permission. See [object encryption key rotation](object-encryption.md).
 
+## Admin access tokens only
+
+`AUTH_ADMIN_TOKENS_ONLY` (default `false`) limits admin routes to admin access
+tokens. When it is `true`, a request to an admin route that carries a session
+token gets 401 `unauthorized` with the message "Admin access token required".
+Routes that require an admin session (admin token management and user erasure)
+are then unavailable. Admin access tokens are validated as
+before: hash, expiration, revocation, User-Agent binding, the creator's email
+allowlist eligibility and the token's permission.
+
 ## Admin email allowlist migration
 
 Platform admin eligibility is controlled by `AUTH_ADMIN_EMAILS`, a comma-separated

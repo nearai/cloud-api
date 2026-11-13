@@ -106,8 +106,9 @@ impl AdminAccessTokenRepository {
         let admin_token = Self::from_row(&row)?;
 
         debug!(
-            "Created admin access token {} for user {}",
-            name, created_by_user_id
+            token_id = %admin_token.id,
+            user_id = %created_by_user_id,
+            "Created admin access token"
         );
 
         Ok((admin_token, admin_access_token))

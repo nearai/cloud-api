@@ -1,9 +1,10 @@
 use aes_gcm::{
-    aead::{rand_core::RngCore, Aead, KeyInit, OsRng, Payload},
+    aead::{Aead, KeyInit, Payload},
     Aes256Gcm, Nonce,
 };
 use anyhow::{anyhow, ensure, Context, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+use rand::{rngs::SysRng, TryRng};
 use serde_json::{json, Value};
 use uuid::Uuid;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
@@ -135,7 +136,9 @@ pub fn encrypt_with_key_id(
 ) -> Result<String> {
     validate_key_id(key_id)?;
     let mut nonce = [0; 12];
-    OsRng.fill_bytes(&mut nonce);
+    SysRng
+        .try_fill_bytes(&mut nonce)
+        .context("operating system randomness unavailable")?;
     let aad = format!("{table}:{column}:{id}");
     let cipher = Aes256Gcm::new_from_slice(key).map_err(|_| anyhow!("invalid key"))?;
     let ciphertext = cipher
@@ -285,6 +288,27 @@ pub fn decrypt_json_if_encrypted_with_ring(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reads_aes_256_gcm_known_ciphertext_with_legacy_envelope() {
+        // Independent OpenSSL AES-256-GCM fixture (Python cryptography), using
+        // key [7; 32], nonce 0..12, and the unchanged table:column:id AAD.
+        let id = Uuid::from_u128(7);
+        let ring = KeyRing::new(DEFAULT_KEY_ID.into(), [7; 32], vec![]).unwrap();
+        let envelope = json!({
+            MARKER: true,
+            "version": 1,
+            "alg": "AES-256-GCM",
+            "key_id": DEFAULT_KEY_ID,
+            "nonce": "AAECAwQFBgcICQoL",
+            "ciphertext": "dOSOEX5w+Soewo35kCwJgpUc0OdgFgJDcyYWJNnckrknki4LqCqlheE="
+        });
+        assert_eq!(
+            decrypt_with_ring(&envelope, &ring, "files", "filename", id).unwrap(),
+            "legacy ciphertext fixture"
+        );
+        assert!(decrypt_with_ring(&envelope, &ring, "files", "storage_key", id).is_err());
+    }
 
     #[test]
     fn key_ring_zeroizes_on_drop() {

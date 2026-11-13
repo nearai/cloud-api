@@ -240,6 +240,8 @@ impl TryFrom<NearSignedMessageJson> for services::auth::near::SignedMessage {
         }
 
         let public_key: near_kit::signer::PublicKey = msg.public_key.parse()?;
+        // near-kit 0.19 parses lengths only; retain invalid-point rejection here.
+        public_key.validate()?;
 
         // Parse base64 signature and create Signature based on key type
         let sig_bytes = BASE64_STANDARD.decode(&msg.signature)?;
@@ -709,16 +711,13 @@ pub async fn near_login(
     Json(auth_request): Json<NearAuthRequest>,
 ) -> Response {
     let account_id_str = auth_request.signed_message.account_id.clone();
-    debug!(
-        "NEAR authentication attempt for account: {}",
-        account_id_str
-    );
+    debug!("NEAR authentication attempt");
 
     // Convert JSON types to internal types
     let signed_message = match auth_request.signed_message.try_into() {
         Ok(msg) => msg,
-        Err(e) => {
-            tracing::warn!("Failed to parse signed message: {}", e);
+        Err(_) => {
+            tracing::warn!("Failed to parse signed message");
             return (
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({
@@ -732,8 +731,8 @@ pub async fn near_login(
 
     let payload = match auth_request.payload.try_into() {
         Ok(p) => p,
-        Err(e) => {
-            tracing::warn!("Failed to parse payload: {}", e);
+        Err(_) => {
+            tracing::warn!("Failed to parse payload");
             return (
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({
@@ -774,7 +773,10 @@ pub async fn near_login(
 
     match result {
         Ok((access_token, refresh_session, refresh_token)) => {
-            debug!("NEAR authentication successful: {}", account_id_str);
+            debug!(
+                user_id = %refresh_session.user_id.0,
+                "NEAR authentication successful"
+            );
 
             let response = NearAuthResponse {
                 access_token,
@@ -968,6 +970,35 @@ mod tests {
 
                 assert!(services::auth::near::SignedMessage::try_from(invalid).is_err());
             }
+        }
+    }
+
+    #[test]
+    fn near_wallet_signature_decoding_rejects_invalid_curve_points() {
+        use near_kit::signer::{ParseKeyError, PublicKey};
+
+        let mut invalid_ed25519 = [0u8; 32];
+        invalid_ed25519[0] = 2;
+        for (public_key, signature_length) in [
+            (PublicKey::Ed25519(invalid_ed25519), 64),
+            (PublicKey::Secp256k1([0; 64]), 65),
+        ] {
+            // Both fixtures decode under 0.19 but are not points on their curves.
+            assert!(public_key.validate().is_err());
+            let encoded_key = public_key.to_string();
+            assert!(encoded_key.parse::<PublicKey>().is_ok());
+            let request = NearSignedMessageJson {
+                account_id: "alice.near".into(),
+                public_key: encoded_key,
+                signature: BASE64_STANDARD.encode(vec![0; signature_length]),
+                state: None,
+            };
+
+            let error = services::auth::near::SignedMessage::try_from(request).unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<ParseKeyError>(),
+                Some(&ParseKeyError::InvalidCurvePoint)
+            );
         }
     }
 

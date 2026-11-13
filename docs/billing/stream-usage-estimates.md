@@ -9,10 +9,15 @@ a completed stream records an estimate with stop reason `incomplete`. A
 provider or transport error (`last_error`) records no usage when no summary
 arrived.
 
-Some providers report prompt usage at stream start with zero completion
-tokens and send the completion total only in the final event. If output was
-streamed but the last usage seen still has zero completion tokens, the record
-keeps the reported prompt and cache tokens and uses the output estimate below.
+If more output arrives after the last provider usage snapshot, the record
+keeps the reported prompt and cache tokens and uses the greater of the
+reported output count and the output estimate below. A usage snapshot that
+covers the last observed output remains authoritative, including when the
+client disconnects before the terminal marker.
+
+A missing provider response ID does not discard observed usage. Such records
+receive an independent inference ID and leave the provider request ID absent.
+An empty stream without provider usage creates no estimated record.
 
 The input estimate includes message text, tool definitions, `tool_choice`,
 prior `tool_calls`, and a fixed 1,024 tokens per non-text content part by
@@ -31,3 +36,9 @@ as exact records. A client retry after a cut stream is a separate request
 and is billed separately. `USAGE_ESTIMATE_INCOMPLETE_STREAMS` defaults to
 `true`; set it to `false` or `0` to disable estimates. Invalid values fail
 configuration loading.
+
+The native Anthropic streaming endpoint uses the same switch and output
+heuristic for text, thinking, and tool JSON deltas after its last output
+usage snapshot. Reported input and cache counts are preserved. A final
+output usage snapshot remains authoritative, even if the connection closes
+before `message_stop`. Provider errors do not trigger output estimation.

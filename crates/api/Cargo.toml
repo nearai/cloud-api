@@ -27,15 +27,15 @@ inference_providers = { path = "../inference_providers", features = ["openapi"] 
 tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.7", features = ["cors", "compression-gzip", "compression-br", "set-header"] }
 uuid = { version = "1.23", features = ["v4", "serde"] }
-opentelemetry = { version = "0.32", features = ["metrics"] }
-opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
-opentelemetry-otlp = { version = "0.32", features = ["metrics", "grpc-tonic"] }
+opentelemetry = { version = "0.33", features = ["metrics"] }
+opentelemetry_sdk = { version = "0.33", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.33", features = ["metrics", "grpc-tonic"] }
 url = "2.5"
 chrono = { version = "0.4", features = ["serde"] }
 # For TypedHeader support
 headers = "0.4"
 # OpenAPI documentation generation
-utoipa = { version = "5", features = ["axum_extras", "chrono", "uuid"] }
+utoipa = { version = "6", features = ["axum_extras", "chrono", "uuid"] }
 thiserror = "2.0"
 # Body hashing middleware dependencies
 sha2 = "0.11"
@@ -43,6 +43,7 @@ hex = "0.4"
 # Constant-time comparison for service-token auth on /v1/internal/usage
 subtle = "2.6"
 bytes = "1.11"
+http-body = "1"
 http-body-util = "0.1"
 # Regional S3 uses SigV4; SigV4a pulls in crypto-bigint affected by RUSTSEC-2026-0387.
 aws-config = { version = "1.8", features = ["behavior-version-latest"] }
@@ -52,8 +53,8 @@ aws-sdk-s3 = { version = "1.134", default-features = false, features = [
     "rt-tokio",
 ] }
 # NEAR wallet authentication
-near-kit = { version = "0.18.3", default-features = false, features = ["rpc"] }
-base64 = "0.22"
+near-kit = { version = "0.19.0", default-features = false, features = ["rpc"] }
+base64 = "0.23"
 # Ordered collections
 indexmap = "2"
 moka = { version = "0.12.15", features = ["future"] }
@@ -61,26 +62,26 @@ moka = { version = "0.12.15", features = ["future"] }
 urlencoding = "2.1"
 # OHTTP gateway (RFC 9458) — HPKE-based request encapsulation/decapsulation
 ohttp = { version = "0.7", features = ["server", "stream", "rust-hpke"] }
-bhttp = "0.7"
+bhttp = "0.8"
 futures-util = "0.3"
 tokio-util = { version = "0.7", features = ["compat", "io"] }
 reqwest = { version = "0.12", features = ["json", "stream"] }
 
 [dev-dependencies]
 database = { path = "../database", features = ["test-support"] }
-axum-test = "20"
+axum-test = "21"
 wiremock = "0.6"
 serde_json = "1.0"
 url = "2.5"
 tokio-test = "0.4"
 sha2 = "0.11"
-base64 = "0.22.1"
+base64 = "0.23.1"
 dotenvy = "0.15.7"
 k256 = { version = "0.14", features = ["ecdsa", "arithmetic"] }
 sha3 = "0.12"
 hmac = "0.13"
 deadpool-postgres = { version = "0.14", features = ["rt_tokio_1"] }
-ed25519-dalek = { version = "2.1", features = ["rand_core"] }
+ed25519-dalek = { version = "3.0", features = ["rand_core"] }
 rand = "0.10"
 services = { path = "../services", features = ["test-mocks"] }
 async-trait = "0.1"

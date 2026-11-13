@@ -42,10 +42,26 @@ pub(super) async fn maybe_redact(
 }
 
 /// Convert an [`AutoRedactError`] into the user-facing error response.
-/// Detector-unavailable is 503 (fail-closed per design); internal errors
+/// Detector-unavailable is 503 (fail-closed per design); an overloaded
+/// detector is the same 503 plus a `Retry-After` header; internal errors
 /// are 500.
 pub(super) fn auto_redact_error_response(err: AutoRedactError) -> Response {
     match err {
+        AutoRedactError::DetectorOverloaded { retry_after_secs } => {
+            tracing::warn!(retry_after_secs, "auto_redact detector overloaded");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                [(
+                    header::RETRY_AFTER,
+                    crate::middleware::retry_after::retry_after_seconds(retry_after_secs).to_string(),
+                )],
+                ResponseJson(ErrorResponse::new(
+                    "PII redaction service is overloaded. Retry after the delay in the Retry-After header, or omit auto_redact to send the prompt as-is.".to_string(),
+                    "auto_redact_unavailable".to_string(),
+                )),
+            )
+                .into_response()
+        }
         AutoRedactError::DetectorUnavailable(msg) => {
             tracing::error!(error = %msg, "auto_redact detector unavailable");
             (

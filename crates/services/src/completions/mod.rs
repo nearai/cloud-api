@@ -129,7 +129,6 @@ where
     workspace_id: Uuid,
     api_key_id: Uuid,
     model_id: Uuid,
-    model_name: String,
     inference_type: crate::usage::ports::InferenceType,
     service_start_time: Instant,
     provider_start_time: Instant,
@@ -152,6 +151,7 @@ where
     last_usage_stats: Option<inference_providers::TokenUsage>,
     estimated_input_tokens: u32,
     streamed_output_bytes: usize,
+    output_bytes_at_last_usage: usize,
     usage_estimate_incomplete_streams: bool,
     /// Last chat ID from streaming chunks (for attestation and inference_id)
     last_chat_id: Option<String>,
@@ -184,6 +184,10 @@ where
     /// Callback to report observed TTFT back to the provider pool for latency-aware
     /// routing. Called once with the backend TTFT (ms) from record_usage_and_metrics.
     latency_reporter: Option<super::inference_provider_pool::ProviderLatencyReporter>,
+    /// The request's tenant ids, captured when the stream is built. The
+    /// signature fetch runs while the response body is polled, after the
+    /// request's own scope has ended.
+    tracing_context: Option<inference_providers::tracing_context::TracingContext>,
 }
 
 impl<S> InterceptStream<S>
@@ -245,7 +249,7 @@ where
             });
         }
 
-        Box::pin(async move {
+        let store = async move {
             match tokio::time::timeout(
                 STREAM_SIGNATURE_STORE_TIMEOUT,
                 attestation_service.store_stream_chat_signature_from_provider(&chat_id),
@@ -272,7 +276,14 @@ where
                         .await;
                 }
             }
-        })
+        };
+        // Re-enter the request's ids so the fetch carries them upstream.
+        match self.tracing_context {
+            Some(context) => Box::pin(inference_providers::tracing_context::with_tracing_context(
+                context, store,
+            )),
+            None => Box::pin(store),
+        }
     }
 
     fn begin_finalizing(&mut self) {
@@ -308,30 +319,20 @@ where
             cache_read_tokens,
             anthropic_cache_write_tokens,
             profiled_cache_write_tokens,
-            chat_id,
             estimated_usage,
-        ) = match (&self.last_usage_stats, &self.last_chat_id) {
-            (Some(usage), Some(chat_id)) => {
-                // Some providers report prompt usage at stream start with zero
-                // completion tokens and send the completion total only in the
-                // final event. If output was streamed but the last usage seen
-                // still has zero completion tokens, keep the reported prompt and
-                // cache values and estimate the output from the streamed bytes.
+        ) = match &self.last_usage_stats {
+            Some(usage) => {
+                // Only supplement a snapshot when more output arrived afterwards.
+                // A final usage event remains authoritative even if the client
+                // disconnects before the terminal marker is read.
                 let estimate_output = self.usage_estimate_incomplete_streams
                     && self.last_error.is_none()
-                    && usage.completion_tokens == 0
-                    && self.streamed_output_bytes > 0;
+                    && self.streamed_output_bytes > self.output_bytes_at_last_usage;
                 let output_tokens = if estimate_output {
-                    let estimated =
+                    usage.completion_tokens.max(
                         i32::try_from(estimate_tokens_from_bytes(self.streamed_output_bytes))
-                            .unwrap_or(i32::MAX);
-                    tracing::info!(
-                        input_tokens = usage.prompt_tokens,
-                        estimated_output_tokens = estimated,
-                        observed_chunks = self.observed_chunk_count,
-                        "Recording estimated output for stream with partial provider usage"
-                    );
-                    estimated
+                            .unwrap_or(i32::MAX),
+                    )
                 } else {
                     usage.completion_tokens
                 };
@@ -341,47 +342,16 @@ where
                     usage.cached_tokens(),
                     usage.cache_creation_tokens(),
                     usage.cache_write_tokens(),
-                    chat_id.clone(),
-                    estimate_output,
+                    output_tokens != usage.completion_tokens,
                 )
             }
-            (None, None) => {
-                // Distinguish client disconnect / provider error from truly unexpected cases.
-                // Client disconnects and provider errors are expected — usage is only sent
-                // in the final chunk, so an interrupted stream will never have it.
-                //
-                // `last_error` must be checked in addition to `stream_completed`: the
-                // route converts an in-stream provider Err into an SSE error frame and
-                // keeps polling, so the stream still ends "normally"
-                // (stream_completed == true) after e.g. a backend queue abort before
-                // the first token. That is a provider error, not a mystery.
-                if !self.stream_completed || self.last_error.is_some() {
-                    tracing::warn!(%organization_id, %model_id, model = %self.model_name,
-                        stream_completed = self.stream_completed,
-                        stream_error = self.last_error.is_some(),
-                        "Stream interrupted before usage stats or chat_id received (client disconnect or provider error)");
-                } else {
-                    tracing::error!(%organization_id, %model_id, model = %self.model_name,
-                        "Stream completed but no usage stats and no chat_id available");
-                }
-                return;
-            }
-            (None, Some(chat_id)) => {
-                if !self.usage_estimate_incomplete_streams {
-                    if !self.stream_completed || self.last_error.is_some() {
-                        tracing::warn!(%chat_id, %organization_id, %model_id, model = %self.model_name,
-                            stream_completed = self.stream_completed,
-                            stream_error = self.last_error.is_some(),
-                            "Stream interrupted before usage stats received (client disconnect or provider error)");
-                    } else {
-                        tracing::error!(%chat_id, %organization_id, %model_id, model = %self.model_name,
-                            "Stream completed but no usage stats available");
-                    }
-                    return;
-                }
-                if self.last_error.is_some() {
-                    tracing::warn!(%chat_id, %organization_id, %model_id, model = %self.model_name,
-                        "Stream ended with provider error before usage stats received");
+            None => {
+                // Keep the existing provider-error policy. A stream with no
+                // parsed response gives us no evidence of billable execution.
+                if !self.usage_estimate_incomplete_streams
+                    || self.last_error.is_some()
+                    || (self.last_chat_id.is_none() && self.streamed_output_bytes == 0)
+                {
                     return;
                 }
                 let input_tokens = i32::try_from(self.estimated_input_tokens).unwrap_or(i32::MAX);
@@ -391,36 +361,10 @@ where
                     i32::try_from(estimate_tokens_from_bytes(self.streamed_output_bytes))
                         .unwrap_or(i32::MAX)
                 };
-                if self.stream_completed {
-                    // A stream that finished normally should carry a usage
-                    // summary, so its absence points at the provider.
-                    tracing::warn!(%chat_id, %organization_id, %model_id, model = %self.model_name,
-                        estimated_input_tokens = input_tokens,
-                        estimated_output_tokens = output_tokens,
-                        observed_chunks = self.observed_chunk_count,
-                        "Stream completed without provider usage; recording estimated usage");
-                } else {
-                    tracing::info!(
-                        estimated_input_tokens = input_tokens,
-                        estimated_output_tokens = output_tokens,
-                        observed_chunks = self.observed_chunk_count,
-                        "Recording estimated usage for stream without provider usage"
-                    );
-                }
-                (input_tokens, output_tokens, 0, 0, 0, chat_id.clone(), true)
-            }
-            (Some(usage), None) => {
-                tracing::error!(
-                    prompt_tokens = usage.prompt_tokens,
-                    completion_tokens = usage.completion_tokens,
-                    %organization_id,
-                    %model_id,
-                    model = %self.model_name,
-                    "Stream ended but no chat_id available"
-                );
-                return;
+                (input_tokens, output_tokens, 0, 0, 0, true)
             }
         };
+        let chat_id = self.last_chat_id.clone();
 
         if input_tokens == 0 && output_tokens == 0 {
             return;
@@ -436,7 +380,10 @@ where
             }
         };
 
-        let inference_id = hash_inference_id_to_uuid(&chat_id);
+        let inference_id = chat_id
+            .as_deref()
+            .map(hash_inference_id_to_uuid)
+            .unwrap_or_else(Uuid::new_v4);
 
         // Create span with full context for async task
         let span = tracing::info_span!(
@@ -545,7 +492,7 @@ where
                         ttft_ms,
                         avg_itl_ms,
                         inference_id: Some(inference_id),
-                        provider_request_id: Some(chat_id),
+                        provider_request_id: chat_id,
                         stop_reason,
                         response_id,
                         provider_attribution,
@@ -700,7 +647,9 @@ where
 
                         if let Some(StreamChunk::Chat(ref chat_chunk)) = event.chunk {
                             // Track chat_id for attestation (updated on each chunk).
-                            self.last_chat_id = Some(chat_chunk.id.clone());
+                            if !chat_chunk.id.is_empty() {
+                                self.last_chat_id = Some(chat_chunk.id.clone());
+                            }
 
                             for choice in &chat_chunk.choices {
                                 if let Some(delta) = &choice.delta {
@@ -738,6 +687,7 @@ where
                             // Track usage stats (updated on each chunk that has usage).
                             if let Some(usage) = &chat_chunk.usage {
                                 self.last_usage_stats = Some(usage.clone());
+                                self.output_bytes_at_last_usage = self.streamed_output_bytes;
                             }
 
                             if let Some(service_tier) = &chat_chunk.service_tier {
@@ -999,33 +949,6 @@ fn estimate_input_tokens(params: &inference_providers::ChatCompletionParams) -> 
 }
 
 impl CompletionServiceImpl {
-    /// Inject tracing correlation IDs into the `extra` map that is forwarded
-    /// to `ChatCompletionParams`. The inference provider reads these keys and
-    /// emits them as `X-Request-Id` / `X-Org-Id` / `X-Workspace-Id` HTTP
-    /// headers on the outbound call to the vLLM/SGLang backend.
-    ///
-    /// The key names must match the constants in
-    /// `inference_providers::attested::nearai::tracing_headers`.
-    fn inject_tracing_headers(
-        extra: &mut std::collections::HashMap<String, serde_json::Value>,
-        request_id: Uuid,
-        organization_id: Uuid,
-        workspace_id: Uuid,
-    ) {
-        extra.insert(
-            "x_request_id".to_string(),
-            serde_json::Value::String(request_id.to_string()),
-        );
-        extra.insert(
-            "x_org_id".to_string(),
-            serde_json::Value::String(organization_id.to_string()),
-        );
-        extra.insert(
-            "x_workspace_id".to_string(),
-            serde_json::Value::String(workspace_id.to_string()),
-        );
-    }
-
     pub fn new(
         inference_provider_pool: Arc<InferenceProviderPool>,
         attestation_service: Arc<dyn AttestationServiceTrait>,
@@ -1489,7 +1412,7 @@ impl CompletionServiceImpl {
                         %organization_id,
                         model,
                         status_code,
-                        provider_message = %message,
+                        error_message_len = message.len(),
                         "Auth error during {}",
                         operation
                     );
@@ -1505,7 +1428,7 @@ impl CompletionServiceImpl {
                         %organization_id,
                         model,
                         status_code,
-                        provider_message = %message,
+                        error_message_len = message.len(),
                         "External provider not found during {}",
                         operation
                     );
@@ -1526,7 +1449,7 @@ impl CompletionServiceImpl {
                         %organization_id,
                         model,
                         status_code,
-                        provider_message = %message,
+                        error_message_len = message.len(),
                         "Provider timeout during {}",
                         operation
                     );
@@ -1568,7 +1491,7 @@ impl CompletionServiceImpl {
                         %organization_id,
                         model,
                         status_code,
-                        provider_message = %message,
+                        error_message_len = message.len(),
                         "Provider error during {}",
                         operation
                     );
@@ -1584,7 +1507,7 @@ impl CompletionServiceImpl {
                         %organization_id,
                         model,
                         status_code,
-                        provider_message = %message,
+                        error_message_len = message.len(),
                         "External provider error during {}",
                         operation
                     );
@@ -1624,7 +1547,7 @@ impl CompletionServiceImpl {
             inference_providers::CompletionError::NoPubKeyProvider(msg) => {
                 tracing::warn!(
                     model,
-                    provider_message = %msg,
+                    error_message_len = msg.len(),
                     "E2EE pubkey routing failed during {} (stale attestation?)",
                     operation
                 );
@@ -1640,7 +1563,7 @@ impl CompletionServiceImpl {
                     tracing::error!(
                         %organization_id,
                         model,
-                        provider_message = %msg,
+                        error_message_len = msg.len(),
                         "Provider error during {}",
                         operation
                     );
@@ -1655,7 +1578,7 @@ impl CompletionServiceImpl {
                 tracing::error!(
                     %organization_id,
                     model,
-                    provider_message = %msg,
+                    error_message_len = msg.len(),
                     "Invalid response during {}",
                     operation
                 );
@@ -1669,7 +1592,7 @@ impl CompletionServiceImpl {
                 tracing::error!(
                     %organization_id,
                     model,
-                    provider_message = %msg,
+                    error_message_len = msg.len(),
                     "Unknown error during {}",
                     operation
                 );
@@ -1708,7 +1631,8 @@ impl CompletionServiceImpl {
             ports::CompletionError::InvalidParams(_) => ERROR_TYPE_INVALID_PARAMS,
             ports::CompletionError::RateLimitExceeded(_) => ERROR_TYPE_RATE_LIMIT,
             ports::CompletionError::ProviderError { .. } => ERROR_TYPE_INFERENCE_ERROR,
-            ports::CompletionError::ServiceOverloaded(_) => ERROR_TYPE_SERVICE_OVERLOADED,
+            ports::CompletionError::ServiceOverloaded(_)
+            | ports::CompletionError::UpstreamOverloaded { .. } => ERROR_TYPE_SERVICE_OVERLOADED,
             ports::CompletionError::InternalError(_) => ERROR_TYPE_INTERNAL_ERROR,
         };
 
@@ -1892,7 +1816,6 @@ impl CompletionServiceImpl {
             workspace_id,
             api_key_id,
             model_id,
-            model_name,
             inference_type,
             service_start_time,
             provider_start_time,
@@ -1908,6 +1831,7 @@ impl CompletionServiceImpl {
             last_usage_stats: None,
             estimated_input_tokens: estimated_input_tokens.unwrap_or(0),
             streamed_output_bytes: 0,
+            output_bytes_at_last_usage: 0,
             // No input estimate means no estimate of any kind for this stream.
             usage_estimate_incomplete_streams: self.usage_estimate_incomplete_streams
                 && estimated_input_tokens.is_some(),
@@ -1925,6 +1849,7 @@ impl CompletionServiceImpl {
             requested_service_tier,
             provider_service_tier: None,
             latency_reporter,
+            tracing_context: inference_providers::tracing_context::current_tracing_context(),
         };
         Box::pin(intercepted_stream)
     }
@@ -1969,10 +1894,6 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         let mut extra = request.extra.clone();
         let (tools, tool_choice) = Self::extract_tools_from_extra(&mut extra);
         let stream_options = Self::extract_stream_options_from_extra(&mut extra);
-
-        // Inject tracing correlation IDs into extra so the inference provider
-        // forwards them as X-Request-Id / X-Org-Id / X-Workspace-Id headers.
-        Self::inject_tracing_headers(&mut extra, request_id, organization_id, workspace_id);
 
         let mut chat_params = inference_providers::ChatCompletionParams {
             placement: Default::default(),
@@ -2184,19 +2105,12 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             None => crate::models::ModelCaller::Organization(request.organization_id),
         };
         let service_start_time = Instant::now();
-        let organization_id = request.organization_id;
-        let workspace_id = request.workspace_id;
-        let request_id = request.request_id;
         let chat_messages = Self::prepare_chat_messages(&request.messages);
 
         // Extract tools from extra if present (Responses API puts them there)
         let mut extra = request.extra.clone();
         let (tools, tool_choice) = Self::extract_tools_from_extra(&mut extra);
         let stream_options = Self::extract_stream_options_from_extra(&mut extra);
-
-        // Inject tracing correlation IDs into extra so the inference provider
-        // forwards them as X-Request-Id / X-Org-Id / X-Workspace-Id headers.
-        Self::inject_tracing_headers(&mut extra, request_id, organization_id, workspace_id);
 
         let mut chat_params = inference_providers::ChatCompletionParams {
             placement: Default::default(),
@@ -2359,7 +2273,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             let attestation_service = self.attestation_service.clone();
             let chat_id = response_with_bytes.response.id.clone();
             let model_name = model.model_name.clone();
-            tokio::spawn(
+            inference_providers::tracing_context::spawn_with_tracing_context(
                 async move {
                     match attestation_service
                         .store_chat_signature_from_provider(chat_id.as_str())
@@ -2681,6 +2595,9 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
                         message: msg,
                     }
                 }
+                inference_providers::PrivacyClassifyError::Overloaded { retry_after_secs } => {
+                    ports::CompletionError::UpstreamOverloaded { retry_after_secs }
+                }
                 inference_providers::PrivacyClassifyError::HttpError {
                     status_code,
                     message,
@@ -2693,7 +2610,14 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
                     429 => ports::CompletionError::RateLimitExceeded(
                         "Rate limit exceeded by upstream provider. Please retry with exponential backoff.".to_string(),
                     ),
-                    503 => ports::CompletionError::ServiceOverloaded(message),
+                    503 => ports::CompletionError::UpstreamOverloaded {
+                        retry_after_secs: None,
+                    },
+                    // Kept distinct so callers can report a timeout.
+                    504 => ports::CompletionError::ProviderError {
+                        status_code: 504,
+                        message,
+                    },
                     500..=599 => ports::CompletionError::ProviderError {
                         status_code: 502,
                         message,
@@ -2862,7 +2786,6 @@ mod tests {
             workspace_id: Uuid::new_v4(),
             api_key_id: Uuid::new_v4(),
             model_id: Uuid::new_v4(),
-            model_name: "test-model".to_string(),
             inference_type: crate::usage::ports::InferenceType::ChatCompletionStream,
             service_start_time: now,
             provider_start_time: now,
@@ -2878,6 +2801,7 @@ mod tests {
             last_usage_stats: None,
             estimated_input_tokens: 7,
             streamed_output_bytes: 0,
+            output_bytes_at_last_usage: 0,
             usage_estimate_incomplete_streams: true,
             last_chat_id: None,
             stream_completed: false,
@@ -2893,6 +2817,7 @@ mod tests {
             requested_service_tier: None,
             provider_service_tier: None,
             latency_reporter: None,
+            tracing_context: None,
         }
     }
 
@@ -2937,6 +2862,105 @@ mod tests {
                 extra: Default::default(),
             })),
         }
+    }
+
+    async fn recorded_usage(
+        service: &crate::test_utils::CapturingUsageService,
+    ) -> Vec<crate::usage::RecordUsageServiceRequest> {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let requests = service.get_requests();
+                if !requests.is_empty() {
+                    return requests;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("usage should be recorded")
+    }
+
+    #[tokio::test]
+    async fn streamed_usage_without_provider_id_is_recorded_once() {
+        use crate::test_utils::CapturingUsageService;
+
+        for usage in [None, Some(TokenUsage::new(42, 11))] {
+            let service = Arc::new(CapturingUsageService::new());
+            let mut event = usage_test_chunk(Some("hello world"), None, usage.clone(), None);
+            if let Some(StreamChunk::Chat(chunk)) = event.chunk.as_mut() {
+                chunk.id.clear();
+            }
+            let mut stream = terminal_test_stream(vec![Ok(event)]);
+            stream.usage_service = service.clone();
+            assert!(stream.next().await.unwrap().is_ok());
+            drop(stream);
+            let requests = recorded_usage(&service).await;
+            assert_eq!(requests.len(), 1);
+            assert_eq!(
+                requests[0].input_tokens,
+                if usage.is_some() { 42 } else { 7 }
+            );
+            assert_eq!(
+                requests[0].output_tokens,
+                if usage.is_some() { 11 } else { 2 }
+            );
+            assert!(requests[0].provider_request_id.is_none());
+            assert!(requests[0].inference_id.is_some());
+            assert_eq!(
+                requests[0].stop_reason,
+                Some(crate::usage::StopReason::ClientDisconnect)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn partial_nonzero_usage_is_supplemented_after_more_output() {
+        use crate::test_utils::CapturingUsageService;
+
+        let service = Arc::new(CapturingUsageService::new());
+        let mut stream = terminal_test_stream(vec![
+            Ok(usage_test_chunk(
+                Some("abcd"),
+                None,
+                Some(TokenUsage::new_with_cache(42, 1, 30)),
+                None,
+            )),
+            Ok(usage_test_chunk(Some("efghijklmnop"), None, None, None)),
+        ]);
+        stream.usage_service = service.clone();
+        assert!(stream.next().await.unwrap().is_ok());
+        assert!(stream.next().await.unwrap().is_ok());
+        drop(stream);
+        let requests = recorded_usage(&service).await;
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].input_tokens, 42);
+        assert_eq!(requests[0].output_tokens, 4);
+        assert_eq!(requests[0].cache_read_tokens, 30);
+        assert!(requests[0].avg_itl_ms.is_none());
+    }
+
+    #[tokio::test]
+    async fn final_usage_survives_disconnect_before_done_without_estimation() {
+        use crate::test_utils::CapturingUsageService;
+
+        let service = Arc::new(CapturingUsageService::new());
+        let mut stream = terminal_test_stream(vec![
+            Ok(usage_test_chunk(Some("abcdefghijklmnop"), None, None, None)),
+            Ok(usage_test_chunk(
+                None,
+                None,
+                Some(TokenUsage::new(42, 1)),
+                Some(FinishReason::Stop),
+            )),
+            Ok(terminal_control_event(b"data: [DONE]\n\n")),
+        ]);
+        stream.usage_service = service.clone();
+        assert!(stream.next().await.unwrap().is_ok());
+        assert!(stream.next().await.unwrap().is_ok());
+        drop(stream);
+        let requests = recorded_usage(&service).await;
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].output_tokens, 1);
     }
 
     #[tokio::test]
@@ -3761,7 +3785,6 @@ mod tests {
             workspace_id,
             api_key_id,
             model_id,
-            model_name: "test-model".to_string(),
             inference_type: crate::usage::ports::InferenceType::ChatCompletionStream,
             service_start_time: now,
             provider_start_time: now,
@@ -3777,6 +3800,7 @@ mod tests {
             last_usage_stats: None,
             estimated_input_tokens: 1,
             streamed_output_bytes: 0,
+            output_bytes_at_last_usage: 0,
             usage_estimate_incomplete_streams: true,
             last_chat_id: None,
             stream_completed: false,
@@ -3792,6 +3816,7 @@ mod tests {
             requested_service_tier: None,
             provider_service_tier: None,
             latency_reporter: None,
+            tracing_context: None,
         };
 
         // Consume both provider chunks, then verify the usage dimensions captured
@@ -3939,7 +3964,6 @@ mod tests {
             workspace_id: Uuid::new_v4(),
             api_key_id: Uuid::new_v4(),
             model_id: Uuid::new_v4(),
-            model_name: "test-model".to_string(),
             inference_type: crate::usage::ports::InferenceType::ChatCompletionStream,
             service_start_time: now,
             provider_start_time: now,
@@ -3955,6 +3979,7 @@ mod tests {
             last_usage_stats: None,
             estimated_input_tokens: 1,
             streamed_output_bytes: 0,
+            output_bytes_at_last_usage: 0,
             usage_estimate_incomplete_streams: true,
             last_chat_id: None,
             stream_completed: false,
@@ -3970,6 +3995,7 @@ mod tests {
             requested_service_tier: None,
             provider_service_tier: None,
             latency_reporter: None,
+            tracing_context: None,
         };
         let _ = intercept_stream.collect::<Vec<_>>().await;
         // Wait for the fire-and-forget usage/metrics task spawned in Drop to finish.
@@ -4098,7 +4124,6 @@ mod tests {
             workspace_id,
             api_key_id,
             model_id,
-            model_name: "test-model".to_string(),
             inference_type: crate::usage::ports::InferenceType::ChatCompletionStream,
             service_start_time,
             provider_start_time,
@@ -4114,6 +4139,7 @@ mod tests {
             last_usage_stats: None,
             estimated_input_tokens: 1,
             streamed_output_bytes: 0,
+            output_bytes_at_last_usage: 0,
             usage_estimate_incomplete_streams: true,
             last_chat_id: None,
             stream_completed: false,
@@ -4129,6 +4155,7 @@ mod tests {
             requested_service_tier: None,
             provider_service_tier: None,
             latency_reporter: None,
+            tracing_context: None,
         };
 
         // Consume the stream
@@ -4231,7 +4258,6 @@ mod tests {
             workspace_id,
             api_key_id,
             model_id,
-            model_name: "test-model".to_string(),
             inference_type: crate::usage::ports::InferenceType::ChatCompletionStream,
             service_start_time: now,
             provider_start_time: now,
@@ -4247,6 +4273,7 @@ mod tests {
             last_usage_stats: None,
             estimated_input_tokens: 1,
             streamed_output_bytes: 0,
+            output_bytes_at_last_usage: 0,
             usage_estimate_incomplete_streams: true,
             last_chat_id: None,
             stream_completed: false,
@@ -4262,6 +4289,7 @@ mod tests {
             requested_service_tier: None,
             provider_service_tier: None,
             latency_reporter: None,
+            tracing_context: None,
         };
 
         let _ = intercept_stream.collect::<Vec<_>>().await;
@@ -4446,7 +4474,6 @@ mod tests {
                 workspace_id: Uuid::new_v4(),
                 api_key_id: Uuid::new_v4(),
                 model_id: Uuid::new_v4(),
-                model_name: "test-model".to_string(),
                 inference_type: crate::usage::ports::InferenceType::ChatCompletionStream,
                 service_start_time: Instant::now(),
                 provider_start_time: Instant::now(),
@@ -4462,6 +4489,7 @@ mod tests {
                 last_usage_stats: None,
                 estimated_input_tokens: 1,
                 streamed_output_bytes: 0,
+                output_bytes_at_last_usage: 0,
                 usage_estimate_incomplete_streams: true,
                 last_chat_id: None,
                 stream_completed: false,
@@ -4477,6 +4505,7 @@ mod tests {
                 requested_service_tier: None,
                 provider_service_tier: None,
                 latency_reporter: None,
+                tracing_context: None,
             };
             // InterceptStream goes out of scope here and Drop is called
         }

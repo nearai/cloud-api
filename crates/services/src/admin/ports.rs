@@ -649,8 +649,7 @@ pub struct AdminApiKeyFilters {
 ///
 /// Unlike the member-facing `/v1/organizations/{id}/members` endpoint (which
 /// hides email/last-login from non-privileged members), the admin view exposes
-/// the full user record — including inactive (soft-deleted) members — consistent
-/// with `/v1/admin/users`.
+/// the full user record — including inactive (soft-deleted) members.
 #[derive(Debug, Clone)]
 pub struct AdminOrganizationMemberInfo {
     pub member_id: uuid::Uuid,
@@ -834,27 +833,6 @@ pub trait AdminRepository: Send + Sync {
         offset: i64,
     ) -> Result<Vec<OrganizationLimitsHistoryEntry>, anyhow::Error>;
 
-    /// List all users with pagination (admin only)
-    async fn list_users(
-        &self,
-        limit: i64,
-        offset: i64,
-        search: Option<String>,
-        is_active: Option<bool>,
-    ) -> Result<(Vec<UserInfo>, i64), anyhow::Error>;
-
-    /// List all users with their earliest organization and spend limit (admin only)
-    /// If search_by_name is provided, filters users by organization name (case-insensitive partial match)
-    /// Returns a tuple of (users, total_count) where total_count is the count of filtered users
-    async fn list_users_with_organizations(
-        &self,
-        limit: i64,
-        offset: i64,
-        search: Option<String>,
-        is_active: Option<bool>,
-        search_by_name: Option<String>,
-    ) -> Result<(Vec<(UserInfo, Option<UserOrganizationInfo>)>, i64), anyhow::Error>;
-
     /// List all models with pagination (admin only)
     /// If include_inactive is true, includes disabled models
     async fn list_models(
@@ -1016,12 +994,6 @@ pub trait AdminRepository: Send + Sync {
         lifecycle: OrganizationLifecycleFilter,
     ) -> Result<Vec<AdminOrganizationInfo>, anyhow::Error>;
 
-    /// Count organizations matching the lifecycle filter (admin only)
-    async fn count_all_organizations(
-        &self,
-        lifecycle: OrganizationLifecycleFilter,
-    ) -> Result<i64, anyhow::Error>;
-
     /// List API keys across all organizations, newest first (admin only).
     /// Includes revoked and inactive keys.
     async fn list_all_api_keys(
@@ -1043,8 +1015,8 @@ pub trait AdminRepository: Send + Sync {
 
     /// List members of a specific organization with full user details, including
     /// inactive (soft-deleted) *users* (admin only). Inactive (soft-deleted)
-    /// *organizations* are excluded (their member rows are not returned),
-    /// matching `/v1/admin/organizations`. Does NOT enforce membership of the
+    /// *organizations* are excluded (their member rows are not returned).
+    /// Does NOT enforce membership of the
     /// caller — authorization is handled by the admin middleware at the route
     /// layer.
     async fn list_organization_members(
@@ -1214,26 +1186,6 @@ pub trait AdminService: Send + Sync {
         offset: i64,
     ) -> Result<(Vec<OrganizationLimitsHistoryEntry>, i64), AdminError>;
 
-    /// List all users with pagination (admin only)
-    async fn list_users(
-        &self,
-        limit: i64,
-        offset: i64,
-        search: Option<String>,
-        is_active: Option<bool>,
-    ) -> Result<(Vec<UserInfo>, i64), AdminError>;
-
-    /// List all users with their earliest organization and spend limit (admin only)
-    /// If search_by_name is provided, filters users by organization name (case-insensitive partial match)
-    async fn list_users_with_organizations(
-        &self,
-        limit: i64,
-        offset: i64,
-        search: Option<String>,
-        is_active: Option<bool>,
-        search_by_name: Option<String>,
-    ) -> Result<(Vec<(UserInfo, Option<UserOrganizationInfo>)>, i64), AdminError>;
-
     /// List all models with pagination (admin only)
     /// If include_inactive is true, includes disabled models
     async fn list_models(
@@ -1312,14 +1264,6 @@ pub trait AdminService: Send + Sync {
         organization_id: uuid::Uuid,
     ) -> Result<Option<u32>, AdminError>;
 
-    /// List organizations matching the lifecycle filter with pagination (admin only)
-    async fn list_organizations(
-        &self,
-        limit: i64,
-        offset: i64,
-        lifecycle: OrganizationLifecycleFilter,
-    ) -> Result<(Vec<AdminOrganizationInfo>, i64), AdminError>;
-
     /// List API keys across all organizations with pagination (admin only).
     /// Returns `InvalidParams` when `created_after` is later than `created_before`.
     async fn list_api_keys(
@@ -1328,13 +1272,6 @@ pub trait AdminService: Send + Sync {
         limit: i64,
         offset: i64,
     ) -> Result<(Vec<AdminApiKeyInfo>, i64), AdminError>;
-
-    /// Get a single organization by id (admin only). Returns
-    /// `OrganizationNotFound` if it does not exist or is inactive.
-    async fn get_organization(
-        &self,
-        organization_id: uuid::Uuid,
-    ) -> Result<AdminOrganizationInfo, AdminError>;
 
     /// List members of a specific organization with full user details (admin only).
     /// Returns `OrganizationNotFound` if the organization does not exist.

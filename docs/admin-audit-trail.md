@@ -47,11 +47,8 @@ token-like segments redacted, other segments as sent) and the client's
 ## Paginated lists
 
 Every paginated admin list records its validated `limit` and `offset` and the
-number of rows in its response, and only after it succeeds: users,
-organizations, organization members, organization limits history, API keys,
-admin access tokens, models, model history, scheduled pricing changes (whose
-page the service validates), AML reports, the AML allowlist, invitation-email
-deliveries, feature requests, and model and organization revenue. A rejected
+number of rows in its response, and only after it succeeds: organization
+members, API keys, admin access tokens and invitation-email deliveries. A rejected
 page, a failed lookup or an invalid filter records no page.
 
 ## OHTTP

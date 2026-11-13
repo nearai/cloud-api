@@ -14,7 +14,7 @@ In both cases the SNP report chain, the debug policy, the minimum TCB, the bindi
 Operators can turn the Sigstore path off without a deploy. Routers are then trusted only through the compiled pins:
 
 ```bash
-curl -X PATCH "$CLOUD_API/v1/admin/settings/tinfoil_trust" \
+curl -X PATCH "$ADMIN_API/v1/admin/settings/tinfoil_trust" \
   -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' \
   --data '{"router_sigstore": false}'
 ```
@@ -36,14 +36,14 @@ The model attestation report (`GET /v1/attestation/report?model=<tinfoil-backed 
 A model release that is not yet in the compiled pins can be trusted without a deploy. An admin adds its Sigstore release bundle to the `tinfoil_trust` setting:
 
 ```bash
-curl -X PATCH "$CLOUD_API/v1/admin/settings/tinfoil_trust" \
+curl -X PATCH "$ADMIN_API/v1/admin/settings/tinfoil_trust" \
   -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' \
   --data @tinfoil-admin-pins.json
 ```
 
 - **The bundle file.** The daily Tinfoil sync job attaches `tinfoil-admin-pins.json` to every run (`{"model_pins": [...]}`), dry runs included. You can also run the job on demand with `workflow_dispatch` and `dry_run=true`.
 - **The PATCH replaces the whole `model_pins` list.** Merge with the current value from `GET /v1/admin/settings/tinfoil_trust` first.
-- **What the PATCH checks.** Cloud API verifies every bundle before storing it. It must be a valid Sigstore attestation, signed by that `tinfoilsh/*` repository's release workflow at that tag.
+- **What the PATCH checks.** The admin API verifies every bundle before storing it, and Cloud API verifies it again when it loads the setting. It must be a valid Sigstore attestation, signed by that `tinfoilsh/*` repository's release workflow at that tag.
 - **What admission checks.** A model is then admitted only when the router's attested proxy document lists it with the same repository, tag and measurement registers as the signed release.
 - **Limits.** At most 32 pins, and at most 1 MiB in all.
 - **Switch.** `{"admin_model_pins": false}` turns admin pins off without removing them.

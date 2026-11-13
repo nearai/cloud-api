@@ -180,7 +180,6 @@ pub async fn rerank(
     State(app_state): State<AppState>,
     Extension(api_key): Extension<AuthenticatedApiKey>,
     Extension(_body_hash): Extension<RequestBodyHash>,
-    Extension(correlation): Extension<RequestCorrelation>,
     headers: header::HeaderMap,
     requested_model: RequestedModel,
     OpenAiJson(request): OpenAiJson<crate::models::RerankRequest>,
@@ -248,7 +247,6 @@ pub async fn rerank(
     // Convert API request to provider params
     let mut extra = std::collections::HashMap::new();
     insert_encryption_headers(&encryption_headers, &mut extra);
-    insert_request_id_header(correlation, &mut extra);
 
     let params = inference_providers::RerankParams {
         model: request.model.clone(),
@@ -342,7 +340,7 @@ pub async fn rerank(
                     tracing::error!(
                         model = %request.model,
                         upstream_status = status_code,
-                        detail = %message,
+                        error_message_len = message.len(),
                         "Rerank provider error"
                     );
                     let http_status = StatusCode::from_u16(status_code)

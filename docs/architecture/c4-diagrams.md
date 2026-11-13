@@ -1438,7 +1438,6 @@ erDiagram
 - `PATCH /v1/admin/models` - Batch upsert models
 - `GET /v1/admin/models/{model_name}/history` - Get complete model history (pricing, context length, etc.)
 - `PUT /v1/admin/organizations/{org_id}/limits` - Update organization limits
-- `GET /v1/admin/users` - List all users
 
 ---
 

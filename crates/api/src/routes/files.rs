@@ -74,7 +74,7 @@ pub async fn upload_file(
 
                         // Read file data (size limit enforced by DefaultBodyLimit layer at framework level)
                         let data = field.bytes().await.map_err(|e| {
-                            tracing::warn!("Failed to read file data: {}", e);
+                            tracing::warn!("Failed to read file data");
                             (
                                 StatusCode::BAD_REQUEST,
                                 Json(ErrorResponse::new(
@@ -103,7 +103,7 @@ pub async fn upload_file(
                     }
                     "purpose" => {
                         let text = field.text().await.map_err(|e| {
-                            tracing::warn!("Failed to read purpose: {}", e);
+                            tracing::warn!("Failed to read purpose");
                             (
                                 StatusCode::BAD_REQUEST,
                                 Json(ErrorResponse::new(
@@ -116,7 +116,7 @@ pub async fn upload_file(
                     }
                     "expires_after[anchor]" => {
                         let text = field.text().await.map_err(|e| {
-                            tracing::warn!("Failed to read expires_after[anchor]: {}", e);
+                            tracing::warn!("Failed to read expires_after[anchor]");
                             (
                                 StatusCode::BAD_REQUEST,
                                 Json(ErrorResponse::new(
@@ -129,7 +129,7 @@ pub async fn upload_file(
                     }
                     "expires_after[seconds]" => {
                         let text = field.text().await.map_err(|e| {
-                            tracing::warn!("Failed to read expires_after[seconds]: {}", e);
+                            tracing::warn!("Failed to read expires_after[seconds]");
                             (
                                 StatusCode::BAD_REQUEST,
                                 Json(ErrorResponse::new(
@@ -138,8 +138,8 @@ pub async fn upload_file(
                                 )),
                             )
                         })?;
-                        expires_after_seconds = Some(text.parse::<i64>().map_err(|e| {
-                            tracing::warn!("Failed to parse expires_after[seconds]: {}", e);
+                        expires_after_seconds = Some(text.parse::<i64>().map_err(|_| {
+                            tracing::warn!("Failed to parse expires_after[seconds]");
                             (
                                 StatusCode::BAD_REQUEST,
                                 Json(ErrorResponse::new(
@@ -151,14 +151,17 @@ pub async fn upload_file(
                         })?);
                     }
                     _ => {
-                        debug!("Ignoring unknown field: {}", field_name);
+                        debug!(
+                            field_name_len = field_name.len(),
+                            "Ignoring unknown multipart field"
+                        );
                     }
                 }
             }
             Ok(None) => break, // All fields read successfully
-            Err(e) => {
+            Err(_) => {
                 // Multipart parsing error (malformed boundary, invalid encoding, etc.)
-                tracing::debug!(error = %e, "Multipart parsing error");
+                tracing::debug!("Multipart parsing error");
                 return Err((
                     StatusCode::BAD_REQUEST,
                     Json(ErrorResponse::new(

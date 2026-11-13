@@ -123,7 +123,8 @@ fn completion_http_status_code(error: &crate::completions::CompletionError) -> u
         | crate::completions::CompletionError::InvalidParams(_) => 400,
         crate::completions::CompletionError::RateLimitExceeded(_) => 429,
         crate::completions::CompletionError::ProviderError { status_code, .. } => *status_code,
-        crate::completions::CompletionError::ServiceOverloaded(_) => 429,
+        crate::completions::CompletionError::ServiceOverloaded(_)
+        | crate::completions::CompletionError::UpstreamOverloaded { .. } => 429,
         crate::completions::CompletionError::InternalError(_) => 500,
     }
 }
@@ -163,6 +164,11 @@ fn completion_response_error(
         crate::completions::CompletionError::ServiceOverloaded(msg) => {
             response_error(msg, "service_overloaded", None)
         }
+        crate::completions::CompletionError::UpstreamOverloaded { .. } => response_error(
+            "All inference backends are overloaded. Please retry with exponential backoff.",
+            "service_overloaded",
+            None,
+        ),
         crate::completions::CompletionError::InternalError(msg) => response_error(
             &format!("Internal server error: {msg}"),
             "internal_server_error",

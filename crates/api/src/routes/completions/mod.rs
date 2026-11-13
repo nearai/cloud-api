@@ -113,16 +113,6 @@ fn insert_encryption_headers(
     }
 }
 
-fn insert_request_id_header(
-    correlation: RequestCorrelation,
-    extra: &mut std::collections::HashMap<String, serde_json::Value>,
-) {
-    extra.insert(
-        "x_request_id".to_string(),
-        serde_json::Value::String(correlation.request_id.to_string()),
-    );
-}
-
 // Custom header for exposing the inference ID as a UUID. Shared with the
 // native Anthropic Messages plane so /v1/billing/costs lookups work the same
 // way against both.

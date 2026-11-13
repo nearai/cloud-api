@@ -7,6 +7,7 @@ pub mod admin_audit;
 pub(crate) mod admin_policy;
 pub mod auth;
 pub mod body_hash;
+pub mod inference_log;
 pub mod metrics;
 pub mod model_deprecation;
 pub mod rate_limit;
@@ -22,6 +23,7 @@ pub use auth::{
     AuthenticatedUser,
 };
 pub use body_hash::{body_hash_middleware, BodyHashLimit, RequestBodyHash};
+pub use inference_log::{inference_log_middleware, InferenceLogState};
 pub use metrics::{http_metrics_middleware, MetricsState};
 pub use model_deprecation::{model_deprecation_middleware, ModelDeprecationState, RequestedModel};
 pub use rate_limit::{api_key_rate_limit_middleware, RateLimitState};

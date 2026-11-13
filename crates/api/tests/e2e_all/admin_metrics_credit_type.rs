@@ -1,7 +1,11 @@
-use crate::admin_provider_attribution_support::setup_platform_provider_usage_fixture;
+use crate::admin_provider_attribution_support::{
+    setup_platform_provider_usage_fixture, PlatformProviderUsageFixture,
+};
 use crate::common::*;
 use chrono::Utc;
+use database::repositories::PgAnalyticsRepository;
 use serde_json::{json, Value};
+use services::admin::{AnalyticsRepository, OrganizationMetrics, TimeSeriesMetrics};
 use uuid::Uuid;
 
 #[tokio::test]
@@ -146,13 +150,13 @@ async fn admin_metrics_credit_type_uses_saved_allocations() {
     .await;
     // Two sources for postpay, but only two matching inference requests.
     let range = "start=2026-09-01T00:00:00Z&end=2026-09-22T00:00:00Z";
-    for (filter, cost, requests, days) in [
-        ("", 28.0, 5_i64, 5_usize),
-        ("&credit_type=postpay", 10.0, 2, 2),
-        ("&credit_type=POSTPAY", 10.0, 2, 2),
-        ("&credit_type=grant", 3.0, 1, 1),
-        ("&credit_type=payment", 8.0, 2, 2),
-        ("&credit_type=staking_farm", 0.0, 0, 0),
+    for (filter, cost, requests) in [
+        ("", 28.0, 5_i64),
+        ("&credit_type=postpay", 10.0, 2),
+        ("&credit_type=POSTPAY", 10.0, 2),
+        ("&credit_type=grant", 3.0, 1),
+        ("&credit_type=payment", 8.0, 2),
+        ("&credit_type=staking_farm", 0.0, 0),
     ] {
         let response = fixture
             .server
@@ -187,46 +191,9 @@ async fn admin_metrics_credit_type_uses_saved_allocations() {
                 requests
             );
         }
-        for granularity in ["hour", "day", "week"] {
-            let response = fixture.server.get(&format!("/v1/admin/organizations/{org}/metrics/timeseries?{range}{filter}&granularity={granularity}"))
-                .add_header("Authorization", format!("Bearer {}", get_session_id())).await;
-            assert_eq!(response.status_code(), 200, "{}", response.text());
-            let metrics: Value = response.json();
-            let points = metrics["data"].as_array().unwrap();
-            if granularity == "day" {
-                assert_eq!(points.len(), days);
-            }
-            assert_eq!(
-                points
-                    .iter()
-                    .map(|p| p["cost_usd"].as_f64().unwrap())
-                    .sum::<f64>(),
-                cost
-            );
-            assert_eq!(
-                points
-                    .iter()
-                    .map(|p| p["requests"].as_i64().unwrap())
-                    .sum::<i64>(),
-                requests
-            );
-            for (field, per_request) in [
-                ("input_tokens", 100),
-                ("output_tokens", 20),
-                ("cache_read_tokens", 10),
-            ] {
-                assert_eq!(
-                    points
-                        .iter()
-                        .map(|p| p[field].as_i64().unwrap())
-                        .sum::<i64>(),
-                    requests * per_request
-                );
-            }
-        }
     }
-    for suffix in ["", "/timeseries"] {
-        let path = format!("/v1/admin/organizations/{org}/metrics{suffix}");
+    {
+        let path = format!("/v1/admin/organizations/{org}/metrics");
         for invalid in ["unknown", "", "post-pay", "postpay%20"] {
             let response = fixture
                 .server
@@ -262,10 +229,10 @@ async fn admin_metrics_credit_type_allows_read_only_tokens() {
     let token = response
         .json::<api::models::AdminAccessTokenResponse>()
         .access_token;
-    for suffix in ["", "/timeseries"] {
+    {
         let response = server
             .get(&format!(
-                "/v1/admin/organizations/{}/metrics{suffix}?credit_type=postpay",
+                "/v1/admin/organizations/{}/metrics?credit_type=postpay",
                 org.id
             ))
             .add_header("Authorization", format!("Bearer {token}"))
@@ -279,26 +246,18 @@ async fn admin_metrics_credit_type_allows_read_only_tokens() {
 fn admin_metrics_credit_type_is_documented() {
     use utoipa::OpenApi;
     let spec = serde_json::to_value(api::openapi::ApiDoc::openapi()).unwrap();
-    let mut descriptions = Vec::new();
-    for path in [
-        "/v1/admin/organizations/{org_id}/metrics",
-        "/v1/admin/organizations/{org_id}/metrics/timeseries",
-    ] {
-        let parameter = spec["paths"][path]["get"]["parameters"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|p| p["name"] == "credit_type")
-            .expect("credit_type parameter");
-        assert_eq!(parameter["in"], "query");
-        assert_eq!(parameter["required"], false);
-        descriptions.push(parameter["description"].clone());
-        assert!(parameter["description"]
-            .as_str()
-            .unwrap()
-            .contains("settlements"));
-    }
-    assert_eq!(descriptions[0], descriptions[1]);
+    let parameter = spec["paths"]["/v1/admin/organizations/{org_id}/metrics"]["get"]["parameters"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["name"] == "credit_type")
+        .expect("credit_type parameter");
+    assert_eq!(parameter["in"], "query");
+    assert_eq!(parameter["required"], false);
+    assert!(parameter["description"]
+        .as_str()
+        .unwrap()
+        .contains("settlements"));
 }
 
 #[tokio::test]
@@ -437,6 +396,37 @@ fn url_time(t: chrono::DateTime<Utc>) -> String {
     t.to_rfc3339().replace('+', "%2B")
 }
 
+async fn org_metrics(
+    fixture: &PlatformProviderUsageFixture,
+    start: chrono::DateTime<Utc>,
+    end: chrono::DateTime<Utc>,
+    credit_type: Option<&str>,
+) -> OrganizationMetrics {
+    PgAnalyticsRepository::new(fixture.database.pool().clone())
+        .get_organization_metrics(fixture.organization_id, start, end, credit_type)
+        .await
+        .expect("organization metrics")
+}
+
+async fn org_series(
+    fixture: &PlatformProviderUsageFixture,
+    start: chrono::DateTime<Utc>,
+    end: chrono::DateTime<Utc>,
+    granularity: &str,
+    credit_type: Option<&str>,
+) -> TimeSeriesMetrics {
+    PgAnalyticsRepository::new(fixture.database.pool().clone())
+        .get_organization_timeseries(
+            fixture.organization_id,
+            start,
+            end,
+            granularity,
+            credit_type,
+        )
+        .await
+        .expect("organization timeseries")
+}
+
 async fn session_json<T: serde::de::DeserializeOwned>(
     server: &axum_test::TestServer,
     path: &str,
@@ -457,7 +447,6 @@ fn assert_close(actual: Option<f64>, expected: f64) {
 
 #[tokio::test]
 async fn org_reports_read_usage_hourly_over_whole_hours() {
-    use services::admin::{OrganizationMetrics, TimeSeriesMetrics};
     let fixture = setup_platform_provider_usage_fixture().await;
     let org = fixture.organization_id;
     let hour = chrono::Duration::hours(1);
@@ -479,21 +468,13 @@ async fn org_reports_read_usage_hourly_over_whole_hours() {
     let range = format!("start={}&end={}", url_time(h), url_time(h + hour * 2));
 
     // Settled hours not recomputed yet (the late-row case the repair endpoint covers): empty.
-    let before: OrganizationMetrics = session_json(
-        &fixture.server,
-        &format!("/v1/admin/organizations/{org}/metrics?{range}"),
-    )
-    .await;
+    let before: OrganizationMetrics = org_metrics(&fixture, h, h + hour * 2, None).await;
     assert_eq!((before.period_start, before.period_end), (h, h + hour * 2));
     assert_eq!(before.summary.total_requests, 0);
 
     crate::usage_hourly::recompute_usage_hours(h, h + hour * 2).await;
 
-    let metrics: OrganizationMetrics = session_json(
-        &fixture.server,
-        &format!("/v1/admin/organizations/{org}/metrics?{range}"),
-    )
-    .await;
+    let metrics: OrganizationMetrics = org_metrics(&fixture, h, h + hour * 2, None).await;
     assert_eq!(
         (metrics.period_start, metrics.period_end),
         (h, h + hour * 2)
@@ -519,11 +500,7 @@ async fn org_reports_read_usage_hourly_over_whole_hours() {
     // Review Focus 2: no ITL samples at all stays null, not zero.
     assert_eq!((model.avg_itl_ms, model.p95_itl_ms), (None, None));
 
-    let series: TimeSeriesMetrics = session_json(
-        &fixture.server,
-        &format!("/v1/admin/organizations/{org}/metrics/timeseries?{range}&granularity=hour"),
-    )
-    .await;
+    let series: TimeSeriesMetrics = org_series(&fixture, h, h + hour * 2, "hour", None).await;
     assert_eq!((series.period_start, series.period_end), (h, h + hour * 2));
     let points: Vec<(String, i64)> = series
         .data
@@ -560,9 +537,8 @@ async fn org_reports_read_usage_hourly_over_whole_hours() {
 /// equals the sum of its parts.
 #[tokio::test]
 async fn org_metrics_count_ttft_under_thresholds() {
-    use services::admin::{MetricsSummary, ModelMetrics, OrganizationMetrics};
+    use services::admin::{MetricsSummary, ModelMetrics};
     let fixture = setup_platform_provider_usage_fixture().await;
-    let org = fixture.organization_id;
     let hour = chrono::Duration::hours(1);
     let (h, _) = crate::admin_provider_attribution_support::isolated_usage_hours(&fixture, 2).await;
     let minutes = chrono::Duration::minutes;
@@ -597,13 +573,7 @@ async fn org_metrics_count_ttft_under_thresholds() {
         ]
     }
     let get = |from: chrono::DateTime<Utc>, to: chrono::DateTime<Utc>| {
-        let path = format!(
-            "/v1/admin/organizations/{org}/metrics?start={}&end={}",
-            url_time(from),
-            url_time(to)
-        );
-        let server = &fixture.server;
-        async move { session_json::<OrganizationMetrics>(server, &path).await }
+        org_metrics(&fixture, from, to, None)
     };
 
     // Whole hours: served from usage_hourly.
@@ -632,7 +602,6 @@ async fn org_metrics_count_ttft_under_thresholds() {
 /// requested range.
 #[tokio::test]
 async fn org_credit_type_reports_stay_raw_live_and_exact() {
-    use services::admin::{OrganizationMetrics, TimeSeriesMetrics};
     let fixture = setup_platform_provider_usage_fixture().await;
     let org = fixture.organization_id;
     // An hour no other test recomputes, so "not recomputed yet" is deterministic.
@@ -686,13 +655,8 @@ async fn org_credit_type_reports_stay_raw_live_and_exact() {
     }
     // Nothing is recomputed. [h, h + 30m) holds four rows: 5000 ms, NULL, 10000 ms and 60000 ms.
     let end = h + chrono::Duration::minutes(30);
-    let range = format!("start={}&end={}", url_time(h), url_time(end));
 
-    let filtered: OrganizationMetrics = session_json(
-        &fixture.server,
-        &format!("/v1/admin/organizations/{org}/metrics?{range}&credit_type=postpay"),
-    )
-    .await;
+    let filtered: OrganizationMetrics = org_metrics(&fixture, h, end, Some("postpay")).await;
     assert_eq!(
         (filtered.period_start, filtered.period_end),
         (h, end),
@@ -723,19 +687,11 @@ async fn org_credit_type_reports_stay_raw_live_and_exact() {
         [3, 0, 1, 2]
     );
 
-    let series: TimeSeriesMetrics = session_json(
-        &fixture.server,
-        &format!("/v1/admin/organizations/{org}/metrics/timeseries?{range}&credit_type=postpay&granularity=hour"),
-    )
-    .await;
+    let series: TimeSeriesMetrics = org_series(&fixture, h, end, "hour", Some("postpay")).await;
     assert_eq!((series.period_start, series.period_end), (h, end));
     assert_eq!(series.data.iter().map(|p| p.requests).sum::<i64>(), 4);
 
-    let unfiltered: OrganizationMetrics = session_json(
-        &fixture.server,
-        &format!("/v1/admin/organizations/{org}/metrics?{range}"),
-    )
-    .await;
+    let unfiltered: OrganizationMetrics = org_metrics(&fixture, h, end, None).await;
     // A sub-hour range reads raw rows, so it is exact without a recompute.
     assert_eq!((unfiltered.period_start, unfiltered.period_end), (h, end));
     assert_eq!(unfiltered.summary.total_requests, 4);
@@ -757,7 +713,7 @@ async fn org_hourly_reports_are_cancelled_at_the_statement_budget() {
     use services::{admin::AnalyticsRepository, common::RepositoryError};
     let fixture = setup_platform_provider_usage_fixture().await;
     let (pool, original_timeout) =
-        crate::admin_analytics_statement_budget::pool_with_slow_tables(&["usage_hourly"], 0.5)
+        crate::admin_provider_attribution_support::pool_with_slow_tables(&["usage_hourly"], 0.5)
             .await;
     let repo = database::repositories::PgAnalyticsRepository::with_statement_timeout(
         pool.clone(),

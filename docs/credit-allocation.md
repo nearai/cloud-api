@@ -31,7 +31,7 @@ credits. Replacing a limit does not reset consumption: changing 100 to 150
 adds 50 of capacity, while writing 150 again adds none.
 
 Both usage-history endpoints, the reporting export/summary, and admin organization
-metrics (`/v1/admin/organizations/{org_id}/metrics` and `/metrics/timeseries`) accept a
+metrics (`/v1/admin/organizations/{org_id}/metrics`) accept a
 `credit_type` filter. Mixed charges are returned once; filtered cost is only the
 matching allocation amount, including later settlement allocations, while request
 and token counts are not multiplied. Each matching request contributes its full

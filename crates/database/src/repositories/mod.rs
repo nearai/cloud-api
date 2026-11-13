@@ -26,6 +26,7 @@ pub mod model_alias;
 pub mod model_repository_impl;
 pub mod near_nonce;
 pub mod oauth_state;
+pub mod ohttp_replay;
 pub mod organization;
 pub mod organization_invitation;
 pub mod organization_limits;

@@ -16,6 +16,7 @@ use crate::routes::api::AppState;
 /// Simple error type local to this module — maps to HTTP status + OpenAI error envelope.
 pub enum OhttpError {
     NotEnabled,
+    Replayed,
     BadRequest(String),
     Internal(String),
 }
@@ -23,6 +24,11 @@ pub enum OhttpError {
 impl IntoResponse for OhttpError {
     fn into_response(self) -> Response {
         let (status, msg, kind) = match self {
+            OhttpError::Replayed => (
+                StatusCode::CONFLICT,
+                "OHTTP encapsulation was already used".to_string(),
+                "invalid_request_error",
+            ),
             OhttpError::NotEnabled => (
                 StatusCode::NOT_FOUND,
                 "OHTTP not enabled".to_string(),
@@ -125,6 +131,7 @@ async fn ohttp_relay_standard(
     let (request_builder, log_path) =
         parse_bhttp_and_build_loopback(state, &bhttp_request, outer_authorization.as_ref())?;
 
+    claim_authenticated_request(state, gateway, enc_request, &request_builder).await?;
     let loopback_response = send_loopback(request_builder).await?;
 
     let response_status = loopback_response.status().as_u16();
@@ -197,6 +204,7 @@ async fn ohttp_relay_chunked(
     let (request_builder, log_path) =
         parse_bhttp_and_build_loopback(state, &bhttp_request, outer_authorization.as_ref())?;
 
+    claim_authenticated_request(state, gateway, enc_request, &request_builder).await?;
     let loopback_response = send_loopback(request_builder).await?;
     let response_status = loopback_response.status().as_u16();
     let response_headers = collect_response_headers(&loopback_response);
@@ -356,6 +364,39 @@ fn collect_response_headers(response: &reqwest::Response) -> Vec<(Vec<u8>, Vec<u
             }
         })
         .collect()
+}
+
+/// Authenticate before allocating durable replay state. Unauthenticated requests
+/// still reach the ordinary middleware, which preserves the endpoint's response.
+async fn claim_authenticated_request(
+    state: &AppState,
+    gateway: &crate::ohttp_gateway::OhttpGateway,
+    encapsulated: &[u8],
+    builder: &reqwest::RequestBuilder,
+) -> Result<(), OhttpError> {
+    let request = builder
+        .try_clone()
+        .ok_or_else(|| OhttpError::Internal("Cannot validate request".into()))?
+        .build()
+        .map_err(|_| OhttpError::BadRequest("Invalid inner request".into()))?;
+    let Some(key) = request
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+    else {
+        return Ok(());
+    };
+    match state.auth_service.validate_api_key(key.to_owned()).await {
+        Ok(_) => {}
+        Err(services::auth::AuthError::Unauthorized) => return Ok(()),
+        Err(_) => return Err(OhttpError::Internal("Unable to validate request".into())),
+    }
+    match gateway.claim_request(encapsulated).await {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(OhttpError::Replayed),
+        Err(_) => Err(OhttpError::Internal("Replay protection unavailable".into())),
+    }
 }
 
 // ── Shared helpers ───────────────────────────────────────────────────────────

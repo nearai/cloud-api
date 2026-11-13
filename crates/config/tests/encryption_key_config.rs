@@ -12,7 +12,7 @@ fn load_config(extra: &[(&str, &str)]) -> Output {
         .env("DATABASE_USERNAME", "test-user")
         .env("DATABASE_CONNECTION_MODE", "direct")
         .env("DATABASE_HOST", "localhost")
-        .env("S3_ENCRYPTION_KEY", "test-s3-key")
+        .env("S3_ENCRYPTION_KEY", "ab".repeat(32))
         .env("AWS_S3_BUCKET", "test-bucket")
         .env("AWS_S3_REGION", "us-east-1")
         .envs(extra.iter().copied())

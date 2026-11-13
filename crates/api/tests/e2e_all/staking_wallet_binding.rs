@@ -51,6 +51,15 @@ async fn current_user_reports_staking_organization_for_bound_wallet() {
         .await
         .unwrap();
 
+    let profile = server
+        .put("/v1/users/me/profile")
+        .add_header("Authorization", format!("Bearer rt_{wallet_user}"))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .json(&serde_json::json!({"display_name": "Updated wallet profile"}))
+        .await;
+    assert_eq!(profile.status_code(), 200, "{}", profile.text());
+    assert_eq!(profile.json::<Value>()["staking_organization_id"], org.id);
+
     let me = server
         .get("/v1/users/me")
         .add_header("Authorization", format!("Bearer rt_{wallet_user}"))

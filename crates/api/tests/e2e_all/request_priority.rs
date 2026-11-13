@@ -1,5 +1,5 @@
 // E2E tests for the organization's scheduler priority on inference requests.
-// The priority (`organizations.request_priority`) is written by cloud-platform and is
+// The priority (`organizations.request_priority`) is written by the admin API and is
 // seeded here; the kept inference routes must forward the organization's value and
 // ignore whatever the client sends.
 

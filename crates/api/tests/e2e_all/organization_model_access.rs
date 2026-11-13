@@ -3,7 +3,7 @@
 // An unlisted model (`isListed: false`) is restricted: an organization may use
 // it through this API only while it holds a grant. Everyone else must get
 // exactly the answer a model that does not exist gets. Grants are managed by
-// admins (seeded here by SQL; the admin routes moved to cloud-platform) and published to trusted
+// admins (seeded here by SQL; the admin routes moved to the admin API) and published to trusted
 // services (`GET /v1/internal/model-access`).
 
 use crate::common::{fake_ita::FakeIta, fake_ita::FakeItaMode, *};

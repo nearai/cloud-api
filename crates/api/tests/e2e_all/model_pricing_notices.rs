@@ -1,6 +1,6 @@
 // E2E tests for the pricing-change notice (`x-model-pricing-change-date`, `upcoming_pricing`
 // in the catalogs) and for the scheduler pass that applies due changes. Changes are
-// scheduled by cloud-platform; here they are seeded and the kept readers and the scheduler
+// scheduled by the admin API; here they are seeded and the kept readers and the scheduler
 // are what is under test.
 //
 // The `serial_` tests touch the database-wide due queue or write malformed pending rows,

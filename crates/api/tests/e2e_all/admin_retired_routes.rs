@@ -114,5 +114,15 @@ async fn retired_routes_are_not_served() {
         .await
         .expect("router response");
         assert_eq!(response.status(), StatusCode::NOT_FOUND, "{method} {path}");
+        // The generic fallback body proves no handler matched; a mounted handler that
+        // reports "unknown model/org" would also return 404 with a different body.
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(
+            body["error"]["message"], "Not found",
+            "{method} {path} was not served by the fallback: {body}"
+        );
     }
 }

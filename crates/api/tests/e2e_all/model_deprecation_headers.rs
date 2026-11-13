@@ -1,6 +1,6 @@
 // E2E tests for the response headers that announce a planned model
 // deprecation (`x-model-deprecation-date`, `x-model-successor`). The plan is
-// written by cloud-platform; here it is seeded on the catalog row and the
+// written by the admin API; here it is seeded on the catalog row and the
 // kept middleware is what is under test.
 
 use crate::common::*;

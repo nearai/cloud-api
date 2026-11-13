@@ -42,7 +42,8 @@ pub const HEADER_GENERATION_ID: &str = "x-generation-id";
         (status = 401, description = "Authentication required", body = ErrorResponse),
         (status = 421, description = "Selected model signing key is unavailable", body = ErrorResponse),
         (status = 429, description = "Rate or concurrency limit", body = ErrorResponse),
-        (status = 502, description = "Invalid provider response", body = ErrorResponse)
+        (status = 502, description = "Invalid provider response", body = ErrorResponse),
+        (status = 500, description = "Internal billing or finalization error", body = ErrorResponse)
     ),
     security(("ApiKeyAuth" = []))
 )]
@@ -128,22 +129,21 @@ pub async fn systemone(
     };
     // System One backends receive no tenant ids: the inference call and the
     // signature fetch in `finalize` both run with the tracing context cleared.
-    let served = match without_tracing_context(
-        state.inference_provider_pool.systemone_with_attribution(
+    let served =
+        match without_tracing_context(state.inference_provider_pool.systemone_with_attribution(
             request,
             body_hash.hash.clone(),
             encryption.model_pub_key.as_deref(),
             !api_key.organization.fallback_enabled(),
-        ),
-    )
-    .await
-    {
-        Ok(response) => response,
-        Err(err) => {
-            tracing::warn!(model = %model.model_name, error = %err, "System One inference failed");
-            return provider_error(err);
-        }
-    };
+        ))
+        .await
+        {
+            Ok(response) => response,
+            Err(err) => {
+                tracing::warn!(model = %model.model_name, "System One inference failed");
+                return provider_error(err);
+            }
+        };
     // Once inference succeeds, finalize billing and signature pins even if the
     // client disconnects while waiting for persistence.
     let finalize = tokio::spawn(without_tracing_context(async move {
@@ -201,14 +201,17 @@ pub async fn systemone(
                 tracing::error!(decision_id = %decision_id, "System One signature finalization failed or timed out");
             }
         };
-        tokio::join!(
+        let (_, billing_result) = tokio::join!(
             signature,
-            completions::record_usage_with_sync_fallback(
+            completions::record_usage_before_response(
                 state.usage_service,
                 usage_request,
                 "System One"
             ),
         );
+        if let Err(response) = billing_result {
+            return response;
+        }
         let tier = serving_from_attribution(&served.provider_attribution).label();
         let mut response = Response::builder()
             .header(header::CONTENT_TYPE, "application/json")

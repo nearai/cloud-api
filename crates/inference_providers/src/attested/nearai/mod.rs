@@ -1761,7 +1761,6 @@ impl InferenceProvider for Fleet {
             if retryable {
                 if let Some(backoff) = signature_fetch_backoff(attempt) {
                     tracing::debug!(
-                        %chat_id,
                         attempt = attempt + 1,
                         "Signature not yet present on backend (404); retrying after backoff"
                     );

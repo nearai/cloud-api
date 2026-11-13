@@ -1038,9 +1038,10 @@ pub struct AudioTranscriptionResponse {
 
 impl From<inference_providers::AudioTranscriptionResponse> for AudioTranscriptionResponse {
     fn from(response: inference_providers::AudioTranscriptionResponse) -> Self {
+        let duration = response.billable_duration();
         Self {
             text: response.text,
-            duration: response.duration,
+            duration,
             language: response.language,
             segments: response.segments.map(|segments| {
                 segments
@@ -5881,6 +5882,7 @@ mod tests {
         let provider_response = inference_providers::AudioTranscriptionResponse {
             text: "hello".to_string(),
             duration: Some(1.0),
+            usage: None,
             language: Some("en".to_string()),
             segments: None,
             words: None,
@@ -5892,6 +5894,19 @@ mod tests {
 
         assert!(value.get("id").is_none());
         assert_eq!(value["text"], "hello");
+    }
+
+    #[test]
+    fn test_audio_transcription_response_uses_duration_usage() {
+        let provider_response: inference_providers::AudioTranscriptionResponse =
+            serde_json::from_value(serde_json::json!({
+                "text": "ok",
+                "usage": {"type": "duration", "seconds": 2.5}
+            }))
+            .unwrap();
+        let value =
+            serde_json::to_value(AudioTranscriptionResponse::from(provider_response)).unwrap();
+        assert_eq!(value["duration"], 2.5);
     }
 
     // ── ImageGenerationRequest size validation ──

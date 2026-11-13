@@ -2096,6 +2096,7 @@ impl crate::InferenceProvider for MockProvider {
         Ok(AudioTranscriptionResponse {
             text: mock_text.clone(),
             duration: Some(mock_duration),
+            usage: None,
             language: params.language.or(Some("en".to_string())),
             segments: wants_segment_timestamps.then(|| {
                 vec![TranscriptionSegment {

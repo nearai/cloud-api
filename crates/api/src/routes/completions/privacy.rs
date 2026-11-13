@@ -164,9 +164,8 @@ const MAX_REASONABLE_PRIVACY_TOKENS: i32 = 1_000_000;
 /// `[0, MAX_REASONABLE_PRIVACY_TOKENS]`, flag zero or oversized counts as
 /// provider anomalies, and record the usage. Classify and redact share this
 /// so their thresholds, anomaly metrics and billing cannot drift apart.
-/// Returns an error for an invalid billing identity. Once inference completes,
-/// a slow or failed usage write uses the shared idempotent retry path rather
-/// than inviting the client to repeat a completed, potentially billed call.
+/// Returns an error when the billing identity or both bounded usage writes
+/// fail, so no completed response advertises an unrecorded inference.
 async fn settle_privacy_usage(
     app_state: &AppState,
     api_key: &AuthenticatedApiKey,
@@ -233,10 +232,12 @@ async fn settle_privacy_usage(
         );
     }
 
+    billing::require_positive_units(token_count)?;
+
     let api_key_id = match Uuid::parse_str(&api_key.api_key.id.0) {
         Ok(id) => id,
-        Err(e) => {
-            tracing::error!(error = %e, "Invalid API key ID for usage tracking");
+        Err(_) => {
+            tracing::error!("Invalid API key ID for usage tracking");
             return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 ResponseJson(ErrorResponse::new(
@@ -276,12 +277,12 @@ async fn settle_privacy_usage(
         dedupe_on_conflict: true,
     };
 
-    record_usage_with_sync_fallback(
+    record_usage_before_response(
         app_state.usage_service.clone(),
         usage_request,
         endpoint.label(),
     )
-    .await;
+    .await?;
 
     Ok(())
 }
@@ -392,8 +393,8 @@ pub async fn privacy_classify(
             )
                 .into_response();
         }
-        Err(e) => {
-            tracing::error!(error = %e, "Failed to resolve model for privacy classify");
+        Err(_) => {
+            tracing::error!("Failed to resolve model for privacy classify");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 ResponseJson(ErrorResponse::new(
@@ -643,8 +644,8 @@ pub async fn privacy_redact(
             )
                 .into_response();
         }
-        Err(e) => {
-            tracing::error!(error = %e, "Failed to resolve model for privacy redact");
+        Err(_) => {
+            tracing::error!("Failed to resolve model for privacy redact");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 ResponseJson(ErrorResponse::new(
@@ -683,8 +684,8 @@ pub async fn privacy_redact(
     }
     let upstream_bytes = match serde_json::to_vec(&upstream_body) {
         Ok(b) => bytes::Bytes::from(b),
-        Err(e) => {
-            tracing::error!(error = %e, "Failed to encode upstream redact body");
+        Err(_) => {
+            tracing::error!("Failed to encode upstream redact body");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 ResponseJson(ErrorResponse::new(
@@ -716,8 +717,8 @@ pub async fn privacy_redact(
     // — handle every variant uniformly as a 500.
     let redacted = match services::auto_redact::apply_detected_spans(&texts, &response_bytes) {
         Ok(r) => r,
-        Err(e) => {
-            tracing::error!(error = %e, "Privacy redact apply failed");
+        Err(_) => {
+            tracing::error!("Privacy redact apply failed");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 ResponseJson(ErrorResponse::new(
@@ -779,8 +780,8 @@ pub async fn privacy_redact(
     }
     let body_bytes = match serde_json::to_vec(&body) {
         Ok(b) => b,
-        Err(e) => {
-            tracing::error!(error = %e, "Failed to encode privacy redact response");
+        Err(_) => {
+            tracing::error!("Failed to encode privacy redact response");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 ResponseJson(ErrorResponse::new(

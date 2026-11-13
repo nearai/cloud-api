@@ -75,8 +75,7 @@ pub async fn image_generations(
             )
                 .into_response();
         }
-        Err(e) => {
-            tracing::debug!(error = %e, "Failed to resolve model for image generation");
+        Err(_) => {
             tracing::warn!("Image generation: model resolution failed");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -142,11 +141,11 @@ pub async fn image_generations(
             let attestation_service = app_state.attestation_service.clone();
             let image_id_for_sig = response_with_bytes.response.id.clone();
             inference_providers::tracing_context::spawn_with_tracing_context(async move {
-                if let Err(e) = attestation_service
+                if attestation_service
                     .store_chat_signature_from_provider(&image_id_for_sig)
                     .await
+                    .is_err()
                 {
-                    tracing::debug!(error = %e, "Failed to store image generation signature");
                     tracing::warn!("Image generation: signature storage failed");
                 } else {
                     tracing::debug!(image_id = %image_id_for_sig, "Stored signature for image generation");
@@ -172,22 +171,22 @@ pub async fn image_generations(
                         .into_response();
                 }
             };
+            if let Err(response) = billing::require_positive_units(image_count) {
+                return response;
+            }
             let provider_request_id = response_with_bytes.response.id.clone();
             let usage_service = app_state.usage_service.clone();
 
             // Parse API key ID early for usage recording
             let api_key_id = match Uuid::parse_str(&api_key_id_str) {
                 Ok(id) => id,
-                Err(e) => {
-                    tracing::error!(error = %e, "Invalid API key ID for usage tracking");
-                    // Still return response but log error
-                    return Response::builder()
-                        .status(StatusCode::OK)
-                        .header(header::CONTENT_TYPE, "application/json")
-                        .body(Body::from(response_with_bytes.raw_bytes))
-                        .unwrap();
+                Err(_) => {
+                    tracing::error!("Invalid API key ID for usage tracking");
+                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
                 }
             };
+
+            let inference_id = hash_inference_id_to_uuid(&provider_request_id);
 
             let usage_request = build_image_usage_request(ImageUsageRecord {
                 organization_id,
@@ -199,20 +198,24 @@ pub async fn image_generations(
                 provider_attribution,
                 inference_type: services::usage::InferenceType::ImageGeneration,
             });
-            record_usage_with_sync_fallback(usage_service, usage_request, "Image generation").await;
+            if let Err(response) =
+                record_usage_before_response(usage_service, usage_request, "Image generation").await
+            {
+                return response;
+            }
 
             // Return the exact bytes from the provider for hash verification
             // This ensures clients can hash the response and compare with attestation endpoints
-            Response::builder()
-                .status(StatusCode::OK)
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(response_with_bytes.raw_bytes))
-                .unwrap()
+            with_billing_inference_id(
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(response_with_bytes.raw_bytes))
+                    .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
+                inference_id,
+            )
         }
         Err(e) => {
-            // Log provider errors at debug level to avoid exposing infrastructure details in production
-            tracing::debug!(error = %e, "Image generation failed");
-
             // Map error to appropriate status code and sanitized message
             let (status_code, message) = match &e {
                 inference_providers::ImageGenerationError::GenerationError(msg) => {
@@ -408,7 +411,7 @@ pub async fn image_edits(
             Err(e) => {
                 // Multipart parsing error (malformed boundary, invalid encoding, etc.)
                 let (status, error_message) = analyze_multipart_error(&e);
-                tracing::debug!(error = %e, message = %error_message, "Multipart parsing error");
+                tracing::debug!(status = status.as_u16(), "Multipart parsing error");
                 return (
                     status,
                     ResponseJson(ErrorResponse::new(
@@ -483,8 +486,7 @@ pub async fn image_edits(
             )
                 .into_response();
         }
-        Err(e) => {
-            tracing::debug!(error = %e, "Failed to resolve model for image edit");
+        Err(_) => {
             tracing::warn!("Image edit: model resolution failed");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -544,11 +546,11 @@ pub async fn image_edits(
             let attestation_service = app_state.attestation_service.clone();
             let image_id_for_sig = response_with_bytes.response.id.clone();
             inference_providers::tracing_context::spawn_with_tracing_context(async move {
-                if let Err(e) = attestation_service
+                if attestation_service
                     .store_chat_signature_from_provider(&image_id_for_sig)
                     .await
+                    .is_err()
                 {
-                    tracing::debug!(error = %e, "Failed to store image edit signature");
                     tracing::warn!("Image edit: signature storage failed");
                 } else {
                     tracing::debug!(image_id = %image_id_for_sig, "Stored signature for image edit");
@@ -574,22 +576,22 @@ pub async fn image_edits(
                         .into_response();
                 }
             };
+            if let Err(response) = billing::require_positive_units(image_count) {
+                return response;
+            }
             let provider_request_id = response_with_bytes.response.id.clone();
             let usage_service = app_state.usage_service.clone();
 
             // Parse API key ID early for usage recording
             let api_key_id = match Uuid::parse_str(&api_key_id_str) {
                 Ok(id) => id,
-                Err(e) => {
-                    tracing::error!(error = %e, "Invalid API key ID for usage tracking");
-                    // Still return response but log error
-                    return Response::builder()
-                        .status(StatusCode::OK)
-                        .header(header::CONTENT_TYPE, "application/json")
-                        .body(Body::from(response_with_bytes.raw_bytes))
-                        .unwrap();
+                Err(_) => {
+                    tracing::error!("Invalid API key ID for usage tracking");
+                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
                 }
             };
+
+            let inference_id = hash_inference_id_to_uuid(&provider_request_id);
 
             let usage_request = build_image_usage_request(ImageUsageRecord {
                 organization_id,
@@ -601,20 +603,24 @@ pub async fn image_edits(
                 provider_attribution,
                 inference_type: services::usage::InferenceType::ImageEdit,
             });
-            record_usage_with_sync_fallback(usage_service, usage_request, "Image edit").await;
+            if let Err(response) =
+                record_usage_before_response(usage_service, usage_request, "Image edit").await
+            {
+                return response;
+            }
 
             // Return the exact bytes from the provider for hash verification
             // This ensures clients can hash the response and compare with attestation endpoints
-            Response::builder()
-                .status(StatusCode::OK)
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(response_with_bytes.raw_bytes))
-                .unwrap()
+            with_billing_inference_id(
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(response_with_bytes.raw_bytes))
+                    .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
+                inference_id,
+            )
         }
         Err(e) => {
-            // Log provider errors at debug level to avoid exposing infrastructure details in production
-            tracing::debug!(error = %e, "Image edit failed");
-
             // Map error to appropriate status code and sanitized message
             let (status_code, message) = match &e {
                 inference_providers::ImageEditError::EditError(msg) => {

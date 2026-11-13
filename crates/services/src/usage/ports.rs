@@ -529,6 +529,16 @@ pub enum RecordUsageApiRequest {
         #[serde(flatten)]
         provider_attribution: ProviderAttribution,
     },
+    /// Audio transcription billed by whole seconds of input duration.
+    AudioTranscription {
+        model: String,
+        /// Positive duration rounded up to the nearest second.
+        duration_seconds: i32,
+        /// External idempotency key (see [`Self::ChatCompletion`]'s `id`)
+        id: String,
+        #[serde(flatten)]
+        provider_attribution: ProviderAttribution,
+    },
     /// Input-token-billed, output-less inference. Bills
     /// `input_tokens × input_cost_per_token` on the named model (no output
     /// cost, no cache pricing) and differs from its siblings only in the

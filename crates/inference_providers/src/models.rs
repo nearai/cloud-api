@@ -1484,6 +1484,10 @@ pub struct AudioTranscriptionResponse {
     #[serde(deserialize_with = "deserialize_duration")]
     pub duration: Option<f64>,
 
+    /// Duration reported by providers using the audio usage object.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<AudioTranscriptionUsage>,
+
     /// Detected language code
     #[serde(skip_serializing_if = "Option::is_none")]
     pub language: Option<String>,
@@ -1499,6 +1503,30 @@ pub struct AudioTranscriptionResponse {
     /// Unique identifier for the transcription
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
+}
+
+/// Usage shape returned by duration-based transcription providers.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AudioTranscriptionUsage {
+    #[serde(rename = "type")]
+    pub usage_type: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_duration")]
+    pub seconds: Option<f64>,
+}
+
+impl AudioTranscriptionResponse {
+    pub fn billable_duration(&self) -> Option<f64> {
+        self.duration
+            .filter(|seconds| seconds.is_finite() && *seconds > 0.0)
+            .or_else(|| {
+                self.usage.as_ref().and_then(|usage| {
+                    (usage.usage_type.as_deref() == Some("duration"))
+                        .then_some(usage.seconds)
+                        .flatten()
+                        .filter(|seconds| seconds.is_finite() && *seconds > 0.0)
+                })
+            })
+    }
 }
 
 /// Custom deserializer to handle duration as either string or number
@@ -1580,6 +1608,27 @@ pub fn detect_audio_content_type(filename: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transcription_duration_accepts_both_provider_shapes() {
+        let verbose: AudioTranscriptionResponse = serde_json::from_value(serde_json::json!({
+            "text": "ok", "duration": "3.2"
+        }))
+        .unwrap();
+        assert_eq!(verbose.billable_duration(), Some(3.2));
+
+        let usage: AudioTranscriptionResponse = serde_json::from_value(serde_json::json!({
+            "text": "ok", "usage": {"type": "duration", "seconds": 4.5}
+        }))
+        .unwrap();
+        assert_eq!(usage.billable_duration(), Some(4.5));
+
+        let invalid: AudioTranscriptionResponse = serde_json::from_value(serde_json::json!({
+            "text": "ok", "duration": 0, "usage": {"type": "tokens", "seconds": 10}
+        }))
+        .unwrap();
+        assert_eq!(invalid.billable_duration(), None);
+    }
 
     #[test]
     fn set_stream_fields_is_the_only_copy_on_the_wire() {

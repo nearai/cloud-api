@@ -152,8 +152,8 @@ pub async fn embeddings(
             )
                 .into_response();
         }
-        Err(e) => {
-            tracing::error!(error = %e, "Failed to resolve model for embeddings");
+        Err(_) => {
+            tracing::error!("Failed to resolve model for embeddings");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 ResponseJson(ErrorResponse::new(
@@ -195,7 +195,7 @@ pub async fn embeddings(
             let token_count = serde_json::from_slice::<UsageExtract>(&response_bytes)
                 .ok()
                 .and_then(|u| u.usage)
-                .and_then(|u| u.total_tokens.or(u.prompt_tokens))
+                .map(|u| billing::reported_input_tokens(u.total_tokens, u.prompt_tokens))
                 .unwrap_or(0);
 
             // Token anomaly detection
@@ -210,6 +210,10 @@ pub async fn embeddings(
                     anomaly: "Token count anomaly: Provider data quality issue detected. Recommendation: Check provider logs and configuration.",
                 },
             );
+            let token_count = match billing::require_positive_units(token_count) {
+                Ok(count) => count,
+                Err(response) => return response,
+            };
 
             // Record usage synchronously
             let workspace_id = api_key.workspace.id.0;
@@ -234,8 +238,13 @@ pub async fn embeddings(
                 )
             };
 
-            if let Err(e) = app_state.usage_service.record_usage(usage_request).await {
-                tracing::error!(error = %e, "Failed to record embeddings usage");
+            if app_state
+                .usage_service
+                .record_usage(usage_request)
+                .await
+                .is_err()
+            {
+                tracing::error!("Failed to record embeddings usage");
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     ResponseJson(ErrorResponse::new(
@@ -247,11 +256,12 @@ pub async fn embeddings(
             }
 
             // Return raw response bytes
-            Response::builder()
+            let response = Response::builder()
                 .status(StatusCode::OK)
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(response_bytes))
-                .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+                .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+            with_billing_inference_id(response, inference_id)
         }
         Err(e) => {
             let (status_code, error_type, message) = match e {

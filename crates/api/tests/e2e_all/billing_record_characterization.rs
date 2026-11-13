@@ -7,10 +7,10 @@
 //!   System One and privacy classify/redact with a valid upstream id. It is a
 //!   random v4 for audio, rerank, embeddings, auto-redact and privacy responses
 //!   without a valid upstream id (as returned by the default MockProvider).
-//! - A failed record fails the request closed (500) for audio, rerank,
-//!   and embeddings; image generation/edit, score, System One and privacy
-//!   classify/redact return 200 and retry the identical request asynchronously;
-//!   the auto-redact classify charge is best-effort and never retried.
+//! - Audio, rerank and embeddings fail closed on a failed usage write. Image
+//!   generation/edit, score and privacy classify/redact retry once before
+//!   returning a billable response. System One uses the same bounded retry;
+//!   auto-redact classify is best-effort.
 
 use crate::common::*;
 use services::completions::hash_inference_id_to_uuid;
@@ -41,9 +41,7 @@ impl RecordingUsageService {
     /// Wait (bounded) until exactly `count` records were captured, then hold
     /// briefly to catch any unexpected extra recording.
     async fn wait_for(&self, count: usize) -> Vec<RecordUsageServiceRequest> {
-        // Async retries are spawned immediately on failure (no backoff), so
-        // the poll budget only covers task-scheduling jitter; the quiet period
-        // absorbs the same jitter before asserting no extra record arrived.
+        // The quiet period catches any unexpected extra recording.
         const POLL_BUDGET: Duration = Duration::from_secs(5);
         const QUIET_PERIOD: Duration = Duration::from_millis(500);
         let deadline = tokio::time::Instant::now() + POLL_BUDGET;
@@ -253,6 +251,42 @@ fn assert_common_shape(record: &RecordUsageServiceRequest, org_id: Uuid) {
     assert!(record.discount.is_none());
 }
 
+fn assert_billing_header(response: &axum_test::TestResponse, record: &RecordUsageServiceRequest) {
+    assert_eq!(
+        response.header("Inference-Id"),
+        record
+            .inference_id
+            .expect("recorded inference id")
+            .to_string()
+    );
+    let exposed_header = response.header("Access-Control-Expose-Headers");
+    let exposed = exposed_header.to_str().expect("valid CORS exposure header");
+    assert!(
+        exposed == "*"
+            || exposed
+                .split(',')
+                .any(|name| name.trim().eq_ignore_ascii_case("Inference-Id")),
+        "Inference-Id must be readable by browser clients"
+    );
+}
+
+async fn billed_cost(f: &Fixture, inference_id: Uuid) -> i64 {
+    let response = post_json(
+        f,
+        "/v1/billing/costs",
+        serde_json::json!({"requestIds": [inference_id]}),
+    )
+    .await;
+    assert_eq!(response.status_code(), 200, "{}", response.text());
+    let body: serde_json::Value = response.json();
+    let requests = body["requests"].as_array().expect("cost entries");
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0]["requestId"], inference_id.to_string());
+    requests[0]["costNanoUsd"]
+        .as_i64()
+        .expect("integer nano-dollar cost")
+}
+
 fn assert_random_v4(record: &RecordUsageServiceRequest) {
     let id = record.inference_id.expect("inference_id should be set");
     assert_eq!(id.get_version_num(), 4, "inference_id should be random v4");
@@ -430,15 +464,21 @@ async fn image_generation_records_hashed_id_with_image_count() {
         record.inference_id,
         Some(hash_inference_id_to_uuid(&provider_id))
     );
+    assert_billing_header(&response, record);
 }
 
 #[tokio::test]
-async fn image_generation_falls_back_to_async_retry_on_record_failure() {
+async fn image_generation_retries_before_returning_billed_success() {
     let f = fixture(1, &[]).await;
     let response = post_image_generation(&f).await;
     assert_eq!(response.status_code(), 200, "{}", response.text());
     let records = f.recorder.wait_for(2).await;
     assert_same_request(&records[0], &records[1]);
+    assert_billing_header(&response, &records[1]);
+    assert_eq!(
+        billed_cost(&f, records[1].inference_id.unwrap()).await,
+        40_000_000
+    );
 }
 
 #[tokio::test]
@@ -461,15 +501,21 @@ async fn image_edit_records_hashed_id_with_image_count() {
         record.inference_id,
         Some(hash_inference_id_to_uuid(&provider_id))
     );
+    assert_billing_header(&response, record);
 }
 
 #[tokio::test]
-async fn image_edit_falls_back_to_async_retry_on_record_failure() {
+async fn image_edit_retries_before_returning_billed_success() {
     let f = fixture(1, &[]).await;
     let response = post_image_edit(&f).await;
     assert_eq!(response.status_code(), 200, "{}", response.text());
     let records = f.recorder.wait_for(2).await;
     assert_same_request(&records[0], &records[1]);
+    assert_billing_header(&response, &records[1]);
+    assert_eq!(
+        billed_cost(&f, records[1].inference_id.unwrap()).await,
+        40_000_000
+    );
 }
 
 // ---------------------------------------------------------------- audio
@@ -492,6 +538,7 @@ async fn audio_records_duration_seconds_with_random_id() {
     assert!(record.image_count.is_none());
     assert_random_v4(record);
     assert_default_attribution(record);
+    assert_billing_header(&response, record);
 }
 
 #[tokio::test]
@@ -522,6 +569,7 @@ async fn rerank_records_total_tokens_with_random_id() {
     assert!(record.image_count.is_none());
     assert_random_v4(record);
     assert_default_attribution(record);
+    assert_billing_header(&response, record);
 }
 
 #[tokio::test]
@@ -557,6 +605,7 @@ async fn embeddings_records_total_tokens_with_random_id() {
     assert!(record.image_count.is_none());
     assert_random_v4(record);
     assert_default_attribution(record);
+    assert_billing_header(&response, record);
 }
 
 #[tokio::test]
@@ -577,17 +626,24 @@ async fn embeddings_fails_closed_on_record_failure() {
 // ---------------------------------------------------------------- score
 
 #[tokio::test]
-async fn score_records_one_token_under_hashed_response_id() {
+async fn score_records_reported_tokens_under_hashed_response_id() {
     let f = fixture(0, &[]).await;
     let response = post_json(&f, "/v1/score", score_body()).await;
     assert_eq!(response.status_code(), 200, "{}", response.text());
     let body: serde_json::Value = response.json();
     let response_id = body["id"].as_str().expect("score response has id");
+    let reported_tokens = body["usage"]["prompt_tokens"]
+        .as_i64()
+        .expect("score response reports input tokens");
+    assert!(
+        reported_tokens > 1,
+        "fixture must distinguish measured usage from one flat unit"
+    );
     let record = &f.recorder.wait_for(1).await[0];
 
     assert_common_shape(record, f.org_id);
     assert_eq!(record.inference_type, InferenceType::Score);
-    assert_eq!(record.input_tokens, 1, "score bills a flat single unit");
+    assert_eq!(i64::from(record.input_tokens), reported_tokens);
     assert_eq!(record.output_tokens, 0);
     assert!(record.image_count.is_none());
     assert_eq!(
@@ -596,15 +652,26 @@ async fn score_records_one_token_under_hashed_response_id() {
     );
     assert!(record.provider_request_id.is_none());
     assert_default_attribution(record);
+    assert_billing_header(&response, record);
+    assert_eq!(
+        billed_cost(&f, record.inference_id.unwrap()).await,
+        reported_tokens * 1_000_000,
+        "the returned ID resolves to usage priced per reported input token"
+    );
 }
 
 #[tokio::test]
-async fn score_falls_back_to_async_retry_on_record_failure() {
+async fn score_retries_before_returning_billed_success() {
     let f = fixture(1, &[]).await;
     let response = post_json(&f, "/v1/score", score_body()).await;
     assert_eq!(response.status_code(), 200, "{}", response.text());
     let records = f.recorder.wait_for(2).await;
     assert_same_request(&records[0], &records[1]);
+    assert_billing_header(&response, &records[1]);
+    assert_eq!(
+        billed_cost(&f, records[1].inference_id.unwrap()).await,
+        i64::from(records[1].input_tokens) * 1_000_000
+    );
 }
 
 // ---------------------------------------------------------------- privacy
@@ -637,15 +704,16 @@ async fn privacy_classify_records_summed_tokens_with_random_id() {
 }
 
 #[tokio::test]
-async fn privacy_classify_falls_back_to_async_retry_on_record_failure() {
+async fn privacy_classify_retries_before_returning_billed_success() {
     let f = fixture(1, &[]).await;
     let response = post_json(&f, "/v1/privacy/classify", classify_body()).await;
     assert_eq!(response.status_code(), 200, "{}", response.text());
     let records = f.recorder.wait_for(2).await;
     assert_same_request(&records[0], &records[1]);
+    assert_billing_header(&response, &records[1]);
     assert_eq!(
-        response.header("Inference-Id"),
-        records[0].inference_id.unwrap().to_string()
+        billed_cost(&f, records[1].inference_id.unwrap()).await,
+        i64::from(records[1].input_tokens) * 1_000_000
     );
 }
 
@@ -666,16 +734,53 @@ async fn privacy_redact_records_as_classify_with_random_id() {
 }
 
 #[tokio::test]
-async fn privacy_redact_falls_back_to_async_retry_on_record_failure() {
+async fn privacy_redact_retries_before_returning_billed_success() {
     let f = fixture(1, &[]).await;
     let response = post_json(&f, "/v1/privacy/redact", redact_body()).await;
     assert_eq!(response.status_code(), 200, "{}", response.text());
     let records = f.recorder.wait_for(2).await;
     assert_same_request(&records[0], &records[1]);
+    assert_billing_header(&response, &records[1]);
     assert_eq!(
-        response.header("Inference-Id"),
-        records[0].inference_id.unwrap().to_string()
+        billed_cost(&f, records[1].inference_id.unwrap()).await,
+        i64::from(records[1].input_tokens) * 1_000_000
     );
+}
+
+#[tokio::test]
+async fn completed_routes_with_terminal_usage_failure_do_not_advertise_billing() {
+    let f = fixture(0, &[]).await;
+    for route in [
+        "image generation",
+        "image edit",
+        "score",
+        "privacy classify",
+        "privacy redact",
+    ] {
+        f.recorder.fail_next.store(2, Ordering::SeqCst);
+        let before = f.recorder.records().len();
+        let response = match route {
+            "image generation" => post_image_generation(&f).await,
+            "image edit" => post_image_edit(&f).await,
+            "score" => post_json(&f, "/v1/score", score_body()).await,
+            "privacy classify" => post_json(&f, "/v1/privacy/classify", classify_body()).await,
+            "privacy redact" => post_json(&f, "/v1/privacy/redact", redact_body()).await,
+            _ => unreachable!("fixed test route"),
+        };
+        assert_eq!(response.status_code(), 500, "{route}: {}", response.text());
+        assert!(
+            response.maybe_header("Inference-Id").is_none(),
+            "{route} must not advertise an unrecorded billing ID"
+        );
+        let records = f.recorder.records();
+        assert_eq!(records.len(), before + 2, "{route} must retry once");
+        assert_same_request(&records[before], &records[before + 1]);
+        assert_eq!(
+            billed_cost(&f, records[before].inference_id.unwrap()).await,
+            0,
+            "{route} did not persist a usage row"
+        );
+    }
 }
 
 // ---------------------------------------------------------------- auto-redact
@@ -811,10 +916,24 @@ async fn systemone_records_tokens_under_hashed_decision_id() {
 }
 
 #[tokio::test]
-async fn systemone_falls_back_to_async_retry_on_record_failure() {
+async fn systemone_retries_before_returning_billed_success() {
     let (f, _upstream, model) = systemone_fixture(1).await;
     let response = post_systemone(&f, &model).await;
     assert_eq!(response.status_code(), 200, "{}", response.text());
     let records = f.recorder.wait_for(2).await;
     assert_same_request(&records[0], &records[1]);
+    assert_billing_header(&response, &records[1]);
+    assert_eq!(billed_cost(&f, records[1].inference_id.unwrap()).await, 36);
+}
+
+#[tokio::test]
+async fn systemone_terminal_usage_failure_has_no_billing_identifier() {
+    let (f, _upstream, model) = systemone_fixture(2).await;
+    let response = post_systemone(&f, &model).await;
+    assert_eq!(response.status_code(), 500, "{}", response.text());
+    assert!(response.maybe_header("Inference-Id").is_none());
+    let records = f.recorder.records();
+    assert_eq!(records.len(), 2);
+    assert_same_request(&records[0], &records[1]);
+    assert_eq!(billed_cost(&f, records[0].inference_id.unwrap()).await, 0);
 }

@@ -159,6 +159,18 @@ impl UsageServiceTrait for MockUsageService {
                     Some(*image_count),
                     InferenceType::ImageGeneration,
                 ),
+                RecordUsageApiRequest::AudioTranscription {
+                    model,
+                    duration_seconds,
+                    ..
+                } => (
+                    model.clone(),
+                    *duration_seconds,
+                    0,
+                    0,
+                    None,
+                    InferenceType::AudioTranscription,
+                ),
                 RecordUsageApiRequest::Embedding {
                     model,
                     input_tokens,
@@ -426,6 +438,18 @@ impl UsageServiceTrait for CapturingUsageService {
                     0,
                     Some(*image_count),
                     InferenceType::ImageGeneration,
+                ),
+                RecordUsageApiRequest::AudioTranscription {
+                    model,
+                    duration_seconds,
+                    ..
+                } => (
+                    model.clone(),
+                    *duration_seconds,
+                    0,
+                    0,
+                    None,
+                    InferenceType::AudioTranscription,
                 ),
                 RecordUsageApiRequest::Embedding {
                     model,

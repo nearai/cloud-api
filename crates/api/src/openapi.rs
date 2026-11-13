@@ -8,11 +8,11 @@ use utoipa::{Modify, OpenApi};
 #[openapi(
     info(
         title = "NEAR AI Cloud API",
-        description = "A comprehensive cloud API for AI model inference, temporary confidential-data migration views, and organization administration.\n\n## Authentication\n\nThis API supports four authentication methods:\n\n1. **Access Token (JWT)**: Use `Authorization: Bearer <jwt_token>` with a short-lived JWT access token for most API endpoints. Obtain this by calling POST /users/me/access_tokens with a refresh token.\n2. **Refresh Token**: Use `Authorization: Bearer <refresh_token>` (prefix: `rt_`) only with POST /users/me/access_tokens to create new JWT access tokens. Obtained from OAuth login.\n3. **API Key (Programmatic Access)**: Use `Authorization: Bearer sk-<api_key>` with an API key (prefix: `sk-`).\n4. **Admin Access Token**: Use `Authorization: Bearer adm_<token>` with approved admin operations. `read_only` permits explicitly approved reads across organizations; `read_write` preserves admin-token write access. Token management always requires an admin session.\n\nClick the **Authorize** button above to configure authentication.
+        description = "A comprehensive cloud API for AI model inference, temporary confidential-data migration views, and organization administration.\n\n## Authentication\n\nThis API supports four authentication methods:\n\n1. **Access Token (JWT)**: Use `Authorization: Bearer <jwt_token>` with a short-lived JWT access token for most API endpoints. Obtain this by calling POST /users/me/access_tokens with a refresh token.\n2. **Refresh Token**: Use `Authorization: Bearer <refresh_token>` (prefix: `rt_`) only with POST /users/me/access_tokens to create new JWT access tokens. Obtained from OAuth login.\n3. **API Key (Programmatic Access)**: Use `Authorization: Bearer sk-<api_key>` with an API key (prefix: `sk-`).\n4. **Admin Access Token**: Use `Authorization: Bearer adm_<token>` with approved admin operations. `read_only` permits explicitly approved reads across organizations; `read_write` preserves admin-token write access.\n\nClick the **Authorize** button above to configure authentication.
 
 ## Deprecations
 
-Operations marked deprecated (account, organization, workspace, invitation, API key, usage, billing, service pricing, staking and admin endpoints) are moving to cloud-platform at the same path. Feature-request and catalog-administration endpoints have moved and are no longer served here. The cloud-platform base URL has not been published yet, and behaviour may differ in edge cases. Inference and content endpoints (chat completions, responses, conversations, embeddings, images, audio, files, attestation) are unaffected.",
+Operations marked deprecated (account, organization, workspace, API key, usage, billing, service pricing, staking and admin endpoints) are moving to cloud-platform at the same path. Feature-request and catalog-administration endpoints have moved and are no longer served here. The cloud-platform base URL has not been published yet, and behaviour may differ in edge cases. Inference and content endpoints (chat completions, responses, conversations, embeddings, images, audio, files, attestation) are unaffected.",
         version = "1.0.0",
         contact(
             name = "NEAR AI Team",
@@ -35,10 +35,9 @@ Operations marked deprecated (account, organization, workspace, invitation, API 
         (name = "Files", description = "Temporary authenticated, workspace-scoped migration access for export and account deletion. Only `GET /v1/files`, `GET /v1/files/{file_id}`, `GET /v1/files/{file_id}/content`, and `DELETE /v1/files/{file_id}` are available. Upload and every other mutation return `410 Gone`; this surface will be removed after data migration. Migration responses use `Cache-Control: no-store`."),
         (name = "Responses", description = "Stateless response inference. Both paths normalize omitted or null `store` to `false` and reject `store: true`. Raw request/response content, response items, and history are not persisted. Clients must include any prior context in each request. Canonical `openai/` models use one upstream native Responses request after alias resolution. Other models use the typed adapter, with bounded request-scoped inference rounds when hosted search is requested.\n\nBoth paths accept client-managed `function` and `custom` tools, including tools grouped in a `namespace`, and leading developer `additional_tools` declarations. Cloud returns calls without executing them; clients replay each `function_call` or `custom_tool_call` with its matching output and caller-managed history. Preserve `call_id`, names, namespaces, raw arguments or custom input, and provider metadata such as `thought_signature`. The typed replay path accepts assistant `output_text` parts and plaintext `reasoning` items, using reasoning content or its summary as prior assistant context. Encrypted-only reasoning requires a native Responses backend. The typed adapter supports text custom tools and the Codex `exec` Lark source grammar; other grammars require a native backend.\n\nEach generated item has its own `output_index`. Tool calls finish with `response.output_item.done`; a successful model turn ends with `response.completed`, including when tools await client execution. Reasoning uses `response.reasoning_text.delta`; failures expose `response.error` in `response.failed` and preserve partial usage.\n\nThe typed adapter executes `web_search` and `web_context_search` using a bounded request-scoped loop, emits search lifecycle events and URL citations, and accumulates usage across inference rounds without storing history. Optional `web_search.count` (0–20) overrides model-selected counts; 0 skips the search provider. If a model emits client tool calls and searches in the same round, client calls are returned without executing that round's searches. On the typed path, completed search output markers may accompany replayed assistant text, but raw search results are not restored across requests. Native Responses also accepts top-level `web_search`, executed by the upstream provider without a Cloud search loop. Complete native `web_search_call` replay items, search configuration, and `include` are forwarded unchanged; provider-returned search citations and sources retain their native shape. `file_search`, `code_interpreter`, and `computer` are unsupported. MCP tools are no longer supported: a request that declares an `mcp` tool returns 400 with `param: \"tools\"`. Image-generation/editing models are rejected on both paths. The separate `POST /mcp` endpoint exposes its `web_search` tool independently of Responses; use `/v1/images/*` for image generation/editing. Existing completed-response gateway attestation is preserved best-effort: when the signature write succeeds, `GET /v1/signature/resp_*` retrieves signatures over SHA-256 request/response digests, never raw content. Interrupted streams create no `resp_*` attestation record or legacy disconnect fallback. Responses rejects conversation linkage, response history, and file input; the separate Conversation and File endpoints are not part of Responses inference."),
         (name = "Organizations", description = "Organization management"),
-        (name = "Organization Members", description = "Organization member and invitation management"),
+        (name = "Organization Members", description = "Organization member management"),
         (name = "Workspaces", description = "Workspace and API key management"),
         (name = "Users", description = "User profile and token management"),
-        (name = "Invitations", description = "Token-based invitation handling"),
         (name = "Usage", description = "Usage tracking and billing information"),
         (name = "Billing", description = "Billing costs endpoint (HuggingFace integration)"),
         (name = "Staking Farm", description = "House of Stake farm credit configuration and synchronization"),
@@ -88,26 +87,12 @@ Operations marked deprecated (account, organization, workspace, invitation, API 
         // Organization endpoints
         crate::routes::organizations::list_organizations,
         crate::routes::organizations::create_organization,
-        crate::routes::organizations::get_organization,
-        crate::routes::organizations::update_organization,
-        crate::routes::organizations::delete_organization,
-        crate::routes::organizations::get_organization_settings,
-        crate::routes::organizations::patch_organization_settings,
         // Organization Members endpoints
         crate::routes::organization_members::add_organization_member,
-        crate::routes::organization_members::invite_organization_member_by_email,
-        crate::routes::organization_members::update_organization_member,
-        crate::routes::organization_members::remove_organization_member,
         crate::routes::organization_members::list_organization_members,
-        crate::routes::organization_members::list_organization_invitations,
-        crate::routes::organization_members::cancel_organization_invitation,
-        crate::routes::organization_members::cancel_invitation,
         // Workspace endpoints
         crate::routes::workspaces::create_workspace,
         crate::routes::workspaces::list_organization_workspaces,
-        crate::routes::workspaces::get_workspace,
-        crate::routes::workspaces::update_workspace,
-        crate::routes::workspaces::delete_workspace,
         crate::routes::workspaces::create_workspace_api_key,
         crate::routes::workspaces::list_workspace_api_keys,
         crate::routes::workspaces::revoke_workspace_api_key,
@@ -115,21 +100,9 @@ Operations marked deprecated (account, organization, workspace, invitation, API 
         crate::routes::workspaces::update_workspace_api_key,
         // Users endpoints
         crate::routes::users::get_current_user,
-        crate::routes::users::get_user_status,
-        crate::routes::users::update_current_user_profile,
-        crate::routes::users::request_contact_email,
-        crate::routes::users::remove_contact_email,
-        crate::routes::users::verify_contact_email,
         crate::routes::users::get_user_refresh_tokens,
         crate::routes::users::revoke_user_refresh_token,
-        crate::routes::users::revoke_all_user_tokens,
         crate::routes::users::create_access_token,
-        crate::routes::users::list_user_invitations,
-        crate::routes::users::accept_invitation,
-        crate::routes::users::decline_invitation,
-        // Invitation endpoints (token-based)
-        crate::routes::users::get_invitation_by_token,
-        crate::routes::users::accept_invitation_by_token,
         // Usage endpoints
         crate::routes::usage::get_organization_balance,
         crate::routes::usage::get_organization_usage_history,
@@ -144,20 +117,11 @@ Operations marked deprecated (account, organization, workspace, invitation, API 
         // Billing endpoints (HuggingFace integration)
         crate::routes::billing::get_billing_costs,
         // Admin endpoints (less frequently used)
-        crate::routes::admin::preview_user_erasure,
-        crate::routes::admin::erase_user,
-        crate::routes::admin::lookup_user_erasures,
         crate::routes::admin::get_organization_metrics,
         crate::routes::credit_transfers::create,
         crate::routes::credit_transfers::history,
         crate::routes::credit_transfers::capacity,
         crate::routes::admin::get_infra_summary,
-        crate::routes::admin::list_invitation_email_deliveries,
-        crate::routes::admin::resend_invitation_email,
-        crate::routes::admin::update_organization_member_role,
-        crate::routes::admin::create_admin_access_token,
-        crate::routes::admin::list_admin_access_tokens,
-        crate::routes::admin::delete_admin_access_token,
         crate::routes::services::list_services,
         crate::routes::services::get_service_by_name,
         // Health check endpoint
@@ -195,39 +159,22 @@ Operations marked deprecated (account, organization, workspace, invitation, API 
             ScoreRequest, ScoreResponse,
             // Organization models
             CreateOrganizationRequest, OrganizationResponse,
-            UpdateOrganizationRequest, CreateApiKeyRequest, ApiKeyResponse,
+            CreateApiKeyRequest, ApiKeyResponse,
             UpdateApiKeySpendLimitRequest, UpdateApiKeyRequest,
             // Workspace models
             crate::routes::workspaces::CreateWorkspaceRequest,
-            crate::routes::workspaces::UpdateWorkspaceRequest,
             crate::routes::workspaces::WorkspaceResponse,
             // Organization Members models
             AddOrganizationMemberRequest,
-            InvitationEntry,
-            InviteOrganizationMemberByEmailRequest,
-            InvitationResult,
-            InviteOrganizationMemberByEmailResponse,
-            UpdateOrganizationMemberRequest,
             OrganizationMemberResponse,
             PublicOrganizationMemberResponse,
             MemberRole,
-            // Organization Invitation models
-            InvitationStatus,
-            InvitationEmailStatus,
-            OrganizationInvitationResponse,
-            OrganizationInvitationWithOrgResponse,
-            AcceptInvitationResponse,
             // Users models
             UserResponse,
             RefreshTokenResponse,
             AccessAndRefreshTokenResponse,
             PublicUserResponse,
             AdminUserResponse,
-            crate::routes::users::UpdateUserProfileRequest,
-            crate::routes::users::UserStatusResponse,
-            crate::routes::users::RequestContactEmailRequest,
-            crate::routes::users::VerifyContactEmailRequest,
-            crate::routes::users::ContactEmailStatusResponse,
             // Temporary Conversation migration models
             BatchConversationsRequest, ConversationBatchResponse, ConversationObject,
             ConversationItemList, ConversationDeleteResult,
@@ -250,18 +197,6 @@ Operations marked deprecated (account, organization, workspace, invitation, API 
             ModelListResponse, ModelWithPricing, UpcomingPricing,
             DecimalPrice, ModelMetadata, CreditType,
             ServiceResponse, ServiceListResponse,
-            // Invitation email delivery models (Admin)
-            AdminInvitationEmailDeliveryResponse, ListAdminInvitationEmailDeliveriesResponse,
-            AdminInvitationEmailResendResultResponse,
-            // User models (Admin)
-            ErasurePreviewResponse, ErasedOrganizationResponse, RetainedOrganizationResponse,
-            ErasureLogResponse, EraseUserRequest, EraseUserResponse, ErasureBlockedResponse,
-            LookupUserErasuresRequest, LookupUserErasuresResponse, UserErasureRecordResponse,
-            ErasureLookupOrganizationResponse,
-            services::user_erasure::ErasureBlocker,
-            // Admin access token models
-            CreateAdminAccessTokenRequest, AdminAccessTokenResponse,
-            AdminAccessTokenPermission, AdminAccessTokenListEntry, ListAdminAccessTokensResponse,
             // Usage tracking models
             crate::routes::usage::OrganizationBalanceResponse,
             crate::routes::usage::UsageHistoryResponse,
@@ -319,7 +254,7 @@ impl Modify for AdminPermissionsAddon {
                     HttpBuilder::new()
                         .scheme(HttpAuthScheme::Bearer)
                         .bearer_format("adm_")
-                        .description(Some("Opaque admin access token. Permission is immutable and applies across organizations: read_only allows approved reads; read_write allows admin mutations. Both require the creator to remain an admin. Token management requires an admin session. Usage bookkeeping and audit logging remain enabled."))
+                        .description(Some("Opaque admin access token. Permission is immutable and applies across organizations: read_only allows approved reads; read_write allows admin mutations. Both require the creator to remain an admin. Usage bookkeeping and audit logging remain enabled."))
                         .build(),
                 ),
             );
@@ -343,30 +278,18 @@ impl Modify for AdminPermissionsAddon {
                 let description = match policy {
                     AdminOperation::Read => "Admin permissions: admin session, read_write token, or read_only token. Approved read across organizations; does not mutate business state.",
                     AdminOperation::Write => "Admin permissions: admin session or read_write token. A read_only token receives HTTP 403 with error.type insufficient_permissions before the handler runs.",
-                    AdminOperation::SessionOnly => "Admin permissions: admin session only. Both read_only and read_write admin tokens receive HTTP 403 with error.type forbidden.",
                 };
                 let existing = operation.description.get_or_insert_default();
                 if !existing.is_empty() {
                     existing.push_str("\n\n");
                 }
                 existing.push_str(description);
-                let mut security = vec![SecurityRequirement::new(
-                    "session_token",
-                    Vec::<String>::new(),
-                )];
-                if policy != AdminOperation::SessionOnly {
-                    security.push(SecurityRequirement::new(
-                        "admin_token",
-                        Vec::<String>::new(),
-                    ));
-                }
-                operation.security = Some(security);
+                operation.security = Some(vec![
+                    SecurityRequirement::new("session_token", Vec::<String>::new()),
+                    SecurityRequirement::new("admin_token", Vec::<String>::new()),
+                ]);
 
-                let forbidden = if policy == AdminOperation::SessionOnly {
-                    "Admin session required; admin tokens receive error.type forbidden."
-                } else {
-                    "Missing admin privileges (forbidden) or insufficient token permission (insufficient_permissions)."
-                };
+                let forbidden = "Missing admin privileges (forbidden) or insufficient token permission (insufficient_permissions).";
                 let response = operation
                     .responses
                     .responses
@@ -465,7 +388,7 @@ impl Modify for SecurityAddon {
 #[cfg(test)]
 mod admin_token_permission_tests {
     use super::*;
-    use serde_json::{json, Value};
+    use serde_json::json;
 
     #[test]
     fn database_encryption_schema_exposes_rotation_requests_and_keys() {
@@ -582,91 +505,26 @@ mod admin_token_permission_tests {
     }
 
     #[test]
-    fn permission_request_defaults_only_when_omitted() {
-        let body = json!({"name": "test", "reason": "test", "expires_in_hours": 24});
-        let request: CreateAdminAccessTokenRequest = serde_json::from_value(body.clone()).unwrap();
-        assert_eq!(request.permission, AdminAccessTokenPermission::ReadWrite);
-        for (value, expected) in [
-            ("read_only", AdminAccessTokenPermission::ReadOnly),
-            ("read_write", AdminAccessTokenPermission::ReadWrite),
-        ] {
-            let mut body = body.clone();
-            body["permission"] = json!(value);
-            let request: CreateAdminAccessTokenRequest = serde_json::from_value(body).unwrap();
-            assert_eq!(request.permission, expected);
-        }
-        for value in [Value::Null, json!("unknown"), json!(false)] {
-            let mut body = body.clone();
-            body["permission"] = value;
-            assert!(serde_json::from_value::<CreateAdminAccessTokenRequest>(body).is_err());
-        }
-        assert!("unknown"
-            .parse::<database::models::AdminAccessTokenPermission>()
-            .is_err());
-    }
-
-    #[test]
-    fn permission_schema_and_admin_authorization_are_documented() {
+    fn admin_authorization_is_documented() {
         let doc = serde_json::to_value(ApiDoc::openapi()).unwrap();
-        let schemas = &doc["components"]["schemas"];
-        assert_eq!(
-            schemas["AdminAccessTokenPermission"]["enum"],
-            json!(["read_only", "read_write"])
-        );
-        let create = &schemas["CreateAdminAccessTokenRequest"];
-        assert_eq!(create["properties"]["permission"]["default"], "read_write");
-        assert!(!create["required"]
-            .as_array()
-            .unwrap()
-            .contains(&json!("permission")));
-        for model in ["AdminAccessTokenResponse", "AdminAccessTokenListEntry"] {
-            assert!(schemas[model]["properties"].get("permission").is_some());
-        }
-        for (path, method, phrase, tokens_allowed) in [
-            (
-                "/v1/admin/invitation-email-deliveries",
-                "get",
-                "read_only token",
-                true,
-            ),
-            (
-                "/v1/admin/users/{user_id}/erasure/preview",
-                "post",
-                "read_only token",
-                true,
-            ),
-            ("/v1/admin/access-tokens", "get", "session only", false),
-            ("/v1/admin/access-tokens", "post", "session only", false),
-            (
-                "/v1/admin/access-tokens/{token_id}",
-                "delete",
-                "session only",
-                false,
-            ),
+        for (path, method) in [
+            ("/v1/admin/organizations/{org_id}/metrics", "get"),
+            ("/v1/admin/platform/infra-summary", "get"),
         ] {
             let operation = &doc["paths"][path][method];
             assert!(
-                operation["description"].as_str().unwrap().contains(phrase),
+                operation["description"]
+                    .as_str()
+                    .unwrap()
+                    .contains("read_only token"),
                 "{method} {path}"
             );
             assert!(operation["responses"].get("403").is_some());
-            assert_eq!(
-                operation["security"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .any(|s| s.get("admin_token").is_some()),
-                tokens_allowed
-            );
+            assert!(operation["security"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|s| s.get("admin_token").is_some()));
         }
-        assert!(doc["paths"]["/v1/admin/access-tokens"]["post"]["responses"]
-            .get("503")
-            .is_some());
-        assert!(
-            doc["paths"]["/v1/admin/access-tokens"]["get"]["responses"]["200"]["content"]
-                ["application/json"]["schema"]
-                .to_string()
-                .contains("ListAdminAccessTokensResponse")
-        );
     }
 }

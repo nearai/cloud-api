@@ -26,14 +26,6 @@ pub trait UserServiceTrait: Send + Sync {
     /// Get a user by their ID
     async fn get_user(&self, user_id: UserId) -> Result<User, UserServiceError>;
 
-    /// Update a user's profile
-    async fn update_profile(
-        &self,
-        user_id: UserId,
-        display_name: Option<String>,
-        avatar_url: Option<String>,
-    ) -> Result<User, UserServiceError>;
-
     /// Get all sessions for a user
     async fn get_user_sessions(&self, user_id: UserId) -> Result<Vec<Session>, UserServiceError>;
 
@@ -43,7 +35,4 @@ pub trait UserServiceTrait: Send + Sync {
         user_id: UserId,
         session_id: SessionId,
     ) -> Result<bool, UserServiceError>;
-
-    /// Revoke all sessions for a user
-    async fn revoke_all_sessions(&self, user_id: UserId) -> Result<usize, UserServiceError>;
 }

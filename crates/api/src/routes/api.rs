@@ -2,7 +2,7 @@ use crate::middleware::{auth_middleware, AuthState};
 use crate::ohttp_gateway::{OhttpAttestation, OhttpGateway};
 use axum::{
     middleware::from_fn_with_state,
-    routing::{delete, get, post, put},
+    routing::{delete, get, post},
     Router,
 };
 use services::{
@@ -25,7 +25,6 @@ pub struct AppState {
     pub service_usage_service:
         Arc<dyn services::service_usage::ServiceUsageServiceTrait + Send + Sync>,
     pub user_service: Arc<dyn services::user::UserServiceTrait + Send + Sync>,
-    pub contact_email_service: Arc<services::contact_email::ContactEmailService>,
     pub files_service: Arc<dyn FileServiceTrait + Send + Sync>,
     pub inference_provider_pool: Arc<services::inference_provider_pool::InferenceProviderPool>,
     pub metrics_service: Arc<dyn services::metrics::MetricsServiceTrait>,
@@ -46,10 +45,7 @@ use crate::routes::{
     organization_members::*,
     organizations::*,
     users::{
-        accept_invitation, create_access_token, decline_invitation, get_current_user,
-        get_user_refresh_tokens, get_user_status, list_user_invitations, remove_contact_email,
-        request_contact_email, revoke_all_user_tokens, revoke_user_refresh_token,
-        update_current_user_profile, verify_contact_email,
+        create_access_token, get_current_user, get_user_refresh_tokens, revoke_user_refresh_token,
     },
 };
 
@@ -58,41 +54,10 @@ pub fn build_management_router(app_state: AppState, auth_state: AuthState) -> Ro
     // Organization routes
     let org_routes = Router::new()
         .route("/", get(list_organizations).post(create_organization))
-        .route(
-            "/{id}",
-            get(get_organization)
-                .put(update_organization)
-                .delete(delete_organization),
-        )
-        // Organization settings management
-        .route(
-            "/{id}/settings",
-            get(get_organization_settings).patch(patch_organization_settings),
-        )
         // Organization member management
         .route(
             "/{id}/members",
             get(list_organization_members).post(add_organization_member),
-        )
-        .route(
-            "/{id}/members/invite-by-email",
-            axum::routing::post(invite_organization_member_by_email),
-        )
-        .route(
-            "/{id}/members/invitations",
-            get(list_organization_invitations),
-        )
-        .route(
-            "/{id}/members/invitations/{invitation_id}",
-            delete(cancel_organization_invitation),
-        )
-        .route(
-            "/{id}/invitations/{invitation_id}",
-            delete(cancel_invitation),
-        )
-        .route(
-            "/{id}/members/{user_id}",
-            put(update_organization_member).delete(remove_organization_member),
         )
         .route(
             "/{id}/usage/balance",
@@ -122,27 +87,11 @@ pub fn build_management_router(app_state: AppState, auth_state: AuthState) -> Ro
     // User routes (require access token authentication)
     let user_routes = Router::new()
         .route("/me", get(get_current_user))
-        .route("/me/status", get(get_user_status))
-        .route("/me/profile", put(update_current_user_profile))
-        .route(
-            "/me/contact-email",
-            axum::routing::post(request_contact_email).delete(remove_contact_email),
-        )
-        .route("/me/invitations", get(list_user_invitations))
-        .route(
-            "/me/invitations/{invitation_id}/accept",
-            axum::routing::post(accept_invitation),
-        )
-        .route(
-            "/me/invitations/{invitation_id}/decline",
-            axum::routing::post(decline_invitation),
-        )
         .route("/me/refresh-tokens", get(get_user_refresh_tokens))
         .route(
             "/me/refresh-tokens/{refresh_token_id}",
             delete(revoke_user_refresh_token),
-        )
-        .route("/me/tokens", delete(revoke_all_user_tokens));
+        );
 
     // Refresh token routes (require refresh token authentication)
     let refresh_token_routes = Router::new()
@@ -156,15 +105,6 @@ pub fn build_management_router(app_state: AppState, auth_state: AuthState) -> Ro
             crate::middleware::auth::refresh_middleware,
         ));
 
-    // Contact email confirmation is public: the emailed token is the credential,
-    // and the link may be opened in a browser with no session.
-    let contact_email_verify_routes = Router::new()
-        .route(
-            "/users/contact-email/verify",
-            axum::routing::post(verify_contact_email),
-        )
-        .with_state(app_state.clone());
-
     // Combine all routes with appropriate auth middleware
     Router::new()
         .nest("/organizations", org_routes)
@@ -172,5 +112,4 @@ pub fn build_management_router(app_state: AppState, auth_state: AuthState) -> Ro
         .with_state(app_state)
         .layer(from_fn_with_state(auth_state, auth_middleware))
         .merge(refresh_token_routes)
-        .merge(contact_email_verify_routes)
 }

@@ -1507,10 +1507,7 @@ fn default_n() -> Option<i64> {
 // Common validation helpers (re-exported)
 // ============================================
 
-use crate::consts::{
-    MAX_DESCRIPTION_LENGTH, MAX_EMAIL_LENGTH, MAX_INVITATIONS_PER_REQUEST, MAX_METADATA_SIZE_BYTES,
-    MAX_NAME_LENGTH, MAX_SETTINGS_SIZE_BYTES, MAX_SYSTEM_PROMPT_LENGTH,
-};
+use crate::consts::{MAX_DESCRIPTION_LENGTH, MAX_METADATA_SIZE_BYTES, MAX_NAME_LENGTH};
 use crate::routes::common::{validate_max_length, validate_non_empty_field};
 
 /// Reject non-positive token limits with an error naming the supplied parameter.
@@ -2669,49 +2666,6 @@ impl CreateOrganizationRequest {
     }
 }
 
-/// Request to update an organization
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
-#[serde(deny_unknown_fields)]
-pub struct UpdateOrganizationRequest {
-    pub name: Option<String>,
-    pub description: Option<String>,
-    pub rate_limit: Option<i32>,
-    pub settings: Option<serde_json::Value>,
-}
-
-impl UpdateOrganizationRequest {
-    pub fn validate(&self) -> Result<(), String> {
-        if let Some(name) = &self.name {
-            validate_non_empty_field(name, "name")?;
-            validate_max_length(name, "name", MAX_NAME_LENGTH)?;
-        }
-
-        if let Some(desc) = &self.description {
-            validate_max_length(desc, "description", MAX_DESCRIPTION_LENGTH)?;
-        }
-
-        if let Some(rate) = self.rate_limit {
-            if rate <= 0 {
-                return Err("rate_limit must be positive".to_string());
-            }
-        }
-
-        if let Some(settings) = &self.settings {
-            // Cap settings size to protect DB from extremely large blobs
-            let serialized =
-                serde_json::to_string(settings).map_err(|_| "Invalid settings JSON".to_string())?;
-            if serialized.len() > MAX_SETTINGS_SIZE_BYTES {
-                return Err(format!(
-                    "settings is too large (max {} bytes when serialized)",
-                    MAX_SETTINGS_SIZE_BYTES
-                ));
-            }
-        }
-
-        Ok(())
-    }
-}
-
 /// Organization response model
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct OrganizationResponse {
@@ -2751,103 +2705,6 @@ pub struct AddOrganizationMemberRequest {
     pub role: MemberRole,
 }
 
-/// Individual invitation entry with email and role
-#[derive(Debug, Clone, Deserialize, ToSchema)]
-pub struct InvitationEntry {
-    pub email: String,
-    pub role: MemberRole,
-}
-
-fn is_basic_valid_email(email: &str) -> bool {
-    // Reject spaces outright
-    if email.contains(' ') {
-        return false;
-    }
-
-    // Require exactly one '@' and non-empty local/domain parts
-    let (local, domain) = match email.split_once('@') {
-        Some(parts) => parts,
-        None => return false,
-    };
-    if local.is_empty() || domain.is_empty() {
-        return false;
-    }
-
-    // Ensure there are no additional '@' characters in the domain part
-    if domain.contains('@') {
-        return false;
-    }
-
-    // Require at least one dot in the domain, not at start or end
-    if !domain.contains('.') {
-        return false;
-    }
-    if domain.starts_with('.') || domain.ends_with('.') {
-        return false;
-    }
-
-    true
-}
-
-impl InvitationEntry {
-    pub fn validate(&self) -> Result<(), String> {
-        validate_non_empty_field(&self.email, "email")?;
-        validate_max_length(&self.email, "email", MAX_EMAIL_LENGTH)?;
-        if !is_basic_valid_email(&self.email) {
-            return Err("email is not a valid email address".to_string());
-        }
-        Ok(())
-    }
-}
-
-/// Request to invite organization members by email
-#[derive(Debug, Deserialize, ToSchema)]
-pub struct InviteOrganizationMemberByEmailRequest {
-    pub invitations: Vec<InvitationEntry>,
-}
-
-impl InviteOrganizationMemberByEmailRequest {
-    pub fn validate(&self) -> Result<(), String> {
-        if self.invitations.is_empty() {
-            return Err("invitations cannot be empty".to_string());
-        }
-
-        // Prevent abuse with very large batches
-        if self.invitations.len() > MAX_INVITATIONS_PER_REQUEST {
-            return Err(format!(
-                "Maximum {} invitations per request",
-                MAX_INVITATIONS_PER_REQUEST
-            ));
-        }
-
-        for (idx, inv) in self.invitations.iter().enumerate() {
-            if let Err(e) = inv.validate() {
-                return Err(format!("invitations[{idx}]: {e}"));
-            }
-        }
-
-        Ok(())
-    }
-}
-
-/// Request to update an organization member
-#[derive(Debug, Deserialize, ToSchema)]
-pub struct UpdateOrganizationMemberRequest {
-    pub role: MemberRole,
-}
-
-/// Organization settings structure
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct OrganizationSettings {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub system_prompt: Option<String>,
-    /// Whether requests may use providers configured as fallbacks.
-    pub fallback_enabled: bool,
-    /// The only models the organization's API keys may use (canonical names,
-    /// sorted), on every route and in `GET /v1/models`. Null: every model.
-    pub allowed_models: Option<Vec<String>>,
-}
-
 /// Wrapper type to distinguish between "field not provided" and "field explicitly set to null"
 /// - Outer None = field not in request body (don't modify)
 /// - Some(None) = field explicitly set to null (delete/clear)
@@ -2862,68 +2719,6 @@ where
 {
     // If the field is present, deserialize it as Option<T>
     Ok(Some(Option::deserialize(deserializer)?))
-}
-
-/// Request to patch organization settings (PATCH endpoint)
-/// Supports three states per field:
-/// - Omit field: no change
-/// - Set to null: delete/clear the field
-/// - Set to value: update the field
-#[derive(Debug, Deserialize, ToSchema)]
-pub struct PatchOrganizationSettingsRequest {
-    /// System prompt for the organization
-    #[serde(default, deserialize_with = "deserialize_nullable")]
-    #[schema(value_type = Option<String>)]
-    pub system_prompt: Nullable<String>,
-    /// Enable/disable configured fallback providers. Null restores the default.
-    #[serde(default, deserialize_with = "deserialize_nullable")]
-    #[schema(value_type = Option<bool>)]
-    pub fallback_enabled: Nullable<bool>,
-    /// Limit the organization's API keys to these models (names or aliases,
-    /// at most 256; stored and returned as canonical names). Every other model
-    /// is answered as if it did not exist. Null allows every model again; an
-    /// empty list is rejected. Owners and admins only.
-    #[serde(default, deserialize_with = "deserialize_nullable")]
-    #[schema(value_type = Option<Vec<String>>)]
-    pub allowed_models: Nullable<Vec<String>>,
-}
-
-impl PatchOrganizationSettingsRequest {
-    pub fn validate(&self) -> Result<(), String> {
-        if let Some(Some(prompt)) = &self.system_prompt {
-            validate_max_length(prompt, "system_prompt", MAX_SYSTEM_PROMPT_LENGTH)?;
-        }
-        Ok(())
-    }
-}
-
-/// Response containing organization settings
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
-pub struct OrganizationSettingsResponse {
-    pub settings: OrganizationSettings,
-}
-
-/// Result of a single invitation attempt
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct InvitationResult {
-    pub email: String,
-    pub success: bool,
-    pub email_sent: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub member: Option<OrganizationMemberResponse>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub email_error: Option<String>,
-}
-
-/// Response for batch invitation requests
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
-pub struct InviteOrganizationMemberByEmailResponse {
-    pub results: Vec<InvitationResult>,
-    pub total: usize,
-    pub successful: usize,
-    pub failed: usize,
 }
 
 /// Public organization member response (for regular members)
@@ -2983,93 +2778,6 @@ pub struct AdminUserOrganizationDetails {
     pub current_usage: Option<OrganizationUsage>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct ErasedOrganizationResponse {
-    pub id: String,
-    pub lifecycle: services::lifecycle::OrganizationLifecycle,
-    pub workspaces: i64,
-    pub api_keys: i64,
-    pub conversations: i64,
-    pub files: i64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct RetainedOrganizationResponse {
-    pub id: String,
-    pub role: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct ErasureLogResponse {
-    pub requested_at: DateTime<Utc>,
-    pub erased_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct ErasurePreviewResponse {
-    pub user_id: String,
-    pub lifecycle: services::lifecycle::UserLifecycle,
-    pub blockers: Vec<services::user_erasure::ErasureBlocker>,
-    pub erased_organizations: Vec<ErasedOrganizationResponse>,
-    pub retained_organizations: Vec<RetainedOrganizationResponse>,
-    pub log: Option<ErasureLogResponse>,
-}
-
-/// Body of the 409 returned when erasure is blocked: the usual error envelope plus the blockers.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct ErasureBlockedResponse {
-    pub error: ErrorDetail,
-    pub blockers: Vec<services::user_erasure::ErasureBlocker>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct EraseUserRequest {
-    /// Must match the user's current email, ignoring case and surrounding whitespace.
-    /// Typed by the operator as a guard against erasing the wrong id.
-    pub confirm_email: String,
-    /// When the person asked (starts the GDPR response clock). Defaults to now.
-    pub requested_at: Option<DateTime<Utc>>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct EraseUserResponse {
-    pub user_id: String,
-    pub lifecycle: services::lifecycle::UserLifecycle,
-    pub already_erased: bool,
-    pub erased_organization_ids: Vec<String>,
-}
-
-/// Body of the erasure lookup: exactly one of `email` or `user_id`. The email is
-/// compared as a digest and must never appear in a URL or query string.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct LookupUserErasuresRequest {
-    pub email: Option<String>,
-    pub user_id: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct ErasureLookupOrganizationResponse {
-    pub organization_id: String,
-    pub lifecycle: services::lifecycle::OrganizationLifecycle,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct UserErasureRecordResponse {
-    pub user_id: String,
-    pub user_lifecycle: services::lifecycle::UserLifecycle,
-    pub admin_user_id: String,
-    pub requested_at: DateTime<Utc>,
-    pub erased_at: DateTime<Utc>,
-    pub erased_organizations: Vec<ErasureLookupOrganizationResponse>,
-    pub retained_organizations: Vec<ErasureLookupOrganizationResponse>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct LookupUserErasuresResponse {
-    /// Newest `erased_at` first; empty when nothing matches.
-    pub erasures: Vec<UserErasureRecordResponse>,
-}
-
 /// Admin user response model (for owners/admins)
 /// Contains sensitive information only visible to organization owners/admins
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -3116,9 +2824,7 @@ pub struct UserResponse {
     /// placeholder (`{account_id}@near`) for NEAR wallet users.
     pub contact_email: Option<String>,
     pub contact_email_verified: bool,
-    /// True when the user signs in with a NEAR wallet and has no verified contact
-    /// email, so the frontend should ask for one. Always false while contact email
-    /// verification is switched off.
+    /// Always false: contact email verification is not served.
     pub needs_contact_email: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub organizations: Option<Vec<UserOrganizationResponse>>,
@@ -3208,90 +2914,6 @@ impl From<database::models::AdminAccessTokenPermission> for AdminAccessTokenPerm
     }
 }
 
-/// Admin access token request model
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct CreateAdminAccessTokenRequest {
-    /// Number of hours until the token expires (required)
-    pub expires_in_hours: i64,
-    /// Name for the token (required)
-    pub name: String,
-    /// Reason for creating the token (required)
-    pub reason: String,
-    /// Defaults to read_write when omitted for backwards compatibility. Null
-    /// and unknown values are rejected. Revoke and recreate to change permission.
-    #[serde(default)]
-    #[schema(default = "read_write")]
-    pub permission: AdminAccessTokenPermission,
-}
-
-/// Admin access token response model
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct AdminAccessTokenResponse {
-    pub id: String,
-    pub access_token: String,
-    pub created_by_user_id: String,
-    pub created_at: DateTime<Utc>,
-    pub expires_at: DateTime<Utc>,
-    pub name: String,
-    pub reason: String,
-    pub permission: AdminAccessTokenPermission,
-}
-
-/// Persisted admin token metadata. Preserves the existing listing response.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct AdminAccessTokenListEntry {
-    pub id: uuid::Uuid,
-    pub token_hash: String,
-    pub created_by_user_id: uuid::Uuid,
-    pub name: String,
-    pub creation_reason: String,
-    pub created_at: DateTime<Utc>,
-    pub expires_at: DateTime<Utc>,
-    pub last_used_at: Option<DateTime<Utc>>,
-    pub is_active: bool,
-    pub revoked_at: Option<DateTime<Utc>>,
-    pub revoked_by_user_id: Option<uuid::Uuid>,
-    pub revocation_reason: Option<String>,
-    pub user_agent: Option<String>,
-    pub permission: AdminAccessTokenPermission,
-}
-
-impl From<database::models::AdminAccessToken> for AdminAccessTokenListEntry {
-    fn from(token: database::models::AdminAccessToken) -> Self {
-        Self {
-            id: token.id,
-            token_hash: token.token_hash,
-            created_by_user_id: token.created_by_user_id,
-            name: token.name,
-            creation_reason: token.creation_reason,
-            created_at: token.created_at,
-            expires_at: token.expires_at,
-            last_used_at: token.last_used_at,
-            is_active: token.is_active,
-            revoked_at: token.revoked_at,
-            revoked_by_user_id: token.revoked_by_user_id,
-            revocation_reason: token.revocation_reason,
-            user_agent: token.user_agent,
-            permission: token.permission.into(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct ListAdminAccessTokensResponse {
-    pub data: Vec<AdminAccessTokenListEntry>,
-    pub limit: i64,
-    pub offset: i64,
-    pub total: i64,
-}
-
-/// Delete admin access token request model
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct DeleteAdminAccessTokenRequest {
-    /// Reason for revoking the token (required)
-    pub reason: String,
-}
-
 /// API Key response model
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ApiKeyResponse {
@@ -3370,103 +2992,6 @@ impl UpdateApiKeyRequest {
 // ============================================
 // Organization Invitations API Models
 // ============================================
-
-/// Organization invitation status
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq)]
-#[serde(rename_all = "lowercase")]
-pub enum InvitationStatus {
-    Pending,
-    Accepted,
-    Declined,
-    Expired,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ToSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum InvitationEmailStatus {
-    NotAttempted,
-    Sent,
-    Failed,
-    Skipped,
-}
-
-/// Organization invitation response
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct OrganizationInvitationResponse {
-    pub id: String,
-    pub organization_id: String,
-    pub email: String,
-    pub role: MemberRole,
-    pub invited_by_user_id: String,
-    pub status: InvitationStatus,
-    pub created_at: DateTime<Utc>,
-    pub expires_at: DateTime<Utc>,
-    pub responded_at: Option<DateTime<Utc>>,
-    pub email_status: InvitationEmailStatus,
-    pub email_sent_at: Option<DateTime<Utc>>,
-    pub email_last_error: Option<String>,
-    pub email_message_id: Option<String>,
-}
-
-/// Organization invitation with organization details
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct OrganizationInvitationWithOrgResponse {
-    #[serde(flatten)]
-    pub invitation: OrganizationInvitationResponse,
-    pub organization_name: String,
-    pub invited_by_display_name: Option<String>,
-}
-
-/// Admin view of invitation email delivery metadata.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct AdminInvitationEmailDeliveryResponse {
-    pub organization_id: String,
-    pub organization_name: String,
-    pub invitation_id: String,
-    pub recipient_email: String,
-    pub role: MemberRole,
-    pub invitation_status: InvitationStatus,
-    pub email_status: InvitationEmailStatus,
-    pub email_sent_at: Option<DateTime<Utc>>,
-    pub email_last_error: Option<String>,
-    pub email_message_id: Option<String>,
-    pub invited_by_user_id: String,
-    pub invited_by_email: Option<String>,
-    pub invited_by_display_name: Option<String>,
-    pub created_at: DateTime<Utc>,
-    pub expires_at: DateTime<Utc>,
-    pub responded_at: Option<DateTime<Utc>>,
-}
-
-/// Paginated admin invitation email delivery response.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct ListAdminInvitationEmailDeliveriesResponse {
-    pub deliveries: Vec<AdminInvitationEmailDeliveryResponse>,
-    pub total: i64,
-    pub limit: i64,
-    pub offset: i64,
-}
-
-/// Admin invitation email resend result.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct AdminInvitationEmailResendResultResponse {
-    pub invitation_id: String,
-    pub recipient_email: String,
-    pub success: bool,
-    pub email_sent: bool,
-    pub email_status: InvitationEmailStatus,
-    pub email_sent_at: Option<DateTime<Utc>>,
-    pub email_message_id: Option<String>,
-    pub email_last_error: Option<String>,
-    pub error: Option<String>,
-}
-
-/// Accept invitation response
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
-pub struct AcceptInvitationResponse {
-    pub organization_member: OrganizationMemberResponse,
-    pub message: String,
-}
 
 // ============================================
 // Model Listing API Models
@@ -5123,16 +4648,6 @@ mod tests {
         let err = bad.validate_request().expect_err("n zero").error;
         assert_eq!(err.param.as_deref(), Some("n"));
         assert_eq!(err.r#type, "invalid_request_error");
-    }
-
-    #[test]
-    fn test_is_basic_valid_email_accepts_simple_email() {
-        assert!(is_basic_valid_email("user@example.com"));
-    }
-
-    #[test]
-    fn test_is_basic_valid_email_rejects_multiple_ats() {
-        assert!(!is_basic_valid_email("user@domain@example.com"));
     }
 
     fn audio_transcription_req() -> AudioTranscriptionRequest {

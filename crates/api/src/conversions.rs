@@ -277,12 +277,8 @@ pub fn verified_contact_email(
 
 /// Convert services User to API UserResponse (without organizations and workspaces)
 ///
-/// `needs_contact_email` comes from the contact email service, which knows
-/// whether the feature is switched on.
-pub fn services_user_to_api_user(
-    user: &services::auth::User,
-    needs_contact_email: bool,
-) -> crate::models::UserResponse {
+/// `needs_contact_email` is always false: contact email verification is not served.
+pub fn services_user_to_api_user(user: &services::auth::User) -> crate::models::UserResponse {
     let contact_email = verified_contact_email(
         user.contact_email.as_deref(),
         user.contact_email_verified_at,
@@ -301,7 +297,7 @@ pub fn services_user_to_api_user(
         auth_provider: user.auth_provider.clone(),
         contact_email_verified: contact_email.is_some(),
         contact_email,
-        needs_contact_email,
+        needs_contact_email: false,
         organizations: None,
         workspaces: None,
     }
@@ -310,14 +306,13 @@ pub fn services_user_to_api_user(
 /// Convert services User to API UserResponse with organizations and workspaces
 pub fn services_user_to_api_user_with_relations(
     user: &services::auth::User,
-    needs_contact_email: bool,
     organizations: Vec<crate::models::UserOrganizationResponse>,
     workspaces: Vec<crate::models::UserWorkspaceResponse>,
 ) -> crate::models::UserResponse {
     crate::models::UserResponse {
         organizations: Some(organizations),
         workspaces: Some(workspaces),
-        ..services_user_to_api_user(user, needs_contact_email)
+        ..services_user_to_api_user(user)
     }
 }
 
@@ -351,18 +346,6 @@ pub fn api_create_org_req_to_services(
     }
 }
 
-/// Convert API UpdateOrganizationRequest to services request
-pub fn api_update_org_req_to_services(
-    req: crate::models::UpdateOrganizationRequest,
-) -> services::organization::ports::UpdateOrganizationRequest {
-    services::organization::ports::UpdateOrganizationRequest {
-        name: req.name,
-        description: req.description,
-        rate_limit: req.rate_limit,
-        settings: req.settings,
-    }
-}
-
 // Legacy DB conversion functions - TODO: Remove once all routes migrated
 pub fn db_create_org_req_to_services(
     req: database::CreateOrganizationRequest,
@@ -370,17 +353,6 @@ pub fn db_create_org_req_to_services(
     services::organization::ports::CreateOrganizationRequest {
         name: req.name,
         description: req.description,
-    }
-}
-
-pub fn db_update_org_req_to_services(
-    req: database::UpdateOrganizationRequest,
-) -> services::organization::ports::UpdateOrganizationRequest {
-    services::organization::ports::UpdateOrganizationRequest {
-        name: req.name,
-        description: req.description,
-        rate_limit: req.rate_limit,
-        settings: req.settings,
     }
 }
 
@@ -438,29 +410,12 @@ pub fn api_add_member_req_to_services(
     }
 }
 
-/// Convert API UpdateOrganizationMemberRequest to services request
-pub fn api_update_member_req_to_services(
-    req: crate::models::UpdateOrganizationMemberRequest,
-) -> services::organization::ports::UpdateOrganizationMemberRequest {
-    services::organization::ports::UpdateOrganizationMemberRequest {
-        role: api_role_to_services_role(req.role),
-    }
-}
-
 // Legacy DB member conversion functions - TODO: Remove once all routes migrated
 pub fn db_add_member_req_to_services(
     req: database::AddOrganizationMemberRequest,
 ) -> services::organization::ports::AddOrganizationMemberRequest {
     services::organization::ports::AddOrganizationMemberRequest {
         user_id: req.user_id,
-        role: db_role_to_member_role(req.role),
-    }
-}
-
-pub fn db_update_member_req_to_services(
-    req: database::UpdateOrganizationMemberRequest,
-) -> services::organization::ports::UpdateOrganizationMemberRequest {
-    services::organization::ports::UpdateOrganizationMemberRequest {
         role: db_role_to_member_role(req.role),
     }
 }
@@ -588,170 +543,6 @@ pub fn services_member_with_user_to_api(
         role: services_role_to_api_role(member.role),
         joined_at: member.joined_at,
         user: services_user_to_public_user(&member.user),
-    }
-}
-
-/// Convert services InvitationResult to API InvitationResult
-pub fn services_invitation_result_to_api(
-    result: services::organization::InvitationResult,
-) -> crate::models::InvitationResult {
-    crate::models::InvitationResult {
-        email: result.email,
-        success: result.success,
-        email_sent: result.email_sent,
-        member: result.member.map(services_member_to_api_member),
-        error: result.error,
-        email_error: result.email_error,
-    }
-}
-
-/// Convert services InvitationStatus to API InvitationStatus
-pub fn services_invitation_status_to_api(
-    status: services::organization::InvitationStatus,
-) -> crate::models::InvitationStatus {
-    match status {
-        services::organization::InvitationStatus::Pending => {
-            crate::models::InvitationStatus::Pending
-        }
-        services::organization::InvitationStatus::Accepted => {
-            crate::models::InvitationStatus::Accepted
-        }
-        services::organization::InvitationStatus::Declined => {
-            crate::models::InvitationStatus::Declined
-        }
-        services::organization::InvitationStatus::Expired => {
-            crate::models::InvitationStatus::Expired
-        }
-    }
-}
-
-pub fn services_invitation_email_status_to_api(
-    status: services::organization::InvitationEmailStatus,
-) -> crate::models::InvitationEmailStatus {
-    match status {
-        services::organization::InvitationEmailStatus::NotAttempted => {
-            crate::models::InvitationEmailStatus::NotAttempted
-        }
-        services::organization::InvitationEmailStatus::Sent => {
-            crate::models::InvitationEmailStatus::Sent
-        }
-        services::organization::InvitationEmailStatus::Failed => {
-            crate::models::InvitationEmailStatus::Failed
-        }
-        services::organization::InvitationEmailStatus::Skipped => {
-            crate::models::InvitationEmailStatus::Skipped
-        }
-    }
-}
-
-pub fn api_invitation_status_to_services(
-    status: crate::models::InvitationStatus,
-) -> services::organization::InvitationStatus {
-    match status {
-        crate::models::InvitationStatus::Pending => {
-            services::organization::InvitationStatus::Pending
-        }
-        crate::models::InvitationStatus::Accepted => {
-            services::organization::InvitationStatus::Accepted
-        }
-        crate::models::InvitationStatus::Declined => {
-            services::organization::InvitationStatus::Declined
-        }
-        crate::models::InvitationStatus::Expired => {
-            services::organization::InvitationStatus::Expired
-        }
-    }
-}
-
-pub fn api_invitation_email_status_to_services(
-    status: crate::models::InvitationEmailStatus,
-) -> services::organization::InvitationEmailStatus {
-    match status {
-        crate::models::InvitationEmailStatus::NotAttempted => {
-            services::organization::InvitationEmailStatus::NotAttempted
-        }
-        crate::models::InvitationEmailStatus::Sent => {
-            services::organization::InvitationEmailStatus::Sent
-        }
-        crate::models::InvitationEmailStatus::Failed => {
-            services::organization::InvitationEmailStatus::Failed
-        }
-        crate::models::InvitationEmailStatus::Skipped => {
-            services::organization::InvitationEmailStatus::Skipped
-        }
-    }
-}
-
-/// Convert services OrganizationInvitation to API OrganizationInvitationResponse
-pub fn services_invitation_to_api(
-    invitation: services::organization::OrganizationInvitation,
-) -> crate::models::OrganizationInvitationResponse {
-    crate::models::OrganizationInvitationResponse {
-        id: invitation.id.to_string(),
-        organization_id: invitation.organization_id.0.to_string(),
-        email: invitation.email,
-        role: services_role_to_api_role(invitation.role),
-        invited_by_user_id: invitation.invited_by_user_id.0.to_string(),
-        status: services_invitation_status_to_api(invitation.status),
-        created_at: invitation.created_at,
-        expires_at: invitation.expires_at,
-        responded_at: invitation.responded_at,
-        email_status: services_invitation_email_status_to_api(invitation.email_status),
-        email_sent_at: invitation.email_sent_at,
-        email_last_error: invitation.email_last_error,
-        email_message_id: invitation.email_message_id,
-    }
-}
-
-/// Convert services OrganizationInvitationWithDetails to API OrganizationInvitationWithOrgResponse
-pub fn services_invitation_to_api_with_org(
-    invitation: services::organization::OrganizationInvitationWithDetails,
-) -> crate::models::OrganizationInvitationWithOrgResponse {
-    crate::models::OrganizationInvitationWithOrgResponse {
-        organization_name: invitation.organization_name,
-        invited_by_display_name: invitation.invited_by_display_name,
-        invitation: services_invitation_to_api(invitation.invitation),
-    }
-}
-
-pub fn services_invitation_email_delivery_to_api(
-    delivery: services::organization::OrganizationInvitationEmailDelivery,
-) -> crate::models::AdminInvitationEmailDeliveryResponse {
-    let invitation = delivery.invitation;
-
-    crate::models::AdminInvitationEmailDeliveryResponse {
-        organization_id: invitation.organization_id.0.to_string(),
-        organization_name: delivery.organization_name,
-        invitation_id: invitation.id.to_string(),
-        recipient_email: invitation.email,
-        role: services_role_to_api_role(invitation.role),
-        invitation_status: services_invitation_status_to_api(invitation.status),
-        email_status: services_invitation_email_status_to_api(invitation.email_status),
-        email_sent_at: invitation.email_sent_at,
-        email_last_error: invitation.email_last_error,
-        email_message_id: invitation.email_message_id,
-        invited_by_user_id: invitation.invited_by_user_id.0.to_string(),
-        invited_by_email: delivery.invited_by_email,
-        invited_by_display_name: delivery.invited_by_display_name,
-        created_at: invitation.created_at,
-        expires_at: invitation.expires_at,
-        responded_at: invitation.responded_at,
-    }
-}
-
-pub fn services_invitation_resend_result_to_api(
-    result: services::organization::InvitationEmailResendResult,
-) -> crate::models::AdminInvitationEmailResendResultResponse {
-    crate::models::AdminInvitationEmailResendResultResponse {
-        invitation_id: result.invitation_id.to_string(),
-        recipient_email: result.recipient_email,
-        success: result.success,
-        email_sent: result.email_sent,
-        email_status: services_invitation_email_status_to_api(result.email_status),
-        email_sent_at: result.email_sent_at,
-        email_message_id: result.email_message_id,
-        email_last_error: result.email_last_error,
-        error: result.error,
     }
 }
 

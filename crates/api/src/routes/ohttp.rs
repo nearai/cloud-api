@@ -17,6 +17,7 @@ use crate::routes::api::AppState;
 pub enum OhttpError {
     NotEnabled,
     Replayed,
+    RateLimited(Box<Response>),
     BadRequest(String),
     Internal(String),
 }
@@ -24,6 +25,7 @@ pub enum OhttpError {
 impl IntoResponse for OhttpError {
     fn into_response(self) -> Response {
         let (status, msg, kind) = match self {
+            OhttpError::RateLimited(response) => return *response,
             OhttpError::Replayed => (
                 StatusCode::CONFLICT,
                 "OHTTP encapsulation was already used".to_string(),
@@ -391,11 +393,17 @@ async fn claim_authenticated_request(
     // Check both accepted credential forms. An unrelated invalid header must
     // not hide a valid credential used by the inner route.
     for key in [bearer, sdk_key].into_iter().flatten() {
-        match state.auth_service.validate_api_key(key.to_owned()).await {
-            Ok(_) => {}
+        let api_key = match state.auth_service.validate_api_key(key.to_owned()).await {
+            Ok(api_key) => api_key,
             Err(services::auth::AuthError::Unauthorized) => continue,
             Err(_) => return Err(OhttpError::Internal("Unable to validate request".into())),
-        }
+        };
+        crate::middleware::rate_limit::check_ohttp_admission_limit(
+            &gateway.admission_limits,
+            &api_key.id.0,
+        )
+        .await
+        .map_err(|response| OhttpError::RateLimited(Box::new(response.into_response())))?;
         return match gateway.claim_request(encapsulated).await {
             Ok(true) => Ok(()),
             Ok(false) => Err(OhttpError::Replayed),

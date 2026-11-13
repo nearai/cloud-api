@@ -13,6 +13,7 @@ const OHTTP_KEY_ID: u8 = 1;
 pub struct OhttpGateway {
     server: Server,
     replay_store: Option<database::repositories::ohttp_replay::OhttpReplayRepository>,
+    pub(crate) admission_limits: crate::middleware::RateLimitState,
     /// Pre-encoded key configuration bytes for the well-known endpoint.
     config_bytes: Vec<u8>,
 }
@@ -37,6 +38,7 @@ impl OhttpGateway {
         Ok(Self {
             server,
             replay_store: None,
+            admission_limits: crate::middleware::RateLimitState::default(),
             config_bytes,
         })
     }

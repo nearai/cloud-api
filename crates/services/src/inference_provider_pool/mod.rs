@@ -10410,6 +10410,110 @@ mod tests {
         );
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn provider_error_logs_keep_diagnostics_without_upstream_content() {
+        use crate::completions::{ports, CompletionServiceImpl};
+        use crate::test_utils::CapturedLogs;
+
+        for (status, message, expected_status, diagnostic) in [
+            (
+                400,
+                "PROVIDER_BODY_SENTINEL",
+                400,
+                "Client error from provider",
+            ),
+            (
+                500,
+                "PROVIDER_BODY_SENTINEL",
+                502,
+                "Provider failed, will try next provider",
+            ),
+            (
+                500,
+                "cannot identify image file <_io.BytesIO PROVIDER_BODY_SENTINEL>",
+                400,
+                "Client media-fetch failure",
+            ),
+        ] {
+            let (pool, model_id) = pool_with_mock_provider().await;
+            let logs = CapturedLogs::default();
+            let _subscriber = tracing::subscriber::set_default(logs.subscriber());
+            let result: Result<ServedProviderResult<()>, _> = pool
+                .retry_with_fallback(&model_id, "test_op", None, |_provider| async move {
+                    Err(CompletionError::HttpError {
+                        status_code: status,
+                        message: message.to_owned(),
+                        is_external: false,
+                    })
+                })
+                .await;
+            let error = result.err().expect("provider must fail");
+            let mapped = CompletionServiceImpl::map_provider_error(
+                &model_id,
+                &error,
+                "test_op",
+                uuid::Uuid::nil(),
+            );
+            match mapped {
+                ports::CompletionError::InvalidParams(message) => {
+                    assert_eq!(expected_status, 400);
+                    if status == 400 {
+                        assert!(message.contains("PROVIDER_BODY_SENTINEL"));
+                    }
+                }
+                ports::CompletionError::ProviderError {
+                    status_code,
+                    message,
+                } => {
+                    assert_eq!(status_code, expected_status);
+                    assert!(!message.contains("PROVIDER_BODY_SENTINEL"));
+                }
+                other => panic!("unexpected mapped error: {other:?}"),
+            }
+
+            let captured = logs.contents();
+            assert!(captured.contains(diagnostic), "{captured}");
+            assert!(captured.contains(&model_id), "{captured}");
+            assert!(captured.contains("error_kind="), "{captured}");
+            assert!(!captured.contains("PROVIDER_BODY_SENTINEL"), "{captured}");
+        }
+    }
+
+    #[tokio::test]
+    async fn embeddings_error_logs_exclude_upstream_content() {
+        use crate::test_utils::CapturedLogs;
+
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+        let provider = Arc::new(inference_providers::mock::MockProvider::new());
+        provider
+            .set_embedding_error_override(Some(inference_providers::EmbeddingError::HttpError {
+                status_code: 400,
+                message: "EMBEDDING_BODY_SENTINEL".to_owned(),
+            }))
+            .await;
+        pool.register_provider("test-embedding".to_owned(), provider)
+            .await;
+        let logs = CapturedLogs::default();
+        let _subscriber = tracing::subscriber::set_default(logs.subscriber());
+        let result = pool
+            .embeddings("test-embedding", bytes::Bytes::new(), Default::default())
+            .await;
+        assert!(matches!(
+            result,
+            Err(inference_providers::EmbeddingError::HttpError {
+                status_code: 400,
+                ..
+            })
+        ));
+        let captured = logs.contents();
+        assert!(
+            captured.contains("Embeddings failed with provider"),
+            "{captured}"
+        );
+        assert!(captured.contains("status_code=400"), "{captured}");
+        assert!(!captured.contains("EMBEDDING_BODY_SENTINEL"), "{captured}");
+    }
+
     /// Multi-provider, alternating-error test pinning Pierre's blocker: provider
     /// A returns a non-retryable client-media 5xx, provider B (if reached)
     /// would return a retryable 5xx. Without the short-circuit, the for-loop

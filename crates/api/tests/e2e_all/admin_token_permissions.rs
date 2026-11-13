@@ -154,7 +154,7 @@ async fn issuance_gate_does_not_relax_existing_token_permissions() {
         call(
             &server,
             Method::GET,
-            "/v1/admin/api-keys",
+            "/v1/admin/invitation-email-deliveries",
             &token,
             json!({})
         )
@@ -221,16 +221,6 @@ async fn read_only_reads_and_mixed_method_mutations_have_no_side_effects() {
             ),
             json!({"role": "member"}),
         ),
-        (
-            Method::POST,
-            format!("/v1/admin/organizations/{}/staking/farm/sync", org.id),
-            json!({}),
-        ),
-        (
-            Method::POST,
-            "/v1/admin/usage-hourly/recompute".into(),
-            json!({"start": "1900-01-01T00:00:00Z", "end": "1900-01-01T01:00:00Z"}),
-        ),
     ] {
         assert_forbidden(
             &call(&server, method, &route, &read_only, body).await,
@@ -242,7 +232,6 @@ async fn read_only_reads_and_mixed_method_mutations_have_no_side_effects() {
     assert_eq!(job_count().await, jobs_before);
 
     for route in [
-        "/v1/admin/api-keys",
         ENCRYPTION_KEYS,
         "/v1/admin/object-encryption/keys",
         "/v1/admin/invitation-email-deliveries",
@@ -523,7 +512,7 @@ async fn permissions_preserve_expiration_revocation_user_agent_and_admin_eligibi
             call(
                 &server,
                 Method::GET,
-                "/v1/admin/api-keys",
+                "/v1/admin/invitation-email-deliveries",
                 &token,
                 json!({})
             )
@@ -533,7 +522,7 @@ async fn permissions_preserve_expiration_revocation_user_agent_and_admin_eligibi
         );
         for user_agent in [None, Some("different client")] {
             let mut request = server
-                .get("/v1/admin/api-keys")
+                .get("/v1/admin/invitation-email-deliveries")
                 .add_header("Authorization", format!("Bearer {token}"));
             if let Some(ua) = user_agent {
                 request = request.add_header("User-Agent", ua);
@@ -552,7 +541,7 @@ async fn permissions_preserve_expiration_revocation_user_agent_and_admin_eligibi
             &call(
                 &server,
                 Method::GET,
-                "/v1/admin/api-keys",
+                "/v1/admin/invitation-email-deliveries",
                 &token,
                 json!({}),
             )
@@ -575,7 +564,7 @@ async fn permissions_preserve_expiration_revocation_user_agent_and_admin_eligibi
             call(
                 &server,
                 Method::GET,
-                "/v1/admin/api-keys",
+                "/v1/admin/invitation-email-deliveries",
                 &token,
                 json!({})
             )
@@ -598,7 +587,7 @@ async fn permissions_preserve_expiration_revocation_user_agent_and_admin_eligibi
             call(
                 &server,
                 Method::GET,
-                "/v1/admin/api-keys",
+                "/v1/admin/invitation-email-deliveries",
                 &expired,
                 json!({})
             )
@@ -611,7 +600,7 @@ async fn permissions_preserve_expiration_revocation_user_agent_and_admin_eligibi
         call(
             &server,
             Method::GET,
-            "/v1/admin/api-keys",
+            "/v1/admin/invitation-email-deliveries",
             "adm_invalid",
             json!({})
         )
@@ -643,7 +632,7 @@ async fn existing_service_tokens_follow_the_creator_email_allowlist() {
     let response = call(
         &allowed_server,
         Method::GET,
-        "/v1/admin/api-keys",
+        "/v1/admin/invitation-email-deliveries",
         &token,
         json!({}),
     )
@@ -662,7 +651,7 @@ async fn existing_service_tokens_follow_the_creator_email_allowlist() {
             let response = call(
                 &denied_server,
                 Method::GET,
-                "/v1/admin/api-keys",
+                "/v1/admin/invitation-email-deliveries",
                 credential,
                 json!({}),
             )
@@ -687,7 +676,7 @@ async fn existing_service_tokens_follow_the_creator_email_allowlist() {
     let response = call(
         &allowed_server,
         Method::GET,
-        "/v1/admin/api-keys",
+        "/v1/admin/invitation-email-deliveries",
         &token,
         json!({}),
     )

@@ -26,9 +26,6 @@ const REQUEST_ID_HEADER: &str = "x-request-id";
 /// the e2e configuration has a valid encryption key), and the object-encryption
 /// router (using mock storage).
 const MOUNTED_ADMIN_ROUTES: &[(&str, &str)] = &[
-    ("GET", "/admin/organizations/{org_id}/usage/balance"),
-    ("GET", "/admin/organizations/{org_id}/staking/farm"),
-    ("POST", "/admin/organizations/{org_id}/staking/farm/sync"),
     ("GET", "/admin/organizations/{org_id}/metrics"),
     ("GET", "/admin/platform/infra-summary"),
     ("GET", "/admin/invitation-email-deliveries"),
@@ -39,23 +36,10 @@ const MOUNTED_ADMIN_ROUTES: &[(&str, &str)] = &[
     ("POST", "/admin/users/{user_id}/erasure/preview"),
     ("POST", "/admin/users/{user_id}/erasure"),
     ("POST", "/admin/user-erasures/lookup"),
-    ("GET", "/admin/api-keys"),
-    ("GET", "/admin/organizations/{org_id}/members"),
     ("PUT", "/admin/organizations/{org_id}/members/{user_id}"),
     ("POST", "/admin/access-tokens"),
     ("GET", "/admin/access-tokens"),
     ("DELETE", "/admin/access-tokens/{token_id}"),
-    ("GET", "/admin/organizations/{org_id}/policy"),
-    ("PUT", "/admin/organizations/{org_id}/policy"),
-    (
-        "GET",
-        "/admin/organizations/{org_id}/credit/transfer/reconciliation",
-    ),
-    (
-        "POST",
-        "/admin/organizations/{org_id}/credit/reconciliations",
-    ),
-    ("POST", "/admin/usage-hourly/recompute"),
     ("POST", "/admin/database-encryption/scan"),
     ("POST", "/admin/database-encryption/jobs"),
     ("GET", "/admin/database-encryption/jobs/{id}"),
@@ -211,12 +195,8 @@ async fn json_body(response: Response) -> Value {
 
 /// Paginated admin lists the page guard must find in the OpenAPI document. A
 /// newly documented paginated list is checked without being listed here.
-const KNOWN_PAGINATED_ADMIN_LISTS: &[&str] = &[
-    "/admin/access-tokens",
-    "/admin/api-keys",
-    "/admin/invitation-email-deliveries",
-    "/admin/organizations/{org_id}/members",
-];
+const KNOWN_PAGINATED_ADMIN_LISTS: &[&str] =
+    &["/admin/access-tokens", "/admin/invitation-email-deliveries"];
 
 /// Admin GET routes documented with `limit` and `offset` query parameters.
 fn documented_paginated_admin_lists() -> BTreeSet<String> {
@@ -383,19 +363,22 @@ async fn admin_token_identity_is_audited_for_allowed_and_denied_requests() {
         &router,
         authorized(
             Method::GET,
-            "/v1/admin/api-keys?limit=1",
+            "/v1/admin/invitation-email-deliveries?limit=1",
             &read_only_token,
             json!({}),
         ),
     )
     .await;
     assert_eq!(response.status(), StatusCode::OK);
-    let returned = json_body(response).await["api_keys"]
+    let returned = json_body(response).await["deliveries"]
         .as_array()
-        .expect("api_keys")
+        .expect("deliveries")
         .len();
     let event = logs.take_single_event();
-    assert_eq!(event["admin_route"], "/v1/admin/api-keys");
+    assert_eq!(
+        event["admin_route"],
+        "/v1/admin/invitation-email-deliveries"
+    );
     assert_eq!(event["admin_auth_outcome"], "allowed");
     assert_eq!(event["admin_credential_kind"], "admin_access_token");
     assert_eq!(event["admin_credential_id"], read_only.id.to_string());
@@ -444,7 +427,7 @@ async fn admin_token_identity_is_audited_for_allowed_and_denied_requests() {
         &router,
         authorized(
             Method::GET,
-            "/v1/admin/api-keys",
+            "/v1/admin/invitation-email-deliveries",
             &read_write_token,
             json!({}),
         ),
@@ -467,20 +450,6 @@ async fn list_handlers_record_validated_pages_and_organization_scope() {
     let (logs, _guard) = CapturedLogs::start();
 
     let lists = [
-        (
-            format!("/v1/admin/organizations/{organization_id}/members?limit=5&offset=0"),
-            "members",
-            5,
-            0,
-            Some(&organization_id),
-        ),
-        (
-            format!("/v1/admin/api-keys?organization_id={organization_id}&limit=10"),
-            "api_keys",
-            10,
-            0,
-            Some(&organization_id),
-        ),
         (
             "/v1/admin/invitation-email-deliveries?limit=1&offset=2".to_string(),
             "deliveries",
@@ -526,7 +495,7 @@ async fn list_handlers_record_validated_pages_and_organization_scope() {
         &router,
         authorized(
             Method::GET,
-            "/v1/admin/api-keys?limit=0",
+            "/v1/admin/invitation-email-deliveries?limit=0",
             &session,
             json!({}),
         ),
@@ -587,7 +556,7 @@ async fn audit_events_exclude_request_content_on_the_real_router() {
     let (logs, _guard) = CapturedLogs::start();
 
     for uri in [
-        format!("/v1/admin/api-keys?search={EMAIL}&limit=1"),
+        format!("/v1/admin/invitation-email-deliveries?recipient_email={EMAIL}&limit=1"),
         format!("/v1/admin/users/{EMAIL}/lookup"),
     ] {
         let response = send(

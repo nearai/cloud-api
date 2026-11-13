@@ -8,9 +8,7 @@ use std::io::Write;
 #[path = "../common/mod.rs"]
 mod common;
 
-mod admin_api_keys;
 mod admin_audit;
-mod admin_credit_reconciliation;
 mod admin_invitation_email_deliveries;
 mod admin_metrics_credit_type;
 mod admin_organization_members;
@@ -18,7 +16,6 @@ mod admin_organization_metrics;
 mod admin_provider_attribution_support;
 mod admin_retired_routes;
 mod admin_token_permissions;
-mod admin_usage_hourly_repair;
 mod anthropic_signatures;
 mod api_key_usage_hourly;
 mod api_keys;
@@ -82,7 +79,6 @@ mod privacy_settlement;
 mod privacy_signatures;
 mod provider_errors;
 mod reasoning;
-mod reporting_usage;
 mod repositories;
 mod request_id_contract;
 mod request_priority;

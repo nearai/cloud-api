@@ -161,11 +161,6 @@ fn auth_state(admin_emails: &[&str]) -> AuthState {
         Arc::new(database::repositories::WorkspaceRepository::new(
             pool.clone(),
         )),
-        Arc::new(
-            services::reporting_tokens::OrganizationReportingTokenServiceImpl::new(Arc::new(
-                database::repositories::OrganizationReportingTokenRepository::new(pool.clone()),
-            )),
-        ),
         // No database: validating an admin access token fails as a 500.
         Arc::new(database::repositories::AdminAccessTokenRepository::new(
             pool,
@@ -198,12 +193,12 @@ async fn probe(headers: HeaderMap) -> &'static str {
     }
 }
 
-async fn members_probe(audit: AdminAudit) -> &'static str {
+async fn metrics_probe(audit: AdminAudit) -> &'static str {
     audit.record_page(PROBE_LIMIT, PROBE_OFFSET, PROBE_RETURNED);
     "ok"
 }
 
-async fn api_keys_probe(audit: AdminAudit) -> &'static str {
+async fn deliveries_probe(audit: AdminAudit) -> &'static str {
     audit.record_organization(FILTER_ORGANIZATION_ID);
     "ok"
 }
@@ -211,9 +206,9 @@ async fn api_keys_probe(audit: AdminAudit) -> &'static str {
 fn app(admin_emails: &[&str], entered_slow_handler: Arc<Notify>) -> Router {
     let admin_routes = Router::new()
         .route("/admin/probe", get(probe))
-        .route("/admin/api-keys", get(api_keys_probe))
+        .route("/admin/invitation-email-deliveries", get(deliveries_probe))
         .route("/admin/organizations/{org_id}", get(|| async { "ok" }))
-        .route("/admin/organizations/{org_id}/members", get(members_probe))
+        .route("/admin/organizations/{org_id}/metrics", get(metrics_probe))
         .route(
             "/admin/slow",
             get(move || {
@@ -376,7 +371,7 @@ async fn allowed_session_read_records_identity_route_organization_and_page() {
         with_session(
             request(
                 Method::GET,
-                &format!("/v1/admin/organizations/{organization_id}/members?limit=2&offset=4"),
+                &format!("/v1/admin/organizations/{organization_id}/metrics?limit=2&offset=4"),
             ),
             user_id,
             Some(session_id),
@@ -389,7 +384,7 @@ async fn allowed_session_read_records_identity_route_organization_and_page() {
     assert_eq!(event["message"], "admin request");
     assert_eq!(
         event["admin_route"],
-        "/v1/admin/organizations/{org_id}/members"
+        "/v1/admin/organizations/{org_id}/metrics"
     );
     assert_eq!(event["admin_method"], "GET");
     assert_eq!(event["admin_status"], 200);
@@ -440,7 +435,7 @@ async fn global_reads_have_no_organization_unless_a_handler_records_a_filter() {
     let response = send(
         &app,
         with_session(
-            request(Method::GET, "/v1/admin/api-keys"),
+            request(Method::GET, "/v1/admin/invitation-email-deliveries"),
             user_id,
             Some(Uuid::new_v4()),
         ),
@@ -499,10 +494,7 @@ async fn rejected_or_missing_credentials_are_denied_without_identity() {
             "none",
         ),
         (
-            Some(format!(
-                "Bearer {}rejected-by-session-auth",
-                services::common::REPORTING_TOKEN_PREFIX
-            )),
+            Some("Bearer rejected-by-session-auth".to_string()),
             StatusCode::UNAUTHORIZED,
             "session",
         ),
@@ -670,7 +662,7 @@ async fn every_request_emits_exactly_one_event_with_its_own_id() {
         (
             &allowed,
             with_session(
-                request(Method::GET, "/v1/admin/api-keys"),
+                request(Method::GET, "/v1/admin/invitation-email-deliveries"),
                 Uuid::new_v4(),
                 Some(Uuid::new_v4()),
             ),
@@ -754,7 +746,7 @@ async fn audit_events_exclude_credentials_content_and_client_controlled_values()
     for request in [
         sentinel_request(
             Method::GET,
-            format!("/v1/admin/organizations/{organization_id}/members?search={EMAIL}&q={QUERY}"),
+            format!("/v1/admin/organizations/{organization_id}/metrics?search={EMAIL}&q={QUERY}"),
             &session,
         ),
         sentinel_request(

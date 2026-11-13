@@ -2093,9 +2093,12 @@ impl crate::InferenceProvider for MockProvider {
                 .as_deref()
                 .is_none_or(|granularities| granularities.iter().any(|value| value == "segment"));
 
+        // Like the real servers: `verbose_json` carries `duration`, the plain
+        // format only reports the length under `usage`.
         Ok(AudioTranscriptionResponse {
             text: mock_text.clone(),
-            duration: Some(mock_duration),
+            duration: verbose_json.then_some(mock_duration),
+            usage_seconds: (!verbose_json).then_some(mock_duration.ceil()),
             language: params.language.or(Some("en".to_string())),
             segments: wants_segment_timestamps.then(|| {
                 vec![TranscriptionSegment {

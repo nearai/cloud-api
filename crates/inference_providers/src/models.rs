@@ -1499,6 +1499,33 @@ pub struct AudioTranscriptionResponse {
     /// Unique identifier for the transcription
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
+
+    /// Audio length in seconds from the `usage` object. The plain `json`
+    /// format reports it there instead of in `duration`.
+    #[serde(default, rename = "usage", skip_serializing)]
+    #[serde(deserialize_with = "deserialize_usage_seconds")]
+    pub usage_seconds: Option<f64>,
+}
+
+impl AudioTranscriptionResponse {
+    /// Audio length in seconds: `duration` when present, else `usage.seconds`.
+    pub fn duration_seconds(&self) -> Option<f64> {
+        self.duration.or(self.usage_seconds)
+    }
+}
+
+/// Read `seconds` from a provider `usage` object. Any other usage shape is
+/// not an error and yields `None`.
+fn deserialize_usage_seconds<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(value.get("seconds").and_then(|seconds| {
+        seconds
+            .as_f64()
+            .or_else(|| seconds.as_str().and_then(|s| s.parse::<f64>().ok()))
+    }))
 }
 
 /// Custom deserializer to handle duration as either string or number
@@ -1580,6 +1607,53 @@ pub fn detect_audio_content_type(filename: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn audio_duration_falls_back_to_usage_seconds() {
+        let duration = |body: serde_json::Value| {
+            serde_json::from_value::<AudioTranscriptionResponse>(body)
+                .unwrap()
+                .duration_seconds()
+        };
+
+        // Plain format: the length is only under `usage`.
+        assert_eq!(
+            duration(serde_json::json!({
+                "text": "hi",
+                "usage": {"type": "duration", "seconds": 3}
+            })),
+            Some(3.0)
+        );
+        // Verbose format: `duration` wins, as a number or a string.
+        assert_eq!(
+            duration(serde_json::json!({
+                "text": "hi",
+                "duration": "2.5",
+                "usage": {"type": "duration", "seconds": 3}
+            })),
+            Some(2.5)
+        );
+        // A usage object without seconds, or no usage at all, is not an error.
+        for body in [
+            serde_json::json!({"text": "hi", "usage": {"type": "tokens", "total_tokens": 7}}),
+            serde_json::json!({"text": "hi", "usage": null}),
+            serde_json::json!({"text": "hi", "usage": "n/a"}),
+            serde_json::json!({"text": "hi"}),
+        ] {
+            assert_eq!(duration(body), None);
+        }
+    }
+
+    #[test]
+    fn audio_usage_seconds_is_not_serialized() {
+        let response: AudioTranscriptionResponse = serde_json::from_value(serde_json::json!({
+            "text": "hi",
+            "usage": {"type": "duration", "seconds": 3}
+        }))
+        .unwrap();
+        let wire = serde_json::to_value(&response).unwrap();
+        assert_eq!(wire, serde_json::json!({"text": "hi"}));
+    }
 
     #[test]
     fn set_stream_fields_is_the_only_copy_on_the_wire() {

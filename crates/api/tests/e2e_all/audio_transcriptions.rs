@@ -618,8 +618,27 @@ async fn test_audio_transcription_usage_tracking() {
         .await;
 
     assert_eq!(response.status_code(), 200);
-    // Usage should be recorded - we verify by checking the response is successful
-    // In a real test, we would query the usage database to verify exact amounts
+    // The plain format has no `duration` field; usage comes from the reported length.
+    let body: serde_json::Value = response.json();
+    assert!(body.get("duration").is_none());
+
+    let inference_id = response
+        .headers()
+        .get("Inference-Id")
+        .expect("Missing Inference-Id header")
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    let billing_response = server
+        .post("/v1/billing/costs")
+        .add_header("Authorization", format!("Bearer {}", api_key))
+        .json(&serde_json::json!({ "requestIds": [inference_id] }))
+        .await;
+    assert_eq!(billing_response.status_code(), 200);
+    let costs: serde_json::Value = billing_response.json();
+    // 100 KB mock file = 10 s, at 1_000_000 nano-USD per second.
+    assert_eq!(costs["requests"][0]["costNanoUsd"], 10_000_000);
 }
 
 /// Regression: a provider 4xx (e.g. whisper's 400 "Invalid or unsupported audio

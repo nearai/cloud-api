@@ -87,7 +87,7 @@ pub(super) fn classify_provider_error_with(
     tag = "Embeddings",
     request_body = EmbeddingsRequestDoc,
     responses(
-        (status = 200, description = "Embeddings generated successfully", body = EmbeddingsResponseDoc),
+        (status = 200, description = "Embeddings generated successfully", body = EmbeddingsResponseDoc, headers(("Inference-Id" = String, description = "Billing UUID of the request, usable with /v1/billing/costs"))),
         (status = 400, description = "Invalid request", body = ErrorResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
         (status = 404, description = "Model not found", body = ErrorResponse),
@@ -247,11 +247,12 @@ pub async fn embeddings(
             }
 
             // Return raw response bytes
-            Response::builder()
+            let http_response = Response::builder()
                 .status(StatusCode::OK)
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(response_bytes))
-                .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+                .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+            billing::with_inference_id(http_response, inference_id)
         }
         Err(e) => {
             let (status_code, error_type, message) = match e {

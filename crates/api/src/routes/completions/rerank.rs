@@ -167,7 +167,7 @@ mod rerank_response_options_tests {
     tag = "Rerank",
     request_body = crate::models::RerankRequest,
     responses(
-        (status = 200, description = "Successful rerank", body = crate::models::RerankResponse),
+        (status = 200, description = "Successful rerank", body = crate::models::RerankResponse, headers(("Inference-Id" = String, description = "Billing UUID of the request, usable with /v1/billing/costs"))),
         (status = 400, description = "Invalid request (empty documents, invalid model, etc.)", body = ErrorResponse),
         (status = 401, description = "Unauthorized (missing or invalid API key)", body = ErrorResponse),
         (status = 404, description = "Model not found", body = ErrorResponse),
@@ -325,7 +325,10 @@ pub async fn rerank(
                     .into_response();
             }
 
-            (StatusCode::OK, ResponseJson(response)).into_response()
+            billing::with_inference_id(
+                (StatusCode::OK, ResponseJson(response)).into_response(),
+                inference_id,
+            )
         }
         Err(e) => {
             let (status_code, error_type, message) = match e {

@@ -5885,6 +5885,7 @@ mod tests {
             segments: None,
             words: None,
             id: Some("trans-internal".to_string()),
+            usage_seconds: None,
         };
 
         let response = AudioTranscriptionResponse::from(provider_response);

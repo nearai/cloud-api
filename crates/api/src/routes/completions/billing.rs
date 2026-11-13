@@ -2,7 +2,7 @@
 
 use crate::{middleware::auth::AuthenticatedApiKey, models::ErrorResponse};
 use axum::{
-    http::StatusCode,
+    http::{HeaderValue, StatusCode},
     response::{IntoResponse, Json as ResponseJson, Response},
 };
 use services::metrics::{consts, MetricsServiceTrait};
@@ -27,6 +27,17 @@ pub(super) fn billing_api_key_id(api_key: &AuthenticatedApiKey) -> Result<Uuid, 
             .into_response()
             .into()
     })
+}
+
+/// Return the usage record's id with a billed response, as the chat endpoints
+/// do, so the caller can look up its cost.
+pub(super) fn with_inference_id(mut response: Response, inference_id: Uuid) -> Response {
+    if let Ok(value) = HeaderValue::from_str(&inference_id.to_string()) {
+        response
+            .headers_mut()
+            .insert(super::HEADER_INFERENCE_ID, value);
+    }
+    response
 }
 
 /// Per-endpoint log messages for [`cap_reported_tokens`].

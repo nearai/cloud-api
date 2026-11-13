@@ -16,7 +16,7 @@ use super::*;
         (status = 200, description = "Successful transcription", content(
             (AudioTranscriptionResponse = "application/json"),
             (String = "text/plain")
-        )),
+        ), headers(("Inference-Id" = String, description = "Billing UUID of the request, usable with /v1/billing/costs"))),
         (status = 400, description = "Invalid request (empty file, unsupported format, file too large)", body = ErrorResponse),
         (status = 401, description = "Unauthorized (missing or invalid API key)", body = ErrorResponse),
         (status = 404, description = "Model not found", body = ErrorResponse),
@@ -243,11 +243,23 @@ pub async fn audio_transcriptions(
 
             // Clamp duration to valid range [0, i32::MAX] to prevent overflow and negative values
             let duration_seconds = response
-                .duration
+                .duration_seconds()
                 .unwrap_or(0.0)
                 .max(0.0)
                 .min(i32::MAX as f64)
                 .ceil() as i32;
+            // Flag a response that reports no duration.
+            let duration_seconds = billing::cap_reported_tokens(
+                app_state.metrics_service.as_ref(),
+                &model_name,
+                organization_id,
+                duration_seconds,
+                &billing::TokenAnomalyMessages {
+                    overflow: "Provider returned unreasonable audio duration - capping",
+                    zero: "Provider returned no audio duration for transcription",
+                    anomaly: "Audio duration anomaly: Provider data quality issue detected. Recommendation: Check provider logs and configuration.",
+                },
+            );
 
             // Parse API key ID to UUID
             let api_key_id = match uuid::Uuid::parse_str(&api_key_id_str) {
@@ -306,7 +318,7 @@ pub async fn audio_transcriptions(
                 "Audio transcription completed and usage recorded successfully"
             );
 
-            if requested_response_format.as_deref() == Some("text") {
+            let http_response = if requested_response_format.as_deref() == Some("text") {
                 (
                     StatusCode::OK,
                     [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
@@ -316,7 +328,8 @@ pub async fn audio_transcriptions(
             } else {
                 let response_body = crate::models::AudioTranscriptionResponse::from(response);
                 (StatusCode::OK, ResponseJson(response_body)).into_response()
-            }
+            };
+            billing::with_inference_id(http_response, inference_id)
         }
         Err(e) => {
             let (status_code, error_type, message) = match e {

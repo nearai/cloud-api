@@ -12,6 +12,7 @@ use crate::usage::{
 };
 use inference_providers::{ChatMessage, MessageRole, SSEEvent, StreamChunk, StreamingResult};
 use moka::future::Cache;
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use uuid::Uuid;
@@ -157,6 +158,10 @@ where
     /// the API route may append one and the provider signature does not cover
     /// the complete public stream.
     saw_upstream_done_marker: bool,
+    /// Native providers can complete without `[DONE]`, but each requested
+    /// choice must have a finish reason before an ordinary EOF is successful.
+    expected_choice_count: i64,
+    finished_choice_indices: HashSet<i64>,
     /// Response ID when called from Responses API (for usage tracking FK)
     response_id: Option<ResponseId>,
     /// Last finish_reason from provider (e.g., "stop", "length", "tool_calls")
@@ -598,6 +603,31 @@ where
                             return Poll::Ready(Some(Ok(event)));
                         }
 
+                        let mut record_finished_choice = |index: i64, finished: bool| {
+                            if finished && (0..self.expected_choice_count).contains(&index) {
+                                self.finished_choice_indices.insert(index);
+                            }
+                        };
+                        match &event.chunk {
+                            Some(StreamChunk::Chat(chunk)) => {
+                                for choice in &chunk.choices {
+                                    record_finished_choice(
+                                        choice.index,
+                                        choice.finish_reason.is_some(),
+                                    );
+                                }
+                            }
+                            Some(StreamChunk::Text(chunk)) => {
+                                for choice in &chunk.choices {
+                                    record_finished_choice(
+                                        choice.index,
+                                        choice.finish_reason.is_some(),
+                                    );
+                                }
+                            }
+                            None => unreachable!("control events are handled above"),
+                        }
+
                         let now = Instant::now();
 
                         if !self.first_token_received {
@@ -649,10 +679,29 @@ where
                         }
                         return Poll::Ready(Some(Ok(event)));
                     }
-                    Poll::Ready(None) => self.begin_finalizing(),
+                    Poll::Ready(None) => {
+                        if self.finished_choice_indices.len() as i64 != self.expected_choice_count {
+                            let error = inference_providers::CompletionError::CompletionError(
+                                "Upstream stream ended before completion".to_string(),
+                            );
+                            tracing::warn!(
+                                request_id = %self.request_id,
+                                model = %self.model_name,
+                                elapsed_ms = self.service_start_time.elapsed().as_millis() as u64,
+                                expected_choices = self.expected_choice_count,
+                                finished_choices = self.finished_choice_indices.len(),
+                                "Completion stream ended before a finish marker"
+                            );
+                            self.last_error = Some(error.clone());
+                            self.begin_finalizing();
+                            return Poll::Ready(Some(Err(error)));
+                        }
+                        self.begin_finalizing();
+                    }
                     Poll::Ready(Some(Err(err))) => {
                         // Capture error for stop_reason in usage recording (handled in Drop).
                         self.last_error = Some(err.clone());
+                        self.begin_finalizing();
                         return Poll::Ready(Some(Err(err)));
                     }
                     Poll::Pending => return Poll::Pending,
@@ -1253,7 +1302,8 @@ impl CompletionServiceImpl {
         ]
     }
 
-    pub(crate) fn map_provider_error(
+    /// Map provider failures consistently before the API sends response bytes.
+    pub fn map_provider_error(
         model: &str,
         error: &inference_providers::CompletionError,
         operation: &str,
@@ -1686,6 +1736,7 @@ impl CompletionServiceImpl {
         cache_write_cost_per_token: Option<i64>,
         requested_service_tier: Option<TextServiceTier>,
         latency_reporter: Option<super::inference_provider_pool::ProviderLatencyReporter>,
+        expected_choice_count: i64,
     ) -> StreamingResult {
         // Create low-cardinality metric tags (no org/workspace/key - those go to database)
         let metric_tags = Self::create_metric_tags(&model_name);
@@ -1724,6 +1775,8 @@ impl CompletionServiceImpl {
             last_chat_id: None,
             stream_completed: false,
             saw_upstream_done_marker: false,
+            expected_choice_count,
+            finished_choice_indices: HashSet::new(),
             response_id,
             last_finish_reason: None,
             last_error: None,
@@ -1961,6 +2014,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
                 cache_write_cost_per_token,
                 requested_service_tier,
                 Some(latency_reporter),
+                request.n.unwrap_or(1).max(1),
             )
             .await;
 
@@ -2680,6 +2734,8 @@ mod tests {
             last_chat_id: None,
             stream_completed: false,
             saw_upstream_done_marker: false,
+            expected_choice_count: 1,
+            finished_choice_indices: HashSet::new(),
             response_id: None,
             last_finish_reason: None,
             last_error: None,
@@ -2701,6 +2757,107 @@ mod tests {
             chunk: None,
             raw_passthrough: true,
         }
+    }
+
+    fn completion_test_event(choices: &[(i64, Option<&str>)], text: bool) -> SSEEvent {
+        let choices: Vec<_> = choices.iter().map(|(index, reason)| {
+            if text {
+                serde_json::json!({"index": index, "text": "partial", "finish_reason": reason})
+            } else {
+                serde_json::json!({"index": index, "delta": {"content": "partial"}, "finish_reason": reason})
+            }
+        }).collect();
+        let value = serde_json::json!({
+            "id": "chatcmpl-terminal-test", "object": if text { "text_completion" } else { "chat.completion.chunk" },
+            "created": 0, "model": "test-model", "choices": choices,
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+        });
+        let chunk = if text {
+            StreamChunk::Text(serde_json::from_value(value.clone()).unwrap())
+        } else {
+            StreamChunk::Chat(serde_json::from_value(value.clone()).unwrap())
+        };
+        SSEEvent {
+            raw_bytes: Bytes::from(format!("data: {value}\n\n")),
+            chunk: Some(chunk),
+            raw_passthrough: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn eof_requires_all_requested_choices_to_finish_without_done() {
+        for text in [false, true] {
+            for (choices, expected, complete) in [
+                (vec![(0, None)], 1, false),
+                (vec![(0, Some("stop"))], 1, true),
+                (vec![(0, Some("length"))], 1, true),
+                (vec![(0, Some("tool_calls"))], 1, true),
+                (vec![(0, Some("content_filter"))], 1, true),
+                (vec![(0, Some("stop")), (1, None)], 2, false),
+                (vec![(0, Some("stop")), (0, Some("stop"))], 2, false),
+                (vec![(0, Some("stop")), (2, Some("stop"))], 2, false),
+                (vec![(0, Some("stop")), (1, Some("length"))], 2, true),
+                (vec![], 1, false),
+            ] {
+                let mut stream = terminal_test_stream(vec![
+                    Ok(completion_test_event(&choices, text)),
+                    // A trailing usage-only event must neither finish a choice
+                    // nor discard its previously observed finish reason.
+                    Ok(completion_test_event(&[], text)),
+                ]);
+                stream.expected_choice_count = expected;
+                let events = stream.by_ref().collect::<Vec<_>>().await;
+                assert_eq!(
+                    events.iter().filter(|event| event.is_err()).count(),
+                    usize::from(!complete),
+                    "text={text}, choices={choices:?}"
+                );
+                assert_eq!(stream.last_error.is_none(), complete);
+                assert!(matches!(&stream.state, StreamState::Done));
+                if !complete {
+                    assert!(events
+                        .last()
+                        .unwrap()
+                        .as_ref()
+                        .unwrap_err()
+                        .to_string()
+                        .contains("Upstream stream ended before completion"));
+                }
+                assert!(stream.next().await.is_none());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_or_control_only_eof_is_an_error() {
+        for events in [vec![], vec![Ok(terminal_control_event(b": keepalive\n\n"))]] {
+            let mut stream = terminal_test_stream(events);
+            let events = stream.by_ref().collect::<Vec<_>>().await;
+            assert_eq!(events.iter().filter(|event| event.is_err()).count(), 1);
+            assert!(stream.last_error.is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_error_stops_polling_before_queued_content_and_done() {
+        let mut stream = terminal_test_stream(vec![
+            Ok(completion_test_event(&[(0, None)], false)),
+            Err(inference_providers::CompletionError::CompletionError(
+                "upstream read failed".into(),
+            )),
+            Ok(completion_test_event(&[(0, Some("stop"))], false)),
+            Ok(terminal_control_event(b"data: [DONE]\n\n")),
+        ]);
+        let events = stream.by_ref().collect::<Vec<_>>().await;
+        assert_eq!(events.len(), 2);
+        assert!(events[0].is_ok());
+        assert!(events[1]
+            .as_ref()
+            .unwrap_err()
+            .to_string()
+            .contains("upstream read failed"));
+        assert!(!stream.saw_upstream_done_marker);
+        assert!(matches!(&stream.state, StreamState::Done));
     }
 
     #[tokio::test]
@@ -2899,6 +3056,8 @@ mod tests {
             last_chat_id: None,
             stream_completed: false,
             saw_upstream_done_marker: false,
+            expected_choice_count: 1,
+            finished_choice_indices: HashSet::new(),
             response_id: None,
             last_finish_reason: None,
             last_error: None,
@@ -3074,6 +3233,8 @@ mod tests {
             last_chat_id: None,
             stream_completed: false,
             saw_upstream_done_marker: false,
+            expected_choice_count: 1,
+            finished_choice_indices: HashSet::new(),
             response_id: None,
             last_finish_reason: None,
             last_error: None,
@@ -3230,6 +3391,8 @@ mod tests {
             last_chat_id: None,
             stream_completed: false,
             saw_upstream_done_marker: false,
+            expected_choice_count: 1,
+            finished_choice_indices: HashSet::new(),
             response_id: None,
             last_finish_reason: None,
             last_error: None,
@@ -3360,6 +3523,8 @@ mod tests {
             last_chat_id: None,
             stream_completed: false,
             saw_upstream_done_marker: false,
+            expected_choice_count: 1,
+            finished_choice_indices: HashSet::new(),
             response_id: None,
             last_finish_reason: None,
             last_error: None,
@@ -3572,6 +3737,8 @@ mod tests {
                 last_chat_id: None,
                 stream_completed: false,
                 saw_upstream_done_marker: false,
+                expected_choice_count: 1,
+                finished_choice_indices: HashSet::new(),
                 response_id: None,
                 last_finish_reason: None,
                 last_error: None,

@@ -211,6 +211,33 @@ async fn seed_recent_usage(
 }
 
 #[tokio::test]
+async fn users_without_a_contact_email_report_none_on_me() {
+    let (server, database) = setup_test_server_with_database().await;
+    let auth = real_auth(&database);
+    let account_id = new_account_id();
+    let (wallet_session, user_id) = near_login(&auth, &account_id).await;
+    let (email_session, _, login_address) = new_user(&database).await;
+
+    // A wallet login stores the placeholder address only; no contact email is set.
+    let wallet = me(&server, &wallet_session).await;
+    assert_eq!(wallet["email"], near_placeholder_email(&account_id));
+    assert!(wallet["contact_email"].is_null(), "{wallet}");
+    assert_eq!(wallet["contact_email_verified"], false, "{wallet}");
+    assert_eq!(wallet["needs_contact_email"], false, "{wallet}");
+    let client = database.pool().get().await.unwrap();
+    assert_eq!(
+        contact_columns(&client, user_id).await,
+        (near_placeholder_email(&account_id), None, None, None)
+    );
+
+    let email_user = me(&server, &email_session).await;
+    assert_eq!(email_user["email"], login_address);
+    assert!(email_user["contact_email"].is_null(), "{email_user}");
+    assert_eq!(email_user["contact_email_verified"], false, "{email_user}");
+    assert_eq!(email_user["needs_contact_email"], false, "{email_user}");
+}
+
+#[tokio::test]
 async fn contact_email_is_unchanged_by_later_wallet_logins() {
     let (server, database) = setup_test_server_with_database().await;
     let auth = real_auth(&database);

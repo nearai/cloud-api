@@ -567,6 +567,56 @@ mod tests {
         assert_eq!(verified_contact_email(None, verified_at), None);
     }
 
+    fn test_user(
+        contact_email: Option<&str>,
+        verified_at: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> services::auth::User {
+        let now = chrono::Utc::now();
+        services::auth::User {
+            id: services::auth::UserId(uuid::Uuid::new_v4()),
+            email: "login@example.com".to_string(),
+            username: "login".to_string(),
+            display_name: None,
+            avatar_url: None,
+            auth_provider: "github".to_string(),
+            provider_user_id: "p-1".to_string(),
+            role: services::auth::UserRole::User,
+            is_active: true,
+            last_login: None,
+            created_at: now,
+            updated_at: now,
+            tokens_revoked_at: None,
+            contact_email: contact_email.map(str::to_owned),
+            contact_email_verified_at: verified_at,
+            email_opt_in_at: verified_at,
+        }
+    }
+
+    #[test]
+    fn user_response_reports_the_contact_email_and_never_asks_for_one() {
+        let with_email = services_user_to_api_user(&test_user(
+            Some("alice@example.com"),
+            Some(chrono::Utc::now()),
+        ));
+        assert_eq!(
+            with_email.contact_email.as_deref(),
+            Some("alice@example.com")
+        );
+        assert!(with_email.contact_email_verified);
+        assert!(!with_email.needs_contact_email);
+
+        let without_email = services_user_to_api_user(&test_user(None, None));
+        assert_eq!(without_email.contact_email, None);
+        assert!(!without_email.contact_email_verified);
+        assert!(!without_email.needs_contact_email);
+
+        // A half-written row is neither shown nor reported as verified.
+        let unverified = services_user_to_api_user(&test_user(Some("alice@example.com"), None));
+        assert_eq!(unverified.contact_email, None);
+        assert!(!unverified.contact_email_verified);
+        assert!(!unverified.needs_contact_email);
+    }
+
     #[test]
     fn test_message_conversion() {
         let http_msg = crate::models::Message {

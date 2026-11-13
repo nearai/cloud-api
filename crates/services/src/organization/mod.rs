@@ -346,7 +346,6 @@ impl OrganizationServiceTrait for OrganizationServiceImpl {
         Ok(members_with_users)
     }
 
-    /// Add a member by user ID (validates user exists, private helper)
     async fn get_organization_settings(
         &self,
         organization_id: OrganizationId,
@@ -369,6 +368,7 @@ impl OrganizationServiceTrait for OrganizationServiceImpl {
         Ok(Self::settings_from_organization(&org))
     }
 
+    /// Add a member by user ID (validates user exists, private helper)
     async fn add_member_validated(
         &self,
         organization_id: OrganizationId,

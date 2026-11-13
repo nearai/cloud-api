@@ -63,6 +63,7 @@ mod openai_tiered_pricing;
 mod openrouter_compat;
 mod openrouter_params;
 mod org_system_prompt;
+mod organization_deactivation;
 mod organization_membership_order;
 mod organization_model_access;
 mod organization_usage_discount;

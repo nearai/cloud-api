@@ -3286,15 +3286,6 @@ pub struct OrganizationMemberResponse {
     pub invited_by: Option<String>,
 }
 
-/// List users response model (admin only)
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct ListUsersResponse {
-    pub users: Vec<AdminUserResponse>,
-    pub total: i64,
-    pub limit: i64,
-    pub offset: i64,
-}
-
 /// Admin AML report audit entry.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct AdminAmlReportResponse {
@@ -3353,30 +3344,6 @@ pub struct ListAdminAmlAllowlistResponse {
 pub struct UpsertAmlAllowlistEntryRequest {
     pub account_id: String,
     pub reason: Option<String>,
-}
-
-/// Organization details for admin organization listing
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct AdminOrganizationResponse {
-    pub id: String,
-    pub name: String,
-    pub description: Option<String>,
-    #[serde(rename = "spendLimit", skip_serializing_if = "Option::is_none")]
-    pub spend_limit: Option<SpendLimit>,
-    #[serde(rename = "currentUsage", skip_serializing_if = "Option::is_none")]
-    pub current_usage: Option<OrganizationUsage>,
-    pub created_at: DateTime<Utc>,
-    /// Always `active` on org detail, which only returns active organizations.
-    pub lifecycle: services::lifecycle::OrganizationLifecycle,
-}
-
-/// List organizations response model (admin only)
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct ListOrganizationsAdminResponse {
-    pub organizations: Vec<AdminOrganizationResponse>,
-    pub total: i64,
-    pub limit: i64,
-    pub offset: i64,
 }
 
 /// API key metadata for admin listing. Never includes key material (raw key,

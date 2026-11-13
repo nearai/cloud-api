@@ -60,6 +60,11 @@ pub enum AutoRedactError {
     /// fires.
     #[error("auto_redact unavailable: {0}")]
     DetectorUnavailable(String),
+    /// The PII detector answered 503 at capacity. Handlers fail closed as for
+    /// [`Self::DetectorUnavailable`] and pass the retry hint to the client.
+    /// `retry_after_secs` is the detector's `Retry-After`, when it sent one.
+    #[error("auto_redact detector overloaded")]
+    DetectorOverloaded { retry_after_secs: Option<u64> },
     /// Internal error (serde, programmer bug). Mapped to 500.
     #[error("auto_redact internal error: {0}")]
     Internal(String),
@@ -105,7 +110,9 @@ fn value_enables(v: &serde_json::Value) -> bool {
 /// mapping. Empty mapping means no PII was detected.
 ///
 /// On detector failure or timeout (see [`REDACT_TIMEOUT`]), returns
-/// [`AutoRedactError::DetectorUnavailable`] without mutating `messages`.
+/// [`AutoRedactError::DetectorUnavailable`] (or
+/// [`AutoRedactError::DetectorOverloaded`] when the detector is at capacity)
+/// without mutating `messages`.
 /// Callers must fail closed.
 /// The second tuple element is the total `input_tokens` the privacy-filter
 /// billed for the classify pass, so the caller can charge it

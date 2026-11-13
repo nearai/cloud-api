@@ -3,7 +3,6 @@ use crate::pool::DbPool;
 use crate::repositories::lifecycle::{org_lifecycle_predicate, ORG_ALL_MEMBERS_ERASED_SQL};
 use crate::repositories::{
     ModelAliasRepository, ModelRepository, OrganizationLimitsRepository, ServiceRepository,
-    UserRepository,
 };
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -16,7 +15,7 @@ use services::admin::{
     OrganizationLimitsHistoryEntry, OrganizationLimitsUpdate, OrganizationModelAccessGrant,
     PlatformServiceInfo, PricingChangeDeliveryRecord, PricingChangeOpenConflictError,
     PricingChangeRecipientRow, ScheduledPricingChange, ScheduledPricingChangeInsert,
-    ScheduledPricingChangeStatus, UpdateModelAdminRequest, UserInfo, UserOrganizationInfo,
+    ScheduledPricingChangeStatus, UpdateModelAdminRequest, UserInfo,
 };
 use services::lifecycle::OrganizationLifecycle;
 use services::service_usage::ports::ServiceUnit;
@@ -54,7 +53,6 @@ pub struct AdminCompositeRepository {
     model_repo: Arc<ModelRepository>,
     alias_repo: Arc<ModelAliasRepository>,
     limits_repo: Arc<OrganizationLimitsRepository>,
-    user_repo: Arc<UserRepository>,
     service_repo: Arc<ServiceRepository>,
 }
 
@@ -72,7 +70,6 @@ impl AdminCompositeRepository {
                 pool.clone(),
                 config,
             )),
-            user_repo: Arc::new(UserRepository::new(pool.clone())),
             service_repo: Arc::new(ServiceRepository::new(pool)),
         }
     }
@@ -830,78 +827,6 @@ impl AdminRepository for AdminCompositeRepository {
                 created_at: h.created_at,
             })
             .collect())
-    }
-
-    async fn list_users(
-        &self,
-        limit: i64,
-        offset: i64,
-        search: Option<String>,
-        is_active: Option<bool>,
-    ) -> Result<(Vec<UserInfo>, i64)> {
-        let (users, total) = self
-            .user_repo
-            .list_admin(limit, offset, search, is_active)
-            .await?;
-
-        let users = users
-            .into_iter()
-            .map(|u| UserInfo {
-                id: u.id,
-                email: u.email,
-                username: u.username,
-                display_name: u.display_name,
-                avatar_url: u.avatar_url,
-                created_at: u.created_at,
-                last_login_at: u.last_login_at,
-                is_active: u.is_active,
-                auth_provider: u.auth_provider,
-                provider_user_id: u.provider_user_id,
-                contact_email: u.contact_email,
-                contact_email_verified_at: u.contact_email_verified_at,
-                email_opt_in_at: u.email_opt_in_at,
-            })
-            .collect();
-
-        Ok((users, total))
-    }
-
-    async fn list_users_with_organizations(
-        &self,
-        limit: i64,
-        offset: i64,
-        search: Option<String>,
-        is_active: Option<bool>,
-        search_by_name: Option<String>,
-    ) -> Result<(Vec<(UserInfo, Option<UserOrganizationInfo>)>, i64)> {
-        let (users_with_orgs, total_count) = self
-            .user_repo
-            .list_with_organizations(limit, offset, search, is_active, search_by_name)
-            .await?;
-
-        let result = users_with_orgs
-            .into_iter()
-            .map(|(u, org_data)| {
-                let user_info = UserInfo {
-                    id: u.id,
-                    email: u.email,
-                    username: u.username,
-                    display_name: u.display_name,
-                    avatar_url: u.avatar_url,
-                    created_at: u.created_at,
-                    last_login_at: u.last_login_at,
-                    is_active: u.is_active,
-                    auth_provider: u.auth_provider,
-                    provider_user_id: u.provider_user_id,
-                    contact_email: u.contact_email,
-                    contact_email_verified_at: u.contact_email_verified_at,
-                    email_opt_in_at: u.email_opt_in_at,
-                };
-                (user_info, org_data)
-            })
-            .collect();
-
-        Ok((result, total_count))
     }
 
     async fn list_models(
@@ -1740,18 +1665,6 @@ impl AdminRepository for AdminCompositeRepository {
         Ok(row.as_ref().map(row_to_admin_org_info))
     }
 
-    async fn count_all_organizations(&self, lifecycle: OrganizationLifecycleFilter) -> Result<i64> {
-        let client = self.pool.get().await?;
-
-        let sql = format!(
-            "SELECT COUNT(*) as count FROM organizations o WHERE {}",
-            org_lifecycle_predicate(lifecycle)
-        );
-        let row = client.query_one(sql.as_str(), &[]).await?;
-
-        Ok(row.get::<_, i64>("count"))
-    }
-
     async fn list_all_api_keys(
         &self,
         filters: &AdminApiKeyFilters,
@@ -1830,15 +1743,14 @@ impl AdminRepository for AdminCompositeRepository {
 
         // Inactive (soft-deleted) *users* are INCLUDED — users are soft-deleted
         // in place (`users.is_active = false`), the response exposes
-        // `user.is_active`, and `/v1/admin/users` likewise returns inactive
-        // users by default.
+        // `user.is_active`.
         //
         // Inactive (soft-deleted) *organizations* are EXCLUDED via the
-        // `organizations` join, matching `/v1/admin/organizations`, which hides
-        // inactive orgs. Org deletion is a soft delete that leaves member rows
-        // behind, so without this join a deactivated org would still list
-        // members — and would flip between 200 and 404 depending on whether it
-        // had any (the service's existence check only runs when `total == 0`).
+        // `organizations` join, which hides inactive orgs. Org deletion is a soft
+        // delete that leaves member rows behind, so without this join a
+        // deactivated org would still list members — and would flip between 200
+        // and 404 depending on whether it had any (the service's existence
+        // check only runs when `total == 0`).
         // Count applies the identical join so totals stay consistent.
         //
         // `m.id` is a unique tiebreaker on the sort: members bulk-inserted in

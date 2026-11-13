@@ -32,7 +32,9 @@ pub fn map_domain_error_to_status(error: &CompletionError) -> StatusCode {
         CompletionError::ProviderError { status_code, .. } => {
             StatusCode::from_u16(*status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
         }
-        CompletionError::ServiceOverloaded(_) => status_overloaded(),
+        CompletionError::ServiceOverloaded(_) | CompletionError::UpstreamOverloaded { .. } => {
+            status_overloaded()
+        }
         CompletionError::InternalError(_) => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }

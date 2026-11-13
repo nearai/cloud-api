@@ -1549,6 +1549,12 @@ pub fn build_completion_routes(
     let model_deprecation_state = middleware::ModelDeprecationState {
         models_service: app_state.models_service.clone(),
     };
+    // One log line per authenticated inference request; inside
+    // authentication so it can name the tenant, outside rate and usage
+    // checks so their rejections are logged too.
+    let inference_log_state = middleware::InferenceLogState {
+        models_service: app_state.models_service.clone(),
+    };
 
     // Native Anthropic Messages support is staging-gated and hard-off by
     // default. Keep it on its own router so enabling it cannot alter the
@@ -1573,6 +1579,10 @@ pub fn build_completion_routes(
             .layer(from_fn_with_state(
                 rate_limit_state.clone(),
                 middleware::rate_limit::anthropic_api_key_rate_limit_middleware,
+            ))
+            .layer(from_fn_with_state(
+                inference_log_state.clone(),
+                middleware::inference_log_middleware,
             ))
             .layer(from_fn_with_state(
                 auth_state_middleware.clone(),
@@ -1645,6 +1655,10 @@ pub fn build_completion_routes(
             middleware::api_key_rate_limit_middleware,
         ))
         .layer(from_fn_with_state(
+            inference_log_state.clone(),
+            middleware::inference_log_middleware,
+        ))
+        .layer(from_fn_with_state(
             auth_state_middleware.clone(),
             middleware::auth::auth_middleware_with_workspace_context,
         ))
@@ -1673,6 +1687,10 @@ pub fn build_completion_routes(
         .layer(from_fn_with_state(
             rate_limit_state.clone(),
             middleware::api_key_rate_limit_middleware,
+        ))
+        .layer(from_fn_with_state(
+            inference_log_state,
+            middleware::inference_log_middleware,
         ))
         .layer(from_fn_with_state(
             auth_state_middleware.clone(),
@@ -1718,6 +1736,9 @@ pub fn build_response_routes(
     let model_deprecation_state = middleware::ModelDeprecationState {
         models_service: native_app_state.models_service.clone(),
     };
+    let inference_log_state = middleware::InferenceLogState {
+        models_service: native_app_state.models_service.clone(),
+    };
     let route_state = responses::ResponseRouteState {
         native_service: services::responses::native::NativeResponsesService {
             models_service: native_app_state.models_service,
@@ -1744,6 +1765,10 @@ pub fn build_response_routes(
         .layer(from_fn_with_state(
             rate_limit_state.clone(),
             middleware::api_key_rate_limit_middleware,
+        ))
+        .layer(from_fn_with_state(
+            inference_log_state,
+            middleware::inference_log_middleware,
         ))
         .layer(from_fn_with_state(
             auth_state_middleware.clone(),
@@ -2351,21 +2376,17 @@ fn build_admin_routes_with_options(
         batch_upsert_models, cancel_model_pricing_change, confirm_model_deprecation,
         confirm_model_pricing_changes, create_admin_access_token, create_service,
         delete_admin_access_token, delete_aml_allowlist_entry, delete_model, deprecate_model,
-        erase_user, get_admin_organization_balance, get_admin_setting, get_billing_summary,
-        get_infra_summary, get_model_consumption_timeseries, get_model_history, get_model_revenue,
-        get_org_revenue, get_organization as get_admin_organization,
-        get_organization_concurrent_limit, get_organization_fallback,
+        erase_user, get_admin_organization_balance, get_admin_setting, get_infra_summary,
+        get_model_history, get_organization_concurrent_limit, get_organization_fallback,
         get_organization_limits_history, get_organization_metrics, get_organization_priority,
-        get_organization_timeseries, get_performance_timeseries, get_platform_metrics,
-        get_platform_timeseries, get_revenue_density, list_admin_access_tokens,
-        list_admin_settings, list_aml_allowlist, list_aml_reports, list_api_keys,
-        list_invitation_email_deliveries, list_model_pricing_changes,
-        list_models as admin_list_models, list_organization_members, list_organizations,
-        list_users, lookup_user_erasures, preview_model_deprecation, preview_model_pricing_changes,
-        preview_user_erasure, resend_invitation_email, update_admin_setting,
-        update_aml_report_status, update_organization_concurrent_limit,
-        update_organization_fallback, update_organization_limits, update_organization_member_role,
-        update_organization_priority, update_service, upsert_aml_allowlist_entry, AdminAppState,
+        list_admin_access_tokens, list_admin_settings, list_aml_allowlist, list_aml_reports,
+        list_api_keys, list_invitation_email_deliveries, list_model_pricing_changes,
+        list_models as admin_list_models, list_organization_members, lookup_user_erasures,
+        preview_model_deprecation, preview_model_pricing_changes, preview_user_erasure,
+        resend_invitation_email, update_admin_setting, update_aml_report_status,
+        update_organization_concurrent_limit, update_organization_fallback,
+        update_organization_limits, update_organization_member_role, update_organization_priority,
+        update_service, upsert_aml_allowlist_entry, AdminAppState,
     };
     use crate::routes::staking_farm::{
         get_admin_organization_staking_farm, sync_admin_organization_staking_farm,
@@ -2546,30 +2567,6 @@ fn build_admin_routes_with_options(
             axum::routing::get(get_organization_metrics),
         )
         .route(
-            "/admin/organizations/{org_id}/metrics/timeseries",
-            axum::routing::get(get_organization_timeseries),
-        )
-        .route(
-            "/admin/platform/metrics",
-            axum::routing::get(get_platform_metrics),
-        )
-        .route(
-            "/admin/platform/metrics/timeseries",
-            axum::routing::get(get_platform_timeseries),
-        )
-        .route(
-            "/admin/platform/billing-summary",
-            axum::routing::get(get_billing_summary),
-        )
-        .route(
-            "/admin/platform/model-revenue",
-            axum::routing::get(get_model_revenue),
-        )
-        .route(
-            "/admin/platform/org-revenue",
-            axum::routing::get(get_org_revenue),
-        )
-        .route(
             "/admin/platform/infra-summary",
             axum::routing::get(get_infra_summary),
         )
@@ -2579,18 +2576,6 @@ fn build_admin_routes_with_options(
             axum::routing::get(get_admin_setting).patch(update_admin_setting),
         )
         .route(
-            "/admin/platform/model-consumption-timeseries",
-            axum::routing::get(get_model_consumption_timeseries),
-        )
-        .route(
-            "/admin/platform/performance-timeseries",
-            axum::routing::get(get_performance_timeseries),
-        )
-        .route(
-            "/admin/platform/revenue-density",
-            axum::routing::get(get_revenue_density),
-        )
-        .route(
             "/admin/invitation-email-deliveries",
             axum::routing::get(list_invitation_email_deliveries),
         )
@@ -2598,7 +2583,6 @@ fn build_admin_routes_with_options(
             "/admin/invitation-email-deliveries/{invitation_id}/resend",
             axum::routing::post(resend_invitation_email),
         )
-        .route("/admin/users", axum::routing::get(list_users))
         .route(
             "/admin/users/{user_id}/erasure/preview",
             axum::routing::post(preview_user_erasure),
@@ -2611,15 +2595,7 @@ fn build_admin_routes_with_options(
             "/admin/user-erasures/lookup",
             axum::routing::post(lookup_user_erasures),
         )
-        .route(
-            "/admin/organizations",
-            axum::routing::get(list_organizations),
-        )
         .route("/admin/api-keys", axum::routing::get(list_api_keys))
-        .route(
-            "/admin/organizations/{org_id}",
-            axum::routing::get(get_admin_organization),
-        )
         .route(
             "/admin/organizations/{org_id}/members",
             axum::routing::get(list_organization_members),
@@ -2666,13 +2642,6 @@ fn build_admin_routes_with_options(
                         database.pool().clone(),
                     ),
                 ))
-        )
-        .merge(
-            Router::new()
-                .route("/admin/organizations/{org_id}/usage-discount",
-                    axum::routing::get(crate::routes::admin_usage_discount::get_usage_discount)
-                        .put(crate::routes::admin_usage_discount::put_usage_discount))
-                .layer(axum::Extension(database::repositories::organization_usage_discount::OrganizationUsageDiscountRepository::new(database.pool().clone())))
         )
         .merge(
             Router::new()

@@ -536,11 +536,8 @@ impl AmlService {
         let slack_client = reqwest::Client::builder()
             .timeout(StdDuration::from_millis(config.high_risk_slack_timeout_ms))
             .build()
-            .unwrap_or_else(|error| {
-                tracing::warn!(
-                    error = %error,
-                    "failed to initialize AML Slack alert client; using default client"
-                );
+            .unwrap_or_else(|_| {
+                tracing::warn!("failed to initialize AML Slack alert client; using default client");
                 reqwest::Client::new()
             });
         Self {
@@ -835,7 +832,8 @@ impl AmlService {
                 }
                 Err(error) => {
                     tracing::warn!(
-                        error = %error,
+                        timeout = error.is_timeout(),
+                        connect = error.is_connect(),
                         "failed to send AML high-risk Slack alert"
                     );
                 }

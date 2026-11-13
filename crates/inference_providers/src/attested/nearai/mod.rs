@@ -3,6 +3,8 @@ mod placement_report;
 mod prefix_router;
 #[cfg(test)]
 mod systemone_tests;
+#[cfg(test)]
+mod tracing_context_tests;
 
 use crate::spki_verifier::{FingerprintState, SharedTlsRoots};
 use crate::{
@@ -87,25 +89,34 @@ fn format_error_chain<E: std::error::Error>(e: &E) -> String {
     out
 }
 
-/// Tracing header keys used in params.extra for propagating request correlation IDs.
-///
-/// These are injected by cloud-api's completion service before calling the inference
-/// provider and are forwarded verbatim as HTTP headers to the downstream vllm-proxy /
-/// inference-proxy. The values are low-sensitivity org metadata (not user content)
-/// so forwarding them is consistent with the TEE trust model.
-/// Keys used in `ChatCompletionParams.extra` for tracing correlation headers.
-///
-/// Values are the snake_case map keys that `prepare_tracing_headers` reads and
-/// strips; the corresponding HTTP header names are `X-Request-Id`, `X-Org-Id`,
-/// and `X-Workspace-Id`. Exposed as `pub(crate)` so `external/mod.rs` can use
-/// the same constants instead of hardcoding the strings.
+/// Request-body keys that name the tracing ids. Cloud-api no longer puts
+/// them in `extra` (the ids travel in [`crate::tracing_context`]); every
+/// provider still drops them so a client body field of the same name cannot
+/// reach a backend or be taken for an authenticated id.
 pub(crate) mod tracing_headers {
-    /// UUIDv4 generated per request by cloud-api. Join key across all hops.
     pub const REQUEST_ID: &str = "x_request_id";
-    /// Organization UUID of the authenticated API key owner.
     pub const ORG_ID: &str = "x_org_id";
-    /// Workspace UUID of the authenticated API key.
     pub const WORKSPACE_ID: &str = "x_workspace_id";
+}
+
+/// Send the authenticated request's ids as `X-Request-Id`, `X-Org-Id` and
+/// `X-Workspace-Id`, when a request is in scope. Called only on inference
+/// requests and the signature fetch for a request's own completion, never on
+/// discovery, attestation or model-list calls.
+fn insert_tracing_context_headers(headers: &mut reqwest::header::HeaderMap) {
+    let Some(context) = crate::tracing_context::current_tracing_context() else {
+        return;
+    };
+    for (name, id) in [
+        ("X-Request-Id", context.request_id),
+        ("X-Org-Id", context.org_id),
+        ("X-Workspace-Id", context.workspace_id),
+    ] {
+        // A UUID's hyphenated form is always a valid header value.
+        if let Ok(value) = HeaderValue::from_str(&id.to_string()) {
+            headers.insert(name, value);
+        }
+    }
 }
 
 /// HTTP headers cloud-api itself sets on an upstream request, never taken
@@ -955,48 +966,26 @@ impl Fleet {
         headers
     }
 
-    /// Prepare tracing headers by extracting correlation IDs from `extra` and forwarding
-    /// as HTTP headers. Removes the keys from `extra` so they don't leak into the JSON body.
+    /// Set the tracing headers on an inference request and drop the tracing
+    /// keys from `extra` so they never reach the JSON body.
     ///
-    /// Silently skips any key whose value is not a valid ASCII header value.
+    /// The ids come only from the authenticated request in scope
+    /// ([`crate::tracing_context`]); a key of the same name in `extra` (for
+    /// example a field in a client's chat body) is discarded, never sent.
     /// Independent of `prepare_encryption_headers` — call order does not matter.
     fn prepare_tracing_headers(
         &self,
         headers: &mut reqwest::header::HeaderMap,
         extra: &mut std::collections::HashMap<String, serde_json::Value>,
     ) {
-        // X-Request-Id — join key across all hops
-        if let Some(id) = extra
-            .remove(tracing_headers::REQUEST_ID)
-            .as_ref()
-            .and_then(|v| v.as_str())
-        {
-            if let Ok(value) = HeaderValue::from_str(id) {
-                headers.insert("X-Request-Id", value);
-            }
+        for key in [
+            tracing_headers::REQUEST_ID,
+            tracing_headers::ORG_ID,
+            tracing_headers::WORKSPACE_ID,
+        ] {
+            extra.remove(key);
         }
-
-        // X-Org-Id — organisation that owns the API key
-        if let Some(org) = extra
-            .remove(tracing_headers::ORG_ID)
-            .as_ref()
-            .and_then(|v| v.as_str())
-        {
-            if let Ok(value) = HeaderValue::from_str(org) {
-                headers.insert("X-Org-Id", value);
-            }
-        }
-
-        // X-Workspace-Id — workspace of the API key
-        if let Some(ws) = extra
-            .remove(tracing_headers::WORKSPACE_ID)
-            .as_ref()
-            .and_then(|v| v.as_str())
-        {
-            if let Ok(value) = HeaderValue::from_str(ws) {
-                headers.insert("X-Workspace-Id", value);
-            }
-        }
+        insert_tracing_context_headers(headers);
     }
 
     /// Send a streaming HTTP POST request with TTFB timeout protection.
@@ -1594,9 +1583,10 @@ impl InferenceProvider for Fleet {
         let encoded_chat_id = urlencoding::encode(chat_id);
         let path_and_query = format!("/v1/signature/{encoded_chat_id}?signing_algo={signing_algo}");
         let canonical_url = format!("{}{}", self.config.base_url, path_and_query);
-        let headers = self
+        let mut headers = self
             .build_headers()
             .map_err(CompletionError::CompletionError)?;
+        insert_tracing_context_headers(&mut headers);
         let timeout = self.config.control_timeout();
 
         // Resolve the backend-index target once; it's stable across retries.
@@ -2343,9 +2333,10 @@ impl InferenceProvider for Fleet {
             extra: Default::default(),
         });
 
-        let headers = self
+        let mut headers = self
             .build_headers()
             .map_err(CompletionError::CompletionError)?;
+        insert_tracing_context_headers(&mut headers);
         let response = self
             .send_streaming_request(&url, headers, &streaming_params, None)
             .await?;
@@ -2544,6 +2535,7 @@ impl InferenceProvider for Fleet {
             HeaderValue::from_str(&request_hash)
                 .map_err(|e| ImageEditError::EditError(format!("Invalid request hash: {e}")))?,
         );
+        insert_tracing_context_headers(&mut headers);
 
         // Dereference Arc<Vec<u8>> to get &[u8] for efficient handling
         let image_data: &[u8] = &params.image;
@@ -2755,14 +2747,29 @@ impl InferenceProvider for Fleet {
 
         if !response.status().is_success() {
             let status_code = response.status().as_u16();
+            let retry_after = response
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned);
+            if status_code == 503 {
+                // An overload answer carries nothing callers use beyond the
+                // status and Retry-After; skip reading the body.
+                return Err(PrivacyClassifyError::from_upstream_status(
+                    status_code,
+                    retry_after.as_deref(),
+                    String::new(),
+                ));
+            }
             let message = response
                 .text()
                 .await
                 .unwrap_or_else(|_| "Unknown error".to_string());
-            return Err(PrivacyClassifyError::HttpError {
+            return Err(PrivacyClassifyError::from_upstream_status(
                 status_code,
+                retry_after.as_deref(),
                 message,
-            });
+            ));
         }
 
         let raw_bytes = response.bytes().await.map_err(to_privacy_classify_error)?;
@@ -3014,6 +3021,107 @@ mod tests {
             timestamp_granularities: Some(vec!["word".to_string(), "segment".to_string()]),
             extra: Default::default(),
         }
+    }
+
+    async fn privacy_classify_against(response: ResponseTemplate) -> PrivacyClassifyError {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/privacy/classify"))
+            .respond_with(response)
+            .expect(1)
+            .mount(&server)
+            .await;
+        let provider = Provider::new(Config::new(
+            server.uri(),
+            Some("sk-test".to_string()),
+            Some(5),
+        ));
+        provider
+            .privacy_classify_raw(
+                bytes::Bytes::from_static(b"{}"),
+                std::collections::HashMap::new(),
+            )
+            .await
+            .expect_err("non-2xx must be an error")
+    }
+
+    #[tokio::test]
+    async fn privacy_classify_503_is_overloaded_with_retry_after() {
+        let err = privacy_classify_against(
+            ResponseTemplate::new(503)
+                .insert_header("retry-after", "3")
+                .set_body_string("upstream text"),
+        )
+        .await;
+        assert!(
+            matches!(
+                err,
+                PrivacyClassifyError::Overloaded {
+                    retry_after_secs: Some(3)
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn privacy_classify_503_without_usable_retry_after() {
+        for response in [
+            ResponseTemplate::new(503),
+            ResponseTemplate::new(503)
+                .insert_header("retry-after", "Wed, 21 Oct 2015 07:28:00 GMT"),
+            ResponseTemplate::new(503).insert_header("retry-after", "-1"),
+        ] {
+            let err = privacy_classify_against(response).await;
+            assert!(
+                matches!(
+                    err,
+                    PrivacyClassifyError::Overloaded {
+                        retry_after_secs: None
+                    }
+                ),
+                "{err:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn privacy_classify_other_statuses_keep_http_error() {
+        for status in [500u16, 504] {
+            let err = privacy_classify_against(
+                ResponseTemplate::new(status).insert_header("retry-after", "3"),
+            )
+            .await;
+            assert!(
+                matches!(err, PrivacyClassifyError::HttpError { status_code, .. } if status_code == status),
+                "{status}: {err:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn privacy_classify_connection_error_is_request_failed() {
+        // Bind then drop a listener so the port refuses connections.
+        let addr = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let provider = Provider::new(Config::new(
+            format!("http://{addr}"),
+            Some("sk-test".to_string()),
+            Some(5),
+        ));
+        let err = provider
+            .privacy_classify_raw(
+                bytes::Bytes::from_static(b"{}"),
+                std::collections::HashMap::new(),
+            )
+            .await
+            .expect_err("refused connection must be an error");
+        assert!(
+            matches!(err, PrivacyClassifyError::RequestFailed(_)),
+            "{err:?}"
+        );
     }
 
     #[tokio::test]
@@ -3301,40 +3409,64 @@ mod tests {
         );
     }
 
+    fn client_tracing_extra() -> std::collections::HashMap<String, serde_json::Value> {
+        [
+            tracing_headers::REQUEST_ID,
+            tracing_headers::ORG_ID,
+            tracing_headers::WORKSPACE_ID,
+        ]
+        .into_iter()
+        .map(|key| (key.to_string(), serde_json::json!("client-value")))
+        .collect()
+    }
+
+    #[tokio::test]
+    async fn test_prepare_tracing_headers_sends_the_authenticated_ids_in_scope() {
+        let provider = create_test_provider();
+        let context = crate::tracing_context::TracingContext {
+            request_id: uuid::Uuid::new_v4(),
+            org_id: uuid::Uuid::new_v4(),
+            workspace_id: uuid::Uuid::new_v4(),
+        };
+        let mut headers = reqwest::header::HeaderMap::new();
+        let mut extra = client_tracing_extra();
+
+        crate::tracing_context::with_tracing_context(context, async {
+            provider
+                .fleet
+                .prepare_tracing_headers(&mut headers, &mut extra);
+        })
+        .await;
+
+        let header = |name: &str| {
+            headers
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned)
+        };
+        assert_eq!(header("X-Request-Id"), Some(context.request_id.to_string()));
+        assert_eq!(header("X-Org-Id"), Some(context.org_id.to_string()));
+        assert_eq!(
+            header("X-Workspace-Id"),
+            Some(context.workspace_id.to_string())
+        );
+        assert!(extra.is_empty(), "body keys must never be sent");
+    }
+
     #[test]
-    fn test_prepare_tracing_headers_forwards_to_http_headers() {
+    fn test_prepare_tracing_headers_never_forwards_body_keys() {
         let provider = create_test_provider();
         let mut headers = reqwest::header::HeaderMap::new();
-        let mut extra = std::collections::HashMap::new();
-        extra.insert(
-            tracing_headers::REQUEST_ID.to_string(),
-            serde_json::Value::String("550e8400-e29b-41d4-a716-446655440000".to_string()),
-        );
-        extra.insert(
-            tracing_headers::ORG_ID.to_string(),
-            serde_json::Value::String("aaaa-bbbb".to_string()),
-        );
-        extra.insert(
-            tracing_headers::WORKSPACE_ID.to_string(),
-            serde_json::Value::String("cccc-dddd".to_string()),
-        );
+        let mut extra = client_tracing_extra();
 
         provider
             .fleet
             .prepare_tracing_headers(&mut headers, &mut extra);
 
-        assert_eq!(
-            headers.get("X-Request-Id").and_then(|v| v.to_str().ok()),
-            Some("550e8400-e29b-41d4-a716-446655440000")
-        );
-        assert_eq!(
-            headers.get("X-Org-Id").and_then(|v| v.to_str().ok()),
-            Some("aaaa-bbbb")
-        );
-        assert_eq!(
-            headers.get("X-Workspace-Id").and_then(|v| v.to_str().ok()),
-            Some("cccc-dddd")
-        );
+        assert!(headers.get("X-Request-Id").is_none());
+        assert!(headers.get("X-Org-Id").is_none());
+        assert!(headers.get("X-Workspace-Id").is_none());
+        assert!(extra.is_empty());
     }
 
     #[test]
@@ -8144,27 +8276,37 @@ mod tests {
             }
         }
 
-        #[test]
-        fn placement_request_reads_the_typed_context() {
+        #[tokio::test]
+        async fn placement_request_reads_the_typed_context() {
             let key = AffinityKey::from_bytes([3u8; 16]);
             let mut params = placement_params(vec![user_msg("hi")]);
             params.model = "m".to_string();
             params.request_priority = -5;
+            // Body keys never stand in for the authenticated ids.
             params.extra = HashMap::from([
-                ("x_request_id".to_string(), "req-9".into()),
-                ("x_org_id".to_string(), "org-9".into()),
+                ("x_request_id".to_string(), "client-value".into()),
+                ("x_org_id".to_string(), "client-value".into()),
             ]);
+            assert_eq!(PlacementRequest::from_params(&params).org_id, "");
+            let ids = crate::tracing_context::TracingContext {
+                request_id: uuid::Uuid::new_v4(),
+                org_id: uuid::Uuid::new_v4(),
+                workspace_id: uuid::Uuid::new_v4(),
+            };
             params.placement = crate::PlacementContext {
                 prompt_tokens: Some(120_000),
                 prefill_heavy: true,
                 affinity: Some(key.clone()),
                 affinity_source: AffinitySource::Prefix,
             };
-            let req = PlacementRequest::from_params(&params);
+            let req = crate::tracing_context::with_tracing_context(ids, async {
+                PlacementRequest::from_params(&params)
+            })
+            .await;
             assert_eq!(req.model, "m");
             assert_eq!(req.priority, -5);
-            assert_eq!(req.request_id, "req-9");
-            assert_eq!(req.org_id, "org-9");
+            assert_eq!(req.request_id, ids.request_id.to_string());
+            assert_eq!(req.org_id, ids.org_id.to_string());
             assert_eq!(req.prompt_tokens, 120_000);
             assert!(req.prefill_heavy);
             let fingerprint = |k: &AffinityKey| pin_id(Tier::Base, k, &PIN_SECRET).to_hex();

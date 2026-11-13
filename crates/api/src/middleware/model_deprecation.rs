@@ -57,7 +57,7 @@ impl RequestedModel {
         let _ = self.0.set(model.to_string());
     }
 
-    fn get(&self) -> Option<&str> {
+    pub(crate) fn get(&self) -> Option<&str> {
         self.0.get().map(String::as_str)
     }
 }
@@ -120,7 +120,12 @@ pub async fn model_deprecation_middleware(
     mut request: Request,
     next: Next,
 ) -> Response {
-    let requested = RequestedModel::default();
+    // An outer layer may already share a slot with the handler; reuse it.
+    let requested = request
+        .extensions()
+        .get::<RequestedModel>()
+        .cloned()
+        .unwrap_or_default();
     request.extensions_mut().insert(requested.clone());
     // Who is asking, read before the request moves on. The auth layer runs
     // outside this one and has stored the API key's organization.

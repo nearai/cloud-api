@@ -39,21 +39,26 @@ pub async fn detect_pii(
     let resp_bytes = pool
         .privacy_classify(model, bytes::Bytes::from(body_bytes), HashMap::new())
         .await
-        .map_err(|e| AutoRedactError::DetectorUnavailable(detector_error_message(&e)))?;
+        .map_err(detector_error)?;
 
     parse_response(&resp_bytes, texts.len())
 }
 
-/// Convert the inference-pool error into a sanitized public message.
-/// We deliberately drop any provider-specific detail that could leak
-/// state about other tenants or backends.
-fn detector_error_message(err: &inference_providers::PrivacyClassifyError) -> String {
+/// Convert the inference-pool error into an [`AutoRedactError`] with a
+/// sanitized message. We deliberately drop any provider-specific detail that
+/// could leak state about other tenants or backends.
+fn detector_error(err: inference_providers::PrivacyClassifyError) -> AutoRedactError {
     use inference_providers::PrivacyClassifyError as E;
     match err {
-        E::HttpError { status_code, .. } => {
-            format!("PII detector returned HTTP {status_code}")
+        E::Overloaded { retry_after_secs } => {
+            AutoRedactError::DetectorOverloaded { retry_after_secs }
         }
-        E::RequestFailed(_) => "PII detector unreachable".to_string(),
+        E::HttpError { status_code, .. } => AutoRedactError::DetectorUnavailable(format!(
+            "PII detector returned HTTP {status_code}"
+        )),
+        E::RequestFailed(_) => {
+            AutoRedactError::DetectorUnavailable("PII detector unreachable".to_string())
+        }
     }
 }
 

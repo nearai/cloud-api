@@ -7,10 +7,10 @@ use crate::{
         AttestationError,
     },
     usage::{
-        InferenceType, InferenceUsageHistoryQuery, InferenceUsageReportQuery,
-        InferenceUsageReportRow, OrganizationBalanceInfo, OrganizationCreditLimit,
-        OrganizationLimit, ProviderAttribution, RecordUsageApiRequest, RecordUsageServiceRequest,
-        UsageCheckResult, UsageDiscount, UsageError, UsageLogEntry, UsageServiceTrait,
+        InferenceType, InferenceUsageHistoryQuery, InferenceUsageReportRow,
+        OrganizationBalanceInfo, OrganizationCreditLimit, OrganizationLimit, ProviderAttribution,
+        RecordUsageApiRequest, RecordUsageServiceRequest, UsageCheckResult, UsageDiscount,
+        UsageError, UsageLogEntry, UsageServiceTrait,
     },
 };
 use async_trait::async_trait;
@@ -333,13 +333,6 @@ impl UsageServiceTrait for MockUsageService {
         Ok(vec![])
     }
 
-    async fn list_inference_usage_report(
-        &self,
-        _query: InferenceUsageReportQuery,
-    ) -> Result<Vec<InferenceUsageReportRow>, UsageError> {
-        Ok(vec![])
-    }
-
     async fn list_inference_usage_history(
         &self,
         _query: InferenceUsageHistoryQuery,
@@ -610,13 +603,6 @@ impl UsageServiceTrait for CapturingUsageService {
         _start_date: chrono::DateTime<chrono::Utc>,
         _end_date: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<Vec<crate::usage::UsageByModelEntry>, UsageError> {
-        Ok(vec![])
-    }
-
-    async fn list_inference_usage_report(
-        &self,
-        _query: InferenceUsageReportQuery,
-    ) -> Result<Vec<InferenceUsageReportRow>, UsageError> {
         Ok(vec![])
     }
 

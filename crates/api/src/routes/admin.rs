@@ -5,18 +5,15 @@ use crate::conversions::{
 };
 use crate::middleware::{AdminAudit, AdminUser};
 use crate::models::{
-    AdminAccessTokenPermission, AdminAccessTokenResponse, AdminApiKeyResponse,
-    AdminInvitationEmailResendResultResponse, AdminOrganizationMemberResponse, AdminUserResponse,
+    AdminAccessTokenPermission, AdminAccessTokenResponse, AdminInvitationEmailResendResultResponse,
     CreateAdminAccessTokenRequest, CreditType, DeleteAdminAccessTokenRequest, EraseUserRequest,
     EraseUserResponse, ErasedOrganizationResponse, ErasureBlockedResponse, ErasureLogResponse,
     ErasureLookupOrganizationResponse, ErasurePreviewResponse, ErrorResponse,
-    ListAdminAccessTokensResponse, ListAdminApiKeysResponse,
-    ListAdminInvitationEmailDeliveriesResponse, ListAdminOrganizationMembersResponse,
-    LookupUserErasuresRequest, LookupUserErasuresResponse, MemberRole, OrganizationMemberResponse,
+    ListAdminAccessTokensResponse, ListAdminInvitationEmailDeliveriesResponse,
+    LookupUserErasuresRequest, LookupUserErasuresResponse, OrganizationMemberResponse,
     RetainedOrganizationResponse, UpdateOrganizationMemberRequest, UserErasureRecordResponse,
 };
 use crate::routes::common::analytics_error_response;
-use crate::routes::usage::{compute_organization_balance_response, OrganizationBalanceResponse};
 use axum::{
     extract::{Json, Path, Query, State},
     http::HeaderMap,
@@ -26,11 +23,10 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use config::ApiConfig;
-use services::admin::{AdminService, AnalyticsService};
+use services::admin::AnalyticsService;
 use services::auth::{AuthServiceTrait, UserId};
-use services::usage::UsageServiceTrait;
 use std::sync::Arc;
-use tracing::{debug, error, warn};
+use tracing::{debug, error};
 use uuid::Uuid;
 
 /// Serialize a stored `deprecation_date` into the OpenRouter-compatible
@@ -43,310 +39,14 @@ pub(crate) fn format_deprecation_date(dt: &DateTime<Utc>) -> String {
 
 #[derive(Clone)]
 pub struct AdminAppState {
-    pub admin_service: Arc<dyn AdminService + Send + Sync>,
     pub analytics_service: Arc<AnalyticsService>,
     pub organization_service:
         Arc<dyn services::organization::OrganizationServiceTrait + Send + Sync>,
     pub auth_service: Arc<dyn AuthServiceTrait>,
-    pub usage_service: Arc<dyn UsageServiceTrait + Send + Sync>,
-    pub staking_farm_service: Arc<services::staking_farm::StakingFarmService>,
     pub config: Arc<ApiConfig>,
     pub admin_access_token_repository: Arc<database::repositories::AdminAccessTokenRepository>,
     pub infra_service: Arc<services::admin::InfraService>,
     pub user_erasure_service: Arc<services::user_erasure::UserErasureService>,
-}
-
-/// Get organization balance (Admin only)
-///
-/// Returns the current spending balance for an organization without requiring
-/// the caller to be a member of that organization. Intended for trusted
-/// automated billing services.
-#[utoipa::path(
-    get,
-    path = "/v1/admin/organizations/{org_id}/usage/balance",
-    tag = "Admin",
-    params(
-        ("org_id" = String, Path, description = "Organization ID")
-    ),
-    responses(
-        (status = 200, description = "Organization balance", body = OrganizationBalanceResponse),
-        (status = 400, description = "Invalid request", body = ErrorResponse),
-        (status = 401, description = "Unauthorized", body = ErrorResponse),
-        (status = 404, description = "Not found", body = ErrorResponse),
-        (status = 500, description = "Internal server error", body = ErrorResponse)
-    ),
-    security(
-        ("session_token" = [])
-    )
-)]
-pub async fn get_admin_organization_balance(
-    State(app_state): State<AdminAppState>,
-    Path(org_id): Path<String>,
-    Extension(_admin_user): Extension<AdminUser>,
-) -> Result<ResponseJson<OrganizationBalanceResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
-    debug!(
-        "Admin get organization balance request for org_id: {}",
-        org_id
-    );
-
-    let organization_id = uuid::Uuid::parse_str(&org_id).map_err(|_| {
-        (
-            StatusCode::BAD_REQUEST,
-            ResponseJson(ErrorResponse::new(
-                "Invalid organization ID format".to_string(),
-                "invalid_id".to_string(),
-            )),
-        )
-    })?;
-
-    compute_organization_balance_response(&*app_state.usage_service, organization_id)
-        .await
-        .map(ResponseJson)
-}
-
-/// List API keys across all organizations (Admin only)
-///
-/// Returns key metadata for activation reporting, newest first, including revoked and
-/// inactive keys. Never returns key material (raw key, hash, or prefix) or key names.
-#[utoipa::path(
-    get,
-    path = "/v1/admin/api-keys",
-    tag = "Admin",
-    params(
-        ("limit" = Option<i64>, Query, description = "Maximum number of API keys to return (default: 100)"),
-        ("offset" = Option<i64>, Query, description = "Number of API keys to skip (default: 0)"),
-        ("organization_id" = Option<Uuid>, Query, description = "Filter by organization ID"),
-        ("created_after" = Option<DateTime<Utc>>, Query, description = "Only keys created at or after this timestamp"),
-        ("created_before" = Option<DateTime<Utc>>, Query, description = "Only keys created at or before this timestamp")
-    ),
-    responses(
-        (status = 200, description = "API keys retrieved successfully", body = ListAdminApiKeysResponse),
-        (status = 400, description = "Invalid request", body = ErrorResponse),
-        (status = 401, description = "Unauthorized", body = ErrorResponse),
-        (status = 500, description = "Internal server error", body = ErrorResponse)
-    ),
-    security(
-        ("session_token" = [])
-    )
-)]
-pub async fn list_api_keys(
-    State(app_state): State<AdminAppState>,
-    Extension(_admin_user): Extension<AdminUser>,
-    audit: AdminAudit,
-    axum::extract::Query(params): axum::extract::Query<ListAdminApiKeysQueryParams>,
-) -> Result<ResponseJson<ListAdminApiKeysResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
-    crate::routes::common::validate_limit_offset(params.limit, params.offset)?;
-
-    debug!(
-        "List API keys request with limit={}, offset={}",
-        params.limit, params.offset
-    );
-    if let Some(organization_id) = params.organization_id {
-        audit.record_organization(organization_id);
-    }
-
-    let filters = services::admin::AdminApiKeyFilters {
-        organization_id: params.organization_id,
-        created_after: params.created_after,
-        created_before: params.created_before,
-    };
-
-    let (api_keys, total) = app_state
-        .admin_service
-        .list_api_keys(filters, params.limit, params.offset)
-        .await
-        .map_err(|e| match e {
-            services::admin::AdminError::InvalidParams(msg) => (
-                StatusCode::BAD_REQUEST,
-                ResponseJson(ErrorResponse::new(msg, "invalid_request".to_string())),
-            ),
-            services::admin::AdminError::Unauthorized(msg) => (
-                StatusCode::UNAUTHORIZED,
-                ResponseJson(ErrorResponse::new(msg, "unauthorized".to_string())),
-            ),
-            _ => {
-                error!("Failed to list API keys: {:?}", e);
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    ResponseJson(ErrorResponse::new(
-                        "Failed to retrieve API keys".to_string(),
-                        "internal_server_error".to_string(),
-                    )),
-                )
-            }
-        })?;
-    audit.record_page(params.limit, params.offset, api_keys.len());
-
-    let response = ListAdminApiKeysResponse {
-        api_keys: api_keys
-            .into_iter()
-            .map(admin_api_key_info_to_response)
-            .collect(),
-        total,
-        limit: params.limit,
-        offset: params.offset,
-    };
-
-    Ok(ResponseJson(response))
-}
-
-fn admin_api_key_info_to_response(key: services::admin::AdminApiKeyInfo) -> AdminApiKeyResponse {
-    AdminApiKeyResponse {
-        id: key.id.to_string(),
-        organization_id: key.organization_id.to_string(),
-        organization_name: key.organization_name,
-        workspace_id: key.workspace_id.to_string(),
-        created_by_user_id: key.created_by_user_id.to_string(),
-        created_at: key.created_at,
-        is_active: key.is_active,
-        deleted_at: key.deleted_at,
-        is_managed_playground: key.is_managed_playground,
-    }
-}
-
-/// Map a raw database role string to the API `MemberRole`. Unknown values fall
-/// back to `Member` (the least-privileged role) so a malformed row can never
-/// be misrepresented as an owner/admin.
-fn member_role_from_db_str(role: &str, member_id: Uuid) -> MemberRole {
-    match role {
-        "owner" => MemberRole::Owner,
-        "admin" => MemberRole::Admin,
-        "member" => MemberRole::Member,
-        _ => {
-            // Unreachable while the `organization_members.role` CHECK constraint
-            // holds, but if it is ever relaxed we must not silently present a
-            // bogus role as a real one. Fall back to the least-privileged role
-            // and surface the anomaly by id only (no raw DB value, per the
-            // project's logging rules).
-            warn!(
-                "Unexpected organization member role for member_id={}; defaulting to 'member'",
-                member_id
-            );
-            MemberRole::Member
-        }
-    }
-}
-
-/// List members of a specific organization (Admin only)
-///
-/// Returns the members of the given organization with full user details
-/// (email, last login, active status).
-/// Only authenticated admins can perform this operation.
-#[utoipa::path(
-    get,
-    path = "/v1/admin/organizations/{org_id}/members",
-    tag = "Admin",
-    params(
-        ("org_id" = Uuid, Path, description = "Organization ID"),
-        ("limit" = Option<i64>, Query, description = "Maximum number of members to return (default: 100)"),
-        ("offset" = Option<i64>, Query, description = "Number of members to skip (default: 0)")
-    ),
-    responses(
-        (status = 200, description = "Organization members retrieved successfully", body = ListAdminOrganizationMembersResponse),
-        (status = 400, description = "Invalid request", body = ErrorResponse),
-        (status = 401, description = "Unauthorized", body = ErrorResponse),
-        (status = 404, description = "Organization not found", body = ErrorResponse),
-        (status = 500, description = "Internal server error", body = ErrorResponse)
-    ),
-    security(
-        ("session_token" = [])
-    )
-)]
-pub async fn list_organization_members(
-    State(app_state): State<AdminAppState>,
-    Extension(_admin_user): Extension<AdminUser>, // Require admin auth
-    audit: AdminAudit,
-    Path(org_id): Path<Uuid>,
-    Query(params): Query<ListOrganizationMembersQueryParams>,
-) -> Result<
-    ResponseJson<ListAdminOrganizationMembersResponse>,
-    (StatusCode, ResponseJson<ErrorResponse>),
-> {
-    crate::routes::common::validate_limit_offset(params.limit, params.offset)?;
-
-    debug!(
-        "List organization members request: org_id={}, limit={}, offset={}",
-        org_id, params.limit, params.offset
-    );
-
-    let (members, total) = app_state
-        .admin_service
-        .list_organization_members(org_id, params.limit, params.offset)
-        .await
-        .map_err(|e| match e {
-            services::admin::AdminError::OrganizationNotFound(_) => {
-                // Expected for probes of unknown/deactivated org ids — keep it
-                // out of error-level logs so it can't be used to flood them.
-                debug!("Organization not found for member list: org_id={}", org_id);
-                (
-                    StatusCode::NOT_FOUND,
-                    ResponseJson(ErrorResponse::new(
-                        "Organization not found".to_string(),
-                        "not_found".to_string(),
-                    )),
-                )
-            }
-            services::admin::AdminError::Unauthorized(msg) => {
-                warn!("Unauthorized organization member list: org_id={}", org_id);
-                (
-                    StatusCode::UNAUTHORIZED,
-                    ResponseJson(ErrorResponse::new(msg, "unauthorized".to_string())),
-                )
-            }
-            other => {
-                error!("Failed to list organization members: {:?}", other);
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    ResponseJson(ErrorResponse::new(
-                        "Failed to retrieve organization members".to_string(),
-                        "internal_server_error".to_string(),
-                    )),
-                )
-            }
-        })?;
-
-    let member_responses: Vec<AdminOrganizationMemberResponse> = members
-        .into_iter()
-        .map(|m| AdminOrganizationMemberResponse {
-            id: m.member_id.to_string(),
-            organization_id: m.organization_id.to_string(),
-            role: member_role_from_db_str(&m.role, m.member_id),
-            joined_at: m.joined_at,
-            invited_by: m.invited_by.map(|id| id.to_string()),
-            user: AdminUserResponse {
-                id: m.user.id.to_string(),
-                email: m.user.email,
-                username: Some(m.user.username),
-                display_name: m.user.display_name,
-                avatar_url: m.user.avatar_url,
-                created_at: m.user.created_at,
-                last_login_at: m.user.last_login_at,
-                is_active: m.user.is_active,
-                lifecycle: crate::conversions::admin_user_lifecycle(
-                    m.user.id,
-                    m.user.is_active,
-                    &m.user.auth_provider,
-                ),
-                auth_provider: m.user.auth_provider,
-                provider_user_id: m.user.provider_user_id,
-                contact_email: crate::conversions::verified_contact_email(
-                    m.user.contact_email.as_deref(),
-                    m.user.contact_email_verified_at,
-                ),
-                contact_email_verified_at: m.user.contact_email_verified_at,
-                email_opt_in_at: m.user.email_opt_in_at,
-                organizations: None,
-            },
-        })
-        .collect();
-    audit.record_page(params.limit, params.offset, member_responses.len());
-
-    Ok(ResponseJson(ListAdminOrganizationMembersResponse {
-        members: member_responses,
-        total,
-        limit: params.limit,
-        offset: params.offset,
-    }))
 }
 
 /// Update an organization member role as a system administrator.
@@ -876,25 +576,6 @@ pub struct ListUsersQueryParams {
     pub search: Option<String>,
     pub is_active: Option<bool>,
     pub search_by_name: Option<String>,
-}
-
-#[derive(Debug, serde::Deserialize)]
-pub struct ListOrganizationMembersQueryParams {
-    #[serde(default = "crate::routes::common::default_limit")]
-    pub limit: i64,
-    #[serde(default)]
-    pub offset: i64,
-}
-
-#[derive(Debug, serde::Deserialize)]
-pub struct ListAdminApiKeysQueryParams {
-    #[serde(default = "crate::routes::common::default_limit")]
-    pub limit: i64,
-    #[serde(default)]
-    pub offset: i64,
-    pub organization_id: Option<Uuid>,
-    pub created_after: Option<DateTime<Utc>>,
-    pub created_before: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, serde::Deserialize)]

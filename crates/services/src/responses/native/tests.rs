@@ -278,9 +278,9 @@ fn usage_observer_does_not_treat_truncation_as_completion() {
 
 use crate::responses::models::{ResponseStatus, ResponseStreamEvent};
 use crate::usage::{
-    InferenceUsageHistoryQuery, InferenceUsageReportQuery, InferenceUsageReportRow,
-    OrganizationBalanceInfo, OrganizationCreditLimit, OrganizationLimit, RecordUsageApiRequest,
-    UsageCheckResult, UsageDiscount, UsageError, UsageLogEntry,
+    InferenceUsageHistoryQuery, InferenceUsageReportRow, OrganizationBalanceInfo,
+    OrganizationCreditLimit, OrganizationLimit, RecordUsageApiRequest, UsageCheckResult,
+    UsageDiscount, UsageError, UsageLogEntry,
 };
 use std::sync::{
     atomic::{AtomicU32, Ordering},
@@ -431,12 +431,6 @@ impl UsageServiceTrait for ScriptedUsage {
         _start_date: chrono::DateTime<chrono::Utc>,
         _end_date: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<Vec<crate::usage::UsageByModelEntry>, UsageError> {
-        unreachable!()
-    }
-    async fn list_inference_usage_report(
-        &self,
-        _query: InferenceUsageReportQuery,
-    ) -> Result<Vec<InferenceUsageReportRow>, UsageError> {
         unreachable!()
     }
     async fn list_inference_usage_history(

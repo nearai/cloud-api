@@ -2015,14 +2015,6 @@ redact-thinking-2026-02-12";
             unimplemented!()
         }
 
-        async fn list_inference_usage_report(
-            &self,
-            _query: services::usage::InferenceUsageReportQuery,
-        ) -> Result<Vec<services::usage::InferenceUsageReportRow>, services::usage::UsageError>
-        {
-            unimplemented!()
-        }
-
         async fn list_inference_usage_history(
             &self,
             _query: services::usage::InferenceUsageHistoryQuery,

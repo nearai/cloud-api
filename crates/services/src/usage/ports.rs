@@ -1,10 +1,7 @@
 use super::provider_attribution::ProviderAttribution;
 use super::text_pricing::{TextPricingProfile, TextServiceTier};
 use crate::responses::models::ResponseId;
-pub use crate::usage::reporting::{
-    InferenceUsageHistoryQuery, InferenceUsageReportCursor, InferenceUsageReportQuery,
-    InferenceUsageReportRow,
-};
+pub use crate::usage::reporting::{InferenceUsageHistoryQuery, InferenceUsageReportRow};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -312,11 +309,6 @@ pub trait UsageServiceTrait: Send + Sync {
         end_date: Option<DateTime<Utc>>,
     ) -> Result<Vec<UsageByModelEntry>, UsageError>;
 
-    async fn list_inference_usage_report(
-        &self,
-        query: InferenceUsageReportQuery,
-    ) -> Result<Vec<InferenceUsageReportRow>, UsageError>;
-
     async fn list_inference_usage_history(
         &self,
         query: InferenceUsageHistoryQuery,
@@ -407,11 +399,6 @@ pub trait UsageRepository: Send + Sync {
         start_date: DateTime<Utc>,
         end_date: Option<DateTime<Utc>>,
     ) -> anyhow::Result<Vec<UsageByModelEntry>>;
-
-    async fn list_inference_usage_report(
-        &self,
-        query: InferenceUsageReportQuery,
-    ) -> anyhow::Result<Vec<InferenceUsageReportRow>>;
 
     async fn list_inference_usage_history(
         &self,

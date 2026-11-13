@@ -577,29 +577,18 @@ fn parse_optional_i32_env(key: &str, default: Option<i32>) -> Result<Option<i32>
     }
 }
 
-/// Operational limits for the programmatic usage-reporting API.
+/// Time budget for usage queries.
 ///
-/// Reporting is disabled by default because its production indexes are built
-/// concurrently outside a migration transaction. Operators enable it only after completing
-/// the rollout checklist in `docs/usage-reporting-rollout.md`.
+/// The database statement timeout for usage history and balance queries is derived
+/// from this request timeout, leaving headroom to answer before the HTTP timeout.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UsageReportingConfig {
-    pub enabled: bool,
-    pub global_requests_per_minute: u32,
-    pub token_requests_per_minute: u32,
-    pub max_concurrent_requests: usize,
-    pub token_max_concurrent_requests: usize,
     pub request_timeout_seconds: u64,
 }
 
 impl Default for UsageReportingConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
-            global_requests_per_minute: 600,
-            token_requests_per_minute: 60,
-            max_concurrent_requests: 4,
-            token_max_concurrent_requests: 2,
             request_timeout_seconds: 15,
         }
     }
@@ -613,42 +602,16 @@ impl UsageReportingConfig {
     pub fn from_env() -> Result<Self, String> {
         let defaults = Self::default();
         let config = Self {
-            enabled: parse_bool_env("USAGE_REPORTING_ENABLED", defaults.enabled)?,
-            global_requests_per_minute: parse_u32_env(
-                "USAGE_REPORTING_GLOBAL_REQUESTS_PER_MINUTE",
-                defaults.global_requests_per_minute,
-            )?,
-            token_requests_per_minute: parse_u32_env(
-                "USAGE_REPORTING_TOKEN_REQUESTS_PER_MINUTE",
-                defaults.token_requests_per_minute,
-            )?,
-            max_concurrent_requests: usize::try_from(parse_u32_env(
-                "USAGE_REPORTING_MAX_CONCURRENT_REQUESTS",
-                u32::try_from(defaults.max_concurrent_requests)
-                    .map_err(|_| "default reporting concurrency exceeds u32".to_string())?,
-            )?)
-            .map_err(|_| "USAGE_REPORTING_MAX_CONCURRENT_REQUESTS is too large".to_string())?,
-            token_max_concurrent_requests: usize::try_from(parse_u32_env(
-                "USAGE_REPORTING_TOKEN_MAX_CONCURRENT_REQUESTS",
-                u32::try_from(defaults.token_max_concurrent_requests)
-                    .map_err(|_| "default token reporting concurrency exceeds u32".to_string())?,
-            )?)
-            .map_err(|_| {
-                "USAGE_REPORTING_TOKEN_MAX_CONCURRENT_REQUESTS is too large".to_string()
-            })?,
             request_timeout_seconds: parse_u64_env(
                 "USAGE_REPORTING_REQUEST_TIMEOUT_SECONDS",
                 defaults.request_timeout_seconds,
             )?,
         };
 
-        if config.global_requests_per_minute == 0
-            || config.token_requests_per_minute == 0
-            || config.max_concurrent_requests == 0
-            || config.token_max_concurrent_requests == 0
-            || config.request_timeout_seconds == 0
-        {
-            return Err("usage reporting limits must be greater than zero".to_string());
+        if config.request_timeout_seconds == 0 {
+            return Err(
+                "USAGE_REPORTING_REQUEST_TIMEOUT_SECONDS must be greater than zero".to_string(),
+            );
         }
         if config.request_timeout_seconds > 3_600 {
             return Err("USAGE_REPORTING_REQUEST_TIMEOUT_SECONDS must not exceed 3600".to_string());
@@ -2106,7 +2069,6 @@ mod tests {
     fn reporting_database_timeout_leaves_headroom_for_http_response() {
         let config = UsageReportingConfig {
             request_timeout_seconds: 15,
-            ..UsageReportingConfig::default()
         };
 
         assert_eq!(

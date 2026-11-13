@@ -324,53 +324,6 @@ impl UsageHistoryQuery {
     }
 }
 
-/// Service usage history entry (platform services like web_search).
-/// All costs use fixed scale of 9 (nano-dollars) and USD currency.
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
-pub struct ServiceUsageEntryResponse {
-    pub id: String,
-    pub organization_id: String,
-    pub workspace_id: String,
-    pub api_key_id: String,
-    pub service_id: String,
-    pub quantity: i32,
-    pub total_cost: i64,            // In nano-dollars (scale 9)
-    pub total_cost_display: String, // Human readable, e.g., "$0.00123"
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub inference_id: Option<String>,
-    pub created_at: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub credit_allocations: Option<Vec<services::usage::CreditAllocation>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub funded_amount: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub unfunded_amount: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub allocation_policy_version: Option<String>,
-}
-
-/// Service usage history response
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
-pub struct ServiceUsageHistoryResponse {
-    pub data: Vec<ServiceUsageEntryResponse>,
-    pub total: usize,
-    pub limit: i64,
-    pub offset: i64,
-}
-
-/// Query parameters for service usage history
-#[derive(Debug, Deserialize)]
-pub struct ServiceUsageHistoryQuery {
-    #[serde(default = "crate::routes::common::default_limit")]
-    pub limit: i64,
-    #[serde(default)]
-    pub offset: i64,
-    /// Filter by platform service name (e.g. \"web_search\").
-    #[serde(rename = "serviceName")]
-    pub service_name: Option<String>,
-    pub credit_type: Option<String>,
-}
-
 /// Get organization balance
 ///
 /// Returns the current spending balance for an organization
@@ -572,32 +525,19 @@ fn usage_history_report_query(
         });
     }
 
-    let params = crate::routes::reporting_usage::ReportingUsageQueryParams {
-        start_time: usage_history_start_time(query)?,
-        end_time: usage_history_end_time(query)?,
-        source: Some("inference".to_string()),
-        workspace_id: query.workspace_id,
-        api_key_id: query.api_key_id,
-        model: None,
-        inference_type: None,
-        service_name: None,
-        credit_type: query.credit_type.clone(),
-        limit: Some(
-            u16::try_from(query.limit)
-                .map_err(|_| usage_history_query_bad_request("Limit cannot exceed 1000"))?,
-        ),
-        cursor: None,
-    };
-    let parsed = crate::routes::reporting_usage::ReportingUsageQuery::try_from(params)
-        .map_err(usage_history_query_error)?;
+    let (start_time, end_time) = normalize_usage_history_range(
+        parse_usage_history_time(usage_history_start_time(query)?.as_deref())?,
+        parse_usage_history_time(usage_history_end_time(query)?.as_deref())?,
+    )
+    .map_err(usage_history_query_error)?;
 
     Ok(InferenceUsageHistoryQuery {
         organization_id,
-        start_time: parsed.start_time,
-        end_time: parsed.end_time,
-        workspace_id: parsed.workspace_id,
-        api_key_id: parsed.api_key_id,
-        credit_type: parsed.credit_type,
+        start_time: Some(start_time),
+        end_time: Some(end_time),
+        workspace_id: query.workspace_id,
+        api_key_id: query.api_key_id,
+        credit_type: query.credit_type.clone(),
         limit: query.limit,
         offset: query.offset,
     })
@@ -645,20 +585,13 @@ fn normalize_usage_history_date(
         return Ok(Some(raw.to_string()));
     }
 
-    let date = NaiveDate::parse_from_str(raw, "%Y-%m-%d").map_err(|_| {
-        usage_history_query_error(
-            crate::routes::reporting_usage::ReportingUsageQueryError::InvalidTimestamp,
-        )
-    })?;
+    let date = NaiveDate::parse_from_str(raw, "%Y-%m-%d")
+        .map_err(|_| usage_history_query_error(UsageHistoryRangeError::InvalidTimestamp))?;
     let time = match boundary {
         DateBoundary::Start => date.and_hms_nano_opt(0, 0, 0, 0),
         DateBoundary::End => date.and_hms_nano_opt(23, 59, 59, 999_999_999),
     }
-    .ok_or_else(|| {
-        usage_history_query_error(
-            crate::routes::reporting_usage::ReportingUsageQueryError::InvalidTimestamp,
-        )
-    })?;
+    .ok_or_else(|| usage_history_query_error(UsageHistoryRangeError::InvalidTimestamp))?;
 
     Ok(Some(
         DateTime::<Utc>::from_naive_utc_and_offset(time, Utc).to_rfc3339(),
@@ -705,9 +638,48 @@ fn checked_usage_history_i32(value: i64, field: &str) -> Result<i32, UsageError>
         .map_err(|_| internal_usage_history_error(&format!("Invalid usage history {field}")))
 }
 
-fn usage_history_query_error(
-    error: crate::routes::reporting_usage::ReportingUsageQueryError,
-) -> UsageError {
+const MAX_USAGE_HISTORY_RANGE_DAYS: i64 = 366;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+enum UsageHistoryRangeError {
+    #[error("start_time and end_time must be RFC3339 timestamps")]
+    InvalidTimestamp,
+    #[error("end_time must be greater than or equal to start_time")]
+    InvalidTimeRange,
+    #[error("time range must not exceed {max_days} days")]
+    TimeRangeTooLarge { max_days: i64 },
+}
+
+fn parse_usage_history_time(value: Option<&str>) -> Result<Option<DateTime<Utc>>, UsageError> {
+    value
+        .map(|timestamp| {
+            DateTime::parse_from_rfc3339(timestamp)
+                .map(|parsed| parsed.with_timezone(&Utc))
+                .map_err(|_| usage_history_query_error(UsageHistoryRangeError::InvalidTimestamp))
+        })
+        .transpose()
+}
+
+/// Default to the trailing maximum window ending now, then bound the range.
+fn normalize_usage_history_range(
+    start_time: Option<DateTime<Utc>>,
+    end_time: Option<DateTime<Utc>>,
+) -> Result<(DateTime<Utc>, DateTime<Utc>), UsageHistoryRangeError> {
+    let end_time = end_time.unwrap_or_else(Utc::now);
+    let start_time =
+        start_time.unwrap_or_else(|| end_time - Duration::days(MAX_USAGE_HISTORY_RANGE_DAYS));
+    if end_time < start_time {
+        return Err(UsageHistoryRangeError::InvalidTimeRange);
+    }
+    if end_time - start_time > Duration::days(MAX_USAGE_HISTORY_RANGE_DAYS) {
+        return Err(UsageHistoryRangeError::TimeRangeTooLarge {
+            max_days: MAX_USAGE_HISTORY_RANGE_DAYS,
+        });
+    }
+    Ok((start_time, end_time))
+}
+
+fn usage_history_query_error(error: UsageHistoryRangeError) -> UsageError {
     (
         StatusCode::BAD_REQUEST,
         ResponseJson(ErrorResponse::new(
@@ -748,103 +720,6 @@ fn usage_query_timeout_error(organization_id: Uuid) -> UsageError {
             "usage_query_timeout".to_string(),
         )),
     )
-}
-
-/// Get service usage history for an organization
-///
-/// Returns paginated service usage logs (e.g., web_search) for an organization.
-#[utoipa::path(
-    get,
-    path = "/v1/organizations/{org_id}/service-usage/history",
-    tag = "Usage",
-    params(
-        ("org_id" = String, Path, description = "Organization ID"),
-        ("serviceName" = Option<String>, Query, description = "Filter by platform service name (e.g. web_search)"),
-        ("credit_type" = Option<CreditType>, Query, description = "Filter costs by their saved credit allocation."),
-        ("limit" = Option<i64>, Query, description = "Number of records to return (default: 100)"),
-        ("offset" = Option<i64>, Query, description = "Offset for pagination (default: 0)")
-    ),
-    responses(
-        (status = 200, description = "Service usage history", body = ServiceUsageHistoryResponse),
-        (status = 401, description = "Unauthorized", body = ErrorResponse),
-        (status = 403, description = "Forbidden", body = ErrorResponse),
-        (status = 500, description = "Internal server error", body = ErrorResponse)
-    ),
-    security(
-        ("session_token" = [])
-    )
-)]
-pub async fn get_service_usage_history(
-    State(app_state): State<AppState>,
-    Extension(user): Extension<AuthenticatedUser>,
-    Path(org_id): Path<String>,
-    Query(mut query): Query<ServiceUsageHistoryQuery>,
-) -> Result<ResponseJson<ServiceUsageHistoryResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
-    tracing::debug!(
-        "Get service usage history for org {} by user {}, service: {:?}, limit: {}, offset: {}",
-        org_id,
-        user.0.id,
-        query.service_name,
-        query.limit,
-        query.offset
-    );
-
-    // Validate pagination parameters
-    crate::routes::common::validate_limit_offset(query.limit, query.offset)?;
-    query.credit_type = normalize_credit_type_filter(query.credit_type.as_deref())?;
-
-    let organization_id = check_org_membership(&app_state, user, &org_id).await?;
-
-    let service_name = query.service_name.as_deref();
-    let credit_type = query.credit_type.as_deref();
-
-    let (history, total) = app_state
-        .service_usage_service
-        .get_usage_history(
-            organization_id,
-            service_name,
-            credit_type,
-            query.limit,
-            query.offset,
-        )
-        .await
-        .map_err(|_| {
-            tracing::error!("Failed to get service usage history");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                ResponseJson(ErrorResponse::new(
-                    "Failed to retrieve service usage history".to_string(),
-                    "internal_server_error".to_string(),
-                )),
-            )
-        })?;
-
-    let data = history
-        .into_iter()
-        .map(|entry| ServiceUsageEntryResponse {
-            id: entry.id.to_string(),
-            organization_id: entry.organization_id.to_string(),
-            workspace_id: entry.workspace_id.to_string(),
-            api_key_id: entry.api_key_id.to_string(),
-            service_id: entry.service_id.to_string(),
-            quantity: entry.quantity,
-            total_cost: entry.total_cost,
-            total_cost_display: format_amount(entry.total_cost),
-            inference_id: entry.inference_id.map(|id| id.to_string()),
-            created_at: entry.created_at.to_rfc3339(),
-            credit_allocations: entry.credit_allocations,
-            funded_amount: entry.funded_amount,
-            unfunded_amount: entry.unfunded_amount,
-            allocation_policy_version: entry.allocation_policy_version,
-        })
-        .collect();
-
-    Ok(ResponseJson(ServiceUsageHistoryResponse {
-        data,
-        total: total as usize,
-        limit: query.limit,
-        offset: query.offset,
-    }))
 }
 
 /// Get API key usage history
@@ -1433,4 +1308,82 @@ pub async fn get_organization_usage_by_model(
         end_date: end_date.map(|d| d.to_rfc3339()),
         data,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ts(value: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(value)
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    #[test]
+    fn usage_history_time_parses_rfc3339_and_rejects_invalid_timestamps() {
+        // Given: RFC3339 start_time/end_time values, one with an offset.
+        let start = parse_usage_history_time(Some("2026-07-01T00:00:00Z")).unwrap();
+        let offset = parse_usage_history_time(Some("2026-07-01T02:00:00+02:00")).unwrap();
+
+        // Then: they parse to UTC instants and a missing value stays absent.
+        assert_eq!(start, Some(ts("2026-07-01T00:00:00Z")));
+        assert_eq!(offset, start);
+        assert_eq!(parse_usage_history_time(None).unwrap(), None);
+
+        // And: a malformed timestamp is a 400 with the reporting query error type.
+        let (status, body) = parse_usage_history_time(Some("not-a-time")).unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body.0.error.r#type, "invalid_reporting_usage_query");
+    }
+
+    #[test]
+    fn usage_history_range_normalizes_open_ended_ranges() {
+        // Given: open-ended queries that would otherwise be unbounded.
+        let before_default = Utc::now();
+        let (default_start, default_end) = normalize_usage_history_range(None, None).unwrap();
+        let after_default = Utc::now();
+        let explicit_end = ts("2026-07-01T00:00:00Z");
+        let recent_start = Utc::now() - Duration::days(1);
+
+        // When: only an end, only a start, or a stale start is supplied.
+        let end_only = normalize_usage_history_range(None, Some(explicit_end)).unwrap();
+        let start_only = normalize_usage_history_range(Some(recent_start), None).unwrap();
+        let stale_result =
+            normalize_usage_history_range(Some(Utc::now() - Duration::days(367)), None);
+
+        // Then: every accepted range is no wider than 366 days.
+        assert!(default_end >= before_default);
+        assert!(default_end <= after_default);
+        assert_eq!(default_end - default_start, Duration::days(366));
+        assert_eq!(end_only.1, explicit_end);
+        assert_eq!(end_only.0, explicit_end - Duration::days(366));
+        assert_eq!(start_only.0, recent_start);
+        assert!(start_only.1 >= recent_start);
+        assert!(matches!(
+            stale_result,
+            Err(UsageHistoryRangeError::TimeRangeTooLarge { max_days: 366 })
+        ));
+    }
+
+    #[test]
+    fn usage_history_range_rejects_inverted_and_too_wide_ranges() {
+        let inverted = normalize_usage_history_range(
+            Some(ts("2026-07-02T00:00:00Z")),
+            Some(ts("2026-07-01T00:00:00Z")),
+        );
+        let too_wide = normalize_usage_history_range(
+            Some(ts("2026-01-01T00:00:00Z")),
+            Some(ts("2027-01-03T00:00:00Z")),
+        );
+
+        assert!(matches!(
+            inverted,
+            Err(UsageHistoryRangeError::InvalidTimeRange)
+        ));
+        assert!(matches!(
+            too_wide,
+            Err(UsageHistoryRangeError::TimeRangeTooLarge { max_days: 366 })
+        ));
+    }
 }

@@ -839,24 +839,6 @@ impl UsageServiceTrait for UsageServiceImpl {
             })
     }
 
-    async fn list_inference_usage_report(
-        &self,
-        query: InferenceUsageReportQuery,
-    ) -> Result<Vec<InferenceUsageReportRow>, UsageError> {
-        self.usage_repository
-            .list_inference_usage_report(query)
-            .await
-            .map_err(|error| {
-                if crate::common::is_query_timeout(&error) {
-                    UsageError::ReportingTimeout
-                } else {
-                    UsageError::InternalError(format!(
-                        "Failed to list inference usage report: {error}"
-                    ))
-                }
-            })
-    }
-
     async fn list_inference_usage_history(
         &self,
         query: InferenceUsageHistoryQuery,

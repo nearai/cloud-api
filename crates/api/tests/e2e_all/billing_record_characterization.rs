@@ -181,13 +181,6 @@ impl UsageServiceTrait for RecordingUsageService {
             .await
     }
 
-    async fn list_inference_usage_report(
-        &self,
-        query: services::usage::InferenceUsageReportQuery,
-    ) -> Result<Vec<services::usage::InferenceUsageReportRow>, UsageError> {
-        self.inner.list_inference_usage_report(query).await
-    }
-
     async fn list_inference_usage_history(
         &self,
         query: services::usage::InferenceUsageHistoryQuery,

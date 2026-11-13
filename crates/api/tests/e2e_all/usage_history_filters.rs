@@ -1,14 +1,21 @@
+//! End-to-end coverage of the `GET /v1/organizations/{id}/usage/history` filter
+//! and range handling.
+
 use crate::common::{
-    create_api_key_in_workspace, create_org, list_workspaces, setup_qwen_model,
+    create_api_key_in_workspace, create_org, get_session_id, list_workspaces, setup_qwen_model,
+    setup_test_server_with_database, MOCK_USER_AGENT,
 };
-use chrono::{DateTime, TimeZone};
+use chrono::{DateTime, Duration, TimeZone, Utc};
+use database::Database;
+use serde_json::Value;
+use std::sync::Arc;
 use utoipa::OpenApi;
 use uuid::Uuid;
 
 #[tokio::test]
 async fn session_usage_history_filters() {
     // Given: one org has usage on two dates and another row on the filtered date in a different workspace/API key.
-    let (server, database) = setup_reporting_usage_server().await;
+    let (server, database) = setup_test_server_with_database().await;
     let fixture = seed_session_history_fixture(&server, &database).await;
 
     // When: the session-authenticated history endpoint receives dashboard-style filters.
@@ -27,10 +34,20 @@ async fn session_usage_history_filters() {
     // Then: only the row matching the date, workspace, and API key filters is returned.
     assert_eq!(response.status_code(), 200, "{}", response.text());
     let body = response.json::<api::routes::usage::UsageHistoryResponse>();
-    assert_eq!(body.total, 1, "filtered total should count only matching rows");
+    assert_eq!(
+        body.total, 1,
+        "filtered total should count only matching rows"
+    );
     assert_eq!(body.limit, 10);
     assert_eq!(body.offset, 0);
     assert_eq!(body.data.len(), 1);
+    // Cross-org exclusion: the other organization's row in the same window is absent.
+    assert!(
+        body.data
+            .iter()
+            .all(|row| row.provider_request_id.as_deref() != Some("provider-request-other-org")),
+        "another organization's usage must not appear"
+    );
     let row = &body.data[0];
     assert_eq!(row.workspace_id, fixture.workspace_id);
     assert_eq!(row.api_key_id, fixture.api_key_id);
@@ -50,13 +67,12 @@ async fn session_usage_history_filters() {
         "data": body.data,
     });
     assert_no_private_session_history_fields(&manual);
-    println!("manual GET /usage/history filtered session 200 {manual}");
 }
 
 #[tokio::test]
 async fn session_usage_history_workspace_and_api_key_filters_remain_unbounded() {
-    // Given: matching usage older than the reporting API's 366-day default window.
-    let (server, database) = setup_reporting_usage_server().await;
+    // Given: matching usage older than the 366-day default window used when no date range is given.
+    let (server, database) = setup_test_server_with_database().await;
     let fixture = seed_session_history_fixture(&server, &database).await;
 
     // When: only workspace and API-key filters are supplied to the legacy history route.
@@ -94,8 +110,7 @@ fn session_usage_history_openapi_lists_supported_filters() {
         .expect("OpenAPI spec should serialize");
 
     // When: the legacy organization history operation is inspected.
-    let parameters = spec["paths"]["/v1/organizations/{org_id}/usage/history"]["get"]
-        ["parameters"]
+    let parameters = spec["paths"]["/v1/organizations/{org_id}/usage/history"]["get"]["parameters"]
         .as_array()
         .expect("history parameters should be an array");
     let names: Vec<&str> = parameters
@@ -119,7 +134,7 @@ fn session_usage_history_openapi_lists_supported_filters() {
 #[tokio::test]
 async fn session_usage_history_rejects_invalid_filter_range() {
     // Given: an organization with session-authenticated usage history access.
-    let (server, database) = setup_reporting_usage_server().await;
+    let (server, database) = setup_test_server_with_database().await;
     let fixture = seed_session_history_fixture(&server, &database).await;
 
     // When: the dashboard-style date range is inverted.
@@ -139,7 +154,136 @@ async fn session_usage_history_rejects_invalid_filter_range() {
     assert_eq!(response.status_code(), 400, "{}", response.text());
     let body = response.json::<Value>();
     assert_no_private_session_history_fields(&body);
-    println!("manual GET /usage/history invalid session range 400 {body}");
+    assert_eq!(body["error"]["type"], "invalid_reporting_usage_query");
+}
+
+#[tokio::test]
+async fn session_usage_history_rejects_range_over_366_days() {
+    // Given: an organization with usage history access.
+    let (server, database) = setup_test_server_with_database().await;
+    let fixture = seed_session_history_fixture(&server, &database).await;
+
+    // When: the requested range spans more than 366 days.
+    let response = server
+        .get(
+            format!(
+                "/v1/organizations/{}/usage/history?start_date=2024-01-01&end_date=2026-07-01",
+                fixture.org_id
+            )
+            .as_str(),
+        )
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .await;
+
+    // Then: it is rejected with the same error code as an inverted range.
+    assert_eq!(response.status_code(), 400, "{}", response.text());
+    let body = response.json::<Value>();
+    assert_eq!(body["error"]["type"], "invalid_reporting_usage_query");
+}
+
+#[tokio::test]
+async fn session_usage_history_omitted_dates_default_to_last_366_days() {
+    // Given: one row older than the default window and one recent row.
+    let (server, database) = setup_test_server_with_database().await;
+    let fixture = seed_session_history_fixture(&server, &database).await;
+    let model = setup_qwen_model(&server).await;
+    let recent = Utc::now() - Duration::days(1);
+    insert_inference_usage_row(
+        &database,
+        &fixture.org_id,
+        &fixture.workspace_id,
+        &fixture.api_key_id,
+        &model,
+        SessionUsageRow {
+            created_at: recent,
+            total_cost: 1100,
+            provider_request_id: "provider-request-recent",
+        },
+    )
+    .await;
+    insert_inference_usage_row(
+        &database,
+        &fixture.org_id,
+        &fixture.workspace_id,
+        &fixture.api_key_id,
+        &model,
+        SessionUsageRow {
+            created_at: Utc::now() - Duration::days(400),
+            total_cost: 1200,
+            provider_request_id: "provider-request-stale",
+        },
+    )
+    .await;
+
+    // When: only an end_date filter is supplied, so the start defaults to 366 days earlier.
+    let end_date = (Utc::now() + Duration::days(1))
+        .format("%Y-%m-%d")
+        .to_string();
+    let response = server
+        .get(
+            format!(
+                "/v1/organizations/{}/usage/history?end_date={end_date}&limit=50",
+                fixture.org_id
+            )
+            .as_str(),
+        )
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .await;
+
+    // Then: the recent row is included and rows outside the window are excluded.
+    assert_eq!(response.status_code(), 200, "{}", response.text());
+    let body = response.json::<api::routes::usage::UsageHistoryResponse>();
+    let ids: Vec<_> = body
+        .data
+        .iter()
+        .filter_map(|row| row.provider_request_id.as_deref())
+        .collect();
+    assert!(ids.contains(&"provider-request-recent"), "{ids:?}");
+    assert!(!ids.contains(&"provider-request-stale"), "{ids:?}");
+    assert!(!ids.contains(&"provider-request-300"), "{ids:?}");
+    assert!(!ids.contains(&"provider-request-other-org"), "{ids:?}");
+}
+
+#[tokio::test]
+async fn unknown_rpt_prefixed_bearer_is_rejected_with_401() {
+    // Regression guard: a bearer that merely starts with `rpt-` is an unknown
+    // credential. It must get a clean 401 on API-key and refresh-token routes
+    // and never a server error. This is not a token-type test.
+    //
+    // Given: an unknown bearer credential starting with `rpt-`.
+    let (server, _database) = setup_test_server_with_database().await;
+    let org = create_org(&server).await;
+
+    // When: it is used on API-key authenticated routes.
+    for path in ["/v1/files?limit=1"] {
+        let response = server
+            .get(path)
+            .add_header("Authorization", "Bearer rpt-0123456789abcdef")
+            .await;
+
+        // Then: the request is cleanly unauthorized, not a server error.
+        assert_eq!(response.status_code(), 401, "{path}: {}", response.text());
+    }
+
+    // And: the refresh-token route rejects it as well. The auth double only
+    // accepts `rt_` refresh tokens, so this exercises a real rejection.
+    let response = server
+        .post("/v1/users/me/access-tokens")
+        .add_header("Authorization", "Bearer rpt-0123456789abcdef")
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .await;
+    assert_eq!(response.status_code(), 401, "{}", response.text());
+
+    // And: a session-authenticated route never turns it into a server error
+    // (the e2e session auth double accepts any bearer, so only the status
+    // class is asserted there).
+    let response = server
+        .get(format!("/v1/organizations/{}/usage/balance", org.id).as_str())
+        .add_header("Authorization", "Bearer rpt-0123456789abcdef")
+        .await;
+    assert!(response.status_code().as_u16() < 500, "{}", response.text());
 }
 
 struct SessionHistoryFixture {
@@ -228,6 +372,34 @@ async fn seed_session_history_fixture(
     )
     .await;
 
+    // Another organization with its own usage row inside the filtered window.
+    let other_org = create_org(server).await;
+    let other_org_workspaces = list_workspaces(server, other_org.id.clone()).await;
+    let other_org_workspace_id = other_org_workspaces
+        .first()
+        .expect("default workspace should exist")
+        .id
+        .clone();
+    let other_org_api_key = create_api_key_in_workspace(
+        server,
+        other_org_workspace_id.clone(),
+        "session history other org key".to_string(),
+    )
+    .await;
+    insert_inference_usage_row(
+        database,
+        &other_org.id,
+        &other_org_workspace_id,
+        &other_org_api_key.id,
+        &model,
+        SessionUsageRow {
+            created_at: ts(2026, 7, 2),
+            total_cost: 1000,
+            provider_request_id: "provider-request-other-org",
+        },
+    )
+    .await;
+
     SessionHistoryFixture {
         org_id: org.id,
         workspace_id,
@@ -305,7 +477,14 @@ async fn insert_inference_usage_row(
 
 fn assert_no_private_session_history_fields(value: &Value) {
     let text = value.to_string();
-    for private in ["prompt", "response_body", "file", "token_hash", "Authorization", "Bearer"] {
+    for private in [
+        "prompt",
+        "response_body",
+        "file",
+        "token_hash",
+        "Authorization",
+        "Bearer",
+    ] {
         assert!(
             !text.contains(private),
             "private field leaked: {private}: {text}"

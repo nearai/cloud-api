@@ -80,12 +80,6 @@ pub struct UpdateModelAdminRequest {
     pub changed_by_user_email: Option<String>,
 }
 
-/// Batch update request format - Map of model name to update data
-pub type BatchUpdateModelAdminRequest = std::collections::HashMap<String, UpdateModelAdminRequest>;
-
-/// Batch update response format - Map of model name to pricing data
-pub type BatchUpdateModelAdminResponse = std::collections::HashMap<String, ModelPricing>;
-
 /// Model pricing information (result after update)
 /// All costs use fixed scale of 9 (nano-dollars) and USD currency
 #[derive(Debug, Clone)]
@@ -138,19 +132,6 @@ pub struct ModelPricing {
     pub is_listed: bool,
 }
 
-/// Stored fields needed to validate a partial model update before persisting it.
-#[derive(Debug, Clone)]
-pub struct ModelValidationState {
-    pub input_cost_per_token: i64,
-    pub output_cost_per_token: i64,
-    pub cost_per_image: i64,
-    pub cache_read_cost_per_token: Option<i64>,
-    pub allow_free: bool,
-    pub provider_type: String,
-    pub provider_config: Option<serde_json::Value>,
-    pub deprecation_date: Option<chrono::DateTime<chrono::Utc>>,
-}
-
 /// Model history entry - includes pricing, context length, and other model attributes
 /// All costs use fixed scale of 9 (nano-dollars) and USD currency
 #[derive(Debug, Clone)]
@@ -201,69 +182,6 @@ pub struct ModelHistoryEntry {
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
-/// Request to update organization limits
-/// All amounts use fixed scale of 9 (nano-dollars)
-#[derive(Debug, Clone)]
-pub struct OrganizationLimitsUpdate {
-    pub spend_limit: i64,
-    pub credit_type: String,
-    pub source: Option<String>,
-    pub currency: String,
-    pub changed_by: Option<String>,
-    pub change_reason: Option<String>,
-    pub changed_by_user_id: Option<uuid::Uuid>, // The authenticated user ID who made the change
-    pub changed_by_user_email: Option<String>, // The email of the authenticated user who made the change
-}
-
-/// Organization limits (current active limits for a specific credit type)
-/// All amounts use fixed scale of 9 (nano-dollars)
-#[derive(Debug, Clone)]
-pub struct OrganizationLimits {
-    pub organization_id: uuid::Uuid,
-    pub spend_limit: i64,
-    pub credit_type: String,
-    pub source: Option<String>,
-    pub currency: String,
-    pub effective_from: chrono::DateTime<chrono::Utc>,
-}
-
-/// Organization limits history entry
-/// All amounts use fixed scale of 9 (nano-dollars)
-#[derive(Debug, Clone)]
-pub struct OrganizationLimitsHistoryEntry {
-    pub id: uuid::Uuid,
-    pub organization_id: uuid::Uuid,
-    pub spend_limit: i64,
-    pub credit_type: String,
-    pub source: Option<String>,
-    pub currency: String,
-    pub effective_from: chrono::DateTime<chrono::Utc>,
-    pub effective_until: Option<chrono::DateTime<chrono::Utc>>,
-    pub changed_by: Option<String>,
-    pub change_reason: Option<String>,
-    pub changed_by_user_id: Option<uuid::Uuid>, // The authenticated user ID who made the change
-    pub changed_by_user_email: Option<String>, // The email of the authenticated user who made the change
-    pub created_at: chrono::DateTime<chrono::Utc>,
-}
-
-/// User information for admin endpoints
-#[derive(Debug, Clone)]
-pub struct UserInfo {
-    pub id: uuid::Uuid,
-    pub email: String,
-    pub username: String,
-    pub display_name: Option<String>,
-    pub avatar_url: Option<String>,
-    pub created_at: chrono::DateTime<chrono::Utc>,
-    pub last_login_at: Option<chrono::DateTime<chrono::Utc>>,
-    pub is_active: bool,
-    pub auth_provider: String,
-    pub provider_user_id: String,
-    pub contact_email: Option<String>,
-    pub contact_email_verified_at: Option<chrono::DateTime<chrono::Utc>>,
-    pub email_opt_in_at: Option<chrono::DateTime<chrono::Utc>>,
-}
-
 /// Organization information for user listing (earliest organization with spend limit and usage)
 #[derive(Debug, Clone)]
 pub struct UserOrganizationInfo {
@@ -274,69 +192,6 @@ pub struct UserOrganizationInfo {
     pub total_spent: Option<i64>, // Amount in nano-dollars (scale 9)
     pub total_requests: Option<i64>,
     pub total_tokens: Option<i64>,
-}
-
-/// Model information for admin listing (includes is_active status)
-/// All costs use fixed scale of 9 (nano-dollars) and USD currency
-#[derive(Debug, Clone)]
-pub struct AdminModelInfo {
-    pub id: uuid::Uuid,
-    pub model_name: String,
-    pub model_display_name: String,
-    pub model_description: String,
-    pub model_icon: Option<String>,
-    pub input_cost_per_token: i64,
-    pub output_cost_per_token: i64,
-    pub cost_per_image: i64,
-    /// `None` = cache pricing disabled; `Some(x)` = cached tokens billed at
-    /// `x` (`Some(0)` = genuinely free).
-    pub cache_read_cost_per_token: Option<i64>,
-    pub text_pricing: Option<serde_json::Value>,
-    pub context_length: i32,
-    pub verifiable: bool,
-    pub is_active: bool,
-    pub owned_by: String,
-    pub aliases: Vec<String>,
-    pub created_at: chrono::DateTime<chrono::Utc>,
-    pub updated_at: chrono::DateTime<chrono::Utc>,
-    // Provider configuration
-    /// Provider type: "vllm" (TEE-enabled) or "external" (3rd party)
-    pub provider_type: String,
-    /// JSON config for external providers (backend, base_url, etc.)
-    pub provider_config: Option<serde_json::Value>,
-    /// Whether this model supports TEE attestation
-    pub attestation_supported: bool,
-    // Architecture/modalities
-    pub input_modalities: Option<Vec<String>>,
-    pub output_modalities: Option<Vec<String>>,
-    /// Base URL for the model's inference endpoint
-    pub inference_url: Option<String>,
-    // OpenRouter-compatibility fields
-    pub hugging_face_id: Option<String>,
-    pub quantization: Option<String>,
-    pub max_output_length: Option<i32>,
-    pub supported_sampling_parameters: Vec<String>,
-    pub supported_features: Vec<String>,
-    /// Datacenter country codes (ISO 3166 Alpha-2) the model runs in.
-    pub datacenters: Option<Vec<String>>,
-    pub is_ready: Option<bool>,
-    pub deprecation_date: Option<chrono::DateTime<chrono::Utc>>,
-    /// Recommended replacement model for the planned deprecation.
-    pub successor_model_name: Option<String>,
-    /// OpenRouter `openrouter.slug` override. NULL = unset.
-    pub openrouter_slug: Option<String>,
-    /// Whether the model is listed. An unlisted model is left out of the
-    /// public model catalogs and only organizations that hold a grant may
-    /// use it.
-    pub is_listed: bool,
-}
-
-/// Active model summary used by the planned-deprecation notification workflow.
-#[derive(Debug, Clone)]
-pub struct ModelDeprecationModel {
-    pub id: uuid::Uuid,
-    pub model_name: String,
-    pub model_display_name: String,
 }
 
 /// One affected admin membership row. The service deduplicates sends by
@@ -384,25 +239,6 @@ pub struct ModelDeprecationDeliveryRecord {
     pub initiated_by_user_email: Option<String>,
 }
 
-#[derive(Debug, Clone)]
-pub struct ModelDeprecationPreview {
-    pub recipient_count: i64,
-    pub organization_count: i64,
-    pub usage_window_days: i64,
-}
-
-#[derive(Debug, Clone)]
-pub struct ModelDeprecationConfirmResult {
-    pub model_id: String,
-    pub successor_model_id: String,
-    pub deprecation_date: chrono::DateTime<chrono::Utc>,
-    pub recipient_count: i64,
-    pub organization_count: i64,
-    pub sent_count: i64,
-    pub failed_count: i64,
-    pub skipped_count: i64,
-}
-
 /// Lifecycle status of a scheduled model pricing change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -435,19 +271,6 @@ impl ScheduledPricingChangeStatus {
             _ => None,
         }
     }
-}
-
-/// Validated per-model input for scheduling a pricing change.
-/// New amounts are nano-dollars (scale 9); `None` = field unchanged.
-#[derive(Debug, Clone)]
-pub struct PricingChangeInput {
-    pub model_name: String,
-    pub effective_at: chrono::DateTime<chrono::Utc>,
-    pub new_input_cost_per_token: Option<i64>,
-    pub new_output_cost_per_token: Option<i64>,
-    pub new_cache_read_cost_per_token: Option<i64>,
-    pub new_cost_per_image: Option<i64>,
-    pub new_text_pricing: Option<crate::usage::TextPricingProfile>,
 }
 
 /// Current pricing + identity snapshot of an active model, captured at
@@ -528,48 +351,6 @@ pub struct PricingChangeRecipientRow {
     pub model_name: String,
 }
 
-/// Per-model breakdown inside a pricing change preview.
-#[derive(Debug, Clone)]
-pub struct PricingChangeModelPreview {
-    pub model_name: String,
-    pub model_display_name: String,
-    pub effective_at: chrono::DateTime<chrono::Utc>,
-    pub recipient_count: i64,
-    pub organization_count: i64,
-    pub old_input_cost_per_token: i64,
-    pub old_output_cost_per_token: i64,
-    /// `None` = cache pricing currently disabled.
-    pub old_cache_read_cost_per_token: Option<i64>,
-    pub old_cost_per_image: i64,
-    pub new_input_cost_per_token: Option<i64>,
-    pub new_output_cost_per_token: Option<i64>,
-    pub new_cache_read_cost_per_token: Option<i64>,
-    pub new_cost_per_image: Option<i64>,
-    pub old_text_pricing: Option<crate::usage::TextPricingProfile>,
-    pub new_text_pricing: Option<crate::usage::TextPricingProfile>,
-}
-
-#[derive(Debug, Clone)]
-pub struct PricingChangePreview {
-    /// Distinct recipient emails across the whole batch.
-    pub recipient_count: i64,
-    /// Distinct organizations across the whole batch.
-    pub organization_count: i64,
-    pub usage_window_days: i64,
-    pub models: Vec<PricingChangeModelPreview>,
-}
-
-#[derive(Debug, Clone)]
-pub struct PricingChangeConfirmResult {
-    pub batch_id: uuid::Uuid,
-    pub recipient_count: i64,
-    pub organization_count: i64,
-    pub sent_count: i64,
-    pub failed_count: i64,
-    pub skipped_count: i64,
-    pub changes: Vec<ScheduledPricingChange>,
-}
-
 #[derive(Debug, Clone)]
 pub struct PricingChangeDeliveryRecord {
     pub batch_id: uuid::Uuid,
@@ -621,57 +402,6 @@ pub enum OrganizationLifecycleFilter {
     All,
 }
 
-/// API key metadata for admin listing. Carries no key material (hash, prefix,
-/// raw key) and no user-supplied key name.
-#[derive(Debug, Clone)]
-pub struct AdminApiKeyInfo {
-    pub id: uuid::Uuid,
-    pub organization_id: uuid::Uuid,
-    pub organization_name: String,
-    pub workspace_id: uuid::Uuid,
-    pub created_by_user_id: uuid::Uuid,
-    pub created_at: chrono::DateTime<chrono::Utc>,
-    pub is_active: bool,
-    pub deleted_at: Option<chrono::DateTime<chrono::Utc>>,
-    /// True when the key was provisioned by the Cloud UI's managed Playground.
-    pub is_managed_playground: bool,
-}
-
-/// Filters for the admin API key listing. Date bounds are inclusive.
-#[derive(Debug, Clone, Default)]
-pub struct AdminApiKeyFilters {
-    pub organization_id: Option<uuid::Uuid>,
-    pub created_after: Option<chrono::DateTime<chrono::Utc>>,
-    pub created_before: Option<chrono::DateTime<chrono::Utc>>,
-}
-
-/// A single organization member with full user details (admin view).
-///
-/// Unlike the member-facing `/v1/organizations/{id}/members` endpoint (which
-/// hides email/last-login from non-privileged members), the admin view exposes
-/// the full user record — including inactive (soft-deleted) members.
-#[derive(Debug, Clone)]
-pub struct AdminOrganizationMemberInfo {
-    pub member_id: uuid::Uuid,
-    pub organization_id: uuid::Uuid,
-    /// Raw role string from the database: "owner", "admin", or "member".
-    pub role: String,
-    pub joined_at: chrono::DateTime<chrono::Utc>,
-    pub invited_by: Option<uuid::Uuid>,
-    pub user: UserInfo,
-}
-
-/// A model as the access-management operations see it. Looked up by
-/// canonical name, active or not, so a grant can be reviewed or revoked while
-/// its model is inactive.
-#[derive(Debug, Clone)]
-pub struct ModelAccessModel {
-    pub id: uuid::Uuid,
-    pub model_name: String,
-    pub is_listed: bool,
-    pub is_active: bool,
-}
-
 /// A grant: one organization that may use one unlisted model.
 #[derive(Debug, Clone)]
 pub struct ModelAccessGrant {
@@ -683,47 +413,8 @@ pub struct ModelAccessGrant {
     pub granted_by_user_email: Option<String>,
 }
 
-/// A model and the active organizations that hold a grant for it.
-#[derive(Debug, Clone)]
-pub struct ModelAccess {
-    pub model: ModelAccessModel,
-    pub grants: Vec<ModelAccessGrant>,
-}
-
-/// One model an organization holds a grant for.
-#[derive(Debug, Clone)]
-pub struct OrganizationModelAccessGrant {
-    pub model: ModelAccessModel,
-    pub granted_at: chrono::DateTime<chrono::Utc>,
-    /// The admin who made the grant. `None` if that user row is gone.
-    pub granted_by_user_id: Option<uuid::Uuid>,
-    pub granted_by_user_email: Option<String>,
-}
-
 #[derive(Debug, thiserror::Error)]
 pub enum AdminError {
-    #[error("Model not found: {0}")]
-    ModelNotFound(String),
-    #[error("Service not found: {0}")]
-    ServiceNotFound(String),
-    #[error("Organization not found: {0}")]
-    OrganizationNotFound(String),
-    #[error("Invalid pricing data: {0}")]
-    InvalidPricing(String),
-    #[error("Invalid limits data: {0}")]
-    InvalidLimits(String),
-    #[error("Invalid deprecation request: {0}")]
-    InvalidDeprecation(String),
-    #[error("Pricing change conflict: {0}")]
-    PricingChangeConflict(String),
-    #[error("Pricing change not found: {0}")]
-    PricingChangeNotFound(String),
-    #[error("Model update conflict: {0}")]
-    ModelUpdateConflict(String),
-    #[error("Invalid parameters: {0}")]
-    InvalidParams(String),
-    #[error("Unauthorized: {0}")]
-    Unauthorized(String),
     #[error("Analytics query exceeded its statement budget")]
     Timeout,
     #[error("Internal error: {0}")]
@@ -754,30 +445,6 @@ pub trait AdminRepository: Send + Sync {
         request: UpdateModelAdminRequest,
     ) -> Result<ModelPricing, anyhow::Error>;
 
-    /// Fetch the stored fields needed to validate a partial model update.
-    /// Returns `None` if the model does not exist (new model).
-    async fn get_model_validation_state(
-        &self,
-        model_name: &str,
-    ) -> Result<Option<ModelValidationState>, anyhow::Error>;
-
-    /// Get complete history for a model with pagination (includes pricing and other attributes)
-    async fn get_model_history(
-        &self,
-        model_name: &str,
-        limit: i64,
-        offset: i64,
-    ) -> Result<(Vec<ModelHistoryEntry>, i64), anyhow::Error>;
-
-    /// Soft delete a model by setting is_active to false
-    async fn soft_delete_model(
-        &self,
-        model_name: &str,
-        change_reason: Option<String>,
-        changed_by_user_id: Option<uuid::Uuid>,
-        changed_by_user_email: Option<String>,
-    ) -> Result<bool, anyhow::Error>;
-
     /// Atomically deprecate `deprecated_model_name` in favor of `successor_model_name`.
     ///
     /// In a single transaction:
@@ -806,62 +473,12 @@ pub trait AdminRepository: Send + Sync {
         changed_by_user_email: Option<String>,
     ) -> Result<Option<DeprecateModelOutcome>, anyhow::Error>;
 
-    /// Update organization limits (creates new history entry, closes previous)
-    async fn update_organization_limits(
-        &self,
-        organization_id: uuid::Uuid,
-        limits: OrganizationLimitsUpdate,
-    ) -> Result<OrganizationLimits, anyhow::Error>;
-
-    /// Get all current active limits for an organization (one per credit type)
-    async fn get_current_organization_limits(
-        &self,
-        organization_id: uuid::Uuid,
-    ) -> Result<Vec<OrganizationLimits>, anyhow::Error>;
-
-    /// Count limits history for an organization
-    async fn count_organization_limits_history(
-        &self,
-        organization_id: uuid::Uuid,
-    ) -> Result<i64, anyhow::Error>;
-
-    /// Get limits history for an organization
-    async fn get_organization_limits_history(
-        &self,
-        organization_id: uuid::Uuid,
-        limit: i64,
-        offset: i64,
-    ) -> Result<Vec<OrganizationLimitsHistoryEntry>, anyhow::Error>;
-
-    /// List all models with pagination (admin only)
-    /// If include_inactive is true, includes disabled models
-    async fn list_models(
-        &self,
-        include_inactive: bool,
-        limit: i64,
-        offset: i64,
-    ) -> Result<(Vec<AdminModelInfo>, i64), anyhow::Error>;
-
-    /// Fetch an active model by canonical model name for planned-deprecation workflows.
-    async fn get_active_model_for_deprecation(
-        &self,
-        model_name: &str,
-    ) -> Result<Option<ModelDeprecationModel>, anyhow::Error>;
-
     /// List active owner/admin recipients for orgs that used the model since `since`.
     async fn list_model_deprecation_recipients(
         &self,
         model_name: &str,
         since: chrono::DateTime<chrono::Utc>,
     ) -> Result<Vec<ModelDeprecationRecipient>, anyhow::Error>;
-
-    /// Return delivery keys already successfully sent for idempotent confirms.
-    async fn list_sent_model_deprecation_delivery_keys(
-        &self,
-        model_id: uuid::Uuid,
-        successor_model_name: &str,
-        deprecation_date: chrono::DateTime<chrono::Utc>,
-    ) -> Result<Vec<(uuid::Uuid, uuid::Uuid)>, anyhow::Error>;
 
     /// True when the user exists and is active. Email batches call this right
     /// before each send so a recipient erased mid-batch is skipped.
@@ -904,31 +521,6 @@ pub trait AdminRepository: Send + Sync {
         change_reason: Option<String>,
     ) -> Result<Vec<ScheduledPricingChange>, anyhow::Error>;
 
-    /// List all rows of one batch (any status), ordered by model name.
-    async fn list_scheduled_pricing_changes_by_batch(
-        &self,
-        batch_id: uuid::Uuid,
-    ) -> Result<Vec<ScheduledPricingChange>, anyhow::Error>;
-
-    /// List scheduled pricing changes, optionally filtered by status,
-    /// newest effective date first. Returns (rows, total).
-    async fn list_scheduled_pricing_changes(
-        &self,
-        status: Option<ScheduledPricingChangeStatus>,
-        limit: i64,
-        offset: i64,
-    ) -> Result<(Vec<ScheduledPricingChange>, i64), anyhow::Error>;
-
-    /// Cancel a pending change. Returns `None` if the row is missing or no
-    /// longer pending (already applying/applied/cancelled) — race-safe
-    /// against the scheduler claim.
-    async fn cancel_scheduled_pricing_change(
-        &self,
-        id: uuid::Uuid,
-        cancelled_by_user_id: Option<uuid::Uuid>,
-        cancelled_by_user_email: Option<String>,
-    ) -> Result<Option<ScheduledPricingChange>, anyhow::Error>;
-
     /// Atomically claim due pending changes (pending -> applying,
     /// apply_attempts + 1) using `FOR UPDATE SKIP LOCKED` so concurrent
     /// instances partition the due set.
@@ -958,33 +550,11 @@ pub trait AdminRepository: Send + Sync {
         max_attempts: i32,
     ) -> Result<u64, anyhow::Error>;
 
-    /// Return (user_id, organization_id) delivery keys already successfully
-    /// sent for this batch, for idempotent confirms.
-    async fn list_sent_pricing_change_delivery_keys(
-        &self,
-        batch_id: uuid::Uuid,
-    ) -> Result<Vec<(uuid::Uuid, uuid::Uuid)>, anyhow::Error>;
-
     /// Persist one pricing change email delivery outcome.
     async fn record_pricing_change_delivery(
         &self,
         record: PricingChangeDeliveryRecord,
     ) -> Result<(), anyhow::Error>;
-
-    /// Update organization concurrent request limit
-    /// Set to None to use the default limit
-    async fn update_organization_concurrent_limit(
-        &self,
-        organization_id: uuid::Uuid,
-        concurrent_limit: Option<u32>,
-    ) -> Result<(), anyhow::Error>;
-
-    /// Get organization concurrent request limit
-    /// Returns None if using default
-    async fn get_organization_concurrent_limit(
-        &self,
-        organization_id: uuid::Uuid,
-    ) -> Result<Option<u32>, anyhow::Error>;
 
     /// List organizations matching the lifecycle filter with pagination (admin only)
     async fn list_all_organizations(
@@ -994,63 +564,12 @@ pub trait AdminRepository: Send + Sync {
         lifecycle: OrganizationLifecycleFilter,
     ) -> Result<Vec<AdminOrganizationInfo>, anyhow::Error>;
 
-    /// List API keys across all organizations, newest first (admin only).
-    /// Includes revoked and inactive keys.
-    async fn list_all_api_keys(
-        &self,
-        filters: &AdminApiKeyFilters,
-        limit: i64,
-        offset: i64,
-    ) -> Result<Vec<AdminApiKeyInfo>, anyhow::Error>;
-
-    /// Count API keys matching the admin listing filters (admin only)
-    async fn count_all_api_keys(&self, filters: &AdminApiKeyFilters) -> Result<i64, anyhow::Error>;
-
     /// Fetch a single active organization by id with spend limit and usage
     /// (admin only). Returns `None` if not found or inactive.
     async fn get_organization(
         &self,
         organization_id: uuid::Uuid,
     ) -> Result<Option<AdminOrganizationInfo>, anyhow::Error>;
-
-    /// List members of a specific organization with full user details, including
-    /// inactive (soft-deleted) *users* (admin only). Inactive (soft-deleted)
-    /// *organizations* are excluded (their member rows are not returned).
-    /// Does NOT enforce membership of the
-    /// caller — authorization is handled by the admin middleware at the route
-    /// layer.
-    async fn list_organization_members(
-        &self,
-        organization_id: uuid::Uuid,
-        limit: i64,
-        offset: i64,
-    ) -> Result<Vec<AdminOrganizationMemberInfo>, anyhow::Error>;
-
-    /// Count members of a specific organization, including inactive members
-    /// (admin only). Must apply the same filters as `list_organization_members`
-    /// so paginated totals stay consistent with the rows.
-    async fn count_organization_members(
-        &self,
-        organization_id: uuid::Uuid,
-    ) -> Result<i64, anyhow::Error>;
-
-    /// Whether an active organization with this id exists (admin only).
-    async fn organization_exists(&self, organization_id: uuid::Uuid)
-        -> Result<bool, anyhow::Error>;
-
-    /// Look a model up by canonical name for access management, active or
-    /// not. `None` if no such model exists.
-    async fn get_model_for_access(
-        &self,
-        model_name: &str,
-    ) -> Result<Option<ModelAccessModel>, anyhow::Error>;
-
-    /// The active organizations that hold a grant for the model, oldest
-    /// grant first.
-    async fn list_model_access_grants(
-        &self,
-        model_id: uuid::Uuid,
-    ) -> Result<Vec<ModelAccessGrant>, anyhow::Error>;
 
     /// Grant the organization access to the model. Returns the stored grant
     /// and whether this call created it: a grant that already exists is
@@ -1074,46 +593,6 @@ pub trait AdminRepository: Send + Sync {
         organization_id: uuid::Uuid,
         revoked_by_user_id: Option<uuid::Uuid>,
     ) -> Result<bool, anyhow::Error>;
-
-    /// The models the organization holds a grant for, by model name.
-    async fn list_organization_model_access(
-        &self,
-        organization_id: uuid::Uuid,
-    ) -> Result<Vec<OrganizationModelAccessGrant>, anyhow::Error>;
-
-    /// List platform services with pagination (admin only)
-    async fn list_services(
-        &self,
-        include_inactive: bool,
-        limit: i64,
-        offset: i64,
-    ) -> Result<(Vec<PlatformServiceInfo>, i64), anyhow::Error>;
-
-    /// Get platform service by id (admin only)
-    async fn get_service_by_id(
-        &self,
-        id: uuid::Uuid,
-    ) -> Result<Option<PlatformServiceInfo>, anyhow::Error>;
-
-    /// Create a platform service (admin only)
-    async fn create_service(
-        &self,
-        service_name: &str,
-        display_name: &str,
-        description: Option<&str>,
-        unit: ServiceUnit,
-        cost_per_unit: i64,
-    ) -> Result<PlatformServiceInfo, anyhow::Error>;
-
-    /// Update platform service (display_name, description, cost_per_unit, is_active)
-    async fn update_service(
-        &self,
-        id: uuid::Uuid,
-        display_name: Option<&str>,
-        description: Option<&str>,
-        cost_per_unit: Option<i64>,
-        is_active: Option<bool>,
-    ) -> Result<Option<PlatformServiceInfo>, anyhow::Error>;
 }
 
 /// Platform service info (for admin CRUD)
@@ -1129,26 +608,4 @@ pub struct PlatformServiceInfo {
     pub is_active: bool,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
-}
-
-/// Admin service trait for managing platform configuration
-#[async_trait]
-pub trait AdminService: Send + Sync {
-    /// List API keys across all organizations with pagination (admin only).
-    /// Returns `InvalidParams` when `created_after` is later than `created_before`.
-    async fn list_api_keys(
-        &self,
-        filters: AdminApiKeyFilters,
-        limit: i64,
-        offset: i64,
-    ) -> Result<(Vec<AdminApiKeyInfo>, i64), AdminError>;
-
-    /// List members of a specific organization with full user details (admin only).
-    /// Returns `OrganizationNotFound` if the organization does not exist.
-    async fn list_organization_members(
-        &self,
-        organization_id: uuid::Uuid,
-        limit: i64,
-        offset: i64,
-    ) -> Result<(Vec<AdminOrganizationMemberInfo>, i64), AdminError>;
 }

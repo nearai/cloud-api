@@ -435,12 +435,10 @@ async fn history_corrects_legacy_and_split_funding_with_reporting_parity() {
         ("grant".into(), 150_000_000)
     );
     drop(client);
-    for prefix in ["/v1/organizations", "/v1/admin/organizations"] {
-        let balance = get(&f, &format!("{prefix}/{}/usage/balance", f.org)).await;
-        assert_eq!(balance["total_spent"], 475_000_000);
-        assert_eq!(balance["total_requests"], 4);
-        assert_eq!(balance["remaining"], 725_000_000);
-    }
+    let balance = get(&f, &format!("/v1/organizations/{}/usage/balance", f.org)).await;
+    assert_eq!(balance["total_spent"], 475_000_000);
+    assert_eq!(balance["total_requests"], 4);
+    assert_eq!(balance["remaining"], 725_000_000);
     let billing = f
         .server
         .post("/v1/billing/costs")
@@ -547,11 +545,7 @@ async fn historical_batches_rollback_resume_and_never_compound() {
     );
     // Half-up rounding on each component: 2 * .75 -> 2; 4 * .75 -> 3.
     assert_eq!(
-        get(
-            &f,
-            &format!("/v1/admin/organizations/{}/usage/balance", f.org)
-        )
-        .await["total_spent"],
+        get(&f, &format!("/v1/organizations/{}/usage/balance", f.org)).await["total_spent"],
         2518
     );
     // A fresh repository represents worker restart; the persisted composite cursor
@@ -693,11 +687,7 @@ async fn platform_services_stay_outside_forward_and_historical_discount() {
         80
     );
     assert_eq!(
-        get(
-            &f,
-            &format!("/v1/admin/organizations/{}/usage/balance", f.org)
-        )
-        .await["total_spent"],
+        get(&f, &format!("/v1/organizations/{}/usage/balance", f.org)).await["total_spent"],
         165
     );
     assert_eq!(rule_json(&f).await["processed_count"], 1);
@@ -760,11 +750,7 @@ async fn full_discount_zeroes_funding_and_nanosecond_cutoff_retries_are_idempote
         (100, 0, 0, 0)
     );
     drop(client);
-    let balance = get(
-        &f,
-        &format!("/v1/admin/organizations/{}/usage/balance", f.org),
-    )
-    .await;
+    let balance = get(&f, &format!("/v1/organizations/{}/usage/balance", f.org)).await;
     assert_eq!(balance["total_spent"], 0);
     assert_eq!(balance["remaining"], 200);
     assert_eq!(balance["total_requests"], 2);

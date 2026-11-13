@@ -35,15 +35,9 @@ pub(crate) fn admin_operation(method: &Method, matched_path: &str) -> AdminOpera
     if matches!(*method, Method::GET | Method::HEAD)
         && matches!(
             path,
-            "/admin/organizations/{org_id}/usage/balance"
-                | "/admin/organizations/{org_id}/policy"
-                | "/admin/organizations/{org_id}/credit/transfer/reconciliation"
-                | "/admin/organizations/{org_id}/staking/farm"
-                | "/admin/organizations/{org_id}/metrics"
+            "/admin/organizations/{org_id}/metrics"
                 | "/admin/platform/infra-summary"
                 | "/admin/invitation-email-deliveries"
-                | "/admin/api-keys"
-                | "/admin/organizations/{org_id}/members"
                 | "/admin/database-encryption/jobs/{id}"
                 | "/admin/database-encryption/keys"
                 | "/admin/object-encryption/jobs/{id}"
@@ -158,14 +152,23 @@ mod tests {
             "/v1/admin/settings/{key}",
             "/v1/admin/aml/reports",
             "/v1/admin/feature-requests",
+            "/v1/admin/api-keys",
+            "/v1/admin/organizations/{org_id}/members",
+            "/v1/admin/organizations/{org_id}/policy",
+            "/v1/admin/organizations/{org_id}/staking/farm",
+            "/v1/admin/organizations/{org_id}/usage/balance",
+            "/v1/admin/organizations/{org_id}/credit/transfer/reconciliation",
         ] {
             assert_eq!(admin_operation(&Method::GET, path), AdminOperation::Write);
         }
     }
 
     #[test]
-    fn api_keys_get_is_read() {
-        for path in ["/v1/admin/api-keys", "/admin/api-keys"] {
+    fn invitation_email_deliveries_get_is_read() {
+        for path in [
+            "/v1/admin/invitation-email-deliveries",
+            "/admin/invitation-email-deliveries",
+        ] {
             assert_eq!(admin_operation(&Method::GET, path), AdminOperation::Read);
             assert_eq!(admin_operation(&Method::HEAD, path), AdminOperation::Read);
             assert_eq!(admin_operation(&Method::POST, path), AdminOperation::Write);

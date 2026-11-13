@@ -24,8 +24,6 @@ pub struct AppState {
     pub usage_service: Arc<dyn services::usage::UsageServiceTrait + Send + Sync>,
     pub service_usage_service:
         Arc<dyn services::service_usage::ServiceUsageServiceTrait + Send + Sync>,
-    pub reporting_token_service:
-        Arc<dyn services::reporting_tokens::OrganizationReportingTokenService>,
     pub user_service: Arc<dyn services::user::UserServiceTrait + Send + Sync>,
     pub contact_email_service: Arc<services::contact_email::ContactEmailService>,
     pub files_service: Arc<dyn FileServiceTrait + Send + Sync>,
@@ -97,21 +95,12 @@ pub fn build_management_router(app_state: AppState, auth_state: AuthState) -> Ro
             put(update_organization_member).delete(remove_organization_member),
         )
         .route(
-            "/{id}/staking/farm/bind",
-            post(crate::routes::staking_farm::bind_organization_staking_farm),
-        )
-        // Usage tracking routes
-        .route(
             "/{id}/usage/balance",
             get(crate::routes::usage::get_organization_balance),
         )
         .route(
             "/{id}/usage/history",
             get(crate::routes::usage::get_organization_usage_history),
-        )
-        .route(
-            "/{id}/staking/farm",
-            get(crate::routes::staking_farm::get_organization_staking_farm),
         )
         .route(
             "/{id}/staking/farm/sync",
@@ -122,25 +111,12 @@ pub fn build_management_router(app_state: AppState, auth_state: AuthState) -> Ro
             get(crate::routes::usage::get_organization_usage_by_model),
         )
         .route(
-            "/{id}/service-usage/history",
-            get(crate::routes::usage::get_service_usage_history),
-        )
-        .route(
             "/{id}/usage/metrics",
             get(crate::routes::usage::get_user_organization_metrics),
         )
         .route(
             "/{id}/usage/timeseries",
             get(crate::routes::usage::get_user_organization_timeseries),
-        )
-        .route(
-            "/{id}/reporting-tokens",
-            get(crate::routes::reporting_tokens::list_reporting_tokens)
-                .post(crate::routes::reporting_tokens::create_reporting_token),
-        )
-        .route(
-            "/{id}/reporting-tokens/{token_id}",
-            delete(crate::routes::reporting_tokens::revoke_reporting_token),
         );
 
     // User routes (require access token authentication)
@@ -191,10 +167,6 @@ pub fn build_management_router(app_state: AppState, auth_state: AuthState) -> Ro
 
     // Combine all routes with appropriate auth middleware
     Router::new()
-        .route(
-            "/staking/farm/config",
-            get(crate::routes::staking_farm::get_staking_farm_config),
-        )
         .nest("/organizations", org_routes)
         .nest("/users", user_routes)
         .with_state(app_state)

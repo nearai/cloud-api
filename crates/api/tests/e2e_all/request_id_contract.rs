@@ -972,12 +972,11 @@ const API_KEY_SECURITY_SCHEMES: [&str; 2] = ["api_key", "ApiKeyAuth"];
 
 /// Security schemes that do not authenticate with an API key. A scheme that is
 /// in neither list fails the guard, so a new one has to be classified.
-const OTHER_SECURITY_SCHEMES: [&str; 5] = [
+const OTHER_SECURITY_SCHEMES: [&str; 4] = [
     "session_token",
     "admin_token",
     "refresh_token",
     "organization_credential",
-    "reporting_token",
 ];
 
 /// API-key POST paths under `/v1/` that are not in the inference table, each

@@ -262,7 +262,7 @@ async fn json_billing_errors_and_task_panics_keep_distinct_diagnostics() {
             assert!(!logs.contains("fixture usage panic"));
         } else {
             assert!(logs.contains("Failed to record native Anthropic usage"));
-            assert!(logs.contains("Internal error: recorded"));
+            assert!(logs.contains("usage_write_failed"));
         }
     }
 }

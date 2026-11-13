@@ -29,6 +29,7 @@ use tracing::Instrument;
 /// event so malformed padding cannot be retained or signed.
 pub const MAX_PROVIDER_DONE_EVENT_BYTES: usize = 64;
 const DEEPSEEK_V4_FLASH_MODEL: &str = "deepseek-ai/DeepSeek-V4-Flash";
+const METRIC_ESTIMATED_STREAM_USAGE: &str = "cloud_api.usage.estimated_stream";
 
 type FinalizeFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
 
@@ -128,7 +129,6 @@ where
     workspace_id: Uuid,
     api_key_id: Uuid,
     model_id: Uuid,
-    model_name: String,
     inference_type: crate::usage::ports::InferenceType,
     service_start_time: Instant,
     provider_start_time: Instant,
@@ -138,6 +138,8 @@ where
     ttft_ms: Option<i32>,
     /// Token count for ITL calculation
     token_count: i32,
+    /// Number of parsed stream chunks, including usage-only chunks.
+    observed_chunk_count: u32,
     /// Last token time for ITL calculation
     last_token_time: Option<Instant>,
     /// Accumulated inter-token latency for average calculation
@@ -147,6 +149,10 @@ where
     concurrent_counter: Option<Arc<AtomicU32>>,
     /// Last received usage stats from streaming chunks
     last_usage_stats: Option<inference_providers::TokenUsage>,
+    estimated_input_tokens: u32,
+    streamed_output_bytes: usize,
+    output_bytes_at_last_usage: usize,
+    usage_estimate_incomplete_streams: bool,
     /// Last chat ID from streaming chunks (for attestation and inference_id)
     last_chat_id: Option<String>,
     /// Flag indicating the stream reached a terminal SSE marker or inner EOF.
@@ -313,61 +319,52 @@ where
             cache_read_tokens,
             anthropic_cache_write_tokens,
             profiled_cache_write_tokens,
-            chat_id,
-        ) = match (&self.last_usage_stats, &self.last_chat_id) {
-            (Some(usage), Some(chat_id)) => (
-                usage.prompt_tokens,
-                usage.completion_tokens,
-                usage.cached_tokens(),
-                usage.cache_creation_tokens(),
-                usage.cache_write_tokens(),
-                chat_id.clone(),
-            ),
-            (None, None) => {
-                // Distinguish client disconnect / provider error from truly unexpected cases.
-                // Client disconnects and provider errors are expected — usage is only sent
-                // in the final chunk, so an interrupted stream will never have it.
-                //
-                // `last_error` must be checked in addition to `stream_completed`: the
-                // route converts an in-stream provider Err into an SSE error frame and
-                // keeps polling, so the stream still ends "normally"
-                // (stream_completed == true) after e.g. a backend queue abort before
-                // the first token. That is a provider error, not a mystery.
-                if !self.stream_completed || self.last_error.is_some() {
-                    tracing::warn!(%organization_id, %model_id, model = %self.model_name,
-                        stream_completed = self.stream_completed,
-                        stream_error = self.last_error.is_some(),
-                        "Stream interrupted before usage stats or chat_id received (client disconnect or provider error)");
+            estimated_usage,
+        ) = match &self.last_usage_stats {
+            Some(usage) => {
+                // Only supplement a snapshot when more output arrived afterwards.
+                // A final usage event remains authoritative even if the client
+                // disconnects before the terminal marker is read.
+                let estimate_output = self.usage_estimate_incomplete_streams
+                    && self.last_error.is_none()
+                    && self.streamed_output_bytes > self.output_bytes_at_last_usage;
+                let output_tokens = if estimate_output {
+                    usage.completion_tokens.max(
+                        i32::try_from(estimate_tokens_from_bytes(self.streamed_output_bytes))
+                            .unwrap_or(i32::MAX),
+                    )
                 } else {
-                    tracing::error!(%organization_id, %model_id, model = %self.model_name,
-                        "Stream completed but no usage stats and no chat_id available");
-                }
-                return;
+                    usage.completion_tokens
+                };
+                (
+                    usage.prompt_tokens,
+                    output_tokens,
+                    usage.cached_tokens(),
+                    usage.cache_creation_tokens(),
+                    usage.cache_write_tokens(),
+                    output_tokens != usage.completion_tokens,
+                )
             }
-            (None, Some(chat_id)) => {
-                if !self.stream_completed || self.last_error.is_some() {
-                    tracing::warn!(%chat_id, %organization_id, %model_id, model = %self.model_name,
-                        stream_completed = self.stream_completed,
-                        stream_error = self.last_error.is_some(),
-                        "Stream interrupted before usage stats received (client disconnect or provider error)");
+            None => {
+                // Keep the existing provider-error policy. A stream with no
+                // parsed response gives us no evidence of billable execution.
+                if !self.usage_estimate_incomplete_streams
+                    || self.last_error.is_some()
+                    || (self.last_chat_id.is_none() && self.streamed_output_bytes == 0)
+                {
+                    return;
+                }
+                let input_tokens = i32::try_from(self.estimated_input_tokens).unwrap_or(i32::MAX);
+                let output_tokens = if self.streamed_output_bytes == 0 {
+                    0
                 } else {
-                    tracing::error!(%chat_id, %organization_id, %model_id, model = %self.model_name,
-                        "Stream completed but no usage stats available");
-                }
-                return;
-            }
-            (Some(usage), None) => {
-                tracing::error!(
-                    prompt_tokens = usage.prompt_tokens,
-                    completion_tokens = usage.completion_tokens,
-                    %organization_id,
-                    %model_id,
-                    model = %self.model_name,
-                    "Stream ended but no chat_id available"
-                );
-                return;
+                    i32::try_from(estimate_tokens_from_bytes(self.streamed_output_bytes))
+                        .unwrap_or(i32::MAX)
+                };
+                (input_tokens, output_tokens, 0, 0, 0, true)
             }
         };
+        let chat_id = self.last_chat_id.clone();
 
         if input_tokens == 0 && output_tokens == 0 {
             return;
@@ -383,7 +380,10 @@ where
             }
         };
 
-        let inference_id = hash_inference_id_to_uuid(&chat_id);
+        let inference_id = chat_id
+            .as_deref()
+            .map(hash_inference_id_to_uuid)
+            .unwrap_or_else(Uuid::new_v4);
 
         // Create span with full context for async task
         let span = tracing::info_span!(
@@ -426,7 +426,9 @@ where
         let requested_service_tier = self.requested_service_tier;
         let provider_service_tier = self.provider_service_tier.clone();
 
-        let avg_itl_ms = if self.token_count > 0 {
+        let avg_itl_ms = if estimated_usage {
+            None
+        } else if self.token_count > 0 {
             Some(self.total_itl_ms / self.token_count as f64)
         } else {
             None
@@ -450,29 +452,35 @@ where
             // series rather than a directly comparable population. Emit them
             // before the billing timeout so a stalled usage write cannot also
             // discard already-observed latency telemetry.
-            let ttft_tags: Vec<&str> = metric_tags.iter().map(|s| s.as_str()).collect();
-            if let Some(duration) = backend_ttft {
-                metrics_service.record_latency(
-                    METRIC_LATENCY_STREAMING_TTFT_BY_INPUT,
-                    duration,
-                    &ttft_tags,
-                );
-            }
-            if let Some(duration) = e2e_ttft {
-                metrics_service.record_latency(
-                    METRIC_LATENCY_STREAMING_TTFT_TOTAL_BY_INPUT,
-                    duration,
-                    &ttft_tags,
-                );
+            if !estimated_usage {
+                let ttft_tags: Vec<&str> = metric_tags.iter().map(|s| s.as_str()).collect();
+                if let Some(duration) = backend_ttft {
+                    metrics_service.record_latency(
+                        METRIC_LATENCY_STREAMING_TTFT_BY_INPUT,
+                        duration,
+                        &ttft_tags,
+                    );
+                }
+                if let Some(duration) = e2e_ttft {
+                    metrics_service.record_latency(
+                        METRIC_LATENCY_STREAMING_TTFT_TOTAL_BY_INPUT,
+                        duration,
+                        &ttft_tags,
+                    );
+                }
             }
 
             handle_clone.block_on(
                 async move {
-                    let stop_reason = Some(crate::usage::StopReason::for_stream_outcome(
-                        last_error.as_ref(),
-                        stream_completed,
-                        last_finish_reason.as_ref(),
-                    ));
+                    let stop_reason = Some(if estimated_usage && stream_completed {
+                        crate::usage::StopReason::Incomplete
+                    } else {
+                        crate::usage::StopReason::for_stream_outcome(
+                            last_error.as_ref(),
+                            stream_completed,
+                            last_finish_reason.as_ref(),
+                        )
+                    });
                     let usage_request = RecordUsageServiceRequest {
                         input_tokens,
                         output_tokens,
@@ -484,7 +492,7 @@ where
                         ttft_ms,
                         avg_itl_ms,
                         inference_id: Some(inference_id),
-                        provider_request_id: Some(chat_id),
+                        provider_request_id: chat_id,
                         stop_reason,
                         response_id,
                         provider_attribution,
@@ -523,9 +531,16 @@ where
 
                     // Record metrics
                     let tags: Vec<&str> = metric_tags.iter().map(|s| s.as_str()).collect();
-                    metrics_service.record_latency(METRIC_LATENCY_TOTAL, e2e_duration, &tags);
+                    if !estimated_usage {
+                        metrics_service.record_latency(METRIC_LATENCY_TOTAL, e2e_duration, &tags);
+                    }
 
-                    if let Some(first_token_instant) = first_token_time {
+                    if estimated_usage {
+                        metrics_service.record_count(METRIC_ESTIMATED_STREAM_USAGE, 1, &tags);
+                    }
+
+                    if let Some(first_token_instant) = first_token_time.filter(|_| !estimated_usage)
+                    {
                         let decoding_duration = first_token_instant.elapsed();
                         metrics_service.record_latency(
                             METRIC_LATENCY_DECODING_TIME,
@@ -550,7 +565,9 @@ where
                         cache_read_tokens as i64,
                         &tags,
                     );
-                    if let Some(rate) = cache_hit_rate_percent(cache_read_tokens, input_tokens) {
+                    if let Some(rate) = cache_hit_rate_percent(cache_read_tokens, input_tokens)
+                        .filter(|_| !estimated_usage)
+                    {
                         metrics_service.record_histogram(METRIC_CACHE_HIT_RATE, rate, &tags);
                     }
                 }
@@ -597,6 +614,7 @@ where
                         if event.chunk.is_none() {
                             return Poll::Ready(Some(Ok(event)));
                         }
+                        self.observed_chunk_count = self.observed_chunk_count.saturating_add(1);
 
                         let now = Instant::now();
 
@@ -629,11 +647,47 @@ where
 
                         if let Some(StreamChunk::Chat(ref chat_chunk)) = event.chunk {
                             // Track chat_id for attestation (updated on each chunk).
-                            self.last_chat_id = Some(chat_chunk.id.clone());
+                            if !chat_chunk.id.is_empty() {
+                                self.last_chat_id = Some(chat_chunk.id.clone());
+                            }
+
+                            for choice in &chat_chunk.choices {
+                                if let Some(delta) = &choice.delta {
+                                    let tool_call_bytes = delta
+                                        .tool_calls
+                                        .as_ref()
+                                        .into_iter()
+                                        .flatten()
+                                        .filter_map(|call| call.function.as_ref())
+                                        .fold(0usize, |total, function| {
+                                            total
+                                                .saturating_add(
+                                                    function.name.as_ref().map_or(0, String::len),
+                                                )
+                                                .saturating_add(
+                                                    function
+                                                        .arguments
+                                                        .as_ref()
+                                                        .map_or(0, String::len),
+                                                )
+                                        });
+                                    self.streamed_output_bytes =
+                                        self.streamed_output_bytes.saturating_add(
+                                            delta.content.as_ref().map_or(0, String::len)
+                                                + delta
+                                                    .reasoning_content
+                                                    .as_ref()
+                                                    .or(delta.reasoning.as_ref())
+                                                    .map_or(0, String::len)
+                                                + tool_call_bytes,
+                                        );
+                                }
+                            }
 
                             // Track usage stats (updated on each chunk that has usage).
                             if let Some(usage) = &chat_chunk.usage {
                                 self.last_usage_stats = Some(usage.clone());
+                                self.output_bytes_at_last_usage = self.streamed_output_bytes;
                             }
 
                             if let Some(service_tier) = &chat_chunk.service_tier {
@@ -802,6 +856,7 @@ pub struct CompletionServiceImpl {
     pub models_repository: Arc<dyn ModelsRepository>,
     concurrent_counts: Cache<(Uuid, Uuid), Arc<AtomicU32>>,
     concurrent_limit: u32,
+    usage_estimate_incomplete_streams: bool,
     /// Cache for per-organization concurrent limits (5-minute TTL)
     org_concurrent_limits: Cache<Uuid, u32>,
     /// Cache of model resolution and of access decisions on unlisted models
@@ -857,24 +912,40 @@ fn compute_prefix_hash(messages: &[inference_providers::ChatMessage]) -> u64 {
     hasher.finish()
 }
 
-/// Rough token count estimate for context-length routing (4 chars ≈ 1 token).
-fn estimate_input_tokens(messages: &[inference_providers::ChatMessage]) -> u32 {
-    let chars: usize = messages
+fn estimate_tokens_from_bytes(bytes: usize) -> u32 {
+    u32::try_from(bytes / 4).unwrap_or(u32::MAX).max(1)
+}
+
+fn estimate_text_input_tokens(params: &inference_providers::ChatCompletionParams) -> u32 {
+    let chars: usize = params
+        .messages
         .iter()
-        .map(|m| {
-            let content = match &m.content {
-                Some(serde_json::Value::String(s)) => s.len(),
+        .map(|message| {
+            let content = match &message.content {
+                Some(serde_json::Value::String(text)) => text.len(),
                 Some(serde_json::Value::Array(parts)) => parts
                     .iter()
-                    .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
-                    .map(|s| s.len())
+                    .filter_map(|part| part.get("text").and_then(|text| text.as_str()))
+                    .map(str::len)
                     .sum(),
                 _ => 0,
             };
-            content + m.reasoning_content.as_ref().map_or(0, |r| r.len())
+            content + message.reasoning_content.as_ref().map_or(0, String::len)
         })
         .sum();
-    (chars / 4).max(1) as u32
+    estimate_tokens_from_bytes(chars)
+}
+
+/// Input-token estimate for a usage row. Prior-turn reasoning is not counted
+/// because some adapters drop it before the request is sent.
+fn estimate_input_tokens(params: &inference_providers::ChatCompletionParams) -> u32 {
+    let estimate = super::inference_provider_pool::estimate_input_with(params, false);
+    u32::try_from(
+        estimate
+            .countable_tokens
+            .saturating_add(estimate.uncounted_tokens),
+    )
+    .unwrap_or(u32::MAX)
 }
 
 impl CompletionServiceImpl {
@@ -905,6 +976,7 @@ impl CompletionServiceImpl {
             models_repository,
             concurrent_counts,
             concurrent_limit: DEFAULT_CONCURRENT_LIMIT,
+            usage_estimate_incomplete_streams: true,
             org_concurrent_limits,
             // Private until `with_model_resolve_cache` shares the one owned by
             // `ModelsServiceImpl`; a private cache is NOT cleared by
@@ -919,6 +991,11 @@ impl CompletionServiceImpl {
     /// `invalidate_models_cache` also clears this service's cached models.
     pub fn with_model_resolve_cache(mut self, cache: crate::models::ModelResolveCache) -> Self {
         self.model_resolve_cache = cache;
+        self
+    }
+
+    pub fn with_usage_estimate_incomplete_streams(mut self, enabled: bool) -> Self {
+        self.usage_estimate_incomplete_streams = enabled;
         self
     }
 
@@ -1200,6 +1277,36 @@ impl CompletionServiceImpl {
         ]
         .iter()
         .any(|key| extra.get(*key).and_then(|v| v.as_str()).is_some())
+    }
+
+    /// Whether `extra` carries a client encryption header. Mirrors the route's
+    /// `e2ee_requested`: `MODEL_PUB_KEY` alone only pins routing and does not
+    /// make the request or response encrypted.
+    fn extra_has_client_encryption(
+        extra: &std::collections::HashMap<String, serde_json::Value>,
+    ) -> bool {
+        use crate::common::encryption_headers as eh;
+        [
+            eh::SIGNING_ALGO,
+            eh::CLIENT_PUB_KEY,
+            eh::ENCRYPTION_VERSION,
+            eh::ENCRYPT_ALL_FIELDS,
+        ]
+        .iter()
+        .any(|key| extra.get(*key).and_then(|v| v.as_str()).is_some())
+    }
+
+    /// Whether a byte-based usage estimate may be recorded for this stream. It
+    /// is skipped only when the payload can be ciphertext: a client-encrypted
+    /// request served by NEAR AI's own fleet. Every other provider receives
+    /// plaintext whatever headers the client sent, so the headers alone never
+    /// turn estimates off.
+    fn usage_estimate_allowed(
+        client_encryption: bool,
+        attribution: &crate::usage::ProviderAttribution,
+    ) -> bool {
+        !(client_encryption
+            && attribution.served_provider_type == Some(crate::usage::ServedProviderType::Vllm))
     }
 
     /// Reject `n > 1` requests for models that don't support multiple completions
@@ -1678,6 +1785,7 @@ impl CompletionServiceImpl {
         inference_type: crate::usage::ports::InferenceType,
         service_start_time: Instant,
         provider_start_time: Instant,
+        estimated_input_tokens: Option<u32>,
         concurrent_counter: Option<Arc<AtomicU32>>,
         response_id: Option<ResponseId>,
         attestation_supported: bool,
@@ -1708,7 +1816,6 @@ impl CompletionServiceImpl {
             workspace_id,
             api_key_id,
             model_id,
-            model_name,
             inference_type,
             service_start_time,
             provider_start_time,
@@ -1716,11 +1823,18 @@ impl CompletionServiceImpl {
             first_token_time: None,
             ttft_ms: None,
             token_count: 0,
+            observed_chunk_count: 0,
             last_token_time: None,
             total_itl_ms: 0.0,
             metric_tags,
             concurrent_counter,
             last_usage_stats: None,
+            estimated_input_tokens: estimated_input_tokens.unwrap_or(0),
+            streamed_output_bytes: 0,
+            output_bytes_at_last_usage: 0,
+            // No input estimate means no estimate of any kind for this stream.
+            usage_estimate_incomplete_streams: self.usage_estimate_incomplete_streams
+                && estimated_input_tokens.is_some(),
             last_chat_id: None,
             stream_completed: false,
             saw_upstream_done_marker: false,
@@ -1896,9 +2010,11 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         let provider_start_time = Instant::now();
 
         // Compute routing hints from the request messages for adaptive load balancing.
+        let estimated_input_tokens = estimate_input_tokens(&chat_params);
+        let client_encryption = Self::extra_has_client_encryption(&chat_params.extra);
         let routing_hints = super::inference_provider_pool::ChatRoutingHints {
             prefix_hash: Some(compute_prefix_hash(&chat_params.messages)),
-            estimated_tokens: Some(estimate_input_tokens(&chat_params.messages)),
+            estimated_tokens: Some(estimate_text_input_tokens(&chat_params)),
             fallback_disabled: !request.fallback_enabled,
             request_priority: chat_params.request_priority,
         };
@@ -1929,6 +2045,9 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         let llm_stream = attributed_stream.stream;
         let provider_attribution = attributed_stream.provider_attribution;
         let latency_reporter = attributed_stream.latency_reporter;
+        let estimated_input_tokens =
+            Self::usage_estimate_allowed(client_encryption, &provider_attribution)
+                .then_some(estimated_input_tokens);
 
         // Transfer counter ownership to InterceptStream (which decrements on drop)
         let counter = guard.disarm();
@@ -1953,6 +2072,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
                 inference_type,
                 service_start_time,
                 provider_start_time,
+                estimated_input_tokens,
                 counter,
                 request.response_id,
                 model.attestation_supported,
@@ -2597,7 +2717,9 @@ mod tests {
     use crate::test_utils::{MockAttestationService, MockUsageService};
     use bytes::Bytes;
     use futures::{stream, StreamExt};
-    use inference_providers::models::{ChatChoice, ChatCompletionChunk, FinishReason, TokenUsage};
+    use inference_providers::models::{
+        ChatChoice, ChatCompletionChunk, ChatDelta, FinishReason, TokenUsage,
+    };
     use std::time::Duration;
 
     #[tokio::test]
@@ -2664,7 +2786,6 @@ mod tests {
             workspace_id: Uuid::new_v4(),
             api_key_id: Uuid::new_v4(),
             model_id: Uuid::new_v4(),
-            model_name: "test-model".to_string(),
             inference_type: crate::usage::ports::InferenceType::ChatCompletionStream,
             service_start_time: now,
             provider_start_time: now,
@@ -2672,11 +2793,16 @@ mod tests {
             first_token_time: None,
             ttft_ms: None,
             token_count: 0,
+            observed_chunk_count: 0,
             last_token_time: None,
             total_itl_ms: 0.0,
             metric_tags: CompletionServiceImpl::create_metric_tags("test-model"),
             concurrent_counter: None,
             last_usage_stats: None,
+            estimated_input_tokens: 7,
+            streamed_output_bytes: 0,
+            output_bytes_at_last_usage: 0,
+            usage_estimate_incomplete_streams: true,
             last_chat_id: None,
             stream_completed: false,
             saw_upstream_done_marker: false,
@@ -2701,6 +2827,782 @@ mod tests {
             chunk: None,
             raw_passthrough: true,
         }
+    }
+
+    fn usage_test_chunk(
+        content: Option<&str>,
+        reasoning_content: Option<&str>,
+        usage: Option<TokenUsage>,
+        finish_reason: Option<FinishReason>,
+    ) -> SSEEvent {
+        SSEEvent {
+            raw_bytes: Bytes::from_static(b"data: test\n\n"),
+            raw_passthrough: true,
+            chunk: Some(StreamChunk::Chat(ChatCompletionChunk {
+                id: "chat-usage-test".to_string(),
+                object: "chat.completion.chunk".to_string(),
+                created: 0,
+                model: "test-model".to_string(),
+                choices: vec![ChatChoice {
+                    index: 0,
+                    delta: Some(ChatDelta {
+                        content: content.map(str::to_string),
+                        reasoning_content: reasoning_content.map(str::to_string),
+                        ..Default::default()
+                    }),
+                    logprobs: None,
+                    finish_reason,
+                    token_ids: None,
+                }],
+                usage,
+                service_tier: None,
+                prompt_token_ids: None,
+                system_fingerprint: None,
+                modality: None,
+                extra: Default::default(),
+            })),
+        }
+    }
+
+    async fn recorded_usage(
+        service: &crate::test_utils::CapturingUsageService,
+    ) -> Vec<crate::usage::RecordUsageServiceRequest> {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let requests = service.get_requests();
+                if !requests.is_empty() {
+                    return requests;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("usage should be recorded")
+    }
+
+    #[tokio::test]
+    async fn streamed_usage_without_provider_id_is_recorded_once() {
+        use crate::test_utils::CapturingUsageService;
+
+        for usage in [None, Some(TokenUsage::new(42, 11))] {
+            let service = Arc::new(CapturingUsageService::new());
+            let mut event = usage_test_chunk(Some("hello world"), None, usage.clone(), None);
+            if let Some(StreamChunk::Chat(chunk)) = event.chunk.as_mut() {
+                chunk.id.clear();
+            }
+            let mut stream = terminal_test_stream(vec![Ok(event)]);
+            stream.usage_service = service.clone();
+            assert!(stream.next().await.unwrap().is_ok());
+            drop(stream);
+            let requests = recorded_usage(&service).await;
+            assert_eq!(requests.len(), 1);
+            assert_eq!(
+                requests[0].input_tokens,
+                if usage.is_some() { 42 } else { 7 }
+            );
+            assert_eq!(
+                requests[0].output_tokens,
+                if usage.is_some() { 11 } else { 2 }
+            );
+            assert!(requests[0].provider_request_id.is_none());
+            assert!(requests[0].inference_id.is_some());
+            assert_eq!(
+                requests[0].stop_reason,
+                Some(crate::usage::StopReason::ClientDisconnect)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn partial_nonzero_usage_is_supplemented_after_more_output() {
+        use crate::test_utils::CapturingUsageService;
+
+        let service = Arc::new(CapturingUsageService::new());
+        let mut stream = terminal_test_stream(vec![
+            Ok(usage_test_chunk(
+                Some("abcd"),
+                None,
+                Some(TokenUsage::new_with_cache(42, 1, 30)),
+                None,
+            )),
+            Ok(usage_test_chunk(Some("efghijklmnop"), None, None, None)),
+        ]);
+        stream.usage_service = service.clone();
+        assert!(stream.next().await.unwrap().is_ok());
+        assert!(stream.next().await.unwrap().is_ok());
+        drop(stream);
+        let requests = recorded_usage(&service).await;
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].input_tokens, 42);
+        assert_eq!(requests[0].output_tokens, 4);
+        assert_eq!(requests[0].cache_read_tokens, 30);
+        assert!(requests[0].avg_itl_ms.is_none());
+    }
+
+    #[tokio::test]
+    async fn final_usage_survives_disconnect_before_done_without_estimation() {
+        use crate::test_utils::CapturingUsageService;
+
+        let service = Arc::new(CapturingUsageService::new());
+        let mut stream = terminal_test_stream(vec![
+            Ok(usage_test_chunk(Some("abcdefghijklmnop"), None, None, None)),
+            Ok(usage_test_chunk(
+                None,
+                None,
+                Some(TokenUsage::new(42, 1)),
+                Some(FinishReason::Stop),
+            )),
+            Ok(terminal_control_event(b"data: [DONE]\n\n")),
+        ]);
+        stream.usage_service = service.clone();
+        assert!(stream.next().await.unwrap().is_ok());
+        assert!(stream.next().await.unwrap().is_ok());
+        drop(stream);
+        let requests = recorded_usage(&service).await;
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].output_tokens, 1);
+    }
+
+    #[tokio::test]
+    async fn incomplete_stream_records_estimated_usage() {
+        use crate::test_utils::CapturingUsageService;
+
+        let usage_service = Arc::new(CapturingUsageService::new());
+        let metrics_service = Arc::new(CapturingMetricsService::new());
+        let mut stream = terminal_test_stream(vec![
+            Ok(usage_test_chunk(Some("hello"), None, None, None)),
+            Ok(usage_test_chunk(Some("world"), Some("abc"), None, None)),
+        ]);
+        stream.usage_service = usage_service.clone();
+        stream.metrics_service = metrics_service.clone();
+        let organization_id = stream.organization_id;
+        let workspace_id = stream.workspace_id;
+        let api_key_id = stream.api_key_id;
+        let model_id = stream.model_id;
+        assert!(stream.next().await.is_some());
+        assert!(stream.next().await.is_some());
+        drop(stream);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let requests = usage_service.get_requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].input_tokens, 7);
+        assert_eq!(requests[0].output_tokens, 3);
+        assert_eq!(requests[0].cache_read_tokens, 0);
+        assert!(requests[0].cache_write.is_none());
+        assert_eq!(requests[0].profiled_cache_write_tokens, 0);
+        assert_eq!(requests[0].organization_id, organization_id);
+        assert_eq!(requests[0].workspace_id, workspace_id);
+        assert_eq!(requests[0].api_key_id, api_key_id);
+        assert_eq!(requests[0].model_id, model_id);
+        assert_eq!(
+            requests[0].provider_request_id.as_deref(),
+            Some("chat-usage-test")
+        );
+        assert_eq!(
+            requests[0].inference_id,
+            Some(hash_inference_id_to_uuid("chat-usage-test"))
+        );
+        assert_eq!(
+            requests[0].stop_reason,
+            Some(crate::usage::StopReason::ClientDisconnect)
+        );
+        let metrics = metrics_service.get_metrics();
+        let estimate_metrics: Vec<_> = metrics
+            .iter()
+            .filter(|metric| metric.name == METRIC_ESTIMATED_STREAM_USAGE)
+            .collect();
+        assert_eq!(estimate_metrics.len(), 1);
+        let estimate_tags = &estimate_metrics[0].tags;
+        assert!(estimate_tags.iter().any(|tag| tag == "model:test-model"));
+        assert!(estimate_tags
+            .iter()
+            .any(|tag| tag.starts_with("environment:")));
+        assert!(estimate_tags
+            .iter()
+            .any(|tag| tag.starts_with("input_bucket:")));
+        assert!(!metrics
+            .iter()
+            .any(|metric| metric.name == METRIC_TOKENS_PER_SECOND));
+        assert!(!metrics
+            .iter()
+            .any(|metric| metric.name == METRIC_LATENCY_STREAMING_TTFT_BY_INPUT));
+        for (name, count) in [
+            (METRIC_TOKENS_INPUT, 7),
+            (METRIC_TOKENS_OUTPUT, 3),
+            (METRIC_TOKENS_CACHED, 0),
+        ] {
+            assert!(metrics.iter().any(|metric| {
+                metric.name == name && matches!(metric.value, MetricValue::Count(v) if v == count)
+            }));
+        }
+        assert!(!metrics
+            .iter()
+            .any(|metric| metric.name == METRIC_CACHE_HIT_RATE));
+        assert!(!metrics
+            .iter()
+            .any(|metric| metric.name == METRIC_LATENCY_TOTAL));
+        assert!(!metrics
+            .iter()
+            .any(|metric| metric.name == METRIC_LATENCY_DECODING_TIME));
+        assert!(requests[0].avg_itl_ms.is_none());
+    }
+
+    #[tokio::test]
+    async fn stream_with_provider_usage_records_exact_usage() {
+        use crate::test_utils::CapturingUsageService;
+
+        let usage_service = Arc::new(CapturingUsageService::new());
+        let metrics_service = Arc::new(CapturingMetricsService::new());
+        let mut stream = terminal_test_stream(vec![
+            Ok(usage_test_chunk(Some("hello"), None, None, None)),
+            Ok(usage_test_chunk(
+                None,
+                None,
+                Some(TokenUsage::new(37, 11)),
+                Some(FinishReason::Stop),
+            )),
+        ]);
+        stream.usage_service = usage_service.clone();
+        stream.metrics_service = metrics_service.clone();
+        let _ = stream.by_ref().collect::<Vec<_>>().await;
+        assert_eq!(stream.observed_chunk_count, 2);
+        drop(stream);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let requests = usage_service.get_requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].input_tokens, 37);
+        assert_eq!(requests[0].output_tokens, 11);
+        assert_eq!(
+            requests[0].stop_reason,
+            Some(crate::usage::StopReason::Stop)
+        );
+        assert!(metrics_service.get_metrics().iter().any(|metric| {
+            metric.name == METRIC_TOKENS_INPUT && matches!(metric.value, MetricValue::Count(37))
+        }));
+        assert!(metrics_service.get_metrics().iter().any(|metric| {
+            metric.name == METRIC_TOKENS_OUTPUT && matches!(metric.value, MetricValue::Count(11))
+        }));
+        assert!(!metrics_service
+            .get_metrics()
+            .iter()
+            .any(|metric| metric.name == "cloud_api.usage.estimated_stream"));
+        assert!(metrics_service
+            .get_metrics()
+            .iter()
+            .any(|metric| metric.name == METRIC_LATENCY_TOTAL));
+    }
+
+    #[tokio::test]
+    async fn stream_usage_after_terminal_choice_records_exact_usage() {
+        use crate::test_utils::CapturingUsageService;
+
+        let usage_service = Arc::new(CapturingUsageService::new());
+        let mut stream = terminal_test_stream(vec![
+            Ok(usage_test_chunk(
+                Some("done"),
+                None,
+                None,
+                Some(FinishReason::Stop),
+            )),
+            Ok(usage_test_chunk(
+                None,
+                None,
+                Some(TokenUsage::new(37, 11)),
+                None,
+            )),
+        ]);
+        stream.usage_service = usage_service.clone();
+        let _ = stream.collect::<Vec<_>>().await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let requests = usage_service.get_requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].input_tokens, 37);
+        assert_eq!(requests[0].output_tokens, 11);
+        assert_eq!(
+            requests[0].stop_reason,
+            Some(crate::usage::StopReason::Stop)
+        );
+    }
+
+    #[tokio::test]
+    async fn incomplete_stream_multibyte_output_uses_utf8_bytes() {
+        use crate::test_utils::CapturingUsageService;
+
+        let usage_service = Arc::new(CapturingUsageService::new());
+        let content = "你好世界";
+        let mut stream =
+            terminal_test_stream(vec![Ok(usage_test_chunk(Some(content), None, None, None))]);
+        stream.usage_service = usage_service.clone();
+        assert!(stream.next().await.is_some());
+        drop(stream);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let requests = usage_service.get_requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].input_tokens, 7);
+        assert_eq!(
+            requests[0].output_tokens,
+            estimate_tokens_from_bytes(content.len()) as i32
+        );
+        assert_eq!(
+            requests[0].stop_reason,
+            Some(crate::usage::StopReason::ClientDisconnect)
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_provider_error_after_content_records_no_usage() {
+        use crate::test_utils::CapturingUsageService;
+
+        let usage_service = Arc::new(CapturingUsageService::new());
+        let mut stream = terminal_test_stream(vec![
+            Ok(usage_test_chunk(Some("partial output"), None, None, None)),
+            Err(inference_providers::CompletionError::CompletionError(
+                "provider failed".to_string(),
+            )),
+        ]);
+        stream.usage_service = usage_service.clone();
+        assert!(stream.next().await.is_some());
+        assert!(stream.next().await.unwrap().is_err());
+        drop(stream);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        assert!(usage_service.get_requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn incomplete_stream_estimate_kill_switch() {
+        use crate::test_utils::CapturingUsageService;
+
+        let usage_service = Arc::new(CapturingUsageService::new());
+        let mut stream =
+            terminal_test_stream(vec![Ok(usage_test_chunk(Some("hello"), None, None, None))]);
+        stream.usage_service = usage_service.clone();
+        stream.usage_estimate_incomplete_streams = false;
+        assert!(stream.next().await.is_some());
+        drop(stream);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(usage_service.get_requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn stream_provider_error_after_role_only_chunk_records_no_usage() {
+        use crate::test_utils::CapturingUsageService;
+
+        let usage_service = Arc::new(CapturingUsageService::new());
+        let mut stream = terminal_test_stream(vec![
+            Ok(usage_test_chunk(None, None, None, None)),
+            Err(inference_providers::CompletionError::CompletionError(
+                "provider failed".to_string(),
+            )),
+        ]);
+        stream.usage_service = usage_service.clone();
+        assert!(stream.next().await.is_some());
+        assert!(stream.next().await.unwrap().is_err());
+        drop(stream);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        assert!(usage_service.get_requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn incomplete_stream_role_only_chunk_records_zero_output() {
+        use crate::test_utils::CapturingUsageService;
+
+        let usage_service = Arc::new(CapturingUsageService::new());
+        let mut stream = terminal_test_stream(vec![Ok(usage_test_chunk(None, None, None, None))]);
+        stream.usage_service = usage_service.clone();
+        assert!(stream.next().await.is_some());
+        drop(stream);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let requests = usage_service.get_requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].input_tokens, 7);
+        assert_eq!(requests[0].output_tokens, 0);
+        assert_eq!(
+            requests[0].stop_reason,
+            Some(crate::usage::StopReason::ClientDisconnect)
+        );
+    }
+
+    #[tokio::test]
+    async fn incomplete_stream_estimate_emits_token_volume_metrics() {
+        let metrics_service = Arc::new(CapturingMetricsService::new());
+        let mut stream =
+            terminal_test_stream(vec![Ok(usage_test_chunk(Some("hello"), None, None, None))]);
+        stream.metrics_service = metrics_service.clone();
+        assert!(stream.next().await.is_some());
+        drop(stream);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let metrics = metrics_service.get_metrics();
+        assert!(metrics.iter().any(|metric| {
+            metric.name == METRIC_TOKENS_INPUT && matches!(metric.value, MetricValue::Count(7))
+        }));
+        assert!(metrics.iter().any(|metric| {
+            metric.name == METRIC_TOKENS_OUTPUT && matches!(metric.value, MetricValue::Count(1))
+        }));
+        assert!(metrics
+            .iter()
+            .any(|metric| metric.name == METRIC_TOKENS_CACHED));
+        assert!(!metrics
+            .iter()
+            .any(|metric| metric.name == METRIC_CACHE_HIT_RATE));
+        assert!(!metrics
+            .iter()
+            .any(|metric| metric.name == METRIC_LATENCY_TOTAL));
+        assert!(!metrics
+            .iter()
+            .any(|metric| metric.name == METRIC_TOKENS_PER_SECOND));
+        assert!(!metrics
+            .iter()
+            .any(|metric| metric.name == METRIC_LATENCY_DECODING_TIME));
+        assert!(!metrics
+            .iter()
+            .any(|metric| metric.name == METRIC_LATENCY_STREAMING_TTFT_BY_INPUT));
+    }
+
+    #[tokio::test]
+    async fn completed_stream_with_partial_start_usage_records_incomplete() {
+        use crate::test_utils::CapturingUsageService;
+
+        let usage_service = Arc::new(CapturingUsageService::new());
+        let metrics_service = Arc::new(CapturingMetricsService::new());
+        let mut stream = terminal_test_stream(vec![
+            Ok(usage_test_chunk(
+                None,
+                None,
+                Some(TokenUsage::new(42, 0)),
+                None,
+            )),
+            Ok(usage_test_chunk(Some("hello world"), None, None, None)),
+        ]);
+        stream.usage_service = usage_service.clone();
+        stream.metrics_service = metrics_service.clone();
+        let _ = stream.collect::<Vec<_>>().await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let requests = usage_service.get_requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].input_tokens, 42);
+        assert_eq!(requests[0].output_tokens, 2);
+        assert_eq!(
+            requests[0].stop_reason,
+            Some(crate::usage::StopReason::Incomplete)
+        );
+        assert_eq!(
+            metrics_service
+                .get_metrics()
+                .iter()
+                .filter(|metric| metric.name == METRIC_ESTIMATED_STREAM_USAGE)
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn incomplete_stream_completed_without_usage_records_incomplete() {
+        use crate::test_utils::CapturingUsageService;
+
+        let usage_service = Arc::new(CapturingUsageService::new());
+        let mut stream =
+            terminal_test_stream(vec![Ok(usage_test_chunk(Some("hello"), None, None, None))]);
+        stream.usage_service = usage_service.clone();
+        let _ = stream.collect::<Vec<_>>().await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let requests = usage_service.get_requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].input_tokens, 7);
+        assert_eq!(requests[0].output_tokens, 1);
+        assert_eq!(
+            requests[0].stop_reason,
+            Some(crate::usage::StopReason::Incomplete)
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_tool_call_only_chunk_counts_output() {
+        use crate::test_utils::CapturingUsageService;
+
+        let usage_service = Arc::new(CapturingUsageService::new());
+        let mut event = usage_test_chunk(None, None, None, None);
+        if let Some(StreamChunk::Chat(chunk)) = &mut event.chunk {
+            chunk.choices[0].delta.as_mut().unwrap().tool_calls =
+                Some(vec![inference_providers::models::ToolCallDelta {
+                    id: None,
+                    type_: None,
+                    index: Some(0),
+                    function: Some(inference_providers::models::FunctionCallDelta {
+                        name: Some("lookup".to_string()),
+                        arguments: Some("{\"city\":\"Paris\"}".to_string()),
+                    }),
+                    thought_signature: None,
+                }]);
+        }
+        let mut stream = terminal_test_stream(vec![Ok(event)]);
+        stream.usage_service = usage_service.clone();
+        assert!(stream.next().await.is_some());
+        drop(stream);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let requests = usage_service.get_requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].input_tokens, 7);
+        assert_eq!(requests[0].output_tokens, 5);
+        assert_eq!(
+            requests[0].stop_reason,
+            Some(crate::usage::StopReason::ClientDisconnect)
+        );
+    }
+
+    #[test]
+    fn estimate_text_input_tokens_ignores_tools() {
+        let base: inference_providers::ChatCompletionParams =
+            serde_json::from_value(serde_json::json!({
+                "model": "m",
+                "messages": [{"role": "user", "content": "hello"}]
+            }))
+            .unwrap();
+        let mut with_tools = base.clone();
+        with_tools.tools = Some(vec![inference_providers::models::ToolDefinition {
+            type_: "function".to_string(),
+            function: inference_providers::models::FunctionDefinition {
+                name: "lookup".to_string(),
+                description: Some("Find a place".to_string()),
+                parameters: serde_json::json!({"type": "object", "properties": {"city": {"type": "string"}}}),
+            },
+        }]);
+        assert_eq!(estimate_text_input_tokens(&base), 1);
+        assert_eq!(
+            estimate_text_input_tokens(&with_tools),
+            estimate_text_input_tokens(&base)
+        );
+        assert!(estimate_input_tokens(&with_tools) > estimate_input_tokens(&base));
+    }
+
+    #[test]
+    fn client_encryption_markers_exclude_the_routing_pin() {
+        for key in [
+            crate::common::encryption_headers::SIGNING_ALGO,
+            crate::common::encryption_headers::CLIENT_PUB_KEY,
+            crate::common::encryption_headers::ENCRYPTION_VERSION,
+            crate::common::encryption_headers::ENCRYPT_ALL_FIELDS,
+        ] {
+            let mut extra = std::collections::HashMap::new();
+            extra.insert(key.to_string(), serde_json::json!("value"));
+            assert!(
+                CompletionServiceImpl::extra_has_client_encryption(&extra),
+                "{key} alone must count as client encryption"
+            );
+        }
+
+        let mut pin_only = std::collections::HashMap::new();
+        pin_only.insert(
+            crate::common::encryption_headers::MODEL_PUB_KEY.to_string(),
+            serde_json::json!("value"),
+        );
+        assert!(!CompletionServiceImpl::extra_has_client_encryption(
+            &pin_only
+        ));
+        assert!(!CompletionServiceImpl::extra_has_client_encryption(
+            &std::collections::HashMap::new()
+        ));
+    }
+
+    #[test]
+    fn usage_estimate_is_skipped_only_for_encrypted_requests_on_the_near_fleet() {
+        use crate::usage::{ProviderAttribution, ServedProviderType};
+
+        let served = |served_provider_type| ProviderAttribution {
+            served_provider_type,
+            ..Default::default()
+        };
+        assert!(!CompletionServiceImpl::usage_estimate_allowed(
+            true,
+            &served(Some(ServedProviderType::Vllm))
+        ));
+        for served_type in [
+            Some(ServedProviderType::Vllm),
+            Some(ServedProviderType::External),
+            Some(ServedProviderType::Chutes),
+            Some(ServedProviderType::Tinfoil),
+            None,
+        ] {
+            assert!(
+                CompletionServiceImpl::usage_estimate_allowed(false, &served(served_type)),
+                "plaintext requests are always estimated"
+            );
+        }
+        for served_type in [
+            Some(ServedProviderType::External),
+            Some(ServedProviderType::Chutes),
+            Some(ServedProviderType::Tinfoil),
+            None,
+        ] {
+            assert!(
+                CompletionServiceImpl::usage_estimate_allowed(true, &served(served_type)),
+                "encryption headers must not switch estimates off on other providers"
+            );
+        }
+    }
+
+    #[test]
+    fn estimate_input_tokens_ignores_prior_reasoning() {
+        let base: inference_providers::ChatCompletionParams =
+            serde_json::from_value(serde_json::json!({
+                "model": "m",
+                "messages": [
+                    {"role": "user", "content": "hello"},
+                    {"role": "assistant", "content": "hi"}
+                ]
+            }))
+            .unwrap();
+        let mut with_reasoning = base.clone();
+        with_reasoning.messages[1].reasoning_content = Some("x".repeat(4_000));
+
+        assert_eq!(
+            estimate_input_tokens(&with_reasoning),
+            estimate_input_tokens(&base)
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_without_chat_chunks_records_no_usage() {
+        use crate::test_utils::CapturingUsageService;
+
+        let usage_service = Arc::new(CapturingUsageService::new());
+        let mut stream = terminal_test_stream(vec![]);
+        stream.usage_service = usage_service.clone();
+        let _ = stream.collect::<Vec<_>>().await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(usage_service.get_requests().is_empty());
+    }
+
+    #[test]
+    fn estimate_tokens_from_bytes_boundaries() {
+        assert_eq!(estimate_tokens_from_bytes(0), 1);
+        assert_eq!(estimate_tokens_from_bytes(4), 1);
+        assert_eq!(estimate_tokens_from_bytes(9), 2);
+        #[cfg(target_pointer_width = "64")]
+        assert_eq!(
+            estimate_tokens_from_bytes((u32::MAX as usize + 1) * 4),
+            u32::MAX
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_with_partial_start_usage_estimates_output() {
+        use crate::test_utils::CapturingUsageService;
+
+        let usage_service = Arc::new(CapturingUsageService::new());
+        let metrics_service = Arc::new(CapturingMetricsService::new());
+        let mut stream = terminal_test_stream(vec![
+            Ok(usage_test_chunk(
+                None,
+                None,
+                Some(TokenUsage::new_with_cache(42, 0, 30)),
+                None,
+            )),
+            Ok(usage_test_chunk(Some("hello world"), None, None, None)),
+        ]);
+        stream.usage_service = usage_service.clone();
+        stream.metrics_service = metrics_service.clone();
+        assert!(stream.next().await.is_some());
+        assert!(stream.next().await.is_some());
+        drop(stream);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let requests = usage_service.get_requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].input_tokens, 42);
+        assert_eq!(requests[0].output_tokens, 2);
+        assert_eq!(requests[0].cache_read_tokens, 30);
+        assert_eq!(
+            requests[0].stop_reason,
+            Some(crate::usage::StopReason::ClientDisconnect)
+        );
+        assert!(requests[0].avg_itl_ms.is_none());
+        assert_eq!(
+            metrics_service
+                .get_metrics()
+                .iter()
+                .filter(|metric| metric.name == METRIC_ESTIMATED_STREAM_USAGE)
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_with_partial_start_usage_and_final_usage_records_exact_usage() {
+        use crate::test_utils::CapturingUsageService;
+
+        let usage_service = Arc::new(CapturingUsageService::new());
+        let metrics_service = Arc::new(CapturingMetricsService::new());
+        let mut stream = terminal_test_stream(vec![
+            Ok(usage_test_chunk(
+                None,
+                None,
+                Some(TokenUsage::new(42, 0)),
+                None,
+            )),
+            Ok(usage_test_chunk(Some("hello world"), None, None, None)),
+            Ok(usage_test_chunk(
+                None,
+                None,
+                Some(TokenUsage::new(42, 11)),
+                Some(FinishReason::Stop),
+            )),
+        ]);
+        stream.usage_service = usage_service.clone();
+        stream.metrics_service = metrics_service.clone();
+        let _ = stream.by_ref().collect::<Vec<_>>().await;
+        drop(stream);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let requests = usage_service.get_requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].input_tokens, 42);
+        assert_eq!(requests[0].output_tokens, 11);
+        assert_eq!(
+            requests[0].stop_reason,
+            Some(crate::usage::StopReason::Stop)
+        );
+        assert!(!metrics_service
+            .get_metrics()
+            .iter()
+            .any(|metric| metric.name == METRIC_ESTIMATED_STREAM_USAGE));
+    }
+
+    #[tokio::test]
+    async fn stream_with_partial_start_usage_kill_switch_keeps_provider_usage() {
+        use crate::test_utils::CapturingUsageService;
+
+        let usage_service = Arc::new(CapturingUsageService::new());
+        let mut stream = terminal_test_stream(vec![
+            Ok(usage_test_chunk(
+                None,
+                None,
+                Some(TokenUsage::new(42, 0)),
+                None,
+            )),
+            Ok(usage_test_chunk(Some("hello world"), None, None, None)),
+        ]);
+        stream.usage_service = usage_service.clone();
+        stream.usage_estimate_incomplete_streams = false;
+        assert!(stream.next().await.is_some());
+        assert!(stream.next().await.is_some());
+        drop(stream);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let requests = usage_service.get_requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].input_tokens, 42);
+        assert_eq!(requests[0].output_tokens, 0);
     }
 
     #[tokio::test]
@@ -2883,7 +3785,6 @@ mod tests {
             workspace_id,
             api_key_id,
             model_id,
-            model_name: "test-model".to_string(),
             inference_type: crate::usage::ports::InferenceType::ChatCompletionStream,
             service_start_time: now,
             provider_start_time: now,
@@ -2891,11 +3792,16 @@ mod tests {
             first_token_time: None,
             ttft_ms: None,
             token_count: 0,
+            observed_chunk_count: 0,
             last_token_time: None,
             total_itl_ms: 0.0,
             metric_tags,
             concurrent_counter: None,
             last_usage_stats: None,
+            estimated_input_tokens: 1,
+            streamed_output_bytes: 0,
+            output_bytes_at_last_usage: 0,
+            usage_estimate_incomplete_streams: true,
             last_chat_id: None,
             stream_completed: false,
             saw_upstream_done_marker: false,
@@ -3058,7 +3964,6 @@ mod tests {
             workspace_id: Uuid::new_v4(),
             api_key_id: Uuid::new_v4(),
             model_id: Uuid::new_v4(),
-            model_name: "test-model".to_string(),
             inference_type: crate::usage::ports::InferenceType::ChatCompletionStream,
             service_start_time: now,
             provider_start_time: now,
@@ -3066,11 +3971,16 @@ mod tests {
             first_token_time: None,
             ttft_ms: None,
             token_count: 0,
+            observed_chunk_count: 0,
             last_token_time: None,
             total_itl_ms: 0.0,
             metric_tags: CompletionServiceImpl::create_metric_tags("test-model"),
             concurrent_counter: None,
             last_usage_stats: None,
+            estimated_input_tokens: 1,
+            streamed_output_bytes: 0,
+            output_bytes_at_last_usage: 0,
+            usage_estimate_incomplete_streams: true,
             last_chat_id: None,
             stream_completed: false,
             saw_upstream_done_marker: false,
@@ -3214,7 +4124,6 @@ mod tests {
             workspace_id,
             api_key_id,
             model_id,
-            model_name: "test-model".to_string(),
             inference_type: crate::usage::ports::InferenceType::ChatCompletionStream,
             service_start_time,
             provider_start_time,
@@ -3222,11 +4131,16 @@ mod tests {
             first_token_time: None,
             ttft_ms: None,
             token_count: 0,
+            observed_chunk_count: 0,
             last_token_time: None,
             total_itl_ms: 0.0,
             metric_tags,
             concurrent_counter: None,
             last_usage_stats: None,
+            estimated_input_tokens: 1,
+            streamed_output_bytes: 0,
+            output_bytes_at_last_usage: 0,
+            usage_estimate_incomplete_streams: true,
             last_chat_id: None,
             stream_completed: false,
             saw_upstream_done_marker: false,
@@ -3344,7 +4258,6 @@ mod tests {
             workspace_id,
             api_key_id,
             model_id,
-            model_name: "test-model".to_string(),
             inference_type: crate::usage::ports::InferenceType::ChatCompletionStream,
             service_start_time: now,
             provider_start_time: now,
@@ -3352,11 +4265,16 @@ mod tests {
             first_token_time: None,
             ttft_ms: None,
             token_count: 0,
+            observed_chunk_count: 0,
             last_token_time: None,
             total_itl_ms: 0.0,
             metric_tags,
             concurrent_counter: None,
             last_usage_stats: None,
+            estimated_input_tokens: 1,
+            streamed_output_bytes: 0,
+            output_bytes_at_last_usage: 0,
+            usage_estimate_incomplete_streams: true,
             last_chat_id: None,
             stream_completed: false,
             saw_upstream_done_marker: false,
@@ -3556,7 +4474,6 @@ mod tests {
                 workspace_id: Uuid::new_v4(),
                 api_key_id: Uuid::new_v4(),
                 model_id: Uuid::new_v4(),
-                model_name: "test-model".to_string(),
                 inference_type: crate::usage::ports::InferenceType::ChatCompletionStream,
                 service_start_time: Instant::now(),
                 provider_start_time: Instant::now(),
@@ -3564,11 +4481,16 @@ mod tests {
                 first_token_time: None,
                 ttft_ms: None,
                 token_count: 0,
+                observed_chunk_count: 0,
                 last_token_time: None,
                 total_itl_ms: 0.0,
                 metric_tags: vec![],
                 concurrent_counter: Some(counter.clone()),
                 last_usage_stats: None,
+                estimated_input_tokens: 1,
+                streamed_output_bytes: 0,
+                output_bytes_at_last_usage: 0,
+                usage_estimate_incomplete_streams: true,
                 last_chat_id: None,
                 stream_completed: false,
                 saw_upstream_done_marker: false,

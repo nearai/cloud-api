@@ -490,6 +490,8 @@ sequenceDiagram
     Note over Client,Database: Streaming provides real-time response<br/>while tracking usage
 ```
 
+If a stream delivers chat chunks but no provider usage, the completion service records a byte-based token estimate with the `incomplete` stop reason.
+
 ### 4. Typed Stateless Response Creation Flow (Platform-specific API)
 
 `POST /v1/responses` is a stateless compatibility API. After alias resolution,

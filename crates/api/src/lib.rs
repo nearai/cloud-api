@@ -550,7 +550,8 @@ pub async fn init_domain_services_with_pool(
         catalog_models.clone(),
         org_limit_repository,
     )
-    .with_model_resolve_cache(models_service.model_resolve_cache());
+    .with_model_resolve_cache(models_service.model_resolve_cache())
+    .with_usage_estimate_incomplete_streams(config.usage_estimate_incomplete_streams);
     // Affinity keys only matter to a pool that places requests.
     if let Some(affinity_secret) = inference_provider_pool.affinity_secret() {
         completion_service = completion_service.with_affinity_secret(affinity_secret);
@@ -3313,6 +3314,7 @@ mod tests {
             staking_farm: config::StakingFarmConfig::default(),
             aml: config::AmlConfig::default(),
             usage_reporting: config::UsageReportingConfig::default(),
+            usage_estimate_incomplete_streams: true,
             credit_allocation: config::CreditAllocationConfig::default(),
             ita: config::ItaAttestationConfig::default(),
             placement: config::PlacementConfig::default(),
@@ -3439,6 +3441,7 @@ mod tests {
             staking_farm: config::StakingFarmConfig::default(),
             aml: config::AmlConfig::default(),
             usage_reporting: config::UsageReportingConfig::default(),
+            usage_estimate_incomplete_streams: true,
             credit_allocation: config::CreditAllocationConfig::default(),
             ita: config::ItaAttestationConfig::default(),
             placement: config::PlacementConfig::default(),

@@ -215,6 +215,116 @@ async fn test_chat_completions_stream_records_usage_in_history() {
     );
 }
 
+#[tokio::test]
+async fn test_chat_completions_stream_without_provider_usage_records_estimate() {
+    ensure_usage_chat_completions_env();
+    let (server, _pool, mock_provider, _db) = setup_test_server_with_pool().await;
+    const OUTPUT: &str = "hello world from mock";
+    mock_provider
+        .set_default_response(
+            inference_providers::mock::ResponseTemplate::new(OUTPUT).with_usage_omitted(),
+        )
+        .await;
+
+    setup_qwen_model(&server).await;
+    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id.clone()).await;
+
+    let stream_resp = server
+        .post("/v1/chat/completions")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&json!({
+            "model": E2E_QWEN_MODEL_NAME,
+            "messages": [{ "role": "user", "content": "hello" }],
+            "stream": true
+        }))
+        .await;
+    assert_eq!(stream_resp.status_code(), 200);
+    let body = stream_resp.text();
+    assert!(body.contains("hello"));
+    assert!(body.contains("[DONE]"));
+
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+    let entry = loop {
+        let history_resp = server
+            .get(&format!(
+                "/v1/organizations/{}/usage/history?limit=1&offset=0",
+                org.id
+            ))
+            .add_header("Authorization", format!("Bearer {}", get_session_id()))
+            .add_header("User-Agent", MOCK_USER_AGENT)
+            .await;
+        assert_eq!(history_resp.status_code(), 200);
+        let history: api::routes::usage::UsageHistoryResponse = history_resp.json();
+        if let Some(entry) = history.data.into_iter().next() {
+            break entry;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "usage row not recorded within 5s"
+        );
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+    };
+    assert_eq!(
+        entry.input_tokens, 5,
+        "5 prompt bytes / 4 + 4 message tokens"
+    );
+    assert_eq!(entry.output_tokens, 5, "21 streamed UTF-8 bytes / 4");
+    assert_eq!(entry.stop_reason.as_deref(), Some("incomplete"));
+}
+
+#[tokio::test]
+async fn test_chat_completions_stream_without_provider_usage_respects_flag_off() {
+    ensure_usage_chat_completions_env();
+    let (server, _pool, mock_provider, _db) = setup_test_server_with_pool_and_config(|config| {
+        config.usage_estimate_incomplete_streams = false;
+    })
+    .await;
+    mock_provider
+        .set_default_response(
+            inference_providers::mock::ResponseTemplate::new("hello world from mock")
+                .with_usage_omitted(),
+        )
+        .await;
+
+    setup_qwen_model(&server).await;
+    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id.clone()).await;
+    let stream_resp = server
+        .post("/v1/chat/completions")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&json!({
+            "model": E2E_QWEN_MODEL_NAME,
+            "messages": [{ "role": "user", "content": "hello" }],
+            "stream": true
+        }))
+        .await;
+    assert_eq!(stream_resp.status_code(), 200);
+    assert!(stream_resp.text().contains("[DONE]"));
+
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(1);
+    loop {
+        let history_resp = server
+            .get(&format!(
+                "/v1/organizations/{}/usage/history?limit=1&offset=0",
+                org.id
+            ))
+            .add_header("Authorization", format!("Bearer {}", get_session_id()))
+            .add_header("User-Agent", MOCK_USER_AGENT)
+            .await;
+        assert_eq!(history_resp.status_code(), 200);
+        let history: api::routes::usage::UsageHistoryResponse = history_resp.json();
+        assert!(
+            history.data.is_empty(),
+            "flag-off stream must not record usage"
+        );
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+    }
+}
+
 /// Register a non-attested (external) chat model in both the provider pool and the DB.
 /// Both attested and non-attested models have usage stripped to `null` when the client
 /// did not request `include_usage`; non-attested streams are simply not gateway-signed.
@@ -782,4 +892,67 @@ async fn test_chat_completions_stream_with_cache_records_cache_in_history() {
         entry.cache_read_tokens, cache_tokens,
         "usage history should record cache_read_tokens from stream completion"
     );
+}
+
+/// A real HTTP/1 disconnect while the usage transaction waits must not cancel settlement.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn non_streaming_usage_survives_http_disconnect_during_settlement() {
+    ensure_usage_chat_completions_env();
+    let (server, router, _, _, database) = setup_test_server_with_pool_and_router().await;
+    setup_qwen_model(&server).await;
+    let org = setup_org_with_credits(&server, 10_000_000_000).await;
+    let key = get_api_key_for_org(&server, org.id.clone()).await;
+    let org_id = uuid::Uuid::parse_str(&org.id).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let serving = tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    let mut connection = database.pool().get().await.unwrap();
+    let lock = connection.transaction().await.unwrap();
+    lock.query(
+        "SELECT id FROM organizations WHERE id = $1 FOR UPDATE",
+        &[&org_id],
+    )
+    .await
+    .unwrap();
+    let sending = tokio::spawn(async move {
+        reqwest::Client::builder().no_proxy().http1_only().build().unwrap()
+            .post(format!("http://{address}/v1/chat/completions"))
+            .bearer_auth(key)
+            .json(&json!({"model": E2E_QWEN_MODEL_NAME, "messages":[{"role":"user","content":"settlement cancellation test"}]}))
+            .send().await
+    });
+    let observer = database.pool().get().await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        loop {
+            let waiting: bool = observer.query_one("SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE pid <> pg_backend_pid() AND wait_event_type = 'Lock' AND query ILIKE '%record_organization_usage%')", &[]).await.unwrap().get(0);
+            if waiting { break; }
+            assert!(!sending.is_finished(), "request finished before settlement lock");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }).await.expect("usage reached the database lock");
+    sending.abort();
+    let _ = sending.await;
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    lock.commit().await.unwrap();
+    let recorded = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let count: i64 = observer
+                .query_one(
+                    "SELECT COUNT(*) FROM organization_usage_log WHERE organization_id = $1",
+                    &[&org_id],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            if count > 0 {
+                return count;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    serving.abort();
+    assert_eq!(recorded.expect("settlement survives the reset"), 1);
 }

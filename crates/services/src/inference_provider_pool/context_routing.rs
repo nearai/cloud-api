@@ -53,8 +53,8 @@
 //! This module is the only owner of the prompt-size estimate and the tier
 //! boundary ([`base_capacity`]). Placement reads
 //! `ChatCompletionParams.placement` (built by [`placement_context`]); it never
-//! re-estimates. The service's `estimate_input_tokens` seeds
-//! `hints.estimated_tokens` for single-capacity sorting only.
+//! re-estimates. The service's `estimate_input_tokens` reuses the raw
+//! estimate (without the tier-routing safety factor) for billing and hints.
 
 use std::sync::OnceLock;
 
@@ -93,10 +93,8 @@ pub(crate) fn media_part_tokens() -> u64 {
     })
 }
 
-/// Decomposed byte-based input estimate for the tier decision. Computed ONLY
-/// inside the pool's multi-capacity refinement — the service-side
-/// `ChatRoutingHints.estimated_tokens` keeps its original (text-only)
-/// semantics so single-capacity models route exactly as before.
+/// Decomposed byte-based input estimate shared by tier routing and service
+/// billing. Only tier routing applies the safety factor.
 pub(crate) struct InputEstimate {
     /// bytes/4 over the countable text (message contents, tool-call args,
     /// tool definitions).
@@ -112,6 +110,17 @@ pub(crate) struct InputEstimate {
 /// serialized tool-calls/definitions as text, flat media cost, and
 /// per-message template overhead.
 pub(crate) fn estimate_input(params: &ChatCompletionParams) -> InputEstimate {
+    estimate_input_with(params, true)
+}
+
+/// As [`estimate_input`]; `include_prior_reasoning` selects whether prior-turn
+/// `reasoning_content` counts. Routing counts it (the engine renders it); a
+/// billing estimate leaves it out because some adapters drop it before the
+/// request is sent.
+pub(crate) fn estimate_input_with(
+    params: &ChatCompletionParams,
+    include_prior_reasoning: bool,
+) -> InputEstimate {
     let mut bytes: usize = 0;
     let mut media_parts: u64 = 0;
     for m in &params.messages {
@@ -131,12 +140,17 @@ pub(crate) fn estimate_input(params: &ChatCompletionParams) -> InputEstimate {
             bytes += serde_json::to_string(tool_calls).map_or(0, |s| s.len());
         }
         // Prior-turn reasoning is part of the prompt the engine renders.
-        if let Some(reasoning) = &m.reasoning_content {
-            bytes += reasoning.len();
+        if include_prior_reasoning {
+            if let Some(reasoning) = &m.reasoning_content {
+                bytes += reasoning.len();
+            }
         }
     }
     if let Some(tools) = &params.tools {
         bytes += serde_json::to_string(tools).map_or(0, |s| s.len());
+    }
+    if let Some(tool_choice) = &params.tool_choice {
+        bytes += serde_json::to_string(tool_choice).map_or(0, |s| s.len());
     }
     InputEstimate {
         countable_tokens: (bytes / 4) as u64,
@@ -447,6 +461,40 @@ mod tests {
         let after = estimate_input(&with_reasoning);
         assert_eq!(after.countable_tokens, before.countable_tokens + 1_000);
         assert_eq!(after.uncounted_tokens, before.uncounted_tokens);
+    }
+
+    #[test]
+    fn estimate_input_counts_tool_choice_and_bounds_media_parts() {
+        let base: ChatCompletionParams = serde_json::from_value(serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "hello"}]}]
+        }))
+        .unwrap();
+        let mut with_choice = base.clone();
+        with_choice.tool_choice = Some(inference_providers::models::ToolChoice::Function {
+            type_: "function".to_string(),
+            function: inference_providers::models::FunctionChoice {
+                name: "lookup".to_string(),
+            },
+        });
+        assert!(
+            estimate_input(&with_choice).countable_tokens > estimate_input(&base).countable_tokens
+        );
+
+        let mut with_image = base.clone();
+        with_image.messages[0].content = Some(serde_json::json!([
+            {"type": "text", "text": "hello"},
+            {"type": "image_url", "image_url": {"url": format!("data:image/png;base64,{}", "A".repeat(100_000))}}
+        ]));
+        let image = estimate_input(&with_image);
+        assert_eq!(
+            image.countable_tokens,
+            estimate_input(&base).countable_tokens
+        );
+        assert_eq!(
+            image.uncounted_tokens,
+            estimate_input(&base).uncounted_tokens + media_part_tokens()
+        );
     }
 
     #[test]

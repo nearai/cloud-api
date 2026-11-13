@@ -114,6 +114,8 @@ struct NativeUsage {
     provider_request_id: Option<String>,
     input_tokens: i64,
     output_tokens: i64,
+    output_bytes: usize,
+    output_bytes_at_last_usage: usize,
     cache_read_input_tokens: i64,
     cache_creation_input_tokens: i64,
     stop_reason: Option<StopReason>,
@@ -128,7 +130,14 @@ impl NativeUsage {
 
     fn apply_usage_object(&mut self, usage: &serde_json::Map<String, serde_json::Value>) {
         update_non_negative(&mut self.input_tokens, usage.get("input_tokens"));
-        update_non_negative(&mut self.output_tokens, usage.get("output_tokens"));
+        if usage
+            .get("output_tokens")
+            .and_then(serde_json::Value::as_i64)
+            .is_some_and(|n| n >= 0)
+        {
+            update_non_negative(&mut self.output_tokens, usage.get("output_tokens"));
+            self.output_bytes_at_last_usage = self.output_bytes;
+        }
         update_non_negative(
             &mut self.cache_read_input_tokens,
             usage.get("cache_read_input_tokens"),
@@ -137,6 +146,16 @@ impl NativeUsage {
             &mut self.cache_creation_input_tokens,
             usage.get("cache_creation_input_tokens"),
         );
+    }
+
+    fn supplement_output(&mut self, enabled: bool, stop_reason: &StopReason) {
+        if enabled
+            && *stop_reason != StopReason::ProviderError
+            && self.output_bytes > self.output_bytes_at_last_usage
+        {
+            let estimate = (self.output_bytes / 4).max(1).min(i64::MAX as usize) as i64;
+            self.output_tokens = self.output_tokens.max(estimate);
+        }
     }
 
     fn input_tokens_for_billing(&self) -> i32 {
@@ -183,6 +202,7 @@ struct NativeBillingContext {
     inference_type: InferenceType,
     provider_attribution: ProviderAttribution,
     cache_write_cost_per_token: i64,
+    estimate_incomplete_streams: bool,
 }
 
 #[derive(Debug, PartialEq)]
@@ -318,6 +338,18 @@ impl SseUsageParser {
                     self.usage.apply_usage(usage);
                 }
             }
+            Some("content_block_delta") => {
+                let delta = &event["delta"];
+                let field = match delta["type"].as_str() {
+                    Some("text_delta") => "text",
+                    Some("thinking_delta") => "thinking",
+                    Some("input_json_delta") => "partial_json",
+                    _ => return,
+                };
+                if let Some(text) = delta[field].as_str() {
+                    self.usage.output_bytes = self.usage.output_bytes.saturating_add(text.len());
+                }
+            }
             Some("message_delta") => {
                 if let Some(usage) = event.get("usage") {
                     self.usage.apply_usage(usage);
@@ -365,6 +397,7 @@ impl NativeUsageStream {
         };
         let mut usage = self.parser.finish();
         let stop_reason = usage.stop_reason.take().unwrap_or(default_reason);
+        usage.supplement_output(context.estimate_incomplete_streams, &stop_reason);
         spawn_native_usage_recording(self.runtime_handle.clone(), context, usage, stop_reason);
     }
 }
@@ -645,6 +678,7 @@ async fn handle_request(
         },
         provider_attribution: served.provider_attribution,
         cache_write_cost_per_token: seed.cache_write_cost_per_token,
+        estimate_incomplete_streams: app_state.config.usage_estimate_incomplete_streams,
     });
 
     build_upstream_response(
@@ -2013,6 +2047,39 @@ redact-thinking-2026-02-12";
         }
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn disconnected_native_output_uses_estimate_and_preserves_cache_usage() {
+        for (enabled, final_usage, expected) in
+            [(true, false, 12), (false, false, 1), (true, true, 7)]
+        {
+            let service = Arc::new(RecordingUsageService::default());
+            let mut context = billing_context(service.clone());
+            context.estimate_incomplete_streams = enabled;
+            let mut stream = usage_stream_over(vec![], Some(context));
+            let start = serde_json::json!({"type":"message_start", "message": {"id":"msg_estimate", "usage":{"input_tokens":4,"output_tokens":1,"cache_read_input_tokens":20,"cache_creation_input_tokens":3}}});
+            stream.parser.apply_event(&start);
+            for (kind, field) in [
+                ("text_delta", "text"),
+                ("thinking_delta", "thinking"),
+                ("input_json_delta", "partial_json"),
+            ] {
+                stream.parser.apply_event(&serde_json::json!({"type":"content_block_delta", "delta": {"type":kind, field:"abcdefghijklmnop"}}));
+            }
+            if final_usage {
+                stream.parser.apply_event(
+                    &serde_json::json!({"type":"message_delta", "usage":{"output_tokens":7}}),
+                );
+            }
+            drop(stream);
+            let recorded = wait_for_recorded_usage(&service).await;
+            assert_eq!(recorded.output_tokens, expected);
+            assert_eq!(recorded.input_tokens, 27);
+            assert_eq!(recorded.cache_read_tokens, 20);
+            assert_eq!(recorded.cache_write.unwrap().tokens, 3);
+            assert_eq!(recorded.stop_reason, Some(StopReason::ClientDisconnect));
+        }
+    }
+
     pub(super) fn billing_context(
         usage_service: Arc<RecordingUsageService>,
     ) -> NativeBillingContext {
@@ -2025,6 +2092,7 @@ redact-thinking-2026-02-12";
             inference_type: InferenceType::ChatCompletionStream,
             provider_attribution: ProviderAttribution::default(),
             cache_write_cost_per_token: 0,
+            estimate_incomplete_streams: true,
         }
     }
 

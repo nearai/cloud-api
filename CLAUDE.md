@@ -129,7 +129,7 @@ Structured logging with `tracing`; production runs at `info` with per-module lev
 
 ### External billing service
 
-Cloud API has no direct Stripe integration. Billing lives in the Next.js app in `../nearai-cloud-ui` (Vercel): `app/api/stripe/webhook/route.ts` handles Stripe checkout, `app/api/credit/sync/route.ts` recalculates credits, and `lib/webhook-utils.ts` calls `PATCH /v1/admin/organizations/{org_id}/limits` (`update_organization_limits` in `crates/api/src/routes/admin.rs`) using `NEAR_AI_CLOUD_ADMIN_ACCESS_TOKEN` and optional `BILLING_SERVICE_USER_AGENT`.
+Cloud API has no direct Stripe integration. Billing lives in a separate web app, which updates organization spend limits through the admin API (`PATCH /v1/admin/organizations/{org_id}/limits`); Cloud API reads the limits from the database.
 
 ## Rules index
 

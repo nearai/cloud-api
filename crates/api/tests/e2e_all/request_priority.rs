@@ -79,21 +79,32 @@ async fn concurrent_requests_of_different_priority_are_not_mixed_up() {
     let other = setup_org_with_credits(&server, 100_000_000_000).await;
     let other_key = get_api_key_for_org(&server, other.id.clone()).await;
 
-    let before = mock.chat_request_priorities().await.len();
-    let body = json!({"model": E2E_QWEN_MODEL_NAME,
-        "messages": [{"role": "user", "content": "synthetic concurrent test"}]});
+    let before = mock.chat_request_priority_log().await.len();
+    let body = |marker: &str| {
+        json!({"model": E2E_QWEN_MODEL_NAME,
+            "messages": [{"role": "user", "content": format!("synthetic concurrent test {marker}")}]})
+    };
     let first = server
         .post("/v1/chat/completions")
         .add_header("Authorization", format!("Bearer {key}"))
-        .json(&body);
+        .json(&body("org-low"));
     let second = server
         .post("/v1/chat/completions")
         .add_header("Authorization", format!("Bearer {other_key}"))
-        .json(&body);
+        .json(&body("org-default"));
     let (first, second) = tokio::join!(first, second);
     first.assert_status_ok();
     second.assert_status_ok();
-    let mut seen = mock.chat_request_priorities().await[before..].to_vec();
-    seen.sort();
-    assert_eq!(seen, vec![-2, 0]);
+    let seen = mock.chat_request_priority_log().await[before..].to_vec();
+    let priority_for = |marker: &str| {
+        let matches: Vec<i32> = seen
+            .iter()
+            .filter(|(_, messages)| messages.contains(marker))
+            .map(|(priority, _)| *priority)
+            .collect();
+        assert_eq!(matches.len(), 1, "one request for {marker}: {seen:?}");
+        matches[0]
+    };
+    assert_eq!(priority_for("org-low"), -2);
+    assert_eq!(priority_for("org-default"), 0);
 }

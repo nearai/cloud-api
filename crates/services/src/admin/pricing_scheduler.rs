@@ -115,7 +115,7 @@ impl ModelPricingScheduler {
     }
 
     async fn apply_change(&self, change: ScheduledPricingChange) {
-        // Direct edits via PATCH /v1/admin/models are not blocked by a
+        // Direct edits via the admin API's PATCH /v1/admin/models are not blocked by a
         // pending schedule, so the live pricing can have drifted from the
         // snapshot captured (and announced by email) at confirm time. The
         // announced change is the source of truth — apply it regardless —
@@ -193,7 +193,7 @@ impl ModelPricingScheduler {
             // Scheduled changes carry `None` = "field unchanged" and can only
             // SET a cache-read price, never disable it (that would need the
             // update-request's explicit-null `Some(None)` state; disabling is
-            // done via PATCH /v1/admin/models instead).
+            // done via the admin API's PATCH /v1/admin/models instead).
             cache_read_cost_per_token: change.new_cache_read_cost_per_token.map(Some),
             text_pricing: change.new_text_pricing.clone().map(Some),
             model_display_name: None,

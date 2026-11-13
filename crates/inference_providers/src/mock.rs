@@ -783,6 +783,9 @@ pub struct MockProvider {
     last_chat_params: Arc<Mutex<Option<ChatCompletionParams>>>,
     /// Numeric policy metadata only, for multi-request propagation assertions.
     chat_request_priorities: Arc<Mutex<Vec<i32>>>,
+    /// Each chat request's priority with its serialized messages, so a test can tie a
+    /// priority to the request that carried it.
+    chat_request_priority_log: Arc<Mutex<Vec<(i32, String)>>>,
     /// Number of chat-completion requests received, across streaming and
     /// non-streaming calls. Useful for asserting one-shot API behavior.
     chat_completion_call_count: Arc<std::sync::atomic::AtomicUsize>,
@@ -902,6 +905,7 @@ impl MockProvider {
             })),
             last_chat_params: Arc::new(Mutex::new(None)),
             chat_request_priorities: Arc::new(Mutex::new(Vec::new())),
+            chat_request_priority_log: Arc::new(Mutex::new(Vec::new())),
             chat_completion_call_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             fail_attestation: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tier: crate::ProviderTier::NonAttested,
@@ -938,6 +942,7 @@ impl MockProvider {
             })),
             last_chat_params: Arc::new(Mutex::new(None)),
             chat_request_priorities: Arc::new(Mutex::new(Vec::new())),
+            chat_request_priority_log: Arc::new(Mutex::new(Vec::new())),
             chat_completion_call_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             fail_attestation: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tier: crate::ProviderTier::NonAttested,
@@ -972,6 +977,7 @@ impl MockProvider {
             })),
             last_chat_params: Arc::new(Mutex::new(None)),
             chat_request_priorities: Arc::new(Mutex::new(Vec::new())),
+            chat_request_priority_log: Arc::new(Mutex::new(Vec::new())),
             chat_completion_call_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             fail_attestation: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tier: crate::ProviderTier::NonAttested,
@@ -1041,6 +1047,11 @@ impl MockProvider {
     /// Get the scheduler priorities recorded across mock completion calls.
     pub async fn chat_request_priorities(&self) -> Vec<i32> {
         self.chat_request_priorities.lock().await.clone()
+    }
+
+    /// Each chat request's priority paired with its serialized messages.
+    pub async fn chat_request_priority_log(&self) -> Vec<(i32, String)> {
+        self.chat_request_priority_log.lock().await.clone()
     }
 
     /// Get the last chat completion params received by the mock provider.
@@ -1369,6 +1380,10 @@ impl crate::InferenceProvider for MockProvider {
             .lock()
             .await
             .push(params.request_priority);
+        self.chat_request_priority_log.lock().await.push((
+            params.request_priority,
+            serde_json::to_string(&params.messages).unwrap_or_default(),
+        ));
         self.chat_completion_call_count
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         *self.last_chat_params.lock().await = Some(params.clone());
@@ -1516,6 +1531,10 @@ impl crate::InferenceProvider for MockProvider {
             .lock()
             .await
             .push(params.request_priority);
+        self.chat_request_priority_log.lock().await.push((
+            params.request_priority,
+            serde_json::to_string(&params.messages).unwrap_or_default(),
+        ));
         self.chat_completion_call_count
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         *self.last_chat_params.lock().await = Some(params.clone());

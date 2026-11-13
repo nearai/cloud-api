@@ -324,9 +324,10 @@ pub async fn limits_history(org_id: &str) -> usage_views::LimitsHistoryResponse 
     }
 }
 
-/// Patch an admin setting and make it live, as `PATCH /v1/admin/settings/{key}` did: store
-/// the merged value, then apply it on every settings service the harness built (the live
-/// values are process-wide, so one apply is enough when several servers share a process).
+/// Patch an admin setting and make it live: store the merged value through one settings
+/// service, then reload every other live settings service the harness built. Each test
+/// server owns its own setting handles, so applying on one service alone would leave the
+/// others stale until their periodic reload.
 pub async fn seed_admin_setting(key: &str, patch: serde_json::Value) {
     let services: Vec<Arc<AdminSettingsService>> = ADMIN_SETTINGS
         .lock()
@@ -334,13 +335,19 @@ pub async fn seed_admin_setting(key: &str, patch: serde_json::Value) {
         .iter()
         .filter_map(Weak::upgrade)
         .collect();
-    let service = services
-        .first()
+    let (first, rest) = services
+        .split_first()
         .expect("no admin settings service registered");
-    service
+    first
         .update(key, patch, user_id_for_session(&super::get_session_id()))
         .await
         .unwrap_or_else(|e| panic!("Failed to seed admin setting {key}: {e:?}"));
+    for service in rest {
+        assert!(
+            service.reload().await,
+            "Failed to reload admin setting {key}"
+        );
+    }
 }
 
 /// Set the organization's concurrent request limit, as the admin concurrent-limit update

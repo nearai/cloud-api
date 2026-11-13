@@ -4,7 +4,6 @@
 //! from a placer decision (or the request params) to observability output,
 //! extracted out of `fleet.rs` to keep that file to routing/reservation state.
 
-use super::tracing_headers;
 use crate::placement_io::{
     PlacementHandles, METRIC_AFFINITY, METRIC_CHOSEN_BACKLOG, METRIC_DECISIONS, METRIC_EXCLUDED,
     METRIC_LANE_CAP, METRIC_LANE_SIZE, METRIC_PLACE_DURATION_US,
@@ -16,8 +15,7 @@ use placement::policy::{Class, Tier};
 use placement::rules::Rule;
 
 /// Routing-only placement inputs: the pool's typed `params.placement`, the
-/// operator priority and the tracing ids (read from `params.extra` before
-/// the tracing helper strips them). Holds an [`AffinityKey`], so it has no
+/// operator priority and the authenticated request's tracing ids. Holds an [`AffinityKey`], so it has no
 /// `Debug`; the key is never logged.
 pub(super) struct PlacementRequest {
     pub(super) model: String,
@@ -41,20 +39,20 @@ pub(super) struct PlacementRequest {
 
 impl PlacementRequest {
     /// Reads `params.placement`, `params.request_priority` and the tracing
-    /// ids without removing anything. Placement never re-estimates: the pool
+    /// ids in scope without removing anything. Placement never re-estimates: the pool
     /// (`inference_provider_pool::context_routing`) owns the size estimate.
     pub(super) fn from_params(params: &ChatCompletionParams) -> Self {
-        let text = |key: &str| params.extra.get(key).and_then(|value| value.as_str());
+        let ids = crate::tracing_context::current_tracing_context();
         let placement = &params.placement;
         Self {
             model: params.model.clone(),
             model_tag: format!("model:{}", params.model),
-            request_id: text(tracing_headers::REQUEST_ID)
-                .unwrap_or_default()
-                .to_string(),
-            org_id: text(tracing_headers::ORG_ID)
-                .unwrap_or_default()
-                .to_string(),
+            request_id: ids
+                .map(|context| context.request_id.to_string())
+                .unwrap_or_default(),
+            org_id: ids
+                .map(|context| context.org_id.to_string())
+                .unwrap_or_default(),
             prompt_tokens: placement.prompt_tokens.unwrap_or(0),
             prefill_heavy: placement.prefill_heavy,
             affinity: placement.affinity.clone(),

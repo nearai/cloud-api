@@ -23,7 +23,6 @@ pub async fn image_generations(
     State(app_state): State<AppState>,
     Extension(api_key): Extension<AuthenticatedApiKey>,
     Extension(body_hash): Extension<RequestBodyHash>,
-    Extension(correlation): Extension<RequestCorrelation>,
     headers: header::HeaderMap,
     requested_model: RequestedModel,
     OpenAiJson(request): OpenAiJson<crate::models::ImageGenerationRequest>,
@@ -118,7 +117,6 @@ pub async fn image_generations(
     // Convert API request to provider params
     let mut extra = std::collections::HashMap::new();
     insert_encryption_headers(&encryption_headers, &mut extra);
-    insert_request_id_header(correlation, &mut extra);
 
     let params = inference_providers::ImageGenerationParams {
         model: request.model.clone(),
@@ -143,7 +141,7 @@ pub async fn image_generations(
             // Store attestation signature for image generation (same pattern as chat completions)
             let attestation_service = app_state.attestation_service.clone();
             let image_id_for_sig = response_with_bytes.response.id.clone();
-            tokio::spawn(async move {
+            inference_providers::tracing_context::spawn_with_tracing_context(async move {
                 if let Err(e) = attestation_service
                     .store_chat_signature_from_provider(&image_id_for_sig)
                     .await
@@ -545,7 +543,7 @@ pub async fn image_edits(
             // Store attestation signature for image edit (same pattern as image generation)
             let attestation_service = app_state.attestation_service.clone();
             let image_id_for_sig = response_with_bytes.response.id.clone();
-            tokio::spawn(async move {
+            inference_providers::tracing_context::spawn_with_tracing_context(async move {
                 if let Err(e) = attestation_service
                     .store_chat_signature_from_provider(&image_id_for_sig)
                     .await

@@ -187,6 +187,70 @@ fn backend_algos_since(provider: &MockProvider, baseline: usize) -> Vec<Option<S
 }
 
 #[tokio::test]
+async fn fleet_reports_survive_cache_hits_and_nonce_requests_bypass_the_cache() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let recorded_calls = calls.clone();
+    let provider = Arc::new(
+        MockProvider::new()
+            .with_tier(inference_providers::ProviderTier::Near)
+            .with_attestation_reports_handler(move |_, _, nonce, _, _| {
+                recorded_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(["a", "b"]
+                    .into_iter()
+                    .map(|instance| {
+                        serde_json::json!({
+                            "instance_id": instance,
+                            "signing_public_key": "shared-key",
+                            "request_nonce": nonce,
+                        })
+                        .as_object()
+                        .unwrap()
+                        .clone()
+                    })
+                    .collect())
+            }),
+    );
+    let pool = Arc::new(InferenceProviderPool::new(
+        None,
+        ExternalProvidersConfig::default(),
+    ));
+    pool.register_provider(MODEL.to_string(), provider).await;
+    let mut service = lifecycle_service(Arc::new(RecordingRepository::default()), pool);
+    service.models_repository = Arc::new(SingleModelRepository);
+    service.gateway_quote_collector = Arc::new(EchoGatewayQuoteCollector);
+    service.report_cache = Some(
+        moka::future::Cache::builder()
+            .max_capacity(16)
+            .time_to_live(Duration::from_secs(60))
+            .build(),
+    );
+
+    for (nonce, expected_calls) in [(None, 1), (None, 1), (Some(NONCE), 2), (Some(NONCE), 3)] {
+        let report = service
+            .get_attestation_report(
+                Some(MODEL.to_string()),
+                Some("ed25519".to_string()),
+                nonce.map(str::to_string),
+                None,
+                false,
+                Some(inference_providers::ProviderFilter::Near),
+                ModelCaller::Anonymous,
+            )
+            .await
+            .expect("fleet report");
+        assert_eq!(report.model_attestations.len(), 2);
+        assert_eq!(report.model_attestations[0]["instance_id"], "a");
+        assert_eq!(report.model_attestations[1]["instance_id"], "b");
+        for entry in &report.model_attestations {
+            assert_eq!(entry["request_nonce"], serde_json::json!(nonce));
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), expected_calls);
+    }
+}
+
+#[tokio::test]
 async fn mixed_case_signing_algo_is_forwarded_lowercased() {
     let (service, provider, baseline) = report_service().await;
 

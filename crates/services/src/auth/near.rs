@@ -114,7 +114,10 @@ impl NearAuthService {
 
     async fn cleanup_nonces(&self) {
         if let Err(err) = self.nonce_repository.cleanup_expired_nonces().await {
-            tracing::warn!("Failed to cleanup expired NEAR nonces: {}", err);
+            tracing::warn!(
+                error_message_len = err.to_string().len(),
+                "Failed to cleanup expired NEAR nonces"
+            );
         }
     }
 
@@ -149,7 +152,7 @@ impl NearAuthService {
     ) -> anyhow::Result<(String, Session, String)> {
         let account_id = signed_message.account_id.to_string();
 
-        tracing::info!("NEAR authentication attempt for account: {}", account_id);
+        tracing::info!("NEAR authentication attempt");
 
         // 1. Validate recipient
         self.validate_recipient(&payload.recipient)
@@ -168,10 +171,7 @@ impl NearAuthService {
 
         // Reject zero-timestamp nonces - a valid nonce must have a current timestamp
         if nonce_timestamp_ms == 0 {
-            tracing::warn!(
-                "NEAR signature rejected: nonce has zero timestamp for account {}",
-                account_id
-            );
+            tracing::warn!("NEAR signature rejected: nonce has zero timestamp");
             return Err(anyhow::anyhow!(NearAuthError::InvalidNonce(
                 "zero timestamp".to_string()
             )));
@@ -180,9 +180,8 @@ impl NearAuthService {
         // Validate timestamp is within acceptable range
         validate_nonce_timestamp_ms(Utc::now(), nonce_timestamp_ms).map_err(|e| {
             tracing::warn!(
-                "NEAR signature rejected: invalid timestamp for account {}: {}",
-                account_id,
-                e
+                expired = matches!(e, NearAuthError::ExpiredNonce),
+                "NEAR signature rejected: invalid timestamp"
             );
             anyhow::anyhow!(e)
         })?;
@@ -203,7 +202,7 @@ impl NearAuthService {
                 )))
             })?;
         if !nonce_consumed {
-            tracing::warn!("NEAR signature replay detected for account {}", account_id);
+            tracing::warn!("NEAR signature replay detected");
             return Err(anyhow::anyhow!(NearAuthError::ReplayAttack));
         }
 
@@ -238,7 +237,10 @@ impl NearAuthService {
             .await
             .map_err(|e| anyhow::anyhow!(NearAuthError::InternalError(e.to_string())))?;
 
-        tracing::info!("NEAR authentication successful - account_id={}", account_id);
+        tracing::info!(
+            user_id = %user.id.0,
+            "NEAR authentication successful"
+        );
 
         Ok((access_token, session, refresh_token))
     }

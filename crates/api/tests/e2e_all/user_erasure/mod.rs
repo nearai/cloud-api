@@ -3,7 +3,6 @@
 use crate::common::*;
 use services::auth::ports::OAuthUserInfo;
 
-mod admin_lists;
 mod blockers;
 mod cleanup;
 mod concurrency;

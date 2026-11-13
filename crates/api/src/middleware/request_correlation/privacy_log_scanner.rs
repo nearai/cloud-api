@@ -85,8 +85,52 @@ pub(super) fn assert_production_logs_exclude_forbidden_expressions() {
             include_str!("../auth.rs"),
         ),
         (
+            "crates/api/src/routes/files.rs",
+            include_str!("../../routes/files.rs"),
+        ),
+        (
+            "crates/api/src/routes/organizations.rs",
+            include_str!("../../routes/organizations.rs"),
+        ),
+        (
+            "crates/api/src/routes/workspaces.rs",
+            include_str!("../../routes/workspaces.rs"),
+        ),
+        (
             "crates/database/src/repositories/oauth_state.rs",
             include_str!("../../../../database/src/repositories/oauth_state.rs"),
+        ),
+        (
+            "crates/services/src/auth/oauth.rs",
+            include_str!("../../../../services/src/auth/oauth.rs"),
+        ),
+        (
+            "crates/api/src/routes/models.rs",
+            include_str!("../../routes/models.rs"),
+        ),
+        (
+            "crates/api/src/routes/ohttp.rs",
+            include_str!("../../routes/ohttp.rs"),
+        ),
+        (
+            "crates/services/src/aml.rs",
+            include_str!("../../../../services/src/aml.rs"),
+        ),
+        (
+            "crates/services/src/auth/mod.rs",
+            include_str!("../../../../services/src/auth/mod.rs"),
+        ),
+        (
+            "crates/services/src/auth/near.rs",
+            include_str!("../../../../services/src/auth/near.rs"),
+        ),
+        (
+            "crates/services/src/completions/mod.rs",
+            include_str!("../../../../services/src/completions/mod.rs"),
+        ),
+        (
+            "crates/services/src/inference_provider_pool/mod.rs",
+            include_str!("../../../../services/src/inference_provider_pool/mod.rs"),
         ),
     ];
     let forbidden = [
@@ -108,6 +152,17 @@ pub(super) fn assert_production_logs_exclude_forbidden_expressions() {
         "crates/api/src/routes/completions",
         &sources,
     );
+
+    // Files where error values are logged as a kind, status or length only.
+    let formatted_error_sources = [
+        "crates/api/src/routes/models.rs",
+        "crates/api/src/routes/workspaces.rs",
+        "crates/services/src/aml.rs",
+        "crates/services/src/auth/mod.rs",
+        "crates/services/src/auth/near.rs",
+        "crates/services/src/auth/oauth.rs",
+        "crates/services/src/inference_provider_pool/mod.rs",
+    ];
 
     for (path, source) in sources {
         for (line, body) in logging_macro_bodies(source) {
@@ -147,6 +202,18 @@ pub(super) fn assert_production_logs_exclude_forbidden_expressions() {
             assert!(
                 !logs_raw_email_field(&code),
                 "{path}:{line} production logging macro must not log raw email fields: {body}"
+            );
+            assert!(
+                !logs_name_field(&code),
+                "{path}:{line} logging macro must log name fields as a length: {body}"
+            );
+            assert!(
+                !logs_unbounded_error_field(&code),
+                "{path}:{line} logging macro must use bounded error fields: {body}"
+            );
+            assert!(
+                !(formatted_error_sources.contains(&path) && logs_formatted_error_value(&body)),
+                "{path}:{line} logging macro must log an error kind, status or length: {body}"
             );
         }
     }
@@ -309,6 +376,95 @@ fn logs_raw_email_field(code: &str) -> bool {
     })
 }
 
+/// Error fields that must not be logged; use the error kind, status or length.
+fn logs_unbounded_error_field(code: &str) -> bool {
+    ["error_detail", "provider_message", "detail"]
+        .into_iter()
+        .any(|field| assigns_field(code, field))
+}
+
+fn assigns_field(code: &str, field: &str) -> bool {
+    code.match_indices(field).any(|(start, _)| {
+        let before = start
+            .checked_sub(1)
+            .and_then(|index| code.as_bytes().get(index))
+            .copied();
+        if is_identifier_byte(before) || before == Some(b'.') {
+            return false;
+        }
+        let after = code[start + field.len()..].trim_start();
+        after.starts_with('=') && !after.starts_with("==")
+    })
+}
+
+/// Error values logged as a field, a `%`/`?` shorthand, a positional argument
+/// or an inline format argument.
+fn logs_formatted_error_value(body: &str) -> bool {
+    let code = string_literals_removed(body);
+    let code = code.as_str();
+    ["error", "err", "e"].into_iter().any(|name| {
+        body.contains(&format!("{{{name}}}"))
+            || body.contains(&format!("{{{name}:"))
+            || assigns_non_literal(code, name)
+            || has_sigil_identifier(code, name)
+            || code.split(',').skip(1).any(|argument| {
+                let argument = argument.trim().trim_start_matches('&');
+                argument == name
+                    || argument.strip_prefix(name).is_some_and(|tail| {
+                        tail.starts_with(')') || (tail.starts_with('.') && tail != ".len()")
+                    })
+            })
+    })
+}
+
+fn assigns_non_literal(code: &str, field: &str) -> bool {
+    code.match_indices(field).any(|(start, _)| {
+        let before = start
+            .checked_sub(1)
+            .and_then(|index| code.as_bytes().get(index))
+            .copied();
+        if is_identifier_byte(before) || before == Some(b'.') {
+            return false;
+        }
+        let after = code[start + field.len()..].trim_start();
+        let Some(value) = after.strip_prefix('=') else {
+            return false;
+        };
+        if value.starts_with('=') {
+            return false;
+        }
+        let value = value.trim_start();
+        !(value.is_empty() || value.starts_with(','))
+    })
+}
+
+fn has_sigil_identifier(code: &str, name: &str) -> bool {
+    code.match_indices(name).any(|(start, _)| {
+        let before = start
+            .checked_sub(1)
+            .and_then(|index| code.as_bytes().get(index))
+            .copied();
+        let after = code.as_bytes().get(start + name.len()).copied();
+        matches!(before, Some(b'%' | b'?')) && !is_identifier_byte(after)
+    })
+}
+
+/// Name fields that may only be logged as a length.
+fn logs_name_field(code: &str) -> bool {
+    ["request.name", ".filename", "provider_user_id"]
+        .into_iter()
+        .any(|pattern| {
+            code.match_indices(pattern).any(|(start, _)| {
+                let after = &code[start + pattern.len()..];
+                if is_identifier_byte(after.as_bytes().first().copied()) {
+                    return false;
+                }
+                let after = after.trim_start();
+                !(after.starts_with(".len(") || after.starts_with(".is_empty("))
+            })
+        })
+}
+
 fn logs_raw_identifier(code: &str, identifier: &str) -> bool {
     has_positional_argument_named(code, identifier) || has_raw_prefixed_identifier(code, identifier)
 }
@@ -352,4 +508,87 @@ fn contains_standalone_identifier(body: &str, identifier: &str) -> bool {
 
 fn is_identifier_byte(byte: Option<u8>) -> bool {
     byte.is_some_and(|value| value.is_ascii_alphanumeric() || value == b'_')
+}
+
+#[test]
+fn error_fields_must_be_bounded() {
+    for line in [
+        "model_id = %model_id, error_detail = %e, \"value-a\"",
+        "status_code, provider_message = %msg, \"value-a\"",
+        "status = 400, detail = %message, \"value-a\"",
+        "detail=%message, \"value-a\"",
+    ] {
+        assert!(
+            logs_unbounded_error_field(&string_literals_removed(line)),
+            "expected a match: {line}"
+        );
+    }
+    for line in [
+        "status_code, error_kind, error_message_len = message.len(), \"value-a\"",
+        "\"detail = %message\"",
+        "has_detail = true, \"value-a\"",
+        "if request.detail == expected",
+    ] {
+        assert!(
+            !logs_unbounded_error_field(&string_literals_removed(line)),
+            "expected no match: {line}"
+        );
+    }
+}
+
+#[test]
+fn name_fields_must_be_lengths() {
+    for line in [
+        "\"value-a: {}\", request.name",
+        "filename = %params.filename, \"value-a\"",
+        "provider_user_id = %item.provider_user_id, \"value-a\"",
+    ] {
+        assert!(
+            logs_name_field(&string_literals_removed(line)),
+            "expected a match: {line}"
+        );
+    }
+    for line in [
+        "filename_len = params.filename.len(), \"value-a\"",
+        "name_len = request.name.len(), \"value-a\"",
+        "user_id = %item.id, \"filename provider_user_id\"",
+    ] {
+        assert!(
+            !logs_name_field(&string_literals_removed(line)),
+            "expected no match: {line}"
+        );
+    }
+}
+
+#[test]
+fn error_values_must_use_kinds() {
+    for line in [
+        "model = %model, error = %e, \"value-a\"",
+        "error = ?err, \"value-a\"",
+        "error=%e.without_url(), \"value-a\"",
+        "%item_id, %error, \"value-a\"",
+        "?e, \"value-a\"",
+        "\"value-a: {}\", e",
+        "\"value-a: {}\", err.to_string()",
+        "\"value-a: {:?}\", &error",
+        "\"value-a: {e}\"",
+        "\"value-a: {err:?}\"",
+    ] {
+        assert!(logs_formatted_error_value(line), "expected a match: {line}");
+    }
+    for line in [
+        "status_code, error_kind = Self::kind(&e), error_message_len = e.len(), \"value-a\"",
+        "error_category = %category, \"value-a\"",
+        "error = \"value-a\", \"value-b\"",
+        "\"error = %e\"",
+        "expired = matches!(e, Kind::A), \"value-a\"",
+        "\"value-a: {}\", item.error_count",
+        "\"value-a: {}\", e.len()",
+        "\"value-a: {error_count}\"",
+    ] {
+        assert!(
+            !logs_formatted_error_value(line),
+            "expected no match: {line}"
+        );
+    }
 }

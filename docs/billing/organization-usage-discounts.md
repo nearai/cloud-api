@@ -1,15 +1,15 @@
 # Organization inference discounts
 
-Administrators can read or save an organization discount at
-`GET|PUT /v1/admin/organizations/{org_id}/usage-discount`.
+An organization discount rule is managed outside cloud-api's admin API; this
+page describes how a saved rule is applied.
 
-The PUT body contains `discount_basis_points` (an integer from 1 to 10000).
-Omit `apply_since` to affect only new usage. Supply an RFC3339 `apply_since`
-timestamp to also correct inference usage from that inclusive timestamp through
-the save-time boundary. GET returns `null` when no rule exists; otherwise both
-endpoints return the percentage, optional cutoff, save time, status and processed
-historical row count. Identical saves are idempotent; different second rules
-return 409. Rules are intentionally immutable in this initial implementation.
+A rule contains `discount_basis_points` (an integer from 1 to 10000) and an
+optional RFC3339 `apply_since` timestamp. Without `apply_since`, the rule affects
+only new usage. With it, inference usage is also corrected from that inclusive
+timestamp through the save-time boundary. A rule records the percentage, optional
+cutoff, save time, status and processed historical row count. Identical saves are
+idempotent; a different second rule is rejected. Rules are intentionally
+immutable in this initial implementation.
 
 The discount applies after existing model/reporter pricing. Input and output
 costs round independently to nano-USD using half-up rounding; their sum is the

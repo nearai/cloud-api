@@ -1,5 +1,9 @@
 # CLAUDE.md
 
+## Contribution privacy
+
+Keep contributions, including those prepared with AI agents, focused on the change and how it was tested. Before publishing, review all content and remove any confidential or sensitive information.
+
 Guidance for Claude Code and other agents working in this repository. Topic rules live in `.claude/rules/` and load automatically when you work on matching files (see the index below); review criteria live in `REVIEW.md`.
 
 ## Privacy comes first

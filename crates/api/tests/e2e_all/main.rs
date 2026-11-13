@@ -57,7 +57,6 @@ mod duplicate_names;
 mod embeddings;
 mod error_msg;
 mod external_providers;
-mod feature_requests;
 mod files;
 mod first_stream_event;
 mod function_tools;

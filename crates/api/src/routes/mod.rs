@@ -1,6 +1,5 @@
 pub mod admin;
 pub mod admin_credit_reconciliation;
-pub mod admin_model_access;
 pub mod admin_usage_hourly;
 pub mod anthropic;
 pub mod api;
@@ -11,7 +10,6 @@ pub mod common;
 pub mod completions;
 pub mod conversations;
 pub mod extractors;
-pub mod feature_requests;
 pub mod files;
 pub mod gateway;
 pub mod health;

@@ -190,10 +190,7 @@ pub async fn create_organization(
     Extension(user): Extension<AuthenticatedUser>,
     Json(request): Json<CreateOrganizationRequest>,
 ) -> Result<Json<OrganizationResponse>, (StatusCode, Json<ErrorResponse>)> {
-    debug!(
-        "Creating organization: {} by user: {}",
-        request.name, user.0.id
-    );
+    debug!(user_id = %user.0.id, "Creating organization");
 
     // Validate request to protect database from invalid or oversized data
     if let Err(msg) = request.validate() {

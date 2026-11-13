@@ -12,6 +12,7 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
+use inference_providers::tracing_context::without_tracing_context;
 use inference_providers::{
     CompletionError, ProviderSource, ProviderTier, ServingProvider, SystemOneRequest,
     SystemOneResponse,
@@ -140,12 +141,16 @@ pub async fn systemone(
         Ok(budget) => budget,
         Err(response) => return response.into_response(),
     };
+    // System One backends receive no tenant ids: the inference call and the
+    // signature fetch in `finalize` both run with the tracing context cleared.
     let served = match budget
-        .run(state.inference_provider_pool.systemone_with_attribution(
-            request,
-            body_hash.hash.clone(),
-            encryption.model_pub_key.as_deref(),
-            !api_key.organization.fallback_enabled(),
+        .run(without_tracing_context(
+            state.inference_provider_pool.systemone_with_attribution(
+                request,
+                body_hash.hash.clone(),
+                encryption.model_pub_key.as_deref(),
+                !api_key.organization.fallback_enabled(),
+            ),
         ))
         .await
     {
@@ -157,7 +162,7 @@ pub async fn systemone(
     };
     // Once inference succeeds, finalize billing and signature pins even if the
     // client disconnects while waiting for persistence.
-    let finalize = tokio::spawn(async move {
+    let finalize = tokio::spawn(without_tracing_context(async move {
         let _slot = slot;
         let decision_id = &served.decision_id;
         let inference_id = hash_inference_id_to_uuid(decision_id);
@@ -237,7 +242,7 @@ pub async fn systemone(
         response
             .body(Body::from(served.response.raw_bytes))
             .expect("validated System One response headers")
-    });
+    }));
     finalize.await.unwrap_or_else(|_| {
         error(
             StatusCode::INTERNAL_SERVER_ERROR,

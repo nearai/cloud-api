@@ -55,8 +55,8 @@ async fn test_admin_list_organization_members_includes_owner() {
 #[tokio::test]
 async fn test_admin_list_organization_members_includes_inactive() {
     // Inactive (soft-deleted) users are deactivated in place (users.is_active =
-    // false). The admin member list must still surface them — matching
-    // /v1/admin/users — so totals don't silently disagree with the row set.
+    // false). The admin member list must still surface them, so totals don't
+    // silently disagree with the row set.
     let (server, database) = setup_test_server_with_database().await;
 
     // The mock admin user is the org owner (an active member).
@@ -302,63 +302,6 @@ async fn test_admin_list_organization_members_org_not_found() {
     );
 
     println!("✅ Admin list organization members returns 404 for unknown org");
-}
-
-#[tokio::test]
-async fn test_admin_get_organization_ok_and_not_found() {
-    let (server, database) = setup_test_server_with_database().await;
-
-    // Existing active org -> 200 with matching id/name.
-    let org = create_org(&server).await;
-    let response = server
-        .get(format!("/v1/admin/organizations/{}", org.id).as_str())
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
-        .add_header("User-Agent", MOCK_USER_AGENT)
-        .await;
-    assert_eq!(
-        response.status_code(),
-        200,
-        "Should get the org, body: {}",
-        response.text()
-    );
-    let body = response.json::<api::models::AdminOrganizationResponse>();
-    assert_eq!(body.id, org.id, "Returned org id should match");
-
-    // Unknown org -> 404.
-    let fake_org_id = uuid::Uuid::new_v4();
-    let response = server
-        .get(format!("/v1/admin/organizations/{fake_org_id}").as_str())
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
-        .add_header("User-Agent", MOCK_USER_AGENT)
-        .await;
-    assert_eq!(response.status_code(), 404, "Unknown org should 404");
-
-    // Deactivated org -> 404 (consistent with the org list hiding inactive orgs).
-    let org_uuid = uuid::Uuid::parse_str(&org.id).expect("org id should be a uuid");
-    {
-        let pool = database.pool();
-        let client = pool.get().await.expect("Failed to get database connection");
-        client
-            .execute(
-                "UPDATE organizations SET is_active = false WHERE id = $1",
-                &[&org_uuid],
-            )
-            .await
-            .expect("Failed to deactivate org");
-    }
-    let response = server
-        .get(format!("/v1/admin/organizations/{}", org.id).as_str())
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
-        .add_header("User-Agent", MOCK_USER_AGENT)
-        .await;
-    assert_eq!(
-        response.status_code(),
-        404,
-        "Deactivated org should 404, body: {}",
-        response.text()
-    );
-
-    println!("✅ Admin get organization returns 200 / 404 / 404 (deactivated)");
 }
 
 #[tokio::test]

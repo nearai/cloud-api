@@ -1148,3 +1148,59 @@ async fn systemone_finalization_survives_client_disconnect() {
         .assert_status_ok();
     assert_eq!(calls.load(Ordering::SeqCst), 2);
 }
+
+/// System One backends receive no tenant ids: neither the decision call nor
+/// the signature fetch that follows it may run with the tracing context.
+#[tokio::test]
+async fn systemone_backend_receives_no_tenant_ids() {
+    let (server, pool, _, _) = setup_test_server_with_pool().await;
+    let key = auth(&server).await;
+    let (model, _) = catalog(&server, None, true).await;
+    let upstream_id = format!("decision-{}", uuid::Uuid::new_v4());
+    let raw = serde_json::to_vec_pretty(&result(Some(&upstream_id))).unwrap();
+    let response_bytes = raw.clone();
+    // A NEAR-tier provider with signatures, so the request also fetches the
+    // provider signature after the decision.
+    let provider = Arc::new(
+        MockProvider::new_accept_all()
+            .with_tier(ProviderTier::Near)
+            .with_provider_source(inference_providers::ProviderSource::Vllm)
+            .with_chat_signature_support(true)
+            .with_systemone_handler(move |req, _| {
+                SystemOneResponseWithBytes::parse(response_bytes.clone(), &req)
+            }),
+    );
+    pool.register_provider(model.clone(), provider.clone())
+        .await;
+    let report = provider
+        .get_attestation_report(model.clone(), Some("ecdsa".into()), None, None, false)
+        .await
+        .unwrap();
+
+    let response = server
+        .post("/v1/systemone")
+        .add_header("Authorization", format!("Bearer {key}"))
+        .add_header("Content-Type", "application/json")
+        .add_header(
+            "x-model-pub-key",
+            report["signing_public_key"].as_str().unwrap(),
+        )
+        .bytes(Bytes::from(
+            serde_json::to_string(&request(&model)).unwrap(),
+        ))
+        .await;
+    assert_eq!(response.status_code(), 200, "{}", response.text());
+
+    // The route finishes the signature fetch before it answers.
+    let calls = provider.tracing_calls();
+    let operations: Vec<_> = calls.iter().map(|call| call.operation).collect();
+    assert!(operations.contains(&"systemone"), "{operations:?}");
+    assert!(operations.contains(&"get_signature"), "{operations:?}");
+    for call in calls {
+        assert_eq!(
+            call.context, None,
+            "`{}` ran with tenant ids on the System One path",
+            call.operation
+        );
+    }
+}

@@ -335,6 +335,56 @@ async fn auto_redact_fail_closed_when_pii_model_missing() {
     );
 }
 
+/// An overloaded detector fails the chat request closed (the prompt never
+/// reaches the chat model) with a retryable 503 and the detector's
+/// `Retry-After`.
+#[tokio::test]
+async fn auto_redact_overloaded_detector_returns_503_with_retry_after() {
+    let (server, _pool, mock_provider, _db) = setup_test_server_with_pool().await;
+    setup_qwen_model(&server).await;
+    setup_privacy_filter_model(&server).await;
+    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id).await;
+    mock_provider
+        .set_privacy_classify_override(Some(
+            inference_providers::mock::PrivacyClassifyOverride::Overloaded {
+                retry_after_secs: Some(4),
+            },
+        ))
+        .await;
+    let chat_calls_before = mock_provider.chat_completion_call_count();
+
+    let resp = server
+        .post("/v1/chat/completions")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .add_header("x-auto-redact", "on")
+        .json(&serde_json::json!({
+            "model": E2E_QWEN_MODEL_NAME,
+            "messages": [{ "role": "user", "content": "email alice@example.com" }],
+        }))
+        .await;
+
+    assert_eq!(resp.status_code(), 503, "{}", resp.text());
+    assert_eq!(
+        resp.headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok()),
+        Some("4")
+    );
+    let body: serde_json::Value = resp.json();
+    assert_eq!(
+        body["error"]["type"].as_str(),
+        Some("auto_redact_unavailable"),
+        "expected typed error: {body}"
+    );
+    assert_eq!(
+        mock_provider.chat_completion_call_count(),
+        chat_calls_before,
+        "the unredacted prompt must not reach the chat model"
+    );
+}
+
 #[tokio::test]
 async fn auto_redact_off_when_header_is_falsy() {
     let (server, _pool, mock_provider, _db) = setup_test_server_with_pool().await;

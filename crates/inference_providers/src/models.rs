@@ -2659,4 +2659,42 @@ pub enum PrivacyClassifyError {
 
     #[error("HTTP {status_code}: {message}")]
     HttpError { status_code: u16, message: String },
+
+    /// The backend answered HTTP 503: it is at capacity and the request was
+    /// not processed. `retry_after_secs` is its `Retry-After` header when
+    /// that header held a delta-seconds value.
+    #[error("Privacy classify backend overloaded")]
+    Overloaded { retry_after_secs: Option<u64> },
+}
+
+impl PrivacyClassifyError {
+    /// Error for a non-success upstream response. A 503 becomes
+    /// [`Self::Overloaded`] and drops the body; any other status keeps it in
+    /// [`Self::HttpError`] for callers that sanitize it.
+    pub fn from_upstream_status(
+        status_code: u16,
+        retry_after: Option<&str>,
+        message: String,
+    ) -> Self {
+        if status_code == 503 {
+            Self::Overloaded {
+                retry_after_secs: retry_after.and_then(parse_retry_after_secs),
+            }
+        } else {
+            Self::HttpError {
+                status_code,
+                message,
+            }
+        }
+    }
+}
+
+/// Parse a `Retry-After` header holding delta-seconds. The HTTP-date form
+/// and anything else that is not a plain non-negative integer yield `None`.
+fn parse_retry_after_secs(value: &str) -> Option<u64> {
+    let value = value.trim();
+    if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    value.parse().ok()
 }

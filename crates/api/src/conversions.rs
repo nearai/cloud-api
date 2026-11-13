@@ -232,6 +232,11 @@ impl From<CompletionError> for crate::models::ErrorResponse {
             CompletionError::ServiceOverloaded(msg) => {
                 ErrorResponse::new(msg, "service_overloaded".to_string())
             }
+            CompletionError::UpstreamOverloaded { .. } => ErrorResponse::new(
+                "All inference backends are overloaded. Please retry with exponential backoff."
+                    .to_string(),
+                "service_overloaded".to_string(),
+            ),
             CompletionError::InternalError(msg) => ErrorResponse::new(
                 format!("Internal server error: {msg}"),
                 "internal_server_error".to_string(),
@@ -770,30 +775,6 @@ pub fn admin_user_lifecycle(
             |_| tracing::warn!(user_id = %user_id, "User row has inconsistent lifecycle columns"),
         )
         .ok()
-}
-
-/// Convert database::User to AdminUserResponse (for owners/admins only)  
-pub fn db_user_to_admin_user(user: &database::User) -> AdminUserResponse {
-    AdminUserResponse {
-        id: user.id.to_string(),
-        email: user.email.clone(),
-        username: Some(user.username.clone()),
-        display_name: user.display_name.clone(),
-        avatar_url: user.avatar_url.clone(),
-        created_at: user.created_at,
-        last_login_at: user.last_login_at,
-        is_active: user.is_active,
-        auth_provider: user.auth_provider.clone(),
-        provider_user_id: user.provider_user_id.clone(),
-        contact_email: verified_contact_email(
-            user.contact_email.as_deref(),
-            user.contact_email_verified_at,
-        ),
-        contact_email_verified_at: user.contact_email_verified_at,
-        email_opt_in_at: user.email_opt_in_at,
-        lifecycle: admin_user_lifecycle(user.id, user.is_active, &user.auth_provider),
-        organizations: None,
-    }
 }
 
 #[cfg(test)]

@@ -46,6 +46,7 @@ hex = "0.4"
 # Constant-time comparison for service-token auth on /v1/internal/usage
 subtle = "2.6"
 bytes = "1.11"
+http-body = "1"
 http-body-util = "0.1"
 # Regional S3 uses SigV4; SigV4a pulls in crypto-bigint affected by RUSTSEC-2026-0387.
 aws-config = { version = "1.8", features = ["behavior-version-latest"] }

@@ -753,6 +753,8 @@ pub enum PrivacyClassifyOverride {
     Body(serde_json::Value),
     /// Fail as if the upstream returned this HTTP status.
     HttpError { status_code: u16, message: String },
+    /// Fail as if the upstream answered 503 with this `Retry-After` value.
+    Overloaded { retry_after_secs: Option<u64> },
 }
 
 /// Builder for configuring a single expectation
@@ -836,6 +838,16 @@ pub struct MockProvider {
     /// What [`InferenceProvider::poll_backend_count`] reports; defaults to
     /// `Skipped`. Set via [`MockProvider::with_count_poll`].
     count_poll: crate::CountPoll,
+    /// The tracing context each inference call saw, in call order, so tests
+    /// can assert which tenant ids a self-hosted backend would receive.
+    tracing_calls: Arc<std::sync::Mutex<Vec<TracingCall>>>,
+}
+
+/// One inference call and the tracing context in scope when it was made.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TracingCall {
+    pub operation: &'static str,
+    pub context: Option<crate::tracing_context::TracingContext>,
 }
 
 impl MockProvider {
@@ -922,6 +934,7 @@ impl MockProvider {
             per_request_public_key: None,
             unpinned_chat_ids: Arc::new(std::sync::Mutex::new(Vec::new())),
             attestation_signing_algos: Arc::new(std::sync::Mutex::new(Vec::new())),
+            tracing_calls: Arc::new(std::sync::Mutex::new(Vec::new())),
             responses_handler: None,
             systemone_handler: None,
             privacy_classify_handler: None,
@@ -959,6 +972,7 @@ impl MockProvider {
             per_request_public_key: None,
             unpinned_chat_ids: Arc::new(std::sync::Mutex::new(Vec::new())),
             attestation_signing_algos: Arc::new(std::sync::Mutex::new(Vec::new())),
+            tracing_calls: Arc::new(std::sync::Mutex::new(Vec::new())),
             responses_handler: None,
             systemone_handler: None,
             privacy_classify_handler: None,
@@ -994,6 +1008,7 @@ impl MockProvider {
             per_request_public_key: None,
             unpinned_chat_ids: Arc::new(std::sync::Mutex::new(Vec::new())),
             attestation_signing_algos: Arc::new(std::sync::Mutex::new(Vec::new())),
+            tracing_calls: Arc::new(std::sync::Mutex::new(Vec::new())),
             responses_handler: None,
             systemone_handler: None,
             privacy_classify_handler: None,
@@ -1054,6 +1069,24 @@ impl MockProvider {
     }
 
     /// Get the last chat completion params received by the mock provider.
+    /// Every inference call recorded so far, with the tracing context it saw.
+    pub fn tracing_calls(&self) -> Vec<TracingCall> {
+        self.tracing_calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    fn record_tracing(&self, operation: &'static str) {
+        self.tracing_calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(TracingCall {
+                operation,
+                context: crate::tracing_context::current_tracing_context(),
+            });
+    }
+
     pub async fn last_chat_params(&self) -> Option<ChatCompletionParams> {
         self.last_chat_params.lock().await.clone()
     }
@@ -1284,6 +1317,7 @@ impl crate::InferenceProvider for MockProvider {
         request_hash: String,
         model_pub_key: Option<&str>,
     ) -> Result<crate::SystemOneResponseWithBytes, CompletionError> {
+        self.record_tracing("systemone");
         let handler = self
             .systemone_handler
             .as_ref()
@@ -1365,6 +1399,7 @@ impl crate::InferenceProvider for MockProvider {
         params: ChatCompletionParams,
         request_hash: String,
     ) -> Result<StreamingResult, CompletionError> {
+        self.record_tracing("chat_completion_stream");
         self.chat_request_priorities
             .lock()
             .await
@@ -1513,6 +1548,7 @@ impl crate::InferenceProvider for MockProvider {
         params: ChatCompletionParams,
         request_hash: String,
     ) -> Result<ChatCompletionResponseWithBytes, CompletionError> {
+        self.record_tracing("chat_completion");
         self.chat_request_priorities
             .lock()
             .await
@@ -1618,6 +1654,7 @@ impl crate::InferenceProvider for MockProvider {
         params: ImageGenerationParams,
         _request_hash: String,
     ) -> Result<ImageGenerationResponseWithBytes, ImageGenerationError> {
+        self.record_tracing("image_generation");
         // Check for invalid model
         if !self.is_valid_model(&params.model) {
             return Err(ImageGenerationError::GenerationError(format!(
@@ -1659,6 +1696,7 @@ impl crate::InferenceProvider for MockProvider {
         params: Arc<ImageEditParams>,
         _request_hash: String,
     ) -> Result<ImageEditResponseWithBytes, ImageEditError> {
+        self.record_tracing("image_edit");
         // Check for invalid model
         if !self.is_valid_model(&params.model) {
             return Err(ImageEditError::EditError(format!(
@@ -1697,6 +1735,7 @@ impl crate::InferenceProvider for MockProvider {
         params: ScoreParams,
         _request_hash: String,
     ) -> Result<ScoreResponse, ScoreError> {
+        self.record_tracing("score");
         // Mock implementation returns a similarity score based on text length similarity
         let len_1 = params.text_1.len() as f64;
         let len_2 = params.text_2.len() as f64;
@@ -1722,6 +1761,7 @@ impl crate::InferenceProvider for MockProvider {
     }
 
     async fn rerank(&self, params: RerankParams) -> Result<RerankResponse, RerankError> {
+        self.record_tracing("rerank");
         // Check for invalid model
         if !self.is_valid_model(&params.model) {
             return Err(RerankError::GenerationError(format!(
@@ -1770,6 +1810,7 @@ impl crate::InferenceProvider for MockProvider {
         _body: bytes::Bytes,
         _extra: std::collections::HashMap<String, serde_json::Value>,
     ) -> Result<bytes::Bytes, EmbeddingError> {
+        self.record_tracing("embeddings_raw");
         {
             let config = self.config.lock().await;
             if let Some(ref error) = config.embedding_error_override {
@@ -1800,6 +1841,7 @@ impl crate::InferenceProvider for MockProvider {
         body: bytes::Bytes,
         _extra: std::collections::HashMap<String, serde_json::Value>,
     ) -> Result<bytes::Bytes, PrivacyClassifyError> {
+        self.record_tracing("privacy_classify_raw");
         if let Some(handler) = &self.privacy_classify_handler {
             return handler(body);
         }
@@ -1811,10 +1853,14 @@ impl crate::InferenceProvider for MockProvider {
                 PrivacyClassifyOverride::HttpError {
                     status_code,
                     message,
-                } => Err(PrivacyClassifyError::HttpError {
+                } => Err(PrivacyClassifyError::from_upstream_status(
                     status_code,
+                    None,
                     message,
-                }),
+                )),
+                PrivacyClassifyOverride::Overloaded { retry_after_secs } => {
+                    Err(PrivacyClassifyError::Overloaded { retry_after_secs })
+                }
             };
         }
 
@@ -1870,6 +1916,7 @@ impl crate::InferenceProvider for MockProvider {
         chat_id: &str,
         signing_algo: Option<String>,
     ) -> Result<ChatSignature, CompletionError> {
+        self.record_tracing("get_signature");
         let signing_algo = signing_algo.unwrap_or_else(|| "ecdsa".to_string());
 
         // Check if we have registered hashes for this chat_id
@@ -1957,6 +2004,7 @@ impl crate::InferenceProvider for MockProvider {
         params: AudioTranscriptionParams,
         _request_hash: String,
     ) -> Result<AudioTranscriptionResponse, AudioTranscriptionError> {
+        self.record_tracing("audio_transcription");
         // Test hook: when set, return the injected error (e.g. a provider
         // HttpError) so tests can exercise the error-mapping path.
         if let Some(ref error) = self.config.lock().await.audio_transcription_error_override {

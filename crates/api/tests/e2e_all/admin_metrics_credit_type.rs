@@ -4,7 +4,7 @@ use crate::admin_provider_attribution_support::{
 use crate::common::*;
 use chrono::Utc;
 use database::repositories::PgAnalyticsRepository;
-use serde_json::{json, Value};
+use serde_json::Value;
 use services::admin::{AnalyticsRepository, OrganizationMetrics, TimeSeriesMetrics};
 use uuid::Uuid;
 
@@ -216,19 +216,19 @@ async fn admin_metrics_credit_type_uses_saved_allocations() {
 
 #[tokio::test]
 async fn admin_metrics_credit_type_allows_read_only_tokens() {
-    let (server, _db) = setup_test_server_with_config_and_database(|config| {
-        config.auth.admin_read_only_tokens_enabled = true;
-    })
-    .await;
+    let (server, db) = setup_test_server_with_database().await;
     let org = create_org(&server).await;
-    let response = server.post("/v1/admin/access-tokens")
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
-        .add_header("User-Agent", MOCK_USER_AGENT)
-        .json(&json!({"name":"credit-metrics", "reason":"test", "expires_in_hours":24, "permission":"read_only"})).await;
-    assert_eq!(response.status_code(), 200, "{}", response.text());
-    let token = response
-        .json::<api::models::AdminAccessTokenResponse>()
-        .access_token;
+    let (_, token) = database::repositories::AdminAccessTokenRepository::new(db.pool().clone())
+        .create(
+            uuid::Uuid::parse_str(MOCK_USER_ID).unwrap(),
+            "credit-metrics".to_string(),
+            "test".to_string(),
+            chrono::Utc::now() + chrono::Duration::hours(24),
+            Some(MOCK_USER_AGENT.to_string()),
+            database::models::AdminAccessTokenPermission::ReadOnly,
+        )
+        .await
+        .unwrap();
     {
         let response = server
             .get(&format!(

@@ -32,10 +32,6 @@ const ENCODING_KEY: &str = "admin-audit-test-encoding-key";
 const ADMIN_EMAILS: &[&str] = &["admin@test.com"];
 /// The mock auth service authenticates every user as admin@test.com.
 const NO_ADMIN_EMAILS: &[&str] = &["other@test.com"];
-const PROBE_LIMIT: i64 = 2;
-const PROBE_OFFSET: i64 = 4;
-const PROBE_RETURNED: usize = 3;
-const FILTER_ORGANIZATION_ID: Uuid = Uuid::from_u128(0x0f11_7e40);
 
 const EVENT_FIELDS: &[&str] = &[
     "message",
@@ -49,9 +45,6 @@ const EVENT_FIELDS: &[&str] = &[
     "admin_credential_kind",
     "admin_credential_id",
     "admin_organization_id",
-    "admin_limit",
-    "admin_offset",
-    "admin_returned_count",
     "admin_duration_ms",
 ];
 
@@ -193,22 +186,14 @@ async fn probe(headers: HeaderMap) -> &'static str {
     }
 }
 
-async fn metrics_probe(audit: AdminAudit) -> &'static str {
-    audit.record_page(PROBE_LIMIT, PROBE_OFFSET, PROBE_RETURNED);
-    "ok"
-}
-
-async fn deliveries_probe(audit: AdminAudit) -> &'static str {
-    audit.record_organization(FILTER_ORGANIZATION_ID);
-    "ok"
-}
-
 fn app(admin_emails: &[&str], entered_slow_handler: Arc<Notify>) -> Router {
     let admin_routes = Router::new()
         .route("/admin/probe", get(probe))
-        .route("/admin/invitation-email-deliveries", get(deliveries_probe))
         .route("/admin/organizations/{org_id}", get(|| async { "ok" }))
-        .route("/admin/organizations/{org_id}/metrics", get(metrics_probe))
+        .route(
+            "/admin/organizations/{org_id}/metrics",
+            get(|| async { "ok" }),
+        )
         .route(
             "/admin/slow",
             get(move || {
@@ -361,7 +346,7 @@ async fn audit_header_carries_the_server_request_id_never_a_client_value() {
 }
 
 #[tokio::test]
-async fn allowed_session_read_records_identity_route_organization_and_page() {
+async fn allowed_session_read_records_identity_route_and_organization() {
     let (logs, _guard) = CapturedLogs::json();
     let app = admin_app();
     let (user_id, session_id, organization_id) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
@@ -371,7 +356,7 @@ async fn allowed_session_read_records_identity_route_organization_and_page() {
         with_session(
             request(
                 Method::GET,
-                &format!("/v1/admin/organizations/{organization_id}/metrics?limit=2&offset=4"),
+                &format!("/v1/admin/organizations/{organization_id}/metrics"),
             ),
             user_id,
             Some(session_id),
@@ -393,9 +378,6 @@ async fn allowed_session_read_records_identity_route_organization_and_page() {
     assert_eq!(event["admin_credential_id"], session_id.to_string());
     assert_eq!(event["admin_user_id"], user_id.to_string());
     assert_eq!(event["admin_organization_id"], organization_id.to_string());
-    assert_eq!(event["admin_limit"], PROBE_LIMIT);
-    assert_eq!(event["admin_offset"], PROBE_OFFSET);
-    assert_eq!(event["admin_returned_count"], PROBE_RETURNED);
     assert!(event["admin_duration_ms"].is_u64());
     // A fully populated event carries every contract field.
     assert_eq!(
@@ -405,7 +387,7 @@ async fn allowed_session_read_records_identity_route_organization_and_page() {
 }
 
 #[tokio::test]
-async fn global_reads_have_no_organization_unless_a_handler_records_a_filter() {
+async fn global_reads_have_no_organization() {
     let (logs, _guard) = CapturedLogs::json();
     let app = admin_app();
     let user_id = Uuid::new_v4();
@@ -421,31 +403,7 @@ async fn global_reads_have_no_organization_unless_a_handler_records_a_filter() {
     assert_eq!(event["admin_auth_outcome"], "allowed");
     assert_eq!(event["admin_credential_kind"], "session");
     assert_eq!(event["admin_user_id"], user_id.to_string());
-    assert_absent(
-        &event,
-        &[
-            "admin_credential_id",
-            "admin_organization_id",
-            "admin_limit",
-            "admin_offset",
-            "admin_returned_count",
-        ],
-    );
-
-    let response = send(
-        &app,
-        with_session(
-            request(Method::GET, "/v1/admin/invitation-email-deliveries"),
-            user_id,
-            Some(Uuid::new_v4()),
-        ),
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(
-        logs.take_single_event()["admin_organization_id"],
-        FILTER_ORGANIZATION_ID.to_string()
-    );
+    assert_absent(&event, &["admin_credential_id", "admin_organization_id"]);
 }
 
 #[tokio::test]
@@ -657,7 +615,10 @@ async fn every_request_emits_exactly_one_event_with_its_own_id() {
         (
             &allowed,
             with_session(
-                request(Method::GET, "/v1/admin/invitation-email-deliveries"),
+                request(
+                    Method::GET,
+                    "/v1/admin/organizations/00000000-0000-0000-0000-000000000001/metrics",
+                ),
                 Uuid::new_v4(),
                 Some(Uuid::new_v4()),
             ),

@@ -33,7 +33,6 @@ struct Fixture {
 async fn fixture() -> Fixture {
     let (server, db) = setup_test_server_with_config_and_database(|config| {
         config.internal_usage_token = Some(INTERNAL_TOKEN.into());
-        config.auth.admin_read_only_tokens_enabled = true;
     })
     .await;
     let org = create_org(&server).await;

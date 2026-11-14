@@ -7,7 +7,6 @@ pub mod auto_redact;
 pub mod caller_credential;
 pub mod common;
 pub mod completions;
-pub mod contact_email;
 pub mod conversations;
 pub mod email;
 pub mod encryption_keys;
@@ -26,7 +25,6 @@ pub mod service_usage;
 pub mod staking_farm;
 pub mod usage;
 pub mod user;
-pub mod user_erasure;
 pub mod web_search;
 pub mod workspace;
 

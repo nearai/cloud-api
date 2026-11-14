@@ -117,7 +117,6 @@ pub struct DomainServices {
     pub workspace_service: Arc<dyn services::workspace::WorkspaceServiceTrait + Send + Sync>,
     pub usage_service: Arc<dyn services::usage::UsageServiceTrait + Send + Sync>,
     pub user_service: Arc<dyn services::user::UserServiceTrait + Send + Sync>,
-    pub contact_email_service: Arc<services::contact_email::ContactEmailService>,
     pub files_service: Arc<dyn services::files::FileServiceTrait + Send + Sync>,
     pub object_encryption_state: object_encryption::ObjectEncryptionState,
     pub metrics_service: Arc<dyn services::metrics::MetricsServiceTrait>,
@@ -189,25 +188,12 @@ pub fn init_auth_services(database: Arc<Database>, config: &ApiConfig) -> AuthCo
     let organization_repo = Arc::new(PgOrganizationRepository::new(database.pool().clone()));
     let user_repository = Arc::new(UserRepository::new(database.pool().clone()))
         as Arc<dyn services::auth::UserRepository>;
-    let invitation_repo = Arc::new(database::PgOrganizationInvitationRepository::new(
-        database.pool().clone(),
-    ))
-        as Arc<dyn services::organization::ports::OrganizationInvitationRepository>;
-    let email_sender = services::email::sender_from_config(&config.invitation_email)
-        .expect("Failed to initialize invitation email sender");
-    let invitations_url = config.invitation_email.invitations_url();
 
     // Create organization service early (needed by AuthService)
-    let organization_service = Arc::new(
-        services::organization::OrganizationServiceImpl::new_with_email_sender(
-            organization_repo.clone()
-                as Arc<dyn services::organization::ports::OrganizationRepository>,
-            user_repository.clone(),
-            invitation_repo,
-            email_sender,
-            invitations_url,
-        ),
-    )
+    let organization_service = Arc::new(services::organization::OrganizationServiceImpl::new(
+        organization_repo.clone() as Arc<dyn services::organization::ports::OrganizationRepository>,
+        user_repository.clone(),
+    ))
         as Arc<dyn services::organization::OrganizationServiceTrait + Send + Sync>;
 
     let auth_service: Arc<dyn AuthServiceTrait> = if config.auth.mock {
@@ -559,24 +545,6 @@ pub async fn init_domain_services_with_pool(
     let session_repo = Arc::new(database::SessionRepository::new(database.pool().clone()))
         as Arc<dyn services::auth::SessionRepository>;
 
-    // Contact email verification for wallet users. Off unless
-    // CONTACT_EMAIL_VERIFICATION_ENABLED is set; it then shares the invitation
-    // email sender settings.
-    let contact_email_service = Arc::new(services::contact_email::ContactEmailService::new(
-        Arc::new(database::repositories::PgContactEmailRepository::new(
-            database.pool().clone(),
-        )),
-        user_repo.clone(),
-        services::email::contact_email_sender_from_config(&config.invitation_email)
-            .expect("Failed to initialize contact email sender"),
-        config
-            .invitation_email
-            .contact_email_verification_enabled
-            .then(|| config.invitation_email.contact_email_verification_url())
-            .flatten(),
-        i64::from(config.invitation_email.contact_email_verification_daily_cap),
-    ));
-
     // Create user service
     let user_service = Arc::new(services::user::UserService::new(user_repo, session_repo))
         as Arc<dyn services::user::UserServiceTrait + Send + Sync>;
@@ -726,7 +694,6 @@ pub async fn init_domain_services_with_pool(
         workspace_service,
         usage_service,
         user_service,
-        contact_email_service,
         files_service,
         object_encryption_state,
         metrics_service,
@@ -1165,7 +1132,6 @@ pub fn build_app_with_config_and_options(
         usage_service: domain_services.usage_service.clone(),
         service_usage_service: domain_services.service_usage_service.clone(),
         user_service: domain_services.user_service.clone(),
-        contact_email_service: domain_services.contact_email_service.clone(),
         files_service: domain_services.files_service.clone(),
         inference_provider_pool: domain_services.inference_provider_pool.clone(),
         metrics_service: domain_services.metrics_service.clone(),
@@ -1275,17 +1241,8 @@ pub fn build_app_with_config_and_options(
         AdminRouteServices {
             object_encryption_state: domain_services.object_encryption_state.clone(),
             analytics_service,
-            organization_service: domain_services.organization_service.clone(),
-            user_erasure_service: Arc::new(services::user_erasure::UserErasureService::new(
-                Arc::new(database::repositories::PostgresUserErasureRepository::new(
-                    database.pool().clone(),
-                )),
-            )),
         },
     );
-
-    let invitation_routes =
-        build_invitation_routes(app_state.clone(), &auth_components.auth_state_middleware);
 
     let files_routes =
         build_files_routes(app_state.clone(), &auth_components.auth_state_middleware);
@@ -1339,7 +1296,6 @@ pub fn build_app_with_config_and_options(
                 .merge(model_routes)
                 .merge(services_routes)
                 .merge(admin_routes)
-                .merge(invitation_routes)
                 .merge(files_routes)
                 .merge(billing_routes)
                 .merge(gateway_routes)
@@ -1398,28 +1354,6 @@ fn with_app_fallbacks_and_layers(
         // Sites that set their own value (per-key limiter window, upstream
         // ITA propagation) are left untouched.
         .layer(map_response(middleware::retry_after_middleware))
-}
-
-/// Build invitation routes with selective auth
-pub fn build_invitation_routes(app_state: AppState, auth_state_middleware: &AuthState) -> Router {
-    use crate::routes::users::{accept_invitation_by_token, get_invitation_by_token};
-    use axum::routing::{get, post};
-
-    Router::new().nest(
-        "/invitations",
-        Router::new()
-            // Public route - no auth required to view invitation
-            .route("/{token}", get(get_invitation_by_token))
-            // Auth required to accept
-            .route(
-                "/{token}/accept",
-                post(accept_invitation_by_token).layer(from_fn_with_state(
-                    auth_state_middleware.clone(),
-                    auth_middleware,
-                )),
-            )
-            .with_state(app_state),
-    )
 }
 
 /// Build authentication routes
@@ -1923,12 +1857,6 @@ pub fn build_workspace_routes(app_state: AppState, auth_state_middleware: &AuthS
             "/organizations/{org_id}/workspaces",
             get(list_organization_workspaces).post(create_workspace),
         )
-        .route(
-            "/workspaces/{workspace_id}",
-            get(get_workspace)
-                .put(update_workspace)
-                .delete(delete_workspace),
-        )
         // Workspace API key management
         .route(
             "/workspaces/{workspace_id}/api-keys",
@@ -2192,9 +2120,6 @@ fn cache_control_layer(value: &'static str) -> CacheControlLayer {
 pub struct AdminRouteServices {
     pub object_encryption_state: object_encryption::ObjectEncryptionState,
     pub analytics_service: Arc<services::admin::AnalyticsService>,
-    pub organization_service:
-        Arc<dyn services::organization::OrganizationServiceTrait + Send + Sync>,
-    pub user_erasure_service: Arc<services::user_erasure::UserErasureService>,
 }
 
 pub fn build_admin_routes(
@@ -2220,17 +2145,7 @@ fn build_admin_routes_with_options(
     services: AdminRouteServices,
 ) -> Router {
     use crate::middleware::admin_middleware;
-    use crate::routes::admin::{
-        create_admin_access_token, delete_admin_access_token, erase_user, get_infra_summary,
-        get_organization_metrics, list_admin_access_tokens, list_invitation_email_deliveries,
-        lookup_user_erasures, preview_user_erasure, resend_invitation_email,
-        update_organization_member_role, AdminAppState,
-    };
-    use database::repositories::AdminAccessTokenRepository;
-
-    // Create admin access token repository
-    let admin_access_token_repository =
-        Arc::new(AdminAccessTokenRepository::new(database.pool().clone()));
+    use crate::routes::admin::{get_infra_summary, get_organization_metrics, AdminAppState};
     let infra_service = Arc::new(services::admin::InfraService::new(
         config.infra.machines_url.clone(),
         config.infra.cost_per_host_usd_month,
@@ -2242,12 +2157,7 @@ fn build_admin_routes_with_options(
 
     let admin_app_state = AdminAppState {
         analytics_service: services.analytics_service,
-        organization_service: services.organization_service,
-        auth_service: auth_state_middleware.auth_service.clone(),
-        config: config.clone(),
-        admin_access_token_repository,
         infra_service,
-        user_erasure_service: services.user_erasure_service,
     };
 
     let database_encryption_state =
@@ -2269,42 +2179,6 @@ fn build_admin_routes_with_options(
         .route(
             "/admin/platform/infra-summary",
             axum::routing::get(get_infra_summary),
-        )
-        .route(
-            "/admin/invitation-email-deliveries",
-            axum::routing::get(list_invitation_email_deliveries),
-        )
-        .route(
-            "/admin/invitation-email-deliveries/{invitation_id}/resend",
-            axum::routing::post(resend_invitation_email),
-        )
-        .route(
-            "/admin/users/{user_id}/erasure/preview",
-            axum::routing::post(preview_user_erasure),
-        )
-        .route(
-            "/admin/users/{user_id}/erasure",
-            axum::routing::post(erase_user),
-        )
-        .route(
-            "/admin/user-erasures/lookup",
-            axum::routing::post(lookup_user_erasures),
-        )
-        .route(
-            "/admin/organizations/{org_id}/members/{user_id}",
-            axum::routing::put(update_organization_member_role),
-        )
-        .route(
-            "/admin/access-tokens",
-            axum::routing::post(create_admin_access_token),
-        )
-        .route(
-            "/admin/access-tokens",
-            axum::routing::get(list_admin_access_tokens),
-        )
-        .route(
-            "/admin/access-tokens/{token_id}",
-            axum::routing::delete(delete_admin_access_token),
         )
         .with_state(admin_app_state);
 
@@ -3026,7 +2900,6 @@ mod tests {
                 google: None,
                 near: config::NearConfig::default(),
                 admin_emails: vec![],
-                admin_read_only_tokens_enabled: false,
                 require_session_bound_access_tokens: false,
             },
             database: config::DatabaseConfig {
@@ -3060,7 +2933,6 @@ mod tests {
                 encryption_key: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
                     .to_string(), // Mock 256-bit hex key
             },
-            invitation_email: config::InvitationEmailConfig::default(),
             otlp: config::OtlpConfig {
                 endpoint: "http://localhost:4317".to_string(),
                 protocol: "grpc".to_string(),
@@ -3152,7 +3024,6 @@ mod tests {
                 google: None,
                 near: config::NearConfig::default(),
                 admin_emails: vec![],
-                admin_read_only_tokens_enabled: false,
                 require_session_bound_access_tokens: false,
             },
             database: config::DatabaseConfig {
@@ -3186,7 +3057,6 @@ mod tests {
                 encryption_key: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
                     .to_string(), // Mock 256-bit hex key
             },
-            invitation_email: config::InvitationEmailConfig::default(),
             otlp: config::OtlpConfig {
                 endpoint: "http://localhost:4317".to_string(),
                 protocol: "grpc".to_string(),

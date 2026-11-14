@@ -372,25 +372,6 @@ impl SessionRepository {
         Ok(result > 0)
     }
 
-    /// Revoke all refresh token sessions for a user
-    pub async fn revoke_all_for_user(&self, user_id: Uuid) -> Result<usize> {
-        let result = retry_db!("revoke_all_refresh_token_sessions", {
-            let client = self
-                .pool
-                .get()
-                .await
-                .context("Failed to get database connection")
-                .map_err(RepositoryError::PoolError)?;
-
-            client
-                .execute("DELETE FROM refresh_tokens WHERE user_id = $1", &[&user_id])
-                .await
-                .map_err(map_db_error)
-        })?;
-
-        Ok(result as usize)
-    }
-
     /// Clean up expired refresh token sessions
     pub async fn cleanup_expired(&self) -> Result<usize> {
         let result = retry_db!("clean_up_expried_refresh_token_session", {
@@ -549,10 +530,6 @@ impl services::auth::SessionRepository for SessionRepository {
         };
 
         Ok((service_session, token))
-    }
-
-    async fn revoke_all_for_user(&self, user_id: services::auth::UserId) -> anyhow::Result<usize> {
-        self.revoke_all_for_user(user_id.0).await
     }
 
     async fn cleanup_expired(&self) -> anyhow::Result<usize> {

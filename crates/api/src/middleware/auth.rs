@@ -84,15 +84,6 @@ fn authorize_admin_operation(
         .map(|p| p.as_str());
     // Missing route metadata is unclassified and must never grant read access.
     let operation = admin_operation(request.method(), matched_path.unwrap_or(""));
-    if operation == AdminOperation::SessionOnly {
-        return Err((
-            StatusCode::FORBIDDEN,
-            axum::Json(crate::models::ErrorResponse::new(
-                "Access token management endpoint detected".to_string(),
-                "forbidden".to_string(),
-            )),
-        ));
-    }
     if permission == AdminAccessTokenPermission::ReadOnly && operation != AdminOperation::Read {
         return Err((
             StatusCode::FORBIDDEN,
@@ -1297,18 +1288,6 @@ mod tests {
                 _: OrganizationId,
                 _: services::auth::UserId,
             ) -> Result<Workspace, RepositoryError> {
-                unimplemented!()
-            }
-            async fn update(
-                &self,
-                _: WorkspaceId,
-                _: Option<String>,
-                _: Option<String>,
-                _: Option<serde_json::Value>,
-            ) -> Result<Option<Workspace>, RepositoryError> {
-                unimplemented!()
-            }
-            async fn delete(&self, _: WorkspaceId) -> Result<bool, RepositoryError> {
                 unimplemented!()
             }
             async fn count_by_organization(

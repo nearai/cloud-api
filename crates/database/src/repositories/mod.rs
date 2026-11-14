@@ -14,7 +14,6 @@ pub mod aml;
 pub mod analytics;
 pub mod api_key;
 pub mod attestation;
-pub mod contact_email;
 pub mod conversation;
 pub mod credit_allocation;
 pub mod file;
@@ -26,7 +25,6 @@ pub mod model_repository_impl;
 pub mod near_nonce;
 pub mod oauth_state;
 pub mod organization;
-pub mod organization_invitation;
 pub mod organization_limits;
 pub mod organization_limits_repository_impl;
 pub mod organization_service_usage;
@@ -43,7 +41,6 @@ pub mod session;
 pub mod usage_hourly;
 pub mod usage_repository_impl;
 pub mod user;
-pub mod user_erasure;
 pub mod utils;
 pub mod workspace;
 
@@ -54,7 +51,6 @@ pub use aml::PostgresAmlRepository;
 pub use analytics::PgAnalyticsRepository;
 pub use api_key::ApiKeyRepository;
 pub use attestation::PgAttestationRepository;
-pub use contact_email::PgContactEmailRepository;
 pub use conversation::PgConversationRepository;
 pub use credit_allocation::CreditAllocationPolicy;
 pub use file::FileRepository;
@@ -64,7 +60,6 @@ pub use model_alias::ModelAliasRepository;
 pub use near_nonce::PostgresNearNonceRepository;
 pub use oauth_state::{OAuthStateRepository, OAuthStateRow};
 pub use organization::PgOrganizationRepository;
-pub use organization_invitation::PgOrganizationInvitationRepository;
 pub use organization_limits::OrganizationLimitsRepository;
 pub use organization_service_usage::{
     OrganizationServiceUsageRepository, RecordServiceUsageRequest,
@@ -78,7 +73,6 @@ pub use service_usage_repository_impl::ServiceUsageRepositoryImpl;
 pub use session::SessionRepository;
 pub use usage_hourly::UsageHourlyRepositoryImpl;
 pub use user::UserRepository;
-pub use user_erasure::PostgresUserErasureRepository;
 pub use workspace::WorkspaceRepository;
 
 pub mod organization_usage_discount;

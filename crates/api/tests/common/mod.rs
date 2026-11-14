@@ -111,7 +111,6 @@ pub fn test_config() -> ApiConfig {
             google: None,
             near: config::NearConfig::default(),
             admin_emails: vec![ADMIN_ALLOWLIST_EMAIL.to_string()],
-            admin_read_only_tokens_enabled: false,
             require_session_bound_access_tokens: false,
         },
         database: config::DatabaseConfig {
@@ -151,7 +150,6 @@ pub fn test_config() -> ApiConfig {
             encryption_key: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
                 .to_string(),
         },
-        invitation_email: config::InvitationEmailConfig::default(),
         otlp: config::OtlpConfig {
             endpoint: std::env::var("TELEMETRY_OTLP_ENDPOINT")
                 .unwrap_or_else(|_| "http://localhost:4317".to_string()),

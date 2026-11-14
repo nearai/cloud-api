@@ -17,7 +17,8 @@ const NVIDIA_NRAS_URL: &str = "https://nras.attestation.nvidia.com/v3/attest/gpu
 const NVIDIA_NRAS_ISSUER: &str = "https://nras.attestation.nvidia.com";
 const NVIDIA_NRAS_JWKS_URL: &str = "https://nras.attestation.nvidia.com/.well-known/jwks.json";
 const MAX_NRAS_RESPONSE_BYTES: usize = 1024 * 1024;
-const MAX_NRAS_JWKS_BYTES: usize = 64 * 1024;
+// The public key set includes certificate chains for retained signing keys.
+const MAX_NRAS_JWKS_BYTES: usize = 1024 * 1024;
 
 /// Result of verifying an attestation report from an inference backend.
 #[derive(Debug, Clone)]
@@ -1968,6 +1969,42 @@ mod tests {
         let (verdict, gpus) = verify_nras_eat(&body, &fixture.jwks, "DEADBEEF").unwrap();
         assert_eq!(verdict, "PASS");
         assert_eq!(gpus.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn nras_accepts_large_jwks_and_verifies_signed_evidence() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let fixture = SignedNrasFixture::new();
+        let mut jwks = serde_json::to_value(&fixture.jwks).expect("serialize test JWKS");
+        let keys = jwks["keys"].as_array_mut().expect("test JWKS keys");
+        let mut retained_key = keys[0].clone();
+        retained_key["x5c"] = json!(["A".repeat(2200)]);
+        for index in 0..200 {
+            retained_key["kid"] = json!(format!("retained-{index}"));
+            keys.push(retained_key.clone());
+        }
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/.well-known/jwks.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(jwks))
+            .mount(&server)
+            .await;
+
+        let response = reqwest::get(format!("{}/.well-known/jwks.json", server.uri()))
+            .await
+            .expect("fetch test JWKS");
+        let bytes = read_nras_response(response, MAX_NRAS_JWKS_BYTES)
+            .await
+            .expect("accept a JWKS with retained certificate chains");
+        let jwks = serde_json::from_slice(&bytes).expect("parse test JWKS");
+        let mut overall = SignedNrasFixture::claims();
+        overall["x-nvidia-overall-att-result"] = json!(true);
+        let body = fixture.bundle(overall);
+        let (verdict, _) =
+            verify_nras_eat(&body, &jwks, "deadbeef").expect("verify signed GPU evidence");
+        assert_eq!(verdict, "PASS");
     }
 
     #[test]

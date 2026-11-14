@@ -1097,6 +1097,7 @@ pub fn build_app_with_config_and_options(
         let seed = domain_services.attestation_service.ed25519_secret_bytes();
         match OhttpGateway::new(&seed) {
             Ok(gw) => {
+                let gw = gw.with_replay_pool(database.pool().clone());
                 tracing::info!(
                     ohttp_key_config = %hex::encode(gw.config_bytes()),
                     "OHTTP gateway enabled"

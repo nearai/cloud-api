@@ -12,6 +12,8 @@ const OHTTP_KEY_ID: u8 = 1;
 /// encrypt to any instance.
 pub struct OhttpGateway {
     server: Server,
+    replay_store: Option<database::repositories::ohttp_replay::OhttpReplayRepository>,
+    pub(crate) admission_limits: crate::middleware::RateLimitState,
     /// Pre-encoded key configuration bytes for the well-known endpoint.
     config_bytes: Vec<u8>,
 }
@@ -35,8 +37,34 @@ impl OhttpGateway {
         let server = Server::new(config)?;
         Ok(Self {
             server,
+            replay_store: None,
+            admission_limits: crate::middleware::RateLimitState::default(),
             config_bytes,
         })
+    }
+
+    pub fn with_replay_pool(mut self, pool: database::DbPool) -> Self {
+        self.replay_store =
+            Some(database::repositories::ohttp_replay::OhttpReplayRepository::new(pool));
+        self
+    }
+
+    /// Claim an authenticated, successfully decrypted encapsulation exactly once.
+    /// Records live for the lifetime of the key configuration, including restarts.
+    pub async fn claim_request(&self, encapsulated: &[u8]) -> anyhow::Result<bool> {
+        use sha2::{Digest, Sha256};
+        // This gateway accepts only X25519: seven header bytes plus the 32-byte
+        // encapsulated key. Keying on that prefix also covers chunked reframing.
+        let prefix = encapsulated
+            .get(..39)
+            .ok_or_else(|| anyhow::anyhow!("Invalid encapsulation"))?;
+        let config_hash = Sha256::digest(&self.config_bytes).to_vec();
+        let request_hash = Sha256::digest(prefix).to_vec();
+        let store = self
+            .replay_store
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Replay store unavailable"))?;
+        store.claim(&config_hash, &request_hash).await
     }
 
     /// Encoded key configuration bytes (served at `/.well-known/ohttp-gateway`).

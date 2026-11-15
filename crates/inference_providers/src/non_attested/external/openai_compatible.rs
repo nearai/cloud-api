@@ -912,6 +912,7 @@ mod tests {
             service_tier: None,
             modalities: None,
             original_request: None,
+            upstream_cache_salt: None,
             extra,
         }
     }

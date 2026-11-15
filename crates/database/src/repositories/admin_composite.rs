@@ -1,24 +1,17 @@
-use crate::models::{UpdateModelPricingRequest, UpdateOrganizationLimitsDbRequest};
+use crate::models::UpdateModelPricingRequest;
 use crate::pool::DbPool;
 use crate::repositories::lifecycle::{org_lifecycle_predicate, ORG_ALL_MEMBERS_ERASED_SQL};
-use crate::repositories::{
-    ModelAliasRepository, ModelRepository, OrganizationLimitsRepository, ServiceRepository,
-};
+use crate::repositories::{ModelAliasRepository, ModelRepository};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use services::admin::{
-    AdminApiKeyFilters, AdminApiKeyInfo, AdminModelInfo, AdminOrganizationInfo,
-    AdminOrganizationMemberInfo, AdminRepository, DeprecateModelOutcome, ModelAccessGrant,
-    ModelAccessModel, ModelDeprecationDeliveryRecord, ModelDeprecationEmailStatus,
-    ModelDeprecationModel, ModelDeprecationRecipient, ModelHistoryEntry, ModelPricing,
-    ModelPricingSnapshot, ModelValidationState, OrganizationLifecycleFilter, OrganizationLimits,
-    OrganizationLimitsHistoryEntry, OrganizationLimitsUpdate, OrganizationModelAccessGrant,
-    PlatformServiceInfo, PricingChangeDeliveryRecord, PricingChangeOpenConflictError,
-    PricingChangeRecipientRow, ScheduledPricingChange, ScheduledPricingChangeInsert,
-    ScheduledPricingChangeStatus, UpdateModelAdminRequest, UserInfo,
+    AdminOrganizationInfo, AdminRepository, DeprecateModelOutcome, ModelAccessGrant,
+    ModelDeprecationDeliveryRecord, ModelDeprecationEmailStatus, ModelDeprecationRecipient,
+    ModelPricing, ModelPricingSnapshot, OrganizationLifecycleFilter, PricingChangeDeliveryRecord,
+    PricingChangeOpenConflictError, PricingChangeRecipientRow, ScheduledPricingChange,
+    ScheduledPricingChangeInsert, ScheduledPricingChangeStatus, UpdateModelAdminRequest,
 };
 use services::lifecycle::OrganizationLifecycle;
-use services::service_usage::ports::ServiceUnit;
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -52,25 +45,14 @@ pub struct AdminCompositeRepository {
     pool: DbPool,
     model_repo: Arc<ModelRepository>,
     alias_repo: Arc<ModelAliasRepository>,
-    limits_repo: Arc<OrganizationLimitsRepository>,
-    service_repo: Arc<ServiceRepository>,
 }
 
 impl AdminCompositeRepository {
     pub fn new(pool: DbPool) -> Self {
-        Self::with_accounting_config(pool, &config::CreditAllocationConfig::default())
-    }
-
-    pub fn with_accounting_config(pool: DbPool, config: &config::CreditAllocationConfig) -> Self {
         Self {
             pool: pool.clone(),
             model_repo: Arc::new(ModelRepository::new(pool.clone())),
             alias_repo: Arc::new(ModelAliasRepository::new(pool.clone())),
-            limits_repo: Arc::new(OrganizationLimitsRepository::with_accounting_config(
-                pool.clone(),
-                config,
-            )),
-            service_repo: Arc::new(ServiceRepository::new(pool)),
         }
     }
 }
@@ -130,34 +112,6 @@ fn row_to_admin_org_info(row: &tokio_postgres::Row) -> AdminOrganizationInfo {
     }
 }
 
-/// Name pattern of API keys provisioned by the Cloud UI's managed Playground:
-/// `Playground-${credential.id}-g${generation}`, where `credential.id` is a
-/// Prisma `uuid()` (see nearai-cloud-ui `lib/playground/service.ts`). The UI
-/// rejects renames of managed keys, so the name is a stable marker. Keep this in
-/// sync with the UI if its naming changes.
-///
-/// Best-effort: key names are user-supplied and the API rename endpoint does not
-/// know about managed keys, so a regular key deliberately given a matching name
-/// is reported as managed, and a managed key renamed through the API directly
-/// (bypassing the UI) is not.
-const MANAGED_PLAYGROUND_KEY_NAME_PATTERN: &str =
-    "^Playground-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}-g[0-9]+$";
-
-/// Map a row from the admin API key SELECT to `AdminApiKeyInfo`.
-fn row_to_admin_api_key_info(row: &tokio_postgres::Row) -> AdminApiKeyInfo {
-    AdminApiKeyInfo {
-        id: row.get("id"),
-        organization_id: row.get("organization_id"),
-        organization_name: row.get("organization_name"),
-        workspace_id: row.get("workspace_id"),
-        created_by_user_id: row.get("created_by_user_id"),
-        created_at: row.get("created_at"),
-        is_active: row.get("is_active"),
-        deleted_at: row.get("deleted_at"),
-        is_managed_playground: row.get("is_managed_playground"),
-    }
-}
-
 /// One grant with its organization and the admin who made it. Only active
 /// organizations: a grant held by an inactive one has no effect. Callers add
 /// the `WHERE` clause.
@@ -181,31 +135,6 @@ fn row_to_model_access_grant(row: &tokio_postgres::Row) -> ModelAccessGrant {
         granted_by_user_id: row.get("created_by_user_id"),
         granted_by_user_email: row.get("created_by_user_email"),
     }
-}
-
-/// The row must select `id, model_name, is_listed, is_active` of `models`.
-fn row_to_model_access_model(row: &tokio_postgres::Row) -> ModelAccessModel {
-    ModelAccessModel {
-        id: row.get("id"),
-        model_name: row.get("model_name"),
-        is_listed: row.get("is_listed"),
-        is_active: row.get("is_active"),
-    }
-}
-
-fn service_to_info(s: &crate::models::Service) -> Result<PlatformServiceInfo, anyhow::Error> {
-    let unit = ServiceUnit::try_from(s.unit.as_str()).map_err(|e| anyhow::anyhow!("{}", e))?;
-    Ok(PlatformServiceInfo {
-        id: s.id,
-        service_name: s.service_name.clone(),
-        display_name: s.display_name.clone(),
-        description: s.description.clone(),
-        unit,
-        cost_per_unit: s.cost_per_unit,
-        is_active: s.is_active,
-        created_at: s.created_at,
-        updated_at: s.updated_at,
-    })
 }
 
 #[async_trait]
@@ -303,103 +232,6 @@ impl AdminRepository for AdminCompositeRepository {
             openrouter_slug: model.openrouter_slug,
             is_listed: model.is_listed,
         })
-    }
-
-    async fn get_model_validation_state(
-        &self,
-        model_name: &str,
-    ) -> Result<Option<ModelValidationState>> {
-        let model = self.model_repo.get_by_internal_name(model_name).await?;
-        Ok(model.map(|m| ModelValidationState {
-            input_cost_per_token: m.input_cost_per_token,
-            output_cost_per_token: m.output_cost_per_token,
-            cost_per_image: m.cost_per_image,
-            cache_read_cost_per_token: m.cache_read_cost_per_token,
-            allow_free: m.allow_free,
-            provider_type: m.provider_type,
-            provider_config: m.provider_config,
-            deprecation_date: m.deprecation_date,
-        }))
-    }
-
-    async fn get_model_history(
-        &self,
-        model_name: &str,
-        limit: i64,
-        offset: i64,
-    ) -> Result<(Vec<ModelHistoryEntry>, i64)> {
-        let total = self
-            .model_repo
-            .count_model_history_by_name(model_name)
-            .await?;
-
-        let history = self
-            .model_repo
-            .get_model_history_by_name(model_name, limit, offset)
-            .await?;
-
-        let entries = history
-            .into_iter()
-            .map(|h| {
-                Ok(ModelHistoryEntry {
-                    id: h.id,
-                    model_id: h.model_id,
-                    input_cost_per_token: h.input_cost_per_token,
-                    output_cost_per_token: h.output_cost_per_token,
-                    cost_per_image: h.cost_per_image,
-                    cache_read_cost_per_token: h.cache_read_cost_per_token,
-                    text_pricing: parse_text_pricing(h.text_pricing)?,
-                    context_length: h.context_length,
-                    model_name: h.model_name,
-                    model_display_name: h.model_display_name,
-                    model_description: h.model_description,
-                    model_icon: h.model_icon,
-                    verifiable: h.verifiable,
-                    is_active: h.is_active,
-                    owned_by: h.owned_by,
-                    input_modalities: h.input_modalities,
-                    output_modalities: h.output_modalities,
-                    inference_url: h.inference_url,
-                    hugging_face_id: h.hugging_face_id,
-                    quantization: h.quantization,
-                    max_output_length: h.max_output_length,
-                    supported_sampling_parameters: h.supported_sampling_parameters,
-                    supported_features: h.supported_features,
-                    datacenters: h.datacenters,
-                    is_ready: h.is_ready,
-                    deprecation_date: h.deprecation_date,
-                    successor_model_name: h.successor_model_name,
-                    openrouter_slug: h.openrouter_slug,
-                    allow_free: h.allow_free,
-                    is_listed: h.is_listed,
-                    effective_from: h.effective_from,
-                    effective_until: h.effective_until,
-                    changed_by_user_id: h.changed_by_user_id,
-                    changed_by_user_email: h.changed_by_user_email,
-                    change_reason: h.change_reason,
-                    created_at: h.created_at,
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-
-        Ok((entries, total))
-    }
-
-    async fn soft_delete_model(
-        &self,
-        model_name: &str,
-        change_reason: Option<String>,
-        changed_by_user_id: Option<Uuid>,
-        changed_by_user_email: Option<String>,
-    ) -> Result<bool> {
-        self.model_repo
-            .soft_delete_model(
-                model_name,
-                change_reason,
-                changed_by_user_id,
-                changed_by_user_email,
-            )
-            .await
     }
 
     async fn deprecate_model(
@@ -744,173 +576,6 @@ impl AdminRepository for AdminCompositeRepository {
         Ok(Some(outcome))
     }
 
-    async fn update_organization_limits(
-        &self,
-        organization_id: Uuid,
-        limits: OrganizationLimitsUpdate,
-    ) -> Result<OrganizationLimits> {
-        let db_request = UpdateOrganizationLimitsDbRequest {
-            spend_limit: limits.spend_limit,
-            credit_type: limits.credit_type,
-            source: limits.source,
-            currency: limits.currency,
-            changed_by: limits.changed_by,
-            change_reason: limits.change_reason,
-            changed_by_user_id: limits.changed_by_user_id,
-            changed_by_user_email: limits.changed_by_user_email,
-        };
-
-        let history = self
-            .limits_repo
-            .update_limits(organization_id, &db_request)
-            .await?;
-
-        Ok(OrganizationLimits {
-            organization_id: history.organization_id,
-            spend_limit: history.spend_limit,
-            credit_type: history.credit_type,
-            source: history.source,
-            currency: history.currency,
-            effective_from: history.effective_from,
-        })
-    }
-
-    async fn get_current_organization_limits(
-        &self,
-        organization_id: Uuid,
-    ) -> Result<Vec<OrganizationLimits>> {
-        let limits = self.limits_repo.get_current_limits(organization_id).await?;
-
-        Ok(limits
-            .into_iter()
-            .map(|h| OrganizationLimits {
-                organization_id: h.organization_id,
-                spend_limit: h.spend_limit,
-                credit_type: h.credit_type,
-                source: h.source,
-                currency: h.currency,
-                effective_from: h.effective_from,
-            })
-            .collect())
-    }
-
-    async fn count_organization_limits_history(&self, organization_id: Uuid) -> Result<i64> {
-        self.limits_repo.count_limits_history(organization_id).await
-    }
-
-    async fn get_organization_limits_history(
-        &self,
-        organization_id: Uuid,
-        limit: i64,
-        offset: i64,
-    ) -> Result<Vec<OrganizationLimitsHistoryEntry>> {
-        let history = self
-            .limits_repo
-            .get_limits_history(organization_id, limit, offset)
-            .await?;
-
-        Ok(history
-            .into_iter()
-            .map(|h| OrganizationLimitsHistoryEntry {
-                id: h.id,
-                organization_id: h.organization_id,
-                spend_limit: h.spend_limit,
-                credit_type: h.credit_type,
-                source: h.source,
-                currency: h.currency,
-                effective_from: h.effective_from,
-                effective_until: h.effective_until,
-                changed_by: h.changed_by,
-                change_reason: h.change_reason,
-                changed_by_user_id: h.changed_by_user_id,
-                changed_by_user_email: h.changed_by_user_email,
-                created_at: h.created_at,
-            })
-            .collect())
-    }
-
-    async fn list_models(
-        &self,
-        include_inactive: bool,
-        limit: i64,
-        offset: i64,
-    ) -> Result<(Vec<AdminModelInfo>, i64)> {
-        let total = self
-            .model_repo
-            .get_all_models_count(include_inactive)
-            .await?;
-
-        let models = self
-            .model_repo
-            .get_all_models(include_inactive, limit, offset)
-            .await?;
-
-        let admin_models = models
-            .into_iter()
-            .map(|m| AdminModelInfo {
-                id: m.id,
-                model_name: m.model_name,
-                model_display_name: m.model_display_name,
-                model_description: m.model_description,
-                model_icon: m.model_icon,
-                input_cost_per_token: m.input_cost_per_token,
-                output_cost_per_token: m.output_cost_per_token,
-                cost_per_image: m.cost_per_image,
-                cache_read_cost_per_token: m.cache_read_cost_per_token,
-                text_pricing: m.text_pricing,
-                context_length: m.context_length,
-                verifiable: m.verifiable,
-                is_active: m.is_active,
-                owned_by: m.owned_by,
-                aliases: m.aliases,
-                created_at: m.created_at,
-                updated_at: m.updated_at,
-                provider_type: m.provider_type,
-                provider_config: m.provider_config,
-                attestation_supported: m.attestation_supported,
-                input_modalities: m.input_modalities,
-                output_modalities: m.output_modalities,
-                inference_url: m.inference_url,
-                hugging_face_id: m.hugging_face_id,
-                quantization: m.quantization,
-                max_output_length: m.max_output_length,
-                supported_sampling_parameters: m.supported_sampling_parameters,
-                supported_features: m.supported_features,
-                datacenters: m.datacenters,
-                is_ready: m.is_ready,
-                deprecation_date: m.deprecation_date,
-                successor_model_name: m.successor_model_name,
-                openrouter_slug: m.openrouter_slug,
-                is_listed: m.is_listed,
-            })
-            .collect();
-
-        Ok((admin_models, total))
-    }
-
-    async fn get_active_model_for_deprecation(
-        &self,
-        model_name: &str,
-    ) -> Result<Option<ModelDeprecationModel>> {
-        let client = self.pool.get().await?;
-        let row = client
-            .query_opt(
-                r#"
-                SELECT id, model_name, model_display_name
-                FROM models
-                WHERE model_name = $1 AND is_active = true
-                "#,
-                &[&model_name],
-            )
-            .await?;
-
-        Ok(row.map(|row| ModelDeprecationModel {
-            id: row.get("id"),
-            model_name: row.get("model_name"),
-            model_display_name: row.get("model_display_name"),
-        }))
-    }
-
     async fn list_model_deprecation_recipients(
         &self,
         model_name: &str,
@@ -963,33 +628,6 @@ impl AdminRepository for AdminCompositeRepository {
                     organization_name: row.get("organization_name"),
                 })
             })
-            .collect())
-    }
-
-    async fn list_sent_model_deprecation_delivery_keys(
-        &self,
-        model_id: Uuid,
-        successor_model_name: &str,
-        deprecation_date: chrono::DateTime<chrono::Utc>,
-    ) -> Result<Vec<(Uuid, Uuid)>> {
-        let client = self.pool.get().await?;
-        let rows = client
-            .query(
-                r#"
-                SELECT recipient_user_id, organization_id
-                FROM model_deprecation_email_deliveries
-                WHERE model_id = $1
-                  AND successor_model_name = $2
-                  AND deprecation_date = $3
-                  AND status = 'sent'
-                "#,
-                &[&model_id, &successor_model_name, &deprecation_date],
-            )
-            .await?;
-
-        Ok(rows
-            .into_iter()
-            .map(|row| (row.get("recipient_user_id"), row.get("organization_id")))
             .collect())
     }
 
@@ -1277,89 +915,6 @@ impl AdminRepository for AdminCompositeRepository {
         Ok(inserted)
     }
 
-    async fn list_scheduled_pricing_changes_by_batch(
-        &self,
-        batch_id: Uuid,
-    ) -> Result<Vec<ScheduledPricingChange>> {
-        let client = self.pool.get().await?;
-        let rows = client
-            .query(
-                r#"
-                SELECT * FROM scheduled_model_pricing_changes
-                WHERE batch_id = $1
-                ORDER BY model_name
-                "#,
-                &[&batch_id],
-            )
-            .await?;
-        rows.iter().map(row_to_scheduled_pricing_change).collect()
-    }
-
-    async fn list_scheduled_pricing_changes(
-        &self,
-        status: Option<ScheduledPricingChangeStatus>,
-        limit: i64,
-        offset: i64,
-    ) -> Result<(Vec<ScheduledPricingChange>, i64)> {
-        let client = self.pool.get().await?;
-        let status_str = status.map(|s| s.as_str());
-        let rows = client
-            .query(
-                r#"
-                SELECT * FROM scheduled_model_pricing_changes
-                WHERE ($1::text IS NULL OR status = $1)
-                ORDER BY effective_at ASC, model_name ASC
-                LIMIT $2 OFFSET $3
-                "#,
-                &[&status_str, &limit, &offset],
-            )
-            .await?;
-        let total: i64 = client
-            .query_one(
-                r#"
-                SELECT COUNT(*) FROM scheduled_model_pricing_changes
-                WHERE ($1::text IS NULL OR status = $1)
-                "#,
-                &[&status_str],
-            )
-            .await?
-            .get(0);
-
-        let changes = rows
-            .iter()
-            .map(row_to_scheduled_pricing_change)
-            .collect::<Result<Vec<_>>>()?;
-        Ok((changes, total))
-    }
-
-    async fn cancel_scheduled_pricing_change(
-        &self,
-        id: Uuid,
-        cancelled_by_user_id: Option<Uuid>,
-        cancelled_by_user_email: Option<String>,
-    ) -> Result<Option<ScheduledPricingChange>> {
-        let client = self.pool.get().await?;
-        let row = client
-            .query_opt(
-                r#"
-                UPDATE scheduled_model_pricing_changes
-                SET status = 'cancelled',
-                    cancelled_at = NOW(),
-                    cancelled_by_user_id = $2,
-                    cancelled_by_user_email = $3,
-                    updated_at = NOW()
-                WHERE id = $1 AND status = 'pending'
-                RETURNING *
-                "#,
-                &[&id, &cancelled_by_user_id, &cancelled_by_user_email],
-            )
-            .await?;
-
-        row.as_ref()
-            .map(row_to_scheduled_pricing_change)
-            .transpose()
-    }
-
     async fn claim_due_pricing_changes(&self, limit: i64) -> Result<Vec<ScheduledPricingChange>> {
         let client = self.pool.get().await?;
         let rows = client
@@ -1450,28 +1005,6 @@ impl AdminRepository for AdminCompositeRepository {
         Ok(count)
     }
 
-    async fn list_sent_pricing_change_delivery_keys(
-        &self,
-        batch_id: Uuid,
-    ) -> Result<Vec<(Uuid, Uuid)>> {
-        let client = self.pool.get().await?;
-        let rows = client
-            .query(
-                r#"
-                SELECT recipient_user_id, organization_id
-                FROM model_pricing_change_email_deliveries
-                WHERE batch_id = $1 AND status = 'sent'
-                "#,
-                &[&batch_id],
-            )
-            .await?;
-
-        Ok(rows
-            .into_iter()
-            .map(|row| (row.get("recipient_user_id"), row.get("organization_id")))
-            .collect())
-    }
-
     async fn record_pricing_change_delivery(
         &self,
         record: PricingChangeDeliveryRecord,
@@ -1530,53 +1063,6 @@ impl AdminRepository for AdminCompositeRepository {
             .await?;
 
         Ok(())
-    }
-
-    async fn update_organization_concurrent_limit(
-        &self,
-        organization_id: Uuid,
-        concurrent_limit: Option<u32>,
-    ) -> Result<()> {
-        let client = self.pool.get().await?;
-
-        // Convert u32 to i32 for PostgreSQL INTEGER type
-        let db_limit: Option<i32> = concurrent_limit.map(|v| v as i32);
-
-        let rows_updated = client
-            .execute(
-                "UPDATE organizations SET rate_limit = $1, updated_at = NOW() WHERE id = $2 AND is_active = true",
-                &[&db_limit, &organization_id],
-            )
-            .await?;
-
-        if rows_updated == 0 {
-            anyhow::bail!("Organization not found or inactive: {}", organization_id);
-        }
-
-        Ok(())
-    }
-
-    async fn get_organization_concurrent_limit(
-        &self,
-        organization_id: Uuid,
-    ) -> Result<Option<u32>> {
-        let client = self.pool.get().await?;
-
-        let row = client
-            .query_opt(
-                "SELECT rate_limit FROM organizations WHERE id = $1 AND is_active = true",
-                &[&organization_id],
-            )
-            .await?;
-
-        match row {
-            Some(r) => {
-                let db_limit: Option<i32> = r.get("rate_limit");
-                // Convert i32 from DB to u32, filtering out non-positive values
-                Ok(db_limit.and_then(|v| u32::try_from(v).ok()))
-            }
-            None => anyhow::bail!("Organization not found or inactive: {}", organization_id),
-        }
     }
 
     async fn list_all_organizations(
@@ -1665,224 +1151,6 @@ impl AdminRepository for AdminCompositeRepository {
         Ok(row.as_ref().map(row_to_admin_org_info))
     }
 
-    async fn list_all_api_keys(
-        &self,
-        filters: &AdminApiKeyFilters,
-        limit: i64,
-        offset: i64,
-    ) -> Result<Vec<AdminApiKeyInfo>> {
-        let client = self.pool.get().await?;
-
-        let rows = client
-            .query(
-                r#"
-                SELECT
-                    ak.id,
-                    w.organization_id,
-                    o.name AS organization_name,
-                    ak.workspace_id,
-                    ak.created_by_user_id,
-                    ak.created_at,
-                    ak.is_active,
-                    ak.deleted_at,
-                    ak.name ~ $1 AS is_managed_playground
-                FROM api_keys ak
-                JOIN workspaces w ON w.id = ak.workspace_id
-                JOIN organizations o ON o.id = w.organization_id
-                WHERE ($2::uuid IS NULL OR w.organization_id = $2)
-                  AND ($3::timestamptz IS NULL OR ak.created_at >= $3)
-                  AND ($4::timestamptz IS NULL OR ak.created_at <= $4)
-                ORDER BY ak.created_at DESC, ak.id DESC
-                LIMIT $5 OFFSET $6
-                "#,
-                &[
-                    &MANAGED_PLAYGROUND_KEY_NAME_PATTERN,
-                    &filters.organization_id,
-                    &filters.created_after,
-                    &filters.created_before,
-                    &limit,
-                    &offset,
-                ],
-            )
-            .await?;
-
-        Ok(rows.iter().map(row_to_admin_api_key_info).collect())
-    }
-
-    async fn count_all_api_keys(&self, filters: &AdminApiKeyFilters) -> Result<i64> {
-        let client = self.pool.get().await?;
-
-        let row = client
-            .query_one(
-                r#"
-                SELECT COUNT(*) AS count
-                FROM api_keys ak
-                JOIN workspaces w ON w.id = ak.workspace_id
-                WHERE ($1::uuid IS NULL OR w.organization_id = $1)
-                  AND ($2::timestamptz IS NULL OR ak.created_at >= $2)
-                  AND ($3::timestamptz IS NULL OR ak.created_at <= $3)
-                "#,
-                &[
-                    &filters.organization_id,
-                    &filters.created_after,
-                    &filters.created_before,
-                ],
-            )
-            .await?;
-
-        Ok(row.get::<_, i64>("count"))
-    }
-
-    async fn list_organization_members(
-        &self,
-        organization_id: Uuid,
-        limit: i64,
-        offset: i64,
-    ) -> Result<Vec<AdminOrganizationMemberInfo>> {
-        let client = self.pool.get().await?;
-
-        // Inactive (soft-deleted) *users* are INCLUDED — users are soft-deleted
-        // in place (`users.is_active = false`), the response exposes
-        // `user.is_active`.
-        //
-        // Inactive (soft-deleted) *organizations* are EXCLUDED via the
-        // `organizations` join, which hides inactive orgs. Org deletion is a soft
-        // delete that leaves member rows behind, so without this join a
-        // deactivated org would still list members — and would flip between 200
-        // and 404 depending on whether it had any (the service's existence
-        // check only runs when `total == 0`).
-        // Count applies the identical join so totals stay consistent.
-        //
-        // `m.id` is a unique tiebreaker on the sort: members bulk-inserted in
-        // one transaction share `joined_at`, so without it paginated pages can
-        // repeat or skip rows.
-        let rows = client
-            .query(
-                r#"
-                SELECT
-                    m.id            AS member_id,
-                    m.organization_id,
-                    m.role,
-                    m.joined_at,
-                    m.invited_by,
-                    u.id            AS user_id,
-                    u.email,
-                    u.username,
-                    u.display_name,
-                    u.avatar_url,
-                    u.created_at    AS user_created_at,
-                    u.last_login_at,
-                    u.is_active,
-                    u.auth_provider,
-                    u.provider_user_id,
-                    u.contact_email,
-                    u.contact_email_verified_at,
-                    u.email_opt_in_at
-                FROM organization_members m
-                JOIN users u ON u.id = m.user_id
-                JOIN organizations o ON o.id = m.organization_id AND o.is_active = true
-                WHERE m.organization_id = $1
-                ORDER BY m.joined_at DESC, m.id
-                LIMIT $2 OFFSET $3
-                "#,
-                &[&organization_id, &limit, &offset],
-            )
-            .await?;
-
-        let members = rows
-            .into_iter()
-            .map(|row| AdminOrganizationMemberInfo {
-                member_id: row.get("member_id"),
-                organization_id: row.get("organization_id"),
-                role: row.get("role"),
-                joined_at: row.get("joined_at"),
-                invited_by: row.get("invited_by"),
-                user: UserInfo {
-                    id: row.get("user_id"),
-                    email: row.get("email"),
-                    username: row.get("username"),
-                    display_name: row.get("display_name"),
-                    avatar_url: row.get("avatar_url"),
-                    created_at: row.get("user_created_at"),
-                    last_login_at: row.get("last_login_at"),
-                    is_active: row.get("is_active"),
-                    auth_provider: row.get("auth_provider"),
-                    provider_user_id: row.get("provider_user_id"),
-                    contact_email: row.get("contact_email"),
-                    contact_email_verified_at: row.get("contact_email_verified_at"),
-                    email_opt_in_at: row.get("email_opt_in_at"),
-                },
-            })
-            .collect();
-
-        Ok(members)
-    }
-
-    async fn count_organization_members(&self, organization_id: Uuid) -> Result<i64> {
-        let client = self.pool.get().await?;
-
-        let row = client
-            .query_one(
-                r#"
-                SELECT COUNT(*) as count
-                FROM organization_members m
-                JOIN users u ON u.id = m.user_id
-                JOIN organizations o ON o.id = m.organization_id AND o.is_active = true
-                WHERE m.organization_id = $1
-                "#,
-                &[&organization_id],
-            )
-            .await?;
-
-        Ok(row.get::<_, i64>("count"))
-    }
-
-    async fn organization_exists(&self, organization_id: Uuid) -> Result<bool> {
-        let client = self.pool.get().await?;
-
-        let row = client
-            .query_one(
-                r#"
-                SELECT EXISTS (
-                    SELECT 1 FROM organizations
-                    WHERE id = $1 AND is_active = true
-                ) AS exists
-                "#,
-                &[&organization_id],
-            )
-            .await?;
-
-        Ok(row.get::<_, bool>("exists"))
-    }
-
-    async fn get_model_for_access(&self, model_name: &str) -> Result<Option<ModelAccessModel>> {
-        let client = self.pool.get().await?;
-        let row = client
-            .query_opt(
-                r#"
-                SELECT id, model_name, is_listed, is_active
-                FROM models
-                WHERE model_name = $1
-                "#,
-                &[&model_name],
-            )
-            .await?;
-
-        Ok(row.as_ref().map(row_to_model_access_model))
-    }
-
-    async fn list_model_access_grants(&self, model_id: Uuid) -> Result<Vec<ModelAccessGrant>> {
-        let client = self.pool.get().await?;
-        let rows = client
-            .query(
-                &format!("{MODEL_ACCESS_GRANT_SELECT} WHERE a.model_id = $1 ORDER BY a.created_at, a.organization_id"),
-                &[&model_id],
-            )
-            .await?;
-
-        Ok(rows.iter().map(row_to_model_access_grant).collect())
-    }
-
     async fn grant_model_access(
         &self,
         model_id: Uuid,
@@ -1965,107 +1233,5 @@ impl AdminRepository for AdminCompositeRepository {
             .await?;
 
         Ok(revoked > 0)
-    }
-
-    async fn list_organization_model_access(
-        &self,
-        organization_id: Uuid,
-    ) -> Result<Vec<OrganizationModelAccessGrant>> {
-        let client = self.pool.get().await?;
-        let rows = client
-            .query(
-                r#"
-                SELECT
-                    m.id,
-                    m.model_name,
-                    m.is_listed,
-                    m.is_active,
-                    a.created_at,
-                    a.created_by_user_id,
-                    u.email AS created_by_user_email
-                FROM organization_model_access a
-                JOIN models m ON m.id = a.model_id
-                LEFT JOIN users u ON u.id = a.created_by_user_id
-                WHERE a.organization_id = $1
-                ORDER BY m.model_name
-                "#,
-                &[&organization_id],
-            )
-            .await?;
-
-        Ok(rows
-            .iter()
-            .map(|row| OrganizationModelAccessGrant {
-                model: row_to_model_access_model(row),
-                granted_at: row.get("created_at"),
-                granted_by_user_id: row.get("created_by_user_id"),
-                granted_by_user_email: row.get("created_by_user_email"),
-            })
-            .collect())
-    }
-
-    async fn list_services(
-        &self,
-        include_inactive: bool,
-        limit: i64,
-        offset: i64,
-    ) -> Result<(Vec<PlatformServiceInfo>, i64)> {
-        let (services, total) = self
-            .service_repo
-            .list(include_inactive, limit, offset)
-            .await?;
-        let infos: Vec<PlatformServiceInfo> = services
-            .iter()
-            .map(service_to_info)
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok((infos, total))
-    }
-
-    async fn get_service_by_id(&self, id: Uuid) -> Result<Option<PlatformServiceInfo>> {
-        Ok(self
-            .service_repo
-            .get_by_id(id)
-            .await?
-            .as_ref()
-            .map(service_to_info)
-            .transpose()?)
-    }
-
-    async fn create_service(
-        &self,
-        service_name: &str,
-        display_name: &str,
-        description: Option<&str>,
-        unit: ServiceUnit,
-        cost_per_unit: i64,
-    ) -> Result<PlatformServiceInfo> {
-        let s = self
-            .service_repo
-            .create(
-                service_name,
-                display_name,
-                description,
-                unit.as_str(),
-                cost_per_unit,
-            )
-            .await?;
-        service_to_info(&s)
-    }
-
-    async fn update_service(
-        &self,
-        id: Uuid,
-        display_name: Option<&str>,
-        description: Option<&str>,
-        cost_per_unit: Option<i64>,
-        is_active: Option<bool>,
-    ) -> Result<Option<PlatformServiceInfo>> {
-        Ok(self
-            .service_repo
-            .update(id, display_name, description, cost_per_unit, is_active)
-            .await?
-            .as_ref()
-            .map(service_to_info)
-            .transpose()?)
     }
 }

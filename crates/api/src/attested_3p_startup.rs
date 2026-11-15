@@ -237,7 +237,7 @@ async fn register_chutes(
             models = ?cfg.chutes_models,
             "ENABLE_CHUTES is off but CHUTES_MODELS is set; if any of these have an active \
              catalog row, requests will surface provider errors — deactivate them via \
-             PATCH /v1/admin/models or re-enable ENABLE_CHUTES"
+             the admin API's PATCH /v1/admin/models or re-enable ENABLE_CHUTES"
         );
     }
     registered
@@ -255,7 +255,7 @@ async fn register_chutes(
 /// it with real pricing/metadata via the admin API) we leave it untouched. We
 /// only INSERT when missing (and a `seed` is given), INACTIVE with **zero
 /// pricing** — the operator must set real per-token rates via
-/// `PATCH /v1/admin/models` before serving paid traffic, which we warn about.
+/// the admin API's `PATCH /v1/admin/models` before serving paid traffic, which we warn about.
 ///
 /// With `seed: None` and no existing row, nothing is seeded and `None` is
 /// returned (3P-only models are out of scope).
@@ -288,13 +288,13 @@ pub async fn ensure_attested_3p_catalog_row(
                 tracing::warn!(
                     model = %model_name,
                     "{label} model has a DISABLED catalog row (is_active=false); requests will \
-                     404 by design — re-enable via PATCH /v1/admin/models if that's unintended"
+                     404 by design — re-enable via the admin API's PATCH /v1/admin/models if that's unintended"
                 );
             } else if !existing.attestation_supported {
                 tracing::warn!(
                     model = %model_name,
                     "{label} model has an existing catalog row with attestation_supported=false; \
-                     E2EE/signature handling may misbehave — fix via PATCH /v1/admin/models"
+                     E2EE/signature handling may misbehave — fix via the admin API's PATCH /v1/admin/models"
                 );
             } else if existing.supported_sampling_parameters.is_empty()
                 && existing.supported_features.is_empty()
@@ -310,7 +310,7 @@ pub async fn ensure_attested_3p_catalog_row(
                     "{label} model has an existing catalog row with EMPTY supported_features \
                      and supported_sampling_parameters — OpenRouter-style routers will refuse \
                      to route tool calls to it; backfilled by migration V0060, or set via \
-                     PATCH /v1/admin/models"
+                     the admin API's PATCH /v1/admin/models"
                 );
             } else {
                 tracing::info!(model = %model_name, "{label} model already in catalog");
@@ -382,7 +382,7 @@ pub async fn ensure_attested_3p_catalog_row(
                     tracing::warn!(
                         model = %model_name,
                         "Seeded {label} catalog row as INACTIVE with zero pricing — set real \
-                         per-token rates AND is_active=true via PATCH /v1/admin/models to serve \
+                         per-token rates AND is_active=true via the admin API's PATCH /v1/admin/models to serve \
                          (kept inactive so paid traffic can't be billed at $0). The seed \
                          advertises `tools`/`json_mode`: verify this model family actually \
                          supports tool-calling (per-family parser + compatible chat \
@@ -405,7 +405,7 @@ pub async fn ensure_attested_3p_catalog_row(
                     tracing::error!(
                         model = %model_name, error = %e,
                         "Failed to seed {label} catalog row; requests for this model will 404 \
-                         until a row exists (create it via PATCH /v1/admin/models)"
+                         until a row exists (create it via the admin API's PATCH /v1/admin/models)"
                     );
                     Some(ProviderPoolRole::Fallback)
                 }

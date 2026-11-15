@@ -366,7 +366,6 @@ pub async fn record_usage_internal(
 struct ReserveUsageRequest {
     #[serde(default)]
     mode: services::usage::budget::policy::AdmissionMode,
-    execution_model: Option<String>,
     id: Uuid,
     organization_id: Uuid,
     workspace_id: Uuid,
@@ -406,22 +405,7 @@ pub async fn reserve_usage_internal(
         )
         .await
         .map_err(|_| failure(StatusCode::BAD_REQUEST, "Model unavailable"))?;
-    // Fusion child endpoints may use model IDs outside this catalog. Their optional
-    // metadata affects only the estimate; the outer billed model remains authorized.
-    let output_hint = if let Some(name) = request.execution_model.as_deref() {
-        state
-            .models_service
-            .resolve_and_get_model(
-                name,
-                services::models::ModelCaller::Organization(request.organization_id),
-            )
-            .await
-            .ok()
-            .and_then(|model| model.max_output_length)
-    } else {
-        model.max_output_length
-    };
-    let features = request.features.with_model_output(output_hint);
+    let features = request.features.with_model_output(model.max_output_length);
     let admitted = state
         .usage_service
         .admit_external(

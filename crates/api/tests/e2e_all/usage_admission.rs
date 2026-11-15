@@ -12,7 +12,7 @@ use std::sync::{
 use std::time::Duration;
 use uuid::Uuid;
 
-// Keep policy updates local to this server, while exercising the actual registry and routes.
+// Keep policy updates local to this server while exercising the settings registry.
 struct SettingsRepository(Mutex<StoredSetting>);
 
 #[async_trait::async_trait]
@@ -77,7 +77,7 @@ pub(super) async fn server(
         Some(settings),
     )
     .await;
-    let app = api::build_app_with_config_and_options(
+    let app = build_app_with_config_and_options(
         database.clone(),
         auth,
         services,
@@ -101,14 +101,8 @@ pub(super) async fn enforcing_server() -> axum_test::TestServer {
     server(enforcing_settings()).await.0
 }
 
-async fn policy(server: &axum_test::TestServer, value: Value) {
-    server
-        .patch("/v1/admin/settings/usage_admission")
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
-        .add_header("User-Agent", MOCK_USER_AGENT)
-        .json(&value)
-        .await
-        .assert_status_ok();
+async fn policy(_server: &axum_test::TestServer, value: Value) {
+    seeding::seed_admin_setting("usage_admission", value).await;
 }
 
 #[tokio::test]

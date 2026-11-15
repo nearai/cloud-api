@@ -10,7 +10,6 @@ use axum::http::Method;
 pub(crate) enum AdminOperation {
     Read,
     Write,
-    SessionOnly,
 }
 
 pub(crate) fn admin_operation(method: &Method, matched_path: &str) -> AdminOperation {
@@ -22,42 +21,12 @@ pub(crate) fn admin_operation(method: &Method, matched_path: &str) -> AdminOpera
         matched_path
     };
 
-    // Confirms whether an email was ever a customer, so no admin tokens.
-    if path == "/admin/users/{user_id}/erasure" || path == "/admin/user-erasures/lookup" {
-        return AdminOperation::SessionOnly;
-    }
-
-    if path == "/admin/access-tokens" || path.starts_with("/admin/access-tokens/") {
-        return AdminOperation::SessionOnly;
-    }
-
     // Explicitly approve GET and its Axum HEAD fallback on these routes only.
     if matches!(*method, Method::GET | Method::HEAD)
         && matches!(
             path,
-            "/admin/models"
-                | "/admin/models/pricing-changes"
-                | "/admin/models/{model_name}/history"
-                | "/admin/models/{model_name}/access"
-                | "/admin/organizations/{org_id}/model-access"
-                | "/admin/organizations/{org_id}/limits/history"
-                | "/admin/organizations/{org_id}/usage/balance"
-                | "/admin/organizations/{org_id}/policy"
-                | "/admin/organizations/{org_id}/credit/transfer/reconciliation"
-                | "/admin/organizations/{org_id}/staking/farm"
-                | "/admin/aml/reports"
-                | "/admin/aml/allowlist"
-                | "/admin/organizations/{org_id}/concurrent-limit"
-                | "/admin/organizations/{org_id}/fallback"
-                | "/admin/organizations/{org_id}/priority"
-                | "/admin/organizations/{org_id}/metrics"
+            "/admin/organizations/{org_id}/metrics"
                 | "/admin/platform/infra-summary"
-                | "/admin/settings"
-                | "/admin/settings/{key}"
-                | "/admin/invitation-email-deliveries"
-                | "/admin/api-keys"
-                | "/admin/organizations/{org_id}/members"
-                | "/admin/feature-requests"
                 | "/admin/database-encryption/jobs/{id}"
                 | "/admin/database-encryption/keys"
                 | "/admin/object-encryption/jobs/{id}"
@@ -73,11 +42,7 @@ pub(crate) fn admin_operation(method: &Method, matched_path: &str) -> AdminOpera
     if *method == Method::POST
         && matches!(
             path,
-            "/admin/models/pricing-changes/preview"
-                | "/admin/models/{model_name}/deprecation/preview"
-                | "/admin/database-encryption/scan"
-                | "/admin/object-encryption/scan"
-                | "/admin/users/{user_id}/erasure/preview"
+            "/admin/database-encryption/scan" | "/admin/object-encryption/scan"
         )
     {
         return AdminOperation::Read;
@@ -135,72 +100,24 @@ mod tests {
     }
 
     #[test]
-    fn user_erasure_preview_is_read_and_execute_is_session_only() {
-        for prefix in ["/v1", ""] {
-            let preview = format!("{prefix}/admin/users/{{user_id}}/erasure/preview");
-            let execute = format!("{prefix}/admin/users/{{user_id}}/erasure");
-            assert_eq!(
-                admin_operation(&Method::POST, &preview),
-                AdminOperation::Read
-            );
-            assert_eq!(
-                admin_operation(&Method::POST, &execute),
-                AdminOperation::SessionOnly
-            );
-        }
-    }
-
-    #[test]
-    fn user_erasure_lookup_is_session_only() {
+    fn removed_admin_routes_are_not_reads() {
         for path in [
-            "/v1/admin/user-erasures/lookup",
-            "/admin/user-erasures/lookup",
-        ] {
-            assert_eq!(
-                admin_operation(&Method::POST, path),
-                AdminOperation::SessionOnly
-            );
-        }
-    }
-
-    #[test]
-    fn settings_get_is_read_and_patch_is_write() {
-        for path in [
+            "/v1/admin/models",
+            "/v1/admin/models/{model_name}/access",
+            "/v1/admin/organizations/{org_id}/model-access",
+            "/v1/admin/organizations/{org_id}/limits/history",
             "/v1/admin/settings",
-            "/admin/settings",
             "/v1/admin/settings/{key}",
-            "/admin/settings/{key}",
+            "/v1/admin/aml/reports",
+            "/v1/admin/feature-requests",
+            "/v1/admin/api-keys",
+            "/v1/admin/organizations/{org_id}/members",
+            "/v1/admin/organizations/{org_id}/policy",
+            "/v1/admin/organizations/{org_id}/staking/farm",
+            "/v1/admin/organizations/{org_id}/usage/balance",
+            "/v1/admin/organizations/{org_id}/credit/transfer/reconciliation",
         ] {
-            assert_eq!(admin_operation(&Method::GET, path), AdminOperation::Read);
-            assert_eq!(admin_operation(&Method::PATCH, path), AdminOperation::Write);
-            assert_eq!(admin_operation(&Method::PUT, path), AdminOperation::Write);
-        }
-    }
-
-    #[test]
-    fn model_access_listings_are_reads_and_grant_and_revoke_are_writes() {
-        for prefix in ["/v1", ""] {
-            for listing in [
-                "/admin/models/{model_name}/access",
-                "/admin/organizations/{org_id}/model-access",
-            ] {
-                let path = format!("{prefix}{listing}");
-                assert_eq!(admin_operation(&Method::GET, &path), AdminOperation::Read);
-                assert_eq!(admin_operation(&Method::PUT, &path), AdminOperation::Write);
-            }
-            let grant = format!("{prefix}/admin/models/{{model_name}}/access/{{org_id}}");
-            for method in [Method::PUT, Method::DELETE, Method::GET] {
-                assert_eq!(admin_operation(&method, &grant), AdminOperation::Write);
-            }
-        }
-    }
-
-    #[test]
-    fn api_keys_get_is_read() {
-        for path in ["/v1/admin/api-keys", "/admin/api-keys"] {
-            assert_eq!(admin_operation(&Method::GET, path), AdminOperation::Read);
-            assert_eq!(admin_operation(&Method::HEAD, path), AdminOperation::Read);
-            assert_eq!(admin_operation(&Method::POST, path), AdminOperation::Write);
+            assert_eq!(admin_operation(&Method::GET, path), AdminOperation::Write);
         }
     }
 }

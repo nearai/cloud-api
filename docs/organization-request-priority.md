@@ -5,19 +5,11 @@ inference backends. Higher values run ahead of lower values in a priority-enable
 SGLang waiting queue. The default is `0`; the supported range is `-1000` through
 `1000`. A value of `-2` runs below a gateway lane configured at `-1`.
 
-## Admin API
+## Setting the priority
 
-- `GET /v1/admin/organizations/{org_id}/priority`
-- `PATCH /v1/admin/organizations/{org_id}/priority` with `{"priority": -2}`
-
-Both return `{"organization_id": "<org UUID>", "priority": -2}`. PATCH requires
-an integer; setting `0` restores the default. Missing and inactive organizations
-return 404. Out-of-range values return 400.
-
-Platform-admin sessions and write-enabled admin tokens can update the setting.
-Read-only admin tokens can GET/HEAD it. Organization owners, organization admins,
-and inference API keys cannot read or update it. The setting is stored separately
-from organization JSON settings and omitted from customer-facing responses.
+The priority is set through the admin API (`GET`/`PATCH /v1/admin/organizations/{org_id}/priority`,
+range `-1000` to `1000`, `0` restores the default). Cloud API only reads it. The value is stored
+separately from organization JSON settings and omitted from customer-facing responses.
 
 ## Request behavior
 
@@ -43,30 +35,12 @@ Direct customer API-key calls to inference-proxy retain their existing priority.
 This migration does not assign priorities to individual organizations or change
 gateway or engine configuration.
 
-## Local end-to-end check
+## Tests
 
-Build `vllm-proxy-rs` in an inference-proxy checkout containing the trusted
-priority-header support (`cargo build --locked --bin vllm-proxy-rs`). With local
-PostgreSQL available, run the opt-in test from the Cloud API checkout:
-
-```bash
-DEV=true BRAVE_SEARCH_PRO_API_KEY=synthetic-unused-test-key \
-DATABASE_HOST=127.0.0.1 DATABASE_PORT=5432 \
-TEST_DATABASE_NAME=platform_api_priority_local_http \
-INFERENCE_PROXY_TEST_BINARY=/absolute/path/to/inference-proxy/target/debug/vllm-proxy-rs \
-cargo nextest run --test e2e_all --run-ignored all -E 'test(organization_priority::)'
-```
-
-The test starts Cloud API on loopback HTTP with real PostgreSQL and the real
-NEAR AI provider, starts an isolated inference-proxy process in development mode,
-and captures requests at a synthetic OpenAI engine. It checks the engine's
-effective priority for chat/text/Responses, JSON and completed SSE, admin updates
-with an already-used API key, boundary values, reset, customer-supplied priority,
-concurrent organizations, and retries after a transient engine rejection. Other
-tests in the same selection cover admin
-authorization and in-flight tool/title generations. The process is stopped at
-test completion. This CPU-only check does not validate GPU scheduling or TEE
-attestation.
+`crates/api/tests/e2e_all/request_priority.rs` seeds an organization's priority and checks that
+chat, text and Responses requests, JSON and streaming, carry it to the provider, that client-sent
+priority values are ignored, and that concurrent requests from different organizations keep their
+own priority.
 
 ## Rollout validation
 

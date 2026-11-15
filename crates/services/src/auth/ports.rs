@@ -299,8 +299,6 @@ pub trait SessionRepository: Send + Sync {
 
     async fn revoke(&self, session_id: SessionId) -> anyhow::Result<bool>;
 
-    async fn revoke_all_for_user(&self, user_id: UserId) -> anyhow::Result<usize>;
-
     async fn cleanup_expired(&self) -> anyhow::Result<usize>;
 }
 

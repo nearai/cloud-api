@@ -290,36 +290,6 @@ VALUES (
 SQL
 ```
 
-### Option C — admin PATCH
-
-If you want to populate models the same way prod does, use
-`PATCH /v1/admin/models`. The body shape is
-`HashMap<model_id, UpdateModelApiRequest>` — note that `inferenceUrl`
-is **camelCase**; the snake_case form is silently ignored.
-
-Admin endpoints are gated by `AUTH_ADMIN_EMAILS`, which has no default (empty
-means nobody is an admin). Set it explicitly for local testing, including
-`admin@test.com` for the seeded mock user `admin@test.com`:
-
-```env
-AUTH_ADMIN_EMAILS=admin@test.com
-```
-
-Then:
-
-```bash
-curl -s "$BASE/v1/admin/models" "${AUTH[@]}" \
-  -X PATCH -H 'Content-Type: application/json' \
-  -d '{
-    "local/test-model": {
-      "modelDisplayName": "Local Test",
-      "modelDescription": "Local OpenAI-compatible backend",
-      "contextLength": 8192,
-      "inferenceUrl": "http://localhost:8002"
-    }
-  }' | jq .
-```
-
 Provider refresh runs every 300s by default
 (`EXTERNAL_PROVIDER_REFRESH_INTERVAL`). Lower it while iterating.
 
@@ -410,6 +380,12 @@ Place system/developer instructions before conversation history. The typed
 adapter combines the leading instruction messages in order, including the
 organization policy and request `instructions`, for models requiring one
 initial system message. User, assistant, and tool history retains its order.
+The organization policy and request `instructions` are forwarded unchanged. The adapter appends one short sentence asking the
+model to reply in the user's language unless instructed otherwise, and adds the
+current UTC date only when the request declares hosted `web_search` or
+`web_context_search`. Server-added instructions, tool definitions, and the
+provider's chat formatting all count toward provider input usage, so a
+Responses request can report more input tokens than its visible text.
 
 Existing completed-response gateway attestation is preserved on a best-effort
 basis. When its signature write succeeds, `GET /v1/signature/resp_*` can
@@ -475,7 +451,7 @@ required for refresh-token endpoints (e.g. `POST /v1/users/me/access_tokens`).
 **403 on `/v1/admin/*` with mock auth**
 The seeded mock user is `admin@test.com`. `AUTH_ADMIN_EMAILS` has no default
 (empty means nobody is an admin); set it explicitly with `admin@test.com` in the
-list (see §5 Option C) and restart the server.
+list and restart the server.
 
 **401 on API-key endpoints right after creating the key**
 The API key cache refreshes asynchronously. Wait ~10 seconds and retry.

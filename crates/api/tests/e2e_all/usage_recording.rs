@@ -913,6 +913,71 @@ async fn test_record_input_only_usage_types() {
     }
 }
 
+/// An audio report uses seconds as its billing unit and retains its own
+/// inference type, so a direct transcription is priced the same way as one
+/// routed through the gateway.
+#[tokio::test]
+async fn test_record_audio_transcription_usage() {
+    let server = enable_internal_usage_server().await;
+    setup_qwen_model(&server).await;
+    let id = provision_identity(&server).await;
+    let report_id = "test-audio-duration-001";
+
+    let response = post_internal_usage(
+        &server,
+        &id,
+        serde_json::json!({
+            "type": "audio_transcription",
+            "model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+            "duration_seconds": 12,
+            "id": report_id,
+        }),
+    )
+    .await;
+    assert_eq!(response.status_code(), 200, "{}", response.text());
+    let body: serde_json::Value = response.json();
+    assert_eq!(body["input_tokens"], 12);
+    assert_eq!(body["output_tokens"], 0);
+    assert_eq!(body["total_cost"], 12_000_000i64);
+
+    let entry = usage_history_entry(&server, &id.org_id, report_id).await;
+    assert_eq!(entry.inference_type, "audio_transcription");
+    assert_eq!(entry.total_cost, 12_000_000i64);
+
+    let duplicate = post_internal_usage(
+        &server,
+        &id,
+        serde_json::json!({
+            "type": "audio_transcription",
+            "model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+            "duration_seconds": 12,
+            "id": report_id,
+        }),
+    )
+    .await;
+    assert_eq!(duplicate.status_code(), 200, "{}", duplicate.text());
+    assert_eq!(duplicate.json::<serde_json::Value>()["id"], body["id"]);
+}
+
+#[tokio::test]
+async fn test_record_audio_transcription_rejects_zero_duration() {
+    let server = enable_internal_usage_server().await;
+    setup_qwen_model(&server).await;
+    let id = provision_identity(&server).await;
+    let response = post_internal_usage(
+        &server,
+        &id,
+        serde_json::json!({
+            "type": "audio_transcription",
+            "model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+            "duration_seconds": 0,
+            "id": "test-audio-duration-zero",
+        }),
+    )
+    .await;
+    assert_eq!(response.status_code(), 400, "{}", response.text());
+}
+
 /// The input-token-billed kinds reject a non-positive `input_tokens`.
 #[tokio::test]
 async fn test_record_input_only_usage_rejects_zero_tokens() {
@@ -1146,7 +1211,7 @@ async fn budget_admission_settles_once_without_resizing_estimate() {
         &identity,
         serde_json::json!({
             "id": execution_id, "model":"Qwen/Qwen3-30B-A3B-Instruct-2507",
-            "execution_model":"fusion-child-not-in-catalog", "features": features
+            "features": features
         }),
     );
     let denied = server.post("/v1/internal/budget").json(&request).await;
@@ -1201,7 +1266,9 @@ async fn budget_admission_settles_once_without_resizing_estimate() {
     }
     let after = client
         .query_one(
-            "SELECT amount, state, actual_cost FROM usage_budget_reservations WHERE id=$1",
+            "SELECT b.amount, b.state, b.actual_cost, u.inference_id, u.provider_request_id \
+             FROM usage_budget_reservations b JOIN organization_usage_log u \
+             ON u.id=b.inference_usage_id WHERE b.id=$1",
             &[&execution_id],
         )
         .await
@@ -1209,6 +1276,14 @@ async fn budget_admission_settles_once_without_resizing_estimate() {
     assert_eq!(after.get::<_, i64>(0), amount);
     assert_eq!(after.get::<_, String>(1), "settled");
     assert_eq!(after.get::<_, i64>(2), 200_000_000);
+    assert_eq!(
+        after.get::<_, uuid::Uuid>(3),
+        uuid::Uuid::new_v5(
+            &uuid::Uuid::from_u128(0x1966acaf_9f95_5dab_b8f0_03a51c091314),
+            b"provider-receipt",
+        )
+    );
+    assert_eq!(after.get::<_, String>(4), "provider-receipt");
     let spent: i64 = client
         .query_one(
             "SELECT total_spent FROM organization_balance WHERE organization_id=$1",

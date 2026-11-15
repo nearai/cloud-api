@@ -97,30 +97,12 @@ impl UsageRepository for CapturingUsageRepository {
         unimplemented!()
     }
 
-    async fn get_stop_reason_by_response_id(&self, _: Uuid) -> anyhow::Result<Option<StopReason>> {
-        unimplemented!()
-    }
-
-    async fn get_stop_reason_by_provider_request_id(
-        &self,
-        _: &str,
-    ) -> anyhow::Result<Option<StopReason>> {
-        unimplemented!()
-    }
-
     async fn get_usage_by_model(
         &self,
         _: Uuid,
         _: chrono::DateTime<chrono::Utc>,
         _: Option<chrono::DateTime<chrono::Utc>>,
     ) -> anyhow::Result<Vec<UsageByModelEntry>> {
-        unimplemented!()
-    }
-
-    async fn list_inference_usage_report(
-        &self,
-        _: InferenceUsageReportQuery,
-    ) -> anyhow::Result<Vec<InferenceUsageReportRow>> {
         unimplemented!()
     }
 

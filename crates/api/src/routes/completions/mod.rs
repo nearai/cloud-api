@@ -64,6 +64,22 @@ pub use score::*;
 // Timeout for synchronous usage recording before response is returned
 const USAGE_RECORDING_TIMEOUT_SECS: u64 = 5;
 
+/// Expose the exact identifier recorded with this completed inference so
+/// callers can retrieve its cost without changing the provider's body.
+fn with_billing_inference_id(mut response: Response, inference_id: Uuid) -> Response {
+    if response.status() != StatusCode::OK {
+        return response;
+    }
+    if let Ok(value) = axum::http::HeaderValue::from_str(&inference_id.to_string()) {
+        response.headers_mut().insert(HEADER_INFERENCE_ID, value);
+        response.headers_mut().insert(
+            header::ACCESS_CONTROL_EXPOSE_HEADERS,
+            axum::http::HeaderValue::from_static(HEADER_INFERENCE_ID),
+        );
+    }
+    response
+}
+
 // Upper bound on leading SSE control events (keepalive comments, blank
 // lines) consumed while peeking for the first parsed chunk. Real upstreams
 // emit zero before the first data chunk; the cap stops a misbehaving or
@@ -219,66 +235,69 @@ fn build_image_usage_request(
     }
 }
 
-/// Record usage synchronously with timeout, falling back to async retry.
-/// Used for non-streaming operations (image gen/edit) where usage should be
-/// persisted before the HTTP response is returned.
-pub(super) async fn record_usage_with_sync_fallback(
+/// Complete a bounded idempotent usage write before returning a billable 200.
+/// The second attempt handles a transient write failure or timeout, but a
+/// process-local task is not enough to establish a billing record.
+#[allow(
+    clippy::result_large_err,
+    reason = "Shared route helper returns a complete HTTP error response"
+)]
+pub(super) async fn record_usage_before_response(
     usage_service: Arc<dyn services::usage::UsageServiceTrait + Send + Sync>,
     request: services::usage::RecordUsageServiceRequest,
     operation_label: &str,
-) {
-    let provider_request_id = request.provider_request_id.clone().unwrap_or_default();
+) -> Result<(), Response> {
     let organization_id = request.organization_id;
-    let timeout_duration = Duration::from_secs(USAGE_RECORDING_TIMEOUT_SECS);
+    let Some(inference_id) = request.inference_id.filter(|_| request.dedupe_on_conflict) else {
+        tracing::error!(
+            operation = operation_label,
+            %organization_id,
+            "Usage write lacks an idempotent inference identifier"
+        );
+        return Err(usage_recording_error());
+    };
 
-    match tokio::time::timeout(
-        timeout_duration,
-        usage_service.record_usage(request.clone()),
-    )
-    .await
-    {
-        Ok(Ok(_)) => {
-            tracing::debug!(
-                image_id = %provider_request_id,
+    for attempt in 1..=2 {
+        let failure_kind = match tokio::time::timeout(
+            Duration::from_secs(USAGE_RECORDING_TIMEOUT_SECS),
+            usage_service.record_usage(request.clone()),
+        )
+        .await
+        {
+            Ok(Ok(_)) => return Ok(()),
+            Ok(Err(_)) => "write_error",
+            Err(_) => "timeout",
+        };
+        if attempt == 1 {
+            tracing::warn!(
+                operation = operation_label,
                 %organization_id,
-                "{operation_label} usage recorded synchronously"
+                %inference_id,
+                failure_kind,
+                "Retrying usage write before response"
             );
-        }
-        Ok(Err(e)) => {
-            tracing::warn!(
-                error = %e,
-                image_id = %provider_request_id,
-                "Failed to record usage synchronously, retrying async"
+        } else {
+            tracing::error!(
+                operation = operation_label,
+                %organization_id,
+                %inference_id,
+                failure_kind,
+                "Usage write failed before response"
             );
-            spawn_async_usage_retry(usage_service, request, provider_request_id, operation_label);
-        }
-        Err(_timeout) => {
-            tracing::warn!(
-                image_id = %provider_request_id,
-                "Usage recording timed out ({USAGE_RECORDING_TIMEOUT_SECS}s), retrying async"
-            );
-            spawn_async_usage_retry(usage_service, request, provider_request_id, operation_label);
         }
     }
+    Err(usage_recording_error())
 }
 
-/// Spawn an async retry for usage recording after a sync attempt fails or times out.
-fn spawn_async_usage_retry(
-    usage_service: Arc<dyn services::usage::UsageServiceTrait + Send + Sync>,
-    request: services::usage::RecordUsageServiceRequest,
-    provider_request_id: String,
-    operation_label: &str,
-) {
-    let label = operation_label.to_string();
-    tokio::spawn(async move {
-        if let Err(e) = usage_service.record_usage(request).await {
-            tracing::error!(
-                error = %e,
-                image_id = %provider_request_id,
-                "Failed to record {label} usage in async retry"
-            );
-        }
-    });
+fn usage_recording_error() -> Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        ResponseJson(ErrorResponse::new(
+            "Failed to record usage".to_string(),
+            "server_error".to_string(),
+        )),
+    )
+        .into_response()
 }
 
 // Helper function to provide detailed error context for multipart parsing failures

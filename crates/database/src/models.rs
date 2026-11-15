@@ -57,67 +57,6 @@ pub struct OrganizationMember {
     pub invited_by: Option<Uuid>,
 }
 
-/// Organization invitation
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OrganizationInvitation {
-    pub id: Uuid,
-    pub organization_id: Uuid,
-    pub email: String,
-    pub role: OrganizationRole,
-    pub invited_by_user_id: Uuid,
-    pub status: InvitationStatus,
-    pub token: String,
-    pub created_at: DateTime<Utc>,
-    pub expires_at: DateTime<Utc>,
-    pub responded_at: Option<DateTime<Utc>>,
-    pub email_status: InvitationEmailStatus,
-    pub email_sent_at: Option<DateTime<Utc>>,
-    pub email_last_error: Option<String>,
-    pub email_message_id: Option<String>,
-}
-
-/// Invitation status
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "lowercase")]
-pub enum InvitationStatus {
-    Pending,
-    Accepted,
-    Declined,
-    Expired,
-}
-
-impl std::fmt::Display for InvitationStatus {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            InvitationStatus::Pending => write!(f, "pending"),
-            InvitationStatus::Accepted => write!(f, "accepted"),
-            InvitationStatus::Declined => write!(f, "declined"),
-            InvitationStatus::Expired => write!(f, "expired"),
-        }
-    }
-}
-
-/// Email delivery status for organization invitations
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "snake_case")]
-pub enum InvitationEmailStatus {
-    NotAttempted,
-    Sent,
-    Failed,
-    Skipped,
-}
-
-impl std::fmt::Display for InvitationEmailStatus {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            InvitationEmailStatus::NotAttempted => write!(f, "not_attempted"),
-            InvitationEmailStatus::Sent => write!(f, "sent"),
-            InvitationEmailStatus::Failed => write!(f, "failed"),
-            InvitationEmailStatus::Skipped => write!(f, "skipped"),
-        }
-    }
-}
-
 /// Role within an organization
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
@@ -248,19 +187,6 @@ pub struct AddOrganizationMemberRequest {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct UpdateOrganizationMemberRequest {
-    pub role: OrganizationRole,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct UpdateOrganizationRequest {
-    pub name: Option<String>,
-    pub description: Option<String>,
-    pub rate_limit: Option<i32>,
-    pub settings: Option<serde_json::Value>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
 pub struct ApiKeyResponse {
     pub id: Uuid,
     pub key: String, // Only returned on creation
@@ -275,19 +201,8 @@ pub struct CreateWorkspaceRequest {
     pub description: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct UpdateWorkspaceRequest {
-    pub name: Option<String>,
-    pub description: Option<String>,
-    pub settings: Option<serde_json::Value>,
-}
-
 impl OrganizationRole {
     pub fn can_manage_organization(&self) -> bool {
-        matches!(self, OrganizationRole::Owner | OrganizationRole::Admin)
-    }
-
-    pub fn can_manage_members(&self) -> bool {
         matches!(self, OrganizationRole::Owner | OrganizationRole::Admin)
     }
 

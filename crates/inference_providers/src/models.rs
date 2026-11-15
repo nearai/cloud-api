@@ -254,6 +254,32 @@ impl std::fmt::Debug for PlacementContext {
     }
 }
 
+/// Request body field that selects an engine's prompt-cache namespace.
+pub const CACHE_SALT_FIELD: &str = "cache_salt";
+
+/// Server-derived prompt-cache namespace for engines that support
+/// `cache_salt`. Set in process on [`ChatCompletionParams::upstream_cache_salt`],
+/// never deserialized from a client body. The value is derived from tenant
+/// identity, so `Debug` never prints it.
+#[derive(Clone, PartialEq, Eq)]
+pub struct UpstreamCacheSalt(String);
+
+impl UpstreamCacheSalt {
+    pub fn new(value: String) -> Self {
+        Self(value)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for UpstreamCacheSalt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("UpstreamCacheSalt(<redacted>)")
+    }
+}
+
 /// Parameters for chat completion requests (matches OpenAI API)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatCompletionParams {
@@ -361,11 +387,45 @@ pub struct ChatCompletionParams {
     #[serde(default, skip_serializing, skip_deserializing)]
     pub original_request: Option<serde_json::Value>,
 
+    /// Organization-scoped prompt-cache namespace set by the completion
+    /// service. Never accepted from or serialized to JSON directly; providers
+    /// whose engines support `cache_salt` write it with
+    /// [`Self::apply_upstream_cache_salt`].
+    #[serde(skip)]
+    pub upstream_cache_salt: Option<UpstreamCacheSalt>,
+
     #[serde(flatten)]
     pub extra: std::collections::HashMap<String, serde_json::Value>,
 }
 
 impl ChatCompletionParams {
+    /// Remove a client `cache_salt` from `extra` and the original request
+    /// sidecar, returning the `extra` value. A client salt is an input to the
+    /// server namespace, never forwarded as is.
+    pub fn take_client_cache_salt(&mut self) -> Option<serde_json::Value> {
+        if let Some(original) = self
+            .original_request
+            .as_mut()
+            .and_then(|value| value.as_object_mut())
+        {
+            original.remove(CACHE_SALT_FIELD);
+        }
+        self.extra.remove(CACHE_SALT_FIELD)
+    }
+
+    /// Replace any body `cache_salt` with the server-derived namespace. With
+    /// no server namespace the body carries no `cache_salt` at all, so client
+    /// input can never select an engine cache namespace.
+    pub fn apply_upstream_cache_salt(&mut self) {
+        self.extra.remove(CACHE_SALT_FIELD);
+        if let Some(salt) = &self.upstream_cache_salt {
+            self.extra.insert(
+                CACHE_SALT_FIELD.to_string(),
+                serde_json::Value::String(salt.as_str().to_string()),
+            );
+        }
+    }
+
     /// Streaming fields on an upstream request are the server's to set. They
     /// leave `extra` as well: it serializes after the typed fields, so a copy
     /// there would replace them on the wire.
@@ -1484,10 +1544,9 @@ pub struct AudioTranscriptionResponse {
     #[serde(deserialize_with = "deserialize_duration")]
     pub duration: Option<f64>,
 
-    /// Actual duration reported in ordinary JSON `usage`; internal accounting only.
-    #[serde(default, rename = "usage", skip_serializing)]
-    #[serde(deserialize_with = "deserialize_audio_usage_duration")]
-    pub usage_duration_seconds: Option<f64>,
+    /// Duration reported by providers using the audio usage object.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<AudioTranscriptionUsage>,
 
     /// Detected language code
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1506,26 +1565,28 @@ pub struct AudioTranscriptionResponse {
     pub id: Option<String>,
 }
 
-impl AudioTranscriptionResponse {
-    /// Prefer the provider's billable usage over verbose-response metadata.
-    pub fn billable_duration_seconds(&self) -> Option<i32> {
-        [self.usage_duration_seconds, self.duration]
-            .into_iter()
-            .flatten()
-            .find(|n| n.is_finite() && *n > 0.0 && n.ceil() <= f64::from(i32::MAX))
-            .map(|n| n.ceil() as i32)
-    }
+/// Usage shape returned by duration-based transcription providers.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AudioTranscriptionUsage {
+    #[serde(rename = "type")]
+    pub usage_type: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_duration")]
+    pub seconds: Option<f64>,
 }
 
-fn deserialize_audio_usage_duration<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let usage = serde_json::Value::deserialize(deserializer)?;
-    // Other usage kinds (such as token billing) do not provide an audio duration.
-    Ok((usage["type"] == "duration")
-        .then(|| usage["seconds"].as_f64())
-        .flatten())
+impl AudioTranscriptionResponse {
+    pub fn billable_duration(&self) -> Option<f64> {
+        self.duration
+            .filter(|seconds| seconds.is_finite() && *seconds > 0.0)
+            .or_else(|| {
+                self.usage.as_ref().and_then(|usage| {
+                    (usage.usage_type.as_deref() == Some("duration"))
+                        .then_some(usage.seconds)
+                        .flatten()
+                        .filter(|seconds| seconds.is_finite() && *seconds > 0.0)
+                })
+            })
+    }
 }
 
 /// Custom deserializer to handle duration as either string or number
@@ -1609,58 +1670,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn audio_transcription_reads_provider_usage_without_changing_response_fields() {
-        for (fields, expected) in [
-            (
-                serde_json::json!({"usage":{"type":"duration","seconds":91}}),
-                Some(91),
-            ),
-            (serde_json::json!({"duration":1.25}), Some(2)),
-            (serde_json::json!({"duration":"1.25"}), Some(2)),
-            (
-                serde_json::json!({"usage":{"type":"duration","seconds":4},"duration":1.25}),
-                Some(4),
-            ),
-            (
-                serde_json::json!({"usage":{"type":"tokens","input_tokens":91}}),
-                None,
-            ),
-            (serde_json::json!({}), None),
-        ] {
-            let mut wire = fields.clone();
-            wire["text"] = serde_json::json!("hello");
-            let response: AudioTranscriptionResponse = serde_json::from_value(wire).unwrap();
-            assert_eq!(response.billable_duration_seconds(), expected, "{fields}");
-            let serialized = serde_json::to_value(response).unwrap();
-            assert!(serialized.get("usage").is_none());
-            assert!(serialized.get("usage_duration_seconds").is_none());
-            if fields.get("duration").is_none() {
-                assert!(serialized.get("duration").is_none());
-            }
-        }
-    }
+    fn transcription_duration_accepts_both_provider_shapes() {
+        let verbose: AudioTranscriptionResponse = serde_json::from_value(serde_json::json!({
+            "text": "ok", "duration": "3.2"
+        }))
+        .unwrap();
+        assert_eq!(verbose.billable_duration(), Some(3.2));
 
-    #[test]
-    fn audio_transcription_invalid_usage_allows_duration_fallback() {
-        for usage in [
-            serde_json::json!({"type":"duration","seconds":0}),
-            serde_json::json!({"type":"duration","seconds":-1}),
-            serde_json::json!({"type":"duration","seconds":2147483648_u64}),
-            serde_json::json!({"type":"duration","seconds":"bad"}),
-            serde_json::json!({"type":"duration"}),
-            serde_json::json!({"type":"tokens","seconds":91}),
-            serde_json::json!(null),
-            serde_json::json!([]),
-        ] {
-            let mut wire = serde_json::json!({"text":"hello","usage":usage});
-            let response: AudioTranscriptionResponse =
-                serde_json::from_value(wire.clone()).unwrap();
-            assert_eq!(response.billable_duration_seconds(), None, "{wire}");
-            wire["duration"] = serde_json::json!(1.25);
-            let response: AudioTranscriptionResponse =
-                serde_json::from_value(wire.clone()).unwrap();
-            assert_eq!(response.billable_duration_seconds(), Some(2), "{wire}");
-        }
+        let usage: AudioTranscriptionResponse = serde_json::from_value(serde_json::json!({
+            "text": "ok", "usage": {"type": "duration", "seconds": 4.5}
+        }))
+        .unwrap();
+        assert_eq!(usage.billable_duration(), Some(4.5));
+
+        let invalid: AudioTranscriptionResponse = serde_json::from_value(serde_json::json!({
+            "text": "ok", "duration": 0, "usage": {"type": "tokens", "seconds": 10}
+        }))
+        .unwrap();
+        assert_eq!(invalid.billable_duration(), None);
     }
 
     #[test]

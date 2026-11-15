@@ -1,3 +1,11 @@
+// E2E tests for the pricing-change notice (`x-model-pricing-change-date`, `upcoming_pricing`
+// in the catalogs) and for the scheduler pass that applies due changes. Changes are
+// scheduled by the admin API; here they are seeded and the kept readers and the scheduler
+// are what is under test.
+//
+// The `serial_` tests touch the database-wide due queue or write malformed pending rows,
+// so they are an exclusive group in `.config/nextest.toml`.
+
 use crate::common::*;
 use chrono::{Duration, Timelike, Utc};
 use futures::FutureExt;
@@ -7,14 +15,12 @@ use std::{panic::AssertUnwindSafe, sync::Arc};
 
 const HEADER: &str = "x-model-pricing-change-date";
 
-fn future_notice_date(days: i64) -> String {
+fn future_notice_date(days: i64) -> chrono::DateTime<Utc> {
     (Utc::now() + Duration::days(days))
         .with_minute(0)
         .and_then(|time| time.with_second(0))
         .and_then(|time| time.with_nanosecond(0))
         .unwrap()
-        .format("%Y-%m-%dT%H:%M:%SZ")
-        .to_string()
 }
 
 fn text_pricing_profile() -> Value {
@@ -35,7 +41,7 @@ struct Fixture {
     model: String,
     alias: String,
     api_key: String,
-    notice_date: String,
+    notice_date: chrono::DateTime<Utc>,
 }
 
 impl Fixture {
@@ -49,20 +55,20 @@ impl Fixture {
         let suffix = uuid::Uuid::new_v4();
         let model = format!("pricing-notice-{suffix}");
         let alias = format!("pricing-notice-alias-{suffix}");
-        let response = server
-            .patch("/v1/admin/models")
-            .add_header("Authorization", format!("Bearer {}", get_session_id()))
-            .add_header("User-Agent", MOCK_USER_AGENT)
-            .json(&json!({ &model: {
+        let mut batch = api::models::BatchUpdateModelApiRequest::new();
+        batch.insert(
+            model.clone(),
+            serde_json::from_value(json!({
                 "inputCostPerToken": { "amount": 1000, "currency": "USD" },
                 "outputCostPerToken": { "amount": 2000, "currency": "USD" },
                 "modelDisplayName": "Pricing notice fixture",
                 "modelDescription": "Synthetic model",
                 "contextLength": 4096, "maxOutputLength": 1024,
                 "verifiable": false, "isActive": true, "aliases": [&alias],
-            } }))
-            .await;
-        assert_eq!(response.status_code(), 200, "{}", response.text());
+            }))
+            .unwrap(),
+        );
+        seed_models(&server, batch, get_session_id()).await;
         models
             .inference_provider_pool
             .register_provider(
@@ -99,33 +105,27 @@ impl Fixture {
         response
     }
 
-    async fn confirm(&self, mut fields: Value) -> Value {
-        fields["modelId"] = json!(self.model);
-        if fields.get("effectiveAt").is_none() {
-            fields["effectiveAt"] = json!(self.notice_date);
-        }
-        let response = self
-            .server
-            .post("/v1/admin/models/pricing-changes/confirm")
-            .add_header("Authorization", format!("Bearer {}", get_session_id()))
-            .add_header("User-Agent", MOCK_USER_AGENT)
-            .json(&json!({"changes": [fields]}))
-            .await;
-        assert_eq!(response.status_code(), 200, "{}", response.text());
-        response.json::<Value>()["changes"][0].clone()
+    /// Schedule a pending change at the fixture's notice date.
+    async fn schedule(
+        &self,
+        new_input: Option<i64>,
+        new_output: Option<i64>,
+        new_cache_read: Option<i64>,
+        text_pricing: Option<Value>,
+    ) -> uuid::Uuid {
+        seeding::seed_pricing_change(
+            &self.model,
+            self.notice_date,
+            new_input,
+            new_output,
+            new_cache_read,
+            text_pricing,
+        )
+        .await
     }
 
-    async fn cancel(&self, change: &Value) {
-        let response = self
-            .server
-            .delete(&format!(
-                "/v1/admin/models/pricing-changes/{}",
-                change["id"].as_str().unwrap()
-            ))
-            .add_header("Authorization", format!("Bearer {}", get_session_id()))
-            .add_header("User-Agent", MOCK_USER_AGENT)
-            .await;
-        assert_eq!(response.status_code(), 200, "{}", response.text());
+    fn notice(&self) -> String {
+        self.notice_date.format("%Y-%m-%dT%H:%M:%SZ").to_string()
     }
 
     async fn catalogs(&self) -> (Value, Value) {
@@ -164,20 +164,15 @@ impl Fixture {
 }
 
 #[tokio::test]
-async fn confirm_and_cancel_refresh_warm_canonical_alias_and_catalog_caches() {
+async fn pending_change_is_announced_on_canonical_alias_and_catalogs() {
     let fixture = Fixture::new().await;
     // Warm cached model entries that have no pending pricing notice.
     fixture.assert_absent().await;
-    let change = fixture
-        .confirm(json!({
-            "inputCostPerToken": {"amount": 3000, "currency": "USD"},
-            "cacheReadCostPerToken": {"amount": 0, "currency": "USD"},
-        }))
-        .await;
+    fixture.schedule(Some(3000), None, Some(0), None).await;
     for alias in [false, true] {
         for stream in [false, true] {
             let response = fixture.chat(alias, stream).await;
-            assert_eq!(response.headers()[HEADER], fixture.notice_date);
+            assert_eq!(response.headers()[HEADER], fixture.notice());
             // Pricing-only notices must work without any deprecation date.
             assert!(!response.headers().contains_key("x-model-deprecation-date"));
             assert_eq!(response.headers()["access-control-expose-headers"], "*");
@@ -190,10 +185,7 @@ async fn confirm_and_cancel_refresh_warm_canonical_alias_and_catalog_caches() {
     }
     let (openai, native) = fixture.catalogs().await;
     assert_eq!(openai["pricing"]["prompt"], "0.000001");
-    assert_eq!(
-        openai["upcoming_pricing"]["effective_at"],
-        fixture.notice_date
-    );
+    assert_eq!(openai["upcoming_pricing"]["effective_at"], fixture.notice());
     assert_eq!(openai["upcoming_pricing"]["pricing"]["prompt"], "0.000003");
     assert_eq!(
         openai["upcoming_pricing"]["pricing"]["completion"],
@@ -204,10 +196,7 @@ async fn confirm_and_cancel_refresh_warm_canonical_alias_and_catalog_caches() {
         "0"
     );
     assert_eq!(native["inputCostPerToken"]["amount"], 1000);
-    assert_eq!(
-        native["upcomingPricing"]["effectiveAt"],
-        fixture.notice_date
-    );
+    assert_eq!(native["upcomingPricing"]["effectiveAt"], fixture.notice());
     assert_eq!(
         native["upcomingPricing"]["pricing"]["inputCostPerToken"]["amount"],
         3000
@@ -216,29 +205,12 @@ async fn confirm_and_cancel_refresh_warm_canonical_alias_and_catalog_caches() {
         native["upcomingPricing"]["pricing"]["cacheReadCostPerToken"]["amount"],
         0
     );
-    fixture.cancel(&change).await;
-    fixture.assert_absent().await;
-
-    // The earlier cancelled row must not shadow a later pending change.
-    let later_date = future_notice_date(180);
-    fixture
-        .confirm(json!({
-            "effectiveAt": later_date,
-            "inputCostPerToken": {"amount": 4000, "currency": "USD"},
-        }))
-        .await;
-    assert_eq!(
-        fixture.chat(true, false).await.headers()[HEADER],
-        later_date
-    );
 }
 
 #[tokio::test]
 async fn notices_cover_non_chat_successes_but_not_errors() {
     let fixture = Fixture::new().await;
-    fixture
-        .confirm(json!({"inputCostPerToken": {"amount": 3000, "currency": "USD"}}))
-        .await;
+    fixture.schedule(Some(3000), None, None, None).await;
     let response = fixture
         .server
         .post("/v1/embeddings")
@@ -246,7 +218,7 @@ async fn notices_cover_non_chat_successes_but_not_errors() {
         .json(&json!({"model": fixture.model, "input": "hello"}))
         .await;
     assert_eq!(response.status_code(), 200, "{}", response.text());
-    assert_eq!(response.headers()[HEADER], fixture.notice_date);
+    assert_eq!(response.headers()[HEADER], fixture.notice());
     let error = fixture
         .server
         .post("/v1/chat/completions")
@@ -258,48 +230,16 @@ async fn notices_cover_non_chat_successes_but_not_errors() {
 }
 
 #[tokio::test]
-async fn future_prices_use_live_unchanged_fields_and_preserve_disabled_cache_pricing() {
-    let fixture = Fixture::new().await;
-    fixture
-        .confirm(json!({"inputCostPerToken": {"amount": 3000, "currency": "USD"}}))
-        .await;
-    fixture.catalogs().await;
-    let response = fixture
-        .server
-        .patch("/v1/admin/models")
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
-        .add_header("User-Agent", MOCK_USER_AGENT)
-        .json(
-            &json!({ &fixture.model: {"outputCostPerToken": {"amount": 9000, "currency": "USD"}}}),
-        )
-        .await;
-    assert_eq!(response.status_code(), 200, "{}", response.text());
-    let (openai, native) = fixture.catalogs().await;
-    assert_eq!(
-        openai["upcoming_pricing"]["pricing"]["completion"],
-        "0.000009"
-    );
-    assert!(openai["upcoming_pricing"]["pricing"]
-        .get("input_cache_read")
-        .is_none());
-    assert_eq!(
-        native["upcomingPricing"]["pricing"]["outputCostPerToken"]["amount"],
-        9000
-    );
-    assert!(native["upcomingPricing"]["pricing"]
-        .get("cacheReadCostPerToken")
-        .is_none());
-}
-
-#[tokio::test]
 async fn serial_scheduler_replaces_the_notice_with_the_announced_tiered_prices() {
     let fixture = Fixture::new().await;
     let profile = text_pricing_profile();
     fixture.assert_absent().await;
-    let change = fixture.confirm(json!({"textPricing": profile})).await;
+    let id = fixture
+        .schedule(Some(1500), Some(4000), Some(250), Some(profile.clone()))
+        .await;
     assert_eq!(
         fixture.chat(true, false).await.headers()[HEADER],
-        fixture.notice_date
+        fixture.notice()
     );
     let (before_openai, before_native) = fixture.catalogs().await;
     assert_eq!(before_openai["upcoming_pricing"]["textPricing"], profile);
@@ -307,13 +247,8 @@ async fn serial_scheduler_replaces_the_notice_with_the_announced_tiered_prices()
         before_native["upcomingPricing"]["pricing"]["textPricing"],
         profile
     );
-    let id = uuid::Uuid::parse_str(change["id"].as_str().unwrap()).unwrap();
-    let updated = fixture.database.pool().get().await.unwrap()
-        .execute("UPDATE scheduled_model_pricing_changes SET effective_at = NOW() - interval '1 minute' WHERE id = $1 AND status = 'pending'", &[&id]).await.unwrap();
-    assert_eq!(
-        updated, 1,
-        "scheduled pricing change {id} was not backdated"
-    );
+
+    seeding::seed_pricing_change_due(id).await;
     let scheduler = services::admin::ModelPricingScheduler::new(
         Arc::new(database::repositories::AdminCompositeRepository::new(
             fixture.database.pool().clone(),
@@ -321,6 +256,7 @@ async fn serial_scheduler_replaces_the_notice_with_the_announced_tiered_prices()
         fixture.models.clone(),
     );
     scheduler.run_once().await.unwrap();
+
     fixture.assert_absent().await;
     let (after_openai, after_native) = fixture.catalogs().await;
     assert_eq!(
@@ -348,21 +284,129 @@ async fn serial_scheduler_replaces_the_notice_with_the_announced_tiered_prices()
     assert!(resolved.upcoming_pricing.is_none());
 }
 
+#[tokio::test]
+async fn serial_concurrent_schedulers_apply_each_due_change_once() {
+    let mut models_service = None;
+    let (server, database) = setup_test_server_with_domain_services(|services, _| {
+        models_service = Some(services.models_service.clone());
+    })
+    .await;
+    let models_service = models_service.unwrap();
+    let mut models = Vec::new();
+    let mut change_ids = Vec::new();
+    for i in 0..5 {
+        let name = format!("pricing-change-race-{i}-{}", uuid::Uuid::new_v4());
+        let mut batch = api::models::BatchUpdateModelApiRequest::new();
+        batch.insert(
+            name.clone(),
+            serde_json::from_value(json!({
+                "inputCostPerToken": { "amount": 1000, "currency": "USD" },
+                "outputCostPerToken": { "amount": 2000, "currency": "USD" },
+                "modelDisplayName": "Pricing change race",
+                "modelDescription": "Synthetic model",
+                "contextLength": 4096, "maxOutputLength": 1024,
+                "verifiable": false, "isActive": true,
+            }))
+            .unwrap(),
+        );
+        seed_models(&server, batch, get_session_id()).await;
+        change_ids.push(
+            seeding::seed_pricing_change(
+                &name,
+                future_notice_date(30),
+                Some(1500),
+                None,
+                None,
+                None,
+            )
+            .await,
+        );
+        models.push(name);
+    }
+    let scheduler = || {
+        services::admin::ModelPricingScheduler::new(
+            Arc::new(database::repositories::AdminCompositeRepository::new(
+                database.pool().clone(),
+            )),
+            models_service.clone(),
+        )
+    };
+    let client = database.pool().get().await.unwrap();
+    let history_len = |name: String| {
+        let client = &client;
+        async move {
+            let count: i64 = client
+                .query_one(
+                    "SELECT COUNT(*) FROM model_history h JOIN models m ON m.id = h.model_id
+                     WHERE m.model_name = $1",
+                    &[&name],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            count
+        }
+    };
+    let mut before = Vec::new();
+    for name in &models {
+        before.push(history_len(name.clone()).await);
+    }
+
+    // Not due yet: a pass leaves every change pending.
+    scheduler().run_once().await.unwrap();
+    for id in &change_ids {
+        let status: String = client
+            .query_one(
+                "SELECT status FROM scheduled_model_pricing_changes WHERE id = $1",
+                &[id],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(status, "pending");
+    }
+
+    // Two scheduler instances racing over the same due set (multi-instance
+    // deployment): SKIP LOCKED claims must partition it.
+    for id in &change_ids {
+        seeding::seed_pricing_change_due(*id).await;
+    }
+    let (a, b) = (scheduler(), scheduler());
+    let (a, b) = tokio::join!(a.run_once(), b.run_once());
+    a.unwrap();
+    b.unwrap();
+
+    for ((name, id), before) in models.iter().zip(&change_ids).zip(before) {
+        let row = client
+            .query_one(
+                "SELECT c.status, m.input_cost_per_token FROM scheduled_model_pricing_changes c
+                 JOIN models m ON m.id = c.model_id WHERE c.id = $1",
+                &[id],
+            )
+            .await
+            .unwrap();
+        assert_eq!(row.get::<_, String>(0), "applied", "{name}");
+        assert_eq!(row.get::<_, i64>(1), 1500, "{name}");
+        // One history entry for the single apply; a double apply would add two.
+        assert_eq!(history_len(name.clone()).await, before + 1, "{name}");
+    }
+}
+
 async fn assert_invalid_pending_profile_is_advisory(profile: Value) {
     let fixture = Fixture::new().await;
-    let change = fixture
-        .confirm(json!({"textPricing": text_pricing_profile()}))
+    let id = fixture
+        .schedule(
+            Some(1500),
+            Some(4000),
+            Some(250),
+            Some(text_pricing_profile()),
+        )
         .await;
-    let id = uuid::Uuid::parse_str(change["id"].as_str().unwrap()).unwrap();
-    // Simulate a newer writer or an out-of-band edit, bypassing admin validation.
-    let updated = fixture.database.pool().get().await.unwrap()
-        .execute("UPDATE scheduled_model_pricing_changes SET new_text_pricing = $2 WHERE id = $1 AND status = 'pending'", &[&id, &profile]).await.unwrap();
-    assert_eq!(updated, 1, "scheduled pricing change {id} was not updated");
-    // These serial_ tests use the existing nextest exclusive group: malformed
-    // rows would otherwise also affect unrelated admin listing tests.
+    // Simulate a newer writer or an out-of-band edit, bypassing validation.
+    seeding::seed_pricing_change_raw_text_pricing(id, &profile).await;
+    // These serial_ tests use the nextest exclusive group: malformed rows
+    // would otherwise also affect unrelated tests that list models.
     let result = AssertUnwindSafe(async {
-        fixture.models.invalidate_models_cache().await;
-
         // Exercise the canonical-only repository path as well as alias resolution.
         let model = fixture
             .models
@@ -400,22 +444,7 @@ async fn assert_invalid_pending_profile_is_advisory(profile: Value) {
     .await;
 
     // Restore the row even if an assertion panics, so later tests see valid data.
-    let restored = fixture
-        .database
-        .pool()
-        .get()
-        .await
-        .unwrap()
-        .execute(
-            "UPDATE scheduled_model_pricing_changes SET new_text_pricing = $2 WHERE id = $1",
-            &[&id, &text_pricing_profile()],
-        )
-        .await
-        .unwrap();
-    assert_eq!(
-        restored, 1,
-        "scheduled pricing change {id} was not restored"
-    );
+    seeding::seed_pricing_change_raw_text_pricing(id, &text_pricing_profile()).await;
     if let Err(panic) = result {
         std::panic::resume_unwind(panic);
     }

@@ -1,5 +1,5 @@
 use super::models::*;
-use super::ports::{MockCreditTransferRepositoryPort, MockOrganizationCredentialRepositoryPort};
+use super::ports::MockCreditTransferRepositoryPort;
 use super::{OrganizationCreditService, OrganizationCreditServiceTrait};
 use serde_json::json;
 use std::sync::Arc;
@@ -7,10 +7,7 @@ use uuid::Uuid;
 
 #[tokio::test]
 async fn invalid_transfer_never_reaches_persistence() {
-    let service = OrganizationCreditService::new(
-        Arc::new(MockCreditTransferRepositoryPort::new()),
-        Arc::new(MockOrganizationCredentialRepositoryPort::new()),
-    );
+    let service = OrganizationCreditService::new(Arc::new(MockCreditTransferRepositoryPort::new()));
     let org = Uuid::new_v4();
     let request = TransferRequest {
         recipient_organization_id: org,
@@ -40,10 +37,7 @@ async fn valid_send_preserves_atomic_adapter_result() {
         .expect_transfer()
         .times(1)
         .returning(|_, _, _, _| Ok((json!({"id": "committed", "sender_snapshot": {}}), true)));
-    let service = OrganizationCreditService::new(
-        Arc::new(transfers),
-        Arc::new(MockOrganizationCredentialRepositoryPort::new()),
-    );
+    let service = OrganizationCreditService::new(Arc::new(transfers));
     let request = TransferRequest {
         recipient_organization_id: Uuid::new_v4(),
         source_credit_type: "payment".into(),
@@ -66,40 +60,6 @@ async fn valid_send_preserves_atomic_adapter_result() {
 
     assert!(replay);
     assert_eq!(result["id"], "committed");
-}
-
-#[tokio::test]
-async fn invalid_policy_and_credential_never_reach_persistence() {
-    let service = OrganizationCreditService::new(
-        Arc::new(MockCreditTransferRepositoryPort::new()),
-        Arc::new(MockOrganizationCredentialRepositoryPort::new()),
-    );
-    let org = Uuid::new_v4();
-    let owner = Uuid::new_v4();
-    let policy = OrganizationPolicy::default();
-    let credential: CredentialRequest = serde_json::from_value(json!({
-        "name": "payout", "permissions": ["admin"],
-        "expires_at": chrono::Utc::now() + chrono::Duration::hours(1)
-    }))
-    .unwrap();
-
-    let policy_error = service
-        .configure_policy(org, Some((policy, owner, String::new())))
-        .await
-        .unwrap_err();
-    let credential_error = service
-        .save_credential(org, owner, None, &credential)
-        .await
-        .unwrap_err();
-
-    assert_eq!(
-        policy_error.downcast_ref::<TransferError>().unwrap().0,
-        "invalid_policy_configuration"
-    );
-    assert_eq!(
-        credential_error.downcast_ref::<TransferError>().unwrap().0,
-        "invalid_credential_configuration"
-    );
 }
 
 #[test]

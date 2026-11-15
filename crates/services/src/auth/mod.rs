@@ -1055,9 +1055,6 @@ mod tests {
         async fn revoke(&self, _: SessionId) -> anyhow::Result<bool> {
             unimplemented!()
         }
-        async fn revoke_all_for_user(&self, _: UserId) -> anyhow::Result<usize> {
-            unimplemented!()
-        }
         async fn cleanup_expired(&self) -> anyhow::Result<usize> {
             unimplemented!()
         }
@@ -1141,9 +1138,6 @@ mod tests {
                 .unwrap()
                 .remove(&session_id.0)
                 .is_some())
-        }
-        async fn revoke_all_for_user(&self, _: UserId) -> anyhow::Result<usize> {
-            unimplemented!()
         }
         async fn cleanup_expired(&self) -> anyhow::Result<usize> {
             unimplemented!()
@@ -1261,18 +1255,6 @@ mod tests {
             _: OrganizationId,
             _: UserId,
         ) -> Result<Workspace, RepositoryError> {
-            unimplemented!()
-        }
-        async fn update(
-            &self,
-            _: WorkspaceId,
-            _: Option<String>,
-            _: Option<String>,
-            _: Option<serde_json::Value>,
-        ) -> Result<Option<Workspace>, RepositoryError> {
-            unimplemented!()
-        }
-        async fn delete(&self, _: WorkspaceId) -> Result<bool, RepositoryError> {
             unimplemented!()
         }
         async fn count_by_organization(&self, _: OrganizationId) -> Result<i64, RepositoryError> {

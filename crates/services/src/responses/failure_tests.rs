@@ -156,6 +156,135 @@ async fn interrupted_reasoning_and_custom_arguments_keep_the_original_failure() 
     }
 }
 
+/// Each round's usage row is keyed by its provider completion ID, and a round
+/// that ends without final usage is not billed by the completion layer.
+#[tokio::test]
+async fn completion_rounds_record_billing_identity_and_detect_missing_usage() {
+    use crate::responses::billing::UnbilledRound;
+    use serde_json::json;
+
+    let request: models::CreateResponseRequest =
+        serde_json::from_value(json!({"model":"test", "store":false})).unwrap();
+    let (responses, items) = transient::repositories();
+    let key = Uuid::new_v4();
+    let response = responses
+        .create(
+            crate::workspace::WorkspaceId(Uuid::new_v4()),
+            key,
+            request.clone(),
+        )
+        .await
+        .unwrap();
+    let mut ctx = ResponseStreamContext::new(
+        ResponseServiceImpl::extract_response_uuid(&response).unwrap(),
+        key,
+        None,
+        response.id.clone(),
+        None,
+        response.created_at,
+        response.model.clone(),
+        UsageTracker::new(),
+    );
+    let chunk =
+        |id: &str,
+         delta: serde_json::Value,
+         usage: serde_json::Value|
+         -> Result<inference_providers::SSEEvent, inference_providers::CompletionError> {
+            Ok(inference_providers::SSEEvent {
+                raw_bytes: Default::default(),
+                raw_passthrough: false,
+                chunk: Some(inference_providers::StreamChunk::Chat(
+                    serde_json::from_value(json!({
+                        "id":id, "object":"chat.completion.chunk", "created":0,
+                        "model":"test", "choices":[{"index":0, "delta":delta}], "usage":usage,
+                    }))
+                    .unwrap(),
+                )),
+            })
+        };
+    let (tx, _rx) = futures::channel::mpsc::unbounded();
+    let mut emitter = EventEmitter::new(tx);
+
+    async fn run_round(
+        chunks: Vec<Result<inference_providers::SSEEvent, inference_providers::CompletionError>>,
+        ctx: &mut ResponseStreamContext,
+        emitter: &mut EventEmitter,
+        items: &Arc<dyn ports::ResponseItemRepositoryTrait>,
+        request: &models::CreateResponseRequest,
+    ) -> crate::responses::service_helpers::ProcessStreamResult {
+        let mut stream: Pin<
+            Box<
+                dyn Stream<
+                        Item = Result<
+                            inference_providers::SSEEvent,
+                            inference_providers::CompletionError,
+                        >,
+                    > + Send,
+            >,
+        > = Box::pin(futures::stream::iter(chunks));
+        ctx.begin_completion();
+        ResponseServiceImpl::process_completion_stream(
+            &mut stream,
+            emitter,
+            ctx,
+            items,
+            request,
+            Uuid::new_v4(),
+            None,
+        )
+        .await
+        .unwrap()
+    }
+
+    let first = run_round(
+        vec![
+            chunk("chatcmpl-round-1", json!({"content":"Hi"}), json!(null)),
+            chunk(
+                "chatcmpl-round-1",
+                json!({}),
+                json!({"prompt_tokens":7, "completion_tokens":2, "total_tokens":9}),
+            ),
+        ],
+        &mut ctx,
+        &mut emitter,
+        &items,
+        &request,
+    )
+    .await;
+    assert!(!first.stream_error);
+    assert_eq!(
+        ctx.billing.billed_inference_ids(),
+        Ok(vec![crate::completions::hash_inference_id_to_uuid(
+            "chatcmpl-round-1"
+        )])
+    );
+    assert_eq!(
+        ctx.billing.first_inference_id(),
+        Some(crate::completions::hash_inference_id_to_uuid(
+            "chatcmpl-round-1"
+        ))
+    );
+
+    // A provider stream that ends cleanly but omits final usage.
+    let second = run_round(
+        vec![chunk(
+            "chatcmpl-round-2",
+            json!({"content":" there"}),
+            json!(null),
+        )],
+        &mut ctx,
+        &mut emitter,
+        &items,
+        &request,
+    )
+    .await;
+    assert!(!second.stream_error);
+    assert_eq!(
+        ctx.billing.billed_inference_ids(),
+        Err(UnbilledRound::MissingUsage)
+    );
+}
+
 #[tokio::test]
 async fn failed_response_keeps_identity_sequence_partial_output_and_usage() {
     for (error, code, status_code) in [

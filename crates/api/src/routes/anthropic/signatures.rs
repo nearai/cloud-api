@@ -3,7 +3,7 @@
 use super::{AnthropicRawBody, AnthropicRawError, Bytes};
 use crate::routes::common::SIGNATURE_STORE_TIMEOUT;
 use futures_util::StreamExt;
-use services::attestation::ports::AttestationServiceTrait;
+use services::attestation::{ports::AttestationServiceTrait, SignatureOwner};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
 
@@ -21,13 +21,19 @@ pub(super) fn valid_message_id(id: &str) -> bool {
 
 pub(super) struct MessageSigningContext {
     service: Arc<dyn AttestationServiceTrait>,
+    owner: SignatureOwner,
     request_hash: String,
 }
 
 impl MessageSigningContext {
-    pub(super) fn new(service: Arc<dyn AttestationServiceTrait>, request_hash: String) -> Self {
+    pub(super) fn new(
+        service: Arc<dyn AttestationServiceTrait>,
+        owner: SignatureOwner,
+        request_hash: String,
+    ) -> Self {
         Self {
             service,
+            owner,
             request_hash,
         }
     }
@@ -38,11 +44,11 @@ impl MessageSigningContext {
         let result = tokio::time::timeout(
             SIGNATURE_STORE_TIMEOUT,
             self.service
-                .store_chat_signature(&id, self.request_hash, response_hash),
+                .store_chat_signature(self.owner, &id, self.request_hash, response_hash),
         )
         .await;
         if !matches!(result, Ok(Ok(()))) {
-            tracing::error!(message_id = %id, "Native Anthropic gateway signature storage failed or timed out");
+            tracing::error!("Native Anthropic gateway signature storage failed or timed out");
         }
     }
 }

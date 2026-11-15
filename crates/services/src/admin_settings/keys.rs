@@ -40,10 +40,9 @@ pub struct PlacementTuning {
     /// How long a follow pin stays valid, in ms (60000 - 3600000).
     pub pin_ttl_ms: i64,
     /// Default true. False routes every request through legacy routing
-    /// (`LegacyReason::Disabled`). A PATCH applies immediately on the instance
-    /// that receives it and on other instances at the next reload
-    /// ([`RELOAD_INTERVAL`]). For an instant fleet-wide stop (affects every
-    /// environment sharing the Valkey) use the Valkey key
+    /// (`LegacyReason::Disabled`). A change made through the admin API takes effect
+    /// on every instance at its next reload ([`RELOAD_INTERVAL`]). For an instant
+    /// fleet-wide stop (affects every environment sharing the Valkey) use the Valkey key
     /// `routed:_placement_off`. Set it to false only after every instance runs
     /// a build that knows this field (`deny_unknown_fields`).
     pub enabled: bool,
@@ -119,9 +118,8 @@ const ATTESTED_3P_FIELDS: &[&str] = &["disabled_sources"];
 /// chat routing and attestation reports. Only attested third parties can be
 /// switched off.
 ///
-/// Propagation: a PATCH applies immediately on the instance that handled it
-/// and within `RELOAD_INTERVAL` (10 min) on every other instance (there is no
-/// cross-instance push). For a faster stop on other instances, redeploy. Per-org
+/// Propagation: a change made through the admin API takes effect within
+/// `RELOAD_INTERVAL` (10 min) on every instance (there is no cross-instance push). For a faster stop on other instances, redeploy. Per-org
 /// `fallback_disabled` is NOT a substitute: it only excludes registered
 /// fallback providers for that organization, not standalone primaries or
 /// attestation reports.

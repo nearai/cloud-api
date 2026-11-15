@@ -10,7 +10,7 @@ paths:
 `crates/api/src/routes/` (HTTP adapters) call service traits; services in `crates/services/src/<domain>/` hold domain logic and depend only on traits declared in that domain's `ports.rs`; `crates/database/src/repositories/` implements those traits. This keeps services testable with fakes (SQL, cache, or mock implementations of the same trait) and free of Axum and SQL types.
 
 - Services take `Arc<dyn SomeRepository>`, never a concrete database type. `crates/services/` does not import the `database` crate.
-- New routes call a service trait, not a repository. Some existing route modules (admin, auth, services, feature requests) still hold concrete repositories in their state; do not add more, and move logic into a service when you change one of them substantially.
+- New routes call a service trait, not a repository. Some existing route modules (admin, auth, services) still hold concrete repositories in their state; do not add more, and move logic into a service when you change one of them substantially.
 - New persistence goes behind a trait in the owning domain's `ports.rs`, implemented in `crates/database/src/repositories/`.
 - New service: `crates/services/src/<name>/` with `ports.rs` plus `mod.rs`/`service.rs`, exported from `crates/services/src/lib.rs`.
 - New endpoint: handler in `crates/api/src/routes/`, wired into the matching `build_*_routes` function in `crates/api/src/lib.rs`, with `utoipa` annotations so it appears in the OpenAPI spec.

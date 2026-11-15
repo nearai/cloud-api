@@ -2,15 +2,15 @@
 use crate::{
     attestation::{
         ita::{ItaTokenQuery, ItaTokenResponse},
-        models::{AttestationReport, SignatureLookupResult},
+        models::{AttestationReport, SignatureLookupResult, SignatureOwner},
         ports::AttestationServiceTrait,
         AttestationError,
     },
     usage::{
-        InferenceType, InferenceUsageHistoryQuery, InferenceUsageReportQuery,
-        InferenceUsageReportRow, OrganizationBalanceInfo, OrganizationCreditLimit,
-        OrganizationLimit, ProviderAttribution, RecordUsageApiRequest, RecordUsageServiceRequest,
-        UsageCheckResult, UsageDiscount, UsageError, UsageLogEntry, UsageServiceTrait,
+        InferenceType, InferenceUsageHistoryQuery, InferenceUsageReportRow,
+        OrganizationBalanceInfo, OrganizationCreditLimit, OrganizationLimit, ProviderAttribution,
+        RecordUsageApiRequest, RecordUsageServiceRequest, UsageCheckResult, UsageDiscount,
+        UsageError, UsageLogEntry, UsageServiceTrait,
     },
 };
 use async_trait::async_trait;
@@ -57,6 +57,7 @@ pub struct MockAttestationService;
 impl AttestationServiceTrait for MockAttestationService {
     async fn get_chat_signature(
         &self,
+        _owner: SignatureOwner,
         _chat_id: &str,
         _signing_algo: Option<String>,
     ) -> Result<SignatureLookupResult, AttestationError> {
@@ -67,6 +68,7 @@ impl AttestationServiceTrait for MockAttestationService {
 
     async fn store_chat_signature_from_provider(
         &self,
+        _owner: SignatureOwner,
         _chat_id: &str,
     ) -> Result<(), AttestationError> {
         Ok(())
@@ -74,6 +76,7 @@ impl AttestationServiceTrait for MockAttestationService {
 
     async fn store_chat_signature(
         &self,
+        _owner: SignatureOwner,
         _chat_id: &str,
         _request_hash: String,
         _response_hash: String,
@@ -83,6 +86,7 @@ impl AttestationServiceTrait for MockAttestationService {
 
     async fn store_response_signature(
         &self,
+        _owner: SignatureOwner,
         _response_id: &str,
         _request_hash: String,
         _response_hash: String,
@@ -193,6 +197,18 @@ impl UsageServiceTrait for MockUsageService {
                     Some(*image_count),
                     InferenceType::ImageGeneration,
                 ),
+                RecordUsageApiRequest::AudioTranscription {
+                    model,
+                    duration_seconds,
+                    ..
+                } => (
+                    model.clone(),
+                    *duration_seconds,
+                    0,
+                    0,
+                    None,
+                    InferenceType::AudioTranscription,
+                ),
                 RecordUsageApiRequest::Embedding {
                     model,
                     input_tokens,
@@ -348,13 +364,6 @@ impl UsageServiceTrait for MockUsageService {
         _start_date: chrono::DateTime<chrono::Utc>,
         _end_date: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<Vec<crate::usage::UsageByModelEntry>, UsageError> {
-        Ok(vec![])
-    }
-
-    async fn list_inference_usage_report(
-        &self,
-        _query: InferenceUsageReportQuery,
-    ) -> Result<Vec<InferenceUsageReportRow>, UsageError> {
         Ok(vec![])
     }
 
@@ -461,6 +470,18 @@ impl UsageServiceTrait for CapturingUsageService {
                     Some(*image_count),
                     InferenceType::ImageGeneration,
                 ),
+                RecordUsageApiRequest::AudioTranscription {
+                    model,
+                    duration_seconds,
+                    ..
+                } => (
+                    model.clone(),
+                    *duration_seconds,
+                    0,
+                    0,
+                    None,
+                    InferenceType::AudioTranscription,
+                ),
                 RecordUsageApiRequest::Embedding {
                     model,
                     input_tokens,
@@ -616,13 +637,6 @@ impl UsageServiceTrait for CapturingUsageService {
         _start_date: chrono::DateTime<chrono::Utc>,
         _end_date: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<Vec<crate::usage::UsageByModelEntry>, UsageError> {
-        Ok(vec![])
-    }
-
-    async fn list_inference_usage_report(
-        &self,
-        _query: InferenceUsageReportQuery,
-    ) -> Result<Vec<InferenceUsageReportRow>, UsageError> {
         Ok(vec![])
     }
 

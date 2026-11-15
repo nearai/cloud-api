@@ -762,25 +762,6 @@ impl services::organization_credits::ports::CreditTransferRepositoryPort
         )
         .await
     }
-
-    async fn configure_policy(
-        &self,
-        org: Uuid,
-        update: Option<(OrganizationPolicy, Uuid, String)>,
-    ) -> anyhow::Result<Value> {
-        CreditTransferRepository::configure_policy(
-            self,
-            org,
-            update
-                .as_ref()
-                .map(|(policy, actor, reason)| (policy.clone(), *actor, reason.as_str())),
-        )
-        .await
-    }
-
-    async fn reconciliation(&self, org: Uuid) -> anyhow::Result<Value> {
-        CreditTransferRepository::reconciliation(self, org).await
-    }
 }
 
 #[cfg(test)]

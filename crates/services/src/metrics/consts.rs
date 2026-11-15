@@ -115,6 +115,14 @@ pub use inference_providers::placement_io::{
     METRIC_WRITE_ERRORS as METRIC_PLACEMENT_WRITE_ERRORS,
 };
 
+// Responses usage confirmation: one sample per completed typed response, after
+// the route polls for a usage row of every billed inference round. Tagged
+// `result` (confirmed|failed), `reason` on failure (a constant failure kind)
+// and environment.
+pub const METRIC_RESPONSES_USAGE_CONFIRMATION: &str = "cloud_api.responses.usage_confirmation";
+pub const METRIC_RESPONSES_USAGE_CONFIRMATION_DURATION: &str =
+    "cloud_api.responses.usage_confirmation.duration";
+
 // HTTP metrics
 pub const METRIC_HTTP_REQUESTS: &str = "cloud_api.http.requests";
 pub const METRIC_HTTP_DURATION: &str = "cloud_api.http.duration";

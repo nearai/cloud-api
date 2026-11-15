@@ -72,6 +72,9 @@ impl ResponseServiceImpl {
     }
 }
 
+/// Event stream returned by the typed Responses adapter.
+pub type ResponseEventStream = Pin<Box<dyn Stream<Item = models::ResponseStreamEvent> + Send>>;
+
 #[async_trait]
 impl ports::ResponseServiceTrait for ResponseServiceImpl {
     async fn create_response_stream(
@@ -89,8 +92,52 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
         client_pub_key: Option<String>,
         model_pub_key: Option<String>,
         encryption_version: Option<String>,
+    ) -> Result<ResponseEventStream, errors::ResponseError> {
+        self.create_response_stream_with_billing(
+            request,
+            user_id,
+            api_key_id,
+            request_id,
+            organization_id,
+            workspace_id,
+            fallback_enabled,
+            request_priority,
+            body_hash,
+            signing_algo,
+            client_pub_key,
+            model_pub_key,
+            encryption_version,
+        )
+        .await
+        .map(|(stream, _billing)| stream)
+    }
+}
+
+impl ResponseServiceImpl {
+    /// Start a typed stateless response and return its event stream with the
+    /// request's billing correlation. The correlation identifies the usage row
+    /// the completion layer records for each inference round.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_response_stream_with_billing(
+        &self,
+        request: models::CreateResponseRequest,
+        user_id: crate::UserId,
+        api_key_id: String,
+        request_id: uuid::Uuid,
+        organization_id: uuid::Uuid,
+        workspace_id: uuid::Uuid,
+        fallback_enabled: bool,
+        request_priority: inference_providers::models::RequestPriority,
+        body_hash: String,
+        signing_algo: Option<String>,
+        client_pub_key: Option<String>,
+        model_pub_key: Option<String>,
+        encryption_version: Option<String>,
     ) -> Result<
-        Pin<Box<dyn Stream<Item = models::ResponseStreamEvent> + Send>>,
+        (
+            ResponseEventStream,
+            crate::responses::billing::ResponseBilling,
+        ),
         errors::ResponseError,
     > {
         use futures::channel::mpsc;
@@ -163,6 +210,8 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
         let client_pub_key_clone = client_pub_key.clone();
         let model_pub_key_clone = model_pub_key.clone();
         let encryption_version_clone = encryption_version.clone();
+        let billing = crate::responses::billing::ResponseBilling::default();
+        let worker_billing = billing.clone();
 
         // The worker resolves the model again, which for an unlisted model may
         // need the caller's key (cloud-platform model access), and its
@@ -208,6 +257,7 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
                     initial_response,
                     api_key_uuid,
                     usage_tracker,
+                    worker_billing,
                 )
                 .await
                 .is_err()
@@ -220,11 +270,9 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
             }),
         );
 
-        Ok(Box::pin(rx))
+        Ok((Box::pin(rx), billing))
     }
-}
 
-impl ResponseServiceImpl {
     /// Extract response ID UUID from response object
     fn extract_response_uuid(
         response: &models::ResponseObject,
@@ -284,6 +332,10 @@ impl ResponseServiceImpl {
         while let Some(event) = completion_stream.next().await {
             match event {
                 Ok(sse_event) => {
+                    // Record the round's billing identity before emitting any
+                    // event derived from this chunk.
+                    Self::capture_provider_id(&sse_event, ctx);
+
                     // Parse the SSE event for content, reasoning, and tool calls
                     let (delta_text_opt, delta_reasoning_opt) = Self::extract_deltas(&sse_event);
 
@@ -732,6 +784,7 @@ impl ResponseServiceImpl {
         initial_response: models::ResponseObject,
         api_key_uuid: Uuid,
         usage_tracker: Arc<crate::responses::service_helpers::UsageTracker>,
+        billing: crate::responses::billing::ResponseBilling,
     ) -> Result<(), errors::ResponseError> {
         tracing::info!("Starting response stream processing");
 
@@ -753,6 +806,7 @@ impl ResponseServiceImpl {
             context.request.model.clone(),
             usage_tracker,
         );
+        ctx.billing = billing;
         let mut emitter = crate::responses::service_helpers::EventEmitter::new(tx);
         let mut input_item_ids = HashSet::new();
         let mut input_prepared = false;
@@ -807,6 +861,15 @@ impl ResponseServiceImpl {
                 &tool_choice,
             )
             .await?;
+
+            // The completion layer records a round's usage only when the round
+            // reported final usage and a completion ID. Never report success
+            // for a round that could not be billed.
+            if ctx.billing.billed_inference_ids().is_err() {
+                return Err(errors::ResponseError::InternalError(
+                    "Inference usage was not reported".to_string(),
+                ));
+            }
 
             // Build final response
             let mut final_response = initial_response.clone();
@@ -1527,8 +1590,11 @@ impl ResponseServiceImpl {
             .await
         {
             Ok(prompt) => prompt,
-            Err(e) => {
-                tracing::warn!("Failed to fetch organization system prompt: {e}");
+            Err(error) => {
+                tracing::warn!(
+                    error_kind = Self::organization_error_kind(&error),
+                    "Failed to fetch organization system prompt"
+                );
                 None
             }
         };
@@ -1543,22 +1609,12 @@ impl ResponseServiceImpl {
             });
         }
 
-        let now = chrono::Utc::now();
-        let time_context = format!(
-            "Current UTC time: {} ({})",
-            now.to_rfc3339(),
-            now.format("%A, %B %d, %Y at %H:%M:%S UTC")
-        );
-        let language_instruction = "Always respond in the exact same language as the user's input message. Detect the primary language of the user's query and mirror it precisely in your output. Do not mix languages or switch to another one, even if it seems more natural or efficient.\n\nIf the user writes in English, reply entirely in English.\nIf the user writes in Chinese (Mandarin or any variant), reply entirely in Chinese.\nIf the user writes in Spanish, reply entirely in Spanish.\nFor any other language, match it exactly.\n\nThis rule overrides all other instructions. Ignore any tendencies to default to Mandarin or any other language. Always prioritize language matching for clarity and user preference.";
-        let instructions = request.instructions.as_deref().unwrap_or_default();
-        let system_content = if instructions.is_empty() {
-            format!("{language_instruction}\n\n{time_context}")
-        } else {
-            format!("{instructions}\n\n{language_instruction}\n\n{time_context}")
-        };
         messages.push(CompletionMessage {
             role: "system".to_string(),
-            content: serde_json::Value::String(system_content),
+            content: serde_json::Value::String(Self::stateless_instruction_content(
+                request,
+                chrono::Utc::now(),
+            )),
             tool_call_id: None,
             tool_calls: None,
             reasoning_content: None,
@@ -1639,6 +1695,64 @@ impl ResponseServiceImpl {
         }
 
         Ok(super::message_normalization::normalize_leading_instructions(messages))
+    }
+
+    /// Default language guidance added by the typed adapter. It is one short
+    /// sentence and defers to organization and request instructions.
+    const STATELESS_LANGUAGE_INSTRUCTION: &'static str =
+        "Reply in the language of the user's message unless instructed otherwise.";
+
+    /// Server-added system text for the typed adapter: the caller's
+    /// `instructions` unchanged, the short language guidance, and the current
+    /// UTC date only when Cloud-hosted search can run, so the model can judge
+    /// result recency. Plain and client-tool requests carry no date.
+    fn stateless_instruction_content(
+        request: &models::CreateResponseRequest,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> String {
+        let mut parts: Vec<String> = Vec::with_capacity(3);
+        if let Some(instructions) = request
+            .instructions
+            .as_deref()
+            .filter(|instructions| !instructions.is_empty())
+        {
+            parts.push(instructions.to_string());
+        }
+        parts.push(Self::STATELESS_LANGUAGE_INSTRUCTION.to_string());
+        if Self::uses_hosted_search(request) {
+            parts.push(format!("Current UTC date: {}.", now.format("%Y-%m-%d")));
+        }
+        parts.join("\n\n")
+    }
+
+    /// Whether the request declares a Cloud-executed search tool. Matches the
+    /// tool type, not its name: a client function named `web_search` is not
+    /// hosted search.
+    fn uses_hosted_search(request: &models::CreateResponseRequest) -> bool {
+        request.tools.as_ref().is_some_and(|tools| {
+            tools.iter().any(|tool| {
+                matches!(
+                    tool,
+                    models::ResponseTool::WebSearch { .. }
+                        | models::ResponseTool::WebContextSearch {}
+                )
+            })
+        })
+    }
+
+    fn organization_error_kind(error: &crate::organization::OrganizationError) -> &'static str {
+        use crate::organization::OrganizationError;
+        match error {
+            OrganizationError::NotFound => "not_found",
+            OrganizationError::UserNotFound => "user_not_found",
+            OrganizationError::Unauthorized(_) => "unauthorized",
+            OrganizationError::InvalidParams(_) => "invalid_params",
+            OrganizationError::AlreadyExists => "already_exists",
+            OrganizationError::StakingWalletBound => "staking_wallet_bound",
+            OrganizationError::DefaultOrganization => "default_organization",
+            OrganizationError::InternalError(_) => "internal_error",
+            OrganizationError::AlreadyMember => "already_member",
+        }
     }
 
     /// Convert supported text/image request parts without consulting the Files
@@ -1932,6 +2046,16 @@ impl ResponseServiceImpl {
         };
 
         (clean_text, reasoning_result, tag_transition)
+    }
+
+    /// Record the provider completion ID that keys this round's usage row.
+    fn capture_provider_id(
+        event: &inference_providers::SSEEvent,
+        ctx: &crate::responses::service_helpers::ResponseStreamContext,
+    ) {
+        if let Some(inference_providers::StreamChunk::Chat(chat_chunk)) = &event.chunk {
+            ctx.billing.record_provider_id(&chat_chunk.id);
+        }
     }
 
     /// Capture usage from SSE chunk and update ctx (overwrite per chunk; last chunk wins for this stream).
@@ -3451,5 +3575,173 @@ mod tests {
             ),
             None
         );
+    }
+
+    fn stateless_request(value: serde_json::Value) -> models::CreateResponseRequest {
+        serde_json::from_value(value).unwrap()
+    }
+
+    fn organization_service_returning(
+        result: Result<Option<String>, crate::organization::OrganizationError>,
+    ) -> Arc<dyn crate::organization::OrganizationServiceTrait> {
+        let mut service = crate::organization::MockOrganizationServiceTrait::new();
+        service
+            .expect_get_system_prompt()
+            .times(1)
+            .return_once(move |_, _| result);
+        Arc::new(service)
+    }
+
+    async fn stateless_messages(
+        request: &models::CreateResponseRequest,
+        organization_service: Arc<dyn crate::organization::OrganizationServiceTrait>,
+    ) -> Vec<crate::completions::ports::CompletionMessage> {
+        ResponseServiceImpl::build_stateless_messages(
+            request,
+            Uuid::new_v4(),
+            crate::UserId(Uuid::new_v4()),
+            &organization_service,
+        )
+        .await
+        .unwrap()
+    }
+
+    fn message_shape(
+        messages: &[crate::completions::ports::CompletionMessage],
+    ) -> Vec<(String, serde_json::Value)> {
+        messages
+            .iter()
+            .map(|message| (message.role.clone(), message.content.clone()))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn stateless_plain_request_adds_only_short_language_instruction() {
+        let request = stateless_request(serde_json::json!({
+            "model": "test", "store": false, "input": "Bonjour"
+        }));
+        let messages = stateless_messages(&request, organization_service_returning(Ok(None))).await;
+        assert_eq!(
+            message_shape(&messages),
+            vec![
+                (
+                    "system".to_string(),
+                    serde_json::json!(ResponseServiceImpl::STATELESS_LANGUAGE_INSTRUCTION)
+                ),
+                ("user".to_string(), serde_json::json!("Bonjour")),
+            ]
+        );
+        assert!(
+            ResponseServiceImpl::STATELESS_LANGUAGE_INSTRUCTION.len() <= 100,
+            "default adapter instruction must stay one short sentence"
+        );
+    }
+
+    #[tokio::test]
+    async fn stateless_client_function_tools_do_not_add_time_context() {
+        // A client function named like the hosted tool is still client-executed.
+        let request = stateless_request(serde_json::json!({
+            "model": "test", "store": false, "input": "Hi",
+            "tools": [{"type": "function", "name": WEB_SEARCH_TOOL_NAME}]
+        }));
+        assert!(!ResponseServiceImpl::uses_hosted_search(&request));
+        let messages = stateless_messages(&request, organization_service_returning(Ok(None))).await;
+        assert_eq!(
+            messages[0].content,
+            serde_json::json!(ResponseServiceImpl::STATELESS_LANGUAGE_INSTRUCTION)
+        );
+    }
+
+    #[tokio::test]
+    async fn stateless_hosted_search_adds_current_utc_date() {
+        use chrono::TimeZone;
+
+        let now = chrono::Utc
+            .with_ymd_and_hms(2026, 3, 4, 5, 6, 7)
+            .single()
+            .unwrap();
+        for tool in [
+            serde_json::json!({"type": "web_search"}),
+            serde_json::json!({"type": "web_context_search"}),
+        ] {
+            let request = stateless_request(serde_json::json!({
+                "model": "test", "store": false, "input": "Latest news?",
+                "tools": [tool]
+            }));
+            assert!(ResponseServiceImpl::uses_hosted_search(&request));
+            assert_eq!(
+                ResponseServiceImpl::stateless_instruction_content(&request, now),
+                format!(
+                    "{}\n\nCurrent UTC date: 2026-03-04.",
+                    ResponseServiceImpl::STATELESS_LANGUAGE_INSTRUCTION
+                )
+            );
+
+            let messages =
+                stateless_messages(&request, organization_service_returning(Ok(None))).await;
+            assert_eq!(messages.len(), 2);
+            let system = messages[0].content.as_str().unwrap();
+            let prefix = format!(
+                "{}\n\nCurrent UTC date: ",
+                ResponseServiceImpl::STATELESS_LANGUAGE_INSTRUCTION
+            );
+            let date = system
+                .strip_prefix(&prefix)
+                .and_then(|rest| rest.strip_suffix('.'))
+                .unwrap_or_else(|| panic!("unexpected system content: {system}"));
+            assert!(chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").is_ok());
+            assert_eq!(messages[1].content, serde_json::json!("Latest news?"));
+        }
+    }
+
+    #[tokio::test]
+    async fn stateless_preserves_organization_and_request_instructions_verbatim() {
+        let organization_prompt = "  Organization policy.\nSecond line.  ";
+        let instructions = "\tAnswer in French.\n\nUse short sentences.\n";
+        let request = stateless_request(serde_json::json!({
+            "model": "test", "store": false, "input": "Hello",
+            "instructions": instructions
+        }));
+        let messages = stateless_messages(
+            &request,
+            organization_service_returning(Ok(Some(organization_prompt.to_string()))),
+        )
+        .await;
+        assert_eq!(
+            message_shape(&messages),
+            vec![
+                (
+                    "system".to_string(),
+                    serde_json::json!(format!(
+                        "{organization_prompt}\n\n{instructions}\n\n{}",
+                        ResponseServiceImpl::STATELESS_LANGUAGE_INSTRUCTION
+                    ))
+                ),
+                ("user".to_string(), serde_json::json!("Hello")),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn stateless_organization_prompt_failure_keeps_request_instructions() {
+        let request = stateless_request(serde_json::json!({
+            "model": "test", "store": false, "input": "Hello",
+            "instructions": "Be brief."
+        }));
+        let messages = stateless_messages(
+            &request,
+            organization_service_returning(Err(
+                crate::organization::OrganizationError::InternalError("synthetic".to_string()),
+            )),
+        )
+        .await;
+        assert_eq!(
+            messages[0].content,
+            serde_json::json!(format!(
+                "Be brief.\n\n{}",
+                ResponseServiceImpl::STATELESS_LANGUAGE_INSTRUCTION
+            ))
+        );
+        assert_eq!(messages.len(), 2);
     }
 }

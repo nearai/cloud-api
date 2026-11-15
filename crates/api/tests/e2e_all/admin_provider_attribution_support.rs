@@ -131,12 +131,6 @@ pub(super) async fn insert_platform_provider_usage_row(
         .expect("insert usage row");
 }
 
-pub(super) async fn isolated_provider_usage_window(
-    fixture: &PlatformProviderUsageFixture,
-) -> ProviderUsageWindow {
-    isolated_usage_hours(fixture, 1).await
-}
-
 /// `hours` (at most `SLOT_HOURS`) whole far-past UTC hours that no other test reads or
 /// recomputes, starting on a slot boundary.
 pub(super) async fn isolated_usage_hours(

@@ -117,24 +117,6 @@ impl WorkspaceServiceImpl {
         Ok((workspace, organization, role))
     }
 
-    /// A workspace is renamed, reconfigured or deleted only by its creator or an organization
-    /// owner or admin. Every member can still read it and create keys in it.
-    async fn check_workspace_change_permission(
-        &self,
-        workspace_id: WorkspaceId,
-        user_id: UserId,
-    ) -> Result<(), WorkspaceError> {
-        let (workspace, _, role) = self
-            .workspace_member_role(workspace_id, user_id.clone())
-            .await?;
-        if workspace.created_by_user_id == user_id || role.can_manage_organization() {
-            return Ok(());
-        }
-        Err(WorkspaceError::Unauthorized(
-            WORKSPACE_CHANGE_FORBIDDEN.to_string(),
-        ))
-    }
-
     /// A key is revoked, deleted or updated only by its creator or an organization owner or admin.
     fn check_api_key_change_permission(
         api_key: &ApiKey,
@@ -150,27 +132,12 @@ impl WorkspaceServiceImpl {
     }
 }
 
-/// Refusal when a member who did not create the workspace tries to change it.
-const WORKSPACE_CHANGE_FORBIDDEN: &str =
-    "Only the workspace creator or an organization owner or admin can change this workspace";
-
 /// Refusal when a member who did not create the key tries to change it.
 const API_KEY_CHANGE_FORBIDDEN: &str =
     "Only the key creator or an organization owner or admin can change this API key";
 
 #[async_trait]
 impl WorkspaceServiceTrait for WorkspaceServiceImpl {
-    async fn get_workspace(
-        &self,
-        workspace_id: WorkspaceId,
-        requester_id: UserId,
-    ) -> Result<Workspace, WorkspaceError> {
-        let (workspace, _) = self
-            .check_workspace_permission(workspace_id, requester_id)
-            .await?;
-        Ok(workspace)
-    }
-
     async fn get_workspace_with_organization(
         &self,
         workspace_id: WorkspaceId,
@@ -493,63 +460,6 @@ impl WorkspaceServiceTrait for WorkspaceServiceImpl {
             Err(WorkspaceError::NotFound) => Ok(false),
             Err(e) => Err(e),
         }
-    }
-
-    async fn update_workspace(
-        &self,
-        workspace_id: WorkspaceId,
-        requester_id: UserId,
-        name: Option<String>,
-        description: Option<String>,
-        settings: Option<serde_json::Value>,
-    ) -> Result<Workspace, WorkspaceError> {
-        // Check permissions
-        self.check_workspace_change_permission(workspace_id.clone(), requester_id)
-            .await?;
-
-        // If name is being updated, check for duplicates in the same organization
-        if let Some(ref new_name) = name {
-            let workspace = self
-                .workspace_repository
-                .get_by_id(workspace_id.clone())
-                .await
-                .map_err(Self::map_repository_error)?
-                .ok_or(WorkspaceError::NotFound)?;
-
-            if let Some(existing) = self
-                .workspace_repository
-                .get_by_name(workspace.organization_id.0, new_name)
-                .await
-                .map_err(Self::map_repository_error)?
-            {
-                if existing.id != workspace_id {
-                    return Err(WorkspaceError::AlreadyExists);
-                }
-            }
-        }
-
-        // Update the workspace
-        self.workspace_repository
-            .update(workspace_id, name, description, settings)
-            .await
-            .map_err(Self::map_repository_error)?
-            .ok_or(WorkspaceError::NotFound)
-    }
-
-    async fn delete_workspace(
-        &self,
-        workspace_id: WorkspaceId,
-        requester_id: UserId,
-    ) -> Result<bool, WorkspaceError> {
-        // Check permissions
-        self.check_workspace_change_permission(workspace_id.clone(), requester_id)
-            .await?;
-
-        // Delete the workspace
-        self.workspace_repository
-            .delete(workspace_id)
-            .await
-            .map_err(Self::map_repository_error)
     }
 
     async fn list_workspaces_for_user(

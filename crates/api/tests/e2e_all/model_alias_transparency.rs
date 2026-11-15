@@ -68,22 +68,7 @@ async fn setup_deprecated_alias_with_mock() -> (
         .register_provider(canonical.clone(), mock_provider_trait)
         .await;
 
-    let resp = server
-        .post("/v1/admin/models/deprecate")
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
-        .add_header("User-Agent", MOCK_USER_AGENT)
-        .json(&serde_json::json!({
-            "modelId": old,
-            "successorModelId": canonical,
-            "changeReason": "alias transparency e2e"
-        }))
-        .await;
-    assert_eq!(
-        resp.status_code(),
-        200,
-        "deprecation should succeed: {}",
-        resp.text()
-    );
+    seeding::seed_deprecation(&old, &canonical, "alias transparency e2e").await;
     (server, router, mock_provider, old, canonical)
 }
 
@@ -540,17 +525,12 @@ async fn test_alias_to_external_model_with_upstream_name_override_warns() {
     );
     seed_models(&server, batch, get_session_id()).await;
 
-    let resp = server
-        .post("/v1/admin/models/deprecate")
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
-        .add_header("User-Agent", MOCK_USER_AGENT)
-        .json(&serde_json::json!({
-            "modelId": old,
-            "successorModelId": canonical,
-            "changeReason": "alias transparency e2e (external override)"
-        }))
-        .await;
-    assert_eq!(resp.status_code(), 200, "{}", resp.text());
+    seeding::seed_deprecation(
+        &old,
+        &canonical,
+        "alias transparency e2e (external override)",
+    )
+    .await;
 
     // Mock backend echoes the UPSTREAM name, like a real external provider
     // applying provider_config.model_name.

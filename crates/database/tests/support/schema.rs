@@ -45,5 +45,23 @@ async fn apply_schema() -> Result<()> {
     if !status.success() {
         bail!("scripts/apply-schema.sh failed with {status}");
     }
+    let (client, connection) = tokio_postgres::Config::new()
+        .host(env_or("PGHOST", "localhost"))
+        .port(env_or("PGPORT", "5432").parse().context("parse PGPORT")?)
+        .user(env_or("PGUSER", "postgres"))
+        .password(env_or("PGPASSWORD", "postgres"))
+        .dbname(env_or("PGDATABASE", "platform_api"))
+        .connect(tokio_postgres::NoTls)
+        .await
+        .context("connect for the test schema bridge")?;
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    client
+        .batch_execute(include_str!(
+            "../../../../scripts/test-chat-signature-owner.sql"
+        ))
+        .await
+        .context("apply the test schema bridge")?;
     Ok(())
 }

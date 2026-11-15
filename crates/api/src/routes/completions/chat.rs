@@ -189,7 +189,6 @@ pub(super) async fn chat_completions_inner(
     request: ChatCompletionRequest,
     request_id: Uuid,
 ) -> axum::response::Response {
-    let workspace_id = api_key.workspace.id.0;
     let request_hash = body_hash.hash.clone();
 
     // Convert HTTP request to service parameters
@@ -286,10 +285,10 @@ pub(super) async fn chat_completions_inner(
                     })
                     .unwrap_or((None, None))
             }
-            Err(error) => {
+            Err(_) => {
                 tracing::warn!(
                     model = %request.model,
-                    error = %error,
+                    error_kind = "model_metadata_lookup",
                     "Failed to read cached model metadata for attestation signing decisions"
                 );
                 (None, None)
@@ -563,6 +562,7 @@ pub(super) async fn chat_completions_inner(
                 let public_signature_hasher_for_chain = public_signature_hasher.clone();
                 let public_signature_chat_id_for_chain = public_signature_chat_id.clone();
                 let attestation_service_for_chain = app_state.attestation_service.clone();
+                let signature_owner = api_key.signature_owner();
 
                 // Re-attach any stashed leading control events, then convert
                 // to a raw bytes stream.
@@ -862,7 +862,9 @@ pub(super) async fn chat_completions_inner(
                                     .unwrap_or_else(|e| {
                                         tracing::error!(
                                             %organization_id,
-                                            "Failed to serialize stream chunk: {e}"
+                                            error_kind = "serialization",
+                                            serde_category = ?e.classify(),
+                                            "Failed to serialize stream chunk"
                                         );
                                         "{}".to_string()
                                     });
@@ -988,7 +990,9 @@ pub(super) async fn chat_completions_inner(
                                                     tracing::error!(
                                                         %organization_id,
                                                         model = %model_name,
-                                                        "Failed to serialize final usage chunk: {e}"
+                                                        error_kind = "serialization",
+                                                        serde_category = ?e.classify(),
+                                                        "Failed to serialize final usage chunk"
                                                     );
                                                 }
                                             },
@@ -1049,7 +1053,8 @@ pub(super) async fn chat_completions_inner(
                                         if let Some(chat_id) = chat_id {
                                             match tokio::time::timeout(
                                                 SIGNATURE_STORE_TIMEOUT,
-                                                attestation_service_for_chain.store_chat_signature(workspace_id,
+                                                attestation_service_for_chain.store_chat_signature(
+                                                    signature_owner,
                                                     &chat_id,
                                                     request_hash.clone(),
                                                     response_hash,
@@ -1061,7 +1066,7 @@ pub(super) async fn chat_completions_inner(
                                                 Ok(Err(error)) => tracing::error!(
                                                     %organization_id,
                                                     model = %model_name,
-                                                    error = %error,
+                                                    error_kind = error.kind(),
                                                     "Failed to store public stream chat signature"
                                                 ),
                                                 Err(_) => tracing::error!(
@@ -1097,7 +1102,8 @@ pub(super) async fn chat_completions_inner(
                                         };
                                         match tokio::time::timeout(
                                             SIGNATURE_STORE_TIMEOUT,
-                                            attestation_service_for_chain.store_chat_signature(workspace_id,
+                                            attestation_service_for_chain.store_chat_signature(
+                                                signature_owner,
                                                 &chat_id,
                                                 request_hash.clone(),
                                                 response_hash,
@@ -1109,7 +1115,7 @@ pub(super) async fn chat_completions_inner(
                                             Ok(Err(error)) => tracing::error!(
                                                 %organization_id,
                                                 model = %model_name,
-                                                error = %error,
+                                                error_kind = error.kind(),
                                                 "Failed to store synthesized-done stream signature"
                                             ),
                                             Err(_) => tracing::error!(
@@ -1231,7 +1237,11 @@ pub(super) async fn chat_completions_inner(
                     match serde_json::to_vec(&response_with_bytes.response) {
                         Ok(b) => b,
                         Err(e) => {
-                            tracing::error!(error = %e, "failed to re-serialize unredacted chat response");
+                            tracing::error!(
+                                error_kind = "serialization",
+                                serde_category = ?e.classify(),
+                                "failed to re-serialize unredacted chat response"
+                            );
                             app_state
                                 .attestation_service
                                 .release_chat_signature_pin(&response_with_bytes.response.id)
@@ -1287,7 +1297,7 @@ pub(super) async fn chat_completions_inner(
                     if let Err(error) = app_state
                         .attestation_service
                         .store_chat_signature_and_unpin(
-                            workspace_id,
+                            api_key.signature_owner(),
                             &response_with_bytes.response.id,
                             request_hash.clone(),
                             response_hash,
@@ -1295,8 +1305,7 @@ pub(super) async fn chat_completions_inner(
                         .await
                     {
                         tracing::error!(
-                            chat_id = %response_with_bytes.response.id,
-                            error = %error,
+                            error_kind = error.kind(),
                             "Failed to store public chat completion signature"
                         );
                     }

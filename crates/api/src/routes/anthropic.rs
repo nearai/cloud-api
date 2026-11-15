@@ -386,8 +386,11 @@ fn spawn_native_usage_recording(
                 .await
                 {
                     Ok(Ok(())) => {}
-                    Ok(Err(error)) => {
-                        tracing::error!(error = %error, "Failed to record native Anthropic stream usage");
+                    Ok(Err(_)) => {
+                        tracing::error!(
+                            error_kind = "usage_write_failed",
+                            "Failed to record native Anthropic stream usage"
+                        );
                     }
                     Err(_) => {
                         tracing::error!("Timed out recording native Anthropic stream usage");
@@ -488,8 +491,8 @@ pub async fn messages(
     body: Bytes,
 ) -> Response {
     let signing = MessageSigningContext::new(
-        api_key.workspace.id.0,
         app_state.attestation_service.clone(),
+        api_key.signature_owner(),
         body_hash.hash,
     );
     handle_request(
@@ -591,8 +594,8 @@ async fn handle_request(
             Err(CompletionError::RateLimitExceeded(message)) => {
                 return anthropic_error(StatusCode::TOO_MANY_REQUESTS, "rate_limit_error", message);
             }
-            Err(error) => {
-                tracing::error!(error = %error, model = %model.model_name, "Failed to acquire native Anthropic concurrency slot");
+            Err(_) => {
+                tracing::error!(error_kind = "concurrency_slot", model = %model.model_name, "Failed to acquire native Anthropic concurrency slot");
                 return anthropic_error(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "api_error",
@@ -626,8 +629,8 @@ async fn handle_request(
         Err(AnthropicRawError::InvalidRequest(message)) => {
             return anthropic_error(StatusCode::BAD_REQUEST, "invalid_request_error", message);
         }
-        Err(AnthropicRawError::Transport(error)) => {
-            tracing::error!(error = %error, model = %model.model_name, "Native Anthropic transport failed");
+        Err(AnthropicRawError::Transport(_)) => {
+            tracing::error!(error_kind = "upstream_transport", model = %model.model_name, "Native Anthropic transport failed");
             return anthropic_error(
                 StatusCode::BAD_GATEWAY,
                 "api_error",
@@ -1068,8 +1071,11 @@ fn model_resolution_error(error: ModelsError) -> Response {
             "not_found_error",
             "The requested model was not found",
         ),
-        other => {
-            tracing::error!(error = %other, "Failed to resolve native Anthropic model");
+        _ => {
+            tracing::error!(
+                error_kind = "model_resolution",
+                "Failed to resolve native Anthropic model"
+            );
             anthropic_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "api_error",
@@ -1092,8 +1098,11 @@ async fn build_upstream_response(
     if status.is_success() && endpoint == AnthropicRawEndpoint::Messages && !stream {
         let bytes = match collect_body(&mut upstream).await {
             Ok(bytes) => bytes,
-            Err(error) => {
-                tracing::error!(error = %error, "Failed to read native Anthropic response body");
+            Err(_) => {
+                tracing::error!(
+                    error_kind = "upstream_body",
+                    "Failed to read native Anthropic response body"
+                );
                 return anthropic_error(
                     StatusCode::BAD_GATEWAY,
                     "api_error",
@@ -1103,8 +1112,11 @@ async fn build_upstream_response(
         };
         let usage = match parse_non_stream_usage(&bytes) {
             Ok(usage) => usage,
-            Err(error) => {
-                tracing::error!(error, "Native Anthropic response omitted valid usage");
+            Err(_) => {
+                tracing::error!(
+                    error_kind = "invalid_upstream_usage",
+                    "Native Anthropic response omitted valid usage"
+                );
                 return anthropic_error(
                     StatusCode::BAD_GATEWAY,
                     "api_error",
@@ -1130,8 +1142,11 @@ async fn build_upstream_response(
         .await;
         let failed = match finalized {
             Ok(Ok(())) => false,
-            Ok(Err(error)) => {
-                tracing::error!(error = %error, "Failed to record native Anthropic usage");
+            Ok(Err(_)) => {
+                tracing::error!(
+                    error_kind = "usage_write_failed",
+                    "Failed to record native Anthropic usage"
+                );
                 true
             }
             Err(error) => {
@@ -1997,14 +2012,6 @@ redact-thinking-2026-02-12";
             _start_date: chrono::DateTime<chrono::Utc>,
             _end_date: Option<chrono::DateTime<chrono::Utc>>,
         ) -> Result<Vec<services::usage::UsageByModelEntry>, services::usage::UsageError> {
-            unimplemented!()
-        }
-
-        async fn list_inference_usage_report(
-            &self,
-            _query: services::usage::InferenceUsageReportQuery,
-        ) -> Result<Vec<services::usage::InferenceUsageReportRow>, services::usage::UsageError>
-        {
             unimplemented!()
         }
 

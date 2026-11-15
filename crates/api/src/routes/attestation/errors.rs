@@ -33,7 +33,8 @@ pub(super) fn signature_error_response(
         | AttestationError::ItaRateLimited { .. }
         | AttestationError::ItaTimeout
         | AttestationError::ItaBadUpstream { .. }
-        | AttestationError::ItaInvalidEvidence { .. } => error_response(
+        | AttestationError::ItaInvalidEvidence { .. }
+        | AttestationError::OwnerConflict => error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             message,
             "internal_server_error",
@@ -75,7 +76,8 @@ pub(super) fn attestation_report_error_response(
         | AttestationError::ItaRateLimited { .. }
         | AttestationError::ItaTimeout
         | AttestationError::ItaBadUpstream { .. }
-        | AttestationError::ItaInvalidEvidence { .. } => error_response(
+        | AttestationError::ItaInvalidEvidence { .. }
+        | AttestationError::OwnerConflict => error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             message,
             "internal_server_error",
@@ -150,14 +152,14 @@ pub(super) fn ita_token_error_response(error: AttestationError) -> Response {
             "not_found_error",
             None,
         )),
-        AttestationError::RepositoryError(_) | AttestationError::InternalError(_) => {
-            error_tuple_into_response(error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                message,
-                "internal_server_error",
-                None,
-            ))
-        }
+        AttestationError::RepositoryError(_)
+        | AttestationError::InternalError(_)
+        | AttestationError::OwnerConflict => error_tuple_into_response(error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            message,
+            "internal_server_error",
+            None,
+        )),
     }
 }
 

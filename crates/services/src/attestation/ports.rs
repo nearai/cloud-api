@@ -1,6 +1,6 @@
 use crate::attestation::ita::{ItaTokenQuery, ItaTokenResponse};
 use crate::attestation::models::{
-    AttestationError, AttestationReport, ChatSignature, SignatureLookupResult,
+    AttestationError, AttestationReport, ChatSignature, SignatureLookupResult, SignatureOwner,
 };
 use crate::models::ModelCaller;
 use async_trait::async_trait;
@@ -8,21 +8,21 @@ use inference_providers::ProviderFilter;
 
 #[async_trait]
 pub trait AttestationServiceTrait: Send + Sync {
-    /// Get a chat signature from the database, with fallback for client disconnect
-    /// signing_algo: Optional signing algorithm ("ed25519" or "ecdsa"), defaults to "ecdsa" if None
-    /// Returns SignatureLookupResult which can be Found (signature) or Unavailable (client disconnect)
+    /// Get a stored chat signature for the calling owner. Rows without an
+    /// owner are unavailable. The owner also scopes the disconnect fallback.
+    /// signing_algo: Optional signing algorithm ("ed25519" or "ecdsa"), defaults to "ecdsa" if None.
     async fn get_chat_signature(
         &self,
-        workspace_id: uuid::Uuid,
+        owner: SignatureOwner,
         chat_id: &str,
         signing_algo: Option<String>,
     ) -> Result<SignatureLookupResult, AttestationError>;
 
-    /// Fetch signature from provider and store it in the database
+    /// Fetch signature from provider and store it in the database for `owner`.
     /// This should be called when a completion finishes
     async fn store_chat_signature_from_provider(
         &self,
-        workspace_id: uuid::Uuid,
+        owner: SignatureOwner,
         chat_id: &str,
     ) -> Result<(), AttestationError>;
 
@@ -31,19 +31,19 @@ pub trait AttestationServiceTrait: Send + Sync {
     /// to persist partial fetches; background callers use the method above.
     async fn store_stream_chat_signature_from_provider(
         &self,
-        workspace_id: uuid::Uuid,
+        owner: SignatureOwner,
         chat_id: &str,
     ) -> Result<(), AttestationError> {
-        self.store_chat_signature_from_provider(workspace_id, chat_id)
+        self.store_chat_signature_from_provider(owner, chat_id)
             .await
     }
 
     /// Store a chat signature directly over gateway-emitted bytes.
     /// Creates a signature with text format "request_hash:response_hash"
-    /// and stores both ECDSA and ED25519 signatures.
+    /// and stores both ECDSA and ED25519 signatures for `owner`.
     async fn store_chat_signature(
         &self,
-        workspace_id: uuid::Uuid,
+        owner: SignatureOwner,
         chat_id: &str,
         request_hash: String,
         response_hash: String,
@@ -56,13 +56,13 @@ pub trait AttestationServiceTrait: Send + Sync {
     /// rewrites; stream lifecycle cleanup is owned by `InterceptStream`.
     async fn store_chat_signature_and_unpin(
         &self,
-        workspace_id: uuid::Uuid,
+        owner: SignatureOwner,
         chat_id: &str,
         request_hash: String,
         response_hash: String,
     ) -> Result<(), AttestationError> {
         let result = self
-            .store_chat_signature(workspace_id, chat_id, request_hash, response_hash)
+            .store_chat_signature(owner, chat_id, request_hash, response_hash)
             .await;
         self.release_chat_signature_pin(chat_id).await;
         result
@@ -76,10 +76,10 @@ pub trait AttestationServiceTrait: Send + Sync {
 
     /// Store a response signature directly (for response streams)
     /// Creates a signature with text format "request_hash:response_hash"
-    /// Stores both ECDSA and ED25519 signatures
+    /// Stores both ECDSA and ED25519 signatures for `owner`
     async fn store_response_signature(
         &self,
-        workspace_id: uuid::Uuid,
+        owner: SignatureOwner,
         response_id: &str,
         request_hash: String,
         response_hash: String,
@@ -113,11 +113,16 @@ pub trait AttestationServiceTrait: Send + Sync {
     ) -> Result<ItaTokenResponse, AttestationError>;
 }
 
+/// Chat-signature storage. Every row is stored with its [`SignatureOwner`] in
+/// the same statement, and reads match owner, id and algorithm together.
 #[async_trait]
 pub trait AttestationRepository: Send + Sync {
+    /// Store or replace one signature for `owner`. A row with the same id and
+    /// algorithm that belongs to another owner, or has no owner, is left
+    /// unchanged and the call fails with [`AttestationError::OwnerConflict`].
     async fn add_chat_signature(
         &self,
-        workspace_id: uuid::Uuid,
+        owner: SignatureOwner,
         chat_id: &str,
         signature: ChatSignature,
     ) -> Result<(), AttestationError>;
@@ -127,19 +132,21 @@ pub trait AttestationRepository: Send + Sync {
     /// one by one and stops at the first failure.
     async fn add_chat_signatures(
         &self,
-        workspace_id: uuid::Uuid,
+        owner: SignatureOwner,
         chat_id: &str,
         signatures: Vec<ChatSignature>,
     ) -> Result<(), AttestationError> {
         for signature in signatures {
-            self.add_chat_signature(workspace_id, chat_id, signature)
-                .await?;
+            self.add_chat_signature(owner, chat_id, signature).await?;
         }
         Ok(())
     }
+
+    /// The signature stored for `owner`, `chat_id` and algorithm. Rows without
+    /// an owner and rows belonging to another owner are reported as missing.
     async fn get_chat_signature(
         &self,
-        workspace_id: uuid::Uuid,
+        owner: SignatureOwner,
         chat_id: &str,
         signing_algo: &str,
     ) -> Result<ChatSignature, AttestationError>;

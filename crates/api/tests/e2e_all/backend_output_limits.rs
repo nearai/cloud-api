@@ -225,13 +225,6 @@ async fn backend_output_limits_six_model_regression() {
 
     assert!(get_json(&server, "/v1/model/list?limit=1").await["models"].is_array());
 
-    let admin = server
-        .get("/v1/admin/models?limit=1")
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
-        .add_header("User-Agent", MOCK_USER_AGENT)
-        .await;
-    assert_eq!(admin.status_code(), 200, "{}", admin.text());
-
     let malformed = server.get("/v1/model/%ZZ").await;
     assert!(
         malformed.status_code().is_client_error(),

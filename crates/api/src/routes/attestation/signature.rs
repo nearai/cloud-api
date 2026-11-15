@@ -1,9 +1,7 @@
 use super::{errors::*, AttestationRouteState};
-use crate::middleware::auth::AuthenticatedApiKey;
-use crate::models::ErrorResponse;
-use axum::Extension;
+use crate::{middleware::auth::AuthenticatedApiKey, models::ErrorResponse};
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Extension, Path, Query, State},
     http::StatusCode,
     response::Json as ResponseJson,
 };
@@ -63,8 +61,13 @@ pub struct SignatureUnavailableResponse {
 /// Get completion or Responses API signature
 ///
 /// Get a cryptographic signature for a chat completion or completed stateless
-/// `resp_*` response. Returns signature data on success, or an unavailable
-/// response if a chat-completion stream was disconnected.
+/// `resp_*` response belonging to the calling key's organization and workspace.
+/// Signatures stored without owner metadata are unavailable.
+/// When no signature is stored for the ID but the calling key's own workspace
+/// has a stream for that ID that ended with a client disconnect, the response
+/// is 200 with `error_code` `STREAM_DISCONNECTED`. Any other missing ID,
+/// including one whose disconnected stream belongs to another workspace, is
+/// reported as not found.
 #[utoipa::path(
     get,
     path = "/v1/signature/{chat_id}",
@@ -73,7 +76,7 @@ pub struct SignatureUnavailableResponse {
         SignatureQuery
     ),
     responses(
-        (status = 200, description = "Signature retrieved or unavailable due to disconnect", body = SignatureResponse),
+        (status = 200, description = "Signature retrieved for the calling workspace, or `STREAM_DISCONNECTED` for the calling workspace's disconnected stream", body = SignatureResponse),
         (status = 404, description = "Signature not found", body = ErrorResponse),
         (status = 400, description = "Invalid parameters", body = ErrorResponse)
     ),
@@ -83,17 +86,17 @@ pub struct SignatureUnavailableResponse {
     tag = "Attestation"
 )]
 pub async fn get_signature(
-    Extension(api_key): Extension<AuthenticatedApiKey>,
     Path(chat_id): Path<String>,
     Query(params): Query<SignatureQuery>,
     State(state): State<AttestationRouteState>,
+    Extension(api_key): Extension<AuthenticatedApiKey>,
 ) -> Result<ResponseJson<serde_json::Value>, (StatusCode, ResponseJson<ErrorResponse>)> {
     validate_signing_algo(params.signing_algo.as_deref())?;
 
     let signing_algo = params.signing_algo;
     let result = state
         .attestation_service
-        .get_chat_signature(api_key.workspace.id.0, chat_id.as_str(), signing_algo)
+        .get_chat_signature(api_key.signature_owner(), chat_id.as_str(), signing_algo)
         .await
         .map_err(signature_error_response)?;
 

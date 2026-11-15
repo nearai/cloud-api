@@ -3,7 +3,7 @@
 use super::{AnthropicRawBody, AnthropicRawError, Bytes};
 use crate::routes::common::SIGNATURE_STORE_TIMEOUT;
 use futures_util::StreamExt;
-use services::attestation::ports::AttestationServiceTrait;
+use services::attestation::{ports::AttestationServiceTrait, SignatureOwner};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
 
@@ -21,20 +21,20 @@ pub(super) fn valid_message_id(id: &str) -> bool {
 
 pub(super) struct MessageSigningContext {
     service: Arc<dyn AttestationServiceTrait>,
+    owner: SignatureOwner,
     request_hash: String,
-    workspace_id: uuid::Uuid,
 }
 
 impl MessageSigningContext {
     pub(super) fn new(
-        workspace_id: uuid::Uuid,
         service: Arc<dyn AttestationServiceTrait>,
+        owner: SignatureOwner,
         request_hash: String,
     ) -> Self {
         Self {
             service,
+            owner,
             request_hash,
-            workspace_id,
         }
     }
 
@@ -43,16 +43,12 @@ impl MessageSigningContext {
         // these bytes. Bound the database write as well as signature creation.
         let result = tokio::time::timeout(
             SIGNATURE_STORE_TIMEOUT,
-            self.service.store_chat_signature(
-                self.workspace_id,
-                &id,
-                self.request_hash,
-                response_hash,
-            ),
+            self.service
+                .store_chat_signature(self.owner, &id, self.request_hash, response_hash),
         )
         .await;
         if !matches!(result, Ok(Ok(()))) {
-            tracing::error!(message_id = %id, "Native Anthropic gateway signature storage failed or timed out");
+            tracing::error!("Native Anthropic gateway signature storage failed or timed out");
         }
     }
 }

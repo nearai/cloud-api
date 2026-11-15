@@ -12,7 +12,7 @@ use super::*;
     tag = "Score",
     request_body = crate::models::ScoreRequest,
     responses(
-        (status = 200, description = "Successful score", body = crate::models::ScoreResponse),
+        (status = 200, description = "Successful score", body = crate::models::ScoreResponse, headers(("Inference-Id" = String, description = "Billing UUID of the request, usable with /v1/billing/costs"))),
         (status = 400, description = "Invalid request (empty texts, invalid model, etc.)", body = ErrorResponse),
         (status = 401, description = "Unauthorized (missing or invalid API key)", body = ErrorResponse),
         (status = 404, description = "Model not found", body = ErrorResponse),
@@ -68,8 +68,8 @@ pub async fn score(
             )
                 .into_response();
         }
-        Err(e) => {
-            tracing::error!(error = %e, "Failed to resolve model for score");
+        Err(_) => {
+            tracing::error!("Failed to resolve model for score");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 ResponseJson(ErrorResponse::new(
@@ -114,10 +114,35 @@ pub async fn score(
         .await
     {
         Ok(response) => {
-            // Record usage for score SYNCHRONOUSLY to ensure billing accuracy
-            // This is critical for revenue tracking and must complete before returning response
             let organization_id = api_key.organization.id.0;
             let workspace_id = api_key.workspace.id.0;
+
+            let token_count = response
+                .usage
+                .as_ref()
+                .map(|usage| {
+                    billing::reported_score_input_tokens(
+                        usage.prompt_tokens,
+                        usage.total_tokens,
+                        usage.completion_tokens,
+                    )
+                })
+                .unwrap_or(0);
+            let token_count = billing::cap_reported_tokens(
+                app_state.metrics_service.as_ref(),
+                &request.model,
+                organization_id,
+                token_count,
+                &billing::TokenAnomalyMessages {
+                    overflow: "Score provider returned unreasonable token count - capping",
+                    zero: "Score provider returned zero tokens",
+                    anomaly: "Score provider token count anomaly detected",
+                },
+            );
+            let token_count = match billing::require_positive_units(token_count) {
+                Ok(count) => count,
+                Err(response) => return response,
+            };
 
             // Parse API key ID to UUID
             let api_key_id = match billing::billing_api_key_id(&api_key) {
@@ -127,9 +152,8 @@ pub async fn score(
 
             let inference_id = hash_inference_id_to_uuid(&response.id);
 
-            // Score requests don't have traditional token counts - use input token count as 1
             let usage_request = services::usage::ports::RecordUsageServiceRequest {
-                input_tokens: 1,
+                input_tokens: token_count,
                 inference_id: Some(inference_id),
                 stop_reason: Some(services::usage::StopReason::Completed),
                 ..services::usage::ports::RecordUsageServiceRequest::base(
@@ -143,51 +167,16 @@ pub async fn score(
                 )
             };
 
-            // Record usage with timeout to prevent blocking responses
-            match tokio::time::timeout(
-                Duration::from_secs(USAGE_RECORDING_TIMEOUT_SECS),
-                app_state.usage_service.record_usage(usage_request.clone()),
+            if let Err(response) = record_usage_before_response(
+                app_state.usage_service.clone(),
+                usage_request,
+                "Score",
             )
             .await
             {
-                Ok(Ok(_)) => ResponseJson(response).into_response(),
-                Ok(Err(e)) => {
-                    tracing::warn!(
-                        error = %e,
-                        model_id = %model_id,
-                        "Failed to record usage synchronously, retrying async"
-                    );
-                    let usage_service_clone = app_state.usage_service.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = usage_service_clone.record_usage(usage_request).await {
-                            tracing::error!(
-                                error = %e,
-                                model_id = %model_id,
-                                "Failed to record score usage in async retry"
-                            );
-                        }
-                    });
-                    ResponseJson(response).into_response()
-                }
-                Err(_timeout) => {
-                    // Recording timed out, fall back to async retry to avoid blocking client
-                    tracing::warn!(
-                        model_id = %model_id,
-                        "Score usage recording timed out, retrying async"
-                    );
-                    let usage_service_clone = app_state.usage_service.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = usage_service_clone.record_usage(usage_request).await {
-                            tracing::error!(
-                                error = %e,
-                                model_id = %model_id,
-                                "Failed to record score usage in async retry"
-                            );
-                        }
-                    });
-                    ResponseJson(response).into_response()
-                }
+                return response;
             }
+            with_billing_inference_id(ResponseJson(response).into_response(), inference_id)
         }
         Err(e) => {
             let (status_code, error_type, message) = match e {

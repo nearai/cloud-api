@@ -43,7 +43,7 @@ impl HeldReportService {
 impl services::attestation::ports::AttestationServiceTrait for HeldReportService {
     async fn get_chat_signature(
         &self,
-        _workspace_id: uuid::Uuid,
+        _owner: services::attestation::SignatureOwner,
         _chat_id: &str,
         _signing_algo: Option<String>,
     ) -> Result<SignatureLookupResult, AttestationError> {
@@ -52,7 +52,7 @@ impl services::attestation::ports::AttestationServiceTrait for HeldReportService
 
     async fn store_chat_signature_from_provider(
         &self,
-        _workspace_id: uuid::Uuid,
+        _owner: services::attestation::SignatureOwner,
         _chat_id: &str,
     ) -> Result<(), AttestationError> {
         Ok(())
@@ -60,7 +60,7 @@ impl services::attestation::ports::AttestationServiceTrait for HeldReportService
 
     async fn store_chat_signature(
         &self,
-        _workspace_id: uuid::Uuid,
+        _owner: services::attestation::SignatureOwner,
         _chat_id: &str,
         _request_hash: String,
         _response_hash: String,
@@ -70,7 +70,7 @@ impl services::attestation::ports::AttestationServiceTrait for HeldReportService
 
     async fn store_response_signature(
         &self,
-        _workspace_id: uuid::Uuid,
+        _owner: services::attestation::SignatureOwner,
         _response_id: &str,
         _request_hash: String,
         _response_hash: String,

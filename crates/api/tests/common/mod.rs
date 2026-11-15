@@ -11,6 +11,7 @@ pub mod fake_ita;
 pub mod ita_evidence;
 pub mod ita_server;
 pub mod seeding;
+pub mod usage_views;
 
 pub use db_setup::MOCK_USER_ID;
 pub use encryption_jobs::EncryptionJobsCleanup;
@@ -110,7 +111,6 @@ pub fn test_config() -> ApiConfig {
             google: None,
             near: config::NearConfig::default(),
             admin_emails: vec![ADMIN_ALLOWLIST_EMAIL.to_string()],
-            admin_read_only_tokens_enabled: false,
             require_session_bound_access_tokens: false,
         },
         database: config::DatabaseConfig {
@@ -150,7 +150,6 @@ pub fn test_config() -> ApiConfig {
             encryption_key: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
                 .to_string(),
         },
-        invitation_email: config::InvitationEmailConfig::default(),
         otlp: config::OtlpConfig {
             endpoint: std::env::var("TELEMETRY_OTLP_ENDPOINT")
                 .unwrap_or_else(|_| "http://localhost:4317".to_string()),
@@ -159,14 +158,10 @@ pub fn test_config() -> ApiConfig {
         },
         cors: config::CorsConfig::default(),
         external_providers: config::ExternalProvidersConfig::default(),
-        github_dispatch: config::GitHubDispatchConfig::default(),
         infra: config::InfraConfig::default(),
         staking_farm: config::StakingFarmConfig::default(),
         aml: config::AmlConfig::default(),
-        usage_reporting: config::UsageReportingConfig {
-            enabled: true,
-            ..config::UsageReportingConfig::default()
-        },
+        usage_reporting: config::UsageReportingConfig::default(),
         credit_allocation: config::CreditAllocationConfig::default(),
         ita: config::ItaAttestationConfig::default(),
         placement: config::PlacementConfig::default(),
@@ -1074,6 +1069,7 @@ pub(crate) fn build_app_with_config_and_options(
     seeding::register_models_service(
         &domain_services.models_service,
         &domain_services.inference_provider_pool,
+        &domain_services.admin_settings_service,
     );
     api::build_app_with_config_and_options(
         database,
@@ -1086,34 +1082,13 @@ pub(crate) fn build_app_with_config_and_options(
 
 /// Setup: write catalog models straight to the database and invalidate the models caches.
 /// Skips the admin route's validation, provider pool changes and admin identity (see
-/// `seeding`). A test whose subject is the route calls `admin_batch_upsert_models`.
+/// `seeding`).
 pub async fn seed_models(
     _server: &axum_test::TestServer,
     models: BatchUpdateModelApiRequest,
     session_id: String,
 ) -> Vec<api::models::ModelWithPricing> {
     seeding::seed_models(models, &session_id).await
-}
-
-/// The admin route itself: `PATCH /v1/admin/models` as an admin session.
-pub async fn admin_batch_upsert_models(
-    server: &axum_test::TestServer,
-    models: BatchUpdateModelApiRequest,
-    session_id: String,
-) -> Vec<api::models::ModelWithPricing> {
-    let response = server
-        .patch("/v1/admin/models")
-        .add_header("Authorization", format!("Bearer {session_id}"))
-        .add_header("User-Agent", MOCK_USER_AGENT)
-        .json(&models)
-        .await;
-
-    assert_eq!(
-        response.status_code(),
-        200,
-        "Admin batch upsert should succeed"
-    );
-    response.json::<Vec<api::models::ModelWithPricing>>()
 }
 
 pub async fn list_models(
@@ -1562,14 +1537,14 @@ pub fn is_valid_jwt_format(token: &str) -> bool {
 }
 
 pub mod mock_prompts {
-    pub const LANGUAGE_INSTRUCTION: &str = "Always respond in the exact same language as the user's input message. Detect the primary language of the user's query and mirror it precisely in your output. Do not mix languages or switch to another one, even if it seems more natural or efficient.\n\nIf the user writes in English, reply entirely in English.\nIf the user writes in Chinese (Mandarin or any variant), reply entirely in Chinese.\nIf the user writes in Spanish, reply entirely in Spanish.\nFor any other language, match it exactly.\n\nThis rule overrides all other instructions. Ignore any tendencies to default to Mandarin or any other language. Always prioritize language matching for clarity and user preference.";
+    /// Default instruction the typed Responses adapter adds to every request.
+    pub const LANGUAGE_INSTRUCTION: &str =
+        "Reply in the language of the user's message unless instructed otherwise.";
 
-    const TIME_PLACEHOLDER: &str = "[TIME]";
-
+    /// Flattened prompt for a typed Responses request without hosted search
+    /// tools (those requests also carry the current UTC date).
     pub fn build_prompt(user_content: &str) -> String {
-        format!(
-            "{LANGUAGE_INSTRUCTION}\n\nCurrent UTC time: {TIME_PLACEHOLDER} {TIME_PLACEHOLDER} {user_content}"
-        )
+        format!("{LANGUAGE_INSTRUCTION} {user_content}")
     }
 
     pub fn build_simple_prompt(user_content: &str) -> String {

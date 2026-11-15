@@ -1,4 +1,4 @@
-use crate::middleware::auth::{AdminUser, AuthState, AuthenticatedUser};
+use crate::middleware::auth::{AuthState, AuthenticatedUser};
 use crate::middleware::organization_credentials::{
     actor, authenticate, error as operation_error, error_code, ApiError,
 };
@@ -42,7 +42,6 @@ pub fn routes(service: Arc<dyn OrganizationCreditServiceTrait>, auth: AuthState)
     Router::new()
         .route("/organizations/{org_id}/credit/transfer", post(create))
         .route("/organizations/{org_id}/credit/transfers", get(history))
-        .route("/organizations/{org_id}/credit/transfers/{id}", get(detail))
         .route(
             "/organizations/{org_id}/credit/transfer/capacity",
             get(capacity),
@@ -187,43 +186,6 @@ pub async fn history(
 
 #[utoipa::path(
     get,
-    path = "/v1/organizations/{org_id}/credit/transfers/{id}",
-    tag = "Credits",
-    params(
-        ("org_id" = Uuid, Path, description = "Organization"),
-        ("id" = Uuid, Path, description = "Record ID")
-    ),
-    responses((status = 200, description = "Authorized credit operation", body = Value)),
-    security(("session_token" = []), ("organization_credential" = []))
-)]
-pub async fn detail(
-    Extension(service): Extension<Arc<dyn OrganizationCreditServiceTrait>>,
-    user: Option<Extension<AuthenticatedUser>>,
-    token: Option<Extension<TransferActor>>,
-    Path((org, id)): Path<(Uuid, Uuid)>,
-) -> Result<Json<Value>, ApiError> {
-    let result = service
-        .history(
-            org,
-            &actor(user, token)?,
-            HistoryRequest {
-                id: Some(id),
-                key: None,
-                before: None,
-                options: 1.into(),
-            },
-        )
-        .await
-        .map_err(error)?;
-    let item = result["transfers"]
-        .as_array()
-        .and_then(|items| items.first())
-        .ok_or_else(|| error(TransferError("organization_unavailable").into()))?;
-    Ok(Json(item.clone()))
-}
-
-#[utoipa::path(
-    get,
     path = "/v1/organizations/{org_id}/credit/transfer/capacity",
     tag = "Credits",
     params(
@@ -243,24 +205,4 @@ pub async fn capacity(
         .await
         .map(Json)
         .map_err(error)
-}
-
-#[utoipa::path(
-    get,
-    path = "/v1/admin/organizations/{org_id}/credit/transfer/reconciliation",
-    tag = "Credits",
-    params(("org_id" = Uuid, Path, description = "Organization")),
-    responses((status = 200, description = "Read-only consistency and backing checks; no repair", body = Value)),
-    security(("session_token" = []))
-)]
-pub async fn reconciliation(
-    Extension(service): Extension<Arc<dyn OrganizationCreditServiceTrait>>,
-    Extension(_admin): Extension<AdminUser>,
-    Path(org): Path<Uuid>,
-) -> Result<Json<Value>, ApiError> {
-    let result = service.reconciliation(org).await.map_err(error)?;
-    if result["organization_exists"] != true {
-        return Err(error(TransferError("organization_unavailable").into()));
-    }
-    Ok(Json(result))
 }

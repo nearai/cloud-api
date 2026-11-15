@@ -2,8 +2,8 @@ use crate::models::RecordUsageRequest;
 use crate::repositories::OrganizationUsageRepository;
 use chrono::{DateTime, Utc};
 use services::usage::ports::{
-    InferenceCost, InferenceUsageHistoryQuery, InferenceUsageReportQuery, InferenceUsageReportRow,
-    OrganizationBalanceInfo, UsageByModelEntry, UsageLogEntry,
+    InferenceCost, InferenceUsageHistoryQuery, InferenceUsageReportRow, OrganizationBalanceInfo,
+    UsageByModelEntry, UsageLogEntry,
 };
 use uuid::Uuid;
 
@@ -240,18 +240,13 @@ impl services::usage::ports::UsageRepository for OrganizationUsageRepository {
             .await
     }
 
-    async fn get_stop_reason_by_response_id(
+    async fn has_client_disconnect_usage(
         &self,
-        response_id: Uuid,
-    ) -> anyhow::Result<Option<services::usage::StopReason>> {
-        self.get_stop_reason_by_response_id(response_id).await
-    }
-
-    async fn get_stop_reason_by_provider_request_id(
-        &self,
-        provider_request_id: &str,
-    ) -> anyhow::Result<Option<services::usage::StopReason>> {
-        self.get_stop_reason_by_provider_request_id(provider_request_id)
+        organization_id: Uuid,
+        workspace_id: Uuid,
+        id: &str,
+    ) -> anyhow::Result<bool> {
+        self.has_client_disconnect_usage(organization_id, workspace_id, id)
             .await
     }
 
@@ -276,13 +271,6 @@ impl services::usage::ports::UsageRepository for OrganizationUsageRepository {
                 request_count: r.request_count,
             })
             .collect())
-    }
-
-    async fn list_inference_usage_report(
-        &self,
-        query: InferenceUsageReportQuery,
-    ) -> anyhow::Result<Vec<InferenceUsageReportRow>> {
-        self.list_inference_usage_report(query).await
     }
 
     async fn list_inference_usage_history(

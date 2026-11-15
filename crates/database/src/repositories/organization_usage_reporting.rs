@@ -2,115 +2,10 @@ use crate::repositories::{utils::map_db_error, OrganizationUsageRepository};
 use crate::retry_db;
 use anyhow::{Context, Result};
 use services::common::RepositoryError;
-use services::usage::{
-    InferenceUsageHistoryQuery, InferenceUsageReportQuery, InferenceUsageReportRow,
-};
+use services::usage::{InferenceUsageHistoryQuery, InferenceUsageReportRow};
 use tokio_postgres::{IsolationLevel, Row};
 
 impl OrganizationUsageRepository {
-    pub async fn list_inference_usage_report(
-        &self,
-        query: InferenceUsageReportQuery,
-    ) -> Result<Vec<InferenceUsageReportRow>> {
-        validate_query(&query)?;
-
-        let cursor = query.cursor;
-        let cursor_created_at = cursor.map(|value| value.created_at);
-        let cursor_id = cursor.map(|value| value.id);
-        let limit = i64::from(query.limit);
-        let deadline = crate::repositories::reporting_query::reporting_deadline(
-            self.reporting_statement_timeout,
-            query.deadline,
-        )?;
-
-        let rows = retry_db!("list_inference_usage_report", {
-            let mut client = self
-                .pool
-                .get()
-                .await
-                .context("Failed to get database connection")
-                .map_err(RepositoryError::PoolError)?;
-
-            let transaction = client
-                .build_transaction()
-                .read_only(true)
-                .start()
-                .await
-                .map_err(map_db_error)?;
-            crate::repositories::reporting_query::configure_reporting_transaction(
-                &transaction,
-                crate::repositories::reporting_query::remaining_statement_timeout(deadline)?,
-            )
-            .await?;
-            let rows = transaction
-                .query(
-                    r#"
-                    SELECT
-                        id, organization_id, workspace_id, api_key_id, created_at,
-                        model_name, inference_type, input_tokens, output_tokens,
-                        cache_read_tokens, cache_write_tokens, total_tokens, input_cost, output_cost,
-                        CASE WHEN $8::TEXT IS NULL THEN total_cost ELSE
-                            (SELECT COALESCE(SUM(a.amount), 0)::BIGINT FROM effective_usage_credit_allocations a
-                             WHERE a.inference_usage_id = organization_usage_log.id
-                               AND a.credit_type = $8)
-                        END AS total_cost,
-                        response_id, provider_request_id, inference_id,
-                        stop_reason, image_count, service_tier, context_band, billing_details,
-                        funded_amount, unfunded_amount, allocation_policy_version,
-                        CASE WHEN funded_amount IS NULL THEN NULL ELSE
-                            COALESCE((SELECT jsonb_agg(jsonb_build_object(
-                                'type', a.credit_type, 'amount', a.amount, 'source', a.source,
-                                'organization_limit_id', a.organization_limit_id,
-                                'policy_version', a.policy_version
-                            ) ORDER BY a.created_at, a.priority_position, a.id)
-                            FROM effective_usage_credit_allocations a
-                            WHERE a.inference_usage_id = organization_usage_log.id
-                              AND ($8::TEXT IS NULL OR a.credit_type = $8)), '[]'::jsonb)
-                        END AS credit_allocations
-                    FROM organization_usage_log
-                    WHERE organization_id = $1
-                      AND ($2::TIMESTAMPTZ IS NULL OR created_at >= $2)
-                      AND ($3::TIMESTAMPTZ IS NULL OR created_at <= $3)
-                      AND ($4::UUID IS NULL OR workspace_id = $4)
-                      AND ($5::UUID IS NULL OR api_key_id = $5)
-                      AND ($6::TEXT IS NULL OR model_name = $6)
-                      AND ($7::TEXT IS NULL OR inference_type = $7)
-                      AND ($8::TEXT IS NULL OR EXISTS (
-                          SELECT 1 FROM effective_usage_credit_allocations allocation_filter
-                          WHERE allocation_filter.inference_usage_id = organization_usage_log.id
-                            AND allocation_filter.credit_type = $8
-                      ))
-                      AND (
-                          $9::TIMESTAMPTZ IS NULL
-                          OR created_at < $9
-                          OR (created_at = $9 AND id < $10::UUID)
-                      )
-                    ORDER BY created_at DESC, id DESC
-                    LIMIT $11
-                    "#,
-                    &[
-                        &query.organization_id,
-                        &query.start_time,
-                        &query.end_time,
-                        &query.workspace_id,
-                        &query.api_key_id,
-                        &query.model,
-                        &query.inference_type,
-                        &query.credit_type,
-                        &cursor_created_at,
-                        &cursor_id,
-                        &limit,
-                    ],
-                )
-                .await
-                .map_err(map_db_error)?;
-            transaction.commit().await.map_err(map_db_error)?;
-            Ok::<_, RepositoryError>(rows)
-        })?;
-
-        Ok(rows.iter().map(row_to_report).collect())
-    }
-
     /// Filtered usage history page plus the exact filtered count, from one snapshot.
     /// Both queries share the reporting deadline: the count reads every matching
     /// row, and an abandoned request must not keep scanning.
@@ -238,21 +133,6 @@ impl OrganizationUsageRepository {
 
         Ok((rows.iter().map(row_to_report).collect(), total))
     }
-}
-
-fn validate_query(query: &InferenceUsageReportQuery) -> Result<()> {
-    if query.limit == 0 {
-        return Err(RepositoryError::ValidationFailed("limit must be positive".to_string()).into());
-    }
-    if let (Some(start), Some(end)) = (query.start_time, query.end_time) {
-        if end < start {
-            return Err(RepositoryError::ValidationFailed(
-                "end_time must be greater than or equal to start_time".to_string(),
-            )
-            .into());
-        }
-    }
-    Ok(())
 }
 
 fn validate_history_query(query: &InferenceUsageHistoryQuery) -> Result<()> {

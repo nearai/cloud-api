@@ -1,4 +1,5 @@
 pub mod affinity;
+pub mod cache_salt;
 pub mod ports;
 
 use crate::attestation::ports::AttestationServiceTrait;
@@ -88,13 +89,13 @@ where
     handle.spawn(async move {
         match tokio::time::timeout(hard_cap, write).await {
             Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                tracing::error!(%inference_id, %error, "Failed to record usage");
+            Ok(Err(_)) => {
+                tracing::error!(%inference_id, error_kind = "usage_write_failed", "Failed to record usage");
             }
-            Err(error) => {
+            Err(_) => {
                 tracing::error!(
                     %inference_id,
-                    %error,
+                    error_kind = "usage_write_timeout",
                     timeout_seconds = hard_cap.as_secs_f64(),
                     "Usage write exceeded hard cap"
                 );
@@ -248,16 +249,20 @@ where
             });
         }
 
+        let owner = crate::attestation::SignatureOwner {
+            organization_id,
+            workspace_id: self.workspace_id,
+        };
         let store = async move {
             match tokio::time::timeout(
                 STREAM_SIGNATURE_STORE_TIMEOUT,
-                attestation_service.store_stream_chat_signature_from_provider(&chat_id),
+                attestation_service.store_stream_chat_signature_from_provider(owner, &chat_id),
             )
             .await
             {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => {
-                    tracing::error!(%organization_id, %model_id, error = ?e, "Failed to store chat signature");
+                    tracing::error!(%organization_id, %model_id, error_kind = e.kind(), "Failed to store chat signature");
                 }
                 Err(_elapsed) => {
                     tracing::error!(
@@ -515,8 +520,8 @@ where
                     );
                     match tokio::time::timeout(Duration::from_secs(2), usage_write).await {
                         Ok(Ok(())) => {}
-                        Ok(Err(error)) => {
-                            tracing::error!(%inference_id, %error, "Usage write task failed");
+                        Ok(Err(_)) => {
+                            tracing::error!(%inference_id, error_kind = "usage_task_failed", "Usage write task failed");
                         }
                         Err(_) => {
                             tracing::warn!(
@@ -1151,10 +1156,10 @@ impl CompletionServiceImpl {
                 match repo.get_concurrent_limit(organization_id).await {
                     Ok(Some(limit)) if limit > 0 => limit,
                     Ok(_) => default_limit, // Use default if NULL or 0
-                    Err(e) => {
+                    Err(_) => {
                         tracing::warn!(
                             organization_id = %organization_id,
-                            error = %e,
+                            error_kind = "limit_lookup_failed",
                             "Failed to fetch org concurrent limit, using default"
                         );
                         default_limit
@@ -1867,6 +1872,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             service_tier: request.service_tier,
             modalities: None,
             original_request: request.original_request.clone(),
+            upstream_cache_salt: None,
             extra,
         };
         chat_params.strip_client_priority();
@@ -1874,6 +1880,11 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         // Routing-only context is set in process below (affinity) and by the
         // pool (size, class); never trust a value from anywhere else.
         chat_params.placement = Default::default();
+        if let Err(e) = cache_salt::scope_to_organization(&mut chat_params, organization_id) {
+            let err = ports::CompletionError::InvalidParams(e.message());
+            self.record_error(&err, None);
+            return Err(err);
+        }
 
         // Resolve model name (could be an alias) and get model details in a single DB call
         // This also validates that the model exists, is active, and may be
@@ -2079,6 +2090,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             service_tier: request.service_tier,
             modalities: None,
             original_request: request.original_request.clone(),
+            upstream_cache_salt: None,
             extra,
         };
         chat_params.strip_client_priority();
@@ -2086,6 +2098,14 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         // Routing-only context is set in process below (affinity) and by the
         // pool (size, class); never trust a value from anywhere else.
         chat_params.placement = Default::default();
+        // Scoped to the organization the work is done for, also when a
+        // platform model was chosen for it.
+        if let Err(e) = cache_salt::scope_to_organization(&mut chat_params, request.organization_id)
+        {
+            let err = ports::CompletionError::InvalidParams(e.message());
+            self.record_error(&err, None);
+            return Err(err);
+        }
 
         // Resolve model name (could be an alias) and get model details in a single DB call
         // This also validates that the model exists, is active, and may be
@@ -2207,23 +2227,26 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             let attestation_service = self.attestation_service.clone();
             let chat_id = response_with_bytes.response.id.clone();
             let model_name = model.model_name.clone();
+            let owner = crate::attestation::SignatureOwner {
+                organization_id,
+                workspace_id: request.workspace_id,
+            };
             inference_providers::tracing_context::spawn_with_tracing_context(
                 async move {
                     match attestation_service
-                        .store_chat_signature_from_provider(chat_id.as_str())
+                        .store_chat_signature_from_provider(owner, chat_id.as_str())
                         .await
                     {
                         Err(e) => {
                             tracing::error!(
-                                %chat_id,
                                 %organization_id,
                                 model = %model_name,
-                                error = %e,
+                                error_kind = e.kind(),
                                 "Failed to store chat signature"
                             );
                         }
                         Ok(()) => {
-                            tracing::debug!("Stored signature for chat_id: {}", chat_id);
+                            tracing::debug!("Stored chat signature");
                         }
                     }
                 }
@@ -4226,6 +4249,7 @@ mod tests {
             service_tier: None,
             modalities: None,
             original_request: None,
+            upstream_cache_salt: None,
             extra: std::collections::HashMap::new(),
         }
     }

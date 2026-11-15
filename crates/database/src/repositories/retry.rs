@@ -23,6 +23,26 @@ pub fn should_retry(err: &RepositoryError) -> bool {
     }
 }
 
+/// Fixed, bounded label for a repository error. Retry logs use this instead of
+/// the error's text, which can carry values from the failed query.
+pub fn error_kind(err: &RepositoryError) -> &'static str {
+    match err {
+        RepositoryError::NotFound(_) => "not_found",
+        RepositoryError::AlreadyExists => "already_exists",
+        RepositoryError::RequiredFieldMissing(_) => "required_field_missing",
+        RepositoryError::ForeignKeyViolation(_) => "foreign_key_violation",
+        RepositoryError::ValidationFailed(_) => "validation_failed",
+        RepositoryError::DependencyExists(_) => "dependency_exists",
+        RepositoryError::TransactionConflict => "transaction_conflict",
+        RepositoryError::ConnectionFailed(_) => "connection_failed",
+        RepositoryError::AuthenticationFailed => "authentication_failed",
+        RepositoryError::QueryTimeout => "query_timeout",
+        RepositoryError::PoolError(_) => "pool_error",
+        RepositoryError::DatabaseError(_) => "database_error",
+        RepositoryError::DataConversionError(_) => "data_conversion_error",
+    }
+}
+
 /// Retry a database operation with exponential backoff
 #[macro_export]
 macro_rules! retry_db {
@@ -61,7 +81,7 @@ macro_rules! retry_db {
                         operation = $operation,
                         attempt = attempt,
                         max_attempts = MAX_ATTEMPTS,
-                        error = %err,
+                        error_kind = $crate::repositories::retry::error_kind(&err),
                         backoff_ms = backoff_ms,
                         "Database operation failed, retrying"
                     );
@@ -74,7 +94,7 @@ macro_rules! retry_db {
                         operation = $operation,
                         attempt = attempt,
                         duration_ms = start.elapsed().as_millis() as u64,
-                        error = %err,
+                        error_kind = $crate::repositories::retry::error_kind(&err),
                         "Database operation failed permanently"
                     );
                     break Err(err);
@@ -86,7 +106,7 @@ macro_rules! retry_db {
 
 #[cfg(test)]
 mod tests {
-    use super::should_retry;
+    use super::{error_kind, should_retry};
     use anyhow::Context;
     use deadpool::managed::TimeoutType;
     use services::common::RepositoryError;
@@ -117,5 +137,35 @@ mod tests {
             "connection closed".into()
         )));
         assert!(should_retry(&RepositoryError::TransactionConflict));
+    }
+
+    #[test]
+    fn error_kind_is_a_fixed_label_without_error_text() {
+        let detail = "secret-value";
+        let cases = [
+            (RepositoryError::NotFound(detail.into()), "not_found"),
+            (
+                RepositoryError::ConnectionFailed(detail.into()),
+                "connection_failed",
+            ),
+            (
+                RepositoryError::ValidationFailed(detail.into()),
+                "validation_failed",
+            ),
+            (
+                RepositoryError::DatabaseError(anyhow::anyhow!(detail)),
+                "database_error",
+            ),
+            (
+                RepositoryError::PoolError(anyhow::anyhow!(detail)),
+                "pool_error",
+            ),
+            (RepositoryError::QueryTimeout, "query_timeout"),
+        ];
+        for (err, expected) in cases {
+            let kind = error_kind(&err);
+            assert_eq!(kind, expected);
+            assert!(!kind.contains(detail));
+        }
     }
 }

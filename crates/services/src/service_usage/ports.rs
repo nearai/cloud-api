@@ -1,7 +1,5 @@
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::time::Instant;
 use utoipa::ToSchema;
 use uuid::Uuid;
 
@@ -57,79 +55,6 @@ pub struct RecordServiceUsageParams {
     pub inference_id: Option<Uuid>,
 }
 
-/// One row of platform service usage (e.g. web_search), in nano-USD.
-#[derive(Debug, Clone)]
-pub struct ServiceUsageLogEntry {
-    pub id: Uuid,
-    pub organization_id: Uuid,
-    pub workspace_id: Uuid,
-    pub api_key_id: Uuid,
-    pub service_id: Uuid,
-    pub quantity: i32,
-    pub total_cost: i64,
-    pub inference_id: Option<Uuid>,
-    pub created_at: chrono::DateTime<chrono::Utc>,
-    pub credit_allocations: Option<Vec<crate::usage::CreditAllocation>>,
-    pub funded_amount: Option<i64>,
-    pub unfunded_amount: Option<i64>,
-    pub allocation_policy_version: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ServiceUsageReportCursor {
-    pub created_at: DateTime<Utc>,
-    pub id: Uuid,
-}
-
-#[derive(Debug, Clone)]
-pub struct ServiceUsageReportFilters {
-    pub organization_id: Uuid,
-    pub service_name: Option<String>,
-    pub workspace_id: Option<Uuid>,
-    pub api_key_id: Option<Uuid>,
-    pub credit_type: Option<String>,
-    pub start_time: Option<DateTime<Utc>>,
-    pub end_time: Option<DateTime<Utc>>,
-    pub cursor: Option<ServiceUsageReportCursor>,
-    pub limit: i64,
-    pub deadline: Option<Instant>,
-}
-
-impl Default for ServiceUsageReportFilters {
-    fn default() -> Self {
-        Self {
-            organization_id: Uuid::default(),
-            service_name: None,
-            workspace_id: None,
-            api_key_id: None,
-            credit_type: None,
-            start_time: None,
-            end_time: None,
-            cursor: None,
-            limit: 100,
-            deadline: None,
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct ServiceUsageReportEntry {
-    pub id: Uuid,
-    pub organization_id: Uuid,
-    pub workspace_id: Uuid,
-    pub api_key_id: Uuid,
-    pub service_id: Uuid,
-    pub service_name: String,
-    pub quantity: i32,
-    pub total_cost: i64,
-    pub inference_id: Option<Uuid>,
-    pub created_at: DateTime<Utc>,
-    pub credit_allocations: Option<Vec<crate::usage::CreditAllocation>>,
-    pub funded_amount: Option<i64>,
-    pub unfunded_amount: Option<i64>,
-    pub allocation_policy_version: Option<String>,
-}
-
 /// Port for the service usage service. Implemented by ServiceUsageService.
 #[async_trait]
 pub trait ServiceUsageServiceTrait: Send + Sync {
@@ -145,21 +70,6 @@ pub trait ServiceUsageServiceTrait: Send + Sync {
         &self,
         params: &RecordServiceUsageWithPricingParams,
     ) -> Result<(), super::ServiceUsageError>;
-
-    /// List service usage logs for an organization, optionally filtered by service name.
-    async fn get_usage_history(
-        &self,
-        organization_id: Uuid,
-        service_name: Option<&str>,
-        credit_type: Option<&str>,
-        limit: i64,
-        offset: i64,
-    ) -> Result<(Vec<ServiceUsageLogEntry>, i64), super::ServiceUsageError>;
-
-    async fn get_usage_report(
-        &self,
-        filters: &ServiceUsageReportFilters,
-    ) -> Result<Vec<ServiceUsageReportEntry>, super::ServiceUsageError>;
 }
 
 /// Port for recording platform service usage (e.g. web_search).
@@ -174,19 +84,4 @@ pub trait ServiceUsageRepositoryTrait: Send + Sync {
 
     /// Insert usage row and update organization_balance. Idempotent when inference_id is set.
     async fn record_service_usage(&self, params: &RecordServiceUsageParams) -> anyhow::Result<()>;
-
-    /// List raw service usage rows for an organization, optionally filtered by service name.
-    async fn list_usage_logs(
-        &self,
-        organization_id: Uuid,
-        service_name: Option<&str>,
-        credit_type: Option<&str>,
-        limit: i64,
-        offset: i64,
-    ) -> anyhow::Result<(Vec<ServiceUsageLogEntry>, i64)>;
-
-    async fn list_usage_report(
-        &self,
-        filters: &ServiceUsageReportFilters,
-    ) -> anyhow::Result<Vec<ServiceUsageReportEntry>>;
 }

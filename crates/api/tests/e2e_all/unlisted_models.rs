@@ -20,8 +20,7 @@ fn unique_model_name(prefix: &str) -> String {
     format!("{prefix}-{}", uuid::Uuid::new_v4())
 }
 
-/// Create or update one model through `PATCH /v1/admin/models` and return its
-/// entry from the response.
+/// Create or update one model by seeding and return its entry.
 async fn upsert_model(
     server: &axum_test::TestServer,
     model_name: &str,
@@ -109,18 +108,20 @@ fn find_model<'a>(models: &'a [serde_json::Value], id: &str) -> Option<&'a serde
     models.iter().find(|model| model["id"] == id)
 }
 
-/// `isListed` on the newest entry of the model's admin history.
-async fn latest_history_is_listed(server: &axum_test::TestServer, model_name: &str) -> bool {
-    let response = server
-        .get(&format!("/v1/admin/models/{model_name}/history"))
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
-        .add_header("User-Agent", MOCK_USER_AGENT)
-        .await;
-    assert_eq!(response.status_code(), 200, "{}", response.text());
-    let history: serde_json::Value = response.json();
-    history["history"][0]["isListed"]
-        .as_bool()
-        .expect("history entries carry isListed")
+/// `is_listed` on the newest entry of the model's history table.
+async fn latest_history_is_listed(_server: &axum_test::TestServer, model_name: &str) -> bool {
+    let database = seeding::seed_database().await;
+    let client = database.pool().get().await.expect("database connection");
+    let row = client
+        .query_one(
+            "SELECT is_listed FROM model_history
+             WHERE model_id = (SELECT id FROM models WHERE model_name = $1)
+             ORDER BY effective_from DESC LIMIT 1",
+            &[&model_name],
+        )
+        .await
+        .expect("history entries exist for a seeded model");
+    row.get("is_listed")
 }
 
 #[tokio::test]

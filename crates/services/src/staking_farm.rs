@@ -272,14 +272,6 @@ impl StakingFarmService {
         self.binding.as_ref()
     }
 
-    pub async fn invalidate_source_cache(&self, org_id: Uuid) {
-        self.no_source_orgs.invalidate(&org_id).await;
-    }
-
-    pub fn config(&self) -> &StakingFarmConfig {
-        &self.config
-    }
-
     pub fn is_enabled(&self) -> bool {
         self.config.enabled
     }

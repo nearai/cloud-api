@@ -626,20 +626,6 @@ impl AmlService {
         self.decision_from_report(&report)
     }
 
-    pub async fn check_authenticated_near_user(
-        &self,
-        user_id: Uuid,
-        auth_provider: &str,
-        provider_user_id: &str,
-        flow: AmlFlow,
-    ) -> Result<AmlDecision, AmlError> {
-        if auth_provider != "near" || provider_user_id.is_empty() {
-            return Ok(AmlDecision::Allowed);
-        }
-        self.check_near_account(Some(user_id), provider_user_id, flow)
-            .await
-    }
-
     pub async fn list_reports(&self, limit: i64, offset: i64) -> Result<AmlReportPage, AmlError> {
         self.repository
             .list_reports(limit, offset)

@@ -1,5 +1,5 @@
 use crate::{
-    models::{CreateWorkspaceRequest, UpdateWorkspaceRequest, Workspace},
+    models::{CreateWorkspaceRequest, Workspace},
     pool::DbPool,
     repositories::utils::map_db_error,
     retry_db,
@@ -276,81 +276,6 @@ impl WorkspaceRepository {
             .collect()
     }
 
-    /// Update a workspace
-    pub async fn update(
-        &self,
-        id: Uuid,
-        request: UpdateWorkspaceRequest,
-    ) -> Result<Option<Workspace>, RepositoryError> {
-        // Build dynamic update query
-        let mut query = String::from("UPDATE workspaces SET updated_at = NOW()");
-        let mut param_index = 2; // Start from $2, $1 is the ID
-        let mut params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = vec![&id];
-
-        if let Some(ref name) = request.name {
-            query.push_str(&format!(", name = ${param_index}"));
-            params.push(name);
-            param_index += 1;
-        }
-
-        if let Some(ref description) = request.description {
-            query.push_str(&format!(", description = ${param_index}"));
-            params.push(description);
-            param_index += 1;
-        }
-
-        if let Some(ref settings) = request.settings {
-            query.push_str(&format!(", settings = ${param_index}"));
-            params.push(settings);
-        }
-
-        query.push_str(" WHERE id = $1 AND is_active = true RETURNING *");
-
-        let row = retry_db!("update_workspace", {
-            let client = self
-                .pool
-                .get()
-                .await
-                .context("Failed to get database connection")
-                .map_err(RepositoryError::PoolError)?;
-
-            client
-                .query_opt(&query, &params)
-                .await
-                .map_err(map_db_error)
-        })?;
-
-        match row {
-            Some(row) => Ok(Some(
-                self.row_to_workspace(row)
-                    .map_err(RepositoryError::DataConversionError)?,
-            )),
-            None => Ok(None),
-        }
-    }
-
-    /// Delete (deactivate) a workspace
-    pub async fn delete(&self, id: Uuid) -> Result<bool, RepositoryError> {
-        let rows_affected = retry_db!("deactivate_workspace", {
-            let client = self
-                .pool
-                .get()
-                .await
-                .context("Failed to get database connection")
-                .map_err(RepositoryError::PoolError)?;
-
-            client
-                .execute(
-                    "UPDATE workspaces SET is_active = false, updated_at = NOW() WHERE id = $1",
-                    &[&id],
-                )
-                .await
-                .map_err(map_db_error)
-        })?;
-
-        Ok(rows_affected > 0)
-    }
-
     /// Helper function to convert database row to Workspace
     fn row_to_workspace(&self, row: tokio_postgres::Row) -> Result<Workspace> {
         Ok(Workspace {
@@ -544,31 +469,6 @@ impl services::workspace::ports::WorkspaceRepository for WorkspaceRepository {
             .create(request, organization_id.0, created_by_user_id.0)
             .await?;
         Ok(db_workspace_to_workspace_service(db_workspace))
-    }
-
-    async fn update(
-        &self,
-        workspace_id: services::workspace::WorkspaceId,
-        name: Option<String>,
-        description: Option<String>,
-        settings: Option<serde_json::Value>,
-    ) -> Result<Option<services::workspace::Workspace>, RepositoryError> {
-        let request = crate::models::UpdateWorkspaceRequest {
-            name,
-            description,
-            settings,
-        };
-        match self.update(workspace_id.0, request).await? {
-            Some(db_workspace) => Ok(Some(db_workspace_to_workspace_service(db_workspace))),
-            None => Ok(None),
-        }
-    }
-
-    async fn delete(
-        &self,
-        workspace_id: services::workspace::WorkspaceId,
-    ) -> Result<bool, RepositoryError> {
-        self.delete(workspace_id.0).await
     }
 
     async fn count_by_organization(

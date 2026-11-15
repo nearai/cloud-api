@@ -1,4 +1,4 @@
--- Executed by GET /v1/admin/organizations/{org_id}/credit/transfer/reconciliation.
+-- Executed by the admin API credit transfer reconciliation route.
 -- One statement provides a consistent MVCC snapshot. It never repairs data.
 WITH ledger AS (
     SELECT sender_organization_id AS organization_id, source_credit_type AS credit_type,

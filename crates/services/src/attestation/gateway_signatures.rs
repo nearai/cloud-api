@@ -2,12 +2,13 @@ use ed25519_dalek::Signer;
 use k256::ecdsa::{RecoveryId, Signature as EcdsaSignature};
 use sha3::{Digest, Keccak256};
 
-use super::{AttestationError, AttestationService, ChatSignature, SignatureKind};
+use super::{AttestationError, AttestationService, ChatSignature, SignatureKind, SignatureOwner};
 use crate::metrics::consts::*;
 
 impl AttestationService {
     pub(in crate::attestation) async fn store_gateway_signature(
         &self,
+        owner: SignatureOwner,
         signature_id: &str,
         id_label: &str,
         request_hash: String,
@@ -42,22 +43,18 @@ impl AttestationService {
         }
 
         self.repository
-            .add_chat_signatures(signature_id, signatures)
+            .add_chat_signatures(owner, signature_id, signatures)
             .await
-            .map_err(|e| {
+            .inspect_err(|e| {
                 tracing::error!(
                     signature_kind = id_label,
-                    signature_id = signature_id,
-                    error = %e,
+                    organization_id = %owner.organization_id,
+                    workspace_id = %owner.workspace_id,
+                    error_kind = e.kind(),
                     "Failed to store gateway signatures in repository"
                 );
-                AttestationError::RepositoryError(e.to_string())
             })?;
-        tracing::info!(
-            signature_kind = id_label,
-            signature_id = signature_id,
-            "Stored gateway signatures"
-        );
+        tracing::info!(signature_kind = id_label, "Stored gateway signatures");
 
         let duration = start_time.elapsed();
         self.metrics_service

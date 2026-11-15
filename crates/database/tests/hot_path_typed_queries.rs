@@ -10,7 +10,10 @@ use database::repositories::{
 use database::{DbPool, PgAttestationRepository, PgOrganizationRepository};
 use deadpool::Runtime;
 use deadpool_postgres::Config;
-use services::attestation::{ports::AttestationRepository as _, ChatSignature, SignatureKind};
+use services::attestation::{
+    ports::AttestationRepository as _, AttestationError, ChatSignature, SignatureKind,
+    SignatureOwner,
+};
 use services::common::hash_api_key;
 use services::completions::ports::OrganizationConcurrentLimitRepository as _;
 use services::staking_farm::{StakingFarmRepository as _, UpsertStakingFarmSourceRequest};
@@ -277,10 +280,15 @@ async fn typed_hot_path_queries_repeat_on_one_pool() -> anyhow::Result<()> {
 
     // attestation: single insert (twice, upsert) and batch insert
     let attestation = PgAttestationRepository::new(pool.clone());
+    let owner = SignatureOwner {
+        organization_id: org_id,
+        workspace_id,
+    };
     let chat_id = format!("chatcmpl-typed-{suffix}");
     for text in ["first", "second"] {
         attestation
             .add_chat_signature(
+                owner,
                 &chat_id,
                 signature("ecdsa", text, Some(SignatureKind::Gateway)),
             )
@@ -293,6 +301,7 @@ async fn typed_hot_path_queries_repeat_on_one_pool() -> anyhow::Result<()> {
     for text in ["one", "two"] {
         attestation
             .add_chat_signatures(
+                owner,
                 &batch_chat_id,
                 vec![
                     signature("ecdsa", text, Some(SignatureKind::ProviderTee)),
@@ -309,6 +318,114 @@ async fn typed_hot_path_queries_repeat_on_one_pool() -> anyhow::Result<()> {
             assert_eq!(stored.signature_kind, kind);
         }
     }
+
+    Ok(())
+}
+
+/// Needs nullable `organization_id` and `workspace_id` UUID columns on
+/// `chat_signatures`; test schema setup adds them if the pinned schema lacks them.
+/// Writes are owner-guarded; reads are global so any caller can verify.
+#[tokio::test]
+async fn chat_signatures_record_their_owner_and_read_globally() -> anyhow::Result<()> {
+    let pool = test_pool().await?;
+    let attestation = PgAttestationRepository::new(pool.clone());
+    let suffix = Uuid::new_v4().simple().to_string();
+    let owner = SignatureOwner {
+        organization_id: Uuid::new_v4(),
+        workspace_id: Uuid::new_v4(),
+    };
+    let other_org = SignatureOwner {
+        organization_id: Uuid::new_v4(),
+        workspace_id: Uuid::new_v4(),
+    };
+
+    // The inserted row carries the writing owner.
+    let chat_id = format!("chatcmpl-owner-{suffix}");
+    attestation
+        .add_chat_signatures(
+            owner,
+            &chat_id,
+            vec![
+                signature("ecdsa", "mine", Some(SignatureKind::Gateway)),
+                signature("ed25519", "mine", Some(SignatureKind::Gateway)),
+            ],
+        )
+        .await?;
+    let stored_owners: Vec<(Option<Uuid>, Option<Uuid>)> = pool
+        .get()
+        .await?
+        .query(
+            "SELECT organization_id, workspace_id FROM chat_signatures WHERE chat_id = $1",
+            &[&chat_id],
+        )
+        .await?
+        .iter()
+        .map(|row| (row.get(0), row.get(1)))
+        .collect();
+    assert_eq!(
+        stored_owners,
+        vec![
+            (Some(owner.organization_id), Some(owner.workspace_id)),
+            (Some(owner.organization_id), Some(owner.workspace_id)),
+        ]
+    );
+
+    // The read is not filtered by owner.
+    for algo in ["ecdsa", "ed25519"] {
+        let stored = attestation.get_chat_signature(&chat_id, algo).await?;
+        assert_eq!(stored.text, "mine");
+    }
+    assert!(matches!(
+        attestation
+            .get_chat_signature(&format!("chatcmpl-missing-{suffix}"), "ecdsa")
+            .await,
+        Err(AttestationError::SignatureNotFound(_))
+    ));
+
+    // Another owner writing the same id fails and changes nothing.
+    let conflict = attestation
+        .add_chat_signature(
+            other_org,
+            &chat_id,
+            signature("ecdsa", "theirs", Some(SignatureKind::Gateway)),
+        )
+        .await;
+    assert!(matches!(conflict, Err(AttestationError::OwnerConflict)));
+    let still_mine = attestation.get_chat_signature(&chat_id, "ecdsa").await?;
+    assert_eq!(still_mine.text, "mine");
+
+    // A row stored before owners were recorded is readable and cannot be
+    // claimed by a later write.
+    let legacy_id = format!("chatcmpl-legacy-{suffix}");
+    pool.get()
+        .await?
+        .execute(
+            "INSERT INTO chat_signatures (chat_id, text, signature, signing_address, signing_algo) VALUES ($1, 'legacy', 'sig', 'addr', 'ecdsa')",
+            &[&legacy_id],
+        )
+        .await?;
+    let legacy = attestation.get_chat_signature(&legacy_id, "ecdsa").await?;
+    assert_eq!(legacy.text, "legacy");
+    let claim = attestation
+        .add_chat_signature(
+            owner,
+            &legacy_id,
+            signature("ecdsa", "claim", Some(SignatureKind::Gateway)),
+        )
+        .await;
+    assert!(matches!(claim, Err(AttestationError::OwnerConflict)));
+    let legacy_owner: (Option<Uuid>, Option<Uuid>, String) = {
+        let row = pool
+            .get()
+            .await?
+            .query_one(
+                "SELECT organization_id, workspace_id, text FROM chat_signatures WHERE chat_id = $1",
+                &[&legacy_id],
+            )
+            .await?;
+        (row.get(0), row.get(1), row.get(2))
+    };
+    assert_eq!(legacy_owner, (None, None, "legacy".to_string()));
 
     Ok(())
 }

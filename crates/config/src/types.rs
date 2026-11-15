@@ -115,11 +115,9 @@ pub struct ApiConfig {
     /// Defaults off so dual-read support can be deployed fleet-wide first.
     pub database_encryption_write_enabled: bool,
     pub s3: S3Config,
-    pub invitation_email: InvitationEmailConfig,
     pub otlp: OtlpConfig,
     pub cors: CorsConfig,
     pub external_providers: ExternalProvidersConfig,
-    pub github_dispatch: GitHubDispatchConfig,
     pub infra: InfraConfig,
     pub staking_farm: StakingFarmConfig,
     pub aml: AmlConfig,
@@ -149,11 +147,9 @@ impl std::fmt::Debug for ApiConfig {
             database_encryption_key_id,
             database_encryption_write_enabled,
             s3,
-            invitation_email,
             otlp,
             cors,
             external_providers,
-            github_dispatch,
             infra,
             staking_farm,
             aml,
@@ -179,11 +175,9 @@ impl std::fmt::Debug for ApiConfig {
                 database_encryption_write_enabled,
             )
             .field("s3", s3)
-            .field("invitation_email", invitation_email)
             .field("otlp", otlp)
             .field("cors", cors)
             .field("external_providers", external_providers)
-            .field("github_dispatch", github_dispatch)
             .field("infra", infra)
             .field("staking_farm", staking_farm)
             .field("aml", aml)
@@ -268,11 +262,9 @@ impl ApiConfig {
                 false,
             )?,
             s3: S3Config::from_env()?,
-            invitation_email: InvitationEmailConfig::from_env()?,
             otlp: OtlpConfig::from_env()?,
             cors: CorsConfig::default(),
             external_providers: ExternalProvidersConfig::from_env(),
-            github_dispatch: GitHubDispatchConfig::from_env()?,
             infra: InfraConfig::from_env()?,
             aml: AmlConfig::from_env()?,
             ita: ItaAttestationConfig::from_env()?,
@@ -581,29 +573,18 @@ fn parse_optional_i32_env(key: &str, default: Option<i32>) -> Result<Option<i32>
     }
 }
 
-/// Operational limits for the programmatic usage-reporting API.
+/// Time budget for usage queries.
 ///
-/// Reporting is disabled by default because its production indexes are built
-/// concurrently outside a migration transaction. Operators enable it only after completing
-/// the rollout checklist in `docs/usage-reporting-rollout.md`.
+/// The database statement timeout for usage history and balance queries is derived
+/// from this request timeout, leaving headroom to answer before the HTTP timeout.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UsageReportingConfig {
-    pub enabled: bool,
-    pub global_requests_per_minute: u32,
-    pub token_requests_per_minute: u32,
-    pub max_concurrent_requests: usize,
-    pub token_max_concurrent_requests: usize,
     pub request_timeout_seconds: u64,
 }
 
 impl Default for UsageReportingConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
-            global_requests_per_minute: 600,
-            token_requests_per_minute: 60,
-            max_concurrent_requests: 4,
-            token_max_concurrent_requests: 2,
             request_timeout_seconds: 15,
         }
     }
@@ -617,42 +598,16 @@ impl UsageReportingConfig {
     pub fn from_env() -> Result<Self, String> {
         let defaults = Self::default();
         let config = Self {
-            enabled: parse_bool_env("USAGE_REPORTING_ENABLED", defaults.enabled)?,
-            global_requests_per_minute: parse_u32_env(
-                "USAGE_REPORTING_GLOBAL_REQUESTS_PER_MINUTE",
-                defaults.global_requests_per_minute,
-            )?,
-            token_requests_per_minute: parse_u32_env(
-                "USAGE_REPORTING_TOKEN_REQUESTS_PER_MINUTE",
-                defaults.token_requests_per_minute,
-            )?,
-            max_concurrent_requests: usize::try_from(parse_u32_env(
-                "USAGE_REPORTING_MAX_CONCURRENT_REQUESTS",
-                u32::try_from(defaults.max_concurrent_requests)
-                    .map_err(|_| "default reporting concurrency exceeds u32".to_string())?,
-            )?)
-            .map_err(|_| "USAGE_REPORTING_MAX_CONCURRENT_REQUESTS is too large".to_string())?,
-            token_max_concurrent_requests: usize::try_from(parse_u32_env(
-                "USAGE_REPORTING_TOKEN_MAX_CONCURRENT_REQUESTS",
-                u32::try_from(defaults.token_max_concurrent_requests)
-                    .map_err(|_| "default token reporting concurrency exceeds u32".to_string())?,
-            )?)
-            .map_err(|_| {
-                "USAGE_REPORTING_TOKEN_MAX_CONCURRENT_REQUESTS is too large".to_string()
-            })?,
             request_timeout_seconds: parse_u64_env(
                 "USAGE_REPORTING_REQUEST_TIMEOUT_SECONDS",
                 defaults.request_timeout_seconds,
             )?,
         };
 
-        if config.global_requests_per_minute == 0
-            || config.token_requests_per_minute == 0
-            || config.max_concurrent_requests == 0
-            || config.token_max_concurrent_requests == 0
-            || config.request_timeout_seconds == 0
-        {
-            return Err("usage reporting limits must be greater than zero".to_string());
+        if config.request_timeout_seconds == 0 {
+            return Err(
+                "USAGE_REPORTING_REQUEST_TIMEOUT_SECONDS must be greater than zero".to_string(),
+            );
         }
         if config.request_timeout_seconds > 3_600 {
             return Err("USAGE_REPORTING_REQUEST_TIMEOUT_SECONDS must not exceed 3600".to_string());
@@ -882,115 +837,6 @@ pub(crate) fn parse_u32_env(key: &str, default: u32) -> Result<u32, String> {
             .map_err(|_| format!("{key} must be an unsigned integer")),
         Err(_) => Ok(default),
     }
-}
-
-/// Default `event_type` when `GITHUB_DISPATCH_EVENT_TYPE` is unset. Shared
-/// between `from_env` and the `Default` impl so a `Default`-constructed config
-/// never dispatches with an empty type (which no workflow listens on).
-pub const DEFAULT_GITHUB_DISPATCH_EVENT_TYPE: &str = "stg_model_loaded";
-
-/// Configuration for triggering GitHub Actions workflows after admin PATCH on
-/// models. When `enabled`, a successful `PATCH /v1/admin/models` fires a
-/// `repository_dispatch` event so downstream automation (validate / promote
-/// pipelines) can react. Intended to be enabled only on staging cloud-api.
-#[derive(Clone)]
-pub struct GitHubDispatchConfig {
-    pub enabled: bool,
-    /// Target repo in `owner/name` form.
-    pub repo: Option<String>,
-    /// `event_type` field in the dispatch payload. Workflows listen on
-    /// `on: repository_dispatch: types: [<event_type>]`.
-    pub event_type: String,
-    /// Fine-grained PAT with `actions: write` scoped to `repo` only.
-    pub pat: Option<String>,
-}
-
-impl std::fmt::Debug for GitHubDispatchConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let Self {
-            enabled,
-            repo,
-            event_type,
-            pat,
-        } = self;
-        f.debug_struct("GitHubDispatchConfig")
-            .field("enabled", enabled)
-            .field("repo", repo)
-            .field("event_type", event_type)
-            .field("pat", &redact_opt(pat))
-            .finish()
-    }
-}
-
-impl Default for GitHubDispatchConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            repo: None,
-            event_type: DEFAULT_GITHUB_DISPATCH_EVENT_TYPE.to_string(),
-            pat: None,
-        }
-    }
-}
-
-impl GitHubDispatchConfig {
-    pub fn from_env() -> Result<Self, String> {
-        let enabled = env::var("ENABLE_GITHUB_DISPATCH")
-            .ok()
-            .and_then(|v| v.parse::<bool>().ok())
-            .unwrap_or(false);
-
-        let repo = non_empty_env("GITHUB_DISPATCH_REPO");
-        let event_type = non_empty_env("GITHUB_DISPATCH_EVENT_TYPE")
-            .unwrap_or_else(|| DEFAULT_GITHUB_DISPATCH_EVENT_TYPE.to_string());
-        // Only read the PAT (which may touch the filesystem) when enabled. A
-        // disabled instance must not fail to boot just because GITHUB_DISPATCH_PAT_FILE
-        // is set in a shared env template but the secret is not mounted.
-        let pat = if enabled {
-            read_optional_secret_env("GITHUB_DISPATCH_PAT_FILE", "GITHUB_DISPATCH_PAT")?
-        } else {
-            None
-        };
-
-        if enabled {
-            match repo.as_deref() {
-                None => {
-                    return Err(
-                        "GITHUB_DISPATCH_REPO must be set when ENABLE_GITHUB_DISPATCH=true"
-                            .to_string(),
-                    );
-                }
-                Some(r) if !is_owner_name(r) => {
-                    return Err(format!(
-                        "GITHUB_DISPATCH_REPO must be in 'owner/name' form, got '{r}'"
-                    ));
-                }
-                _ => {}
-            }
-            if pat.is_none() {
-                return Err(
-                    "GITHUB_DISPATCH_PAT or GITHUB_DISPATCH_PAT_FILE must be set when ENABLE_GITHUB_DISPATCH=true"
-                        .to_string(),
-                );
-            }
-        }
-
-        Ok(Self {
-            enabled,
-            repo,
-            event_type,
-            pat,
-        })
-    }
-}
-
-/// `true` when `s` is `owner/name`: exactly one `/` with both sides non-empty.
-fn is_owner_name(s: &str) -> bool {
-    let mut parts = s.split('/');
-    matches!(
-        (parts.next(), parts.next(), parts.next()),
-        (Some(owner), Some(name), None) if !owner.is_empty() && !name.is_empty()
-    )
 }
 
 /// Database configuration
@@ -1282,9 +1128,6 @@ pub struct AuthConfig {
     /// Explicit email addresses that are granted platform admin access
     /// An empty list denies admin access; domain-wide grants are not supported.
     pub admin_emails: Vec<String>,
-    /// Enable only after all API instances enforce admin token permissions.
-    /// Disabling issuance does not disable enforcement for existing tokens.
-    pub admin_read_only_tokens_enabled: bool,
     /// Reject session access tokens that carry no `sid` (session id) claim.
     ///
     /// Access tokens minted since session binding was introduced are tied to
@@ -1308,7 +1151,6 @@ impl std::fmt::Debug for AuthConfig {
             google,
             near,
             admin_emails,
-            admin_read_only_tokens_enabled,
             require_session_bound_access_tokens,
         } = self;
         f.debug_struct("AuthConfig")
@@ -1318,10 +1160,6 @@ impl std::fmt::Debug for AuthConfig {
             .field("google", google)
             .field("near", near)
             .field("admin_emails", admin_emails)
-            .field(
-                "admin_read_only_tokens_enabled",
-                admin_read_only_tokens_enabled,
-            )
             .field(
                 "require_session_bound_access_tokens",
                 require_session_bound_access_tokens,
@@ -1401,10 +1239,6 @@ impl AuthConfig {
             google,
             near,
             admin_emails,
-            admin_read_only_tokens_enabled: parse_bool_env(
-                "AUTH_ADMIN_READ_ONLY_TOKENS_ENABLED",
-                false,
-            )?,
             require_session_bound_access_tokens: parse_bool_env(
                 "AUTH_REQUIRE_SESSION_BOUND_ACCESS_TOKENS",
                 false,
@@ -1714,153 +1548,6 @@ impl PlacementEndpoint {
             tls,
             ca_pem,
         })
-    }
-}
-
-/// Default for `CONTACT_EMAIL_VERIFICATION_DAILY_CAP`.
-pub const DEFAULT_CONTACT_EMAIL_VERIFICATION_DAILY_CAP: u32 = 500;
-
-/// Email notification configuration for organization invitations.
-#[derive(Clone)]
-pub struct InvitationEmailConfig {
-    pub enabled: bool,
-    /// Lets NEAR wallet users add and verify a contact email. Switched on its
-    /// own, but uses the same sender address, Resend key and frontend URL.
-    pub contact_email_verification_enabled: bool,
-    /// Most contact email verification emails sent per 24 hours, across all
-    /// users and addresses.
-    pub contact_email_verification_daily_cap: u32,
-    pub from_email: Option<String>,
-    pub reply_to: Option<String>,
-    pub resend_api_key: Option<String>,
-    pub frontend_base_url: Option<String>,
-}
-
-impl std::fmt::Debug for InvitationEmailConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let Self {
-            enabled,
-            contact_email_verification_enabled,
-            contact_email_verification_daily_cap,
-            from_email,
-            reply_to,
-            resend_api_key,
-            frontend_base_url,
-        } = self;
-        f.debug_struct("InvitationEmailConfig")
-            .field("enabled", enabled)
-            .field(
-                "contact_email_verification_enabled",
-                contact_email_verification_enabled,
-            )
-            .field(
-                "contact_email_verification_daily_cap",
-                contact_email_verification_daily_cap,
-            )
-            .field("from_email", from_email)
-            .field("reply_to", reply_to)
-            .field("resend_api_key", &redact_opt(resend_api_key))
-            .field("frontend_base_url", frontend_base_url)
-            .finish()
-    }
-}
-
-impl Default for InvitationEmailConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            contact_email_verification_enabled: false,
-            contact_email_verification_daily_cap: DEFAULT_CONTACT_EMAIL_VERIFICATION_DAILY_CAP,
-            from_email: None,
-            reply_to: None,
-            resend_api_key: None,
-            frontend_base_url: None,
-        }
-    }
-}
-
-impl InvitationEmailConfig {
-    pub fn from_env() -> Result<Self, String> {
-        let enabled = env::var("INVITATION_EMAIL_ENABLED")
-            .ok()
-            .and_then(|v| v.parse::<bool>().ok())
-            .unwrap_or(false);
-        let contact_email_verification_enabled = env::var("CONTACT_EMAIL_VERIFICATION_ENABLED")
-            .ok()
-            .and_then(|v| v.parse::<bool>().ok())
-            .unwrap_or(false);
-        let contact_email_verification_daily_cap = parse_u32_env(
-            "CONTACT_EMAIL_VERIFICATION_DAILY_CAP",
-            DEFAULT_CONTACT_EMAIL_VERIFICATION_DAILY_CAP,
-        )?;
-
-        let from_email = non_empty_env("INVITATION_EMAIL_FROM");
-        let reply_to = non_empty_env("INVITATION_EMAIL_REPLY_TO");
-        let resend_api_key = if enabled || contact_email_verification_enabled {
-            read_optional_secret_env("RESEND_API_KEY_FILE", "RESEND_API_KEY")?
-        } else {
-            None
-        };
-        let frontend_base_url = non_empty_env("CLOUD_UI_BASE_URL");
-
-        for (switched_on, switch) in [
-            (enabled, "INVITATION_EMAIL_ENABLED"),
-            (
-                contact_email_verification_enabled,
-                "CONTACT_EMAIL_VERIFICATION_ENABLED",
-            ),
-        ] {
-            if !switched_on {
-                continue;
-            }
-            if from_email.is_none() {
-                return Err(format!(
-                    "INVITATION_EMAIL_FROM must be set when {switch}=true"
-                ));
-            }
-            if resend_api_key.is_none() {
-                return Err(format!(
-                    "RESEND_API_KEY or RESEND_API_KEY_FILE must be set when {switch}=true"
-                ));
-            }
-            if frontend_base_url.is_none() {
-                return Err(format!("CLOUD_UI_BASE_URL must be set when {switch}=true"));
-            }
-        }
-        // A cap of zero would refuse every request while the feature looks on.
-        if contact_email_verification_enabled && contact_email_verification_daily_cap == 0 {
-            return Err(
-                "CONTACT_EMAIL_VERIFICATION_DAILY_CAP must be greater than 0 when \
-                 CONTACT_EMAIL_VERIFICATION_ENABLED=true; set \
-                 CONTACT_EMAIL_VERIFICATION_ENABLED=false to switch the feature off"
-                    .to_string(),
-            );
-        }
-
-        Ok(Self {
-            enabled,
-            contact_email_verification_enabled,
-            contact_email_verification_daily_cap,
-            from_email,
-            reply_to,
-            resend_api_key,
-            frontend_base_url,
-        })
-    }
-
-    pub fn invitations_url(&self) -> Option<String> {
-        self.frontend_base_url
-            .as_ref()
-            .map(|base_url| format!("{}/dashboard/invitations", base_url.trim_end_matches('/')))
-    }
-
-    /// Frontend page that confirms a contact email. The verification token is
-    /// appended in the URL fragment (`#token=...`), which browsers do not send to
-    /// the server, so it stays out of access logs and referrers.
-    pub fn contact_email_verification_url(&self) -> Option<String> {
-        self.frontend_base_url
-            .as_ref()
-            .map(|base_url| format!("{}/verify-contact-email", base_url.trim_end_matches('/')))
     }
 }
 
@@ -2219,7 +1906,6 @@ mod tests {
     fn reporting_database_timeout_leaves_headroom_for_http_response() {
         let config = UsageReportingConfig {
             request_timeout_seconds: 15,
-            ..UsageReportingConfig::default()
         };
 
         assert_eq!(
@@ -2377,7 +2063,6 @@ mod tests {
             google: None,
             near: NearConfig::default(),
             admin_emails: vec!["alice@near.ai".to_string(), "bob@near.org".to_string()],
-            admin_read_only_tokens_enabled: false,
             require_session_bound_access_tokens: false,
         };
 
@@ -2483,24 +2168,11 @@ mod tests {
             google: None,
             near: NearConfig::default(),
             admin_emails: vec![],
-            admin_read_only_tokens_enabled: false,
             require_session_bound_access_tokens: false,
         };
 
         // Should return false when no admin emails configured
         assert!(!config.is_admin_email("admin@near.ai"));
-    }
-
-    fn clear_github_dispatch_env() {
-        for key in [
-            "ENABLE_GITHUB_DISPATCH",
-            "GITHUB_DISPATCH_REPO",
-            "GITHUB_DISPATCH_EVENT_TYPE",
-            "GITHUB_DISPATCH_PAT",
-            "GITHUB_DISPATCH_PAT_FILE",
-        ] {
-            std::env::remove_var(key);
-        }
     }
 
     fn clear_staking_farm_env() {
@@ -2634,32 +2306,6 @@ mod tests {
     }
 
     #[test]
-    fn github_dispatch_and_invitation_email_debug_redact_tokens() {
-        let dispatch = GitHubDispatchConfig {
-            enabled: true,
-            repo: Some("owner/repo".to_string()),
-            pat: Some("sentinel-github-pat".to_string()),
-            ..GitHubDispatchConfig::default()
-        };
-        let debug = format!("{dispatch:?}");
-        assert!(!debug.contains("sentinel-github-pat"));
-        assert!(debug.contains("owner/repo"));
-
-        let email = InvitationEmailConfig {
-            enabled: true,
-            resend_api_key: Some("sentinel-resend-key".to_string()),
-            from_email: Some("noreply@example.test".to_string()),
-            ..InvitationEmailConfig::default()
-        };
-        let debug = format!("{email:?}");
-        assert!(!debug.contains("sentinel-resend-key"));
-        assert!(debug.contains("noreply@example.test"));
-
-        let unset = format!("{:?}", GitHubDispatchConfig::default());
-        assert!(unset.contains("pat: None"));
-    }
-
-    #[test]
     fn api_config_debug_redacts_all_secrets() {
         let config = ApiConfig {
             server: ServerConfig {
@@ -2691,10 +2337,6 @@ mod tests {
                 object_rewrap_max_bytes: 1024,
                 object_encryption_write_enabled: false,
             },
-            invitation_email: InvitationEmailConfig {
-                resend_api_key: Some("sentinel-resend-key".to_string()),
-                ..InvitationEmailConfig::default()
-            },
             otlp: OtlpConfig {
                 endpoint: "http://localhost:4317".to_string(),
                 protocol: "grpc".to_string(),
@@ -2707,10 +2349,6 @@ mod tests {
             external_providers: ExternalProvidersConfig {
                 openai_api_key: Some("sentinel-openai-key".to_string()),
                 ..ExternalProvidersConfig::default()
-            },
-            github_dispatch: GitHubDispatchConfig {
-                pat: Some("sentinel-github-pat".to_string()),
-                ..GitHubDispatchConfig::default()
             },
             infra: InfraConfig {
                 prometheus_bearer_token: Some("sentinel-prometheus-token".to_string()),
@@ -2740,9 +2378,7 @@ mod tests {
             "sentinel-db-password",
             "sentinel-database-encryption-key",
             "sentinel-s3-encryption-key",
-            "sentinel-resend-key",
             "sentinel-openai-key",
-            "sentinel-github-pat",
             "sentinel-prometheus-token",
             "sentinel-lukka-token",
             "sentinel-redis-password",
@@ -3123,28 +2759,6 @@ mod tests {
 
     #[test]
     #[serial]
-    fn github_dispatch_disabled_by_default() {
-        clear_github_dispatch_env();
-        let config = GitHubDispatchConfig::from_env().unwrap();
-        assert!(!config.enabled);
-        assert!(config.repo.is_none());
-        assert!(config.pat.is_none());
-        assert_eq!(config.event_type, DEFAULT_GITHUB_DISPATCH_EVENT_TYPE);
-    }
-
-    #[test]
-    #[serial]
-    fn github_dispatch_default_matches_from_env_event_type() {
-        // The Default impl must agree with from_env's fallback so a
-        // Default-constructed config never carries an empty event_type.
-        assert_eq!(
-            GitHubDispatchConfig::default().event_type,
-            DEFAULT_GITHUB_DISPATCH_EVENT_TYPE
-        );
-    }
-
-    #[test]
-    #[serial]
     fn staking_farm_config_uses_shared_near_network() {
         clear_staking_farm_env();
         std::env::set_var("STAKING_FARM_ENABLED", "true");
@@ -3163,72 +2777,6 @@ mod tests {
         assert_eq!(config.farm_product_id, "cloud-credits");
 
         clear_staking_farm_env();
-    }
-
-    #[test]
-    #[serial]
-    fn github_dispatch_disabled_ignores_unreadable_pat_file() {
-        // Regression: a disabled instance must boot even when PAT_FILE points
-        // at a missing secret (e.g. left in a shared env template).
-        clear_github_dispatch_env();
-        std::env::set_var("ENABLE_GITHUB_DISPATCH", "false");
-        std::env::set_var(
-            "GITHUB_DISPATCH_PAT_FILE",
-            "/nonexistent/github_dispatch_pat",
-        );
-        let config = GitHubDispatchConfig::from_env().unwrap();
-        assert!(!config.enabled);
-        assert!(config.pat.is_none());
-        clear_github_dispatch_env();
-    }
-
-    #[test]
-    #[serial]
-    fn github_dispatch_enabled_requires_repo() {
-        clear_github_dispatch_env();
-        std::env::set_var("ENABLE_GITHUB_DISPATCH", "true");
-        std::env::set_var("GITHUB_DISPATCH_PAT", "ghp_test");
-        let err = GitHubDispatchConfig::from_env().unwrap_err();
-        assert!(err.contains("GITHUB_DISPATCH_REPO"));
-        clear_github_dispatch_env();
-    }
-
-    #[test]
-    #[serial]
-    fn github_dispatch_enabled_requires_pat() {
-        clear_github_dispatch_env();
-        std::env::set_var("ENABLE_GITHUB_DISPATCH", "true");
-        std::env::set_var("GITHUB_DISPATCH_REPO", "nearai/cvm-ansible-playbooks");
-        let err = GitHubDispatchConfig::from_env().unwrap_err();
-        assert!(err.contains("PAT"));
-        clear_github_dispatch_env();
-    }
-
-    #[test]
-    #[serial]
-    fn github_dispatch_enabled_rejects_malformed_repo() {
-        clear_github_dispatch_env();
-        std::env::set_var("ENABLE_GITHUB_DISPATCH", "true");
-        std::env::set_var("GITHUB_DISPATCH_REPO", "noslash");
-        std::env::set_var("GITHUB_DISPATCH_PAT", "ghp_test");
-        let err = GitHubDispatchConfig::from_env().unwrap_err();
-        assert!(err.contains("owner/name"));
-        clear_github_dispatch_env();
-    }
-
-    #[test]
-    #[serial]
-    fn github_dispatch_enabled_ok_with_inline_pat() {
-        clear_github_dispatch_env();
-        std::env::set_var("ENABLE_GITHUB_DISPATCH", "true");
-        std::env::set_var("GITHUB_DISPATCH_REPO", "nearai/cvm-ansible-playbooks");
-        std::env::set_var("GITHUB_DISPATCH_PAT", "ghp_test");
-        let config = GitHubDispatchConfig::from_env().unwrap();
-        assert!(config.enabled);
-        assert_eq!(config.repo.as_deref(), Some("nearai/cvm-ansible-playbooks"));
-        assert_eq!(config.pat.as_deref(), Some("ghp_test"));
-        assert_eq!(config.event_type, DEFAULT_GITHUB_DISPATCH_EVENT_TYPE);
-        clear_github_dispatch_env();
     }
 
     #[test]
@@ -3316,257 +2864,6 @@ mod tests {
         assert_eq!(config.exact_matches.len(), 1);
         assert_eq!(config.wildcard_suffixes.len(), 1);
         std::env::remove_var("CORS_ALLOWED_ORIGINS");
-    }
-
-    #[test]
-    #[serial]
-    fn test_invitation_email_config_defaults_disabled() {
-        clear_invitation_email_env();
-
-        let config = InvitationEmailConfig::from_env().unwrap();
-
-        assert!(!config.enabled);
-        assert!(config.from_email.is_none());
-        assert!(config.resend_api_key.is_none());
-        assert!(config.invitations_url().is_none());
-    }
-
-    #[test]
-    #[serial]
-    fn test_invitation_email_config_does_not_read_resend_key_file_when_disabled() {
-        clear_invitation_email_env();
-        std::env::set_var("RESEND_API_KEY_FILE", "/missing/resend-api-key");
-
-        let config = InvitationEmailConfig::from_env().unwrap();
-
-        assert!(!config.enabled);
-        assert!(config.resend_api_key.is_none());
-        clear_invitation_email_env();
-    }
-
-    #[test]
-    #[serial]
-    fn test_invitation_email_config_requires_from_when_enabled() {
-        clear_invitation_email_env();
-        std::env::set_var("INVITATION_EMAIL_ENABLED", "true");
-        std::env::set_var("CLOUD_UI_BASE_URL", "https://cloud.example.com");
-
-        let error = InvitationEmailConfig::from_env().unwrap_err();
-
-        assert!(error.contains("INVITATION_EMAIL_FROM"));
-        clear_invitation_email_env();
-    }
-
-    #[test]
-    #[serial]
-    fn test_invitation_email_config_requires_resend_api_key_when_enabled() {
-        clear_invitation_email_env();
-        std::env::set_var("INVITATION_EMAIL_ENABLED", "true");
-        std::env::set_var("INVITATION_EMAIL_FROM", "no-reply@example.com");
-        std::env::set_var("CLOUD_UI_BASE_URL", "https://cloud.example.com");
-
-        let error = InvitationEmailConfig::from_env().unwrap_err();
-
-        assert!(error.contains("RESEND_API_KEY"));
-        clear_invitation_email_env();
-    }
-
-    #[test]
-    #[serial]
-    fn test_invitation_email_config_requires_frontend_url_when_enabled() {
-        clear_invitation_email_env();
-        std::env::set_var("INVITATION_EMAIL_ENABLED", "true");
-        std::env::set_var("INVITATION_EMAIL_FROM", "no-reply@example.com");
-        std::env::set_var("RESEND_API_KEY", "re_test");
-
-        let error = InvitationEmailConfig::from_env().unwrap_err();
-
-        assert!(error.contains("CLOUD_UI_BASE_URL"));
-        clear_invitation_email_env();
-    }
-
-    #[test]
-    #[serial]
-    fn test_invitation_email_config_builds_inbox_url() {
-        clear_invitation_email_env();
-        std::env::set_var("INVITATION_EMAIL_ENABLED", "true");
-        std::env::set_var("INVITATION_EMAIL_FROM", "no-reply@example.com");
-        std::env::set_var("RESEND_API_KEY", "re_test");
-        std::env::set_var("CLOUD_UI_BASE_URL", "https://cloud.example.com/");
-
-        let config = InvitationEmailConfig::from_env().unwrap();
-
-        assert_eq!(config.resend_api_key.as_deref(), Some("re_test"));
-        assert_eq!(
-            config.invitations_url().as_deref(),
-            Some("https://cloud.example.com/dashboard/invitations")
-        );
-        clear_invitation_email_env();
-    }
-
-    #[test]
-    #[serial]
-    fn test_invitation_email_config_reads_resend_api_key_file() {
-        clear_invitation_email_env();
-        let path =
-            std::env::temp_dir().join(format!("cloud-api-resend-key-{}", std::process::id()));
-        std::fs::write(&path, " re_file_test \n").unwrap();
-        std::env::set_var("INVITATION_EMAIL_ENABLED", "true");
-        std::env::set_var("INVITATION_EMAIL_FROM", "no-reply@example.com");
-        std::env::set_var("RESEND_API_KEY_FILE", &path);
-        std::env::set_var("CLOUD_UI_BASE_URL", "https://cloud.example.com/");
-
-        let config = InvitationEmailConfig::from_env().unwrap();
-
-        assert_eq!(config.resend_api_key.as_deref(), Some("re_file_test"));
-        clear_invitation_email_env();
-        std::fs::remove_file(path).unwrap();
-    }
-
-    #[test]
-    #[serial]
-    fn test_contact_email_verification_defaults_disabled() {
-        clear_invitation_email_env();
-        std::env::set_var("RESEND_API_KEY_FILE", "/missing/resend-api-key");
-
-        let config = InvitationEmailConfig::from_env().unwrap();
-
-        assert!(!config.contact_email_verification_enabled);
-        assert_eq!(config.contact_email_verification_daily_cap, 500);
-        assert_eq!(
-            InvitationEmailConfig::default().contact_email_verification_daily_cap,
-            500
-        );
-        assert!(config.resend_api_key.is_none());
-        assert!(config.contact_email_verification_url().is_none());
-        clear_invitation_email_env();
-    }
-
-    #[test]
-    #[serial]
-    fn test_contact_email_verification_daily_cap_is_read_and_validated() {
-        clear_invitation_email_env();
-        std::env::set_var("CONTACT_EMAIL_VERIFICATION_DAILY_CAP", " 50 ");
-        assert_eq!(
-            InvitationEmailConfig::from_env()
-                .unwrap()
-                .contact_email_verification_daily_cap,
-            50
-        );
-
-        for invalid in ["-1", "many", ""] {
-            std::env::set_var("CONTACT_EMAIL_VERIFICATION_DAILY_CAP", invalid);
-            let error = InvitationEmailConfig::from_env().unwrap_err();
-            assert!(
-                error.contains("CONTACT_EMAIL_VERIFICATION_DAILY_CAP"),
-                "{error}"
-            );
-        }
-        clear_invitation_email_env();
-    }
-
-    #[test]
-    #[serial]
-    fn test_contact_email_verification_daily_cap_of_zero_fails_when_enabled() {
-        clear_invitation_email_env();
-        std::env::set_var("CONTACT_EMAIL_VERIFICATION_DAILY_CAP", "0");
-
-        // Off: the cap is not used, so zero is accepted.
-        assert_eq!(
-            InvitationEmailConfig::from_env()
-                .unwrap()
-                .contact_email_verification_daily_cap,
-            0
-        );
-
-        std::env::set_var("CONTACT_EMAIL_VERIFICATION_ENABLED", "true");
-        std::env::set_var("INVITATION_EMAIL_FROM", "no-reply@example.com");
-        std::env::set_var("RESEND_API_KEY", "re_test");
-        std::env::set_var("CLOUD_UI_BASE_URL", "https://cloud.example.com");
-        let error = InvitationEmailConfig::from_env().unwrap_err();
-        assert!(
-            error.contains("CONTACT_EMAIL_VERIFICATION_DAILY_CAP must be greater than 0"),
-            "{error}"
-        );
-
-        std::env::set_var("CONTACT_EMAIL_VERIFICATION_DAILY_CAP", "1");
-        assert!(InvitationEmailConfig::from_env().is_ok());
-        clear_invitation_email_env();
-    }
-
-    #[test]
-    #[serial]
-    fn test_contact_email_verification_requires_sender_settings_when_enabled() {
-        for (missing, set) in [
-            (
-                "INVITATION_EMAIL_FROM",
-                vec![
-                    ("RESEND_API_KEY", "re_test"),
-                    ("CLOUD_UI_BASE_URL", "https://cloud.example.com"),
-                ],
-            ),
-            (
-                "RESEND_API_KEY",
-                vec![
-                    ("INVITATION_EMAIL_FROM", "no-reply@example.com"),
-                    ("CLOUD_UI_BASE_URL", "https://cloud.example.com"),
-                ],
-            ),
-            (
-                "CLOUD_UI_BASE_URL",
-                vec![
-                    ("INVITATION_EMAIL_FROM", "no-reply@example.com"),
-                    ("RESEND_API_KEY", "re_test"),
-                ],
-            ),
-        ] {
-            clear_invitation_email_env();
-            std::env::set_var("CONTACT_EMAIL_VERIFICATION_ENABLED", "true");
-            for (key, value) in set {
-                std::env::set_var(key, value);
-            }
-
-            let error = InvitationEmailConfig::from_env().unwrap_err();
-
-            assert!(error.contains(missing), "{error}");
-            assert!(
-                error.contains("CONTACT_EMAIL_VERIFICATION_ENABLED"),
-                "{error}"
-            );
-        }
-        clear_invitation_email_env();
-    }
-
-    #[test]
-    #[serial]
-    fn test_contact_email_verification_is_independent_of_invitation_emails() {
-        clear_invitation_email_env();
-        std::env::set_var("CONTACT_EMAIL_VERIFICATION_ENABLED", "true");
-        std::env::set_var("INVITATION_EMAIL_FROM", "no-reply@example.com");
-        std::env::set_var("RESEND_API_KEY", "re_test");
-        std::env::set_var("CLOUD_UI_BASE_URL", "https://cloud.example.com/");
-
-        let config = InvitationEmailConfig::from_env().unwrap();
-
-        assert!(config.contact_email_verification_enabled);
-        assert!(!config.enabled);
-        assert_eq!(config.resend_api_key.as_deref(), Some("re_test"));
-        assert_eq!(
-            config.contact_email_verification_url().as_deref(),
-            Some("https://cloud.example.com/verify-contact-email")
-        );
-        clear_invitation_email_env();
-    }
-
-    fn clear_invitation_email_env() {
-        std::env::remove_var("CONTACT_EMAIL_VERIFICATION_ENABLED");
-        std::env::remove_var("CONTACT_EMAIL_VERIFICATION_DAILY_CAP");
-        std::env::remove_var("INVITATION_EMAIL_ENABLED");
-        std::env::remove_var("INVITATION_EMAIL_FROM");
-        std::env::remove_var("INVITATION_EMAIL_REPLY_TO");
-        std::env::remove_var("RESEND_API_KEY");
-        std::env::remove_var("RESEND_API_KEY_FILE");
-        std::env::remove_var("CLOUD_UI_BASE_URL");
     }
 
     #[test]

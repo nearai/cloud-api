@@ -216,12 +216,18 @@ mod tests {
             .with_writer(move || writer_logs.writer())
             .finish();
         let request_id = Uuid::new_v4();
-        let body = Body::from(
-            r#"{"prompt":"CUSTOMER_PROMPT_SENTINEL","tool_arguments":{"secret":"TOOL_ARG_SENTINEL"},"api_key":"sk-log-sentinel"}"#,
-        );
+        let body = r#"{"prompt":"CUSTOMER_PROMPT_SENTINEL","tool_arguments":{"secret":"TOOL_ARG_SENTINEL"},"api_key":"sk-log-sentinel"}"#;
+        let body_hash = {
+            use sha2::{Digest, Sha256};
+            hex::encode(Sha256::digest(body.as_bytes()))
+        };
         let token_path = "tok_live_customer_invitation_secret_1234567890";
         let app = Router::new()
             .route("/v1/invitations/{token}", post(|| async { "ok" }))
+            .layer(axum::middleware::from_fn_with_state(
+                crate::middleware::body_hash::BodyHashLimit(1024),
+                crate::middleware::body_hash::body_hash_middleware,
+            ))
             .layer(from_fn(request_correlation_middleware));
 
         let _subscriber_guard = tracing::subscriber::set_default(subscriber);
@@ -234,7 +240,7 @@ mod tests {
                     .header("x-org-id", "spoofed-org-sentinel")
                     .header("authorization", "Bearer sk-log-sentinel")
                     .header("User-Agent", "USER_AGENT_LOG_SENTINEL")
-                    .body(body)
+                    .body(Body::from(body))
                     .expect("test request should build"),
             )
             .await
@@ -260,6 +266,7 @@ mod tests {
             "spoofed-org-sentinel",
             "USER_AGENT_LOG_SENTINEL",
             token_path,
+            &body_hash,
         ] {
             assert!(
                 !captured.contains(forbidden),

@@ -17,6 +17,40 @@ use async_trait::async_trait;
 use inference_providers::ProviderFilter;
 use uuid::Uuid;
 
+#[derive(Clone, Default)]
+pub struct CapturedLogs(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl CapturedLogs {
+    pub fn subscriber(&self) -> impl tracing::Subscriber + Send + Sync {
+        let logs = self.clone();
+        tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_ansi(false)
+            .without_time()
+            .with_writer(move || logs.clone())
+            .finish()
+    }
+
+    pub fn contents(&self) -> String {
+        String::from_utf8(self.0.lock().expect("captured logs lock").clone())
+            .expect("logs are UTF-8")
+    }
+}
+
+impl std::io::Write for CapturedLogs {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .lock()
+            .expect("captured logs lock")
+            .extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 pub struct MockAttestationService;
 
 #[async_trait]

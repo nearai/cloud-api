@@ -310,16 +310,24 @@ fn usage_observer_does_not_treat_truncation_as_completion() {
 // Billing lifecycle of the native stream (synthetic upstream, scripted usage).
 // ---------------------------------------------------------------------------
 
+use crate::completions::concurrency::ConcurrencySlots;
 use crate::responses::models::{ResponseStatus, ResponseStreamEvent};
 use crate::usage::{
     InferenceUsageHistoryQuery, InferenceUsageReportRow, OrganizationBalanceInfo,
     OrganizationCreditLimit, OrganizationLimit, RecordUsageApiRequest, UsageCheckResult,
     UsageDiscount, UsageError, UsageLogEntry,
 };
-use std::sync::{
-    atomic::{AtomicU32, Ordering},
-    Mutex,
-};
+use std::sync::Mutex;
+
+/// A guard holding one live slot of a fresh registry; the registry reports 0
+/// in use once the guard is released.
+fn live_guard() -> (ConcurrentRequestGuard, Arc<ConcurrencySlots>) {
+    let slots = ConcurrencySlots::new();
+    let slot = slots
+        .try_acquire((Uuid::new_v4(), Uuid::new_v4()), 1)
+        .expect("fresh registry admits one slot");
+    (ConcurrentRequestGuard::new(slot), slots)
+}
 
 const CREATED: &str = "event: response.created\ndata: {\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"resp_synthetic\",\"status\":\"in_progress\"}}\n\n";
 const DELTA: &str = "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"sequence_number\":1,\"delta\":\"Hi\"}\n\n";
@@ -503,16 +511,11 @@ fn body_of(chunks: Vec<&'static str>) -> ResponsesRawBody {
 fn usage_stream(
     usage: &Arc<ScriptedUsage>,
     body: ResponsesRawBody,
-) -> (UsageStream, Uuid, Arc<AtomicU32>) {
+) -> (UsageStream, Uuid, Arc<ConcurrencySlots>) {
     let billing = billing(usage, InferenceType::ChatCompletionStream);
     let inference_id = billing.inference_id;
-    let slots = Arc::new(AtomicU32::new(1));
-    let stream = UsageStream::new(
-        body,
-        billing,
-        ConcurrentRequestGuard::new(slots.clone()),
-        tokio::runtime::Handle::current(),
-    );
+    let (guard, slots) = live_guard();
+    let stream = UsageStream::new(body, billing, guard, tokio::runtime::Handle::current());
     (stream, inference_id, slots)
 }
 
@@ -557,7 +560,7 @@ async fn streaming_success_releases_terminal_event_only_after_usage_is_recorded(
     let mut client = advance_to_billing_wait(&mut stream).await;
     assert_eq!(client, [CREATED, DELTA].concat().as_bytes());
     assert!(usage.committed().is_empty());
-    assert_eq!(slots.load(Ordering::Acquire), 0, "slot released at EOF");
+    assert_eq!(slots.in_use(), 0, "slot released at EOF");
 
     let (rest, errors) = drain(&mut stream).await;
     assert_eq!(errors, 0);
@@ -780,7 +783,7 @@ async fn client_disconnect_before_upstream_eof_keeps_observed_usage() {
     assert_eq!(stream.next().await.unwrap().unwrap(), CREATED.as_bytes());
     assert!(futures::poll!(stream.next()).is_pending());
     drop(stream);
-    assert_eq!(slots.load(Ordering::Acquire), 0);
+    assert_eq!(slots.in_use(), 0);
     tokio::time::timeout(Duration::from_secs(5), async {
         while usage.committed().is_empty() {
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -841,8 +844,7 @@ async fn non_streaming_records_usage_under_the_returned_billing_id() {
     let usage = ScriptedUsage::new(WriteOutcome::Succeed);
     let billing = billing(&usage, InferenceType::ChatCompletion);
     let expected = billing.inference_id;
-    let slots = Arc::new(AtomicU32::new(1));
-    let guard = ConcurrentRequestGuard::new(slots.clone());
+    let (guard, slots) = live_guard();
     let response = account(json_upstream(completed_json()), false, billing, guard)
         .await
         .unwrap();
@@ -854,7 +856,7 @@ async fn non_streaming_records_usage_under_the_returned_billing_id() {
         committed[0].provider_request_id.as_deref(),
         Some("resp_synthetic")
     );
-    assert_eq!(slots.load(Ordering::Acquire), 0);
+    assert_eq!(slots.in_use(), 0);
 }
 
 #[tokio::test]
@@ -862,7 +864,7 @@ async fn non_streaming_usage_failure_returns_no_response_body() {
     let usage = ScriptedUsage::new(WriteOutcome::RejectBeforeWrite);
     let billing = billing(&usage, InferenceType::ChatCompletion);
     let inference_id = billing.inference_id;
-    let guard = ConcurrentRequestGuard::new(Arc::new(AtomicU32::new(1)));
+    let guard = live_guard().0;
     let result = account(json_upstream(completed_json()), false, billing, guard).await;
     assert!(matches!(
         result,
@@ -879,7 +881,7 @@ async fn non_streaming_commit_then_error_reports_unknown_outcome_not_failure() {
     let usage = ScriptedUsage::new(WriteOutcome::CommitThenFail);
     let billing = billing(&usage, InferenceType::ChatCompletion);
     let inference_id = billing.inference_id;
-    let guard = ConcurrentRequestGuard::new(Arc::new(AtomicU32::new(1)));
+    let guard = live_guard().0;
     let result = account(json_upstream(completed_json()), false, billing, guard).await;
     assert!(matches!(
         result,
@@ -973,7 +975,7 @@ async fn non_streaming_verdict_wait_is_bounded_and_reports_unknown() {
     let usage = ScriptedUsage::new(WriteOutcome::Hang);
     let billing = billing(&usage, InferenceType::ChatCompletion);
     let inference_id = billing.inference_id;
-    let guard = ConcurrentRequestGuard::new(Arc::new(AtomicU32::new(1)));
+    let guard = live_guard().0;
     let started = tokio::time::Instant::now();
     let result = account(json_upstream(completed_json()), false, billing, guard).await;
     assert_eq!(started.elapsed(), BILLING_VERDICT_WAIT);
@@ -994,7 +996,7 @@ async fn non_streaming_verdict_timeout_does_not_cancel_the_write() {
     let usage = ScriptedUsage::new(WriteOutcome::Slow(delay));
     let billing = billing(&usage, InferenceType::ChatCompletion);
     let inference_id = billing.inference_id;
-    let guard = ConcurrentRequestGuard::new(Arc::new(AtomicU32::new(1)));
+    let guard = live_guard().0;
     let result = account(json_upstream(completed_json()), false, billing, guard).await;
     assert!(matches!(
         result,

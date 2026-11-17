@@ -129,7 +129,9 @@ fn service(repo: Arc<CountingModelsRepository>) -> CompletionServiceImpl {
         Arc::new(CapturingUsageService::new()),
         Arc::new(CapturingMetricsService::new()),
         repo,
-        Arc::new(StaticOrganizationLimitRepository),
+        Arc::new(StaticOrganizationLimitRepository {
+            limit: DEFAULT_CONCURRENT_LIMIT,
+        }),
     )
 }
 
@@ -452,7 +454,9 @@ async fn a_granted_organization_is_served_an_unlisted_model() {
         Arc::new(CapturingUsageService::new()),
         Arc::new(CapturingMetricsService::new()),
         repo.clone(),
-        Arc::new(StaticOrganizationLimitRepository),
+        Arc::new(StaticOrganizationLimitRepository {
+            limit: DEFAULT_CONCURRENT_LIMIT,
+        }),
     );
 
     // The provider is there, yet an organization without a grant is refused.
@@ -552,7 +556,9 @@ async fn a_platform_model_is_resolved_as_a_trusted_caller() {
         Arc::new(CapturingUsageService::new()),
         Arc::new(CapturingMetricsService::new()),
         repo,
-        Arc::new(StaticOrganizationLimitRepository),
+        Arc::new(StaticOrganizationLimitRepository {
+            limit: DEFAULT_CONCURRENT_LIMIT,
+        }),
     );
 
     // Named by a request, both are refused: the organization holds no grant.

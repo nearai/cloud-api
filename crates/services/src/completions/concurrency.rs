@@ -27,6 +27,10 @@ pub(crate) const SLOT_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 /// real leak, not a slow request.
 pub(crate) const SLOT_HELD_WARN_THRESHOLD: Duration = Duration::from_secs(30 * 60);
 
+/// Below this capacity the registry's key map is already small, so `release`
+/// never bothers shrinking it.
+const MIN_SHRINK_CAPACITY: usize = 256;
+
 /// Registry of live concurrency slots, keyed by (organization, model).
 ///
 /// The in-flight count for a key is simply `holders.len()` under a single
@@ -151,6 +155,15 @@ impl ConcurrencySlots {
             state.holders.remove(&id);
             if state.holders.is_empty() {
                 keys.remove(&key);
+                // Removing keys never shrinks a HashMap, so a burst of distinct keys would pin
+                // its high-water allocation for the life of the process. Shrink once the map
+                // is mostly empty; live keys are preserved (this only reallocates buckets).
+                if keys.capacity() > MIN_SHRINK_CAPACITY
+                    && keys.capacity() > keys.len().saturating_mul(4)
+                {
+                    let target_capacity = keys.len().saturating_mul(2).max(MIN_SHRINK_CAPACITY);
+                    keys.shrink_to(target_capacity);
+                }
             }
         }
     }
@@ -158,6 +171,11 @@ impl ConcurrencySlots {
     #[cfg(test)]
     pub(crate) fn in_use(&self) -> usize {
         self.lock().values().map(|state| state.holders.len()).sum()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn capacity(&self) -> usize {
+        self.lock().capacity()
     }
 
     /// In-flight count for one key; 0 when the key is not tracked.
@@ -220,7 +238,7 @@ pub(crate) fn spawn_slot_monitor(
     };
 
     let weak = Arc::downgrade(registry);
-    std::mem::drop(handle.spawn(async move {
+    let monitor = handle.spawn(async move {
         let tags = [format!("{TAG_ENVIRONMENT}:{}", get_environment())];
         let tags_str: Vec<&str> = tags.iter().map(|s| s.as_str()).collect();
 
@@ -234,6 +252,9 @@ pub(crate) fn spawn_slot_monitor(
             ticker.tick().await;
 
             let report = {
+                // Holding `metrics` for the life of this task means it is not
+                // dropped until the tick after the registry itself is dropped
+                // (<= SLOT_SWEEP_INTERVAL, 60s); that bounded delay is accepted.
                 let Some(registry) = weak.upgrade() else {
                     tracing::debug!("Concurrency slot registry dropped; stopping slot monitor");
                     return;
@@ -241,21 +262,30 @@ pub(crate) fn spawn_slot_monitor(
                 registry.sweep(Instant::now(), SLOT_HELD_WARN_THRESHOLD)
             };
 
-            metrics.record_histogram(
-                METRIC_CONCURRENT_SLOTS_IN_USE,
-                report.in_use as f64,
-                &tags_str,
-            );
-            metrics.record_histogram(
-                METRIC_CONCURRENT_SLOTS_MAX_PER_KEY,
-                report.max_per_key as f64,
-                &tags_str,
-            );
-            metrics.record_histogram(
-                METRIC_CONCURRENT_SLOTS_OVER_THRESHOLD,
-                report.over_threshold as f64,
-                &tags_str,
-            );
+            // A panic here (e.g. a poisoned std Mutex inside a metrics backend)
+            // must not take down the whole sweep loop: leak detection below still
+            // needs to run every tick.
+            let metrics_panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                metrics.record_histogram(
+                    METRIC_CONCURRENT_SLOTS_IN_USE,
+                    report.in_use as f64,
+                    &tags_str,
+                );
+                metrics.record_histogram(
+                    METRIC_CONCURRENT_SLOTS_MAX_PER_KEY,
+                    report.max_per_key as f64,
+                    &tags_str,
+                );
+                metrics.record_histogram(
+                    METRIC_CONCURRENT_SLOTS_OVER_THRESHOLD,
+                    report.over_threshold as f64,
+                    &tags_str,
+                );
+            }))
+            .is_err();
+            if metrics_panicked {
+                tracing::error!("Recording concurrency slot metrics panicked");
+            }
 
             for slot in &report.newly_over_threshold {
                 tracing::warn!(
@@ -281,17 +311,55 @@ pub(crate) fn spawn_slot_monitor(
                 "Concurrency slot sweep"
             );
         }
-    }));
+    });
+
+    // If the sweep loop above ever terminates via panic (JoinError), nobody else
+    // observes it: leak detection would silently stop. Supervise it so that gets
+    // logged. A normal exit (registry dropped) returns `Ok(())` and is already
+    // logged at debug level above; only a genuine task failure is an error here.
+    handle.spawn(async move {
+        if monitor.await.is_err() {
+            tracing::error!(
+                "Concurrency slot monitor task terminated unexpectedly; leaked-slot detection is no longer running"
+            );
+        }
+    });
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::metrics::capturing::{CapturingMetricsService, MetricValue};
-    use std::sync::atomic::AtomicU32;
+    use async_trait::async_trait;
+    use std::sync::atomic::{AtomicU32, AtomicUsize};
 
     fn test_key() -> SlotKey {
         (Uuid::new_v4(), Uuid::new_v4())
+    }
+
+    /// Metrics backend that panics on every histogram recording, simulating e.g.
+    /// a poisoned std Mutex inside `OtlpMetricsService::record_histogram`. Counts
+    /// calls so a test can prove the sweep loop kept running across the panic.
+    struct PanickingMetricsService {
+        calls: AtomicUsize,
+    }
+
+    impl PanickingMetricsService {
+        fn new() -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl MetricsServiceTrait for PanickingMetricsService {
+        fn record_latency(&self, _name: &str, _duration: Duration, _tags: &[&str]) {}
+        fn record_count(&self, _name: &str, _value: i64, _tags: &[&str]) {}
+        fn record_histogram(&self, _name: &str, _value: f64, _tags: &[&str]) {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            panic!("simulated metrics backend panic");
+        }
     }
 
     /// The old moka cache expired the counter 600 s after insertion regardless of
@@ -584,5 +652,93 @@ mod tests {
             vec![format!("{TAG_ENVIRONMENT}:{}", get_environment())],
             "slot metrics must carry the environment tag only (no org/model cardinality)"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn slot_monitor_survives_a_panicking_metrics_service() {
+        let metrics = Arc::new(PanickingMetricsService::new());
+        let registry = ConcurrencySlots::new();
+        spawn_slot_monitor(&registry, metrics.clone());
+
+        let key = test_key();
+        let _slot = registry.try_acquire(key, 3).expect("should be admitted");
+
+        // Advance past several sweep ticks; each tick panics inside the metrics
+        // call, but the loop (and thus leak detection) must keep running.
+        for _ in 0..20 {
+            tokio::time::advance(SLOT_SWEEP_INTERVAL).await;
+            tokio::task::yield_now().await;
+            if metrics.calls.load(Ordering::SeqCst) >= 2 {
+                break;
+            }
+        }
+
+        assert!(
+            metrics.calls.load(Ordering::SeqCst) >= 2,
+            "expected the monitor loop to survive the first panic and keep ticking, got {} call(s)",
+            metrics.calls.load(Ordering::SeqCst)
+        );
+        assert_eq!(
+            registry.in_use(),
+            1,
+            "the registry must stay intact across a panicking metrics service"
+        );
+
+        let report = registry.sweep(Instant::now(), SLOT_HELD_WARN_THRESHOLD);
+        assert_eq!(report.in_use, 1, "a subsequent sweep must still work");
+    }
+
+    #[test]
+    fn registry_shrinks_after_a_burst_of_distinct_keys() {
+        let registry = ConcurrencySlots::new();
+        let keys: Vec<SlotKey> = (0..10_000).map(|_| test_key()).collect();
+
+        let mut slots: Vec<ConcurrencySlot> = keys
+            .iter()
+            .map(|&key| {
+                registry
+                    .try_acquire(key, 1)
+                    .expect("each distinct key should be admitted under its own limit")
+            })
+            .collect();
+
+        let high_water_capacity = registry.capacity();
+        assert!(
+            high_water_capacity >= 10_000,
+            "expected capacity to grow to accommodate 10,000 distinct keys, got {high_water_capacity}"
+        );
+
+        // Releasing a handful of keys out of a large, mostly-live map must not
+        // trigger our shrink logic (`capacity() > 4 * len()` is nowhere close to
+        // true here): live keys are not disturbed by needless rehashing.
+        // hashbrown's own bookkeeping can drift `capacity()` by a handful of
+        // units on removal (its erase path sometimes reclaims a tombstone as
+        // EMPTY), so allow slack bounded by the number of removals rather than
+        // requiring bit-for-bit equality.
+        for _ in 0..10 {
+            slots.pop();
+        }
+        let capacity_after_small_release = registry.capacity();
+        assert!(
+            high_water_capacity.saturating_sub(capacity_after_small_release) <= 10,
+            "releasing a few keys out of a mostly-live map must not meaningfully shrink it: \
+             {high_water_capacity} -> {capacity_after_small_release}"
+        );
+
+        // Release everything else; the map should shrink back down.
+        slots.clear();
+        assert_eq!(registry.tracked_keys(), 0);
+        assert!(
+            registry.capacity() <= 2 * MIN_SHRINK_CAPACITY,
+            "expected the map to shrink once nearly empty, got capacity {}",
+            registry.capacity()
+        );
+
+        // The registry must still work correctly after shrinking.
+        let fresh_key = test_key();
+        let _slot = registry
+            .try_acquire(fresh_key, 1)
+            .expect("acquiring after a shrink should still work");
+        assert_eq!(registry.in_use(), 1);
     }
 }

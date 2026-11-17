@@ -204,6 +204,40 @@ fn native_client_tools_preserve_grammar_namespaces_and_custom_replay() {
 }
 
 #[test]
+fn native_client_tool_search_declaration_and_replay_pass_unchanged() {
+    let body = json!({
+        "model": "openai/gpt-6-astra", "store": false, "stream": true,
+        "tools": [
+            {"type":"function", "name":"exec_command", "strict":false, "parameters":{"type":"object"}},
+            {"type":"custom", "name":"apply_patch", "format":{"type":"grammar", "syntax":"lark", "definition":"start: /.+/s"}},
+            {"type":"tool_search", "execution":"client", "description":"Search deferred tools.", "parameters":{
+                "type":"object", "properties":{"query":{"type":"string"}, "limit":{"type":"number"}},
+                "required":["query"], "additionalProperties":false
+            }},
+            {"type":"web_search", "external_web_access":false}
+        ],
+        "input": [
+            {"role":"user", "content":"List today's calendar events."},
+            {"type":"reasoning", "id":"rs_1", "encrypted_content":"opaque", "summary":[]},
+            {"type":"tool_search_call", "id":"tsc_1", "call_id":"call_search", "status":"completed",
+                "execution":"client", "arguments":{"query":"calendar events", "limit":3}},
+            {"type":"tool_search_output", "id":"tso_1", "call_id":"call_search", "status":"completed",
+                "execution":"client", "tools":[{"type":"namespace", "name":"mcp__calendar",
+                    "description":"Calendar tools.", "tools":[{"type":"function", "name":"list_events",
+                        "strict":false, "defer_loading":true, "parameters":{"type":"object"}}]}]},
+            {"type":"function_call", "id":"fc_1", "call_id":"call_list", "namespace":"mcp__calendar",
+                "name":"list_events", "arguments":"{}"},
+            {"type":"function_call_output", "call_id":"call_list", "output":"No events."}
+        ],
+        "include":["reasoning.encrypted_content"]
+    });
+    let normalized =
+        crate::responses::client_tools::normalize_native_request(body.clone()).unwrap();
+    assert!(validate(&normalized).is_ok());
+    assert_eq!(normalized, body);
+}
+
+#[test]
 fn fragmented_native_events_keep_usage_including_cache_writes() {
     let wire = concat!(
         "event: response.created\r\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"status\":\"in_progress\"}}\r\n\r\n",

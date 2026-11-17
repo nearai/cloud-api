@@ -239,8 +239,12 @@ fn tool_name(tool: &Value) -> Result<String, String> {
 /// Client-facing rejection for MCP tools, which are no longer supported.
 pub const MCP_TOOLS_UNSUPPORTED: &str = "MCP tools are no longer supported.";
 
+const TOOL_SEARCH_REQUIRES_NATIVE: &str =
+    "tool_search and its replay items require a native Responses backend";
+
 /// Whether a Responses request declares an `mcp` tool anywhere a tool can be
-/// declared: top-level `tools`, a `namespace`, or an `additional_tools` input.
+/// declared: top-level `tools`, a `namespace`, an `additional_tools` input, or
+/// the tools loaded by a replayed `tool_search_output`.
 pub fn contains_mcp_tool(body: &Value) -> bool {
     fn any_mcp(tools: &Value) -> bool {
         tools.as_array().is_some_and(|tools| {
@@ -251,9 +255,12 @@ pub fn contains_mcp_tool(body: &Value) -> bool {
     }
     any_mcp(&body["tools"])
         || body["input"].as_array().is_some_and(|input| {
-            input
-                .iter()
-                .any(|item| item["type"] == "additional_tools" && any_mcp(&item["tools"]))
+            input.iter().any(|item| {
+                matches!(
+                    item["type"].as_str(),
+                    Some("additional_tools" | "tool_search_output")
+                ) && any_mcp(&item["tools"])
+            })
         })
 }
 
@@ -302,17 +309,51 @@ fn visit_tools<'a>(
     Ok(())
 }
 
+/// Client-executed tool search: the model emits a `tool_search_call`, the
+/// client searches its own deferred tools and replays the matches in a
+/// `tool_search_output`. Hosted (`server`) tool search is not offered.
+fn is_client_tool_search(item: &Value) -> bool {
+    item["execution"] == "client"
+}
+
+fn validate_native_tool_list(tools: &[Value], declared: bool) -> Result<(), String> {
+    for tool in tools {
+        // Native web search is executed by the upstream Responses provider.
+        // Its configuration and the tool-search declaration have no
+        // client-tool name and stay unmodified.
+        if declared
+            && (tool["type"] == "web_search"
+                || tool["type"] == "tool_search" && is_client_tool_search(tool))
+        {
+            continue;
+        }
+        visit_tools(std::slice::from_ref(tool), false, |tool, _| {
+            tool_name(tool).map(|_| ())
+        })?;
+    }
+    Ok(())
+}
+
 fn validate_native_tools(body: &Value) -> Result<(), String> {
     if let Some(tools) = body.get("tools").filter(|value| !value.is_null()) {
-        for tool in tools.as_array().ok_or("tools must be an array")? {
-            // Native web search is executed by the upstream Responses provider.
-            // Its configuration has no client-tool name and stays unmodified.
-            if tool["type"] == "web_search" {
-                continue;
-            }
-            visit_tools(std::slice::from_ref(tool), false, |tool, _| {
-                tool_name(tool).map(|_| ())
-            })?;
+        validate_native_tool_list(tools.as_array().ok_or("tools must be an array")?, true)?;
+    }
+    for item in body["input"].as_array().into_iter().flatten() {
+        let output = match item["type"].as_str() {
+            Some("tool_search_call") => false,
+            Some("tool_search_output") => true,
+            _ => continue,
+        };
+        if !is_client_tool_search(item) {
+            return Err("Only client-executed tool search can be replayed".into());
+        }
+        if output {
+            // Loaded tools join the model's tool list, so they follow the
+            // same client-managed tool rules as declared tools.
+            let tools = item["tools"]
+                .as_array()
+                .ok_or("tool_search_output.tools must be an array")?;
+            validate_native_tool_list(tools, false)?;
         }
     }
     Ok(())
@@ -390,6 +431,15 @@ pub fn normalize_request(mut body: Value) -> Result<(Value, ClientToolAdapter), 
         })
         .collect();
     if let Some(tools) = body.get("tools").filter(|value| !value.is_null()) {
+        // Tool search loads new tools mid-response; the Chat adapter cannot.
+        if tools
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|tool| tool["type"] == "tool_search")
+        {
+            return Err(TOOL_SEARCH_REQUIRES_NATIVE.into());
+        }
         visit_tools(
             tools.as_array().ok_or("tools must be an array")?,
             true,
@@ -454,6 +504,14 @@ pub fn normalize_request(mut body: Value) -> Result<(Value, ClientToolAdapter), 
     }
 
     if let Some(input) = body.get_mut("input").and_then(Value::as_array_mut) {
+        if input.iter().any(|item| {
+            matches!(
+                item["type"].as_str(),
+                Some("tool_search_call" | "tool_search_output")
+            )
+        }) {
+            return Err(TOOL_SEARCH_REQUIRES_NATIVE.into());
+        }
         // Completed searches are informational output markers, not client tool
         // calls. The replayed assistant text supplies context; do not execute
         // searches again or create an unmatched tool-result message.

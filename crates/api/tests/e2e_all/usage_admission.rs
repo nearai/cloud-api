@@ -1,45 +1,17 @@
 use crate::common::*;
 use axum::http::StatusCode;
+use database::repositories::PostgresAdminSettingsRepository;
 use serde_json::{json, Value};
-use services::admin_settings::{AdminSettingsRepository, AdminSettingsService, StoredSetting};
+use services::admin_settings::{AdminSettingsRepository, AdminSettingsService};
 use services::usage::budget::policy::{
     AdmissionMode, AdmissionPolicy, AdmissionSettings, UsageAdmissionKey,
 };
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
-    Arc, Mutex,
+    Arc,
 };
 use std::time::Duration;
 use uuid::Uuid;
-
-// Keep policy updates local to this server while exercising the settings registry.
-struct SettingsRepository(Mutex<StoredSetting>);
-
-#[async_trait::async_trait]
-impl AdminSettingsRepository for SettingsRepository {
-    async fn get_all(&self) -> anyhow::Result<Vec<StoredSetting>> {
-        Ok(vec![self.0.lock().unwrap().clone()])
-    }
-    async fn get(&self, key: &str) -> anyhow::Result<Option<StoredSetting>> {
-        Ok((key == "usage_admission").then(|| self.0.lock().unwrap().clone()))
-    }
-    async fn upsert(
-        &self,
-        key: &str,
-        value: Value,
-        by_user: Uuid,
-    ) -> anyhow::Result<StoredSetting> {
-        assert_eq!(key, "usage_admission");
-        let row = StoredSetting {
-            key: key.into(),
-            value,
-            updated_by_user_id: Some(by_user),
-            updated_at: chrono::Utc::now(),
-        };
-        *self.0.lock().unwrap() = row.clone();
-        Ok(row)
-    }
-}
 
 pub(super) async fn server(
     settings: AdmissionSettings,
@@ -49,23 +21,53 @@ pub(super) async fn server(
     Arc<services::inference_provider_pool::InferenceProviderPool>,
     Arc<database::Database>,
 ) {
+    let (server, mock, pool, database, _) = server_with_policy(settings).await;
+    (server, mock, pool, database)
+}
+
+async fn server_with_policy(
+    settings: AdmissionSettings,
+) -> (
+    axum_test::TestServer,
+    Arc<inference_providers::mock::MockProvider>,
+    Arc<services::inference_provider_pool::InferenceProviderPool>,
+    Arc<database::Database>,
+    Arc<AdminSettingsService>,
+) {
     let database = Arc::new(database::Database::new(db_setup::create_test_pool().await));
     let mut config = test_config();
     config.internal_usage_token = Some("test-internal-secret".into());
     assert_mock_user_in_db(&database).await;
     let auth = api::init_auth_services(database.clone(), &config);
     let (pool, mock) = api::init_inference_providers_with_mocks(&config).await;
+    // Each test changes global defaults on its own connection. The actual repository still
+    // reads the organization rows and the global setting in one PostgreSQL statement.
+    let policy_pool = db_setup::create_test_pool().await;
+    policy_pool.current().unwrap().resize(1);
+    policy_pool
+        .get()
+        .await
+        .unwrap()
+        .batch_execute(
+            "CREATE TEMP TABLE admin_settings (LIKE public.admin_settings INCLUDING ALL)",
+        )
+        .await
+        .unwrap();
+    let repository = Arc::new(PostgresAdminSettingsRepository::new(policy_pool));
+    repository
+        .upsert(
+            "usage_admission",
+            serde_json::to_value(settings).unwrap(),
+            Uuid::new_v4(),
+        )
+        .await
+        .unwrap();
     let settings = Arc::new(
-        AdminSettingsService::builder(Arc::new(SettingsRepository(Mutex::new(StoredSetting {
-            key: "usage_admission".into(),
-            value: serde_json::to_value(settings).unwrap(),
-            updated_by_user_id: None,
-            updated_at: chrono::Utc::now(),
-        }))))
-        .register::<UsageAdmissionKey>(Arc::new(arc_swap::ArcSwap::from_pointee(
-            AdmissionSettings::default(),
-        )))
-        .build(),
+        AdminSettingsService::builder(repository)
+            .register::<UsageAdmissionKey>(Arc::new(arc_swap::ArcSwap::from_pointee(
+                AdmissionSettings::default(),
+            )))
+            .build(),
     );
     assert!(settings.reload().await);
     let services = api::init_domain_services_with_pool(
@@ -74,7 +76,7 @@ pub(super) async fn server(
         auth.organization_service.clone(),
         pool.clone(),
         Arc::new(services::metrics::MockMetricsService),
-        Some(settings),
+        Some(settings.clone()),
     )
     .await;
     let app = build_app_with_config_and_options(
@@ -84,7 +86,13 @@ pub(super) async fn server(
         Arc::new(config),
         E2E_APP_BUILD_OPTIONS,
     );
-    (axum_test::TestServer::new(app), mock, pool, database)
+    (
+        axum_test::TestServer::new(app),
+        mock,
+        pool,
+        database,
+        settings,
+    )
 }
 
 pub(super) fn enforcing_settings() -> AdmissionSettings {
@@ -101,8 +109,18 @@ pub(super) async fn enforcing_server() -> axum_test::TestServer {
     server(enforcing_settings()).await.0
 }
 
-async fn policy(_server: &axum_test::TestServer, value: Value) {
-    seeding::seed_admin_setting("usage_admission", value).await;
+async fn enforce_organization(db: &database::Database, settings: &AdminSettingsService, id: Uuid) {
+    db.pool()
+        .get()
+        .await
+        .unwrap()
+        .execute(
+            "INSERT INTO organization_usage_admission (organization_id,mode) VALUES ($1,'enforce')",
+            &[&id],
+        )
+        .await
+        .unwrap();
+    assert!(settings.reload().await);
 }
 
 #[tokio::test]
@@ -191,7 +209,7 @@ async fn native_responses_preserve_capacity_and_unavailable_admission_statuses()
 
 #[tokio::test]
 async fn global_disable_and_reenable_preserve_direct_admission_policy_and_existing_holds() {
-    let (server, _, _, db) = server(AdmissionSettings::default()).await;
+    let (server, _, _, db, settings) = server_with_policy(AdmissionSettings::default()).await;
     setup_qwen_model(&server).await;
     let org = setup_org_with_credits(&server, 1_000_000_000).await;
     let ws = list_workspaces(&server, org.id.clone()).await.remove(0);
@@ -204,17 +222,26 @@ async fn global_disable_and_reenable_preserve_direct_admission_policy_and_existi
     .unwrap();
     let body = json!({"id":id,"organization_id":org.id,"workspace_id":ws.id,"api_key_id":key.id,
         "model":E2E_QWEN_MODEL_NAME,"features":features});
-    for (change, expected, expected_holds) in [
-        (json!({}), "audit", 0),
-        (
-            json!({"organizations":{org.id.clone():{"mode":"enforce"}}}),
-            "enforce",
-            1,
-        ),
-        (json!({"enabled":false}), "off", 1),
-        (json!({"enabled":true}), "enforce", 2),
+    for (step, expected, expected_holds) in [
+        (0, "audit", 0),
+        (1, "enforce", 1),
+        (2, "off", 1),
+        (3, "enforce", 2),
     ] {
-        policy(&server, change).await;
+        match step {
+            1 => enforce_organization(&db, &settings, Uuid::parse_str(&org.id).unwrap()).await,
+            2 | 3 => {
+                settings
+                    .update(
+                        "usage_admission",
+                        json!({"enabled":step == 3}),
+                        Uuid::new_v4(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            _ => {}
+        }
         let mut body = body.clone();
         body["id"] = json!(Uuid::new_v4());
         let response = server
@@ -245,7 +272,7 @@ async fn global_disable_and_reenable_preserve_direct_admission_policy_and_existi
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ten_concurrent_requests_share_a_small_key_budget_and_settle_actual_spend() {
-    let (server, mock, pool, db) = server(AdmissionSettings::default()).await;
+    let (server, mock, pool, db, settings) = server_with_policy(AdmissionSettings::default()).await;
     let model = format!("admission-test-{}", Uuid::new_v4());
     pool.register_provider(model.clone(), mock.clone()).await;
     let mut models = api::models::BatchUpdateModelApiRequest::new();
@@ -276,11 +303,7 @@ async fn ten_concurrent_requests_share_a_small_key_budget_and_settle_actual_spen
         )
         .await
         .unwrap();
-    policy(
-        &server,
-        json!({"organizations":{org.id.clone():{"mode":"enforce"}}}),
-    )
-    .await;
+    enforce_organization(&db, &settings, org_id).await;
 
     let gate = Arc::new(tokio::sync::Semaphore::new(0));
     mock.set_default_response(
@@ -342,7 +365,10 @@ async fn ten_concurrent_requests_share_a_small_key_budget_and_settle_actual_spen
             .get(0);
         assert_eq!(spent, 0, "no actual bill is posted before responses finish");
         // Stopping new admission must not prevent already admitted usage from settling.
-        policy(&server, json!({"enabled":false})).await;
+        settings
+            .update("usage_admission", json!({"enabled":false}), Uuid::new_v4())
+            .await
+            .unwrap();
         gate.add_permits(10);
         admitted
     };

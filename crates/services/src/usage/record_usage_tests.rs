@@ -495,10 +495,17 @@ async fn admission_uses_live_org_policy_and_audit_off_never_create_holds() {
         async fn get(&self, _: &str) -> anyhow::Result<Option<StoredSetting>> {
             Ok(Some(StoredSetting {
                 key: "usage_admission".into(),
-                value: self.0.clone(),
+                value: serde_json::json!({}),
                 updated_by_user_id: None,
                 updated_at: chrono::Utc::now(),
             }))
+        }
+        async fn load_usage_admission(&self) -> anyhow::Result<budget::policy::AdmissionSnapshot> {
+            budget::policy::AdmissionSnapshot::from_rows(
+                &serde_json::json!({}),
+                serde_json::from_value(self.0.clone())?,
+            )
+            .map_err(anyhow::Error::msg)
         }
         async fn upsert(
             &self,
@@ -511,12 +518,17 @@ async fn admission_uses_live_org_policy_and_audit_off_never_create_holds() {
     }
     let enforced = Uuid::new_v4();
     let disabled = Uuid::new_v4();
-    let settings=Arc::new(AdminSettingsService::builder(Arc::new(SettingsRepo(serde_json::json!({
-        "defaults":{"mode":"audit"},"organizations":{
-            enforced.to_string():{"mode":"enforce","organization_max_unsettled":512,"key_max_unsettled":128,"reservation_ttl_seconds":900,"unknown_outcome_ttl_seconds":60},
-            disabled.to_string():{"mode":"off"}
-        }
-    })))).register::<UsageAdmissionKey>(Arc::new(arc_swap::ArcSwap::from_pointee(AdmissionSettings::default()))).build());
+    let overrides = serde_json::json!({
+        enforced.to_string():{"mode":"enforce","organization_max_unsettled":512,"key_max_unsettled":128,"reservation_ttl_seconds":900,"unknown_outcome_ttl_seconds":60},
+        disabled.to_string():{"mode":"off"}
+    });
+    let settings = Arc::new(
+        AdminSettingsService::builder(Arc::new(SettingsRepo(overrides)))
+            .register::<UsageAdmissionKey>(Arc::new(arc_swap::ArcSwap::from_pointee(
+                AdmissionSettings::default(),
+            )))
+            .build(),
+    );
     assert!(settings.reload().await);
     let repo = Arc::new(CapturingUsageRepository::default());
     let metrics = Arc::new(CapturingMetricsService::new());

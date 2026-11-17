@@ -82,10 +82,11 @@ The administrator-only `usage_admission` setting controls admission. Its default
 organization policy is `audit`: estimates are recorded without creating holds or
 rejecting requests on admission errors. Actual usage is billed in every mode.
 
-The `defaults` policy applies to organizations absent from `organizations`.
-Each organization entry is a complete override; omitted fields use built-in defaults.
-Creating holds requires an explicit `enforce` mode in the selected policy.
-PATCH replaces each supplied top-level field, including the organization map.
+Administrators can override individual fields at
+`/v1/admin/organizations/{org_id}/usage-admission`. GET returns the overrides and
+the effective policy. PATCH changes only supplied fields. A JSON `null` restores
+inheritance from the global `defaults` for that field. Creating holds requires
+`enforce` in the effective policy.
 
 The top-level `enabled` switch defaults to `true`, which uses the selected organization
 policy. Setting it to `false` skips admission for every organization, including explicit

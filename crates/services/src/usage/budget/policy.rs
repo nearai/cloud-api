@@ -3,7 +3,7 @@
 pub(in crate::usage) const ESTIMATOR_VERSION: u32 = 2;
 use crate::admin_settings::SettingKey;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::HashMap;
 use uuid::Uuid;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -72,8 +72,6 @@ pub struct AdmissionSettings {
     /// Stops new admissions without changing organization policies or existing holds.
     pub enabled: bool,
     pub defaults: AdmissionPolicy,
-    /// Complete overrides, held in operator settings rather than owner-editable org settings.
-    pub organizations: BTreeMap<Uuid, AdmissionPolicy>,
 }
 
 impl Default for AdmissionSettings {
@@ -81,19 +79,60 @@ impl Default for AdmissionSettings {
         Self {
             enabled: true,
             defaults: AdmissionPolicy::default(),
-            organizations: BTreeMap::new(),
         }
     }
 }
 
-impl AdmissionSettings {
+#[derive(Debug, Default, Clone, PartialEq, Deserialize)]
+pub struct AdmissionOverrides {
+    pub mode: Option<AdmissionMode>,
+    pub organization_max_unsettled: Option<i32>,
+    pub key_max_unsettled: Option<i32>,
+    pub reservation_ttl_seconds: Option<i32>,
+    pub unknown_outcome_ttl_seconds: Option<i32>,
+}
+
+/// The global setting and explicit organization rows read in one database snapshot.
+#[derive(Debug, Default, PartialEq)]
+pub struct AdmissionSnapshot {
+    pub global: AdmissionSettings,
+    pub organizations: HashMap<Uuid, AdmissionOverrides>,
+}
+
+impl AdmissionSnapshot {
+    pub fn from_rows(
+        global: &serde_json::Value,
+        organizations: HashMap<Uuid, AdmissionOverrides>,
+    ) -> Result<Self, String> {
+        let snapshot = Self {
+            global: UsageAdmissionKey::parse(global, false)?,
+            organizations,
+        };
+        for id in snapshot.organizations.keys() {
+            snapshot.for_organization(*id).validate()?;
+        }
+        Ok(snapshot)
+    }
+
     pub fn for_organization(&self, id: Uuid) -> AdmissionPolicy {
-        let mut policy = self
-            .organizations
-            .get(&id)
-            .unwrap_or(&self.defaults)
-            .clone();
-        if !self.enabled {
+        let d = &self.global.defaults;
+        let mut policy = match self.organizations.get(&id) {
+            Some(o) => AdmissionPolicy {
+                mode: o.mode.unwrap_or(d.mode),
+                organization_max_unsettled: o
+                    .organization_max_unsettled
+                    .unwrap_or(d.organization_max_unsettled),
+                key_max_unsettled: o.key_max_unsettled.unwrap_or(d.key_max_unsettled),
+                reservation_ttl_seconds: o
+                    .reservation_ttl_seconds
+                    .unwrap_or(d.reservation_ttl_seconds),
+                unknown_outcome_ttl_seconds: o
+                    .unknown_outcome_ttl_seconds
+                    .unwrap_or(d.unknown_outcome_ttl_seconds),
+            },
+            None => d.clone(),
+        };
+        if !self.global.enabled {
             policy.mode = AdmissionMode::Off;
         }
         policy
@@ -103,7 +142,7 @@ impl AdmissionSettings {
 pub struct UsageAdmissionKey;
 impl SettingKey for UsageAdmissionKey {
     const NAME: &'static str = "usage_admission";
-    const FIELDS: &'static [&'static str] = &["enabled", "defaults", "organizations"];
+    const FIELDS: &'static [&'static str] = &["enabled", "defaults"];
     type Value = AdmissionSettings;
     type Published = AdmissionSettings;
     fn default_value() -> Self::Value {
@@ -125,32 +164,13 @@ impl SettingKey for UsageAdmissionKey {
                 if let Some(defaults) = object.get_mut("defaults").and_then(|v| v.as_object_mut()) {
                     defaults.retain(|key, _| fields.contains(&key.as_str()));
                 }
-                if let Some(organizations) = object
-                    .get_mut("organizations")
-                    .and_then(|v| v.as_object_mut())
-                {
-                    for policy in organizations.values_mut().filter_map(|v| v.as_object_mut()) {
-                        policy.retain(|key, _| fields.contains(&key.as_str()));
-                    }
-                }
             }
         }
         let settings: Self::Value = serde_json::from_value(value).map_err(|e| e.to_string())?;
         settings.defaults.validate()?;
-        for policy in settings.organizations.values() {
-            policy.validate()?;
-        }
         Ok(settings)
     }
-    fn publish(value: &Self::Value, version: u64) -> Self::Published {
-        tracing::info!(
-            event = "usage_admission_config_applied",
-            version,
-            enabled = value.enabled,
-            default_mode = super::metrics::mode_label(value.defaults.mode),
-            organization_overrides = value.organizations.len(),
-            "Admission configuration applied"
-        );
+    fn publish(value: &Self::Value, _version: u64) -> Self::Published {
         value.clone()
     }
 }
@@ -190,49 +210,38 @@ mod tests {
     use super::*;
     use serde_json::json;
     #[test]
-    fn global_disable_preserves_default_and_organization_policies_for_reenable() {
-        let id = Uuid::new_v4();
-        let ordinary = Uuid::new_v4();
-        let mut settings = UsageAdmissionKey::parse(&json!({}), true).unwrap();
-        assert!(settings.enabled);
-        assert_eq!(
-            settings.for_organization(ordinary).mode,
-            AdmissionMode::Audit
-        );
-        settings.organizations.insert(
-            id,
-            AdmissionPolicy {
-                mode: AdmissionMode::Enforce,
-                ..Default::default()
-            },
-        );
-        assert_eq!(settings.for_organization(id).mode, AdmissionMode::Enforce);
-        assert_eq!(
-            settings.for_organization(ordinary).mode,
-            AdmissionMode::Audit
-        );
-        settings.enabled = false;
-        assert_eq!(settings.for_organization(id).mode, AdmissionMode::Off);
-        assert_eq!(settings.for_organization(ordinary).mode, AdmissionMode::Off);
-        settings.enabled = true;
-        assert_eq!(settings.for_organization(id).mode, AdmissionMode::Enforce);
-        assert_eq!(
-            settings.for_organization(ordinary).mode,
-            AdmissionMode::Audit
-        );
-    }
-    #[test]
     fn policy_validates_modes_limits_ttls_and_org_overrides() {
         let id = Uuid::new_v4();
-        let settings = UsageAdmissionKey::parse(&json!({"defaults":{"mode":"audit"},"organizations":{id.to_string():{"organization_max_unsettled":512,"key_max_unsettled":128}}}), true).unwrap();
+        let global = json!({"defaults":{"key_max_unsettled":8}});
+        let overrides = HashMap::from([(
+            id,
+            AdmissionOverrides {
+                mode: Some(AdmissionMode::Enforce),
+                ..Default::default()
+            },
+        )]);
+        let mut snapshot = AdmissionSnapshot::from_rows(&global, overrides).unwrap();
+        assert_eq!(snapshot.for_organization(id).mode, AdmissionMode::Enforce);
+        assert_eq!(snapshot.for_organization(id).key_max_unsettled, 8);
         assert_eq!(
-            settings.for_organization(Uuid::new_v4()).mode,
+            snapshot.for_organization(Uuid::new_v4()).mode,
             AdmissionMode::Audit
         );
-        assert_eq!(
-            settings.for_organization(id).organization_max_unsettled,
-            512
-        );
+        snapshot.global.enabled = false;
+        assert_eq!(snapshot.for_organization(id).mode, AdmissionMode::Off);
+        snapshot.global.enabled = true;
+        assert_eq!(snapshot.for_organization(id).mode, AdmissionMode::Enforce);
+        assert!(AdmissionSnapshot::from_rows(
+            &global,
+            HashMap::from([(
+                id,
+                AdmissionOverrides {
+                    reservation_ttl_seconds: Some(1),
+                    ..Default::default()
+                }
+            )])
+        )
+        .is_err());
         for invalid in [
             json!({"mode":"typo"}),
             json!({"key_max_unsettled":0}),
@@ -242,13 +251,8 @@ mod tests {
         ] {
             assert!(UsageAdmissionKey::parse(&json!({"defaults":invalid}), true).is_err());
         }
-        let stopped = UsageAdmissionKey::parse(
-            &json!({"enabled":false,"organizations":{id.to_string():{"mode":"enforce"}}}),
-            true,
-        )
-        .unwrap();
-        assert_eq!(stopped.for_organization(id).mode, AdmissionMode::Off);
         for invalid in [
+            json!({"organizations":{}}),
             json!({"enabled":"false"}),
             json!({"enabled":0}),
             json!({"mode":"off"}),

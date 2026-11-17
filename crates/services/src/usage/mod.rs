@@ -204,9 +204,8 @@ impl UsageServiceImpl {
     fn admission_policy(&self, organization_id: Uuid) -> budget::policy::AdmissionPolicy {
         self.admission_settings
             .as_ref()
-            .map(|settings| settings.current::<budget::policy::UsageAdmissionKey>())
+            .map(|settings| settings.admission_policy(organization_id))
             .unwrap_or_default()
-            .for_organization(organization_id)
     }
 
     pub fn with_admission_settings(

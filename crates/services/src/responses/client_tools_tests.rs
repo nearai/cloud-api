@@ -617,3 +617,177 @@ fn completed_search_replay_keeps_assistant_context_without_tool_history() {
         .is_err());
     }
 }
+
+fn tool_search(execution: Option<&str>) -> Value {
+    let mut tool = json!({
+        "type": "tool_search", "description": "Search deferred tools.",
+        "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}
+    });
+    if let Some(execution) = execution {
+        tool["execution"] = json!(execution);
+    }
+    tool
+}
+
+fn tool_search_replay(execution: &str, tools: Vec<Value>) -> Vec<Value> {
+    vec![
+        json!({"type": "tool_search_call", "id": "tsc_old", "call_id": "call_search", "status": "completed",
+            "execution": execution, "arguments": {"query": "calendar", "limit": 3}}),
+        json!({"type": "tool_search_output", "id": "tso_old", "call_id": "call_search", "status": "completed",
+            "execution": execution, "tools": tools}),
+    ]
+}
+
+fn deferred(name: &str) -> Value {
+    let mut tool = function(name);
+    tool["defer_loading"] = json!(true);
+    tool
+}
+
+#[test]
+fn native_relays_client_tool_search_declarations_unchanged() {
+    let tools = vec![
+        function("exec_command"),
+        custom("apply_patch"),
+        tool_search(Some("client")),
+        json!({"type": "web_search", "external_web_access": false}),
+    ];
+    let body = request(tools.clone());
+    assert_eq!(normalize_native_request(body.clone()).unwrap(), body);
+    let promoted = normalize_native_request(json!({"model": "test", "store": false, "input": [
+        {"type": "additional_tools", "role": "developer", "tools": [tool_search(Some("client"))]},
+        {"role": "user", "content": "Synthetic task."}
+    ]}))
+    .unwrap();
+    assert_eq!(promoted["tools"], json!([tool_search(Some("client"))]));
+}
+
+#[test]
+fn native_rejects_hosted_or_nested_tool_search() {
+    for tools in [
+        vec![tool_search(None)],
+        vec![tool_search(Some("server"))],
+        vec![tool_search(Some("hosted"))],
+        vec![namespace("client", vec![tool_search(Some("client"))])],
+    ] {
+        assert!(
+            normalize_native_request(request(tools.clone())).is_err(),
+            "{tools:?}"
+        );
+    }
+    let mut body = request(vec![tool_search(Some("client"))]);
+    body["input"] = json!(tool_search_replay(
+        "client",
+        vec![tool_search(Some("client"))]
+    ));
+    assert!(normalize_native_request(body).is_err());
+}
+
+#[test]
+fn native_replays_client_tool_search_with_loaded_namespace() {
+    let mut input = tool_search_replay(
+        "client",
+        vec![namespace(
+            "mcp__calendar",
+            vec![deferred("list_events"), deferred("create_event")],
+        )],
+    );
+    input.push(
+        json!({"type": "function_call", "id": "fc_old", "call_id": "call_list",
+        "namespace": "mcp__calendar", "name": "list_events", "arguments": "{\"start\":\"today\"}"}),
+    );
+    input.push(
+        json!({"type": "function_call_output", "call_id": "call_list", "output": "No events."}),
+    );
+    let mut body = request(vec![tool_search(Some("client"))]);
+    body["input"] = json!(input);
+    assert_eq!(normalize_native_request(body.clone()).unwrap(), body);
+    // An empty search result is a valid replay.
+    body["input"] = json!(tool_search_replay("client", vec![]));
+    assert_eq!(normalize_native_request(body.clone()).unwrap(), body);
+}
+
+#[test]
+fn tool_search_output_tools_follow_the_native_client_tool_rules() {
+    let hosted = [
+        "mcp",
+        "file_search",
+        "code_interpreter",
+        "image_generation",
+        "computer",
+        "local_shell",
+        "web_search",
+        "tool_search",
+    ];
+    let mut loaded: Vec<Value> = hosted
+        .iter()
+        .flat_map(|kind| {
+            let tool = json!({"type": kind, "name": "hosted", "execution": "client"});
+            [tool.clone(), namespace("client", vec![tool])]
+        })
+        .collect();
+    loaded.push(json!({"type": "function", "name": " "}));
+    loaded.push(json!({"type": "namespace", "tools": [function("lookup")]}));
+    for tool in loaded {
+        let mut body = request(vec![tool_search(Some("client"))]);
+        body["input"] = json!(tool_search_replay("client", vec![tool.clone()]));
+        assert!(normalize_native_request(body).is_err(), "{tool}");
+    }
+    for tools in [json!(null), json!({}), json!("lookup")] {
+        let mut replay = tool_search_replay("client", vec![]);
+        replay[1]["tools"] = tools;
+        let body = json!({"model": "test", "store": false, "input": replay});
+        assert!(normalize_native_request(body).is_err());
+    }
+}
+
+#[test]
+fn only_client_executed_tool_search_items_can_be_replayed() {
+    for (index, execution) in [
+        (0, json!("server")),
+        (1, json!("server")),
+        (0, json!(null)),
+        (1, json!(null)),
+    ] {
+        let mut replay = tool_search_replay("client", vec![]);
+        replay[index]["execution"] = execution;
+        let body = json!({"model": "test", "store": false, "input": replay});
+        assert!(normalize_native_request(body).is_err(), "{index}");
+    }
+}
+
+#[test]
+fn typed_adapter_rejects_tool_search_and_its_replay_items() {
+    let mut bodies = vec![
+        request(vec![tool_search(Some("client"))]),
+        request(vec![function("lookup"), tool_search(None)]),
+    ];
+    for item in tool_search_replay("client", vec![]) {
+        bodies.push(json!({"model": "test", "store": false, "input": [item]}));
+    }
+    for body in bodies {
+        let error = normalize_request(body.clone()).unwrap_err();
+        assert!(
+            error.contains("tool_search") && error.contains("native Responses backend"),
+            "{body}: {error}"
+        );
+    }
+}
+
+#[test]
+fn mcp_tools_loaded_by_tool_search_are_detected() {
+    let mcp =
+        json!({"type": "mcp", "server_label": "remote", "server_url": "https://mcp.invalid/"});
+    for tools in [
+        vec![mcp.clone()],
+        vec![namespace("client", vec![mcp.clone()])],
+    ] {
+        let body = json!({"model": "test", "input": tool_search_replay("client", tools)});
+        assert!(contains_mcp_tool(&body), "{body}");
+    }
+    let body = json!({"model": "test", "input": tool_search_replay(
+        "client",
+        vec![namespace("mcp", vec![function("mcp")])]
+    )});
+    assert!(!contains_mcp_tool(&body));
+}

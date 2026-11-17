@@ -36,7 +36,7 @@ const BILLING_VERDICT_WAIT: Duration = Duration::from_secs(35);
 const MAX_RESPONSE_ID_LEN: usize = 128;
 const BILLING_FAILURE_MESSAGE: &str = "Failed to record usage";
 
-const CLIENT_TOOLS_ERROR: &str = "Native stateless Responses supports valid client-managed function, custom, and namespace tools, plus top-level web_search";
+const CLIENT_TOOLS_ERROR: &str = "Native stateless Responses supports valid client-managed function, custom, and namespace tools, client-executed tool_search, and top-level web_search";
 
 /// Terminal Responses events contain the complete output, not just usage.
 /// Bound memory while allowing large tool arguments/output.
@@ -305,6 +305,8 @@ fn validate(body: &Value) -> Result<(), &'static str> {
                         | "function_call_output"
                         | "custom_tool_call"
                         | "custom_tool_call_output"
+                        | "tool_search_call"
+                        | "tool_search_output"
                         | "web_search_call"
                         | "reasoning"
                 )

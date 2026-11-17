@@ -121,6 +121,10 @@ async fn stateless_responses_reject_unsupported_tools_before_provider_work() {
             serde_json::json!({"type": "code_interpreter"}),
         ),
         ("computer", serde_json::json!({"type": "computer"})),
+        (
+            "tool_search",
+            serde_json::json!({"type": "tool_search", "execution": "client"}),
+        ),
     ];
 
     for (tool_type, tool) in rejected_tools {
@@ -236,6 +240,16 @@ async fn mcp_tools_are_rejected_before_model_resolution_or_provider_work() {
             serde_json::json!({"input": [
                 {"type": "additional_tools", "role": "developer", "tools": [mcp.clone()]},
                 {"role": "user", "content": "Use the configured tool."}
+            ]}),
+        ),
+        (
+            "tool_search_output",
+            serde_json::json!({"input": [
+                {"role": "user", "content": "Use the configured tool."},
+                {"type": "tool_search_call", "call_id": "call_search", "execution": "client",
+                    "status": "completed", "arguments": {"query": "remote"}},
+                {"type": "tool_search_output", "call_id": "call_search", "execution": "client",
+                    "status": "completed", "tools": [mcp.clone()]}
             ]}),
         ),
     ];

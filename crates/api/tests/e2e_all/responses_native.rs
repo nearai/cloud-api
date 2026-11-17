@@ -325,3 +325,147 @@ async fn stored_response(database: &database::Database, id: &str) -> bool {
         .unwrap()
         .get(0)
 }
+
+#[tokio::test]
+async fn native_responses_relay_client_tool_search_and_its_replay() {
+    let model = format!("openai/native-tool-search-{}", uuid::Uuid::new_v4());
+    let (server, pool, _, _database) = setup_test_server_with_pool().await;
+    let captured = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let calls = captured.clone();
+    let provider = Arc::new(MockProvider::new_accept_all().with_responses_handler(move |body: Value| {
+        calls.lock().unwrap().push(body.clone());
+        let item = json!({"type":"tool_search_call","id":"tsc_native","call_id":"call_search","execution":"client",
+            "arguments":{"query":"calendar events","limit":3},"status":"completed"});
+        let native = json!({"id":format!("resp_{}", uuid::Uuid::new_v4()),"object":"response","status":"completed",
+            "output":[item],"usage":{"input_tokens":10,"output_tokens":5,"total_tokens":15},
+            "service_tier":"default","store":false});
+        let stream = body["stream"] == true;
+        let bytes = if stream {
+            format!(
+                "event: response.output_item.done\ndata: {}\n\nevent: response.completed\ndata: {}\n\n",
+                json!({"type":"response.output_item.done","output_index":0,"item":item,"sequence_number":1}),
+                json!({"type":"response.completed","response":native,"sequence_number":2})
+            )
+        } else {
+            native.to_string()
+        };
+        ResponsesRawResponse {
+            status: axum::http::StatusCode::OK,
+            headers: [(axum::http::header::CONTENT_TYPE, axum::http::HeaderValue::from_static(if stream {"text/event-stream"} else {"application/json"}))].into_iter().collect(),
+            body: Box::pin(futures_util::stream::iter(vec![Ok(Bytes::from(bytes))])),
+        }
+    }));
+    let mut batch = api::models::BatchUpdateModelApiRequest::new();
+    batch.insert(
+        model.clone(),
+        serde_json::from_value(json!({
+            "inputCostPerToken":{"amount":1000,"currency":"USD"},"outputCostPerToken":{"amount":2000,"currency":"USD"},
+            "modelDisplayName":"Tool search fixture","modelDescription":"Native Responses test",
+            "contextLength":10000,"maxOutputLength":1000,"isActive":true,"ownedBy":"openai",
+            "verifiable":false,"inputModalities":["text"],"outputModalities":["text"]
+        }))
+        .unwrap(),
+    );
+    seed_models(&server, batch, get_session_id()).await;
+    pool.register_provider(model.clone(), provider.clone())
+        .await;
+    let org = setup_org_with_credits(&server, 10_000_000_000).await;
+    let key = get_api_key_for_org(&server, org.id.clone()).await;
+    let auth = format!("Bearer {key}");
+
+    let tool_search = json!({"type":"tool_search","execution":"client","description":"Search deferred tools.",
+        "parameters":{"type":"object","properties":{"query":{"type":"string"},"limit":{"type":"number"}},
+            "required":["query"],"additionalProperties":false}});
+    let tools = json!([
+        {"type":"function","name":"exec_command","strict":false,"parameters":{"type":"object","properties":{}}},
+        {"type":"custom","name":"apply_patch","format":{"type":"grammar","syntax":"lark","definition":"start: /.+/s"}},
+        tool_search.clone(),
+        {"type":"web_search","external_web_access":false}
+    ]);
+    let loaded = json!([{"type":"namespace","name":"mcp__calendar","description":"Calendar tools.","tools":[
+        {"type":"function","name":"list_events","strict":false,"defer_loading":true,
+            "parameters":{"type":"object","properties":{"start":{"type":"string"}},"required":["start"]}}]}]);
+    let replay = |loaded: Value| {
+        json!([
+            {"role":"user","content":"List today's calendar events."},
+            {"type":"tool_search_call","id":"tsc_native","call_id":"call_search","status":"completed",
+                "execution":"client","arguments":{"query":"calendar events","limit":3}},
+            {"type":"tool_search_output","id":"tso_client","call_id":"call_search","status":"completed",
+                "execution":"client","tools":loaded},
+            {"type":"function_call","id":"fc_native","call_id":"call_list","namespace":"mcp__calendar",
+                "name":"list_events","arguments":"{\"start\":\"today\"}"},
+            {"type":"function_call_output","call_id":"call_list","output":"No events."}
+        ])
+    };
+    let requests = [
+        json!({"model":model,"store":false,"input":"List today's calendar events.","tools":tools}),
+        json!({"model":model,"store":false,"input":replay(loaded.clone()),"tools":tools}),
+    ];
+    for (index, request) in requests.iter().enumerate() {
+        for stream in [false, true] {
+            let mut body = request.clone();
+            body["stream"] = json!(stream);
+            let response = server
+                .post("/v1/responses")
+                .add_header("Authorization", &auth)
+                .json(&body)
+                .await;
+            assert_eq!(
+                response.status_code(),
+                200,
+                "{index}/{stream}: {}",
+                response.text()
+            );
+            if stream {
+                assert!(response.text().contains("\"type\":\"tool_search_call\""));
+            } else {
+                assert_eq!(
+                    response.json::<Value>()["output"][0]["type"],
+                    "tool_search_call"
+                );
+            }
+            let forwarded = captured.lock().unwrap().last().unwrap().clone();
+            assert_eq!(forwarded["tools"], request["tools"], "{index}/{stream}");
+            assert_eq!(forwarded["input"], request["input"], "{index}/{stream}");
+        }
+    }
+    assert_eq!(captured.lock().unwrap().len(), 4);
+
+    // Hosted tool search and hosted tools loaded through a search result are
+    // rejected before any provider work.
+    let mut hosted_search = tool_search.clone();
+    hosted_search["execution"] = json!("server");
+    let mut server_replay = replay(loaded.clone());
+    server_replay[1]["execution"] = json!("server");
+    for rejected in [
+        json!({"input":"hello","tools":[hosted_search]}),
+        json!({"input":replay(json!([{"type":"code_interpreter","container":{"type":"auto"}}])),"tools":tools}),
+        json!({"input":replay(json!([{"type":"file_search","vector_store_ids":["vs_shared"]}])),"tools":tools}),
+        json!({"input":server_replay,"tools":tools}),
+    ] {
+        let mut body = json!({"model":model,"store":false});
+        body.as_object_mut()
+            .unwrap()
+            .extend(rejected.as_object().unwrap().clone());
+        let response = server
+            .post("/v1/responses")
+            .add_header("Authorization", &auth)
+            .json(&body)
+            .await;
+        assert_eq!(
+            response.status_code(),
+            400,
+            "{rejected}: {}",
+            response.text()
+        );
+        let error = response.json::<api::models::ErrorResponse>();
+        assert_eq!(error.error.r#type, "invalid_request_error");
+        assert!(
+            error.error.message.contains("tool_search"),
+            "{}",
+            error.error.message
+        );
+    }
+    assert_eq!(captured.lock().unwrap().len(), 4);
+    assert!(provider.last_chat_params().await.is_none());
+}

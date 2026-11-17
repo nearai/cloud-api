@@ -974,7 +974,7 @@ pub async fn response_history_gone() -> axum::response::Response {
     tag = "Responses",
     request_body(
         content = serde_json::Value,
-        description = "Polymorphic stateless JSON request. After alias resolution, canonical openai/ models accept validated provider-native Responses fields. Other models use the typed StatelessCreateResponseRequestSchema component. Both paths normalize omitted or null store to false and reject store: true. The typed adapter supports hosted web_search and web_context_search with request-scoped context. Native Responses accepts client-managed tools and top-level web_search, executed upstream in one provider request; complete web_search_call replay items and include are forwarded unchanged. File tools are unsupported. MCP tools are no longer supported and return 400 with param tools."
+        description = "Polymorphic stateless JSON request. After alias resolution, canonical openai/ models accept validated provider-native Responses fields. Other models use the typed StatelessCreateResponseRequestSchema component. Both paths normalize omitted or null store to false and reject store: true. The typed adapter supports hosted web_search and web_context_search with request-scoped context. Native Responses accepts client-managed tools, client-executed tool_search, and top-level web_search, executed upstream in one provider request; tool_search_call and tool_search_output replay items are forwarded unchanged when the loaded tools are client-managed; complete web_search_call replay items and include are forwarded unchanged. File tools are unsupported. MCP tools are no longer supported and return 400 with param tools."
     ),
     responses(
         (

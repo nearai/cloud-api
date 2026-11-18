@@ -13,6 +13,7 @@ pub mod ohttp_gateway;
 pub mod openapi;
 pub mod openapi_deprecation;
 pub mod routes;
+pub mod telemetry;
 
 use crate::ohttp_gateway::{OhttpAttestation, OhttpGateway};
 use crate::routes::mcp_server::{handle_mcp_request, McpRouteState};
@@ -2983,6 +2984,8 @@ mod tests {
                 endpoint: "http://localhost:4317".to_string(),
                 protocol: "grpc".to_string(),
                 instance_id: None,
+                traces_enabled: false,
+                traces_sample_ratio: 0.01,
             },
             cors: config::CorsConfig::default(),
             external_providers: config::ExternalProvidersConfig::default(),
@@ -3107,6 +3110,8 @@ mod tests {
                 endpoint: "http://localhost:4317".to_string(),
                 protocol: "grpc".to_string(),
                 instance_id: None,
+                traces_enabled: false,
+                traces_sample_ratio: 0.01,
             },
             cors: config::CorsConfig::default(),
             external_providers: config::ExternalProvidersConfig::default(),

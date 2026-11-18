@@ -168,7 +168,11 @@ pub async fn chat_completions(
         request_id = %request_id,
         org_id = %api_key.organization.id.0,
         workspace_id = %api_key.workspace.id.0,
-        model = %request.model,
+        // Client input: kept local, never exported with the span.
+        requested_model = %request.model,
+        // Canonical catalog name, recorded once the request resolves to a
+        // known model this organization may use.
+        model = tracing::field::Empty,
     );
 
     chat_completions_inner(app_state, api_key, body_hash, headers, request, request_id)
@@ -276,6 +280,9 @@ pub(super) async fn chat_completions_inner(
                     }
                     _ => None,
                 };
+                if let Some(model) = model {
+                    tracing::Span::current().record("model", model.model_name.as_str());
+                }
                 model
                     .map(|model| {
                         (

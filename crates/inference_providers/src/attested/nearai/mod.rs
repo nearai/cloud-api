@@ -116,7 +116,16 @@ pub(crate) mod tracing_headers {
 /// `X-Workspace-Id`, when a request is in scope. Called only on inference
 /// requests and the signature fetch for a request's own completion, never on
 /// discovery, attestation or model-list calls.
+///
+/// When the current span carries a valid OpenTelemetry context, the W3C
+/// `traceparent` header is sent too (never `tracestate`). Without an enabled
+/// tracer there is no valid context and nothing is added.
 fn insert_tracing_context_headers(headers: &mut reqwest::header::HeaderMap) {
+    if let Some(traceparent) = crate::tracing_context::current_traceparent() {
+        if let Ok(value) = HeaderValue::from_str(&traceparent) {
+            headers.insert("traceparent", value);
+        }
+    }
     let Some(context) = crate::tracing_context::current_tracing_context() else {
         return;
     };

@@ -69,6 +69,38 @@ where
     tokio::spawn(scoped(fut))
 }
 
+/// The 32-hex trace id of the current span's OpenTelemetry context, when that
+/// context is valid. `None` outside a span, or when tracing is not enabled.
+pub fn current_trace_id() -> Option<String> {
+    use opentelemetry::trace::TraceContextExt;
+    use tracing_opentelemetry::OpenTelemetrySpanExt;
+
+    let context = tracing::Span::current().context();
+    let span = context.span();
+    let span_context = span.span_context();
+    span_context
+        .is_valid()
+        .then(|| span_context.trace_id().to_string())
+}
+
+/// The W3C `traceparent` value for the current span's OpenTelemetry context,
+/// when that context is valid and a text-map propagator is installed. Never
+/// includes `tracestate`.
+pub fn current_traceparent() -> Option<String> {
+    use opentelemetry::trace::TraceContextExt;
+    use tracing_opentelemetry::OpenTelemetrySpanExt;
+
+    let context = tracing::Span::current().context();
+    if !context.span().span_context().is_valid() {
+        return None;
+    }
+    let mut carrier = std::collections::HashMap::<String, String>::new();
+    opentelemetry::global::get_text_map_propagator(|propagator| {
+        propagator.inject_context(&context, &mut carrier);
+    });
+    carrier.remove("traceparent")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

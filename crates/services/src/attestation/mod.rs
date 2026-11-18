@@ -92,4 +92,20 @@ pub struct AttestationService {
     /// the GPU evidence — serving a cached report for a different nonce would
     /// defeat the freshness/replay guarantee.
     report_cache: Option<moka::future::Cache<String, Arc<models::AttestationReport>>>,
+    /// Per-organization access to long-context tiers: a report for an
+    /// organization that may not use a model's long tier leaves that tier
+    /// out. `None` until `with_long_context_access`: nobody is restricted.
+    long_context_access: Option<Arc<crate::long_context_access::LongContextAccess>>,
+}
+
+impl AttestationService {
+    /// Apply each organization's access to long-context tiers to its reports
+    /// (see [`crate::long_context_access`]). Production wiring must call it.
+    pub fn with_long_context_access(
+        mut self,
+        access: Arc<crate::long_context_access::LongContextAccess>,
+    ) -> Self {
+        self.long_context_access = Some(access);
+        self
+    }
 }

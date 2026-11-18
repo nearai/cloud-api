@@ -129,10 +129,25 @@ impl AttestationService {
             None
         };
 
+        // An organization that may not use the model's long-context tier gets
+        // a report without it. Decided before the cache lookup, like the
+        // model resolution above, and keyed below only when it restricts the
+        // report, so every other caller keeps sharing cache entries.
+        let long_context_allowed = match (&resolved_canonical, caller, &self.long_context_access) {
+            (Some(canonical), ModelCaller::Organization(organization_id), Some(access)) => {
+                self.inference_provider_pool
+                    .long_context_base_capacity(canonical)
+                    .await
+                    .is_none()
+                    || access.is_allowed(organization_id, canonical).await
+            }
+            _ => true,
+        };
+
         // Precompute the no-nonce cache key BEFORE the params are moved into the
         // build closure below.
         let cache_key = format!(
-            "{}|off={}",
+            "{}{}|off={}",
             report_cache_key(
                 model.as_deref(),
                 signing_algo.as_deref(),
@@ -140,6 +155,7 @@ impl AttestationService {
                 provider_filter,
                 signing_address.as_deref(),
             ),
+            if long_context_allowed { "" } else { "|lc=base" },
             // The live `attested_3p` kill-switch policy is part of the key: a
             // cache hit skips the build (and the pool's disabled-source
             // filter), so a report cached before a source was disabled must
@@ -242,6 +258,7 @@ impl AttestationService {
                             signing_address,
                             include_tls_fingerprint,
                             provider_filter,
+                            long_context_allowed,
                         )
                         .await
                         .map_err(|e| AttestationError::ProviderError(e.to_string()))

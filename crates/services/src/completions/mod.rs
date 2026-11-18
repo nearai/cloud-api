@@ -821,6 +821,9 @@ pub struct CompletionServiceImpl {
     /// `x_placement_affinity`/`x_placement_affinity_source` extra keys are
     /// still stripped unconditionally (a deny-list). Never logged.
     affinity_secret: Option<[u8; 32]>,
+    /// Per-organization access to long-context tiers. `None` until
+    /// `with_long_context_access`: every organization may use them.
+    long_context_access: Option<Arc<crate::long_context_access::LongContextAccess>>,
 }
 
 /// TTL for organization concurrent limit cache (5 minutes)
@@ -917,6 +920,67 @@ impl CompletionServiceImpl {
             model_resolve_cache: crate::models::new_model_resolve_cache(),
             organization_limit_repository,
             affinity_secret: None,
+            long_context_access: None,
+        }
+    }
+
+    /// Apply each organization's access to long-context tiers (see
+    /// [`crate::long_context_access`]). Production wiring must call it.
+    pub fn with_long_context_access(
+        mut self,
+        access: Arc<crate::long_context_access::LongContextAccess>,
+    ) -> Self {
+        self.long_context_access = Some(access);
+        self
+    }
+
+    /// Whether `organization_id` may use the long-context tier of
+    /// `model_name` (canonical). Reads the organization's access only for a
+    /// model that has such a tier.
+    async fn resolve_long_context_allowed(&self, organization_id: Uuid, model_name: &str) -> bool {
+        let Some(access) = &self.long_context_access else {
+            return true;
+        };
+        if self
+            .inference_provider_pool
+            .long_context_base_capacity(model_name)
+            .await
+            .is_none()
+        {
+            return true;
+        }
+        access.is_allowed(organization_id, model_name).await
+    }
+
+    /// The routing flag for a chat request, or the typed error when the
+    /// request needs more context than its organization may use. Checked
+    /// before a concurrency slot is taken or any provider is called.
+    async fn long_context_routing(
+        &self,
+        organization_id: Uuid,
+        chat_params: &inference_providers::ChatCompletionParams,
+    ) -> Result<bool, ports::CompletionError> {
+        let allowed = self
+            .resolve_long_context_allowed(organization_id, &chat_params.model)
+            .await;
+        match self
+            .inference_provider_pool
+            .long_context_limit_exceeded(chat_params, allowed)
+            .await
+        {
+            None => Ok(allowed),
+            Some(limit) => {
+                // Ids, the model name and numbers only.
+                tracing::info!(
+                    %organization_id,
+                    model = %chat_params.model,
+                    limit,
+                    "Rejected a request above the organization's long-context limit"
+                );
+                let err = ports::CompletionError::ContextLengthExceeded { limit };
+                self.record_error(&err, Some(&chat_params.model));
+                Err(err)
+            }
         }
     }
 
@@ -1526,7 +1590,8 @@ impl CompletionServiceImpl {
     fn record_error(&self, error: &ports::CompletionError, model_name: Option<&str>) {
         let error_type = match error {
             ports::CompletionError::InvalidModel(_) => ERROR_TYPE_INVALID_MODEL,
-            ports::CompletionError::InvalidParams(_) => ERROR_TYPE_INVALID_PARAMS,
+            ports::CompletionError::InvalidParams(_)
+            | ports::CompletionError::ContextLengthExceeded { .. } => ERROR_TYPE_INVALID_PARAMS,
             ports::CompletionError::RateLimitExceeded(_) => ERROR_TYPE_RATE_LIMIT,
             ports::CompletionError::ProviderError { .. } => ERROR_TYPE_INFERENCE_ERROR,
             ports::CompletionError::ServiceOverloaded(_)
@@ -1759,6 +1824,11 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             .map(ports::ConcurrentRequestGuard::new)
     }
 
+    async fn long_context_allowed(&self, organization_id: Uuid, model_name: &str) -> bool {
+        self.resolve_long_context_allowed(organization_id, model_name)
+            .await
+    }
+
     async fn create_chat_completion_stream(
         &self,
         request: ports::CompletionRequest,
@@ -1880,6 +1950,9 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             chat_params.model = canonical_name.clone();
         }
         Self::apply_deepseek_v4_flash_thinking_compat(canonical_name, &mut chat_params);
+        let long_context_allowed = self
+            .long_context_routing(organization_id, &chat_params)
+            .await?;
 
         let counter = self
             .try_acquire_concurrent_slot(organization_id, model.id, canonical_name)
@@ -1912,6 +1985,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             estimated_tokens: Some(estimate_input_tokens(&chat_params.messages)),
             fallback_disabled: !request.fallback_enabled,
             request_priority: chat_params.request_priority,
+            long_context_allowed,
         };
 
         // Get the LLM stream
@@ -2108,6 +2182,9 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         Self::apply_deepseek_v4_flash_thinking_compat(canonical_name, &mut chat_params);
 
         let organization_id = request.organization_id;
+        let long_context_allowed = self
+            .long_context_routing(organization_id, &chat_params)
+            .await?;
         let counter = self
             .try_acquire_concurrent_slot(organization_id, model.id, canonical_name)
             .await?;
@@ -2141,6 +2218,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
                 super::inference_provider_pool::ChatRoutingHints {
                     fallback_disabled: !request.fallback_enabled,
                     request_priority,
+                    long_context_allowed,
                     ..Default::default()
                 },
             )
@@ -2612,6 +2690,9 @@ pub use ports::*;
 
 #[cfg(test)]
 mod provider_attribution_tests;
+
+#[cfg(test)]
+mod long_context_tests;
 
 #[cfg(test)]
 mod tests {

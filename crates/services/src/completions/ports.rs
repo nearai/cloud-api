@@ -61,6 +61,12 @@ pub enum CompletionError {
     #[error("Invalid parameters: {0}")]
     InvalidParams(String),
 
+    /// The request needs more context than the model allows for its
+    /// organization, which may not use the model's long-context tier.
+    /// `limit` is the base tier's capacity in tokens.
+    #[error("{}", crate::inference_provider_pool::long_context_limit_message(*limit))]
+    ContextLengthExceeded { limit: u32 },
+
     #[error("Provider error (HTTP {status_code}): {message}")]
     ProviderError { status_code: u16, message: String },
 
@@ -191,6 +197,11 @@ pub trait CompletionServiceTrait: Send + Sync {
         model_id: Uuid,
         model_name: &str,
     ) -> Result<ConcurrentRequestGuard, CompletionError>;
+
+    /// Whether `organization_id` may use the long-context tier of
+    /// `model_name` (canonical), for a direct transport route that builds its
+    /// own routing hints. Always `true` for a model without such a tier.
+    async fn long_context_allowed(&self, organization_id: Uuid, model_name: &str) -> bool;
 
     /// Create a streaming completion
     async fn create_chat_completion_stream(

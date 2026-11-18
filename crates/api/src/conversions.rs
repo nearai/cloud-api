@@ -202,6 +202,14 @@ impl From<CompletionError> for crate::models::ErrorResponse {
             CompletionError::InvalidParams(msg) => {
                 ErrorResponse::new(msg, "invalid_request_error".to_string())
             }
+            err @ CompletionError::ContextLengthExceeded { .. } => ErrorResponse {
+                error: crate::models::ErrorDetail {
+                    message: err.to_string(),
+                    r#type: "invalid_request_error".to_string(),
+                    param: None,
+                    code: Some("context_length_exceeded".to_string()),
+                },
+            },
             CompletionError::RateLimitExceeded(msg) => {
                 let message = if msg.is_empty() {
                     "Rate limit exceeded".to_string()
@@ -552,6 +560,28 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
+
+    #[test]
+    fn long_context_limit_maps_to_an_openai_context_length_error() {
+        let error = CompletionError::ContextLengthExceeded { limit: 100_000 };
+        assert_eq!(
+            crate::routes::common::map_domain_error_to_status(&error),
+            axum::http::StatusCode::BAD_REQUEST
+        );
+        let body = serde_json::to_value(ErrorResponse::from(error)).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "error": {
+                    "message": "This request needs more context than this model allows for \
+                                your organization (limit: 100000 tokens).",
+                    "type": "invalid_request_error",
+                    "param": null,
+                    "code": "context_length_exceeded"
+                }
+            })
+        );
+    }
 
     #[test]
     fn contact_email_is_only_shown_with_its_verification_time() {

@@ -127,6 +127,10 @@ pub async fn systemone(
             )
         }
     };
+    let long_context_allowed = state
+        .completion_service
+        .long_context_allowed(api_key.organization.id.0, &model.model_name)
+        .await;
     // System One backends receive no tenant ids: the inference call and the
     // signature fetch in `finalize` both run with the tracing context cleared.
     let served =
@@ -135,6 +139,7 @@ pub async fn systemone(
             body_hash.hash.clone(),
             encryption.model_pub_key.as_deref(),
             !api_key.organization.fallback_enabled(),
+            long_context_allowed,
         ))
         .await
         {

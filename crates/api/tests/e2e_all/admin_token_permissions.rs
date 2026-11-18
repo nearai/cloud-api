@@ -105,7 +105,7 @@ async fn admin_token_server(
             user,
             "admin tokens only".into(),
             "test".into(),
-            chrono::Utc::now() + chrono::Duration::hours(1),
+            jiff::Timestamp::now() + jiff::SignedDuration::from_hours(1),
             Some(MOCK_USER_AGENT.into()),
             AdminAccessTokenPermission::ReadWrite,
         )

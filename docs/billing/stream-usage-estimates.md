@@ -23,13 +23,16 @@ The input estimate includes message text, tool definitions, `tool_choice`,
 prior `tool_calls`, and a fixed 1,024 tokens per non-text content part by
 default (`CONTEXT_ROUTE_MEDIA_PART_TOKENS` can override that fixed amount).
 It does not count prior-turn reasoning text, which some adapters drop before
-the request is sent. A client-encrypted request served by NEAR AI's own
-fleet records no estimate, because byte counts over ciphertext do not reflect
-the prompt or the output.
+the request is sent. NEAR AI's own fleet reports cumulative usage on every
+streamed chunk, so a cut encrypted stream is billed from the last usage it
+received. No byte estimate is added for such a request, or for an encrypted
+request whose serving provider is unknown, because byte counts over
+ciphertext do not reflect the prompt or the output.
 The output estimate includes streamed text, reasoning text, and tool-call
 name and argument deltas. Text uses a UTF-8 bytes/4 heuristic, so CJK and
 emoji counts are approximate. When no usage was reported, cached tokens are
-zero and the estimated input is charged at the full input rate.
+zero and the estimated input is charged at the full input rate. Without a
+usage report there is no evidence of a cache hit to discount.
 
 Estimated records debit credits and count toward spend limits in the same way
 as exact records. A client retry after a cut stream is a separate request

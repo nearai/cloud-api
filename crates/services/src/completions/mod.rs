@@ -1447,17 +1447,21 @@ impl CompletionServiceImpl {
         .any(|key| extra.get(*key).and_then(|v| v.as_str()).is_some())
     }
 
-    /// Whether a byte-based usage estimate may be recorded for this stream. It
-    /// is skipped only when the payload can be ciphertext: a client-encrypted
-    /// request served by NEAR AI's own fleet. Every other provider receives
-    /// plaintext whatever headers the client sent, so the headers alone never
-    /// turn estimates off.
+    /// Whether a byte-based usage estimate may be recorded for this stream.
+    /// Plaintext requests are always estimated. A client-encrypted request is
+    /// estimated only when it is known to be served by a provider outside
+    /// NEAR AI's own fleet, which receives plaintext whatever headers the
+    /// client sent. If the serving provider is unknown, the payload may be
+    /// ciphertext, so no estimate is recorded (fail closed).
     fn usage_estimate_allowed(
         client_encryption: bool,
         attribution: &crate::usage::ProviderAttribution,
     ) -> bool {
-        !(client_encryption
-            && attribution.served_provider_type == Some(crate::usage::ServedProviderType::Vllm))
+        !client_encryption
+            || matches!(
+                attribution.served_provider_type,
+                Some(t) if t != crate::usage::ServedProviderType::Vllm
+            )
     }
 
     /// Reject `n > 1` requests for models that don't support multiple completions
@@ -3570,7 +3574,7 @@ mod tests {
     }
 
     #[test]
-    fn usage_estimate_is_skipped_only_for_encrypted_requests_on_the_near_fleet() {
+    fn usage_estimate_is_skipped_for_encrypted_requests_unless_served_outside_the_near_fleet() {
         use crate::usage::{ProviderAttribution, ServedProviderType};
 
         let served = |served_provider_type| ProviderAttribution {
@@ -3581,6 +3585,10 @@ mod tests {
             true,
             &served(Some(ServedProviderType::Vllm))
         ));
+        assert!(
+            !CompletionServiceImpl::usage_estimate_allowed(true, &served(None)),
+            "encrypted request with unknown provider must not be estimated"
+        );
         for served_type in [
             Some(ServedProviderType::Vllm),
             Some(ServedProviderType::External),
@@ -3597,7 +3605,6 @@ mod tests {
             Some(ServedProviderType::External),
             Some(ServedProviderType::Chutes),
             Some(ServedProviderType::Tinfoil),
-            None,
         ] {
             assert!(
                 CompletionServiceImpl::usage_estimate_allowed(true, &served(served_type)),

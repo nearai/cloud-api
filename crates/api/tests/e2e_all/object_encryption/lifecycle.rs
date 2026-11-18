@@ -15,7 +15,7 @@ async fn read_only_tokens_scan_but_cannot_mutate_and_job_kinds_are_isolated() {
             actor,
             "object rotation reads".into(),
             "test".into(),
-            chrono::Utc::now() + chrono::Duration::hours(1),
+            jiff::Timestamp::now() + jiff::SignedDuration::from_hours(1),
             Some(MOCK_USER_AGENT.into()),
             AdminAccessTokenPermission::ReadOnly,
         )

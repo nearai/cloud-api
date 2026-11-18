@@ -23,7 +23,7 @@ async fn issue(db: &Arc<database::Database>, permission: Option<&str>) -> Issued
             Uuid::parse_str(MOCK_USER_ID).unwrap(),
             format!("permissions-{}", Uuid::new_v4()),
             "Admin permission integration test".to_string(),
-            chrono::Utc::now() + chrono::Duration::hours(24),
+            jiff::Timestamp::now() + jiff::SignedDuration::from_hours(24),
             Some(MOCK_USER_AGENT.to_string()),
             permission,
         )
@@ -309,7 +309,7 @@ async fn database_encryption_reads_cannot_create_or_cancel_jobs() {
             user,
             "encryption reads".into(),
             "test".into(),
-            chrono::Utc::now() + chrono::Duration::hours(1),
+            jiff::Timestamp::now() + jiff::SignedDuration::from_hours(1),
             Some(MOCK_USER_AGENT.into()),
             database::models::AdminAccessTokenPermission::ReadOnly,
         )
@@ -384,9 +384,7 @@ async fn database_encryption_reads_cannot_create_or_cancel_jobs() {
         .await
         .unwrap();
     assert_eq!(row.get::<_, String>(0), "completed");
-    assert!(row
-        .get::<_, Option<chrono::DateTime<chrono::Utc>>>(1)
-        .is_none());
+    assert!(row.get::<_, Option<jiff::Timestamp>>(1).is_none());
 }
 
 #[tokio::test]
@@ -497,7 +495,7 @@ async fn permissions_preserve_expiration_revocation_user_agent_and_admin_eligibi
                 user,
                 "lifecycle".into(),
                 "test".into(),
-                chrono::Utc::now() + chrono::Duration::hours(1),
+                jiff::Timestamp::now() + jiff::SignedDuration::from_hours(1),
                 Some(MOCK_USER_AGENT.into()),
                 permission,
             )
@@ -553,7 +551,7 @@ async fn permissions_preserve_expiration_revocation_user_agent_and_admin_eligibi
                 user,
                 "expired".into(),
                 "test".into(),
-                chrono::Utc::now() - chrono::Duration::hours(1),
+                jiff::Timestamp::now() - jiff::SignedDuration::from_hours(1),
                 Some(MOCK_USER_AGENT.into()),
                 permission,
             )
@@ -592,7 +590,7 @@ async fn existing_service_tokens_follow_the_creator_email_allowlist() {
             Uuid::parse_str(MOCK_USER_ID).unwrap(),
             format!("allowlist-{}", Uuid::new_v4()),
             "Existing service credential".to_string(),
-            chrono::Utc::now() + chrono::Duration::hours(1),
+            jiff::Timestamp::now() + jiff::SignedDuration::from_hours(1),
             Some(MOCK_USER_AGENT.to_string()),
             database::models::AdminAccessTokenPermission::ReadWrite,
         )

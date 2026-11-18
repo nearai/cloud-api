@@ -470,7 +470,7 @@ mod tests {
             rtmr1: None,
             rtmr2: None,
             rekor_log_index: 7,
-            integrated_time: chrono::DateTime::from_timestamp(0, 0).unwrap(),
+            integrated_time: jiff::Timestamp::new(0, 0).unwrap(),
         }
     }
 

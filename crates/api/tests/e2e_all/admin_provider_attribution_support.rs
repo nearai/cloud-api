@@ -2,7 +2,7 @@ use crate::common::*;
 use std::sync::OnceLock;
 
 static HARNESS_ENV: OnceLock<()> = OnceLock::new();
-type ProviderUsageWindow = (chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>);
+type ProviderUsageWindow = (jiff::Timestamp, jiff::Timestamp);
 
 pub(super) struct PlatformProviderUsageFixture {
     pub(super) server: axum_test::TestServer,
@@ -15,7 +15,7 @@ pub(super) struct PlatformProviderUsageFixture {
 }
 
 pub(super) struct ProviderUsageSeedRow<'a> {
-    pub(super) created_at: chrono::DateTime<chrono::Utc>,
+    pub(super) created_at: jiff::Timestamp,
     pub(super) input_tokens: i32,
     pub(super) output_tokens: i32,
     pub(super) cache_read_tokens: i32,
@@ -154,9 +154,9 @@ pub(super) async fn isolated_usage_hours(
         (1..=SLOT_HOURS).contains(&hours),
         "at most {SLOT_HOURS} hours"
     );
-    let base = chrono::DateTime::parse_from_rfc3339("1900-01-01T00:00:00Z")
-        .expect("provider usage window base is valid")
-        .with_timezone(&chrono::Utc);
+    let base = "1900-01-01T00:00:00Z"
+        .parse::<jiff::Timestamp>()
+        .expect("provider usage window base is valid");
     let client = fixture.database.pool().get().await.expect("db connection");
 
     for _ in 0..MAX_ATTEMPTS {
@@ -166,8 +166,8 @@ pub(super) async fn isolated_usage_hours(
             .expect("allocate provider usage window")
             .get(0);
         let slot = allocation_id.rem_euclid(SLOT_COUNT);
-        let start = base + chrono::Duration::hours(slot * SLOT_HOURS);
-        let slot_end = start + chrono::Duration::hours(SLOT_HOURS);
+        let start = base + jiff::SignedDuration::from_hours(slot * SLOT_HOURS);
+        let slot_end = start + jiff::SignedDuration::from_hours(SLOT_HOURS);
         let occupied: bool = client
             .query_one(
                 r#"
@@ -184,7 +184,7 @@ pub(super) async fn isolated_usage_hours(
             .get(0);
 
         if !occupied {
-            return (start, start + chrono::Duration::hours(hours));
+            return (start, start + jiff::SignedDuration::from_hours(hours));
         }
     }
 

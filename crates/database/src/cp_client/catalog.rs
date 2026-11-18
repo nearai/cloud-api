@@ -35,7 +35,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use reqwest::{Method, StatusCode};
 use serde::Deserialize;
 use services::metrics::MetricsServiceTrait;
@@ -113,18 +113,18 @@ struct CatalogModelDto {
     #[serde(default)]
     is_ready: Option<bool>,
     #[serde(default)]
-    deprecation_date: Option<DateTime<Utc>>,
+    deprecation_date: Option<Timestamp>,
     #[serde(default)]
     successor_model_name: Option<String>,
     #[serde(default)]
     openrouter_slug: Option<String>,
     is_listed: bool,
-    created_at: DateTime<Utc>,
+    created_at: Timestamp,
 }
 
 #[derive(Debug, Deserialize)]
 struct UpcomingPricingDto {
-    effective_at: DateTime<Utc>,
+    effective_at: Timestamp,
     input_cost_per_token: i64,
     output_cost_per_token: i64,
     #[serde(default)]

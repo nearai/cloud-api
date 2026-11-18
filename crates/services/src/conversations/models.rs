@@ -1,4 +1,4 @@
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -46,14 +46,14 @@ pub struct Conversation {
     pub id: ConversationId,
     pub workspace_id: WorkspaceId,
     pub api_key_id: uuid::Uuid,
-    pub pinned_at: Option<DateTime<Utc>>, // Timestamp when pinned, NULL if not pinned
-    pub archived_at: Option<DateTime<Utc>>, // Timestamp when archived, NULL if not archived
-    pub deleted_at: Option<DateTime<Utc>>, // Timestamp when soft-deleted, NULL if not deleted
+    pub pinned_at: Option<Timestamp>, // Timestamp when pinned, NULL if not pinned
+    pub archived_at: Option<Timestamp>, // Timestamp when archived, NULL if not archived
+    pub deleted_at: Option<Timestamp>, // Timestamp when soft-deleted, NULL if not deleted
     pub cloned_from_id: Option<ConversationId>, // ID of conversation this was cloned from
     pub root_response_id: Option<String>, // ID of hidden structural root response
-    pub metadata: serde_json::Value, // JSONB storing conversation metadata (includes title/name)
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
+    pub metadata: serde_json::Value,  // JSONB storing conversation metadata (includes title/name)
+    pub created_at: Timestamp,
+    pub updated_at: Timestamp,
 }
 
 /// Domain model for a conversation message (extracted from responses)
@@ -63,7 +63,7 @@ pub struct ConversationMessage {
     pub role: String,
     pub content: String,
     pub metadata: Option<serde_json::Value>,
-    pub created_at: DateTime<Utc>,
+    pub created_at: Timestamp,
 }
 
 /// Conversation item

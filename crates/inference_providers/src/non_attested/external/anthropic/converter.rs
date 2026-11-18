@@ -860,7 +860,7 @@ pub struct AnthropicParserState {
 impl AnthropicParserState {
     pub fn new(model: String) -> Self {
         Self {
-            inner: anthropic_compat::StreamState::new(model, chrono::Utc::now().timestamp()),
+            inner: anthropic_compat::StreamState::new(model, jiff::Timestamp::now().as_second()),
         }
     }
 

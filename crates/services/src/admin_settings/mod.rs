@@ -27,8 +27,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
-use chrono::{DateTime, Utc};
 use inference_providers::DisabledSources;
+use jiff::Timestamp;
 use placement::Tuning;
 use serde_json::{Map, Value};
 use uuid::Uuid;
@@ -65,7 +65,7 @@ pub enum AdminSettingsError {
 pub struct SettingView {
     pub key: &'static str,
     pub value: Value,
-    pub updated_at: Option<DateTime<Utc>>,
+    pub updated_at: Option<Timestamp>,
     pub updated_by_user_id: Option<Uuid>,
 }
 
@@ -350,7 +350,7 @@ mod tests {
                     key: key.to_string(),
                     value,
                     updated_by_user_id: None,
-                    updated_at: Utc::now(),
+                    updated_at: Timestamp::now(),
                 },
             );
         }
@@ -383,7 +383,7 @@ mod tests {
                 key: key.to_string(),
                 value,
                 updated_by_user_id: Some(by_user),
-                updated_at: Utc::now(),
+                updated_at: Timestamp::now(),
             };
             self.rows
                 .lock()
@@ -886,7 +886,7 @@ mod tests {
     #[tokio::test]
     async fn reload_reparses_same_timestamp_different_value() {
         let (svc, repo, handle) = versioned_service::<CountKey>();
-        let at = Utc::now();
+        let at = Timestamp::now();
         let put_at = |n: i64| {
             repo.rows.lock().unwrap().insert(
                 "count_key".to_string(),

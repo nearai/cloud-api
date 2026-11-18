@@ -269,7 +269,7 @@ pub fn current_unix_timestamp() -> i64 {
 /// matters for a half-written row, which must never be reported as verified.
 pub fn verified_contact_email(
     contact_email: Option<&str>,
-    contact_email_verified_at: Option<chrono::DateTime<chrono::Utc>>,
+    contact_email_verified_at: Option<jiff::Timestamp>,
 ) -> Option<String> {
     contact_email
         .filter(|_| contact_email_verified_at.is_some())
@@ -555,7 +555,7 @@ mod tests {
 
     #[test]
     fn contact_email_is_only_shown_with_its_verification_time() {
-        let verified_at = Some(chrono::Utc::now());
+        let verified_at = Some(jiff::Timestamp::now());
 
         assert_eq!(
             verified_contact_email(Some("alice@example.com"), verified_at),
@@ -570,9 +570,9 @@ mod tests {
 
     fn test_user(
         contact_email: Option<&str>,
-        verified_at: Option<chrono::DateTime<chrono::Utc>>,
+        verified_at: Option<jiff::Timestamp>,
     ) -> services::auth::User {
-        let now = chrono::Utc::now();
+        let now = jiff::Timestamp::now();
         services::auth::User {
             id: services::auth::UserId(uuid::Uuid::new_v4()),
             email: "login@example.com".to_string(),
@@ -597,7 +597,7 @@ mod tests {
     fn user_response_reports_the_contact_email_and_never_asks_for_one() {
         let with_email = services_user_to_api_user(&test_user(
             Some("alice@example.com"),
-            Some(chrono::Utc::now()),
+            Some(jiff::Timestamp::now()),
         ));
         assert_eq!(
             with_email.contact_email.as_deref(),

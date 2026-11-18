@@ -1,7 +1,7 @@
 use crate::middleware::AdminUser;
 use axum::{extract::Path, http::StatusCode, Extension, Json};
-use chrono::{DateTime, Utc};
 use database::{field_encryption::KeyRing, DbPool};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::{
@@ -432,8 +432,8 @@ pub struct JobResponse {
     actions: Value,
     progress: Value,
     cursor: Value,
-    created_at: DateTime<Utc>,
-    completed_at: Option<DateTime<Utc>>,
+    created_at: Timestamp,
+    completed_at: Option<Timestamp>,
     last_error_class: Option<String>,
     last_error_message: Option<String>,
 }

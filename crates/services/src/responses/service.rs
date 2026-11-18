@@ -1613,7 +1613,7 @@ impl ResponseServiceImpl {
             role: "system".to_string(),
             content: serde_json::Value::String(Self::stateless_instruction_content(
                 request,
-                chrono::Utc::now(),
+                jiff::Timestamp::now(),
             )),
             tool_call_id: None,
             tool_calls: None,
@@ -1708,7 +1708,7 @@ impl ResponseServiceImpl {
     /// result recency. Plain and client-tool requests carry no date.
     fn stateless_instruction_content(
         request: &models::CreateResponseRequest,
-        now: chrono::DateTime<chrono::Utc>,
+        now: jiff::Timestamp,
     ) -> String {
         let mut parts: Vec<String> = Vec::with_capacity(3);
         if let Some(instructions) = request
@@ -1720,7 +1720,7 @@ impl ResponseServiceImpl {
         }
         parts.push(Self::STATELESS_LANGUAGE_INSTRUCTION.to_string());
         if Self::uses_hosted_search(request) {
-            parts.push(format!("Current UTC date: {}.", now.format("%Y-%m-%d")));
+            parts.push(format!("Current UTC date: {}.", now.strftime("%Y-%m-%d")));
         }
         parts.join("\n\n")
     }
@@ -3489,7 +3489,7 @@ mod tests {
             successor_model_name: None,
             openrouter_slug: None,
             is_listed: true,
-            created_at: chrono::Utc::now(),
+            created_at: jiff::Timestamp::now(),
         }
     }
 
@@ -3654,12 +3654,7 @@ mod tests {
 
     #[tokio::test]
     async fn stateless_hosted_search_adds_current_utc_date() {
-        use chrono::TimeZone;
-
-        let now = chrono::Utc
-            .with_ymd_and_hms(2026, 3, 4, 5, 6, 7)
-            .single()
-            .unwrap();
+        let now = "2026-03-04T05:06:07Z".parse::<jiff::Timestamp>().unwrap();
         for tool in [
             serde_json::json!({"type": "web_search"}),
             serde_json::json!({"type": "web_context_search"}),
@@ -3689,7 +3684,7 @@ mod tests {
                 .strip_prefix(&prefix)
                 .and_then(|rest| rest.strip_suffix('.'))
                 .unwrap_or_else(|| panic!("unexpected system content: {system}"));
-            assert!(chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").is_ok());
+            assert!(jiff::civil::Date::strptime("%Y-%m-%d", date).is_ok());
             assert_eq!(messages[1].content, serde_json::json!("Latest news?"));
         }
     }

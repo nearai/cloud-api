@@ -290,7 +290,7 @@ pub async fn run(client: &reqwest::Client, cfg: &ProbeConfig) -> Result<ProbeOut
     let bundle: AtcBundle = serde_json::from_str(&atc_text)
         .map_err(|_| ProbeError::Fetch("ATC bundle: malformed".into()))?;
 
-    let observed_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let observed_at = jiff::Timestamp::now().strftime("%FT%TZ").to_string();
     let mut observations = Observations {
         observed_at,
         ..Observations::default()

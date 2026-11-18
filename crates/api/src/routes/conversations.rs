@@ -1430,7 +1430,7 @@ fn convert_domain_conversation_to_http(
     if let Some(pinned_at) = domain_conversation.pinned_at {
         metadata.insert(
             "pinned_at".to_string(),
-            serde_json::json!(pinned_at.timestamp()),
+            serde_json::json!(services::timestamps::unix_seconds(pinned_at)),
         );
     } else {
         // Remove pinned_at from metadata if it's not pinned
@@ -1441,7 +1441,7 @@ fn convert_domain_conversation_to_http(
     if let Some(archived_at) = domain_conversation.archived_at {
         metadata.insert(
             "archived_at".to_string(),
-            serde_json::json!(archived_at.timestamp()),
+            serde_json::json!(services::timestamps::unix_seconds(archived_at)),
         );
     } else {
         // Remove archived_at from metadata if it's not archived
@@ -1474,7 +1474,7 @@ fn convert_domain_conversation_to_http(
     ConversationObject {
         id: domain_conversation.id.to_string(),
         object: "conversation".to_string(),
-        created_at: domain_conversation.created_at.timestamp(),
+        created_at: services::timestamps::unix_seconds(domain_conversation.created_at),
         metadata: serde_json::Value::Object(metadata),
     }
 }

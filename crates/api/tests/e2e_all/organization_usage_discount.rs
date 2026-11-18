@@ -2,7 +2,6 @@
 //! snapshots in agreement. This module owns the global hourly lock and runs serially.
 use crate::common::*;
 use axum::http::StatusCode;
-use chrono::{DateTime, Duration, Utc};
 use database::{
     models::RecordUsageRequest,
     repositories::{
@@ -12,6 +11,7 @@ use database::{
         OrganizationUsageRepository,
     },
 };
+use jiff::{SignedDuration, Timestamp};
 use serde_json::{json, Value};
 use std::sync::Arc;
 use uuid::Uuid;
@@ -77,7 +77,7 @@ fn discount_repo(f: &Fixture) -> OrganizationUsageDiscountRepository {
 async fn put(
     f: &Fixture,
     basis_points: i32,
-    since: Option<DateTime<Utc>>,
+    since: Option<Timestamp>,
 ) -> anyhow::Result<OrganizationUsageDiscount> {
     let creator = Uuid::new_v4();
     f.db.pool().get().await?
@@ -106,7 +106,7 @@ async fn rule_json(f: &Fixture) -> Value {
     serde_json::to_value(discount_repo(f).get(f.org).await.unwrap()).unwrap()
 }
 
-async fn save(f: &Fixture, since: Option<DateTime<Utc>>) -> Value {
+async fn save(f: &Fixture, since: Option<Timestamp>) -> Value {
     let rule = put(f, BASIS_POINTS, since).await.unwrap();
     assert_eq!(
         rule.status,
@@ -183,7 +183,7 @@ fn request(f: &Fixture, cost: i64) -> RecordUsageRequest {
 
 /// Legacy rows deliberately bypass today's allocator; all other fixtures use the
 /// actual posting path or explicitly seed a balanced historical ledger.
-async fn legacy(f: &Fixture, at: DateTime<Utc>, request: &RecordUsageRequest) -> Uuid {
+async fn legacy(f: &Fixture, at: Timestamp, request: &RecordUsageRequest) -> Uuid {
     f.db.pool()
         .get()
         .await
@@ -245,7 +245,10 @@ async fn validation_and_identical_save_retry() {
         (0, None),
         (10001, None),
         (-1, None),
-        (2500, Some(Utc::now() + Duration::days(1))),
+        (
+            2500,
+            Some(Timestamp::now() + SignedDuration::from_hours(24)),
+        ),
     ] {
         let error = put(&f, basis_points, since).await.unwrap_err();
         assert!(
@@ -262,9 +265,13 @@ async fn validation_and_identical_save_retry() {
     assert_eq!(save(&f, None).await, saved);
     assert!(is_conflict(&put(&f, 3000, None).await.unwrap_err()));
     assert!(is_conflict(
-        &put(&f, BASIS_POINTS, Some(Utc::now() - Duration::days(1)))
-            .await
-            .unwrap_err()
+        &put(
+            &f,
+            BASIS_POINTS,
+            Some(Timestamp::now() - SignedDuration::from_hours(24))
+        )
+        .await
+        .unwrap_err()
     ));
     assert_eq!(rule_json(&f).await, saved);
 }
@@ -342,13 +349,13 @@ async fn history_corrects_legacy_and_split_funding_with_reporting_parity() {
     credits(&f, "postpay", 900_000_000).await;
     let hour = crate::usage_hourly::random_past_hour();
     let before = request(&f, 100_000_000);
-    legacy(&f, hour - Duration::microseconds(1), &before).await;
+    legacy(&f, hour - SignedDuration::from_micros(1), &before).await;
     let old = request(&f, 100_000_000);
     let legacy_id = legacy(&f, hour, &old).await;
     let split = request(&f, 200_000_000);
-    let split_id = legacy(&f, hour + Duration::minutes(1), &split).await;
+    let split_id = legacy(&f, hour + SignedDuration::from_mins(1), &split).await;
     let paid = request(&f, 200_000_000);
-    let paid_id = legacy(&f, hour + Duration::minutes(2), &paid).await;
+    let paid_id = legacy(&f, hour + SignedDuration::from_mins(2), &paid).await;
     let client = f.db.pool().get().await.unwrap();
     for (id, kind, amount, priority) in [
         (split_id, "grant", 150_000_000_i64, 0_i32),
@@ -365,8 +372,8 @@ async fn history_corrects_legacy_and_split_funding_with_reporting_parity() {
     drop(client);
     seed_balance(&f, 200_000_000).await;
     crate::usage_hourly::recompute_usage_hours(
-        hour - Duration::hours(1),
-        hour + Duration::hours(1),
+        hour - SignedDuration::from_hours(1),
+        hour + SignedDuration::from_hours(1),
     )
     .await;
     save(&f, Some(hour)).await;
@@ -457,8 +464,8 @@ async fn history_corrects_legacy_and_split_funding_with_reporting_parity() {
     );
     let range = format!(
         "start={}&end={}",
-        hour.format("%Y-%m-%dT%H:%M:%SZ"),
-        (hour + Duration::hours(1)).format("%Y-%m-%dT%H:%M:%SZ")
+        hour.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        (hour + SignedDuration::from_hours(1)).strftime("%Y-%m-%dT%H:%M:%SZ")
     );
     for (filter, cost, count) in [
         ("", 0.375, 3),
@@ -493,7 +500,7 @@ async fn historical_batches_rollback_resume_and_never_compound() {
         .unwrap();
     drop(client);
     seed_balance(&f, 3018).await;
-    crate::usage_hourly::recompute_usage_hours(hour, hour + Duration::hours(1)).await;
+    crate::usage_hourly::recompute_usage_hours(hour, hour + SignedDuration::from_hours(1)).await;
     save(&f, Some(hour)).await;
     let repo = OrganizationUsageDiscountRepository::new(f.db.pool().clone());
     let mut lock_client = f.db.pool().get().await.unwrap();
@@ -657,7 +664,7 @@ async fn platform_services_stay_outside_forward_and_historical_discount() {
         .await
         .unwrap();
     drop(client);
-    crate::usage_hourly::recompute_usage_hours(hour, hour + Duration::hours(1)).await;
+    crate::usage_hourly::recompute_usage_hours(hour, hour + SignedDuration::from_hours(1)).await;
     save(&f, Some(hour)).await;
     finish(&f).await;
     assert_eq!(
@@ -700,7 +707,7 @@ async fn full_discount_zeroes_funding_and_nanosecond_cutoff_retries_are_idempote
     let original = request(&f, 100);
     let row = usage.record_usage(original.clone()).await.unwrap();
     let hour = crate::usage_hourly::random_past_hour();
-    let at = hour + Duration::minutes(1);
+    let at = hour + SignedDuration::from_mins(1);
     f.db.pool()
         .get()
         .await
@@ -711,8 +718,8 @@ async fn full_discount_zeroes_funding_and_nanosecond_cutoff_retries_are_idempote
         )
         .await
         .unwrap();
-    crate::usage_hourly::recompute_usage_hours(hour, hour + Duration::hours(1)).await;
-    let since = hour + Duration::nanoseconds(123_456_789);
+    crate::usage_hourly::recompute_usage_hours(hour, hour + SignedDuration::from_hours(1)).await;
+    let since = hour + SignedDuration::from_nanos(123_456_789);
     let saved = put(&f, 10_000, Some(since)).await.unwrap();
     assert_eq!(saved.status, "applying");
     let saved = serde_json::to_value(saved).unwrap();
@@ -759,7 +766,7 @@ async fn full_discount_zeroes_funding_and_nanosecond_cutoff_retries_are_idempote
 #[tokio::test]
 async fn worker_claims_recover_after_crash_and_fence_stale_workers() {
     let f = fixture().await;
-    save(&f, Some(Utc::now() - Duration::days(1))).await;
+    save(&f, Some(Timestamp::now() - SignedDuration::from_hours(24))).await;
     let repo = OrganizationUsageDiscountRepository::new(f.db.pool().clone());
     let (left, right) = tokio::join!(repo.claim_next(), repo.claim_next());
     let mut claims: Vec<_> = [left.unwrap(), right.unwrap()]
@@ -817,7 +824,7 @@ async fn worker_claims_recover_after_crash_and_fence_stale_workers() {
 #[tokio::test]
 async fn worker_failures_back_off_show_safe_diagnostics_and_clear_after_repair() {
     let f = fixture().await;
-    save(&f, Some(Utc::now() - Duration::days(1))).await;
+    save(&f, Some(Timestamp::now() - SignedDuration::from_hours(24))).await;
     // Synthetic drift in the correction's own records: a batch counted with no adjustments.
     f.db.pool()
         .get()
@@ -843,10 +850,12 @@ async fn worker_failures_back_off_show_safe_diagnostics_and_clear_after_repair()
             response["last_error"],
             "Accounting verification failed. Reconcile organization balances before retry."
         );
-        let retry = DateTime::parse_from_rfc3339(response["next_retry_at"].as_str().unwrap())
+        let retry = response["next_retry_at"]
+            .as_str()
             .unwrap()
-            .with_timezone(&Utc);
-        let delay = (retry - Utc::now()).num_seconds();
+            .parse::<Timestamp>()
+            .unwrap();
+        let delay = retry.duration_since(Timestamp::now()).as_secs();
         assert!(
             (expected_delay - 5..=expected_delay).contains(&delay),
             "{delay}"
@@ -888,7 +897,7 @@ async fn ledger_drift_outside_the_correction_does_not_block_activation() {
         .await
         .unwrap();
     assert_eq!(drifted, 1);
-    save(&f, Some(Utc::now() - Duration::days(1))).await;
+    save(&f, Some(Timestamp::now() - SignedDuration::from_hours(24))).await;
     let repo = OrganizationUsageDiscountRepository::new(f.db.pool().clone());
     let claim = repo.claim_next().await.unwrap().unwrap();
     assert_eq!(claim.organization_id, f.org);
@@ -926,7 +935,7 @@ async fn verification_fails_when_credit_notes_miss_part_of_the_funded_reduction(
     client.execute("INSERT INTO organization_credit_consumption (organization_id,credit_type,amount) VALUES ($1,'postpay',200000000)",&[&f.org]).await.unwrap();
     drop(client);
     seed_balance(&f, 0).await;
-    crate::usage_hourly::recompute_usage_hours(hour, hour + Duration::hours(1)).await;
+    crate::usage_hourly::recompute_usage_hours(hour, hour + SignedDuration::from_hours(1)).await;
     save(&f, Some(hour)).await;
     let repo = OrganizationUsageDiscountRepository::new(f.db.pool().clone());
     assert!(repo.apply_batch(f.org).await.unwrap(), "corrects the row");

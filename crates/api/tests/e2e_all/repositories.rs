@@ -1,8 +1,8 @@
 // E2E tests for Repository-level database operations
 // These tests directly test repository behavior with the database
 
-use chrono::{Duration, Utc};
 use database::OAuthStateRepository;
+use jiff::{SignedDuration, Timestamp};
 
 async fn get_test_pool() -> database::pool::DbPool {
     let (_server, _inference_provider_pool, _mock_provider, database) =
@@ -53,7 +53,7 @@ async fn test_expired_state_not_returned() {
 
     // Create state with past expiration
     let client = pool.get().await.unwrap();
-    let past_time = Utc::now() - Duration::minutes(1);
+    let past_time = Timestamp::now() - SignedDuration::from_mins(1);
     client
         .execute(
             r#"

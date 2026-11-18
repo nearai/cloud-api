@@ -5,8 +5,12 @@ permissions:
 
 on:
   schedule:
-    # Thursday 00:00 UTC — promote frozen :staging → :prod
-    - cron: "0 0 * * 4"
+    # Mon-Thu 19:00 UTC (12:00 PT during PDT): promote verified :staging to :prod.
+    # Matches the agreed Brave release window (10:00 PT staging freeze, then
+    # 12:00 PT prod promotion) so each release gets a US-hours verification slot.
+    # Cron is UTC and does not track DST: 19:00 UTC is 12:00 PT in summer (PDT)
+    # and 11:00 PT in winter (PST); revisit the offset at the DST change.
+    - cron: "0 19 * * 1-4"
   workflow_dispatch:
     inputs:
       target:

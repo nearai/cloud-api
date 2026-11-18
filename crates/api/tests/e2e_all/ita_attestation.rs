@@ -312,16 +312,6 @@ async fn setup_deprecated_alias(fake_ita: &FakeIta) -> (axum_test::TestServer, S
     );
     seed_models(&server, batch, get_session_id()).await;
 
-    let response = server
-        .post("/v1/admin/models/deprecate")
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
-        .add_header("User-Agent", MOCK_USER_AGENT)
-        .json(&json!({
-            "modelId": alias,
-            "successorModelId": canonical,
-            "changeReason": "ITA alias e2e"
-        }))
-        .await;
-    assert_eq!(response.status_code(), 200, "{}", response.text());
+    seeding::seed_deprecation(&alias, &canonical, "ITA alias e2e").await;
     (server, alias, canonical)
 }

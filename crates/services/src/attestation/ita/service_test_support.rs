@@ -13,7 +13,7 @@ use uuid::Uuid;
 use super::super::{client::client_test_support::FakeIta, ItaClient};
 use crate::{
     attestation::{
-        models::{ChatSignature, DstackCpuQuote},
+        models::{ChatSignature, DstackCpuQuote, SignatureOwner},
         ports::AttestationRepository,
         AttestationError, AttestationService, GatewayQuoteCollector, GatewayQuoteInput,
         ModelAttestationCollector, ModelAttestationInput,
@@ -22,9 +22,9 @@ use crate::{
     metrics::MetricsServiceTrait,
     models::{ModelWithPricing, ModelsRepository},
     usage::{
-        InferenceCost, InferenceUsageHistoryQuery, InferenceUsageReportQuery,
-        InferenceUsageReportRow, OrganizationBalanceInfo, RecordUsageDbRequest, StopReason,
-        UsageByModelEntry, UsageLogEntry, UsageRepository,
+        InferenceCost, InferenceUsageHistoryQuery, InferenceUsageReportRow,
+        OrganizationBalanceInfo, RecordUsageDbRequest, UsageByModelEntry, UsageLogEntry,
+        UsageRepository,
     },
 };
 
@@ -202,7 +202,7 @@ impl ModelAttestationCollector for RecordingModelCollector {
         let gpu_nonce = input.nonce.ok_or_else(|| {
             AttestationError::InternalError("expected ITA GPU nonce for model evidence".to_string())
         })?;
-        Ok(vec![model_evidence(&gpu_nonce)])
+        Ok(vec![model_evidence(&gpu_nonce, "HOPPER")])
     }
 }
 
@@ -215,14 +215,14 @@ impl RecordingModelCollector {
     }
 }
 
-fn model_evidence(gpu_nonce: &str) -> Map<String, Value> {
+pub(super) fn model_evidence(gpu_nonce: &str, arch: &str) -> Map<String, Value> {
     let pem = format!(
         "-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n",
         STANDARD.encode(b"test-der-certificate-bytes")
     );
     let payload = json!({
         "gpu_nonce": gpu_nonce,
-        "arch": "HOPPER",
+        "arch": arch,
         "evidence_list": [{ "certificate": STANDARD.encode(pem), "evidence": "ZXZpZGVuY2U=" }]
     });
     let mut evidence = Map::new();
@@ -311,6 +311,7 @@ struct NoopAttestationRepository;
 impl AttestationRepository for NoopAttestationRepository {
     async fn add_chat_signature(
         &self,
+        _owner: SignatureOwner,
         _chat_id: &str,
         _signature: ChatSignature,
     ) -> Result<(), AttestationError> {
@@ -380,33 +381,12 @@ impl UsageRepository for NoopUsageRepository {
         Ok(Vec::new())
     }
 
-    async fn get_stop_reason_by_response_id(
-        &self,
-        _response_id: Uuid,
-    ) -> anyhow::Result<Option<StopReason>> {
-        Ok(None)
-    }
-
-    async fn get_stop_reason_by_provider_request_id(
-        &self,
-        _provider_request_id: &str,
-    ) -> anyhow::Result<Option<StopReason>> {
-        Ok(None)
-    }
-
     async fn get_usage_by_model(
         &self,
         _organization_id: Uuid,
         _start_date: chrono::DateTime<chrono::Utc>,
         _end_date: Option<chrono::DateTime<chrono::Utc>>,
     ) -> anyhow::Result<Vec<UsageByModelEntry>> {
-        Ok(Vec::new())
-    }
-
-    async fn list_inference_usage_report(
-        &self,
-        _query: InferenceUsageReportQuery,
-    ) -> anyhow::Result<Vec<InferenceUsageReportRow>> {
         Ok(Vec::new())
     }
 

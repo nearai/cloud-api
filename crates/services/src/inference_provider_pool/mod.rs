@@ -28,6 +28,8 @@ mod context_routing;
 pub use context_routing::expand_inference_endpoints;
 
 #[cfg(test)]
+mod attestation_tests;
+#[cfg(test)]
 mod channel_binding_tests;
 #[cfg(test)]
 mod chutes_routing_tests;
@@ -4304,8 +4306,57 @@ impl InferenceProviderPool {
         }
     }
 
+    /// Collect one report from the first successful provider for ITA's single
+    /// GPU evidence set. Keep this separate from Gateway fleet collection:
+    /// different fleets may report different GPU architectures.
+    pub(crate) async fn get_single_attestation_report(
+        &self,
+        model: String,
+        signing_algo: Option<String>,
+        nonce: Option<String>,
+        signing_address: Option<String>,
+        include_tls_fingerprint: bool,
+    ) -> Result<serde_json::Map<String, serde_json::Value>, AttestationError> {
+        let providers = self
+            .get_providers_for_model(&model)
+            .await
+            .ok_or_else(|| AttestationError::ProviderNotFound(model.clone()))?;
+        let mut last_error = None;
+        for provider in self.drop_disabled_sources(providers) {
+            match provider
+                .get_attestation_report(
+                    model.clone(),
+                    signing_algo.clone(),
+                    nonce.clone(),
+                    signing_address.clone(),
+                    include_tls_fingerprint,
+                )
+                .await
+            {
+                Ok(mut report) => {
+                    report.remove("all_attestations");
+                    return Ok(report);
+                }
+                Err(error) => {
+                    debug!(
+                        model = %model,
+                        error_kind = Self::attestation_error_kind(&error),
+                        "Provider returned error for ITA attestation request, trying next"
+                    );
+                    last_error = Some(error);
+                }
+            }
+        }
+        Err(last_error
+            .map(|error| AttestationError::FetchError(error.to_string()))
+            .unwrap_or_else(|| AttestationError::ProviderNotFound(model)))
+    }
+
     /// `provider_filter`: when `Some`, only providers matching the filter (NEAR tier,
-    /// or attested 3P of the given source) are tried. `None` preserves the existing behaviour (first successful wins).
+    /// or attested 3P of the given source) are tried. NEAR reports cover every
+    /// registered NEAR fleet for the model; other sources retain first-success
+    /// selection. A failed NEAR collection can fall back to another source when
+    /// the filter permits it, but reports from different sources are never mixed.
     ///
     /// `signing_algo` is forwarded to each backend verbatim. Backends accept
     /// only lowercase `ecdsa` / `ed25519`, so callers must pass a normalized
@@ -4339,36 +4390,84 @@ impl InferenceProviderPool {
             return Err(AttestationError::ProviderNotFound(model));
         }
 
-        // Keys are KMS-root-derived, so replicas under different roots can
-        // return different reports. Returning one report is still correct:
-        // discovery registers every key and request-time backend affinity keeps
-        // a client-pinned key within the matching identity group.
-        // Try providers in order and return the first successful response.
+        // A model can have multiple NEAR inference URLs/context tiers, each
+        // backed by several CVMs. Collect the entire NEAR group at its first
+        // position in the existing provider order. Never merge a partial group
+        // with a fallback source, or collapse CVMs that share a signing key.
         let mut last_error = None;
-        for provider in providers {
-            match provider
-                .get_attestation_report(
+        let mut tried_near = false;
+        for provider in &providers {
+            let is_near = provider.tier() == inference_providers::ProviderTier::Near;
+            let targets = if is_near {
+                if tried_near {
+                    continue;
+                }
+                tried_near = true;
+                providers
+                    .iter()
+                    .filter(|p| p.tier() == inference_providers::ProviderTier::Near)
+                    .collect::<Vec<_>>()
+            } else {
+                vec![provider]
+            };
+            let mut reports = Vec::new();
+            let mut failure = None;
+            // Fleets come from model configuration. Collect them concurrently
+            // so their timeouts do not add up, retaining provider order in the
+            // response and in failure selection.
+            let collections = futures::future::join_all(targets.into_iter().map(|target| {
+                target.get_attestation_reports(
                     model.clone(),
                     signing_algo.clone(),
                     nonce.clone(),
                     signing_address.clone(),
                     include_tls_fingerprint,
                 )
-                .await
-            {
-                Ok(mut attestation) => {
-                    attestation.remove("all_attestations");
-                    return Ok(vec![attestation]);
-                }
-                Err(e) => {
-                    tracing::debug!(
-                        model = %model,
-                        error_kind = Self::attestation_error_kind(&e),
-                        "Provider returned error for attestation request, trying next"
-                    );
-                    last_error = Some(e);
+            }))
+            .await;
+            for (fleet_index, result) in collections.into_iter().enumerate() {
+                match result {
+                    Ok(batch) if !batch.is_empty() => {
+                        reports.extend(batch.into_iter().map(|mut report| {
+                            report.remove("all_attestations");
+                            report
+                        }));
+                    }
+                    // A signer filter can legitimately exclude an entire fleet.
+                    Err(AttestationError::SigningAddressNotFound(_))
+                        if signing_address.is_some() =>
+                    {
+                        debug!(
+                            model = %model,
+                            fleet_index,
+                            "Attestation fleet excluded: no backend matches the signing address"
+                        );
+                    }
+                    result => {
+                        failure = Some(match result {
+                            Err(error) => error,
+                            Ok(_) => AttestationError::InvalidResponse(
+                                "Provider returned an empty attestation collection".to_string(),
+                            ),
+                        });
+                        break;
+                    }
                 }
             }
+            if failure.is_none() && !reports.is_empty() {
+                return Ok(reports);
+            }
+            let error = failure.unwrap_or_else(|| {
+                AttestationError::SigningAddressNotFound(
+                    signing_address.clone().unwrap_or_default(),
+                )
+            });
+            debug!(
+                model = %model,
+                error_kind = Self::attestation_error_kind(&error),
+                "Provider attestation collection failed, trying the next source"
+            );
+            last_error = Some(error);
         }
 
         Err(last_error
@@ -5458,7 +5557,7 @@ impl InferenceProviderPool {
             );
             return Err(
                 "providerConfig.api_key is the redaction placeholder \"***\", not a key; \
-                 set the real key with PATCH /v1/admin/models"
+                 set the real key with the admin API's PATCH /v1/admin/models"
                     .to_string(),
             );
         }
@@ -5815,7 +5914,7 @@ impl InferenceProviderPool {
                             successful_calls = outcome.successful_calls,
                             failed_calls = outcome.failed_calls,
                             verify_failures = outcome.verify_failures,
-                            failure_reasons = ?outcome.failure_reasons,
+                            failure_reason_count = outcome.failure_reasons.len(),
                             "No TLS fingerprints pinned during initial discovery — provider will reject connections until attestation succeeds"
                         );
                     } else {
@@ -5831,9 +5930,9 @@ impl InferenceProviderPool {
                             replaced_state = outcome.replaced_state,
                             distinct_keys = outcome.distinct_pubkeys().len(),
                             distinct_identities = outcome.distinct_identities().len(),
-                            divergent_algos = ?outcome.divergent_algos(),
-                            observed_fingerprints = ?outcome.observed_fingerprints,
-                            failure_reasons = ?outcome.failure_reasons,
+                            divergent_algo_count = outcome.divergent_algos().len(),
+                            observed_fingerprint_count = outcome.observed_fingerprints.len(),
+                            failure_reason_count = outcome.failure_reasons.len(),
                             "Initial attestation discovery complete"
                         );
                         // Pre-warm all bucket clients in the background so the
@@ -6126,8 +6225,8 @@ impl InferenceProviderPool {
                         total_pinned = outcome.total_pinned,
                         verify_failures = outcome.verify_failures,
                         replaced_state = outcome.replaced_state,
-                        observed_fingerprints = ?outcome.observed_fingerprints,
-                        failure_reasons = ?outcome.failure_reasons,
+                        observed_fingerprint_count = outcome.observed_fingerprints.len(),
+                        failure_reason_count = outcome.failure_reasons.len(),
                         "Cumulative discovery expanded pinned backend set"
                     );
                 } else {
@@ -6140,8 +6239,8 @@ impl InferenceProviderPool {
                         verify_failures = outcome.verify_failures,
                         total_pinned = outcome.total_pinned,
                         replaced_state = outcome.replaced_state,
-                        observed_fingerprints = ?outcome.observed_fingerprints,
-                        failure_reasons = ?outcome.failure_reasons,
+                        observed_fingerprint_count = outcome.observed_fingerprints.len(),
+                        failure_reason_count = outcome.failure_reasons.len(),
                         "Cumulative discovery cycle (no new fingerprints)"
                     );
                 }
@@ -8390,6 +8489,7 @@ mod tests {
             service_tier: None,
             modalities: None,
             original_request: None,
+            upstream_cache_salt: None,
             extra: std::collections::HashMap::new(),
         };
 
@@ -8467,6 +8567,7 @@ mod tests {
             service_tier: None,
             modalities: None,
             original_request: None,
+            upstream_cache_salt: None,
             extra: std::collections::HashMap::new(),
         };
 
@@ -10311,6 +10412,110 @@ mod tests {
         );
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn provider_error_logs_keep_diagnostics_without_upstream_content() {
+        use crate::completions::{ports, CompletionServiceImpl};
+        use crate::test_utils::CapturedLogs;
+
+        for (status, message, expected_status, diagnostic) in [
+            (
+                400,
+                "PROVIDER_BODY_SENTINEL",
+                400,
+                "Client error from provider",
+            ),
+            (
+                500,
+                "PROVIDER_BODY_SENTINEL",
+                502,
+                "Provider failed, will try next provider",
+            ),
+            (
+                500,
+                "cannot identify image file <_io.BytesIO PROVIDER_BODY_SENTINEL>",
+                400,
+                "Client media-fetch failure",
+            ),
+        ] {
+            let (pool, model_id) = pool_with_mock_provider().await;
+            let logs = CapturedLogs::default();
+            let _subscriber = tracing::subscriber::set_default(logs.subscriber());
+            let result: Result<ServedProviderResult<()>, _> = pool
+                .retry_with_fallback(&model_id, "test_op", None, |_provider| async move {
+                    Err(CompletionError::HttpError {
+                        status_code: status,
+                        message: message.to_owned(),
+                        is_external: false,
+                    })
+                })
+                .await;
+            let error = result.err().expect("provider must fail");
+            let mapped = CompletionServiceImpl::map_provider_error(
+                &model_id,
+                &error,
+                "test_op",
+                uuid::Uuid::nil(),
+            );
+            match mapped {
+                ports::CompletionError::InvalidParams(message) => {
+                    assert_eq!(expected_status, 400);
+                    if status == 400 {
+                        assert!(message.contains("PROVIDER_BODY_SENTINEL"));
+                    }
+                }
+                ports::CompletionError::ProviderError {
+                    status_code,
+                    message,
+                } => {
+                    assert_eq!(status_code, expected_status);
+                    assert!(!message.contains("PROVIDER_BODY_SENTINEL"));
+                }
+                other => panic!("unexpected mapped error: {other:?}"),
+            }
+
+            let captured = logs.contents();
+            assert!(captured.contains(diagnostic), "{captured}");
+            assert!(captured.contains(&model_id), "{captured}");
+            assert!(captured.contains("error_kind="), "{captured}");
+            assert!(!captured.contains("PROVIDER_BODY_SENTINEL"), "{captured}");
+        }
+    }
+
+    #[tokio::test]
+    async fn embeddings_error_logs_exclude_upstream_content() {
+        use crate::test_utils::CapturedLogs;
+
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+        let provider = Arc::new(inference_providers::mock::MockProvider::new());
+        provider
+            .set_embedding_error_override(Some(inference_providers::EmbeddingError::HttpError {
+                status_code: 400,
+                message: "EMBEDDING_BODY_SENTINEL".to_owned(),
+            }))
+            .await;
+        pool.register_provider("test-embedding".to_owned(), provider)
+            .await;
+        let logs = CapturedLogs::default();
+        let _subscriber = tracing::subscriber::set_default(logs.subscriber());
+        let result = pool
+            .embeddings("test-embedding", bytes::Bytes::new(), Default::default())
+            .await;
+        assert!(matches!(
+            result,
+            Err(inference_providers::EmbeddingError::HttpError {
+                status_code: 400,
+                ..
+            })
+        ));
+        let captured = logs.contents();
+        assert!(
+            captured.contains("Embeddings failed with provider"),
+            "{captured}"
+        );
+        assert!(captured.contains("status_code=400"), "{captured}");
+        assert!(!captured.contains("EMBEDDING_BODY_SENTINEL"), "{captured}");
+    }
+
     /// Multi-provider, alternating-error test pinning Pierre's blocker: provider
     /// A returns a non-retryable client-media 5xx, provider B (if reached)
     /// would return a retryable 5xx. Without the short-circuit, the for-loop
@@ -11170,6 +11375,7 @@ mod tests {
             service_tier: None,
             modalities: None,
             original_request: None,
+            upstream_cache_salt: None,
             extra: std::collections::HashMap::new(),
         }
     }

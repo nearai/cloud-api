@@ -8,8 +8,6 @@ use axum::{
 use database::models::AdminAccessTokenPermission;
 use database::User as DbUser;
 use services::auth::{AuthError, AuthServiceTrait, OAuthManager, SessionToken};
-use services::common::REPORTING_TOKEN_PREFIX;
-use services::reporting_tokens::{ReportingTokenScope, ValidatedOrganizationReportingToken};
 use std::sync::Arc;
 use tracing::{debug, error};
 
@@ -86,15 +84,6 @@ fn authorize_admin_operation(
         .map(|p| p.as_str());
     // Missing route metadata is unclassified and must never grant read access.
     let operation = admin_operation(request.method(), matched_path.unwrap_or(""));
-    if operation == AdminOperation::SessionOnly {
-        return Err((
-            StatusCode::FORBIDDEN,
-            axum::Json(crate::models::ErrorResponse::new(
-                "Access token management endpoint detected".to_string(),
-                "forbidden".to_string(),
-            )),
-        ));
-    }
     if permission == AdminAccessTokenPermission::ReadOnly && operation != AdminOperation::Read {
         return Err((
             StatusCode::FORBIDDEN,
@@ -138,14 +127,17 @@ pub struct AuthenticatedApiKey {
     pub organization: services::organization::Organization,
 }
 
-#[derive(Clone, Debug)]
-pub struct AuthenticatedReportingToken {
-    pub id: uuid::Uuid,
-    pub organization_id: uuid::Uuid,
-    pub token_prefix: String,
-    pub scope: ReportingTokenScope,
+impl AuthenticatedApiKey {
+    /// The owner recorded with every signature this key creates. Signature
+    /// reads are not limited to it; it only scopes the `STREAM_DISCONNECTED`
+    /// check when no signature is stored.
+    pub fn signature_owner(&self) -> services::attestation::SignatureOwner {
+        services::attestation::SignatureOwner {
+            organization_id: self.organization.id.0,
+            workspace_id: self.workspace.id.0,
+        }
+    }
 }
-
 /// The caller's API key to carry into cloud-platform reads. Copied only for a
 /// successful key, and only when some cloud-platform area is on.
 fn caller_key(token: Option<&str>) -> Option<String> {
@@ -459,55 +451,6 @@ pub async fn auth_middleware(
     }
 }
 
-pub async fn auth_middleware_with_reporting_token(
-    State(state): State<AuthState>,
-    request: Request,
-    next: Next,
-) -> Result<Response, (StatusCode, axum::Json<crate::models::ErrorResponse>)> {
-    let auth_header = request
-        .headers()
-        .get("authorization")
-        .and_then(|h| h.to_str().ok());
-
-    tracing::debug!(
-        has_authorization = auth_header.is_some(),
-        "Auth reporting token middleware"
-    );
-
-    let auth_result = if let Some(auth_value) = auth_header {
-        debug!("Found Authorization header");
-        if let Some(token) = auth_value.strip_prefix("Bearer ") {
-            authenticate_reporting_token(&state, token).await
-        } else {
-            debug!("Authorization header uses unsupported scheme");
-            Err((
-                StatusCode::UNAUTHORIZED,
-                axum::Json(crate::models::ErrorResponse::new(
-                    "Invalid authorization header format".to_string(),
-                    "invalid_auth_header".to_string(),
-                )),
-            ))
-        }
-    } else {
-        Err((
-            StatusCode::UNAUTHORIZED,
-            axum::Json(crate::models::ErrorResponse::new(
-                "Missing authorization header".to_string(),
-                "missing_auth_header".to_string(),
-            )),
-        ))
-    };
-
-    match auth_result {
-        Ok(reporting_token) => {
-            let mut request = request;
-            request.extensions_mut().insert(reporting_token);
-            Ok(next.run(request).await)
-        }
-        Err(error) => Err(error),
-    }
-}
-
 /// Admin authentication middleware - verifies user is authenticated AND has admin access
 /// Supports both access tokens (with admin email allowlist check) and admin access tokens
 pub async fn admin_middleware(
@@ -585,7 +528,7 @@ pub async fn admin_middleware(
                     }
                     Err(err) => {
                         debug!(
-                            status = err.0.as_u16(),
+                            error_kind = "admin_token_validation",
                             "Admin access token validation failed"
                         );
                         // Don't fall back to session token for admin access tokens
@@ -748,17 +691,6 @@ async fn authenticate_session_access(
     state: &AuthState,
     token: String, // jwt
 ) -> Result<(DbUser, Option<uuid::Uuid>), (StatusCode, axum::Json<crate::models::ErrorResponse>)> {
-    if token.starts_with(REPORTING_TOKEN_PREFIX) {
-        debug!("Reporting token rejected by session middleware");
-        return Err((
-            StatusCode::UNAUTHORIZED,
-            axum::Json(crate::models::ErrorResponse::new(
-                "Invalid or expired access token".to_string(),
-                "unauthorized".to_string(),
-            )),
-        ));
-    }
-
     debug!("Authenticating session access token");
     // Use auth service
 
@@ -831,10 +763,6 @@ pub async fn refresh_middleware(
         debug!("Found Authorization header");
         if let Some(token) = auth_value.strip_prefix("Bearer ") {
             debug!("Extracted Bearer token");
-            if token.starts_with(REPORTING_TOKEN_PREFIX) {
-                debug!("Reporting token rejected by refresh middleware");
-                return Err(StatusCode::UNAUTHORIZED);
-            }
             if let Some(user_agent_value) = user_agent {
                 authenticate_session_refresh(
                     &state,
@@ -962,48 +890,6 @@ async fn authenticate_api_key(
         .api_key)
 }
 
-async fn authenticate_reporting_token(
-    state: &AuthState,
-    token: &str,
-) -> Result<AuthenticatedReportingToken, (StatusCode, axum::Json<crate::models::ErrorResponse>)> {
-    debug!("Calling reporting token service to validate token");
-
-    match state.reporting_token_service.validate(token).await {
-        Ok(Some(validated)) => Ok(reporting_token_extension(validated)),
-        Ok(None) => {
-            debug!("Invalid or expired reporting token");
-            Err((
-                StatusCode::UNAUTHORIZED,
-                axum::Json(crate::models::ErrorResponse::new(
-                    "Invalid or expired reporting token".to_string(),
-                    "invalid_reporting_token".to_string(),
-                )),
-            ))
-        }
-        Err(_) => {
-            error!("Failed to validate reporting token");
-            Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                axum::Json(crate::models::ErrorResponse::new(
-                    "Failed to validate reporting token".to_string(),
-                    "internal_server_error".to_string(),
-                )),
-            ))
-        }
-    }
-}
-
-fn reporting_token_extension(
-    validated: ValidatedOrganizationReportingToken,
-) -> AuthenticatedReportingToken {
-    AuthenticatedReportingToken {
-        id: validated.id,
-        organization_id: validated.organization_id,
-        token_prefix: validated.token_prefix,
-        scope: validated.scope,
-    }
-}
-
 /// Authenticate using API key and resolve workspace/organization context
 async fn authenticate_api_key_with_context(
     state: &AuthState,
@@ -1067,8 +953,6 @@ pub struct AuthState {
     pub oauth_manager: Arc<OAuthManager>,
     pub auth_service: Arc<dyn AuthServiceTrait>,
     pub workspace_repository: Arc<dyn services::workspace::WorkspaceRepository>,
-    pub reporting_token_service:
-        Arc<dyn services::reporting_tokens::OrganizationReportingTokenService>,
     pub admin_access_token_repository: Arc<database::repositories::AdminAccessTokenRepository>,
     pub admin_emails: Vec<String>,
     pub encoding_key: String,
@@ -1082,9 +966,6 @@ impl AuthState {
         oauth_manager: Arc<OAuthManager>,
         auth_service: Arc<dyn AuthServiceTrait>,
         workspace_repository: Arc<dyn services::workspace::WorkspaceRepository>,
-        reporting_token_service: Arc<
-            dyn services::reporting_tokens::OrganizationReportingTokenService,
-        >,
         admin_access_token_repository: Arc<database::repositories::AdminAccessTokenRepository>,
         admin_emails: Vec<String>,
         encoding_key: String,
@@ -1093,7 +974,6 @@ impl AuthState {
             oauth_manager,
             auth_service,
             workspace_repository,
-            reporting_token_service,
             admin_access_token_repository,
             admin_emails,
             encoding_key,
@@ -1252,10 +1132,6 @@ mod tests {
         use services::common::RepositoryError;
         use services::models::{resolve_model_cached, ModelCaller, ModelsRepository};
         use services::organization::{Organization, OrganizationId};
-        use services::reporting_tokens::{
-            CreateOrganizationReportingTokenRequest, CreatedOrganizationReportingToken,
-            OrganizationReportingToken, OrganizationReportingTokenService,
-        };
         use services::workspace::{
             ApiKey, ApiKeyId, ApiKeyOrderBy, ApiKeyOrderDirection, ApiKeyRepository,
             CreateApiKeyRequest, Workspace, WorkspaceId, WorkspaceOrderBy, WorkspaceOrderDirection,
@@ -1433,18 +1309,6 @@ mod tests {
             ) -> Result<Workspace, RepositoryError> {
                 unimplemented!()
             }
-            async fn update(
-                &self,
-                _: WorkspaceId,
-                _: Option<String>,
-                _: Option<String>,
-                _: Option<serde_json::Value>,
-            ) -> Result<Option<Workspace>, RepositoryError> {
-                unimplemented!()
-            }
-            async fn delete(&self, _: WorkspaceId) -> Result<bool, RepositoryError> {
-                unimplemented!()
-            }
             async fn count_by_organization(
                 &self,
                 _: OrganizationId,
@@ -1460,38 +1324,6 @@ mod tests {
             }
         }
 
-        struct NoReportingTokens;
-        #[async_trait]
-        impl OrganizationReportingTokenService for NoReportingTokens {
-            async fn create(
-                &self,
-                _: CreateOrganizationReportingTokenRequest,
-            ) -> Result<CreatedOrganizationReportingToken, RepositoryError> {
-                unimplemented!()
-            }
-            async fn validate(
-                &self,
-                _: &str,
-            ) -> Result<Option<ValidatedOrganizationReportingToken>, RepositoryError> {
-                Ok(None)
-            }
-            async fn get_by_id(
-                &self,
-                _: Uuid,
-            ) -> Result<Option<OrganizationReportingToken>, RepositoryError> {
-                unimplemented!()
-            }
-            async fn list_active_by_organization(
-                &self,
-                _: Uuid,
-            ) -> Result<Vec<OrganizationReportingToken>, RepositoryError> {
-                unimplemented!()
-            }
-            async fn revoke(&self, _: Uuid, _: Uuid) -> Result<bool, RepositoryError> {
-                unimplemented!()
-            }
-        }
-
         fn auth_state() -> AuthState {
             AuthState::new(
                 Arc::new(OAuthManager::new(None, None).unwrap()),
@@ -1499,7 +1331,6 @@ mod tests {
                     apikey_repository: Arc::new(OneKey),
                 }),
                 Arc::new(OneWorkspace),
-                Arc::new(NoReportingTokens),
                 Arc::new(database::repositories::AdminAccessTokenRepository::new(
                     database::DbPool::uninitialized(),
                 )),

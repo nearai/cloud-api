@@ -1,11 +1,54 @@
 use axum::{
-    body::Body,
+    body::{Body, Bytes},
+    extract::MatchedPath,
     http::{header::CACHE_CONTROL, HeaderMap, HeaderValue, Request},
     middleware::Next,
     response::Response,
 };
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use tracing::Instrument;
 use uuid::Uuid;
+
+/// Response body that keeps the request span open until the body is fully
+/// sent or dropped, and enters the span while the body is polled, so work
+/// driven by the body (a streamed completion, usage recording) runs inside
+/// the request span.
+struct SpanBody {
+    inner: Body,
+    span: tracing::Span,
+}
+
+impl Drop for SpanBody {
+    fn drop(&mut self) {
+        // Drop the wrapped body inside the span, so work its destructor starts
+        // (a streamed completion recording its usage) is parented to it.
+        let _entered = self.span.enter();
+        self.inner = Body::empty();
+    }
+}
+
+impl http_body::Body for SpanBody {
+    type Data = Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        let this = &mut *self;
+        let _entered = this.span.enter();
+        Pin::new(&mut this.inner).poll_frame(cx)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.size_hint()
+    }
+}
 
 #[cfg(test)]
 mod privacy_log_scanner;
@@ -35,8 +78,25 @@ pub async fn request_correlation_middleware(mut request: Request<Body>, next: Ne
 
     let method = request.method().clone();
     let path = log_safe_path(request.uri().path());
+    // The route template, never the raw path: path segments can carry ids.
+    let route = request
+        .extensions()
+        .get::<MatchedPath>()
+        .map_or("unmatched", MatchedPath::as_str)
+        .to_owned();
+    let otel_method = super::metrics::bounded_method(&method);
+    let otel_name = format!("{otel_method} {route}");
+    // Every request starts its own trace: an inbound `traceparent` is never
+    // read, and the span has no parent.
     let span = tracing::info_span!(
+        parent: None,
         "http_request",
+        otel.name = %otel_name,
+        otel.kind = "server",
+        http.request.method = otel_method,
+        http.route = %route,
+        http.response.status_code = tracing::field::Empty,
+        otel.status_code = tracing::field::Empty,
         request_id = %request_id,
         client_request_id = client_request_id.map(tracing::field::display),
         method = %method,
@@ -54,11 +114,17 @@ pub async fn request_correlation_middleware(mut request: Request<Body>, next: Ne
     let run = async move { next.run(request).await };
     let mut response = if database::cp_client::client::configured() {
         database::cp_client::with_request_id(request_id, run)
-            .instrument(span)
+            .instrument(span.clone())
             .await
     } else {
-        run.instrument(span).await
+        run.instrument(span.clone()).await
     };
+    let status = response.status();
+    span.record("http.response.status_code", i64::from(status.as_u16()));
+    if status.is_server_error() {
+        span.record("otel.status_code", "ERROR");
+    }
+    let trace_id = span.in_scope(inference_providers::tracing_context::current_trace_id);
     let response_request_id = client_request_id.unwrap_or(request_id);
     if let Ok(value) = HeaderValue::from_str(&response_request_id.to_string()) {
         response.headers_mut().insert(REQUEST_ID_HEADER, value);
@@ -69,10 +135,12 @@ pub async fn request_correlation_middleware(mut request: Request<Body>, next: Ne
         client_request_id = client_request_id.map(tracing::field::display),
         method = %method,
         path = %path,
-        status = response.status().as_u16(),
+        status = status.as_u16(),
+        trace_id = trace_id.as_deref(),
         "request completed"
     );
-    response
+    let (parts, body) = response.into_parts();
+    Response::from_parts(parts, Body::new(SpanBody { inner: body, span }))
 }
 
 fn prevent_request_id_caching(headers: &mut HeaderMap) {
@@ -216,12 +284,18 @@ mod tests {
             .with_writer(move || writer_logs.writer())
             .finish();
         let request_id = Uuid::new_v4();
-        let body = Body::from(
-            r#"{"prompt":"CUSTOMER_PROMPT_SENTINEL","tool_arguments":{"secret":"TOOL_ARG_SENTINEL"},"api_key":"sk-log-sentinel"}"#,
-        );
+        let body = r#"{"prompt":"CUSTOMER_PROMPT_SENTINEL","tool_arguments":{"secret":"TOOL_ARG_SENTINEL"},"api_key":"sk-log-sentinel"}"#;
+        let body_hash = {
+            use sha2::{Digest, Sha256};
+            hex::encode(Sha256::digest(body.as_bytes()))
+        };
         let token_path = "tok_live_customer_invitation_secret_1234567890";
         let app = Router::new()
             .route("/v1/invitations/{token}", post(|| async { "ok" }))
+            .layer(axum::middleware::from_fn_with_state(
+                crate::middleware::body_hash::BodyHashLimit(1024),
+                crate::middleware::body_hash::body_hash_middleware,
+            ))
             .layer(from_fn(request_correlation_middleware));
 
         let _subscriber_guard = tracing::subscriber::set_default(subscriber);
@@ -234,7 +308,7 @@ mod tests {
                     .header("x-org-id", "spoofed-org-sentinel")
                     .header("authorization", "Bearer sk-log-sentinel")
                     .header("User-Agent", "USER_AGENT_LOG_SENTINEL")
-                    .body(body)
+                    .body(Body::from(body))
                     .expect("test request should build"),
             )
             .await
@@ -260,6 +334,7 @@ mod tests {
             "spoofed-org-sentinel",
             "USER_AGENT_LOG_SENTINEL",
             token_path,
+            &body_hash,
         ] {
             assert!(
                 !captured.contains(forbidden),

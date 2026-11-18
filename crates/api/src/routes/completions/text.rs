@@ -142,7 +142,11 @@ pub async fn completions(
         request_id = %request_id,
         org_id = %api_key.organization.id.0,
         workspace_id = %api_key.workspace.id.0,
-        model = %request.model,
+        // Client input: kept local, never exported with the span.
+        requested_model = %request.model,
+        // Canonical catalog name, recorded once the request resolves to a
+        // catalog model.
+        model = tracing::field::Empty,
     );
 
     completions_inner(app_state, api_key, body_hash, headers, request, request_id)
@@ -271,14 +275,23 @@ pub(super) async fn completions_inner(
     let resolved_model_name = alias_canonical.as_deref().unwrap_or(&request.model);
     let legacy_gateway_signature_enabled =
         match app_state.models_service.get_models_with_pricing().await {
-            Ok(models) => models
-                .iter()
-                .find(|model| model.model_name == resolved_model_name)
-                .is_some_and(|model| model.attestation_supported),
-            Err(error) => {
+            Ok(models) => {
+                let model = models
+                    .iter()
+                    .find(|model| model.model_name == resolved_model_name);
+                match model {
+                    Some(model) => {
+                        // The catalog's own name, never the client's string.
+                        tracing::Span::current().record("model", model.model_name.as_str());
+                        model.attestation_supported
+                    }
+                    None => false,
+                }
+            }
+            Err(_) => {
                 tracing::warn!(
                     model = %request.model,
-                    error = %error,
+                    error_kind = "model_metadata_lookup_failed",
                     "Failed to read cached model metadata for legacy completion signing"
                 );
                 false
@@ -368,6 +381,7 @@ pub(super) async fn completions_inner(
                     Arc::new(tokio::sync::Mutex::new(stream_chat_id.clone()));
                 let stream_error_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
                 let attestation_service = app_state.attestation_service.clone();
+                let signature_owner = api_key.signature_owner();
 
                 // Warning to inject into the first streamed chunk of an
                 // alias-served response (issue #573).
@@ -479,6 +493,7 @@ pub(super) async fn completions_inner(
                                     match tokio::time::timeout(
                                         SIGNATURE_STORE_TIMEOUT,
                                         attestation_service.store_chat_signature(
+                                            signature_owner,
                                             &chat_id,
                                             request_hash,
                                             response_hash,
@@ -490,7 +505,7 @@ pub(super) async fn completions_inner(
                                         Ok(Err(error)) => tracing::error!(
                                             %organization_id,
                                             model = %model_name,
-                                            error = %error,
+                                            error_kind = error.kind(),
                                             "Failed to store legacy completion stream signature"
                                         ),
                                         Err(_) => tracing::error!(
@@ -571,8 +586,8 @@ pub(super) async fn completions_inner(
 
                 let body_bytes = match serde_json::to_vec(&completion) {
                     Ok(b) => b,
-                    Err(e) => {
-                        tracing::error!(error = %e, "failed to serialize text completion response");
+                    Err(_) => {
+                        tracing::error!("failed to serialize text completion response");
                         app_state
                             .attestation_service
                             .release_chat_signature_pin(&chat_id)
@@ -604,12 +619,16 @@ pub(super) async fn completions_inner(
                     let response_hash = hex::encode(Sha256::digest(&body_bytes));
                     if let Err(error) = app_state
                         .attestation_service
-                        .store_chat_signature_and_unpin(&chat_id, request_hash, response_hash)
+                        .store_chat_signature_and_unpin(
+                            api_key.signature_owner(),
+                            &chat_id,
+                            request_hash,
+                            response_hash,
+                        )
                         .await
                     {
                         tracing::error!(
-                            chat_id = %chat_id,
-                            error = %error,
+                            error_kind = error.kind(),
                             "Failed to store legacy completion signature"
                         );
                     }

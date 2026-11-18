@@ -439,6 +439,33 @@ impl UsageServiceTrait for UsageServiceImpl {
                     *provider_attribution,
                 )
             }
+            RecordUsageApiRequest::AudioTranscription {
+                model,
+                duration_seconds,
+                id,
+                provider_attribution,
+            } => {
+                if id.trim().is_empty() {
+                    return Err(UsageError::ValidationError(
+                        "id must be a non-empty string".into(),
+                    ));
+                }
+                if *duration_seconds <= 0 {
+                    return Err(UsageError::ValidationError(
+                        "duration_seconds must be positive".into(),
+                    ));
+                }
+                (
+                    model.clone(),
+                    *duration_seconds,
+                    0,
+                    0,
+                    None,
+                    InferenceType::AudioTranscription,
+                    id.clone(),
+                    *provider_attribution,
+                )
+            }
             RecordUsageApiRequest::Embedding {
                 model,
                 input_tokens,
@@ -808,24 +835,6 @@ impl UsageServiceTrait for UsageServiceImpl {
                     UsageError::ReportingTimeout
                 } else {
                     UsageError::InternalError(format!("Failed to get usage by model: {e}"))
-                }
-            })
-    }
-
-    async fn list_inference_usage_report(
-        &self,
-        query: InferenceUsageReportQuery,
-    ) -> Result<Vec<InferenceUsageReportRow>, UsageError> {
-        self.usage_repository
-            .list_inference_usage_report(query)
-            .await
-            .map_err(|error| {
-                if crate::common::is_query_timeout(&error) {
-                    UsageError::ReportingTimeout
-                } else {
-                    UsageError::InternalError(format!(
-                        "Failed to list inference usage report: {error}"
-                    ))
                 }
             })
     }

@@ -2,20 +2,54 @@
 use crate::{
     attestation::{
         ita::{ItaTokenQuery, ItaTokenResponse},
-        models::{AttestationReport, SignatureLookupResult},
+        models::{AttestationReport, SignatureLookupResult, SignatureOwner},
         ports::AttestationServiceTrait,
         AttestationError,
     },
     usage::{
-        InferenceType, InferenceUsageHistoryQuery, InferenceUsageReportQuery,
-        InferenceUsageReportRow, OrganizationBalanceInfo, OrganizationCreditLimit,
-        OrganizationLimit, ProviderAttribution, RecordUsageApiRequest, RecordUsageServiceRequest,
-        UsageCheckResult, UsageDiscount, UsageError, UsageLogEntry, UsageServiceTrait,
+        InferenceType, InferenceUsageHistoryQuery, InferenceUsageReportRow,
+        OrganizationBalanceInfo, OrganizationCreditLimit, OrganizationLimit, ProviderAttribution,
+        RecordUsageApiRequest, RecordUsageServiceRequest, UsageCheckResult, UsageDiscount,
+        UsageError, UsageLogEntry, UsageServiceTrait,
     },
 };
 use async_trait::async_trait;
 use inference_providers::ProviderFilter;
 use uuid::Uuid;
+
+#[derive(Clone, Default)]
+pub struct CapturedLogs(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl CapturedLogs {
+    pub fn subscriber(&self) -> impl tracing::Subscriber + Send + Sync {
+        let logs = self.clone();
+        tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_ansi(false)
+            .without_time()
+            .with_writer(move || logs.clone())
+            .finish()
+    }
+
+    pub fn contents(&self) -> String {
+        String::from_utf8(self.0.lock().expect("captured logs lock").clone())
+            .expect("logs are UTF-8")
+    }
+}
+
+impl std::io::Write for CapturedLogs {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .lock()
+            .expect("captured logs lock")
+            .extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
 
 pub struct MockAttestationService;
 
@@ -23,6 +57,7 @@ pub struct MockAttestationService;
 impl AttestationServiceTrait for MockAttestationService {
     async fn get_chat_signature(
         &self,
+        _owner: SignatureOwner,
         _chat_id: &str,
         _signing_algo: Option<String>,
     ) -> Result<SignatureLookupResult, AttestationError> {
@@ -33,6 +68,7 @@ impl AttestationServiceTrait for MockAttestationService {
 
     async fn store_chat_signature_from_provider(
         &self,
+        _owner: SignatureOwner,
         _chat_id: &str,
     ) -> Result<(), AttestationError> {
         Ok(())
@@ -40,6 +76,7 @@ impl AttestationServiceTrait for MockAttestationService {
 
     async fn store_chat_signature(
         &self,
+        _owner: SignatureOwner,
         _chat_id: &str,
         _request_hash: String,
         _response_hash: String,
@@ -49,6 +86,7 @@ impl AttestationServiceTrait for MockAttestationService {
 
     async fn store_response_signature(
         &self,
+        _owner: SignatureOwner,
         _response_id: &str,
         _request_hash: String,
         _response_hash: String,
@@ -159,6 +197,18 @@ impl UsageServiceTrait for MockUsageService {
                     Some(*image_count),
                     InferenceType::ImageGeneration,
                 ),
+                RecordUsageApiRequest::AudioTranscription {
+                    model,
+                    duration_seconds,
+                    ..
+                } => (
+                    model.clone(),
+                    *duration_seconds,
+                    0,
+                    0,
+                    None,
+                    InferenceType::AudioTranscription,
+                ),
                 RecordUsageApiRequest::Embedding {
                     model,
                     input_tokens,
@@ -314,13 +364,6 @@ impl UsageServiceTrait for MockUsageService {
         _start_date: chrono::DateTime<chrono::Utc>,
         _end_date: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<Vec<crate::usage::UsageByModelEntry>, UsageError> {
-        Ok(vec![])
-    }
-
-    async fn list_inference_usage_report(
-        &self,
-        _query: InferenceUsageReportQuery,
-    ) -> Result<Vec<InferenceUsageReportRow>, UsageError> {
         Ok(vec![])
     }
 
@@ -427,6 +470,18 @@ impl UsageServiceTrait for CapturingUsageService {
                     Some(*image_count),
                     InferenceType::ImageGeneration,
                 ),
+                RecordUsageApiRequest::AudioTranscription {
+                    model,
+                    duration_seconds,
+                    ..
+                } => (
+                    model.clone(),
+                    *duration_seconds,
+                    0,
+                    0,
+                    None,
+                    InferenceType::AudioTranscription,
+                ),
                 RecordUsageApiRequest::Embedding {
                     model,
                     input_tokens,
@@ -582,13 +637,6 @@ impl UsageServiceTrait for CapturingUsageService {
         _start_date: chrono::DateTime<chrono::Utc>,
         _end_date: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<Vec<crate::usage::UsageByModelEntry>, UsageError> {
-        Ok(vec![])
-    }
-
-    async fn list_inference_usage_report(
-        &self,
-        _query: InferenceUsageReportQuery,
-    ) -> Result<Vec<InferenceUsageReportRow>, UsageError> {
         Ok(vec![])
     }
 

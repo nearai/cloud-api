@@ -229,8 +229,11 @@ async fn bootstrap_shared_db_once() -> Result<()> {
         .context("connect to the admin database for e2e bootstrap")?;
 
     tokio::spawn(async move {
-        if let Err(error) = connection.await {
-            warn!(%error, "Admin database connection closed during e2e bootstrap");
+        if connection.await.is_err() {
+            warn!(
+                error_kind = "admin_connection_closed",
+                "Admin database connection closed during e2e bootstrap"
+            );
         }
     });
 
@@ -306,6 +309,16 @@ async fn bootstrap_shared_db_once() -> Result<()> {
         )
         .context("create the e2e migration connection pool")?;
     let database = Database::new(migration_pool.into());
+    database
+        .pool()
+        .get()
+        .await
+        .context("get a connection for the test schema bridge")?
+        .batch_execute(include_str!(
+            "../../../../scripts/test-chat-signature-owner.sql"
+        ))
+        .await
+        .context("apply the test schema bridge")?;
     seed_shared_test_fixtures(&database).await?;
 
     debug!(database = %db_name, "Shared e2e database is ready");
@@ -504,7 +517,12 @@ async fn bootstrap_shared_db_with_retry() -> Result<()> {
         match bootstrap_shared_db_once().await {
             Ok(()) => return Ok(()),
             Err(error) => {
-                warn!(attempt, max_attempts = MAX_ATTEMPTS, %error, "E2E database bootstrap attempt failed");
+                warn!(
+                    attempt,
+                    max_attempts = MAX_ATTEMPTS,
+                    error_kind = "bootstrap_failed",
+                    "E2E database bootstrap attempt failed"
+                );
                 last_error = Some(error);
                 if attempt < MAX_ATTEMPTS {
                     tokio::time::sleep(Duration::from_millis(250 * attempt as u64)).await;

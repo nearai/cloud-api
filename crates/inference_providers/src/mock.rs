@@ -724,6 +724,8 @@ struct MockConfig {
     /// When set, privacy classify calls return this instead of running the
     /// built-in shape-based detector.
     privacy_classify_override: Option<PrivacyClassifyOverride>,
+    /// When set, embeddings and rerank responses report zero usage.
+    report_zero_usage: bool,
 }
 
 /// Scripted privacy-classify outcome for [`MockProvider::set_privacy_classify_override`].
@@ -757,6 +759,19 @@ impl MockExpectationBuilder {
 
 type ResponsesHandler =
     Arc<dyn Fn(serde_json::Value) -> crate::responses_raw::ResponsesRawResponse + Send + Sync>;
+type AttestationReportsHandler = Arc<
+    dyn Fn(
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            bool,
+        ) -> futures_util::future::BoxFuture<
+            'static,
+            Result<Vec<serde_json::Map<String, serde_json::Value>>, AttestationError>,
+        > + Send
+        + Sync,
+>;
 type PrivacyClassifyHandler =
     Arc<dyn Fn(bytes::Bytes) -> Result<bytes::Bytes, PrivacyClassifyError> + Send + Sync>;
 type SystemOneHandler = Arc<
@@ -771,6 +786,7 @@ type SystemOneHandler = Arc<
 /// Mock provider that implements InferenceProvider for testing
 pub struct MockProvider {
     responses_handler: Option<ResponsesHandler>,
+    attestation_reports_handler: Option<AttestationReportsHandler>,
     systemone_handler: Option<SystemOneHandler>,
     privacy_classify_handler: Option<PrivacyClassifyHandler>,
     /// List of available mock models
@@ -783,6 +799,9 @@ pub struct MockProvider {
     last_chat_params: Arc<Mutex<Option<ChatCompletionParams>>>,
     /// Numeric policy metadata only, for multi-request propagation assertions.
     chat_request_priorities: Arc<Mutex<Vec<i32>>>,
+    /// Each chat request's priority with its serialized messages, so a test can tie a
+    /// priority to the request that carried it.
+    chat_request_priority_log: Arc<Mutex<Vec<(i32, String)>>>,
     /// Number of chat-completion requests received, across streaming and
     /// non-streaming calls. Useful for asserting one-shot API behavior.
     chat_completion_call_count: Arc<std::sync::atomic::AtomicUsize>,
@@ -876,6 +895,46 @@ impl MockProvider {
         self
     }
 
+    /// Supply a fleet report collection for provider-pool tests.
+    pub fn with_attestation_reports_handler(
+        self,
+        handler: impl Fn(
+                String,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+                bool,
+            )
+                -> Result<Vec<serde_json::Map<String, serde_json::Value>>, AttestationError>
+            + Send
+            + Sync
+            + 'static,
+    ) -> Self {
+        self.with_async_attestation_reports_handler(move |model, algo, nonce, address, tls| {
+            let result = handler(model, algo, nonce, address, tls);
+            async move { result }
+        })
+    }
+
+    /// Supply an asynchronous collection, e.g. to coordinate concurrent fleets.
+    pub fn with_async_attestation_reports_handler<F, Fut>(mut self, handler: F) -> Self
+    where
+        F: Fn(String, Option<String>, Option<String>, Option<String>, bool) -> Fut
+            + Send
+            + Sync
+            + 'static,
+        Fut: std::future::Future<
+                Output = Result<Vec<serde_json::Map<String, serde_json::Value>>, AttestationError>,
+            > + Send
+            + 'static,
+    {
+        self.attestation_reports_handler =
+            Some(Arc::new(move |model, algo, nonce, address, tls| {
+                Box::pin(handler(model, algo, nonce, address, tls))
+            }));
+        self
+    }
+
     /// Create a new mock provider with default models
     pub fn new() -> Self {
         let models = vec![ModelInfo {
@@ -899,9 +958,11 @@ impl MockProvider {
                 embedding_error_override: None,
                 audio_transcription_error_override: None,
                 privacy_classify_override: None,
+                report_zero_usage: false,
             })),
             last_chat_params: Arc::new(Mutex::new(None)),
             chat_request_priorities: Arc::new(Mutex::new(Vec::new())),
+            chat_request_priority_log: Arc::new(Mutex::new(Vec::new())),
             chat_completion_call_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             fail_attestation: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tier: crate::ProviderTier::NonAttested,
@@ -915,6 +976,7 @@ impl MockProvider {
             attestation_signing_algos: Arc::new(std::sync::Mutex::new(Vec::new())),
             tracing_calls: Arc::new(std::sync::Mutex::new(Vec::new())),
             responses_handler: None,
+            attestation_reports_handler: None,
             systemone_handler: None,
             privacy_classify_handler: None,
         }
@@ -935,9 +997,11 @@ impl MockProvider {
                 embedding_error_override: None,
                 audio_transcription_error_override: None,
                 privacy_classify_override: None,
+                report_zero_usage: false,
             })),
             last_chat_params: Arc::new(Mutex::new(None)),
             chat_request_priorities: Arc::new(Mutex::new(Vec::new())),
+            chat_request_priority_log: Arc::new(Mutex::new(Vec::new())),
             chat_completion_call_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             fail_attestation: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tier: crate::ProviderTier::NonAttested,
@@ -951,6 +1015,7 @@ impl MockProvider {
             attestation_signing_algos: Arc::new(std::sync::Mutex::new(Vec::new())),
             tracing_calls: Arc::new(std::sync::Mutex::new(Vec::new())),
             responses_handler: None,
+            attestation_reports_handler: None,
             systemone_handler: None,
             privacy_classify_handler: None,
         }
@@ -969,9 +1034,11 @@ impl MockProvider {
                 embedding_error_override: None,
                 audio_transcription_error_override: None,
                 privacy_classify_override: None,
+                report_zero_usage: false,
             })),
             last_chat_params: Arc::new(Mutex::new(None)),
             chat_request_priorities: Arc::new(Mutex::new(Vec::new())),
+            chat_request_priority_log: Arc::new(Mutex::new(Vec::new())),
             chat_completion_call_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             fail_attestation: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tier: crate::ProviderTier::NonAttested,
@@ -985,6 +1052,7 @@ impl MockProvider {
             attestation_signing_algos: Arc::new(std::sync::Mutex::new(Vec::new())),
             tracing_calls: Arc::new(std::sync::Mutex::new(Vec::new())),
             responses_handler: None,
+            attestation_reports_handler: None,
             systemone_handler: None,
             privacy_classify_handler: None,
         }
@@ -1041,6 +1109,11 @@ impl MockProvider {
     /// Get the scheduler priorities recorded across mock completion calls.
     pub async fn chat_request_priorities(&self) -> Vec<i32> {
         self.chat_request_priorities.lock().await.clone()
+    }
+
+    /// Each chat request's priority paired with its serialized messages.
+    pub async fn chat_request_priority_log(&self) -> Vec<(i32, String)> {
+        self.chat_request_priority_log.lock().await.clone()
     }
 
     /// Get the last chat completion params received by the mock provider.
@@ -1160,6 +1233,13 @@ impl MockProvider {
     pub async fn set_privacy_classify_override(&self, outcome: Option<PrivacyClassifyOverride>) {
         let mut config = self.config.lock().await;
         config.privacy_classify_override = outcome;
+    }
+
+    /// Make embeddings and rerank responses report zero usage, for tests of
+    /// the zero-unit billing rule. Pass `false` to restore the fixed counts.
+    pub async fn set_report_zero_usage(&self, enabled: bool) {
+        let mut config = self.config.lock().await;
+        config.report_zero_usage = enabled;
     }
 
     /// Generate a completion ID
@@ -1369,6 +1449,10 @@ impl crate::InferenceProvider for MockProvider {
             .lock()
             .await
             .push(params.request_priority);
+        self.chat_request_priority_log.lock().await.push((
+            params.request_priority,
+            serde_json::to_string(&params.messages).unwrap_or_default(),
+        ));
         self.chat_completion_call_count
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         *self.last_chat_params.lock().await = Some(params.clone());
@@ -1516,6 +1600,10 @@ impl crate::InferenceProvider for MockProvider {
             .lock()
             .await
             .push(params.request_priority);
+        self.chat_request_priority_log.lock().await.push((
+            params.request_priority,
+            serde_json::to_string(&params.messages).unwrap_or_default(),
+        ));
         self.chat_completion_call_count
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         *self.last_chat_params.lock().await = Some(params.clone());
@@ -1753,13 +1841,18 @@ impl crate::InferenceProvider for MockProvider {
                 .unwrap()
         });
 
+        let total_tokens = if self.config.lock().await.report_zero_usage {
+            0
+        } else {
+            50
+        };
         let response = RerankResponse {
             id: format!("rerank-{}", self.generate_id()),
             model: params.model.clone(),
             results,
             usage: Some(RerankUsage {
                 prompt_tokens: None,
-                total_tokens: Some(50),
+                total_tokens: Some(total_tokens),
             }),
         };
 
@@ -1772,12 +1865,17 @@ impl crate::InferenceProvider for MockProvider {
         _extra: std::collections::HashMap<String, serde_json::Value>,
     ) -> Result<bytes::Bytes, EmbeddingError> {
         self.record_tracing("embeddings_raw");
-        {
+        let tokens = {
             let config = self.config.lock().await;
             if let Some(ref error) = config.embedding_error_override {
                 return Err(error.clone());
             }
-        }
+            if config.report_zero_usage {
+                0
+            } else {
+                10
+            }
+        };
         let embedding: Vec<f64> = vec![0.0; 384];
         let response_json = serde_json::json!({
             "object": "list",
@@ -1788,8 +1886,8 @@ impl crate::InferenceProvider for MockProvider {
             }],
             "model": "mock-embedding-model",
             "usage": {
-                "prompt_tokens": 10,
-                "total_tokens": 10
+                "prompt_tokens": tokens,
+                "total_tokens": tokens
             }
         });
         let bytes = serde_json::to_vec(&response_json)
@@ -1960,6 +2058,35 @@ impl crate::InferenceProvider for MockProvider {
         Ok(report)
     }
 
+    async fn get_attestation_reports(
+        &self,
+        model: String,
+        signing_algo: Option<String>,
+        nonce: Option<String>,
+        signing_address: Option<String>,
+        include_tls_fingerprint: bool,
+    ) -> Result<Vec<serde_json::Map<String, serde_json::Value>>, AttestationError> {
+        if let Some(handler) = &self.attestation_reports_handler {
+            return handler(
+                model,
+                signing_algo,
+                nonce,
+                signing_address,
+                include_tls_fingerprint,
+            )
+            .await;
+        }
+        self.get_attestation_report(
+            model,
+            signing_algo,
+            nonce,
+            signing_address,
+            include_tls_fingerprint,
+        )
+        .await
+        .map(|report| vec![report])
+    }
+
     async fn audio_transcription(
         &self,
         params: AudioTranscriptionParams,
@@ -1988,9 +2115,15 @@ impl crate::InferenceProvider for MockProvider {
                 .as_deref()
                 .is_none_or(|granularities| granularities.iter().any(|value| value == "segment"));
 
+        // Like the real servers: `verbose_json` carries `duration`, the plain
+        // format reports the length only under `usage`.
         Ok(AudioTranscriptionResponse {
             text: mock_text.clone(),
-            duration: Some(mock_duration),
+            duration: verbose_json.then_some(mock_duration),
+            usage: (!verbose_json).then(|| crate::models::AudioTranscriptionUsage {
+                usage_type: Some("duration".to_string()),
+                seconds: Some(mock_duration.ceil()),
+            }),
             language: params.language.or(Some("en".to_string())),
             segments: wants_segment_timestamps.then(|| {
                 vec![TranscriptionSegment {

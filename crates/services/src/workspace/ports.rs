@@ -163,18 +163,6 @@ pub trait WorkspaceRepository: Send + Sync {
         created_by_user_id: UserId,
     ) -> Result<Workspace, RepositoryError>;
 
-    /// Update a workspace
-    async fn update(
-        &self,
-        workspace_id: WorkspaceId,
-        name: Option<String>,
-        description: Option<String>,
-        settings: Option<serde_json::Value>,
-    ) -> Result<Option<Workspace>, RepositoryError>;
-
-    /// Delete (deactivate) a workspace
-    async fn delete(&self, workspace_id: WorkspaceId) -> Result<bool, RepositoryError>;
-
     /// Count workspaces for an organization
     async fn count_by_organization(
         &self,
@@ -254,13 +242,6 @@ pub trait ApiKeyRepository: Send + Sync {
 #[cfg_attr(test, mockall::automock)]
 #[async_trait]
 pub trait WorkspaceServiceTrait: Send + Sync {
-    /// Get a workspace by ID
-    async fn get_workspace(
-        &self,
-        workspace_id: WorkspaceId,
-        requester_id: UserId,
-    ) -> Result<Workspace, WorkspaceError>;
-
     /// Get a workspace with its organization
     async fn get_workspace_with_organization(
         &self,
@@ -351,23 +332,6 @@ pub trait WorkspaceServiceTrait: Send + Sync {
         &self,
         workspace_id: WorkspaceId,
         user_id: UserId,
-    ) -> Result<bool, WorkspaceError>;
-
-    /// Update a workspace with permission checking
-    async fn update_workspace(
-        &self,
-        workspace_id: WorkspaceId,
-        requester_id: UserId,
-        name: Option<String>,
-        description: Option<String>,
-        settings: Option<serde_json::Value>,
-    ) -> Result<Workspace, WorkspaceError>;
-
-    /// Delete (deactivate) a workspace with permission checking
-    async fn delete_workspace(
-        &self,
-        workspace_id: WorkspaceId,
-        requester_id: UserId,
     ) -> Result<bool, WorkspaceError>;
 
     /// List all workspaces accessible to a user across all their organizations in a single query.

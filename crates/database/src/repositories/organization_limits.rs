@@ -270,67 +270,6 @@ impl OrganizationLimitsRepository {
         Ok((statuses, unfunded, unattributed))
     }
 
-    /// Count limits history for an organization
-    pub async fn count_limits_history(&self, organization_id: Uuid) -> Result<i64> {
-        let row = retry_db!("count_organization_limits_history", {
-            let client = self
-                .pool
-                .get()
-                .await
-                .context("Failed to get database connection")
-                .map_err(RepositoryError::PoolError)?;
-
-            client
-                .query_one(
-                    "SELECT COUNT(*) FROM organization_limits_history WHERE organization_id = $1",
-                    &[&organization_id],
-                )
-                .await
-                .map_err(map_db_error)
-        })?;
-
-        Ok(row.get("count"))
-    }
-
-    /// Get all limits history for an organization
-    pub async fn get_limits_history(
-        &self,
-        organization_id: Uuid,
-        limit: i64,
-        offset: i64,
-    ) -> Result<Vec<OrganizationLimitsHistory>> {
-        let rows = retry_db!("get_organization_limits_history", {
-            let client = self
-                .pool
-                .get()
-                .await
-                .context("Failed to get database connection")
-                .map_err(RepositoryError::PoolError)?;
-
-            client
-                .query(
-                    r#"
-                    SELECT id, organization_id, spend_limit, credit_type, source, currency,
-                           effective_from, effective_until,
-                           changed_by, change_reason, changed_by_user_id, changed_by_user_email, created_at
-                    FROM organization_limits_history
-                    WHERE organization_id = $1
-                    ORDER BY effective_from DESC
-                    LIMIT $2 OFFSET $3
-                    "#,
-                    &[&organization_id, &limit, &offset],
-                )
-                .await
-                .map_err(map_db_error)
-        })?;
-
-        let history = rows
-            .into_iter()
-            .map(|row| self.row_to_limits_history(&row))
-            .collect();
-        Ok(history)
-    }
-
     /// Helper method to convert database row to OrganizationLimitsHistory
     fn row_to_limits_history(&self, row: &Row) -> OrganizationLimitsHistory {
         OrganizationLimitsHistory {

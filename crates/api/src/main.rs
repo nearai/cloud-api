@@ -1,18 +1,23 @@
-use api::{build_app_with_config, init_auth_services, init_database, init_domain_services};
+use api::{
+    build_app_with_config, init_auth_services, init_database, init_domain_services, telemetry,
+};
 use config::{ApiConfig, LoggingConfig};
 use database::repositories::AdminCompositeRepository;
 use database::{Database, ShutdownCoordinator, ShutdownStage};
 use opentelemetry::global;
+use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_otlp::{MetricExporter, WithExportConfig};
 use opentelemetry_sdk::metrics::SdkMeterProvider;
+use opentelemetry_sdk::trace::SdkTracerProvider;
 use services::admin::ModelPricingScheduler;
 use services::inference_provider_pool::InferenceProviderPool;
 use services::metrics::{MetricsServiceTrait, OtlpMetricsService};
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::level_filters::LevelFilter;
-
-mod telemetry;
+use tracing_subscriber::{
+    layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer, Registry,
+};
 
 #[tokio::main]
 async fn main() {
@@ -35,15 +40,24 @@ async fn main() {
 
     // Load configuration and initialize logging
     let config = load_configuration();
-    init_tracing(&config.logging);
+
+    // Get environment from env var (local, dev, staging, prod)
+    let environment = std::env::var("ENVIRONMENT").unwrap_or_else(|_| "local".to_string());
+    let resource =
+        telemetry::build_telemetry_resource(&environment, config.otlp.instance_id.as_deref());
+
+    // The tracer provider is built before the subscriber so the subscriber can
+    // export spans through it. `None` when tracing is disabled.
+    let tracer_provider = telemetry::build_tracer_provider(&config.otlp, resource.clone());
+    init_tracing(&config.logging, tracer_provider.as_ref());
+    tracing::info!(
+        traces_enabled = tracer_provider.is_some(),
+        traces_sample_ratio = config.otlp.traces_sample_ratio,
+        "Distributed tracing configured"
+    );
 
     // Initialize core services
     let database = init_database(&config.database).await;
-    if config.usage_reporting.enabled {
-        database::ensure_usage_reporting_indexes(database.pool())
-            .await
-            .expect("Usage reporting index prerequisites are not satisfied");
-    }
     let auth_components = init_auth_services(database.clone(), &config);
 
     // Initialize OpenTelemetry pipeline
@@ -52,12 +66,6 @@ async fn main() {
         .with_endpoint(&config.otlp.endpoint)
         .build()
         .expect("Failed to build OTLP metrics exporter");
-
-    // Get environment from env var (local, dev, staging, prod)
-    let environment = std::env::var("ENVIRONMENT").unwrap_or_else(|_| "local".to_string());
-
-    let resource =
-        telemetry::build_telemetry_resource(&environment, config.otlp.instance_id.as_deref());
 
     let meter_provider = SdkMeterProvider::builder()
         .with_periodic_exporter(exporter)
@@ -167,6 +175,7 @@ async fn main() {
         pricing_scheduler,
         usage_hourly_scheduler,
         discount_worker,
+        tracer_provider,
     )
     .await;
 }
@@ -183,6 +192,7 @@ fn load_configuration() -> ApiConfig {
 }
 
 /// Start the HTTP server with graceful shutdown on SIGTERM/SIGINT
+#[allow(clippy::too_many_arguments)]
 async fn start_server(
     app: axum::Router,
     config: Arc<ApiConfig>,
@@ -191,6 +201,7 @@ async fn start_server(
     pricing_scheduler: Arc<ModelPricingScheduler>,
     usage_hourly_scheduler: Arc<services::usage::UsageHourlyScheduler>,
     discount_worker: tokio::task::JoinHandle<()>,
+    tracer_provider: Option<SdkTracerProvider>,
 ) {
     let bind_address = format!("{}:{}", config.server.host, config.server.port);
     let listener = tokio::net::TcpListener::bind(&bind_address)
@@ -222,6 +233,7 @@ async fn start_server(
                 usage_hourly_scheduler,
             )
             .await;
+            shutdown_tracer_provider(tracer_provider).await;
         }
         Err(e) => {
             tracing::error!("Server error: {}", e);
@@ -232,9 +244,23 @@ async fn start_server(
                 usage_hourly_scheduler,
             )
             .await;
+            shutdown_tracer_provider(tracer_provider).await;
             std::process::exit(1);
         }
     }
+}
+
+/// Flush pending spans and stop the tracer provider. Logs only whether the
+/// shutdown succeeded.
+async fn shutdown_tracer_provider(tracer_provider: Option<SdkTracerProvider>) {
+    let Some(provider) = tracer_provider else {
+        return;
+    };
+    let result =
+        tokio::task::spawn_blocking(move || provider.shutdown_with_timeout(Duration::from_secs(5)))
+            .await;
+    let flushed = matches!(result, Ok(Ok(())));
+    tracing::info!(flushed, "Tracer provider shut down");
 }
 
 /// Perform coordinated shutdown with timeout protection
@@ -374,45 +400,80 @@ fn default_level(filter: &str) -> Option<LevelFilter> {
         .find_map(|directive| directive.parse::<LevelFilter>().ok())
 }
 
-/// Initialize tracing/logging based on configuration
-fn init_tracing(logging_config: &LoggingConfig) {
-    let filter = build_log_filter(logging_config);
+/// Crate targets whose spans are exported. Dependency crates are never
+/// exported, whatever their level.
+const EXPORTED_SPAN_TARGETS: &[&str] = &["api", "services", "inference_providers", "database"];
 
-    // Initialize tracing based on the format specified in config
+/// Whether `metadata` describes an INFO-or-more-severe span from one of our
+/// own crates. Events never qualify, so log messages cannot become span
+/// events.
+fn is_exported_span(metadata: &tracing::Metadata<'_>) -> bool {
+    metadata.is_span()
+        && *metadata.level() <= tracing::Level::INFO
+        && EXPORTED_SPAN_TARGETS.iter().any(|prefix| {
+            metadata
+                .target()
+                .strip_prefix(prefix)
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with("::"))
+        })
+}
+
+/// The span-export filter. The decision depends only on static metadata, so
+/// it is cached per callsite and carries an INFO level hint: callsites it
+/// rejects (dependency crates, events, verbose levels) cost nothing per call.
+fn exported_span_filter<S>() -> impl tracing_subscriber::layer::Filter<S> {
+    tracing_subscriber::filter::dynamic_filter_fn(|metadata, _| is_exported_span(metadata))
+        .with_callsite_filter(|metadata| {
+            if is_exported_span(metadata) {
+                tracing::subscriber::Interest::always()
+            } else {
+                tracing::subscriber::Interest::never()
+            }
+        })
+        .with_max_level_hint(LevelFilter::INFO)
+}
+
+type BoxedLayer = Box<dyn Layer<Registry> + Send + Sync>;
+
+/// Build the log output layer for the configured format. The log filter is
+/// attached to this layer only, so it never affects span export.
+fn build_fmt_layer(logging_config: &LoggingConfig) -> BoxedLayer {
+    let filter = EnvFilter::new(build_log_filter(logging_config));
     match logging_config.format.as_str() {
-        "json" => {
-            tracing_subscriber::fmt()
-                .json()
-                .with_env_filter(filter)
-                .with_current_span(false)
-                .with_span_list(false)
-                .init();
-        }
-        "compact" => {
-            tracing_subscriber::fmt()
-                .compact()
-                .with_env_filter(filter)
-                .with_target(false)
-                .with_thread_ids(false)
-                .with_thread_names(false)
-                .init();
-        }
-        "pretty" => {
-            tracing_subscriber::fmt()
-                .pretty()
-                .with_env_filter(filter)
-                .init();
-        }
-        _ => {
-            // Default to JSON format for containerized environments (Datadog friendly)
-            tracing_subscriber::fmt()
-                .json()
-                .with_env_filter(filter)
-                .with_current_span(false)
-                .with_span_list(false)
-                .init();
-        }
+        "compact" => tracing_subscriber::fmt::layer()
+            .compact()
+            .with_target(false)
+            .with_thread_ids(false)
+            .with_thread_names(false)
+            .with_filter(filter)
+            .boxed(),
+        "pretty" => tracing_subscriber::fmt::layer()
+            .pretty()
+            .with_filter(filter)
+            .boxed(),
+        // "json" and the default for containerized environments.
+        _ => tracing_subscriber::fmt::layer()
+            .json()
+            .with_current_span(false)
+            .with_span_list(false)
+            .with_filter(filter)
+            .boxed(),
     }
+}
+
+/// Initialize tracing/logging based on configuration. When a tracer provider
+/// is given, spans from our own crates are also exported through it.
+fn init_tracing(logging_config: &LoggingConfig, tracer_provider: Option<&SdkTracerProvider>) {
+    let mut layers: Vec<BoxedLayer> = vec![build_fmt_layer(logging_config)];
+    if let Some(provider) = tracer_provider {
+        layers.push(
+            tracing_opentelemetry::layer()
+                .with_tracer(provider.tracer("cloud-api"))
+                .with_filter(exported_span_filter())
+                .boxed(),
+        );
+    }
+    tracing_subscriber::registry().with(layers).init();
 }
 
 #[cfg(test)]
@@ -421,6 +482,37 @@ mod tests {
     use std::collections::HashMap;
     use std::io::Write;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn only_info_or_higher_spans_from_our_crates_are_exported() {
+        use opentelemetry::trace::TracerProvider as _;
+        use opentelemetry_sdk::trace::{InMemorySpanExporter, SimpleSpanProcessor};
+
+        let exporter = InMemorySpanExporter::default();
+        let provider = telemetry::tracer_provider_with_processor(
+            1.0,
+            SimpleSpanProcessor::new(exporter.clone()),
+        );
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_opentelemetry::layer()
+                .with_tracer(provider.tracer("test"))
+                .with_filter(exported_span_filter()),
+        );
+        tracing::subscriber::with_default(subscriber, || {
+            let _kept = tracing::info_span!(target: "api::routes", "kept").entered();
+            tracing::info!(target: "api::routes", "an event is never a span event");
+            drop(_kept);
+            tracing::info_span!(target: "services", "kept_exact").in_scope(|| {});
+            tracing::debug_span!(target: "api::routes", "too_verbose").in_scope(|| {});
+            tracing::info_span!(target: "tokio_postgres::query", "dependency").in_scope(|| {});
+            tracing::info_span!(target: "apiary::other", "similar_prefix").in_scope(|| {});
+        });
+        let spans = exporter.get_finished_spans().unwrap();
+        let mut names: Vec<_> = spans.iter().map(|span| span.name.to_string()).collect();
+        names.sort();
+        assert_eq!(names, vec!["kept", "kept_exact"]);
+        assert!(spans.iter().all(|span| span.events.is_empty()));
+    }
 
     fn logging(level: &str, modules: &[(&str, &str)]) -> LoggingConfig {
         LoggingConfig {

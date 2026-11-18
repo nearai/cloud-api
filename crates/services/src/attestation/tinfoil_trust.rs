@@ -1,6 +1,6 @@
 //! The `tinfoil_trust` runtime setting, owned by Tinfoil attestation. It is
 //! an [`admin_settings`](crate::admin_settings) key: admins change it with
-//! `PATCH /v1/admin/settings/tinfoil_trust`, and Tinfoil reads it through a
+//! `PATCH /v1/admin/settings/tinfoil_trust` on the admin API, and Tinfoil reads it through a
 //! [`Versioned`] handle.
 
 use std::sync::Arc;

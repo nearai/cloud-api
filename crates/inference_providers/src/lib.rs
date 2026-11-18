@@ -102,7 +102,7 @@ pub use models::{
     ModelInfo, PlacementContext, PrivacyClassifyError, RerankError, RerankParams, RerankResponse,
     RerankResult, RerankScore, RerankUsage, ScoreError, ScoreParams, ScoreResponse, ScoreResult,
     ScoreUsage, StreamChunk, StreamOptions, TokenUsage, ToolChoice, ToolDefinition,
-    TranscriptionSegment, TranscriptionWord,
+    TranscriptionSegment, TranscriptionWord, UpstreamCacheSalt, CACHE_SALT_FIELD,
 };
 pub use sse_parser::{
     new_external_sse_parser, new_sse_parser, BufferedSSEParser, SSEEvent, SSEEventParser, SSEParser,
@@ -703,6 +703,32 @@ pub trait InferenceProvider {
         signing_address: Option<String>,
         include_tls_fingerprint: bool,
     ) -> Result<serde_json::Map<String, serde_json::Value>, AttestationError>;
+
+    /// Reports for the serving backends behind this provider. Providers without
+    /// backend discovery retain their single-report contract. A fleet override
+    /// must not silently return a partial collection after a fetch failure.
+    /// Success must contain at least one report. Use `SigningAddressNotFound`
+    /// when no backend matches a requested signer, or `ProviderNotFound` when
+    /// the provider has no serving backends; an empty successful collection is
+    /// a contract violation and fails the whole source group.
+    async fn get_attestation_reports(
+        &self,
+        model: String,
+        signing_algo: Option<String>,
+        nonce: Option<String>,
+        signing_address: Option<String>,
+        include_tls_fingerprint: bool,
+    ) -> Result<Vec<serde_json::Map<String, serde_json::Value>>, AttestationError> {
+        self.get_attestation_report(
+            model,
+            signing_algo,
+            nonce,
+            signing_address,
+            include_tls_fingerprint,
+        )
+        .await
+        .map(|report| vec![report])
+    }
 
     /// Performs an audio transcription request
     ///

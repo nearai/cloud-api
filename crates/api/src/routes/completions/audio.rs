@@ -16,7 +16,7 @@ use super::*;
         (status = 200, description = "Successful transcription", content(
             (AudioTranscriptionResponse = "application/json"),
             (String = "text/plain")
-        )),
+        ), headers(("Inference-Id" = String, description = "Billing UUID of the request, usable with /v1/billing/costs"))),
         (status = 400, description = "Invalid request (empty file, unsupported format, file too large)", body = ErrorResponse),
         (status = 401, description = "Unauthorized (missing or invalid API key)", body = ErrorResponse),
         (status = 404, description = "Model not found", body = ErrorResponse),
@@ -173,8 +173,8 @@ pub async fn audio_transcriptions(
             )
                 .into_response();
         }
-        Err(e) => {
-            tracing::error!(error = %e, "Failed to resolve model for audio transcription");
+        Err(_) => {
+            tracing::error!("Failed to resolve model for audio transcription");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 ResponseJson(ErrorResponse::new(
@@ -241,13 +241,11 @@ pub async fn audio_transcriptions(
             let workspace_id = api_key.workspace.id.0;
             let api_key_id_str = api_key.api_key.id.0.clone();
 
-            // Clamp duration to valid range [0, i32::MAX] to prevent overflow and negative values
-            let duration_seconds = response
-                .duration
-                .unwrap_or(0.0)
-                .max(0.0)
-                .min(i32::MAX as f64)
-                .ceil() as i32;
+            let duration_seconds = billing::reported_audio_seconds(response.billable_duration());
+            let duration_seconds = match billing::require_positive_units(duration_seconds) {
+                Ok(seconds) => seconds,
+                Err(response) => return response,
+            };
 
             // Parse API key ID to UUID
             let api_key_id = match uuid::Uuid::parse_str(&api_key_id_str) {
@@ -282,9 +280,13 @@ pub async fn audio_transcriptions(
             };
 
             // Record usage synchronously - fail the request if usage recording fails
-            if let Err(e) = app_state.usage_service.record_usage(usage_request).await {
+            if app_state
+                .usage_service
+                .record_usage(usage_request)
+                .await
+                .is_err()
+            {
                 tracing::error!(
-                    error = %e,
                     %organization_id,
                     %workspace_id,
                     "Failed to record audio transcription usage"
@@ -306,7 +308,7 @@ pub async fn audio_transcriptions(
                 "Audio transcription completed and usage recorded successfully"
             );
 
-            if requested_response_format.as_deref() == Some("text") {
+            let response = if requested_response_format.as_deref() == Some("text") {
                 (
                     StatusCode::OK,
                     [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
@@ -316,7 +318,8 @@ pub async fn audio_transcriptions(
             } else {
                 let response_body = crate::models::AudioTranscriptionResponse::from(response);
                 (StatusCode::OK, ResponseJson(response_body)).into_response()
-            }
+            };
+            with_billing_inference_id(response, inference_id)
         }
         Err(e) => {
             let (status_code, error_type, message) = match e {

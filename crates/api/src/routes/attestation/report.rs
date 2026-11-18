@@ -40,7 +40,8 @@ pub struct AttestationQuery {
     pub include_tls_fingerprint: Option<bool>,
     /// Restrict the report to a specific provider.
     /// Accepted values: `near` (NEAR AI's own TEE fleet), `chutes`, or `tinfoil` (attested third-party sources).
-    /// When omitted, the first successfully responding provider is used.
+    /// NEAR reports include the model's healthy backends across its NEAR fleets.
+    /// When omitted, the first successful source is used; sources are not mixed.
     pub provider: Option<String>,
 }
 
@@ -115,6 +116,8 @@ impl From<services::attestation::models::DstackCpuQuote> for DstackCpuQuote {
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct AttestationResponse {
     pub gateway_attestation: DstackCpuQuote,
+    /// Model reports from the selected source. NEAR includes each discovered
+    /// backend's evidence; distinct backends can share a signing public key.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub model_attestations: Vec<serde_json::Map<String, serde_json::Value>>,
     /// PEM-encoded TLS certificate read from `TLS_CERT_PATH` when `include_tls_fingerprint=true`.

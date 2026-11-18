@@ -161,6 +161,12 @@ const OPENAI_UNSUPPORTED_SAMPLING_PARAMS: &[&str] =
 /// Strip sampling parameters that OpenAI's chat/completions API rejects, but
 /// only when the upstream is OpenAI-source. See
 /// `OPENAI_UNSUPPORTED_SAMPLING_PARAMS` for the rationale.
+///
+/// Also omits `n` when it is 1. The API layer fills in `n = 1` when the client
+/// leaves it out, so it is on every request, and some OpenAI models (GPT-6.2
+/// Astra and Sol) reject any `n`, even 1. Leaving it out is equivalent because
+/// 1 is OpenAI's default. `n > 1` is rejected for external providers before a
+/// request gets here, and is left untouched.
 fn strip_unsupported_sampling_params(
     params: &mut ChatCompletionParams,
     base_url: &str,
@@ -168,6 +174,9 @@ fn strip_unsupported_sampling_params(
 ) {
     if !is_openai_source(base_url) {
         return;
+    }
+    if params.n == Some(1) {
+        params.n = None;
     }
     // Collect into a single log line rather than one per stripped key: OpenRouter
     // clients send these params broadly, so per-key logging would multiply log
@@ -911,6 +920,7 @@ mod tests {
             service_tier: None,
             modalities: None,
             original_request: None,
+            upstream_cache_salt: None,
             extra,
         }
     }
@@ -1282,6 +1292,51 @@ mod tests {
         );
         assert!(wire.contains("Cached context"));
         assert!(wire.contains("Volatile"));
+    }
+
+    /// The API layer defaults `n` to 1, and GPT-6.2 models reject any `n`.
+    /// For an OpenAI upstream the default must not reach the wire.
+    #[test]
+    fn test_strip_sampling_params_openai_omits_default_n() {
+        for base_url in &[
+            "https://api.openai.com/v1",
+            "https://my-resource.openai.azure.com/openai",
+        ] {
+            let mut params = make_chat_params(None, None);
+            params.n = Some(1);
+            strip_unsupported_sampling_params(&mut params, base_url, "gpt-6.2-astra");
+            assert_eq!(params.n, None, "n=1 must be omitted for {base_url}");
+            let wire = serde_json::to_value(&params).unwrap();
+            assert!(
+                wire.get("n").is_none(),
+                "n must not be serialized for {base_url}: {wire}"
+            );
+        }
+    }
+
+    /// Only the default is omitted: any other value is left for the upstream
+    /// (n > 1 is rejected earlier for external providers).
+    #[test]
+    fn test_strip_sampling_params_openai_keeps_non_default_n() {
+        let mut params = make_chat_params(None, None);
+        params.n = Some(2);
+        strip_unsupported_sampling_params(&mut params, "https://api.openai.com/v1", "gpt-4.1");
+        assert_eq!(params.n, Some(2));
+    }
+
+    /// Other openai-compatible providers and look-alike hosts keep `n`.
+    #[test]
+    fn test_strip_sampling_params_non_openai_keeps_default_n() {
+        for base_url in &[
+            "https://api.together.xyz/v1",
+            "https://openrouter.ai/api/v1",
+            "https://api.openai.com.evil.example/v1",
+        ] {
+            let mut params = make_chat_params(None, None);
+            params.n = Some(1);
+            strip_unsupported_sampling_params(&mut params, base_url, "some-model");
+            assert_eq!(params.n, Some(1), "n must be preserved for {base_url}");
+        }
     }
 
     /// A look-alike host must keep the sampling knobs (we only strip for the

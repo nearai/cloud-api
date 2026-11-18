@@ -1,6 +1,5 @@
-//! Who may change a workspace or an API key: its creator, or an organization owner or admin.
-//! A plain member still reads the shared workspace and creates keys in it, and changes only their
-//! own.
+//! Who may change an API key: its creator, or an organization owner or admin.
+//! A plain member still creates keys in the shared workspace, and changes only their own.
 use crate::common::*;
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -56,7 +55,7 @@ async fn call(
 }
 
 #[tokio::test]
-async fn workspace_and_key_changes_by_creator_or_admin() {
+async fn api_key_changes_by_creator_or_admin() {
     let (server, database) = setup_test_server_with_database().await;
     let (owner, _) = setup_unique_test_session(&database).await;
     let (member, _) = setup_unique_test_session(&database).await;
@@ -80,19 +79,6 @@ async fn workspace_and_key_changes_by_creator_or_admin() {
     .id;
     let owner_key = format!("{shared_keys}/{owner_key_id}");
 
-    let own = call(
-        &server,
-        &member,
-        "POST",
-        &format!("/v1/organizations/{}/workspaces", org.id),
-        Some(json!({"name": format!("own-{}", Uuid::new_v4())})),
-    )
-    .await;
-    assert!(own.status_code().is_success(), "member creates a workspace");
-    let own_workspace = format!(
-        "/v1/workspaces/{}",
-        own.json::<Value>()["id"].as_str().unwrap()
-    );
     let mut member_keys = Vec::new();
     for name in ["member-1", "member-2"] {
         let key = create_api_key_in_workspace_with_session(
@@ -107,22 +93,6 @@ async fn workspace_and_key_changes_by_creator_or_admin() {
     let (member_key, second_member_key) = (&member_keys[0], &member_keys[1]);
 
     let cases: Vec<Case> = vec![
-        (
-            "member updates the shared workspace",
-            &member,
-            "PUT",
-            shared.clone(),
-            Some(json!({"description": "x"})),
-            false,
-        ),
-        (
-            "member deletes the shared workspace",
-            &member,
-            "DELETE",
-            shared.clone(),
-            None,
-            false,
-        ),
         (
             "member revokes the owner's key",
             &member,
@@ -148,14 +118,6 @@ async fn workspace_and_key_changes_by_creator_or_admin() {
             false,
         ),
         (
-            "member updates own workspace",
-            &member,
-            "PUT",
-            own_workspace.clone(),
-            Some(json!({"description": "mine"})),
-            true,
-        ),
-        (
             "member updates own key",
             &member,
             "PATCH",
@@ -169,14 +131,6 @@ async fn workspace_and_key_changes_by_creator_or_admin() {
             "PATCH",
             format!("{member_key}/spend-limit"),
             Some(json!({"spendLimit": null})),
-            true,
-        ),
-        (
-            "admin updates the shared workspace",
-            &admin,
-            "PUT",
-            shared.clone(),
-            Some(json!({"description": "by admin"})),
             true,
         ),
         (
@@ -200,14 +154,6 @@ async fn workspace_and_key_changes_by_creator_or_admin() {
             &member,
             "DELETE",
             member_key.clone(),
-            None,
-            true,
-        ),
-        (
-            "admin deletes a member's workspace",
-            &admin,
-            "DELETE",
-            own_workspace.clone(),
             None,
             true,
         ),

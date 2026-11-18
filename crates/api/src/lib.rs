@@ -12,15 +12,13 @@ pub mod ohttp_gateway;
 pub mod openapi;
 pub mod openapi_deprecation;
 pub mod routes;
+pub mod telemetry;
 
 use crate::ohttp_gateway::{OhttpAttestation, OhttpGateway};
 use crate::routes::mcp_server::{handle_mcp_request, McpRouteState};
 use crate::routes::ohttp::{ohttp_config, ohttp_relay};
 use crate::{
-    middleware::{
-        auth::{auth_middleware_with_api_key, auth_middleware_with_reporting_token},
-        auth_middleware, AuthState,
-    },
+    middleware::{auth::auth_middleware_with_api_key, auth_middleware, AuthState},
     openapi::ApiDoc,
     routes::{
         api::{build_management_router, AppState},
@@ -35,9 +33,6 @@ use crate::{
             image_generations, models, privacy_classify, privacy_redact, rerank, score,
         },
         conversations,
-        feature_requests::{
-            list_admin_feature_requests, submit_feature_request, FeatureRequestsRouteState,
-        },
         health::health_check,
         models::{get_model_by_name, list_models, ModelsAppState},
         responses,
@@ -123,7 +118,6 @@ pub struct DomainServices {
     pub workspace_service: Arc<dyn services::workspace::WorkspaceServiceTrait + Send + Sync>,
     pub usage_service: Arc<dyn services::usage::UsageServiceTrait + Send + Sync>,
     pub user_service: Arc<dyn services::user::UserServiceTrait + Send + Sync>,
-    pub contact_email_service: Arc<services::contact_email::ContactEmailService>,
     pub files_service: Arc<dyn services::files::FileServiceTrait + Send + Sync>,
     pub object_encryption_state: object_encryption::ObjectEncryptionState,
     pub metrics_service: Arc<dyn services::metrics::MetricsServiceTrait>,
@@ -195,25 +189,12 @@ pub fn init_auth_services(database: Arc<Database>, config: &ApiConfig) -> AuthCo
     let organization_repo = Arc::new(PgOrganizationRepository::new(database.pool().clone()));
     let user_repository = Arc::new(UserRepository::new(database.pool().clone()))
         as Arc<dyn services::auth::UserRepository>;
-    let invitation_repo = Arc::new(database::PgOrganizationInvitationRepository::new(
-        database.pool().clone(),
-    ))
-        as Arc<dyn services::organization::ports::OrganizationInvitationRepository>;
-    let email_sender = services::email::sender_from_config(&config.invitation_email)
-        .expect("Failed to initialize invitation email sender");
-    let invitations_url = config.invitation_email.invitations_url();
 
     // Create organization service early (needed by AuthService)
-    let organization_service = Arc::new(
-        services::organization::OrganizationServiceImpl::new_with_email_sender(
-            organization_repo.clone()
-                as Arc<dyn services::organization::ports::OrganizationRepository>,
-            user_repository.clone(),
-            invitation_repo,
-            email_sender,
-            invitations_url,
-        ),
-    )
+    let organization_service = Arc::new(services::organization::OrganizationServiceImpl::new(
+        organization_repo.clone() as Arc<dyn services::organization::ports::OrganizationRepository>,
+        user_repository.clone(),
+    ))
         as Arc<dyn services::organization::OrganizationServiceTrait + Send + Sync>;
 
     let auth_service: Arc<dyn AuthServiceTrait> = if config.auth.mock {
@@ -268,13 +249,6 @@ pub fn init_auth_services(database: Arc<Database>, config: &ApiConfig) -> AuthCo
         oauth_manager_arc.clone(),
         auth_service.clone(),
         workspace_repository.clone(),
-        Arc::new(
-            services::reporting_tokens::OrganizationReportingTokenServiceImpl::new(Arc::new(
-                database::repositories::OrganizationReportingTokenRepository::new(
-                    database.pool().clone(),
-                ),
-            )),
-        ) as Arc<dyn services::reporting_tokens::OrganizationReportingTokenService>,
         admin_access_token_repository,
         config.auth.admin_emails.clone(),
         config.auth.encoding_key.clone(),
@@ -573,24 +547,6 @@ pub async fn init_domain_services_with_pool(
     let session_repo = Arc::new(database::SessionRepository::new(database.pool().clone()))
         as Arc<dyn services::auth::SessionRepository>;
 
-    // Contact email verification for wallet users. Off unless
-    // CONTACT_EMAIL_VERIFICATION_ENABLED is set; it then shares the invitation
-    // email sender settings.
-    let contact_email_service = Arc::new(services::contact_email::ContactEmailService::new(
-        Arc::new(database::repositories::PgContactEmailRepository::new(
-            database.pool().clone(),
-        )),
-        user_repo.clone(),
-        services::email::contact_email_sender_from_config(&config.invitation_email)
-            .expect("Failed to initialize contact email sender"),
-        config
-            .invitation_email
-            .contact_email_verification_enabled
-            .then(|| config.invitation_email.contact_email_verification_url())
-            .flatten(),
-        i64::from(config.invitation_email.contact_email_verification_daily_cap),
-    ));
-
     // Create user service
     let user_service = Arc::new(services::user::UserService::new(user_repo, session_repo))
         as Arc<dyn services::user::UserServiceTrait + Send + Sync>;
@@ -649,7 +605,6 @@ pub async fn init_domain_services_with_pool(
     let org_service_usage_repo = Arc::new(
         database::repositories::OrganizationServiceUsageRepository::with_accounting_config(
             database.pool().clone(),
-            reporting_statement_timeout,
             &config.credit_allocation,
         ),
     );
@@ -741,7 +696,6 @@ pub async fn init_domain_services_with_pool(
         workspace_service,
         usage_service,
         user_service,
-        contact_email_service,
         files_service,
         object_encryption_state,
         metrics_service,
@@ -1179,16 +1133,7 @@ pub fn build_app_with_config_and_options(
         attestation_service: domain_services.attestation_service.clone(),
         usage_service: domain_services.usage_service.clone(),
         service_usage_service: domain_services.service_usage_service.clone(),
-        reporting_token_service: Arc::new(
-            services::reporting_tokens::OrganizationReportingTokenServiceImpl::new(Arc::new(
-                database::repositories::OrganizationReportingTokenRepository::new(
-                    database.pool().clone(),
-                ),
-            )),
-        )
-            as Arc<dyn services::reporting_tokens::OrganizationReportingTokenService>,
         user_service: domain_services.user_service.clone(),
-        contact_email_service: domain_services.contact_email_service.clone(),
         files_service: domain_services.files_service.clone(),
         inference_provider_pool: domain_services.inference_provider_pool.clone(),
         metrics_service: domain_services.metrics_service.clone(),
@@ -1269,10 +1214,6 @@ pub fn build_app_with_config_and_options(
 
     let organization_credit_service = build_organization_credit_service(&database, &config);
     let transfer_routes = crate::routes::credit_transfers::routes(
-        organization_credit_service.clone(),
-        auth_components.auth_state_middleware.clone(),
-    );
-    let organization_credential_routes = crate::routes::organization_credentials::routes(
         organization_credit_service,
         auth_components.auth_state_middleware.clone(),
     );
@@ -1301,63 +1242,17 @@ pub fn build_app_with_config_and_options(
         build_options,
         AdminRouteServices {
             object_encryption_state: domain_services.object_encryption_state.clone(),
-            inference_provider_pool: app_state.inference_provider_pool.clone(),
             analytics_service,
-            staking_farm_service: app_state.staking_farm_service.clone(),
-            aml_service: app_state.aml_service.clone(),
-            models_service: cloud_platform::invalidating_models_service(
-                domain_services.models_service.clone(),
-                domain_services.cloud_platform_catalog.clone(),
-            ),
-            completion_service: domain_services.completion_service.clone(),
-            organization_service: domain_services.organization_service.clone(),
-            usage_service: domain_services.usage_service.clone(),
-            admin_settings_service: domain_services.admin_settings_service.clone(),
-            user_erasure_service: Arc::new(services::user_erasure::UserErasureService::new(
-                Arc::new(database::repositories::PostgresUserErasureRepository::new(
-                    database.pool().clone(),
-                )),
-            )),
         },
     );
 
-    let invitation_routes =
-        build_invitation_routes(app_state.clone(), &auth_components.auth_state_middleware);
-
     let files_routes =
         build_files_routes(app_state.clone(), &auth_components.auth_state_middleware);
-
-    let feature_request_routes = build_feature_request_routes(
-        database.pool().clone(),
-        &auth_components.auth_state_middleware,
-    );
 
     let billing_routes = build_billing_routes(
         domain_services.usage_service.clone(),
         &auth_components.auth_state_middleware,
     );
-    let reporting_usage_routes = if config.usage_reporting.enabled {
-        let summary_repository = Arc::new(
-            database::repositories::PostgresReportingUsageSummaryRepository::with_statement_timeout(
-                database.pool().clone(),
-                config.usage_reporting.database_statement_timeout(),
-            ),
-        )
-            as Arc<dyn services::reporting_usage::ReportingUsageSummaryRepository>;
-        let summary_service = Arc::new(services::reporting_usage::ReportingUsageService::new(
-            summary_repository,
-        ));
-        build_reporting_usage_routes(
-            domain_services.usage_service.clone(),
-            domain_services.service_usage_service.clone(),
-            summary_service,
-            middleware::ReportingGuardState::from_config(&config.usage_reporting),
-            &auth_components.auth_state_middleware,
-        )
-    } else {
-        tracing::info!("Programmatic usage reporting routes are disabled");
-        Router::new()
-    };
 
     // Build OpenAPI and documentation routes
     let openapi_routes = build_openapi_routes();
@@ -1398,17 +1293,13 @@ pub fn build_app_with_config_and_options(
                 .merge(conversation_routes)
                 .merge(management_routes)
                 .merge(transfer_routes)
-                .merge(organization_credential_routes)
                 .merge(workspace_routes)
                 .merge(attestation_routes.clone())
                 .merge(model_routes)
                 .merge(services_routes)
                 .merge(admin_routes)
-                .merge(invitation_routes)
                 .merge(files_routes)
-                .merge(feature_request_routes)
                 .merge(billing_routes)
-                .merge(reporting_usage_routes)
                 .merge(gateway_routes)
                 .merge(internal_routes)
                 .merge(health_routes)
@@ -1465,28 +1356,6 @@ fn with_app_fallbacks_and_layers(
         // Sites that set their own value (per-key limiter window, upstream
         // ITA propagation) are left untouched.
         .layer(map_response(middleware::retry_after_middleware))
-}
-
-/// Build invitation routes with selective auth
-pub fn build_invitation_routes(app_state: AppState, auth_state_middleware: &AuthState) -> Router {
-    use crate::routes::users::{accept_invitation_by_token, get_invitation_by_token};
-    use axum::routing::{get, post};
-
-    Router::new().nest(
-        "/invitations",
-        Router::new()
-            // Public route - no auth required to view invitation
-            .route("/{token}", get(get_invitation_by_token))
-            // Auth required to accept
-            .route(
-                "/{token}/accept",
-                post(accept_invitation_by_token).layer(from_fn_with_state(
-                    auth_state_middleware.clone(),
-                    auth_middleware,
-                )),
-            )
-            .with_state(app_state),
-    )
 }
 
 /// Build authentication routes
@@ -1750,6 +1619,7 @@ pub fn build_response_routes(
         },
         response_service: response_service.clone(),
         attestation_service,
+        metrics_service: native_app_state.metrics_service,
     };
 
     let inference_routes = Router::new()
@@ -1989,12 +1859,6 @@ pub fn build_workspace_routes(app_state: AppState, auth_state_middleware: &AuthS
             "/organizations/{org_id}/workspaces",
             get(list_organization_workspaces).post(create_workspace),
         )
-        .route(
-            "/workspaces/{workspace_id}",
-            get(get_workspace)
-                .put(update_workspace)
-                .delete(delete_workspace),
-        )
         // Workspace API key management
         .route(
             "/workspaces/{workspace_id}/api-keys",
@@ -2079,37 +1943,6 @@ where
         .nest("/files/", descendants)
 }
 
-/// Build feature request routes for user submissions and admin aggregation.
-pub fn build_feature_request_routes(
-    pool: database::DbPool,
-    auth_state_middleware: &AuthState,
-) -> Router {
-    use crate::middleware::{admin_middleware, auth_middleware};
-
-    let state = FeatureRequestsRouteState {
-        repository: Arc::new(database::repositories::FeatureRequestRepository::new(pool)),
-    };
-
-    let user_routes = Router::new()
-        .route("/feature-requests", post(submit_feature_request))
-        .with_state(state.clone())
-        .layer(from_fn_with_state(
-            auth_state_middleware.clone(),
-            auth_middleware,
-        ));
-
-    // Classify read operations in middleware::admin_policy when adding admin routes.
-    let admin_routes = Router::new()
-        .route("/admin/feature-requests", get(list_admin_feature_requests))
-        .with_state(state)
-        .layer(from_fn_with_state(
-            auth_state_middleware.clone(),
-            admin_middleware,
-        ));
-
-    Router::new().merge(user_routes).merge(admin_routes)
-}
-
 /// Build billing routes with API key auth (HuggingFace billing integration)
 pub fn build_billing_routes(
     usage_service: Arc<dyn services::usage::UsageServiceTrait + Send + Sync>,
@@ -2123,54 +1956,6 @@ pub fn build_billing_routes(
         .layer(from_fn_with_state(
             auth_state_middleware.clone(),
             middleware::auth::auth_middleware_with_workspace_context,
-        ))
-}
-
-pub fn build_reporting_usage_routes(
-    usage_service: Arc<dyn services::usage::UsageServiceTrait + Send + Sync>,
-    service_usage_service: Arc<dyn services::service_usage::ServiceUsageServiceTrait + Send + Sync>,
-    summary_service: Arc<services::reporting_usage::ReportingUsageService>,
-    guard_state: middleware::ReportingGuardState,
-    auth_state_middleware: &AuthState,
-) -> Router {
-    let export_state = crate::routes::reporting_usage::ReportingUsageExportState::new(
-        usage_service,
-        service_usage_service,
-    );
-    let summary_state =
-        crate::routes::reporting_usage::ReportingUsageSummaryState::new(summary_service);
-    let export_router = Router::new()
-        .route(
-            "/organizations/{org_id}/usage/export",
-            get(crate::routes::reporting_usage::export_usage),
-        )
-        .with_state(export_state);
-    let summary_router = Router::new()
-        .route(
-            "/organizations/{org_id}/usage/summary",
-            get(crate::routes::reporting_usage::summary_usage),
-        )
-        .with_state(summary_state);
-    let router = Router::new().merge(export_router).merge(summary_router);
-
-    #[cfg(debug_assertions)]
-    let router = router.route(
-        "/organizations/{org_id}/usage/reporting-token-auth-probe",
-        get(crate::routes::reporting_usage::reporting_token_auth_probe),
-    );
-
-    router
-        .layer(from_fn_with_state(
-            guard_state.clone(),
-            middleware::reporting_token_guard_middleware,
-        ))
-        .layer(from_fn_with_state(
-            auth_state_middleware.clone(),
-            auth_middleware_with_reporting_token,
-        ))
-        .layer(from_fn_with_state(
-            guard_state,
-            middleware::reporting_global_guard_middleware,
         ))
 }
 
@@ -2336,18 +2121,7 @@ fn cache_control_layer(value: &'static str) -> CacheControlLayer {
 /// Build admin routes (authenticated endpoints)
 pub struct AdminRouteServices {
     pub object_encryption_state: object_encryption::ObjectEncryptionState,
-    pub inference_provider_pool: Arc<services::inference_provider_pool::InferenceProviderPool>,
     pub analytics_service: Arc<services::admin::AnalyticsService>,
-    pub staking_farm_service: Arc<services::staking_farm::StakingFarmService>,
-    pub aml_service: Arc<services::aml::AmlService>,
-    /// Invalidated by admin writes: see `cloud_platform::invalidating_models_service`.
-    pub models_service: Arc<dyn services::models::ModelsServiceTrait>,
-    pub completion_service: Arc<services::CompletionServiceImpl>,
-    pub organization_service:
-        Arc<dyn services::organization::OrganizationServiceTrait + Send + Sync>,
-    pub usage_service: Arc<dyn services::usage::UsageServiceTrait + Send + Sync>,
-    pub admin_settings_service: Arc<services::admin_settings::AdminSettingsService>,
-    pub user_erasure_service: Arc<services::user_erasure::UserErasureService>,
 }
 
 pub fn build_admin_routes(
@@ -2373,57 +2147,7 @@ fn build_admin_routes_with_options(
     services: AdminRouteServices,
 ) -> Router {
     use crate::middleware::admin_middleware;
-    use crate::routes::admin::{
-        batch_upsert_models, cancel_model_pricing_change, confirm_model_deprecation,
-        confirm_model_pricing_changes, create_admin_access_token, create_service,
-        delete_admin_access_token, delete_aml_allowlist_entry, delete_model, deprecate_model,
-        erase_user, get_admin_organization_balance, get_admin_setting, get_infra_summary,
-        get_model_history, get_organization_concurrent_limit, get_organization_fallback,
-        get_organization_limits_history, get_organization_metrics, get_organization_priority,
-        list_admin_access_tokens, list_admin_settings, list_aml_allowlist, list_aml_reports,
-        list_api_keys, list_invitation_email_deliveries, list_model_pricing_changes,
-        list_models as admin_list_models, list_organization_members, lookup_user_erasures,
-        preview_model_deprecation, preview_model_pricing_changes, preview_user_erasure,
-        resend_invitation_email, update_admin_setting, update_aml_report_status,
-        update_organization_concurrent_limit, update_organization_fallback,
-        update_organization_limits, update_organization_member_role, update_organization_priority,
-        update_service, upsert_aml_allowlist_entry, AdminAppState,
-    };
-    use crate::routes::staking_farm::{
-        get_admin_organization_staking_farm, sync_admin_organization_staking_farm,
-    };
-    use database::repositories::{AdminAccessTokenRepository, AdminCompositeRepository};
-    use services::admin::AdminServiceImpl;
-
-    // Create composite admin repository (handles models, organization limits, and users)
-    let admin_repository = Arc::new(AdminCompositeRepository::with_accounting_config(
-        database.pool().clone(),
-        &config.credit_allocation,
-    ));
-
-    // Create admin access token repository
-    let admin_access_token_repository =
-        Arc::new(AdminAccessTokenRepository::new(database.pool().clone()));
-    // Create admin service with composite repository.
-    //
-    // The admin service holds a reference to the `models_service` so it can
-    // invalidate the public `/v1/model/list` cache after admin writes
-    // (`upsert`, `delete`, `deprecate`) that mutate the `models` or
-    // `model_aliases` tables. It also holds the `completion_service` so it
-    // can invalidate the per-org concurrent-limit cache after a PATCH to
-    // `/v1/admin/organizations/{org_id}/concurrent-limit`.
-    let admin_service = Arc::new(AdminServiceImpl::new(
-        admin_repository as Arc<dyn services::admin::AdminRepository>,
-        services.models_service,
-        services.completion_service.clone()
-            as Arc<dyn services::completions::CompletionServiceTrait>,
-        services::email::sender_from_config(&config.invitation_email)
-            .expect("Failed to initialize admin email sender"),
-    )) as Arc<dyn services::admin::AdminService + Send + Sync>;
-
-    let github_dispatcher =
-        services::github_dispatch::dispatcher_from_config(&config.github_dispatch);
-
+    use crate::routes::admin::{get_infra_summary, get_organization_metrics, AdminAppState};
     let infra_service = Arc::new(services::admin::InfraService::new(
         config.infra.machines_url.clone(),
         config.infra.cost_per_host_usd_month,
@@ -2434,20 +2158,8 @@ fn build_admin_routes_with_options(
     ));
 
     let admin_app_state = AdminAppState {
-        admin_service,
         analytics_service: services.analytics_service,
-        organization_service: services.organization_service,
-        auth_service: auth_state_middleware.auth_service.clone(),
-        usage_service: services.usage_service,
-        staking_farm_service: services.staking_farm_service,
-        aml_service: services.aml_service,
-        config: config.clone(),
-        admin_access_token_repository,
-        inference_provider_pool: services.inference_provider_pool,
-        github_dispatcher,
         infra_service,
-        admin_settings_service: services.admin_settings_service,
-        user_erasure_service: services.user_erasure_service,
     };
 
     let database_encryption_state =
@@ -2463,107 +2175,6 @@ fn build_admin_routes_with_options(
     // Classify read operations in middleware::admin_policy when adding admin routes.
     let admin_routes = Router::new()
         .route(
-            "/admin/models",
-            axum::routing::get(admin_list_models).patch(batch_upsert_models),
-        )
-        .route(
-            "/admin/models/deprecate",
-            axum::routing::post(deprecate_model),
-        )
-        .route(
-            "/admin/models/pricing-changes",
-            axum::routing::get(list_model_pricing_changes),
-        )
-        .route(
-            "/admin/models/pricing-changes/preview",
-            axum::routing::post(preview_model_pricing_changes),
-        )
-        .route(
-            "/admin/models/pricing-changes/confirm",
-            axum::routing::post(confirm_model_pricing_changes),
-        )
-        .route(
-            "/admin/models/pricing-changes/{id}",
-            axum::routing::delete(cancel_model_pricing_change),
-        )
-        .route(
-            "/admin/models/{model_name}",
-            axum::routing::delete(delete_model),
-        )
-        .route(
-            "/admin/models/{model_name}/history",
-            axum::routing::get(get_model_history),
-        )
-        .route(
-            "/admin/models/{model_name}/deprecation/preview",
-            axum::routing::post(preview_model_deprecation),
-        )
-        .route(
-            "/admin/models/{model_name}/deprecation/confirm",
-            axum::routing::post(confirm_model_deprecation),
-        )
-        .route(
-            "/admin/models/{model_name}/access",
-            axum::routing::get(crate::routes::admin_model_access::get_model_access),
-        )
-        .route(
-            "/admin/models/{model_name}/access/{org_id}",
-            axum::routing::put(crate::routes::admin_model_access::grant_model_access)
-                .delete(crate::routes::admin_model_access::revoke_model_access),
-        )
-        .route(
-            "/admin/organizations/{org_id}/model-access",
-            axum::routing::get(crate::routes::admin_model_access::list_organization_model_access),
-        )
-        .route("/admin/services", axum::routing::post(create_service))
-        .route("/admin/services/{id}", axum::routing::patch(update_service))
-        .route(
-            "/admin/organizations/{org_id}/limits",
-            axum::routing::patch(update_organization_limits),
-        )
-        .route(
-            "/admin/organizations/{org_id}/limits/history",
-            axum::routing::get(get_organization_limits_history),
-        )
-        .route(
-            "/admin/organizations/{org_id}/usage/balance",
-            axum::routing::get(get_admin_organization_balance),
-        )
-        .route(
-            "/admin/organizations/{org_id}/staking/farm",
-            axum::routing::get(get_admin_organization_staking_farm),
-        )
-        .route(
-            "/admin/organizations/{org_id}/staking/farm/sync",
-            axum::routing::post(sync_admin_organization_staking_farm),
-        )
-        .route("/admin/aml/reports", axum::routing::get(list_aml_reports))
-        .route(
-            "/admin/aml/reports/{report_id}/status",
-            axum::routing::patch(update_aml_report_status),
-        )
-        .route(
-            "/admin/aml/allowlist",
-            axum::routing::get(list_aml_allowlist).post(upsert_aml_allowlist_entry),
-        )
-        .route(
-            "/admin/aml/allowlist/{account_id}",
-            axum::routing::delete(delete_aml_allowlist_entry),
-        )
-        .route(
-            "/admin/organizations/{org_id}/concurrent-limit",
-            axum::routing::patch(update_organization_concurrent_limit)
-                .get(get_organization_concurrent_limit),
-        )
-        .route(
-            "/admin/organizations/{org_id}/priority",
-            axum::routing::get(get_organization_priority).patch(update_organization_priority),
-        )
-        .route(
-            "/admin/organizations/{org_id}/fallback",
-            axum::routing::get(get_organization_fallback).patch(update_organization_fallback),
-        )
-        .route(
             "/admin/organizations/{org_id}/metrics",
             axum::routing::get(get_organization_metrics),
         )
@@ -2571,95 +2182,7 @@ fn build_admin_routes_with_options(
             "/admin/platform/infra-summary",
             axum::routing::get(get_infra_summary),
         )
-        .route("/admin/settings", axum::routing::get(list_admin_settings))
-        .route(
-            "/admin/settings/{key}",
-            axum::routing::get(get_admin_setting).patch(update_admin_setting),
-        )
-        .route(
-            "/admin/invitation-email-deliveries",
-            axum::routing::get(list_invitation_email_deliveries),
-        )
-        .route(
-            "/admin/invitation-email-deliveries/{invitation_id}/resend",
-            axum::routing::post(resend_invitation_email),
-        )
-        .route(
-            "/admin/users/{user_id}/erasure/preview",
-            axum::routing::post(preview_user_erasure),
-        )
-        .route(
-            "/admin/users/{user_id}/erasure",
-            axum::routing::post(erase_user),
-        )
-        .route(
-            "/admin/user-erasures/lookup",
-            axum::routing::post(lookup_user_erasures),
-        )
-        .route("/admin/api-keys", axum::routing::get(list_api_keys))
-        .route(
-            "/admin/organizations/{org_id}/members",
-            axum::routing::get(list_organization_members),
-        )
-        .route(
-            "/admin/organizations/{org_id}/members/{user_id}",
-            axum::routing::put(update_organization_member_role),
-        )
-        .route(
-            "/admin/access-tokens",
-            axum::routing::post(create_admin_access_token),
-        )
-        .route(
-            "/admin/access-tokens",
-            axum::routing::get(list_admin_access_tokens),
-        )
-        .route(
-            "/admin/access-tokens/{token_id}",
-            axum::routing::delete(delete_admin_access_token),
-        )
-        .with_state(admin_app_state)
-        .merge(
-            Router::new()
-                .route(
-                    "/admin/organizations/{org_id}/policy",
-                    get(crate::routes::organization_policy::get_policy)
-                        .put(crate::routes::organization_policy::put_policy),
-                )
-                .route("/admin/organizations/{org_id}/credit/transfer/reconciliation", get(crate::routes::credit_transfers::reconciliation))
-                .layer(axum::Extension(
-                    build_organization_credit_service(&database, &config),
-                ))
-        )
-        .merge(
-            Router::new()
-                .route(
-                    "/admin/organizations/{org_id}/credit/reconciliations",
-                    axum::routing::post(
-                        crate::routes::admin_credit_reconciliation::reconcile_organization_credits,
-                    ),
-                )
-                .layer(axum::Extension(
-                    database::repositories::credit_reconciliation::CreditReconciliationRepository::new(
-                        database.pool().clone(),
-                    ),
-                ))
-        )
-        .merge(
-            Router::new()
-                .route(
-                    "/admin/usage-hourly/recompute",
-                    axum::routing::post(crate::routes::admin_usage_hourly::recompute_usage_hourly),
-                )
-                .layer(axum::Extension(
-                    crate::routes::admin_usage_hourly::UsageHourlyRepairState {
-                        repository: Arc::new(
-                            database::repositories::UsageHourlyRepositoryImpl::new(
-                                database.pool().clone(),
-                            ),
-                        ),
-                    },
-                )),
-        );
+        .with_state(admin_app_state);
 
     let admin_routes = if let Some(database_encryption_state) = database_encryption_state {
         if build_options.start_database_encryption_recovery {
@@ -2780,18 +2303,14 @@ fn build_organization_credit_service(
     config: &ApiConfig,
 ) -> Arc<dyn services::organization_credits::OrganizationCreditServiceTrait> {
     use database::repositories::credit_transfers::CreditTransferRepository;
-    use database::repositories::organization_credentials::OrganizationCredentialRepository;
     use services::organization_credits::OrganizationCreditService;
 
     let transfers = Arc::new(CreditTransferRepository::new(
         database.pool().clone(),
         &config.credit_allocation,
     ));
-    let credentials = Arc::new(OrganizationCredentialRepository::new(
-        database.pool().clone(),
-    ));
 
-    Arc::new(OrganizationCreditService::new(transfers, credentials))
+    Arc::new(OrganizationCreditService::new(transfers))
 }
 
 #[cfg(test)]
@@ -2821,26 +2340,6 @@ mod tests {
         );
     }
 
-    /// The seeded values must stay within OpenRouter's fixed vocabulary so the
-    /// auto-seeded row would pass the same validation the admin write path
-    /// (`PATCH /v1/admin/models`) enforces. This guards against the two lists
-    /// drifting apart.
-    #[test]
-    fn chutes_seed_values_are_valid_openrouter_vocabulary() {
-        for p in CHUTES_SUPPORTED_SAMPLING_PARAMS {
-            assert!(
-                crate::routes::admin::VALID_SAMPLING_PARAMS.contains(p),
-                "seeded sampling parameter '{p}' is not in OpenRouter's vocabulary"
-            );
-        }
-        for f in CHUTES_SUPPORTED_FEATURES {
-            assert!(
-                crate::routes::admin::VALID_FEATURES.contains(f),
-                "seeded feature '{f}' is not in OpenRouter's vocabulary"
-            );
-        }
-    }
-
     #[test]
     fn test_openapi_spec_generation() {
         // Test that we can generate the OpenAPI spec without errors
@@ -2865,50 +2364,6 @@ mod tests {
         assert!(components.security_schemes.contains_key("session_token"));
         assert!(components.security_schemes.contains_key("refresh_token"));
         assert!(components.security_schemes.contains_key("api_key"));
-        assert!(components.security_schemes.contains_key("reporting_token"));
-
-        let spec_json = serde_json::to_value(&spec).unwrap();
-        assert_reporting_path_security(
-            &spec_json,
-            "/v1/organizations/{org_id}/reporting-tokens",
-            "post",
-            "session_token",
-        );
-        assert_reporting_path_security(
-            &spec_json,
-            "/v1/organizations/{org_id}/reporting-tokens",
-            "get",
-            "session_token",
-        );
-        assert_reporting_path_security(
-            &spec_json,
-            "/v1/organizations/{org_id}/reporting-tokens/{token_id}",
-            "delete",
-            "session_token",
-        );
-        assert_reporting_path_security(
-            &spec_json,
-            "/v1/organizations/{org_id}/usage/export",
-            "get",
-            "reporting_token",
-        );
-        assert_reporting_path_security(
-            &spec_json,
-            "/v1/organizations/{org_id}/usage/summary",
-            "get",
-            "reporting_token",
-        );
-        println!(
-            "OPENAPI_REPORTING_CONTRACT={}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "reporting_tokens": spec_json["paths"]["/v1/organizations/{org_id}/reporting-tokens"],
-                "reporting_token_revoke": spec_json["paths"]["/v1/organizations/{org_id}/reporting-tokens/{token_id}"],
-                "usage_export": spec_json["paths"]["/v1/organizations/{org_id}/usage/export"],
-                "usage_summary": spec_json["paths"]["/v1/organizations/{org_id}/usage/summary"],
-                "reporting_token_scheme": spec_json["components"]["securitySchemes"]["reporting_token"],
-            }))
-            .unwrap()
-        );
 
         // Verify servers are not hardcoded (will be set dynamically on client)
         assert!(spec.servers.is_none() || spec.servers.as_ref().unwrap().is_empty());
@@ -3015,24 +2470,6 @@ mod tests {
         assert_eq!(
             schemas["OutputTokensDetails"]["required"],
             serde_json::json!(["reasoning_tokens"])
-        );
-    }
-
-    fn assert_reporting_path_security(
-        spec: &serde_json::Value,
-        path: &str,
-        method: &str,
-        scheme: &str,
-    ) {
-        let operation = &spec["paths"][path][method];
-        assert!(
-            operation.is_object(),
-            "missing OpenAPI operation: {method} {path}"
-        );
-        assert_eq!(
-            operation["security"],
-            serde_json::json!([{ scheme: [] }]),
-            "{method} {path} must use only {scheme} security"
         );
     }
 
@@ -3182,42 +2619,6 @@ mod tests {
             serde_json::json!([{ "api_key": [] }]),
             "/v1/signature/{{chat_id}} must require api_key security"
         );
-    }
-
-    #[test]
-    fn test_openapi_admin_aml_paths_require_admin_security() {
-        let spec = serde_json::to_value(ApiDoc::openapi()).unwrap();
-        let paths = spec["paths"].as_object().unwrap();
-
-        for (path, method) in [
-            ("/v1/admin/aml/reports", "get"),
-            ("/v1/admin/aml/reports/{report_id}/status", "patch"),
-            ("/v1/admin/aml/allowlist", "get"),
-            ("/v1/admin/aml/allowlist", "post"),
-            ("/v1/admin/aml/allowlist/{account_id}", "delete"),
-        ] {
-            let operation = &paths[path][method];
-            assert!(
-                operation.is_object(),
-                "missing OpenAPI operation: {method} {path}"
-            );
-            assert_eq!(
-                operation["security"],
-                serde_json::json!([{ "session_token": [] }, { "admin_token": [] }]),
-                "{method} {path} must require session_token or admin_token security"
-            );
-        }
-    }
-
-    #[test]
-    fn test_openapi_admin_aml_report_response_excludes_raw_provider_result() {
-        let spec = serde_json::to_value(ApiDoc::openapi()).unwrap();
-        let properties = spec["components"]["schemas"]["AdminAmlReportResponse"]["properties"]
-            .as_object()
-            .expect("AdminAmlReportResponse should have schema properties");
-
-        assert!(!properties.contains_key("result_json"));
-        assert!(!properties.contains_key("resultJson"));
     }
 
     #[test]
@@ -3501,7 +2902,6 @@ mod tests {
                 google: None,
                 near: config::NearConfig::default(),
                 admin_emails: vec![],
-                admin_read_only_tokens_enabled: false,
                 require_session_bound_access_tokens: false,
                 admin_tokens_only: false,
             },
@@ -3536,15 +2936,15 @@ mod tests {
                 encryption_key: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
                     .to_string(), // Mock 256-bit hex key
             },
-            invitation_email: config::InvitationEmailConfig::default(),
             otlp: config::OtlpConfig {
                 endpoint: "http://localhost:4317".to_string(),
                 protocol: "grpc".to_string(),
                 instance_id: None,
+                traces_enabled: false,
+                traces_sample_ratio: 0.01,
             },
             cors: config::CorsConfig::default(),
             external_providers: config::ExternalProvidersConfig::default(),
-            github_dispatch: config::GitHubDispatchConfig::default(),
             infra: config::InfraConfig::default(),
             staking_farm: config::StakingFarmConfig::default(),
             aml: config::AmlConfig::default(),
@@ -3629,7 +3029,6 @@ mod tests {
                 google: None,
                 near: config::NearConfig::default(),
                 admin_emails: vec![],
-                admin_read_only_tokens_enabled: false,
                 require_session_bound_access_tokens: false,
                 admin_tokens_only: false,
             },
@@ -3664,15 +3063,15 @@ mod tests {
                 encryption_key: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
                     .to_string(), // Mock 256-bit hex key
             },
-            invitation_email: config::InvitationEmailConfig::default(),
             otlp: config::OtlpConfig {
                 endpoint: "http://localhost:4317".to_string(),
                 protocol: "grpc".to_string(),
                 instance_id: None,
+                traces_enabled: false,
+                traces_sample_ratio: 0.01,
             },
             cors: config::CorsConfig::default(),
             external_providers: config::ExternalProvidersConfig::default(),
-            github_dispatch: config::GitHubDispatchConfig::default(),
             infra: config::InfraConfig::default(),
             staking_farm: config::StakingFarmConfig::default(),
             aml: config::AmlConfig::default(),

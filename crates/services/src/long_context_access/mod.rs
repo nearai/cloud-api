@@ -13,12 +13,15 @@
 //!
 //! Both inputs are written elsewhere, so this module only reads them, cached
 //! per organization for [`POLICY_TTL`]: a change applies within that time.
-//! Each input falls back on its own: a failed or timed-out read keeps the
-//! last value of that input read successfully for that organization, or else
-//! its default (nothing blocked, nothing turned off). An answer that fell
-//! back to a default is cached for [`COLD_FALLBACK_TTL`] only; every other
+//! Each input falls back on its own when a read fails or times out: it keeps
+//! the last value of that input read successfully for that organization
+//! (for up to [`LAST_GOOD_TTL`]), or else fails closed: a failed blocks read
+//! blocks every model, a failed settings read turns every model off. A
+//! fail-closed answer is cached for [`COLD_FALLBACK_TTL`] only; every other
 //! answer for [`POLICY_TTL`]. One load runs per organization at a time, so a
-//! failing database sees at most one read per organization per window.
+//! failing database sees at most one read per organization per window. A
+//! schema without the blocks table is a successful read with no blocks (the
+//! repository's concern).
 //!
 //! [`Organization::long_context_disabled_models`]: crate::organization::Organization::long_context_disabled_models
 
@@ -37,7 +40,7 @@ pub use ports::LongContextAccessRepository;
 /// How long one organization's answer is reused.
 const POLICY_TTL: Duration = Duration::from_secs(30);
 /// How long an answer is reused when a read failed and that input had no
-/// last good value (it fell back to the default).
+/// last good value (the answer fails closed).
 const COLD_FALLBACK_TTL: Duration = Duration::from_secs(2);
 /// How long the last successful read of each input is kept as the fallback
 /// for a failed one.
@@ -50,11 +53,13 @@ const CACHE_CAPACITY: u64 = 10_000;
 /// One organization's long-context access inputs.
 #[derive(Debug)]
 struct OrganizationPolicy {
-    /// Canonical names the platform blocked.
-    blocked: Arc<HashSet<String>>,
-    /// What the organization turned off itself.
+    /// Canonical names the platform blocked. `None`: unknown (the read
+    /// failed with no last good value), so every model is blocked.
+    blocked: Option<Arc<HashSet<String>>>,
+    /// What the organization turned off itself (`All` when the read failed
+    /// with no last good value).
     disabled: Arc<LongContextDisabledModels>,
-    /// A read failed and that input fell back to its default.
+    /// A read failed and that input had no last good value.
     cold_fallback: bool,
 }
 
@@ -82,7 +87,10 @@ impl moka::Expiry<Uuid, Arc<OrganizationPolicy>> for PolicyExpiry {
 
 impl OrganizationPolicy {
     fn allows(&self, model_name: &str) -> bool {
-        !self.blocked.contains(model_name) && !self.disabled.contains(model_name)
+        self.blocked
+            .as_ref()
+            .is_some_and(|blocked| !blocked.contains(model_name))
+            && !self.disabled.contains(model_name)
     }
 }
 
@@ -171,21 +179,19 @@ impl LongContextAccess {
                 self.last_blocked
                     .insert(organization_id, blocked.clone())
                     .await;
-                blocked
+                Some(blocked)
             }
             Err(error_kind) => {
+                let last_good = self.last_blocked.get(&organization_id).await;
+                cold_fallback |= last_good.is_none();
                 tracing::warn!(
                     %organization_id,
                     error_kind,
-                    "Failed to read long-context blocks; using the last known value"
+                    has_last_good = last_good.is_some(),
+                    "Failed to read long-context blocks; using the last known value, \
+                     or blocking every model without one"
                 );
-                self.last_blocked
-                    .get(&organization_id)
-                    .await
-                    .unwrap_or_else(|| {
-                        cold_fallback = true;
-                        Arc::default()
-                    })
+                last_good
             }
         };
 
@@ -201,18 +207,16 @@ impl LongContextAccess {
                 disabled
             }
             Err(error_kind) => {
+                let last_good = self.last_disabled.get(&organization_id).await;
+                cold_fallback |= last_good.is_none();
                 tracing::warn!(
                     %organization_id,
                     error_kind,
-                    "Failed to read organization long-context settings; using the last known value"
+                    has_last_good = last_good.is_some(),
+                    "Failed to read organization long-context settings; using the last known \
+                     value, or turning every model off without one"
                 );
-                self.last_disabled
-                    .get(&organization_id)
-                    .await
-                    .unwrap_or_else(|| {
-                        cold_fallback = true;
-                        Arc::default()
-                    })
+                last_good.unwrap_or_else(|| Arc::new(LongContextDisabledModels::All))
             }
         };
 

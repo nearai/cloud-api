@@ -5,6 +5,7 @@
 
 use crate::common::*;
 use api::models::BatchUpdateModelApiRequest;
+use database::repositories::long_context_access::query_blocked_model_names;
 use database::repositories::PgLongContextAccessRepository;
 use services::long_context_access::LongContextAccessRepository;
 use wiremock::matchers::{method, path};
@@ -289,25 +290,11 @@ async fn e2e_org_switch_blocks_the_context_400_fall_through() {
     assert_eq!(completions_hits(&long).await, 0);
 }
 
-async fn has_blocks_table(database: &database::Database) -> bool {
-    database
-        .pool()
-        .get()
-        .await
-        .unwrap()
-        .query_one(
-            "SELECT to_regclass('organization_model_long_context_blocks') IS NOT NULL",
-            &[],
-        )
-        .await
-        .unwrap()
-        .get(0)
-}
-
-/// The repository reads an organization's settings, and answers "no blocks"
-/// (not an error) on a schema without the blocks table.
+/// The repository reads an organization's settings, and maps a schema
+/// without the blocks table (SQLSTATE 42P01) to "no blocks", not an error.
+/// The missing table is simulated with a search path that cannot see it.
 #[tokio::test]
-async fn e2e_repository_reads_settings_and_tolerates_a_missing_blocks_table() {
+async fn e2e_repository_reads_settings_and_maps_a_missing_blocks_table_to_no_blocks() {
     let (server, database) = setup_test_server_with_database().await;
     let repository = PgLongContextAccessRepository::new(database.pool().clone());
     let (org_id, _) = org_with_key(&server, &database, Some(serde_json::json!(["a/b"]))).await;
@@ -329,24 +316,25 @@ async fn e2e_repository_reads_settings_and_tolerates_a_missing_blocks_table() {
         None
     );
 
-    if !has_blocks_table(&database).await {
-        assert_eq!(
-            repository.blocked_model_names(org_id).await.unwrap(),
-            Vec::<String>::new()
-        );
-    }
+    let mut client = database.pool().get().await.unwrap();
+    let transaction = client.transaction().await.unwrap();
+    transaction
+        .batch_execute("SET LOCAL search_path TO e2e_schema_without_tables")
+        .await
+        .unwrap();
+    assert_eq!(
+        query_blocked_model_names(&*transaction, org_id)
+            .await
+            .unwrap(),
+        None
+    );
 }
 
-/// A platform block row caps the organization the same way. Runs only once
-/// the database schema has the blocks table; earlier schemas skip it.
+/// A platform block row caps the organization the same way.
 #[tokio::test]
 async fn e2e_platform_block_caps_requests_at_the_base_tier() {
     let (server, database) = setup_test_server_with_database().await;
     let client = database.pool().get().await.unwrap();
-    if !has_blocks_table(&database).await {
-        eprintln!("skipped: the schema has no organization_model_long_context_blocks table");
-        return;
-    }
 
     let (base, long) = (MockServer::start().await, MockServer::start().await);
     let model = setup_tiered_model(&server, &base.uri(), &long.uri()).await;

@@ -128,18 +128,32 @@ async fn answers_are_cached_per_organization_for_the_ttl() {
     assert_eq!(repository.block_reads.load(Ordering::SeqCst), 2);
 }
 
+/// A read that fails with no last good value fails closed: every model is
+/// restricted, whichever input failed.
 #[tokio::test]
-async fn a_failed_read_without_a_previous_value_allows_and_is_cached() {
-    let repository = Fake::new(&[MODEL], serde_json::json!({}));
+async fn a_failed_read_without_a_previous_value_restricts_and_is_cached() {
+    // Blocks: every model is blocked.
+    let repository = Fake::new(&[], serde_json::json!({}));
     repository.blocks_fail.store(true, Ordering::SeqCst);
     let access = access(repository.clone(), Duration::from_secs(30));
     let org = Uuid::new_v4();
-
-    assert!(access.is_allowed(org, MODEL).await);
-    // The degraded answer is reused for its window: a failing read runs once
-    // per organization per window.
-    assert!(access.is_allowed(org, MODEL).await);
+    assert!(!access.is_allowed(org, MODEL).await);
+    assert!(!access.is_allowed(org, OTHER).await);
+    // The answer is reused for its window: a failing read runs once per
+    // organization per window.
     assert_eq!(repository.block_reads.load(Ordering::SeqCst), 1);
+
+    // Settings: every model is turned off.
+    let repository = Fake::new(&[], serde_json::json!({}));
+    repository.settings_fail.store(true, Ordering::SeqCst);
+    let access = super::LongContextAccess::with_timing(
+        repository,
+        Duration::from_secs(30),
+        Duration::from_secs(30),
+        Duration::from_millis(200),
+    );
+    assert!(!access.is_allowed(org, MODEL).await);
+    assert!(!access.is_allowed(org, OTHER).await);
 }
 
 #[tokio::test]
@@ -179,20 +193,25 @@ async fn a_failed_settings_read_keeps_the_last_known_switch() {
     assert!(!access.is_allowed(org, MODEL).await);
 }
 
-/// Each input keeps its own last good value: blocks that never load do not
-/// stop the organization's switch from being remembered.
+/// Each input keeps its own last good value, also when the two inputs fail
+/// on different loads: the settings read in a load whose blocks read failed
+/// is still remembered.
 #[tokio::test]
-async fn the_switch_survives_a_settings_failure_while_blocks_always_fail() {
+async fn the_switch_survives_when_the_inputs_fail_on_different_loads() {
     let repository = Fake::new(
         &[],
         serde_json::json!({ "long_context_disabled_models": [MODEL] }),
     );
-    repository.blocks_fail.store(true, Ordering::SeqCst);
     let access = access(repository.clone(), Duration::from_millis(50));
     let org = Uuid::new_v4();
-    assert!(!access.is_allowed(org, MODEL).await);
 
+    // Load 1: blocks fail (no last good value, fail closed), settings load.
+    repository.blocks_fail.store(true, Ordering::SeqCst);
+    assert!(!access.is_allowed(org, OTHER).await);
+
+    // Load 2: blocks load, settings fail: the switch from load 1 applies.
     expire().await;
+    repository.blocks_fail.store(false, Ordering::SeqCst);
     repository.settings_fail.store(true, Ordering::SeqCst);
     assert!(
         !access.is_allowed(org, MODEL).await,
@@ -201,17 +220,20 @@ async fn the_switch_survives_a_settings_failure_while_blocks_always_fail() {
     assert!(access.is_allowed(org, OTHER).await);
 }
 
-/// The mirror case: settings that never load do not stop a block from being
-/// remembered.
+/// The mirror case for a block.
 #[tokio::test]
-async fn the_block_survives_a_block_failure_while_settings_always_fail() {
+async fn the_block_survives_when_the_inputs_fail_on_different_loads() {
     let repository = Fake::new(&[MODEL], serde_json::json!({}));
-    repository.settings_fail.store(true, Ordering::SeqCst);
     let access = access(repository.clone(), Duration::from_millis(50));
     let org = Uuid::new_v4();
-    assert!(!access.is_allowed(org, MODEL).await);
 
+    // Load 1: settings fail (fail closed), blocks load.
+    repository.settings_fail.store(true, Ordering::SeqCst);
+    assert!(!access.is_allowed(org, OTHER).await);
+
+    // Load 2: settings load, blocks fail: the block from load 1 applies.
     expire().await;
+    repository.settings_fail.store(false, Ordering::SeqCst);
     repository.blocks_fail.store(true, Ordering::SeqCst);
     assert!(
         !access.is_allowed(org, MODEL).await,
@@ -220,22 +242,23 @@ async fn the_block_survives_a_block_failure_while_settings_always_fail() {
     assert!(access.is_allowed(org, OTHER).await);
 }
 
+/// A timed-out read counts as a failed one: without a last good value the
+/// answer fails closed, quickly.
 #[tokio::test]
-async fn a_slow_read_times_out_and_allows() {
+async fn a_slow_read_times_out_and_restricts() {
     let repository = Arc::new(Fake {
-        blocked: Mutex::new(vec![MODEL.to_string()]),
         blocks_delay: Some(Duration::from_secs(5)),
         ..Default::default()
     });
     let access = access(repository, Duration::from_secs(30));
     let started = std::time::Instant::now();
-    assert!(access.is_allowed(Uuid::new_v4(), MODEL).await);
+    assert!(!access.is_allowed(Uuid::new_v4(), OTHER).await);
     assert!(started.elapsed() < Duration::from_secs(2));
 }
 
-/// A read that fails with no last good value falls back to "allowed" for
-/// the short cold-fallback TTL only; a fallback that uses a last good value
-/// keeps the full TTL.
+/// A read that fails with no last good value fails closed for the short
+/// cold-fallback TTL only; a fallback that uses a last good value keeps the
+/// full TTL.
 #[tokio::test]
 async fn a_cold_fallback_is_cached_briefly_and_a_warm_one_for_the_full_ttl() {
     let cold_ttl = Duration::from_millis(50);
@@ -251,13 +274,14 @@ async fn a_cold_fallback_is_cached_briefly_and_a_warm_one_for_the_full_ttl() {
         Duration::from_millis(200),
     );
     let org = Uuid::new_v4();
-    assert!(cold.is_allowed(org, MODEL).await);
-    assert!(cold.is_allowed(org, MODEL).await);
+    assert!(!cold.is_allowed(org, OTHER).await);
+    assert!(!cold.is_allowed(org, OTHER).await);
     assert_eq!(repository.block_reads.load(Ordering::SeqCst), 1);
     tokio::time::sleep(Duration::from_millis(150)).await;
-    // The read works again: the block applies after the short window, long
-    // before the full TTL.
+    // The read works again: after the short window, long before the full
+    // TTL, only the real block applies.
     repository.blocks_fail.store(false, Ordering::SeqCst);
+    assert!(cold.is_allowed(org, OTHER).await);
     assert!(!cold.is_allowed(org, MODEL).await);
     assert_eq!(repository.block_reads.load(Ordering::SeqCst), 2);
 
@@ -296,6 +320,6 @@ async fn concurrent_misses_share_one_failing_read() {
     let access = access(repository.clone(), Duration::from_secs(30));
     let org = Uuid::new_v4();
     let answers = futures::future::join_all((0..16).map(|_| access.is_allowed(org, MODEL))).await;
-    assert!(answers.into_iter().all(|allowed| allowed));
+    assert!(answers.into_iter().all(|allowed| !allowed));
     assert_eq!(repository.block_reads.load(Ordering::SeqCst), 1);
 }

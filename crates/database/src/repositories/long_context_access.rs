@@ -9,6 +9,7 @@ use async_trait::async_trait;
 use services::common::RepositoryError;
 use services::long_context_access::LongContextAccessRepository;
 use tokio_postgres::error::SqlState;
+use tokio_postgres::GenericClient;
 use uuid::Uuid;
 
 /// At most one "blocks table unavailable" warning per this many seconds.
@@ -34,6 +35,37 @@ fn warn_blocks_table_missing() {
     }
 }
 
+/// The canonical names of the models blocked for `organization_id`, read on
+/// `client`; `None` when its schema has no blocks table (SQLSTATE 42P01),
+/// where no block can exist.
+pub async fn query_blocked_model_names<C: GenericClient + Sync>(
+    client: &C,
+    organization_id: Uuid,
+) -> Result<Option<Vec<String>>, RepositoryError> {
+    let rows = match client
+        .query(
+            "SELECT m.model_name
+             FROM organization_model_long_context_blocks b
+             JOIN models m ON m.id = b.model_id
+             WHERE b.organization_id = $1",
+            &[&organization_id],
+        )
+        .await
+    {
+        Ok(rows) => rows,
+        Err(err) if err.code() == Some(&SqlState::UNDEFINED_TABLE) => return Ok(None),
+        Err(err) => return Err(map_db_error(err)),
+    };
+    rows.iter()
+        .map(|row| {
+            row.try_get::<_, String>("model_name")
+                .context("Failed to read a blocked model name")
+                .map_err(RepositoryError::DataConversionError)
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(Some)
+}
+
 /// Reads what the long-context access check needs: the per-model blocks
 /// (`organization_model_long_context_blocks`) and an organization's
 /// settings. Never writes either.
@@ -51,41 +83,21 @@ impl PgLongContextAccessRepository {
 #[async_trait]
 impl LongContextAccessRepository for PgLongContextAccessRepository {
     async fn blocked_model_names(&self, organization_id: Uuid) -> Result<Vec<String>> {
-        // `None`: the schema has no blocks table, so nothing is blocked.
-        let rows = retry_db!("list_organization_long_context_blocks", {
+        let names = retry_db!("list_organization_long_context_blocks", {
             let client = self
                 .pool
                 .get()
                 .await
                 .context("Failed to get database connection")
                 .map_err(RepositoryError::PoolError)?;
-
-            match client
-                .query(
-                    "SELECT m.model_name
-                     FROM organization_model_long_context_blocks b
-                     JOIN models m ON m.id = b.model_id
-                     WHERE b.organization_id = $1",
-                    &[&organization_id],
-                )
-                .await
-            {
-                Ok(rows) => Ok(Some(rows)),
-                Err(err) if err.code() == Some(&SqlState::UNDEFINED_TABLE) => Ok(None),
-                Err(err) => Err(map_db_error(err)),
-            }
+            query_blocked_model_names(&**client, organization_id).await
         })?;
 
-        let Some(rows) = rows else {
+        // No blocks table: nothing is blocked.
+        Ok(names.unwrap_or_else(|| {
             warn_blocks_table_missing();
-            return Ok(Vec::new());
-        };
-        rows.iter()
-            .map(|row| {
-                row.try_get::<_, String>("model_name")
-                    .context("Failed to read a blocked model name")
-            })
-            .collect()
+            Vec::new()
+        }))
     }
 
     async fn organization_settings(

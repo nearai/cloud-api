@@ -990,22 +990,22 @@ impl CompletionServiceImpl {
         &self,
         request: &ports::CompletionRequest,
     ) -> Result<(), ports::CompletionError> {
-        // An unknown model, or a failed lookup, is reported by dispatch.
-        let Ok(Some(model)) = self
-            .resolve_model_cached(
+        // An unknown model or a failed lookup fails here, with dispatch's
+        // error, before the caller's other paid work.
+        let model = self
+            .resolve_request_model(
                 &request.model,
                 crate::models::ModelCaller::Organization(request.organization_id),
             )
-            .await
-        else {
-            return Ok(());
-        };
+            .await?;
         if self
             .resolve_long_context_allowed(request.organization_id, &model.model_name)
             .await
         {
             return Ok(());
         }
+        // As dispatch: tool definitions that typed parsing cannot read stay
+        // in `extra`, are forwarded as is, and count toward the size.
         let mut extra = request.extra.clone();
         let (tools, _) = Self::extract_tools_from_extra(&mut extra);
         let params = inference_providers::ChatCompletionParams {
@@ -1037,11 +1037,38 @@ impl CompletionServiceImpl {
             modalities: None,
             original_request: None,
             upstream_cache_salt: None,
-            extra: std::collections::HashMap::new(),
+            extra,
         };
         self.long_context_routing(request.organization_id, &params)
             .await
             .map(|_| ())
+    }
+
+    /// Resolve the request's model for `caller`, recording and returning the
+    /// request error for an unknown model or a failed lookup.
+    async fn resolve_request_model(
+        &self,
+        requested: &str,
+        caller: crate::models::ModelCaller,
+    ) -> Result<crate::models::ModelWithPricing, ports::CompletionError> {
+        match self.resolve_model_cached(requested, caller).await {
+            Ok(Some(model)) => Ok(model),
+            Ok(None) => {
+                let err = ports::CompletionError::InvalidModel(format!(
+                    "Model '{requested}' not found. It's not a valid model name or alias."
+                ));
+                // Do not record the invalid model name in metrics to avoid high cardinality
+                self.record_error(&err, None);
+                Err(err)
+            }
+            Err(e) => {
+                let err =
+                    ports::CompletionError::InternalError(format!("Failed to resolve model: {e}"));
+                // Do not record the possibly invalid model name in metrics
+                self.record_error(&err, None);
+                Err(err)
+            }
+        }
     }
 
     /// Share the model-resolve cache owned by `ModelsServiceImpl` so its
@@ -1973,31 +2000,12 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         // Resolve model name (could be an alias) and get model details in a single DB call
         // This also validates that the model exists, is active, and may be
         // used by the request's organization
-        let model = match self
-            .resolve_model_cached(
+        let model = self
+            .resolve_request_model(
                 &request.model,
                 crate::models::ModelCaller::Organization(request.organization_id),
             )
-            .await
-        {
-            Ok(Some(m)) => m,
-            Ok(None) => {
-                let err = ports::CompletionError::InvalidModel(format!(
-                    "Model '{}' not found. It's not a valid model name or alias.",
-                    request.model
-                ));
-                // Do not record the invalid model name in metrics to avoid high cardinality
-                self.record_error(&err, None);
-                return Err(err);
-            }
-            Err(e) => {
-                let err =
-                    ports::CompletionError::InternalError(format!("Failed to resolve model: {e}"));
-                // Do not record the possibly invalid model name in metrics
-                self.record_error(&err, None);
-                return Err(err);
-            }
-        };
+            .await?;
 
         model
             .validate_endpoint(crate::models::InferenceEndpoint::ChatCompletions)
@@ -2197,28 +2205,9 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         // Resolve model name (could be an alias) and get model details in a single DB call
         // This also validates that the model exists, is active, and may be
         // used by whoever chose it (see `model_caller` above)
-        let model = match self
-            .resolve_model_cached(&request.model, model_caller)
-            .await
-        {
-            Ok(Some(m)) => m,
-            Ok(None) => {
-                let err = ports::CompletionError::InvalidModel(format!(
-                    "Model '{}' not found. It's not a valid model name or alias.",
-                    request.model
-                ));
-                // Do not record the invalid model name in metrics to avoid high cardinality
-                self.record_error(&err, None);
-                return Err(err);
-            }
-            Err(e) => {
-                let err =
-                    ports::CompletionError::InternalError(format!("Failed to resolve model: {e}"));
-                // Do not record the possibly invalid model name in metrics
-                self.record_error(&err, None);
-                return Err(err);
-            }
-        };
+        let model = self
+            .resolve_request_model(&request.model, model_caller)
+            .await?;
 
         model
             .validate_endpoint(crate::models::InferenceEndpoint::ChatCompletions)

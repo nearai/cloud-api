@@ -6,7 +6,12 @@
 //! recorded per model whenever its inference URLs are loaded
 //! ([`InferenceProviderPool::record_long_context_boundaries`]). It never
 //! comes from the providers currently registered, so a base fleet that drops
-//! out cannot make the model look single-tier. A NEAR provider whose declared
+//! out cannot make the model look single-tier. A load publishes a model's
+//! boundary together with its new providers, under the provider-mapping
+//! write lock, and the candidate filters read both under the read lock, so a
+//! boundary never meets another load's providers. A full refresh forgets the
+//! boundary of a model it no longer lists, once none of that model's
+//! long-tier providers is registered. A NEAR provider whose declared
 //! capacity is above the boundary is the long tier. Third-party fallbacks
 //! never define or move the boundary and are never dropped. A model without
 //! a configured long tier is unaffected by the flag.
@@ -20,7 +25,7 @@
 //!   retry, nor the context-length-400 fall-through, nor the low-priority pin
 //!   can reach it. With no base provider registered, it gets no provider.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use inference_providers::{ChatCompletionParams, CompletionError, ProviderTier, SystemOneRequest};
@@ -45,7 +50,9 @@ impl InferenceProviderPool {
     /// Record the configured long-context boundary of every model in
     /// `models`, the `(model, inference_url, max_context)` entries of a load
     /// (each model with all its entries): the base capacity when its entries
-    /// declare two or more capacities, otherwise none.
+    /// declare two or more capacities, otherwise none. The load calls this
+    /// while holding the `provider_mappings` write lock that publishes the
+    /// same models' providers.
     pub(crate) fn record_long_context_boundaries(&self, models: &[(String, String, Option<u32>)]) {
         let mut capacities: HashMap<&str, Vec<Option<u32>>> = HashMap::new();
         for (model, _, capacity) in models {
@@ -68,6 +75,39 @@ impl InferenceProviderPool {
                 }
             }
         }
+    }
+
+    /// After a successful full refresh that listed `listed` models, forget
+    /// the boundary of every model it did not list (it no longer has a
+    /// configured long tier, for example it moved to an external provider).
+    /// A model with a long-tier provider still registered keeps its boundary
+    /// until that provider is gone. Partial loads never prune.
+    pub(super) async fn prune_long_context_boundaries(&self, listed: &HashSet<String>) {
+        let mappings = self.provider_mappings.write().await;
+        let states = self
+            .provider_load_state
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut boundaries = self
+            .long_context_boundaries
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        boundaries.retain(|model, boundary| {
+            listed.contains(model)
+                || mappings
+                    .model_to_providers
+                    .get(model)
+                    .is_some_and(|providers| {
+                        providers.iter().any(|provider| {
+                            let ptr = Arc::as_ptr(provider) as *const () as usize;
+                            is_long_tier(
+                                provider.tier() == ProviderTier::Near,
+                                states.get(&ptr).and_then(|state| state.max_context_tokens),
+                                *boundary,
+                            )
+                        })
+                    })
+        });
     }
 
     /// The configured long-context tier boundary of `model_id` (module

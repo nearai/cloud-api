@@ -216,3 +216,92 @@ async fn long_context_allowed_reports_the_organization_access() {
             .await
     );
 }
+
+/// Tool definitions typed parsing cannot read stay in `extra` and are
+/// forwarded; the pre-dispatch check counts them like dispatch does.
+#[tokio::test]
+async fn the_precheck_counts_tool_definitions_left_in_extra() {
+    let f = fixture(true).await;
+    let mut request = request(f.blocked, 40);
+    // An unknown tool type: typed parsing falls back and keeps the raw list.
+    request.extra.insert(
+        "tools".to_string(),
+        serde_json::json!([{"type": "custom_search", "description": "d".repeat(20_000)}]),
+    );
+    match ports::CompletionServiceTrait::check_long_context_limit(&f.service, &request).await {
+        Err(ports::CompletionError::ContextLengthExceeded { limit }) => assert_eq!(limit, 1_000),
+        other => panic!("expected ContextLengthExceeded, got: {other:?}"),
+    }
+    // Without the tools the same request fits.
+    request.extra.remove("tools");
+    assert!(
+        ports::CompletionServiceTrait::check_long_context_limit(&f.service, &request)
+            .await
+            .is_ok()
+    );
+    assert_eq!(f.base.chat_completion_call_count(), 0);
+    assert_eq!(f.long.chat_completion_call_count(), 0);
+}
+
+/// Model catalog whose lookups fail.
+struct FailingModelsRepository;
+
+#[async_trait::async_trait]
+impl crate::models::ModelsRepository for FailingModelsRepository {
+    async fn get_all_active_models(
+        &self,
+    ) -> Result<Vec<crate::models::ModelWithPricing>, anyhow::Error> {
+        anyhow::bail!("catalog unavailable")
+    }
+
+    async fn get_model_by_name(
+        &self,
+        _: &str,
+    ) -> Result<Option<crate::models::ModelWithPricing>, anyhow::Error> {
+        anyhow::bail!("catalog unavailable")
+    }
+
+    async fn resolve_and_get_model(
+        &self,
+        _: &str,
+    ) -> Result<Option<crate::models::ModelWithPricing>, anyhow::Error> {
+        anyhow::bail!("catalog unavailable")
+    }
+
+    async fn get_configured_model_names(&self) -> Result<Vec<String>, anyhow::Error> {
+        anyhow::bail!("catalog unavailable")
+    }
+}
+
+/// The pre-dispatch check fails on an unknown model or a failed model lookup
+/// (with dispatch's errors) instead of letting the caller's paid work run.
+#[tokio::test]
+async fn the_precheck_fails_on_an_unknown_model_or_a_failed_lookup() {
+    let f = fixture(true).await;
+    let mut unknown = request(f.blocked, 40);
+    unknown.model = "org/unknown".to_string();
+    assert!(matches!(
+        ports::CompletionServiceTrait::check_long_context_limit(&f.service, &unknown).await,
+        Err(ports::CompletionError::InvalidModel(_))
+    ));
+
+    let failing = CompletionServiceImpl::new(
+        Arc::new(InferenceProviderPool::new(
+            None,
+            config::ExternalProvidersConfig::default(),
+        )),
+        Arc::new(MockAttestationService),
+        Arc::new(CapturingUsageService::new()),
+        Arc::new(CapturingMetricsService::new()),
+        Arc::new(FailingModelsRepository),
+        Arc::new(StaticOrganizationLimitRepository),
+    );
+    assert!(matches!(
+        ports::CompletionServiceTrait::check_long_context_limit(
+            &failing,
+            &request(Uuid::new_v4(), 40)
+        )
+        .await,
+        Err(ports::CompletionError::InternalError(_))
+    ));
+}

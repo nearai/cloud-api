@@ -332,6 +332,7 @@ pub(super) fn lifecycle_service(
         gateway_quote_collector: Arc::new(DstackGatewayQuoteCollector),
         model_attestation_collector: Arc::new(ProviderPoolModelAttestationCollector::new(pool)),
         report_cache: None,
+        long_context_access: None,
     }
 }
 

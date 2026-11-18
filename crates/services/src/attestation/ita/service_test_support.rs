@@ -96,6 +96,7 @@ fn service_with_collectors(
         gateway_quote_collector: Arc::new(gateway_collector),
         model_attestation_collector: Arc::new(model_collector),
         report_cache: None,
+        long_context_access: None,
     }
 }
 

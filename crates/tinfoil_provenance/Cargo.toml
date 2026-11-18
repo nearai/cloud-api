@@ -15,4 +15,4 @@ jiff = { version = "0.2.46", default-features = false, features = ["std", "serde
 # Sigstore bundle verification, offline against the crate's embedded
 # public-good trusted root.
 # The only crate that may depend on sigstore-verify directly (CI guard).
-sigstore-verify = { version = "0.15", default-features = false, features = ["aws-lc-rs"] }
+sigstore-verify = { version = "0.16", default-features = false, features = ["aws-lc-rs"] }

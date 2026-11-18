@@ -20,8 +20,13 @@ pub const TICK_MINUTE: u32 = 5;
 /// Floor to the UTC boundary of `unit_secs`; rem_euclid keeps pre-epoch times flooring down.
 fn trunc_secs(t: Timestamp, unit_secs: i64) -> Timestamp {
     let width = i128::from(unit_secs) * 1_000_000_000;
-    Timestamp::from_nanosecond(t.as_nanosecond().div_euclid(width) * width)
-        .expect("UTC boundary is representable")
+    let remainder = t.as_nanosecond().rem_euclid(width);
+    t.checked_sub(SignedDuration::from_nanos_i128(remainder))
+        .unwrap_or(Timestamp::MIN)
+}
+
+pub fn is_whole_hour(t: Timestamp) -> bool {
+    t.as_second() % 3600 == 0 && t.subsec_nanosecond() == 0
 }
 
 pub fn trunc_hour(t: Timestamp) -> Timestamp {
@@ -462,6 +467,9 @@ mod tests {
 
     #[test]
     fn trunc_uses_utc_boundaries_before_epoch_and_with_subseconds() {
+        assert_eq!(trunc_hour(Timestamp::MIN), Timestamp::MIN);
+        assert_eq!(trunc_day(Timestamp::MIN), Timestamp::MIN);
+        assert!(!is_whole_hour(Timestamp::MIN));
         let x = t("1969-12-31T23:59:59.999999999Z");
         assert_eq!(trunc_hour(x), t("1969-12-31T23:00:00Z"));
         assert_eq!(trunc_day(x), t("1969-12-31T00:00:00Z"));

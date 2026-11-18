@@ -106,7 +106,7 @@ async fn typed_hot_path_queries_repeat_on_one_pool() -> anyhow::Result<()> {
             .await?;
         client
             .execute(
-                "INSERT INTO api_keys (id, key_hash, key_prefix, name, workspace_id, created_by_user_id) VALUES ($1, $2, 'sk-live-typed', 'typed', $3, $4)",
+                "INSERT INTO api_keys (id, key_hash, key_prefix, name, workspace_id, created_by_user_id, expires_at) VALUES ($1, $2, 'sk-live-typed', 'typed', $3, $4, '9999-12-31 00:00:00+00')",
                 &[&key_id, &hash_api_key(&api_key), &workspace_id, &user_id],
             )
             .await?;
@@ -129,6 +129,7 @@ async fn typed_hot_path_queries_repeat_on_one_pool() -> anyhow::Result<()> {
     for _ in 0..3 {
         let key = api_keys.validate(&api_key).await?.expect("key validates");
         assert_eq!(key.id, key_id);
+        assert_eq!(key.expires_at, Some(Timestamp::MAX));
         assert_eq!(key.workspace_id, workspace_id);
     }
     assert!(api_keys.validate("sk-live-missing").await?.is_none());

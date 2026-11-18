@@ -1,3 +1,4 @@
+use crate::bounded_timestamp::BoundedTimestamp;
 use crate::models::ApiKey;
 use crate::pool::DbPool;
 use crate::repositories::usage_hourly::with_usage_rows;
@@ -524,7 +525,9 @@ impl ApiKeyRepository {
             workspace_id: row.get("workspace_id"),
             created_by_user_id: row.get("created_by_user_id"),
             created_at: row.get("created_at"),
-            expires_at: row.get("expires_at"),
+            expires_at: row
+                .try_get::<_, Option<BoundedTimestamp>>("expires_at")?
+                .map(|t| t.0),
             last_used_at: row.get("last_used_at"),
             is_active: row.get("is_active"),
             deleted_at: row.get("deleted_at"),
@@ -543,7 +546,9 @@ impl ApiKeyRepository {
             workspace_id: row.get("workspace_id"),
             created_by_user_id: row.get("created_by_user_id"),
             created_at: row.get("created_at"),
-            expires_at: row.get("expires_at"),
+            expires_at: row
+                .try_get::<_, Option<BoundedTimestamp>>("expires_at")?
+                .map(|t| t.0),
             last_used_at: row.get("last_used_at"),
             is_active: row.get("is_active"),
             deleted_at: row.get("deleted_at"),

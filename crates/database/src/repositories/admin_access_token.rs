@@ -1,3 +1,4 @@
+use crate::bounded_timestamp::BoundedTimestamp;
 use crate::pool::DbPool;
 use crate::retry_db;
 use crate::{
@@ -28,7 +29,7 @@ impl AdminAccessTokenRepository {
             name: row.get("name"),
             creation_reason: row.get("creation_reason"),
             created_at: row.get("created_at"),
-            expires_at: row.get("expires_at"),
+            expires_at: row.try_get::<_, BoundedTimestamp>("expires_at")?.0,
             last_used_at: row.get("last_used_at"),
             is_active: row.get("is_active"),
             revoked_at: row.get("revoked_at"),

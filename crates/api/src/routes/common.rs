@@ -241,7 +241,11 @@ pub fn parse_metrics_range(
     };
     let start = match start {
         Some(s) => services::timestamps::parse_timestamp(s).ok_or_else(|| bad("start"))?,
-        None => end - jiff::SignedDuration::from_hours(30 * 24),
+        None => end
+            .checked_sub(jiff::SignedDuration::from_hours(30 * 24))
+            .map_err(|_| {
+                range_err("Default start is outside the supported timestamp range.".to_string())
+            })?,
     };
 
     if start >= end {
@@ -665,6 +669,13 @@ pub fn analytics_error_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn metrics_default_range_at_timestamp_boundary() {
+        let end = jiff::Timestamp::MIN.to_string();
+        let err = parse_metrics_range(None, Some(&end), None, 30, 30).unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
 
     #[test]
     fn redact_provider_config_hides_every_present_key() {

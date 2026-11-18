@@ -645,6 +645,8 @@ enum UsageHistoryRangeError {
     InvalidTimestamp,
     #[error("end_time must be greater than or equal to start_time")]
     InvalidTimeRange,
+    #[error("default start_time is outside the supported timestamp range")]
+    DefaultStartOutOfRange,
     #[error("time range must not exceed {max_days} days")]
     TimeRangeTooLarge { max_days: i64 },
 }
@@ -664,9 +666,14 @@ fn normalize_usage_history_range(
     end_time: Option<Timestamp>,
 ) -> Result<(Timestamp, Timestamp), UsageHistoryRangeError> {
     let end_time = end_time.unwrap_or_else(Timestamp::now);
-    let start_time = start_time.unwrap_or_else(|| {
-        end_time - SignedDuration::from_hours(MAX_USAGE_HISTORY_RANGE_DAYS * 24)
-    });
+    let start_time = match start_time {
+        Some(start) => start,
+        None => end_time
+            .checked_sub(SignedDuration::from_hours(
+                MAX_USAGE_HISTORY_RANGE_DAYS * 24,
+            ))
+            .map_err(|_| UsageHistoryRangeError::DefaultStartOutOfRange)?,
+    };
     if end_time < start_time {
         return Err(UsageHistoryRangeError::InvalidTimeRange);
     }
@@ -963,22 +970,21 @@ fn validate_date_range(start: jiff::Timestamp, end: jiff::Timestamp) -> Result<(
     Ok(())
 }
 
-fn parse_datetime_or_default(
-    value: &Option<String>,
-    default: jiff::Timestamp,
-) -> Result<jiff::Timestamp, (StatusCode, ResponseJson<ErrorResponse>)> {
-    match value {
-        Some(s) => services::timestamps::parse_timestamp(s).ok_or_else(|| {
-            (
-                StatusCode::BAD_REQUEST,
-                ResponseJson(ErrorResponse::new(
-                    "Invalid date format. Use ISO 8601 (e.g. 2024-01-01T00:00:00Z).".to_string(),
-                    "invalid_date".to_string(),
-                )),
-            )
-        }),
-        None => Ok(default),
-    }
+fn parse_optional_datetime(value: Option<&str>) -> Result<Option<Timestamp>, UsageError> {
+    value
+        .map(|s| {
+            services::timestamps::parse_timestamp(s).ok_or_else(|| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    ResponseJson(ErrorResponse::new(
+                        "Invalid date format. Use ISO 8601 (e.g. 2024-01-01T00:00:00Z)."
+                            .to_string(),
+                        "invalid_date".to_string(),
+                    )),
+                )
+            })
+        })
+        .transpose()
 }
 
 /// `end` defaults to now and `start` to 30 days before `end`.
@@ -986,8 +992,21 @@ fn parse_date_range(
     start: &Option<String>,
     end: &Option<String>,
 ) -> Result<(jiff::Timestamp, jiff::Timestamp), UsageError> {
-    let end = parse_datetime_or_default(end, Timestamp::now())?;
-    let start = parse_datetime_or_default(start, end - SignedDuration::from_hours(30 * 24))?;
+    let end = parse_optional_datetime(end.as_deref())?.unwrap_or_else(Timestamp::now);
+    let start = match parse_optional_datetime(start.as_deref())? {
+        Some(start) => start,
+        None => end
+            .checked_sub(SignedDuration::from_hours(30 * 24))
+            .map_err(|_| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    ResponseJson(ErrorResponse::new(
+                        "Default start is outside the supported timestamp range.".to_string(),
+                        "invalid_date_range".to_string(),
+                    )),
+                )
+            })?,
+    };
     validate_date_range(start, end)?;
     Ok((start, end))
 }
@@ -1308,6 +1327,25 @@ pub async fn get_organization_usage_by_model(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_range_at_timestamp_boundary() {
+        assert_eq!(
+            normalize_usage_history_range(None, Some(Timestamp::MIN)),
+            Err(UsageHistoryRangeError::DefaultStartOutOfRange)
+        );
+        let start = Timestamp::MIN;
+        let end = start.checked_add(SignedDuration::from_hours(1)).unwrap();
+        let end_param = Some(end.to_string());
+        assert_eq!(
+            parse_date_range(&None, &end_param).unwrap_err().0,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            parse_date_range(&Some(start.to_string()), &end_param).unwrap(),
+            (start, end)
+        );
+    }
 
     fn ts(value: &str) -> Timestamp {
         value.parse::<jiff::Timestamp>().unwrap()

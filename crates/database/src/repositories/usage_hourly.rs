@@ -6,10 +6,10 @@ use crate::repositories::reporting_query::configure_reporting_transaction;
 use crate::repositories::utils::map_db_error;
 use anyhow::Context;
 use jiff::{civil::Date, Timestamp};
+use services::usage::is_whole_hour;
 use services::usage::ports::{
     AggregateLockBehavior, DayParity, DayTotals, HourlyProgress, RecomputeReport,
 };
-use services::usage::trunc_hour;
 use std::time::Duration;
 use tokio_postgres::IsolationLevel;
 
@@ -195,7 +195,7 @@ impl services::usage::ports::UsageHourlyRepository for UsageHourlyRepositoryImpl
     ) -> anyhow::Result<Option<RecomputeReport>> {
         anyhow::ensure!(from < to, "usage_hourly recompute: empty window");
         anyhow::ensure!(
-            trunc_hour(from) == from && trunc_hour(to) == to,
+            is_whole_hour(from) && is_whole_hour(to),
             "usage_hourly recompute: bounds must be whole UTC hours"
         );
         let mut client = self
@@ -245,7 +245,7 @@ impl services::usage::ports::UsageHourlyRepository for UsageHourlyRepositoryImpl
 
     async fn day_parity(&self, day: Date) -> anyhow::Result<DayParity> {
         let start = day.to_zoned(jiff::tz::TimeZone::UTC)?.timestamp();
-        let end = start + jiff::SignedDuration::from_hours(24);
+        let end = start.checked_add(jiff::SignedDuration::from_hours(24))?;
         let mut client = self
             .pool
             .get()

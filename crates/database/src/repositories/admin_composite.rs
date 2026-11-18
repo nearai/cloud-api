@@ -1,3 +1,4 @@
+use crate::bounded_timestamp::BoundedTimestamp;
 use crate::models::UpdateModelPricingRequest;
 use crate::pool::DbPool;
 use crate::repositories::lifecycle::{org_lifecycle_predicate, ORG_ALL_MEMBERS_ERASED_SQL};
@@ -79,7 +80,7 @@ fn row_to_scheduled_pricing_change(
         old_cost_per_image: row.get("old_cost_per_image"),
         old_text_pricing: parse_text_pricing(row.get("old_text_pricing"))?,
         new_text_pricing: parse_text_pricing(row.get("new_text_pricing"))?,
-        effective_at: row.get("effective_at"),
+        effective_at: row.try_get::<_, BoundedTimestamp>("effective_at")?.0,
         status,
         apply_attempts: row.get("apply_attempts"),
         applied_at: row.get("applied_at"),

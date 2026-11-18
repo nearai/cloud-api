@@ -25,9 +25,9 @@ pub fn status_overloaded() -> StatusCode {
 /// Map domain errors to HTTP status codes
 pub fn map_domain_error_to_status(error: &CompletionError) -> StatusCode {
     match error {
-        CompletionError::InvalidModel(_) | CompletionError::InvalidParams(_) => {
-            StatusCode::BAD_REQUEST
-        }
+        CompletionError::InvalidModel(_)
+        | CompletionError::InvalidParams(_)
+        | CompletionError::ContextLengthExceeded { .. } => StatusCode::BAD_REQUEST,
         CompletionError::RateLimitExceeded(_) => StatusCode::TOO_MANY_REQUESTS,
         CompletionError::ProviderError { status_code, .. } => {
             StatusCode::from_u16(*status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)

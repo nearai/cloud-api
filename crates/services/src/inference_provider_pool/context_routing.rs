@@ -60,6 +60,9 @@ use std::sync::OnceLock;
 
 use inference_providers::{ChatCompletionParams, PlacementContext};
 
+/// The `extra` key of tool definitions that typed parsing left untouched.
+const EXTRA_TOOLS_KEY: &str = "tools";
+
 /// providerConfig key holding the long-context tier declaration. Snake_case
 /// like the other `provider_config` contents (`base_url`, `model_name`).
 const LONG_CONTEXT_KEY: &str = "long_context";
@@ -136,7 +139,12 @@ pub(crate) fn estimate_input(params: &ChatCompletionParams) -> InputEstimate {
         }
     }
     if let Some(tools) = &params.tools {
-        bytes += serde_json::to_string(tools).map_or(0, |s| s.len());
+        bytes += serialized_len(tools);
+    }
+    // Tool definitions that typed parsing could not read stay in `extra` and
+    // are forwarded as is: they occupy the window too.
+    if let Some(tools) = params.extra.get(EXTRA_TOOLS_KEY) {
+        bytes += serialized_len(tools);
     }
     InputEstimate {
         countable_tokens: (bytes / 4) as u64,
@@ -183,6 +191,42 @@ pub(crate) fn exceeds_declared_capacity(
 pub(crate) fn requirement(estimate: &InputEstimate) -> u64 {
     ((estimate.countable_tokens as f64 * safety_factor()).ceil() as u64)
         .saturating_add(estimate.uncounted_tokens)
+}
+
+/// Counts the bytes a serializer writes, without keeping them.
+struct ByteCounter(usize);
+
+impl std::io::Write for ByteCounter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0 += bytes.len();
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Serialized size of `value` in bytes (0 if it cannot be serialized).
+fn serialized_len(value: &impl serde::Serialize) -> usize {
+    let mut counter = ByteCounter(0);
+    match serde_json::to_writer(&mut counter, value) {
+        Ok(()) => counter.0,
+        Err(_) => 0,
+    }
+}
+
+/// The size estimate of a System One request, whose body is opaque to
+/// routing: bytes/4 of its serialized state and questions (every byte of
+/// text counts), times the safety factor, plus the flat media cost per image
+/// asset. Same formula as [`requirement`].
+pub(crate) fn systemone_requirement(request: &inference_providers::SystemOneRequest) -> u64 {
+    let bytes = serialized_len(&request.state) + serialized_len(&request.questions);
+    let assets = request.assets.as_ref().map_or(0, |assets| assets.len()) as u64;
+    requirement(&InputEstimate {
+        countable_tokens: (bytes / 4) as u64,
+        uncounted_tokens: assets * media_part_tokens(),
+    })
 }
 
 /// The typed placement context for a chat request: its size
@@ -430,6 +474,23 @@ mod tests {
     }
 
     #[test]
+    fn tool_definitions_left_in_extra_count_toward_input_estimates() {
+        let base: ChatCompletionParams = serde_json::from_value(serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "q"}]
+        }))
+        .unwrap();
+        let mut with_raw_tools = base.clone();
+        let raw = serde_json::json!([{"type": "custom", "description": "d".repeat(4_000)}]);
+        let raw_len = serde_json::to_string(&raw).unwrap().len();
+        with_raw_tools.extra.insert("tools".to_string(), raw);
+
+        let before = estimate_input(&base);
+        let after = estimate_input(&with_raw_tools);
+        assert!(after.countable_tokens >= before.countable_tokens + (raw_len / 4) as u64);
+    }
+
+    #[test]
     fn prior_reasoning_counts_toward_input_estimates() {
         let base: ChatCompletionParams = serde_json::from_value(serde_json::json!({
             "model": "m",
@@ -447,6 +508,38 @@ mod tests {
         let after = estimate_input(&with_reasoning);
         assert_eq!(after.countable_tokens, before.countable_tokens + 1_000);
         assert_eq!(after.uncounted_tokens, before.uncounted_tokens);
+    }
+
+    #[test]
+    fn systemone_requirement_counts_text_and_a_flat_cost_per_asset() {
+        let request =
+            |state: &str, assets: serde_json::Value| -> inference_providers::SystemOneRequest {
+                let mut body = serde_json::json!({
+                    "model": "m",
+                    "state": state,
+                    "questions": {"q": {"type": "noul", "instructions": "i"}}
+                });
+                if !assets.is_null() {
+                    body["assets"] = assets;
+                }
+                serde_json::from_value(body).unwrap()
+            };
+        let small = systemone_requirement(&request("s", serde_json::Value::Null));
+        let large = systemone_requirement(&request(&"a".repeat(40_000), serde_json::Value::Null));
+        // 40_000 more bytes of text: about 10_000 more tokens before the
+        // safety factor.
+        assert!(large >= small + 10_000, "small {small}, large {large}");
+        assert!(
+            large >= (10_000.0 * safety_factor()) as u64,
+            "text is scaled by the safety factor"
+        );
+
+        // An image asset costs the flat media amount, not its base64 bytes.
+        let with_image = systemone_requirement(&request(
+            "s",
+            serde_json::json!({"img": {"format": "png", "data_base64": "A".repeat(400_000)}}),
+        ));
+        assert_eq!(with_image, small + media_part_tokens());
     }
 
     #[test]

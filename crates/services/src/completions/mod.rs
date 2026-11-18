@@ -821,6 +821,9 @@ pub struct CompletionServiceImpl {
     /// `x_placement_affinity`/`x_placement_affinity_source` extra keys are
     /// still stripped unconditionally (a deny-list). Never logged.
     affinity_secret: Option<[u8; 32]>,
+    /// Per-organization access to long-context tiers. `None` until
+    /// `with_long_context_access`: every organization may use them.
+    long_context_access: Option<Arc<crate::long_context_access::LongContextAccess>>,
 }
 
 /// TTL for organization concurrent limit cache (5 minutes)
@@ -917,6 +920,149 @@ impl CompletionServiceImpl {
             model_resolve_cache: crate::models::new_model_resolve_cache(),
             organization_limit_repository,
             affinity_secret: None,
+            long_context_access: None,
+        }
+    }
+
+    /// Apply each organization's access to long-context tiers (see
+    /// [`crate::long_context_access`]). Production wiring must call it.
+    pub fn with_long_context_access(
+        mut self,
+        access: Arc<crate::long_context_access::LongContextAccess>,
+    ) -> Self {
+        self.long_context_access = Some(access);
+        self
+    }
+
+    /// Whether `organization_id` may use the long-context tier of
+    /// `model_name` (canonical), from its access policy alone (cached per
+    /// organization). It does not depend on whether the model has a long tier
+    /// right now: a tier that appears during the request is still covered,
+    /// and the pool enforces the answer only where a tier boundary exists.
+    async fn resolve_long_context_allowed(&self, organization_id: Uuid, model_name: &str) -> bool {
+        match &self.long_context_access {
+            Some(access) => access.is_allowed(organization_id, model_name).await,
+            None => true,
+        }
+    }
+
+    /// The routing flag for a chat request, or the typed error when the
+    /// request needs more context than its organization may use. Checked
+    /// before a concurrency slot is taken or any provider is called.
+    async fn long_context_routing(
+        &self,
+        organization_id: Uuid,
+        chat_params: &inference_providers::ChatCompletionParams,
+    ) -> Result<bool, ports::CompletionError> {
+        let allowed = self
+            .resolve_long_context_allowed(organization_id, &chat_params.model)
+            .await;
+        match self
+            .inference_provider_pool
+            .long_context_limit_exceeded(chat_params, allowed)
+        {
+            None => Ok(allowed),
+            Some(limit) => {
+                // Ids, the model name and numbers only.
+                tracing::info!(
+                    %organization_id,
+                    model = %chat_params.model,
+                    limit,
+                    "Rejected a request above the organization's long-context limit"
+                );
+                let err = ports::CompletionError::ContextLengthExceeded { limit };
+                self.record_error(&err, Some(&chat_params.model));
+                Err(err)
+            }
+        }
+    }
+
+    /// [`ports::CompletionServiceTrait::check_long_context_limit`]: the size
+    /// check of [`Self::long_context_routing`] for a request that is not
+    /// dispatched yet. Builds the size-relevant parameters (messages, tools)
+    /// only for an organization that may not use the model's long tier.
+    async fn check_long_context_limit_impl(
+        &self,
+        request: &ports::CompletionRequest,
+    ) -> Result<(), ports::CompletionError> {
+        // An unknown model or a failed lookup fails here, with dispatch's
+        // error, before the caller's other paid work.
+        let model = self
+            .resolve_request_model(
+                &request.model,
+                crate::models::ModelCaller::Organization(request.organization_id),
+            )
+            .await?;
+        if self
+            .resolve_long_context_allowed(request.organization_id, &model.model_name)
+            .await
+        {
+            return Ok(());
+        }
+        // As dispatch: tool definitions that typed parsing cannot read stay
+        // in `extra`, are forwarded as is, and count toward the size.
+        let mut extra = request.extra.clone();
+        let (tools, _) = Self::extract_tools_from_extra(&mut extra);
+        let params = inference_providers::ChatCompletionParams {
+            placement: Default::default(),
+            request_priority: request.request_priority,
+            model: model.model_name.clone(),
+            messages: Self::prepare_chat_messages(&request.messages),
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            stop: None,
+            stream: None,
+            tools,
+            max_completion_tokens: None,
+            n: None,
+            frequency_penalty: None,
+            presence_penalty: None,
+            logit_bias: None,
+            logprobs: None,
+            top_logprobs: None,
+            user: None,
+            seed: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+            metadata: None,
+            store: None,
+            stream_options: None,
+            service_tier: None,
+            modalities: None,
+            original_request: None,
+            upstream_cache_salt: None,
+            extra,
+        };
+        self.long_context_routing(request.organization_id, &params)
+            .await
+            .map(|_| ())
+    }
+
+    /// Resolve the request's model for `caller`, recording and returning the
+    /// request error for an unknown model or a failed lookup.
+    async fn resolve_request_model(
+        &self,
+        requested: &str,
+        caller: crate::models::ModelCaller,
+    ) -> Result<crate::models::ModelWithPricing, ports::CompletionError> {
+        match self.resolve_model_cached(requested, caller).await {
+            Ok(Some(model)) => Ok(model),
+            Ok(None) => {
+                let err = ports::CompletionError::InvalidModel(format!(
+                    "Model '{requested}' not found. It's not a valid model name or alias."
+                ));
+                // Do not record the invalid model name in metrics to avoid high cardinality
+                self.record_error(&err, None);
+                Err(err)
+            }
+            Err(e) => {
+                let err =
+                    ports::CompletionError::InternalError(format!("Failed to resolve model: {e}"));
+                // Do not record the possibly invalid model name in metrics
+                self.record_error(&err, None);
+                Err(err)
+            }
         }
     }
 
@@ -1526,7 +1672,8 @@ impl CompletionServiceImpl {
     fn record_error(&self, error: &ports::CompletionError, model_name: Option<&str>) {
         let error_type = match error {
             ports::CompletionError::InvalidModel(_) => ERROR_TYPE_INVALID_MODEL,
-            ports::CompletionError::InvalidParams(_) => ERROR_TYPE_INVALID_PARAMS,
+            ports::CompletionError::InvalidParams(_)
+            | ports::CompletionError::ContextLengthExceeded { .. } => ERROR_TYPE_INVALID_PARAMS,
             ports::CompletionError::RateLimitExceeded(_) => ERROR_TYPE_RATE_LIMIT,
             ports::CompletionError::ProviderError { .. } => ERROR_TYPE_INFERENCE_ERROR,
             ports::CompletionError::ServiceOverloaded(_)
@@ -1759,6 +1906,18 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             .map(ports::ConcurrentRequestGuard::new)
     }
 
+    async fn long_context_allowed(&self, organization_id: Uuid, model_name: &str) -> bool {
+        self.resolve_long_context_allowed(organization_id, model_name)
+            .await
+    }
+
+    async fn check_long_context_limit(
+        &self,
+        request: &ports::CompletionRequest,
+    ) -> Result<(), ports::CompletionError> {
+        self.check_long_context_limit_impl(request).await
+    }
+
     async fn create_chat_completion_stream(
         &self,
         request: ports::CompletionRequest,
@@ -1836,31 +1995,12 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         // Resolve model name (could be an alias) and get model details in a single DB call
         // This also validates that the model exists, is active, and may be
         // used by the request's organization
-        let model = match self
-            .resolve_model_cached(
+        let model = self
+            .resolve_request_model(
                 &request.model,
                 crate::models::ModelCaller::Organization(request.organization_id),
             )
-            .await
-        {
-            Ok(Some(m)) => m,
-            Ok(None) => {
-                let err = ports::CompletionError::InvalidModel(format!(
-                    "Model '{}' not found. It's not a valid model name or alias.",
-                    request.model
-                ));
-                // Do not record the invalid model name in metrics to avoid high cardinality
-                self.record_error(&err, None);
-                return Err(err);
-            }
-            Err(e) => {
-                let err =
-                    ports::CompletionError::InternalError(format!("Failed to resolve model: {e}"));
-                // Do not record the possibly invalid model name in metrics
-                self.record_error(&err, None);
-                return Err(err);
-            }
-        };
+            .await?;
 
         model
             .validate_endpoint(crate::models::InferenceEndpoint::ChatCompletions)
@@ -1880,6 +2020,9 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             chat_params.model = canonical_name.clone();
         }
         Self::apply_deepseek_v4_flash_thinking_compat(canonical_name, &mut chat_params);
+        let long_context_allowed = self
+            .long_context_routing(organization_id, &chat_params)
+            .await?;
 
         let counter = self
             .try_acquire_concurrent_slot(organization_id, model.id, canonical_name)
@@ -1912,6 +2055,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             estimated_tokens: Some(estimate_input_tokens(&chat_params.messages)),
             fallback_disabled: !request.fallback_enabled,
             request_priority: chat_params.request_priority,
+            long_context_allowed,
         };
 
         // Get the LLM stream
@@ -2056,28 +2200,9 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         // Resolve model name (could be an alias) and get model details in a single DB call
         // This also validates that the model exists, is active, and may be
         // used by whoever chose it (see `model_caller` above)
-        let model = match self
-            .resolve_model_cached(&request.model, model_caller)
-            .await
-        {
-            Ok(Some(m)) => m,
-            Ok(None) => {
-                let err = ports::CompletionError::InvalidModel(format!(
-                    "Model '{}' not found. It's not a valid model name or alias.",
-                    request.model
-                ));
-                // Do not record the invalid model name in metrics to avoid high cardinality
-                self.record_error(&err, None);
-                return Err(err);
-            }
-            Err(e) => {
-                let err =
-                    ports::CompletionError::InternalError(format!("Failed to resolve model: {e}"));
-                // Do not record the possibly invalid model name in metrics
-                self.record_error(&err, None);
-                return Err(err);
-            }
-        };
+        let model = self
+            .resolve_request_model(&request.model, model_caller)
+            .await?;
 
         model
             .validate_endpoint(crate::models::InferenceEndpoint::ChatCompletions)
@@ -2108,6 +2233,9 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         Self::apply_deepseek_v4_flash_thinking_compat(canonical_name, &mut chat_params);
 
         let organization_id = request.organization_id;
+        let long_context_allowed = self
+            .long_context_routing(organization_id, &chat_params)
+            .await?;
         let counter = self
             .try_acquire_concurrent_slot(organization_id, model.id, canonical_name)
             .await?;
@@ -2141,6 +2269,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
                 super::inference_provider_pool::ChatRoutingHints {
                     fallback_disabled: !request.fallback_enabled,
                     request_priority,
+                    long_context_allowed,
                     ..Default::default()
                 },
             )
@@ -2612,6 +2741,9 @@ pub use ports::*;
 
 #[cfg(test)]
 mod provider_attribution_tests;
+
+#[cfg(test)]
+mod long_context_tests;
 
 #[cfg(test)]
 mod tests {

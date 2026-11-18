@@ -530,3 +530,235 @@ async fn unlisted_model_report_is_refused_like_an_unknown_model_even_when_cached
         backend_calls
     );
 }
+
+/// Blocks fake for the long-context tests: `blocked` is blocked from every
+/// model's long tier.
+struct BlockedOrganization {
+    blocked: Uuid,
+}
+
+#[async_trait]
+impl crate::long_context_access::LongContextAccessRepository for BlockedOrganization {
+    async fn blocked_model_names(&self, organization_id: Uuid) -> anyhow::Result<Vec<String>> {
+        Ok(if organization_id == self.blocked {
+            vec![MODEL.to_string()]
+        } else {
+            Vec::new()
+        })
+    }
+
+    async fn organization_settings(&self, _: Uuid) -> anyhow::Result<Option<serde_json::Value>> {
+        Ok(None)
+    }
+}
+
+/// An organization that may not use the model's long-context tier gets a
+/// report without it, and the no-nonce cache never crosses the two answers,
+/// in either order.
+#[tokio::test]
+async fn long_context_restricted_report_excludes_the_long_tier_and_is_cached_apart() {
+    use inference_providers::ProviderTier;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let blocked = Uuid::new_v4();
+    let restricted = ModelCaller::Organization(blocked);
+    let unrestricted = ModelCaller::Organization(Uuid::new_v4());
+
+    for order in [
+        [restricted, unrestricted, ModelCaller::Anonymous],
+        [unrestricted, ModelCaller::Anonymous, restricted],
+    ] {
+        let pool = Arc::new(InferenceProviderPool::new(
+            None,
+            ExternalProvidersConfig::default(),
+        ));
+        let calls = Arc::new(AtomicUsize::new(0));
+        for (fleet, capacity) in [("base", 1_000), ("long", 10_000)] {
+            let calls = calls.clone();
+            let provider = Arc::new(
+                MockProvider::new()
+                    .with_tier(ProviderTier::Near)
+                    .with_attestation_reports_handler(move |_, _, _, _, _| {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        Ok(vec![serde_json::json!({ "fleet": fleet })
+                            .as_object()
+                            .unwrap()
+                            .clone()])
+                    }),
+            );
+            pool.register_pinned_provider(
+                MODEL.to_string(),
+                provider,
+                Some(capacity),
+                crate::inference_provider_pool::ProviderPoolRole::Primary,
+            )
+            .await;
+        }
+        // The catalog row's configured tiers, as an inference-URL load records.
+        pool.record_long_context_boundaries(&[
+            (
+                MODEL.to_string(),
+                "https://base.example".to_string(),
+                Some(1_000),
+            ),
+            (
+                MODEL.to_string(),
+                "https://long.example".to_string(),
+                Some(10_000),
+            ),
+        ]);
+        let access = Arc::new(crate::long_context_access::LongContextAccess::new(
+            Arc::new(BlockedOrganization { blocked }),
+        ));
+
+        let mut service = lifecycle_service(Arc::new(RecordingRepository::default()), pool)
+            .with_long_context_access(access);
+        service.models_repository = Arc::new(SingleModelRepository);
+        service.gateway_quote_collector = Arc::new(EchoGatewayQuoteCollector);
+        service.report_cache = Some(
+            moka::future::Cache::builder()
+                .max_capacity(16)
+                .time_to_live(Duration::from_secs(60))
+                .build(),
+        );
+
+        let mut restricted_misses = 0;
+        for caller in order {
+            let before = calls.load(Ordering::SeqCst);
+            let report = service
+                .get_attestation_report(
+                    Some(MODEL.to_string()),
+                    None,
+                    None,
+                    None,
+                    false,
+                    None,
+                    caller,
+                )
+                .await
+                .expect("report");
+            let fleets: Vec<&str> = report
+                .model_attestations
+                .iter()
+                .map(|entry| entry["fleet"].as_str().unwrap())
+                .collect();
+            if caller == restricted {
+                assert_eq!(fleets, vec!["base"], "order: {order:?}");
+                restricted_misses += calls.load(Ordering::SeqCst) - before;
+            } else {
+                assert_eq!(fleets, vec!["base", "long"], "order: {order:?}");
+            }
+        }
+        // The restricted report was built for the restricted caller (one
+        // fleet collected), never taken from the shared entry.
+        assert_eq!(restricted_misses, 1, "order: {order:?}");
+        // One build for the shared entry, one for the restricted one.
+        assert_eq!(calls.load(Ordering::SeqCst), 3, "order: {order:?}");
+    }
+}
+
+/// The report cache is partitioned by the caller's access policy alone, also
+/// while the model has no long tier: when a refresh adds one, a restricted
+/// caller can never be served a report cached for an unrestricted caller.
+#[tokio::test]
+async fn long_context_report_partition_follows_the_policy_across_a_refresh() {
+    use inference_providers::ProviderTier;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let blocked = Uuid::new_v4();
+    let restricted = ModelCaller::Organization(blocked);
+    let unrestricted = ModelCaller::Organization(Uuid::new_v4());
+    let pool = Arc::new(InferenceProviderPool::new(
+        None,
+        ExternalProvidersConfig::default(),
+    ));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let fleet = |name: &'static str| {
+        let calls = calls.clone();
+        Arc::new(
+            MockProvider::new()
+                .with_tier(ProviderTier::Near)
+                .with_attestation_reports_handler(move |_, _, _, _, _| {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(vec![serde_json::json!({ "fleet": name })
+                        .as_object()
+                        .unwrap()
+                        .clone()])
+                }),
+        )
+    };
+    // Single tier: only the base fleet, no boundary.
+    pool.register_pinned_provider(
+        MODEL.to_string(),
+        fleet("base"),
+        Some(1_000),
+        crate::inference_provider_pool::ProviderPoolRole::Primary,
+    )
+    .await;
+    let access = Arc::new(crate::long_context_access::LongContextAccess::new(
+        Arc::new(BlockedOrganization { blocked }),
+    ));
+    let mut service = lifecycle_service(Arc::new(RecordingRepository::default()), pool.clone())
+        .with_long_context_access(access);
+    service.models_repository = Arc::new(SingleModelRepository);
+    service.gateway_quote_collector = Arc::new(EchoGatewayQuoteCollector);
+    service.report_cache = Some(
+        moka::future::Cache::builder()
+            .max_capacity(16)
+            .time_to_live(Duration::from_secs(60))
+            .build(),
+    );
+    let fleets = |caller: ModelCaller| {
+        let service = &service;
+        async move {
+            service
+                .get_attestation_report(
+                    Some(MODEL.to_string()),
+                    None,
+                    None,
+                    None,
+                    false,
+                    None,
+                    caller,
+                )
+                .await
+                .expect("report")
+                .model_attestations
+                .iter()
+                .map(|entry| entry["fleet"].as_str().unwrap().to_string())
+                .collect::<Vec<_>>()
+        }
+    };
+
+    // Before the refresh the restricted caller already has its own entry.
+    assert_eq!(fleets(restricted).await, vec!["base"]);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(fleets(unrestricted).await, vec!["base"]);
+    assert_eq!(calls.load(Ordering::SeqCst), 2, "separate cache entries");
+
+    // The refresh adds the long tier and its boundary. Entries cached so far
+    // never mixed the two callers; a new entry for each caller follows the
+    // policy (the unrestricted one cached first, then the restricted one).
+    pool.register_pinned_provider(
+        MODEL.to_string(),
+        fleet("long"),
+        Some(10_000),
+        crate::inference_provider_pool::ProviderPoolRole::Primary,
+    )
+    .await;
+    pool.record_long_context_boundaries(&[
+        (
+            MODEL.to_string(),
+            "https://base.example".to_string(),
+            Some(1_000),
+        ),
+        (
+            MODEL.to_string(),
+            "https://long.example".to_string(),
+            Some(10_000),
+        ),
+    ]);
+    service.report_cache.as_ref().unwrap().invalidate_all();
+    assert_eq!(fleets(unrestricted).await, vec!["base", "long"]);
+    assert_eq!(fleets(restricted).await, vec!["base"]);
+}

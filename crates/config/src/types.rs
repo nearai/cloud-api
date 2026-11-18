@@ -1140,6 +1140,13 @@ pub struct AuthConfig {
     /// outstanding legacy tokens have expired to reject any token that cannot
     /// be tied to a live session.
     pub require_session_bound_access_tokens: bool,
+    /// Accept only admin access tokens (`adm_`) on admin routes.
+    ///
+    /// Default `false`: admin routes accept a session token from an allowlisted
+    /// user or an admin access token. Set `AUTH_ADMIN_TOKENS_ONLY=true` to refuse
+    /// session tokens on admin routes with 401. An admin access token is then
+    /// also accepted only while its creator has at least one admin passkey.
+    pub admin_tokens_only: bool,
 }
 
 impl std::fmt::Debug for AuthConfig {
@@ -1152,6 +1159,7 @@ impl std::fmt::Debug for AuthConfig {
             near,
             admin_emails,
             require_session_bound_access_tokens,
+            admin_tokens_only,
         } = self;
         f.debug_struct("AuthConfig")
             .field("mock", mock)
@@ -1164,6 +1172,7 @@ impl std::fmt::Debug for AuthConfig {
                 "require_session_bound_access_tokens",
                 require_session_bound_access_tokens,
             )
+            .field("admin_tokens_only", admin_tokens_only)
             .finish()
     }
 }
@@ -1243,6 +1252,7 @@ impl AuthConfig {
                 "AUTH_REQUIRE_SESSION_BOUND_ACCESS_TOKENS",
                 false,
             )?,
+            admin_tokens_only: parse_bool_env("AUTH_ADMIN_TOKENS_ONLY", false)?,
         })
     }
 
@@ -2152,6 +2162,7 @@ mod tests {
             near: NearConfig::default(),
             admin_emails: vec!["alice@near.ai".to_string(), "bob@near.org".to_string()],
             require_session_bound_access_tokens: false,
+            admin_tokens_only: false,
         };
 
         // Explicitly allowed addresses
@@ -2257,6 +2268,7 @@ mod tests {
             near: NearConfig::default(),
             admin_emails: vec![],
             require_session_bound_access_tokens: false,
+            admin_tokens_only: false,
         };
 
         // Should return false when no admin emails configured

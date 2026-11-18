@@ -162,6 +162,8 @@ const APPROVED: &[ApprovedGroup] = &[
     ApprovedGroup { table: "organization_credit_reconciliations", columns: &["idempotency_key", "amounts", "reason", "result"], reason: "Restricted administrator accounting audit and idempotent replay data, consistent with organization limit change reasons and billing correction records; reasons may include billing/contract references" },
     ApprovedGroup { table: "admin_access_token", columns: &["token_hash", "name", "creation_reason", "revocation_reason", "user_agent", "permission"], reason: "Operational admin-token metadata; the credential itself is stored as a one-way hash" },
     ApprovedGroup { table: "admin_settings", columns: &["key", "value"], reason: "Operator-set runtime settings (tuning knobs, kill switches, public signed trust inputs); no secrets or customer data" },
+    ApprovedGroup { table: "browser_oauth_states", columns: &["state", "provider", "pkce_verifier", "frontend_callback", "frontend_state", "code_challenge", "client"], reason: "Short-lived browser OAuth handshake state required for indexed callback lookup and PKCE completion; client is a protocol enum" },
+    ApprovedGroup { table: "browser_oauth_codes", columns: &["code_hash", "code_challenge", "client", "origin"], reason: "Short-lived one-use authorization codes stored as a one-way hash, with the PKCE challenge, client enum and requesting origin needed to redeem them" },
     ApprovedGroup { table: "aml_allowlisted_accounts", columns: &["account_id", "address_type", "reason"], reason: "Queryable compliance allowlist and audit rationale" },
     ApprovedGroup { table: "aml_reports", columns: &["flow", "provider", "account_id", "address_type", "risk_level", "report_id", "reason", "result_json"], reason: "Queryable compliance evidence with access restricted to AML/admin workflows" },
     ApprovedGroup { table: "api_keys", columns: &["key_hash", "name", "key_prefix"], reason: "API credentials are one-way hashed; name and prefix are query/display metadata" },
@@ -191,7 +193,7 @@ const APPROVED: &[ApprovedGroup] = &[
     ApprovedGroup { table: "organization_service_usage_log", columns: &["allocation_policy_version"], reason: "Restricted platform-service metering and billing dimensions" },
     ApprovedGroup { table: "organization_usage_log", columns: &["request_type", "model_name", "inference_type", "provider_request_id", "stop_reason", "served_provider_tier", "served_provider_type", "billing_details", "service_tier", "context_band", "allocation_policy_version"], reason: "Restricted metering and billing dimensions" },
     ApprovedGroup { table: "organizations", columns: &["name", "description", "settings"], reason: "Organization profile and administrator-managed settings" },
-    ApprovedGroup { table: "refresh_tokens", columns: &["token_hash", "previous_token_hash", "ip_address", "user_agent"], reason: "Refresh credentials are one-way hashed; security telemetry supports session management" },
+    ApprovedGroup { table: "refresh_tokens", columns: &["token_hash", "previous_token_hash", "ip_address", "user_agent", "client"], reason: "Refresh credentials are one-way hashed; security telemetry supports session management; client is a protocol enum" },
     ApprovedGroup { table: "refinery_schema_history", columns: &["name", "applied_on", "checksum"], reason: "Database migration framework bookkeeping" },
     ApprovedGroup { table: "responses", columns: &["model", "status", "usage", "next_response_ids"], reason: "Queryable response lifecycle, routing, usage, and structural relationship data" },
     ApprovedGroup { table: "scheduled_model_pricing_changes", columns: &["model_name", "model_display_name", "status", "last_error", "cancelled_by_user_email", "created_by_user_email", "change_reason", "old_text_pricing", "new_text_pricing"], reason: "Restricted administrator pricing workflow and audit data" },
@@ -204,6 +206,8 @@ const APPROVED: &[ApprovedGroup] = &[
     ApprovedGroup { table: "usage_discount_adjustments", columns: &["original_billing_details"], reason: "Restricted immutable billing correction audit" },
     ApprovedGroup { table: "usage_hourly", columns: &["model_name", "inference_type", "served_provider_type", "served_provider_tier"], reason: "Derived hourly metering aggregate; same restricted dimensions as organization_usage_log" },
     ApprovedGroup { table: "users", columns: &["email", "username", "display_name", "avatar_url", "auth_provider", "provider_user_id", "contact_email"], reason: "Account identity and contact fields required for login, uniqueness, email delivery, and user-facing profiles" },
+    ApprovedGroup { table: "webauthn_credentials", columns: &["client", "rp_id", "enrolled_via", "passkey"], reason: "Passkey public-key credential records and relying-party identifier required for assertion verification; no private keys are stored; client and enrolment source are protocol enums" },
+    ApprovedGroup { table: "webauthn_challenges", columns: &["client", "purpose", "state"], reason: "Short-lived one-use passkey ceremony state; client and purpose are protocol enums" },
     ApprovedGroup { table: "workspaces", columns: &["name", "description", "settings"], reason: "Workspace profile and administrator-managed settings" },
 ];
 

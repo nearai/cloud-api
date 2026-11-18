@@ -536,6 +536,16 @@ pub async fn admin_middleware(
                         Err(err)
                     }
                 }
+            } else if state.admin_tokens_only {
+                debug!("Session token refused: admin access token required");
+                audit.record_credential(AdminCredentialKind::Session, None);
+                Err((
+                    StatusCode::UNAUTHORIZED,
+                    axum::Json(crate::models::ErrorResponse::new(
+                        "Admin access token required".to_string(),
+                        "unauthorized".to_string(),
+                    )),
+                ))
             } else {
                 // Not an admin access token, try as session token
                 debug!("Token does not appear to be an admin access token, trying session token");
@@ -585,6 +595,12 @@ pub async fn admin_middleware(
                 ));
             }
 
+            if let AdminAuthContext::AccessToken { token_id, .. } = context {
+                require_creator_admin_passkey(&state, user.id, token_id)
+                    .await
+                    .inspect_err(|_| audit.record_denied())?;
+            }
+
             authorize_admin_operation(context, &request).inspect_err(|_| audit.record_denied())?;
 
             debug!(admin_user_id = %user.id, authenticated = true, "Admin access granted");
@@ -627,6 +643,56 @@ fn is_admin_user(admin_emails: &[String], user: &DbUser) -> bool {
     }
 
     config::email_matches_admin_allowlist(admin_emails, &user.email)
+}
+
+/// When `admin_tokens_only` is set, an admin access token is accepted only while
+/// its creator has at least one admin passkey. Refusals use the same answers as
+/// admin access token validation.
+async fn require_creator_admin_passkey(
+    state: &AuthState,
+    creator_user_id: uuid::Uuid,
+    admin_access_token_id: uuid::Uuid,
+) -> Result<(), (StatusCode, axum::Json<crate::models::ErrorResponse>)> {
+    if !state.admin_tokens_only {
+        return Ok(());
+    }
+
+    match state
+        .admin_access_token_repository
+        .user_has_admin_passkey(creator_user_id)
+        .await
+    {
+        Ok(true) => Ok(()),
+        Ok(false) => {
+            debug!(
+                admin_user_id = %creator_user_id,
+                admin_access_token_id = %admin_access_token_id,
+                error_kind = "creator_without_admin_passkey",
+                "Admin access token refused"
+            );
+            Err((
+                StatusCode::UNAUTHORIZED,
+                axum::Json(crate::models::ErrorResponse::new(
+                    "Invalid admin access token".to_string(),
+                    "unauthorized".to_string(),
+                )),
+            ))
+        }
+        Err(_) => {
+            error!(
+                admin_access_token_id = %admin_access_token_id,
+                error_kind = "admin_passkey_lookup_failed",
+                "Failed to validate admin access token"
+            );
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(crate::models::ErrorResponse::new(
+                    "Failed to validate admin access token".to_string(),
+                    "internal_server_error".to_string(),
+                )),
+            ))
+        }
+    }
 }
 
 /// Authenticate admin access token
@@ -946,6 +1012,10 @@ pub struct AuthState {
     pub admin_access_token_repository: Arc<database::repositories::AdminAccessTokenRepository>,
     pub admin_emails: Vec<String>,
     pub encoding_key: String,
+    /// When true, admin routes accept only admin access tokens, refuse session
+    /// tokens, and require the token's creator to have an admin passkey. See
+    /// `AuthConfig::admin_tokens_only`.
+    pub admin_tokens_only: bool,
 }
 
 impl AuthState {
@@ -964,7 +1034,13 @@ impl AuthState {
             admin_access_token_repository,
             admin_emails,
             encoding_key,
+            admin_tokens_only: false,
         }
+    }
+
+    pub fn with_admin_tokens_only(mut self, admin_tokens_only: bool) -> Self {
+        self.admin_tokens_only = admin_tokens_only;
+        self
     }
 }
 

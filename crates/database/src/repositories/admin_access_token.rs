@@ -107,8 +107,9 @@ impl AdminAccessTokenRepository {
         let admin_token = Self::from_row(&row)?;
 
         debug!(
-            "Created admin access token {} for user {}",
-            name, created_by_user_id
+            token_id = %admin_token.id,
+            user_id = %created_by_user_id,
+            "Created admin access token"
         );
 
         Ok((admin_token, admin_access_token))
@@ -202,6 +203,28 @@ impl AdminAccessTokenRepository {
             }
             None => Ok(None),
         }
+    }
+
+    /// Whether the user has at least one admin passkey registered.
+    pub async fn user_has_admin_passkey(&self, user_id: Uuid) -> Result<bool> {
+        let row = retry_db!("user_has_admin_passkey", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
+
+            client
+                .query_one(
+                    "SELECT EXISTS (SELECT 1 FROM webauthn_credentials WHERE user_id = $1 AND client = 'admin')",
+                    &[&user_id],
+                )
+                .await
+                .map_err(map_db_error)
+        })?;
+
+        Ok(row.get(0))
     }
 
     /// List admin access tokens with pagination

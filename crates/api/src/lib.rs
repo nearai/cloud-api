@@ -1312,7 +1312,9 @@ pub fn build_app_with_config_and_options(
         .merge(mcp_routes)
         .merge(ohttp_root_routes);
 
-    with_app_fallbacks_and_layers(router, metrics_state, cors)
+    let admin_audit_store =
+        middleware::admin_audit_store::AdminAuditStore::from_env(database.pool());
+    with_app_fallbacks_and_layers(router, metrics_state, cors, admin_audit_store)
 }
 
 /// Wrap the assembled routes in the app-wide fallbacks and middleware.
@@ -1323,6 +1325,7 @@ fn with_app_fallbacks_and_layers(
     router: Router,
     metrics_state: middleware::MetricsState,
     cors: CorsLayer,
+    admin_audit_store: Option<middleware::admin_audit_store::AdminAuditStore>,
 ) -> Router {
     router
         // Requests matching no route (or no method on a matched route) get a
@@ -1349,6 +1352,7 @@ fn with_app_fallbacks_and_layers(
         // and unmatched admin paths: after routing (MatchedPath), outside
         // CORS, and inside request correlation, whose request id it reuses.
         .layer(from_fn(middleware::admin_audit_middleware))
+        .layer(axum::Extension(admin_audit_store))
         .layer(from_fn(middleware::request_correlation_middleware))
         // Outermost response pass: every client-facing 429 gets a
         // machine-readable Retry-After header (SDK backoff honors it).

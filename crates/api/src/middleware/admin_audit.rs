@@ -28,6 +28,7 @@
 //! dropped before a response (client disconnect) is still logged once,
 //! without `admin_status`.
 
+use super::admin_audit_store::AdminAuditStore;
 use crate::middleware::{metrics::bounded_method, RequestCorrelation};
 use axum::{
     body::Body,
@@ -36,8 +37,10 @@ use axum::{
     middleware::Next,
     response::Response,
 };
+use database::admin_audit::AdminRequest;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
+use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 /// Response header with the server-generated id of an admin request.
@@ -149,17 +152,50 @@ struct AdminAuditEvent {
     started: Instant,
     record: AdminAudit,
     status: Option<u16>,
+    store: Option<AdminAuditStore>,
 }
 
 impl AdminAuditEvent {
-    /// Record the response status; dropping `self` here emits the event.
-    fn finish(mut self, status: u16) {
+    /// Record the response status before waiting for the bounded write.
+    async fn finish(mut self, status: u16) {
         self.status = Some(status);
+        let write = self.persist();
+        drop(self);
+        if let Some(write) = write {
+            let _ = write.await;
+        }
+    }
+
+    fn persist(&mut self) -> Option<JoinHandle<()>> {
+        let store = self.store.take()?;
+        store.submit(AdminRequest {
+            request_id: self.request_id,
+            occurred_at: chrono::Utc::now(),
+            route_template: self.route.clone(),
+            method: self.method,
+            status: self.status.and_then(|status| i16::try_from(status).ok()),
+            auth_outcome: self
+                .record
+                .snapshot()
+                .outcome
+                .map_or("unknown", AuthOutcome::as_str),
+        })
+    }
+}
+
+impl AuthOutcome {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Allowed => "allowed",
+            Self::Denied => "denied",
+        }
     }
 }
 
 impl Drop for AdminAuditEvent {
     fn drop(&mut self) {
+        // When the request was cancelled, detach a bounded write with no HTTP status.
+        drop(self.persist());
         let record = self.record.snapshot();
         let allowed = record.outcome == Some(AuthOutcome::Allowed);
         let organization_id = self.route_organization_id.filter(|_| allowed);
@@ -174,11 +210,7 @@ impl Drop for AdminAuditEvent {
             admin_route = self.route.as_str(),
             admin_method = self.method,
             admin_status = self.status,
-            admin_auth_outcome = match record.outcome {
-                Some(AuthOutcome::Allowed) => "allowed",
-                Some(AuthOutcome::Denied) => "denied",
-                None => "unknown",
-            },
+            admin_auth_outcome = record.outcome.map_or("unknown", AuthOutcome::as_str),
             admin_user_id = record.user_id.map(tracing::field::display),
             admin_credential_kind = record
                 .credential_kind
@@ -218,6 +250,10 @@ pub async fn admin_audit_middleware(request: Request<Body>, next: Next) -> Respo
         started,
         record,
         status: None,
+        store: parts
+            .extensions
+            .remove::<Option<AdminAuditStore>>()
+            .flatten(),
     };
 
     let mut response = next.run(Request::from_parts(parts, body)).await;
@@ -226,7 +262,7 @@ pub async fn admin_audit_middleware(request: Request<Body>, next: Next) -> Respo
             .headers_mut()
             .insert(ADMIN_AUDIT_REQUEST_ID_HEADER, value);
     }
-    event.finish(response.status().as_u16());
+    event.finish(response.status().as_u16()).await;
     response
 }
 

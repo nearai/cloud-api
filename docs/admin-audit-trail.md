@@ -1,5 +1,14 @@
 # Admin audit trail
 
+When `ADMIN_REQUEST_AUDIT_ENABLED=true`, the audit middleware also attempts to append the server
+request ID, timestamp, route template, HTTP method, status, and authorization outcome to the
+`admin_request_audit` Postgres table. Provision the table and its insert permission before turning
+on the option. The stored row omits all caller and credential identifiers and request content.
+The response waits up to one second. The writer has four concurrent slots and a limit of 64
+pending writes.
+Unconfirmed writes increment `cloud_api_admin_audit_store_failures`. The response status is
+independent of the write result.
+
 Every request to `/v1/admin` or a path below it logs exactly one INFO event with
 `audit_event="admin_request"`: reads, writes, 401/403 denials, CORS preflights,
 unsupported methods and admin paths that match no route. A request whose client

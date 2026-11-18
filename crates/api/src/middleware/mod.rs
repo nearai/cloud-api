@@ -4,6 +4,7 @@
 // including authentication, authorization, and request processing.
 
 pub mod admin_audit;
+pub(crate) mod admin_audit_store;
 pub(crate) mod admin_policy;
 pub mod auth;
 pub mod body_hash;

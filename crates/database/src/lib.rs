@@ -1,3 +1,4 @@
+pub mod admin_audit;
 pub mod cluster_manager;
 pub mod constants;
 pub mod cp_client;

@@ -187,6 +187,14 @@ async fn probe(headers: HeaderMap) -> &'static str {
 }
 
 fn app(admin_emails: &[&str], entered_slow_handler: Arc<Notify>) -> Router {
+    app_with_store(admin_emails, entered_slow_handler, None)
+}
+
+fn app_with_store(
+    admin_emails: &[&str],
+    entered_slow_handler: Arc<Notify>,
+    store: Option<AdminAuditStore>,
+) -> Router {
     let admin_routes = Router::new()
         .route("/admin/probe", get(probe))
         .route("/admin/organizations/{org_id}", get(|| async { "ok" }))
@@ -220,11 +228,69 @@ fn app(admin_emails: &[&str], entered_slow_handler: Arc<Notify>) -> Router {
             metrics_service: Arc::new(services::metrics::MockMetricsService),
         },
         crate::build_cors_layer(config::CorsConfig::default()),
+        store,
     )
 }
 
 fn admin_app() -> Router {
     app(ADMIN_EMAILS, Arc::new(Notify::new()))
+}
+
+#[tokio::test]
+#[ignore = "requires AUDIT_TEST_DATABASE_URL and the admin audit table"]
+async fn protected_audit_matches_read_and_denial_responses() {
+    use deadpool_postgres::{Manager, Pool};
+
+    let url = std::env::var("AUDIT_TEST_DATABASE_URL").expect("local audit test database URL");
+    let writer = url.parse().expect("writer connection settings");
+    let manager = Manager::new(writer, tokio_postgres::NoTls);
+    let pool = database::DbPool::new(Pool::builder(manager).build().expect("audit pool"));
+    let reader_url = std::env::var("AUDIT_TEST_READER_URL").unwrap_or(url);
+    let (client, connection) = tokio_postgres::connect(&reader_url, tokio_postgres::NoTls)
+        .await
+        .expect("audit reader connection");
+    let _reader = tokio::spawn(connection);
+    let store = AdminAuditStore::new(pool);
+    for (emails, session, status, outcome) in [
+        (ADMIN_EMAILS, true, 200_i16, "allowed"),
+        (ADMIN_EMAILS, false, 401, "denied"),
+        (NO_ADMIN_EMAILS, true, 403, "denied"),
+    ] {
+        let app = app_with_store(emails, Arc::new(Notify::new()), Some(store.clone()));
+        let request = request(Method::GET, "/v1/admin/probe");
+        let request = if session {
+            with_session(request, Uuid::new_v4(), Some(Uuid::new_v4()))
+        } else {
+            request.body(Body::empty()).expect("request")
+        };
+        let response = app.oneshot(request).await.expect("response");
+        assert_eq!(i16::try_from(response.status().as_u16()), Ok(status));
+        let request_id = header(&response, ADMIN_AUDIT_REQUEST_ID_HEADER)
+            .parse::<Uuid>()
+            .expect("audit UUID");
+        let row = client
+            .query_one(
+                "SELECT to_jsonb(audit) - 'occurred_at' FROM admin_request_audit AS audit
+                 WHERE request_id = $1",
+                &[&request_id],
+            )
+            .await
+            .expect("one stored audit row for the response");
+        assert_eq!(
+            row.get::<_, Value>(0),
+            serde_json::json!({
+                "request_id": request_id,
+                "service": "cloud-api",
+                "route_template": "/v1/admin/probe",
+                "method": "GET",
+                "status": status,
+                "auth_outcome": outcome,
+                "page_limit": null,
+                "page_offset": null,
+                "returned_count": null,
+            })
+        );
+    }
 }
 
 fn request(method: Method, uri: &str) -> axum::http::request::Builder {

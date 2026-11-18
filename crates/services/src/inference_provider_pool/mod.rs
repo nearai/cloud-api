@@ -1041,6 +1041,11 @@ pub struct InferenceProviderPool {
     /// providers happen to be live, so it survives primary discovery failures
     /// and temporary primary-fleet disappearance.
     fallback_providers: Arc<std::sync::RwLock<HashMap<String, Vec<Arc<InferenceProviderTrait>>>>>,
+    /// Configured long-context tier boundary (base capacity) per model, from
+    /// the catalog's `long_context` expansion. Recorded on every inference-URL
+    /// load, independent of which providers are live (see
+    /// `long_context_gate`).
+    long_context_boundaries: Arc<std::sync::RwLock<HashMap<String, u32>>>,
 }
 
 /// Stable routing role assigned when an out-of-band provider is registered.
@@ -1415,6 +1420,7 @@ impl InferenceProviderPool {
                 inference_providers::DisabledSources::default(),
             )),
             fallback_providers: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            long_context_boundaries: Arc::new(std::sync::RwLock::new(HashMap::new())),
         }
     }
 
@@ -4656,8 +4662,7 @@ impl InferenceProviderPool {
         // context.
         self.apply_context_routing(&model_id, &mut params, &mut hints)
             .await;
-        self.reject_above_long_context_limit(&params, &hints)
-            .await?;
+        self.reject_above_long_context_limit(&params, &hints)?;
 
         let mut params_for_provider = params.clone();
         reinsert_pubkey_pin(&mut params_for_provider, model_pub_key_str.as_deref());
@@ -4857,8 +4862,7 @@ impl InferenceProviderPool {
         // context.
         self.apply_context_routing(&model_id, &mut params, &mut hints)
             .await;
-        self.reject_above_long_context_limit(&params, &hints)
-            .await?;
+        self.reject_above_long_context_limit(&params, &hints)?;
 
         tracing::debug!(
             model = %model_id,
@@ -4927,6 +4931,7 @@ impl InferenceProviderPool {
         fallback_disabled: bool,
         long_context_allowed: bool,
     ) -> Result<AttributedSystemOne, CompletionError> {
+        self.reject_systemone_above_long_context_limit(&request, long_context_allowed)?;
         let hints = ChatRoutingHints {
             fallback_disabled,
             long_context_allowed,
@@ -5809,6 +5814,7 @@ impl InferenceProviderPool {
         if models.is_empty() {
             return;
         }
+        self.record_long_context_boundaries(&models);
 
         let api_key = self.api_key.clone();
         let pool_load_state = self.provider_load_state.clone();

@@ -36,32 +36,53 @@ pub(in crate::attestation) fn decode_nonce_hex(nonce: &str) -> Result<Vec<u8>, A
     Ok(nonce_bytes)
 }
 
-/// Build the cache key for the no-nonce attestation-report cache.
+/// Key of the no-nonce attestation-report cache.
 ///
-/// SAFETY-CRITICAL: the nonce is deliberately NOT an input — this cache is only
+/// SAFETY-CRITICAL: the nonce is deliberately NOT a field — this cache is only
 /// ever consulted for nonce-less requests (the caller checks `nonce.is_none()`
-/// before using the returned key). Every other parameter that changes the report
-/// contents IS part of the key, so a request can never receive a report built
-/// for a different model / algo / tls-fingerprint / provider tier / signing
-/// address. `signing_algo` is the output of [`normalize_signing_algo`]. An
-/// omitted algorithm keys separately from an explicit `ed25519`: the gateway
-/// quote defaults to ed25519, but the model backend applies its own default
-/// (ecdsa on inference-proxy), so the two requests get different reports.
+/// before using the key). Every other input that changes the report contents
+/// IS a field, so a request can never receive a report built for a different
+/// model / algo / tls-fingerprint / provider tier / signing address / policy.
+/// Each input is its own typed field: no caller-supplied value (the signing
+/// address is not validated) can spell another caller's key.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(in crate::attestation) struct ReportCacheKey {
+    model: Option<String>,
+    /// The output of [`normalize_signing_algo`]. An omitted algorithm keys
+    /// separately from an explicit `ed25519`: the gateway quote defaults to
+    /// ed25519, but the model backend applies its own default (ecdsa on
+    /// inference-proxy), so the two requests get different reports.
+    signing_algo: Option<String>,
+    include_tls_fingerprint: bool,
+    provider_filter: Option<ProviderFilter>,
+    signing_address: Option<String>,
+    /// The live `attested_3p` kill-switch policy: a cache hit skips the build
+    /// (and the pool's disabled-source filter), so a report cached before a
+    /// source was disabled must not be reachable once the policy changes.
+    disabled_sources: Vec<inference_providers::ProviderSource>,
+    /// The caller may not use the model's long-context tier, so its report
+    /// leaves that tier out.
+    long_context_restricted: bool,
+}
+
+/// The cache key for the request parameters, with no source disabled and no
+/// long-context restriction.
 fn report_cache_key(
     model: Option<&str>,
     signing_algo: Option<&str>,
     include_tls_fingerprint: bool,
     provider_filter: Option<ProviderFilter>,
     signing_address: Option<&str>,
-) -> String {
-    format!(
-        "m={}|a={}|tls={}|pf={}|sa={}",
-        model.unwrap_or("*"),
-        signing_algo.unwrap_or("-"),
+) -> ReportCacheKey {
+    ReportCacheKey {
+        model: model.map(str::to_string),
+        signing_algo: signing_algo.map(str::to_string),
         include_tls_fingerprint,
-        provider_filter.map(ProviderFilter::as_str).unwrap_or("-"),
-        signing_address.unwrap_or("-"),
-    )
+        provider_filter,
+        signing_address: signing_address.map(str::to_string),
+        disabled_sources: Vec::new(),
+        long_context_restricted: false,
+    }
 }
 
 /// Gateway quote algorithm when the caller does not choose one.
@@ -131,13 +152,12 @@ impl AttestationService {
 
         // An organization that may not use the model's long-context tier gets
         // a report without it. Decided before the cache lookup, like the
-        // model resolution above, and keyed below only when it restricts the
-        // report, so every other caller keeps sharing cache entries.
+        // model resolution above; only such callers get a separate key, so
+        // every other caller keeps sharing cache entries.
         let long_context_allowed = match (&resolved_canonical, caller, &self.long_context_access) {
             (Some(canonical), ModelCaller::Organization(organization_id), Some(access)) => {
                 self.inference_provider_pool
                     .long_context_base_capacity(canonical)
-                    .await
                     .is_none()
                     || access.is_allowed(organization_id, canonical).await
             }
@@ -145,30 +165,24 @@ impl AttestationService {
         };
 
         // Precompute the no-nonce cache key BEFORE the params are moved into the
-        // build closure below.
-        let cache_key = format!(
-            "{}{}|off={}",
-            report_cache_key(
+        // build closure below. The live kill-switch policy applies on this
+        // instance immediately, for filtered and unfiltered requests.
+        let cache_key = ReportCacheKey {
+            disabled_sources: self
+                .inference_provider_pool
+                .attested_3p_disabled()
+                .load()
+                .iter()
+                .collect(),
+            long_context_restricted: !long_context_allowed,
+            ..report_cache_key(
                 model.as_deref(),
                 signing_algo.as_deref(),
                 include_tls_fingerprint,
                 provider_filter,
                 signing_address.as_deref(),
-            ),
-            if long_context_allowed { "" } else { "|lc=base" },
-            // The live `attested_3p` kill-switch policy is part of the key: a
-            // cache hit skips the build (and the pool's disabled-source
-            // filter), so a report cached before a source was disabled must
-            // not be reachable once the policy changes. Applies on this
-            // instance immediately, for filtered and unfiltered requests.
-            self.inference_provider_pool
-                .attested_3p_disabled()
-                .load()
-                .iter()
-                .map(inference_providers::ProviderSource::as_str)
-                .collect::<Vec<_>>()
-                .join(","),
-        );
+            )
+        };
 
         // The full (expensive) report build. `nonce` is the closure parameter so
         // the body below is unchanged. Called exactly once per request: the
@@ -338,7 +352,7 @@ impl AttestationService {
 
 #[cfg(test)]
 mod cache_key_tests {
-    use super::{normalize_signing_algo, report_cache_key};
+    use super::{normalize_signing_algo, report_cache_key, ReportCacheKey};
     use crate::attestation::AttestationError;
     use inference_providers::{ProviderFilter, ProviderSource};
 
@@ -359,8 +373,9 @@ mod cache_key_tests {
             None,
         );
         let n = report_cache_key(Some("m"), None, false, Some(ProviderFilter::Near), None);
-        assert!(c.contains("pf=chutes") && t.contains("pf=tinfoil") && n.contains("pf=near"));
         assert_ne!(c, t);
+        assert_ne!(c, n);
+        assert_ne!(t, n);
     }
 
     #[test]
@@ -460,12 +475,33 @@ mod cache_key_tests {
 
     #[test]
     fn none_model_is_distinct_from_wildcard_literal() {
-        // A request for all models (None) keys on "*"; a model literally named
-        // "*" is not a realistic catalog entry, so this is acceptable and just
-        // documents the sentinel.
-        assert_eq!(
+        // Typed fields: a request for all models (None) no longer shares a key
+        // with a model literally named "*".
+        assert_ne!(
             report_cache_key(None, Some("ecdsa"), false, None, None),
             report_cache_key(Some("*"), Some("ecdsa"), false, None, None),
+        );
+    }
+
+    #[test]
+    fn a_crafted_signing_address_cannot_spell_a_policy_field() {
+        let restricted = ReportCacheKey {
+            long_context_restricted: true,
+            ..report_cache_key(Some("m"), None, false, None, Some("0xabc"))
+        };
+        // The marker the previous string key appended after the address.
+        let crafted = report_cache_key(Some("m"), None, false, None, Some("0xabc|lc=base"));
+        assert_ne!(restricted, crafted);
+
+        let disabled = ReportCacheKey {
+            disabled_sources: vec![ProviderSource::Chutes],
+            ..report_cache_key(Some("m"), None, false, None, Some("0xabc"))
+        };
+        let crafted = report_cache_key(Some("m"), None, false, None, Some("0xabc|off=chutes"));
+        assert_ne!(disabled, crafted);
+        assert_ne!(
+            restricted,
+            report_cache_key(Some("m"), None, false, None, Some("0xabc"))
         );
     }
 }

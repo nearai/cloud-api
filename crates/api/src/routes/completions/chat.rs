@@ -340,6 +340,24 @@ pub(super) async fn chat_completions_inner(
     let rewrite_public_stream_usage = usage_mode.rewrite_public_stream_usage;
     let strip_intermediate_usage = usage_mode.strip_intermediate_usage;
 
+    // The redaction classifier below is a paid inference call: refuse a
+    // request above the organization's long-context limit before it runs.
+    // Dispatch checks again on the redacted request.
+    if auto_redact_requested(&headers, &service_request) {
+        if let Err(domain_error) = app_state
+            .completion_service
+            .check_long_context_limit(&service_request)
+            .await
+        {
+            let status_code = map_domain_error_to_status(&domain_error);
+            return (
+                status_code,
+                ResponseJson::<ErrorResponse>(domain_error.into()),
+            )
+                .into_response();
+        }
+    }
+
     // Auto-redact (opt-in via x-auto-redact header or auto_redact body field).
     // On success this may rewrite service_request.messages to substitute
     // placeholders for PII; the returned map drives the response un-redact.

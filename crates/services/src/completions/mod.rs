@@ -944,7 +944,6 @@ impl CompletionServiceImpl {
         if self
             .inference_provider_pool
             .long_context_base_capacity(model_name)
-            .await
             .is_none()
         {
             return true;
@@ -966,7 +965,6 @@ impl CompletionServiceImpl {
         match self
             .inference_provider_pool
             .long_context_limit_exceeded(chat_params, allowed)
-            .await
         {
             None => Ok(allowed),
             Some(limit) => {
@@ -982,6 +980,68 @@ impl CompletionServiceImpl {
                 Err(err)
             }
         }
+    }
+
+    /// [`ports::CompletionServiceTrait::check_long_context_limit`]: the size
+    /// check of [`Self::long_context_routing`] for a request that is not
+    /// dispatched yet. Builds the size-relevant parameters (messages, tools)
+    /// only for an organization that may not use the model's long tier.
+    async fn check_long_context_limit_impl(
+        &self,
+        request: &ports::CompletionRequest,
+    ) -> Result<(), ports::CompletionError> {
+        // An unknown model, or a failed lookup, is reported by dispatch.
+        let Ok(Some(model)) = self
+            .resolve_model_cached(
+                &request.model,
+                crate::models::ModelCaller::Organization(request.organization_id),
+            )
+            .await
+        else {
+            return Ok(());
+        };
+        if self
+            .resolve_long_context_allowed(request.organization_id, &model.model_name)
+            .await
+        {
+            return Ok(());
+        }
+        let mut extra = request.extra.clone();
+        let (tools, _) = Self::extract_tools_from_extra(&mut extra);
+        let params = inference_providers::ChatCompletionParams {
+            placement: Default::default(),
+            request_priority: request.request_priority,
+            model: model.model_name.clone(),
+            messages: Self::prepare_chat_messages(&request.messages),
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            stop: None,
+            stream: None,
+            tools,
+            max_completion_tokens: None,
+            n: None,
+            frequency_penalty: None,
+            presence_penalty: None,
+            logit_bias: None,
+            logprobs: None,
+            top_logprobs: None,
+            user: None,
+            seed: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+            metadata: None,
+            store: None,
+            stream_options: None,
+            service_tier: None,
+            modalities: None,
+            original_request: None,
+            upstream_cache_salt: None,
+            extra: std::collections::HashMap::new(),
+        };
+        self.long_context_routing(request.organization_id, &params)
+            .await
+            .map(|_| ())
     }
 
     /// Share the model-resolve cache owned by `ModelsServiceImpl` so its
@@ -1827,6 +1887,13 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
     async fn long_context_allowed(&self, organization_id: Uuid, model_name: &str) -> bool {
         self.resolve_long_context_allowed(organization_id, model_name)
             .await
+    }
+
+    async fn check_long_context_limit(
+        &self,
+        request: &ports::CompletionRequest,
+    ) -> Result<(), ports::CompletionError> {
+        self.check_long_context_limit_impl(request).await
     }
 
     async fn create_chat_completion_stream(

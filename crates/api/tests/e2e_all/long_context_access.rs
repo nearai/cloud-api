@@ -201,6 +201,52 @@ async fn e2e_org_switch_caps_requests_at_the_base_tier() {
     assert_eq!(completions_hits(&long).await, 1);
 }
 
+/// With auto-redact on, an oversized request is refused before the paid
+/// redaction classifier runs: the classifier is set to fail, and the client
+/// still gets the long-context 400, not the classifier's 503.
+#[tokio::test]
+async fn e2e_oversized_request_is_refused_before_auto_redact_runs() {
+    let (server, _pool, mock, database) = setup_test_server_with_pool().await;
+    let (base, long) = (MockServer::start().await, MockServer::start().await);
+    let model = setup_tiered_model(&server, &base.uri(), &long.uri()).await;
+    mount_tier(&base, &model, "base").await;
+    mount_tier(&long, &model, "long").await;
+    mock.set_privacy_classify_override(Some(
+        inference_providers::mock::PrivacyClassifyOverride::Overloaded {
+            retry_after_secs: Some(1),
+        },
+    ))
+    .await;
+    let (_, capped) = org_with_key(&server, &database, Some(serde_json::json!([model]))).await;
+
+    let resp = server
+        .post("/v1/chat/completions")
+        .add_header("Authorization", format!("Bearer {capped}"))
+        .add_header("x-auto-redact", "true")
+        .json(&serde_json::json!({
+            "model": model,
+            "messages": [{"role": "user", "content": "a".repeat(OVERSIZED_BYTES)}],
+            "max_tokens": 10
+        }))
+        .await;
+    assert_context_length_exceeded(&resp);
+
+    // Control: a request that fits reaches the (failing) classifier.
+    let resp = server
+        .post("/v1/chat/completions")
+        .add_header("Authorization", format!("Bearer {capped}"))
+        .add_header("x-auto-redact", "true")
+        .json(&serde_json::json!({
+            "model": model,
+            "messages": [{"role": "user", "content": "Hi"}],
+            "max_tokens": 10
+        }))
+        .await;
+    assert_eq!(resp.status_code(), 503, "body: {}", resp.text());
+    assert_eq!(completions_hits(&base).await, 0);
+    assert_eq!(completions_hits(&long).await, 0);
+}
+
 /// A malformed stored setting turns the long tier off for every model.
 #[tokio::test]
 async fn e2e_malformed_org_switch_fails_closed() {

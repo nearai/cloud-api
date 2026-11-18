@@ -54,7 +54,9 @@ impl LongContextAccessRepository for Fake {
 }
 
 fn access(repository: Arc<Fake>, ttl: Duration) -> LongContextAccess {
-    LongContextAccess::with_timing(repository, ttl, Duration::from_millis(200))
+    // The short cold-fallback TTL is long here so only the tests about it
+    // see it expire.
+    LongContextAccess::with_timing(repository, ttl, ttl, Duration::from_millis(200))
 }
 
 /// Long enough for a 50 ms policy entry to expire.
@@ -134,8 +136,8 @@ async fn a_failed_read_without_a_previous_value_allows_and_is_cached() {
     let org = Uuid::new_v4();
 
     assert!(access.is_allowed(org, MODEL).await);
-    // The degraded answer is reused for the TTL: a failing read runs once
-    // per organization per TTL.
+    // The degraded answer is reused for its window: a failing read runs once
+    // per organization per window.
     assert!(access.is_allowed(org, MODEL).await);
     assert_eq!(repository.block_reads.load(Ordering::SeqCst), 1);
 }
@@ -229,4 +231,71 @@ async fn a_slow_read_times_out_and_allows() {
     let started = std::time::Instant::now();
     assert!(access.is_allowed(Uuid::new_v4(), MODEL).await);
     assert!(started.elapsed() < Duration::from_secs(2));
+}
+
+/// A read that fails with no last good value falls back to "allowed" for
+/// the short cold-fallback TTL only; a fallback that uses a last good value
+/// keeps the full TTL.
+#[tokio::test]
+async fn a_cold_fallback_is_cached_briefly_and_a_warm_one_for_the_full_ttl() {
+    let cold_ttl = Duration::from_millis(50);
+    let ttl = Duration::from_secs(1);
+
+    // Cold: no previous value.
+    let repository = Fake::new(&[MODEL], serde_json::json!({}));
+    repository.blocks_fail.store(true, Ordering::SeqCst);
+    let cold = LongContextAccess::with_timing(
+        repository.clone(),
+        ttl,
+        cold_ttl,
+        Duration::from_millis(200),
+    );
+    let org = Uuid::new_v4();
+    assert!(cold.is_allowed(org, MODEL).await);
+    assert!(cold.is_allowed(org, MODEL).await);
+    assert_eq!(repository.block_reads.load(Ordering::SeqCst), 1);
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    // The read works again: the block applies after the short window, long
+    // before the full TTL.
+    repository.blocks_fail.store(false, Ordering::SeqCst);
+    assert!(!cold.is_allowed(org, MODEL).await);
+    assert_eq!(repository.block_reads.load(Ordering::SeqCst), 2);
+
+    // Warm: the fallback uses the last good value and keeps the full TTL.
+    let repository = Fake::new(&[MODEL], serde_json::json!({}));
+    let warm = LongContextAccess::with_timing(
+        repository.clone(),
+        ttl,
+        cold_ttl,
+        Duration::from_millis(200),
+    );
+    let org = Uuid::new_v4();
+    assert!(!warm.is_allowed(org, MODEL).await);
+    tokio::time::sleep(ttl + Duration::from_millis(100)).await;
+    repository.blocks_fail.store(true, Ordering::SeqCst);
+    assert!(!warm.is_allowed(org, MODEL).await);
+    assert_eq!(repository.block_reads.load(Ordering::SeqCst), 2);
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert!(!warm.is_allowed(org, MODEL).await);
+    assert_eq!(
+        repository.block_reads.load(Ordering::SeqCst),
+        2,
+        "a fallback with a last good value is reused for the full TTL"
+    );
+}
+
+/// Concurrent requests of one organization share one load, also when the
+/// read fails.
+#[tokio::test]
+async fn concurrent_misses_share_one_failing_read() {
+    let repository = Arc::new(Fake {
+        blocks_delay: Some(Duration::from_millis(50)),
+        ..Default::default()
+    });
+    repository.blocks_fail.store(true, Ordering::SeqCst);
+    let access = access(repository.clone(), Duration::from_secs(30));
+    let org = Uuid::new_v4();
+    let answers = futures::future::join_all((0..16).map(|_| access.is_allowed(org, MODEL))).await;
+    assert!(answers.into_iter().all(|allowed| allowed));
+    assert_eq!(repository.block_reads.load(Ordering::SeqCst), 1);
 }

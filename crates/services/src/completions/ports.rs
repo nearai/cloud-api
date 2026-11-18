@@ -203,6 +203,15 @@ pub trait CompletionServiceTrait: Send + Sync {
     /// own routing hints. Always `true` for a model without such a tier.
     async fn long_context_allowed(&self, organization_id: Uuid, model_name: &str) -> bool;
 
+    /// Fail with [`CompletionError::ContextLengthExceeded`] when `request`
+    /// needs more context than its organization may use on the model, for a
+    /// route that does other paid work before dispatch. Dispatch checks
+    /// again; an unknown model passes here and is reported there.
+    async fn check_long_context_limit(
+        &self,
+        request: &CompletionRequest,
+    ) -> Result<(), CompletionError>;
+
     /// Create a streaming completion
     async fn create_chat_completion_stream(
         &self,

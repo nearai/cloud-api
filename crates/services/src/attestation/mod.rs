@@ -91,7 +91,8 @@ pub struct AttestationService {
     /// because the nonce is cryptographically bound into the TDX report_data and
     /// the GPU evidence — serving a cached report for a different nonce would
     /// defeat the freshness/replay guarantee.
-    report_cache: Option<moka::future::Cache<String, Arc<models::AttestationReport>>>,
+    report_cache:
+        Option<moka::future::Cache<report::ReportCacheKey, Arc<models::AttestationReport>>>,
     /// Per-organization access to long-context tiers: a report for an
     /// organization that may not use a model's long tier leaves that tier
     /// out. `None` until `with_long_context_access`: nobody is restricted.

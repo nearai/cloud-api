@@ -15,9 +15,10 @@
 //! per organization for [`POLICY_TTL`]: a change applies within that time.
 //! Each input falls back on its own: a failed or timed-out read keeps the
 //! last value of that input read successfully for that organization, or else
-//! its default (nothing blocked, nothing turned off). A degraded answer is
-//! cached for the TTL like any other, so a failing read runs at most once per
-//! organization per TTL.
+//! its default (nothing blocked, nothing turned off). An answer that fell
+//! back to a default is cached for [`COLD_FALLBACK_TTL`] only; every other
+//! answer for [`POLICY_TTL`]. One load runs per organization at a time, so a
+//! failing database sees at most one read per organization per window.
 //!
 //! [`Organization::long_context_disabled_models`]: crate::organization::Organization::long_context_disabled_models
 
@@ -35,6 +36,9 @@ pub use ports::LongContextAccessRepository;
 
 /// How long one organization's answer is reused.
 const POLICY_TTL: Duration = Duration::from_secs(30);
+/// How long an answer is reused when a read failed and that input had no
+/// last good value (it fell back to the default).
+const COLD_FALLBACK_TTL: Duration = Duration::from_secs(2);
 /// How long the last successful read of each input is kept as the fallback
 /// for a failed one.
 const LAST_GOOD_TTL: Duration = Duration::from_secs(24 * 60 * 60);
@@ -50,6 +54,30 @@ struct OrganizationPolicy {
     blocked: Arc<HashSet<String>>,
     /// What the organization turned off itself.
     disabled: Arc<LongContextDisabledModels>,
+    /// A read failed and that input fell back to its default.
+    cold_fallback: bool,
+}
+
+/// Expiry of a cached answer: [`COLD_FALLBACK_TTL`]-like for a cold
+/// fallback, [`POLICY_TTL`]-like otherwise.
+struct PolicyExpiry {
+    ttl: Duration,
+    cold_fallback_ttl: Duration,
+}
+
+impl moka::Expiry<Uuid, Arc<OrganizationPolicy>> for PolicyExpiry {
+    fn expire_after_create(
+        &self,
+        _organization_id: &Uuid,
+        policy: &Arc<OrganizationPolicy>,
+        _created_at: std::time::Instant,
+    ) -> Option<Duration> {
+        Some(if policy.cold_fallback {
+            self.cold_fallback_ttl
+        } else {
+            self.ttl
+        })
+    }
 }
 
 impl OrganizationPolicy {
@@ -88,19 +116,23 @@ pub struct LongContextAccess {
 
 impl LongContextAccess {
     pub fn new(repository: Arc<dyn LongContextAccessRepository>) -> Self {
-        Self::with_timing(repository, POLICY_TTL, LOAD_TIMEOUT)
+        Self::with_timing(repository, POLICY_TTL, COLD_FALLBACK_TTL, LOAD_TIMEOUT)
     }
 
     fn with_timing(
         repository: Arc<dyn LongContextAccessRepository>,
         policy_ttl: Duration,
+        cold_fallback_ttl: Duration,
         load_timeout: Duration,
     ) -> Self {
         Self {
             repository,
             policies: Cache::builder()
                 .max_capacity(CACHE_CAPACITY)
-                .time_to_live(policy_ttl)
+                .expire_after(PolicyExpiry {
+                    ttl: policy_ttl,
+                    cold_fallback_ttl,
+                })
                 .build(),
             last_blocked: last_good(),
             last_disabled: last_good(),
@@ -132,6 +164,7 @@ impl LongContextAccess {
             ),
         );
 
+        let mut cold_fallback = false;
         let blocked = match read_outcome(blocked) {
             Ok(names) => {
                 let blocked = Arc::new(names.into_iter().collect::<HashSet<_>>());
@@ -149,7 +182,10 @@ impl LongContextAccess {
                 self.last_blocked
                     .get(&organization_id)
                     .await
-                    .unwrap_or_default()
+                    .unwrap_or_else(|| {
+                        cold_fallback = true;
+                        Arc::default()
+                    })
             }
         };
 
@@ -173,11 +209,18 @@ impl LongContextAccess {
                 self.last_disabled
                     .get(&organization_id)
                     .await
-                    .unwrap_or_default()
+                    .unwrap_or_else(|| {
+                        cold_fallback = true;
+                        Arc::default()
+                    })
             }
         };
 
-        Arc::new(OrganizationPolicy { blocked, disabled })
+        Arc::new(OrganizationPolicy {
+            blocked,
+            disabled,
+            cold_fallback,
+        })
     }
 }
 

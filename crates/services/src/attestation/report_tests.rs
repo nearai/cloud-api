@@ -594,6 +594,19 @@ async fn long_context_restricted_report_excludes_the_long_tier_and_is_cached_apa
             )
             .await;
         }
+        // The catalog row's configured tiers, as an inference-URL load records.
+        pool.record_long_context_boundaries(&[
+            (
+                MODEL.to_string(),
+                "https://base.example".to_string(),
+                Some(1_000),
+            ),
+            (
+                MODEL.to_string(),
+                "https://long.example".to_string(),
+                Some(10_000),
+            ),
+        ]);
         let access = Arc::new(crate::long_context_access::LongContextAccess::new(
             Arc::new(BlockedOrganization { blocked }),
         ));

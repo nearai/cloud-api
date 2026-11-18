@@ -61,6 +61,19 @@ async fn fixture(tiered: bool) -> Fixture {
     let mut fleets = vec![(long.clone(), 10_000)];
     if tiered {
         fleets.push((base.clone(), 1_000));
+        // The catalog row's configured tiers, as an inference-URL load records.
+        pool.record_long_context_boundaries(&[
+            (
+                MODEL.to_string(),
+                "https://base.example".to_string(),
+                Some(1_000),
+            ),
+            (
+                MODEL.to_string(),
+                "https://long.example".to_string(),
+                Some(10_000),
+            ),
+        ]);
     }
     for (provider, capacity) in fleets {
         pool.register_pinned_provider(

@@ -72,6 +72,23 @@ async fn register(
     }
 }
 
+/// Record `model`'s configured tiers (base `BASE_CAPACITY`, long
+/// `LONG_CAPACITY`), as an inference-URL load of its catalog row does.
+fn configure_tiers(pool: &InferenceProviderPool, model: &str) {
+    pool.record_long_context_boundaries(&[
+        (
+            model.to_string(),
+            "https://base.example".to_string(),
+            Some(BASE_CAPACITY),
+        ),
+        (
+            model.to_string(),
+            "https://long.example".to_string(),
+            Some(LONG_CAPACITY),
+        ),
+    ]);
+}
+
 /// A model with a base tier, a long tier and an attested third-party
 /// fallback whose window matches the long tier.
 async fn tiered_pool() -> (
@@ -94,6 +111,7 @@ async fn tiered_pool() -> (
         ],
     )
     .await;
+    configure_tiers(&pool, MODEL);
     (pool, base, long, fallback)
 }
 
@@ -137,19 +155,14 @@ async fn oversized_restricted_request_is_rejected_before_any_provider_call() {
 
     // The typed pre-check agrees.
     assert_eq!(
-        pool.long_context_limit_exceeded(&oversized(MODEL), false)
-            .await,
+        pool.long_context_limit_exceeded(&oversized(MODEL), false),
         Some(BASE_CAPACITY)
     );
     assert_eq!(
-        pool.long_context_limit_exceeded(&oversized(MODEL), true)
-            .await,
+        pool.long_context_limit_exceeded(&oversized(MODEL), true),
         None
     );
-    assert_eq!(
-        pool.long_context_limit_exceeded(&small(MODEL), false).await,
-        None
-    );
+    assert_eq!(pool.long_context_limit_exceeded(&small(MODEL), false), None);
 }
 
 #[tokio::test]
@@ -247,6 +260,7 @@ async fn context_length_400_never_falls_through_to_the_long_tier_when_restricted
             &[(&base, Some(BASE_CAPACITY)), (&long, Some(LONG_CAPACITY))],
         )
         .await;
+        configure_tiers(&pool, MODEL);
         base.set_error_override(Some(CompletionError::HttpError {
             status_code: 400,
             message: "This model's maximum context length is 1000 tokens.".to_string(),
@@ -292,10 +306,9 @@ async fn restricted_flag_does_not_change_a_single_tier_model() {
     )
     .await;
 
-    assert_eq!(pool.long_context_base_capacity(MODEL).await, None);
+    assert_eq!(pool.long_context_base_capacity(MODEL), None);
     assert_eq!(
-        pool.long_context_limit_exceeded(&oversized(MODEL), false)
-            .await,
+        pool.long_context_limit_exceeded(&oversized(MODEL), false),
         None
     );
 
@@ -315,10 +328,7 @@ async fn restricted_flag_does_not_change_a_single_tier_model() {
 #[tokio::test]
 async fn restricted_candidates_exclude_only_the_long_tier() {
     let (pool, base, long, fallback) = tiered_pool().await;
-    assert_eq!(
-        pool.long_context_base_capacity(MODEL).await,
-        Some(BASE_CAPACITY)
-    );
+    assert_eq!(pool.long_context_base_capacity(MODEL), Some(BASE_CAPACITY));
 
     let ptr = |provider: &Arc<InferenceProviderTrait>| Arc::as_ptr(provider) as *const () as usize;
     let mock_ptr = |provider: &Arc<MockProvider>| Arc::as_ptr(provider) as *const () as usize;
@@ -388,6 +398,7 @@ async fn restricted_attestation_report_leaves_out_the_long_tier() {
         &[(&base, Some(BASE_CAPACITY)), (&long, Some(LONG_CAPACITY))],
     )
     .await;
+    configure_tiers(&pool, MODEL);
 
     let fleets = |reports: Vec<serde_json::Map<String, serde_json::Value>>| -> Vec<String> {
         reports
@@ -438,6 +449,7 @@ async fn systemone_never_reaches_the_long_tier_when_restricted() {
             &[(&base, Some(BASE_CAPACITY)), (&long, Some(LONG_CAPACITY))],
         )
         .await;
+        configure_tiers(&pool, MODEL);
         let request = serde_json::from_value(serde_json::json!({
             "model": MODEL,
             "state": {"message": "m"},
@@ -457,4 +469,143 @@ async fn systemone_never_reaches_the_long_tier_when_restricted() {
             "long_context_allowed: {long_context_allowed}"
         );
     }
+}
+
+/// The boundary comes from the configured tiers, not from the providers that
+/// are registered: with the base fleet gone, a restricted organization gets
+/// no provider (never the long one), and its attestation report has no
+/// fleet from the long tier.
+#[tokio::test]
+async fn evicted_base_tier_never_exposes_the_long_tier() {
+    let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+    let long = Arc::new(
+        MockProvider::new_accept_all()
+            .with_tier(ProviderTier::Near)
+            .with_attestation_reports_handler(|_, _, _, _, _| {
+                let mut report = serde_json::Map::new();
+                report.insert("fleet".to_string(), serde_json::json!("long"));
+                Ok(vec![report])
+            }),
+    );
+    configure_tiers(&pool, MODEL);
+    // Only the long provider is registered.
+    register(&pool, MODEL, &[(&long, Some(LONG_CAPACITY))]).await;
+
+    assert_eq!(pool.long_context_base_capacity(MODEL), Some(BASE_CAPACITY));
+    assert_eq!(
+        pool.get_providers_with_fallback(MODEL, None, &restricted())
+            .await
+            .map(|providers| providers.len()),
+        Some(0)
+    );
+    assert!(pool
+        .chat_completion_with_attribution_and_hints(small(MODEL), "h1".into(), restricted())
+        .await
+        .is_err());
+    assert!(pool
+        .chat_completion_stream(small(MODEL), "h2".into(), restricted())
+        .await
+        .is_err());
+    assert!(matches!(
+        pool.chat_completion_with_attribution_and_hints(
+            oversized(MODEL),
+            "h3".into(),
+            restricted()
+        )
+        .await,
+        Err(CompletionError::HttpError {
+            status_code: 400,
+            ..
+        })
+    ));
+    assert_eq!(long.chat_completion_call_count(), 0);
+    assert!(pool
+        .get_attestation_report(MODEL.into(), None, None, None, false, None, false)
+        .await
+        .is_err());
+
+    // Unrestricted organizations still reach it.
+    served_by(
+        &pool
+            .chat_completion_with_attribution_and_hints(
+                small(MODEL),
+                "h4".into(),
+                ChatRoutingHints::default(),
+            )
+            .await,
+    )
+    .unwrap();
+    assert_eq!(long.chat_completion_call_count(), 1);
+}
+
+/// An oversized System One request of a restricted organization is refused
+/// before any provider call, like a chat request.
+#[tokio::test]
+async fn oversized_systemone_request_is_rejected_when_restricted() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let tier = || {
+        let calls = calls.clone();
+        Arc::new(
+            MockProvider::new_accept_all()
+                .with_tier(ProviderTier::Near)
+                .with_systemone_handler(move |_, _| {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Err(CompletionError::HttpError {
+                        status_code: 503,
+                        message: "unused".to_string(),
+                        is_external: false,
+                    })
+                }),
+        )
+    };
+    let (base, long) = (tier(), tier());
+    register(
+        &pool,
+        MODEL,
+        &[(&base, Some(BASE_CAPACITY)), (&long, Some(LONG_CAPACITY))],
+    )
+    .await;
+    configure_tiers(&pool, MODEL);
+    let request = |state: String| -> inference_providers::SystemOneRequest {
+        serde_json::from_value(serde_json::json!({
+            "model": MODEL,
+            "state": state,
+            "questions": {"q": {"type": "noul", "instructions": "i"}}
+        }))
+        .unwrap()
+    };
+
+    let oversized = request("a".repeat(20_000));
+    assert_eq!(
+        pool.systemone_long_context_limit_exceeded(&oversized, false),
+        Some(BASE_CAPACITY)
+    );
+    assert_eq!(
+        pool.systemone_long_context_limit_exceeded(&oversized, true),
+        None
+    );
+    assert_eq!(
+        pool.systemone_long_context_limit_exceeded(&request("s".into()), false),
+        None
+    );
+
+    match pool
+        .systemone_with_attribution(oversized, "h".into(), None, false, false)
+        .await
+    {
+        Err(CompletionError::HttpError {
+            status_code,
+            message,
+            ..
+        }) => {
+            assert_eq!(status_code, 400);
+            assert_eq!(message, super::long_context_limit_message(BASE_CAPACITY));
+        }
+        Err(other) => panic!("expected a 400, got: {other}"),
+        Ok(_) => panic!("the request must be rejected"),
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
 }

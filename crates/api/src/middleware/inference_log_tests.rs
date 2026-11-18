@@ -6,8 +6,8 @@ use axum::{
     routing::post,
     Router,
 };
-use chrono::Utc;
 use futures::StreamExt;
+use jiff::Timestamp;
 use services::models::{ModelInfo, ModelWithPricing, ModelsError};
 use services::organization::{Organization, OrganizationId};
 use services::workspace::{ApiKey, ApiKeyId, Workspace, WorkspaceId};
@@ -111,7 +111,7 @@ fn model(name: &str) -> ModelWithPricing {
         successor_model_name: None,
         openrouter_slug: None,
         is_listed: true,
-        created_at: Utc::now(),
+        created_at: Timestamp::now(),
     }
 }
 
@@ -142,7 +142,7 @@ impl Tenant {
                 name: "k".to_string(),
                 workspace_id: WorkspaceId(self.workspace_id),
                 created_by_user_id: owner.clone(),
-                created_at: Utc::now(),
+                created_at: Timestamp::now(),
                 expires_at: None,
                 last_used_at: None,
                 is_active: true,
@@ -156,8 +156,8 @@ impl Tenant {
                 description: None,
                 organization_id: OrganizationId(self.org_id),
                 created_by_user_id: owner.clone(),
-                created_at: Utc::now(),
-                updated_at: Utc::now(),
+                created_at: Timestamp::now(),
+                updated_at: Timestamp::now(),
                 is_active: true,
                 settings: None,
             },
@@ -169,8 +169,8 @@ impl Tenant {
                 owner_id: owner,
                 settings: serde_json::json!({}),
                 is_active: true,
-                created_at: Utc::now(),
-                updated_at: Utc::now(),
+                created_at: Timestamp::now(),
+                updated_at: Timestamp::now(),
             },
         }
     }

@@ -79,7 +79,7 @@ pub(super) fn test_model(model_name: &str) -> ModelWithPricing {
         successor_model_name: None,
         openrouter_slug: None,
         is_listed: true,
-        created_at: chrono::Utc::now(),
+        created_at: jiff::Timestamp::now(),
     }
 }
 

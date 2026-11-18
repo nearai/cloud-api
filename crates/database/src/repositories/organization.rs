@@ -8,7 +8,7 @@ use crate::repositories::utils::map_db_error;
 use crate::retry_db;
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
-use chrono::Utc;
+use jiff::Timestamp;
 use services::auth::ports::UserId;
 use services::common::RepositoryError;
 use services::organization::ports::*;
@@ -118,7 +118,7 @@ impl PgOrganizationRepository {
         let id = Uuid::new_v4();
 
         let row = retry_db!("create_organization_with_owner", {
-            let now = Utc::now();
+            let now = Timestamp::now();
             let mut client = self
                 .pool
                 .get()
@@ -311,7 +311,7 @@ impl PgOrganizationRepository {
                 return Err(RepositoryError::AlreadyExists);
             }
 
-            let now = Utc::now();
+            let now = Timestamp::now();
             let row = transaction.query_one(
                 "INSERT INTO organization_members (id, organization_id, user_id, role, joined_at, invited_by)
                  VALUES ($1, $2, $3, $4, $5, $6)

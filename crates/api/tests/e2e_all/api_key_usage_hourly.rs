@@ -6,7 +6,7 @@ use crate::admin_provider_attribution_support::{
 };
 use crate::common::*;
 use crate::usage_hourly::{insert_raw, recompute_usage_hours};
-use chrono::Duration;
+use jiff::SignedDuration;
 
 async fn listed_usage(fixture: &PlatformProviderUsageFixture) -> Option<i64> {
     let response = fixture
@@ -32,7 +32,7 @@ async fn api_key_list_inference_usage_is_exact_without_waiting_for_the_rollup() 
     // A row in the re-read window is served from raw immediately, with no recompute.
     insert_raw(
         &fixture,
-        chrono::Utc::now() - Duration::minutes(1),
+        jiff::Timestamp::now() - SignedDuration::from_mins(1),
         3_000_000_000,
         1,
         None,
@@ -47,10 +47,10 @@ async fn api_key_list_inference_usage_is_exact_without_waiting_for_the_rollup() 
     // Aggregating the slot's second hour first puts `hour` below the watermark no matter
     // what the shared database already holds.
     let (hour, slot_end) = isolated_usage_hours(&fixture, 2).await;
-    let hour_end = hour + Duration::hours(1);
+    let hour_end = hour + SignedDuration::from_hours(1);
     insert_raw(
         &fixture,
-        hour_end + Duration::minutes(5),
+        hour_end + SignedDuration::from_mins(5),
         1_000_000_000,
         1,
         None,
@@ -63,7 +63,7 @@ async fn api_key_list_inference_usage_is_exact_without_waiting_for_the_rollup() 
 
     insert_raw(
         &fixture,
-        hour + Duration::minutes(5),
+        hour + SignedDuration::from_mins(5),
         5_000_000_000,
         1,
         None,

@@ -1,4 +1,4 @@
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -2624,7 +2624,7 @@ impl UpdateConversationRequest {
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct CreateApiKeyRequest {
     pub name: String,
-    pub expires_at: Option<DateTime<Utc>>,
+    pub expires_at: Option<Timestamp>,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(rename = "spendLimit")]
     pub spend_limit: Option<DecimalPriceRequest>,
@@ -2678,8 +2678,8 @@ pub struct OrganizationResponse {
     pub settings: serde_json::Value,
     pub role: MemberRole,
     pub is_active: bool,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
+    pub created_at: Timestamp,
+    pub updated_at: Timestamp,
 }
 
 /// Paginated organizations list response
@@ -2730,7 +2730,7 @@ pub struct PublicOrganizationMemberResponse {
     pub id: String,
     pub organization_id: String,
     pub role: MemberRole,
-    pub joined_at: DateTime<Utc>,
+    pub joined_at: Timestamp,
     pub user: PublicUserResponse,
 }
 
@@ -2751,7 +2751,7 @@ pub struct PublicUserResponse {
     pub username: Option<String>,
     pub display_name: Option<String>,
     pub avatar_url: Option<String>,
-    pub created_at: DateTime<Utc>,
+    pub created_at: Timestamp,
 }
 
 /// Organization usage information (for admin user listing)
@@ -2789,17 +2789,17 @@ pub struct AdminUserResponse {
     pub username: Option<String>,
     pub display_name: Option<String>,
     pub avatar_url: Option<String>,
-    pub created_at: DateTime<Utc>,
-    pub last_login_at: Option<DateTime<Utc>>,
+    pub created_at: Timestamp,
+    pub last_login_at: Option<Timestamp>,
     pub is_active: bool,
     pub auth_provider: String,
     pub provider_user_id: String,
     /// Verified contact address. `email` is the login identity, which is a
     /// placeholder for NEAR wallet users.
     pub contact_email: Option<String>,
-    pub contact_email_verified_at: Option<DateTime<Utc>>,
+    pub contact_email_verified_at: Option<Timestamp>,
     /// When the user agreed to be emailed at `contact_email`.
-    pub email_opt_in_at: Option<DateTime<Utc>>,
+    pub email_opt_in_at: Option<Timestamp>,
     /// Omitted when the row's `is_active`/`auth_provider` columns are inconsistent.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lifecycle: Option<services::lifecycle::UserLifecycle>,
@@ -2817,9 +2817,9 @@ pub struct UserResponse {
     pub username: String,
     pub display_name: Option<String>,
     pub avatar_url: Option<String>,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
-    pub last_login_at: Option<DateTime<Utc>>,
+    pub created_at: Timestamp,
+    pub updated_at: Timestamp,
+    pub last_login_at: Option<Timestamp>,
     pub is_active: bool,
     pub auth_provider: String,
     /// Verified contact address. `email` is the login identity, which is a
@@ -2842,7 +2842,7 @@ pub struct UserOrganizationResponse {
     pub description: Option<String>,
     pub role: MemberRole,
     pub is_active: bool,
-    pub created_at: DateTime<Utc>,
+    pub created_at: Timestamp,
 }
 
 /// User's workspace (subset of WorkspaceResponse)
@@ -2852,7 +2852,7 @@ pub struct UserWorkspaceResponse {
     pub name: String,
     pub organization_id: String,
     pub is_active: bool,
-    pub created_at: DateTime<Utc>,
+    pub created_at: Timestamp,
 }
 
 /// Refresh token response model
@@ -2860,8 +2860,8 @@ pub struct UserWorkspaceResponse {
 pub struct RefreshTokenResponse {
     pub id: String,
     pub user_id: String,
-    pub created_at: DateTime<Utc>,
-    pub expires_at: DateTime<Utc>,
+    pub created_at: Timestamp,
+    pub expires_at: Timestamp,
     pub ip_address: Option<String>,
     pub user_agent: String,
 }
@@ -2871,7 +2871,7 @@ pub struct RefreshTokenResponse {
 pub struct AccessAndRefreshTokenResponse {
     pub access_token: String,
     pub refresh_token: String,
-    pub refresh_token_expiration: DateTime<Utc>,
+    pub refresh_token_expiration: Timestamp,
 }
 
 /// Organization member response model (non-sensitive)
@@ -2881,7 +2881,7 @@ pub struct OrganizationMemberResponse {
     pub organization_id: String,
     pub user_id: String,
     pub role: MemberRole,
-    pub joined_at: DateTime<Utc>,
+    pub joined_at: Timestamp,
     pub invited_by: Option<String>,
 }
 
@@ -2925,14 +2925,14 @@ pub struct ApiKeyResponse {
     pub key_prefix: String,
     pub workspace_id: String,
     pub created_by_user_id: String,
-    pub created_at: DateTime<Utc>,
-    pub last_used_at: Option<DateTime<Utc>>,
-    pub expires_at: Option<DateTime<Utc>>,
+    pub created_at: Timestamp,
+    pub last_used_at: Option<Timestamp>,
+    pub expires_at: Option<Timestamp>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub spend_limit: Option<DecimalPrice>,
     pub is_active: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub deleted_at: Option<DateTime<Utc>>,
+    pub deleted_at: Option<Timestamp>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usage: Option<DecimalPrice>,
 }
@@ -2968,7 +2968,7 @@ pub struct UpdateApiKeyRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub expires_at: Option<DateTime<Utc>>,
+    pub expires_at: Option<Timestamp>,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(rename = "spendLimit")]
     pub spend_limit: Option<DecimalPriceRequest>,
@@ -3029,9 +3029,9 @@ pub struct AdminServiceResponse {
     #[serde(rename = "isActive")]
     pub is_active: bool,
     #[serde(rename = "createdAt")]
-    pub created_at: DateTime<Utc>,
+    pub created_at: Timestamp,
     #[serde(rename = "updatedAt")]
-    pub updated_at: DateTime<Utc>,
+    pub updated_at: Timestamp,
 }
 
 impl From<services::admin::PlatformServiceInfo> for AdminServiceResponse {
@@ -3069,9 +3069,9 @@ pub struct ServiceResponse {
     #[serde(rename = "isActive")]
     pub is_active: bool,
     #[serde(rename = "createdAt")]
-    pub created_at: DateTime<Utc>,
+    pub created_at: Timestamp,
     #[serde(rename = "updatedAt")]
-    pub updated_at: DateTime<Utc>,
+    pub updated_at: Timestamp,
 }
 
 impl From<AdminServiceResponse> for ServiceResponse {
@@ -3123,9 +3123,9 @@ pub struct AdminModelWithPricing {
     #[serde(rename = "isActive")]
     pub is_active: bool,
     #[serde(rename = "createdAt")]
-    pub created_at: DateTime<Utc>,
+    pub created_at: Timestamp,
     #[serde(rename = "updatedAt")]
-    pub updated_at: DateTime<Utc>,
+    pub updated_at: Timestamp,
 }
 
 /// A scheduled change on the OpenAI-compatible model catalog. Prices use the

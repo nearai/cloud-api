@@ -56,8 +56,8 @@ pub struct WorkspaceResponse {
     pub description: Option<String>,
     pub organization_id: String,
     pub created_by_user_id: String,
-    pub created_at: chrono::DateTime<chrono::Utc>,
-    pub updated_at: chrono::DateTime<chrono::Utc>,
+    pub created_at: jiff::Timestamp,
+    pub updated_at: jiff::Timestamp,
     pub is_active: bool,
     pub settings: Option<serde_json::Value>,
 }
@@ -881,7 +881,7 @@ pub async fn update_workspace_api_key(
     // If spend_limit is provided, wrap the amount in Some(Some(amount))
     let spend_limit_nano = request.spend_limit.map(|limit| Some(limit.amount));
 
-    // Convert expires_at to Option<Option<DateTime<Utc>>>
+    // Convert expires_at to Option<Option<Timestamp>>
     // If expires_at is provided, wrap it in Some(Some(value))
     let expires_at_opt = request.expires_at.map(Some);
 

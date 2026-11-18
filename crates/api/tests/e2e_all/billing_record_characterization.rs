@@ -189,8 +189,8 @@ impl UsageServiceTrait for RecordingUsageService {
     async fn get_usage_by_model(
         &self,
         organization_id: Uuid,
-        start_date: chrono::DateTime<chrono::Utc>,
-        end_date: Option<chrono::DateTime<chrono::Utc>>,
+        start_date: jiff::Timestamp,
+        end_date: Option<jiff::Timestamp>,
     ) -> Result<Vec<services::usage::UsageByModelEntry>, UsageError> {
         self.inner
             .get_usage_by_model(organization_id, start_date, end_date)

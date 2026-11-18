@@ -556,7 +556,7 @@ mod tests {
             key: key.to_string(),
             value,
             updated_by_user_id: None,
-            updated_at: chrono::Utc::now(),
+            updated_at: jiff::Timestamp::now(),
         }
     }
 

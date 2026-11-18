@@ -517,7 +517,7 @@ mod tests {
                     }
                 }
             }
-            org.updated_at = chrono::Utc::now();
+            org.updated_at = jiff::Timestamp::now();
             Ok(org.clone())
         }
 
@@ -662,7 +662,7 @@ mod tests {
     ) {
         let organization_id = OrganizationId(Uuid::new_v4());
         let user_id = UserId(Uuid::new_v4());
-        let now = chrono::Utc::now();
+        let now = jiff::Timestamp::now();
         let org_repo = Arc::new(StubOrgRepo {
             org: Mutex::new(Organization {
                 request_priority: 0,
@@ -747,8 +747,8 @@ mod tests {
             owner_id: UserId(Uuid::new_v4()),
             settings,
             is_active: true,
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
+            created_at: jiff::Timestamp::now(),
+            updated_at: jiff::Timestamp::now(),
         };
         let set = |names: &[&str]| -> std::collections::HashSet<String> {
             names.iter().map(|name| name.to_string()).collect()

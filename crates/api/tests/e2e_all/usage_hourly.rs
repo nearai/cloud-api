@@ -3,13 +3,13 @@
 //! tests move global progress, so they use a far-future namespace (+4000 days) and clean it up.
 
 use crate::admin_provider_attribution_support::setup_platform_provider_usage_fixture;
-use chrono::{DateTime, Duration, TimeZone, Utc};
 use database::repositories::UsageHourlyRepositoryImpl;
+use jiff::{SignedDuration, Timestamp};
 use services::usage::ports::{AggregateLockBehavior, UsageHourlyRepository};
 
-pub(crate) fn random_past_hour() -> DateTime<Utc> {
+pub(crate) fn random_past_hour() -> Timestamp {
     let hours = (uuid::Uuid::new_v4().as_u128() % (20 * 365 * 24)) as i64;
-    Utc.with_ymd_and_hms(2001, 1, 1, 0, 0, 0).unwrap() + Duration::hours(hours)
+    "2001-01-01T00:00:00Z".parse::<jiff::Timestamp>().unwrap() + SignedDuration::from_hours(hours)
 }
 
 /// One raw usage row; total_tokens is input + output.
@@ -27,7 +27,7 @@ struct RawRow<'a> {
 
 async fn insert_raw_row(
     f: &crate::admin_provider_attribution_support::PlatformProviderUsageFixture,
-    created_at: DateTime<Utc>,
+    created_at: Timestamp,
     r: RawRow<'_>,
 ) {
     let client = f.database.pool().get().await.unwrap();
@@ -63,7 +63,7 @@ async fn insert_raw_row(
 
 pub(crate) async fn insert_raw(
     f: &crate::admin_provider_attribution_support::PlatformProviderUsageFixture,
-    created_at: DateTime<Utc>,
+    created_at: Timestamp,
     total_cost: i64,
     tokens: i32,
     ttft_ms: Option<i32>,
@@ -83,7 +83,7 @@ pub(crate) async fn insert_raw(
 
 async fn org_rows(
     f: &crate::admin_provider_attribution_support::PlatformProviderUsageFixture,
-) -> Vec<(DateTime<Utc>, Option<String>, i64, i64, i64, i64)> {
+) -> Vec<(Timestamp, Option<String>, i64, i64, i64, i64)> {
     let client = f.database.pool().get().await.unwrap();
     client
         .query(
@@ -103,7 +103,7 @@ async fn org_rows(
 /// only what `usage_hourly` holds (spec §6); `Wait` serializes with every other
 /// recompute, and replace semantics over append-only raw rows mean a later recompute never
 /// drops another test's rows.
-pub(crate) async fn recompute_usage_hours(from: DateTime<Utc>, to: DateTime<Utc>) {
+pub(crate) async fn recompute_usage_hours(from: Timestamp, to: Timestamp) {
     let pool = crate::common::db_setup::create_test_pool().await;
     UsageHourlyRepositoryImpl::new(pool)
         .recompute(from, to, AggregateLockBehavior::Wait)
@@ -116,10 +116,10 @@ pub(crate) async fn recompute_usage_hours(from: DateTime<Utc>, to: DateTime<Utc>
 /// current (open) hour. Every e2e test finishes well within ten minutes (nextest
 /// terminates at 120 s).
 pub(crate) async fn recompute_recent_usage() {
-    let now = Utc::now();
+    let now = Timestamp::now();
     recompute_usage_hours(
-        services::usage::trunc_hour(now - Duration::minutes(10)),
-        services::usage::trunc_hour(now) + Duration::hours(1),
+        services::usage::trunc_hour(now - SignedDuration::from_mins(10)),
+        services::usage::trunc_hour(now) + SignedDuration::from_hours(1),
     )
     .await;
 }
@@ -133,7 +133,7 @@ async fn recompute_aggregates_exactly_by_utc_hour_including_null_dimensions() {
     insert_raw(&f, h, 100, 10, Some(200), None, Some("external")).await;
     insert_raw(
         &f,
-        h + Duration::minutes(59) + Duration::milliseconds(59_999),
+        h + SignedDuration::from_mins(59) + SignedDuration::from_millis(59_999),
         50,
         5,
         None,
@@ -141,10 +141,19 @@ async fn recompute_aggregates_exactly_by_utc_hour_including_null_dimensions() {
         Some("external"),
     )
     .await;
-    insert_raw(&f, h + Duration::minutes(30), 7, 1, Some(100), None, None).await;
     insert_raw(
         &f,
-        h + Duration::hours(1),
+        h + SignedDuration::from_mins(30),
+        7,
+        1,
+        Some(100),
+        None,
+        None,
+    )
+    .await;
+    insert_raw(
+        &f,
+        h + SignedDuration::from_hours(1),
         1,
         1,
         None,
@@ -154,7 +163,11 @@ async fn recompute_aggregates_exactly_by_utc_hour_including_null_dimensions() {
     .await;
 
     let report = repo
-        .recompute(h, h + Duration::hours(2), AggregateLockBehavior::Wait)
+        .recompute(
+            h,
+            h + SignedDuration::from_hours(2),
+            AggregateLockBehavior::Wait,
+        )
         .await
         .unwrap()
         .unwrap();
@@ -164,7 +177,14 @@ async fn recompute_aggregates_exactly_by_utc_hour_including_null_dimensions() {
         vec![
             (h, None, 1, 7, 0, 1),
             (h, Some("external".into()), 2, 150, 1, 1),
-            (h + Duration::hours(1), Some("external".into()), 1, 1, 0, 0),
+            (
+                h + SignedDuration::from_hours(1),
+                Some("external".into()),
+                1,
+                1,
+                0,
+                0
+            ),
         ]
     );
 }
@@ -177,7 +197,7 @@ async fn recompute_computes_every_aggregate_column_and_excludes_the_upper_bound(
     let ext = Some("external");
     let rows = [
         (
-            Duration::zero(),
+            SignedDuration::ZERO,
             10,
             20,
             3,
@@ -187,7 +207,7 @@ async fn recompute_computes_every_aggregate_column_and_excludes_the_upper_bound(
             None,
         ),
         (
-            Duration::minutes(10),
+            SignedDuration::from_mins(10),
             5,
             7,
             0,
@@ -197,7 +217,7 @@ async fn recompute_computes_every_aggregate_column_and_excludes_the_upper_bound(
             Some("incomplete"),
         ),
         (
-            Duration::minutes(20),
+            SignedDuration::from_mins(20),
             1,
             2,
             1,
@@ -207,7 +227,7 @@ async fn recompute_computes_every_aggregate_column_and_excludes_the_upper_bound(
             Some("timeout"),
         ),
         (
-            Duration::minutes(30),
+            SignedDuration::from_mins(30),
             4,
             0,
             0,
@@ -217,7 +237,7 @@ async fn recompute_computes_every_aggregate_column_and_excludes_the_upper_bound(
             Some("completed"),
         ),
         (
-            Duration::milliseconds(3_599_500),
+            SignedDuration::from_millis(3_599_500),
             0,
             1,
             0,
@@ -228,7 +248,7 @@ async fn recompute_computes_every_aggregate_column_and_excludes_the_upper_bound(
         ),
         // Exactly `to`: outside [h, h+1h), must not be counted or written.
         (
-            Duration::hours(1),
+            SignedDuration::from_hours(1),
             1000,
             1000,
             1000,
@@ -252,10 +272,14 @@ async fn recompute_computes_every_aggregate_column_and_excludes_the_upper_bound(
         insert_raw_row(&f, h + offset, row).await;
     }
 
-    repo.recompute(h, h + Duration::hours(1), AggregateLockBehavior::Wait)
-        .await
-        .unwrap()
-        .unwrap();
+    repo.recompute(
+        h,
+        h + SignedDuration::from_hours(1),
+        AggregateLockBehavior::Wait,
+    )
+    .await
+    .unwrap()
+    .unwrap();
 
     let client = f.database.pool().get().await.unwrap();
     let got = client
@@ -272,7 +296,7 @@ async fn recompute_computes_every_aggregate_column_and_excludes_the_upper_bound(
         .unwrap();
     assert_eq!(got.len(), 1, "only hour h is written");
     let r = &got[0];
-    assert_eq!(r.get::<_, DateTime<Utc>>("hour"), h);
+    assert_eq!(r.get::<_, Timestamp>("hour"), h);
     let ints: Vec<i64> = [
         "request_count",
         "input_tokens",
@@ -310,8 +334,8 @@ async fn recompute_computes_every_aggregate_column_and_excludes_the_upper_bound(
         assert!((got - want).abs() < 1e-9, "{col}: got {got}, want {want}");
     }
     assert_eq!(
-        r.get::<_, DateTime<Utc>>("last_usage_at"),
-        h + Duration::milliseconds(3_599_500)
+        r.get::<_, Timestamp>("last_usage_at"),
+        h + SignedDuration::from_millis(3_599_500)
     );
 }
 
@@ -334,7 +358,7 @@ async fn recompute_counts_ttft_strictly_under_each_threshold() {
     for (i, ttft) in ttfts.into_iter().enumerate() {
         insert_raw(
             &f,
-            h + Duration::minutes(i as i64),
+            h + SignedDuration::from_mins(i as i64),
             1,
             1,
             ttft,
@@ -343,10 +367,14 @@ async fn recompute_counts_ttft_strictly_under_each_threshold() {
         )
         .await;
     }
-    repo.recompute(h, h + Duration::hours(1), AggregateLockBehavior::Wait)
-        .await
-        .unwrap()
-        .unwrap();
+    repo.recompute(
+        h,
+        h + SignedDuration::from_hours(1),
+        AggregateLockBehavior::Wait,
+    )
+    .await
+    .unwrap()
+    .unwrap();
 
     let client = f.database.pool().get().await.unwrap();
     let r = client
@@ -395,12 +423,20 @@ async fn recompute_is_idempotent_and_picks_up_late_rows() {
     let repo = UsageHourlyRepositoryImpl::new(f.database.pool().clone());
     let h = random_past_hour();
     insert_raw(&f, h, 10, 1, None, None, Some("external")).await;
-    repo.recompute(h, h + Duration::hours(1), AggregateLockBehavior::Wait)
-        .await
-        .unwrap();
-    repo.recompute(h, h + Duration::hours(1), AggregateLockBehavior::Wait)
-        .await
-        .unwrap();
+    repo.recompute(
+        h,
+        h + SignedDuration::from_hours(1),
+        AggregateLockBehavior::Wait,
+    )
+    .await
+    .unwrap();
+    repo.recompute(
+        h,
+        h + SignedDuration::from_hours(1),
+        AggregateLockBehavior::Wait,
+    )
+    .await
+    .unwrap();
     assert_eq!(
         org_rows(&f).await,
         vec![(h, Some("external".into()), 1, 10, 0, 0)]
@@ -408,7 +444,7 @@ async fn recompute_is_idempotent_and_picks_up_late_rows() {
 
     insert_raw(
         &f,
-        h + Duration::minutes(10),
+        h + SignedDuration::from_mins(10),
         5,
         1,
         None,
@@ -416,9 +452,13 @@ async fn recompute_is_idempotent_and_picks_up_late_rows() {
         Some("external"),
     )
     .await;
-    repo.recompute(h, h + Duration::hours(1), AggregateLockBehavior::Wait)
-        .await
-        .unwrap();
+    repo.recompute(
+        h,
+        h + SignedDuration::from_hours(1),
+        AggregateLockBehavior::Wait,
+    )
+    .await
+    .unwrap();
     assert_eq!(
         org_rows(&f).await,
         vec![(h, Some("external".into()), 2, 15, 0, 0)]
@@ -440,13 +480,21 @@ async fn recompute_without_wait_returns_none_when_lock_is_held() {
 
     let h = random_past_hour();
     assert!(repo
-        .recompute(h, h + Duration::hours(1), AggregateLockBehavior::SkipIfBusy)
+        .recompute(
+            h,
+            h + SignedDuration::from_hours(1),
+            AggregateLockBehavior::SkipIfBusy
+        )
         .await
         .unwrap()
         .is_none());
     tx.rollback().await.unwrap();
     assert!(repo
-        .recompute(h, h + Duration::hours(1), AggregateLockBehavior::SkipIfBusy)
+        .recompute(
+            h,
+            h + SignedDuration::from_hours(1),
+            AggregateLockBehavior::SkipIfBusy
+        )
         .await
         .unwrap()
         .is_some());
@@ -458,9 +506,18 @@ async fn recompute_rejects_bounds_not_on_whole_utc_hours() {
     let repo = UsageHourlyRepositoryImpl::new(f.database.pool().clone());
     let h = random_past_hour();
     for (from, to) in [
-        (h + Duration::minutes(30), h + Duration::hours(2)),
-        (h, h + Duration::hours(1) + Duration::seconds(1)),
-        (h + Duration::milliseconds(1), h + Duration::hours(1)),
+        (
+            h + SignedDuration::from_mins(30),
+            h + SignedDuration::from_hours(2),
+        ),
+        (
+            h,
+            h + SignedDuration::from_hours(1) + SignedDuration::from_secs(1),
+        ),
+        (
+            h + SignedDuration::from_millis(1),
+            h + SignedDuration::from_hours(1),
+        ),
     ] {
         let err = repo
             .recompute(from, to, AggregateLockBehavior::Wait)
@@ -482,7 +539,7 @@ async fn day_parity_ok_after_recompute_and_flags_rows_added_later() {
     let day_start = services::usage::trunc_day(random_past_hour());
     insert_raw(
         &f,
-        day_start + Duration::hours(5),
+        day_start + SignedDuration::from_hours(5),
         10,
         1,
         Some(50),
@@ -492,18 +549,21 @@ async fn day_parity_ok_after_recompute_and_flags_rows_added_later() {
     .await;
     repo.recompute(
         day_start,
-        day_start + Duration::days(1),
+        day_start + SignedDuration::from_hours(24),
         AggregateLockBehavior::Wait,
     )
     .await
     .unwrap();
 
-    let parity = repo.day_parity(day_start.date_naive()).await.unwrap();
+    let parity = repo
+        .day_parity(day_start.to_zoned(jiff::tz::TimeZone::UTC).date())
+        .await
+        .unwrap();
     assert!(parity.is_ok(), "{parity:?}");
 
     insert_raw(
         &f,
-        day_start + Duration::hours(6),
+        day_start + SignedDuration::from_hours(6),
         1,
         1,
         None,
@@ -511,7 +571,10 @@ async fn day_parity_ok_after_recompute_and_flags_rows_added_later() {
         Some("external"),
     )
     .await;
-    let parity = repo.day_parity(day_start.date_naive()).await.unwrap();
+    let parity = repo
+        .day_parity(day_start.to_zoned(jiff::tz::TimeZone::UTC).date())
+        .await
+        .unwrap();
     assert!(!parity.is_ok());
     assert_eq!(parity.raw.request_count - parity.aggregate.request_count, 1);
 }
@@ -569,13 +632,13 @@ async fn serial_progress_reports_max_hour_and_next_raw_hour() {
         .await
         .unwrap()
         .max_hour
-        .unwrap_or_else(Utc::now)
-        .max(Utc::now());
-    let a = services::usage::trunc_hour(base) + Duration::days(4000);
-    let b = a + Duration::days(3);
+        .unwrap_or_else(Timestamp::now)
+        .max(Timestamp::now());
+    let a = services::usage::trunc_hour(base) + SignedDuration::from_hours(4000 * 24);
+    let b = a + SignedDuration::from_hours(3 * 24);
     insert_raw(
         &f,
-        a + Duration::minutes(15),
+        a + SignedDuration::from_mins(15),
         1,
         1,
         None,
@@ -585,7 +648,7 @@ async fn serial_progress_reports_max_hour_and_next_raw_hour() {
     .await;
     insert_raw(
         &f,
-        b + Duration::minutes(15),
+        b + SignedDuration::from_mins(15),
         1,
         1,
         None,
@@ -594,9 +657,13 @@ async fn serial_progress_reports_max_hour_and_next_raw_hour() {
     )
     .await;
 
-    repo.recompute(a, a + Duration::hours(1), AggregateLockBehavior::Wait)
-        .await
-        .unwrap();
+    repo.recompute(
+        a,
+        a + SignedDuration::from_hours(1),
+        AggregateLockBehavior::Wait,
+    )
+    .await
+    .unwrap();
     let progress = repo.progress().await.unwrap();
     assert_eq!(progress.max_hour, Some(a));
     assert_eq!(progress.next_raw_hour, Some(b)); // jumps the empty span between a+1h and b
@@ -615,14 +682,14 @@ async fn serial_concurrent_ticks_write_each_hour_once() {
         .await
         .unwrap()
         .max_hour
-        .unwrap_or_else(Utc::now)
-        .max(Utc::now());
-    let h = services::usage::trunc_hour(base) + Duration::days(4000);
+        .unwrap_or_else(Timestamp::now)
+        .max(Timestamp::now());
+    let h = services::usage::trunc_hour(base) + SignedDuration::from_hours(4000 * 24);
     // Anchor progress just before h so the planned window is deterministic regardless of
     // other tests' rows: max_hour = h-2h, next_raw_hour = h.
     insert_raw(
         &f,
-        h - Duration::hours(2),
+        h - SignedDuration::from_hours(2),
         1,
         1,
         None,
@@ -631,15 +698,15 @@ async fn serial_concurrent_ticks_write_each_hour_once() {
     )
     .await;
     repo.recompute(
-        h - Duration::hours(2),
-        h - Duration::hours(1),
+        h - SignedDuration::from_hours(2),
+        h - SignedDuration::from_hours(1),
         AggregateLockBehavior::Wait,
     )
     .await
     .unwrap();
     insert_raw(
         &f,
-        h + Duration::minutes(1),
+        h + SignedDuration::from_mins(1),
         3,
         1,
         None,
@@ -648,7 +715,7 @@ async fn serial_concurrent_ticks_write_each_hour_once() {
     )
     .await;
     // Clock so that h is inside the steady 3-hour re-read window: plan = [h-1h, h+2h).
-    let now = h + Duration::hours(2) + Duration::minutes(5);
+    let now = h + SignedDuration::from_hours(2) + SignedDuration::from_mins(5);
 
     let a = services::usage::UsageHourlyScheduler::new(
         repo.clone(),
@@ -667,7 +734,14 @@ async fn serial_concurrent_ticks_write_each_hour_once() {
     assert_eq!(
         org_rows(&f).await,
         vec![
-            (h - Duration::hours(2), Some("external".into()), 1, 1, 0, 0),
+            (
+                h - SignedDuration::from_hours(2),
+                Some("external".into()),
+                1,
+                1,
+                0,
+                0
+            ),
             (h, Some("external".into()), 1, 3, 0, 0),
         ]
     );

@@ -1,6 +1,6 @@
 use crate::pool::DbPool;
 use async_trait::async_trait;
-use chrono::{Duration, Utc};
+use jiff::{SignedDuration, Timestamp};
 use services::auth::NearNonceRepository;
 
 pub struct PostgresNearNonceRepository {
@@ -28,7 +28,7 @@ impl NearNonceRepository for PostgresNearNonceRepository {
 
     async fn cleanup_expired_nonces(&self) -> anyhow::Result<u64> {
         let client = self.pool.get().await?;
-        let cutoff = Utc::now() - Duration::minutes(10);
+        let cutoff = Timestamp::now() - SignedDuration::from_mins(10);
         let deleted = client
             .execute(
                 "DELETE FROM near_used_nonces WHERE used_at < $1",

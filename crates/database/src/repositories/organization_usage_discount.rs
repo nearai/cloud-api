@@ -3,7 +3,7 @@ use crate::models::RecordUsageRequest;
 use crate::pool::DbPool;
 use crate::repositories::usage_hourly::USAGE_HOURLY_LOCK_KEY;
 use anyhow::{ensure, Result};
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::Serialize;
 use services::common::RepositoryError;
 use services::usage::ports::UsageDiscount;
@@ -53,12 +53,12 @@ pub struct OrganizationUsageDiscount {
     #[serde(skip)]
     pub id: Uuid,
     pub discount_basis_points: i32,
-    pub apply_since: Option<DateTime<Utc>>,
-    pub saved_at: DateTime<Utc>,
+    pub apply_since: Option<Timestamp>,
+    pub saved_at: Timestamp,
     pub status: String,
     pub processed_count: i64,
     pub last_error: Option<String>,
-    pub next_retry_at: Option<DateTime<Utc>>,
+    pub next_retry_at: Option<Timestamp>,
 }
 
 impl OrganizationUsageDiscount {
@@ -104,15 +104,20 @@ impl OrganizationUsageDiscountRepository {
         &self,
         organization_id: Uuid,
         basis_points: i32,
-        apply_since: Option<DateTime<Utc>>,
+        apply_since: Option<Timestamp>,
         created_by: Uuid,
     ) -> Result<OrganizationUsageDiscount> {
         // PostgreSQL timestamps have microsecond precision. Normalize before comparing
         // retry terms so an RFC3339 nanosecond input remains idempotent after storage.
         let apply_since = apply_since
             .map(|value| {
-                DateTime::from_timestamp_micros(value.timestamp_micros())
-                    .ok_or(DiscountError::Invalid)
+                value
+                    .round(
+                        jiff::TimestampRound::new()
+                            .smallest(jiff::Unit::Microsecond)
+                            .mode(jiff::RoundMode::Floor),
+                    )
+                    .map_err(|_| DiscountError::Invalid)
             })
             .transpose()?;
         if !(1..=10_000).contains(&basis_points) {
@@ -148,7 +153,7 @@ impl OrganizationUsageDiscountRepository {
             }
             return Ok(rule);
         }
-        let preflight_at: DateTime<Utc> = boundary
+        let preflight_at: Timestamp = boundary
             .query_one("SELECT clock_timestamp()", &[])
             .await?
             .get(0);
@@ -216,7 +221,7 @@ impl OrganizationUsageDiscountRepository {
         }
 
         // Transaction-start now() can precede time spent waiting for the accounting lock.
-        let saved_at: DateTime<Utc> = tx.query_one("SELECT clock_timestamp()", &[]).await?.get(0);
+        let saved_at: Timestamp = tx.query_one("SELECT clock_timestamp()", &[]).await?.get(0);
         if apply_since.is_some() {
             validate_history(&tx, organization_id, preflight_at, saved_at).await?;
         }
@@ -276,7 +281,7 @@ impl OrganizationUsageDiscountRepository {
             return Ok(false);
         }
         let rule = OrganizationUsageDiscount::from_row(&rule_row);
-        let cursor_at: Option<DateTime<Utc>> = rule_row.get("cursor_created_at");
+        let cursor_at: Option<Timestamp> = rule_row.get("cursor_created_at");
         let cursor_id: Option<Uuid> = rule_row.get("cursor_usage_id");
         // Serialize cost corrections with aggregate replacement. Do not wait while
         // holding the organization lock if the hourly scheduler is already running.
@@ -413,7 +418,7 @@ impl OrganizationUsageDiscountRepository {
 .get(0);
         ensure!(consistent, "Discount allocation does not reconcile");
         let last = rows.last().expect("nonempty batch");
-        let last_at: DateTime<Utc> = last.get("created_at");
+        let last_at: Timestamp = last.get("created_at");
         let last_id: Uuid = last.get("id");
         let count = rows.len() as i64;
         tx.execute(
@@ -588,8 +593,8 @@ impl OrganizationUsageDiscountRepository {
 async fn validate_history(
     tx: &Transaction<'_>,
     organization_id: Uuid,
-    since: DateTime<Utc>,
-    until: DateTime<Utc>,
+    since: Timestamp,
+    until: Timestamp,
 ) -> Result<()> {
     let invalid: bool = tx.query_one(r#"
         SELECT EXISTS (
@@ -623,7 +628,7 @@ async fn validate_history(
 pub async fn apply_to_request(
     tx: &Transaction<'_>,
     request: &mut RecordUsageRequest,
-) -> Result<DateTime<Utc>, RepositoryError> {
+) -> Result<Timestamp, RepositoryError> {
     let row = tx
         .query_one(
             r#"
@@ -640,7 +645,7 @@ pub async fn apply_to_request(
         )
         .await
         .map_err(crate::repositories::utils::map_db_error)?;
-    let recorded_at: DateTime<Utc> = row.get("recorded_at");
+    let recorded_at: Timestamp = row.get("recorded_at");
     let Some(rule_id) = row.get::<_, Option<Uuid>>("id") else {
         return Ok(recorded_at);
     };

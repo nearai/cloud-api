@@ -1,5 +1,5 @@
 use axum::{http::StatusCode, Json};
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -180,8 +180,8 @@ pub struct ObjectJobResponse {
     pub(super) actions: Value,
     pub(super) progress: Value,
     pub(super) cursor: Value,
-    pub(super) created_at: DateTime<Utc>,
-    pub(super) completed_at: Option<DateTime<Utc>>,
+    pub(super) created_at: Timestamp,
+    pub(super) completed_at: Option<Timestamp>,
     pub(super) last_error_class: Option<String>,
     pub(super) last_error_message: Option<String>,
 }

@@ -2,8 +2,8 @@
 use super::{StakingFarmAmlGate, UpsertStakingFarmSourceRequest};
 use crate::{aml::AmlFlow, auth::near::SignedMessage};
 use async_trait::async_trait;
-use chrono::{DateTime, Duration, Utc};
 use config::{NearConfig, StakingFarmConfig};
+use jiff::{SignedDuration, Timestamp};
 use near_kit::{standards::nep413::SignMessageParams, AccountId, Near};
 use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
@@ -59,7 +59,7 @@ pub struct BindingChallenge {
     pub organization_id: Uuid,
     pub actor_user_id: Uuid,
     pub near_account_id: String,
-    pub expires_at: DateTime<Utc>,
+    pub expires_at: Timestamp,
     pub payload: BindingPayload,
     pub binding_terms_version: String,
     pub network_id: String,
@@ -205,7 +205,7 @@ impl StakingBindingService {
         let account: AccountId = account.parse().map_err(|_| BindingError::InvalidProof)?;
         let account = account.to_string();
         let challenge_id = Uuid::new_v4();
-        let expires_at = Utc::now() + Duration::minutes(5);
+        let expires_at = Timestamp::now() + SignedDuration::from_mins(5);
         let mut nonce = vec![0; 32];
         OsRng.fill_bytes(&mut nonce);
         let c = &self.config;
@@ -258,7 +258,7 @@ impl StakingBindingService {
         {
             return Ok(result);
         }
-        if challenge.expires_at <= Utc::now()
+        if challenge.expires_at <= Timestamp::now()
             || challenge.payload.recipient != self.recipient
             || challenge.network_id != self.config.network_id
             || challenge.contract_id != self.config.contract_id
@@ -343,7 +343,7 @@ mod tests {
             organization_id: Uuid::new_v4(),
             actor_user_id: Uuid::new_v4(),
             near_account_id: "alice.testnet".into(),
-            expires_at: Utc::now() + Duration::minutes(5),
+            expires_at: Timestamp::now() + SignedDuration::from_mins(5),
             payload: BindingPayload {
                 message: "Bind this org and grant Admin".into(),
                 nonce: vec![7; 32],
@@ -398,7 +398,7 @@ mod tests {
         ] {
             let mut c = challenge();
             if case == "expired" {
-                c.expires_at = Utc::now() - Duration::seconds(1);
+                c.expires_at = Timestamp::now() - SignedDuration::from_secs(1);
             }
             if case == "stored_terms_changed" {
                 c.binding_terms_version = "previous-version".into();

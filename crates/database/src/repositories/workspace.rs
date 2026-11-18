@@ -6,7 +6,7 @@ use crate::{
 };
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use chrono::Utc;
+use jiff::Timestamp;
 use services::common::RepositoryError;
 use services::workspace::{WorkspaceOrderBy, WorkspaceOrderDirection};
 use tokio_postgres::types::Type;
@@ -30,7 +30,7 @@ impl WorkspaceRepository {
         created_by_user_id: Uuid,
     ) -> Result<Workspace, RepositoryError> {
         let id = Uuid::new_v4();
-        let now = Utc::now();
+        let now = Timestamp::now();
 
         let row = retry_db!("create_workspace", {
             let client = self

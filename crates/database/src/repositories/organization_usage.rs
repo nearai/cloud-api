@@ -5,7 +5,6 @@ use crate::repositories::usage_hourly::with_usage_rows;
 use crate::repositories::utils::map_db_error;
 use crate::retry_db;
 use anyhow::{Context, Result};
-use chrono::Utc;
 use services::common::RepositoryError;
 use services::responses::models::ResponseId;
 use std::collections::HashMap;
@@ -389,8 +388,8 @@ impl OrganizationUsageRepository {
     pub async fn get_usage_by_model_since(
         &self,
         organization_id: Uuid,
-        start_date: chrono::DateTime<Utc>,
-        end_date: Option<chrono::DateTime<Utc>>,
+        start_date: jiff::Timestamp,
+        end_date: Option<jiff::Timestamp>,
     ) -> Result<Vec<UsageByModel>> {
         let deadline = crate::repositories::reporting_query::reporting_deadline(
             self.reporting_statement_timeout,

@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -34,8 +34,8 @@ pub struct Workspace {
     pub description: Option<String>,
     pub organization_id: OrganizationId,
     pub created_by_user_id: UserId,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
+    pub created_at: Timestamp,
+    pub updated_at: Timestamp,
     pub is_active: bool,
     pub settings: Option<serde_json::Value>,
 }
@@ -50,11 +50,11 @@ pub struct ApiKey {
     pub name: String,
     pub workspace_id: WorkspaceId,
     pub created_by_user_id: UserId,
-    pub created_at: DateTime<Utc>,
-    pub expires_at: Option<DateTime<Utc>>,
-    pub last_used_at: Option<DateTime<Utc>>,
+    pub created_at: Timestamp,
+    pub expires_at: Option<Timestamp>,
+    pub last_used_at: Option<Timestamp>,
     pub is_active: bool,
-    pub deleted_at: Option<DateTime<Utc>>,
+    pub deleted_at: Option<Timestamp>,
     /// Optional spending limit in nano-dollars (scale 9, USD). None means no limit.
     pub spend_limit: Option<i64>,
     /// Total usage/spend in nano-dollars (scale 9, USD). None if not fetched.
@@ -66,7 +66,7 @@ pub struct CreateApiKeyRequest {
     pub name: String,
     pub workspace_id: WorkspaceId,
     pub created_by_user_id: UserId,
-    pub expires_at: Option<DateTime<Utc>>,
+    pub expires_at: Option<Timestamp>,
     /// Optional spending limit in nano-dollars (scale 9, USD). None means no limit.
     pub spend_limit: Option<i64>,
 }
@@ -209,7 +209,7 @@ pub trait ApiKeyRepository: Send + Sync {
         &self,
         id: ApiKeyId,
         name: Option<String>,
-        expires_at: Option<Option<DateTime<Utc>>>,
+        expires_at: Option<Option<Timestamp>>,
         spend_limit: Option<Option<i64>>,
         is_active: Option<bool>,
     ) -> Result<ApiKey, RepositoryError>;
@@ -233,7 +233,7 @@ pub trait ApiKeyRepository: Send + Sync {
     /// Get key hashes created after a timestamp (for incremental Bloom Filter updates)
     async fn get_active_key_hashes_created_after(
         &self,
-        timestamp: DateTime<Utc>,
+        timestamp: Timestamp,
     ) -> Result<Vec<String>, RepositoryError>;
 }
 
@@ -322,7 +322,7 @@ pub trait WorkspaceServiceTrait: Send + Sync {
         api_key_id: ApiKeyId,
         requester_id: UserId,
         name: Option<String>,
-        expires_at: Option<Option<DateTime<Utc>>>,
+        expires_at: Option<Option<Timestamp>>,
         spend_limit: Option<Option<i64>>,
         is_active: Option<bool>,
     ) -> Result<ApiKey, WorkspaceError>;

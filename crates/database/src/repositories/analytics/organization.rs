@@ -4,7 +4,7 @@
 use super::{approx_percentile, arm, nano_to_usd, weighted_mean};
 use crate::repositories::usage_hourly::with_usage_rows;
 use crate::repositories::utils::map_db_error;
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use services::admin::{
     ApiKeyMetrics, MetricsSummary, ModelMetrics, OrganizationMetrics, TimeSeriesMetrics,
     TimeSeriesPoint, WorkspaceMetrics,
@@ -160,8 +160,8 @@ fn credit_type_metrics_sql() -> String {
 /// credit type.
 fn bind<'a>(
     org_id: &'a Uuid,
-    start: &'a DateTime<Utc>,
-    end: &'a DateTime<Utc>,
+    start: &'a Timestamp,
+    end: &'a Timestamp,
     credit_type: &'a Option<&str>,
 ) -> Vec<&'a (dyn ToSql + Sync)> {
     let mut params: Vec<&'a (dyn ToSql + Sync)> = vec![org_id, start, end];
@@ -188,7 +188,7 @@ async fn organization_name(
 pub(super) async fn get_organization_metrics_with_client(
     tx: &Transaction<'_>,
     deadline: Instant,
-    window: (Uuid, DateTime<Utc>, DateTime<Utc>),
+    window: (Uuid, Timestamp, Timestamp),
     credit_type: Option<&str>,
 ) -> Result<OrganizationMetrics, RepositoryError> {
     let (org_id, start, end) = window;
@@ -311,7 +311,7 @@ pub(super) async fn get_organization_metrics_with_client(
 pub(super) async fn get_organization_timeseries_with_client(
     tx: &Transaction<'_>,
     deadline: Instant,
-    window: (Uuid, DateTime<Utc>, DateTime<Utc>),
+    window: (Uuid, Timestamp, Timestamp),
     granularity: &str,
     credit_type: Option<&str>,
 ) -> Result<TimeSeriesMetrics, RepositoryError> {

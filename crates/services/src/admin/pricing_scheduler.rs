@@ -87,7 +87,7 @@ impl ModelPricingScheduler {
         let recovered = self
             .repository
             .recover_stale_applying_pricing_changes(
-                chrono::Duration::seconds(STALE_APPLYING_AFTER_SECS),
+                jiff::SignedDuration::from_secs(STALE_APPLYING_AFTER_SECS),
                 MAX_APPLY_ATTEMPTS,
             )
             .await?;

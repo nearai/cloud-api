@@ -463,8 +463,8 @@ impl UsageServiceTrait for ScriptedUsage {
     async fn get_usage_by_model(
         &self,
         _organization_id: Uuid,
-        _start_date: chrono::DateTime<chrono::Utc>,
-        _end_date: Option<chrono::DateTime<chrono::Utc>>,
+        _start_date: jiff::Timestamp,
+        _end_date: Option<jiff::Timestamp>,
     ) -> Result<Vec<crate::usage::UsageByModelEntry>, UsageError> {
         unreachable!()
     }

@@ -3,7 +3,7 @@
 //! rows, and every history and by-model query stops at the statement timeout.
 
 use crate::common::*;
-use chrono::{Duration, SecondsFormat, Utc};
+use jiff::{SignedDuration, Timestamp};
 use serde_json::Value;
 use uuid::Uuid;
 
@@ -15,13 +15,22 @@ async fn usage_by_model_combines_hourly_counts_with_recent_requests() {
     use crate::usage_hourly::{insert_raw, recompute_usage_hours};
 
     let fixture = setup_platform_provider_usage_fixture().await;
-    let hour = services::usage::trunc_hour(Utc::now() - Duration::days(1));
+    let hour = services::usage::trunc_hour(Timestamp::now() - SignedDuration::from_hours(24));
     // Two requests collapse into one aggregate row; count requests, not rows.
     for _ in 0..2 {
         insert_raw(&fixture, hour, 100, 10, None, None, Some("external")).await;
     }
-    recompute_usage_hours(hour, hour + Duration::hours(1)).await;
-    insert_raw(&fixture, Utc::now(), 7, 3, None, None, Some("external")).await;
+    recompute_usage_hours(hour, hour + SignedDuration::from_hours(1)).await;
+    insert_raw(
+        &fixture,
+        Timestamp::now(),
+        7,
+        3,
+        None,
+        None,
+        Some("external"),
+    )
+    .await;
 
     let response = fixture
         .server
@@ -51,25 +60,28 @@ async fn usage_by_model_custom_range_includes_start_and_excludes_end() {
     // Both bounds fall mid-hour: the range reads raw rows at each edge and the hourly
     // aggregate for the whole hours between them.
     let hour = random_past_hour();
-    let start = hour + Duration::minutes(30);
-    let end = hour + Duration::hours(3) + Duration::minutes(30);
+    let start = hour + SignedDuration::from_mins(30);
+    let end = hour + SignedDuration::from_hours(3) + SignedDuration::from_mins(30);
     // Each cost is its own decimal digit, so the summed cost names the rows counted.
     for (created_at, cost) in [
-        (start - Duration::milliseconds(1), 1),
+        (start - SignedDuration::from_millis(1), 1),
         (start, 10),
-        (hour + Duration::hours(1), 100),
-        (hour + Duration::hours(2) + Duration::minutes(59), 1_000),
-        (end - Duration::milliseconds(1), 10_000),
+        (hour + SignedDuration::from_hours(1), 100),
+        (
+            hour + SignedDuration::from_hours(2) + SignedDuration::from_mins(59),
+            1_000,
+        ),
+        (end - SignedDuration::from_millis(1), 10_000),
         (end, 100_000),
     ] {
         insert_raw(&fixture, created_at, cost, 1, None, None, Some("external")).await;
     }
-    recompute_usage_hours(hour, hour + Duration::hours(4)).await;
+    recompute_usage_hours(hour, hour + SignedDuration::from_hours(4)).await;
 
     let range = format!(
         "start={}&end={}",
-        start.to_rfc3339_opts(SecondsFormat::Secs, true),
-        end.to_rfc3339_opts(SecondsFormat::Secs, true)
+        start.strftime("%FT%TZ"),
+        end.strftime("%FT%TZ")
     );
     // `start`/`end` select the custom range with or without a `period`.
     for query in [
@@ -79,8 +91,16 @@ async fn usage_by_model_custom_range_includes_start_and_excludes_end() {
     ] {
         let body = get_by_model(&fixture.server, fixture.organization_id, &query).await;
         assert_eq!(body["period"], "custom", "{query}");
-        assert_eq!(body["start_date"], start.to_rfc3339(), "{query}");
-        assert_eq!(body["end_date"], end.to_rfc3339(), "{query}");
+        assert_eq!(
+            body["start_date"],
+            services::timestamps::format_utc(start),
+            "{query}"
+        );
+        assert_eq!(
+            body["end_date"],
+            services::timestamps::format_utc(end),
+            "{query}"
+        );
         let rows = body["data"].as_array().expect("by-model entries");
         assert_eq!(rows.len(), 1, "{query}");
         assert_eq!(rows[0]["request_count"], 4, "{query}");

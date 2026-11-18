@@ -5,8 +5,8 @@ use crate::common::{
     create_api_key_in_workspace, create_org, get_session_id, list_workspaces, setup_qwen_model,
     setup_test_server_with_database, MOCK_USER_AGENT,
 };
-use chrono::{DateTime, Duration, TimeZone, Utc};
 use database::Database;
+use jiff::{SignedDuration, Timestamp};
 use serde_json::Value;
 use std::sync::Arc;
 use utoipa::OpenApi;
@@ -51,7 +51,10 @@ async fn session_usage_history_filters() {
     let row = &body.data[0];
     assert_eq!(row.workspace_id, fixture.workspace_id);
     assert_eq!(row.api_key_id, fixture.api_key_id);
-    assert_eq!(row.created_at, ts(2026, 7, 2).to_rfc3339());
+    assert_eq!(
+        row.created_at,
+        services::timestamps::format_utc(ts(2026, 7, 2))
+    );
     assert_eq!(row.total_cost, 700);
     assert_eq!(row.stop_reason.as_deref(), Some("completed"));
     assert_eq!(
@@ -96,7 +99,7 @@ async fn session_usage_history_workspace_and_api_key_filters_remain_unbounded() 
     assert!(body
         .data
         .iter()
-        .any(|row| row.created_at == ts(2024, 1, 1).to_rfc3339()));
+        .any(|row| row.created_at == services::timestamps::format_utc(ts(2024, 1, 1))));
     assert!(body
         .data
         .iter()
@@ -188,7 +191,7 @@ async fn session_usage_history_omitted_dates_default_to_last_366_days() {
     let (server, database) = setup_test_server_with_database().await;
     let fixture = seed_session_history_fixture(&server, &database).await;
     let model = setup_qwen_model(&server).await;
-    let recent = Utc::now() - Duration::days(1);
+    let recent = Timestamp::now() - SignedDuration::from_hours(24);
     insert_inference_usage_row(
         &database,
         &fixture.org_id,
@@ -209,7 +212,7 @@ async fn session_usage_history_omitted_dates_default_to_last_366_days() {
         &fixture.api_key_id,
         &model,
         SessionUsageRow {
-            created_at: Utc::now() - Duration::days(400),
+            created_at: Timestamp::now() - SignedDuration::from_hours(400 * 24),
             total_cost: 1200,
             provider_request_id: "provider-request-stale",
         },
@@ -217,8 +220,8 @@ async fn session_usage_history_omitted_dates_default_to_last_366_days() {
     .await;
 
     // When: only an end_date filter is supplied, so the start defaults to 366 days earlier.
-    let end_date = (Utc::now() + Duration::days(1))
-        .format("%Y-%m-%d")
+    let end_date = (Timestamp::now() + SignedDuration::from_hours(24))
+        .strftime("%Y-%m-%d")
         .to_string();
     let response = server
         .get(
@@ -425,7 +428,7 @@ async fn create_workspace(server: &axum_test::TestServer, org_id: &str) -> Strin
 }
 
 struct SessionUsageRow {
-    created_at: DateTime<Utc>,
+    created_at: Timestamp,
     total_cost: i64,
     provider_request_id: &'static str,
 }
@@ -492,8 +495,8 @@ fn assert_no_private_session_history_fields(value: &Value) {
     }
 }
 
-fn ts(year: i32, month: u32, day: u32) -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(year, month, day, 0, 0, 0)
-        .single()
-        .expect("fixture timestamp")
+fn ts(year: i32, month: u32, day: u32) -> Timestamp {
+    format!("{year:04}-{month:02}-{day:02}T00:00:00Z")
+        .parse()
+        .unwrap()
 }

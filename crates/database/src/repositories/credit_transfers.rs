@@ -4,7 +4,7 @@ use crate::pool::DbPool;
 use crate::repositories::credit_allocation::{
     lock_organization_accounting, settle_unfunded_usage, CreditAllocationPolicy,
 };
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde_json::{json, Value};
 
 use super::organization_credentials::{
@@ -322,7 +322,7 @@ impl CreditTransferRepository {
             "amount_applied_to_debt": settled,
         });
         let id = Uuid::new_v4();
-        let created_at: DateTime<Utc> = tx.query_one("SELECT clock_timestamp()", &[]).await?.get(0);
+        let created_at: Timestamp = tx.query_one("SELECT clock_timestamp()", &[]).await?.get(0);
         // The sender sees delivery and its own position only. Recipient debt and
         // unrelated balances stay in the separately authorized stored snapshot.
         let result = json!({
@@ -514,7 +514,7 @@ impl CreditTransferRepository {
         actor: &TransferActor,
         id: Option<Uuid>,
         key: Option<&str>,
-        before: Option<(DateTime<Utc>, Uuid)>,
+        before: Option<(Timestamp, Uuid)>,
         options: impl Into<TransferHistoryOptions>,
     ) -> anyhow::Result<Value> {
         let options = options.into();
@@ -568,7 +568,7 @@ impl CreditTransferRepository {
             .collect::<Vec<_>>();
         let next = rows.last().map(|row| {
             json!({
-                "before_time": row.get::<_, DateTime<Utc>>("created_at"),
+                "before_time": row.get::<_, Timestamp>("created_at"),
                 "before_id": row.get::<_, Uuid>("id"),
             })
         });

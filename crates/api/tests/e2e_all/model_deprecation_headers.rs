@@ -5,7 +5,7 @@
 
 use crate::common::*;
 use api::models::BatchUpdateModelApiRequest;
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 
 /// `2030-01-01` defaults to 13:00 UTC.
 const DEPRECATION_DATE_HEADER: &str = "2030-01-01T13:00:00Z";
@@ -18,7 +18,7 @@ struct Fixture {
     successor: String,
 }
 
-fn deprecation_date() -> DateTime<Utc> {
+fn deprecation_date() -> Timestamp {
     DEPRECATION_DATE_HEADER.parse().unwrap()
 }
 

@@ -96,7 +96,7 @@ async fn run() -> Result<(), Failure> {
         out.skipped.clone(),
         &base,
     );
-    let date = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    let date = jiff::Timestamp::now().strftime("%Y-%m-%d").to_string();
     write(&out_path, &pins.to_canonical_json())?;
     write(&report_path, &render_markdown(&report, &date))?;
     let audit = serde_json::json!({

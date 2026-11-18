@@ -817,7 +817,7 @@ fn billing_failure_event(frame: &FailureFrame<'_>) -> Bytes {
         "response": {
             "id": failure_response_id(frame.response_id, frame.inference_id),
             "object": "response",
-            "created_at": frame.created_at.unwrap_or_else(|| chrono::Utc::now().timestamp()),
+            "created_at": frame.created_at.unwrap_or_else(|| jiff::Timestamp::now().as_second()),
             "status": "failed",
             "background": false,
             "error": {

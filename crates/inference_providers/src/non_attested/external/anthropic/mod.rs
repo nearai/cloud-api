@@ -359,7 +359,7 @@ impl ExternalBackend for AnthropicBackend {
             &anthropic_response,
             &anthropic_compat::ResponseOptions {
                 model: model.to_string(),
-                created: chrono::Utc::now().timestamp(),
+                created: jiff::Timestamp::now().as_second(),
                 strip_json_fence: wants_json_output(&params.extra),
             },
         )

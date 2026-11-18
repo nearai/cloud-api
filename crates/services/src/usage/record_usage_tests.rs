@@ -43,7 +43,7 @@ impl UsageRepository for CapturingUsageRepository {
             output_cost: request.output_cost,
             total_cost: request.total_cost,
             inference_type: request.inference_type,
-            created_at: chrono::Utc::now(),
+            created_at: jiff::Timestamp::now(),
             ttft_ms: request.ttft_ms,
             avg_itl_ms: request.avg_itl_ms,
             inference_id: request.inference_id,
@@ -100,8 +100,8 @@ impl UsageRepository for CapturingUsageRepository {
     async fn get_usage_by_model(
         &self,
         _: Uuid,
-        _: chrono::DateTime<chrono::Utc>,
-        _: Option<chrono::DateTime<chrono::Utc>>,
+        _: jiff::Timestamp,
+        _: Option<jiff::Timestamp>,
     ) -> anyhow::Result<Vec<UsageByModelEntry>> {
         unimplemented!()
     }
@@ -497,7 +497,7 @@ async fn admission_uses_live_org_policy_and_audit_off_never_create_holds() {
                 key: "usage_admission".into(),
                 value: serde_json::json!({}),
                 updated_by_user_id: None,
-                updated_at: chrono::Utc::now(),
+                updated_at: jiff::Timestamp::now(),
             }))
         }
         async fn load_usage_admission(&self) -> anyhow::Result<budget::policy::AdmissionSnapshot> {

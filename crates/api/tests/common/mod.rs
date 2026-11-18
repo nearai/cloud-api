@@ -165,6 +165,7 @@ pub fn test_config() -> ApiConfig {
         staking_farm: config::StakingFarmConfig::default(),
         aml: config::AmlConfig::default(),
         usage_reporting: config::UsageReportingConfig::default(),
+        usage_estimate_incomplete_streams: true,
         credit_allocation: config::CreditAllocationConfig::default(),
         ita: config::ItaAttestationConfig::default(),
         placement: config::PlacementConfig::default(),

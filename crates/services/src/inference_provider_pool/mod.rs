@@ -25,6 +25,7 @@ use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, info, warn};
 
 mod context_routing;
+pub(crate) use context_routing::estimate_input_with;
 pub use context_routing::expand_inference_endpoints;
 mod long_context_gate;
 pub use long_context_gate::limit_message as long_context_limit_message;

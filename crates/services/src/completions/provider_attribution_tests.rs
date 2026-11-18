@@ -275,3 +275,141 @@ async fn failed_providers_do_not_record_served_attribution() {
         "terminal provider failures must not record successful usage"
     );
 }
+
+async fn estimate_service(
+    model_name: &str,
+    tier: inference_providers::ProviderTier,
+    source: inference_providers::ProviderSource,
+    attestation_supported: bool,
+) -> (CompletionServiceImpl, Arc<CapturingUsageService>) {
+    use inference_providers::mock::{MockProvider, RequestMatcher, ResponseTemplate};
+
+    let pool = Arc::new(InferenceProviderPool::new(
+        None,
+        config::ExternalProvidersConfig::default(),
+    ));
+    let provider = Arc::new(
+        MockProvider::new_accept_all()
+            .with_tier(tier)
+            .with_provider_source(source),
+    );
+    provider
+        .when(RequestMatcher::Any)
+        .respond_with(
+            ResponseTemplate::new("hello from the model, streamed without a usage summary")
+                .with_usage_omitted(),
+        )
+        .await;
+    pool.register_provider(model_name.to_string(), provider)
+        .await;
+
+    let mut model = test_model(model_name);
+    model.attestation_supported = attestation_supported;
+    let usage_service = Arc::new(CapturingUsageService::new());
+    let service = CompletionServiceImpl::new(
+        pool,
+        Arc::new(MockAttestationService),
+        usage_service.clone(),
+        Arc::new(CapturingMetricsService::new()),
+        Arc::new(StaticModelsRepository { model }),
+        Arc::new(StaticOrganizationLimitRepository),
+    );
+    (service, usage_service)
+}
+
+async fn drain_stream(service: &CompletionServiceImpl, model_name: &str, header: Option<&str>) {
+    use futures::StreamExt;
+
+    let mut request = completion_request(model_name);
+    request.stream = Some(true);
+    if let Some(key) = header {
+        request
+            .extra
+            .insert(key.to_string(), serde_json::json!("value"));
+    }
+    let stream = service
+        .create_chat_completion_stream(request)
+        .await
+        .expect("the stream should start");
+    let _ = stream.collect::<Vec<_>>().await;
+}
+
+#[tokio::test]
+async fn plaintext_request_on_the_near_fleet_records_an_estimate() {
+    use inference_providers::{ProviderSource, ProviderTier};
+
+    let model_name = "z-ai/glm-5.1";
+    let (service, usage_service) =
+        estimate_service(model_name, ProviderTier::Near, ProviderSource::Vllm, true).await;
+
+    drain_stream(&service, model_name, None).await;
+
+    let requests = wait_for_usage_requests(&usage_service, 1).await;
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].input_tokens > 0 && requests[0].output_tokens > 0);
+    assert_eq!(
+        requests[0].stop_reason,
+        Some(crate::usage::StopReason::Incomplete)
+    );
+}
+
+#[tokio::test]
+async fn encrypted_request_on_the_near_fleet_records_no_estimate() {
+    use inference_providers::{ProviderSource, ProviderTier};
+
+    let model_name = "z-ai/glm-5.1";
+    let (service, usage_service) =
+        estimate_service(model_name, ProviderTier::Near, ProviderSource::Vllm, true).await;
+
+    drain_stream(
+        &service,
+        model_name,
+        Some(crate::common::encryption_headers::CLIENT_PUB_KEY),
+    )
+    .await;
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        usage_service.get_requests().is_empty(),
+        "byte counts over ciphertext must not be billed"
+    );
+}
+
+#[tokio::test]
+async fn encryption_headers_do_not_turn_off_estimates_on_other_providers() {
+    use inference_providers::{ProviderSource, ProviderTier};
+
+    let cases = [
+        (
+            ProviderTier::NonAttested,
+            ProviderSource::External,
+            false,
+            crate::common::encryption_headers::ENCRYPTION_VERSION,
+        ),
+        (
+            ProviderTier::Attested3p,
+            ProviderSource::Chutes,
+            true,
+            crate::common::encryption_headers::CLIENT_PUB_KEY,
+        ),
+        (
+            ProviderTier::Attested3p,
+            ProviderSource::Tinfoil,
+            true,
+            crate::common::encryption_headers::SIGNING_ALGO,
+        ),
+    ];
+    for (tier, source, attested, header) in cases {
+        let model_name = "z-ai/glm-5.1";
+        let (service, usage_service) = estimate_service(model_name, tier, source, attested).await;
+
+        drain_stream(&service, model_name, Some(header)).await;
+
+        let requests = wait_for_usage_requests(&usage_service, 1).await;
+        assert_eq!(requests.len(), 1, "{source:?} with {header}");
+        assert!(
+            requests[0].output_tokens > 0,
+            "{source:?} with {header} must still be estimated"
+        );
+    }
+}

@@ -1144,8 +1144,8 @@ pub struct AuthConfig {
     ///
     /// Default `false`: admin routes accept a session token from an allowlisted
     /// user or an admin access token. Set `AUTH_ADMIN_TOKENS_ONLY=true` to refuse
-    /// session tokens on admin routes with 401; admin access token validation is
-    /// unchanged.
+    /// session tokens on admin routes with 401. An admin access token is then
+    /// also accepted only while its creator has at least one admin passkey.
     pub admin_tokens_only: bool,
 }
 

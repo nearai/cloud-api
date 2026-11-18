@@ -609,3 +609,142 @@ async fn oversized_systemone_request_is_rejected_when_restricted() {
     }
     assert_eq!(calls.load(Ordering::SeqCst), 0);
 }
+
+/// A load publishes a model's boundary with its new providers. While a load
+/// that moves the model to one endpoint is paused before its discovery, the
+/// old boundary still keeps a restricted organization off the old long tier;
+/// once the load completes, the boundary and the old providers are gone
+/// together.
+#[tokio::test]
+async fn a_load_publishes_the_boundary_together_with_its_providers() {
+    let pool = Arc::new(InferenceProviderPool::new(
+        None,
+        ExternalProvidersConfig::default(),
+    ));
+    let base = provider(ProviderTier::Near);
+    let long = provider(ProviderTier::Near);
+    register(
+        &pool,
+        MODEL,
+        &[(&base, Some(BASE_CAPACITY)), (&long, Some(LONG_CAPACITY))],
+    )
+    .await;
+    configure_tiers(&pool, MODEL);
+    let ptr = |provider: &Arc<InferenceProviderTrait>| Arc::as_ptr(provider) as *const () as usize;
+    let mock_ptr = |provider: &Arc<MockProvider>| Arc::as_ptr(provider) as *const () as usize;
+    let restricted_candidates = || async {
+        pool.get_providers_with_fallback(MODEL, None, &restricted())
+            .await
+            .unwrap()
+            .iter()
+            .map(ptr)
+            .collect::<Vec<usize>>()
+    };
+
+    // Pause the load before discovery: it waits for the URL-provider cache.
+    let cache_guard = pool.inference_url_providers.write().await;
+    let load = {
+        let pool = pool.clone();
+        tokio::spawn(async move {
+            pool.load_inference_url_models(
+                vec![(
+                    MODEL.to_string(),
+                    "https://single.invalid".to_string(),
+                    Some(LONG_CAPACITY),
+                )],
+                true,
+            )
+            .await;
+        })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert!(!load.is_finished(), "the load must still be paused");
+    assert_eq!(pool.long_context_base_capacity(MODEL), Some(BASE_CAPACITY));
+    assert_eq!(restricted_candidates().await, vec![mock_ptr(&base)]);
+
+    // Resume: the load (discovery fails fast here) publishes both at once.
+    drop(cache_guard);
+    load.await.unwrap();
+    assert_eq!(pool.long_context_base_capacity(MODEL), None);
+    let candidates = restricted_candidates().await;
+    assert_eq!(candidates.len(), 1);
+    assert!(!candidates.contains(&mock_ptr(&base)));
+    assert!(!candidates.contains(&mock_ptr(&long)));
+}
+
+/// A successful full refresh forgets the boundary of a model it no longer
+/// lists, unless one of its long-tier providers is still registered; a
+/// partial load never prunes.
+#[tokio::test]
+async fn a_full_refresh_forgets_boundaries_of_models_it_no_longer_lists() {
+    let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+    let moved = "org/moved-to-external";
+    let lingering = "org/long-tier-still-registered";
+    let listed = "org/still-tiered";
+    for model in [moved, lingering, listed] {
+        configure_tiers(&pool, model);
+    }
+    let external = provider(ProviderTier::NonAttested);
+    register(&pool, moved, &[(&external, None)]).await;
+    let long = provider(ProviderTier::Near);
+    register(&pool, lingering, &[(&long, Some(LONG_CAPACITY))]).await;
+
+    pool.load_inference_url_models(
+        vec![(
+            "org/other".to_string(),
+            "https://other.invalid".to_string(),
+            Some(8_192),
+        )],
+        true,
+    )
+    .await;
+    for model in [moved, lingering, listed] {
+        assert_eq!(
+            pool.long_context_base_capacity(model),
+            Some(BASE_CAPACITY),
+            "a partial load must not prune {model}"
+        );
+    }
+
+    pool.sync_inference_url_models(vec![
+        (
+            listed.to_string(),
+            "https://still-base.invalid".to_string(),
+            Some(BASE_CAPACITY),
+        ),
+        (
+            listed.to_string(),
+            "https://still-long.invalid".to_string(),
+            Some(LONG_CAPACITY),
+        ),
+    ])
+    .await;
+    assert_eq!(pool.long_context_base_capacity(moved), None);
+    assert_eq!(
+        pool.long_context_base_capacity(lingering),
+        Some(BASE_CAPACITY),
+        "kept while its long-tier provider is registered"
+    );
+    assert_eq!(pool.long_context_base_capacity(listed), Some(BASE_CAPACITY));
+
+    // Once that provider is gone, the next full refresh forgets it.
+    pool.provider_mappings
+        .write()
+        .await
+        .model_to_providers
+        .remove(lingering);
+    pool.sync_inference_url_models(vec![
+        (
+            listed.to_string(),
+            "https://still-base.invalid".to_string(),
+            Some(BASE_CAPACITY),
+        ),
+        (
+            listed.to_string(),
+            "https://still-long.invalid".to_string(),
+            Some(LONG_CAPACITY),
+        ),
+    ])
+    .await;
+    assert_eq!(pool.long_context_base_capacity(lingering), None);
+}

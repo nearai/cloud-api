@@ -60,6 +60,9 @@ use std::sync::OnceLock;
 
 use inference_providers::{ChatCompletionParams, PlacementContext};
 
+/// The `extra` key of tool definitions that typed parsing left untouched.
+const EXTRA_TOOLS_KEY: &str = "tools";
+
 /// providerConfig key holding the long-context tier declaration. Snake_case
 /// like the other `provider_config` contents (`base_url`, `model_name`).
 const LONG_CONTEXT_KEY: &str = "long_context";
@@ -136,7 +139,12 @@ pub(crate) fn estimate_input(params: &ChatCompletionParams) -> InputEstimate {
         }
     }
     if let Some(tools) = &params.tools {
-        bytes += serde_json::to_string(tools).map_or(0, |s| s.len());
+        bytes += serialized_len(tools);
+    }
+    // Tool definitions that typed parsing could not read stay in `extra` and
+    // are forwarded as is: they occupy the window too.
+    if let Some(tools) = params.extra.get(EXTRA_TOOLS_KEY) {
+        bytes += serialized_len(tools);
     }
     InputEstimate {
         countable_tokens: (bytes / 4) as u64,
@@ -463,6 +471,23 @@ mod tests {
                 "invalid long block must leave the identity expansion for {pc}"
             );
         }
+    }
+
+    #[test]
+    fn tool_definitions_left_in_extra_count_toward_input_estimates() {
+        let base: ChatCompletionParams = serde_json::from_value(serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "q"}]
+        }))
+        .unwrap();
+        let mut with_raw_tools = base.clone();
+        let raw = serde_json::json!([{"type": "custom", "description": "d".repeat(4_000)}]);
+        let raw_len = serde_json::to_string(&raw).unwrap().len();
+        with_raw_tools.extra.insert("tools".to_string(), raw);
+
+        let before = estimate_input(&base);
+        let after = estimate_input(&with_raw_tools);
+        assert!(after.countable_tokens >= before.countable_tokens + (raw_len / 4) as u64);
     }
 
     #[test]

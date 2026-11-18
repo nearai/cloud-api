@@ -786,8 +786,8 @@ mod tests {
                 owner_id: UserId(Uuid::new_v4()),
                 settings,
                 is_active: true,
-                created_at: chrono::Utc::now(),
-                updated_at: chrono::Utc::now(),
+                created_at: jiff::Timestamp::now(),
+                updated_at: jiff::Timestamp::now(),
             }
             .long_context_disabled_models()
         };

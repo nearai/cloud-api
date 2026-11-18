@@ -17,6 +17,10 @@ keeps the reported prompt and cache tokens and uses the output estimate below.
 The input estimate includes message text, tool definitions, `tool_choice`,
 prior `tool_calls`, and a fixed 1,024 tokens per non-text content part by
 default (`CONTEXT_ROUTE_MEDIA_PART_TOKENS` can override that fixed amount).
+It does not count prior-turn reasoning text, which some adapters drop before
+the request is sent. A client-encrypted request served by NEAR AI's own
+fleet records no estimate, because byte counts over ciphertext do not reflect
+the prompt or the output.
 The output estimate includes streamed text, reasoning text, and tool-call
 name and argument deltas. Text uses a UTF-8 bytes/4 heuristic, so CJK and
 emoji counts are approximate. When no usage was reported, cached tokens are

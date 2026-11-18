@@ -2,7 +2,7 @@ use super::super::auth::ports::{User, UserId};
 use super::super::common::RepositoryError;
 use anyhow::Result;
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -32,8 +32,8 @@ pub struct Organization {
     pub owner_id: UserId,
     pub settings: serde_json::Value,
     pub is_active: bool,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
+    pub created_at: Timestamp,
+    pub updated_at: Timestamp,
 }
 
 impl Organization {
@@ -112,7 +112,7 @@ pub struct OrganizationMember {
     pub organization_id: OrganizationId,
     pub user_id: UserId,
     pub role: MemberRole,
-    pub joined_at: DateTime<Utc>,
+    pub joined_at: Timestamp,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -207,7 +207,7 @@ pub struct OrganizationMemberWithUser {
     pub organization_id: OrganizationId,
     pub user_id: UserId,
     pub role: MemberRole,
-    pub joined_at: DateTime<Utc>,
+    pub joined_at: Timestamp,
     pub user: User,
 }
 

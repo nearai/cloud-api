@@ -6,7 +6,7 @@ use crate::pool::DbPool;
 use crate::repositories::utils::map_db_error;
 use crate::retry_db;
 use anyhow::{bail, Context, Result};
-use chrono::Utc;
+use jiff::Timestamp;
 use services::common::RepositoryError;
 use tracing::{debug, error, warn};
 use uuid::Uuid;
@@ -99,7 +99,7 @@ impl McpConnectorRepository {
             .transpose()?;
 
         let row = retry_db!("create_mcp_connector", {
-            let now = Utc::now();
+            let now = Timestamp::now();
             let client = self
                 .pool
                 .get()
@@ -232,7 +232,7 @@ impl McpConnectorRepository {
         id: Uuid,
         request: UpdateMcpConnectorRequest,
     ) -> Result<McpConnector> {
-        let now = Utc::now();
+        let now = Timestamp::now();
         let encrypted_description = request
             .description
             .map(|value| self.encrypt_text("mcp_connectors", "description", id, value))
@@ -371,7 +371,7 @@ impl McpConnectorRepository {
             .transpose()?;
 
         let rows_affected = retry_db!("update_mcp_connector_connection_status", {
-            let now = Utc::now();
+            let now = Timestamp::now();
 
             debug!("Executing UPDATE query for connector {}: status={}, error_message={:?}, capabilities={:?}, now={}, id={}",
                    id, status_str, error_message, capabilities.as_ref().map(|_| "<present>"), now, id);
@@ -462,7 +462,7 @@ impl McpConnectorRepository {
             .transpose()?;
 
         retry_db!("log_mcp_connector_usage", {
-            let now = Utc::now();
+            let now = Timestamp::now();
             let client = self
                 .pool
                 .get()

@@ -74,7 +74,9 @@ fn admin_pin_view(pin: &AdminModelPin) -> AdminPinView {
         repo: pin.repo.clone(),
         tag: pin.tag.clone(),
         rekor_log_index: prov.as_ref().map(|p| p.rekor_log_index),
-        integrated_time: prov.as_ref().map(|p| p.integrated_time.to_rfc3339()),
+        integrated_time: prov
+            .as_ref()
+            .map(|p| crate::timestamps::format_utc(p.integrated_time)),
         snp_measurement: prov.as_ref().map(|p| p.snp_measurement.clone()),
         rtmr1: prov.as_ref().and_then(|p| p.rtmr1.clone()),
         rtmr2: prov.as_ref().and_then(|p| p.rtmr2.clone()),

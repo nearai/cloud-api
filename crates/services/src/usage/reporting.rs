@@ -1,12 +1,12 @@
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InferenceUsageHistoryQuery {
     pub organization_id: Uuid,
-    pub start_time: Option<DateTime<Utc>>,
-    pub end_time: Option<DateTime<Utc>>,
+    pub start_time: Option<Timestamp>,
+    pub end_time: Option<Timestamp>,
     pub workspace_id: Option<Uuid>,
     pub api_key_id: Option<Uuid>,
     pub credit_type: Option<String>,
@@ -20,7 +20,7 @@ pub struct InferenceUsageReportRow {
     pub organization_id: Uuid,
     pub workspace_id: Uuid,
     pub api_key_id: Uuid,
-    pub created_at: DateTime<Utc>,
+    pub created_at: Timestamp,
     pub model: String,
     pub inference_type: String,
     pub input_tokens: i64,

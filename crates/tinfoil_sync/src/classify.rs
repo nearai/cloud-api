@@ -293,7 +293,7 @@ mod tests {
             rtmr1: Some("r1".into()),
             rtmr2: Some("r2".into()),
             rekor_log_index: 1,
-            integrated_time: chrono::DateTime::UNIX_EPOCH,
+            integrated_time: jiff::Timestamp::UNIX_EPOCH,
         }
     }
     fn obs_router(m: &str) -> Observations {

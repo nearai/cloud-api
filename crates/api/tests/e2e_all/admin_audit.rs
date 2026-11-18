@@ -275,7 +275,7 @@ async fn admin_token_identity_is_audited_for_allowed_and_denied_requests() {
                     creator,
                     format!("admin-audit-{}", Uuid::new_v4()),
                     "admin audit e2e".to_string(),
-                    chrono::Utc::now() + chrono::Duration::hours(1),
+                    jiff::Timestamp::now() + jiff::SignedDuration::from_hours(1),
                     Some(MOCK_USER_AGENT.to_string()),
                     permission,
                 )

@@ -3,7 +3,7 @@ use crate::repositories::utils::map_db_error;
 use crate::retry_db;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use services::aml::{
     AmlAllowlistEntry, AmlAllowlistPage, AmlReport, AmlReportPage, AmlReportPolicySignals,
     AmlRepository, AmlRiskLevel, NewAmlAllowlistEntry, NewAmlReport,
@@ -59,7 +59,7 @@ impl AmlRepository for PostgresAmlRepository {
         account_id: &str,
         address_type: &str,
         provider: &str,
-        fresh_after: Option<DateTime<Utc>>,
+        fresh_after: Option<Timestamp>,
         risk_level_policy_configured: bool,
         score_policy_configured: bool,
     ) -> Result<Option<AmlReport>> {

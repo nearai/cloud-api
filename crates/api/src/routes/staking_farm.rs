@@ -151,7 +151,7 @@ async fn require_near_default_org(
 fn source_to_response(source: OrganizationStakingFarmSource) -> StakingFarmStateResponse {
     StakingFarmStateResponse {
         organization_id: source.organization_id.to_string(),
-        bound_at: source.created_at.to_rfc3339(),
+        bound_at: services::timestamps::format_utc(source.created_at),
         bound_by_user_id: source.created_by_user_id.map(|id| id.to_string()),
         near_account_id: source.near_account_id,
         network_id: source.network_id,
@@ -165,7 +165,7 @@ fn source_to_response(source: OrganizationStakingFarmSource) -> StakingFarmState
         farm_credit_nano_usd: source.last_synced_credit_nano_usd,
         last_synced_reward_units_24: source.last_synced_reward_units_24,
         last_synced_credit_nano_usd: source.last_synced_credit_nano_usd,
-        last_synced_at: source.last_synced_at.map(|value| value.to_rfc3339()),
+        last_synced_at: source.last_synced_at.map(services::timestamps::format_utc),
         sync_status: source.sync_status,
         last_sync_error: source.last_sync_error,
         active_positions: source.active_positions,

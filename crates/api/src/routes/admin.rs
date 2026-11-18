@@ -7,7 +7,7 @@ use axum::{
     response::Json as ResponseJson,
     Extension,
 };
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use services::admin::AnalyticsService;
 use std::sync::Arc;
 use tracing::debug;
@@ -16,8 +16,8 @@ use tracing::debug;
 /// UTC-hour form `YYYY-MM-DDTHH:00:00Z` (matching the spec's examples, e.g.
 /// `2025-06-01T15:00:00Z`). The stored value is always normalized to a whole
 /// UTC hour, so this is a faithful round-trip.
-pub(crate) fn format_deprecation_date(dt: &DateTime<Utc>) -> String {
-    dt.format("%Y-%m-%dT%H:00:00Z").to_string()
+pub(crate) fn format_deprecation_date(dt: &Timestamp) -> String {
+    dt.strftime("%Y-%m-%dT%H:00:00Z").to_string()
 }
 
 #[derive(Clone)]

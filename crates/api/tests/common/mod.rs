@@ -23,9 +23,9 @@ use api::{
 };
 use async_trait::async_trait;
 use base64::Engine;
-use chrono::Utc;
 use config::ApiConfig;
 use database::Database;
+use jiff::Timestamp;
 pub use services::auth::ports::MOCK_USER_AGENT;
 use services::auth::AccessTokenClaims;
 use services::responses::tools::{
@@ -1574,7 +1574,7 @@ fn generate_test_signature() -> String {
 
 /// Create NEP-413 nonce with timestamp offset in milliseconds.
 pub fn create_near_test_nonce(timestamp_offset_ms: i64) -> Vec<u8> {
-    let now_ms = Utc::now().timestamp_millis();
+    let now_ms = Timestamp::now().as_millisecond();
     let nonce_timestamp_ms = (now_ms + timestamp_offset_ms) as u64;
     let mut nonce = Vec::with_capacity(32);
     nonce.extend_from_slice(&nonce_timestamp_ms.to_be_bytes());

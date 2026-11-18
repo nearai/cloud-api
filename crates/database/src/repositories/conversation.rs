@@ -3,7 +3,7 @@ use crate::repositories::utils::map_db_error;
 use crate::retry_db;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use chrono::Utc;
+use jiff::Timestamp;
 use services::common::RepositoryError;
 use services::conversations::models::{Conversation, ConversationId};
 use services::conversations::ports::ConversationRepository;
@@ -87,7 +87,7 @@ impl ConversationRepository for PgConversationRepository {
         let stored_metadata = self.encrypt_metadata(id, &metadata)?;
 
         let row = retry_db!("create_new_conversation", {
-            let now = Utc::now();
+            let now = Timestamp::now();
             let client = self
                 .pool
                 .get()
@@ -153,7 +153,7 @@ impl ConversationRepository for PgConversationRepository {
     ) -> Result<Option<Conversation>> {
         let stored_metadata = self.encrypt_metadata(id.0, &metadata)?;
         let row = retry_db!("update_conversation_metadata", {
-            let now = Utc::now();
+            let now = Timestamp::now();
             let client = self
                 .pool
                 .get()
@@ -195,7 +195,7 @@ impl ConversationRepository for PgConversationRepository {
         is_pinned: bool,
     ) -> Result<Option<Conversation>> {
         let row = retry_db!("set_conversation_pinned", {
-            let now = Utc::now();
+            let now = Timestamp::now();
             let pinned_at = if is_pinned { Some(now) } else { None };
             let client = self
                 .pool
@@ -238,7 +238,7 @@ impl ConversationRepository for PgConversationRepository {
         is_archived: bool,
     ) -> Result<Option<Conversation>> {
         let row = retry_db!("set_conversation_archived", {
-            let now = Utc::now();
+            let now = Timestamp::now();
             let archived_at = if is_archived { Some(now) } else { None };
             let client = self
                 .pool
@@ -282,7 +282,7 @@ impl ConversationRepository for PgConversationRepository {
         api_key_id: uuid::Uuid,
     ) -> Result<Option<Conversation>> {
         let new_conv_id = Uuid::new_v4();
-        let now = Utc::now();
+        let now = Timestamp::now();
 
         // Get database client with retry
         let mut client = retry_db!("get_db_client_for_clone", {
@@ -534,7 +534,7 @@ impl ConversationRepository for PgConversationRepository {
             let old_item_id: Uuid = item_row.try_get("id")?;
             let old_response_id: Uuid = item_row.try_get("response_id")?;
             let mut item_json: serde_json::Value = item_row.try_get("item")?;
-            let original_created_at: chrono::DateTime<Utc> = item_row.try_get("created_at")?;
+            let original_created_at: jiff::Timestamp = item_row.try_get("created_at")?;
 
             // Map old response_id to new response_id
             let new_response_id = id_map
@@ -605,7 +605,7 @@ impl ConversationRepository for PgConversationRepository {
     /// Soft delete a conversation (sets deleted_at timestamp)
     async fn delete(&self, id: ConversationId, workspace_id: WorkspaceId) -> Result<bool> {
         let result = retry_db!("delete_conversation", {
-            let now = Utc::now();
+            let now = Timestamp::now();
             let client = self
                 .pool
                 .get()

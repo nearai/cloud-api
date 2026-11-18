@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use bloomfilter::Bloom;
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use moka::future::Cache;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::AtomicBool;
@@ -80,16 +80,16 @@ pub struct User {
     pub provider_user_id: String,
     pub role: UserRole,
     pub is_active: bool,
-    pub last_login: Option<DateTime<Utc>>,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
-    pub tokens_revoked_at: Option<DateTime<Utc>>,
+    pub last_login: Option<Timestamp>,
+    pub created_at: Timestamp,
+    pub updated_at: Timestamp,
+    pub tokens_revoked_at: Option<Timestamp>,
     /// Address the user asked to be contacted at. Set only once verified, and never
     /// written by login. `email` stays the login identity.
     pub contact_email: Option<String>,
-    pub contact_email_verified_at: Option<DateTime<Utc>>,
+    pub contact_email_verified_at: Option<Timestamp>,
     /// When the user agreed to be emailed at `contact_email`.
-    pub email_opt_in_at: Option<DateTime<Utc>>,
+    pub email_opt_in_at: Option<Timestamp>,
 }
 
 /// A session access token that passed validation.
@@ -125,8 +125,8 @@ pub struct AuthSession {
     pub user_id: UserId,
     pub access_token: String,
     pub refresh_token: Option<String>,
-    pub expires_at: DateTime<Utc>,
-    pub created_at: DateTime<Utc>,
+    pub expires_at: Timestamp,
+    pub created_at: Timestamp,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -261,8 +261,8 @@ pub struct Session {
     pub id: SessionId,
     pub user_id: UserId,
     pub token_hash: String, // Store hashed session token
-    pub created_at: DateTime<Utc>,
-    pub expires_at: DateTime<Utc>,
+    pub created_at: Timestamp,
+    pub expires_at: Timestamp,
     pub ip_address: Option<String>,
     pub user_agent: String,
 }
@@ -455,9 +455,9 @@ impl MockAuthService {
             provider_user_id: "mock-admin".to_string(),
             role: UserRole::User,
             is_active: true,
-            last_login: Some(chrono::Utc::now()),
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
+            last_login: Some(jiff::Timestamp::now()),
+            created_at: jiff::Timestamp::now(),
+            updated_at: jiff::Timestamp::now(),
             tokens_revoked_at: None,
             contact_email: None,
             contact_email_verified_at: None,
@@ -496,13 +496,14 @@ impl MockAuthService {
         expires_in_hours: i64,
         refresh_expires_in_hours: i64,
     ) -> (String, Session, String) {
-        let expiration = chrono::Utc::now() + chrono::Duration::hours(expires_in_hours);
+        let expiration =
+            jiff::Timestamp::now() + jiff::SignedDuration::from_hours(expires_in_hours);
         let session_id = SessionId(uuid::Uuid::new_v4());
 
         let claims = AccessTokenClaims {
             sub: user_id.clone(),
-            exp: expiration.timestamp(),
-            iat: chrono::Utc::now().timestamp(),
+            exp: crate::timestamps::unix_seconds(expiration),
+            iat: jiff::Timestamp::now().as_second(),
             sid: Some(session_id.clone()),
         };
 
@@ -514,13 +515,14 @@ impl MockAuthService {
         .unwrap();
         // Generate token with same format as real session repository
         let session_token = format!("rt_{}", uuid::Uuid::new_v4().to_string().replace("-", ""));
-        let expires_at = chrono::Utc::now() + chrono::Duration::hours(refresh_expires_in_hours);
+        let expires_at =
+            jiff::Timestamp::now() + jiff::SignedDuration::from_hours(refresh_expires_in_hours);
 
         let session = Session {
             id: session_id,
             user_id,
             token_hash: "mock_token_hash".to_string(),
-            created_at: chrono::Utc::now(),
+            created_at: jiff::Timestamp::now(),
             expires_at,
             ip_address: ip_address.or(Some("127.0.0.1".to_string())),
             user_agent,
@@ -558,12 +560,13 @@ impl AuthServiceTrait for MockAuthService {
         encoding_key: String,
         expires_in_hours: i64,
     ) -> Result<String, AuthError> {
-        let expiration = chrono::Utc::now() + chrono::Duration::hours(expires_in_hours);
+        let expiration =
+            jiff::Timestamp::now() + jiff::SignedDuration::from_hours(expires_in_hours);
 
         let claims = AccessTokenClaims {
             sub: user_id,
-            exp: expiration.timestamp(),
-            iat: chrono::Utc::now().timestamp(),
+            exp: crate::timestamps::unix_seconds(expiration),
+            iat: jiff::Timestamp::now().as_second(),
             sid: session_id,
         };
 

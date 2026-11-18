@@ -258,7 +258,7 @@ pub(super) fn model_with_pricing_to_info(model: services::models::ModelWithPrici
     ModelInfo {
         id: model.model_name,
         object: "model".to_string(),
-        created: model.created_at.timestamp(),
+        created: services::timestamps::unix_seconds(model.created_at),
         owned_by: model.owned_by,
         name,
         hugging_face_id: model.hugging_face_id,

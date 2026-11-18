@@ -330,11 +330,24 @@ async fn e2e_repository_reads_settings_and_maps_a_missing_blocks_table_to_no_blo
     );
 }
 
-/// A platform block row caps the organization the same way.
+/// A platform block row caps the organization the same way. Runs once the
+/// pinned schema has the blocks table; until the pin moves, it is skipped.
 #[tokio::test]
 async fn e2e_platform_block_caps_requests_at_the_base_tier() {
     let (server, database) = setup_test_server_with_database().await;
     let client = database.pool().get().await.unwrap();
+    let has_blocks_table: bool = client
+        .query_one(
+            "SELECT to_regclass('organization_model_long_context_blocks') IS NOT NULL",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    if !has_blocks_table {
+        eprintln!("skipped: the pinned schema has no organization_model_long_context_blocks table");
+        return;
+    }
 
     let (base, long) = (MockServer::start().await, MockServer::start().await);
     let model = setup_tiered_model(&server, &base.uri(), &long.uri()).await;

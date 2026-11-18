@@ -460,6 +460,14 @@ pub async fn init_domain_services_with_pool(
         )),
     );
 
+    // Per-organization access to long-context tiers, shared by the
+    // completion and attestation services below.
+    let long_context_access = Arc::new(services::long_context_access::LongContextAccess::new(
+        Arc::new(database::repositories::PgLongContextAccessRepository::new(
+            database.pool().clone(),
+        )),
+    ));
+
     // Create attestation service
     let attestation_service = Arc::new(
         services::attestation::AttestationService::init(
@@ -472,7 +480,8 @@ pub async fn init_domain_services_with_pool(
             config.ita.clone(),
         )
         .await
-        .unwrap(),
+        .unwrap()
+        .with_long_context_access(long_context_access.clone()),
     );
 
     // Prepare repositories for usage service (will be created after workspace service)
@@ -551,7 +560,8 @@ pub async fn init_domain_services_with_pool(
         catalog_models.clone(),
         org_limit_repository,
     )
-    .with_model_resolve_cache(models_service.model_resolve_cache());
+    .with_model_resolve_cache(models_service.model_resolve_cache())
+    .with_long_context_access(long_context_access);
     // Affinity keys only matter to a pool that places requests.
     if let Some(affinity_secret) = inference_provider_pool.affinity_secret() {
         completion_service = completion_service.with_affinity_secret(affinity_secret);

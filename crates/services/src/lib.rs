@@ -16,6 +16,7 @@ pub mod files;
 pub mod id_prefixes;
 pub mod inference_provider_pool;
 pub mod lifecycle;
+pub mod long_context_access;
 pub mod metrics;
 pub mod models;
 pub mod organization;

@@ -14,15 +14,7 @@ pub(super) async fn maybe_redact(
     service_request: &mut ServiceCompletionRequest,
     pool: &services::inference_provider_pool::InferenceProviderPool,
 ) -> Result<(bool, RedactionMap, i64), AutoRedactError> {
-    let header_values: Vec<&str> = headers
-        .get_all(auto_redact::AUTO_REDACT_HEADER)
-        .iter()
-        .filter_map(|v| v.to_str().ok())
-        .collect();
-    let body_field = service_request
-        .extra
-        .get(auto_redact::AUTO_REDACT_BODY_FIELD);
-    let enabled = auto_redact::is_enabled(header_values.iter().copied(), body_field);
+    let enabled = auto_redact_requested(headers, service_request);
 
     // Always strip the body field so providers with strict JSON schemas
     // (e.g. Anthropic) don't 400 on unknown keys.
@@ -39,6 +31,24 @@ pub(super) async fn maybe_redact(
     )
     .await?;
     Ok((true, map, classify_tokens))
+}
+
+/// Whether the request opts in to auto-redact (header or body field).
+pub(super) fn auto_redact_requested(
+    headers: &header::HeaderMap,
+    service_request: &ServiceCompletionRequest,
+) -> bool {
+    let header_values: Vec<&str> = headers
+        .get_all(auto_redact::AUTO_REDACT_HEADER)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .collect();
+    auto_redact::is_enabled(
+        header_values.iter().copied(),
+        service_request
+            .extra
+            .get(auto_redact::AUTO_REDACT_BODY_FIELD),
+    )
 }
 
 /// Convert an [`AutoRedactError`] into the user-facing error response.

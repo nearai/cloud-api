@@ -5,8 +5,8 @@ use crate::test_utils::{CapturingUsageService, MockAttestationService};
 use std::sync::Arc;
 use std::time::Duration;
 
-struct StaticModelsRepository {
-    model: ModelWithPricing,
+pub(super) struct StaticModelsRepository {
+    pub(super) model: ModelWithPricing,
 }
 
 #[async_trait::async_trait]

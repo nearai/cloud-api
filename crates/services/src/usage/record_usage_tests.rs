@@ -556,6 +556,17 @@ async fn admission_uses_live_org_policy_and_audit_off_never_create_holds() {
             service.admit(identity, features).await.unwrap().is_some(),
             expected
         );
+        for kind in [
+            InferenceType::ChatCompletion,
+            InferenceType::ImageGeneration,
+            InferenceType::ImageEdit,
+            InferenceType::AudioTranscription,
+            InferenceType::Decisions,
+        ] {
+            let invalid = budget::UsageFeatures::measure_json(kind, &serde_json::json!({"n":0}));
+            let result = service.admit(identity, invalid).await;
+            assert_eq!(result.is_err(), expected, "{kind:?}");
+        }
         if !expected {
             let overflowing = budget::UsageFeatures::from_json(
                 InferenceType::ChatCompletion,
@@ -580,13 +591,13 @@ async fn admission_uses_live_org_policy_and_audit_off_never_create_holds() {
         .iter()
         .filter(|metric| metric.name == budget::metrics::DECISIONS)
         .collect();
-    assert_eq!(decisions.len(), 5);
+    assert_eq!(decisions.len(), 20);
     for outcome in ["admitted", "off", "estimated", "estimate_failed"] {
         assert!(decisions
             .iter()
             .any(|metric| metric.tags.contains(&format!("outcome:{outcome}"))));
     }
-    for (stage, expected) in [("reserve", 1), ("total", 5)] {
+    for (stage, expected) in [("reserve", 1), ("total", 20)] {
         assert_eq!(
             recorded
                 .iter()
@@ -600,4 +611,52 @@ async fn admission_uses_live_org_policy_and_audit_off_never_create_holds() {
         .tags
         .iter()
         .any(|tag| tag.contains(&enforced.to_string()))));
+}
+
+#[tokio::test]
+async fn admission_reuses_trusted_pricing_without_a_second_model_read() {
+    struct NoModelReads;
+    #[async_trait::async_trait]
+    impl ModelRepository for NoModelReads {
+        async fn get_model_by_name(&self, _: &str) -> anyhow::Result<Option<ModelPricing>> {
+            panic!("unexpected model read");
+        }
+        async fn get_model_by_id(&self, _: Uuid) -> anyhow::Result<Option<ModelPricing>> {
+            panic!("unexpected model read");
+        }
+    }
+    let pricing = model();
+    let identity = BillingIdentity {
+        organization_id: Uuid::new_v4(),
+        workspace_id: Uuid::new_v4(),
+        api_key_id: Uuid::new_v4(),
+        model_id: pricing.id,
+    };
+    let mut features = budget::UsageFeatures::measure_json(
+        InferenceType::ChatCompletion,
+        &serde_json::json!({"max_tokens":8}),
+    );
+    features.pricing = Some(pricing);
+    let serialized = serde_json::to_value(&features).unwrap();
+    assert!(serialized.get("pricing").is_none());
+    let external: budget::UsageFeatures = serde_json::from_value(serialized).unwrap();
+    assert!(external.pricing.is_none());
+    let service = UsageServiceImpl::new(
+        Arc::new(CapturingUsageRepository::default()),
+        Arc::new(NoModelReads),
+        Arc::new(UnusedLimitsRepository),
+        Arc::new(MockWorkspaceServiceTrait::new()),
+        Arc::new(CapturingMetricsService::new()),
+    );
+    let admission = service
+        .reserve_budget(
+            Uuid::new_v4(),
+            identity,
+            features,
+            budget::policy::AdmissionMode::Enforce,
+            "gateway",
+        )
+        .await
+        .unwrap();
+    assert!(admission.estimated_amount.unwrap() > 0);
 }

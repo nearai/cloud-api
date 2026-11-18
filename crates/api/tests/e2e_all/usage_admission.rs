@@ -415,3 +415,40 @@ async fn ten_concurrent_requests_share_a_small_key_budget_and_settle_actual_spen
         }
     }).await.expect("actual usage settles and releases all holds");
 }
+
+#[tokio::test]
+async fn audit_and_off_do_not_reject_chat_on_estimation_metadata() {
+    for mode in [AdmissionMode::Audit, AdmissionMode::Off] {
+        let settings = AdmissionSettings {
+            defaults: AdmissionPolicy {
+                mode,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let (server, _, _, db) = server(settings).await;
+        setup_qwen_model(&server).await;
+        let org = setup_org_with_credits(&server, 1_000_000_000).await;
+        let key = get_api_key_for_org(&server, org.id.clone()).await;
+        for stream in [false, true] {
+            server.post("/v1/chat/completions")
+                .add_header("Authorization", format!("Bearer {key}"))
+                .json(&json!({"model":E2E_QWEN_MODEL_NAME, "messages":[{"role":"user","content":"hello"}],
+                    "max_tokens":8, "max_output_tokens":-1, "stream":stream}))
+                .await.assert_status_ok();
+        }
+        let count: i64 = db
+            .pool()
+            .get()
+            .await
+            .unwrap()
+            .query_one(
+                "SELECT COUNT(*) FROM usage_budget_reservations WHERE organization_id=$1",
+                &[&Uuid::parse_str(&org.id).unwrap()],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(count, 0);
+    }
+}

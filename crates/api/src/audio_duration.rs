@@ -4,7 +4,6 @@ use lofty::{
     file::{AudioFile, FileType},
     probe::Probe,
 };
-use matroska_demuxer::{Frame, MatroskaFile};
 use std::io::{self, Cursor, Read, Seek, SeekFrom};
 use std::time::{Duration, Instant};
 
@@ -61,7 +60,7 @@ impl Seek for MeterReader<'_> {
 
 fn seconds(bytes: &[u8]) -> Option<i32> {
     if bytes.starts_with(&[0x1a, 0x45, 0xdf, 0xa3]) {
-        return webm_seconds(bytes);
+        return None;
     }
     let options = ParseOptions::new()
         .read_tags(false)
@@ -162,42 +161,6 @@ fn positive_seconds(value: u128) -> Option<i32> {
     i32::try_from(value).ok().filter(|seconds| *seconds > 0)
 }
 
-fn webm_seconds(bytes: &[u8]) -> Option<i32> {
-    let mut file = MatroskaFile::open(MeterReader::new(bytes)).ok()?;
-    let track = file.tracks().iter().find(|track| track.audio().is_some())?;
-    if track.codec_id() != "A_OPUS" {
-        return None;
-    }
-    let id = track.track_number().get();
-    let mut samples = 0_u64;
-    let mut frame = Frame::default();
-    while file.next_frame(&mut frame).ok()? {
-        if frame.track == id {
-            // WebM may omit block durations; Opus has an explicit duration in every packet.
-            samples = samples.checked_add(opus_samples(&frame.data)?)?;
-        }
-    }
-    positive_seconds(u128::from(samples).div_ceil(48_000))
-}
-
-// RFC 6716 sections 3.1 and 3.2: frame size and count are in the packet header.
-fn opus_samples(packet: &[u8]) -> Option<u64> {
-    let toc = *packet.first()?;
-    let config = toc >> 3;
-    let samples = match config {
-        0..=11 => [480_u64, 960, 1920, 2880][usize::from(config & 3)],
-        12..=15 => [480, 960][usize::from(config & 1)],
-        _ => [120, 240, 480, 960][usize::from(config & 3)],
-    };
-    let count = match toc & 3 {
-        0 => 1,
-        1 | 2 => 2,
-        _ => u64::from(*packet.get(1)? & 0x3f),
-    };
-    let total = samples * count;
-    (count > 0 && total <= 5760).then_some(total)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -247,7 +210,6 @@ mod tests {
             include_bytes!("../tests/fixtures/audio/silence.flac").as_slice(),
             include_bytes!("../tests/fixtures/audio/silence.m4a").as_slice(),
             include_bytes!("../tests/fixtures/audio/silence.ogg").as_slice(),
-            include_bytes!("../tests/fixtures/audio/silence.webm").as_slice(),
         ] {
             assert_eq!(seconds(bytes), Some(2));
         }
@@ -264,19 +226,15 @@ mod tests {
     }
 
     #[test]
-    fn opus_packet_duration_covers_frame_modes_and_rejects_invalid_counts() {
-        for (packet, expected) in [
-            (vec![0], Some(480)),
-            (vec![3 << 3], Some(2880)),
-            (vec![13 << 3], Some(960)),
-            (vec![16 << 3], Some(120)),
-            (vec![(19 << 3) | 1], Some(1920)),
-            (vec![(19 << 3) | 3, 6], Some(5760)),
-            (vec![(19 << 3) | 3, 7], None),
-            (vec![3, 0], None),
-            (vec![3], None),
-        ] {
-            assert_eq!(opus_samples(&packet), expected);
-        }
+    fn webm_uploads_skip_optional_metering() {
+        assert_eq!(
+            seconds(include_bytes!("../tests/fixtures/audio/silence.webm")),
+            None
+        );
+        // An EBML element claiming an oversized payload never reaches a demuxer.
+        assert_eq!(
+            seconds(&[0x1a, 0x45, 0xdf, 0xa3, 0x01, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]),
+            None
+        );
     }
 }

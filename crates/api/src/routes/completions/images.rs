@@ -113,27 +113,19 @@ pub async fn image_generations(
         request.response_format.clone()
     };
 
-    let features = match services::usage::budget::UsageFeatures::from_json(
+    let features = services::usage::budget::UsageFeatures::measure_json(
         services::usage::InferenceType::ImageGeneration,
         &serde_json::json!({"n": request.n}),
+    );
+    let budget = match crate::routes::common::usage_execution(
+        &app_state,
+        &api_key,
+        model.id,
+        features.with_model(&model),
     ) {
-        Ok(features) => features,
-        Err(_) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                ResponseJson(ErrorResponse::new(
-                    "Invalid admission metadata".into(),
-                    "invalid_request_error".into(),
-                )),
-            )
-                .into_response()
-        }
+        Ok(budget) => budget,
+        Err(response) => return response.into_response(),
     };
-    let budget =
-        match crate::routes::common::usage_execution(&app_state, &api_key, model.id, features) {
-            Ok(budget) => budget,
-            Err(response) => return response.into_response(),
-        };
 
     // Convert API request to provider params
     let mut extra = std::collections::HashMap::new();
@@ -557,27 +549,19 @@ pub async fn image_edits(
         request.response_format.clone()
     };
 
-    let features = match services::usage::budget::UsageFeatures::from_json(
+    let features = services::usage::budget::UsageFeatures::measure_json(
         services::usage::InferenceType::ImageEdit,
         &serde_json::json!({}),
+    );
+    let budget = match crate::routes::common::usage_execution(
+        &app_state,
+        &api_key,
+        model.id,
+        features.with_model(&model),
     ) {
-        Ok(features) => features,
-        Err(_) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                ResponseJson(ErrorResponse::new(
-                    "Invalid admission metadata".into(),
-                    "invalid_request_error".into(),
-                )),
-            )
-                .into_response()
-        }
+        Ok(budget) => budget,
+        Err(response) => return response.into_response(),
     };
-    let budget =
-        match crate::routes::common::usage_execution(&app_state, &api_key, model.id, features) {
-            Ok(budget) => budget,
-            Err(response) => return response.into_response(),
-        };
 
     // Convert API request to provider params
     let params = inference_providers::ImageEditParams {

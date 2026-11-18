@@ -240,13 +240,21 @@ impl UsageServiceImpl {
             }
             let quote_started = std::time::Instant::now();
             let quote = async {
-                let pricing = self
-                    .model_repository
-                    .get_model_by_id(identity.model_id)
-                    .await
-                    .map_err(|e| UsageError::InternalError(e.to_string()))?
-                    .ok_or_else(|| UsageError::ModelNotFound(identity.model_id.to_string()))?;
-                bounds.estimate()?.quote(&pricing)
+                let estimate = bounds.estimate()?;
+                let pricing = if let Some(pricing) = bounds
+                    .pricing
+                    .as_ref()
+                    .filter(|p| p.id == identity.model_id)
+                {
+                    pricing.clone()
+                } else {
+                    self.model_repository
+                        .get_model_by_id(identity.model_id)
+                        .await
+                        .map_err(|e| UsageError::InternalError(e.to_string()))?
+                        .ok_or_else(|| UsageError::ModelNotFound(identity.model_id.to_string()))?
+                };
+                estimate.quote(&pricing)
             }
             .await;
             metrics::duration(

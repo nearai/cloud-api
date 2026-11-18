@@ -405,7 +405,7 @@ pub async fn reserve_usage_internal(
         )
         .await
         .map_err(|_| failure(StatusCode::BAD_REQUEST, "Model unavailable"))?;
-    let features = request.features.with_model_output(model.max_output_length);
+    let features = request.features.with_model(&model);
     let admitted = state
         .usage_service
         .admit_external(

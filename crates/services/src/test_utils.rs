@@ -386,6 +386,8 @@ impl UsageServiceTrait for MockUsageService {
 
 /// A usage service that captures requests for testing
 pub struct CapturingUsageService {
+    pub stall_recording: std::sync::atomic::AtomicBool,
+    pub skip_admission: std::sync::atomic::AtomicBool,
     pub admissions: std::sync::Mutex<Vec<Uuid>>,
     pub releases: std::sync::Mutex<Vec<Uuid>>,
     pub unknown_outcomes: std::sync::Mutex<Vec<Uuid>>,
@@ -396,6 +398,8 @@ pub struct CapturingUsageService {
 impl CapturingUsageService {
     pub fn new() -> Self {
         Self {
+            stall_recording: std::sync::atomic::AtomicBool::new(false),
+            skip_admission: std::sync::atomic::AtomicBool::new(false),
             admissions: std::sync::Mutex::new(Vec::new()),
             releases: std::sync::Mutex::new(Vec::new()),
             unknown_outcomes: std::sync::Mutex::new(Vec::new()),
@@ -424,6 +428,12 @@ impl UsageServiceTrait for CapturingUsageService {
         _: crate::usage::BillingIdentity,
         _: crate::usage::budget::UsageFeatures,
     ) -> Result<Option<Uuid>, UsageError> {
+        if self
+            .skip_admission
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Ok(None);
+        }
         let mut admissions = self.admissions.lock().unwrap();
         if self
             .admission_limit
@@ -477,6 +487,12 @@ impl UsageServiceTrait for CapturingUsageService {
             provider_attribution: request.provider_attribution,
         };
         self.requests.lock().unwrap().push(request);
+        if self
+            .stall_recording
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            std::future::pending::<()>().await;
+        }
         Ok(entry)
     }
 

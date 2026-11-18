@@ -185,12 +185,11 @@ impl NativeResponsesService {
                 api_key_id: context.api_key_id,
                 model_id: model.id,
             },
-            crate::usage::budget::UsageFeatures::from_json(
+            crate::usage::budget::UsageFeatures::measure_json(
                 crate::usage::InferenceType::ChatCompletion,
                 &body,
             )
-            .map_err(|_| NativeResponsesError::Internal("Cannot estimate request"))?
-            .with_model_output(model.max_output_length),
+            .with_model(&model),
         );
         let stream = body["stream"] == true;
         let (upstream, attribution) = budget

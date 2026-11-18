@@ -166,14 +166,15 @@ but no longer reduce available capacity. If final usage is lost before it reache
 the existing accounting path, expiry does not reconstruct it or charge the estimate.
 
 Audio settlement prefers the provider's duration-based `usage.seconds`, then
-verbose-response `duration`. If neither supplies a usable value, local Rust parsers
-read frame/sample timing from the uploaded audio, rounded up to seconds.
-Local file metering has at most four workers and a one-second parsing budget; if it
-cannot complete, provider usage remains authoritative. MP3 metering counts complete
-frames instead of trusting summary frame counts. This does not change uploaded bytes, response format,
-or encryption. The byte/rate estimate is never used as actual usage. If neither
-the provider nor the file supplies usable duration, return the existing response,
-log the missing usage, and apply the unknown-outcome grace period.
+verbose-response `duration`. Uploaded-file timing and byte counts are admission
+estimates only and never substitute for actual usage. Missing provider duration
+returns a billing error from the gateway; direct proxy reporting logs the missing
+usage without charging an estimate. The reservation uses the unknown-outcome grace period.
+
+Optional local metering has at most four workers and a one-second parsing budget.
+MP3 metering counts complete frames instead of trusting summary frame counts.
+WebM skips local parsing and uses the byte-based estimate. Uploads, response format,
+and encryption are preserved.
 
 Direct proxy requests use the internal admission endpoint with numeric metadata and a sanitized service-tier label
 and a separate `admission_id` in the final HTTP/SQS usage receipt. Admission also

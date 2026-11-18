@@ -1924,9 +1924,8 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             self.affinity_secret,
         );
 
-        let features = crate::usage::budget::UsageFeatures::from_chat(&chat_params)
-            .map_err(crate::usage::budget::service_error)?
-            .with_model_output(model.max_output_length);
+        let features =
+            crate::usage::budget::UsageFeatures::measure_chat(&chat_params).with_model(&model);
         let budget = crate::usage::budget::BudgetExecution::new(
             self.usage_service.clone(),
             crate::usage::BillingIdentity {
@@ -2170,9 +2169,8 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             self.affinity_secret,
         );
 
-        let features = crate::usage::budget::UsageFeatures::from_chat(&chat_params)
-            .map_err(crate::usage::budget::service_error)?
-            .with_model_output(model.max_output_length);
+        let features =
+            crate::usage::budget::UsageFeatures::measure_chat(&chat_params).with_model(&model);
         let budget = crate::usage::budget::BudgetExecution::new(
             self.usage_service.clone(),
             crate::usage::BillingIdentity {
@@ -2215,6 +2213,14 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
                 return Err(err);
             }
         };
+        let mut outcome = crate::usage::budget::OutcomeGuard::new(
+            self.usage_service.clone(),
+            organization_id,
+            budget
+                .id()
+                .await
+                .map_err(crate::usage::budget::service_error)?,
+        );
         let response_with_bytes = attributed_response.response;
         let provider_attribution = attributed_response.provider_attribution;
 
@@ -2341,7 +2347,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
                 provider_attribution,
                 // Written once per served request: a provider id seen
                 // before is not a retry.
-                dedupe_on_conflict: true,
+                dedupe_on_conflict: false,
                 ..RecordUsageServiceRequest::base(
                     crate::usage::BillingIdentity {
                         organization_id,
@@ -2368,6 +2374,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             api_key_id
         );
 
+        outcome.disarm();
         Ok(response_with_bytes)
     }
 

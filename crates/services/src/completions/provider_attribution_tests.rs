@@ -152,6 +152,7 @@ async fn completion_service_with_mock_providers(
     ));
     let near = Arc::new(
         MockProvider::new_accept_all()
+            .with_chat_id("shared-provider-id")
             .with_tier(ProviderTier::Near)
             .with_provider_source(ProviderSource::Vllm),
     );
@@ -274,4 +275,55 @@ async fn failed_providers_do_not_record_served_attribution() {
         requests.is_empty(),
         "terminal provider failures must not record successful usage"
     );
+}
+
+#[tokio::test]
+async fn cancellation_during_nonstreaming_usage_recording_marks_outcome_unknown() {
+    let model = "test/cancel-settlement";
+    let (service, usage) = completion_service_with_mock_providers(model, false, false).await;
+    usage
+        .stall_recording
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let task = tokio::spawn(async move {
+        service
+            .create_chat_completion(completion_request(model))
+            .await
+    });
+    let recorded = wait_for_usage_requests(&usage, 1).await;
+    let id = recorded[0].budget_id.unwrap();
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while usage.unknown_outcomes.lock().unwrap().is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(*usage.unknown_outcomes.lock().unwrap(), vec![id]);
+    assert!(usage.releases.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn nonstreaming_chat_without_reservation_preserves_each_usage_record() {
+    let model = "test/independent-completions";
+    let (service, usage) = completion_service_with_mock_providers(model, false, false).await;
+    usage
+        .skip_admission
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    for _ in 0..2 {
+        service
+            .create_chat_completion(completion_request(model))
+            .await
+            .unwrap();
+    }
+    let recorded = usage.get_requests();
+    assert_eq!(recorded.len(), 2);
+    assert_eq!(
+        recorded[0].provider_request_id,
+        recorded[1].provider_request_id
+    );
+    assert!(recorded
+        .iter()
+        .all(|request| request.budget_id.is_none() && !request.dedupe_on_conflict));
 }

@@ -851,6 +851,7 @@ pub struct MockProvider {
     /// order. Lets lifecycle tests assert the signature-fetch routing pin was
     /// released. `std::sync::Mutex` because the trait method is synchronous.
     unpinned_chat_ids: Arc<std::sync::Mutex<Vec<String>>>,
+    chat_id_override: Option<String>,
     /// `signing_algo` of every [`InferenceProvider::get_attestation_report`]
     /// call, in call order, so tests can assert what the gateway forwarded.
     attestation_signing_algos: Arc<std::sync::Mutex<Vec<Option<String>>>>,
@@ -994,6 +995,7 @@ impl MockProvider {
             count_poll: crate::CountPoll::Skipped,
             per_request_public_key: None,
             unpinned_chat_ids: Arc::new(std::sync::Mutex::new(Vec::new())),
+            chat_id_override: None,
             attestation_signing_algos: Arc::new(std::sync::Mutex::new(Vec::new())),
             tracing_calls: Arc::new(std::sync::Mutex::new(Vec::new())),
             responses_handler: None,
@@ -1035,6 +1037,7 @@ impl MockProvider {
             count_poll: crate::CountPoll::Skipped,
             per_request_public_key: None,
             unpinned_chat_ids: Arc::new(std::sync::Mutex::new(Vec::new())),
+            chat_id_override: None,
             attestation_signing_algos: Arc::new(std::sync::Mutex::new(Vec::new())),
             tracing_calls: Arc::new(std::sync::Mutex::new(Vec::new())),
             responses_handler: None,
@@ -1074,6 +1077,7 @@ impl MockProvider {
             count_poll: crate::CountPoll::Skipped,
             per_request_public_key: None,
             unpinned_chat_ids: Arc::new(std::sync::Mutex::new(Vec::new())),
+            chat_id_override: None,
             attestation_signing_algos: Arc::new(std::sync::Mutex::new(Vec::new())),
             tracing_calls: Arc::new(std::sync::Mutex::new(Vec::new())),
             responses_handler: None,
@@ -1282,8 +1286,17 @@ impl MockProvider {
         format!("cmpl-{}", uuid::Uuid::new_v4())
     }
 
+    /// Return one provider ID across independent completions.
+    pub fn with_chat_id(mut self, id: impl Into<String>) -> Self {
+        self.chat_id_override = Some(id.into());
+        self
+    }
+
     /// Generate a chat completion ID
     fn generate_chat_id(&self) -> String {
+        if let Some(id) = &self.chat_id_override {
+            return id.clone();
+        }
         // These IDs are persisted in the shared E2E database. A timestamp hash
         // can collide when separate nextest processes generate responses in
         // the same clock tick, allowing one test to overwrite another test's

@@ -131,17 +131,13 @@ pub async fn systemone(
         Ok(value) => value,
         Err(_) => return error(StatusCode::INTERNAL_SERVER_ERROR, "Cannot estimate request"),
     };
-    let features = match services::usage::budget::UsageFeatures::from_json(
-        InferenceType::Decisions,
-        &metadata,
-    ) {
-        Ok(features) => features,
-        Err(_) => return error(StatusCode::BAD_REQUEST, "Invalid admission metadata"),
-    };
-    let budget = match common::usage_execution(&state, &api_key, model.id, features) {
-        Ok(budget) => budget,
-        Err(response) => return response.into_response(),
-    };
+    let features =
+        services::usage::budget::UsageFeatures::measure_json(InferenceType::Decisions, &metadata);
+    let budget =
+        match common::usage_execution(&state, &api_key, model.id, features.with_model(&model)) {
+            Ok(budget) => budget,
+            Err(response) => return response.into_response(),
+        };
     // System One backends receive no tenant ids: the inference call and the
     // signature fetch in `finalize` both run with the tracing context cleared.
     let served = match budget

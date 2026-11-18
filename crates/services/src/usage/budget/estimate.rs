@@ -6,6 +6,11 @@ use serde_json::Value;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UsageFeatures {
+    // Local extraction failures are interpreted only after resolving the admission policy.
+    #[serde(skip)]
+    measurement_failed: bool,
+    #[serde(skip)]
+    pub(in crate::usage) pricing: Option<super::ModelPricing>,
     pub inference_type: InferenceType,
     pub text_bytes: u64,
     pub token_ids: u64,
@@ -28,6 +33,37 @@ pub struct UsageFeatures {
 }
 
 impl UsageFeatures {
+    /// Reuse the authenticated model lookup; prices supplied over the wire are never trusted.
+    pub fn with_model(mut self, model: &crate::models::ModelWithPricing) -> Self {
+        self.pricing = Some(super::ModelPricing {
+            id: model.id,
+            model_name: model.model_name.clone(),
+            input_cost_per_token: model.input_cost_per_token,
+            output_cost_per_token: model.output_cost_per_token,
+            cost_per_image: model.cost_per_image,
+            cache_read_cost_per_token: model.cache_read_cost_per_token,
+            text_pricing: model.text_pricing.clone(),
+        });
+        self.with_model_output(model.max_output_length)
+    }
+
+    pub fn measure_chat(params: &inference_providers::ChatCompletionParams) -> Self {
+        Self::measured(InferenceType::ChatCompletion, Self::from_chat(params))
+    }
+
+    pub fn measure_json(kind: InferenceType, body: &Value) -> Self {
+        Self::measured(kind, Self::from_json(kind, body))
+    }
+
+    fn measured(kind: InferenceType, result: Result<Self, UsageError>) -> Self {
+        result.unwrap_or_else(|_| {
+            let mut features = Self::from_json(kind, &Value::Null)
+                .expect("empty metadata has valid default counts");
+            features.measurement_failed = true;
+            features
+        })
+    }
+
     /// Walk borrowed chat content so estimation does not duplicate inline media payloads.
     pub fn from_chat(
         params: &inference_providers::ChatCompletionParams,
@@ -138,6 +174,8 @@ impl UsageFeatures {
                 .transpose()
         };
         let mut features = Self {
+            measurement_failed: false,
+            pricing: None,
             inference_type: kind,
             text_bytes: 0,
             token_ids: 0,
@@ -261,6 +299,11 @@ impl UsageFeatures {
     }
 
     pub fn estimate(&self) -> Result<UsageEstimate, UsageError> {
+        if self.measurement_failed {
+            return Err(UsageError::ValidationError(
+                "Cannot estimate request metadata".into(),
+            ));
+        }
         if self.executions == 0
             || self.batch_items == 0
             || self.choices == 0

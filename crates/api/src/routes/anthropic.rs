@@ -609,21 +609,11 @@ async fn handle_request(
     };
 
     let budget = if let Some(seed) = &billing_seed {
-        let bounds = match services::usage::budget::UsageFeatures::from_json(
+        let bounds = services::usage::budget::UsageFeatures::measure_json(
             InferenceType::ChatCompletion,
             &prepared.body,
         )
-        .map(|features| features.with_model_output(model.max_output_length))
-        {
-            Ok(bounds) => bounds,
-            Err(_) => {
-                return anthropic_error(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "api_error",
-                    "Invalid model budget bounds",
-                )
-            }
-        };
+        .with_model(&model);
         Some(services::usage::budget::BudgetExecution::new(
             app_state.usage_service.clone(),
             services::usage::BillingIdentity {

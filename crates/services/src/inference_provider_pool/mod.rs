@@ -5454,7 +5454,7 @@ impl InferenceProviderPool {
             crate::usage::budget::before_attempt().await.map_err(|e| {
                 AnthropicRawError::Budget {
                     status_code: crate::usage::budget::admission_status(&e),
-                    message: e.to_string(),
+                    message: crate::usage::budget::public_message(&e),
                 }
             })?;
         }

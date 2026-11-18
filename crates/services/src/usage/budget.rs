@@ -260,7 +260,7 @@ pub async fn before_attempt() -> Result<(), UsageError> {
 pub fn completion_error(error: UsageError) -> inference_providers::CompletionError {
     inference_providers::CompletionError::HttpError {
         status_code: admission_status(&error),
-        message: error.to_string(),
+        message: public_message(&error),
         is_external: false,
     }
 }
@@ -268,7 +268,19 @@ pub fn completion_error(error: UsageError) -> inference_providers::CompletionErr
 pub fn service_error(error: UsageError) -> crate::completions::ports::CompletionError {
     crate::completions::ports::CompletionError::ProviderError {
         status_code: admission_status(&error),
-        message: error.to_string(),
+        message: public_message(&error),
+    }
+}
+
+pub(crate) fn public_message(error: &UsageError) -> String {
+    if admission_status(error) == 503 {
+        tracing::warn!(
+            reason = metrics::error_reason(error),
+            "Monetary admission unavailable"
+        );
+        "Monetary admission unavailable".into()
+    } else {
+        error.to_string()
     }
 }
 
@@ -369,6 +381,30 @@ mod tests {
     }
 
     #[test]
+    fn admission_unavailability_does_not_expose_repository_details() {
+        let error = UsageError::InternalError("host=private-db SELECT secret FROM account".into());
+        for message in [
+            match completion_error(error.clone()) {
+                inference_providers::CompletionError::HttpError {
+                    status_code: 503,
+                    message,
+                    ..
+                } => message,
+                other => panic!("{other:?}"),
+            },
+            match service_error(error) {
+                crate::completions::ports::CompletionError::ProviderError {
+                    status_code: 503,
+                    message,
+                } => message,
+                other => panic!("{other:?}"),
+            },
+        ] {
+            assert_eq!(message, "Monetary admission unavailable");
+        }
+    }
+
+    #[test]
     fn quote_rounds_up_uses_minimum_and_preserves_free_models_without_overflow() {
         let pricing = ModelPricing {
             id: Uuid::new_v4(),
@@ -459,6 +495,49 @@ mod tests {
                 usize::from(dispatched)
             );
         }
+    }
+
+    #[tokio::test]
+    async fn completed_inner_timeout_retains_funding_and_marks_unknown() {
+        use inference_providers::retry_admission::RetryAdmission;
+        let service = Arc::new(crate::test_utils::CapturingUsageService::new());
+        let identity = BillingIdentity {
+            organization_id: Uuid::new_v4(),
+            workspace_id: Uuid::new_v4(),
+            api_key_id: Uuid::new_v4(),
+            model_id: Uuid::new_v4(),
+        };
+        let execution = BudgetExecution::new(
+            service.clone(),
+            identity,
+            UsageFeatures::measure_json(InferenceType::AudioTranscription, &json!({})),
+        );
+        let result = execution
+            .run(tokio::time::timeout(
+                std::time::Duration::from_millis(5),
+                async {
+                    before_attempt().await.unwrap();
+                    execution.mark_dispatched().await;
+                    std::future::pending::<()>().await;
+                },
+            ))
+            .await;
+        assert!(result.is_err());
+        let id = execution.id().await.unwrap().unwrap();
+        drop(OutcomeGuard::new(
+            service.clone(),
+            identity.organization_id,
+            Some(id),
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while service.unknown_outcomes.lock().unwrap().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(*service.unknown_outcomes.lock().unwrap(), vec![id]);
+        assert!(service.releases.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

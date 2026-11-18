@@ -104,15 +104,15 @@ async fn test_audio_transcription_basic() {
     assert!(!body.text.is_empty());
 }
 
-/// Ordinary JSON usage or local file timing settles without adding response fields.
+/// Provider-reported JSON usage settles without adding response fields.
 #[tokio::test]
-async fn json_audio_usage_and_local_fallback_settle_without_response_changes() {
+async fn json_audio_usage_settles_without_response_changes() {
     for (audio, filename, mime, usage_seconds, billed_seconds) in [
         (
             include_bytes!("../fixtures/audio/silence.wav").as_slice(),
             "sample.wav",
             "audio/wav",
-            None,
+            Some(2.0),
             2,
         ),
         (
@@ -154,7 +154,7 @@ async fn json_audio_usage_and_local_fallback_settle_without_response_changes() {
         let row = client.query_one("SELECT COUNT(*), COALESCE(SUM(amount),0)::BIGINT FROM usage_budget_reservations WHERE organization_id=$1 AND state='settled'", &[&org_id]).await.unwrap();
         assert_eq!(row.get::<_, i64>(0), 1);
         assert!(row.get::<_, i64>(1) > 0);
-        if usage_seconds.is_none() {
+        if filename == "sample.wav" {
             assert_eq!(
                 row.get::<_, i64>(1),
                 80_000_000,
@@ -171,6 +171,48 @@ async fn json_audio_usage_and_local_fallback_settle_without_response_changes() {
             .get(0);
         assert_eq!(spent, i64::from(billed_seconds) * 1_000_000);
     }
+}
+
+#[tokio::test]
+async fn missing_provider_duration_retains_hold_without_charging_local_timing() {
+    let (server, mock, model) = setup_whisper_model().await;
+    mock.omit_audio_duration().await;
+    let org = setup_org_with_credits(&server, 10_000_000_000).await;
+    let key = get_api_key_for_org(&server, org.id.clone()).await;
+    let response = server
+        .post("/v1/audio/transcriptions")
+        .add_header("Authorization", format!("Bearer {key}"))
+        .multipart(
+            axum_test::multipart::MultipartForm::new()
+                .add_part(
+                    "file",
+                    axum_test::multipart::Part::bytes(
+                        include_bytes!("../fixtures/audio/silence.wav").to_vec(),
+                    )
+                    .file_name("sample.wav")
+                    .mime_type("audio/wav"),
+                )
+                .add_text("model", model)
+                .add_text("response_format", "json"),
+        )
+        .await;
+    assert_eq!(response.status_code(), 502);
+    let pool = crate::common::db_setup::create_test_pool().await;
+    let client = pool.get().await.unwrap();
+    let org_id = uuid::Uuid::parse_str(&org.id).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let count: i64 = client.query_one(
+                "SELECT COUNT(*) FROM usage_budget_reservations WHERE organization_id=$1 AND state='active' AND outcome_unknown_at IS NOT NULL",
+                &[&org_id]).await.unwrap().get(0);
+            if count == 1 { break; }
+            tokio::task::yield_now().await;
+        }
+    }).await.unwrap();
+    let spent: i64 = client.query_one(
+        "SELECT COALESCE(SUM(total_cost),0)::BIGINT FROM organization_usage_log WHERE organization_id=$1",
+        &[&org_id]).await.unwrap().get(0);
+    assert_eq!(spent, 0);
 }
 
 /// Test audio transcription with language parameter

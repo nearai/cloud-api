@@ -69,7 +69,6 @@ tokio-util = { version = "0.7", features = ["compat", "io"] }
 reqwest = { version = "0.12", features = ["json", "stream"] }
 
 [dev-dependencies]
-time = { version = "0.3", features = ["parsing"] }
 opentelemetry_sdk = { version = "0.33", features = ["rt-tokio", "trace", "testing"] }
 database = { path = "../database", features = ["test-support"] }
 axum-test = "21"

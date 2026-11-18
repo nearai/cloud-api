@@ -374,10 +374,10 @@ pub async fn get_organization_balance(
         ("org_id" = String, Path, description = "Organization ID"),
         ("limit" = Option<i64>, Query, description = "Number of records to return (default: 100)"),
         ("offset" = Option<i64>, Query, description = "Offset for pagination (default: 0)"),
-        ("start_date" = Option<String>, Query, description = "Inclusive UTC start date in YYYY-MM-DD or RFC3339 format."),
-        ("end_date" = Option<String>, Query, description = "Inclusive UTC end date in YYYY-MM-DD or RFC3339 format."),
-        ("start_time" = Option<String>, Query, description = "Inclusive RFC3339 start timestamp. Takes precedence over start_date."),
-        ("end_time" = Option<String>, Query, description = "Inclusive RFC3339 end timestamp. Takes precedence over end_date."),
+        ("start_date" = Option<String>, Query, description = "Inclusive UTC start date as YYYY-MM-DD or a timestamp with a UTC offset."),
+        ("end_date" = Option<String>, Query, description = "Inclusive UTC end date as YYYY-MM-DD or a timestamp with a UTC offset."),
+        ("start_time" = Option<String>, Query, description = "Inclusive start timestamp with a UTC offset (e.g. 2026-01-01T00:00:00Z). Takes precedence over start_date."),
+        ("end_time" = Option<String>, Query, description = "Inclusive end timestamp with a UTC offset (e.g. 2026-01-02T00:00:00Z). Takes precedence over end_date."),
         ("workspace_id" = Option<Uuid>, Query, description = "Filter by workspace ID."),
         ("api_key_id" = Option<Uuid>, Query, description = "Filter by API key ID."),
         ("credit_type" = Option<CreditType>, Query, description = "Filter costs by their saved credit allocation.")
@@ -581,7 +581,7 @@ fn normalize_usage_history_date(
     let Some(raw) = value else {
         return Ok(None);
     };
-    if services::timestamps::parse_rfc3339(raw).is_some() {
+    if services::timestamps::parse_timestamp(raw).is_some() {
         return Ok(Some(raw.to_string()));
     }
 
@@ -652,7 +652,7 @@ enum UsageHistoryRangeError {
 fn parse_usage_history_time(value: Option<&str>) -> Result<Option<Timestamp>, UsageError> {
     value
         .map(|timestamp| {
-            services::timestamps::parse_rfc3339(timestamp)
+            services::timestamps::parse_timestamp(timestamp)
                 .ok_or_else(|| usage_history_query_error(UsageHistoryRangeError::InvalidTimestamp))
         })
         .transpose()
@@ -968,7 +968,7 @@ fn parse_datetime_or_default(
     default: jiff::Timestamp,
 ) -> Result<jiff::Timestamp, (StatusCode, ResponseJson<ErrorResponse>)> {
     match value {
-        Some(s) => services::timestamps::parse_rfc3339(s).ok_or_else(|| {
+        Some(s) => services::timestamps::parse_timestamp(s).ok_or_else(|| {
             (
                 StatusCode::BAD_REQUEST,
                 ResponseJson(ErrorResponse::new(
@@ -1322,6 +1322,10 @@ mod tests {
         // Then: they parse to UTC instants and a missing value stays absent.
         assert_eq!(start, Some(ts("2026-07-01T00:00:00Z")));
         assert_eq!(offset, start);
+        assert_eq!(
+            parse_usage_history_time(Some("2026-07-01T00:00Z[UTC]")).unwrap(),
+            start
+        );
         assert_eq!(parse_usage_history_time(None).unwrap(), None);
 
         // And: a malformed timestamp is a 400 with the reporting query error type.

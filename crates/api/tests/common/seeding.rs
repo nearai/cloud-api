@@ -463,17 +463,13 @@ fn usd_price(amount: i64) -> DecimalPrice {
 
 /// Whole-hour UTC instant, or a bare date that means 13:00 UTC on that day.
 fn parse_deprecation_date(value: &str) -> Option<Timestamp> {
-    if let Ok(parsed) =
-        time::OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339)
-    {
-        if !parsed.offset().is_utc()
-            || parsed.minute() != 0
-            || parsed.second() != 0
-            || parsed.nanosecond() != 0
-        {
-            return None;
-        }
-        return Timestamp::from_nanosecond(parsed.unix_timestamp_nanos()).ok();
+    if let Ok(parsed) = value.parse::<Timestamp>() {
+        let offset = jiff::fmt::temporal::Pieces::parse(value)
+            .ok()?
+            .to_numeric_offset()?;
+        return (offset == jiff::tz::Offset::UTC
+            && parsed.as_nanosecond() % 3_600_000_000_000 == 0)
+            .then_some(parsed);
     }
     let date = jiff::civil::Date::strptime("%Y-%m-%d", value).ok()?;
     jiff::tz::Offset::UTC

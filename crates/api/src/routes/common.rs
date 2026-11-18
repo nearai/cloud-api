@@ -236,11 +236,11 @@ pub fn parse_metrics_range(
     };
 
     let end = match end {
-        Some(s) => services::timestamps::parse_rfc3339(s).ok_or_else(|| bad("end"))?,
+        Some(s) => services::timestamps::parse_timestamp(s).ok_or_else(|| bad("end"))?,
         None => jiff::Timestamp::now(),
     };
     let start = match start {
-        Some(s) => services::timestamps::parse_rfc3339(s).ok_or_else(|| bad("start"))?,
+        Some(s) => services::timestamps::parse_timestamp(s).ok_or_else(|| bad("start"))?,
         None => end - jiff::SignedDuration::from_hours(30 * 24),
     };
 

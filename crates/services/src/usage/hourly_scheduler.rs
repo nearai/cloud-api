@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use chrono::{DateTime, NaiveDate, TimeDelta, Timelike, Utc};
+use jiff::{civil::Date, SignedDuration, Timestamp};
 use tracing::{error, info, warn};
 
 use super::ports::{AggregateLockBehavior, DayParity, HourlyProgress, UsageHourlyRepository};
@@ -18,28 +18,29 @@ pub const NIGHTLY_PARITY_HOUR: u32 = 3;
 pub const TICK_MINUTE: u32 = 5;
 
 /// Floor to the UTC boundary of `unit_secs`; rem_euclid keeps pre-epoch times flooring down.
-fn trunc_secs(t: DateTime<Utc>, unit_secs: i64) -> DateTime<Utc> {
-    t - TimeDelta::seconds(t.timestamp().rem_euclid(unit_secs))
-        - TimeDelta::nanoseconds(i64::from(t.timestamp_subsec_nanos()))
+fn trunc_secs(t: Timestamp, unit_secs: i64) -> Timestamp {
+    let width = i128::from(unit_secs) * 1_000_000_000;
+    Timestamp::from_nanosecond(t.as_nanosecond().div_euclid(width) * width)
+        .expect("UTC boundary is representable")
 }
 
-pub fn trunc_hour(t: DateTime<Utc>) -> DateTime<Utc> {
+pub fn trunc_hour(t: Timestamp) -> Timestamp {
     trunc_secs(t, 3600)
 }
 
-pub fn trunc_day(t: DateTime<Utc>) -> DateTime<Utc> {
+pub fn trunc_day(t: Timestamp) -> Timestamp {
     trunc_secs(t, 86_400)
 }
 
 /// One data-derived cursor (spec §5.3). `from` resumes at the next raw hour after the last
 /// computed hour (jumping empty spans), never later than the 3-hour re-read boundary.
 /// Catch-up windows end on UTC midnight so every historical day ends inside exactly one window.
-pub fn plan_window(progress: HourlyProgress, now: DateTime<Utc>) -> (DateTime<Utc>, DateTime<Utc>) {
+pub fn plan_window(progress: HourlyProgress, now: Timestamp) -> (Timestamp, Timestamp) {
     let target = trunc_hour(now);
-    let reread = target - TimeDelta::hours(REREAD_HOURS);
+    let reread = target - SignedDuration::from_hours(REREAD_HOURS);
     let from = progress.next_raw_hour.unwrap_or(target).min(reread);
     let to = if from < reread {
-        (trunc_day(from) + TimeDelta::days(CATCH_UP_DAYS)).min(reread)
+        (trunc_day(from) + SignedDuration::from_hours(CATCH_UP_DAYS * 24)).min(reread)
     } else {
         target
     };
@@ -50,32 +51,40 @@ pub fn plan_window(progress: HourlyProgress, now: DateTime<Utc>) -> (DateTime<Ut
 /// The nightly 03:xx check assumes the default hourly cadence; custom intervals may miss it.
 /// It adds yesterday only once it has been recomputed (its end <= `to`), so a tick still catching
 /// up far behind never checks a day it has not written yet.
-pub fn parity_days(from: DateTime<Utc>, to: DateTime<Utc>, now: DateTime<Utc>) -> Vec<NaiveDate> {
+pub fn parity_days(from: Timestamp, to: Timestamp, now: Timestamp) -> Vec<Date> {
     let horizon = trunc_hour(now);
     let mut days = std::collections::BTreeSet::new();
     // Starts after `from` (trunc_day(from) <= from), so every day_end satisfies from < day_end.
-    let mut day_end = trunc_day(from) + TimeDelta::days(1);
+    let mut day_end = trunc_day(from) + SignedDuration::from_hours(24);
     while day_end <= to {
-        if day_end + TimeDelta::hours(REREAD_HOURS) <= horizon {
-            days.insert((day_end - TimeDelta::days(1)).date_naive());
+        if day_end + SignedDuration::from_hours(REREAD_HOURS) <= horizon {
+            days.insert(
+                (day_end - SignedDuration::from_hours(24))
+                    .to_zoned(jiff::tz::TimeZone::UTC)
+                    .date(),
+            );
         }
-        day_end += TimeDelta::days(1);
+        day_end += SignedDuration::from_hours(24);
     }
-    let yesterday_start = trunc_day(now) - TimeDelta::days(1);
-    if now.hour() == NIGHTLY_PARITY_HOUR && yesterday_start + TimeDelta::days(1) <= to {
-        days.insert(yesterday_start.date_naive());
+    let yesterday_start = trunc_day(now) - SignedDuration::from_hours(24);
+    if i32::from(now.to_zoned(jiff::tz::TimeZone::UTC).hour()) == NIGHTLY_PARITY_HOUR as i32
+        && yesterday_start + SignedDuration::from_hours(24) <= to
+    {
+        days.insert(yesterday_start.to_zoned(jiff::tz::TimeZone::UTC).date());
     }
     days.into_iter().collect()
 }
 
 /// Delay from `now` to the next HH:05:00 UTC (strictly in the future).
-pub fn initial_delay(now: DateTime<Utc>) -> std::time::Duration {
-    let mut next = trunc_hour(now) + TimeDelta::minutes(TICK_MINUTE as i64);
+pub fn initial_delay(now: Timestamp) -> std::time::Duration {
+    let mut next = trunc_hour(now) + SignedDuration::from_mins(TICK_MINUTE as i64);
     if next <= now {
-        next += TimeDelta::hours(1);
+        next += SignedDuration::from_hours(1);
     }
     // Invariant: next > now by construction above, so the delta is positive.
-    (next - now).to_std().expect("next tick is in the future")
+    next.duration_since(now)
+        .try_into()
+        .expect("next tick is in the future")
 }
 
 /// Tick spacing while catching up after deploy (spec §5.2): one 3-day window per minute.
@@ -83,7 +92,7 @@ pub const CATCH_UP_TICK_SECS: u64 = 60;
 
 /// Delay until the next regular tick: the next HH:05 UTC when the interval is the default
 /// hourly cadence, otherwise the plain interval.
-pub fn next_regular_delay(now: DateTime<Utc>, interval_secs: u64) -> std::time::Duration {
+pub fn next_regular_delay(now: Timestamp, interval_secs: u64) -> std::time::Duration {
     if interval_secs == 3600 {
         initial_delay(now)
     } else {
@@ -93,8 +102,8 @@ pub fn next_regular_delay(now: DateTime<Utc>, interval_secs: u64) -> std::time::
 
 #[derive(Debug)]
 pub struct TickOutcome {
-    pub from: DateTime<Utc>,
-    pub to: DateTime<Utc>,
+    pub from: Timestamp,
+    pub to: Timestamp,
     pub caught_up: bool,
     pub skipped: bool,
     pub rows_written: u64,
@@ -138,14 +147,14 @@ impl UsageHourlyScheduler {
                 let mut catching_up = true;
                 loop {
                     tokio::time::sleep(delay).await;
-                    match scheduler.run_once(Utc::now()).await {
+                    match scheduler.run_once(Timestamp::now()).await {
                         Ok(outcome) => catching_up = !outcome.caught_up,
                         Err(e) => error!(error = %e, "usage_hourly tick failed"),
                     }
                     delay = if catching_up {
                         std::time::Duration::from_secs(CATCH_UP_TICK_SECS)
                     } else {
-                        next_regular_delay(Utc::now(), interval_secs)
+                        next_regular_delay(Timestamp::now(), interval_secs)
                     };
                 }
             }
@@ -166,7 +175,7 @@ impl UsageHourlyScheduler {
 
     /// One pass: plan from progress, recompute, check parity days, log. Public so tests
     /// can drive it deterministically with an explicit clock.
-    pub async fn run_once(&self, now: DateTime<Utc>) -> anyhow::Result<TickOutcome> {
+    pub async fn run_once(&self, now: Timestamp) -> anyhow::Result<TickOutcome> {
         let started = std::time::Instant::now();
         let progress = self.repository.progress().await?;
         // Freshness (spec §9): seconds since the start of the oldest raw hour not yet aggregated
@@ -179,16 +188,16 @@ impl UsageHourlyScheduler {
             let pending_from = progress
                 .next_raw_hour
                 .map_or(current_hour, |hour| hour.min(current_hour));
-            let lag = now - pending_from;
+            let lag = now.duration_since(pending_from);
             let env_tag = format!("{TAG_ENVIRONMENT}:{}", get_environment());
             self.metrics_service.record_histogram(
                 METRIC_USAGE_HOURLY_LAG_SECONDS,
-                lag.as_seconds_f64(),
+                lag.as_secs_f64(),
                 &[env_tag.as_str()],
             );
         }
         let (from, to) = plan_window(progress, now);
-        let caught_up = from == trunc_hour(now) - TimeDelta::hours(REREAD_HOURS);
+        let caught_up = from == trunc_hour(now) - SignedDuration::from_hours(REREAD_HOURS);
 
         let Some(report) = self
             .repository
@@ -259,8 +268,8 @@ mod tests {
     use crate::metrics::consts::{get_environment, METRIC_USAGE_HOURLY_LAG_SECONDS};
     use crate::usage::ports::{DayTotals, RecomputeReport};
 
-    fn t(s: &str) -> DateTime<Utc> {
-        DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
+    fn t(s: &str) -> Timestamp {
+        s.parse::<jiff::Timestamp>().unwrap()
     }
     fn p(max_hour: Option<&str>, next_raw_hour: Option<&str>) -> HourlyProgress {
         HourlyProgress {
@@ -268,8 +277,8 @@ mod tests {
             next_raw_hour: next_raw_hour.map(t),
         }
     }
-    fn d(s: &str) -> NaiveDate {
-        NaiveDate::parse_from_str(s, "%Y-%m-%d").unwrap()
+    fn d(s: &str) -> Date {
+        Date::strptime("%Y-%m-%d", s).unwrap()
     }
 
     #[test]
@@ -474,8 +483,8 @@ mod tests {
         lock_busy: bool,
         /// Raw totals differ from the aggregate on every checked day.
         parity_mismatch: bool,
-        recomputes: Mutex<Vec<(DateTime<Utc>, DateTime<Utc>)>>,
-        parity_calls: Mutex<Vec<NaiveDate>>,
+        recomputes: Mutex<Vec<(Timestamp, Timestamp)>>,
+        parity_calls: Mutex<Vec<Date>>,
     }
 
     #[async_trait::async_trait]
@@ -485,8 +494,8 @@ mod tests {
         }
         async fn recompute(
             &self,
-            from: DateTime<Utc>,
-            to: DateTime<Utc>,
+            from: Timestamp,
+            to: Timestamp,
             _lock_behavior: AggregateLockBehavior,
         ) -> anyhow::Result<Option<RecomputeReport>> {
             if self.lock_busy {
@@ -495,7 +504,7 @@ mod tests {
             self.recomputes.lock().unwrap().push((from, to));
             Ok(Some(RecomputeReport { rows_written: 7 }))
         }
-        async fn day_parity(&self, day: NaiveDate) -> anyhow::Result<DayParity> {
+        async fn day_parity(&self, day: Date) -> anyhow::Result<DayParity> {
             self.parity_calls.lock().unwrap().push(day);
             let raw = DayTotals {
                 request_count: i64::from(self.parity_mismatch),

@@ -2,8 +2,8 @@ use crate::admin_provider_attribution_support::{
     setup_platform_provider_usage_fixture, PlatformProviderUsageFixture,
 };
 use crate::common::*;
-use chrono::Utc;
 use database::repositories::PgAnalyticsRepository;
+use jiff::Timestamp;
 use serde_json::Value;
 use services::admin::{AnalyticsRepository, OrganizationMetrics, TimeSeriesMetrics};
 use uuid::Uuid;
@@ -35,9 +35,7 @@ async fn admin_metrics_credit_type_uses_saved_allocations() {
         ("2026-08-31T23:59:59Z", 100), // before start
     ] {
         let id = Uuid::new_v4();
-        let created_at = chrono::DateTime::parse_from_rfc3339(date)
-            .unwrap()
-            .with_timezone(&Utc);
+        let created_at = date.parse::<jiff::Timestamp>().unwrap();
         let cost = dollars * 1_000_000_000;
         client
             .execute(
@@ -138,11 +136,7 @@ async fn admin_metrics_credit_type_uses_saved_allocations() {
     ).await.unwrap();
     // Unfiltered reports read usage_hourly (spec §6.2): recompute every seeded hour, from
     // the "before start" row through the "exclusive end" row, in one pass.
-    let hour = |t: &str| {
-        chrono::DateTime::parse_from_rfc3339(t)
-            .unwrap()
-            .with_timezone(&Utc)
-    };
+    let hour = |t: &str| t.parse::<jiff::Timestamp>().unwrap();
     crate::usage_hourly::recompute_usage_hours(
         hour("2026-08-31T23:00:00Z"),
         hour("2026-09-22T01:00:00Z"),
@@ -223,7 +217,7 @@ async fn admin_metrics_credit_type_allows_read_only_tokens() {
             uuid::Uuid::parse_str(MOCK_USER_ID).unwrap(),
             "credit-metrics".to_string(),
             "test".to_string(),
-            chrono::Utc::now() + chrono::Duration::hours(24),
+            jiff::Timestamp::now() + jiff::SignedDuration::from_hours(24),
             Some(MOCK_USER_AGENT.to_string()),
             database::models::AdminAccessTokenPermission::ReadOnly,
         )
@@ -272,7 +266,7 @@ async fn admin_metrics_credit_type_timeout_is_shared_and_transaction_local() {
     insert_platform_provider_usage_row(
         &fixture,
         ProviderUsageSeedRow {
-            created_at: Utc::now(),
+            created_at: Timestamp::now(),
             input_tokens: 100,
             output_tokens: 20,
             cache_read_tokens: 0,
@@ -319,8 +313,8 @@ async fn admin_metrics_credit_type_timeout_is_shared_and_transaction_local() {
         pool.clone(),
         Duration::from_millis(400),
     );
-    let start = Utc::now() - chrono::Duration::days(1);
-    let end = Utc::now() + chrono::Duration::days(1);
+    let start = Timestamp::now() - jiff::SignedDuration::from_hours(24);
+    let end = Timestamp::now() + jiff::SignedDuration::from_hours(24);
     // Each delayed statement is individually shorter than the budget, but the
     // organization lookup and allocation query together exceed it.
     let summary = tokio::time::timeout(
@@ -392,14 +386,14 @@ async fn admin_metrics_credit_type_timeout_is_shared_and_transaction_local() {
     );
 }
 
-fn url_time(t: chrono::DateTime<Utc>) -> String {
-    t.to_rfc3339().replace('+', "%2B")
+fn url_time(t: jiff::Timestamp) -> String {
+    services::timestamps::format_utc(t).replace('+', "%2B")
 }
 
 async fn org_metrics(
     fixture: &PlatformProviderUsageFixture,
-    start: chrono::DateTime<Utc>,
-    end: chrono::DateTime<Utc>,
+    start: jiff::Timestamp,
+    end: jiff::Timestamp,
     credit_type: Option<&str>,
 ) -> OrganizationMetrics {
     PgAnalyticsRepository::new(fixture.database.pool().clone())
@@ -410,8 +404,8 @@ async fn org_metrics(
 
 async fn org_series(
     fixture: &PlatformProviderUsageFixture,
-    start: chrono::DateTime<Utc>,
-    end: chrono::DateTime<Utc>,
+    start: jiff::Timestamp,
+    end: jiff::Timestamp,
     granularity: &str,
     credit_type: Option<&str>,
 ) -> TimeSeriesMetrics {
@@ -449,14 +443,18 @@ fn assert_close(actual: Option<f64>, expected: f64) {
 async fn org_reports_read_usage_hourly_over_whole_hours() {
     let fixture = setup_platform_provider_usage_fixture().await;
     let org = fixture.organization_id;
-    let hour = chrono::Duration::hours(1);
+    let hour = jiff::SignedDuration::from_hours(1);
     // Two hours no other test recomputes, so "not aggregated yet" is deterministic.
     let (h, _) = crate::admin_provider_attribution_support::isolated_usage_hours(&fixture, 2).await;
     for (at, cost, ttft) in [
-        (h + chrono::Duration::minutes(10), 1_000_000_000_i64, 100),
-        (h + chrono::Duration::minutes(20), 1_000_000_000, 200),
         (
-            h + hour + chrono::Duration::minutes(10),
+            h + jiff::SignedDuration::from_mins(10),
+            1_000_000_000_i64,
+            100,
+        ),
+        (h + jiff::SignedDuration::from_mins(20), 1_000_000_000, 200),
+        (
+            h + hour + jiff::SignedDuration::from_mins(10),
             2_000_000_000,
             1000,
         ),
@@ -510,8 +508,8 @@ async fn org_reports_read_usage_hourly_over_whole_hours() {
     assert_eq!(
         points,
         vec![
-            (h.format("%Y-%m-%d %H:%M:%S+00").to_string(), 2),
-            ((h + hour).format("%Y-%m-%d %H:%M:%S+00").to_string(), 1),
+            (h.strftime("%Y-%m-%d %H:%M:%S+00").to_string(), 2),
+            ((h + hour).strftime("%Y-%m-%d %H:%M:%S+00").to_string(), 1),
         ]
     );
 
@@ -521,15 +519,24 @@ async fn org_reports_read_usage_hourly_over_whole_hours() {
         &format!("/v1/organizations/{org}/usage/metrics?{range}"),
     )
     .await;
-    assert_eq!(customer["period_start"], h.to_rfc3339());
-    assert_eq!(customer["period_end"], (h + hour * 2).to_rfc3339());
+    assert_eq!(
+        customer["period_start"],
+        services::timestamps::format_utc(h)
+    );
+    assert_eq!(
+        customer["period_end"],
+        services::timestamps::format_utc(h + hour * 2)
+    );
     assert_eq!(customer["summary"]["total_requests"], 3);
     let customer_series: serde_json::Value = session_json(
         &fixture.server,
         &format!("/v1/organizations/{org}/usage/timeseries?{range}&granularity=hour"),
     )
     .await;
-    assert_eq!(customer_series["period_start"], h.to_rfc3339());
+    assert_eq!(
+        customer_series["period_start"],
+        services::timestamps::format_utc(h)
+    );
     assert_eq!(customer_series["data"].as_array().unwrap().len(), 2);
 }
 
@@ -539,9 +546,9 @@ async fn org_reports_read_usage_hourly_over_whole_hours() {
 async fn org_metrics_count_ttft_under_thresholds() {
     use services::admin::{MetricsSummary, ModelMetrics};
     let fixture = setup_platform_provider_usage_fixture().await;
-    let hour = chrono::Duration::hours(1);
+    let hour = jiff::SignedDuration::from_hours(1);
     let (h, _) = crate::admin_provider_attribution_support::isolated_usage_hours(&fixture, 2).await;
-    let minutes = chrono::Duration::minutes;
+    let minutes = jiff::SignedDuration::from_mins;
     for (at, ttft) in [
         (h + minutes(10), Some(4_999)),
         (h + minutes(40), Some(5_000)),
@@ -572,9 +579,7 @@ async fn org_metrics_count_ttft_under_thresholds() {
             m.ttft_under_60s_requests,
         ]
     }
-    let get = |from: chrono::DateTime<Utc>, to: chrono::DateTime<Utc>| {
-        org_metrics(&fixture, from, to, None)
-    };
+    let get = |from: jiff::Timestamp, to: jiff::Timestamp| org_metrics(&fixture, from, to, None);
 
     // Whole hours: served from usage_hourly.
     let whole = get(h, h + hour * 2).await;
@@ -623,7 +628,7 @@ async fn org_credit_type_reports_stay_raw_live_and_exact() {
         (24, 1, Some(60_000)),
         (50, 4, Some(70_000)),
     ] {
-        let at = h + chrono::Duration::minutes(minute);
+        let at = h + jiff::SignedDuration::from_mins(minute);
         crate::usage_hourly::insert_raw(
             &fixture,
             at,
@@ -654,7 +659,7 @@ async fn org_credit_type_reports_stay_raw_live_and_exact() {
             .unwrap();
     }
     // Nothing is recomputed. [h, h + 30m) holds four rows: 5000 ms, NULL, 10000 ms and 60000 ms.
-    let end = h + chrono::Duration::minutes(30);
+    let end = h + jiff::SignedDuration::from_mins(30);
 
     let filtered: OrganizationMetrics = org_metrics(&fixture, h, end, Some("postpay")).await;
     assert_eq!(
@@ -719,7 +724,10 @@ async fn org_hourly_reports_are_cancelled_at_the_statement_budget() {
         pool.clone(),
         std::time::Duration::from_millis(400),
     );
-    let (start, end) = (Utc::now() - chrono::Duration::days(1), Utc::now());
+    let (start, end) = (
+        Timestamp::now() - jiff::SignedDuration::from_hours(24),
+        Timestamp::now(),
+    );
 
     let metrics = repo
         .get_organization_metrics(fixture.organization_id, start, end, None)

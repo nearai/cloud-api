@@ -7,19 +7,21 @@
 // so they are an exclusive group in `.config/nextest.toml`.
 
 use crate::common::*;
-use chrono::{Duration, Timelike, Utc};
 use futures::FutureExt;
+use jiff::{SignedDuration, Timestamp};
 use serde_json::{json, Value};
 use services::models::{ModelCaller, ModelsServiceTrait};
 use std::{panic::AssertUnwindSafe, sync::Arc};
 
 const HEADER: &str = "x-model-pricing-change-date";
 
-fn future_notice_date(days: i64) -> chrono::DateTime<Utc> {
-    (Utc::now() + Duration::days(days))
-        .with_minute(0)
-        .and_then(|time| time.with_second(0))
-        .and_then(|time| time.with_nanosecond(0))
+fn future_notice_date(days: i64) -> jiff::Timestamp {
+    (Timestamp::now() + SignedDuration::from_hours(days * 24))
+        .round(
+            jiff::TimestampRound::new()
+                .smallest(jiff::Unit::Hour)
+                .mode(jiff::RoundMode::Floor),
+        )
         .unwrap()
 }
 
@@ -41,7 +43,7 @@ struct Fixture {
     model: String,
     alias: String,
     api_key: String,
-    notice_date: chrono::DateTime<Utc>,
+    notice_date: jiff::Timestamp,
 }
 
 impl Fixture {
@@ -125,7 +127,7 @@ impl Fixture {
     }
 
     fn notice(&self) -> String {
-        self.notice_date.format("%Y-%m-%dT%H:%M:%SZ").to_string()
+        self.notice_date.strftime("%Y-%m-%dT%H:%M:%SZ").to_string()
     }
 
     async fn catalogs(&self) -> (Value, Value) {

@@ -73,7 +73,7 @@ fn convert_to_openai_response(
     Ok(ChatCompletionResponse {
         id: format!("gemini-{}", Uuid::new_v4()),
         object: "chat.completion".to_string(),
-        created: chrono::Utc::now().timestamp(),
+        created: jiff::Timestamp::now().as_second(),
         model: model.to_string(),
         choices: vec![ChatCompletionResponseChoice {
             index: 0,
@@ -464,7 +464,7 @@ impl ExternalBackend for GeminiBackend {
 
         let openai_response = ImageGenerationResponse {
             id: format!("gemini-img-{}", Uuid::new_v4()),
-            created: chrono::Utc::now().timestamp(),
+            created: jiff::Timestamp::now().as_second(),
             data: gemini_response
                 .generated_images
                 .into_iter()

@@ -3,7 +3,7 @@ use crate::repositories::utils::map_db_error;
 use crate::retry_db;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use services::common::RepositoryError;
 use services::responses::models::*;
 use services::responses::ports::*;
@@ -162,7 +162,7 @@ impl PgResponseRepository {
         }
 
         // No root yet - create one.
-        let now = Utc::now();
+        let now = Timestamp::now();
         let model = "root_response".to_string();
         let status = "completed";
         let usage_json = serde_json::json!({
@@ -406,7 +406,7 @@ impl ResponseRepositoryTrait for PgResponseRepository {
         // Insert response and update previous response in a single retry_db! block
         // This ensures all queries are retried together if needed
         retry_db!("insert_response_and_update_parent", {
-            let now = Utc::now();
+            let now = Timestamp::now();
             let client = self
                 .pool
                 .get()
@@ -473,13 +473,13 @@ impl ResponseRepositoryTrait for PgResponseRepository {
             id: format!("conv_{}", uuid.simple()),
         });
 
-        let now = Utc::now();
+        let now = Timestamp::now();
 
         // Build ResponseObject from the database row
         let response_obj = ResponseObject {
             id: response_id,
             object: "response".to_string(),
-            created_at: now.timestamp(),
+            created_at: services::timestamps::unix_seconds(now),
             status: ResponseStatus::InProgress,
             background: request.background.unwrap_or(false),
             conversation: conversation_ref,
@@ -577,7 +577,7 @@ impl ResponseRepositoryTrait for PgResponseRepository {
             _ => ResponseStatus::Failed,
         };
 
-        let created_at: DateTime<Utc> = row.get("created_at");
+        let created_at: Timestamp = row.get("created_at");
         let conversation_uuid: Option<Uuid> = row.get("conversation_id");
         let usage_json: Option<serde_json::Value> = row.get("usage");
         let metadata_json = self.decrypt_metadata(response_uuid, row.get("metadata"))?;
@@ -618,7 +618,7 @@ impl ResponseRepositoryTrait for PgResponseRepository {
         let response_obj = ResponseObject {
             id: format!("resp_{}", response_uuid.simple()),
             object: "response".to_string(),
-            created_at: created_at.timestamp(),
+            created_at: services::timestamps::unix_seconds(created_at),
             status,
             background: false, // Default, not stored in DB
             conversation: conversation_ref,
@@ -675,7 +675,7 @@ impl ResponseRepositoryTrait for PgResponseRepository {
         // Note: output_message column was removed in migration V0021
         // Messages are now stored as response_items instead
         let rows_affected = retry_db!("update_response", {
-            let now = Utc::now();
+            let now = Timestamp::now();
             let client = self
                 .pool
                 .get()
@@ -777,7 +777,7 @@ impl ResponseRepositoryTrait for PgResponseRepository {
         let response_obj = ResponseObject {
             id: format!("resp_{}", response_uuid.simple()),
             object: "response".to_string(),
-            created_at: row.get::<_, chrono::DateTime<Utc>>(11).timestamp(),
+            created_at: services::timestamps::unix_seconds(row.get::<_, jiff::Timestamp>(11)),
             status: response_status,
             background: false, // Not stored in DB, default value
             conversation: conversation_ref,
@@ -912,7 +912,7 @@ impl ResponseRepositoryTrait for PgResponseRepository {
             _ => ResponseStatus::Failed,
         };
 
-        let created_at: DateTime<Utc> = row.get("created_at");
+        let created_at: Timestamp = row.get("created_at");
         let conversation_uuid: Option<Uuid> = row.get("conversation_id");
         let usage_json: Option<serde_json::Value> = row.get("usage");
         let metadata_json = self.decrypt_metadata(response_uuid, row.get("metadata"))?;
@@ -953,7 +953,7 @@ impl ResponseRepositoryTrait for PgResponseRepository {
         let response_obj = ResponseObject {
             id: format!("resp_{}", response_uuid.simple()),
             object: "response".to_string(),
-            created_at: created_at.timestamp(),
+            created_at: services::timestamps::unix_seconds(created_at),
             status,
             background: false,
             conversation: conversation_ref,

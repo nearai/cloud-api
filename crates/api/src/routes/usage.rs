@@ -12,7 +12,7 @@ use axum::{
     response::Json as ResponseJson,
     Extension,
 };
-use chrono::{DateTime, Duration, NaiveDate, Utc};
+use jiff::{civil::Date, SignedDuration, Timestamp};
 use serde::{Deserialize, Serialize};
 use services::{
     organization::OrganizationError,
@@ -184,10 +184,10 @@ pub async fn compute_organization_balance_response(
                 spend_limit_display,
                 remaining,
                 remaining_display,
-                last_usage_at: balance.last_usage_at.map(|dt| dt.to_rfc3339()),
+                last_usage_at: balance.last_usage_at.map(services::timestamps::format_utc),
                 total_requests: balance.total_requests,
                 total_tokens: balance.total_tokens,
-                updated_at: balance.updated_at.to_rfc3339(),
+                updated_at: services::timestamps::format_utc(balance.updated_at),
                 credit_limits,
                 unfunded_amount: limit.as_ref().map_or(0, |value| value.unfunded),
             })
@@ -206,7 +206,7 @@ pub async fn compute_organization_balance_response(
                     last_usage_at: None,
                     total_requests: 0,
                     total_tokens: 0,
-                    updated_at: Utc::now().to_rfc3339(),
+                    updated_at: services::timestamps::format_utc(Timestamp::now()),
                     credit_limits,
                     unfunded_amount: limit_info.unfunded,
                 })
@@ -455,7 +455,7 @@ pub async fn get_organization_usage_history(
             total_cost: entry.total_cost,
             total_cost_display: format_amount(entry.total_cost),
             inference_type: entry.inference_type.to_string(),
-            created_at: entry.created_at.to_rfc3339(),
+            created_at: services::timestamps::format_utc(entry.created_at),
             stop_reason: entry.stop_reason.map(|r| r.to_string()),
             response_id: entry.response_id.map(|id| id.to_string()),
             provider_request_id: entry.provider_request_id,
@@ -581,21 +581,20 @@ fn normalize_usage_history_date(
     let Some(raw) = value else {
         return Ok(None);
     };
-    if DateTime::parse_from_rfc3339(raw).is_ok() {
+    if services::timestamps::parse_rfc3339(raw).is_some() {
         return Ok(Some(raw.to_string()));
     }
 
-    let date = NaiveDate::parse_from_str(raw, "%Y-%m-%d")
+    let date = Date::strptime("%Y-%m-%d", raw)
         .map_err(|_| usage_history_query_error(UsageHistoryRangeError::InvalidTimestamp))?;
-    let time = match boundary {
-        DateBoundary::Start => date.and_hms_nano_opt(0, 0, 0, 0),
-        DateBoundary::End => date.and_hms_nano_opt(23, 59, 59, 999_999_999),
-    }
-    .ok_or_else(|| usage_history_query_error(UsageHistoryRangeError::InvalidTimestamp))?;
-
-    Ok(Some(
-        DateTime::<Utc>::from_naive_utc_and_offset(time, Utc).to_rfc3339(),
-    ))
+    let civil = match boundary {
+        DateBoundary::Start => date.at(0, 0, 0, 0),
+        DateBoundary::End => date.at(23, 59, 59, 999_999_999),
+    };
+    let timestamp = jiff::tz::Offset::UTC
+        .to_timestamp(civil)
+        .map_err(|_| usage_history_query_error(UsageHistoryRangeError::InvalidTimestamp))?;
+    Ok(Some(services::timestamps::format_utc(timestamp)))
 }
 
 fn usage_report_row_response(
@@ -620,7 +619,7 @@ fn usage_report_row_response(
         total_cost: row.total_cost_nano_usd,
         total_cost_display: format_amount(row.total_cost_nano_usd),
         inference_type: row.inference_type,
-        created_at: row.created_at.to_rfc3339(),
+        created_at: services::timestamps::format_utc(row.created_at),
         stop_reason: row.stop_reason,
         response_id: row.response_id.map(|id| id.to_string()),
         provider_request_id: row.provider_request_id,
@@ -650,28 +649,30 @@ enum UsageHistoryRangeError {
     TimeRangeTooLarge { max_days: i64 },
 }
 
-fn parse_usage_history_time(value: Option<&str>) -> Result<Option<DateTime<Utc>>, UsageError> {
+fn parse_usage_history_time(value: Option<&str>) -> Result<Option<Timestamp>, UsageError> {
     value
         .map(|timestamp| {
-            DateTime::parse_from_rfc3339(timestamp)
-                .map(|parsed| parsed.with_timezone(&Utc))
-                .map_err(|_| usage_history_query_error(UsageHistoryRangeError::InvalidTimestamp))
+            services::timestamps::parse_rfc3339(timestamp)
+                .ok_or_else(|| usage_history_query_error(UsageHistoryRangeError::InvalidTimestamp))
         })
         .transpose()
 }
 
 /// Default to the trailing maximum window ending now, then bound the range.
 fn normalize_usage_history_range(
-    start_time: Option<DateTime<Utc>>,
-    end_time: Option<DateTime<Utc>>,
-) -> Result<(DateTime<Utc>, DateTime<Utc>), UsageHistoryRangeError> {
-    let end_time = end_time.unwrap_or_else(Utc::now);
-    let start_time =
-        start_time.unwrap_or_else(|| end_time - Duration::days(MAX_USAGE_HISTORY_RANGE_DAYS));
+    start_time: Option<Timestamp>,
+    end_time: Option<Timestamp>,
+) -> Result<(Timestamp, Timestamp), UsageHistoryRangeError> {
+    let end_time = end_time.unwrap_or_else(Timestamp::now);
+    let start_time = start_time.unwrap_or_else(|| {
+        end_time - SignedDuration::from_hours(MAX_USAGE_HISTORY_RANGE_DAYS * 24)
+    });
     if end_time < start_time {
         return Err(UsageHistoryRangeError::InvalidTimeRange);
     }
-    if end_time - start_time > Duration::days(MAX_USAGE_HISTORY_RANGE_DAYS) {
+    if end_time.duration_since(start_time)
+        > SignedDuration::from_hours(MAX_USAGE_HISTORY_RANGE_DAYS * 24)
+    {
         return Err(UsageHistoryRangeError::TimeRangeTooLarge {
             max_days: MAX_USAGE_HISTORY_RANGE_DAYS,
         });
@@ -843,7 +844,7 @@ pub async fn get_api_key_usage_history(
             total_cost: entry.total_cost,
             total_cost_display: format_amount(entry.total_cost),
             inference_type: entry.inference_type.to_string(),
-            created_at: entry.created_at.to_rfc3339(),
+            created_at: services::timestamps::format_utc(entry.created_at),
             stop_reason: entry.stop_reason.map(|r| r.to_string()),
             response_id: entry.response_id.map(|id| id.to_string()),
             provider_request_id: entry.provider_request_id,
@@ -940,10 +941,7 @@ pub struct TimeSeriesQuery {
 
 const MAX_DATE_RANGE_DAYS: i64 = 366;
 
-fn validate_date_range(
-    start: chrono::DateTime<Utc>,
-    end: chrono::DateTime<Utc>,
-) -> Result<(), UsageError> {
+fn validate_date_range(start: jiff::Timestamp, end: jiff::Timestamp) -> Result<(), UsageError> {
     if start >= end {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -953,7 +951,7 @@ fn validate_date_range(
             )),
         ));
     }
-    if end - start > Duration::days(MAX_DATE_RANGE_DAYS) {
+    if end.duration_since(start) > SignedDuration::from_hours(MAX_DATE_RANGE_DAYS * 24) {
         return Err((
             StatusCode::BAD_REQUEST,
             ResponseJson(ErrorResponse::new(
@@ -967,21 +965,18 @@ fn validate_date_range(
 
 fn parse_datetime_or_default(
     value: &Option<String>,
-    default: chrono::DateTime<Utc>,
-) -> Result<chrono::DateTime<Utc>, (StatusCode, ResponseJson<ErrorResponse>)> {
+    default: jiff::Timestamp,
+) -> Result<jiff::Timestamp, (StatusCode, ResponseJson<ErrorResponse>)> {
     match value {
-        Some(s) => chrono::DateTime::parse_from_rfc3339(s)
-            .map(|dt| dt.with_timezone(&Utc))
-            .map_err(|_| {
-                (
-                    StatusCode::BAD_REQUEST,
-                    ResponseJson(ErrorResponse::new(
-                        "Invalid date format. Use ISO 8601 (e.g. 2024-01-01T00:00:00Z)."
-                            .to_string(),
-                        "invalid_date".to_string(),
-                    )),
-                )
-            }),
+        Some(s) => services::timestamps::parse_rfc3339(s).ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                ResponseJson(ErrorResponse::new(
+                    "Invalid date format. Use ISO 8601 (e.g. 2024-01-01T00:00:00Z).".to_string(),
+                    "invalid_date".to_string(),
+                )),
+            )
+        }),
         None => Ok(default),
     }
 }
@@ -990,9 +985,9 @@ fn parse_datetime_or_default(
 fn parse_date_range(
     start: &Option<String>,
     end: &Option<String>,
-) -> Result<(chrono::DateTime<Utc>, chrono::DateTime<Utc>), UsageError> {
-    let end = parse_datetime_or_default(end, Utc::now())?;
-    let start = parse_datetime_or_default(start, end - Duration::days(30))?;
+) -> Result<(jiff::Timestamp, jiff::Timestamp), UsageError> {
+    let end = parse_datetime_or_default(end, Timestamp::now())?;
+    let start = parse_datetime_or_default(start, end - SignedDuration::from_hours(30 * 24))?;
     validate_date_range(start, end)?;
     Ok((start, end))
 }
@@ -1038,8 +1033,8 @@ pub async fn get_user_organization_metrics(
 
     Ok(ResponseJson(UserOrganizationMetrics {
         organization_id: metrics.organization_id.to_string(),
-        period_start: metrics.period_start.to_rfc3339(),
-        period_end: metrics.period_end.to_rfc3339(),
+        period_start: services::timestamps::format_utc(metrics.period_start),
+        period_end: services::timestamps::format_utc(metrics.period_end),
         summary: UserMetricsSummary {
             total_requests: metrics.summary.total_requests,
             total_input_tokens: metrics.summary.total_input_tokens,
@@ -1128,8 +1123,8 @@ pub async fn get_user_organization_timeseries(
 
     Ok(ResponseJson(UserTimeSeriesMetrics {
         organization_id: timeseries.organization_id.to_string(),
-        period_start: timeseries.period_start.to_rfc3339(),
-        period_end: timeseries.period_end.to_rfc3339(),
+        period_start: services::timestamps::format_utc(timeseries.period_start),
+        period_end: services::timestamps::format_utc(timeseries.period_end),
         granularity: timeseries.granularity,
         data: timeseries
             .data
@@ -1159,12 +1154,12 @@ pub enum UsageByModelPeriod {
 
 impl UsageByModelPeriod {
     /// Start of the rolling window; `None` for `Custom`.
-    fn since(self) -> Option<chrono::DateTime<Utc>> {
-        let now = Utc::now();
+    fn since(self) -> Option<jiff::Timestamp> {
+        let now = Timestamp::now();
         match self {
-            UsageByModelPeriod::Day => Some(now - Duration::days(1)),
-            UsageByModelPeriod::Week => Some(now - Duration::days(7)),
-            UsageByModelPeriod::Month => Some(now - Duration::days(30)),
+            UsageByModelPeriod::Day => Some(now - SignedDuration::from_hours(24)),
+            UsageByModelPeriod::Week => Some(now - SignedDuration::from_hours(7 * 24)),
+            UsageByModelPeriod::Month => Some(now - SignedDuration::from_hours(30 * 24)),
             UsageByModelPeriod::Custom => None,
         }
     }
@@ -1304,8 +1299,8 @@ pub async fn get_organization_usage_by_model(
 
     Ok(ResponseJson(UsageByModelResponse {
         period: period.as_str().to_string(),
-        start_date: start_date.to_rfc3339(),
-        end_date: end_date.map(|d| d.to_rfc3339()),
+        start_date: services::timestamps::format_utc(start_date),
+        end_date: end_date.map(services::timestamps::format_utc),
         data,
     }))
 }
@@ -1314,10 +1309,8 @@ pub async fn get_organization_usage_by_model(
 mod tests {
     use super::*;
 
-    fn ts(value: &str) -> DateTime<Utc> {
-        DateTime::parse_from_rfc3339(value)
-            .unwrap()
-            .with_timezone(&Utc)
+    fn ts(value: &str) -> Timestamp {
+        value.parse::<jiff::Timestamp>().unwrap()
     }
 
     #[test]
@@ -1340,24 +1333,32 @@ mod tests {
     #[test]
     fn usage_history_range_normalizes_open_ended_ranges() {
         // Given: open-ended queries that would otherwise be unbounded.
-        let before_default = Utc::now();
+        let before_default = Timestamp::now();
         let (default_start, default_end) = normalize_usage_history_range(None, None).unwrap();
-        let after_default = Utc::now();
+        let after_default = Timestamp::now();
         let explicit_end = ts("2026-07-01T00:00:00Z");
-        let recent_start = Utc::now() - Duration::days(1);
+        let recent_start = Timestamp::now() - SignedDuration::from_hours(24);
 
         // When: only an end, only a start, or a stale start is supplied.
         let end_only = normalize_usage_history_range(None, Some(explicit_end)).unwrap();
         let start_only = normalize_usage_history_range(Some(recent_start), None).unwrap();
-        let stale_result =
-            normalize_usage_history_range(Some(Utc::now() - Duration::days(367)), None);
+        let stale_result = normalize_usage_history_range(
+            Some(Timestamp::now() - SignedDuration::from_hours(367 * 24)),
+            None,
+        );
 
         // Then: every accepted range is no wider than 366 days.
         assert!(default_end >= before_default);
         assert!(default_end <= after_default);
-        assert_eq!(default_end - default_start, Duration::days(366));
+        assert_eq!(
+            default_end.duration_since(default_start),
+            SignedDuration::from_hours(366 * 24)
+        );
         assert_eq!(end_only.1, explicit_end);
-        assert_eq!(end_only.0, explicit_end - Duration::days(366));
+        assert_eq!(
+            end_only.0,
+            explicit_end - SignedDuration::from_hours(366 * 24)
+        );
         assert_eq!(start_only.0, recent_start);
         assert!(start_only.1 >= recent_start);
         assert!(matches!(

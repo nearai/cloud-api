@@ -5,7 +5,7 @@ use crate::repositories::utils::map_db_error;
 use crate::retry_db;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use services::common::{extract_api_key_prefix, generate_api_key, hash_api_key, RepositoryError};
 use services::workspace::ports::{ApiKeyOrderBy, ApiKeyOrderDirection, CreateApiKeyRequest};
 use tokio_postgres::types::Type;
@@ -32,7 +32,7 @@ impl ApiKeyRepository {
         let key_prefix = extract_api_key_prefix(&key);
 
         let _row = retry_db!("create_api_key", {
-            let now = Utc::now();
+            let now = Timestamp::now();
             let client = self
                 .pool
                 .get()
@@ -446,7 +446,7 @@ impl ApiKeyRepository {
         &self,
         id: Uuid,
         name: Option<String>,
-        expires_at: Option<Option<DateTime<Utc>>>,
+        expires_at: Option<Option<Timestamp>>,
         spend_limit: Option<Option<i64>>,
         is_active: Option<bool>,
     ) -> Result<ApiKey, RepositoryError> {
@@ -582,7 +582,7 @@ impl ApiKeyRepository {
     /// Get key hashes created after a timestamp for incremental Bloom Filter updates
     pub async fn get_active_key_hashes_created_after(
         &self,
-        timestamp: DateTime<Utc>,
+        timestamp: Timestamp,
     ) -> Result<Vec<String>, RepositoryError> {
         let rows = retry_db!("get_active_key_hashes_created_after", {
             let client = self
@@ -691,7 +691,7 @@ impl services::workspace::ports::ApiKeyRepository for ApiKeyRepository {
         &self,
         id: services::workspace::ApiKeyId,
         name: Option<String>,
-        expires_at: Option<Option<DateTime<Utc>>>,
+        expires_at: Option<Option<Timestamp>>,
         spend_limit: Option<Option<i64>>,
         is_active: Option<bool>,
     ) -> Result<services::workspace::ApiKey, RepositoryError> {
@@ -735,7 +735,7 @@ impl services::workspace::ports::ApiKeyRepository for ApiKeyRepository {
 
     async fn get_active_key_hashes_created_after(
         &self,
-        timestamp: DateTime<Utc>,
+        timestamp: Timestamp,
     ) -> Result<Vec<String>, RepositoryError> {
         self.get_active_key_hashes_created_after(timestamp).await
     }

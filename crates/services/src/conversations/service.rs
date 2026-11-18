@@ -378,7 +378,7 @@ impl ports::ConversationServiceTrait for ConversationServiceImpl {
         //                     "{}:{}:{}",
         //                     role,
         //                     content,
-        //                     response.created_at.timestamp() / 60
+        //                     crate::timestamps::unix_seconds(response.created_at) / 60
         //                 ); // Group by minute
 
         //                 // Only add if we haven't seen this content recently
@@ -401,7 +401,7 @@ impl ports::ConversationServiceTrait for ConversationServiceImpl {
         //         let dedup_key = format!(
         //             "assistant:{}:{}",
         //             output,
-        //             response.updated_at.timestamp() / 60
+        //             crate::timestamps::unix_seconds(response.updated_at) / 60
         //         );
 
         //         if !seen_content.contains(&dedup_key) {
@@ -693,7 +693,7 @@ mod tests {
         let id = models::ConversationId(Uuid::new_v4());
         let workspace_id = WorkspaceId(Uuid::new_v4());
         let api_key_id = Uuid::new_v4();
-        let now = chrono::Utc::now();
+        let now = jiff::Timestamp::now();
 
         let conversation = models::Conversation {
             id,
@@ -763,7 +763,7 @@ mod tests {
         id: models::ConversationId,
         workspace_id: WorkspaceId,
     ) -> models::Conversation {
-        let now = chrono::Utc::now();
+        let now = jiff::Timestamp::now();
         models::Conversation {
             id,
             workspace_id,

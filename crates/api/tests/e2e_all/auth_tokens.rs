@@ -296,12 +296,12 @@ async fn test_refresh_token_rotation_reuses_predecessor_briefly() {
     );
 
     // Validate that the new refresh token has an extended expiration time (7 days = 168 hours)
-    let now = chrono::Utc::now();
-    let expected_expiration = now + chrono::Duration::hours(7 * 24);
+    let now = jiff::Timestamp::now();
+    let expected_expiration = now + jiff::SignedDuration::from_hours(7 * 24);
     let actual_expiration = token_response1.refresh_token_expiration;
 
     // Allow 5 minutes tolerance for test execution time
-    let tolerance = chrono::Duration::minutes(5);
+    let tolerance = jiff::SignedDuration::from_mins(5);
     let min_expected = expected_expiration - tolerance;
     let max_expected = expected_expiration + tolerance;
 
@@ -351,11 +351,12 @@ async fn test_refresh_token_rotation_reuses_predecessor_briefly() {
     );
 
     // Validate that the rotated refresh token also has extended expiration
-    let now_after_rotation = chrono::Utc::now();
-    let expected_expiration_after_rotation = now_after_rotation + chrono::Duration::hours(7 * 24);
+    let now_after_rotation = jiff::Timestamp::now();
+    let expected_expiration_after_rotation =
+        now_after_rotation + jiff::SignedDuration::from_hours(7 * 24);
     let actual_expiration_after_rotation = token_response3.refresh_token_expiration;
 
-    let tolerance = chrono::Duration::minutes(5);
+    let tolerance = jiff::SignedDuration::from_mins(5);
     let min_expected_after = expected_expiration_after_rotation - tolerance;
     let max_expected_after = expected_expiration_after_rotation + tolerance;
 

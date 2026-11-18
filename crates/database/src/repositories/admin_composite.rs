@@ -439,7 +439,7 @@ impl AdminRepository for AdminCompositeRepository {
                     .ok()
                     .flatten(),
                 &deprecated_row_after
-                    .try_get::<_, Option<chrono::DateTime<chrono::Utc>>>("deprecation_date")
+                    .try_get::<_, Option<jiff::Timestamp>>("deprecation_date")
                     .ok()
                     .flatten(),
                 &deprecated_row_after
@@ -579,7 +579,7 @@ impl AdminRepository for AdminCompositeRepository {
     async fn list_model_deprecation_recipients(
         &self,
         model_name: &str,
-        since: chrono::DateTime<chrono::Utc>,
+        since: jiff::Timestamp,
     ) -> Result<Vec<ModelDeprecationRecipient>> {
         let client = self.pool.get().await?;
         let rows = client
@@ -649,7 +649,7 @@ impl AdminRepository for AdminCompositeRepository {
         let client = self.pool.get().await?;
         let status = record.status.as_str();
         let email_sent_at = if record.status == ModelDeprecationEmailStatus::Sent {
-            Some(chrono::Utc::now())
+            Some(jiff::Timestamp::now())
         } else {
             None
         };
@@ -746,7 +746,7 @@ impl AdminRepository for AdminCompositeRepository {
     async fn list_pricing_change_recipients(
         &self,
         model_names: &[String],
-        since: chrono::DateTime<chrono::Utc>,
+        since: jiff::Timestamp,
     ) -> Result<Vec<PricingChangeRecipientRow>> {
         let client = self.pool.get().await?;
         let rows = client
@@ -980,11 +980,11 @@ impl AdminRepository for AdminCompositeRepository {
 
     async fn recover_stale_applying_pricing_changes(
         &self,
-        stale_after: chrono::Duration,
+        stale_after: jiff::SignedDuration,
         max_attempts: i32,
     ) -> Result<u64> {
         let client = self.pool.get().await?;
-        let stale_secs = stale_after.num_seconds() as f64;
+        let stale_secs = stale_after.as_secs() as f64;
         let count = client
             .execute(
                 r#"
@@ -1012,7 +1012,7 @@ impl AdminRepository for AdminCompositeRepository {
         let client = self.pool.get().await?;
         let status = record.status.as_str();
         let email_sent_at = if record.status == ModelDeprecationEmailStatus::Sent {
-            Some(chrono::Utc::now())
+            Some(jiff::Timestamp::now())
         } else {
             None
         };

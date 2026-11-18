@@ -1,7 +1,7 @@
 pub mod binding;
 use async_trait::async_trait;
-use chrono::{DateTime, Duration, Utc};
 use config::StakingFarmConfig;
+use jiff::{SignedDuration, Timestamp};
 use near_kit::Near;
 use serde::{Deserialize, Serialize};
 use std::future::IntoFuture;
@@ -89,9 +89,9 @@ pub struct OrganizationStakingFarmSource {
     pub sync_status: String,
     pub last_sync_error: Option<String>,
     pub created_by_user_id: Option<Uuid>,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
-    pub last_synced_at: Option<DateTime<Utc>>,
+    pub created_at: Timestamp,
+    pub updated_at: Timestamp,
+    pub last_synced_at: Option<Timestamp>,
     pub last_synced_accumulated_reward_units_24: Option<String>,
     pub last_synced_pending_reward_units_24: Option<String>,
     pub last_synced_reward_units_24: Option<String>,
@@ -459,10 +459,10 @@ impl StakingFarmService {
             return Ok(Some(source));
         }
 
-        let stale_after = Duration::seconds(self.config.sync_staleness_seconds.max(0));
+        let stale_after = SignedDuration::from_secs(self.config.sync_staleness_seconds.max(0));
         let is_stale = source
             .last_synced_at
-            .map(|synced_at| Utc::now().signed_duration_since(synced_at) >= stale_after)
+            .map(|synced_at| Timestamp::now().duration_since(synced_at) >= stale_after)
             .unwrap_or(true)
             || source.sync_status == StakingSyncStatus::NeverSynced.as_str()
             || source.sync_status == StakingSyncStatus::Stale.as_str()
@@ -705,8 +705,8 @@ mod tests {
                 sync_status: StakingSyncStatus::NeverSynced.as_str().to_string(),
                 last_sync_error: None,
                 created_by_user_id: request.created_by_user_id,
-                created_at: Utc::now(),
-                updated_at: Utc::now(),
+                created_at: Timestamp::now(),
+                updated_at: Timestamp::now(),
                 last_synced_at: None,
                 last_synced_accumulated_reward_units_24: None,
                 last_synced_pending_reward_units_24: None,
@@ -749,7 +749,7 @@ mod tests {
             source.last_synced_credit_nano_usd = update.last_synced_credit_nano_usd;
             source.active_positions = update.active_positions;
             if update.sync_status == StakingSyncStatus::Synced {
-                source.last_synced_at = Some(Utc::now());
+                source.last_synced_at = Some(Timestamp::now());
             }
             *self.source.lock().unwrap() = Some(source.clone());
             Ok(source)
@@ -892,9 +892,9 @@ mod tests {
             sync_status: StakingSyncStatus::Synced.as_str().to_string(),
             last_sync_error: None,
             created_by_user_id: None,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
-            last_synced_at: Some(Utc::now() - Duration::seconds(600)),
+            created_at: Timestamp::now(),
+            updated_at: Timestamp::now(),
+            last_synced_at: Some(Timestamp::now() - SignedDuration::from_secs(600)),
             last_synced_accumulated_reward_units_24: Some("0".to_string()),
             last_synced_pending_reward_units_24: Some("0".to_string()),
             last_synced_reward_units_24: Some("0".to_string()),
@@ -1289,7 +1289,7 @@ mod tests {
     async fn fresh_source_is_not_synced_automatically() {
         let organization_id = Uuid::new_v4();
         let mut source = source_fixture(organization_id);
-        source.last_synced_at = Some(Utc::now());
+        source.last_synced_at = Some(Timestamp::now());
         source.last_synced_credit_nano_usd = Some(1_000_000_000);
         let repo = Arc::new(MockStakingFarmRepository::default());
         *repo.source.lock().unwrap() = Some(source);
@@ -1342,7 +1342,7 @@ mod tests {
     async fn existing_source_is_never_cached() {
         let organization_id = Uuid::new_v4();
         let mut source = source_fixture(organization_id);
-        source.last_synced_at = Some(Utc::now());
+        source.last_synced_at = Some(Timestamp::now());
         let repo = Arc::new(MockStakingFarmRepository::default());
         *repo.source.lock().unwrap() = Some(source);
         let service = no_source_service(&repo);

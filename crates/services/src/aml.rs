@@ -1,6 +1,6 @@
 use async_trait::async_trait;
-use chrono::{DateTime, Duration, Utc};
 use config::AmlConfig;
+use jiff::{SignedDuration, Timestamp};
 use moka::future::Cache;
 use serde::{Deserialize, Deserializer, Serialize};
 use std::{sync::Arc, time::Duration as StdDuration};
@@ -59,11 +59,11 @@ pub struct AmlReport {
     pub score: Option<i32>,
     pub report_id: Option<String>,
     pub reason: Option<String>,
-    pub provider_report_time: Option<DateTime<Utc>>,
+    pub provider_report_time: Option<Timestamp>,
     pub result_json: serde_json::Value,
     pub active: bool,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
+    pub created_at: Timestamp,
+    pub updated_at: Timestamp,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -99,7 +99,7 @@ pub struct NewAmlReport {
     pub score: Option<i32>,
     pub report_id: Option<String>,
     pub reason: Option<String>,
-    pub provider_report_time: Option<DateTime<Utc>>,
+    pub provider_report_time: Option<Timestamp>,
     pub result_json: serde_json::Value,
     pub active: bool,
 }
@@ -110,7 +110,7 @@ pub struct AmlAllowlistEntry {
     pub address_type: String,
     pub reason: Option<String>,
     pub created_by_user_id: Option<Uuid>,
-    pub created_at: DateTime<Utc>,
+    pub created_at: Timestamp,
 }
 
 #[derive(Debug, Clone)]
@@ -147,7 +147,7 @@ pub trait AmlRepository: Send + Sync {
         account_id: &str,
         address_type: &str,
         provider: &str,
-        fresh_after: Option<DateTime<Utc>>,
+        fresh_after: Option<Timestamp>,
         risk_level_policy_configured: bool,
         score_policy_configured: bool,
     ) -> anyhow::Result<Option<AmlReport>>;
@@ -235,7 +235,7 @@ struct LukkaReportInfo {
     #[serde(default, deserialize_with = "lenient_opt")]
     report_id: Option<String>,
     #[serde(default, deserialize_with = "lenient_opt")]
-    report_time: Option<DateTime<Utc>>,
+    report_time: Option<Timestamp>,
     #[serde(default, deserialize_with = "lenient_opt")]
     description: Option<String>,
     #[serde(flatten)]
@@ -578,7 +578,8 @@ impl AmlService {
             return Ok(AmlDecision::Allowed);
         }
 
-        let fresh_after = Utc::now() - Duration::days(self.config.refresh_window_days);
+        let fresh_after =
+            Timestamp::now() - SignedDuration::from_hours((self.config.refresh_window_days) * 24);
         if let Some(report) = self
             .latest_active_report_with_policy_signal(&account_id, Some(fresh_after))
             .await?
@@ -735,7 +736,7 @@ impl AmlService {
     async fn latest_active_report_with_policy_signal(
         &self,
         account_id: &str,
-        fresh_after: Option<DateTime<Utc>>,
+        fresh_after: Option<Timestamp>,
     ) -> Result<Option<AmlReport>, AmlError> {
         self.repository
             .latest_active_report_with_policy_signal(
@@ -861,7 +862,7 @@ fn high_risk_slack_payload(
     let reason = report.reason.as_deref().unwrap_or("-");
     let provider_report_time = report
         .provider_report_time
-        .map(|time| time.to_rfc3339())
+        .map(crate::timestamps::format_utc)
         .unwrap_or_else(|| "-".to_string());
     let score_block_threshold = score_block_threshold
         .map(|threshold| threshold.to_string())
@@ -1187,7 +1188,7 @@ mod tests {
             _account_id: &str,
             _address_type: &str,
             _provider: &str,
-            fresh_after: Option<DateTime<Utc>>,
+            fresh_after: Option<Timestamp>,
             risk_level_policy_configured: bool,
             score_policy_configured: bool,
         ) -> anyhow::Result<Option<AmlReport>> {
@@ -1252,7 +1253,7 @@ mod tests {
                 return Ok(None);
             };
             report.active = active;
-            report.updated_at = Utc::now();
+            report.updated_at = Timestamp::now();
             Ok(Some(report.clone()))
         }
 
@@ -1314,7 +1315,7 @@ mod tests {
                 address_type: entry.address_type,
                 reason: entry.reason,
                 created_by_user_id: entry.created_by_user_id,
-                created_at: Utc::now(),
+                created_at: Timestamp::now(),
             };
             if let Some(existing) = entries.iter_mut().find(|existing| {
                 existing.account_id == stored.account_id
@@ -1604,7 +1605,7 @@ mod tests {
             reason: Some("missing_score".to_string()),
             ..new_report(AmlRiskLevel::High)
         });
-        prior_score_only_report.created_at = Utc::now() - Duration::days(31);
+        prior_score_only_report.created_at = Timestamp::now() - SignedDuration::from_hours(31 * 24);
         repo.reports.lock().unwrap().push(prior_score_only_report);
         let provider = Arc::new(StaticProvider(NewAmlReport {
             risk_level: AmlRiskLevel::Unknown,
@@ -1637,14 +1638,14 @@ mod tests {
             active: true,
             ..new_report(AmlRiskLevel::Low)
         });
-        older_score_report.created_at = Utc::now() - Duration::days(1);
+        older_score_report.created_at = Timestamp::now() - SignedDuration::from_hours(24);
         let mut newer_no_score_report = report_to_stored(NewAmlReport {
             risk_level: AmlRiskLevel::Low,
             score: None,
             active: true,
             ..new_report(AmlRiskLevel::Low)
         });
-        newer_no_score_report.created_at = Utc::now();
+        newer_no_score_report.created_at = Timestamp::now();
         repo.reports
             .lock()
             .unwrap()
@@ -2029,7 +2030,7 @@ mod tests {
     #[tokio::test]
     async fn allowlist_list_pagination_preserves_limit_offset_and_total() {
         let repo = Arc::new(MockAmlRepository::default());
-        let now = Utc::now();
+        let now = Timestamp::now();
         repo.allowlist_entries.lock().unwrap().extend([
             AmlAllowlistEntry {
                 account_id: "alice.near".to_string(),
@@ -2149,8 +2150,8 @@ mod tests {
             provider_report_time: report.provider_report_time,
             result_json: report.result_json,
             active: report.active,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
+            created_at: Timestamp::now(),
+            updated_at: Timestamp::now(),
         }
     }
 }

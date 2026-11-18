@@ -1001,8 +1001,8 @@ mod tests {
             username: "admin-probe".to_string(),
             display_name: None,
             avatar_url: None,
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
+            created_at: jiff::Timestamp::now(),
+            updated_at: jiff::Timestamp::now(),
             last_login_at: None,
             is_active: true,
             auth_provider: auth_provider.to_string(),
@@ -1053,7 +1053,7 @@ mod tests {
         let admin_emails = vec!["admin@near.ai".to_string()];
         let mut user = admin_test_user("google", "other@near.ai");
         user.contact_email = Some("admin@near.ai".to_string());
-        user.contact_email_verified_at = Some(chrono::Utc::now());
+        user.contact_email_verified_at = Some(jiff::Timestamp::now());
 
         assert!(!is_admin_user(&admin_emails, &user));
 
@@ -1109,7 +1109,7 @@ mod tests {
         use async_trait::async_trait;
         use axum::routing::post;
         use axum::{Extension, Router};
-        use chrono::{DateTime, Utc};
+        use jiff::Timestamp;
         use services::common::RepositoryError;
         use services::models::{resolve_model_cached, ModelCaller, ModelsRepository};
         use services::organization::{Organization, OrganizationId};
@@ -1146,7 +1146,7 @@ mod tests {
                     name: "k".to_string(),
                     workspace_id: WorkspaceId(workspace_id()),
                     created_by_user_id: services::auth::UserId(Uuid::nil()),
-                    created_at: Utc::now(),
+                    created_at: Timestamp::now(),
                     expires_at: None,
                     last_used_at: None,
                     is_active: true,
@@ -1188,7 +1188,7 @@ mod tests {
                 &self,
                 _: ApiKeyId,
                 _: Option<String>,
-                _: Option<Option<DateTime<Utc>>>,
+                _: Option<Option<Timestamp>>,
                 _: Option<Option<i64>>,
                 _: Option<bool>,
             ) -> Result<ApiKey, RepositoryError> {
@@ -1212,7 +1212,7 @@ mod tests {
             }
             async fn get_active_key_hashes_created_after(
                 &self,
-                _: DateTime<Utc>,
+                _: Timestamp,
             ) -> Result<Vec<String>, RepositoryError> {
                 Ok(vec![])
             }
@@ -1247,8 +1247,8 @@ mod tests {
                         description: None,
                         organization_id: OrganizationId(organization_id()),
                         created_by_user_id: owner.clone(),
-                        created_at: Utc::now(),
-                        updated_at: Utc::now(),
+                        created_at: Timestamp::now(),
+                        updated_at: Timestamp::now(),
                         is_active: true,
                         settings: None,
                     },
@@ -1260,8 +1260,8 @@ mod tests {
                         owner_id: owner,
                         settings: serde_json::json!({}),
                         is_active: true,
-                        created_at: Utc::now(),
-                        updated_at: Utc::now(),
+                        created_at: Timestamp::now(),
+                        updated_at: Timestamp::now(),
                     },
                 )))
             }

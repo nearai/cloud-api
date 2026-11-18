@@ -2,7 +2,6 @@
 //! is called repeatedly on one pool. A wrong parameter `Type` fails at runtime,
 //! so this proves the declared types match the columns.
 
-use chrono::Utc;
 use database::repositories::{
     ApiKeyRepository, ModelRepository, OrganizationStakingFarmSourcesRepository,
     OrganizationUsageRepository, WorkspaceRepository,
@@ -10,6 +9,7 @@ use database::repositories::{
 use database::{DbPool, PgAttestationRepository, PgOrganizationRepository};
 use deadpool::Runtime;
 use deadpool_postgres::Config;
+use jiff::Timestamp;
 use services::attestation::{
     ports::AttestationRepository as _, AttestationError, ChatSignature, SignatureKind,
     SignatureOwner,
@@ -70,7 +70,7 @@ async fn typed_hot_path_queries_repeat_on_one_pool() -> anyhow::Result<()> {
     let api_key = format!("sk-live-typed-{suffix}");
     let model_name = format!("typed/model-{suffix}");
     let alias_name = format!("typed-alias-{suffix}");
-    let now = Utc::now();
+    let now = Timestamp::now();
 
     {
         let client = pool.get().await?;
@@ -140,7 +140,7 @@ async fn typed_hot_path_queries_repeat_on_one_pool() -> anyhow::Result<()> {
             &[&key_id],
         )
         .await?
-        .get::<_, Option<chrono::DateTime<Utc>>>(0);
+        .get::<_, Option<jiff::Timestamp>>(0);
     assert!(last_used.is_some());
 
     // workspace::get_workspace_with_organization

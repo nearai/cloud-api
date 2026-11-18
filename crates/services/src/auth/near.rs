@@ -1,5 +1,5 @@
-use chrono::{DateTime, Duration, Utc};
 use config::NearConfig;
+use jiff::{SignedDuration, Timestamp};
 use near_kit::{
     signer::{PublicKey, Signature},
     standards::nep413::{self, NonceValidation, SignMessageParams, VerifyOptions},
@@ -71,20 +71,22 @@ pub struct NearAuthService {
 /// - Timestamp is older than MAX_NONCE_AGE_MS (expired)
 /// - Timestamp is in the future
 pub(crate) fn validate_nonce_timestamp_ms(
-    now: DateTime<Utc>,
+    now: Timestamp,
     nonce_timestamp_ms: u64,
 ) -> Result<(), NearAuthError> {
-    let nonce_time = DateTime::from_timestamp_millis(nonce_timestamp_ms as i64).ok_or(
-        NearAuthError::InvalidNonce("timestamp out of valid range".to_string()),
-    )?;
+    let nonce_time = Timestamp::from_millisecond(nonce_timestamp_ms as i64)
+        .ok()
+        .ok_or(NearAuthError::InvalidNonce(
+            "timestamp out of valid range".to_string(),
+        ))?;
 
-    let age = now.signed_duration_since(nonce_time);
+    let age = now.duration_since(nonce_time);
 
-    if age > Duration::milliseconds(MAX_NONCE_AGE_MS as i64) {
+    if age > SignedDuration::from_millis(MAX_NONCE_AGE_MS as i64) {
         return Err(NearAuthError::ExpiredNonce);
     }
 
-    if age < Duration::zero() {
+    if age < SignedDuration::ZERO {
         return Err(NearAuthError::InvalidTimestamp);
     }
 
@@ -178,7 +180,7 @@ impl NearAuthService {
         }
 
         // Validate timestamp is within acceptable range
-        validate_nonce_timestamp_ms(Utc::now(), nonce_timestamp_ms).map_err(|e| {
+        validate_nonce_timestamp_ms(Timestamp::now(), nonce_timestamp_ms).map_err(|e| {
             tracing::warn!(
                 expired = matches!(e, NearAuthError::ExpiredNonce),
                 "NEAR signature rejected: invalid timestamp"
@@ -302,7 +304,6 @@ pub async fn verify_wallet_control(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone;
 
     #[test]
     fn nep413_hash_matches_wallet_fixtures_with_and_without_callback() {
@@ -344,9 +345,9 @@ mod tests {
 
     #[test]
     fn test_rejects_out_of_range_timestamp() {
-        let now = Utc.timestamp_millis_opt(1_000_000).unwrap();
+        let now = Timestamp::from_millisecond(1_000_000).unwrap();
 
-        // i64::MAX is beyond chrono's valid range
+        // i64::MAX is beyond the timestamp range
         let nonce_timestamp_ms = i64::MAX as u64;
 
         let result = validate_nonce_timestamp_ms(now, nonce_timestamp_ms);
@@ -361,8 +362,8 @@ mod tests {
 
     #[test]
     fn test_accepts_recent_valid_timestamp() {
-        let now = Utc.timestamp_millis_opt(1_000_000).unwrap();
-        let nonce_ts = now.timestamp_millis() - 60_000; // 1 minute ago
+        let now = Timestamp::from_millisecond(1_000_000).unwrap();
+        let nonce_ts = now.as_millisecond() - 60_000; // 1 minute ago
 
         let result = validate_nonce_timestamp_ms(now, nonce_ts as u64);
 
@@ -371,8 +372,8 @@ mod tests {
 
     #[test]
     fn test_rejects_expired_timestamp() {
-        let now = Utc.timestamp_millis_opt(1_000_000).unwrap();
-        let nonce_ts = now.timestamp_millis() - (10 * 60 * 1000); // 10 minutes ago (exceeds 5-minute window)
+        let now = Timestamp::from_millisecond(1_000_000).unwrap();
+        let nonce_ts = now.as_millisecond() - (10 * 60 * 1000); // 10 minutes ago (exceeds 5-minute window)
 
         let result = validate_nonce_timestamp_ms(now, nonce_ts as u64);
 
@@ -386,8 +387,8 @@ mod tests {
 
     #[test]
     fn test_rejects_future_timestamp() {
-        let now = Utc.timestamp_millis_opt(1_000_000).unwrap();
-        let nonce_ts = now.timestamp_millis() + 60_000; // 1 minute in the future
+        let now = Timestamp::from_millisecond(1_000_000).unwrap();
+        let nonce_ts = now.as_millisecond() + 60_000; // 1 minute in the future
 
         let result = validate_nonce_timestamp_ms(now, nonce_ts as u64);
 
@@ -401,10 +402,10 @@ mod tests {
 
     #[test]
     fn test_accepts_timestamp_at_boundary() {
-        let now = Utc.timestamp_millis_opt(1_000_000).unwrap();
+        let now = Timestamp::from_millisecond(1_000_000).unwrap();
 
         // Exactly at the 5-minute boundary should still be valid
-        let nonce_ts = now.timestamp_millis() - (5 * 60 * 1000); // Exactly 5 minutes ago
+        let nonce_ts = now.as_millisecond() - (5 * 60 * 1000); // Exactly 5 minutes ago
 
         let result = validate_nonce_timestamp_ms(now, nonce_ts as u64);
 
@@ -416,10 +417,10 @@ mod tests {
 
     #[test]
     fn test_rejects_timestamp_just_beyond_boundary() {
-        let now = Utc.timestamp_millis_opt(1_000_000).unwrap();
+        let now = Timestamp::from_millisecond(1_000_000).unwrap();
 
         // Just beyond the 5-minute boundary should be rejected
-        let nonce_ts = now.timestamp_millis() - (5 * 60 * 1000 + 1); // 5 minutes + 1ms ago
+        let nonce_ts = now.as_millisecond() - (5 * 60 * 1000 + 1); // 5 minutes + 1ms ago
 
         let result = validate_nonce_timestamp_ms(now, nonce_ts as u64);
 
@@ -432,7 +433,7 @@ mod tests {
     #[test]
     fn test_negative_i64_max_out_of_range() {
         // i64::MIN also causes from_timestamp_millis to return None
-        let now = Utc.timestamp_millis_opt(1_000_000).unwrap();
+        let now = Timestamp::from_millisecond(1_000_000).unwrap();
 
         // Large negative value (way before year -262144)
         let nonce_timestamp_ms = (-9_000_000_000_000_000i64) as u64;
@@ -447,7 +448,7 @@ mod tests {
 
     #[test]
     fn test_empty_nonce_timestamp_validation() {
-        let now = Utc.timestamp_millis_opt(1_000_000).unwrap();
+        let now = Timestamp::from_millisecond(1_000_000).unwrap();
         let empty_nonce_ms = 0u64;
 
         let result = validate_nonce_timestamp_ms(now, empty_nonce_ms);
@@ -462,7 +463,7 @@ mod tests {
         // now = 1_000_000 ms (16.67 minutes after Unix epoch)
         // short_timestamp_ms = 0xFFFF_FFFF (4294967295 ms = 49.7 days after epoch)
         // This timestamp is ~49.5 days in the future
-        let now = Utc.timestamp_millis_opt(1_000_000).unwrap();
+        let now = Timestamp::from_millisecond(1_000_000).unwrap();
         let short_timestamp_ms = 0xFFFF_FFFFu64;
 
         let result = validate_nonce_timestamp_ms(now, short_timestamp_ms);

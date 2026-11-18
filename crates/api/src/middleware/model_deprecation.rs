@@ -30,7 +30,7 @@ use axum::{
     middleware::Next,
     response::Response,
 };
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use services::models::{ModelCaller, ModelWithPricing, ModelsServiceTrait};
 
 use super::auth::AuthenticatedApiKey;
@@ -82,7 +82,7 @@ pub struct ModelDeprecationState {
 /// What the response headers say about a model's planned deprecation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelDeprecationNotice {
-    deprecation_date: DateTime<Utc>,
+    deprecation_date: Timestamp,
     successor: Option<String>,
 }
 
@@ -197,11 +197,10 @@ pub async fn model_deprecation_middleware(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone;
 
     fn example(successor: Option<&str>) -> ModelDeprecationNotice {
         ModelDeprecationNotice {
-            deprecation_date: Utc.with_ymd_and_hms(2026, 12, 1, 13, 0, 0).unwrap(),
+            deprecation_date: "2026-12-01T13:00:00Z".parse::<jiff::Timestamp>().unwrap(),
             successor: successor.map(str::to_string),
         }
     }
@@ -244,7 +243,7 @@ mod tests {
         assert!(headers.get(HEADER_MODEL_SUCCESSOR).is_none());
     }
 
-    fn model(deprecation_date: Option<DateTime<Utc>>) -> ModelWithPricing {
+    fn model(deprecation_date: Option<Timestamp>) -> ModelWithPricing {
         ModelWithPricing {
             upcoming_pricing: None,
             id: uuid::Uuid::nil(),
@@ -278,7 +277,7 @@ mod tests {
             successor_model_name: Some("nearai/new-model".to_string()),
             openrouter_slug: None,
             is_listed: true,
-            created_at: Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
+            created_at: "2026-01-01T00:00:00Z".parse::<jiff::Timestamp>().unwrap(),
         }
     }
 
@@ -290,7 +289,7 @@ mod tests {
 
     #[test]
     fn notice_is_built_from_the_catalog_row() {
-        let date = Utc.with_ymd_and_hms(2026, 12, 1, 13, 0, 0).unwrap();
+        let date = "2026-12-01T13:00:00Z".parse::<jiff::Timestamp>().unwrap();
         assert_eq!(
             ModelDeprecationNotice::from_model(&model(Some(date))),
             Some(ModelDeprecationNotice {

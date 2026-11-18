@@ -12,8 +12,8 @@ use crate::organization::OrganizationRepository;
 use crate::workspace::{ApiKey, ApiKeyRepository, WorkspaceId, WorkspaceRepository};
 use async_trait::async_trait;
 use bloomfilter::Bloom;
-use chrono::Utc;
 use hmac::{Hmac, KeyInit, Mac};
+use jiff::Timestamp;
 use moka::future::Cache;
 use sha2::Sha256;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -88,12 +88,13 @@ impl AuthServiceTrait for AuthService {
         encoding_key: String,
         expires_in_hours: i64,
     ) -> Result<String, AuthError> {
-        let expiration = chrono::Utc::now() + chrono::Duration::hours(expires_in_hours);
+        let expiration =
+            jiff::Timestamp::now() + jiff::SignedDuration::from_hours(expires_in_hours);
 
         let claims = AccessTokenClaims {
             sub: user_id,
-            exp: expiration.timestamp(),
-            iat: chrono::Utc::now().timestamp(),
+            exp: crate::timestamps::unix_seconds(expiration),
+            iat: jiff::Timestamp::now().as_second(),
             sid: session_id,
         };
 
@@ -117,7 +118,7 @@ impl AuthServiceTrait for AuthService {
         )
         .map_err(|_| AuthError::SessionNotFound)?;
 
-        if claims.claims.exp < Utc::now().timestamp() {
+        if claims.claims.exp < Timestamp::now().as_second() {
             return Err(AuthError::SessionNotFound);
         }
 
@@ -145,8 +146,8 @@ impl AuthServiceTrait for AuthService {
 
         // Check if token was issued before tokens_revoked_at
         if let Some(revoked_at) = user.tokens_revoked_at {
-            let token_issued_at = chrono::DateTime::from_timestamp(claims.iat, 0)
-                .ok_or(AuthError::SessionNotFound)?;
+            let token_issued_at =
+                jiff::Timestamp::from_second(claims.iat).map_err(|_| AuthError::SessionNotFound)?;
 
             if token_issued_at < revoked_at {
                 debug!(
@@ -171,7 +172,7 @@ impl AuthServiceTrait for AuthService {
                     .map_err(|e| AuthError::InternalError(format!("Failed to get session: {e}")))?
                     .ok_or(AuthError::SessionNotFound)?;
 
-                if session.user_id != claims.sub || session.expires_at < Utc::now() {
+                if session.user_id != claims.sub || session.expires_at < Timestamp::now() {
                     debug!("Access token session is expired or bound to another user");
                     return Err(AuthError::SessionNotFound);
                 }
@@ -225,7 +226,7 @@ impl AuthServiceTrait for AuthService {
 
         debug!(user_id = %session.user_id.0, "Refresh session validated");
         // Check if session is expired (validation already handles this, but keep for clarity)
-        if session.expires_at < Utc::now() {
+        if session.expires_at < Timestamp::now() {
             return Err(AuthError::SessionNotFound);
         }
 
@@ -685,16 +686,16 @@ impl AuthService {
         }
 
         tokio::spawn(async move {
-            let mut last_sync = Utc::now();
-            let mut last_full_rebuild = Utc::now()
-                - chrono::Duration::seconds(BLOOM_FILTER_FULL_REBUILD_INTERVAL_SECS as i64);
+            let mut last_sync = Timestamp::now();
+            let mut last_full_rebuild = Timestamp::now()
+                - jiff::SignedDuration::from_secs(BLOOM_FILTER_FULL_REBUILD_INTERVAL_SECS as i64);
 
             // Initial full build
             match rebuild_bloom(&*api_key_repository, &bloom_filter, &ready_flag).await {
                 Ok(count) => {
                     // Keep last_sync at the pre-fetch timestamp to ensure keys created
                     // during the fetch are picked up by the next incremental sync
-                    last_full_rebuild = Utc::now();
+                    last_full_rebuild = Timestamp::now();
                     info!("Initialized bloom filter with {} keys", count);
                 }
                 Err(e) => {
@@ -707,10 +708,10 @@ impl AuthService {
 
             loop {
                 tokio::time::sleep(Duration::from_secs(BLOOM_FILTER_SYNC_INTERVAL_SECS)).await;
-                let now = Utc::now();
+                let now = Timestamp::now();
 
                 // Periodic full rebuild to remove revoked keys.
-                if (now - last_full_rebuild).num_seconds()
+                if now.duration_since(last_full_rebuild).as_secs()
                     >= BLOOM_FILTER_FULL_REBUILD_INTERVAL_SECS as i64
                 {
                     match rebuild_bloom(&*api_key_repository, &bloom_filter, &ready_flag).await {
@@ -771,7 +772,7 @@ mod tests {
         WorkspaceRepository,
     };
     use bloomfilter::Bloom;
-    use chrono::Utc;
+    use jiff::Timestamp;
     use std::sync::atomic::AtomicBool;
     use std::sync::Mutex;
     use tokio::sync::RwLock;
@@ -807,8 +808,8 @@ mod tests {
             role: UserRole::User,
             is_active: true,
             last_login: None,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
+            created_at: Timestamp::now(),
+            updated_at: Timestamp::now(),
             tokens_revoked_at: None,
             contact_email: None,
             contact_email_verified_at: None,
@@ -1072,12 +1073,12 @@ mod tests {
             }
         }
 
-        fn insert_session(&self, user_id: UserId, expires_at: chrono::DateTime<Utc>) -> Session {
+        fn insert_session(&self, user_id: UserId, expires_at: jiff::Timestamp) -> Session {
             let session = Session {
                 id: SessionId(Uuid::new_v4()),
                 user_id,
                 token_hash: "test_token_hash".to_string(),
-                created_at: Utc::now(),
+                created_at: Timestamp::now(),
                 expires_at,
                 ip_address: None,
                 user_agent: "Test Agent".to_string(),
@@ -1105,7 +1106,7 @@ mod tests {
         ) -> anyhow::Result<(Session, String)> {
             let session = self.insert_session(
                 user_id,
-                Utc::now() + chrono::Duration::hours(expires_in_hours),
+                Timestamp::now() + jiff::SignedDuration::from_hours(expires_in_hours),
             );
             let token = format!("rt_{}", session.id.0.simple());
             Ok((session, token))
@@ -1183,7 +1184,7 @@ mod tests {
             &self,
             _: ApiKeyId,
             _: Option<String>,
-            _: Option<Option<chrono::DateTime<Utc>>>,
+            _: Option<Option<jiff::Timestamp>>,
             _: Option<Option<i64>>,
             _: Option<bool>,
         ) -> Result<ApiKey, RepositoryError> {
@@ -1207,7 +1208,7 @@ mod tests {
         }
         async fn get_active_key_hashes_created_after(
             &self,
-            _: chrono::DateTime<Utc>,
+            _: jiff::Timestamp,
         ) -> Result<Vec<String>, RepositoryError> {
             Ok(vec![])
         }
@@ -1874,8 +1875,10 @@ mod tests {
         let service = build_auth_service_with_sessions(user_repo, session_repo.clone(), false);
 
         // Session row exists but is already expired.
-        let expired_session =
-            session_repo.insert_session(user.id.clone(), Utc::now() - chrono::Duration::hours(1));
+        let expired_session = session_repo.insert_session(
+            user.id.clone(),
+            Timestamp::now() - jiff::SignedDuration::from_hours(1),
+        );
         let access_token = service
             .create_session_access_token(
                 user.id.clone(),
@@ -1935,7 +1938,7 @@ mod tests {
         // Session belongs to a different user than the token subject.
         let other_session = session_repo.insert_session(
             UserId(Uuid::new_v4()),
-            Utc::now() + chrono::Duration::hours(24),
+            Timestamp::now() + jiff::SignedDuration::from_hours(24),
         );
         let access_token = service
             .create_session_access_token(

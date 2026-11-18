@@ -1,5 +1,5 @@
 //! Domain types and pure validation shared by services and transactional adapters.
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
@@ -92,7 +92,7 @@ pub struct CredentialRequest {
     pub permissions: Vec<String>,
     #[serde(default)]
     pub constraints: CredentialConstraints,
-    pub expires_at: DateTime<Utc>,
+    pub expires_at: Timestamp,
 }
 
 impl CredentialRequest {
@@ -105,8 +105,8 @@ impl CredentialRequest {
                 .permissions
                 .iter()
                 .any(|p| !matches!(p.as_str(), READ_CREDITS | TRANSFER_CREDITS))
-            || self.expires_at <= Utc::now()
-            || self.expires_at > Utc::now() + chrono::Duration::days(366)
+            || self.expires_at <= Timestamp::now()
+            || self.expires_at > Timestamp::now() + jiff::SignedDuration::from_hours(366 * 24)
         {
             return Err(OrganizationOperationError("invalid_credential_configuration").into());
         }
@@ -321,7 +321,7 @@ impl OrganizationPolicy {
 pub struct HistoryRequest {
     pub id: Option<Uuid>,
     pub key: Option<String>,
-    pub before: Option<(DateTime<Utc>, Uuid)>,
+    pub before: Option<(Timestamp, Uuid)>,
     pub options: TransferHistoryOptions,
 }
 

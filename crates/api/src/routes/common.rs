@@ -218,10 +218,7 @@ pub fn parse_metrics_range(
     granularity: Option<&str>,
     max_hour_days: i64,
     max_day_days: i64,
-) -> Result<
-    (chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>),
-    (StatusCode, ResponseJson<ErrorResponse>),
-> {
+) -> Result<(jiff::Timestamp, jiff::Timestamp), (StatusCode, ResponseJson<ErrorResponse>)> {
     let bad = |field: &str| {
         (
             StatusCode::BAD_REQUEST,
@@ -239,40 +236,36 @@ pub fn parse_metrics_range(
     };
 
     let end = match end {
-        Some(s) => chrono::DateTime::parse_from_rfc3339(s)
-            .map(|dt| dt.with_timezone(&chrono::Utc))
-            .map_err(|_| bad("end"))?,
-        None => chrono::Utc::now(),
+        Some(s) => services::timestamps::parse_rfc3339(s).ok_or_else(|| bad("end"))?,
+        None => jiff::Timestamp::now(),
     };
     let start = match start {
-        Some(s) => chrono::DateTime::parse_from_rfc3339(s)
-            .map(|dt| dt.with_timezone(&chrono::Utc))
-            .map_err(|_| bad("start"))?,
-        None => end - chrono::Duration::days(30),
+        Some(s) => services::timestamps::parse_rfc3339(s).ok_or_else(|| bad("start"))?,
+        None => end - jiff::SignedDuration::from_hours(30 * 24),
     };
 
     if start >= end {
         return Err(range_err("'start' must be before 'end'".to_string()));
     }
 
-    let window = end - start;
+    let window = end.duration_since(start);
     match granularity {
         Some("hour") => {
-            if window > chrono::Duration::days(max_hour_days) {
+            if window > jiff::SignedDuration::from_hours(max_hour_days * 24) {
                 return Err(range_err(format!(
                     "'hour' granularity is limited to {max_hour_days} days; use a coarser granularity or a shorter range"
                 )));
             }
         }
         Some("week") => {
-            if window > chrono::Duration::days(1096) {
+            if window > jiff::SignedDuration::from_hours(1096 * 24) {
                 return Err(range_err(
                     "'week' granularity is limited to 3 years".to_string(),
                 ));
             }
         }
         Some("month") => {
-            if window > chrono::Duration::days(1826) {
+            if window > jiff::SignedDuration::from_hours(1826 * 24) {
                 return Err(range_err(
                     "'month' granularity is limited to 5 years".to_string(),
                 ));
@@ -280,7 +273,7 @@ pub fn parse_metrics_range(
         }
         // "day" or None: caller-configured cap for non-hour ranges.
         _ => {
-            if window > chrono::Duration::days(max_day_days) {
+            if window > jiff::SignedDuration::from_hours(max_day_days * 24) {
                 return Err(range_err(format!(
                     "'day' granularity is limited to {max_day_days} days"
                 )));

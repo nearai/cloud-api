@@ -935,20 +935,15 @@ impl CompletionServiceImpl {
     }
 
     /// Whether `organization_id` may use the long-context tier of
-    /// `model_name` (canonical). Reads the organization's access only for a
-    /// model that has such a tier.
+    /// `model_name` (canonical), from its access policy alone (cached per
+    /// organization). It does not depend on whether the model has a long tier
+    /// right now: a tier that appears during the request is still covered,
+    /// and the pool enforces the answer only where a tier boundary exists.
     async fn resolve_long_context_allowed(&self, organization_id: Uuid, model_name: &str) -> bool {
-        let Some(access) = &self.long_context_access else {
-            return true;
-        };
-        if self
-            .inference_provider_pool
-            .long_context_base_capacity(model_name)
-            .is_none()
-        {
-            return true;
+        match &self.long_context_access {
+            Some(access) => access.is_allowed(organization_id, model_name).await,
+            None => true,
         }
-        access.is_allowed(organization_id, model_name).await
     }
 
     /// The routing flag for a chat request, or the typed error when the

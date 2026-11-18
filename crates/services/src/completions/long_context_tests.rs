@@ -192,17 +192,98 @@ async fn small_request_of_a_blocked_organization_never_reaches_the_long_tier() {
     assert!(f.long.chat_completion_call_count() > 0);
 }
 
+/// The restriction comes from the organization's policy alone, also for a
+/// model without a long tier now; such a model is unaffected by it.
 #[tokio::test]
-async fn a_single_tier_model_needs_no_access_lookup() {
+async fn a_single_tier_model_is_unaffected_by_a_restriction() {
     let f = fixture(false).await;
     assert!(
-        ports::CompletionServiceTrait::long_context_allowed(&f.service, f.blocked, MODEL).await
+        !ports::CompletionServiceTrait::long_context_allowed(&f.service, f.blocked, MODEL).await
     );
     f.service
         .create_chat_completion(request(f.blocked, 20_000))
         .await
         .expect("a single-tier model is unaffected");
-    assert_eq!(f.blocks.reads.load(Ordering::SeqCst), 0);
+    // One policy read, cached for the organization.
+    assert_eq!(f.blocks.reads.load(Ordering::SeqCst), 1);
+}
+
+/// A refresh that turns a single-tier model into a two-tier one between the
+/// restriction decision and provider selection: the restriction, decided
+/// while the model had no long tier, still keeps the long tier out.
+#[tokio::test(start_paused = true)]
+async fn a_restriction_decided_before_a_tier_appears_still_applies() {
+    let f = fixture(false).await;
+    let allowed =
+        ports::CompletionServiceTrait::long_context_allowed(&f.service, f.blocked, MODEL).await;
+    assert!(!allowed);
+
+    // The refresh: a base tier and the configured boundary appear.
+    let pool = &f.service.inference_provider_pool;
+    pool.register_pinned_provider(
+        MODEL.to_string(),
+        f.base.clone(),
+        Some(1_000),
+        ProviderPoolRole::Primary,
+    )
+    .await;
+    pool.record_long_context_boundaries(&[
+        (
+            MODEL.to_string(),
+            "https://base.example".to_string(),
+            Some(1_000),
+        ),
+        (
+            MODEL.to_string(),
+            "https://long.example".to_string(),
+            Some(10_000),
+        ),
+    ]);
+    f.base
+        .set_error_override(Some(ProviderError::HttpError {
+            status_code: 503,
+            message: "queue full".to_string(),
+            is_external: false,
+        }))
+        .await;
+    let params = |bytes: usize| -> inference_providers::ChatCompletionParams {
+        serde_json::from_value(serde_json::json!({
+            "model": MODEL,
+            "messages": [{"role": "user", "content": "a".repeat(bytes)}]
+        }))
+        .unwrap()
+    };
+    let hints = |long_context_allowed| crate::inference_provider_pool::ChatRoutingHints {
+        long_context_allowed,
+        ..Default::default()
+    };
+
+    // Small request: the base tier fails and the long tier is never tried.
+    assert!(pool
+        .chat_completion_with_attribution_and_hints(params(40), "h1".into(), hints(allowed))
+        .await
+        .is_err());
+    assert_eq!(f.long.chat_completion_call_count(), 0);
+    // Oversized request: refused, as the boundary now exists.
+    assert!(matches!(
+        pool.chat_completion_with_attribution_and_hints(
+            params(20_000),
+            "h2".into(),
+            hints(allowed)
+        )
+        .await,
+        Err(ProviderError::HttpError {
+            status_code: 400,
+            ..
+        })
+    ));
+    assert_eq!(f.long.chat_completion_call_count(), 0);
+
+    // Control: an unrestricted request fails over to the long tier.
+    pool.chat_completion_with_attribution_and_hints(params(40), "h3".into(), hints(true))
+        .await
+        .expect("failover to the long tier");
+    assert_eq!(f.long.chat_completion_call_count(), 1);
 }
 
 #[tokio::test]

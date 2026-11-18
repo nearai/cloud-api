@@ -200,7 +200,9 @@ pub trait CompletionServiceTrait: Send + Sync {
 
     /// Whether `organization_id` may use the long-context tier of
     /// `model_name` (canonical), for a direct transport route that builds its
-    /// own routing hints. Always `true` for a model without such a tier.
+    /// own routing hints. From the organization's access policy alone, also
+    /// for a model without such a tier now; the pool enforces it only where a
+    /// tier boundary exists.
     async fn long_context_allowed(&self, organization_id: Uuid, model_name: &str) -> bool;
 
     /// Fail with [`CompletionError::ContextLengthExceeded`] when `request`

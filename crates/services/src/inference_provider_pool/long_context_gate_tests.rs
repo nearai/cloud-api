@@ -8,6 +8,7 @@ use inference_providers::mock::MockProvider;
 use inference_providers::{ChatCompletionParams, CompletionError, ProviderTier};
 
 use super::{ChatRoutingHints, InferenceProviderPool, InferenceProviderTrait};
+use crate::test_utils::with_test_budget;
 
 const MODEL: &str = "org/tiered";
 const BASE_CAPACITY: u32 = 1_000;
@@ -126,12 +127,15 @@ fn served_by(result: &Result<impl Sized, CompletionError>) -> Result<(), String>
 async fn oversized_restricted_request_is_rejected_before_any_provider_call() {
     let (pool, base, long, fallback) = tiered_pool().await;
 
-    let non_streaming = pool
-        .chat_completion_with_attribution_and_hints(oversized(MODEL), "h1".into(), restricted())
-        .await;
-    let streaming = pool
-        .chat_completion_stream(oversized(MODEL), "h2".into(), restricted())
-        .await;
+    let non_streaming = with_test_budget(pool.chat_completion_with_attribution_and_hints(
+        oversized(MODEL),
+        "h1".into(),
+        restricted(),
+    ))
+    .await;
+    let streaming =
+        with_test_budget(pool.chat_completion_stream(oversized(MODEL), "h2".into(), restricted()))
+            .await;
 
     for error in [non_streaming.err(), streaming.err()] {
         match error {
@@ -168,13 +172,12 @@ async fn oversized_restricted_request_is_rejected_before_any_provider_call() {
 #[tokio::test]
 async fn oversized_unrestricted_request_is_served_by_the_long_tier() {
     let (pool, base, long, _) = tiered_pool().await;
-    let result = pool
-        .chat_completion_with_attribution_and_hints(
-            oversized(MODEL),
-            "h".into(),
-            ChatRoutingHints::default(),
-        )
-        .await;
+    let result = with_test_budget(pool.chat_completion_with_attribution_and_hints(
+        oversized(MODEL),
+        "h".into(),
+        ChatRoutingHints::default(),
+    ))
+    .await;
     served_by(&result).unwrap();
     assert_eq!(long.chat_completion_call_count(), 1);
     assert_eq!(base.chat_completion_call_count(), 0);
@@ -202,9 +205,12 @@ async fn retryable_base_error_never_reaches_the_long_tier_when_restricted() {
             }))
             .await;
 
-        let result = pool
-            .chat_completion_with_attribution_and_hints(small(MODEL), "h".into(), hints)
-            .await;
+        let result = with_test_budget(pool.chat_completion_with_attribution_and_hints(
+            small(MODEL),
+            "h".into(),
+            hints,
+        ))
+        .await;
 
         assert!(base.chat_completion_call_count() > 0);
         if long_may_serve {
@@ -237,9 +243,12 @@ async fn retryable_base_error_falls_back_to_the_third_party_when_restricted() {
     }))
     .await;
 
-    let result = pool
-        .chat_completion_with_attribution_and_hints(small(MODEL), "h".into(), restricted())
-        .await;
+    let result = with_test_budget(pool.chat_completion_with_attribution_and_hints(
+        small(MODEL),
+        "h".into(),
+        restricted(),
+    ))
+    .await;
 
     served_by(&result).unwrap();
     assert_eq!(fallback.chat_completion_call_count(), 1);
@@ -268,9 +277,8 @@ async fn context_length_400_never_falls_through_to_the_long_tier_when_restricted
         }))
         .await;
 
-        let streaming = pool
-            .chat_completion_stream(small(MODEL), "h".into(), hints)
-            .await;
+        let streaming =
+            with_test_budget(pool.chat_completion_stream(small(MODEL), "h".into(), hints)).await;
 
         assert_eq!(base.chat_completion_call_count(), 1);
         if long_may_serve {
@@ -318,9 +326,12 @@ async fn restricted_flag_does_not_change_a_single_tier_model() {
         .unwrap();
     assert_eq!(restricted_order.len(), 2);
 
-    let result = pool
-        .chat_completion_with_attribution_and_hints(oversized(MODEL), "h".into(), restricted())
-        .await;
+    let result = with_test_budget(pool.chat_completion_with_attribution_and_hints(
+        oversized(MODEL),
+        "h".into(),
+        restricted(),
+    ))
+    .await;
     served_by(&result).unwrap();
     assert_eq!(near.chat_completion_call_count(), 1);
 }
@@ -457,9 +468,14 @@ async fn systemone_never_reaches_the_long_tier_when_restricted() {
         }))
         .unwrap();
 
-        let result = pool
-            .systemone_with_attribution(request, "h".into(), None, false, long_context_allowed)
-            .await;
+        let result = with_test_budget(pool.systemone_with_attribution(
+            request,
+            "h".into(),
+            None,
+            false,
+            long_context_allowed,
+        ))
+        .await;
 
         assert!(result.is_err());
         assert!(base_calls.load(Ordering::SeqCst) > 0);
@@ -498,20 +514,26 @@ async fn evicted_base_tier_never_exposes_the_long_tier() {
             .map(|providers| providers.len()),
         Some(0)
     );
-    assert!(pool
-        .chat_completion_with_attribution_and_hints(small(MODEL), "h1".into(), restricted())
+    assert!(
+        with_test_budget(pool.chat_completion_with_attribution_and_hints(
+            small(MODEL),
+            "h1".into(),
+            restricted()
+        ))
         .await
-        .is_err());
-    assert!(pool
-        .chat_completion_stream(small(MODEL), "h2".into(), restricted())
-        .await
-        .is_err());
+        .is_err()
+    );
+    assert!(
+        with_test_budget(pool.chat_completion_stream(small(MODEL), "h2".into(), restricted()))
+            .await
+            .is_err()
+    );
     assert!(matches!(
-        pool.chat_completion_with_attribution_and_hints(
+        with_test_budget(pool.chat_completion_with_attribution_and_hints(
             oversized(MODEL),
             "h3".into(),
             restricted()
-        )
+        ))
         .await,
         Err(CompletionError::HttpError {
             status_code: 400,
@@ -526,13 +548,12 @@ async fn evicted_base_tier_never_exposes_the_long_tier() {
 
     // Unrestricted organizations still reach it.
     served_by(
-        &pool
-            .chat_completion_with_attribution_and_hints(
-                small(MODEL),
-                "h4".into(),
-                ChatRoutingHints::default(),
-            )
-            .await,
+        &with_test_budget(pool.chat_completion_with_attribution_and_hints(
+            small(MODEL),
+            "h4".into(),
+            ChatRoutingHints::default(),
+        ))
+        .await,
     )
     .unwrap();
     assert_eq!(long.chat_completion_call_count(), 1);
@@ -592,9 +613,14 @@ async fn oversized_systemone_request_is_rejected_when_restricted() {
         None
     );
 
-    match pool
-        .systemone_with_attribution(oversized, "h".into(), None, false, false)
-        .await
+    match with_test_budget(pool.systemone_with_attribution(
+        oversized,
+        "h".into(),
+        None,
+        false,
+        false,
+    ))
+    .await
     {
         Err(CompletionError::HttpError {
             status_code,

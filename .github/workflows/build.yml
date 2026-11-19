@@ -123,8 +123,8 @@ jobs:
           cosign sign --yes "${REGISTRY}/${IMAGE_REPOSITORY}@${IMAGE_DIGEST}"
 
       # The deploy repository and its dispatch credentials come from secrets (masked in logs). The token is
-      # minted below from a GitHub App installed only on the deploy repository and is scoped to it. Checked
-      # before :staging moves, so a missing setting never moves :staging without a deploy.
+      # minted from a GitHub App installed only on the deploy repository and is scoped to it. Both happen
+      # before :staging moves, so a missing setting or a broken install never moves :staging without a deploy.
       - name: Check the staging dispatch settings
         if: env.ALSO_TAG_STAGING == 'true'
         env:
@@ -156,6 +156,17 @@ jobs:
           fi
           exit "$missing"
 
+      - name: Mint a dispatch token for the deploy repository
+        if: env.ALSO_TAG_STAGING == 'true'
+        id: dispatch-token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ secrets.DEPLOY_DISPATCH_CLIENT_ID }}
+          private-key: ${{ secrets.DEPLOY_DISPATCH_APP_KEY }}
+          owner: ${{ secrets.DEPLOY_REPO_OWNER }}
+          repositories: ${{ secrets.DEPLOY_REPO_NAME }}
+          permission-contents: write
+
       - name: Tag staging for continuous integration
         if: env.ALSO_TAG_STAGING == 'true'
         run: |
@@ -168,17 +179,6 @@ jobs:
           skopeo copy oci-archive:./oci.tar "docker://${STAGING_STAMPED_REF}"
           echo "STAGING_REFERENCE=${STAGING_REF}" >> "$GITHUB_ENV"
           echo "STAGING_STAMPED_REFERENCE=${STAGING_STAMPED_REF}" >> "$GITHUB_ENV"
-
-      - name: Mint a dispatch token for the deploy repository
-        if: env.ALSO_TAG_STAGING == 'true'
-        id: dispatch-token
-        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
-        with:
-          client-id: ${{ secrets.DEPLOY_DISPATCH_CLIENT_ID }}
-          private-key: ${{ secrets.DEPLOY_DISPATCH_APP_KEY }}
-          owner: ${{ secrets.DEPLOY_REPO_OWNER }}
-          repositories: ${{ secrets.DEPLOY_REPO_NAME }}
-          permission-contents: write
 
       - name: Trigger staging deployment
         if: env.ALSO_TAG_STAGING == 'true'

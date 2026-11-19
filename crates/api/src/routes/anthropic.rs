@@ -409,6 +409,11 @@ fn spawn_native_usage_recording(
     usage: NativeUsage,
     stop_reason: StopReason,
 ) {
+    let mut outcome = services::usage::budget::OutcomeGuard::new(
+        context.usage_service.clone(),
+        context.organization_id,
+        context.budget_id,
+    );
     let task_handle = handle.clone();
     let spawned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         handle.spawn_blocking(move || {
@@ -419,7 +424,7 @@ fn spawn_native_usage_recording(
                 )
                 .await
                 {
-                    Ok(Ok(())) => {}
+                    Ok(Ok(())) => outcome.disarm(),
                     Ok(Err(_)) => {
                         tracing::error!(
                             error_kind = "usage_write_failed",
@@ -2006,10 +2011,23 @@ redact-thinking-2026-02-12";
     pub(super) struct RecordingUsageService {
         pub(super) records: std::sync::Mutex<Vec<RecordUsageServiceRequest>>,
         pub(super) panic_on_record: bool,
+        pub(super) stall_recording: bool,
+        pub(super) unknown: Option<tokio::sync::mpsc::UnboundedSender<(Uuid, Uuid)>>,
     }
 
     #[async_trait::async_trait]
     impl UsageServiceTrait for RecordingUsageService {
+        async fn mark_budget_unknown(
+            &self,
+            organization_id: Uuid,
+            id: Uuid,
+        ) -> Result<(), services::usage::UsageError> {
+            if let Some(unknown) = &self.unknown {
+                unknown.send((organization_id, id)).unwrap();
+            }
+            Ok(())
+        }
+
         async fn record_usage(
             &self,
             request: RecordUsageServiceRequest,
@@ -2019,6 +2037,9 @@ redact-thinking-2026-02-12";
                 .lock()
                 .expect("records mutex should not poison")
                 .push(request);
+            if self.stall_recording {
+                std::future::pending::<()>().await;
+            }
             Err(services::usage::UsageError::InternalError(
                 "recorded".to_string(),
             ))
@@ -2195,6 +2216,32 @@ redact-thinking-2026-02-12";
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         panic!("usage was not recorded within 2s");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn native_stream_settlement_marks_unknown_on_timeout_or_panic() {
+        for panic_on_record in [false, true] {
+            let (unknown, mut outcomes) = tokio::sync::mpsc::unbounded_channel();
+            let service = Arc::new(RecordingUsageService {
+                stall_recording: true,
+                panic_on_record,
+                unknown: Some(unknown),
+                ..Default::default()
+            });
+            let context = billing_context(service.clone());
+            let expected = (context.organization_id, context.budget_id.unwrap());
+            let mut stream = usage_stream_over(vec![], Some(context));
+            stream.parser.usage.input_tokens = 4;
+            drop(stream);
+
+            let outcome = tokio::time::timeout(Duration::from_secs(5), outcomes.recv())
+                .await
+                .expect("interrupted native stream settlement should mark its reservation unknown");
+            assert_eq!(outcome, Some(expected));
+            if !panic_on_record {
+                assert_eq!(service.records.lock().unwrap().len(), 1);
+            }
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

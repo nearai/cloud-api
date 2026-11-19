@@ -417,6 +417,11 @@ where
         let last_error = self.last_error.clone();
         let response_id = self.response_id.clone();
         let usage_service = self.usage_service.clone();
+        let mut outcome = crate::usage::budget::OutcomeGuard::new(
+            usage_service.clone(),
+            organization_id,
+            budget_id,
+        );
         let metrics_service = self.metrics_service.clone();
         let ttft_ms = self.ttft_ms;
 
@@ -528,8 +533,12 @@ where
                     };
                     let usage_write = spawn_usage_write(
                         &write_handle,
-                        async move { usage_service.record_usage(usage_request).await.map(|_| ()) }
-                            .instrument(write_span),
+                        async move {
+                            usage_service.record_usage(usage_request).await?;
+                            outcome.disarm();
+                            Ok(())
+                        }
+                        .instrument(write_span),
                         inference_id,
                         Duration::from_secs(30),
                     );
@@ -3103,6 +3112,39 @@ mod tests {
         })
         .await
         .expect("usage should be recorded")
+    }
+
+    #[tokio::test]
+    async fn chat_stream_settlement_marks_unknown_only_after_the_write_hard_cap() {
+        let service = Arc::new(crate::test_utils::CapturingUsageService::new());
+        service
+            .stall_recording
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut stream = terminal_test_stream(vec![Ok(usage_test_chunk(
+            Some("hello"),
+            Some("chat"),
+            Some(TokenUsage::new(4, 1)),
+            None,
+        ))]);
+        stream.usage_service = service.clone();
+        let budget_id = stream.budget_id.unwrap();
+        assert!(stream.next().await.unwrap().is_ok());
+        drop(stream);
+        assert_eq!(recorded_usage(&service).await[0].budget_id, Some(budget_id));
+
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(3)).await;
+        assert!(service.unknown_outcomes.lock().unwrap().is_empty());
+        tokio::time::advance(Duration::from_secs(30)).await;
+        tokio::time::resume();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while service.unknown_outcomes.lock().unwrap().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the write hard cap should mark the reservation unknown");
+        assert_eq!(*service.unknown_outcomes.lock().unwrap(), [budget_id]);
     }
 
     #[tokio::test]

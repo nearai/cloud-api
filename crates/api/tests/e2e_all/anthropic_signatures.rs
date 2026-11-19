@@ -20,6 +20,13 @@ async fn streaming_message_has_gateway_receipts_and_correlated_billing() {
 async fn verify_message(stream: bool) {
     let upstream = MockServer::start().await;
     let id = format!("msg_{}", uuid::Uuid::new_v4());
+    let history = json!([
+        {"role":"user","content":"Check the forecast"},
+        {"role":"assistant","content":[
+            {"type":"thinking","thinking":"Check the forecast","signature":"opaque-native-fixture"},
+            {"type":"tool_use","id":"toolu_previous","name":"weather","input":{"city":"Tokyo"}}]},
+        {"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_previous","content":"Sunny"}]}
+    ]);
     let raw = if stream {
         format!("event: message_start\r\ndata: {}\r\n\r\nevent: ping\ndata: {{\"type\":\"ping\"}}\n\nevent: content_block_start\ndata: {}\n\nevent: content_block_stop\ndata: {{\"type\":\"content_block_stop\",\"index\":0}}\n\nevent: message_delta\ndata: {}\n\nevent: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n",
             json!({"type":"message_start","message":{"id":id,"type":"message","content":[],"usage":{"input_tokens":10}}}),
@@ -27,14 +34,14 @@ async fn verify_message(stream: bool) {
             json!({"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":5}}))
     } else {
         serde_json::to_string_pretty(&json!({"id":id,"type":"message","role":"assistant","model":"claude-fixture",
-            "content":[{"type":"tool_use","id":"toolu_fixture","name":"weather","input":{"city":"Tokyo"}}],
+            "content":[{"type":"thinking","thinking":"Check again","signature":"opaque-native-next"},{"type":"tool_use","id":"toolu_fixture","name":"weather","input":{"city":"Tokyo"}}],
             "stop_reason":"tool_use","usage":{"input_tokens":10,"output_tokens":5}})).unwrap()
     };
     Mock::given(method("POST"))
         .and(path("/v1/messages"))
         .and(header("x-api-key", "fixture-upstream-key"))
         .and(body_partial_json(
-            json!({"model":"claude-fixture","stream":stream}),
+            json!({"model":"claude-fixture","stream":stream,"messages":history}),
         ))
         .respond_with(
             ResponseTemplate::new(200)
@@ -75,7 +82,7 @@ async fn verify_message(stream: bool) {
     // Pretty-printed input and a model alias detect accidental hashing after
     // JSON normalization or the provider's model-name rewrite.
     let request = serde_json::to_string_pretty(&json!({"model":alias,"max_tokens":16,
-        "stream":stream,"messages":[{"role":"user","content":"Weather?"}],
+        "stream":stream,"messages":history,
         "tools":[{"name":"weather","input_schema":{"type":"object","properties":{"city":{"type":"string"}}}}]})).unwrap();
     let response = server
         .post("/v1/messages")

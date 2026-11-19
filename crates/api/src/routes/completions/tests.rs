@@ -35,10 +35,8 @@ fn chat_token_limits_are_normalized_before_dispatch() {
             Uuid::nil(),
             false,
             0,
-            RequestBodyHash {
-                hash: "original-request-hash".to_string(),
-                body_bytes: serde_json::to_vec(&body).unwrap().into(),
-            },
+            "original-request-hash".to_string(),
+            Some(body.clone()),
             Uuid::nil(),
         );
         assert_eq!(service.max_tokens, expected, "{body}");

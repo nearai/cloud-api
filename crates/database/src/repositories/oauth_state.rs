@@ -1,6 +1,6 @@
 use crate::pool::DbPool;
 use anyhow::{Context, Result};
-use chrono::{DateTime, Duration, Utc};
+use jiff::{SignedDuration, Timestamp};
 use tracing::debug;
 
 pub struct OAuthStateRepository {
@@ -13,8 +13,8 @@ pub struct OAuthStateRow {
     pub provider: String,
     pub pkce_verifier: Option<String>,
     pub frontend_callback: Option<String>,
-    pub created_at: DateTime<Utc>,
-    pub expires_at: DateTime<Utc>,
+    pub created_at: Timestamp,
+    pub expires_at: Timestamp,
 }
 
 impl OAuthStateRepository {
@@ -36,8 +36,8 @@ impl OAuthStateRepository {
             .await
             .context("Failed to get database connection")?;
 
-        let now = Utc::now();
-        let expires_at = now + Duration::minutes(10);
+        let now = Timestamp::now();
+        let expires_at = now + SignedDuration::from_mins(10);
 
         let row = client
             .query_one(
@@ -68,7 +68,7 @@ impl OAuthStateRepository {
             .await
             .context("Failed to get database connection")?;
 
-        let now = Utc::now();
+        let now = Timestamp::now();
 
         let row = client
             .query_opt(
@@ -108,7 +108,7 @@ impl OAuthStateRepository {
             .await
             .context("Failed to get database connection")?;
 
-        let now = Utc::now();
+        let now = Timestamp::now();
         let result = client
             .execute("DELETE FROM oauth_states WHERE expires_at <= $1", &[&now])
             .await

@@ -7,7 +7,7 @@ pub use storage::ObjectKeyState;
 
 use crate::common::RepositoryError;
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use std::sync::Arc;
 use storage::StorageTrait;
 use thiserror::Error;
@@ -184,8 +184,8 @@ pub fn validate_encoding(content_type: &str, data: &[u8]) -> Result<(), FileServ
 pub fn calculate_expires_at(
     anchor: &str,
     seconds: i64,
-    created_at: DateTime<Utc>,
-) -> Result<DateTime<Utc>, FileServiceError> {
+    created_at: Timestamp,
+) -> Result<Timestamp, FileServiceError> {
     // Maximum expiration is 1 year (31536000 seconds)
     const MAX_EXPIRATION_SECONDS: i64 = 31536000;
 
@@ -202,7 +202,7 @@ pub fn calculate_expires_at(
     }
 
     match anchor {
-        "created_at" => Ok(created_at + chrono::Duration::seconds(seconds)),
+        "created_at" => Ok(created_at + jiff::SignedDuration::from_secs(seconds)),
         _ => Err(FileServiceError::InvalidExpiresAfter(format!(
             "Invalid anchor: {anchor}. Must be 'created_at'"
         ))),
@@ -229,7 +229,7 @@ pub struct UploadFileParams {
     pub purpose: String,
     pub workspace_id: Uuid,
     pub uploaded_by_api_key_id: Uuid,
-    pub expires_at: Option<DateTime<Utc>>,
+    pub expires_at: Option<Timestamp>,
 }
 
 /// File service trait for managing file uploads, downloads, and metadata

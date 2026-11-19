@@ -25,9 +25,9 @@ pub fn status_overloaded() -> StatusCode {
 /// Map domain errors to HTTP status codes
 pub fn map_domain_error_to_status(error: &CompletionError) -> StatusCode {
     match error {
-        CompletionError::InvalidModel(_) | CompletionError::InvalidParams(_) => {
-            StatusCode::BAD_REQUEST
-        }
+        CompletionError::InvalidModel(_)
+        | CompletionError::InvalidParams(_)
+        | CompletionError::ContextLengthExceeded { .. } => StatusCode::BAD_REQUEST,
         CompletionError::RateLimitExceeded(_) => StatusCode::TOO_MANY_REQUESTS,
         CompletionError::ProviderError { status_code, .. } => {
             StatusCode::from_u16(*status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
@@ -218,10 +218,7 @@ pub fn parse_metrics_range(
     granularity: Option<&str>,
     max_hour_days: i64,
     max_day_days: i64,
-) -> Result<
-    (chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>),
-    (StatusCode, ResponseJson<ErrorResponse>),
-> {
+) -> Result<(jiff::Timestamp, jiff::Timestamp), (StatusCode, ResponseJson<ErrorResponse>)> {
     let bad = |field: &str| {
         (
             StatusCode::BAD_REQUEST,
@@ -239,40 +236,40 @@ pub fn parse_metrics_range(
     };
 
     let end = match end {
-        Some(s) => chrono::DateTime::parse_from_rfc3339(s)
-            .map(|dt| dt.with_timezone(&chrono::Utc))
-            .map_err(|_| bad("end"))?,
-        None => chrono::Utc::now(),
+        Some(s) => services::timestamps::parse_timestamp(s).ok_or_else(|| bad("end"))?,
+        None => jiff::Timestamp::now(),
     };
     let start = match start {
-        Some(s) => chrono::DateTime::parse_from_rfc3339(s)
-            .map(|dt| dt.with_timezone(&chrono::Utc))
-            .map_err(|_| bad("start"))?,
-        None => end - chrono::Duration::days(30),
+        Some(s) => services::timestamps::parse_timestamp(s).ok_or_else(|| bad("start"))?,
+        None => end
+            .checked_sub(jiff::SignedDuration::from_hours(30 * 24))
+            .map_err(|_| {
+                range_err("Default start is outside the supported timestamp range.".to_string())
+            })?,
     };
 
     if start >= end {
         return Err(range_err("'start' must be before 'end'".to_string()));
     }
 
-    let window = end - start;
+    let window = end.duration_since(start);
     match granularity {
         Some("hour") => {
-            if window > chrono::Duration::days(max_hour_days) {
+            if window > jiff::SignedDuration::from_hours(max_hour_days * 24) {
                 return Err(range_err(format!(
                     "'hour' granularity is limited to {max_hour_days} days; use a coarser granularity or a shorter range"
                 )));
             }
         }
         Some("week") => {
-            if window > chrono::Duration::days(1096) {
+            if window > jiff::SignedDuration::from_hours(1096 * 24) {
                 return Err(range_err(
                     "'week' granularity is limited to 3 years".to_string(),
                 ));
             }
         }
         Some("month") => {
-            if window > chrono::Duration::days(1826) {
+            if window > jiff::SignedDuration::from_hours(1826 * 24) {
                 return Err(range_err(
                     "'month' granularity is limited to 5 years".to_string(),
                 ));
@@ -280,7 +277,7 @@ pub fn parse_metrics_range(
         }
         // "day" or None: caller-configured cap for non-hour ranges.
         _ => {
-            if window > chrono::Duration::days(max_day_days) {
+            if window > jiff::SignedDuration::from_hours(max_day_days * 24) {
                 return Err(range_err(format!(
                     "'day' granularity is limited to {max_day_days} days"
                 )));
@@ -672,6 +669,13 @@ pub fn analytics_error_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn metrics_default_range_at_timestamp_boundary() {
+        let end = jiff::Timestamp::MIN.to_string();
+        let err = parse_metrics_range(None, Some(&end), None, 30, 30).unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
 
     #[test]
     fn redact_provider_config_hides_every_present_key() {

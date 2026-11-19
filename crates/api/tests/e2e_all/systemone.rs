@@ -844,7 +844,7 @@ async fn systemone_fallback_respects_trust_and_organization_policy() {
     .await;
     let req = serde_json::from_value(request(&model)).unwrap();
     let served = pool
-        .systemone_with_attribution(req, "hash".into(), None, false)
+        .systemone_with_attribution(req, "hash".into(), None, false, true)
         .await
         .unwrap();
     assert_eq!(
@@ -855,7 +855,7 @@ async fn systemone_fallback_respects_trust_and_organization_policy() {
     assert_eq!(hits.load(Ordering::SeqCst), 1);
     let req = serde_json::from_value(request(&model)).unwrap();
     assert!(pool
-        .systemone_with_attribution(req, "hash".into(), None, true)
+        .systemone_with_attribution(req, "hash".into(), None, true, true)
         .await
         .is_err());
     assert_eq!(hits.load(Ordering::SeqCst), 1);
@@ -913,6 +913,7 @@ async fn systemone_invalid_success_and_timeout_never_invoke_a_second_provider() 
                 "hash".into(),
                 None,
                 false,
+                true,
             )
             .await
             .err()

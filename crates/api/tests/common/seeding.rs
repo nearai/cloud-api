@@ -32,7 +32,6 @@ use api::models::{
     SpendLimit, UpdateOrganizationLimitsResponse,
 };
 use api::routes::workspaces::WorkspaceResponse;
-use chrono::{DateTime, Utc};
 use database::models::{AdminAccessTokenPermission, UpdateModelPricingRequest};
 use database::repositories::admin_access_token::AdminAccessTokenRepository;
 use database::repositories::credit_allocation::settle_unfunded_usage;
@@ -41,6 +40,7 @@ use database::repositories::model_alias::ModelAliasRepository;
 use database::repositories::AdminCompositeRepository;
 use database::repositories::CreditAllocationPolicy;
 use database::Database;
+use jiff::Timestamp;
 use services::admin::AdminRepository;
 use services::admin_settings::AdminSettingsService;
 use services::inference_provider_pool::InferenceProviderPool;
@@ -143,8 +143,8 @@ pub async fn seed_organization(session_id: &str) -> OrganizationResponse {
         )
         .await
         .expect("Failed to seed organization");
-    let created_at: DateTime<Utc> = row.get("created_at");
-    let updated_at: DateTime<Utc> = row.get("updated_at");
+    let created_at: Timestamp = row.get("created_at");
+    let updated_at: Timestamp = row.get("updated_at");
     let settings: Option<serde_json::Value> = row.get("settings");
     let is_active: bool = row.get("is_active");
 
@@ -226,7 +226,7 @@ pub async fn seed_credit_limit(
         .expect("lock organization");
     assert!(org.is_some(), "Organization not found: {organization_id}");
 
-    let now = Utc::now();
+    let now = Timestamp::now();
     transaction
         .execute(
             "UPDATE organization_limits_history
@@ -260,7 +260,7 @@ pub async fn seed_credit_limit(
         )
         .await
         .expect("Failed to seed credit limit");
-    let effective_from: DateTime<Utc> = row.get("effective_from");
+    let effective_from: Timestamp = row.get("effective_from");
 
     settle_unfunded_usage(
         &transaction,
@@ -283,7 +283,7 @@ pub async fn seed_credit_limit(
             scale: 9,
             currency,
         },
-        updated_at: effective_from.to_rfc3339(),
+        updated_at: services::timestamps::format_utc(effective_from),
     }
 }
 
@@ -317,8 +317,8 @@ pub async fn limits_history(org_id: &str) -> usage_views::LimitsHistoryResponse 
                     amount: row.get("spend_limit"),
                 },
                 effective_until: row
-                    .get::<_, Option<DateTime<Utc>>>("effective_until")
-                    .map(|t| t.to_rfc3339()),
+                    .get::<_, Option<Timestamp>>("effective_until")
+                    .map(services::timestamps::format_utc),
             })
             .collect(),
     }
@@ -420,7 +420,7 @@ pub async fn seed_api_key(workspace_id: &str, name: String, session_id: &str) ->
                 Uuid::parse_str(workspace_id).expect("workspace id must be a UUID"),
             ),
             created_by_user_id: services::auth::ports::UserId(created_by),
-            expires_at: Some(Utc::now() + chrono::Duration::days(90)),
+            expires_at: Some(Timestamp::now() + jiff::SignedDuration::from_hours(90 * 24)),
             spend_limit: None,
         })
         .await
@@ -462,23 +462,19 @@ fn usd_price(amount: i64) -> DecimalPrice {
 }
 
 /// Whole-hour UTC instant, or a bare date that means 13:00 UTC on that day.
-fn parse_deprecation_date(value: &str) -> Option<DateTime<Utc>> {
-    use chrono::Timelike;
-    if let Ok(parsed) = DateTime::parse_from_rfc3339(value) {
-        let utc = parsed.with_timezone(&Utc);
-        if parsed.offset().local_minus_utc() != 0
-            || utc.minute() != 0
-            || utc.second() != 0
-            || utc.nanosecond() != 0
-        {
-            return None;
-        }
-        return Some(utc);
+fn parse_deprecation_date(value: &str) -> Option<Timestamp> {
+    if let Ok(parsed) = value.parse::<Timestamp>() {
+        let offset = jiff::fmt::temporal::Pieces::parse(value)
+            .ok()?
+            .to_numeric_offset()?;
+        return (offset == jiff::tz::Offset::UTC
+            && parsed.as_nanosecond() % 3_600_000_000_000 == 0)
+            .then_some(parsed);
     }
-    chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d")
-        .ok()?
-        .and_hms_opt(13, 0, 0)
-        .map(|naive| DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc))
+    let date = jiff::civil::Date::strptime("%Y-%m-%d", value).ok()?;
+    jiff::tz::Offset::UTC
+        .to_timestamp(date.at(13, 0, 0, 0))
+        .ok()
 }
 
 /// Merge a providerConfig write into the stored config: keys sent replace stored keys and
@@ -582,7 +578,7 @@ fn model_metadata(model: database::models::Model) -> ModelMetadata {
         is_ready: model.is_ready,
         deprecation_date: model
             .deprecation_date
-            .map(|date| date.format("%Y-%m-%dT%H:00:00Z").to_string()),
+            .map(|date| date.strftime("%Y-%m-%dT%H:00:00Z").to_string()),
         successor_model_id: model.successor_model_name,
         openrouter_slug: model.openrouter_slug,
         is_listed: Some(model.is_listed),
@@ -832,7 +828,7 @@ pub async fn seed_deprecation(model_id: &str, successor_model_id: &str, change_r
 /// response headers only; it does not deactivate the model (see `seed_deprecation` for that).
 pub async fn seed_planned_deprecation(
     model_name: &str,
-    deprecation_date: Option<DateTime<Utc>>,
+    deprecation_date: Option<Timestamp>,
     successor_model_name: Option<&str>,
 ) {
     let database = seed_database().await;
@@ -859,7 +855,7 @@ pub async fn seed_planned_deprecation(
 /// so notices see the pending row.
 pub async fn seed_pricing_change(
     model_name: &str,
-    effective_at: DateTime<Utc>,
+    effective_at: Timestamp,
     new_input_cost_per_token: Option<i64>,
     new_output_cost_per_token: Option<i64>,
     new_cache_read_cost_per_token: Option<i64>,
@@ -1173,7 +1169,7 @@ pub async fn seed_admin_access_token_bound_to(email: &str, user_agent: Option<&s
             created_by,
             format!("e2e-{}", Uuid::new_v4()),
             "e2e test".to_string(),
-            Utc::now() + chrono::Duration::days(1),
+            Timestamp::now() + jiff::SignedDuration::from_hours(24),
             user_agent.map(str::to_string),
             AdminAccessTokenPermission::ReadWrite,
         )

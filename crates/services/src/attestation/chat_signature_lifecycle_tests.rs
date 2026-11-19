@@ -281,8 +281,8 @@ impl UsageRepository for NoopUsageRepository {
     async fn get_usage_by_model(
         &self,
         _organization_id: Uuid,
-        _start_date: chrono::DateTime<chrono::Utc>,
-        _end_date: Option<chrono::DateTime<chrono::Utc>>,
+        _start_date: jiff::Timestamp,
+        _end_date: Option<jiff::Timestamp>,
     ) -> anyhow::Result<Vec<UsageByModelEntry>> {
         Ok(Vec::new())
     }
@@ -332,6 +332,7 @@ pub(super) fn lifecycle_service(
         gateway_quote_collector: Arc::new(DstackGatewayQuoteCollector),
         model_attestation_collector: Arc::new(ProviderPoolModelAttestationCollector::new(pool)),
         report_cache: None,
+        long_context_access: None,
     }
 }
 

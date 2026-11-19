@@ -794,7 +794,7 @@ fn credential_request(
             "max_total_amount": total,
             "allowed_source_types": ["payment"],
         }},
-        "expires_at": chrono::Utc::now() + chrono::Duration::hours(1),
+        "expires_at": jiff::Timestamp::now() + jiff::SignedDuration::from_hours(1),
     }))
     .unwrap()
 }

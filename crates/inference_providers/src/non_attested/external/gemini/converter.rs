@@ -998,7 +998,7 @@ impl GeminiParserState {
         Self {
             model,
             request_id: format!("gemini-{}", Uuid::new_v4()),
-            created: chrono::Utc::now().timestamp(),
+            created: jiff::Timestamp::now().as_second(),
             chunk_index: 0,
             usage: TokenUsage::default(),
         }

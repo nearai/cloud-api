@@ -5,7 +5,7 @@ use crate::repositories::utils::map_db_error;
 use crate::retry_db;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use services::common::RepositoryError;
 use tokio_postgres::types::Type;
 use tokio_postgres::Row;
@@ -379,8 +379,7 @@ impl ModelRepository {
         //   - Some(Some(v))     -> clear=false, value=Some(v) -> set to v
         let is_ready_value: Option<bool> = update_request.is_ready.flatten();
         let is_ready_clear: bool = matches!(update_request.is_ready, Some(None));
-        let deprecation_date_value: Option<DateTime<Utc>> =
-            update_request.deprecation_date.flatten();
+        let deprecation_date_value: Option<Timestamp> = update_request.deprecation_date.flatten();
         let deprecation_date_clear: bool = matches!(update_request.deprecation_date, Some(None));
         let successor_value: Option<String> = update_request.successor_model_name.clone().flatten();
         let successor_clear: bool = matches!(update_request.successor_model_name, Some(None));
@@ -698,7 +697,7 @@ impl ModelRepository {
         let output_modalities_json =
             serialize_modalities(&req.output_modalities, "output_modalities")?;
         let is_ready_value: Option<bool> = req.is_ready.flatten();
-        let deprecation_date_value: Option<DateTime<Utc>> = req.deprecation_date.flatten();
+        let deprecation_date_value: Option<Timestamp> = req.deprecation_date.flatten();
         let openrouter_slug_value: Option<String> = req.openrouter_slug.clone().flatten();
         let successor_value: Option<String> = req.successor_model_name.clone().flatten();
         // Absent and explicit-null both insert NULL = cache pricing disabled.
@@ -931,7 +930,7 @@ impl ModelRepository {
     pub async fn get_model_state_at_time(
         &self,
         model_id: &uuid::Uuid,
-        timestamp: DateTime<Utc>,
+        timestamp: Timestamp,
     ) -> Result<Option<ModelHistory>> {
         let rows = retry_db!("get_model_state_at_time", {
             let client = self
@@ -1239,7 +1238,7 @@ impl ModelRepository {
                         .flatten(),
                     &model_row.try_get::<_, Option<bool>>("is_ready").ok().flatten(),
                     &model_row
-                        .try_get::<_, Option<chrono::DateTime<chrono::Utc>>>("deprecation_date")
+                        .try_get::<_, Option<jiff::Timestamp>>("deprecation_date")
                         .ok()
                         .flatten(),
                     &model_row

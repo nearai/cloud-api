@@ -95,7 +95,7 @@ pub async fn run_sync(
             "admin pin candidate left out of {ADMIN_PINS_FILE} (more than one PATCH accepts): {c}"
         )
     }));
-    let date = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    let date = jiff::Timestamp::now().strftime("%Y-%m-%d").to_string();
     // Leave the file untouched when nothing was added, so an unchanged run
     // produces no diff (and so no PR).
     // An incomplete probe (router not verified, or no proxy document) leaves

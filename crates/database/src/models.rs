@@ -1,4 +1,4 @@
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use services::responses::models::ResponseId;
 use uuid::Uuid;
@@ -12,8 +12,8 @@ pub struct Organization {
     pub id: Uuid,
     pub name: String,
     pub description: Option<String>,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
+    pub created_at: Timestamp,
+    pub updated_at: Timestamp,
     pub is_active: bool,
     /// API rate limits for the organization (requests per minute)
     pub rate_limit: Option<i32>,
@@ -29,21 +29,21 @@ pub struct User {
     pub username: String,
     pub display_name: Option<String>,
     pub avatar_url: Option<String>,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
-    pub last_login_at: Option<DateTime<Utc>>,
+    pub created_at: Timestamp,
+    pub updated_at: Timestamp,
+    pub last_login_at: Option<Timestamp>,
     pub is_active: bool,
     /// OAuth provider (github, google, etc.)
     pub auth_provider: String,
     /// OAuth provider user ID
     pub provider_user_id: String,
     /// Timestamp when all tokens were revoked (for invalidating access tokens)
-    pub tokens_revoked_at: Option<DateTime<Utc>>,
+    pub tokens_revoked_at: Option<Timestamp>,
     /// Verified contact address (set at confirmation, never by login)
     pub contact_email: Option<String>,
-    pub contact_email_verified_at: Option<DateTime<Utc>>,
+    pub contact_email_verified_at: Option<Timestamp>,
     /// When the user agreed to be emailed at `contact_email`
-    pub email_opt_in_at: Option<DateTime<Utc>>,
+    pub email_opt_in_at: Option<Timestamp>,
 }
 
 /// Organization membership - many-to-many relationship between users and organizations
@@ -53,7 +53,7 @@ pub struct OrganizationMember {
     pub organization_id: Uuid,
     pub user_id: Uuid,
     pub role: OrganizationRole,
-    pub joined_at: DateTime<Utc>,
+    pub joined_at: Timestamp,
     pub invited_by: Option<Uuid>,
 }
 
@@ -84,8 +84,8 @@ pub struct Workspace {
     pub description: Option<String>,
     pub organization_id: Uuid,
     pub created_by_user_id: Uuid,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
+    pub created_at: Timestamp,
+    pub updated_at: Timestamp,
     pub is_active: bool,
     pub settings: Option<serde_json::Value>,
 }
@@ -99,11 +99,11 @@ pub struct ApiKey {
     pub name: String,
     pub workspace_id: Uuid, // Changed from organization_id to workspace_id
     pub created_by_user_id: Uuid,
-    pub created_at: DateTime<Utc>,
-    pub expires_at: Option<DateTime<Utc>>,
-    pub last_used_at: Option<DateTime<Utc>>,
+    pub created_at: Timestamp,
+    pub expires_at: Option<Timestamp>,
+    pub last_used_at: Option<Timestamp>,
     pub is_active: bool,
-    pub deleted_at: Option<DateTime<Utc>>, // Soft delete timestamp
+    pub deleted_at: Option<Timestamp>, // Soft delete timestamp
     /// Optional spending limit in nano-dollars (scale 9, USD). None means no limit.
     pub spend_limit: Option<i64>,
     /// Total usage/spend in nano-dollars (scale 9, USD). Computed from usage logs.
@@ -116,8 +116,8 @@ pub struct Session {
     pub id: Uuid,
     pub user_id: Uuid,
     pub token_hash: String, // Store hashed session token
-    pub created_at: DateTime<Utc>,
-    pub expires_at: DateTime<Utc>,
+    pub created_at: Timestamp,
+    pub expires_at: Timestamp,
     pub ip_address: Option<String>,
     pub user_agent: String,
 }
@@ -161,11 +161,11 @@ pub struct AdminAccessToken {
     pub created_by_user_id: Uuid,
     pub name: String,
     pub creation_reason: String,
-    pub created_at: DateTime<Utc>,
-    pub expires_at: DateTime<Utc>,
-    pub last_used_at: Option<DateTime<Utc>>,
+    pub created_at: Timestamp,
+    pub expires_at: Timestamp,
+    pub last_used_at: Option<Timestamp>,
     pub is_active: bool,
-    pub revoked_at: Option<DateTime<Utc>>,
+    pub revoked_at: Option<Timestamp>,
     pub revoked_by_user_id: Option<Uuid>,
     pub revocation_reason: Option<String>,
     pub user_agent: Option<String>,
@@ -191,8 +191,8 @@ pub struct ApiKeyResponse {
     pub id: Uuid,
     pub key: String, // Only returned on creation
     pub name: String,
-    pub created_at: DateTime<Utc>,
-    pub expires_at: Option<DateTime<Utc>>,
+    pub created_at: Timestamp,
+    pub expires_at: Option<Timestamp>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -258,9 +258,9 @@ pub struct McpConnector {
     pub auth_config: Option<serde_json::Value>,
     pub is_active: bool,
     pub created_by: Uuid,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
-    pub last_connected_at: Option<DateTime<Utc>>,
+    pub created_at: Timestamp,
+    pub updated_at: Timestamp,
+    pub last_connected_at: Option<Timestamp>,
     pub connection_status: McpConnectionStatus,
     pub error_message: Option<String>,
     pub capabilities: Option<serde_json::Value>,
@@ -306,7 +306,7 @@ pub struct McpConnectorUsage {
     pub status_code: Option<i32>,
     pub error_message: Option<String>,
     pub duration_ms: Option<i32>,
-    pub created_at: DateTime<Utc>,
+    pub created_at: Timestamp,
 }
 
 // ============================================
@@ -327,8 +327,8 @@ pub struct Response {
     pub next_response_ids: Option<serde_json::Value>, // JSONB array of next response UUIDs
     pub usage: Option<serde_json::Value>,   // JSONB storing token usage
     pub metadata: Option<serde_json::Value>,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
+    pub created_at: Timestamp,
+    pub updated_at: Timestamp,
 }
 
 /// Response status enum
@@ -359,13 +359,13 @@ pub struct Conversation {
     pub id: Uuid,
     pub workspace_id: Uuid,
     pub api_key_id: Uuid,
-    pub pinned_at: Option<DateTime<Utc>>, // Timestamp when pinned, NULL if not pinned
-    pub archived_at: Option<DateTime<Utc>>, // Timestamp when archived, NULL if not archived
-    pub deleted_at: Option<DateTime<Utc>>, // Timestamp when soft-deleted, NULL if not deleted
-    pub cloned_from_id: Option<Uuid>,     // ID of conversation this was cloned from
-    pub metadata: serde_json::Value, // JSONB storing conversation metadata (includes title/name)
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
+    pub pinned_at: Option<Timestamp>, // Timestamp when pinned, NULL if not pinned
+    pub archived_at: Option<Timestamp>, // Timestamp when archived, NULL if not archived
+    pub deleted_at: Option<Timestamp>, // Timestamp when soft-deleted, NULL if not deleted
+    pub cloned_from_id: Option<Uuid>, // ID of conversation this was cloned from
+    pub metadata: serde_json::Value,  // JSONB storing conversation metadata (includes title/name)
+    pub created_at: Timestamp,
+    pub updated_at: Timestamp,
 }
 
 // ============================================
@@ -436,7 +436,7 @@ pub struct Model {
     /// verbatim; does not affect Cloud API's own listing/filtering. NULL = unset.
     pub is_ready: Option<bool>,
     /// Planned deprecation date (ISO 8601). NULL = no planned deprecation.
-    pub deprecation_date: Option<DateTime<Utc>>,
+    pub deprecation_date: Option<Timestamp>,
     /// Canonical name of the recommended replacement model. Cleared together
     /// with `deprecation_date`.
     pub successor_model_name: Option<String>,
@@ -457,8 +457,8 @@ pub struct Model {
     /// organization with a row in `organization_model_access` may use it.
     pub is_listed: bool,
     pub owned_by: String,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
+    pub created_at: Timestamp,
+    pub updated_at: Timestamp,
 }
 
 /// Request to update model pricing
@@ -517,7 +517,7 @@ pub struct UpdateModelPricingRequest {
     pub is_ready: Option<Option<bool>>,
     /// Tri-state: `None` = leave unchanged, `Some(None)` = clear to NULL,
     /// `Some(Some(dt))` = set to `dt`.
-    pub deprecation_date: Option<Option<DateTime<Utc>>>,
+    pub deprecation_date: Option<Option<Timestamp>>,
     /// Recommended replacement model for a planned deprecation.
     /// Tri-state: `None` = leave unchanged, `Some(None)` = clear to NULL,
     /// `Some(Some(v))` = set to `v`. Also cleared when `deprecation_date` is.
@@ -579,20 +579,20 @@ pub struct ModelHistory {
     /// Datacenter country codes (ISO 3166 Alpha-2) the model ran in.
     pub datacenters: Option<Vec<String>>,
     pub is_ready: Option<bool>,
-    pub deprecation_date: Option<DateTime<Utc>>,
+    pub deprecation_date: Option<Timestamp>,
     pub successor_model_name: Option<String>,
     /// OpenRouter `openrouter.slug` override the model carried at this point.
     pub openrouter_slug: Option<String>,
 
     // Temporal fields
-    pub effective_from: DateTime<Utc>,
-    pub effective_until: Option<DateTime<Utc>>,
+    pub effective_from: Timestamp,
+    pub effective_until: Option<Timestamp>,
 
     // Tracking fields
     pub changed_by_user_id: Option<Uuid>,
     pub changed_by_user_email: Option<String>,
     pub change_reason: Option<String>,
-    pub created_at: DateTime<Utc>,
+    pub created_at: Timestamp,
 
     /// If true, this model was allowed to serve without pricing at this point in time.
     pub allow_free: bool,
@@ -610,8 +610,8 @@ pub struct ModelAlias {
     pub alias_name: String,
     pub canonical_model_id: Uuid,
     pub is_active: bool,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
+    pub created_at: Timestamp,
+    pub updated_at: Timestamp,
 }
 
 // ============================================
@@ -633,15 +633,15 @@ pub struct OrganizationLimitsHistory {
     pub currency: String,
 
     // Temporal fields
-    pub effective_from: DateTime<Utc>,
-    pub effective_until: Option<DateTime<Utc>>,
+    pub effective_from: Timestamp,
+    pub effective_until: Option<Timestamp>,
 
     // Tracking fields
     pub changed_by: Option<String>,
     pub change_reason: Option<String>,
     pub changed_by_user_id: Option<Uuid>, // The authenticated user ID who made the change
     pub changed_by_user_email: Option<String>, // The email of the authenticated user who made the change
-    pub created_at: DateTime<Utc>,
+    pub created_at: Timestamp,
 }
 
 /// Request to update organization limits
@@ -682,7 +682,7 @@ pub struct OrganizationUsageLog {
     pub output_cost: i64,
     pub total_cost: i64,
     pub inference_type: String,
-    pub created_at: DateTime<Utc>,
+    pub created_at: Timestamp,
     /// Time to first token in milliseconds
     pub ttft_ms: Option<i32>,
     /// Average inter-token latency in milliseconds
@@ -723,10 +723,10 @@ pub struct OrganizationBalance {
     /// Historical consumption not yet assigned to a credit type, in nano-USD.
     pub legacy_unattributed_amount: i64,
     pub total_spent: i64,
-    pub last_usage_at: Option<DateTime<Utc>>,
+    pub last_usage_at: Option<Timestamp>,
     pub total_requests: i64,
     pub total_tokens: i64,
-    pub updated_at: DateTime<Utc>,
+    pub updated_at: Timestamp,
 }
 
 /// Request to record usage
@@ -790,8 +790,8 @@ pub struct Service {
     /// Price per unit in nano-USD (scale 9).
     pub cost_per_unit: i64,
     pub is_active: bool,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
+    pub created_at: Timestamp,
+    pub updated_at: Timestamp,
 }
 
 /// One row in organization_service_usage_log (service usage, nano-USD).
@@ -805,7 +805,7 @@ pub struct OrganizationServiceUsageLog {
     pub quantity: i32,
     pub total_cost: i64,
     pub inference_id: Option<Uuid>,
-    pub created_at: DateTime<Utc>,
+    pub created_at: Timestamp,
     pub credit_allocations: Option<Vec<services::usage::CreditAllocation>>,
     pub funded_amount: Option<i64>,
     pub unfunded_amount: Option<i64>,
@@ -827,8 +827,8 @@ pub struct File {
     pub storage_key: String,
     pub workspace_id: Uuid,
     pub uploaded_by_api_key_id: Uuid,
-    pub created_at: DateTime<Utc>,
-    pub expires_at: Option<DateTime<Utc>>,
+    pub created_at: Timestamp,
+    pub expires_at: Option<Timestamp>,
 }
 
 /// File purpose enum

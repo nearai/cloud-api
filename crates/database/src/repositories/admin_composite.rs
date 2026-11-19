@@ -1,3 +1,4 @@
+use crate::bounded_timestamp::BoundedTimestamp;
 use crate::models::UpdateModelPricingRequest;
 use crate::pool::DbPool;
 use crate::repositories::lifecycle::{org_lifecycle_predicate, ORG_ALL_MEMBERS_ERASED_SQL};
@@ -79,7 +80,7 @@ fn row_to_scheduled_pricing_change(
         old_cost_per_image: row.get("old_cost_per_image"),
         old_text_pricing: parse_text_pricing(row.get("old_text_pricing"))?,
         new_text_pricing: parse_text_pricing(row.get("new_text_pricing"))?,
-        effective_at: row.get("effective_at"),
+        effective_at: row.try_get::<_, BoundedTimestamp>("effective_at")?.0,
         status,
         apply_attempts: row.get("apply_attempts"),
         applied_at: row.get("applied_at"),
@@ -439,7 +440,7 @@ impl AdminRepository for AdminCompositeRepository {
                     .ok()
                     .flatten(),
                 &deprecated_row_after
-                    .try_get::<_, Option<chrono::DateTime<chrono::Utc>>>("deprecation_date")
+                    .try_get::<_, Option<jiff::Timestamp>>("deprecation_date")
                     .ok()
                     .flatten(),
                 &deprecated_row_after
@@ -579,7 +580,7 @@ impl AdminRepository for AdminCompositeRepository {
     async fn list_model_deprecation_recipients(
         &self,
         model_name: &str,
-        since: chrono::DateTime<chrono::Utc>,
+        since: jiff::Timestamp,
     ) -> Result<Vec<ModelDeprecationRecipient>> {
         let client = self.pool.get().await?;
         let rows = client
@@ -649,7 +650,7 @@ impl AdminRepository for AdminCompositeRepository {
         let client = self.pool.get().await?;
         let status = record.status.as_str();
         let email_sent_at = if record.status == ModelDeprecationEmailStatus::Sent {
-            Some(chrono::Utc::now())
+            Some(jiff::Timestamp::now())
         } else {
             None
         };
@@ -746,7 +747,7 @@ impl AdminRepository for AdminCompositeRepository {
     async fn list_pricing_change_recipients(
         &self,
         model_names: &[String],
-        since: chrono::DateTime<chrono::Utc>,
+        since: jiff::Timestamp,
     ) -> Result<Vec<PricingChangeRecipientRow>> {
         let client = self.pool.get().await?;
         let rows = client
@@ -980,11 +981,11 @@ impl AdminRepository for AdminCompositeRepository {
 
     async fn recover_stale_applying_pricing_changes(
         &self,
-        stale_after: chrono::Duration,
+        stale_after: jiff::SignedDuration,
         max_attempts: i32,
     ) -> Result<u64> {
         let client = self.pool.get().await?;
-        let stale_secs = stale_after.num_seconds() as f64;
+        let stale_secs = stale_after.as_secs() as f64;
         let count = client
             .execute(
                 r#"
@@ -1012,7 +1013,7 @@ impl AdminRepository for AdminCompositeRepository {
         let client = self.pool.get().await?;
         let status = record.status.as_str();
         let email_sent_at = if record.status == ModelDeprecationEmailStatus::Sent {
-            Some(chrono::Utc::now())
+            Some(jiff::Timestamp::now())
         } else {
             None
         };

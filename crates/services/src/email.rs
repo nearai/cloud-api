@@ -1,4 +1,4 @@
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 
 /// Domain of the placeholder login address stored for NEAR wallet users. A wallet
 /// has no email, and `users.email` is required and unique, so the login identity
@@ -31,7 +31,7 @@ pub fn is_placeholder_email(email: &str) -> bool {
 pub fn deliverable_email<'a>(
     login_email: &'a str,
     contact_email: Option<&'a str>,
-    contact_email_verified_at: Option<DateTime<Utc>>,
+    contact_email_verified_at: Option<Timestamp>,
 ) -> Option<&'a str> {
     match (contact_email, contact_email_verified_at) {
         (Some(contact_email), Some(_)) => Some(contact_email),
@@ -42,7 +42,6 @@ pub fn deliverable_email<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone;
 
     #[test]
     fn placeholder_detection_matches_only_wallet_login_addresses() {
@@ -73,7 +72,7 @@ mod tests {
 
     #[test]
     fn deliverable_email_prefers_verified_contact_email() {
-        let verified_at = Some(Utc.with_ymd_and_hms(2026, 5, 15, 12, 0, 0).unwrap());
+        let verified_at = Some("2026-05-15T12:00:00Z".parse::<jiff::Timestamp>().unwrap());
 
         // Wallet user with a verified contact email.
         assert_eq!(

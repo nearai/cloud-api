@@ -178,3 +178,81 @@ async fn systemone_in_scope_sends_no_tenant_ids() {
 
     assert_no_ids_sent(&server, "systemone").await;
 }
+
+mod traceparent {
+    use super::*;
+    use opentelemetry::trace::TracerProvider as _;
+    use opentelemetry_sdk::propagation::TraceContextPropagator;
+    use opentelemetry_sdk::trace::SdkTracerProvider;
+    use tracing_subscriber::layer::SubscriberExt;
+
+    fn is_well_formed(value: &str) -> bool {
+        let parts: Vec<&str> = value.split('-').collect();
+        parts.len() == 4
+            && parts[0] == "00"
+            && parts[1].len() == 32
+            && parts[2].len() == 16
+            && parts[3].len() == 2
+            && parts[1..]
+                .iter()
+                .all(|part| part.chars().all(|c| c.is_ascii_hexdigit()))
+    }
+
+    #[tokio::test]
+    async fn sent_on_inference_calls_under_an_otel_layer() {
+        opentelemetry::global::set_text_map_propagator(TraceContextPropagator::new());
+        let tracer_provider = SdkTracerProvider::builder().build();
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_opentelemetry::layer().with_tracer(tracer_provider.tracer("test")));
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let server = mock_server().await;
+        let provider = provider(&server);
+        let span = tracing::info_span!("outer");
+        let trace_id = {
+            let _entered = span.enter();
+            crate::tracing_context::current_trace_id().expect("valid trace id in span")
+        };
+        assert_eq!(trace_id.len(), 32);
+        let params = Arc::new(ImageEditParams {
+            model: "test-model".into(),
+            prompt: "synthetic".into(),
+            image: Arc::new(vec![0x89, b'P', b'N', b'G']),
+            size: None,
+            response_format: None,
+        });
+        let call = provider.image_edit(params, "hash".into());
+        let _ = tracing::Instrument::instrument(call, span).await;
+
+        let requests = server.received_requests().await.unwrap();
+        assert!(!requests.is_empty());
+        for request in &requests {
+            let value = header(request, "traceparent").expect("traceparent sent");
+            assert!(is_well_formed(&value), "malformed traceparent: {value}");
+            assert!(value.contains(&trace_id));
+            assert_eq!(header(request, "tracestate"), None);
+        }
+    }
+
+    #[tokio::test]
+    async fn absent_without_an_otel_layer() {
+        let server = mock_server().await;
+        let provider = provider(&server);
+        let params = Arc::new(ImageEditParams {
+            model: "test-model".into(),
+            prompt: "synthetic".into(),
+            image: Arc::new(vec![0x89, b'P', b'N', b'G']),
+            size: None,
+            response_format: None,
+        });
+        let _ = provider.image_edit(params, "hash".into()).await;
+
+        let requests = server.received_requests().await.unwrap();
+        assert!(!requests.is_empty());
+        for request in &requests {
+            assert_eq!(header(request, "traceparent"), None);
+            assert_eq!(header(request, "tracestate"), None);
+        }
+        assert_eq!(crate::tracing_context::current_trace_id(), None);
+    }
+}

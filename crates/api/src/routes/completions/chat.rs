@@ -168,7 +168,11 @@ pub async fn chat_completions(
         request_id = %request_id,
         org_id = %api_key.organization.id.0,
         workspace_id = %api_key.workspace.id.0,
-        model = %request.model,
+        // Client input: kept local, never exported with the span.
+        requested_model = %request.model,
+        // Canonical catalog name, recorded once the request resolves to a
+        // known model this organization may use.
+        model = tracing::field::Empty,
     );
 
     chat_completions_inner(app_state, api_key, body_hash, headers, request, request_id)
@@ -276,6 +280,9 @@ pub(super) async fn chat_completions_inner(
                     }
                     _ => None,
                 };
+                if let Some(model) = model {
+                    tracing::Span::current().record("model", model.model_name.as_str());
+                }
                 model
                     .map(|model| {
                         (
@@ -332,6 +339,24 @@ pub(super) async fn chat_completions_inner(
     let usage_mode = chat_stream_usage_mode(&request, model_attestation_supported, e2ee_active);
     let rewrite_public_stream_usage = usage_mode.rewrite_public_stream_usage;
     let strip_intermediate_usage = usage_mode.strip_intermediate_usage;
+
+    // The redaction classifier below is a paid inference call: refuse a
+    // request above the organization's long-context limit before it runs.
+    // Dispatch checks again on the redacted request.
+    if auto_redact_requested(&headers, &service_request) {
+        if let Err(domain_error) = app_state
+            .completion_service
+            .check_long_context_limit(&service_request)
+            .await
+        {
+            let status_code = map_domain_error_to_status(&domain_error);
+            return (
+                status_code,
+                ResponseJson::<ErrorResponse>(domain_error.into()),
+            )
+                .into_response();
+        }
+    }
 
     // Auto-redact (opt-in via x-auto-redact header or auto_redact body field).
     // On success this may rewrite service_request.messages to substitute

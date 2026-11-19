@@ -7,7 +7,7 @@ use std::any::Any;
 use std::sync::{Arc, Mutex};
 
 use arc_swap::ArcSwap;
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde_json::Value;
 
 use super::{AdminSettingsRepository, AdminSettingsService, StoredSetting};
@@ -83,7 +83,7 @@ pub(super) trait ErasedKey: Send + Sync {
 struct State {
     /// `None`: nothing applied yet. `Some(None)`: applied with no row.
     /// `Some(Some(t))`: applied the row last updated at `t`.
-    applied: Option<Option<DateTime<Utc>>>,
+    applied: Option<Option<Timestamp>>,
     /// The stored value last applied. `updated_at` alone is not enough to
     /// skip a reload: two writes can share a timestamp.
     last_raw: Option<Value>,

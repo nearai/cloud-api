@@ -7,7 +7,7 @@
 
 use crate::common::RepositoryError;
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use uuid::Uuid;
@@ -95,8 +95,8 @@ pub struct ModelMetrics {
 pub struct OrganizationMetrics {
     pub organization_id: Uuid,
     pub organization_name: String,
-    pub period_start: DateTime<Utc>,
-    pub period_end: DateTime<Utc>,
+    pub period_start: Timestamp,
+    pub period_end: Timestamp,
     pub summary: MetricsSummary,
     pub by_workspace: Vec<WorkspaceMetrics>,
     pub by_api_key: Vec<ApiKeyMetrics>,
@@ -119,8 +119,8 @@ pub struct TimeSeriesPoint {
 pub struct TimeSeriesMetrics {
     pub organization_id: Uuid,
     pub organization_name: String,
-    pub period_start: DateTime<Utc>,
-    pub period_end: DateTime<Utc>,
+    pub period_start: Timestamp,
+    pub period_end: Timestamp,
     pub granularity: String,
     pub data: Vec<TimeSeriesPoint>,
 }
@@ -132,8 +132,8 @@ pub trait AnalyticsRepository: Send + Sync {
     async fn get_organization_metrics(
         &self,
         org_id: Uuid,
-        start: DateTime<Utc>,
-        end: DateTime<Utc>,
+        start: Timestamp,
+        end: Timestamp,
         credit_type: Option<&str>,
     ) -> Result<OrganizationMetrics, RepositoryError>;
 
@@ -141,8 +141,8 @@ pub trait AnalyticsRepository: Send + Sync {
     async fn get_organization_timeseries(
         &self,
         org_id: Uuid,
-        start: DateTime<Utc>,
-        end: DateTime<Utc>,
+        start: Timestamp,
+        end: Timestamp,
         granularity: &str,
         credit_type: Option<&str>,
     ) -> Result<TimeSeriesMetrics, RepositoryError>;
@@ -168,8 +168,8 @@ impl AnalyticsService {
     pub async fn get_organization_metrics(
         &self,
         org_id: Uuid,
-        start: DateTime<Utc>,
-        end: DateTime<Utc>,
+        start: Timestamp,
+        end: Timestamp,
         credit_type: Option<&str>,
     ) -> Result<OrganizationMetrics, super::AdminError> {
         self.repository
@@ -184,8 +184,8 @@ impl AnalyticsService {
     pub async fn get_organization_timeseries(
         &self,
         org_id: Uuid,
-        start: DateTime<Utc>,
-        end: DateTime<Utc>,
+        start: Timestamp,
+        end: Timestamp,
         granularity: &str,
         credit_type: Option<&str>,
     ) -> Result<TimeSeriesMetrics, super::AdminError> {

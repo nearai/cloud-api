@@ -319,10 +319,7 @@ impl BindingRepository for PostgresStakingBindingRepository {
             )
             .await?
             .ok_or(BindingError::InvalidChallenge)?;
-        if row
-            .get::<_, Option<chrono::DateTime<chrono::Utc>>>(0)
-            .is_some()
-        {
+        if row.get::<_, Option<jiff::Timestamp>>(0).is_some() {
             if row.get::<_, Option<Uuid>>(1) != Some(key)
                 || row.get::<_, Option<String>>(2).as_deref() != Some(digest)
             {

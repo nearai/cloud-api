@@ -25,7 +25,10 @@ use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, info, warn};
 
 mod context_routing;
+pub(crate) use context_routing::estimate_input_with;
 pub use context_routing::expand_inference_endpoints;
+mod long_context_gate;
+pub use long_context_gate::limit_message as long_context_limit_message;
 
 #[cfg(test)]
 mod attestation_tests;
@@ -33,6 +36,8 @@ mod attestation_tests;
 mod channel_binding_tests;
 #[cfg(test)]
 mod chutes_routing_tests;
+#[cfg(test)]
+mod long_context_gate_tests;
 #[cfg(test)]
 mod privacy_classify_tests;
 
@@ -307,7 +312,6 @@ struct ProviderLatencyState {
 }
 
 /// Routing hints derived from the request content to guide provider selection.
-#[derive(Default)]
 pub struct ChatRoutingHints {
     /// Consistent hash of the first PREFIX_HASH_MESSAGES messages for KV-cache routing.
     /// When set, provider selection within the leading tier uses this hash instead of
@@ -335,6 +339,24 @@ pub struct ChatRoutingHints {
     /// context-length-400 fall-through to a larger declared NEAR sibling is
     /// unaffected by the pin (see `context_routing` module docs).
     pub request_priority: RequestPriority,
+    /// Whether the requesting organization may use the model's long-context
+    /// tier. Defaults to `true`, today's behavior. When `false` and the model
+    /// has a long tier, a request above the base tier is rejected before any
+    /// provider call and the long tier is never a candidate (see
+    /// `long_context_gate`).
+    pub long_context_allowed: bool,
+}
+
+impl Default for ChatRoutingHints {
+    fn default() -> Self {
+        Self {
+            prefix_hash: None,
+            estimated_tokens: None,
+            fallback_disabled: false,
+            request_priority: 0,
+            long_context_allowed: true,
+        }
+    }
 }
 
 /// Callback for reporting observed TTFT (ms) back to the pool for future routing.
@@ -1020,6 +1042,12 @@ pub struct InferenceProviderPool {
     /// providers happen to be live, so it survives primary discovery failures
     /// and temporary primary-fleet disappearance.
     fallback_providers: Arc<std::sync::RwLock<HashMap<String, Vec<Arc<InferenceProviderTrait>>>>>,
+    /// Configured long-context tier boundary (base capacity) per model, from
+    /// the catalog's `long_context` expansion (see `long_context_gate`).
+    /// Written only while holding the `provider_mappings` write lock, together
+    /// with the providers it describes, so a reader holding the read lock sees
+    /// a boundary and providers from the same load.
+    long_context_boundaries: Arc<std::sync::RwLock<HashMap<String, u32>>>,
 }
 
 /// Stable routing role assigned when an out-of-band provider is registered.
@@ -1394,6 +1422,7 @@ impl InferenceProviderPool {
                 inference_providers::DisabledSources::default(),
             )),
             fallback_providers: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            long_context_boundaries: Arc::new(std::sync::RwLock::new(HashMap::new())),
         }
     }
 
@@ -2780,6 +2809,13 @@ impl InferenceProviderPool {
 
         // Get providers by model_id first
         let model_providers = mappings.model_to_providers.get(model_id)?.clone();
+        // Drop the long-context tier from the model's whole provider set,
+        // before the signing-key filter below: a pinned key must not reach it.
+        let model_providers = if hints.long_context_allowed {
+            model_providers
+        } else {
+            self.drop_long_context_tier(model_id, model_providers)
+        };
 
         // Filter by model_pub_key if provided
         let providers = if let Some(pub_key) = model_pub_key {
@@ -4361,6 +4397,11 @@ impl InferenceProviderPool {
     /// `signing_algo` is forwarded to each backend verbatim. Backends accept
     /// only lowercase `ecdsa` / `ed25519`, so callers must pass a normalized
     /// value (the attestation service does).
+    ///
+    /// `long_context_allowed`: when `false`, the model's long-context tier is
+    /// left out, as it is for that organization's requests (see
+    /// `long_context_gate`).
+    #[allow(clippy::too_many_arguments)]
     pub async fn get_attestation_report(
         &self,
         model: String,
@@ -4369,11 +4410,23 @@ impl InferenceProviderPool {
         signing_address: Option<String>,
         include_tls_fingerprint: bool,
         provider_filter: Option<inference_providers::ProviderFilter>,
+        long_context_allowed: bool,
     ) -> Result<Vec<serde_json::Map<String, serde_json::Value>>, AttestationError> {
-        let all_providers = self
-            .get_providers_for_model(&model)
-            .await
-            .ok_or_else(|| AttestationError::ProviderNotFound(model.clone()))?;
+        // Filter under the mapping read lock, so the boundary and the
+        // providers come from the same load (see `long_context_boundaries`).
+        let all_providers = {
+            let mappings = self.provider_mappings.read().await;
+            let providers = mappings
+                .model_to_providers
+                .get(&model)
+                .cloned()
+                .ok_or_else(|| AttestationError::ProviderNotFound(model.clone()))?;
+            if long_context_allowed {
+                providers
+            } else {
+                self.drop_long_context_tier(&model, providers)
+            }
+        };
 
         let all_providers = self.drop_disabled_sources(all_providers);
 
@@ -4617,6 +4670,7 @@ impl InferenceProviderPool {
         // context.
         self.apply_context_routing(&model_id, &mut params, &mut hints)
             .await;
+        self.reject_above_long_context_limit(&params, &hints)?;
 
         let mut params_for_provider = params.clone();
         reinsert_pubkey_pin(&mut params_for_provider, model_pub_key_str.as_deref());
@@ -4816,6 +4870,7 @@ impl InferenceProviderPool {
         // context.
         self.apply_context_routing(&model_id, &mut params, &mut hints)
             .await;
+        self.reject_above_long_context_limit(&params, &hints)?;
 
         tracing::debug!(
             model = %model_id,
@@ -4882,9 +4937,12 @@ impl InferenceProviderPool {
         request_hash: String,
         model_pub_key: Option<&str>,
         fallback_disabled: bool,
+        long_context_allowed: bool,
     ) -> Result<AttributedSystemOne, CompletionError> {
+        self.reject_systemone_above_long_context_limit(&request, long_context_allowed)?;
         let hints = ChatRoutingHints {
             fallback_disabled,
+            long_context_allowed,
             ..Default::default()
         };
         let served = self
@@ -6516,11 +6574,21 @@ impl InferenceProviderPool {
                 .read()
                 .unwrap_or_else(|e| e.into_inner())
                 .clone();
+            let published: HashSet<String> = model_providers.keys().cloned().collect();
             for (model_name, providers) in
                 Self::merge_discovered_and_pinned(model_providers, &pinned_providers)
             {
                 mappings.model_to_providers.insert(model_name, providers);
             }
+            // Publish the configured long-context boundaries of the models whose
+            // providers were just replaced, under the same lock: a reader never
+            // sees one load's boundary with another load's providers.
+            let published_entries: Vec<(String, String, Option<u32>)> = models
+                .iter()
+                .filter(|(model_name, _, _)| published.contains(model_name))
+                .cloned()
+                .collect();
+            self.record_long_context_boundaries(&published_entries);
 
             if !old_provider_ptrs.is_empty() {
                 mappings.pubkey_to_providers.retain(|_, providers| {
@@ -6660,6 +6728,7 @@ impl InferenceProviderPool {
             models.iter().map(|(name, _, _)| name.clone()).collect();
         self.load_inference_url_models(models, false).await;
         self.prune_stale_pinned(&complete_names).await;
+        self.prune_long_context_boundaries(&complete_names).await;
     }
 
     /// Remove models from provider_mappings that are not in `valid_model_names`.
@@ -9078,6 +9147,7 @@ mod tests {
             None,
             false,
             Some(ProviderFilter::Source(ProviderSource::Chutes)),
+            true,
         )
         .await
         .expect("attestation succeeds before the source is disabled");
@@ -9100,6 +9170,7 @@ mod tests {
                 None,
                 false,
                 Some(ProviderFilter::Source(ProviderSource::Chutes)),
+                true,
             )
             .await
             .unwrap_err();

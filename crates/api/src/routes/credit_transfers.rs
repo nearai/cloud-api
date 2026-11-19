@@ -10,7 +10,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::Deserialize;
 use serde_json::Value;
 use services::organization_credits::models::{
@@ -134,7 +134,7 @@ pub async fn create(
 #[derive(Deserialize)]
 pub struct HistoryQuery {
     idempotency_key: Option<String>,
-    before_time: Option<DateTime<Utc>>,
+    before_time: Option<Timestamp>,
     before_id: Option<Uuid>,
     limit: Option<i64>,
     direction: Option<String>,

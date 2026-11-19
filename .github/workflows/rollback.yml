@@ -222,7 +222,7 @@ jobs:
           echo "- release: [\`${TAG}\`](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases/tag/${TAG})" >> "$GITHUB_STEP_SUMMARY"
 
   trigger-redeploy:
-    name: Trigger cvm-ansible-playbooks redeploy
+    name: Trigger the production redeploy
     needs: rollback-prod
     # Default GHA behaviour: run only when rollback-prod succeeds.
     # The audit-tag step uses continue-on-error so it cannot fail the job,
@@ -230,21 +230,58 @@ jobs:
     # redeploy. The :prod retag step has no continue-on-error, so a retag
     # failure correctly blocks the redeploy.
     runs-on: ubuntu-latest
+    permissions: {}
     steps:
-      # cvm-ansible-playbooks `Update Cloud API Prod` re-reads :prod from
-      # Docker Hub, which we just re-pointed at the rolled-back digest. We
-      # trigger its existing workflow_dispatch (not repository_dispatch) so
-      # this rollback workflow stays self-contained — no change required in
-      # cvm-ansible-playbooks. REPOSITORY_DISPATCH_TOKEN is already used by
-      # build.yml for cross-repo dispatch into the same target repo.
-      - name: Dispatch Update Cloud API Prod
+      # The production deploy re-reads :prod, which was just re-pointed at the rolled-back digest. It is
+      # triggered with a redeploy-cloud-api-prod event that carries no payload; the receiving workflow runs
+      # it like its scheduled run (all gates apply). The deploy repository and the GitHub App credentials
+      # come from secrets (masked in logs); the token is scoped to the deploy repository.
+      - name: Check the dispatch settings
         env:
-          GH_TOKEN: ${{ secrets.REPOSITORY_DISPATCH_TOKEN }}
+          DEPLOY_REPO_OWNER: ${{ secrets.DEPLOY_REPO_OWNER }}
+          DEPLOY_REPO_NAME: ${{ secrets.DEPLOY_REPO_NAME }}
+          DEPLOY_DISPATCH_CLIENT_ID: ${{ secrets.DEPLOY_DISPATCH_CLIENT_ID }}
+          DEPLOY_DISPATCH_APP_KEY: ${{ secrets.DEPLOY_DISPATCH_APP_KEY }}
         run: |
-          set -euo pipefail
-          gh workflow run update_cloud_api_prod.yml \
-            --repo nearai/cvm-ansible-playbooks \
-            --ref main
+          missing=0
+          for v in DEPLOY_REPO_OWNER DEPLOY_REPO_NAME DEPLOY_DISPATCH_CLIENT_ID DEPLOY_DISPATCH_APP_KEY; do
+            if [ -z "${!v//[[:space:]]/}" ]; then
+              echo "::error::Secret ${v} is not set"
+              missing=1
+            fi
+          done
+          for v in DEPLOY_REPO_OWNER DEPLOY_REPO_NAME; do
+            if ! [[ "${!v}" =~ ^[A-Za-z0-9._-]+$ ]]; then
+              echo "::error::Secret ${v} must match ^[A-Za-z0-9._-]+\$"
+              missing=1
+            fi
+          done
+          if [[ "$DEPLOY_DISPATCH_APP_KEY" != *"-----BEGIN"*"PRIVATE KEY-----"* ]]; then
+            echo "::error::Secret DEPLOY_DISPATCH_APP_KEY is not a PEM private key"
+            missing=1
+          fi
+          if ! [[ "$DEPLOY_DISPATCH_CLIENT_ID" =~ ^Iv[0-9A-Za-z.]+$ ]]; then
+            echo "::error::Secret DEPLOY_DISPATCH_CLIENT_ID is not a GitHub App client ID"
+            missing=1
+          fi
+          exit "$missing"
+
+      - name: Mint a dispatch token for the deploy repository
+        id: dispatch-token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ secrets.DEPLOY_DISPATCH_CLIENT_ID }}
+          private-key: ${{ secrets.DEPLOY_DISPATCH_APP_KEY }}
+          owner: ${{ secrets.DEPLOY_REPO_OWNER }}
+          repositories: ${{ secrets.DEPLOY_REPO_NAME }}
+          permission-contents: write
+
+      - name: Trigger the production redeploy
+        uses: peter-evans/repository-dispatch@28959ce8df70de7be546dd1250a005dd32156697 # v4.0.1
+        with:
+          token: ${{ steps.dispatch-token.outputs.token }}
+          repository: ${{ secrets.DEPLOY_REPO_OWNER }}/${{ secrets.DEPLOY_REPO_NAME }}
+          event-type: redeploy-cloud-api-prod
 
       - name: Summary
         env:
@@ -259,8 +296,7 @@ jobs:
             echo "- target digest: \`${NEEDS_ROLLBACK_PROD_TARGET_DIGEST}\`"
             echo "- audit tag: \`${NEEDS_ROLLBACK_PROD_AUDIT_TAG}\`"
             echo ""
-            echo "Triggered \`Update Cloud API Prod\` on \`nearai/cvm-ansible-playbooks\`."
-            echo "Track the deploy: https://github.com/nearai/cvm-ansible-playbooks/actions/workflows/update_cloud_api_prod.yml"
+            echo "Triggered the production redeploy (redeploy-cloud-api-prod)."
             echo ""
             echo "Verify when deploy completes: https://cloud-api.near.ai/v1/health"
           } >> "$GITHUB_STEP_SUMMARY"

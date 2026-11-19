@@ -3,7 +3,7 @@ use crate::repositories::utils::map_db_error;
 use crate::retry_db;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use chrono::Utc;
+use jiff::Timestamp;
 use services::common::RepositoryError;
 use services::staking_farm::{
     OrganizationStakingFarmSource, StakingFarmOrganizationInactive, StakingFarmRepository,
@@ -298,7 +298,7 @@ impl StakingFarmRepository for OrganizationStakingFarmSourcesRepository {
                 .map_err(RepositoryError::PoolError)?;
 
             let transaction = client.transaction().await.map_err(map_db_error)?;
-            let now = Utc::now();
+            let now = Timestamp::now();
             crate::repositories::credit_allocation::lock_organization_accounting(
                 &transaction,
                 organization_id,

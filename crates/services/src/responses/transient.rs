@@ -61,7 +61,7 @@ fn response_id_string(response_id: Uuid) -> String {
 
 fn initial_response(request: models::CreateResponseRequest) -> (Uuid, models::ResponseObject) {
     let response_id = Uuid::new_v4();
-    let now = chrono::Utc::now().timestamp();
+    let now = jiff::Timestamp::now().as_second();
 
     (
         response_id,

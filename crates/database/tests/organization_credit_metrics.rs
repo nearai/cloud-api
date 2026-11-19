@@ -1,7 +1,6 @@
 //! Exercise the public repository on connection-local tables. The fixture includes
 //! the ledger's reversal view, without requiring global schema changes or locks.
 
-use chrono::{TimeZone, Utc};
 use database::{repositories::PgAnalyticsRepository, DbPool};
 use deadpool_postgres::{Config, Runtime};
 use services::{admin::AnalyticsRepository, common::RepositoryError};
@@ -39,8 +38,8 @@ async fn fixture() -> anyhow::Result<DbPool> {
 async fn credit_metrics_preserve_live_allocations_and_empty_dimensions() -> anyhow::Result<()> {
     let pool = fixture().await?;
     let repo = PgAnalyticsRepository::new(pool.clone());
-    let start = Utc.with_ymd_and_hms(2026, 10, 2, 16, 0, 0).unwrap();
-    let end = Utc.with_ymd_and_hms(2026, 11, 2, 12, 2, 0).unwrap();
+    let start = "2026-10-02T16:00:00Z".parse::<jiff::Timestamp>().unwrap();
+    let end = "2026-11-02T12:02:00Z".parse::<jiff::Timestamp>().unwrap();
 
     let report = repo
         .get_organization_metrics(ORG, start, end, Some("postpay"))
@@ -192,8 +191,8 @@ async fn credit_metrics_read_allocations_once_for_all_breakdowns() -> anyhow::Re
     drop(client);
 
     let repo = PgAnalyticsRepository::new(pool.clone());
-    let start = Utc.with_ymd_and_hms(2026, 10, 2, 16, 0, 0).unwrap();
-    let end = Utc.with_ymd_and_hms(2026, 11, 2, 12, 2, 0).unwrap();
+    let start = "2026-10-02T16:00:00Z".parse::<jiff::Timestamp>().unwrap();
+    let end = "2026-11-02T12:02:00Z".parse::<jiff::Timestamp>().unwrap();
     let report = repo
         .get_organization_metrics(ORG, start, end, Some("postpay"))
         .await?;
@@ -244,8 +243,8 @@ async fn credit_metrics_keep_one_transaction_local_timeout_budget() -> anyhow::R
 
     let repo =
         PgAnalyticsRepository::with_statement_timeout(pool.clone(), Duration::from_millis(400));
-    let start = Utc.with_ymd_and_hms(2026, 10, 2, 16, 0, 0).unwrap();
-    let end = Utc.with_ymd_and_hms(2026, 11, 2, 12, 2, 0).unwrap();
+    let start = "2026-10-02T16:00:00Z".parse::<jiff::Timestamp>().unwrap();
+    let end = "2026-11-02T12:02:00Z".parse::<jiff::Timestamp>().unwrap();
 
     let metrics = repo
         .get_organization_metrics(ORG, start, end, Some("postpay"))

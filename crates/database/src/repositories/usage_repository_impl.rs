@@ -1,6 +1,6 @@
 use crate::models::RecordUsageRequest;
 use crate::repositories::OrganizationUsageRepository;
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use services::usage::ports::{
     InferenceCost, InferenceUsageHistoryQuery, InferenceUsageReportRow, OrganizationBalanceInfo,
     UsageByModelEntry, UsageLogEntry,
@@ -253,8 +253,8 @@ impl services::usage::ports::UsageRepository for OrganizationUsageRepository {
     async fn get_usage_by_model(
         &self,
         organization_id: Uuid,
-        start_date: DateTime<Utc>,
-        end_date: Option<DateTime<Utc>>,
+        start_date: Timestamp,
+        end_date: Option<Timestamp>,
     ) -> anyhow::Result<Vec<UsageByModelEntry>> {
         let rows = self
             .get_usage_by_model_since(organization_id, start_date, end_date)

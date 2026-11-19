@@ -5,7 +5,6 @@ use axum::{
     response::{Html, IntoResponse, Redirect, Response},
     Extension, Json,
 };
-use chrono::Utc;
 use config::ApiConfig;
 use database::repositories::OAuthStateRepository;
 use serde::{Deserialize, Serialize};
@@ -246,7 +245,7 @@ pub struct OAuthInitQuery {
 pub struct TokenExchangeResponse {
     access_token: String,
     refresh_token: String,
-    refresh_token_expiration: chrono::DateTime<Utc>,
+    refresh_token_expiration: jiff::Timestamp,
     user: AuthResponse,
 }
 
@@ -409,7 +408,7 @@ impl<'de> serde::Deserialize<'de> for NearPayloadJson {
 pub struct NearAuthResponse {
     access_token: String,
     refresh_token: String,
-    refresh_token_expiration: chrono::DateTime<Utc>,
+    refresh_token_expiration: jiff::Timestamp,
     user: AuthResponse,
 }
 

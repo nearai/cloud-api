@@ -87,11 +87,9 @@ load fails, admission returns HTTP 503 and the instance retries every 30 seconds
 After a successful load, failed refreshes keep the last policy. An empty set of stored
 settings is a successful load and uses the defaults.
 
-Administrators can override individual fields at
-`/v1/admin/organizations/{org_id}/usage-admission`. GET returns the overrides and
-the effective policy. PATCH changes only supplied fields. A JSON `null` restores
-inheritance from the global `defaults` for that field. Creating holds requires
-`enforce` in the effective policy.
+Cloud API loads organization-specific overrides with the global policy. Each
+unset field inherits its value from the global `defaults`. An organization creates
+holds when its effective mode is `enforce` and admission is enabled.
 
 The top-level `enabled` switch defaults to `true`, which uses the selected organization
 policy. Setting it to `false` skips admission for every organization, including explicit

@@ -2,7 +2,7 @@ use super::super::auth::ports::{User, UserId};
 use super::super::common::RepositoryError;
 use anyhow::Result;
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -32,8 +32,8 @@ pub struct Organization {
     pub owner_id: UserId,
     pub settings: serde_json::Value,
     pub is_active: bool,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
+    pub created_at: Timestamp,
+    pub updated_at: Timestamp,
 }
 
 impl Organization {
@@ -77,10 +77,81 @@ impl Organization {
             }
         }
     }
+
+    /// The models whose long-context tier this organization turned off
+    /// (`long_context_disabled_models`, canonical names). Absent, `null` or
+    /// an empty list: none.
+    ///
+    /// A stored value that is not a list of strings turns it off for every
+    /// model: the setting fails closed.
+    pub fn long_context_disabled_models(&self) -> LongContextDisabledModels {
+        LongContextDisabledModels::from_settings(self.id.0, Some(&self.settings))
+    }
 }
 
 /// The organization setting that lists the models it may use.
 pub const ALLOWED_MODELS_SETTING: &str = "allowed_models";
+
+/// The organization setting that lists the models whose long-context tier
+/// it turned off.
+pub const LONG_CONTEXT_DISABLED_MODELS_SETTING: &str = "long_context_disabled_models";
+
+/// Parsed `long_context_disabled_models` setting
+/// ([`Organization::long_context_disabled_models`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum LongContextDisabledModels {
+    /// No model: the setting is absent, `null` or an empty list.
+    #[default]
+    None,
+    /// These canonical model names.
+    Models(std::collections::HashSet<String>),
+    /// Every model: the stored value is malformed.
+    All,
+}
+
+impl LongContextDisabledModels {
+    /// Parse the setting from an organization's settings (`None`: no
+    /// settings). See [`Organization::long_context_disabled_models`].
+    pub fn from_settings(organization_id: Uuid, settings: Option<&serde_json::Value>) -> Self {
+        match settings.and_then(|settings| settings.get(LONG_CONTEXT_DISABLED_MODELS_SETTING)) {
+            None | Some(serde_json::Value::Null) => Self::None,
+            Some(serde_json::Value::Array(entries)) => {
+                let names: Option<std::collections::HashSet<String>> = entries
+                    .iter()
+                    .map(|entry| entry.as_str().map(str::to_string))
+                    .collect();
+                match names {
+                    Some(names) if names.is_empty() => Self::None,
+                    Some(names) => Self::Models(names),
+                    None => {
+                        tracing::warn!(
+                            %organization_id,
+                            "long_context_disabled_models setting has entries that are not model names; long context is off for every model"
+                        );
+                        Self::All
+                    }
+                }
+            }
+            Some(_) => {
+                tracing::warn!(
+                    %organization_id,
+                    "long_context_disabled_models setting is not a list; long context is off for every model"
+                );
+                Self::All
+            }
+        }
+    }
+
+    /// Whether the organization turned the long-context tier of `model_name`
+    /// (canonical) off.
+    pub fn contains(&self, model_name: &str) -> bool {
+        match self {
+            Self::None => false,
+            Self::Models(names) => names.contains(model_name),
+            Self::All => true,
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct OrganizationSettings {
@@ -112,7 +183,7 @@ pub struct OrganizationMember {
     pub organization_id: OrganizationId,
     pub user_id: UserId,
     pub role: MemberRole,
-    pub joined_at: DateTime<Utc>,
+    pub joined_at: Timestamp,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -207,7 +278,7 @@ pub struct OrganizationMemberWithUser {
     pub organization_id: OrganizationId,
     pub user_id: UserId,
     pub role: MemberRole,
-    pub joined_at: DateTime<Utc>,
+    pub joined_at: Timestamp,
     pub user: User,
 }
 

@@ -138,6 +138,7 @@ impl AttestationService {
             gateway_quote_collector: Arc::new(DstackGatewayQuoteCollector),
             model_attestation_collector,
             report_cache,
+            long_context_access: None,
         })
     }
 }

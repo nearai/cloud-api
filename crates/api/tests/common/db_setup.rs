@@ -557,6 +557,17 @@ pub async fn bootstrap_test_database() {
 /// Create a 4-connection deadpool pool to the shared e2e database.
 /// Called once per test.
 pub async fn create_test_pool() -> database::pool::DbPool {
+    create_test_pool_with_options("").await
+}
+
+/// As [`create_test_pool`], with every connection's `search_path` set to
+/// `search_path` (for example a schema that does not exist, so no table is
+/// visible).
+pub async fn create_test_pool_with_search_path(search_path: &str) -> database::pool::DbPool {
+    create_test_pool_with_options(&format!(" -c search_path={search_path}")).await
+}
+
+async fn create_test_pool_with_options(extra_options: &str) -> database::pool::DbPool {
     let _ = dotenvy::dotenv();
     if !database_was_prebootstrapped() {
         ensure_shared_db().await;
@@ -572,11 +583,10 @@ pub async fn create_test_pool() -> database::pool::DbPool {
     pg_config.connect_timeout = Some(Duration::from_secs(10));
     pg_config.keepalives = Some(true);
     pg_config.keepalives_idle = Some(Duration::from_secs(5));
-    pg_config.options = Some(
+    pg_config.options = Some(format!(
         "-c statement_timeout=30000 -c lock_timeout=10000 \
-         -c idle_in_transaction_session_timeout=30000"
-            .to_string(),
-    );
+         -c idle_in_transaction_session_timeout=30000{extra_options}"
+    ));
     // The E2E runner creates many short-lived processes through Docker's
     // published PostgreSQL port. Verify pooled connections before reuse so a
     // hard-closed socket is discarded instead of failing the test's next SQL.

@@ -41,7 +41,7 @@ use crate::repositories::utils::map_db_error;
 use crate::retry_db;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use chrono::Utc;
+use jiff::Timestamp;
 use services::common::RepositoryError;
 use services::conversations::models::ConversationId;
 use services::responses::models::*;
@@ -100,8 +100,8 @@ impl PgResponseItemsRepository {
 
         // Use the item's own created_at timestamp, not the response's created_at
         // This ensures each item has a unique timestamp reflecting when it was created
-        let item_created_at: chrono::DateTime<chrono::Utc> = row.try_get("created_at")?;
-        let created_at_timestamp = item_created_at.timestamp();
+        let item_created_at: jiff::Timestamp = row.try_get("created_at")?;
+        let created_at_timestamp = services::timestamps::unix_seconds(item_created_at);
 
         let model = match item.model() {
             Some(m) if !m.is_empty() => m.to_string(),
@@ -283,7 +283,7 @@ impl ResponseItemRepositoryTrait for PgResponseItemsRepository {
         let conversation_uuid = conversation_id.map(|cid| cid.0);
 
         let row = retry_db!("create_response_item", {
-            let now = Utc::now();
+            let now = Timestamp::now();
             let client = self
                 .pool
                 .get()
@@ -389,7 +389,7 @@ impl ResponseItemRepositoryTrait for PgResponseItemsRepository {
         }
 
         let row = retry_db!("update_response_item", {
-            let now = Utc::now();
+            let now = Timestamp::now();
             let client = self
                 .pool
                 .get()
@@ -572,7 +572,7 @@ impl ResponseItemRepositoryTrait for PgResponseItemsRepository {
                 )));
             };
 
-            let cursor_created_at: chrono::DateTime<Utc> = cursor_row.try_get("created_at")?;
+            let cursor_created_at: jiff::Timestamp = cursor_row.try_get("created_at")?;
             let cursor_id: Uuid = cursor_row.try_get("id")?;
             Some((cursor_created_at, cursor_id))
         } else {

@@ -23,7 +23,7 @@ async fn issue(db: &Arc<database::Database>, permission: Option<&str>) -> Issued
             Uuid::parse_str(MOCK_USER_ID).unwrap(),
             format!("permissions-{}", Uuid::new_v4()),
             "Admin permission integration test".to_string(),
-            chrono::Utc::now() + chrono::Duration::hours(24),
+            jiff::Timestamp::now() + jiff::SignedDuration::from_hours(24),
             Some(MOCK_USER_AGENT.to_string()),
             permission,
         )
@@ -83,6 +83,124 @@ async fn permissions_persist_in_create_validate_and_get() {
         assert_eq!(validated.permission, expected);
         assert!(validated.last_used_at.is_some());
     }
+}
+
+/// Starts a server with the real auth service and a fresh allowlisted user, and
+/// issues a read-write admin token for that user.
+async fn admin_token_server(
+    admin_tokens_only: bool,
+) -> (axum_test::TestServer, Arc<database::Database>, Uuid, String) {
+    let user = Uuid::new_v4();
+    let creator_email = format!("test-{user}@test.com");
+    let (server, db) = setup_test_server_with_config_and_database(|config| {
+        config.auth.mock = false;
+        config.auth.admin_emails = vec![creator_email.clone()];
+        config.auth.admin_tokens_only = admin_tokens_only;
+    })
+    .await;
+    setup_unique_test_session_with_user_id(&db, user).await;
+    let repo = database::repositories::AdminAccessTokenRepository::new(db.pool().clone());
+    let (_, token) = repo
+        .create(
+            user,
+            "admin tokens only".into(),
+            "test".into(),
+            jiff::Timestamp::now() + jiff::SignedDuration::from_hours(1),
+            Some(MOCK_USER_AGENT.into()),
+            AdminAccessTokenPermission::ReadWrite,
+        )
+        .await
+        .unwrap();
+    (server, db, user, token)
+}
+
+async fn insert_passkey(db: &Arc<database::Database>, user: Uuid, client: &str) {
+    let credential_id = Uuid::new_v4().as_bytes().to_vec();
+    db.pool()
+        .get()
+        .await
+        .unwrap()
+        .execute(
+            "INSERT INTO webauthn_credentials \
+             (user_id, client, rp_id, credential_id, passkey, backup_eligible, backup_state, enrolled_via) \
+             VALUES ($1, $2, 'localhost', $3, '{}'::jsonb, false, false, 'session')",
+            &[&user, &client, &credential_id],
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn admin_tokens_only_accepts_admin_tokens_and_refuses_sessions() {
+    let (server, db, user, token) = admin_token_server(true).await;
+    insert_passkey(&db, user, "admin").await;
+
+    let response = call(&server, Method::GET, ENCRYPTION_KEYS, &token, json!({})).await;
+    assert_eq!(response.status_code(), StatusCode::OK);
+
+    let scope = json!({"fields": [{"table": "files", "column": "filename"}]});
+    for (method, path) in [
+        (Method::GET, ENCRYPTION_KEYS),
+        (Method::POST, "/v1/admin/database-encryption/scan"),
+    ] {
+        let response = call(
+            &server,
+            method,
+            path,
+            &get_session_id(),
+            json!({"scope": scope, "limit": 1}),
+        )
+        .await;
+        assert_eq!(response.status_code(), StatusCode::UNAUTHORIZED, "{path}");
+        let body = response.json::<Value>();
+        assert_eq!(body["error"]["message"], "Admin access token required");
+        assert_eq!(body["error"]["type"], "unauthorized");
+    }
+}
+
+#[tokio::test]
+async fn admin_tokens_only_requires_an_admin_passkey_for_the_token_creator() {
+    let (server, db, user, token) = admin_token_server(true).await;
+    let assert_refused = |response: axum_test::TestResponse| {
+        assert_eq!(response.status_code(), StatusCode::UNAUTHORIZED);
+        let body = response.json::<Value>();
+        assert_eq!(body["error"]["message"], "Invalid admin access token");
+        assert_eq!(body["error"]["type"], "unauthorized");
+    };
+
+    // No passkey at all.
+    assert_refused(call(&server, Method::GET, ENCRYPTION_KEYS, &token, json!({})).await);
+
+    // A passkey registered for the user client does not count.
+    insert_passkey(&db, user, "user").await;
+    assert_refused(call(&server, Method::GET, ENCRYPTION_KEYS, &token, json!({})).await);
+
+    // An admin passkey for another user does not count.
+    let other = Uuid::new_v4();
+    setup_unique_test_session_with_user_id(&db, other).await;
+    insert_passkey(&db, other, "admin").await;
+    assert_refused(call(&server, Method::GET, ENCRYPTION_KEYS, &token, json!({})).await);
+
+    // The same token is accepted once its creator has an admin passkey.
+    insert_passkey(&db, user, "admin").await;
+    assert_eq!(
+        call(&server, Method::GET, ENCRYPTION_KEYS, &token, json!({}))
+            .await
+            .status_code(),
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn admin_tokens_without_creator_passkey_work_when_admin_tokens_only_is_off() {
+    let (server, _db, _user, token) = admin_token_server(false).await;
+
+    assert_eq!(
+        call(&server, Method::GET, ENCRYPTION_KEYS, &token, json!({}))
+            .await
+            .status_code(),
+        StatusCode::OK
+    );
 }
 
 #[tokio::test]
@@ -191,7 +309,7 @@ async fn database_encryption_reads_cannot_create_or_cancel_jobs() {
             user,
             "encryption reads".into(),
             "test".into(),
-            chrono::Utc::now() + chrono::Duration::hours(1),
+            jiff::Timestamp::now() + jiff::SignedDuration::from_hours(1),
             Some(MOCK_USER_AGENT.into()),
             database::models::AdminAccessTokenPermission::ReadOnly,
         )
@@ -266,9 +384,7 @@ async fn database_encryption_reads_cannot_create_or_cancel_jobs() {
         .await
         .unwrap();
     assert_eq!(row.get::<_, String>(0), "completed");
-    assert!(row
-        .get::<_, Option<chrono::DateTime<chrono::Utc>>>(1)
-        .is_none());
+    assert!(row.get::<_, Option<jiff::Timestamp>>(1).is_none());
 }
 
 #[tokio::test]
@@ -379,7 +495,7 @@ async fn permissions_preserve_expiration_revocation_user_agent_and_admin_eligibi
                 user,
                 "lifecycle".into(),
                 "test".into(),
-                chrono::Utc::now() + chrono::Duration::hours(1),
+                jiff::Timestamp::now() + jiff::SignedDuration::from_hours(1),
                 Some(MOCK_USER_AGENT.into()),
                 permission,
             )
@@ -435,7 +551,7 @@ async fn permissions_preserve_expiration_revocation_user_agent_and_admin_eligibi
                 user,
                 "expired".into(),
                 "test".into(),
-                chrono::Utc::now() - chrono::Duration::hours(1),
+                jiff::Timestamp::now() - jiff::SignedDuration::from_hours(1),
                 Some(MOCK_USER_AGENT.into()),
                 permission,
             )
@@ -474,7 +590,7 @@ async fn existing_service_tokens_follow_the_creator_email_allowlist() {
             Uuid::parse_str(MOCK_USER_ID).unwrap(),
             format!("allowlist-{}", Uuid::new_v4()),
             "Existing service credential".to_string(),
-            chrono::Utc::now() + chrono::Duration::hours(1),
+            jiff::Timestamp::now() + jiff::SignedDuration::from_hours(1),
             Some(MOCK_USER_AGENT.to_string()),
             database::models::AdminAccessTokenPermission::ReadWrite,
         )

@@ -1,8 +1,8 @@
 use crate::common::*;
 use axum::http::StatusCode;
-use chrono::{Duration, Utc};
 use database::repositories::credit_transfers::CreditTransferRepository;
 use database::repositories::organization_credentials::OrganizationCredentialRepository;
+use jiff::{SignedDuration, Timestamp};
 use serde_json::{json, Value};
 use services::organization_credits::models::{
     CredentialConstraints, CredentialPolicy, CredentialRequest, OrganizationPolicy,
@@ -61,7 +61,7 @@ async fn create_credential(
                         ..Default::default()
                     },
                 },
-                expires_at: Utc::now() + Duration::hours(1),
+                expires_at: Timestamp::now() + SignedDuration::from_hours(1),
             },
         )
         .await

@@ -12,6 +12,7 @@ pub mod ohttp_gateway;
 pub mod openapi;
 pub mod openapi_deprecation;
 pub mod routes;
+pub mod telemetry;
 
 use crate::ohttp_gateway::{OhttpAttestation, OhttpGateway};
 use crate::routes::mcp_server::{handle_mcp_request, McpRouteState};
@@ -251,7 +252,8 @@ pub fn init_auth_services(database: Arc<Database>, config: &ApiConfig) -> AuthCo
         admin_access_token_repository,
         config.auth.admin_emails.clone(),
         config.auth.encoding_key.clone(),
-    );
+    )
+    .with_admin_tokens_only(config.auth.admin_tokens_only);
 
     // Create NEAR nonce repository
     let nonce_repository = Arc::new(database::PostgresNearNonceRepository::new(
@@ -456,6 +458,14 @@ pub async fn init_domain_services_with_pool(
         )),
     );
 
+    // Per-organization access to long-context tiers, shared by the
+    // completion and attestation services below.
+    let long_context_access = Arc::new(services::long_context_access::LongContextAccess::new(
+        Arc::new(database::repositories::PgLongContextAccessRepository::new(
+            database.pool().clone(),
+        )),
+    ));
+
     // Create attestation service
     let attestation_service = Arc::new(
         services::attestation::AttestationService::init(
@@ -468,7 +478,8 @@ pub async fn init_domain_services_with_pool(
             config.ita.clone(),
         )
         .await
-        .unwrap(),
+        .unwrap()
+        .with_long_context_access(long_context_access.clone()),
     );
 
     // Prepare repositories for usage service (will be created after workspace service)
@@ -526,7 +537,9 @@ pub async fn init_domain_services_with_pool(
         catalog_models.clone(),
         org_limit_repository,
     )
-    .with_model_resolve_cache(models_service.model_resolve_cache());
+    .with_model_resolve_cache(models_service.model_resolve_cache())
+    .with_long_context_access(long_context_access)
+    .with_usage_estimate_incomplete_streams(config.usage_estimate_incomplete_streams);
     // Affinity keys only matter to a pool that places requests.
     if let Some(affinity_secret) = inference_provider_pool.affinity_secret() {
         completion_service = completion_service.with_affinity_secret(affinity_secret);
@@ -2902,6 +2915,7 @@ mod tests {
                 near: config::NearConfig::default(),
                 admin_emails: vec![],
                 require_session_bound_access_tokens: false,
+                admin_tokens_only: false,
             },
             database: config::DatabaseConfig {
                 connection_mode: config::DatabaseConnectionMode::Patroni,
@@ -2938,6 +2952,8 @@ mod tests {
                 endpoint: "http://localhost:4317".to_string(),
                 protocol: "grpc".to_string(),
                 instance_id: None,
+                traces_enabled: false,
+                traces_sample_ratio: 0.01,
             },
             cors: config::CorsConfig::default(),
             external_providers: config::ExternalProvidersConfig::default(),
@@ -2945,6 +2961,7 @@ mod tests {
             staking_farm: config::StakingFarmConfig::default(),
             aml: config::AmlConfig::default(),
             usage_reporting: config::UsageReportingConfig::default(),
+            usage_estimate_incomplete_streams: true,
             credit_allocation: config::CreditAllocationConfig::default(),
             ita: config::ItaAttestationConfig::default(),
             placement: config::PlacementConfig::default(),
@@ -3026,6 +3043,7 @@ mod tests {
                 near: config::NearConfig::default(),
                 admin_emails: vec![],
                 require_session_bound_access_tokens: false,
+                admin_tokens_only: false,
             },
             database: config::DatabaseConfig {
                 connection_mode: config::DatabaseConnectionMode::Patroni,
@@ -3062,6 +3080,8 @@ mod tests {
                 endpoint: "http://localhost:4317".to_string(),
                 protocol: "grpc".to_string(),
                 instance_id: None,
+                traces_enabled: false,
+                traces_sample_ratio: 0.01,
             },
             cors: config::CorsConfig::default(),
             external_providers: config::ExternalProvidersConfig::default(),
@@ -3069,6 +3089,7 @@ mod tests {
             staking_farm: config::StakingFarmConfig::default(),
             aml: config::AmlConfig::default(),
             usage_reporting: config::UsageReportingConfig::default(),
+            usage_estimate_incomplete_streams: true,
             credit_allocation: config::CreditAllocationConfig::default(),
             ita: config::ItaAttestationConfig::default(),
             placement: config::PlacementConfig::default(),

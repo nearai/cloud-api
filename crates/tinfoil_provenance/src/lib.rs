@@ -1,6 +1,6 @@
 //! Offline Sigstore verification of a Tinfoil release attestation.
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -15,7 +15,7 @@ pub struct Provenance {
     /// Index of the release signature's entry in the Rekor transparency log.
     pub rekor_log_index: u64,
     /// When Rekor integrated that entry into the log.
-    pub integrated_time: DateTime<Utc>,
+    pub integrated_time: Timestamp,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -127,7 +127,7 @@ fn verify_bundle_for(
 /// Both are informational (reported so a reader can look the entry up). They
 /// are read from the first tlog entry of a bundle that sigstore-verify has
 /// already validated; they do not feed any trust decision.
-fn rekor_entry(bundle: &serde_json::Value) -> Result<(u64, DateTime<Utc>), ProvenanceError> {
+fn rekor_entry(bundle: &serde_json::Value) -> Result<(u64, Timestamp), ProvenanceError> {
     let entry = &bundle["verificationMaterial"]["tlogEntries"][0];
     let log_index = entry["logIndex"]
         .as_str()
@@ -136,7 +136,7 @@ fn rekor_entry(bundle: &serde_json::Value) -> Result<(u64, DateTime<Utc>), Prove
     let integrated_time = entry["integratedTime"]
         .as_str()
         .and_then(|v| v.parse::<i64>().ok())
-        .and_then(|secs| DateTime::from_timestamp(secs, 0))
+        .and_then(|secs| Timestamp::from_second(secs).ok())
         .ok_or_else(|| bad("no rekor integrated time"))?;
     Ok((log_index, integrated_time))
 }
@@ -293,7 +293,6 @@ mod tests {
 
     #[test]
     fn recorded_bundles_expose_rekor_entry() {
-        use chrono::Datelike;
         let model: serde_json::Value =
             serde_json::from_str(include_str!("../testdata/model_sigstore_bundle.json")).unwrap();
         let router = atc();
@@ -306,7 +305,9 @@ mod tests {
             verify_release(&model, "tinfoilsh/confidential-deepseek-v4-1-flash").unwrap(),
         ] {
             assert!(r.rekor_log_index > 0);
-            assert!((2024..=2027).contains(&r.integrated_time.year()));
+            assert!(
+                (2024..=2027).contains(&r.integrated_time.to_zoned(jiff::tz::TimeZone::UTC).year())
+            );
         }
     }
 

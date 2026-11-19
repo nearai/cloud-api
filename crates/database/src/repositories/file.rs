@@ -2,7 +2,7 @@ use crate::retry_db;
 use crate::{pool::DbPool, repositories::utils::map_db_error};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use chrono::Utc;
+use jiff::Timestamp;
 use services::common::RepositoryError;
 use services::files::{File, FileRepositoryTrait};
 use tracing::debug;
@@ -63,7 +63,7 @@ impl FileRepository {
             };
 
         let row = match retry_db!("create_new_file_record", {
-            let now = Utc::now();
+            let now = Timestamp::now();
             let client = self
                 .pool
                 .get()
@@ -370,7 +370,7 @@ impl FileRepository {
     /// Get expired files
     pub async fn get_expired_files(&self) -> Result<Vec<File>, RepositoryError> {
         let rows = retry_db!("get_expired_files", {
-            let now = Utc::now();
+            let now = Timestamp::now();
             let client = self
                 .pool
                 .get()

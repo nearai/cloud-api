@@ -23,9 +23,9 @@ use api::{
 };
 use async_trait::async_trait;
 use base64::Engine;
-use chrono::Utc;
 use config::ApiConfig;
 use database::Database;
+use jiff::Timestamp;
 pub use services::auth::ports::MOCK_USER_AGENT;
 use services::auth::AccessTokenClaims;
 use services::responses::tools::{
@@ -112,6 +112,7 @@ pub fn test_config() -> ApiConfig {
             near: config::NearConfig::default(),
             admin_emails: vec![ADMIN_ALLOWLIST_EMAIL.to_string()],
             require_session_bound_access_tokens: false,
+            admin_tokens_only: false,
         },
         database: config::DatabaseConfig {
             connection_mode: config::DatabaseConnectionMode::Patroni,
@@ -155,6 +156,8 @@ pub fn test_config() -> ApiConfig {
                 .unwrap_or_else(|_| "http://localhost:4317".to_string()),
             protocol: std::env::var("TELEMETRY_OTLP_PROTOCOL").unwrap_or("grpc".to_string()),
             instance_id: None,
+            traces_enabled: false,
+            traces_sample_ratio: 0.01,
         },
         cors: config::CorsConfig::default(),
         external_providers: config::ExternalProvidersConfig::default(),
@@ -162,6 +165,7 @@ pub fn test_config() -> ApiConfig {
         staking_farm: config::StakingFarmConfig::default(),
         aml: config::AmlConfig::default(),
         usage_reporting: config::UsageReportingConfig::default(),
+        usage_estimate_incomplete_streams: true,
         credit_allocation: config::CreditAllocationConfig::default(),
         ita: config::ItaAttestationConfig::default(),
         placement: config::PlacementConfig::default(),
@@ -1572,7 +1576,7 @@ fn generate_test_signature() -> String {
 
 /// Create NEP-413 nonce with timestamp offset in milliseconds.
 pub fn create_near_test_nonce(timestamp_offset_ms: i64) -> Vec<u8> {
-    let now_ms = Utc::now().timestamp_millis();
+    let now_ms = Timestamp::now().as_millisecond();
     let nonce_timestamp_ms = (now_ms + timestamp_offset_ms) as u64;
     let mut nonce = Vec::with_capacity(32);
     nonce.extend_from_slice(&nonce_timestamp_ms.to_be_bytes());

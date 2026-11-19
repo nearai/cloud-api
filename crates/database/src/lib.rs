@@ -1,3 +1,4 @@
+mod bounded_timestamp;
 pub mod cluster_manager;
 pub mod constants;
 pub mod cp_client;

@@ -48,6 +48,7 @@ async fn fetch(
         address,
         true,
         filter,
+        true,
     )
     .await
 }

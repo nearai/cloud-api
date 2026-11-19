@@ -3,7 +3,7 @@ use crate::repositories::utils::map_db_error;
 use crate::{models::User, retry_db};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use chrono::Utc;
+use jiff::Timestamp;
 use services::auth::{OAuthUserInfo, UserId};
 use services::common::RepositoryError;
 use tracing::debug;
@@ -31,7 +31,7 @@ impl UserRepository {
         let id = Uuid::new_v4();
 
         let row = retry_db!("create_new_user", {
-            let now = Utc::now();
+            let now = Timestamp::now();
             let mut client = self
                 .pool
                 .get()

@@ -18,8 +18,9 @@ use services::usage::{
     InferenceType, RecordUsageServiceRequest, StopReason, UsageError, UsageServiceTrait,
 };
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
+use tokio::sync::{mpsc, Notify};
 use uuid::Uuid;
 
 /// Wraps the real usage service, captures every `record_usage` request, and
@@ -28,6 +29,13 @@ struct RecordingUsageService {
     inner: Arc<dyn UsageServiceTrait + Send + Sync>,
     records: Mutex<Vec<RecordUsageServiceRequest>>,
     fail_next: AtomicUsize,
+    stalled: OnceLock<StalledSettlement>,
+}
+
+struct StalledSettlement {
+    budget_id: Uuid,
+    write_started: Notify,
+    unknown: mpsc::UnboundedSender<(Uuid, Uuid)>,
 }
 
 impl RecordingUsageService {
@@ -62,7 +70,18 @@ impl UsageServiceTrait for RecordingUsageService {
         identity: services::usage::BillingIdentity,
         features: services::usage::budget::UsageFeatures,
     ) -> Result<Option<Uuid>, UsageError> {
+        if let Some(stalled) = self.stalled.get() {
+            return Ok(Some(stalled.budget_id));
+        }
         self.inner.admit(identity, features).await
+    }
+
+    async fn mark_budget_unknown(&self, org: Uuid, id: Uuid) -> Result<(), UsageError> {
+        if let Some(stalled) = self.stalled.get() {
+            stalled.unknown.send((org, id)).unwrap();
+            return Ok(());
+        }
+        self.inner.mark_budget_unknown(org, id).await
     }
 
     async fn record_usage(
@@ -73,6 +92,10 @@ impl UsageServiceTrait for RecordingUsageService {
             .lock()
             .expect("records mutex should not poison")
             .push(request.clone());
+        if let Some(stalled) = self.stalled.get() {
+            stalled.write_started.notify_one();
+            return std::future::pending().await;
+        }
         let fail = self
             .fail_next
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
@@ -239,6 +262,7 @@ async fn fixture_with_providers(
             inner: services.usage_service.clone(),
             records: Mutex::new(Vec::new()),
             fail_next: AtomicUsize::new(fail_next),
+            stalled: OnceLock::new(),
         });
         services.usage_service = wrapped.clone();
         recorder = Some((wrapped, services.inference_provider_pool.clone()));
@@ -508,6 +532,57 @@ async fn image_generation_retries_before_returning_billed_success() {
     assert_eq!(
         billed_cost(&f, records[1].inference_id.unwrap()).await,
         40_000_000
+    );
+}
+
+fn stall_image_settlement(
+    f: &Fixture,
+) -> (&StalledSettlement, mpsc::UnboundedReceiver<(Uuid, Uuid)>) {
+    let (tx, rx) = mpsc::unbounded_channel();
+    let stalled = f.recorder.stalled.get_or_init(|| StalledSettlement {
+        budget_id: Uuid::new_v4(),
+        write_started: Notify::new(),
+        unknown: tx,
+    });
+    (stalled, rx)
+}
+
+#[tokio::test]
+async fn image_settlement_marks_the_reservation_unknown_after_both_writes_time_out() {
+    let f = fixture(0, &[]).await;
+    let (stalled, mut unknown) = stall_image_settlement(&f);
+
+    let response = post_image_generation(&f).await;
+    assert_eq!(response.status_code(), 500);
+    let records = f.recorder.records();
+    assert_eq!(records.len(), 2);
+    assert_same_request(&records[0], &records[1]);
+    assert_eq!(records[0].budget_id, Some(stalled.budget_id));
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(2), unknown.recv())
+            .await
+            .unwrap(),
+        Some((f.org_id, stalled.budget_id))
+    );
+}
+
+#[tokio::test]
+async fn image_settlement_marks_the_reservation_unknown_when_cancelled_during_a_write() {
+    let f = fixture(0, &[]).await;
+    let (stalled, mut unknown) = stall_image_settlement(&f);
+    let mut request = Box::pin(post_image_generation(&f));
+    tokio::select! {
+        _ = stalled.write_started.notified() => {}
+        _ = &mut request => panic!("request completed while its usage write was pending"),
+    }
+    drop(request);
+
+    assert_eq!(f.recorder.records().len(), 1);
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(2), unknown.recv())
+            .await
+            .unwrap(),
+        Some((f.org_id, stalled.budget_id))
     );
 }
 

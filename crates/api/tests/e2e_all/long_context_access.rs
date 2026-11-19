@@ -140,6 +140,14 @@ async fn org_with_key(
     (org_id, get_api_key_for_org(server, org.id).await)
 }
 
+/// How many times the redaction classifier ran on the harness provider.
+fn classifier_calls(mock: &inference_providers::mock::MockProvider) -> usize {
+    mock.tracing_calls()
+        .iter()
+        .filter(|call| call.operation == "privacy_classify_raw")
+        .count()
+}
+
 fn assert_context_length_exceeded(resp: &axum_test::TestResponse) {
     assert_eq!(resp.status_code(), 400, "body: {}", resp.text());
     let body: serde_json::Value = resp.json();
@@ -231,6 +239,37 @@ async fn e2e_oversized_request_is_refused_before_auto_redact_runs() {
         }))
         .await;
     assert_context_length_exceeded(&resp);
+    assert_eq!(classifier_calls(&mock), 0);
+
+    // Oversized by tool definitions that typed parsing cannot read (they are
+    // forwarded as is): refused the same way.
+    let resp = server
+        .post("/v1/chat/completions")
+        .add_header("Authorization", format!("Bearer {capped}"))
+        .add_header("x-auto-redact", "true")
+        .json(&serde_json::json!({
+            "model": model,
+            "messages": [{"role": "user", "content": "Hi"}],
+            "tools": [{"type": "custom_search", "description": "d".repeat(OVERSIZED_BYTES)}],
+            "max_tokens": 10
+        }))
+        .await;
+    assert_context_length_exceeded(&resp);
+    assert_eq!(classifier_calls(&mock), 0);
+
+    // An unknown model is refused before the classifier as well.
+    let resp = server
+        .post("/v1/chat/completions")
+        .add_header("Authorization", format!("Bearer {capped}"))
+        .add_header("x-auto-redact", "true")
+        .json(&serde_json::json!({
+            "model": format!("e2e-org/unknown-{}", uuid::Uuid::new_v4()),
+            "messages": [{"role": "user", "content": "Hi"}],
+            "max_tokens": 10
+        }))
+        .await;
+    assert_eq!(resp.status_code(), 400, "body: {}", resp.text());
+    assert_eq!(classifier_calls(&mock), 0);
 
     // Control: a request that fits reaches the (failing) classifier.
     let resp = server
@@ -244,6 +283,7 @@ async fn e2e_oversized_request_is_refused_before_auto_redact_runs() {
         }))
         .await;
     assert_eq!(resp.status_code(), 503, "body: {}", resp.text());
+    assert_eq!(classifier_calls(&mock), 1);
     assert_eq!(completions_hits(&base).await, 0);
     assert_eq!(completions_hits(&long).await, 0);
 }
@@ -327,6 +367,17 @@ async fn e2e_repository_reads_settings_and_maps_a_missing_blocks_table_to_no_blo
             .await
             .unwrap(),
         None
+    );
+    drop(transaction);
+
+    // The public read on connections that cannot see the table: no blocks.
+    let isolated = PgLongContextAccessRepository::new(
+        crate::common::db_setup::create_test_pool_with_search_path("e2e_schema_without_tables")
+            .await,
+    );
+    assert_eq!(
+        isolated.blocked_model_names(org_id).await.unwrap(),
+        Vec::<String>::new()
     );
 }
 

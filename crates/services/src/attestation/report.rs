@@ -151,15 +151,14 @@ impl AttestationService {
         };
 
         // An organization that may not use the model's long-context tier gets
-        // a report without it. Decided before the cache lookup, like the
-        // model resolution above; only such callers get a separate key, so
-        // every other caller keeps sharing cache entries.
+        // a report without it. Decided from its access policy alone, before
+        // the cache lookup like the model resolution above, whether or not the
+        // model has a long tier right now: the build filters wherever a tier
+        // boundary exists at that time, and only such callers get a separate
+        // key, so every other caller keeps sharing cache entries.
         let long_context_allowed = match (&resolved_canonical, caller, &self.long_context_access) {
             (Some(canonical), ModelCaller::Organization(organization_id), Some(access)) => {
-                self.inference_provider_pool
-                    .long_context_base_capacity(canonical)
-                    .is_none()
-                    || access.is_allowed(organization_id, canonical).await
+                access.is_allowed(organization_id, canonical).await
             }
             _ => true,
         };

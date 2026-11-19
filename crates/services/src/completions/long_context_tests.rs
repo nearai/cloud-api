@@ -192,17 +192,98 @@ async fn small_request_of_a_blocked_organization_never_reaches_the_long_tier() {
     assert!(f.long.chat_completion_call_count() > 0);
 }
 
+/// The restriction comes from the organization's policy alone, also for a
+/// model without a long tier now; such a model is unaffected by it.
 #[tokio::test]
-async fn a_single_tier_model_needs_no_access_lookup() {
+async fn a_single_tier_model_is_unaffected_by_a_restriction() {
     let f = fixture(false).await;
     assert!(
-        ports::CompletionServiceTrait::long_context_allowed(&f.service, f.blocked, MODEL).await
+        !ports::CompletionServiceTrait::long_context_allowed(&f.service, f.blocked, MODEL).await
     );
     f.service
         .create_chat_completion(request(f.blocked, 20_000))
         .await
         .expect("a single-tier model is unaffected");
-    assert_eq!(f.blocks.reads.load(Ordering::SeqCst), 0);
+    // One policy read, cached for the organization.
+    assert_eq!(f.blocks.reads.load(Ordering::SeqCst), 1);
+}
+
+/// A refresh that turns a single-tier model into a two-tier one between the
+/// restriction decision and provider selection: the restriction, decided
+/// while the model had no long tier, still keeps the long tier out.
+#[tokio::test(start_paused = true)]
+async fn a_restriction_decided_before_a_tier_appears_still_applies() {
+    let f = fixture(false).await;
+    let allowed =
+        ports::CompletionServiceTrait::long_context_allowed(&f.service, f.blocked, MODEL).await;
+    assert!(!allowed);
+
+    // The refresh: a base tier and the configured boundary appear.
+    let pool = &f.service.inference_provider_pool;
+    pool.register_pinned_provider(
+        MODEL.to_string(),
+        f.base.clone(),
+        Some(1_000),
+        ProviderPoolRole::Primary,
+    )
+    .await;
+    pool.record_long_context_boundaries(&[
+        (
+            MODEL.to_string(),
+            "https://base.example".to_string(),
+            Some(1_000),
+        ),
+        (
+            MODEL.to_string(),
+            "https://long.example".to_string(),
+            Some(10_000),
+        ),
+    ]);
+    f.base
+        .set_error_override(Some(ProviderError::HttpError {
+            status_code: 503,
+            message: "queue full".to_string(),
+            is_external: false,
+        }))
+        .await;
+    let params = |bytes: usize| -> inference_providers::ChatCompletionParams {
+        serde_json::from_value(serde_json::json!({
+            "model": MODEL,
+            "messages": [{"role": "user", "content": "a".repeat(bytes)}]
+        }))
+        .unwrap()
+    };
+    let hints = |long_context_allowed| crate::inference_provider_pool::ChatRoutingHints {
+        long_context_allowed,
+        ..Default::default()
+    };
+
+    // Small request: the base tier fails and the long tier is never tried.
+    assert!(pool
+        .chat_completion_with_attribution_and_hints(params(40), "h1".into(), hints(allowed))
+        .await
+        .is_err());
+    assert_eq!(f.long.chat_completion_call_count(), 0);
+    // Oversized request: refused, as the boundary now exists.
+    assert!(matches!(
+        pool.chat_completion_with_attribution_and_hints(
+            params(20_000),
+            "h2".into(),
+            hints(allowed)
+        )
+        .await,
+        Err(ProviderError::HttpError {
+            status_code: 400,
+            ..
+        })
+    ));
+    assert_eq!(f.long.chat_completion_call_count(), 0);
+
+    // Control: an unrestricted request fails over to the long tier.
+    pool.chat_completion_with_attribution_and_hints(params(40), "h3".into(), hints(true))
+        .await
+        .expect("failover to the long tier");
+    assert_eq!(f.long.chat_completion_call_count(), 1);
 }
 
 #[tokio::test]
@@ -215,4 +296,93 @@ async fn long_context_allowed_reports_the_organization_access() {
         ports::CompletionServiceTrait::long_context_allowed(&f.service, Uuid::new_v4(), MODEL)
             .await
     );
+}
+
+/// Tool definitions typed parsing cannot read stay in `extra` and are
+/// forwarded; the pre-dispatch check counts them like dispatch does.
+#[tokio::test]
+async fn the_precheck_counts_tool_definitions_left_in_extra() {
+    let f = fixture(true).await;
+    let mut request = request(f.blocked, 40);
+    // An unknown tool type: typed parsing falls back and keeps the raw list.
+    request.extra.insert(
+        "tools".to_string(),
+        serde_json::json!([{"type": "custom_search", "description": "d".repeat(20_000)}]),
+    );
+    match ports::CompletionServiceTrait::check_long_context_limit(&f.service, &request).await {
+        Err(ports::CompletionError::ContextLengthExceeded { limit }) => assert_eq!(limit, 1_000),
+        other => panic!("expected ContextLengthExceeded, got: {other:?}"),
+    }
+    // Without the tools the same request fits.
+    request.extra.remove("tools");
+    assert!(
+        ports::CompletionServiceTrait::check_long_context_limit(&f.service, &request)
+            .await
+            .is_ok()
+    );
+    assert_eq!(f.base.chat_completion_call_count(), 0);
+    assert_eq!(f.long.chat_completion_call_count(), 0);
+}
+
+/// Model catalog whose lookups fail.
+struct FailingModelsRepository;
+
+#[async_trait::async_trait]
+impl crate::models::ModelsRepository for FailingModelsRepository {
+    async fn get_all_active_models(
+        &self,
+    ) -> Result<Vec<crate::models::ModelWithPricing>, anyhow::Error> {
+        anyhow::bail!("catalog unavailable")
+    }
+
+    async fn get_model_by_name(
+        &self,
+        _: &str,
+    ) -> Result<Option<crate::models::ModelWithPricing>, anyhow::Error> {
+        anyhow::bail!("catalog unavailable")
+    }
+
+    async fn resolve_and_get_model(
+        &self,
+        _: &str,
+    ) -> Result<Option<crate::models::ModelWithPricing>, anyhow::Error> {
+        anyhow::bail!("catalog unavailable")
+    }
+
+    async fn get_configured_model_names(&self) -> Result<Vec<String>, anyhow::Error> {
+        anyhow::bail!("catalog unavailable")
+    }
+}
+
+/// The pre-dispatch check fails on an unknown model or a failed model lookup
+/// (with dispatch's errors) instead of letting the caller's paid work run.
+#[tokio::test]
+async fn the_precheck_fails_on_an_unknown_model_or_a_failed_lookup() {
+    let f = fixture(true).await;
+    let mut unknown = request(f.blocked, 40);
+    unknown.model = "org/unknown".to_string();
+    assert!(matches!(
+        ports::CompletionServiceTrait::check_long_context_limit(&f.service, &unknown).await,
+        Err(ports::CompletionError::InvalidModel(_))
+    ));
+
+    let failing = CompletionServiceImpl::new(
+        Arc::new(InferenceProviderPool::new(
+            None,
+            config::ExternalProvidersConfig::default(),
+        )),
+        Arc::new(MockAttestationService),
+        Arc::new(CapturingUsageService::new()),
+        Arc::new(CapturingMetricsService::new()),
+        Arc::new(FailingModelsRepository),
+        Arc::new(StaticOrganizationLimitRepository),
+    );
+    assert!(matches!(
+        ports::CompletionServiceTrait::check_long_context_limit(
+            &failing,
+            &request(Uuid::new_v4(), 40)
+        )
+        .await,
+        Err(ports::CompletionError::InternalError(_))
+    ));
 }

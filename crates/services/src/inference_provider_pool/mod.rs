@@ -79,6 +79,7 @@ use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, info, warn};
 
 mod context_routing;
+pub(crate) use context_routing::estimate_input_with;
 pub use context_routing::expand_inference_endpoints;
 mod long_context_gate;
 pub use long_context_gate::limit_message as long_context_limit_message;
@@ -1096,9 +1097,10 @@ pub struct InferenceProviderPool {
     /// and temporary primary-fleet disappearance.
     fallback_providers: Arc<std::sync::RwLock<HashMap<String, Vec<Arc<InferenceProviderTrait>>>>>,
     /// Configured long-context tier boundary (base capacity) per model, from
-    /// the catalog's `long_context` expansion. Recorded on every inference-URL
-    /// load, independent of which providers are live (see
-    /// `long_context_gate`).
+    /// the catalog's `long_context` expansion (see `long_context_gate`).
+    /// Written only while holding the `provider_mappings` write lock, together
+    /// with the providers it describes, so a reader holding the read lock sees
+    /// a boundary and providers from the same load.
     long_context_boundaries: Arc<std::sync::RwLock<HashMap<String, u32>>>,
 }
 
@@ -4476,14 +4478,20 @@ impl InferenceProviderPool {
         provider_filter: Option<inference_providers::ProviderFilter>,
         long_context_allowed: bool,
     ) -> Result<Vec<serde_json::Map<String, serde_json::Value>>, AttestationError> {
-        let all_providers = self
-            .get_providers_for_model(&model)
-            .await
-            .ok_or_else(|| AttestationError::ProviderNotFound(model.clone()))?;
-        let all_providers = if long_context_allowed {
-            all_providers
-        } else {
-            self.drop_long_context_tier(&model, all_providers)
+        // Filter under the mapping read lock, so the boundary and the
+        // providers come from the same load (see `long_context_boundaries`).
+        let all_providers = {
+            let mappings = self.provider_mappings.read().await;
+            let providers = mappings
+                .model_to_providers
+                .get(&model)
+                .cloned()
+                .ok_or_else(|| AttestationError::ProviderNotFound(model.clone()))?;
+            if long_context_allowed {
+                providers
+            } else {
+                self.drop_long_context_tier(&model, providers)
+            }
         };
 
         let all_providers = self.drop_disabled_sources(all_providers);
@@ -5924,7 +5932,6 @@ impl InferenceProviderPool {
         if models.is_empty() {
             return;
         }
-        self.record_long_context_boundaries(&models);
 
         let api_key = self.api_key.clone();
         let pool_load_state = self.provider_load_state.clone();
@@ -6677,11 +6684,21 @@ impl InferenceProviderPool {
                 .read()
                 .unwrap_or_else(|e| e.into_inner())
                 .clone();
+            let published: HashSet<String> = model_providers.keys().cloned().collect();
             for (model_name, providers) in
                 Self::merge_discovered_and_pinned(model_providers, &pinned_providers)
             {
                 mappings.model_to_providers.insert(model_name, providers);
             }
+            // Publish the configured long-context boundaries of the models whose
+            // providers were just replaced, under the same lock: a reader never
+            // sees one load's boundary with another load's providers.
+            let published_entries: Vec<(String, String, Option<u32>)> = models
+                .iter()
+                .filter(|(model_name, _, _)| published.contains(model_name))
+                .cloned()
+                .collect();
+            self.record_long_context_boundaries(&published_entries);
 
             if !old_provider_ptrs.is_empty() {
                 mappings.pubkey_to_providers.retain(|_, providers| {
@@ -6821,6 +6838,7 @@ impl InferenceProviderPool {
             models.iter().map(|(name, _, _)| name.clone()).collect();
         self.load_inference_url_models(models, false).await;
         self.prune_stale_pinned(&complete_names).await;
+        self.prune_long_context_boundaries(&complete_names).await;
     }
 
     /// Remove models from provider_mappings that are not in `valid_model_names`.

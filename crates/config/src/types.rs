@@ -122,6 +122,7 @@ pub struct ApiConfig {
     pub staking_farm: StakingFarmConfig,
     pub aml: AmlConfig,
     pub usage_reporting: UsageReportingConfig,
+    pub usage_estimate_incomplete_streams: bool,
     /// Posting-time credit allocation policy. The order is persisted with
     /// every attributed usage charge, so changing it never rewrites history.
     pub credit_allocation: CreditAllocationConfig,
@@ -154,6 +155,7 @@ impl std::fmt::Debug for ApiConfig {
             staking_farm,
             aml,
             usage_reporting,
+            usage_estimate_incomplete_streams,
             credit_allocation,
             ita,
             placement,
@@ -182,6 +184,10 @@ impl std::fmt::Debug for ApiConfig {
             .field("staking_farm", staking_farm)
             .field("aml", aml)
             .field("usage_reporting", usage_reporting)
+            .field(
+                "usage_estimate_incomplete_streams",
+                usage_estimate_incomplete_streams,
+            )
             .field("credit_allocation", credit_allocation)
             .field("ita", ita)
             .field("placement", placement)
@@ -269,6 +275,10 @@ impl ApiConfig {
             aml: AmlConfig::from_env()?,
             ita: ItaAttestationConfig::from_env()?,
             usage_reporting: UsageReportingConfig::from_env()?,
+            usage_estimate_incomplete_streams: parse_bool_env(
+                "USAGE_ESTIMATE_INCOMPLETE_STREAMS",
+                true,
+            )?,
             credit_allocation: CreditAllocationConfig::from_env()?,
             placement: PlacementConfig::from_env()?,
         })
@@ -1140,6 +1150,13 @@ pub struct AuthConfig {
     /// outstanding legacy tokens have expired to reject any token that cannot
     /// be tied to a live session.
     pub require_session_bound_access_tokens: bool,
+    /// Accept only admin access tokens (`adm_`) on admin routes.
+    ///
+    /// Default `false`: admin routes accept a session token from an allowlisted
+    /// user or an admin access token. Set `AUTH_ADMIN_TOKENS_ONLY=true` to refuse
+    /// session tokens on admin routes with 401. An admin access token is then
+    /// also accepted only while its creator has at least one admin passkey.
+    pub admin_tokens_only: bool,
 }
 
 impl std::fmt::Debug for AuthConfig {
@@ -1152,6 +1169,7 @@ impl std::fmt::Debug for AuthConfig {
             near,
             admin_emails,
             require_session_bound_access_tokens,
+            admin_tokens_only,
         } = self;
         f.debug_struct("AuthConfig")
             .field("mock", mock)
@@ -1164,6 +1182,7 @@ impl std::fmt::Debug for AuthConfig {
                 "require_session_bound_access_tokens",
                 require_session_bound_access_tokens,
             )
+            .field("admin_tokens_only", admin_tokens_only)
             .finish()
     }
 }
@@ -1243,6 +1262,7 @@ impl AuthConfig {
                 "AUTH_REQUIRE_SESSION_BOUND_ACCESS_TOKENS",
                 false,
             )?,
+            admin_tokens_only: parse_bool_env("AUTH_ADMIN_TOKENS_ONLY", false)?,
         })
     }
 
@@ -2008,6 +2028,28 @@ mod tests {
 
     #[test]
     #[serial]
+    fn usage_estimate_incomplete_streams_defaults_on_and_accepts_false() {
+        let key = "USAGE_ESTIMATE_INCOMPLETE_STREAMS";
+        let original = std::env::var_os(key);
+        std::env::remove_var(key);
+        assert!(parse_bool_env(key, true).unwrap());
+        std::env::set_var(key, "false");
+        assert!(!parse_bool_env(key, true).unwrap());
+        std::env::set_var(key, "0");
+        assert!(!parse_bool_env(key, true).unwrap());
+        std::env::set_var(key, "garbage");
+        assert_eq!(
+            parse_bool_env(key, true),
+            Err(format!("{key} must be true or false"))
+        );
+        match original {
+            Some(value) => std::env::set_var(key, value),
+            None => std::env::remove_var(key),
+        }
+    }
+
+    #[test]
+    #[serial]
     fn credit_allocation_defaults_and_policy_version_boundaries() {
         let _env = CreditAllocationEnvGuard::new();
         let defaults = CreditAllocationConfig::from_env().unwrap();
@@ -2152,6 +2194,7 @@ mod tests {
             near: NearConfig::default(),
             admin_emails: vec!["alice@near.ai".to_string(), "bob@near.org".to_string()],
             require_session_bound_access_tokens: false,
+            admin_tokens_only: false,
         };
 
         // Explicitly allowed addresses
@@ -2257,6 +2300,7 @@ mod tests {
             near: NearConfig::default(),
             admin_emails: vec![],
             require_session_bound_access_tokens: false,
+            admin_tokens_only: false,
         };
 
         // Should return false when no admin emails configured
@@ -2450,6 +2494,7 @@ mod tests {
                 ..AmlConfig::default()
             },
             usage_reporting: UsageReportingConfig::default(),
+            usage_estimate_incomplete_streams: true,
             credit_allocation: CreditAllocationConfig::default(),
             ita: ItaAttestationConfig::default(),
             placement: PlacementConfig {

@@ -255,7 +255,8 @@ pub fn init_auth_services(database: Arc<Database>, config: &ApiConfig) -> AuthCo
         admin_access_token_repository,
         config.auth.admin_emails.clone(),
         config.auth.encoding_key.clone(),
-    );
+    )
+    .with_admin_tokens_only(config.auth.admin_tokens_only);
 
     // Create NEAR nonce repository
     let nonce_repository = Arc::new(database::PostgresNearNonceRepository::new(
@@ -561,7 +562,8 @@ pub async fn init_domain_services_with_pool(
         org_limit_repository,
     )
     .with_model_resolve_cache(models_service.model_resolve_cache())
-    .with_long_context_access(long_context_access);
+    .with_long_context_access(long_context_access)
+    .with_usage_estimate_incomplete_streams(config.usage_estimate_incomplete_streams);
     // Affinity keys only matter to a pool that places requests.
     if let Some(affinity_secret) = inference_provider_pool.affinity_secret() {
         completion_service = completion_service.with_affinity_secret(affinity_secret);
@@ -2958,6 +2960,7 @@ mod tests {
                 near: config::NearConfig::default(),
                 admin_emails: vec![],
                 require_session_bound_access_tokens: false,
+                admin_tokens_only: false,
             },
             database: config::DatabaseConfig {
                 connection_mode: config::DatabaseConnectionMode::Patroni,
@@ -3003,6 +3006,7 @@ mod tests {
             staking_farm: config::StakingFarmConfig::default(),
             aml: config::AmlConfig::default(),
             usage_reporting: config::UsageReportingConfig::default(),
+            usage_estimate_incomplete_streams: true,
             credit_allocation: config::CreditAllocationConfig::default(),
             ita: config::ItaAttestationConfig::default(),
             placement: config::PlacementConfig::default(),
@@ -3084,6 +3088,7 @@ mod tests {
                 near: config::NearConfig::default(),
                 admin_emails: vec![],
                 require_session_bound_access_tokens: false,
+                admin_tokens_only: false,
             },
             database: config::DatabaseConfig {
                 connection_mode: config::DatabaseConnectionMode::Patroni,
@@ -3129,6 +3134,7 @@ mod tests {
             staking_farm: config::StakingFarmConfig::default(),
             aml: config::AmlConfig::default(),
             usage_reporting: config::UsageReportingConfig::default(),
+            usage_estimate_incomplete_streams: true,
             credit_allocation: config::CreditAllocationConfig::default(),
             ita: config::ItaAttestationConfig::default(),
             placement: config::PlacementConfig::default(),

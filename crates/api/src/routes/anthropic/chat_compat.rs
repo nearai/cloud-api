@@ -158,8 +158,9 @@ fn usage(value: &TokenUsage) -> Value {
         "cache_read_input_tokens":read, "cache_creation_input_tokens":write})
 }
 
-fn stop_reason(reason: Option<&str>) -> RouteResult<&'static str> {
+fn stop_reason(reason: Option<&str>, has_tool_calls: bool) -> RouteResult<&'static str> {
     match reason {
+        Some("stop") if has_tool_calls => Ok("tool_use"),
         Some("stop") => Ok("end_turn"),
         Some("tool_calls" | "function_call") => Ok("tool_use"),
         Some("length") => Ok("max_tokens"),
@@ -198,7 +199,8 @@ fn from_chat(
         .find(|c| c.index == 0)
         .ok_or_else(|| upstream("Chat response has no completion"))?;
     let msg = &choice.message;
-    let reason = stop_reason(choice.finish_reason.as_deref())?;
+    let tool_calls = msg.tool_calls.as_deref().unwrap_or_default();
+    let reason = stop_reason(choice.finish_reason.as_deref(), !tool_calls.is_empty())?;
     let mut content = Vec::new();
     if show_thinking {
         if let Some(thought) = msg
@@ -217,7 +219,7 @@ fn from_chat(
     {
         content.push(json!({"type":"text","text":text}));
     }
-    for call in msg.tool_calls.iter().flatten() {
+    for call in tool_calls {
         let id = call
             .id
             .as_deref()
@@ -235,7 +237,7 @@ fn from_chat(
         };
         content.push(json!({"type":"tool_use","id":id,"name":name,"input":input}));
     }
-    if reason == "tool_use" && !content.iter().any(|block| block["type"] == "tool_use") {
+    if reason == "tool_use" && tool_calls.is_empty() {
         return Err(upstream("Chat response ended with a missing tool call"));
     }
     Ok(message(

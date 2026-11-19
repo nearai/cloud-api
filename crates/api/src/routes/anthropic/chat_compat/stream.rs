@@ -281,7 +281,7 @@ impl Encoder {
             Some(FinishReason::ContentFilter) => "content_filter",
             None => return Err(upstream("Chat stream ended before its finish reason")),
         };
-        let reason = stop_reason(Some(reason))?;
+        let reason = stop_reason(Some(reason), !self.tools.is_empty())?;
         if reason == "tool_use" && self.tools.is_empty() {
             return Err(upstream("Chat stream ended with a missing tool call"));
         }

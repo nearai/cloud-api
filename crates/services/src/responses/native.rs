@@ -441,6 +441,7 @@ impl BillingVerdict {
             UsageError::InternalError(_)
             | UsageError::ReportingTimeout
             | UsageError::LimitExceeded(_)
+            | UsageError::AdmissionPolicyUnavailable
             | UsageError::CapacityExceeded
             | UsageError::Unauthorized(_)
             | UsageError::NotFound(_) => Self::Unknown,
@@ -456,6 +457,7 @@ impl BillingVerdict {
             UsageError::ReportingTimeout => "timeout",
             UsageError::LimitExceeded(_) => "limit_exceeded",
             UsageError::CapacityExceeded => "capacity_exceeded",
+            UsageError::AdmissionPolicyUnavailable => "policy_unavailable",
             UsageError::Unauthorized(_) => "unauthorized",
             UsageError::NotFound(_) => "not_found",
         }

@@ -272,13 +272,15 @@ pub fn service_error(error: UsageError) -> crate::completions::ports::Completion
     }
 }
 
+pub(crate) const UNAVAILABLE_MESSAGE: &str = "Monetary admission unavailable";
+
 pub(crate) fn public_message(error: &UsageError) -> String {
     if admission_status(error) == 503 {
         tracing::warn!(
             reason = metrics::error_reason(error),
             "Monetary admission unavailable"
         );
-        "Monetary admission unavailable".into()
+        UNAVAILABLE_MESSAGE.into()
     } else {
         error.to_string()
     }

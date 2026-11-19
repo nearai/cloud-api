@@ -25,15 +25,21 @@ pub(super) async fn server(
     (server, mock, pool, database)
 }
 
-async fn server_with_policy(
-    settings: AdmissionSettings,
-) -> (
+type PolicyFixture = (
     axum_test::TestServer,
     Arc<inference_providers::mock::MockProvider>,
     Arc<services::inference_provider_pool::InferenceProviderPool>,
     Arc<database::Database>,
     Arc<AdminSettingsService>,
-) {
+);
+
+async fn server_with_policy(settings: AdmissionSettings) -> PolicyFixture {
+    let fixture = server_with_stored_policy(serde_json::to_value(settings).unwrap()).await;
+    assert!(fixture.4.reload().await);
+    fixture
+}
+
+async fn server_with_stored_policy(value: Value) -> PolicyFixture {
     let database = Arc::new(database::Database::new(db_setup::create_test_pool().await));
     let mut config = test_config();
     config.internal_usage_token = Some("test-internal-secret".into());
@@ -55,11 +61,7 @@ async fn server_with_policy(
         .unwrap();
     let repository = Arc::new(PostgresAdminSettingsRepository::new(policy_pool));
     repository
-        .upsert(
-            "usage_admission",
-            serde_json::to_value(settings).unwrap(),
-            Uuid::new_v4(),
-        )
+        .upsert("usage_admission", value, Uuid::new_v4())
         .await
         .unwrap();
     let settings = Arc::new(
@@ -69,7 +71,6 @@ async fn server_with_policy(
             )))
             .build(),
     );
-    assert!(settings.reload().await);
     let services = api::init_domain_services_with_pool(
         database.clone(),
         &config,
@@ -121,6 +122,82 @@ async fn enforce_organization(db: &database::Database, settings: &AdminSettingsS
         .await
         .unwrap();
     assert!(settings.reload().await);
+}
+
+#[tokio::test]
+async fn gateway_and_direct_admission_return_503_until_policy_loads() {
+    let (server, mock, _, _, settings) =
+        server_with_stored_policy(json!({"defaults":{"mode":"invalid"}})).await;
+    assert!(!settings.reload().await);
+    setup_qwen_model(&server).await;
+    let org = setup_org_with_credits(&server, 1_000_000_000).await;
+    let ws = list_workspaces(&server, org.id.clone()).await.remove(0);
+    let key = create_api_key_in_workspace(&server, ws.id.clone(), "policy-load".into()).await;
+    let auth = format!("Bearer {}", key.key.as_ref().unwrap());
+    let chat = |stream: bool| {
+        server
+            .post("/v1/chat/completions")
+            .add_header("Authorization", auth.clone())
+            .json(&json!({"model": E2E_QWEN_MODEL_NAME, "stream": stream,
+            "messages": [{"role":"user","content":"hi"}], "max_tokens": 1}))
+    };
+    let features = services::usage::budget::UsageFeatures::from_json(
+        services::usage::InferenceType::ChatCompletion,
+        &json!({"max_tokens":1}),
+    )
+    .unwrap();
+    let direct = || {
+        server
+            .post("/v1/internal/budget")
+            .add_header("Authorization", "Bearer test-internal-secret")
+            .json(
+                &json!({"id": Uuid::new_v4(), "organization_id": org.id, "workspace_id": ws.id,
+            "api_key_id": key.id, "model": E2E_QWEN_MODEL_NAME, "features": features}),
+            )
+    };
+
+    let refusal = direct().await;
+    refusal.assert_status(StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        refusal.json::<Value>()["error"]["type"],
+        "admission_policy_unavailable"
+    );
+    for stream in [false, true] {
+        chat(stream)
+            .await
+            .assert_status(StatusCode::SERVICE_UNAVAILABLE);
+    }
+    assert_eq!(mock.chat_completion_call_count(), 0);
+    use axum_test::multipart::{MultipartForm, Part};
+    server
+        .post("/v1/audio/transcriptions")
+        .add_header("Authorization", auth.clone())
+        .multipart(
+            MultipartForm::new()
+                .add_part(
+                    "file",
+                    Part::bytes(include_bytes!("../fixtures/audio/silence.wav").to_vec())
+                        .file_name("test.wav")
+                        .mime_type("audio/wav"),
+                )
+                .add_text("model", E2E_QWEN_MODEL_NAME),
+        )
+        .await
+        .assert_status(StatusCode::SERVICE_UNAVAILABLE);
+
+    settings
+        .update(
+            "usage_admission",
+            json!({"defaults":{"mode":"audit"}}),
+            Uuid::new_v4(),
+        )
+        .await
+        .unwrap();
+    let admitted = direct().await;
+    admitted.assert_status_ok();
+    assert_eq!(admitted.json::<Value>()["mode"], "audit");
+    chat(false).await.assert_status_ok();
+    assert_eq!(mock.chat_completion_call_count(), 1);
 }
 
 #[tokio::test]

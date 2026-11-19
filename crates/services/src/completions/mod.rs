@@ -1637,6 +1637,13 @@ impl CompletionServiceImpl {
                         message: "The request timed out. Please try again.".to_string(),
                     }
                 }
+                // Local admission errors return before the pool wraps upstream failures.
+                (503, false) if message == crate::usage::budget::UNAVAILABLE_MESSAGE => {
+                    ports::CompletionError::ProviderError {
+                        status_code: 503,
+                        message: message.clone(),
+                    }
+                }
                 // 503 Service Unavailable = service overloaded
                 (503, _) => {
                     tracing::warn!(
@@ -2683,6 +2690,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
                                 "Rate limit exceeded by upstream provider. Please retry with exponential backoff.".to_string(),
                             ));
                         }
+                        503 if message == crate::usage::budget::UNAVAILABLE_MESSAGE => 503,
                         503 => {
                             return Err(ports::CompletionError::ServiceOverloaded(message));
                         }

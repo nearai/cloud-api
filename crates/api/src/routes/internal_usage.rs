@@ -421,6 +421,14 @@ pub async fn reserve_usage_internal(
         )
         .await
         .map_err(|error| match error {
+            services::usage::UsageError::AdmissionPolicyUnavailable => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                ResponseJson(ErrorResponse::new(
+                    "Admission policy unavailable".into(),
+                    "admission_policy_unavailable".into(),
+                )),
+            )
+                .into_response(),
             services::usage::UsageError::LimitExceeded(_) => failure(
                 StatusCode::PAYMENT_REQUIRED,
                 "Insufficient available budget",

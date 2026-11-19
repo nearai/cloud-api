@@ -82,6 +82,11 @@ The administrator-only `usage_admission` setting controls admission. Its default
 organization policy is `audit`: estimates are recorded without creating holds or
 rejecting requests on admission errors. Actual usage is billed in every mode.
 
+An instance needs one successful policy load before it can admit requests. If the first
+load fails, admission returns HTTP 503 and the instance retries every 30 seconds.
+After a successful load, failed refreshes keep the last policy. An empty set of stored
+settings is a successful load and uses the defaults.
+
 Administrators can override individual fields at
 `/v1/admin/organizations/{org_id}/usage-admission`. GET returns the overrides and
 the effective policy. PATCH changes only supplied fields. A JSON `null` restores

@@ -179,8 +179,9 @@ impl AdminSettingsService {
             .ok_or(AdminSettingsError::UnknownKey)
     }
 
-    pub fn admission_policy(&self, org: Uuid) -> AdmissionPolicy {
-        self.admission.load().value.for_organization(org)
+    pub fn admission_policy(&self, org: Uuid) -> Option<AdmissionPolicy> {
+        let snapshot = self.admission.load();
+        (snapshot.version > 0).then(|| snapshot.value.for_organization(org))
     }
 
     async fn refresh_admission(&self) -> bool {
@@ -465,6 +466,42 @@ mod tests {
         (svc, repo, handle)
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn admission_policy_requires_a_first_snapshot_and_survives_refresh_failure() {
+        use crate::usage::budget::policy::{AdmissionMode, AdmissionSettings};
+        let repo = Arc::new(FakeRepo::default());
+        let settings = Arc::new(
+            AdminSettingsService::builder(repo.clone())
+                .register::<UsageAdmissionKey>(Arc::new(ArcSwap::from_pointee(
+                    AdmissionSettings::default(),
+                )))
+                .build(),
+        );
+        let org = Uuid::new_v4();
+        *repo.admission_rows.lock().unwrap() = json!({org.to_string(): {"mode": "enforce"}});
+        *repo.fail_get_all.lock().unwrap() = true;
+        settings.clone().start().await;
+        assert!(settings.admission_policy(org).is_none());
+
+        *repo.fail_get_all.lock().unwrap() = false;
+        tokio::time::sleep(INITIAL_LOAD_RETRY + Duration::from_secs(1)).await;
+        assert_eq!(
+            settings.admission_policy(org).unwrap().mode,
+            AdmissionMode::Enforce
+        );
+        assert_eq!(
+            settings.admission_policy(Uuid::new_v4()).unwrap().mode,
+            AdmissionMode::Audit
+        );
+
+        *repo.fail_get_all.lock().unwrap() = true;
+        assert!(!settings.reload().await);
+        assert_eq!(
+            settings.admission_policy(org).unwrap().mode,
+            AdmissionMode::Enforce
+        );
+    }
+
     #[tokio::test]
     async fn usage_admission_policy_updates_are_published_and_invalid_values_do_not_replace_them() {
         use crate::usage::budget::policy::{AdmissionMode, AdmissionSettings, UsageAdmissionKey};
@@ -485,7 +522,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(settings.admission_policy(org).key_max_unsettled, 8);
+        assert_eq!(settings.admission_policy(org).unwrap().key_max_unsettled, 8);
         assert_eq!(
             settings.current::<UsageAdmissionKey>().defaults.mode,
             AdmissionMode::Audit
@@ -495,17 +532,20 @@ mod tests {
                 .update("usage_admission", json!({"enabled":enabled}), author)
                 .await
                 .unwrap();
-            assert_eq!(settings.admission_policy(org).mode, expected);
+            assert_eq!(settings.admission_policy(org).unwrap().mode, expected);
             let reader = AdminSettingsService::builder(repo.clone())
                 .register::<UsageAdmissionKey>(Arc::new(ArcSwap::from_pointee(
                     AdmissionSettings::default(),
                 )))
                 .build();
             assert!(reader.reload().await);
-            assert_eq!(reader.admission_policy(org).mode, expected);
+            assert_eq!(reader.admission_policy(org).unwrap().mode, expected);
         }
         assert_eq!(
-            settings.admission_policy(org).organization_max_unsettled,
+            settings
+                .admission_policy(org)
+                .unwrap()
+                .organization_max_unsettled,
             512
         );
         assert!(settings
@@ -531,10 +571,16 @@ mod tests {
         assert_eq!(handle.load().defaults.mode, AdmissionMode::Off);
         *repo.admission_rows.lock().unwrap() = json!({org.to_string():{"mode":"misspelled"}});
         assert!(!settings.reload().await);
-        assert_eq!(settings.admission_policy(org).mode, AdmissionMode::Enforce);
+        assert_eq!(
+            settings.admission_policy(org).unwrap().mode,
+            AdmissionMode::Enforce
+        );
         *repo.admission_rows.lock().unwrap() = json!({});
         assert!(settings.reload().await);
-        assert_eq!(settings.admission_policy(org).mode, AdmissionMode::Off);
+        assert_eq!(
+            settings.admission_policy(org).unwrap().mode,
+            AdmissionMode::Off
+        );
         let row = repo
             .rows
             .lock()

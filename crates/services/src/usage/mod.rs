@@ -201,11 +201,11 @@ pub struct UsageServiceImpl {
 }
 
 impl UsageServiceImpl {
-    fn admission_policy(&self, organization_id: Uuid) -> budget::policy::AdmissionPolicy {
-        self.admission_settings
-            .as_ref()
-            .map(|settings| settings.admission_policy(organization_id))
-            .unwrap_or_default()
+    fn admission_policy(&self, organization_id: Uuid) -> Option<budget::policy::AdmissionPolicy> {
+        match &self.admission_settings {
+            Some(settings) => settings.admission_policy(organization_id),
+            None => Some(Default::default()),
+        }
     }
 
     pub fn with_admission_settings(
@@ -225,7 +225,9 @@ impl UsageServiceImpl {
         path: &'static str,
     ) -> Result<budget::BudgetAdmission, UsageError> {
         use budget::{metrics, policy::AdmissionMode};
-        let policy = self.admission_policy(identity.organization_id);
+        let policy = self
+            .admission_policy(identity.organization_id)
+            .ok_or(UsageError::AdmissionPolicyUnavailable)?;
         let mode = policy.mode.combined(requested_mode);
         let started = std::time::Instant::now();
         let mut audit_error = None;
@@ -502,6 +504,7 @@ impl UsageServiceTrait for UsageServiceImpl {
     async fn mark_budget_unknown(&self, organization_id: Uuid, id: Uuid) -> Result<(), UsageError> {
         let grace = self
             .admission_policy(organization_id)
+            .unwrap_or_default()
             .unknown_outcome_ttl_seconds;
         tokio::time::timeout(
             std::time::Duration::from_secs(2),

@@ -13,7 +13,11 @@ use axum::{
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::Response,
 };
-use inference_providers::{ChatCompletionResponse, ServingProvider, TokenUsage};
+use inference_providers::{
+    models::{FunctionCall, ToolCall},
+    ChatCompletionResponse, ServingProvider, TokenUsage,
+};
+use serde::Deserialize;
 use serde_json::{json, Value};
 use services::completions::{hash_inference_id_to_uuid, CompletionError};
 use uuid::Uuid;
@@ -185,6 +189,10 @@ fn tool_input(raw: &str) -> RouteResult<Value> {
     Ok(value)
 }
 
+fn legacy_tool_id(message_id: &str) -> String {
+    format!("call_{}", hash_inference_id_to_uuid(message_id).simple())
+}
+
 fn from_chat(
     chat: &ChatCompletionResponse,
     model: &str,
@@ -199,7 +207,24 @@ fn from_chat(
         .find(|c| c.index == 0)
         .ok_or_else(|| upstream("Chat response has no completion"))?;
     let msg = &choice.message;
-    let tool_calls = msg.tool_calls.as_deref().unwrap_or_default();
+    let legacy_call;
+    let tool_calls = match (
+        msg.tool_calls.as_deref().unwrap_or_default(),
+        &msg.function_call,
+    ) {
+        ([], Some(function)) => {
+            legacy_call = ToolCall {
+                id: Some(legacy_tool_id(&chat.id)),
+                function: FunctionCall::deserialize(function)
+                    .map_err(|_| upstream("Invalid legacy function call in chat response"))?,
+                type_: None,
+                index: None,
+                thought_signature: None,
+            };
+            std::slice::from_ref(&legacy_call)
+        }
+        (calls, _) => calls,
+    };
     let reason = stop_reason(choice.finish_reason.as_deref(), !tool_calls.is_empty())?;
     let mut content = Vec::new();
     if show_thinking {

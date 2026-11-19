@@ -113,6 +113,41 @@ fn translates_json_with_cache_counts_and_tool_replay() {
     );
 }
 
+#[test]
+fn legacy_function_call_returns_a_replayable_tool_use() {
+    let mut chat: ChatCompletionResponse = serde_json::from_value(json!({
+        "id": "chat-123", "object": "chat.completion", "created": 1, "model": "chat",
+        "choices": [{"index": 0, "finish_reason": "function_call", "message": {
+            "role": "assistant", "content": null, "tool_calls": [],
+            "function_call": {"name": "lookup", "arguments": r#"{"city":"Paris"}"#}
+        }}],
+        "usage": {"prompt_tokens": 4, "completion_tokens": 2, "total_tokens": 6}
+    }))
+    .unwrap();
+    let message = from_chat(&chat, "chat", false).unwrap();
+    let id = message["content"][0]["id"].as_str().unwrap();
+    assert!(!id.is_empty());
+    assert_eq!(message["stop_reason"], "tool_use");
+    assert_eq!(
+        message["content"],
+        json!([{
+            "type": "tool_use", "id": id, "name": "lookup", "input": {"city": "Paris"}
+        }])
+    );
+
+    let next = request(json!([
+        {"role":"user","content":"Look up Paris"},
+        {"role":"assistant","content":message["content"]},
+        {"role":"user","content":[{"type":"tool_result","tool_use_id":id,"content":"sunny"}]}
+    ]));
+    let history = serde_json::to_value(request::translate(&next, "chat", false).unwrap()).unwrap();
+    assert_eq!(history["messages"][1]["tool_calls"][0]["id"], id);
+    assert_eq!(history["messages"][2]["tool_call_id"], id);
+
+    chat.choices[0].message.function_call.as_mut().unwrap()["arguments"] = json!("{");
+    assert!(from_chat(&chat, "chat", false).is_err());
+}
+
 fn chunk(choices: Value, usage: Value) -> SSEEvent {
     let chunk:ChatCompletionChunk=serde_json::from_value(json!({"id":"chat-123","model":"upstream","object":"chat.completion.chunk","created":1,"choices":choices,"usage":usage})).unwrap();
     SSEEvent {
@@ -144,6 +179,42 @@ async fn events(chunks: Vec<SSEEvent>) -> Vec<Value> {
     })
     .collect()
     .await
+}
+
+#[tokio::test]
+async fn legacy_function_deltas_form_one_tool_use() {
+    let out = events(vec![
+        delta(json!({"role":"assistant","function_call":null}), None),
+        delta(
+            json!({"function_call":{"name":"lookup","arguments":""}}),
+            None,
+        ),
+        delta(json!({"function_call":{"arguments":"{\"city\":"}}), None),
+        delta(json!({"function_call":{"arguments":"\"Paris\"}"}}), None),
+        delta(json!({}), Some("function_call")),
+    ])
+    .await;
+
+    assert_eq!(out.last().unwrap()["type"], "message_stop");
+    let starts: Vec<_> = out
+        .iter()
+        .filter(|e| e["type"] == "content_block_start")
+        .collect();
+    assert_eq!(starts.len(), 1);
+    let block = &starts[0]["content_block"];
+    assert_eq!(block["type"], "tool_use");
+    assert_eq!(block["name"], "lookup");
+    assert!(!block["id"].as_str().unwrap().is_empty());
+    let args: String = out
+        .iter()
+        .filter_map(|e| e["delta"]["partial_json"].as_str())
+        .collect();
+    assert_eq!(
+        serde_json::from_str::<Value>(&args).unwrap(),
+        json!({"city":"Paris"})
+    );
+    let terminal = out.iter().find(|e| e["type"] == "message_delta").unwrap();
+    assert_eq!(terminal["delta"]["stop_reason"], "tool_use");
 }
 
 #[tokio::test]

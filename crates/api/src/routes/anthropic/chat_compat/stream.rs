@@ -1,10 +1,13 @@
-use super::{message, stop_reason, tool_input, upstream, usage, valid_message_id, RouteResult};
+use super::{
+    legacy_tool_id, message, stop_reason, tool_input, upstream, usage, valid_message_id,
+    RouteResult,
+};
 use crate::routes::anthropic::STREAM_ID_PEEK_TIMEOUT;
 use axum::body::Bytes;
 use futures_util::{future::ready, stream, StreamExt};
 use inference_providers::{
     anthropic_raw::AnthropicRawBody,
-    models::{ChatCompletionChunk, ToolCallDelta},
+    models::{ChatCompletionChunk, FunctionCallDelta},
     FinishReason, StreamChunk, StreamingResult, TokenUsage,
 };
 use serde_json::{json, Value};
@@ -101,7 +104,7 @@ struct Tool {
 struct Encoder {
     model: String,
     show_thinking: bool,
-    started: bool,
+    message_id: String,
     index: usize,
     open_text: Option<&'static str>,
     tools: BTreeMap<i64, Tool>,
@@ -117,7 +120,7 @@ impl Encoder {
         Self {
             model,
             show_thinking,
-            started: false,
+            message_id: String::new(),
             index: 0,
             open_text: None,
             tools: BTreeMap::new(),
@@ -133,15 +136,15 @@ impl Encoder {
         if let Some(usage) = chunk.usage {
             self.usage = usage;
         }
-        if !self.started {
+        if self.message_id.is_empty() {
             if !valid_message_id(&chunk.id) {
                 return Err(upstream("Chat stream has no message ID"));
             }
-            self.started = true;
-            out.push_back(frame(json!({"type":"message_start","message":message(&chunk.id,&self.model,json!([]),None,usage(&self.usage))})));
+            self.message_id = chunk.id;
+            out.push_back(frame(json!({"type":"message_start","message":message(&self.message_id,&self.model,json!([]),None,usage(&self.usage))})));
         }
         for choice in chunk.choices.into_iter().filter(|c| c.index == 0) {
-            if let Some(delta) = choice.delta {
+            if let Some(mut delta) = choice.delta {
                 if self.show_thinking {
                     self.text(
                         "thinking",
@@ -155,8 +158,20 @@ impl Encoder {
                     delta.extra.get("refusal").and_then(Value::as_str),
                     out,
                 )?;
-                for call in delta.tool_calls.into_iter().flatten() {
-                    self.tool(call, out)?;
+                let calls = delta.tool_calls.unwrap_or_default();
+                if let Some(function) = delta
+                    .extra
+                    .remove("function_call")
+                    .filter(|f| calls.is_empty() && !f.is_null())
+                {
+                    let function = serde_json::from_value(function)
+                        .map_err(|_| upstream("Invalid legacy function call in chat stream"))?;
+                    let id =
+                        (!self.tools.contains_key(&0)).then(|| legacy_tool_id(&self.message_id));
+                    self.tool(0, id, Some(function), out)?;
+                }
+                for call in calls {
+                    self.tool(call.index.unwrap_or(0), call.id, call.function, out)?;
                 }
             }
             if choice.finish_reason.is_some() {
@@ -227,20 +242,25 @@ impl Encoder {
         Ok(())
     }
 
-    fn tool(&mut self, delta: ToolCallDelta, out: &mut Frames) -> RouteResult<()> {
+    fn tool(
+        &mut self,
+        key: i64,
+        id: Option<String>,
+        function: Option<FunctionCallDelta>,
+        out: &mut Frames,
+    ) -> RouteResult<()> {
         self.close_text(out);
-        let key = delta.index.unwrap_or(0);
         if !(0..128).contains(&key) {
             return Err(upstream("Invalid chat tool index"));
         }
         let tool = self.tools.entry(key).or_default();
-        if let Some(id) = delta.id.filter(|id| !id.is_empty()) {
+        if let Some(id) = id.filter(|id| !id.is_empty()) {
             if !tool.id.is_empty() && tool.id != id {
                 return Err(upstream("Chat tool ID changed during streaming"));
             }
             tool.id = id;
         }
-        if let Some(f) = delta.function {
+        if let Some(f) = function {
             if let Some(name) = f.name.filter(|n| !n.is_empty() && *n != tool.name) {
                 if self.live_tool == Some(key) {
                     return Err(upstream("Chat tool name changed after its arguments began"));

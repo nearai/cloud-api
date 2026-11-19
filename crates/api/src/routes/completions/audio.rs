@@ -208,9 +208,32 @@ pub async fn audio_transcriptions(
         _ => request.response_format.clone(),
     };
 
+    let mut features = services::usage::budget::UsageFeatures::measure_json(
+        services::usage::InferenceType::AudioTranscription,
+        &serde_json::json!({}),
+    );
+    features.media_bytes = request.file_bytes.len() as u64;
+    // Meter a shared view of the upload; keep the original available even if the
+    // blocking parser fails. Once it finishes, the provider reuses the same buffer.
+    let file_bytes = bytes::Bytes::from(request.file_bytes);
+    let file_duration_seconds = if app_state.usage_service.measure_admission(organization_id) {
+        crate::audio_duration::measure(file_bytes.clone()).await
+    } else {
+        None
+    };
+    features.audio_duration_seconds = file_duration_seconds.map(|n| n as u64);
+    let budget = match crate::routes::common::usage_execution(
+        &app_state,
+        &api_key,
+        model_id,
+        features.with_model(&model),
+    ) {
+        Ok(budget) => budget,
+        Err(response) => return response.into_response(),
+    };
     let params = inference_providers::AudioTranscriptionParams {
         model: model_name.clone(),
-        file_bytes: request.file_bytes,
+        file_bytes: file_bytes.into(),
         filename: request.filename,
         language: request
             .language
@@ -222,17 +245,21 @@ pub async fn audio_transcriptions(
     };
 
     // Call completion service which handles concurrent request limiting
-    match app_state
-        .completion_service
-        .audio_transcription(
+    let result = budget
+        .run(app_state.completion_service.audio_transcription(
             organization_id,
             model_id,
             &model_name,
             params,
             body_hash.hash.clone(),
-        )
-        .await
-    {
+        ))
+        .await;
+    let mut outcome = services::usage::budget::OutcomeGuard::new(
+        app_state.usage_service.clone(),
+        organization_id,
+        budget.id().await.ok().flatten(),
+    );
+    match result {
         Ok(response) => {
             // Record usage for audio transcription SYNCHRONOUSLY before returning response
             // Critical for financial accuracy: if usage recording fails, client gets 500 error
@@ -244,7 +271,9 @@ pub async fn audio_transcriptions(
             let duration_seconds = billing::reported_audio_seconds(response.billable_duration());
             let duration_seconds = match billing::require_positive_units(duration_seconds) {
                 Ok(seconds) => seconds,
-                Err(response) => return response,
+                Err(response) => {
+                    return response;
+                }
             };
 
             // Parse API key ID to UUID
@@ -265,6 +294,7 @@ pub async fn audio_transcriptions(
 
             let inference_id = uuid::Uuid::new_v4();
             let usage_request = services::usage::RecordUsageServiceRequest {
+                budget_id: budget.id().await.ok().flatten(),
                 input_tokens: duration_seconds, // Bill by duration in seconds
                 inference_id: Some(inference_id),
                 stop_reason: Some(services::usage::StopReason::Completed),
@@ -301,6 +331,7 @@ pub async fn audio_transcriptions(
                     .into_response();
             }
 
+            outcome.disarm();
             tracing::info!(
                 %organization_id,
                 %workspace_id,
@@ -323,6 +354,14 @@ pub async fn audio_transcriptions(
         }
         Err(e) => {
             let (status_code, error_type, message) = match e {
+                services::completions::ports::CompletionError::Admission {
+                    status_code,
+                    message,
+                } => (
+                    StatusCode::from_u16(status_code).unwrap_or(StatusCode::SERVICE_UNAVAILABLE),
+                    services::usage::budget::admission_error_type(status_code, &message),
+                    message,
+                ),
                 services::completions::ports::CompletionError::RateLimitExceeded(msg) => {
                     tracing::warn!("Concurrent request limit exceeded for audio transcription");
                     (StatusCode::TOO_MANY_REQUESTS, "rate_limit_error", msg)

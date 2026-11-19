@@ -64,6 +64,7 @@ pub mod models;
 pub mod non_attested;
 pub mod placement_io;
 pub mod responses_raw;
+pub mod retry_admission;
 pub mod rotation;
 pub mod spki_verifier;
 pub mod sse_parser;

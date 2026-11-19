@@ -15,7 +15,7 @@ use super::*;
 use crate::inference_provider_pool::ProviderPoolRole;
 use crate::long_context_access::{LongContextAccess, LongContextAccessRepository};
 use crate::metrics::capturing::CapturingMetricsService;
-use crate::test_utils::{CapturingUsageService, MockAttestationService};
+use crate::test_utils::{with_test_budget, CapturingUsageService, MockAttestationService};
 
 const MODEL: &str = "org/tiered";
 
@@ -258,20 +258,21 @@ async fn a_restriction_decided_before_a_tier_appears_still_applies() {
         ..Default::default()
     };
 
+    let dispatch = |bytes, hash: &str, allowed| {
+        with_test_budget(pool.chat_completion_with_attribution_and_hints(
+            params(bytes),
+            hash.to_string(),
+            hints(allowed),
+        ))
+    };
+
     // Small request: the base tier fails and the long tier is never tried.
-    assert!(pool
-        .chat_completion_with_attribution_and_hints(params(40), "h1".into(), hints(allowed))
-        .await
-        .is_err());
+    assert!(dispatch(40, "h1", allowed).await.is_err());
+    assert!(f.base.chat_completion_call_count() > 0);
     assert_eq!(f.long.chat_completion_call_count(), 0);
     // Oversized request: refused, as the boundary now exists.
     assert!(matches!(
-        pool.chat_completion_with_attribution_and_hints(
-            params(20_000),
-            "h2".into(),
-            hints(allowed)
-        )
-        .await,
+        dispatch(20_000, "h2", allowed).await,
         Err(ProviderError::HttpError {
             status_code: 400,
             ..
@@ -280,7 +281,7 @@ async fn a_restriction_decided_before_a_tier_appears_still_applies() {
     assert_eq!(f.long.chat_completion_call_count(), 0);
 
     // Control: an unrestricted request fails over to the long tier.
-    pool.chat_completion_with_attribution_and_hints(params(40), "h3".into(), hints(true))
+    dispatch(40, "h3", true)
         .await
         .expect("failover to the long tier");
     assert_eq!(f.long.chat_completion_call_count(), 1);

@@ -13,9 +13,9 @@ fn translates_claude_tool_history_and_images() {
         {"role":"assistant","content":[{"type":"thinking","thinking":"Use the tool","signature":""},
             {"type":"tool_use","id":"call-a","name":"Read","input":{"file_path":"sample.txt"}},
             {"type":"tool_use","id":"call-b","name":"Read","input":{"file_path":"second.txt"}}]},
-        {"role":"user","content":[{"type":"tool_result","tool_use_id":"call-a","content":[
-            {"type":"text","text":"image from file"},{"type":"image","source":{"type":"base64","media_type":"image/png","data":"YQ=="}}]},
-            {"type":"tool_result","tool_use_id":"call-b","is_error":true,"content":"missing"},
+        {"role":"user","content":[{"type":"tool_result","tool_use_id":"call-b","is_error":true,"content":"missing"},
+            {"type":"tool_result","tool_use_id":"call-a","content":[
+                {"type":"text","text":"image from file"},{"type":"image","source":{"type":"base64","media_type":"image/png","data":"YQ=="}}]},
             {"type":"text","text":"summarize"}]}
     ]));
     body["tools"] = json!([{"name":"Read","input_schema":{"type":"object","properties":{"file_path":{"type":"string"}}}}]);
@@ -33,9 +33,10 @@ fn translates_claude_tool_history_and_images() {
         m[2]["tool_calls"][0]["function"]["arguments"],
         r#"{"file_path":"sample.txt"}"#
     );
-    assert_eq!(m[3]["tool_call_id"], "call-a");
-    assert_eq!(m[4]["tool_call_id"], "call-b");
-    assert_eq!(m[4]["content"], "Tool error:\nmissing");
+    assert_eq!(m[3]["tool_call_id"], "call-b");
+    assert_eq!(m[3]["content"], "Tool error:\nmissing");
+    assert_eq!(m[4]["tool_call_id"], "call-a");
+    assert_eq!(m[4]["content"], "image from file");
     assert_eq!(
         m[5]["content"][0]["image_url"]["url"],
         "data:image/png;base64,YQ=="
@@ -101,7 +102,11 @@ fn translates_json_with_cache_counts_and_tool_replay() {
     let call = &mut chat.choices[0].message.tool_calls.as_mut().unwrap()[0];
     call.function.arguments = Some("{".into());
     assert!(from_chat(&chat, "vendor/private", false).is_err());
+    chat.choices[0].finish_reason = Some("length".into());
+    let truncated = from_chat(&chat, "vendor/private", false).unwrap();
+    assert_eq!(truncated["stop_reason"], "max_tokens");
     chat.choices[0].message.tool_calls = None;
+    chat.choices[0].finish_reason = Some("stop".into());
     assert_eq!(
         from_chat(&chat, "vendor/private", false).unwrap()["stop_reason"],
         "end_turn"
@@ -210,17 +215,14 @@ async fn streamed_stop_reason_accounts_for_a_completed_tool_call() {
 }
 
 #[tokio::test]
-async fn incomplete_stream_or_bad_tool_json_never_emits_success() {
+async fn partial_streams_distinguish_truncation_from_failure() {
+    let partial_tool =
+        json!({"tool_calls":[{"index":0,"id":"one","function":{"name":"Read","arguments":"{"}}]});
     for chunks in [
         vec![delta(json!({"content":"partial"}), None)],
-        vec![delta(
-            json!({"tool_calls":[{"index":0,"id":"one","function":{"name":"Read","arguments":"{"}}]}),
-            Some("tool_calls"),
-        )],
-        vec![delta(
-            json!({"tool_calls":[{"index":0,"id":"one","function":{"name":"Read","arguments":"{"}}]}),
-            Some("stop"),
-        )],
+        vec![delta(partial_tool.clone(), None)],
+        vec![delta(partial_tool.clone(), Some("tool_calls"))],
+        vec![delta(partial_tool.clone(), Some("stop"))],
     ] {
         let out = events(chunks).await;
         assert_eq!(out.last().unwrap()["type"], "error");
@@ -228,6 +230,15 @@ async fn incomplete_stream_or_bad_tool_json_never_emits_success() {
             .iter()
             .any(|e| matches!(e["type"].as_str(), Some("message_delta" | "message_stop"))));
     }
+
+    let out = events(vec![
+        delta(partial_tool, None),
+        delta(json!({}), Some("length")),
+    ])
+    .await;
+    assert_eq!(out.last().unwrap()["type"], "message_stop");
+    let terminal = out.iter().find(|e| e["type"] == "message_delta").unwrap();
+    assert_eq!(terminal["delta"]["stop_reason"], "max_tokens");
 }
 
 #[test]

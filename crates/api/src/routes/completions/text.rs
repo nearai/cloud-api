@@ -346,6 +346,13 @@ pub(super) async fn completions_inner(
                             }
                             true
                         }
+                        Some(Err(error)) => {
+                            return initial_stream_error_response(
+                                &request.model,
+                                error,
+                                api_key.organization.id.0,
+                            );
+                        }
                         _ => break None,
                     };
                     if is_control {
@@ -460,6 +467,7 @@ pub(super) async fn completions_inner(
                                     stream_error_count
                                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                     tracing::error!(
+                                        %request_id,
                                         %organization_id,
                                         model = %model_for_err,
                                         error_type = %completion_stream_error_category(&e),
@@ -482,8 +490,11 @@ pub(super) async fn completions_inner(
                             let stream_errored = stream_error_count
                                 .load(std::sync::atomic::Ordering::Relaxed)
                                 > 0;
+                            if stream_errored {
+                                return None;
+                            }
 
-                            if legacy_gateway_signature_enabled && !stream_errored {
+                            if legacy_gateway_signature_enabled {
                                 let response_hash = {
                                     let mut hasher = public_signature_hasher.lock().await;
                                     hasher.update(&done);
@@ -523,9 +534,9 @@ pub(super) async fn completions_inner(
                                 }
                             }
 
-                            Ok::<Bytes, Infallible>(done)
+                            Some(Ok::<Bytes, Infallible>(done))
                         }
-                    }));
+                    }).filter_map(futures::future::ready));
 
                 let mut response_builder = Response::builder()
                     .status(StatusCode::OK)

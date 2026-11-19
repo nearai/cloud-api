@@ -157,12 +157,61 @@ impl BudgetExecution {
         output
     }
 
+    async fn admit_attempt(&self) -> Result<(), UsageError> {
+        let mut last = self.last.lock().await;
+        let service = self.service.clone();
+        let identity = self.identity;
+        let features = self.features.clone();
+        let mut pending = PendingAdmission {
+            result: Some(Box::pin(
+                async move { service.admit(identity, features).await },
+            )),
+            service: self.service.clone(),
+            org: identity.organization_id,
+        };
+        let result = pending.result.as_mut().expect("pending admission").await;
+        pending.result = None;
+        *last = Some(Attempt {
+            id: result?,
+            dispatched: false,
+        });
+        Ok(())
+    }
+
     pub async fn id(&self) -> Result<Option<Uuid>, UsageError> {
         self.last
             .lock()
             .await
             .map(|attempt| attempt.id)
             .ok_or_else(|| UsageError::InternalError("execution has no admitted attempt".into()))
+    }
+}
+
+// If the caller leaves during admission, finish that same decision before releasing it.
+struct PendingAdmission {
+    result: Option<futures_util::future::BoxFuture<'static, Result<Option<Uuid>, UsageError>>>,
+    service: Arc<dyn super::UsageServiceTrait>,
+    org: Uuid,
+}
+impl Drop for PendingAdmission {
+    fn drop(&mut self) {
+        if let (Some(result), Ok(runtime)) =
+            (self.result.take(), tokio::runtime::Handle::try_current())
+        {
+            let service = self.service.clone();
+            let org = self.org;
+            runtime.spawn(async move {
+                if let Ok(Some(id)) = result.await {
+                    release_undispatched(service.as_ref(), org, id).await;
+                }
+            });
+        }
+    }
+}
+
+async fn release_undispatched(service: &dyn super::UsageServiceTrait, org: Uuid, id: Uuid) {
+    if service.release_budget(org, id).await.is_err() {
+        unknown_outcome(service, org, Some(id)).await;
     }
 }
 
@@ -246,33 +295,24 @@ pub async fn before_attempt() -> Result<(), UsageError> {
     let execution = EXECUTION
         .try_with(Clone::clone)
         .map_err(|_| UsageError::InternalError("execution is missing monetary admission".into()))?;
-    let id = execution
-        .service
-        .admit(execution.identity, execution.features.clone())
-        .await?;
-    *execution.last.lock().await = Some(Attempt {
-        id,
-        dispatched: false,
-    });
-    Ok(())
+    execution.admit_attempt().await
 }
 
 pub fn completion_error(error: UsageError) -> inference_providers::CompletionError {
-    inference_providers::CompletionError::HttpError {
+    inference_providers::CompletionError::Admission {
         status_code: admission_status(&error),
         message: public_message(&error),
-        is_external: false,
     }
 }
 
 pub fn service_error(error: UsageError) -> crate::completions::ports::CompletionError {
-    crate::completions::ports::CompletionError::ProviderError {
+    crate::completions::ports::CompletionError::Admission {
         status_code: admission_status(&error),
         message: public_message(&error),
     }
 }
 
-pub(crate) const UNAVAILABLE_MESSAGE: &str = "Monetary admission unavailable";
+const UNAVAILABLE_MESSAGE: &str = "Monetary admission unavailable";
 
 pub(crate) fn public_message(error: &UsageError) -> String {
     if admission_status(error) == 503 {
@@ -283,6 +323,19 @@ pub(crate) fn public_message(error: &UsageError) -> String {
         UNAVAILABLE_MESSAGE.into()
     } else {
         error.to_string()
+    }
+}
+
+pub fn admission_error_type(status: u16, message: &str) -> &'static str {
+    match status {
+        400 => "invalid_request_error",
+        402 if message.starts_with("Limit exceeded: API key spend limit exceeded.") => {
+            "api_key_limit_exceeded"
+        }
+        402 => "insufficient_credits",
+        403 => "permission_error",
+        429 => "rate_limit_exceeded",
+        _ => "service_overloaded",
     }
 }
 
@@ -318,13 +371,9 @@ impl inference_providers::retry_admission::RetryAdmission for BudgetExecution {
                     Some(id),
                 )
                 .await;
-            } else if self
-                .service
-                .release_budget(self.identity.organization_id, id)
-                .await
-                .is_err()
-            {
-                tracing::warn!(%id, "Undispatched budget release failed; awaiting expiry");
+            } else {
+                release_undispatched(self.service.as_ref(), self.identity.organization_id, id)
+                    .await;
             }
         }
     }
@@ -332,29 +381,12 @@ impl inference_providers::retry_admission::RetryAdmission for BudgetExecution {
     async fn release_not_dispatched(&self) {
         let attempt = self.last.lock().await.take();
         if let Some(Attempt { id: Some(id), .. }) = attempt {
-            if self
-                .service
-                .release_budget(self.identity.organization_id, id)
-                .await
-                .is_err()
-            {
-                // Existing expiry remains the fallback; never turn release failure into a retry.
-                tracing::warn!(%id, "Undispatched budget release failed; awaiting expiry");
-            }
+            release_undispatched(self.service.as_ref(), self.identity.organization_id, id).await;
         }
     }
     async fn admit_retry(&self) -> Result<(), inference_providers::CompletionError> {
         self.attempt_failed().await;
-        let id = self
-            .service
-            .admit(self.identity, self.features.clone())
-            .await
-            .map_err(completion_error)?;
-        *self.last.lock().await = Some(Attempt {
-            id,
-            dispatched: false,
-        });
-        Ok(())
+        self.admit_attempt().await.map_err(completion_error)
     }
 }
 
@@ -374,10 +406,10 @@ mod tests {
         ] {
             assert_eq!(admission_status(&error), expected);
             assert!(
-                matches!(completion_error(error.clone()), inference_providers::CompletionError::HttpError {status_code,..} if status_code==expected)
+                matches!(completion_error(error.clone()), inference_providers::CompletionError::Admission {status_code,..} if status_code==expected)
             );
             assert!(
-                matches!(service_error(error), crate::completions::ports::CompletionError::ProviderError {status_code,..} if status_code==expected)
+                matches!(service_error(error), crate::completions::ports::CompletionError::Admission {status_code,..} if status_code==expected)
             );
         }
     }
@@ -387,7 +419,7 @@ mod tests {
         let error = UsageError::InternalError("host=private-db SELECT secret FROM account".into());
         for message in [
             match completion_error(error.clone()) {
-                inference_providers::CompletionError::HttpError {
+                inference_providers::CompletionError::Admission {
                     status_code: 503,
                     message,
                     ..
@@ -395,7 +427,7 @@ mod tests {
                 other => panic!("{other:?}"),
             },
             match service_error(error) {
-                crate::completions::ports::CompletionError::ProviderError {
+                crate::completions::ports::CompletionError::Admission {
                     status_code: 503,
                     message,
                 } => message,
@@ -441,6 +473,69 @@ mod tests {
         let mut huge = pricing;
         huge.cost_per_image = i64::MAX;
         assert!(estimate.quote(&huge).is_err());
+    }
+
+    #[tokio::test]
+    async fn cancelled_admission_finishes_then_releases_its_own_hold() {
+        use inference_providers::retry_admission::RetryAdmission;
+        use tokio::time::{timeout, Duration};
+        for retry in [false, true] {
+            let mut service = crate::test_utils::CapturingUsageService::new();
+            service.admission_reply = Some(tokio::sync::Semaphore::new(usize::from(retry)));
+            service.fail_release = retry;
+            let service = Arc::new(service);
+            let execution = BudgetExecution::new(
+                service.clone(),
+                BillingIdentity {
+                    organization_id: Uuid::new_v4(),
+                    workspace_id: Uuid::new_v4(),
+                    api_key_id: Uuid::new_v4(),
+                    model_id: Uuid::new_v4(),
+                },
+                UsageFeatures::from_json(InferenceType::ChatCompletion, &json!({})).unwrap(),
+            );
+            let task = tokio::spawn(async move {
+                execution
+                    .run(async {
+                        before_attempt().await.unwrap();
+                        if retry {
+                            execution.mark_dispatched().await;
+                            execution.admit_retry().await.unwrap();
+                        }
+                    })
+                    .await;
+            });
+            timeout(Duration::from_secs(2), async {
+                while service.admissions.lock().unwrap().len() != 1 + usize::from(retry) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+            assert!(service.releases.lock().unwrap().is_empty());
+            service.admission_reply.as_ref().unwrap().add_permits(1);
+            timeout(Duration::from_secs(2), async {
+                while service.releases.lock().unwrap().is_empty()
+                    || (retry && service.unknown_outcomes.lock().unwrap().len() < 2)
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            let admissions = service.admissions.lock().unwrap();
+            assert_eq!(
+                *service.releases.lock().unwrap(),
+                [*admissions.last().unwrap()]
+            );
+            if retry {
+                assert_eq!(*service.unknown_outcomes.lock().unwrap(), *admissions);
+            } else {
+                assert!(service.unknown_outcomes.lock().unwrap().is_empty());
+            }
+        }
     }
 
     #[tokio::test]

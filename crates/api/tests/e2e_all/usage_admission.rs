@@ -142,7 +142,7 @@ async fn enforce_organization(db: &database::Database, settings: &AdminSettingsS
 
 #[tokio::test]
 async fn gateway_and_direct_admission_return_503_until_policy_loads() {
-    let (server, mock, _, _, settings) =
+    let (server, mock, _, db, settings) =
         server_with_stored_policy(json!({"defaults":{"mode":"invalid"}})).await;
     assert!(!settings.reload().await);
     setup_qwen_model(&server).await;
@@ -214,6 +214,30 @@ async fn gateway_and_direct_admission_return_503_until_policy_loads() {
     assert_eq!(admitted.json::<Value>()["mode"], "audit");
     chat(false).await.assert_status_ok();
     assert_eq!(mock.chat_completion_call_count(), 1);
+
+    let other = setup_org_with_credits(&server, 1_000_000_000).await;
+    let other_key = get_api_key_for_org(&server, other.id).await;
+    db.pool().get().await.unwrap().execute(
+        "INSERT INTO organization_usage_admission (organization_id,mode,reservation_ttl_seconds) VALUES ($1,'enforce',120)",
+        &[&Uuid::parse_str(&org.id).unwrap()],
+    ).await.unwrap();
+    assert!(settings.reload().await);
+    direct()
+        .await
+        .assert_status(StatusCode::SERVICE_UNAVAILABLE);
+    chat(false)
+        .await
+        .assert_status(StatusCode::SERVICE_UNAVAILABLE);
+    server.post("/v1/chat/completions").add_header("Authorization", format!("Bearer {other_key}"))
+        .json(&json!({"model": E2E_QWEN_MODEL_NAME, "messages": [{"role":"user","content":"hi"}], "max_tokens":1}))
+        .await.assert_status_ok();
+    settings
+        .update("usage_admission", json!({"enabled":false}), Uuid::new_v4())
+        .await
+        .unwrap();
+    let off = direct().await;
+    off.assert_status_ok();
+    assert_eq!(off.json::<Value>()["mode"], "off");
 }
 
 #[tokio::test]
@@ -324,6 +348,31 @@ async fn native_responses_preserve_capacity_and_unavailable_admission_statuses()
             assert_eq!(response.status_code(), expected, "{}", response.text());
             assert!(!response.text().contains("lock timeout"));
             assert!(!response.text().contains("SQLSTATE"));
+        }
+        if expected == StatusCode::TOO_MANY_REQUESTS {
+            use axum_test::multipart::{MultipartForm, Part};
+            let response = server
+                .post("/v1/audio/transcriptions")
+                .add_header(
+                    "Authorization",
+                    format!("Bearer {}", key.key.as_ref().unwrap()),
+                )
+                .multipart(
+                    MultipartForm::new()
+                        .add_part(
+                            "file",
+                            Part::bytes(include_bytes!("../fixtures/audio/silence.wav").to_vec())
+                                .file_name("test.wav")
+                                .mime_type("audio/wav"),
+                        )
+                        .add_text("model", model.clone()),
+                )
+                .await;
+            response.assert_status(expected);
+            assert_eq!(
+                response.json::<Value>()["error"]["type"],
+                "rate_limit_exceeded"
+            );
         }
         lock.rollback().await.unwrap();
         if expected == StatusCode::TOO_MANY_REQUESTS {

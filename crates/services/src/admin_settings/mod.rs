@@ -181,7 +181,10 @@ impl AdminSettingsService {
 
     pub fn admission_policy(&self, org: Uuid) -> Option<AdmissionPolicy> {
         let snapshot = self.admission.load();
-        (snapshot.version > 0).then(|| snapshot.value.for_organization(org))
+        if snapshot.version == 0 {
+            return None;
+        }
+        snapshot.value.for_organization(org)
     }
 
     async fn refresh_admission(&self) -> bool {
@@ -570,10 +573,11 @@ mod tests {
             .unwrap();
         assert_eq!(handle.load().defaults.mode, AdmissionMode::Off);
         *repo.admission_rows.lock().unwrap() = json!({org.to_string():{"mode":"misspelled"}});
-        assert!(!settings.reload().await);
+        assert!(settings.reload().await);
+        assert!(settings.admission_policy(org).is_none());
         assert_eq!(
-            settings.admission_policy(org).unwrap().mode,
-            AdmissionMode::Enforce
+            settings.admission_policy(Uuid::new_v4()).unwrap().mode,
+            AdmissionMode::Off
         );
         *repo.admission_rows.lock().unwrap() = json!({});
         assert!(settings.reload().await);

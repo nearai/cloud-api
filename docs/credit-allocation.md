@@ -104,6 +104,11 @@ Changing a mode does not release previously created holds. Limits must be positi
 the normal TTL is 1–86400 seconds and the unknown-outcome TTL must be positive and no
 longer than the normal TTL. Invalid settings are rejected.
 
+After the global settings load, an invalid enforce policy or an unreadable override
+returns 503 for that organization alone. A known audit or off mode can continue
+with default limits when its numeric overrides are invalid. Global disable applies
+to every organization.
+
 Audit still performs local feature measurement, reads model pricing, and records estimates.
 It avoids reservation writes and admission row locks. Feature collection precedes policy
 selection and remains on the request path when admission is disabled. Direct admission still
@@ -162,7 +167,7 @@ after the last organization it attempted. A busy organization can wait multiple 
 Admission also reclaims expired holds for its organization. There are no heartbeats or estimate resizing. A client disconnect or transport
 error still records any billable usage already received and settles the hold.
 A connection or request-construction failure known to precede dispatch releases the
-hold immediately. HTTP errors, post-connect timeouts, cancellation and missing final usage
+hold immediately. If release fails, the service attempts to apply the shorter unknown-outcome grace period. HTTP errors, post-connect timeouts, cancellation and missing final usage
 mark the outcome unknown: the attempt leaves the running-slot count, while its money
 stays reserved until the earlier of its original expiry and the configured grace period
 (default five minutes). Duplicate notices never extend that deadline. The same treatment
@@ -182,7 +187,7 @@ a maximum receipt-delivery window. If final usage is lost before it reaches
 the existing accounting path, expiry does not reconstruct it or charge the estimate.
 
 Audio settlement prefers the provider's duration-based `usage.seconds`, then
-verbose-response `duration`. Uploaded-file timing and byte counts are admission
+verbose-response `duration`. Off mode skips local duration parsing. Uploaded-file timing and byte counts are admission
 estimates only and never substitute for actual usage. Missing provider duration
 returns a billing error from the gateway; direct proxy reporting logs the missing
 usage without charging an estimate. The reservation uses the unknown-outcome grace period.

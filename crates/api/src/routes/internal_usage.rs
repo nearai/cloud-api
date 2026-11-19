@@ -382,15 +382,14 @@ pub async fn reserve_usage_internal(
     verify_internal_usage_token(&headers, state.config.internal_usage_token.as_deref())
         .map_err(IntoResponse::into_response)?;
     let failure = |status, message: &str| {
-        let response = (
+        (
             status,
             ResponseJson(ErrorResponse::new(
                 message.into(),
                 "budget_admission_error".into(),
             )),
         )
-            .into_response();
-        crate::middleware::rate_limit::with_retry_after(response)
+            .into_response()
     };
     let request: ReserveUsageRequest = serde_json::from_slice(&body)
         .map_err(|_| failure(StatusCode::BAD_REQUEST, "Invalid admission metadata"))?;
@@ -433,10 +432,19 @@ pub async fn reserve_usage_internal(
                 StatusCode::PAYMENT_REQUIRED,
                 "Insufficient available budget",
             ),
-            services::usage::UsageError::CapacityExceeded => failure(
-                StatusCode::TOO_MANY_REQUESTS,
-                "Too many unsettled executions",
-            ),
+            services::usage::UsageError::CapacityExceeded => {
+                let mut response = failure(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "Too many unsettled executions",
+                );
+                response.headers_mut().insert(
+                    axum::http::header::RETRY_AFTER,
+                    axum::http::HeaderValue::from(
+                        crate::middleware::retry_after::retry_after_seconds(None),
+                    ),
+                );
+                response
+            }
             services::usage::UsageError::Unauthorized(_) => {
                 failure(StatusCode::FORBIDDEN, "Billing identity unavailable")
             }

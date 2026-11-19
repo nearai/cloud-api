@@ -291,6 +291,17 @@ fn error(status: StatusCode, message: &str) -> Response {
 }
 
 fn provider_error(err: CompletionError) -> Response {
+    if let CompletionError::Admission {
+        status_code,
+        message,
+    } = err
+    {
+        return (
+            StatusCode::from_u16(status_code).unwrap_or(StatusCode::SERVICE_UNAVAILABLE),
+            Json(ErrorResponse::new(message, "budget_admission_error".into())),
+        )
+            .into_response();
+    }
     if matches!(err, CompletionError::NoPubKeyProvider(_)) {
         return error(
             StatusCode::MISDIRECTED_REQUEST,

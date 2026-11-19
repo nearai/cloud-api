@@ -685,11 +685,7 @@ async fn handle_request(
             status_code,
             message,
         }) => {
-            return anthropic_error(
-                StatusCode::from_u16(status_code).unwrap_or(StatusCode::SERVICE_UNAVAILABLE),
-                "api_error",
-                message,
-            );
+            return admission_error(status_code, message);
         }
         Err(AnthropicRawError::UnsupportedProvider) => {
             return anthropic_error(
@@ -1451,6 +1447,20 @@ fn is_forwardable_upstream_header(name: &header::HeaderName) -> bool {
     matches!(name.as_str(), "content-type" | "request-id" | "retry-after")
 }
 
+fn admission_error(status_code: u16, message: String) -> Response {
+    anthropic_error(
+        StatusCode::from_u16(status_code).unwrap_or(StatusCode::SERVICE_UNAVAILABLE),
+        match status_code {
+            400 => "invalid_request_error",
+            402 => "billing_error",
+            403 => "permission_error",
+            429 => "rate_limit_error",
+            _ => "api_error",
+        },
+        message,
+    )
+}
+
 fn anthropic_error(
     status: StatusCode,
     error_type: impl Into<String>,
@@ -1504,6 +1514,26 @@ mod tests {
             "messages": [{"role": "user", "content": "hello"}]
         }))
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn admission_errors_have_protocol_specific_types() {
+        for (code, kind) in [
+            (400, "invalid_request_error"),
+            (402, "billing_error"),
+            (403, "permission_error"),
+            (429, "rate_limit_error"),
+            (503, "api_error"),
+        ] {
+            let response = admission_error(code, "admission message".into());
+            assert_eq!(response.status().as_u16(), code);
+            let bytes = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body["error"]["type"], kind);
+            assert_eq!(body["error"]["message"], "admission message");
+        }
     }
 
     #[test]

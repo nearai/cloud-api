@@ -32,7 +32,7 @@ impl services::usage::ports::UsageRepository for OrganizationUsageRepository {
     async fn release_budget(&self, organization_id: Uuid, id: Uuid) -> anyhow::Result<()> {
         let mut client = self.pool.get().await?;
         let tx = client.transaction().await?;
-        tx.batch_execute("SET LOCAL statement_timeout = '10s'; SET LOCAL lock_timeout = '5s'")
+        tx.batch_execute("SET LOCAL statement_timeout = '1s'; SET LOCAL lock_timeout = '500ms'")
             .await?;
         tx.query_one(
             "SELECT release_usage_budget($1,$2)",
@@ -82,7 +82,7 @@ impl services::usage::ports::UsageRepository for OrganizationUsageRepository {
                 Ok(None) => {}
                 Err(error) if client.is_closed() => return Err(error.into()),
                 Err(error) => {
-                    tracing::warn!(organization_id = %org, %error, "Unable to expire organization budgets")
+                    tracing::warn!(organization_id = %org, sqlstate = error.code().map(|code| code.code()), "Unable to expire organization budgets")
                 }
             }
         }

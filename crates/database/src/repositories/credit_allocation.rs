@@ -81,41 +81,6 @@ pub async fn allocate_usage(
 
     lock_organization_accounting(transaction, organization_id).await?;
 
-    // An active reservation already owns its funding. Settle it in the usage transaction.
-    let reserved: Option<serde_json::Value> = match parent {
-        UsageAllocationParent::Inference(id) => transaction
-            .query_one(
-                "SELECT settle_usage_budget($1,
-                (SELECT inference_id FROM organization_usage_log WHERE id = $2), $2, $3)",
-                &[&organization_id, &id, &total_cost],
-            )
-            .await
-            .map_err(map_db_error)?
-            .get(0),
-        UsageAllocationParent::Service(_) => None,
-    };
-    if let Some(allocations) = reserved
-        .map(serde_json::from_value::<Vec<CreditAllocation>>)
-        .transpose()
-        .map_err(|e| RepositoryError::ValidationFailed(e.to_string()))?
-    {
-        let funded = allocations.iter().try_fold(0_i64, |total, allocation| {
-            total.checked_add(allocation.amount).ok_or_else(|| {
-                RepositoryError::ValidationFailed("reserved funding overflow".into())
-            })
-        })?;
-        let unfunded = total_cost
-            .checked_sub(funded)
-            .filter(|n| *n >= 0)
-            .ok_or_else(|| RepositoryError::ValidationFailed("invalid reserved funding".into()))?;
-        transaction.execute("UPDATE organization_balance SET unresolved_unfunded_amount = unresolved_unfunded_amount + $2 WHERE organization_id=$1", &[&organization_id, &unfunded]).await.map_err(map_db_error)?;
-        return Ok(AllocationResult {
-            allocations,
-            funded_amount: funded,
-            unfunded_amount: unfunded,
-        });
-    }
-
     let rows = transaction
         .query(
             r#"

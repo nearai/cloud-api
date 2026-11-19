@@ -3096,6 +3096,7 @@ impl InferenceProviderPool {
         };
 
         match error {
+            CompletionError::Admission { .. } => error,
             CompletionError::HttpError {
                 status_code,
                 message,
@@ -3139,6 +3140,7 @@ impl InferenceProviderPool {
     /// Safe to log: contains no caller-controlled content.
     fn classify_error_kind(error: &CompletionError) -> &'static str {
         match error {
+            CompletionError::Admission { .. } => "admission",
             CompletionError::CompletionError(_) => "completion_error",
             CompletionError::HttpError { status_code, .. } => match status_code {
                 500..=599 => "http_5xx",
@@ -3301,6 +3303,7 @@ impl InferenceProviderPool {
     /// the label directly so the rationale is visible in production logs.
     fn classify_retry_decision(error: &CompletionError) -> &'static str {
         match error {
+            CompletionError::Admission { .. } => "non_retryable_admission",
             CompletionError::CompletionError(msg) => {
                 let lower = msg.to_lowercase();
                 let is_inference_timeout = (lower.contains("operation timed out")
@@ -3431,6 +3434,7 @@ impl InferenceProviderPool {
     fn completion_error_message_len(error: &CompletionError) -> usize {
         match error {
             CompletionError::HttpError { message, .. }
+            | CompletionError::Admission { message, .. }
             | CompletionError::CompletionError(message)
             | CompletionError::InvalidResponse(message)
             | CompletionError::Unknown(message)
@@ -4033,6 +4037,7 @@ impl InferenceProviderPool {
                             ),
                         });
                     }
+                    Err(e @ CompletionError::Admission { .. }) => return Err(e),
                     Err(e) => {
                         let tier = provider.tier();
                         let provider_source = provider.provider_source();
@@ -5114,6 +5119,13 @@ impl InferenceProviderPool {
             )
             .await
             .map_err(|e| match e {
+                CompletionError::Admission {
+                    status_code,
+                    message,
+                } => ImageGenerationError::HttpError {
+                    status_code,
+                    message,
+                },
                 CompletionError::HttpError {
                     status_code,
                     message,
@@ -5199,6 +5211,13 @@ impl InferenceProviderPool {
                             } => CompletionError::CompletionError(format!(
                                 "HTTP error {status_code}: {message}"
                             )),
+                            AudioTranscriptionError::Admission {
+                                status_code,
+                                message,
+                            } => CompletionError::Admission {
+                                status_code,
+                                message,
+                            },
                             AudioTranscriptionError::TranscriptionError(msg) => {
                                 CompletionError::CompletionError(msg)
                             }
@@ -5213,6 +5232,13 @@ impl InferenceProviderPool {
                 // 5xx -> 502, 503 -> overloaded, 429 -> rate limit). Infra 4xx
                 // were already downgraded to a generic provider failure and fall
                 // through the `other` arm to a 502 server error.
+                CompletionError::Admission {
+                    status_code,
+                    message,
+                } => AudioTranscriptionError::Admission {
+                    status_code,
+                    message,
+                },
                 CompletionError::HttpError {
                     status_code,
                     message,
@@ -5277,6 +5303,13 @@ impl InferenceProviderPool {
             })
             .await
             .map_err(|e| match e {
+                CompletionError::Admission {
+                    status_code,
+                    message,
+                } => ImageEditError::HttpError {
+                    status_code,
+                    message,
+                },
                 CompletionError::HttpError {
                     status_code,
                     message,
@@ -8640,7 +8673,7 @@ mod tests {
                 .await;
             assert!(matches!(
                 result,
-                Err(CompletionError::HttpError {
+                Err(CompletionError::Admission {
                     status_code: 503,
                     ..
                 })
@@ -8649,6 +8682,27 @@ mod tests {
             assert!(pool.provider_failure_counts.read().unwrap().is_empty());
         }
         // Non-text requests have no monetary scope and still reach their provider once.
+        for status_code in [403, 429, 503] {
+            let calls = std::sync::atomic::AtomicUsize::new(0);
+            let result = crate::test_utils::with_test_budget(pool.retry_with_fallback(
+                "admission-test",
+                "chat_completion",
+                None,
+                |_| async {
+                    calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Err::<(), _>(CompletionError::Admission {
+                        status_code,
+                        message: "local admission".into(),
+                    })
+                },
+            ))
+            .await;
+            assert!(
+                matches!(result, Err(CompletionError::Admission { status_code: actual, .. }) if actual == status_code)
+            );
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert!(pool.provider_failure_counts.read().unwrap().is_empty());
+        }
         pool.retry_with_fallback("admission-test", "embeddings", None, |_| async {
             calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(())

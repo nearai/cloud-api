@@ -547,6 +547,10 @@ async fn admission_uses_live_org_policy_and_audit_off_never_create_holds() {
             api_key_id: Uuid::new_v4(),
             model_id: Uuid::new_v4(),
         };
+        assert_eq!(
+            service.measure_admission(identity.organization_id),
+            identity.organization_id != disabled
+        );
         let features = budget::UsageFeatures::from_json(
             InferenceType::ChatCompletion,
             &serde_json::json!({"max_tokens":1}),

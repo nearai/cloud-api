@@ -190,6 +190,41 @@ async fn account(pool: &database::DbPool, org: Uuid) -> anyhow::Result<(i64, i64
 }
 
 #[tokio::test]
+async fn release_reports_lock_contention_before_the_service_deadline() -> anyhow::Result<()> {
+    let pool = test_pool().await?;
+    let model = insert_model(&pool, "release-timeout").await?;
+    let org = fund(&pool).await?;
+    let repo = OrganizationUsageRepository::new(pool.clone());
+    let reservation = quote(&org, &model);
+    repo.admit_budget(&reservation).await?;
+    let mut client = pool.get().await?;
+    let lock = client.transaction().await?;
+    lock.query_one(
+        "SELECT id FROM organizations WHERE id=$1 FOR UPDATE",
+        &[&org.org_id],
+    )
+    .await?;
+    let error = tokio::time::timeout(
+        Duration::from_secs(2),
+        repo.release_budget(org.org_id, reservation.id),
+    )
+    .await?
+    .unwrap_err();
+    assert_eq!(
+        error
+            .downcast_ref::<tokio_postgres::Error>()
+            .and_then(|e| e.code()),
+        Some(&tokio_postgres::error::SqlState::LOCK_NOT_AVAILABLE)
+    );
+    assert_eq!(account(&pool, org.org_id).await?, (10, 0, 0));
+    lock.rollback().await?;
+    repo.release_budget(org.org_id, reservation.id).await?;
+    assert_eq!(account(&pool, org.org_id).await?, (0, 0, 0));
+    cleanup_usage_fixtures(&pool, &[org.org_id], &[model.id]).await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn expiry_skips_a_locked_organization_and_revisits_it() -> anyhow::Result<()> {
     let pool = test_pool().await?;
     let model = insert_model(&pool, "expiry-progress").await?;

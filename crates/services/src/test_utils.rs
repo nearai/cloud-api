@@ -392,6 +392,8 @@ pub struct CapturingUsageService {
     pub releases: std::sync::Mutex<Vec<Uuid>>,
     pub unknown_outcomes: std::sync::Mutex<Vec<Uuid>>,
     pub admission_limit: Option<usize>,
+    pub admission_reply: Option<tokio::sync::Semaphore>,
+    pub fail_release: bool,
     requests: std::sync::Mutex<Vec<RecordUsageServiceRequest>>,
 }
 
@@ -404,6 +406,8 @@ impl CapturingUsageService {
             releases: std::sync::Mutex::new(Vec::new()),
             unknown_outcomes: std::sync::Mutex::new(Vec::new()),
             admission_limit: None,
+            admission_reply: None,
+            fail_release: false,
             requests: std::sync::Mutex::new(Vec::new()),
         }
     }
@@ -421,6 +425,9 @@ impl UsageServiceTrait for CapturingUsageService {
     }
     async fn release_budget(&self, _: Uuid, id: Uuid) -> Result<(), UsageError> {
         self.releases.lock().unwrap().push(id);
+        if self.fail_release {
+            return Err(UsageError::InternalError("release timed out".into()));
+        }
         Ok(())
     }
     async fn admit(
@@ -434,17 +441,22 @@ impl UsageServiceTrait for CapturingUsageService {
         {
             return Ok(None);
         }
-        let mut admissions = self.admissions.lock().unwrap();
-        if self
-            .admission_limit
-            .is_some_and(|limit| admissions.len() >= limit)
-        {
-            return Err(UsageError::LimitExceeded(
-                "synthetic budget exhausted".into(),
-            ));
-        }
         let id = Uuid::new_v4();
-        admissions.push(id);
+        {
+            let mut admissions = self.admissions.lock().unwrap();
+            if self
+                .admission_limit
+                .is_some_and(|limit| admissions.len() >= limit)
+            {
+                return Err(UsageError::LimitExceeded(
+                    "synthetic budget exhausted".into(),
+                ));
+            }
+            admissions.push(id);
+        }
+        if let Some(reply) = &self.admission_reply {
+            reply.acquire().await.unwrap().forget();
+        }
         Ok(Some(id))
     }
 

@@ -216,7 +216,11 @@ pub async fn audio_transcriptions(
     // Meter a shared view of the upload; keep the original available even if the
     // blocking parser fails. Once it finishes, the provider reuses the same buffer.
     let file_bytes = bytes::Bytes::from(request.file_bytes);
-    let file_duration_seconds = crate::audio_duration::measure(file_bytes.clone()).await;
+    let file_duration_seconds = if app_state.usage_service.measure_admission(organization_id) {
+        crate::audio_duration::measure(file_bytes.clone()).await
+    } else {
+        None
+    };
     features.audio_duration_seconds = file_duration_seconds.map(|n| n as u64);
     let budget = match crate::routes::common::usage_execution(
         &app_state,
@@ -350,6 +354,14 @@ pub async fn audio_transcriptions(
         }
         Err(e) => {
             let (status_code, error_type, message) = match e {
+                services::completions::ports::CompletionError::Admission {
+                    status_code,
+                    message,
+                } => (
+                    StatusCode::from_u16(status_code).unwrap_or(StatusCode::SERVICE_UNAVAILABLE),
+                    services::usage::budget::admission_error_type(status_code, &message),
+                    message,
+                ),
                 services::completions::ports::CompletionError::RateLimitExceeded(msg) => {
                     tracing::warn!("Concurrent request limit exceeded for audio transcription");
                     (StatusCode::TOO_MANY_REQUESTS, "rate_limit_error", msg)

@@ -1543,16 +1543,19 @@ impl CompletionServiceImpl {
         organization_id: Uuid,
     ) -> ports::CompletionError {
         match error {
+            inference_providers::CompletionError::Admission {
+                status_code,
+                message,
+            } => ports::CompletionError::Admission {
+                status_code: *status_code,
+                message: message.clone(),
+            },
             inference_providers::CompletionError::HttpError {
                 status_code,
                 message,
                 is_external,
             } => match (*status_code, *is_external) {
                 // --- Client errors that should be passed through (both internal and external) ---
-                (402, false) => ports::CompletionError::ProviderError {
-                    status_code: 402,
-                    message: message.clone(),
-                },
                 // 400 Bad Request = invalid params (context too long, bad format, etc.)
                 (400, _) => {
                     tracing::warn!(%organization_id, model, status_code, "Client error during {}", operation);
@@ -1635,13 +1638,6 @@ impl CompletionServiceImpl {
                     ports::CompletionError::ProviderError {
                         status_code: 504,
                         message: "The request timed out. Please try again.".to_string(),
-                    }
-                }
-                // Local admission errors return before the pool wraps upstream failures.
-                (503, false) if message == crate::usage::budget::UNAVAILABLE_MESSAGE => {
-                    ports::CompletionError::ProviderError {
-                        status_code: 503,
-                        message: message.clone(),
                     }
                 }
                 // 503 Service Unavailable = service overloaded
@@ -1817,6 +1813,7 @@ impl CompletionServiceImpl {
             ports::CompletionError::InvalidParams(_)
             | ports::CompletionError::ContextLengthExceeded { .. } => ERROR_TYPE_INVALID_PARAMS,
             ports::CompletionError::RateLimitExceeded(_) => ERROR_TYPE_RATE_LIMIT,
+            ports::CompletionError::Admission { .. } => "admission",
             ports::CompletionError::ProviderError { .. } => ERROR_TYPE_INFERENCE_ERROR,
             ports::CompletionError::ServiceOverloaded(_)
             | ports::CompletionError::UpstreamOverloaded { .. } => ERROR_TYPE_SERVICE_OVERLOADED,
@@ -2679,6 +2676,13 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
                         message: msg,
                     })
                 }
+                inference_providers::AudioTranscriptionError::Admission {
+                    status_code,
+                    message,
+                } => Err(ports::CompletionError::Admission {
+                    status_code,
+                    message,
+                }),
                 inference_providers::AudioTranscriptionError::HttpError {
                     status_code,
                     message,
@@ -2690,7 +2694,6 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
                                 "Rate limit exceeded by upstream provider. Please retry with exponential backoff.".to_string(),
                             ));
                         }
-                        503 if message == crate::usage::budget::UNAVAILABLE_MESSAGE => 503,
                         503 => {
                             return Err(ports::CompletionError::ServiceOverloaded(message));
                         }
@@ -5145,6 +5148,21 @@ mod tests {
                 );
             }
             other => panic!("Expected ProviderError, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn local_admission_status_and_message_survive_chat_mapping() {
+        for status_code in [400, 402, 403, 429, 503] {
+            let error = inference_providers::CompletionError::Admission {
+                status_code,
+                message: "local admission".into(),
+            };
+            let mapped =
+                CompletionServiceImpl::map_provider_error("model", &error, "chat", Uuid::nil());
+            assert!(
+                matches!(mapped, ports::CompletionError::Admission {status_code: actual, message} if actual == status_code && message == "local admission")
+            );
         }
     }
 

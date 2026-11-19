@@ -81,6 +81,7 @@ fn to_privacy_classify_error<E: std::fmt::Display>(e: E) -> PrivacyClassifyError
 /// transport-level reason ends up in logs.
 fn completion_error_kind(error: &CompletionError) -> &'static str {
     match error {
+        CompletionError::Admission { .. } => "admission",
         CompletionError::CompletionError(_) => "completion_error",
         CompletionError::HttpError { .. } => "http_error",
         CompletionError::InvalidResponse(_) => "invalid_response",

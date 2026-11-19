@@ -200,11 +200,9 @@ impl NativeResponsesService {
             ))
             .await
             .map_err(|error| match error {
-                CompletionError::HttpError {
-                    status_code,
-                    is_external: false,
-                    ..
-                } => NativeResponsesError::AdmissionRejected(status_code),
+                CompletionError::Admission { status_code, .. } => {
+                    NativeResponsesError::AdmissionRejected(status_code)
+                }
                 _ => NativeResponsesError::Provider("Native OpenAI Responses request failed"),
             })?;
         let billing = Billing {

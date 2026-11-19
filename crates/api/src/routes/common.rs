@@ -29,7 +29,8 @@ pub fn map_domain_error_to_status(error: &CompletionError) -> StatusCode {
         | CompletionError::InvalidParams(_)
         | CompletionError::ContextLengthExceeded { .. } => StatusCode::BAD_REQUEST,
         CompletionError::RateLimitExceeded(_) => StatusCode::TOO_MANY_REQUESTS,
-        CompletionError::ProviderError { status_code, .. } => {
+        CompletionError::Admission { status_code, .. }
+        | CompletionError::ProviderError { status_code, .. } => {
             StatusCode::from_u16(*status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
         }
         CompletionError::ServiceOverloaded(_) | CompletionError::UpstreamOverloaded { .. } => {

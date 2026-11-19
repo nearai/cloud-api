@@ -78,9 +78,12 @@ impl UsageFeatures {
         )?;
         for message in &params.messages {
             if let Some(content) = &message.content {
-                features.count(content)?;
+                features.count(content, true)?;
             }
-            features.count(&serde_json::to_value(&message.role).map_err(|_| overflow())?)?;
+            features.count(
+                &serde_json::to_value(&message.role).map_err(|_| overflow())?,
+                false,
+            )?;
             for text in [
                 &message.name,
                 &message.tool_call_id,
@@ -96,7 +99,7 @@ impl UsageFeatures {
             }
             // Tool-call arguments are text; their protocol wrapper is small and has no media.
             if let Some(calls) = &message.tool_calls {
-                features.count(&serde_json::to_value(calls).map_err(|_| overflow())?)?;
+                features.count(&serde_json::to_value(calls).map_err(|_| overflow())?, false)?;
             }
         }
         for name in [
@@ -109,7 +112,10 @@ impl UsageFeatures {
             "assets",
         ] {
             if let Some(value) = params.extra.get(name) {
-                features.count(value)?;
+                features.count(
+                    value,
+                    matches!(name, "input" | "prompt" | "system" | "assets"),
+                )?;
             }
         }
         if let Some(items) = params.extra.get("prompt").and_then(Value::as_array) {
@@ -214,7 +220,10 @@ impl UsageFeatures {
             "assets",
         ] {
             if let Some(value) = body.get(name) {
-                features.count(value)?;
+                features.count(
+                    value,
+                    matches!(name, "input" | "prompt" | "system" | "assets"),
+                )?;
             }
         }
         // Schemas are part of the model input. Count their serialized keys and values;
@@ -249,7 +258,7 @@ impl UsageFeatures {
         self
     }
 
-    fn count(&mut self, value: &Value) -> Result<(), UsageError> {
+    fn count(&mut self, value: &Value, content_part: bool) -> Result<(), UsageError> {
         let add = |target: &mut u64, n: u64| -> Result<(), UsageError> {
             *target = target.checked_add(n).ok_or_else(overflow)?;
             Ok(())
@@ -261,12 +270,12 @@ impl UsageFeatures {
             }
             Value::Array(items) => {
                 for item in items {
-                    self.count(item)?;
+                    self.count(item, content_part)?;
                 }
             }
             Value::Object(fields) => {
                 let kind = fields.get("type").and_then(Value::as_str).unwrap_or("");
-                let media = match kind {
+                let media = match if content_part { kind } else { "" } {
                     "image" | "image_url" | "input_image" => Some(&mut self.images),
                     "audio" | "input_audio" | "audio_url" => Some(&mut self.audio),
                     "video" | "video_url" | "input_video" => Some(&mut self.video),
@@ -281,14 +290,32 @@ impl UsageFeatures {
                             continue;
                         }
                         match name.as_str() {
-                            "image_url" | "input_image" | "image" => add(&mut self.images, 1)?,
-                            "audio_url" | "input_audio" | "audio" => add(&mut self.audio, 1)?,
-                            "video_url" | "input_video" | "video" => add(&mut self.video, 1)?,
-                            "file_id" | "file_url" | "file_data" | "url" | "data" | "b64_json" => {
+                            "image_url" | "input_image" | "image"
+                                if content_part && kind.is_empty() =>
+                            {
+                                add(&mut self.images, 1)?
+                            }
+                            "audio_url" | "input_audio" | "audio"
+                                if content_part && kind.is_empty() =>
+                            {
+                                add(&mut self.audio, 1)?
+                            }
+                            "video_url" | "input_video" | "video"
+                                if content_part && kind.is_empty() =>
+                            {
+                                add(&mut self.video, 1)?
+                            }
+                            "file_id" | "file_url" | "file_data" | "url" | "data" | "b64_json"
+                                if content_part && kind.is_empty() =>
+                            {
                                 add(&mut self.unknown_media, 1)?
                             }
+                            "input" | "arguments" | "citations" | "results" => {
+                                // Tool payloads and citations are model input even when they contain media-shaped JSON.
+                                self.count_schema(item)?;
+                            }
                             "id" => {}
-                            _ => self.count(item)?,
+                            _ => self.count(item, matches!(name.as_str(), "content" | "output"))?,
                         }
                     }
                 }

@@ -501,6 +501,11 @@ impl UsageServiceImpl {
 
 #[async_trait::async_trait]
 impl UsageServiceTrait for UsageServiceImpl {
+    fn measure_admission(&self, organization_id: Uuid) -> bool {
+        self.admission_policy(organization_id)
+            .is_some_and(|p| p.mode != budget::policy::AdmissionMode::Off)
+    }
+
     async fn mark_budget_unknown(&self, organization_id: Uuid, id: Uuid) -> Result<(), UsageError> {
         let grace = self
             .admission_policy(organization_id)

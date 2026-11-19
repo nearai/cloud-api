@@ -96,46 +96,64 @@ pub struct AdmissionOverrides {
 #[derive(Debug, Default, PartialEq)]
 pub struct AdmissionSnapshot {
     pub global: AdmissionSettings,
-    pub organizations: HashMap<Uuid, AdmissionOverrides>,
+    pub organizations: HashMap<Uuid, Option<AdmissionPolicy>>,
 }
 
 impl AdmissionSnapshot {
     pub fn from_rows(
         global: &serde_json::Value,
-        organizations: HashMap<Uuid, AdmissionOverrides>,
+        rows: HashMap<Uuid, serde_json::Value>,
     ) -> Result<Self, String> {
-        let snapshot = Self {
-            global: UsageAdmissionKey::parse(global, false)?,
+        let global = UsageAdmissionKey::parse(global, false)?;
+        let defaults = &global.defaults;
+        let organizations = rows
+            .into_iter()
+            .map(|(id, row)| {
+                let merged = serde_json::from_value::<AdmissionOverrides>(row)
+                    .ok()
+                    .map(|o| AdmissionPolicy {
+                            mode: o.mode.unwrap_or(defaults.mode),
+                            organization_max_unsettled: o
+                                .organization_max_unsettled
+                                .unwrap_or(defaults.organization_max_unsettled),
+                            key_max_unsettled: o
+                                .key_max_unsettled
+                                .unwrap_or(defaults.key_max_unsettled),
+                            reservation_ttl_seconds: o
+                                .reservation_ttl_seconds
+                                .unwrap_or(defaults.reservation_ttl_seconds),
+                            unknown_outcome_ttl_seconds: o
+                                .unknown_outcome_ttl_seconds
+                                .unwrap_or(defaults.unknown_outcome_ttl_seconds),
+                    });
+                let policy = match merged {
+                    Some(p) if p.validate().is_ok() => Some(p),
+                    invalid => {
+                        tracing::warn!(organization_id = %id, "Invalid organization admission policy");
+                        invalid.filter(|p| p.mode != AdmissionMode::Enforce)
+                            .map(|p| AdmissionPolicy { mode: p.mode, ..defaults.clone() })
+                    }
+                };
+                (id, policy)
+            })
+            .collect();
+        Ok(Self {
+            global,
             organizations,
-        };
-        for id in snapshot.organizations.keys() {
-            snapshot.for_organization(*id).validate()?;
-        }
-        Ok(snapshot)
+        })
     }
 
-    pub fn for_organization(&self, id: Uuid) -> AdmissionPolicy {
-        let d = &self.global.defaults;
-        let mut policy = match self.organizations.get(&id) {
-            Some(o) => AdmissionPolicy {
-                mode: o.mode.unwrap_or(d.mode),
-                organization_max_unsettled: o
-                    .organization_max_unsettled
-                    .unwrap_or(d.organization_max_unsettled),
-                key_max_unsettled: o.key_max_unsettled.unwrap_or(d.key_max_unsettled),
-                reservation_ttl_seconds: o
-                    .reservation_ttl_seconds
-                    .unwrap_or(d.reservation_ttl_seconds),
-                unknown_outcome_ttl_seconds: o
-                    .unknown_outcome_ttl_seconds
-                    .unwrap_or(d.unknown_outcome_ttl_seconds),
-            },
-            None => d.clone(),
-        };
+    pub fn for_organization(&self, id: Uuid) -> Option<AdmissionPolicy> {
         if !self.global.enabled {
-            policy.mode = AdmissionMode::Off;
+            return Some(AdmissionPolicy {
+                mode: AdmissionMode::Off,
+                ..self.global.defaults.clone()
+            });
         }
-        policy
+        self.organizations
+            .get(&id)
+            .cloned()
+            .unwrap_or_else(|| Some(self.global.defaults.clone()))
     }
 }
 
@@ -213,35 +231,37 @@ mod tests {
     fn policy_validates_modes_limits_ttls_and_org_overrides() {
         let id = Uuid::new_v4();
         let global = json!({"defaults":{"key_max_unsettled":8}});
-        let overrides = HashMap::from([(
-            id,
-            AdmissionOverrides {
-                mode: Some(AdmissionMode::Enforce),
-                ..Default::default()
-            },
-        )]);
+        let invalid = Uuid::new_v4();
+        let overrides = HashMap::from([
+            (id, json!({"mode":"enforce"})),
+            (
+                invalid,
+                json!({"mode":"enforce","reservation_ttl_seconds":120}),
+            ),
+        ]);
         let mut snapshot = AdmissionSnapshot::from_rows(&global, overrides).unwrap();
-        assert_eq!(snapshot.for_organization(id).mode, AdmissionMode::Enforce);
-        assert_eq!(snapshot.for_organization(id).key_max_unsettled, 8);
         assert_eq!(
-            snapshot.for_organization(Uuid::new_v4()).mode,
+            snapshot.for_organization(id).unwrap().mode,
+            AdmissionMode::Enforce
+        );
+        assert_eq!(snapshot.for_organization(id).unwrap().key_max_unsettled, 8);
+        assert_eq!(
+            snapshot.for_organization(Uuid::new_v4()).unwrap().mode,
             AdmissionMode::Audit
         );
+        assert!(snapshot.for_organization(invalid).is_none());
         snapshot.global.enabled = false;
-        assert_eq!(snapshot.for_organization(id).mode, AdmissionMode::Off);
+        assert_eq!(
+            snapshot.for_organization(invalid).unwrap().mode,
+            AdmissionMode::Off
+        );
         snapshot.global.enabled = true;
-        assert_eq!(snapshot.for_organization(id).mode, AdmissionMode::Enforce);
-        assert!(AdmissionSnapshot::from_rows(
-            &global,
-            HashMap::from([(
-                id,
-                AdmissionOverrides {
-                    reservation_ttl_seconds: Some(1),
-                    ..Default::default()
-                }
-            )])
-        )
-        .is_err());
+        assert!(snapshot.for_organization(invalid).is_none());
+        for mode in [AdmissionMode::Off, AdmissionMode::Audit] {
+            let rows = HashMap::from([(id, json!({"mode": mode, "reservation_ttl_seconds":120}))]);
+            let snapshot = AdmissionSnapshot::from_rows(&global, rows).unwrap();
+            assert_eq!(snapshot.for_organization(id).unwrap().mode, mode);
+        }
         for invalid in [
             json!({"mode":"typo"}),
             json!({"key_max_unsettled":0}),

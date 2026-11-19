@@ -18,11 +18,12 @@ and Opus model overrides to the same chat model if those tasks should also use i
 Chat translation supports system instructions, text and images, client tool
 calls and results, and reasoning returned by the model. Anthropic-signed
 thinking is relayed on the native path. On the chat path, visible reasoning
-has an empty signature and can be replayed as plain reasoning. An omitted
-thinking display hides reasoning from the client. Use visible thinking for a
-model that requires its prior reasoning along with tool results. For models
-that advertise reasoning, a token budget maps to a low, medium, or high effort
-hint.
+has an empty signature and can be replayed as plain reasoning. Setting
+`thinking.display` to `"omitted"` hides reasoning from the client. Use visible
+thinking for a model that requires its prior reasoning along with tool results.
+Models that list `reasoning_effort` among their supported sampling parameters
+receive a low, medium, or high effort hint for a thinking budget. Other chat
+models use their own reasoning defaults.
 
 Token counting at `/v1/messages/count_tokens` is available for native Anthropic
 models. Chat models return a 404 for this operation. Models that require the

@@ -60,11 +60,10 @@ pub(super) async fn respond(
     headers: &HeaderMap,
     alias: Option<String>,
 ) -> RouteResult<Response> {
-    let supports_effort = model.supported_features.iter().any(|f| f == "reasoning")
-        || model
-            .supported_sampling_parameters
-            .iter()
-            .any(|p| p == "reasoning_effort" || p == "reasoning");
+    let supports_effort = model
+        .supported_sampling_parameters
+        .iter()
+        .any(|parameter| parameter == "reasoning_effort");
     let model = model.model_name.as_str();
     let request = request::translate(&body, model, supports_effort)?;
     let streaming = request.stream == Some(true);

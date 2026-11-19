@@ -208,7 +208,7 @@ async fn openai_chat_uses_only_chat_completions_even_when_the_model_requires_res
         "inputCostPerToken":{"amount":1000,"currency":"USD"},"outputCostPerToken":{"amount":2000,"currency":"USD"},
         "modelDisplayName":"Chat fixture","modelDescription":"Chat model","aliases":[alias],"contextLength":10000,"maxOutputLength":512,
         "verifiable":false,"attestationSupported":false,"isActive":true,"inputModalities":["text"],"outputModalities":["text"],
-        "providerType":"external","providerConfig":{"backend":"openai_compatible","base_url":format!("{}/v1",upstream.uri()),"model_name":"chat-model","api_key":"fixture-upstream-key"}
+        "supportedFeatures":["reasoning"],"providerType":"external","providerConfig":{"backend":"openai_compatible","base_url":format!("{}/v1",upstream.uri()),"model_name":"chat-model","api_key":"fixture-upstream-key"}
     })).unwrap());
     seed_models(&server, batch, get_session_id()).await;
     let org = setup_org_with_credits(&server, 10_000_000_000).await;
@@ -221,6 +221,8 @@ async fn openai_chat_uses_only_chat_completions_even_when_the_model_requires_res
             .add_header("anthropic-version", "2023-06-01")
             .json(&json!({
                 "model": requested_model,
+                "thinking": {"type":"adaptive"},
+                "output_config": {"effort":"high"},
                 "max_tokens": 32,
                 "messages": [{"role":"user", "content":prompt}]
             }))
@@ -239,11 +241,15 @@ async fn openai_chat_uses_only_chat_completions_even_when_the_model_requires_res
             assert_eq!(message["error"]["type"], "invalid_request_error");
         }
     }
-    assert!(upstream
-        .received_requests()
-        .await
-        .unwrap()
-        .iter()
-        .all(|request| request.url.path() != "/v1/responses"));
+    for request in upstream.received_requests().await.unwrap() {
+        assert_ne!(request.url.path(), "/v1/responses");
+        if request.url.path() == "/v1/chat/completions" {
+            assert!(request
+                .body_json::<Value>()
+                .unwrap()
+                .get("reasoning_effort")
+                .is_none());
+        }
+    }
     upstream.verify().await;
 }

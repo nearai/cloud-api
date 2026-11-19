@@ -4,7 +4,7 @@ use crate::repositories::credit_allocation::{settle_unfunded_usage, CreditAlloca
 use crate::repositories::utils::map_db_error;
 use crate::retry_db;
 use anyhow::{Context, Result};
-use chrono::Utc;
+use jiff::Timestamp;
 use services::common::RepositoryError;
 use tokio_postgres::types::Type;
 use tokio_postgres::Row;
@@ -102,7 +102,7 @@ impl OrganizationLimitsRepository {
                 ));
             }
 
-            let now = Utc::now();
+            let now = Timestamp::now();
 
             // Close any existing active limits of the same credit_type (set effective_until to now)
             transaction

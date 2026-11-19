@@ -202,6 +202,14 @@ impl From<CompletionError> for crate::models::ErrorResponse {
             CompletionError::InvalidParams(msg) => {
                 ErrorResponse::new(msg, "invalid_request_error".to_string())
             }
+            err @ CompletionError::ContextLengthExceeded { .. } => ErrorResponse {
+                error: crate::models::ErrorDetail {
+                    message: err.to_string(),
+                    r#type: "invalid_request_error".to_string(),
+                    param: None,
+                    code: Some("context_length_exceeded".to_string()),
+                },
+            },
             CompletionError::RateLimitExceeded(msg) => {
                 let message = if msg.is_empty() {
                     "Rate limit exceeded".to_string()
@@ -269,7 +277,7 @@ pub fn current_unix_timestamp() -> i64 {
 /// matters for a half-written row, which must never be reported as verified.
 pub fn verified_contact_email(
     contact_email: Option<&str>,
-    contact_email_verified_at: Option<chrono::DateTime<chrono::Utc>>,
+    contact_email_verified_at: Option<jiff::Timestamp>,
 ) -> Option<String> {
     contact_email
         .filter(|_| contact_email_verified_at.is_some())
@@ -554,8 +562,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn long_context_limit_maps_to_an_openai_context_length_error() {
+        let error = CompletionError::ContextLengthExceeded { limit: 100_000 };
+        assert_eq!(
+            crate::routes::common::map_domain_error_to_status(&error),
+            axum::http::StatusCode::BAD_REQUEST
+        );
+        let body = serde_json::to_value(ErrorResponse::from(error)).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "error": {
+                    "message": "This request needs more context than this model allows for \
+                                your organization (limit: 100000 tokens).",
+                    "type": "invalid_request_error",
+                    "param": null,
+                    "code": "context_length_exceeded"
+                }
+            })
+        );
+    }
+
+    #[test]
     fn contact_email_is_only_shown_with_its_verification_time() {
-        let verified_at = Some(chrono::Utc::now());
+        let verified_at = Some(jiff::Timestamp::now());
 
         assert_eq!(
             verified_contact_email(Some("alice@example.com"), verified_at),
@@ -570,9 +600,9 @@ mod tests {
 
     fn test_user(
         contact_email: Option<&str>,
-        verified_at: Option<chrono::DateTime<chrono::Utc>>,
+        verified_at: Option<jiff::Timestamp>,
     ) -> services::auth::User {
-        let now = chrono::Utc::now();
+        let now = jiff::Timestamp::now();
         services::auth::User {
             id: services::auth::UserId(uuid::Uuid::new_v4()),
             email: "login@example.com".to_string(),
@@ -597,7 +627,7 @@ mod tests {
     fn user_response_reports_the_contact_email_and_never_asks_for_one() {
         let with_email = services_user_to_api_user(&test_user(
             Some("alice@example.com"),
-            Some(chrono::Utc::now()),
+            Some(jiff::Timestamp::now()),
         ));
         assert_eq!(
             with_email.contact_email.as_deref(),

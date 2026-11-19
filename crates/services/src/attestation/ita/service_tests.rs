@@ -312,7 +312,15 @@ async fn model_flow_keeps_single_provider_evidence_with_mixed_arch_fleets() -> T
     // Gateway reports still include both fleets; ITA must select one provider
     // before building its single-architecture GPU evidence request.
     let gateway_reports = pool
-        .get_attestation_report("canonical-model".into(), None, None, None, false, None)
+        .get_attestation_report(
+            "canonical-model".into(),
+            None,
+            None,
+            None,
+            false,
+            None,
+            true,
+        )
         .await?;
     assert_eq!(gateway_reports.len(), 2);
     let secondary_requests = blackwell.received_requests().await.unwrap().len();

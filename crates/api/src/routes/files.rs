@@ -207,7 +207,7 @@ pub async fn upload_file(
     })?;
 
     // Calculate expires_at if expires_after is provided
-    let created_at = chrono::Utc::now();
+    let created_at = jiff::Timestamp::now();
     let expires_at =
         if let (Some(anchor), Some(seconds)) = (expires_after_anchor, expires_after_seconds) {
             Some(
@@ -285,8 +285,8 @@ pub async fn upload_file(
         id: format!("{PREFIX_FILE}{}", file.id),
         object: "file".to_string(),
         bytes: file.bytes,
-        created_at: file.created_at.timestamp(),
-        expires_at: file.expires_at.map(|dt| dt.timestamp()),
+        created_at: services::timestamps::unix_seconds(file.created_at),
+        expires_at: file.expires_at.map(services::timestamps::unix_seconds),
         filename: file.filename,
         purpose: file.purpose,
     };
@@ -391,8 +391,8 @@ pub async fn list_files(
             id: format!("{PREFIX_FILE}{}", file.id),
             object: "file".to_string(),
             bytes: file.bytes,
-            created_at: file.created_at.timestamp(),
-            expires_at: file.expires_at.map(|dt| dt.timestamp()),
+            created_at: services::timestamps::unix_seconds(file.created_at),
+            expires_at: file.expires_at.map(services::timestamps::unix_seconds),
             filename: file.filename.clone(),
             purpose: file.purpose.clone(),
         })
@@ -485,8 +485,8 @@ pub async fn get_file(
         id: format!("{PREFIX_FILE}{}", file.id),
         object: "file".to_string(),
         bytes: file.bytes,
-        created_at: file.created_at.timestamp(),
-        expires_at: file.expires_at.map(|dt| dt.timestamp()),
+        created_at: services::timestamps::unix_seconds(file.created_at),
+        expires_at: file.expires_at.map(services::timestamps::unix_seconds),
         filename: file.filename,
         purpose: file.purpose,
     };

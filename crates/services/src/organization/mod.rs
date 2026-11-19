@@ -517,7 +517,7 @@ mod tests {
                     }
                 }
             }
-            org.updated_at = chrono::Utc::now();
+            org.updated_at = jiff::Timestamp::now();
             Ok(org.clone())
         }
 
@@ -662,7 +662,7 @@ mod tests {
     ) {
         let organization_id = OrganizationId(Uuid::new_v4());
         let user_id = UserId(Uuid::new_v4());
-        let now = chrono::Utc::now();
+        let now = jiff::Timestamp::now();
         let org_repo = Arc::new(StubOrgRepo {
             org: Mutex::new(Organization {
                 request_priority: 0,
@@ -747,8 +747,8 @@ mod tests {
             owner_id: UserId(Uuid::new_v4()),
             settings,
             is_active: true,
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
+            created_at: jiff::Timestamp::now(),
+            updated_at: jiff::Timestamp::now(),
         };
         let set = |names: &[&str]| -> std::collections::HashSet<String> {
             names.iter().map(|name| name.to_string()).collect()
@@ -772,6 +772,60 @@ mod tests {
                 org(serde_json::json!({ "allowed_models": value })).allowed_models(),
                 Some(set(&[]))
             );
+        }
+    }
+
+    #[test]
+    fn long_context_disabled_models_parse_and_fail_closed() {
+        let disabled = |settings: serde_json::Value| {
+            Organization {
+                request_priority: 0,
+                id: OrganizationId(Uuid::new_v4()),
+                name: "Example Org".to_string(),
+                description: None,
+                owner_id: UserId(Uuid::new_v4()),
+                settings,
+                is_active: true,
+                created_at: jiff::Timestamp::now(),
+                updated_at: jiff::Timestamp::now(),
+            }
+            .long_context_disabled_models()
+        };
+        let key = LONG_CONTEXT_DISABLED_MODELS_SETTING;
+
+        // Absent, null and empty: nothing is turned off.
+        for settings in [
+            serde_json::json!({}),
+            serde_json::json!({ key: null }),
+            serde_json::json!({ key: [] }),
+        ] {
+            let parsed = disabled(settings);
+            assert_eq!(parsed, LongContextDisabledModels::None);
+            assert!(!parsed.contains("a/b"));
+        }
+
+        let parsed = disabled(serde_json::json!({ key: ["a/b", "c/d"] }));
+        assert_eq!(
+            parsed,
+            LongContextDisabledModels::Models(
+                ["a/b", "c/d"].iter().map(|name| name.to_string()).collect()
+            )
+        );
+        assert!(parsed.contains("a/b"));
+        assert!(parsed.contains("c/d"));
+        assert!(!parsed.contains("e/f"));
+
+        // Anything that is not a list of names turns it off for every model.
+        for value in [
+            serde_json::json!("a/b"),
+            serde_json::json!(["a/b", 7]),
+            serde_json::json!([null]),
+            serde_json::json!({ "a/b": true }),
+            serde_json::json!(true),
+        ] {
+            let parsed = disabled(serde_json::json!({ key: value }));
+            assert_eq!(parsed, LongContextDisabledModels::All, "value: {value}");
+            assert!(parsed.contains("e/f"));
         }
     }
 }

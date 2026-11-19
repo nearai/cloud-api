@@ -112,7 +112,7 @@ async fn recovery_retries_a_busy_job_lease_without_waiting_for_global_recovery()
     let actor = Uuid::parse_str(MOCK_USER_ID).unwrap();
     let cursor = json!({"lease":{
         "token":Uuid::new_v4(),
-        "expires_at":chrono::Utc::now().timestamp() + 120
+        "expires_at":jiff::Timestamp::now().as_second() + 120
     }});
     let client = database.pool().get().await.unwrap();
     client.execute(

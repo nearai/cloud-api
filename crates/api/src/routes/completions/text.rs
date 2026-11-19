@@ -142,7 +142,11 @@ pub async fn completions(
         request_id = %request_id,
         org_id = %api_key.organization.id.0,
         workspace_id = %api_key.workspace.id.0,
-        model = %request.model,
+        // Client input: kept local, never exported with the span.
+        requested_model = %request.model,
+        // Canonical catalog name, recorded once the request resolves to a
+        // catalog model.
+        model = tracing::field::Empty,
     );
 
     completions_inner(app_state, api_key, body_hash, headers, request, request_id)
@@ -271,10 +275,19 @@ pub(super) async fn completions_inner(
     let resolved_model_name = alias_canonical.as_deref().unwrap_or(&request.model);
     let legacy_gateway_signature_enabled =
         match app_state.models_service.get_models_with_pricing().await {
-            Ok(models) => models
-                .iter()
-                .find(|model| model.model_name == resolved_model_name)
-                .is_some_and(|model| model.attestation_supported),
+            Ok(models) => {
+                let model = models
+                    .iter()
+                    .find(|model| model.model_name == resolved_model_name);
+                match model {
+                    Some(model) => {
+                        // The catalog's own name, never the client's string.
+                        tracing::Span::current().record("model", model.model_name.as_str());
+                        model.attestation_supported
+                    }
+                    None => false,
+                }
+            }
             Err(_) => {
                 tracing::warn!(
                     model = %request.model,

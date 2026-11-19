@@ -144,7 +144,7 @@ fn make_model_with_pricing(
         successor_model_name: None,
         openrouter_slug: None,
         is_listed: true,
-        created_at: chrono::Utc::now(),
+        created_at: jiff::Timestamp::now(),
     }
 }
 

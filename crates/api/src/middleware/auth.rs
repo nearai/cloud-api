@@ -536,6 +536,16 @@ pub async fn admin_middleware(
                         Err(err)
                     }
                 }
+            } else if state.admin_tokens_only {
+                debug!("Session token refused: admin access token required");
+                audit.record_credential(AdminCredentialKind::Session, None);
+                Err((
+                    StatusCode::UNAUTHORIZED,
+                    axum::Json(crate::models::ErrorResponse::new(
+                        "Admin access token required".to_string(),
+                        "unauthorized".to_string(),
+                    )),
+                ))
             } else {
                 // Not an admin access token, try as session token
                 debug!("Token does not appear to be an admin access token, trying session token");
@@ -585,6 +595,12 @@ pub async fn admin_middleware(
                 ));
             }
 
+            if let AdminAuthContext::AccessToken { token_id, .. } = context {
+                require_creator_admin_passkey(&state, user.id, token_id)
+                    .await
+                    .inspect_err(|_| audit.record_denied())?;
+            }
+
             authorize_admin_operation(context, &request).inspect_err(|_| audit.record_denied())?;
 
             debug!(admin_user_id = %user.id, authenticated = true, "Admin access granted");
@@ -627,6 +643,56 @@ fn is_admin_user(admin_emails: &[String], user: &DbUser) -> bool {
     }
 
     config::email_matches_admin_allowlist(admin_emails, &user.email)
+}
+
+/// When `admin_tokens_only` is set, an admin access token is accepted only while
+/// its creator has at least one admin passkey. Refusals use the same answers as
+/// admin access token validation.
+async fn require_creator_admin_passkey(
+    state: &AuthState,
+    creator_user_id: uuid::Uuid,
+    admin_access_token_id: uuid::Uuid,
+) -> Result<(), (StatusCode, axum::Json<crate::models::ErrorResponse>)> {
+    if !state.admin_tokens_only {
+        return Ok(());
+    }
+
+    match state
+        .admin_access_token_repository
+        .user_has_admin_passkey(creator_user_id)
+        .await
+    {
+        Ok(true) => Ok(()),
+        Ok(false) => {
+            debug!(
+                admin_user_id = %creator_user_id,
+                admin_access_token_id = %admin_access_token_id,
+                error_kind = "creator_without_admin_passkey",
+                "Admin access token refused"
+            );
+            Err((
+                StatusCode::UNAUTHORIZED,
+                axum::Json(crate::models::ErrorResponse::new(
+                    "Invalid admin access token".to_string(),
+                    "unauthorized".to_string(),
+                )),
+            ))
+        }
+        Err(_) => {
+            error!(
+                admin_access_token_id = %admin_access_token_id,
+                error_kind = "admin_passkey_lookup_failed",
+                "Failed to validate admin access token"
+            );
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(crate::models::ErrorResponse::new(
+                    "Failed to validate admin access token".to_string(),
+                    "internal_server_error".to_string(),
+                )),
+            ))
+        }
+    }
 }
 
 /// Authenticate admin access token
@@ -946,6 +1012,10 @@ pub struct AuthState {
     pub admin_access_token_repository: Arc<database::repositories::AdminAccessTokenRepository>,
     pub admin_emails: Vec<String>,
     pub encoding_key: String,
+    /// When true, admin routes accept only admin access tokens, refuse session
+    /// tokens, and require the token's creator to have an admin passkey. See
+    /// `AuthConfig::admin_tokens_only`.
+    pub admin_tokens_only: bool,
 }
 
 impl AuthState {
@@ -964,7 +1034,13 @@ impl AuthState {
             admin_access_token_repository,
             admin_emails,
             encoding_key,
+            admin_tokens_only: false,
         }
+    }
+
+    pub fn with_admin_tokens_only(mut self, admin_tokens_only: bool) -> Self {
+        self.admin_tokens_only = admin_tokens_only;
+        self
     }
 }
 
@@ -1001,8 +1077,8 @@ mod tests {
             username: "admin-probe".to_string(),
             display_name: None,
             avatar_url: None,
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
+            created_at: jiff::Timestamp::now(),
+            updated_at: jiff::Timestamp::now(),
             last_login_at: None,
             is_active: true,
             auth_provider: auth_provider.to_string(),
@@ -1053,7 +1129,7 @@ mod tests {
         let admin_emails = vec!["admin@near.ai".to_string()];
         let mut user = admin_test_user("google", "other@near.ai");
         user.contact_email = Some("admin@near.ai".to_string());
-        user.contact_email_verified_at = Some(chrono::Utc::now());
+        user.contact_email_verified_at = Some(jiff::Timestamp::now());
 
         assert!(!is_admin_user(&admin_emails, &user));
 
@@ -1109,7 +1185,7 @@ mod tests {
         use async_trait::async_trait;
         use axum::routing::post;
         use axum::{Extension, Router};
-        use chrono::{DateTime, Utc};
+        use jiff::Timestamp;
         use services::common::RepositoryError;
         use services::models::{resolve_model_cached, ModelCaller, ModelsRepository};
         use services::organization::{Organization, OrganizationId};
@@ -1146,7 +1222,7 @@ mod tests {
                     name: "k".to_string(),
                     workspace_id: WorkspaceId(workspace_id()),
                     created_by_user_id: services::auth::UserId(Uuid::nil()),
-                    created_at: Utc::now(),
+                    created_at: Timestamp::now(),
                     expires_at: None,
                     last_used_at: None,
                     is_active: true,
@@ -1188,7 +1264,7 @@ mod tests {
                 &self,
                 _: ApiKeyId,
                 _: Option<String>,
-                _: Option<Option<DateTime<Utc>>>,
+                _: Option<Option<Timestamp>>,
                 _: Option<Option<i64>>,
                 _: Option<bool>,
             ) -> Result<ApiKey, RepositoryError> {
@@ -1212,7 +1288,7 @@ mod tests {
             }
             async fn get_active_key_hashes_created_after(
                 &self,
-                _: DateTime<Utc>,
+                _: Timestamp,
             ) -> Result<Vec<String>, RepositoryError> {
                 Ok(vec![])
             }
@@ -1247,8 +1323,8 @@ mod tests {
                         description: None,
                         organization_id: OrganizationId(organization_id()),
                         created_by_user_id: owner.clone(),
-                        created_at: Utc::now(),
-                        updated_at: Utc::now(),
+                        created_at: Timestamp::now(),
+                        updated_at: Timestamp::now(),
                         is_active: true,
                         settings: None,
                     },
@@ -1260,8 +1336,8 @@ mod tests {
                         owner_id: owner,
                         settings: serde_json::json!({}),
                         is_active: true,
-                        created_at: Utc::now(),
-                        updated_at: Utc::now(),
+                        created_at: Timestamp::now(),
+                        updated_at: Timestamp::now(),
                     },
                 )))
             }

@@ -122,6 +122,7 @@ pub struct ApiConfig {
     pub staking_farm: StakingFarmConfig,
     pub aml: AmlConfig,
     pub usage_reporting: UsageReportingConfig,
+    pub usage_estimate_incomplete_streams: bool,
     /// Posting-time credit allocation policy. The order is persisted with
     /// every attributed usage charge, so changing it never rewrites history.
     pub credit_allocation: CreditAllocationConfig,
@@ -154,6 +155,7 @@ impl std::fmt::Debug for ApiConfig {
             staking_farm,
             aml,
             usage_reporting,
+            usage_estimate_incomplete_streams,
             credit_allocation,
             ita,
             placement,
@@ -182,6 +184,10 @@ impl std::fmt::Debug for ApiConfig {
             .field("staking_farm", staking_farm)
             .field("aml", aml)
             .field("usage_reporting", usage_reporting)
+            .field(
+                "usage_estimate_incomplete_streams",
+                usage_estimate_incomplete_streams,
+            )
             .field("credit_allocation", credit_allocation)
             .field("ita", ita)
             .field("placement", placement)
@@ -269,6 +275,10 @@ impl ApiConfig {
             aml: AmlConfig::from_env()?,
             ita: ItaAttestationConfig::from_env()?,
             usage_reporting: UsageReportingConfig::from_env()?,
+            usage_estimate_incomplete_streams: parse_bool_env(
+                "USAGE_ESTIMATE_INCOMPLETE_STREAMS",
+                true,
+            )?,
             credit_allocation: CreditAllocationConfig::from_env()?,
             placement: PlacementConfig::from_env()?,
         })
@@ -1140,6 +1150,13 @@ pub struct AuthConfig {
     /// outstanding legacy tokens have expired to reject any token that cannot
     /// be tied to a live session.
     pub require_session_bound_access_tokens: bool,
+    /// Accept only admin access tokens (`adm_`) on admin routes.
+    ///
+    /// Default `false`: admin routes accept a session token from an allowlisted
+    /// user or an admin access token. Set `AUTH_ADMIN_TOKENS_ONLY=true` to refuse
+    /// session tokens on admin routes with 401. An admin access token is then
+    /// also accepted only while its creator has at least one admin passkey.
+    pub admin_tokens_only: bool,
 }
 
 impl std::fmt::Debug for AuthConfig {
@@ -1152,6 +1169,7 @@ impl std::fmt::Debug for AuthConfig {
             near,
             admin_emails,
             require_session_bound_access_tokens,
+            admin_tokens_only,
         } = self;
         f.debug_struct("AuthConfig")
             .field("mock", mock)
@@ -1164,6 +1182,7 @@ impl std::fmt::Debug for AuthConfig {
                 "require_session_bound_access_tokens",
                 require_session_bound_access_tokens,
             )
+            .field("admin_tokens_only", admin_tokens_only)
             .finish()
     }
 }
@@ -1243,6 +1262,7 @@ impl AuthConfig {
                 "AUTH_REQUIRE_SESSION_BOUND_ACCESS_TOKENS",
                 false,
             )?,
+            admin_tokens_only: parse_bool_env("AUTH_ADMIN_TOKENS_ONLY", false)?,
         })
     }
 
@@ -1765,15 +1785,18 @@ mod tests {
     }
 
     struct TelemetryEnvGuard {
-        values: [(&'static str, Option<OsString>); 3],
+        values: [(&'static str, Option<OsString>); 6],
     }
 
     impl TelemetryEnvGuard {
         fn new() -> Self {
-            const KEYS: [&str; 3] = [
+            const KEYS: [&str; 6] = [
                 "TELEMETRY_SERVICE_INSTANCE_ID_FILE",
                 "TELEMETRY_OTLP_ENDPOINT",
                 "TELEMETRY_OTLP_PROTOCOL",
+                "TELEMETRY_TRACES_ENABLED",
+                "TELEMETRY_TRACES_SAMPLE_RATIO",
+                "OTEL_SDK_DISABLED",
             ];
 
             Self {
@@ -1902,6 +1925,91 @@ mod tests {
         assert_eq!(std::env::var_os("TELEMETRY_OTLP_PROTOCOL"), original[2]);
     }
 
+    fn clear_trace_env() {
+        for key in [
+            "TELEMETRY_TRACES_ENABLED",
+            "TELEMETRY_TRACES_SAMPLE_RATIO",
+            "OTEL_SDK_DISABLED",
+        ] {
+            std::env::remove_var(key);
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn otlp_traces_default_to_disabled_with_one_percent_sampling() {
+        let _env = TelemetryEnvGuard::new();
+        clear_trace_env();
+
+        let config = OtlpConfig::from_env().unwrap();
+
+        assert!(!config.traces_enabled);
+        assert_eq!(config.traces_sample_ratio, 0.01);
+    }
+
+    #[test]
+    #[serial]
+    fn otlp_traces_accept_valid_values() {
+        let _env = TelemetryEnvGuard::new();
+        clear_trace_env();
+        for (raw, expected) in [
+            ("true", true),
+            ("TRUE", true),
+            ("1", true),
+            ("false", false),
+            ("False", false),
+            ("0", false),
+        ] {
+            std::env::set_var("TELEMETRY_TRACES_ENABLED", raw);
+            assert_eq!(OtlpConfig::from_env().unwrap().traces_enabled, expected);
+        }
+        std::env::set_var("TELEMETRY_TRACES_ENABLED", "true");
+        for (raw, expected) in [("0", 0.0), ("0.25", 0.25), ("1", 1.0), ("1.0", 1.0)] {
+            std::env::set_var("TELEMETRY_TRACES_SAMPLE_RATIO", raw);
+            assert_eq!(
+                OtlpConfig::from_env().unwrap().traces_sample_ratio,
+                expected
+            );
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn otlp_traces_reject_invalid_enabled_value() {
+        let _env = TelemetryEnvGuard::new();
+        clear_trace_env();
+        for raw in ["yes", "on", "2", ""] {
+            std::env::set_var("TELEMETRY_TRACES_ENABLED", raw);
+            let error = OtlpConfig::from_env().unwrap_err();
+            assert!(error.contains("TELEMETRY_TRACES_ENABLED"));
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn otlp_traces_reject_invalid_sample_ratio() {
+        let _env = TelemetryEnvGuard::new();
+        clear_trace_env();
+        for raw in ["-0.1", "1.5", "abc", "NaN", "inf", ""] {
+            std::env::set_var("TELEMETRY_TRACES_SAMPLE_RATIO", raw);
+            let error = OtlpConfig::from_env().unwrap_err();
+            assert!(error.contains("TELEMETRY_TRACES_SAMPLE_RATIO"));
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn otel_sdk_disabled_overrides_traces_enabled() {
+        let _env = TelemetryEnvGuard::new();
+        clear_trace_env();
+        std::env::set_var("TELEMETRY_TRACES_ENABLED", "true");
+        std::env::set_var("OTEL_SDK_DISABLED", "TRUE");
+        assert!(!OtlpConfig::from_env().unwrap().traces_enabled);
+
+        std::env::set_var("OTEL_SDK_DISABLED", "false");
+        assert!(OtlpConfig::from_env().unwrap().traces_enabled);
+    }
+
     #[test]
     fn reporting_database_timeout_leaves_headroom_for_http_response() {
         let config = UsageReportingConfig {
@@ -1916,6 +2024,28 @@ mod tests {
             config.database_statement_timeout()
                 < std::time::Duration::from_secs(config.request_timeout_seconds)
         );
+    }
+
+    #[test]
+    #[serial]
+    fn usage_estimate_incomplete_streams_defaults_on_and_accepts_false() {
+        let key = "USAGE_ESTIMATE_INCOMPLETE_STREAMS";
+        let original = std::env::var_os(key);
+        std::env::remove_var(key);
+        assert!(parse_bool_env(key, true).unwrap());
+        std::env::set_var(key, "false");
+        assert!(!parse_bool_env(key, true).unwrap());
+        std::env::set_var(key, "0");
+        assert!(!parse_bool_env(key, true).unwrap());
+        std::env::set_var(key, "garbage");
+        assert_eq!(
+            parse_bool_env(key, true),
+            Err(format!("{key} must be true or false"))
+        );
+        match original {
+            Some(value) => std::env::set_var(key, value),
+            None => std::env::remove_var(key),
+        }
     }
 
     #[test]
@@ -2064,6 +2194,7 @@ mod tests {
             near: NearConfig::default(),
             admin_emails: vec!["alice@near.ai".to_string(), "bob@near.org".to_string()],
             require_session_bound_access_tokens: false,
+            admin_tokens_only: false,
         };
 
         // Explicitly allowed addresses
@@ -2169,6 +2300,7 @@ mod tests {
             near: NearConfig::default(),
             admin_emails: vec![],
             require_session_bound_access_tokens: false,
+            admin_tokens_only: false,
         };
 
         // Should return false when no admin emails configured
@@ -2341,6 +2473,8 @@ mod tests {
                 endpoint: "http://localhost:4317".to_string(),
                 protocol: "grpc".to_string(),
                 instance_id: None,
+                traces_enabled: false,
+                traces_sample_ratio: 0.01,
             },
             cors: CorsConfig {
                 exact_matches: Vec::new(),
@@ -2360,6 +2494,7 @@ mod tests {
                 ..AmlConfig::default()
             },
             usage_reporting: UsageReportingConfig::default(),
+            usage_estimate_incomplete_streams: true,
             credit_allocation: CreditAllocationConfig::default(),
             ita: ItaAttestationConfig::default(),
             placement: PlacementConfig {
@@ -3499,6 +3634,36 @@ pub struct OtlpConfig {
     pub endpoint: String,
     pub protocol: String,
     pub instance_id: Option<String>,
+    /// Whether distributed tracing is exported. Off unless explicitly enabled.
+    pub traces_enabled: bool,
+    /// Fraction of root traces that are sampled, within `[0.0, 1.0]`.
+    pub traces_sample_ratio: f64,
+}
+
+/// Default fraction of root traces sampled when tracing is enabled.
+const DEFAULT_TRACES_SAMPLE_RATIO: f64 = 0.01;
+
+fn parse_traces_enabled(raw: Option<&str>) -> Result<bool, String> {
+    match raw.map(str::trim) {
+        None => Ok(false),
+        Some(value) if value.eq_ignore_ascii_case("true") || value == "1" => Ok(true),
+        Some(value) if value.eq_ignore_ascii_case("false") || value == "0" => Ok(false),
+        Some(_) => Err("TELEMETRY_TRACES_ENABLED must be true, false, 1 or 0".to_string()),
+    }
+}
+
+fn parse_traces_sample_ratio(raw: Option<&str>) -> Result<f64, String> {
+    let Some(raw) = raw else {
+        return Ok(DEFAULT_TRACES_SAMPLE_RATIO);
+    };
+    let ratio: f64 = raw
+        .trim()
+        .parse()
+        .map_err(|_| "TELEMETRY_TRACES_SAMPLE_RATIO must be a number".to_string())?;
+    if !(0.0..=1.0).contains(&ratio) {
+        return Err("TELEMETRY_TRACES_SAMPLE_RATIO must be between 0.0 and 1.0".to_string());
+    }
+    Ok(ratio)
 }
 
 impl OtlpConfig {
@@ -3506,8 +3671,17 @@ impl OtlpConfig {
         let instance_id =
             read_optional_non_empty_file_env("TELEMETRY_SERVICE_INSTANCE_ID_FILE", None)?;
 
+        let requested = parse_traces_enabled(env::var("TELEMETRY_TRACES_ENABLED").ok().as_deref())?;
+        let sdk_disabled = env::var("OTEL_SDK_DISABLED")
+            .map(|value| value.trim().eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let traces_sample_ratio =
+            parse_traces_sample_ratio(env::var("TELEMETRY_TRACES_SAMPLE_RATIO").ok().as_deref())?;
+
         Ok(Self {
             instance_id,
+            traces_enabled: requested && !sdk_disabled,
+            traces_sample_ratio,
             ..Self::default()
         })
     }
@@ -3520,6 +3694,8 @@ impl Default for OtlpConfig {
                 .unwrap_or_else(|_| "http://localhost:4317".to_string()),
             protocol: env::var("TELEMETRY_OTLP_PROTOCOL").unwrap_or_else(|_| "grpc".to_string()),
             instance_id: None,
+            traces_enabled: false,
+            traces_sample_ratio: DEFAULT_TRACES_SAMPLE_RATIO,
         }
     }
 }

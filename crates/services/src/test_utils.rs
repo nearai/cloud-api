@@ -146,7 +146,7 @@ impl UsageServiceTrait for MockUsageService {
             output_cost: 0,
             total_cost: 0,
             inference_type: _request.inference_type,
-            created_at: chrono::Utc::now(),
+            created_at: jiff::Timestamp::now(),
             ttft_ms: _request.ttft_ms,
             avg_itl_ms: _request.avg_itl_ms,
             inference_id: _request.inference_id,
@@ -277,7 +277,7 @@ impl UsageServiceTrait for MockUsageService {
             output_cost: 0,
             total_cost: 0,
             inference_type,
-            created_at: chrono::Utc::now(),
+            created_at: jiff::Timestamp::now(),
             ttft_ms: None,
             avg_itl_ms: None,
             inference_id: None,
@@ -361,8 +361,8 @@ impl UsageServiceTrait for MockUsageService {
     async fn get_usage_by_model(
         &self,
         _organization_id: Uuid,
-        _start_date: chrono::DateTime<chrono::Utc>,
-        _end_date: Option<chrono::DateTime<chrono::Utc>>,
+        _start_date: jiff::Timestamp,
+        _end_date: Option<jiff::Timestamp>,
     ) -> Result<Vec<crate::usage::UsageByModelEntry>, UsageError> {
         Ok(vec![])
     }
@@ -417,7 +417,7 @@ impl UsageServiceTrait for CapturingUsageService {
             output_cost: 0,
             total_cost: 0,
             inference_type: request.inference_type,
-            created_at: chrono::Utc::now(),
+            created_at: jiff::Timestamp::now(),
             ttft_ms: request.ttft_ms,
             avg_itl_ms: request.avg_itl_ms,
             inference_id: request.inference_id,
@@ -550,7 +550,7 @@ impl UsageServiceTrait for CapturingUsageService {
             output_cost: 0,
             total_cost: 0,
             inference_type,
-            created_at: chrono::Utc::now(),
+            created_at: jiff::Timestamp::now(),
             ttft_ms: None,
             avg_itl_ms: None,
             inference_id: None,
@@ -634,8 +634,8 @@ impl UsageServiceTrait for CapturingUsageService {
     async fn get_usage_by_model(
         &self,
         _organization_id: Uuid,
-        _start_date: chrono::DateTime<chrono::Utc>,
-        _end_date: Option<chrono::DateTime<chrono::Utc>>,
+        _start_date: jiff::Timestamp,
+        _end_date: Option<jiff::Timestamp>,
     ) -> Result<Vec<crate::usage::UsageByModelEntry>, UsageError> {
         Ok(vec![])
     }

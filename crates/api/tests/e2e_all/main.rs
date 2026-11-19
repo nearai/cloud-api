@@ -51,6 +51,7 @@ mod glm52_tier_routing;
 mod health;
 mod incomplete_streams;
 mod ita_attestation;
+mod long_context_access;
 mod mcp_server;
 mod message_metadata;
 mod model_alias_transparency;

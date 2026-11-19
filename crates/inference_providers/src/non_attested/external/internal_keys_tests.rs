@@ -89,7 +89,13 @@ async fn image_generation_body_omits_internal_keys_on_the_wire() {
     assert_stripped(&body, "image_generation");
     // Made inside an authenticated request's scope, the call still carries
     // no tenant ids: only self-hosted backends receive them.
-    for name in ["x-request-id", "x-org-id", "x-workspace-id"] {
+    for name in [
+        "x-request-id",
+        "x-org-id",
+        "x-workspace-id",
+        "traceparent",
+        "tracestate",
+    ] {
         assert!(
             requests[0].headers.get(name).is_none(),
             "{name} must never reach an external provider"

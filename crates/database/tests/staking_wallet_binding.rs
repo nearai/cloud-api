@@ -36,7 +36,7 @@ fn challenge(org: Uuid, actor: Uuid, account: String) -> BindingChallenge {
         organization_id: org,
         actor_user_id: actor,
         near_account_id: account,
-        expires_at: chrono::Utc::now() + chrono::Duration::minutes(5),
+        expires_at: jiff::Timestamp::now() + jiff::SignedDuration::from_mins(5),
         payload: BindingPayload {
             message: "Verified in service tests".into(),
             nonce: vec![1; 32],
@@ -404,7 +404,7 @@ async fn synthetic_email_collision_returns_typed_conflict_and_rolls_back() -> an
             &[&c.challenge_id]
         )
         .await?
-        .get::<_, Option<chrono::DateTime<chrono::Utc>>>(0)
+        .get::<_, Option<jiff::Timestamp>>(0)
         .is_none());
     Ok(())
 }

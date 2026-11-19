@@ -1,3 +1,4 @@
+use crate::bounded_timestamp::BoundedTimestamp;
 use crate::pool::DbPool;
 use crate::retry_db;
 use crate::{
@@ -5,7 +6,7 @@ use crate::{
     repositories::utils::map_db_error,
 };
 use anyhow::{Context, Result};
-use chrono::Utc;
+use jiff::Timestamp;
 use services::common::RepositoryError;
 use sha2::{Digest, Sha256};
 use tracing::debug;
@@ -28,7 +29,7 @@ impl AdminAccessTokenRepository {
             name: row.get("name"),
             creation_reason: row.get("creation_reason"),
             created_at: row.get("created_at"),
-            expires_at: row.get("expires_at"),
+            expires_at: row.try_get::<_, BoundedTimestamp>("expires_at")?.0,
             last_used_at: row.get("last_used_at"),
             is_active: row.get("is_active"),
             revoked_at: row.get("revoked_at"),
@@ -60,7 +61,7 @@ impl AdminAccessTokenRepository {
         created_by_user_id: Uuid,
         name: String,
         creation_reason: String,
-        expires_at: chrono::DateTime<Utc>,
+        expires_at: jiff::Timestamp,
         user_agent: Option<String>,
         permission: AdminAccessTokenPermission,
     ) -> Result<(AdminAccessToken, String)> {
@@ -69,7 +70,7 @@ impl AdminAccessTokenRepository {
         let token_hash = Self::hash_admin_access_token(&admin_access_token);
 
         let row = retry_db!("create_new_admin_access", {
-            let now = Utc::now();
+            let now = Timestamp::now();
             let client = self
                 .pool
                 .get()
@@ -106,8 +107,9 @@ impl AdminAccessTokenRepository {
         let admin_token = Self::from_row(&row)?;
 
         debug!(
-            "Created admin access token {} for user {}",
-            name, created_by_user_id
+            token_id = %admin_token.id,
+            user_id = %created_by_user_id,
+            "Created admin access token"
         );
 
         Ok((admin_token, admin_access_token))
@@ -122,7 +124,7 @@ impl AdminAccessTokenRepository {
         let token_hash = Self::hash_admin_access_token(token);
 
         let row = retry_db!("validate_admin_access_token", {
-            let now = Utc::now();
+            let now = Timestamp::now();
             let client = self
                 .pool
                 .get()
@@ -148,7 +150,7 @@ impl AdminAccessTokenRepository {
         match row {
             Some(row) => {
                 let mut admin_token = Self::from_row(&row)?;
-                let now = Utc::now();
+                let now = Timestamp::now();
                 let client = self
                     .pool
                     .get()
@@ -203,6 +205,28 @@ impl AdminAccessTokenRepository {
         }
     }
 
+    /// Whether the user has at least one admin passkey registered.
+    pub async fn user_has_admin_passkey(&self, user_id: Uuid) -> Result<bool> {
+        let row = retry_db!("user_has_admin_passkey", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
+
+            client
+                .query_one(
+                    "SELECT EXISTS (SELECT 1 FROM webauthn_credentials WHERE user_id = $1 AND client = 'admin')",
+                    &[&user_id],
+                )
+                .await
+                .map_err(map_db_error)
+        })?;
+
+        Ok(row.get(0))
+    }
+
     /// List admin access tokens with pagination
     pub async fn list(&self, limit: i64, offset: i64) -> Result<Vec<AdminAccessToken>> {
         let rows = retry_db!("list_admin_access_tokens_with_pagination", {
@@ -239,7 +263,7 @@ impl AdminAccessTokenRepository {
         revocation_reason: String,
     ) -> Result<bool> {
         let result = retry_db!("revoke_admin_access", {
-            let now = Utc::now();
+            let now = Timestamp::now();
             let client = self
                 .pool
                 .get()
@@ -285,7 +309,7 @@ impl AdminAccessTokenRepository {
     /// Clean up expired tokens
     pub async fn cleanup_expired(&self) -> Result<usize> {
         let result = retry_db!("clean_up_expired_tokens", {
-            let now = Utc::now();
+            let now = Timestamp::now();
             let client = self
                 .pool
                 .get()

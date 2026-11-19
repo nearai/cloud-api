@@ -16,7 +16,7 @@ placement = { path = "../placement" }
 async-trait = "0.1"
 base64 = "0.23"
 bytes = "1.11"
-chrono = { version = "0.4", features = ["serde"] }
+jiff = { version = "0.2.46", default-features = false, features = ["std", "serde"] }
 uuid = { version = "1", features = ["v4"] }
 futures-core = "0.3"
 http = "1"
@@ -37,6 +37,8 @@ ring = "0.17"
 hex = "0.4"
 futures-util = "0.3"
 tracing = "0.1"
+opentelemetry = { version = "0.33", features = ["trace"] }
+tracing-opentelemetry = "0.34"
 dstack-sdk-types = "0.1.2"
 serde_urlencoded = "0.7.1"
 regex = "1"
@@ -56,6 +58,7 @@ async-stream = "0.3"
 
 # Dev dependencies for testing and examples
 [dev-dependencies]
+opentelemetry_sdk = { version = "0.33", features = ["trace"] }
 zeroize = "1.9"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["std", "fmt"] }
 futures-util = "0.3"

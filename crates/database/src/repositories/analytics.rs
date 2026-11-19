@@ -9,7 +9,7 @@ mod organization;
 use super::{reporting_query, utils::map_db_error};
 use crate::pool::DbPool;
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use services::admin::{AnalyticsRepository, OrganizationMetrics, TimeSeriesMetrics};
 use services::common::RepositoryError;
 use std::time::{Duration, Instant};
@@ -98,8 +98,8 @@ impl AnalyticsRepository for PgAnalyticsRepository {
     async fn get_organization_metrics(
         &self,
         org_id: Uuid,
-        start: DateTime<Utc>,
-        end: DateTime<Utc>,
+        start: Timestamp,
+        end: Timestamp,
         credit_type: Option<&str>,
     ) -> Result<OrganizationMetrics, RepositoryError> {
         self.run_report(self.statement_timeout, async |tx, deadline| {
@@ -117,8 +117,8 @@ impl AnalyticsRepository for PgAnalyticsRepository {
     async fn get_organization_timeseries(
         &self,
         org_id: Uuid,
-        start: DateTime<Utc>,
-        end: DateTime<Utc>,
+        start: Timestamp,
+        end: Timestamp,
         granularity: &str,
         credit_type: Option<&str>,
     ) -> Result<TimeSeriesMetrics, RepositoryError> {

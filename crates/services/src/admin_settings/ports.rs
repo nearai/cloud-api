@@ -1,6 +1,6 @@
 use anyhow::Result;
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde_json::Value;
 use uuid::Uuid;
 
@@ -10,7 +10,7 @@ pub struct StoredSetting {
     pub key: String,
     pub value: Value,
     pub updated_by_user_id: Option<Uuid>,
-    pub updated_at: DateTime<Utc>,
+    pub updated_at: Timestamp,
 }
 
 #[async_trait]

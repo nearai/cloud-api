@@ -27,15 +27,16 @@ inference_providers = { path = "../inference_providers", features = ["openapi"] 
 tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.7", features = ["cors", "compression-gzip", "compression-br", "set-header"] }
 uuid = { version = "1.23", features = ["v4", "serde"] }
-opentelemetry = { version = "0.33", features = ["metrics"] }
-opentelemetry_sdk = { version = "0.33", features = ["rt-tokio"] }
-opentelemetry-otlp = { version = "0.33", features = ["metrics", "grpc-tonic"] }
+opentelemetry = { version = "0.33", features = ["metrics", "trace"] }
+opentelemetry_sdk = { version = "0.33", features = ["rt-tokio", "trace"] }
+opentelemetry-otlp = { version = "0.33", features = ["metrics", "trace", "grpc-tonic"] }
+tracing-opentelemetry = "0.34"
 url = "2.5"
-chrono = { version = "0.4", features = ["serde"] }
+jiff = { version = "0.2.46", default-features = false, features = ["std", "serde"] }
 # For TypedHeader support
 headers = "0.4"
 # OpenAPI documentation generation
-utoipa = { version = "6", features = ["axum_extras", "chrono", "uuid"] }
+utoipa = { version = "6", features = ["axum_extras", "jiff_0_2", "uuid"] }
 thiserror = "2.0"
 # Body hashing middleware dependencies
 sha2 = "0.11"
@@ -68,6 +69,7 @@ tokio-util = { version = "0.7", features = ["compat", "io"] }
 reqwest = { version = "0.12", features = ["json", "stream"] }
 
 [dev-dependencies]
+opentelemetry_sdk = { version = "0.33", features = ["rt-tokio", "trace", "testing"] }
 database = { path = "../database", features = ["test-support"] }
 axum-test = "21"
 wiremock = "0.6"

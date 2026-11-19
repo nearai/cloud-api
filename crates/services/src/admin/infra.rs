@@ -7,7 +7,7 @@
 //!
 //! No customer data is involved — only host IPs, model identifiers, and counts.
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, RwLock};
@@ -50,7 +50,7 @@ pub struct InfraSummary {
     pub model_gpu_allocations: Vec<ModelGpuAllocation>,
     /// True when current GPU allocation is unavailable or served from cache.
     pub gpu_data_stale: bool,
-    pub fetched_at: DateTime<Utc>,
+    pub fetched_at: Timestamp,
     /// True when this is last-known / fallback data because the live fetch failed.
     pub stale: bool,
 }
@@ -248,7 +248,7 @@ impl InfraService {
             hourly_gpu_burn_usd: total_allocated_gpus as f64 * self.cost_per_gpu_hour_usd,
             model_gpu_allocations,
             gpu_data_stale,
-            fetched_at: Utc::now(),
+            fetched_at: Timestamp::now(),
             stale,
         }
     }

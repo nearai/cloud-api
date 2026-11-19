@@ -71,6 +71,7 @@ impl ResponseError {
                 error,
                 crate::completions::CompletionError::InvalidModel(_)
                     | crate::completions::CompletionError::InvalidParams(_)
+                    | crate::completions::CompletionError::ContextLengthExceeded { .. }
                     | crate::completions::CompletionError::RateLimitExceeded(_)
             ),
             ResponseError::InternalError(_) | ResponseError::StreamInterrupted => false,
@@ -120,7 +121,8 @@ impl ResponseError {
 fn completion_http_status_code(error: &crate::completions::CompletionError) -> u16 {
     match error {
         crate::completions::CompletionError::InvalidModel(_)
-        | crate::completions::CompletionError::InvalidParams(_) => 400,
+        | crate::completions::CompletionError::InvalidParams(_)
+        | crate::completions::CompletionError::ContextLengthExceeded { .. } => 400,
         crate::completions::CompletionError::RateLimitExceeded(_) => 429,
         crate::completions::CompletionError::ProviderError { status_code, .. } => *status_code,
         crate::completions::CompletionError::ServiceOverloaded(_)
@@ -141,6 +143,11 @@ fn completion_response_error(
         crate::completions::CompletionError::InvalidParams(msg) => {
             response_error(msg, "invalid_request_error", None)
         }
+        crate::completions::CompletionError::ContextLengthExceeded { .. } => response_error(
+            &error.to_string(),
+            "invalid_request_error",
+            Some("context_length_exceeded"),
+        ),
         crate::completions::CompletionError::RateLimitExceeded(msg) => {
             let message = if msg.is_empty() {
                 "Rate limit exceeded"
@@ -224,5 +231,17 @@ mod tests {
         let response_err = ResponseError::Completion(completion_err);
         assert_eq!(response_err.http_status_code(), 429);
         assert_eq!(response_err.response_error().type_, "rate_limit_exceeded");
+    }
+
+    #[test]
+    fn test_responses_api_long_context_limit_is_a_client_400() {
+        let response_err =
+            ResponseError::Completion(CompletionError::ContextLengthExceeded { limit: 100_000 });
+        assert_eq!(response_err.http_status_code(), 400);
+        assert!(response_err.is_client_caused());
+        let body = response_err.response_error();
+        assert_eq!(body.type_, "invalid_request_error");
+        assert_eq!(body.code.as_deref(), Some("context_length_exceeded"));
+        assert!(body.message.contains("limit: 100000 tokens"));
     }
 }

@@ -2,7 +2,7 @@
 //! typed constraints only narrow the organization's administrative policy.
 use crate::pool::DbPool;
 use crate::repositories::credit_allocation::lock_organization_accounting;
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde_json::{json, Value};
 use tokio_postgres::Transaction;
 use uuid::Uuid;
@@ -260,7 +260,7 @@ impl OrganizationCredentialRepository {
         )
             .await?
             .ok_or(OrganizationOperationError("credential_not_found"))?;
-        if row.get::<_, Option<DateTime<Utc>>>(0).is_none() {
+        if row.get::<_, Option<Timestamp>>(0).is_none() {
             let result: Value = tx.query_one(
                 r#"UPDATE organization_credentials SET revoked_at = clock_timestamp(), revoked_by = $3
                    WHERE organization_id = $1 AND id = $2
@@ -347,7 +347,7 @@ mod tests {
             "name": "Worker",
             "permissions": ["credits:transfer"],
             "constraints": {"credits:transfer": {"max_total_amount": 10}},
-            "expires_at": Utc::now() + chrono::Duration::hours(1),
+            "expires_at": Timestamp::now() + jiff::SignedDuration::from_hours(1),
         });
         let request: CredentialRequest = serde_json::from_value(valid.clone()).unwrap();
         assert!(request.validate().is_ok());
@@ -373,7 +373,7 @@ mod tests {
         assert!(serde_json::from_value::<CredentialRequest>(invalid).is_err());
 
         let mut expired: CredentialRequest = serde_json::from_value(valid).unwrap();
-        expired.expires_at = Utc::now() - chrono::Duration::seconds(1);
+        expired.expires_at = Timestamp::now() - jiff::SignedDuration::from_secs(1);
         assert!(expired.validate().is_err());
     }
 }

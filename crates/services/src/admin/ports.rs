@@ -61,7 +61,7 @@ pub struct UpdateModelAdminRequest {
     ///
     /// Tri-state: `None` = leave unchanged, `Some(None)` = clear to NULL,
     /// `Some(Some(dt))` = set to `dt`.
-    pub deprecation_date: Option<Option<chrono::DateTime<chrono::Utc>>>,
+    pub deprecation_date: Option<Option<jiff::Timestamp>>,
     /// Recommended replacement model for a planned deprecation (canonical
     /// model name). Announced in the `x-model-successor` response header.
     /// Cleared together with `deprecation_date`.
@@ -121,7 +121,7 @@ pub struct ModelPricing {
     /// Datacenter country codes (ISO 3166 Alpha-2) the model runs in.
     pub datacenters: Option<Vec<String>>,
     pub is_ready: Option<bool>,
-    pub deprecation_date: Option<chrono::DateTime<chrono::Utc>>,
+    pub deprecation_date: Option<jiff::Timestamp>,
     /// Recommended replacement model for the planned deprecation.
     pub successor_model_name: Option<String>,
     /// OpenRouter `openrouter.slug` override. NULL = unset.
@@ -164,7 +164,7 @@ pub struct ModelHistoryEntry {
     /// Datacenter country codes (ISO 3166 Alpha-2) the model ran in.
     pub datacenters: Option<Vec<String>>,
     pub is_ready: Option<bool>,
-    pub deprecation_date: Option<chrono::DateTime<chrono::Utc>>,
+    pub deprecation_date: Option<jiff::Timestamp>,
     /// Recommended replacement model for the planned deprecation.
     pub successor_model_name: Option<String>,
     /// OpenRouter `openrouter.slug` override the model carried at this point.
@@ -174,12 +174,12 @@ pub struct ModelHistoryEntry {
     /// Whether the model was listed (in the public model catalogs and open to
     /// every caller) at this point in time.
     pub is_listed: bool,
-    pub effective_from: chrono::DateTime<chrono::Utc>,
-    pub effective_until: Option<chrono::DateTime<chrono::Utc>>,
+    pub effective_from: jiff::Timestamp,
+    pub effective_until: Option<jiff::Timestamp>,
     pub changed_by_user_id: Option<uuid::Uuid>,
     pub changed_by_user_email: Option<String>,
     pub change_reason: Option<String>,
-    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub created_at: jiff::Timestamp,
 }
 
 /// Organization information for user listing (earliest organization with spend limit and usage)
@@ -227,7 +227,7 @@ pub struct ModelDeprecationDeliveryRecord {
     pub model_name: String,
     pub model_display_name: String,
     pub successor_model_name: String,
-    pub deprecation_date: chrono::DateTime<chrono::Utc>,
+    pub deprecation_date: jiff::Timestamp,
     pub recipient_user_id: uuid::Uuid,
     pub recipient_email: String,
     pub organization_id: uuid::Uuid,
@@ -305,7 +305,7 @@ pub struct ScheduledPricingChangeInsert {
     pub old_cost_per_image: i64,
     pub old_text_pricing: Option<crate::usage::TextPricingProfile>,
     pub new_text_pricing: Option<crate::usage::TextPricingProfile>,
-    pub effective_at: chrono::DateTime<chrono::Utc>,
+    pub effective_at: jiff::Timestamp,
 }
 
 /// Full `scheduled_model_pricing_changes` row.
@@ -327,15 +327,15 @@ pub struct ScheduledPricingChange {
     pub old_cost_per_image: i64,
     pub old_text_pricing: Option<crate::usage::TextPricingProfile>,
     pub new_text_pricing: Option<crate::usage::TextPricingProfile>,
-    pub effective_at: chrono::DateTime<chrono::Utc>,
+    pub effective_at: jiff::Timestamp,
     pub status: ScheduledPricingChangeStatus,
     pub apply_attempts: i32,
-    pub applied_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub applied_at: Option<jiff::Timestamp>,
     pub last_error: Option<String>,
     pub created_by_user_id: Option<uuid::Uuid>,
     pub created_by_user_email: Option<String>,
     pub change_reason: Option<String>,
-    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub created_at: jiff::Timestamp,
 }
 
 /// One affected (user, org, model) row. The service consolidates sends into
@@ -387,7 +387,7 @@ pub struct AdminOrganizationInfo {
     pub total_spent: Option<i64>, // Amount in nano-dollars (scale 9)
     pub total_requests: Option<i64>,
     pub total_tokens: Option<i64>,
-    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub created_at: jiff::Timestamp,
     pub lifecycle: crate::lifecycle::OrganizationLifecycle,
 }
 
@@ -407,7 +407,7 @@ pub enum OrganizationLifecycleFilter {
 pub struct ModelAccessGrant {
     pub organization_id: uuid::Uuid,
     pub organization_name: String,
-    pub granted_at: chrono::DateTime<chrono::Utc>,
+    pub granted_at: jiff::Timestamp,
     /// The admin who made the grant. `None` if that user row is gone.
     pub granted_by_user_id: Option<uuid::Uuid>,
     pub granted_by_user_email: Option<String>,
@@ -477,7 +477,7 @@ pub trait AdminRepository: Send + Sync {
     async fn list_model_deprecation_recipients(
         &self,
         model_name: &str,
-        since: chrono::DateTime<chrono::Utc>,
+        since: jiff::Timestamp,
     ) -> Result<Vec<ModelDeprecationRecipient>, anyhow::Error>;
 
     /// True when the user exists and is active. Email batches call this right
@@ -502,7 +502,7 @@ pub trait AdminRepository: Send + Sync {
     async fn list_pricing_change_recipients(
         &self,
         model_names: &[String],
-        since: chrono::DateTime<chrono::Utc>,
+        since: jiff::Timestamp,
     ) -> Result<Vec<PricingChangeRecipientRow>, anyhow::Error>;
 
     /// Insert all rows of a batch in one transaction.
@@ -546,7 +546,7 @@ pub trait AdminRepository: Send + Sync {
     /// `max_attempts`, otherwise `failed`. Returns the number of rows moved.
     async fn recover_stale_applying_pricing_changes(
         &self,
-        stale_after: chrono::Duration,
+        stale_after: jiff::SignedDuration,
         max_attempts: i32,
     ) -> Result<u64, anyhow::Error>;
 
@@ -606,6 +606,6 @@ pub struct PlatformServiceInfo {
     /// Price per unit in nano-USD (scale 9).
     pub cost_per_unit: i64,
     pub is_active: bool,
-    pub created_at: chrono::DateTime<chrono::Utc>,
-    pub updated_at: chrono::DateTime<chrono::Utc>,
+    pub created_at: jiff::Timestamp,
+    pub updated_at: jiff::Timestamp,
 }

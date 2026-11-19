@@ -10,6 +10,144 @@ use uuid::Uuid;
 /// Trait implementation adapter for UsageRepository
 #[async_trait::async_trait]
 impl services::usage::ports::UsageRepository for OrganizationUsageRepository {
+    async fn mark_budget_unknown(
+        &self,
+        organization_id: Uuid,
+        id: Uuid,
+        grace_seconds: i32,
+    ) -> anyhow::Result<()> {
+        let mut client = self.pool.get().await?;
+        let tx = client.transaction().await?;
+        tx.batch_execute("SET LOCAL statement_timeout = '1s'; SET LOCAL lock_timeout = '500ms'")
+            .await?;
+        tx.query_one(
+            "SELECT mark_usage_budget_unknown($1,$2,$3)",
+            &[&organization_id, &id, &grace_seconds],
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn release_budget(&self, organization_id: Uuid, id: Uuid) -> anyhow::Result<()> {
+        let mut client = self.pool.get().await?;
+        let tx = client.transaction().await?;
+        tx.batch_execute("SET LOCAL statement_timeout = '1s'; SET LOCAL lock_timeout = '500ms'")
+            .await?;
+        tx.query_one(
+            "SELECT release_usage_budget($1,$2)",
+            &[&organization_id, &id],
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+    async fn expire_budgets(&self) -> anyhow::Result<u64> {
+        let mut expired = 0;
+        let mut client = self.pool.get().await?;
+        let cursor = *self.expiry_cursor.lock().unwrap_or_else(|e| e.into_inner());
+        let organizations = client
+            .query(
+                "SELECT organization_id FROM usage_budget_reservations
+             WHERE state = 'active' AND expires_at <= statement_timestamp()
+             GROUP BY organization_id
+             ORDER BY organization_id <= $1::uuid, organization_id LIMIT 100",
+                &[&cursor],
+            )
+            .await?;
+        for row in organizations {
+            let org: Uuid = row.get(0);
+            // Resume past this organization even if the background deadline interrupts the pass.
+            *self.expiry_cursor.lock().unwrap_or_else(|e| e.into_inner()) = Some(org);
+            let result = async {
+                let tx = client.transaction().await?;
+                tx.batch_execute(
+                    "SET LOCAL statement_timeout = '10s'; SET LOCAL lock_timeout = '500ms'",
+                )
+                .await?;
+                let row = tx
+                    .query_opt(
+                        "WITH candidate AS MATERIALIZED (
+                        SELECT id FROM organizations WHERE id=$1 FOR UPDATE SKIP LOCKED
+                     ) SELECT expire_usage_budgets(id) FROM candidate",
+                        &[&org],
+                    )
+                    .await?;
+                tx.commit().await?;
+                Ok::<_, tokio_postgres::Error>(row)
+            }
+            .await;
+            match result {
+                Ok(Some(row)) => expired += u64::try_from(row.get::<_, i64>(0))?,
+                Ok(None) => {}
+                Err(error) if client.is_closed() => return Err(error.into()),
+                Err(error) => {
+                    tracing::warn!(organization_id = %org, sqlstate = error.code().map(|code| code.code()), "Unable to expire organization budgets")
+                }
+            }
+        }
+        Ok(expired)
+    }
+
+    async fn admit_budget(
+        &self,
+        r: &services::usage::budget::BudgetReservation,
+    ) -> Result<(), services::usage::UsageError> {
+        use services::usage::UsageError;
+        let result: anyhow::Result<()> =
+            tokio::time::timeout(std::time::Duration::from_millis(1500), async {
+                let mut client = self.pool.get().await?;
+                let tx = client.transaction().await?;
+                tx.batch_execute(
+                    "SET LOCAL statement_timeout = '1s'; SET LOCAL lock_timeout = '500ms'",
+                )
+                .await?;
+                tx.query_one(
+                    "SELECT admit_usage_budget($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)",
+                    &[
+                        &r.id,
+                        &r.identity.organization_id,
+                        &r.identity.workspace_id,
+                        &r.identity.api_key_id,
+                        &r.identity.model_id,
+                        &r.amount,
+                        &r.inference_type.as_str(),
+                        &i64::from(r.estimator_version),
+                        &self.allocation_policy.priority,
+                        &self.allocation_policy.version,
+                        &r.organization_max_unsettled,
+                        &r.key_max_unsettled,
+                        &r.reservation_ttl_seconds,
+                    ],
+                )
+                .await?;
+                tx.commit().await?;
+                Ok(())
+            })
+            .await
+            .unwrap_or_else(|_| Err(anyhow::anyhow!("budget admission deadline elapsed")));
+        result.map_err(|error| {
+            match error
+                .downcast_ref::<tokio_postgres::Error>()
+                .and_then(|e| e.code())
+                .map(|c| c.code())
+            {
+                Some("NBKEX") => UsageError::LimitExceeded(
+                    "API key spend limit exceeded. Insufficient available budget for this request."
+                        .into(),
+                ),
+                Some("NBOEX") => UsageError::LimitExceeded(
+                    "Credit limit exceeded. Insufficient available budget for this request.".into(),
+                ),
+                Some("NBBUS") => UsageError::CapacityExceeded,
+                Some("NBORG" | "NBKEY") => {
+                    UsageError::Unauthorized("Billing identity is unavailable".into())
+                }
+                _ => UsageError::InternalError(format!("Budget admission failed: {error}")),
+            }
+        })
+    }
+
     async fn record_usage(
         &self,
         request: services::usage::ports::RecordUsageDbRequest,

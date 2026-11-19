@@ -59,6 +59,8 @@ pub struct AnthropicRawResponse {
 pub enum AnthropicRawError {
     #[error("native Anthropic Messages transport is not supported by this provider")]
     UnsupportedProvider,
+    #[error("Monetary admission failed (HTTP {status_code}): {message}")]
+    Budget { status_code: u16, message: String },
     #[error("invalid native Anthropic request: {0}")]
     InvalidRequest(String),
     #[error("Anthropic transport failed: {0}")]

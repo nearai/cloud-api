@@ -1,3 +1,57 @@
+#[derive(Clone, Copy)]
+enum BudgetOperation {
+    Chat,
+    Stream,
+    Image,
+    ImageEdit,
+    Audio,
+    SystemOne,
+    #[cfg(test)]
+    Test(&'static str),
+}
+impl BudgetOperation {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Chat => "chat_completion",
+            Self::Stream => "chat_completion_stream",
+            Self::Image => "image_generation",
+            Self::ImageEdit => "image_edit",
+            Self::Audio => "audio_transcription",
+            Self::SystemOne => "systemone",
+            #[cfg(test)]
+            Self::Test(name) => name,
+        }
+    }
+    fn requires_admission(self) -> bool {
+        match self {
+            Self::Chat
+            | Self::Stream
+            | Self::Image
+            | Self::ImageEdit
+            | Self::Audio
+            | Self::SystemOne => true,
+            #[cfg(test)]
+            Self::Test(_) => false,
+        }
+    }
+}
+
+// Existing routing-only tests use arbitrary labels; production dispatch requires the enum.
+#[cfg(test)]
+impl From<&'static str> for BudgetOperation {
+    fn from(name: &'static str) -> Self {
+        match name {
+            "chat_completion" => Self::Chat,
+            "chat_completion_stream" => Self::Stream,
+            "image_generation" => Self::Image,
+            "image_edit" => Self::ImageEdit,
+            "audio_transcription" => Self::Audio,
+            "systemone" => Self::SystemOne,
+            other => Self::Test(other),
+        }
+    }
+}
+
 use crate::attestation::{AttestationVerifier, BackendAttestationVerifier, ReplicaReportKey};
 use crate::common::encryption_headers;
 use config::ExternalProvidersConfig;
@@ -3042,6 +3096,7 @@ impl InferenceProviderPool {
         };
 
         match error {
+            CompletionError::Admission { .. } => error,
             CompletionError::HttpError {
                 status_code,
                 message,
@@ -3085,6 +3140,7 @@ impl InferenceProviderPool {
     /// Safe to log: contains no caller-controlled content.
     fn classify_error_kind(error: &CompletionError) -> &'static str {
         match error {
+            CompletionError::Admission { .. } => "admission",
             CompletionError::CompletionError(_) => "completion_error",
             CompletionError::HttpError { status_code, .. } => match status_code {
                 500..=599 => "http_5xx",
@@ -3247,6 +3303,7 @@ impl InferenceProviderPool {
     /// the label directly so the rationale is visible in production logs.
     fn classify_retry_decision(error: &CompletionError) -> &'static str {
         match error {
+            CompletionError::Admission { .. } => "non_retryable_admission",
             CompletionError::CompletionError(msg) => {
                 let lower = msg.to_lowercase();
                 let is_inference_timeout = (lower.contains("operation timed out")
@@ -3377,6 +3434,7 @@ impl InferenceProviderPool {
     fn completion_error_message_len(error: &CompletionError) -> usize {
         match error {
             CompletionError::HttpError { message, .. }
+            | CompletionError::Admission { message, .. }
             | CompletionError::CompletionError(message)
             | CompletionError::InvalidResponse(message)
             | CompletionError::Unknown(message)
@@ -3584,7 +3642,7 @@ impl InferenceProviderPool {
     async fn retry_with_fallback<T, F, Fut>(
         &self,
         model_id: &str,
-        operation_name: &str,
+        operation: impl Into<BudgetOperation>,
         model_pub_key: Option<&str>,
         provider_fn: F,
     ) -> Result<ServedProviderResult<T>, CompletionError>
@@ -3594,7 +3652,7 @@ impl InferenceProviderPool {
     {
         self.retry_with_fallback_caps(
             model_id,
-            operation_name,
+            operation,
             model_pub_key,
             false,
             &ChatRoutingHints::default(),
@@ -3614,7 +3672,7 @@ impl InferenceProviderPool {
     async fn retry_with_fallback_caps<T, F, Fut>(
         &self,
         model_id: &str,
-        operation_name: &str,
+        operation: impl Into<BudgetOperation>,
         model_pub_key: Option<&str>,
         needs_client_e2ee: bool,
         hints: &ChatRoutingHints,
@@ -3624,6 +3682,8 @@ impl InferenceProviderPool {
         F: Fn(Arc<InferenceProviderTrait>) -> Fut,
         Fut: std::future::Future<Output = Result<T, CompletionError>>,
     {
+        let operation = operation.into();
+        let operation_name = operation.name();
         let providers = match self
             .get_providers_with_fallback(model_id, model_pub_key, hints)
             .await
@@ -3885,7 +3945,17 @@ impl InferenceProviderPool {
                     retry_count
                 );
 
-                match provider_fn(provider.clone()).await {
+                // Admission failures are local: do not retry them as provider failures.
+                if operation.requires_admission() {
+                    crate::usage::budget::before_attempt()
+                        .await
+                        .map_err(crate::usage::budget::completion_error)?;
+                }
+                let result = provider_fn(provider.clone()).await;
+                if result.is_err() {
+                    inference_providers::retry_admission::attempt_failed().await;
+                }
+                match result {
                     Ok(result) => {
                         // Reset failure counter on success
                         {
@@ -3967,6 +4037,7 @@ impl InferenceProviderPool {
                             ),
                         });
                     }
+                    Err(e @ CompletionError::Admission { .. }) => return Err(e),
                     Err(e) => {
                         let tier = provider.tier();
                         let provider_source = provider.provider_source();
@@ -4683,7 +4754,7 @@ impl InferenceProviderPool {
         let served = self
             .retry_with_fallback_caps(
                 &model_id,
-                "chat_completion_stream",
+                BudgetOperation::Stream,
                 model_pub_key,
                 needs_client_e2ee,
                 &hints,
@@ -4885,7 +4956,7 @@ impl InferenceProviderPool {
         let served = self
             .retry_with_fallback_caps(
                 &model_id,
-                "chat_completion",
+                BudgetOperation::Chat,
                 model_pub_key,
                 needs_client_e2ee,
                 &hints,
@@ -4948,7 +5019,7 @@ impl InferenceProviderPool {
         let served = self
             .retry_with_fallback_caps(
                 &request.model,
-                "systemone",
+                BudgetOperation::SystemOne,
                 model_pub_key,
                 false,
                 &hints,
@@ -5031,18 +5102,40 @@ impl InferenceProviderPool {
         let cloned_params = params.clone();
 
         let served = self
-            .retry_with_fallback(&model_id, "image_generation", model_pub_key, |provider| {
-                let params = cloned_params.clone();
-                let request_hash = request_hash.clone();
-                async move {
-                    provider
-                        .image_generation(params, request_hash)
-                        .await
-                        .map_err(|e| CompletionError::CompletionError(e.to_string()))
-                }
-            })
+            .retry_with_fallback(
+                &model_id,
+                BudgetOperation::Image,
+                model_pub_key,
+                |provider| {
+                    let params = cloned_params.clone();
+                    let request_hash = request_hash.clone();
+                    async move {
+                        provider
+                            .image_generation(params, request_hash)
+                            .await
+                            .map_err(|e| CompletionError::CompletionError(e.to_string()))
+                    }
+                },
+            )
             .await
-            .map_err(|e| ImageGenerationError::GenerationError(e.to_string()))?;
+            .map_err(|e| match e {
+                CompletionError::Admission {
+                    status_code,
+                    message,
+                } => ImageGenerationError::HttpError {
+                    status_code,
+                    message,
+                },
+                CompletionError::HttpError {
+                    status_code,
+                    message,
+                    ..
+                } => ImageGenerationError::HttpError {
+                    status_code,
+                    message,
+                },
+                other => ImageGenerationError::GenerationError(other.to_string()),
+            })?;
         let response = served.value;
         let provider = served.provider;
         let provider_attribution = served.provider_attribution;
@@ -5078,7 +5171,7 @@ impl InferenceProviderPool {
         );
 
         let served = self
-            .retry_with_fallback(&model_id, "audio_transcription", None, |provider| {
+            .retry_with_fallback(&model_id, BudgetOperation::Audio, None, |provider| {
                 let params = params.clone();
                 let request_hash = request_hash.clone();
                 async move {
@@ -5118,6 +5211,13 @@ impl InferenceProviderPool {
                             } => CompletionError::CompletionError(format!(
                                 "HTTP error {status_code}: {message}"
                             )),
+                            AudioTranscriptionError::Admission {
+                                status_code,
+                                message,
+                            } => CompletionError::Admission {
+                                status_code,
+                                message,
+                            },
                             AudioTranscriptionError::TranscriptionError(msg) => {
                                 CompletionError::CompletionError(msg)
                             }
@@ -5132,6 +5232,13 @@ impl InferenceProviderPool {
                 // 5xx -> 502, 503 -> overloaded, 429 -> rate limit). Infra 4xx
                 // were already downgraded to a generic provider failure and fall
                 // through the `other` arm to a 502 server error.
+                CompletionError::Admission {
+                    status_code,
+                    message,
+                } => AudioTranscriptionError::Admission {
+                    status_code,
+                    message,
+                },
                 CompletionError::HttpError {
                     status_code,
                     message,
@@ -5184,7 +5291,7 @@ impl InferenceProviderPool {
         let params = Arc::new(params);
 
         let served = self
-            .retry_with_fallback(&model_id, "image_edit", None, |provider| {
+            .retry_with_fallback(&model_id, BudgetOperation::ImageEdit, None, |provider| {
                 let params = params.clone();
                 let request_hash = request_hash.clone();
                 async move {
@@ -5195,7 +5302,24 @@ impl InferenceProviderPool {
                 }
             })
             .await
-            .map_err(|e| ImageEditError::EditError(e.to_string()))?;
+            .map_err(|e| match e {
+                CompletionError::Admission {
+                    status_code,
+                    message,
+                } => ImageEditError::HttpError {
+                    status_code,
+                    message,
+                },
+                CompletionError::HttpError {
+                    status_code,
+                    message,
+                    ..
+                } => ImageEditError::HttpError {
+                    status_code,
+                    message,
+                },
+                other => ImageEditError::EditError(other.to_string()),
+            })?;
         let response = served.value;
         let provider = served.provider;
         let provider_attribution = served.provider_attribution;
@@ -5387,7 +5511,14 @@ impl InferenceProviderPool {
             provider.as_ref(),
             self.is_registered_fallback_provider(model, &provider),
         );
-        let response = provider.responses_raw(body).await?;
+        crate::usage::budget::before_attempt()
+            .await
+            .map_err(crate::usage::budget::completion_error)?;
+        let response = provider.responses_raw(body).await;
+        if response.is_err() {
+            inference_providers::retry_admission::attempt_failed().await;
+        }
+        let response = response?;
         Ok((response, attribution))
     }
 
@@ -5410,7 +5541,19 @@ impl InferenceProviderPool {
             .ok_or(AnthropicRawError::UnsupportedProvider)?;
 
         let provider_attribution = served_provider_attribution(provider.as_ref(), false);
-        let response = provider.anthropic_raw(request).await?;
+        if request.endpoint == inference_providers::AnthropicRawEndpoint::Messages {
+            crate::usage::budget::before_attempt().await.map_err(|e| {
+                AnthropicRawError::Budget {
+                    status_code: crate::usage::budget::admission_status(&e),
+                    message: crate::usage::budget::public_message(&e),
+                }
+            })?;
+        }
+        let response = provider.anthropic_raw(request).await;
+        if response.is_err() {
+            inference_providers::retry_admission::attempt_failed().await;
+        }
+        let response = response?;
 
         Ok(AttributedAnthropicRawResponse {
             response,
@@ -6958,6 +7101,7 @@ impl InferenceProviderPool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_utils::with_test_budget;
 
     fn provider_model(
         model_id: &str,
@@ -8512,6 +8656,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn text_admission_failure_does_not_retry_or_change_provider_health() {
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+        pool.register_provider(
+            "admission-test".into(),
+            Arc::new(inference_providers::mock::MockProvider::new()),
+        )
+        .await;
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        for operation in ["chat_completion", "chat_completion_stream"] {
+            let result = pool
+                .retry_with_fallback("admission-test", operation, None, |_| async {
+                    calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(())
+                })
+                .await;
+            assert!(matches!(
+                result,
+                Err(CompletionError::Admission {
+                    status_code: 503,
+                    ..
+                })
+            ));
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+            assert!(pool.provider_failure_counts.read().unwrap().is_empty());
+        }
+        // Non-text requests have no monetary scope and still reach their provider once.
+        for status_code in [403, 429, 503] {
+            let calls = std::sync::atomic::AtomicUsize::new(0);
+            let result = crate::test_utils::with_test_budget(pool.retry_with_fallback(
+                "admission-test",
+                "chat_completion",
+                None,
+                |_| async {
+                    calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Err::<(), _>(CompletionError::Admission {
+                        status_code,
+                        message: "local admission".into(),
+                    })
+                },
+            ))
+            .await;
+            assert!(
+                matches!(result, Err(CompletionError::Admission { status_code: actual, .. }) if actual == status_code)
+            );
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert!(pool.provider_failure_counts.read().unwrap().is_empty());
+        }
+        pool.retry_with_fallback("admission-test", "embeddings", None, |_| async {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
     async fn test_streaming_chat_id_mapping_available_immediately() {
         use futures_util::StreamExt;
         use inference_providers::mock::MockProvider;
@@ -8562,14 +8763,13 @@ mod tests {
             extra: std::collections::HashMap::new(),
         };
 
-        let mut stream = pool
-            .chat_completion_stream(
-                params,
-                "test-request-hash".to_string(),
-                ChatRoutingHints::default(),
-            )
-            .await
-            .expect("Should create stream");
+        let mut stream = with_test_budget(pool.chat_completion_stream(
+            params,
+            "test-request-hash".to_string(),
+            ChatRoutingHints::default(),
+        ))
+        .await
+        .expect("Should create stream");
 
         let first_event = stream.next().await.unwrap().unwrap();
         let chat_id = match first_event.chunk {
@@ -8641,13 +8841,12 @@ mod tests {
         };
 
         // When
-        let result = pool
-            .chat_completion_stream(
-                params,
-                "test-request-hash".to_string(),
-                ChatRoutingHints::default(),
-            )
-            .await;
+        let result = with_test_budget(pool.chat_completion_stream(
+            params,
+            "test-request-hash".to_string(),
+            ChatRoutingHints::default(),
+        ))
+        .await;
 
         // Then
         match result {
@@ -10293,7 +10492,7 @@ mod tests {
         );
 
         // When: the request crosses the non-streaming pool boundary.
-        pool.chat_completion(params, "test-request-hash".to_string())
+        with_test_budget(pool.chat_completion(params, "test-request-hash".to_string()))
             .await
             .expect("provider was called");
 
@@ -10327,14 +10526,13 @@ mod tests {
         );
 
         // When: the request crosses the streaming pool boundary.
-        let _stream = pool
-            .chat_completion_stream(
-                params,
-                "test-request-hash".to_string(),
-                ChatRoutingHints::default(),
-            )
-            .await
-            .expect("provider was called");
+        let _stream = with_test_budget(pool.chat_completion_stream(
+            params,
+            "test-request-hash".to_string(),
+            ChatRoutingHints::default(),
+        ))
+        .await
+        .expect("provider was called");
 
         // Then: the dispatched clone still carries the routing pin.
         let received = mock.last_chat_params().await.expect("provider was called");
@@ -11494,8 +11692,7 @@ mod tests {
         let mut params = fallback_params(&model_id);
         params.request_priority = -2;
         let started = std::time::Instant::now();
-        let resp = pool
-            .chat_completion(params, "test-hash".to_string())
+        let resp = with_test_budget(pool.chat_completion(params, "test-hash".to_string()))
             .await
             .expect("NEAR 5xx must fall back to Chutes, not fail the client request");
         let elapsed = started.elapsed();
@@ -11586,10 +11783,11 @@ mod tests {
         pool.set_declared_ctx(&(tinfoil.clone() as Arc<InferenceProviderTrait>), 128_000);
         pool.set_declared_ctx(&(chutes.clone() as Arc<InferenceProviderTrait>), 1_000_000);
 
-        let resp = pool
-            .chat_completion(fallback_params(&model_id), "test-hash".to_string())
-            .await
-            .expect("a Tinfoil auth failure must fall through to Chutes");
+        let resp = with_test_budget(
+            pool.chat_completion(fallback_params(&model_id), "test-hash".to_string()),
+        )
+        .await
+        .expect("a Tinfoil auth failure must fall through to Chutes");
         assert!(near.last_chat_params().await.is_some());
         assert!(tinfoil.last_chat_params().await.is_some());
         assert!(chutes.last_chat_params().await.is_some());
@@ -11628,9 +11826,10 @@ mod tests {
             );
         }
 
-        let result = pool
-            .chat_completion(fallback_params(&model_id), "test-hash".to_string())
-            .await;
+        let result = with_test_budget(
+            pool.chat_completion(fallback_params(&model_id), "test-hash".to_string()),
+        )
+        .await;
         assert!(
             result.is_err(),
             "all providers failing must surface an error, not a false success"
@@ -11667,10 +11866,11 @@ mod tests {
             );
         }
 
-        let resp = pool
-            .chat_completion(fallback_params(&model_id), "test-hash".to_string())
-            .await
-            .expect("healthy NEAR must serve");
+        let resp = with_test_budget(
+            pool.chat_completion(fallback_params(&model_id), "test-hash".to_string()),
+        )
+        .await
+        .expect("healthy NEAR must serve");
         let body = String::from_utf8_lossy(&resp.raw_bytes);
         assert!(
             body.contains("served-by-near-primary"),
@@ -11725,12 +11925,13 @@ mod tests {
                 );
             }
 
-            let resp = pool
-                .chat_completion(fallback_params(&model_id), "test-hash".to_string())
-                .await
-                .unwrap_or_else(|e| {
-                    panic!("NEAR {status_code} model-not-found must fall back to Chutes, got: {e}")
-                });
+            let resp = with_test_budget(
+                pool.chat_completion(fallback_params(&model_id), "test-hash".to_string()),
+            )
+            .await
+            .unwrap_or_else(|e| {
+                panic!("NEAR {status_code} model-not-found must fall back to Chutes, got: {e}")
+            });
             assert!(
                 near.last_chat_params().await.is_some(),
                 "NEAR must be attempted first ({status_code})"
@@ -11828,8 +12029,8 @@ mod tests {
                     .max_context_tokens = Some(1_048_576);
             }
 
-            let resp = pool
-                .chat_completion(fallback_params(&model_id), "test-hash".to_string())
+            let resp = with_test_budget(pool
+                .chat_completion(fallback_params(&model_id), "test-hash".to_string()))
                 .await
                 .unwrap_or_else(|e| {
                     panic!("context-length 400 must fall through to the bigger provider, got: {e} (message: {message})")
@@ -11966,8 +12167,7 @@ mod tests {
         let mut params = fallback_params(&model_id);
         params.messages[0].content = Some(serde_json::Value::String("a".repeat(1_200_000)));
 
-        let err = pool
-            .chat_completion(params, "test-hash".to_string())
+        let err = with_test_budget(pool.chat_completion(params, "test-hash".to_string()))
             .await
             .expect_err("both providers fail");
         assert!(
@@ -12250,16 +12450,15 @@ mod tests {
         let mut params = fallback_params(&model_id);
         params.messages[0].content = Some(serde_json::Value::String("a".repeat(1_200_000)));
 
-        let result = pool
-            .chat_completion_with_attribution_and_hints(
-                params,
-                "test-hash".to_string(),
-                ChatRoutingHints {
-                    request_priority: -2,
-                    ..Default::default()
-                },
-            )
-            .await;
+        let result = with_test_budget(pool.chat_completion_with_attribution_and_hints(
+            params,
+            "test-hash".to_string(),
+            ChatRoutingHints {
+                request_priority: -2,
+                ..Default::default()
+            },
+        ))
+        .await;
         let err = match result {
             Err(e) => e,
             Ok(_) => panic!("the long tier's 503 must surface, not a base success"),
@@ -12344,16 +12543,15 @@ mod tests {
         let mut params = fallback_params(&model_id);
         params.messages[0].content = Some(serde_json::Value::String("a".repeat(833_334)));
 
-        let result = pool
-            .chat_completion_with_attribution_and_hints(
-                params,
-                "test-hash".to_string(),
-                ChatRoutingHints {
-                    request_priority: -2,
-                    ..Default::default()
-                },
-            )
-            .await;
+        let result = with_test_budget(pool.chat_completion_with_attribution_and_hints(
+            params,
+            "test-hash".to_string(),
+            ChatRoutingHints {
+                request_priority: -2,
+                ..Default::default()
+            },
+        ))
+        .await;
 
         match result {
             Ok(_) => {}
@@ -12414,16 +12612,15 @@ mod tests {
         }
         let mut params = fallback_params(&model_id);
         params.messages[0].content = Some(serde_json::Value::String("a".repeat(833_334)));
-        let result = pool
-            .chat_completion_with_attribution_and_hints(
-                params,
-                "test-hash".to_string(),
-                ChatRoutingHints {
-                    request_priority: -2,
-                    ..Default::default()
-                },
-            )
-            .await;
+        let result = with_test_budget(pool.chat_completion_with_attribution_and_hints(
+            params,
+            "test-hash".to_string(),
+            ChatRoutingHints {
+                request_priority: -2,
+                ..Default::default()
+            },
+        ))
+        .await;
         if let Err(error) = result {
             panic!("model-not-found fall-through should reach the other NEAR tier: {error}");
         }
@@ -12489,16 +12686,15 @@ mod tests {
 
         let mut params = fallback_params(&model_id);
         params.messages[0].content = Some(serde_json::Value::String("a".repeat(833_334)));
-        let result = pool
-            .chat_completion_with_attribution_and_hints(
-                params,
-                "test-hash".to_string(),
-                ChatRoutingHints {
-                    request_priority: -2,
-                    ..Default::default()
-                },
-            )
-            .await;
+        let result = with_test_budget(pool.chat_completion_with_attribution_and_hints(
+            params,
+            "test-hash".to_string(),
+            ChatRoutingHints {
+                request_priority: -2,
+                ..Default::default()
+            },
+        ))
+        .await;
         if let Err(error) = result {
             panic!("context fall-through should survive a busy same-tier provider: {error}");
         }
@@ -12811,14 +13007,13 @@ mod tests {
         pool.seed_ttft(&near_dyn, 3000.0);
         pool.seed_ttft(&backup_dyn, 100.0);
 
-        let served = pool
-            .chat_completion_stream_with_attribution(
-                fallback_params(&model_id),
-                "slow-near".to_string(),
-                ChatRoutingHints::default(),
-            )
-            .await
-            .expect("slow NEAR must still serve");
+        let served = with_test_budget(pool.chat_completion_stream_with_attribution(
+            fallback_params(&model_id),
+            "slow-near".to_string(),
+            ChatRoutingHints::default(),
+        ))
+        .await
+        .expect("slow NEAR must still serve");
         assert!(near.last_chat_params().await.is_some());
         assert!(
             backup.last_chat_params().await.is_none(),
@@ -12922,10 +13117,13 @@ mod tests {
         // Short: fits the base tier, so it is not heavy.
         let mut short = sized_params(model, 4_000);
         short.max_tokens = Some(2_000);
-        let _stream = pool
-            .chat_completion_stream(short, "h1".to_string(), ChatRoutingHints::default())
-            .await
-            .expect("served");
+        let _stream = with_test_budget(pool.chat_completion_stream(
+            short,
+            "h1".to_string(),
+            ChatRoutingHints::default(),
+        ))
+        .await
+        .expect("served");
         let ctx = served_placement(base).await;
         assert_eq!(ctx.prompt_tokens, Some(heuristic_requirement(4_000)));
         assert!(!ctx.prefill_heavy);
@@ -12934,10 +13132,13 @@ mod tests {
         // input, over the 100k base window.
         let mut heavy = sized_params(model, 400_000);
         heavy.max_tokens = Some(8_000);
-        let _stream = pool
-            .chat_completion_stream(heavy, "h2".to_string(), ChatRoutingHints::default())
-            .await
-            .expect("served");
+        let _stream = with_test_budget(pool.chat_completion_stream(
+            heavy,
+            "h2".to_string(),
+            ChatRoutingHints::default(),
+        ))
+        .await
+        .expect("served");
         let ctx = served_placement(long).await;
         let prompt = heuristic_requirement(400_000);
         assert_eq!(ctx.prompt_tokens, Some(prompt));
@@ -12951,14 +13152,13 @@ mod tests {
         let (pool, providers) = capacity_pool(model, &[100_000]).await;
 
         // Oversized for the only tier: still sized, never heavy.
-        let _stream = pool
-            .chat_completion_stream(
-                sized_params(model, 600_000),
-                "h".to_string(),
-                ChatRoutingHints::default(),
-            )
-            .await
-            .expect("served");
+        let _stream = with_test_budget(pool.chat_completion_stream(
+            sized_params(model, 600_000),
+            "h".to_string(),
+            ChatRoutingHints::default(),
+        ))
+        .await
+        .expect("served");
         let ctx = served_placement(&providers[0]).await;
         assert_eq!(ctx.prompt_tokens, Some(heuristic_requirement(600_000)));
         assert!(!ctx.prefill_heavy);
@@ -12983,10 +13183,13 @@ mod tests {
         assert_eq!(params.placement.prompt_tokens, Some(prompt));
         assert!(!params.placement.prefill_heavy);
 
-        let _stream = pool
-            .chat_completion_stream(params, "h".to_string(), ChatRoutingHints::default())
-            .await
-            .expect("served");
+        let _stream = with_test_budget(pool.chat_completion_stream(
+            params,
+            "h".to_string(),
+            ChatRoutingHints::default(),
+        ))
+        .await
+        .expect("served");
         assert!(
             base.last_chat_params().await.is_some(),
             "a short prompt sorts base first"
@@ -13022,14 +13225,13 @@ mod tests {
         let model = "acme/any-new-model";
         let (pool, providers) = capacity_pool(model, &[262_144, 1_048_576]).await;
 
-        let _stream = pool
-            .chat_completion_stream(
-                sized_params(model, 1_200_000),
-                "h".to_string(),
-                ChatRoutingHints::default(),
-            )
-            .await
-            .expect("served");
+        let _stream = with_test_budget(pool.chat_completion_stream(
+            sized_params(model, 1_200_000),
+            "h".to_string(),
+            ChatRoutingHints::default(),
+        ))
+        .await
+        .expect("served");
         let ctx = served_placement(&providers[1]).await;
         assert_eq!(ctx.prompt_tokens, Some(heuristic_requirement(1_200_000)));
         assert!(ctx.prefill_heavy);
@@ -13044,7 +13246,7 @@ mod tests {
         // The service's affinity survives the pool's context.
         params.placement.affinity = Some(placement::affinity::AffinityKey::from_bytes([1; 16]));
         params.placement.affinity_source = placement::decision::AffinitySource::Header;
-        pool.chat_completion(params, "h".to_string())
+        with_test_budget(pool.chat_completion(params, "h".to_string()))
             .await
             .expect("served");
         let ctx = served_placement(&providers[1]).await;
@@ -13245,7 +13447,7 @@ mod tests {
                     ],
                 );
             }
-            pool.chat_completion(fallback_params(&model_id), "h".to_string())
+            with_test_budget(pool.chat_completion(fallback_params(&model_id), "h".to_string()))
                 .await
                 .expect("served");
 
@@ -13317,7 +13519,7 @@ mod tests {
             );
         }
 
-        pool.chat_completion(fallback_params(&model_id), "h".to_string())
+        with_test_budget(pool.chat_completion(fallback_params(&model_id), "h".to_string()))
             .await
             .expect("NEAR primary should serve");
 
@@ -13393,7 +13595,7 @@ mod tests {
             );
         }
 
-        pool.chat_completion(fallback_params(&model_id), "h".to_string())
+        with_test_budget(pool.chat_completion(fallback_params(&model_id), "h".to_string()))
             .await
             .expect("Chutes fallback should serve after retryable NEAR failure");
 
@@ -13493,9 +13695,9 @@ mod tests {
             );
         }
 
-        let result = pool
-            .chat_completion(fallback_params(&model_id), "h".to_string())
-            .await;
+        let result =
+            with_test_budget(pool.chat_completion(fallback_params(&model_id), "h".to_string()))
+                .await;
 
         assert!(
             result.is_err(),
@@ -13647,9 +13849,10 @@ mod tests {
             );
         }
 
-        let genuine_4xx_result = genuine_4xx_pool
-            .chat_completion(fallback_params(&model_id), "h".to_string())
-            .await;
+        let genuine_4xx_result = with_test_budget(
+            genuine_4xx_pool.chat_completion(fallback_params(&model_id), "h".to_string()),
+        )
+        .await;
         assert!(
             genuine_4xx_result.is_err(),
             "genuine client 4xx must still return the provider error"
@@ -13712,9 +13915,10 @@ mod tests {
             );
         }
 
-        let client_media_result = client_media_pool
-            .chat_completion(fallback_params(&model_id), "h".to_string())
-            .await;
+        let client_media_result = with_test_budget(
+            client_media_pool.chat_completion(fallback_params(&model_id), "h".to_string()),
+        )
+        .await;
         assert!(
             matches!(
                 client_media_result,
@@ -13785,10 +13989,11 @@ mod tests {
                 .insert(near_key, 10);
         }
 
-        let served = pool
-            .chat_completion_with_attribution(fallback_params(&model_id), "h".to_string())
-            .await
-            .expect("demoted NEAR should allow Chutes to serve");
+        let served = with_test_budget(
+            pool.chat_completion_with_attribution(fallback_params(&model_id), "h".to_string()),
+        )
+        .await
+        .expect("demoted NEAR should allow Chutes to serve");
 
         let body = String::from_utf8_lossy(&served.response.raw_bytes);
         assert!(
@@ -13846,10 +14051,11 @@ mod tests {
             .await;
         pool.prune_stale_pinned(&HashSet::new()).await;
 
-        let served = pool
-            .chat_completion_with_attribution(fallback_params(&model_id), "h".to_string())
-            .await
-            .expect("pinned Chutes should serve after NEAR disappears");
+        let served = with_test_budget(
+            pool.chat_completion_with_attribution(fallback_params(&model_id), "h".to_string()),
+        )
+        .await
+        .expect("pinned Chutes should serve after NEAR disappears");
 
         let body = String::from_utf8_lossy(&served.response.raw_bytes);
         assert!(
@@ -13891,10 +14097,11 @@ mod tests {
         pool.register_pinned_provider(model_id.clone(), chutes, None, ProviderPoolRole::Primary)
             .await;
 
-        let served = pool
-            .chat_completion_with_attribution(fallback_params(&model_id), "h".to_string())
-            .await
-            .expect("Chutes-only model should serve");
+        let served = with_test_budget(
+            pool.chat_completion_with_attribution(fallback_params(&model_id), "h".to_string()),
+        )
+        .await
+        .expect("Chutes-only model should serve");
 
         let body = String::from_utf8_lossy(&served.response.raw_bytes);
         assert!(
@@ -14003,23 +14210,29 @@ mod tests {
         pool.register_provider(model.into(), primary).await;
         pool.register_pinned_secondary_provider(model.into(), fallback.clone(), None)
             .await;
-        assert!(pool
-            .responses_raw(model, serde_json::json!({"store":false}), false)
-            .await
-            .is_err());
+        assert!(with_test_budget(pool.responses_raw(
+            model,
+            serde_json::json!({"store":false}),
+            false
+        ))
+        .await
+        .is_err());
         assert_eq!(calls.load(Ordering::SeqCst), 0);
-        let (_, attribution) = pool
-            .responses_raw(model, serde_json::json!({"store":false}), true)
-            .await
-            .unwrap();
+        let (_, attribution) =
+            with_test_budget(pool.responses_raw(model, serde_json::json!({"store":false}), true))
+                .await
+                .unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert!(attribution.served_via_fallback);
         pool.register_provider("native/primary".into(), fallback)
             .await;
-        let (_, attribution) = pool
-            .responses_raw("native/primary", serde_json::json!({"store":false}), false)
-            .await
-            .unwrap();
+        let (_, attribution) = with_test_budget(pool.responses_raw(
+            "native/primary",
+            serde_json::json!({"store":false}),
+            false,
+        ))
+        .await
+        .unwrap();
         assert!(!attribution.served_via_fallback);
     }
 
@@ -14056,16 +14269,15 @@ mod tests {
         )
         .await;
 
-        let disabled = pool
-            .chat_completion_with_attribution_and_hints(
-                fallback_params(&model_id),
-                "disabled".to_string(),
-                ChatRoutingHints {
-                    fallback_disabled: true,
-                    ..Default::default()
-                },
-            )
-            .await;
+        let disabled = with_test_budget(pool.chat_completion_with_attribution_and_hints(
+            fallback_params(&model_id),
+            "disabled".to_string(),
+            ChatRoutingHints {
+                fallback_disabled: true,
+                ..Default::default()
+            },
+        ))
+        .await;
         assert!(disabled.is_err(), "the primary error must surface");
         assert!(primary.last_chat_params().await.is_some());
         assert!(
@@ -14073,8 +14285,11 @@ mod tests {
             "disabled policy must not invoke the registered fallback"
         );
 
-        let enabled = pool
-            .chat_completion_with_attribution(fallback_params(&model_id), "enabled".to_string())
+        let enabled =
+            with_test_budget(pool.chat_completion_with_attribution(
+                fallback_params(&model_id),
+                "enabled".to_string(),
+            ))
             .await
             .expect("default policy should allow the registered fallback");
         assert!(fallback.last_chat_params().await.is_some());
@@ -14153,30 +14368,28 @@ mod tests {
         )
         .await;
 
-        let disabled = pool
-            .chat_completion_stream_with_attribution(
-                fallback_params(&model_id),
-                "disabled".to_string(),
-                ChatRoutingHints {
-                    fallback_disabled: true,
-                    ..Default::default()
-                },
-            )
-            .await;
+        let disabled = with_test_budget(pool.chat_completion_stream_with_attribution(
+            fallback_params(&model_id),
+            "disabled".to_string(),
+            ChatRoutingHints {
+                fallback_disabled: true,
+                ..Default::default()
+            },
+        ))
+        .await;
         assert!(disabled.is_err(), "the primary stream error must surface");
         assert!(
             fallback.last_chat_params().await.is_none(),
             "disabled policy must not invoke the registered fallback stream"
         );
 
-        let enabled = pool
-            .chat_completion_stream_with_attribution(
-                fallback_params(&model_id),
-                "enabled".to_string(),
-                ChatRoutingHints::default(),
-            )
-            .await
-            .expect("default policy should allow the registered fallback stream");
+        let enabled = with_test_budget(pool.chat_completion_stream_with_attribution(
+            fallback_params(&model_id),
+            "enabled".to_string(),
+            ChatRoutingHints::default(),
+        ))
+        .await
+        .expect("default policy should allow the registered fallback stream");
         assert!(fallback.last_chat_params().await.is_some());
         assert!(enabled.provider_attribution.served_via_fallback);
     }
@@ -14272,17 +14485,16 @@ mod tests {
         )
         .await;
 
-        let served = pool
-            .chat_completion_with_attribution_and_hints(
-                fallback_params(&model_id),
-                "primary-retry".to_string(),
-                ChatRoutingHints {
-                    fallback_disabled: true,
-                    ..Default::default()
-                },
-            )
-            .await
-            .expect("a primary peer should serve after another primary fails");
+        let served = with_test_budget(pool.chat_completion_with_attribution_and_hints(
+            fallback_params(&model_id),
+            "primary-retry".to_string(),
+            ChatRoutingHints {
+                fallback_disabled: true,
+                ..Default::default()
+            },
+        ))
+        .await
+        .expect("a primary peer should serve after another primary fails");
         assert!(first.last_chat_params().await.is_some());
         assert!(second.last_chat_params().await.is_some());
         assert!(fallback.last_chat_params().await.is_none());
@@ -14308,17 +14520,16 @@ mod tests {
             )
             .await;
 
-        let single = single_pool
-            .chat_completion_with_attribution_and_hints(
-                fallback_params(&single_model),
-                "single".to_string(),
-                ChatRoutingHints {
-                    fallback_disabled: true,
-                    ..Default::default()
-                },
-            )
-            .await
-            .expect("a model that has never had a primary peer remains directly usable");
+        let single = with_test_budget(single_pool.chat_completion_with_attribution_and_hints(
+            fallback_params(&single_model),
+            "single".to_string(),
+            ChatRoutingHints {
+                fallback_disabled: true,
+                ..Default::default()
+            },
+        ))
+        .await
+        .expect("a model that has never had a primary peer remains directly usable");
         assert!(only_provider.last_chat_params().await.is_some());
         assert!(!single.provider_attribution.served_via_fallback);
     }

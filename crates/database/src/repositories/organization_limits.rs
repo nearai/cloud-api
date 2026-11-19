@@ -228,6 +228,7 @@ impl OrganizationLimitsRepository {
                        olh.changed_by_user_email, olh.created_at,
                        olh.transferred_out, olh.effective_capacity,
                        COALESCE(consumed.amount, 0)::BIGINT AS consumed,
+                       reserved_credit(olh.organization_id, olh.credit_type) AS reserved,
                        COALESCE(balance.unresolved_unfunded_amount, 0)::BIGINT AS unfunded,
                        COALESCE(balance.legacy_unattributed_amount, 0)::BIGINT AS unattributed
                 FROM organization_credit_capacities olh
@@ -259,6 +260,7 @@ impl OrganizationLimitsRepository {
                     available: row
                         .get::<_, i64>("effective_capacity")
                         .saturating_sub(consumed)
+                        .saturating_sub(row.get::<_, i64>("reserved"))
                         .max(0),
                     transferred_out: row.get("transferred_out"),
                     effective_capacity: row.get("effective_capacity"),

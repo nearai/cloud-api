@@ -52,6 +52,8 @@ impl std::fmt::Display for CompletionId {
 // Error types
 #[derive(Debug, thiserror::Error)]
 pub enum CompletionError {
+    #[error("{message}")]
+    Admission { status_code: u16, message: String },
     #[error("Invalid model: {0}")]
     InvalidModel(String),
 

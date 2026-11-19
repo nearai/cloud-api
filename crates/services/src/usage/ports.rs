@@ -2,7 +2,7 @@ use super::provider_attribution::ProviderAttribution;
 use super::text_pricing::{TextPricingProfile, TextServiceTier};
 use crate::responses::models::ResponseId;
 pub use crate::usage::reporting::{InferenceUsageHistoryQuery, InferenceUsageReportRow};
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -305,8 +305,8 @@ pub trait UsageServiceTrait: Send + Sync {
     async fn get_usage_by_model(
         &self,
         organization_id: Uuid,
-        start_date: DateTime<Utc>,
-        end_date: Option<DateTime<Utc>>,
+        start_date: Timestamp,
+        end_date: Option<Timestamp>,
     ) -> Result<Vec<UsageByModelEntry>, UsageError>;
 
     async fn list_inference_usage_history(
@@ -382,8 +382,8 @@ pub trait UsageRepository: Send + Sync {
     async fn get_usage_by_model(
         &self,
         organization_id: Uuid,
-        start_date: DateTime<Utc>,
-        end_date: Option<DateTime<Utc>>,
+        start_date: Timestamp,
+        end_date: Option<Timestamp>,
     ) -> anyhow::Result<Vec<UsageByModelEntry>>;
 
     async fn list_inference_usage_history(
@@ -395,9 +395,9 @@ pub trait UsageRepository: Send + Sync {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HourlyProgress {
     /// Latest `hour` present in usage_hourly (None when the table is empty).
-    pub max_hour: Option<DateTime<Utc>>,
+    pub max_hour: Option<Timestamp>,
     /// First raw UTC hour at or after `max_hour + 1h` (or the oldest raw hour when max_hour is None).
-    pub next_raw_hour: Option<DateTime<Utc>>,
+    pub next_raw_hour: Option<Timestamp>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -417,7 +417,7 @@ pub struct DayTotals {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DayParity {
-    pub day: chrono::NaiveDate,
+    pub day: jiff::civil::Date,
     pub raw: DayTotals,
     pub aggregate: DayTotals,
 }
@@ -443,11 +443,11 @@ pub trait UsageHourlyRepository: Send + Sync {
     /// when another transaction holds the aggregate lock.
     async fn recompute(
         &self,
-        from: DateTime<Utc>,
-        to: DateTime<Utc>,
+        from: Timestamp,
+        to: Timestamp,
         lock_behavior: AggregateLockBehavior,
     ) -> anyhow::Result<Option<RecomputeReport>>;
-    async fn day_parity(&self, day: chrono::NaiveDate) -> anyhow::Result<DayParity>;
+    async fn day_parity(&self, day: jiff::civil::Date) -> anyhow::Result<DayParity>;
 }
 
 #[async_trait::async_trait]
@@ -976,10 +976,10 @@ pub struct OrganizationBalanceInfo {
     /// Historical consumption not yet assigned to a credit type, in nano-USD.
     pub legacy_unattributed_amount: i64,
     pub total_spent: i64,
-    pub last_usage_at: Option<DateTime<Utc>>,
+    pub last_usage_at: Option<Timestamp>,
     pub total_requests: i64,
     pub total_tokens: i64,
-    pub updated_at: DateTime<Utc>,
+    pub updated_at: Timestamp,
 }
 
 /// Per-model usage aggregation over a time window.
@@ -1016,7 +1016,7 @@ pub struct UsageLogEntry {
     pub output_cost: i64,
     pub total_cost: i64,
     pub inference_type: InferenceType,
-    pub created_at: DateTime<Utc>,
+    pub created_at: Timestamp,
     /// Time to first token in milliseconds
     pub ttft_ms: Option<i32>,
     /// Average inter-token latency in milliseconds

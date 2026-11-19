@@ -84,7 +84,7 @@ pub struct ModelWithPricing {
     pub is_ready: Option<bool>,
     /// Planned deprecation date (OpenRouter `deprecation_date`, ISO 8601).
     /// NULL = no planned deprecation.
-    pub deprecation_date: Option<chrono::DateTime<chrono::Utc>>,
+    pub deprecation_date: Option<jiff::Timestamp>,
     /// Recommended replacement model for the planned deprecation
     /// (`x-model-successor` response header).
     pub successor_model_name: Option<String>,
@@ -99,7 +99,7 @@ pub struct ModelWithPricing {
     /// look at this field.
     pub is_listed: bool,
     /// When the model row was created — used as OpenRouter's `created` unix timestamp.
-    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub created_at: jiff::Timestamp,
 }
 
 /// Who is asking for a model. Every lookup of a model for a request states

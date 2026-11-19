@@ -1,4 +1,4 @@
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::Deserialize;
 
 use super::ModelWithPricing;
@@ -8,7 +8,7 @@ use crate::{admin::ScheduledPricingChangeStatus, usage::TextPricingProfile};
 /// administrator's identity, reason and delivery history never enter this DTO.
 #[derive(Debug, Deserialize)]
 pub struct ModelPricingChange {
-    pub effective_at: DateTime<Utc>,
+    pub effective_at: Timestamp,
     pub status: ScheduledPricingChangeStatus,
     pub new_input_cost_per_token: Option<i64>,
     pub new_output_cost_per_token: Option<i64>,
@@ -20,7 +20,7 @@ pub struct ModelPricingChange {
 /// Complete future prices, in the same nano-dollar units as the current model.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpcomingModelPricing {
-    pub effective_at: DateTime<Utc>,
+    pub effective_at: Timestamp,
     pub input_cost_per_token: i64,
     pub output_cost_per_token: i64,
     pub cache_read_cost_per_token: Option<i64>,

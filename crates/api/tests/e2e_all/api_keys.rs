@@ -255,7 +255,7 @@ async fn test_api_key_prevents_duplicate_names_in_workspace() {
     // Try to create another key with the same name in the same workspace - should fail
     let request = api::models::CreateApiKeyRequest {
         name: key_name.clone(),
-        expires_at: Some(chrono::Utc::now() + chrono::Duration::days(90)),
+        expires_at: Some(jiff::Timestamp::now() + jiff::SignedDuration::from_hours(90 * 24)),
         spend_limit: None,
     };
 
@@ -943,7 +943,7 @@ async fn test_api_key_with_expiration() {
     // Create API key with short expiration (1 day)
     let request = api::models::CreateApiKeyRequest {
         name: "Short-lived Key".to_string(),
-        expires_at: Some(chrono::Utc::now() + chrono::Duration::days(1)),
+        expires_at: Some(jiff::Timestamp::now() + jiff::SignedDuration::from_hours(24)),
         spend_limit: None,
     };
 
@@ -961,7 +961,7 @@ async fn test_api_key_with_expiration() {
     // Create API key with long expiration (365 days)
     let request = api::models::CreateApiKeyRequest {
         name: "Long-lived Key".to_string(),
-        expires_at: Some(chrono::Utc::now() + chrono::Duration::days(365)),
+        expires_at: Some(jiff::Timestamp::now() + jiff::SignedDuration::from_hours(365 * 24)),
         spend_limit: None,
     };
 

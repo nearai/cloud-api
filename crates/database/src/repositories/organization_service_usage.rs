@@ -7,7 +7,7 @@ use crate::repositories::credit_allocation::{
 use crate::repositories::utils::map_db_error;
 use crate::retry_db;
 use anyhow::{Context, Result};
-use chrono::Utc;
+use jiff::Timestamp;
 use services::common::RepositoryError;
 use tokio_postgres::Row;
 use uuid::Uuid;
@@ -64,7 +64,7 @@ impl OrganizationServiceUsageRepository {
             lock_organization_accounting(&transaction, request.organization_id).await?;
 
             let id = Uuid::new_v4();
-            let now = Utc::now();
+            let now = Timestamp::now();
 
             let maybe_row = transaction
                 .query_opt(

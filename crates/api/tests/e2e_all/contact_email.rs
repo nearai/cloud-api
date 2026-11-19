@@ -3,8 +3,8 @@
 
 use crate::common::*;
 use api::models::BatchUpdateModelApiRequest;
-use chrono::{DateTime, Utc};
 use database::Database;
+use jiff::Timestamp;
 use services::admin::AdminRepository;
 use services::auth::ports::OAuthUserInfo;
 use services::auth::AuthServiceTrait;
@@ -119,12 +119,7 @@ async fn me(server: &axum_test::TestServer, session: &str) -> serde_json::Value 
     response.json()
 }
 
-type ContactColumns = (
-    String,
-    Option<String>,
-    Option<DateTime<Utc>>,
-    Option<DateTime<Utc>>,
-);
+type ContactColumns = (String, Option<String>, Option<Timestamp>, Option<Timestamp>);
 
 /// `(email, contact_email, contact_email_verified_at, email_opt_in_at)`.
 async fn contact_columns(client: &deadpool_postgres::Object, user_id: Uuid) -> ContactColumns {
@@ -311,7 +306,7 @@ async fn notification_recipients_skip_placeholder_users_and_use_the_contact_emai
     }
 
     let repository = database::repositories::AdminCompositeRepository::new(database.pool().clone());
-    let since = Utc::now() - chrono::Duration::days(30);
+    let since = Timestamp::now() - jiff::SignedDuration::from_hours(30 * 24);
     let recipients = || async {
         let deprecation: Vec<(Uuid, String)> = repository
             .list_model_deprecation_recipients(&old, since)

@@ -96,6 +96,7 @@ fn service_with_collectors(
         gateway_quote_collector: Arc::new(gateway_collector),
         model_attestation_collector: Arc::new(model_collector),
         report_cache: None,
+        long_context_access: None,
     }
 }
 
@@ -301,7 +302,7 @@ fn canonical_model() -> ModelWithPricing {
         successor_model_name: None,
         openrouter_slug: None,
         is_listed: true,
-        created_at: chrono::Utc::now(),
+        created_at: jiff::Timestamp::now(),
     }
 }
 
@@ -385,8 +386,8 @@ impl UsageRepository for NoopUsageRepository {
     async fn get_usage_by_model(
         &self,
         _organization_id: Uuid,
-        _start_date: chrono::DateTime<chrono::Utc>,
-        _end_date: Option<chrono::DateTime<chrono::Utc>>,
+        _start_date: jiff::Timestamp,
+        _end_date: Option<jiff::Timestamp>,
     ) -> anyhow::Result<Vec<UsageByModelEntry>> {
         Ok(Vec::new())
     }

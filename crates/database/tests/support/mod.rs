@@ -1,7 +1,7 @@
-use chrono::{DateTime, TimeZone, Utc};
 use database::DbPool;
 use deadpool::Runtime;
 use deadpool_postgres::Config;
+use jiff::Timestamp;
 use tokio_postgres::NoTls;
 use uuid::Uuid;
 
@@ -27,7 +27,7 @@ pub struct UsageSeed {
     pub workspace_id: Uuid,
     pub api_key_id: Uuid,
     pub model: ModelFixture,
-    pub created_at: DateTime<Utc>,
+    pub created_at: Timestamp,
     pub inference_type: &'static str,
     pub input_tokens: i32,
     pub output_tokens: i32,
@@ -41,8 +41,10 @@ pub struct UsageSeed {
     pub provider_request_id: &'static str,
 }
 
-pub fn ts(year: i32, month: u32, day: u32, hour: u32) -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(year, month, day, hour, 0, 0).unwrap()
+pub fn ts(year: i32, month: u32, day: u32, hour: u32) -> Timestamp {
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:00:00Z")
+        .parse()
+        .unwrap()
 }
 
 pub async fn test_pool() -> anyhow::Result<DbPool> {
@@ -61,7 +63,7 @@ pub async fn insert_org_fixture(pool: &DbPool) -> anyhow::Result<OrgFixture> {
     let api_key_a_id = Uuid::new_v4();
     let api_key_b_id = Uuid::new_v4();
     let suffix = org_id.simple().to_string();
-    let now = Utc::now();
+    let now = Timestamp::now();
 
     client
         .execute(
@@ -136,7 +138,7 @@ pub async fn insert_org_fixture(pool: &DbPool) -> anyhow::Result<OrgFixture> {
 pub async fn insert_model(pool: &DbPool, name: &str) -> anyhow::Result<ModelFixture> {
     let client = pool.get().await?;
     let id = Uuid::new_v4();
-    let now = Utc::now();
+    let now = Timestamp::now();
     client
         .execute(
             "INSERT INTO models (id, model_name, model_display_name, model_description, input_cost_per_token, output_cost_per_token, context_length, verifiable, is_active, created_at, updated_at)

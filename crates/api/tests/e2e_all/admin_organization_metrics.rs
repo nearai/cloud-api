@@ -210,16 +210,16 @@ async fn test_admin_get_organization_metrics_with_time_range() {
     let org = create_org(&server).await;
 
     // URL-encode `+` because query-form decoding otherwise turns it into a space.
-    let now = chrono::Utc::now();
-    let week_ago = now - chrono::Duration::days(7);
+    let now = jiff::Timestamp::now();
+    let week_ago = now - jiff::SignedDuration::from_hours(7 * 24);
 
     let response = server
         .get(
             format!(
                 "/v1/admin/organizations/{}/metrics?start={}&end={}",
                 org.id,
-                week_ago.to_rfc3339().replace('+', "%2B"),
-                now.to_rfc3339().replace('+', "%2B")
+                services::timestamps::format_utc(week_ago).replace('+', "%2B"),
+                services::timestamps::format_utc(now).replace('+', "%2B")
             )
             .as_str(),
         )
@@ -538,8 +538,8 @@ async fn organization_metrics_uses_30_day_default_and_366_day_maximum() {
     assert_eq!(default.status_code(), 200, "{}", default.text());
     let metrics = default.json::<OrganizationMetrics>();
     assert_eq!(
-        metrics.period_end - metrics.period_start,
-        chrono::Duration::days(30)
+        metrics.period_end.duration_since(metrics.period_start),
+        jiff::SignedDuration::from_hours(30 * 24)
     );
 
     let at_max = admin_get(

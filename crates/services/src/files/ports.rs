@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -16,8 +16,8 @@ pub struct File {
     pub storage_key: String,
     pub workspace_id: Uuid,
     pub uploaded_by_api_key_id: Uuid,
-    pub created_at: DateTime<Utc>,
-    pub expires_at: Option<DateTime<Utc>>,
+    pub created_at: Timestamp,
+    pub expires_at: Option<Timestamp>,
 }
 
 /// Parameters for creating a file record
@@ -30,7 +30,7 @@ pub struct CreateFileParams {
     pub storage_key: String,
     pub workspace_id: Uuid,
     pub uploaded_by_api_key_id: Uuid,
-    pub expires_at: Option<DateTime<Utc>>,
+    pub expires_at: Option<Timestamp>,
 }
 
 /// Repository trait for file operations

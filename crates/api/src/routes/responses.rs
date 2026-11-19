@@ -811,7 +811,7 @@ fn stream_failure_event(
             "object": "response",
             "created_at": response
                 .map(|response| response.created_at)
-                .unwrap_or_else(|| chrono::Utc::now().timestamp()),
+                .unwrap_or_else(|| jiff::Timestamp::now().as_second()),
             "status": "failed",
             "background": false,
             "error": error,
@@ -1961,8 +1961,8 @@ mod tests {
         async fn get_usage_by_model(
             &self,
             _organization_id: Uuid,
-            _start_date: chrono::DateTime<chrono::Utc>,
-            _end_date: Option<chrono::DateTime<chrono::Utc>>,
+            _start_date: jiff::Timestamp,
+            _end_date: Option<jiff::Timestamp>,
         ) -> Result<Vec<services::usage::UsageByModelEntry>, services::usage::UsageError> {
             unimplemented!()
         }

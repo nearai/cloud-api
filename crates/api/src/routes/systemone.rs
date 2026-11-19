@@ -107,6 +107,27 @@ pub async fn systemone(
         None
     };
     request.model = model.model_name.clone();
+    let long_context_allowed = state
+        .completion_service
+        .long_context_allowed(api_key.organization.id.0, &model.model_name)
+        .await;
+    if let Some(limit) = state
+        .inference_provider_pool
+        .systemone_long_context_limit_exceeded(&request, long_context_allowed)
+    {
+        tracing::info!(
+            model = %model.model_name,
+            limit,
+            "Rejected a System One request above the organization's long-context limit"
+        );
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::from(
+                services::completions::CompletionError::ContextLengthExceeded { limit },
+            )),
+        )
+            .into_response();
+    }
     let api_key_id = match Uuid::parse_str(&api_key.api_key.id.0) {
         Ok(id) => id,
         Err(_) => return error(StatusCode::INTERNAL_SERVER_ERROR, "Invalid billing context"),
@@ -135,6 +156,7 @@ pub async fn systemone(
             body_hash.hash.clone(),
             encryption.model_pub_key.as_deref(),
             !api_key.organization.fallback_enabled(),
+            long_context_allowed,
         ))
         .await
         {

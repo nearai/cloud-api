@@ -2,7 +2,7 @@ use crate::pool::DbPool;
 use crate::repositories::utils::map_db_error;
 use crate::{models::Session, retry_db};
 use anyhow::{Context, Result};
-use chrono::Utc;
+use jiff::Timestamp;
 use regex::Regex;
 use services::common::RepositoryError;
 use sha2::{Digest, Sha256};
@@ -80,9 +80,9 @@ impl SessionRepository {
         let normalized_user_agent = Self::normalize_user_agent(&user_agent);
 
         let row = retry_db!("create_new_refresh_token", {
-            let now = Utc::now();
+            let now = Timestamp::now();
             let expires_at = now
-                + chrono::Duration::seconds(
+                + jiff::SignedDuration::from_secs(
                     expires_in_hours
                         .checked_mul(3600)
                         .context("Invalid expiration hours: value too large")
@@ -134,7 +134,7 @@ impl SessionRepository {
     pub async fn validate(&self, session_token: &str, user_agent: &str) -> Result<Option<Session>> {
         // Hash the token directly (it already includes rt_ prefix if present)
         let token_hash = Self::hash_session_token(session_token);
-        let now = Utc::now();
+        let now = Timestamp::now();
 
         // Normalize the incoming user agent
         let normalized_user_agent = Self::normalize_user_agent(user_agent);
@@ -158,7 +158,7 @@ impl SessionRepository {
                     &[
                         &token_hash,
                         &now,
-                        &(now - chrono::Duration::seconds(REFRESH_REUSE_WINDOW_SECONDS)),
+                        &(now - jiff::SignedDuration::from_secs(REFRESH_REUSE_WINDOW_SECONDS)),
                     ],
                 )
                 .await
@@ -219,7 +219,7 @@ impl SessionRepository {
             WHERE user_id = $1 AND expires_at > $2
             ORDER BY created_at DESC
             "#,
-                    &[&user_id, &Utc::now()],
+                    &[&user_id, &Timestamp::now()],
                 )
                 .await
                 .map_err(map_db_error)
@@ -232,8 +232,8 @@ impl SessionRepository {
 
     /// Extend a refresh token session's expiration time
     pub async fn extend(&self, session_id: Uuid, additional_hours: i64) -> Result<bool> {
-        let new_expiry = Utc::now()
-            + chrono::Duration::seconds(
+        let new_expiry = Timestamp::now()
+            + jiff::SignedDuration::from_secs(
                 additional_hours
                     .checked_mul(3600)
                     .context("Invalid additional hours: value too large")?,
@@ -279,8 +279,8 @@ impl SessionRepository {
     ) -> Result<(Session, String)> {
         let old_token_hash = Self::hash_session_token(old_token);
         let successor_hash = Self::hash_session_token(successor_token);
-        let new_expires_at = Utc::now()
-            + chrono::Duration::seconds(
+        let new_expires_at = Timestamp::now()
+            + jiff::SignedDuration::from_secs(
                 expires_in_hours
                     .checked_mul(3600)
                     .context("Invalid expiration hours: value too large")?,
@@ -298,7 +298,7 @@ impl SessionRepository {
             let row = tx
                 .query_opt(
                     "SELECT * FROM refresh_tokens WHERE id = $1 AND expires_at > $2 FOR UPDATE",
-                    &[&session_id, &Utc::now()],
+                    &[&session_id, &Timestamp::now()],
                 )
                 .await
                 .map_err(map_db_error)?
@@ -309,9 +309,10 @@ impl SessionRepository {
                 })?;
             let current_hash: String = row.get("token_hash");
             let previous_hash: Option<String> = row.get("previous_token_hash");
-            let rotated_at: Option<chrono::DateTime<Utc>> = row.get("rotated_at");
+            let rotated_at: Option<jiff::Timestamp> = row.get("rotated_at");
             let in_reuse_window = rotated_at.is_some_and(|at| {
-                at > Utc::now() - chrono::Duration::seconds(REFRESH_REUSE_WINDOW_SECONDS)
+                at > Timestamp::now()
+                    - jiff::SignedDuration::from_secs(REFRESH_REUSE_WINDOW_SECONDS)
             });
 
             let result = if current_hash == old_token_hash {
@@ -322,7 +323,7 @@ impl SessionRepository {
                     let updated = tx
                         .query_one(
                             "UPDATE refresh_tokens SET token_hash = $1, previous_token_hash = $2, rotated_at = $3, expires_at = $4 WHERE id = $5 RETURNING *",
-                            &[&successor_hash, &old_token_hash, &Utc::now(), &new_expires_at, &session_id],
+                            &[&successor_hash, &old_token_hash, &Timestamp::now(), &new_expires_at, &session_id],
                         )
                         .await
                         .map_err(map_db_error)?;
@@ -385,7 +386,7 @@ impl SessionRepository {
             client
                 .execute(
                     "DELETE FROM refresh_tokens WHERE expires_at < $1",
-                    &[&Utc::now()],
+                    &[&Timestamp::now()],
                 )
                 .await
                 .map_err(map_db_error)

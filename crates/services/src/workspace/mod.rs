@@ -7,7 +7,7 @@ use crate::auth::ports::UserId;
 use crate::common::RepositoryError;
 use crate::organization::{MemberRole, OrganizationId, OrganizationServiceTrait};
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 
 pub struct WorkspaceServiceImpl {
     workspace_repository: Arc<dyn WorkspaceRepository>,
@@ -403,7 +403,7 @@ impl WorkspaceServiceTrait for WorkspaceServiceImpl {
         api_key_id: ApiKeyId,
         requester_id: UserId,
         name: Option<String>,
-        expires_at: Option<Option<DateTime<Utc>>>,
+        expires_at: Option<Option<Timestamp>>,
         spend_limit: Option<Option<i64>>,
         is_active: Option<bool>,
     ) -> Result<ApiKey, WorkspaceError> {

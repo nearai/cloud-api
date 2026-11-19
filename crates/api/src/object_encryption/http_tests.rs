@@ -21,7 +21,7 @@ fn fixture() -> (TestServer, Arc<MockStorage>) {
 }
 
 pub(super) fn admin() -> AdminUser {
-    let now = chrono::Utc::now();
+    let now = jiff::Timestamp::now();
     AdminUser(database::User {
         id: Uuid::new_v4(),
         email: "admin@near.ai".into(),

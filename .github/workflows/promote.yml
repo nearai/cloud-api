@@ -133,7 +133,7 @@ jobs:
           skopeo copy "docker://${IMAGE}@${IMAGE_DIGEST}" "docker://${IMAGE}:prod"
 
       # Immutable rollback tag — format: prod-YYYYMMDD-<shortsha>.
-      # Provides addressable history for cvm-ansible-playbooks rollback workflow.
+      # Provides addressable history for the production rollback workflow.
       # Copy from the resolved digest (not the :prod tag) to avoid any
       # eventual-consistency race after the previous :prod write.
       - name: Push stamped prod tag

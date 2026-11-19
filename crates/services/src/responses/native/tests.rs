@@ -347,6 +347,7 @@ enum WriteOutcome {
 /// actually committed.
 struct ScriptedUsage {
     outcome: WriteOutcome,
+    unknown_notices: AtomicU32,
     attempts: Mutex<Vec<RecordUsageServiceRequest>>,
     committed: Mutex<Vec<RecordUsageServiceRequest>>,
 }
@@ -355,6 +356,7 @@ impl ScriptedUsage {
     fn new(outcome: WriteOutcome) -> Arc<Self> {
         Arc::new(Self {
             outcome,
+            unknown_notices: AtomicU32::new(0),
             attempts: Mutex::new(Vec::new()),
             committed: Mutex::new(Vec::new()),
         })
@@ -369,6 +371,10 @@ impl ScriptedUsage {
 
 #[async_trait::async_trait]
 impl UsageServiceTrait for ScriptedUsage {
+    async fn mark_budget_unknown(&self, _org: Uuid, _id: Uuid) -> Result<(), UsageError> {
+        self.unknown_notices.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
     async fn record_usage(
         &self,
         request: RecordUsageServiceRequest,
@@ -478,7 +484,7 @@ impl UsageServiceTrait for ScriptedUsage {
 
 fn billing(usage: &Arc<ScriptedUsage>, inference_type: InferenceType) -> Billing {
     Billing {
-        budget_id: None,
+        budget_id: Some(Uuid::new_v4()),
         usage_service: usage.clone(),
         attestation_service: Arc::new(crate::test_utils::MockAttestationService),
         inference_id: Uuid::new_v4(),
@@ -574,6 +580,7 @@ async fn streaming_success_releases_terminal_event_only_after_usage_is_recorded(
         "bytes pass through unchanged"
     );
 
+    assert_eq!(usage.unknown_notices.load(Ordering::SeqCst), 0);
     let committed = usage.committed();
     assert_eq!(committed.len(), 1);
     let record = &committed[0];
@@ -849,6 +856,7 @@ async fn non_streaming_records_usage_under_the_returned_billing_id() {
         .await
         .unwrap();
     assert_eq!(response.inference_id, expected);
+    assert_eq!(usage.unknown_notices.load(Ordering::SeqCst), 0);
     let committed = usage.committed();
     assert_eq!(committed.len(), 1);
     assert_eq!(committed[0].inference_id, Some(expected));

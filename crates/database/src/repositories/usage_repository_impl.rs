@@ -44,28 +44,47 @@ impl services::usage::ports::UsageRepository for OrganizationUsageRepository {
     }
     async fn expire_budgets(&self) -> anyhow::Result<u64> {
         let mut expired = 0;
-        let organizations = self
-            .pool
-            .get()
-            .await?
+        let mut client = self.pool.get().await?;
+        let cursor = *self.expiry_cursor.lock().unwrap_or_else(|e| e.into_inner());
+        let organizations = client
             .query(
                 "SELECT organization_id FROM usage_budget_reservations
-             WHERE state = 'active' AND expires_at <= clock_timestamp()
-             GROUP BY organization_id ORDER BY MIN(expires_at),organization_id LIMIT 100",
-                &[],
+             WHERE state = 'active' AND expires_at <= statement_timestamp()
+             GROUP BY organization_id
+             ORDER BY organization_id <= $1::uuid, organization_id LIMIT 100",
+                &[&cursor],
             )
             .await?;
         for row in organizations {
-            let mut client = self.pool.get().await?;
-            let tx = client.transaction().await?;
-            tx.batch_execute("SET LOCAL statement_timeout = '10s'; SET LOCAL lock_timeout = '5s'")
+            let org: Uuid = row.get(0);
+            // Resume past this organization even if the background deadline interrupts the pass.
+            *self.expiry_cursor.lock().unwrap_or_else(|e| e.into_inner()) = Some(org);
+            let result = async {
+                let tx = client.transaction().await?;
+                tx.batch_execute(
+                    "SET LOCAL statement_timeout = '10s'; SET LOCAL lock_timeout = '500ms'",
+                )
                 .await?;
-            let released: i64 = tx
-                .query_one("SELECT expire_usage_budgets($1)", &[&row.get::<_, Uuid>(0)])
-                .await?
-                .get(0);
-            tx.commit().await?;
-            expired += u64::try_from(released)?;
+                let row = tx
+                    .query_opt(
+                        "WITH candidate AS MATERIALIZED (
+                        SELECT id FROM organizations WHERE id=$1 FOR UPDATE SKIP LOCKED
+                     ) SELECT expire_usage_budgets(id) FROM candidate",
+                        &[&org],
+                    )
+                    .await?;
+                tx.commit().await?;
+                Ok::<_, tokio_postgres::Error>(row)
+            }
+            .await;
+            match result {
+                Ok(Some(row)) => expired += u64::try_from(row.get::<_, i64>(0))?,
+                Ok(None) => {}
+                Err(error) if client.is_closed() => return Err(error.into()),
+                Err(error) => {
+                    tracing::warn!(organization_id = %org, %error, "Unable to expire organization budgets")
+                }
+            }
         }
         Ok(expired)
     }

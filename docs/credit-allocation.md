@@ -74,8 +74,8 @@ transaction. The original estimate is never resized, debited or refunded. Admiss
 creates an active hold in one operation. The internal release operation only frees
 attempts confirmed not to have been dispatched. It stores the amount, inference type and estimator version with
 billing identity and expiry, without persisting full input features or estimator policies.
-Actual pricing and organization discounts follow the existing settlement path;
-admission does not freeze them. A duplicate report with unchanged usage facts
+The quote uses the prices resolved for admission. The first successful posting uses
+the prices and organization discount effective at settlement. A duplicate report with unchanged usage facts
 returns the recorded charge even when live prices or discounts have since changed.
 
 The administrator-only `usage_admission` setting controls admission. Its default
@@ -129,7 +129,13 @@ output schemas (including property names), explicit token IDs, a flat 32-token o
 media allowances, then add the requested output estimate capped by the known catalog
 output limit. Without an explicit limit, the quote uses the known catalog output limit,
 or 4096 only when the catalog has no limit. These are estimates, not hard ceilings
-on actual cost. Fixed per-item media allowances also apply to opaque or remote media;
+on actual cost. If several in-flight requests finish above their estimates, each settles
+in full and their overages can accumulate. Conversely, an estimate above available
+credit returns HTTP 402 before dispatch. A smaller output allowance can reduce the
+quote even when the input is unchanged. The eventual cost of a refused request is
+unobserved. To evaluate overestimation, sample completed audit requests and compare
+the quote, the credit available at admission, and the posted charge. Fixed per-item
+media allowances also apply to opaque or remote media;
 no downloads or remote counting are performed.
 Batch/choice/attempt counts multiply the corresponding units. Images use requested
 image count and catalog price; transcription uses the larger of the byte/rate floor
@@ -150,8 +156,10 @@ older debt all protect other requests' active holds under the organization lock.
 
 Each actual retry gets its own reservation. Actual usage follows the existing
 recording and retry paths; admission adds no durable receipt queue or background
-settlement replay. Cloud API releases expired holds every 30 seconds, and admission
-also reclaims expired holds for its organization. There are no heartbeats or estimate resizing. A client disconnect or transport
+settlement replay. The background expiry pass runs every 30 seconds and visits up to 100 organizations.
+It skips locked organizations, continues after an individual cleanup error, and resumes
+after the last organization it attempted. A busy organization can wait multiple passes.
+Admission also reclaims expired holds for its organization. There are no heartbeats or estimate resizing. A client disconnect or transport
 error still records any billable usage already received and settles the hold.
 A connection or request-construction failure known to precede dispatch releases the
 hold immediately. HTTP errors, post-connect timeouts, cancellation and missing final usage
@@ -166,8 +174,11 @@ and the unsettled slot, preserving the identity needed for a late usage report.
 A late report still charges actual usage once, including overage. Work that outlives
 the TTL may overlap newly admitted work.
 Duplicate reports charge once even after a lost acknowledgement or deletion of the
-optional Responses record. Settled rows retain metadata for deduplication and audit
-but no longer reduce available capacity. If final usage is lost before it reaches
+optional Responses record. Released and settled rows are retained. Active-only indexes
+support expiry and admission as history grows. Late receipts need the reservation and
+its billing identity. Duplicate receipts need the link to the original usage row and
+its posted charge. Any retention limit would have to preserve these lookups or define
+a maximum receipt-delivery window. If final usage is lost before it reaches
 the existing accounting path, expiry does not reconstruct it or charge the estimate.
 
 Audio settlement prefers the provider's duration-based `usage.seconds`, then

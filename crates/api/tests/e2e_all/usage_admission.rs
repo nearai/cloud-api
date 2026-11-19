@@ -42,6 +42,8 @@ async fn server_with_policy(settings: AdmissionSettings) -> PolicyFixture {
 async fn server_with_stored_policy(value: Value) -> PolicyFixture {
     let database = Arc::new(database::Database::new(db_setup::create_test_pool().await));
     let mut config = test_config();
+    config.external_providers.enable_anthropic_messages = true;
+    config.external_providers.timeout_seconds = 5;
     config.internal_usage_token = Some("test-internal-secret".into());
     assert_mock_user_in_db(&database).await;
     let auth = api::init_auth_services(database.clone(), &config);
@@ -94,6 +96,20 @@ async fn server_with_stored_policy(value: Value) -> PolicyFixture {
         database,
         settings,
     )
+}
+
+pub(super) async fn assert_clean_settlements(db: &database::Database, org: Uuid, count: i64) {
+    let row = db.pool().get().await.unwrap().query_one(
+        "SELECT count(*), count(DISTINCT u.id), bool_and(r.state='settled'
+         AND r.outcome_unknown_at IS NULL AND r.actual_cost=u.total_cost),
+         reserved_credit($1), (SELECT count(*) FROM organization_usage_log WHERE organization_id=$1)
+         FROM usage_budget_reservations r LEFT JOIN organization_usage_log u ON u.id=r.inference_usage_id
+         WHERE r.organization_id=$1", &[&org]).await.unwrap();
+    assert_eq!(row.get::<_, i64>(0), count);
+    assert_eq!(row.get::<_, i64>(1), count);
+    assert!(row.get::<_, bool>(2));
+    assert_eq!(row.get::<_, i64>(3), 0);
+    assert_eq!(row.get::<_, i64>(4), count);
 }
 
 pub(super) fn enforcing_settings() -> AdmissionSettings {
@@ -198,6 +214,44 @@ async fn gateway_and_direct_admission_return_503_until_policy_loads() {
     assert_eq!(admitted.json::<Value>()["mode"], "audit");
     chat(false).await.assert_status_ok();
     assert_eq!(mock.chat_completion_call_count(), 1);
+}
+
+#[tokio::test]
+async fn chat_stream_settles_once_without_marking_its_hold_unknown() {
+    let (server, _, _, db) = server(enforcing_settings()).await;
+    let org = setup_org_with_credits(&server, 10_000_000_000).await;
+    let key = get_api_key_for_org(&server, org.id.clone()).await;
+    let response = server
+        .post("/v1/chat/completions")
+        .add_header("Authorization", format!("Bearer {key}"))
+        .json(
+            &json!({"model":E2E_QWEN_MODEL_NAME,"messages":[{"role":"user","content":"Hi"}],
+                       "stream":true,"max_tokens":8}),
+        )
+        .await;
+    response.assert_status_ok();
+    assert!(response.text().contains("[DONE]"));
+    let org = Uuid::parse_str(&org.id).unwrap();
+    let client = db.pool().get().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let posted: bool = client
+                .query_one(
+                    "SELECT EXISTS (SELECT 1 FROM organization_usage_log WHERE organization_id=$1)",
+                    &[&org],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            if posted {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the stream's background settlement should commit");
+    assert_clean_settlements(&db, org, 1).await;
 }
 
 #[tokio::test]
@@ -491,6 +545,7 @@ async fn ten_concurrent_requests_share_a_small_key_budget_and_settle_actual_spen
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }).await.expect("actual usage settles and releases all holds");
+    assert_clean_settlements(&db, org_id, admitted as i64).await;
 }
 
 #[tokio::test]

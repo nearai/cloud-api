@@ -1199,7 +1199,19 @@ async fn test_internal_usage_rejects_discount_above_ceiling() {
 #[tokio::test]
 async fn budget_admission_settles_once_without_resizing_estimate() {
     let server = super::usage_admission::enforcing_server().await;
-    setup_qwen_model(&server).await;
+    let model = format!("admission-price-{}", uuid::Uuid::new_v4());
+    let mut models = api::models::BatchUpdateModelApiRequest::new();
+    models.insert(
+        model.clone(),
+        serde_json::from_value(serde_json::json!({
+            "inputCostPerToken":{"amount":1_000_000,"currency":"USD"},
+            "outputCostPerToken":{"amount":2_000_000,"currency":"USD"},
+            "modelDisplayName":"Pricing fixture","modelDescription":"Settlement prices",
+            "contextLength":4096,"maxOutputLength":128,"isActive":true,"verifiable":false
+        }))
+        .unwrap(),
+    );
+    seed_models(&server, models, get_session_id()).await;
     let identity = provision_identity(&server).await;
     let execution_id = uuid::Uuid::new_v4();
     let features = services::usage::budget::UsageFeatures::from_json(
@@ -1210,7 +1222,7 @@ async fn budget_admission_settles_once_without_resizing_estimate() {
     let request = internal_usage_body(
         &identity,
         serde_json::json!({
-            "id": execution_id, "model":"Qwen/Qwen3-30B-A3B-Instruct-2507",
+            "id": execution_id, "model":model,
             "features": features
         }),
     );
@@ -1251,18 +1263,25 @@ async fn budget_admission_settles_once_without_resizing_estimate() {
         .unwrap()
         .get(0);
     assert_eq!(spent, 0, "admission does not debit actual balance");
-    for _ in 0..2 {
+    for rate in [4_000_000_i64, 6_000_000] {
+        assert_eq!(client.execute(
+            "UPDATE models SET input_cost_per_token=$2, output_cost_per_token=$2::bigint*2 WHERE model_name=$1",
+            &[&model,&rate]).await.unwrap(),1);
         let receipt = post_internal_usage(
             &server,
             &identity,
             serde_json::json!({
-                "type":"chat_completion", "model":"Qwen/Qwen3-30B-A3B-Instruct-2507",
+                "type":"chat_completion", "model":model,
                 "input_tokens":100, "output_tokens":50, "id":"provider-receipt",
                 "admission_id":execution_id
             }),
         )
         .await;
         assert_eq!(receipt.status_code(), 200, "{}", receipt.text());
+        assert_eq!(
+            receipt.json::<serde_json::Value>()["total_cost"],
+            800_000_000_i64
+        );
     }
     let after = client
         .query_one(
@@ -1275,7 +1294,7 @@ async fn budget_admission_settles_once_without_resizing_estimate() {
         .unwrap();
     assert_eq!(after.get::<_, i64>(0), amount);
     assert_eq!(after.get::<_, String>(1), "settled");
-    assert_eq!(after.get::<_, i64>(2), 200_000_000);
+    assert_eq!(after.get::<_, i64>(2), 800_000_000);
     assert_eq!(
         after.get::<_, uuid::Uuid>(3),
         uuid::Uuid::new_v5(
@@ -1293,7 +1312,7 @@ async fn budget_admission_settles_once_without_resizing_estimate() {
         .unwrap()
         .get(0);
     assert_eq!(
-        spent, 200_000_000,
+        spent, 800_000_000,
         "actual usage is billed once, including overage"
     );
 }

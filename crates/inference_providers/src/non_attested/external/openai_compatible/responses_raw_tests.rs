@@ -66,8 +66,10 @@ async fn native_transport_rejects_stateful_requests_before_sending() {
     assert!(server.received_requests().await.unwrap().is_empty());
 }
 
+/// Only OpenAI hosts move Astra tool requests to `/responses`
+/// (see `chat_via_responses`); other OpenAI-compatible hosts keep chat.
 #[tokio::test]
-async fn astra_chat_completions_still_use_native_chat_endpoint() {
+async fn astra_chat_completions_on_non_openai_host_use_chat_endpoint() {
     let (server, backend, config) = backend().await;
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))

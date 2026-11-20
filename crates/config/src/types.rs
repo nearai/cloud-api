@@ -1157,6 +1157,11 @@ pub struct AuthConfig {
     /// session tokens on admin routes with 401. An admin access token is then
     /// also accepted only while its creator has at least one admin passkey.
     pub admin_tokens_only: bool,
+    /// `AUTH_LOGIN_EMAIL_DOMAINS`: comma-separated domain names. When set, OAuth sign-in is
+    /// admitted only for an address the provider is authoritative for in one of these domains
+    /// (exact, case-insensitive match), and NEAR wallet sign-in is refused. Empty admits every
+    /// sign-in. Existing sessions and API keys are not affected.
+    pub login_email_domains: Vec<String>,
 }
 
 impl std::fmt::Debug for AuthConfig {
@@ -1170,6 +1175,7 @@ impl std::fmt::Debug for AuthConfig {
             admin_emails,
             require_session_bound_access_tokens,
             admin_tokens_only,
+            login_email_domains,
         } = self;
         f.debug_struct("AuthConfig")
             .field("mock", mock)
@@ -1183,6 +1189,7 @@ impl std::fmt::Debug for AuthConfig {
                 require_session_bound_access_tokens,
             )
             .field("admin_tokens_only", admin_tokens_only)
+            .field("login_email_domains", login_email_domains)
             .finish()
     }
 }
@@ -1245,6 +1252,9 @@ impl AuthConfig {
             }
         }
 
+        let login_email_domains =
+            parse_login_email_domains(&env::var("AUTH_LOGIN_EMAIL_DOMAINS").unwrap_or_default())?;
+
         let near = NearConfig::from_env();
 
         Ok(Self {
@@ -1263,13 +1273,69 @@ impl AuthConfig {
                 false,
             )?,
             admin_tokens_only: parse_bool_env("AUTH_ADMIN_TOKENS_ONLY", false)?,
+            login_email_domains,
         })
+    }
+
+    /// Whether sign-in is limited to `login_email_domains`.
+    pub fn restricts_login(&self) -> bool {
+        !self.login_email_domains.is_empty()
+    }
+
+    /// Whether an OAuth identity may sign in: always without a domain list; with one, only an
+    /// address the provider is authoritative for, in a listed domain.
+    pub fn admits_login_email(&self, email: &str, email_authoritative: bool) -> bool {
+        if self.login_email_domains.is_empty() {
+            return true;
+        }
+        email_authoritative
+            && admin_email_domain(email.trim()).is_some_and(|domain| {
+                self.login_email_domains
+                    .iter()
+                    .any(|listed| listed.eq_ignore_ascii_case(domain))
+            })
     }
 
     /// Check if a complete email address is explicitly allowed admin access
     pub fn is_admin_email(&self, email: &str) -> bool {
         email_matches_admin_allowlist(&self.admin_emails, email)
     }
+}
+
+/// `AUTH_LOGIN_EMAIL_DOMAINS`: comma-separated, trimmed and lowercased, empty entries skipped.
+/// Each entry must be a bare domain name of two or more labels; the error names the setting and
+/// the entry's position, never its value.
+fn parse_login_email_domains(raw: &str) -> Result<Vec<String>, String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .enumerate()
+        .map(|(index, entry)| {
+            if is_domain_name(entry) {
+                Ok(entry.to_ascii_lowercase())
+            } else {
+                Err(format!(
+                    "AUTH_LOGIN_EMAIL_DOMAINS entry {} is invalid; configure domain names such as example.com",
+                    index + 1,
+                ))
+            }
+        })
+        .collect()
+}
+
+/// Two or more labels of ASCII letters, digits and inner hyphens.
+fn is_domain_name(entry: &str) -> bool {
+    let labels: Vec<&str> = entry.split('.').collect();
+    entry.len() <= 253
+        && labels.len() >= 2
+        && labels.iter().all(|label| {
+            (1..=63).contains(&label.len())
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        })
 }
 
 pub fn email_matches_admin_allowlist(admin_emails: &[String], email: &str) -> bool {
@@ -2111,6 +2177,104 @@ mod tests {
     }
 
     #[test]
+    fn login_email_domains_parse_and_admit() {
+        for (raw, expected) in [
+            ("", Some(vec![])),
+            (" , ,", Some(vec![])),
+            (
+                " NEAR.ai , example.org ",
+                Some(vec!["near.ai", "example.org"]),
+            ),
+            ("near", None),
+            ("alice@near.ai", None),
+            ("*.near.ai", None),
+            ("https://near.ai", None),
+            ("near.ai:443", None),
+            ("near..ai", None),
+            ("-near.ai", None),
+            ("near.ai,bad domain", None),
+        ] {
+            let parsed = parse_login_email_domains(raw);
+            match expected {
+                Some(domains) => assert_eq!(parsed.unwrap(), domains, "{raw:?}"),
+                None => {
+                    let error = parsed.unwrap_err();
+                    assert!(error.contains("AUTH_LOGIN_EMAIL_DOMAINS entry"), "{raw:?}");
+                    assert!(
+                        !error.contains(raw.trim()),
+                        "{raw:?}: error echoes the value"
+                    );
+                }
+            }
+        }
+
+        let open = AuthConfig::default();
+        assert!(!open.restricts_login());
+        assert!(open.admits_login_email("alice.near@near", false));
+
+        let listed = AuthConfig {
+            login_email_domains: vec!["near.ai".to_string()],
+            ..AuthConfig::default()
+        };
+        assert!(listed.restricts_login());
+        for (email, authoritative, expected) in [
+            ("alice@near.ai", true, true),
+            ("Alice@NEAR.AI", true, true),
+            ("alice@near.ai", false, false),
+            ("alice@example.org", true, false),
+            ("alice@mail.near.ai", true, false),
+            ("alice@evilnear.ai", true, false),
+            ("near.ai@example.org", true, false),
+            ("x@evil.com@near.ai", true, false),
+            ("alice.near@near", false, false),
+            ("@near.ai", true, false),
+        ] {
+            assert_eq!(
+                listed.admits_login_email(email, authoritative),
+                expected,
+                "{email} {authoritative}"
+            );
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn login_email_domains_come_from_the_environment() {
+        let keys = ["AUTH_LOGIN_EMAIL_DOMAINS", "AUTH_ENCODING_KEY"];
+        let previous = keys.map(|key| (key, env::var_os(key)));
+        struct RestoreEnv([(&'static str, Option<std::ffi::OsString>); 2]);
+        impl Drop for RestoreEnv {
+            fn drop(&mut self) {
+                for (key, value) in &self.0 {
+                    match value {
+                        Some(value) => env::set_var(key, value),
+                        None => env::remove_var(key),
+                    }
+                }
+            }
+        }
+        let _restore = RestoreEnv(previous);
+        env::set_var("AUTH_ENCODING_KEY", "test-encoding-key");
+
+        env::remove_var("AUTH_LOGIN_EMAIL_DOMAINS");
+        assert!(AuthConfig::from_env()
+            .unwrap()
+            .login_email_domains
+            .is_empty());
+
+        env::set_var("AUTH_LOGIN_EMAIL_DOMAINS", " NEAR.ai ");
+        assert_eq!(
+            AuthConfig::from_env().unwrap().login_email_domains,
+            ["near.ai"]
+        );
+
+        env::set_var("AUTH_LOGIN_EMAIL_DOMAINS", "near.ai,*.example.org");
+        let error = AuthConfig::from_env().unwrap_err();
+        assert!(error.contains("AUTH_LOGIN_EMAIL_DOMAINS entry 2 is invalid"));
+        assert!(!error.contains("example.org"));
+    }
+
+    #[test]
     #[serial]
     fn admin_email_environment_has_no_domain_fallback() {
         let keys = [
@@ -2195,6 +2359,7 @@ mod tests {
             admin_emails: vec!["alice@near.ai".to_string(), "bob@near.org".to_string()],
             require_session_bound_access_tokens: false,
             admin_tokens_only: false,
+            login_email_domains: Vec::new(),
         };
 
         // Explicitly allowed addresses
@@ -2301,6 +2466,7 @@ mod tests {
             admin_emails: vec![],
             require_session_bound_access_tokens: false,
             admin_tokens_only: false,
+            login_email_domains: Vec::new(),
         };
 
         // Should return false when no admin emails configured

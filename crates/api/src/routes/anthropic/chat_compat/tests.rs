@@ -38,13 +38,54 @@ fn translates_claude_tool_history_and_images() {
     assert_eq!(m[4]["tool_call_id"], "call-a");
     assert_eq!(m[4]["content"], "image from file");
     assert_eq!(
-        m[5]["content"][0]["image_url"]["url"],
+        m[5]["content"][0],
+        json!({"type":"text","text":"Image from tool call call-a:"})
+    );
+    assert_eq!(
+        m[5]["content"][1]["image_url"]["url"],
         "data:image/png;base64,YQ=="
     );
     assert_eq!(chat["tool_choice"]["function"]["name"], "Read");
     assert_eq!(chat["parallel_tool_calls"], false);
     assert_eq!(chat["stream_options"]["include_usage"], true);
     assert_eq!(chat["reasoning_effort"], "high");
+}
+
+#[test]
+fn parallel_tool_results_keep_the_same_image_with_its_own_call() {
+    let image =
+        json!({"type":"image","source":{"type":"url","url":"https://example.com/image.png"}});
+    for owner in ["left", "right"] {
+        let results = ["left", "right"].map(|id| {
+            let mut content = vec![json!({"type":"text","text":"ok"})];
+            if id == owner {
+                content.push(image.clone());
+            }
+            json!({"type":"tool_result","tool_use_id":id,"content":content})
+        });
+        let body = request(json!([
+            {"role":"assistant","content":[
+                {"type":"tool_use","id":"left","name":"Read","input":{}},
+                {"type":"tool_use","id":"right","name":"Read","input":{}}]},
+            {"role":"user","content":results}
+        ]));
+        let chat = serde_json::to_value(request::translate(&body, "chat", false).unwrap()).unwrap();
+        let messages = chat["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 4);
+        for (reply, id) in messages[1..3].iter().zip(["left", "right"]) {
+            assert_eq!(reply["role"], "tool");
+            assert_eq!(reply["tool_call_id"], id);
+            assert_eq!(reply["content"], "ok");
+        }
+        assert_eq!(messages[3]["role"], "user");
+        assert_eq!(
+            messages[3]["content"],
+            json!([
+                {"type":"text","text":format!("Image from tool call {owner}:")},
+                {"type":"image_url","image_url":{"url":"https://example.com/image.png"}}
+            ])
+        );
+    }
 }
 
 #[test]
@@ -69,7 +110,7 @@ fn translates_json_with_cache_counts_and_tool_replay() {
         "choices":[{"index":0,"message":{"role":"assistant","reasoning_content":"think","content":"text",
             "tool_calls":[{"id":"call-id","type":"function","function":{"name":"lookup","arguments":"{\"q\":1}"}}]},"finish_reason":"tool_calls"}],
         "usage":{"prompt_tokens":12,"completion_tokens":3,"total_tokens":15,"prompt_tokens_details":{"cached_tokens":5,"cache_write_tokens":2}}})).unwrap();
-    let msg = from_chat(&chat, "vendor/private", true).unwrap();
+    let msg = from_chat(&chat, "vendor/private", true, &[]).unwrap();
     assert_eq!(msg["id"], "chat-123");
     assert_eq!(msg["stop_reason"], "tool_use");
     assert_eq!(
@@ -84,7 +125,7 @@ fn translates_json_with_cache_counts_and_tool_replay() {
         msg["usage"],
         json!({"input_tokens":5,"output_tokens":3,"cache_read_input_tokens":5,"cache_creation_input_tokens":2})
     );
-    let hidden = from_chat(&chat, "vendor/private", false).unwrap();
+    let hidden = from_chat(&chat, "vendor/private", false, &[]).unwrap();
     assert_eq!(hidden["content"][0]["type"], "text");
     for (finish, expected) in [
         ("length", "max_tokens"),
@@ -92,7 +133,7 @@ fn translates_json_with_cache_counts_and_tool_replay() {
         ("stop", "tool_use"),
     ] {
         chat.choices[0].finish_reason = Some(finish.to_owned());
-        let msg = from_chat(&chat, "vendor/private", false).unwrap();
+        let msg = from_chat(&chat, "vendor/private", false, &[]).unwrap();
         assert_eq!(
             msg["stop_reason"], expected,
             "upstream finish_reason={finish}"
@@ -101,14 +142,14 @@ fn translates_json_with_cache_counts_and_tool_replay() {
     chat.choices[0].finish_reason = Some("stop".into());
     let call = &mut chat.choices[0].message.tool_calls.as_mut().unwrap()[0];
     call.function.arguments = Some("{".into());
-    assert!(from_chat(&chat, "vendor/private", false).is_err());
+    assert!(from_chat(&chat, "vendor/private", false, &[]).is_err());
     chat.choices[0].finish_reason = Some("length".into());
-    let truncated = from_chat(&chat, "vendor/private", false).unwrap();
+    let truncated = from_chat(&chat, "vendor/private", false, &[]).unwrap();
     assert_eq!(truncated["stop_reason"], "max_tokens");
     chat.choices[0].message.tool_calls = None;
     chat.choices[0].finish_reason = Some("stop".into());
     assert_eq!(
-        from_chat(&chat, "vendor/private", false).unwrap()["stop_reason"],
+        from_chat(&chat, "vendor/private", false, &[]).unwrap()["stop_reason"],
         "end_turn"
     );
 }
@@ -124,7 +165,7 @@ fn legacy_function_call_returns_a_replayable_tool_use() {
         "usage": {"prompt_tokens": 4, "completion_tokens": 2, "total_tokens": 6}
     }))
     .unwrap();
-    let message = from_chat(&chat, "chat", false).unwrap();
+    let message = from_chat(&chat, "chat", false, &[]).unwrap();
     let id = message["content"][0]["id"].as_str().unwrap();
     assert!(!id.is_empty());
     assert_eq!(message["stop_reason"], "tool_use");
@@ -145,7 +186,7 @@ fn legacy_function_call_returns_a_replayable_tool_use() {
     assert_eq!(history["messages"][2]["tool_call_id"], id);
 
     chat.choices[0].message.function_call.as_mut().unwrap()["arguments"] = json!("{");
-    assert!(from_chat(&chat, "chat", false).is_err());
+    assert!(from_chat(&chat, "chat", false, &[]).is_err());
 }
 
 fn chunk(choices: Value, usage: Value) -> SSEEvent {
@@ -163,8 +204,12 @@ fn delta(d: Value, finish: Option<&str>) -> SSEEvent {
     )
 }
 async fn events(chunks: Vec<SSEEvent>) -> Vec<Value> {
+    events_with_stops(chunks, Vec::new()).await
+}
+
+async fn events_with_stops(chunks: Vec<SSEEvent>, stops: Vec<String>) -> Vec<Value> {
     let source = Box::pin(futures_stream::iter(chunks.into_iter().map(Ok)));
-    let (body, id) = stream::convert(source, "private".into(), true)
+    let (body, id) = stream::convert(source, "private".into(), true, stops)
         .await
         .unwrap();
     assert_eq!(id.as_deref(), Some("chat-123"));
@@ -179,6 +224,109 @@ async fn events(chunks: Vec<SSEEvent>) -> Vec<Value> {
     })
     .collect()
     .await
+}
+
+#[tokio::test]
+async fn only_an_explicit_requested_stop_string_identifies_a_custom_stop() {
+    let stops = vec!["END".to_owned()];
+    for (reported, finish, expected) in [
+        (json!("END"), "stop", "stop_sequence"),
+        (json!("OTHER"), "stop", "end_turn"),
+        (json!(42), "stop", "end_turn"),
+        (Value::Null, "stop", "end_turn"),
+        (json!("END"), "length", "max_tokens"),
+        (json!("END"), "content_filter", "refusal"),
+    ] {
+        let marker = if expected == "stop_sequence" {
+            json!("END")
+        } else {
+            Value::Null
+        };
+        let choice = json!({"index":0,"finish_reason":finish,"stop_reason":reported});
+        let mut full = choice.clone();
+        full["message"] = json!({"role":"assistant","content":"END"});
+        let chat = serde_json::from_value(json!({
+            "id":"chat-123","model":"chat","object":"chat.completion","created":1,"choices":[full],
+            "usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}
+        }))
+        .unwrap();
+        let msg = from_chat(&chat, "chat", false, &stops).unwrap();
+        assert_eq!(msg["stop_reason"], expected);
+        assert_eq!(msg["stop_sequence"], marker);
+
+        let frames = events_with_stops(
+            vec![
+                delta(json!({"content":"END"}), None),
+                chunk(json!([choice]), Value::Null),
+            ],
+            stops.clone(),
+        )
+        .await;
+        let terminal = frames
+            .iter()
+            .find(|e| e["type"] == "message_delta")
+            .unwrap();
+        assert_eq!(
+            terminal["delta"],
+            json!({"stop_reason":expected,"stop_sequence":marker})
+        );
+    }
+}
+
+#[tokio::test]
+async fn refusal_omits_only_the_interrupted_tool_in_json_and_sse() {
+    let calls = json!([
+        {"index":0,"id":"partial","type":"function","function":{"name":"Read","arguments":"{\"file\":"}},
+        {"index":1,"id":"ready","type":"function","function":{"name":"List","arguments":"{}"}}
+    ]);
+    let chat = serde_json::from_value(json!({
+        "id":"chat-123","model":"chat","object":"chat.completion","created":1,
+        "choices":[{"index":0,"message":{"role":"assistant","content":"Earlier text.","tool_calls":calls,"refusal":"Filtered."},"finish_reason":"content_filter"}],
+        "usage":{"prompt_tokens":4,"completion_tokens":7,"total_tokens":11}
+    })).unwrap();
+    let msg = from_chat(&chat, "chat", false, &[]).unwrap();
+    assert_eq!(msg["stop_reason"], "refusal");
+    assert_eq!(msg["stop_sequence"], Value::Null);
+    assert_eq!(
+        msg["content"],
+        json!([
+            {"type":"text","text":"Earlier text."}, {"type":"text","text":"Filtered."},
+            {"type":"tool_use","id":"ready","name":"List","input":{}}
+        ])
+    );
+
+    let out = events(vec![
+        delta(json!({"content":"Earlier text."}), None),
+        delta(json!({"tool_calls":calls}), None),
+        delta(json!({"refusal":"Filtered."}), Some("content_filter")),
+        chunk(
+            json!([]),
+            json!({"prompt_tokens":4,"completion_tokens":7,"total_tokens":11}),
+        ),
+    ])
+    .await;
+    let tools: Vec<_> = out
+        .iter()
+        .filter_map(|e| e["content_block"]["id"].as_str())
+        .collect();
+    assert_eq!(tools, ["ready"]);
+    let args: String = out
+        .iter()
+        .filter_map(|e| e["delta"]["partial_json"].as_str())
+        .collect();
+    assert_eq!(args, "{}");
+    let text: String = out
+        .iter()
+        .filter_map(|e| e["delta"]["text"].as_str())
+        .collect();
+    assert_eq!(text, "Earlier text.Filtered.");
+    let terminal = out.iter().find(|e| e["type"] == "message_delta").unwrap();
+    assert_eq!(
+        terminal["delta"],
+        json!({"stop_reason":"refusal","stop_sequence":null})
+    );
+    assert_eq!(terminal["usage"]["output_tokens"], 7);
+    assert_eq!(out.last().unwrap()["type"], "message_stop");
 }
 
 #[tokio::test]

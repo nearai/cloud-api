@@ -391,6 +391,7 @@ fn chat_stream_content_choice() -> inference_providers::models::ChatChoice {
         }),
         logprobs: None,
         finish_reason: None,
+        stop_reason: None,
         token_ids: None,
     }
 }
@@ -1031,6 +1032,7 @@ fn make_chat_chunk_with_choice(
             delta,
             logprobs: None,
             finish_reason,
+            stop_reason: None,
             token_ids: None,
         }],
         usage: None,

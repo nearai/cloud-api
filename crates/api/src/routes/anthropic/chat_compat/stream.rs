@@ -17,6 +17,7 @@ pub(super) async fn convert(
     source: StreamingResult,
     model: String,
     show_thinking: bool,
+    requested_stops: Vec<String>,
 ) -> RouteResult<(AnthropicRawBody, Option<String>)> {
     let mut chunks = Box::pin(
         source
@@ -40,7 +41,7 @@ pub(super) async fn convert(
     };
     let state = (
         chunks,
-        Encoder::new(model, show_thinking),
+        Encoder::new(model, show_thinking, requested_stops),
         VecDeque::new(),
         false,
     );
@@ -98,7 +99,6 @@ struct Tool {
     id: String,
     name: String,
     args: String,
-    sent: usize,
 }
 
 struct Encoder {
@@ -108,15 +108,16 @@ struct Encoder {
     index: usize,
     open_text: Option<&'static str>,
     tools: BTreeMap<i64, Tool>,
-    live_tool: Option<i64>,
     buffered: usize,
     trailing_text: Vec<(&'static str, String)>,
     usage: TokenUsage,
     finish: Option<FinishReason>,
+    requested_stops: Vec<String>,
+    reported_stop: Option<String>,
 }
 
 impl Encoder {
-    fn new(model: String, show_thinking: bool) -> Self {
+    fn new(model: String, show_thinking: bool, requested_stops: Vec<String>) -> Self {
         Self {
             model,
             show_thinking,
@@ -124,11 +125,12 @@ impl Encoder {
             index: 0,
             open_text: None,
             tools: BTreeMap::new(),
-            live_tool: None,
             buffered: 0,
             trailing_text: Vec::new(),
             usage: TokenUsage::default(),
             finish: None,
+            requested_stops,
+            reported_stop: None,
         }
     }
 
@@ -141,7 +143,7 @@ impl Encoder {
                 return Err(upstream("Chat stream has no message ID"));
             }
             self.message_id = chunk.id;
-            out.push_back(frame(json!({"type":"message_start","message":message(&self.message_id,&self.model,json!([]),None,usage(&self.usage))})));
+            out.push_back(frame(json!({"type":"message_start","message":message(&self.message_id,&self.model,json!([]),None,None,usage(&self.usage))})));
         }
         for choice in chunk.choices.into_iter().filter(|c| c.index == 0) {
             if let Some(mut delta) = choice.delta {
@@ -176,6 +178,9 @@ impl Encoder {
             }
             if choice.finish_reason.is_some() {
                 self.finish = choice.finish_reason;
+            }
+            if let Some(Value::String(marker)) = choice.stop_reason {
+                self.reported_stop = Some(marker);
             }
         }
         Ok(())
@@ -262,9 +267,6 @@ impl Encoder {
         }
         if let Some(f) = function {
             if let Some(name) = f.name.filter(|n| !n.is_empty() && *n != tool.name) {
-                if self.live_tool == Some(key) {
-                    return Err(upstream("Chat tool name changed after its arguments began"));
-                }
                 self.buffered += name.len();
                 tool.name.push_str(&name);
             }
@@ -275,20 +277,6 @@ impl Encoder {
         }
         if self.buffered > MAX_BUFFERED_BYTES {
             return Err(upstream("Chat tool arguments exceeded the stream buffer"));
-        }
-        // The first call can stream live. Parallel calls may interleave on the wire;
-        // emit each subsequent call as one contiguous Messages block.
-        if key == 0
-            && self.live_tool.is_none()
-            && !tool.id.is_empty()
-            && !tool.name.is_empty()
-            && !tool.args.is_empty()
-        {
-            start_tool(self.index, tool, out);
-            self.live_tool = Some(key);
-        }
-        if self.live_tool == Some(key) {
-            flush_args(self.index, tool, out);
         }
         Ok(())
     }
@@ -301,46 +289,41 @@ impl Encoder {
             Some(FinishReason::ContentFilter) => "content_filter",
             None => return Err(upstream("Chat stream ended before its finish reason")),
         };
-        let reason = stop_reason(Some(reason), !self.tools.is_empty())?;
+        let reported_stop = self.reported_stop.take();
+        let (reason, stop_sequence) = stop_reason(
+            Some(reason),
+            !self.tools.is_empty(),
+            reported_stop.as_deref(),
+            &self.requested_stops,
+        )?;
         if reason == "tool_use" && self.tools.is_empty() {
             return Err(upstream("Chat stream ended with a missing tool call"));
         }
         self.close_text(out);
-        for (key, mut tool) in std::mem::take(&mut self.tools) {
-            if reason != "max_tokens" {
-                tool_input(&tool.args)?;
-            }
-            if tool.id.is_empty() || tool.name.is_empty() {
-                if reason == "max_tokens" {
+        // A Messages tool block cannot be retracted if filtering interrupts its arguments.
+        for tool in std::mem::take(&mut self.tools).into_values() {
+            if reason == "max_tokens" {
+                if tool.id.is_empty() || tool.name.is_empty() {
                     continue;
                 }
-                return Err(upstream("Incomplete tool call in chat stream"));
+            } else if let Err(error) = tool_input(&tool.id, &tool.name, &tool.args) {
+                if reason == "refusal" {
+                    continue;
+                }
+                return Err(error);
             }
-            if self.live_tool != Some(key) {
-                start_tool(self.index, &tool, out);
-            }
-            flush_args(self.index, &mut tool, out);
+            out.push_back(frame(json!({"type":"content_block_start","index":self.index,"content_block":{"type":"tool_use","id":tool.id,"name":tool.name,"input":{}}})));
+            fragments(&tool.args, |part| {
+                out.push_back(frame(json!({"type":"content_block_delta","index":self.index,"delta":{"type":"input_json_delta","partial_json":part}})))
+            });
             self.close_block(out);
         }
         for (kind, text) in std::mem::take(&mut self.trailing_text) {
             self.text(kind, Some(&text), out)?;
         }
         self.close_text(out);
-        out.push_back(frame(json!({"type":"message_delta","delta":{"stop_reason":reason,"stop_sequence":null},"usage":usage(&self.usage)})));
+        out.push_back(frame(json!({"type":"message_delta","delta":{"stop_reason":reason,"stop_sequence":stop_sequence},"usage":usage(&self.usage)})));
         out.push_back(frame(json!({"type":"message_stop"})));
         Ok(())
-    }
-}
-
-fn start_tool(index: usize, tool: &Tool, out: &mut Frames) {
-    out.push_back(frame(json!({"type":"content_block_start","index":index,"content_block":{"type":"tool_use","id":tool.id,"name":tool.name,"input":{}}})));
-}
-
-fn flush_args(index: usize, tool: &mut Tool, out: &mut Frames) {
-    if let Some(fragment) = tool.args.get(tool.sent..).filter(|s| !s.is_empty()) {
-        fragments(fragment, |part| {
-            out.push_back(frame(json!({"type":"content_block_delta","index":index,"delta":{"type":"input_json_delta","partial_json":part}})))
-        });
-        tool.sent = tool.args.len();
     }
 }

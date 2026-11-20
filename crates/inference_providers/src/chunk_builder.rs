@@ -40,6 +40,7 @@ impl ChunkContext {
                 delta: Some(delta),
                 logprobs: None,
                 finish_reason,
+                stop_reason: None,
                 token_ids: None,
             }],
             usage,

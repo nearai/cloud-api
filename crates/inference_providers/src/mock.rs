@@ -500,6 +500,7 @@ impl ResponseTemplate {
                         }),
                         logprobs: None,
                         finish_reason: None,
+                        stop_reason: None,
                         token_ids: None,
                     }],
                     usage: Some(self.token_usage(
@@ -554,6 +555,7 @@ impl ResponseTemplate {
                         }),
                         logprobs: None,
                         finish_reason,
+                        stop_reason: None,
                         token_ids: None,
                     }],
                     usage: Some(self.token_usage(
@@ -609,6 +611,7 @@ impl ResponseTemplate {
                         }),
                         logprobs: None,
                         finish_reason: None,
+                        stop_reason: None,
                         token_ids: None,
                     }],
                     usage: Some(self.token_usage(
@@ -669,6 +672,7 @@ impl ResponseTemplate {
                             }),
                             logprobs: None,
                             finish_reason,
+                            stop_reason: None,
                             token_ids: None,
                         }],
                         usage: Some(self.token_usage(

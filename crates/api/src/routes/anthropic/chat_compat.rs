@@ -69,7 +69,7 @@ pub(super) async fn respond(
         .iter()
         .any(|parameter| parameter == "reasoning_effort");
     let model = model.model_name.as_str();
-    let request = request::translate(&body, model, supports_effort)?;
+    let mut request = request::translate(&body, model, supports_effort)?;
     let streaming = request.stream == Some(true);
     let show_thinking = match body.pointer("/thinking/display").map(Value::as_str) {
         None | Some(Some("summarized")) => matches!(
@@ -92,6 +92,11 @@ pub(super) async fn respond(
         None,
         request_id,
     );
+    let stop_sequences = request
+        .stop
+        .take()
+        .map(|s| s.into_vec())
+        .unwrap_or_default();
     drop(request);
     completion.skip_provider_chat_signature = true;
     completion.session_hint = session_hint_from_headers(headers);
@@ -102,7 +107,8 @@ pub(super) async fn respond(
             .create_chat_completion_stream(completion)
             .await
             .map_err(service_error)?;
-        let (source, id) = stream::convert(source, model.to_owned(), show_thinking).await?;
+        let (source, id) =
+            stream::convert(source, model.to_owned(), show_thinking, stop_sequences).await?;
         let serving = match id.as_deref() {
             Some(id) => state
                 .inference_provider_pool
@@ -128,7 +134,7 @@ pub(super) async fn respond(
             .create_chat_completion(completion)
             .await
             .map_err(service_error)?;
-        let message = from_chat(&result.response, model, show_thinking)?;
+        let message = from_chat(&result.response, model, show_thinking, &stop_sequences)?;
         let bytes = serde_json::to_vec(&message).map_err(|_| upstream("Invalid chat response"))?;
         let id = result.response.id;
         signing
@@ -162,25 +168,50 @@ fn usage(value: &TokenUsage) -> Value {
         "cache_read_input_tokens":read, "cache_creation_input_tokens":write})
 }
 
-fn stop_reason(reason: Option<&str>, has_tool_calls: bool) -> RouteResult<&'static str> {
-    match reason {
-        Some("stop") if has_tool_calls => Ok("tool_use"),
-        Some("stop") => Ok("end_turn"),
-        Some("tool_calls" | "function_call") => Ok("tool_use"),
-        Some("length") => Ok("max_tokens"),
-        Some("content_filter") => Ok("refusal"),
-        _ => Err(upstream(
-            "Chat response is missing a supported finish reason",
-        )),
-    }
+fn stop_reason<'a>(
+    reason: Option<&str>,
+    has_tool_calls: bool,
+    reported_stop: Option<&'a str>,
+    requested_stops: &[String],
+) -> RouteResult<(&'static str, Option<&'a str>)> {
+    let reason = match reason {
+        Some("stop") if has_tool_calls => "tool_use",
+        Some("stop") => {
+            if let Some(marker) =
+                reported_stop.filter(|s| !s.is_empty() && requested_stops.iter().any(|r| r == s))
+            {
+                return Ok(("stop_sequence", Some(marker)));
+            }
+            "end_turn"
+        }
+        Some("tool_calls" | "function_call") => "tool_use",
+        Some("length") => "max_tokens",
+        Some("content_filter") => "refusal",
+        _ => {
+            return Err(upstream(
+                "Chat response is missing a supported finish reason",
+            ))
+        }
+    };
+    Ok((reason, None))
 }
 
-fn message(id: &str, model: &str, content: Value, reason: Option<&str>, usage: Value) -> Value {
+fn message(
+    id: &str,
+    model: &str,
+    content: Value,
+    reason: Option<&str>,
+    stop_sequence: Option<&str>,
+    usage: Value,
+) -> Value {
     json!({"id":id,"type":"message","role":"assistant","model":model,"content":content,
-        "stop_reason":reason,"stop_sequence":null,"usage":usage})
+        "stop_reason":reason,"stop_sequence":stop_sequence,"usage":usage})
 }
 
-fn tool_input(raw: &str) -> RouteResult<Value> {
+fn tool_input(id: &str, name: &str, raw: &str) -> RouteResult<Value> {
+    if id.is_empty() || name.is_empty() {
+        return Err(upstream("Tool call is missing its ID or name"));
+    }
     let value: Value =
         serde_json::from_str(raw).map_err(|_| upstream("Invalid tool arguments from model"))?;
     if !value.is_object() {
@@ -197,6 +228,7 @@ fn from_chat(
     chat: &ChatCompletionResponse,
     model: &str,
     show_thinking: bool,
+    requested_stops: &[String],
 ) -> RouteResult<Value> {
     if !valid_message_id(&chat.id) {
         return Err(upstream("Chat response is missing a valid ID"));
@@ -225,7 +257,12 @@ fn from_chat(
         }
         (calls, _) => calls,
     };
-    let reason = stop_reason(choice.finish_reason.as_deref(), !tool_calls.is_empty())?;
+    let (reason, stop_sequence) = stop_reason(
+        choice.finish_reason.as_deref(),
+        !tool_calls.is_empty(),
+        choice.extra.get("stop_reason").and_then(Value::as_str),
+        requested_stops,
+    )?;
     let mut content = Vec::new();
     if show_thinking {
         if let Some(thought) = msg
@@ -245,19 +282,14 @@ fn from_chat(
         content.push(json!({"type":"text","text":text}));
     }
     for call in tool_calls {
-        let id = call
-            .id
-            .as_deref()
-            .filter(|v| !v.is_empty())
-            .ok_or_else(|| upstream("Tool call has no ID"))?;
-        let name = call
-            .function
-            .name
-            .as_deref()
-            .filter(|v| !v.is_empty())
-            .ok_or_else(|| upstream("Tool call has no name"))?;
-        let input = match tool_input(call.function.arguments.as_deref().unwrap_or("")) {
-            Err(_) if reason == "max_tokens" => continue,
+        let id = call.id.as_deref().unwrap_or_default();
+        let name = call.function.name.as_deref().unwrap_or_default();
+        let input = match tool_input(
+            id,
+            name,
+            call.function.arguments.as_deref().unwrap_or_default(),
+        ) {
+            Err(_) if matches!(reason, "max_tokens" | "refusal") => continue,
             result => result?,
         };
         content.push(json!({"type":"tool_use","id":id,"name":name,"input":input}));
@@ -270,6 +302,7 @@ fn from_chat(
         model,
         content.into(),
         Some(reason),
+        stop_sequence,
         usage(&chat.usage),
     ))
 }

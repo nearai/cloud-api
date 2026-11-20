@@ -223,7 +223,10 @@ fn user(content: &[Value], messages: &mut Vec<Value>) -> RouteResult<()> {
                         match string(item, "type")? {
                             "text" => text.push(string(item, "text")?.to_owned()),
                             "tool_reference" => text.push(string(item, "tool_name")?.to_owned()),
-                            "image" => parts.push(user_part(item)?),
+                            "image" => {
+                                parts.push(json!({"type":"text","text":format!("Image from tool call {id}:")}));
+                                parts.push(user_part(item)?);
+                            }
                             _ => return Err(invalid("Unsupported tool_result content block")),
                         }
                     }

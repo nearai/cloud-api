@@ -25,6 +25,12 @@ Models that list `reasoning_effort` among their supported sampling parameters
 receive a low, medium, or high effort hint for a thinking budget. Other chat
 models use their own reasoning defaults.
 
+On the chat path, text streams as it is generated until a tool call begins.
+Tool blocks are sent once the completion outcome is known. If filtering
+interrupts a tool call, the response ends with `refusal` and omits that
+incomplete call. A custom stop sequence is returned when the chat model
+explicitly identifies a match from the request's `stop_sequences`.
+
 Token counting at `/v1/messages/count_tokens` is available for native Anthropic
 models. Chat models return a 404 for this operation. Models that require the
 OpenAI Responses API return their Chat Completions error on `/v1/messages`.

@@ -189,9 +189,16 @@ async fn openai_chat_uses_only_chat_completions_even_when_the_model_requires_res
     let model = format!("openai/messages-{}", uuid::Uuid::new_v4());
     let alias = format!("chat-alias-{}", uuid::Uuid::new_v4());
     let id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
+    let stops = ["<first>", "<second>"];
+    let stream_chunk = json!({
+        "id":format!("chatcmpl-{}",uuid::Uuid::new_v4()),"object":"chat.completion.chunk","created":1,"model":"chat-model",
+        "choices":[{"index":0,"delta":{"content":"Hi"},"finish_reason":"stop","stop_reason":stops[1]}],
+        "usage":{"prompt_tokens":7,"completion_tokens":1,"total_tokens":8}
+    });
     for (prompt, response) in [
         ("hello", ResponseTemplate::new(200).set_body_json(json!({"id":id,"object":"chat.completion","created":1,"model":"chat-model","choices":[
-            {"index":0,"message":{"role":"assistant","content":"Hi"},"finish_reason":"stop"}],"usage":{"prompt_tokens":7,"completion_tokens":1,"total_tokens":8}}))),
+            {"index":0,"message":{"role":"assistant","content":"Hi"},"finish_reason":"stop","stop_reason":stops[1]}],"usage":{"prompt_tokens":7,"completion_tokens":1,"total_tokens":8}}))),
+        ("stream", ResponseTemplate::new(200).set_body_raw(format!("data: {stream_chunk}\n\ndata: [DONE]\n\n"), "text/event-stream")),
         ("responses-only", ResponseTemplate::new(400).set_body_json(json!({"error":{"message":"This model requires the Responses API","type":"invalid_request_error"}}))),
     ] {
         Mock::given(method("POST")).and(path("/v1/chat/completions"))
@@ -213,7 +220,7 @@ async fn openai_chat_uses_only_chat_completions_even_when_the_model_requires_res
     seed_models(&server, batch, get_session_id()).await;
     let org = setup_org_with_credits(&server, 10_000_000_000).await;
     let key = get_api_key_for_org(&server, org.id).await;
-    for (prompt, status) in [("hello", 200), ("responses-only", 400)] {
+    for (prompt, status) in [("hello", 200), ("stream", 200), ("responses-only", 400)] {
         let requested_model = if status == 200 { &alias } else { &model };
         let response = server
             .post("/v1/messages")
@@ -224,14 +231,36 @@ async fn openai_chat_uses_only_chat_completions_even_when_the_model_requires_res
                 "thinking": {"type":"adaptive"},
                 "output_config": {"effort":"high"},
                 "max_tokens": 32,
+                "stop_sequences": stops,
+                "stream": prompt == "stream",
                 "messages": [{"role":"user", "content":prompt}]
             }))
             .await;
         assert_eq!(response.status_code(), status, "{}", response.text());
+        if prompt == "stream" {
+            let events: Vec<Value> = response
+                .text()
+                .lines()
+                .filter_map(|l| l.strip_prefix("data: "))
+                .map(|l| serde_json::from_str(l).unwrap())
+                .collect();
+            let terminal = events
+                .iter()
+                .find(|e| e["type"] == "message_delta")
+                .unwrap();
+            assert_eq!(
+                terminal["delta"],
+                json!({"stop_reason":"stop_sequence","stop_sequence":stops[1]})
+            );
+            assert_eq!(events.last().unwrap()["type"], "message_stop");
+            continue;
+        }
         let message: Value = response.json();
         if status == 200 {
             assert_eq!(message["content"], json!([{"type":"text","text":"Hi"}]));
             assert_eq!(message["id"], id);
+            assert_eq!(message["stop_reason"], "stop_sequence");
+            assert_eq!(message["stop_sequence"], stops[1]);
             assert_eq!(
                 response.header("x-model-alias-resolved").to_str().unwrap(),
                 format!("{alias} -> {model}")
@@ -244,11 +273,9 @@ async fn openai_chat_uses_only_chat_completions_even_when_the_model_requires_res
     for request in upstream.received_requests().await.unwrap() {
         assert_ne!(request.url.path(), "/v1/responses");
         if request.url.path() == "/v1/chat/completions" {
-            assert!(request
-                .body_json::<Value>()
-                .unwrap()
-                .get("reasoning_effort")
-                .is_none());
+            let body = request.body_json::<Value>().unwrap();
+            assert!(body.get("reasoning_effort").is_none());
+            assert_eq!(body["stop"], json!(stops));
         }
     }
     upstream.verify().await;

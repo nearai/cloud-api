@@ -28,6 +28,8 @@ pub struct OpenAiCompatibleBackend {
     client: Client,
 }
 
+mod chat_via_responses;
+
 pub(super) const CATALOG_MODEL_NAME_KEY: &str = "catalog_model_name";
 
 impl OpenAiCompatibleBackend {
@@ -251,6 +253,11 @@ impl ExternalBackend for OpenAiCompatibleBackend {
         model: &str,
         params: ChatCompletionParams,
     ) -> Result<StreamingResult, CompletionError> {
+        // GPT-6 Astra rejects function tools on /chat/completions; send those
+        // requests to /responses and translate the stream back.
+        if chat_via_responses::routes(&params, config, model) {
+            return chat_via_responses::chat_completion_stream(self, config, model, params).await;
+        }
         let url = format!("{}/chat/completions", config.base_url);
 
         // Ensure streaming and usage are enabled
@@ -326,6 +333,11 @@ impl ExternalBackend for OpenAiCompatibleBackend {
         model: &str,
         params: ChatCompletionParams,
     ) -> Result<ChatCompletionResponseWithBytes, CompletionError> {
+        // GPT-6 Astra rejects function tools on /chat/completions; send those
+        // requests to /responses and translate the response back.
+        if chat_via_responses::routes(&params, config, model) {
+            return chat_via_responses::chat_completion(self, config, model, params).await;
+        }
         let url = format!("{}/chat/completions", config.base_url);
 
         // Ensure non-streaming

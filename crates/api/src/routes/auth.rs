@@ -86,8 +86,6 @@ fn validate_frontend_callback(
     Ok(url)
 }
 
-/// Only the known account conflict is redirected here; general OAuth callback
-/// failures retain their existing handling. Never put internal errors in a URL.
 /// The error of a sign-in that `AUTH_LOGIN_EMAIL_DOMAINS` refuses, and its fixed description: it
 /// names neither the address nor the list.
 const LOGIN_REFUSED_ERROR: &str = "access_denied";
@@ -132,6 +130,8 @@ fn login_refused_response(frontend_callback: Option<&str>, cors: &config::CorsCo
     Redirect::temporary(callback_url.as_str()).into_response()
 }
 
+/// Only the known account conflict is redirected here; general OAuth callback
+/// failures retain their existing handling. Never put internal errors in a URL.
 fn oauth_user_error_response(
     error: AuthError,
     frontend_callback: Option<&str>,
@@ -530,8 +530,8 @@ pub async fn oauth_callback(
             )
                 .into_response();
         }
-        Err(e) => {
-            error!("Database error retrieving OAuth state: {}", e);
+        Err(_) => {
+            error!("Database error retrieving OAuth state");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({
@@ -606,10 +606,11 @@ pub async fn oauth_callback(
         }
     };
 
-    if !config
-        .auth
-        .admits_login_email(&oauth_user_info.email, oauth_user_info.email_authoritative)
-    {
+    if !config.auth.admits_login_email(
+        &oauth_user_info.provider,
+        &oauth_user_info.email,
+        oauth_user_info.email_authoritative,
+    ) {
         warn!(
             provider = %oauth_state_row.provider,
             "OAuth sign-in refused by the email domain list"

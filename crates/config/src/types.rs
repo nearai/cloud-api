@@ -1254,6 +1254,12 @@ impl AuthConfig {
 
         let login_email_domains =
             parse_login_email_domains(&env::var("AUTH_LOGIN_EMAIL_DOMAINS").unwrap_or_default())?;
+        // A staging deployment is for its team only: it never starts without a domain list.
+        if login_email_domains.is_empty() && env::var("ENVIRONMENT").as_deref() == Ok("staging") {
+            return Err(
+                "AUTH_LOGIN_EMAIL_DOMAINS is required when ENVIRONMENT=staging".to_string(),
+            );
+        }
 
         let near = NearConfig::from_env();
 
@@ -1282,13 +1288,21 @@ impl AuthConfig {
         !self.login_email_domains.is_empty()
     }
 
-    /// Whether an OAuth identity may sign in: always without a domain list; with one, only an
-    /// address the provider is authoritative for, in a listed domain.
-    pub fn admits_login_email(&self, email: &str, email_authoritative: bool) -> bool {
+    /// Whether an OAuth identity may sign in: always without a domain list; with one, only a
+    /// Google account with an authoritative address (verified, in a Workspace hosted domain or
+    /// Gmail) in a listed domain. GitHub is refused because it never re-checks a verified address,
+    /// so a former member, or anyone who could read a group address in the domain, would pass.
+    pub fn admits_login_email(
+        &self,
+        provider: &str,
+        email: &str,
+        email_authoritative: bool,
+    ) -> bool {
         if self.login_email_domains.is_empty() {
             return true;
         }
-        email_authoritative
+        provider == "google"
+            && email_authoritative
             && admin_email_domain(email.trim()).is_some_and(|domain| {
                 self.login_email_domains
                     .iter()
@@ -1303,10 +1317,12 @@ impl AuthConfig {
 }
 
 /// `AUTH_LOGIN_EMAIL_DOMAINS`: comma-separated, trimmed and lowercased, empty entries skipped.
-/// Each entry must be a bare domain name of two or more labels; the error names the setting and
-/// the entry's position, never its value.
+/// Each entry must be a bare domain name of two or more labels, and a value that is not blank must
+/// list at least one, so a typo never turns the list off. Errors name the setting and the entry's
+/// position, never its value.
 fn parse_login_email_domains(raw: &str) -> Result<Vec<String>, String> {
-    raw.split(',')
+    let domains = raw
+        .split(',')
         .map(str::trim)
         .filter(|entry| !entry.is_empty())
         .enumerate()
@@ -1320,7 +1336,14 @@ fn parse_login_email_domains(raw: &str) -> Result<Vec<String>, String> {
                 ))
             }
         })
-        .collect()
+        .collect::<Result<Vec<_>, _>>()?;
+    if domains.is_empty() && !raw.trim().is_empty() {
+        return Err(
+            "AUTH_LOGIN_EMAIL_DOMAINS lists no domain name; unset it or configure domain names such as example.com"
+                .to_string(),
+        );
+    }
+    Ok(domains)
 }
 
 /// Two or more labels of ASCII letters, digits and inner hyphens.
@@ -2180,7 +2203,9 @@ mod tests {
     fn login_email_domains_parse_and_admit() {
         for (raw, expected) in [
             ("", Some(vec![])),
-            (" , ,", Some(vec![])),
+            ("   ", Some(vec![])),
+            (" , ,", None),
+            (",", None),
             (
                 " NEAR.ai , example.org ",
                 Some(vec!["near.ai", "example.org"]),
@@ -2199,40 +2224,45 @@ mod tests {
                 Some(domains) => assert_eq!(parsed.unwrap(), domains, "{raw:?}"),
                 None => {
                     let error = parsed.unwrap_err();
-                    assert!(error.contains("AUTH_LOGIN_EMAIL_DOMAINS entry"), "{raw:?}");
-                    assert!(
-                        !error.contains(raw.trim()),
-                        "{raw:?}: error echoes the value"
-                    );
+                    assert!(error.contains("AUTH_LOGIN_EMAIL_DOMAINS"), "{raw:?}");
+                    if raw.trim().len() > 1 {
+                        assert!(
+                            !error.contains(raw.trim()),
+                            "{raw:?}: error echoes the value"
+                        );
+                    }
                 }
             }
         }
 
         let open = AuthConfig::default();
         assert!(!open.restricts_login());
-        assert!(open.admits_login_email("alice.near@near", false));
+        assert!(open.admits_login_email("near", "alice.near@near", false));
+        assert!(open.admits_login_email("github", "alice@example.org", false));
 
         let listed = AuthConfig {
             login_email_domains: vec!["near.ai".to_string()],
             ..AuthConfig::default()
         };
         assert!(listed.restricts_login());
-        for (email, authoritative, expected) in [
-            ("alice@near.ai", true, true),
-            ("Alice@NEAR.AI", true, true),
-            ("alice@near.ai", false, false),
-            ("alice@example.org", true, false),
-            ("alice@mail.near.ai", true, false),
-            ("alice@evilnear.ai", true, false),
-            ("near.ai@example.org", true, false),
-            ("x@evil.com@near.ai", true, false),
-            ("alice.near@near", false, false),
-            ("@near.ai", true, false),
+        for (provider, email, authoritative, expected) in [
+            ("google", "alice@near.ai", true, true),
+            ("google", "Alice@NEAR.AI", true, true),
+            ("google", "alice@near.ai", false, false),
+            ("github", "alice@near.ai", true, false),
+            ("near", "alice@near.ai", true, false),
+            ("google", "alice@example.org", true, false),
+            ("google", "alice@mail.near.ai", true, false),
+            ("google", "alice@evilnear.ai", true, false),
+            ("google", "near.ai@example.org", true, false),
+            ("google", "x@evil.com@near.ai", true, false),
+            ("near", "alice.near@near", false, false),
+            ("google", "@near.ai", true, false),
         ] {
             assert_eq!(
-                listed.admits_login_email(email, authoritative),
+                listed.admits_login_email(provider, email, authoritative),
                 expected,
-                "{email} {authoritative}"
+                "{provider} {email} {authoritative}"
             );
         }
     }
@@ -2240,9 +2270,13 @@ mod tests {
     #[test]
     #[serial]
     fn login_email_domains_come_from_the_environment() {
-        let keys = ["AUTH_LOGIN_EMAIL_DOMAINS", "AUTH_ENCODING_KEY"];
+        let keys = [
+            "AUTH_LOGIN_EMAIL_DOMAINS",
+            "AUTH_ENCODING_KEY",
+            "ENVIRONMENT",
+        ];
         let previous = keys.map(|key| (key, env::var_os(key)));
-        struct RestoreEnv([(&'static str, Option<std::ffi::OsString>); 2]);
+        struct RestoreEnv([(&'static str, Option<std::ffi::OsString>); 3]);
         impl Drop for RestoreEnv {
             fn drop(&mut self) {
                 for (key, value) in &self.0 {
@@ -2255,7 +2289,27 @@ mod tests {
         }
         let _restore = RestoreEnv(previous);
         env::set_var("AUTH_ENCODING_KEY", "test-encoding-key");
+        env::remove_var("ENVIRONMENT");
 
+        env::remove_var("AUTH_LOGIN_EMAIL_DOMAINS");
+        assert!(AuthConfig::from_env()
+            .unwrap()
+            .login_email_domains
+            .is_empty());
+
+        // Staging never starts without a list; other environments may leave it unset.
+        env::set_var("ENVIRONMENT", "staging");
+        let error = AuthConfig::from_env().unwrap_err();
+        assert!(
+            error.contains("AUTH_LOGIN_EMAIL_DOMAINS is required"),
+            "{error}"
+        );
+        env::set_var("AUTH_LOGIN_EMAIL_DOMAINS", "near.ai");
+        assert_eq!(
+            AuthConfig::from_env().unwrap().login_email_domains,
+            ["near.ai"]
+        );
+        env::set_var("ENVIRONMENT", "prod");
         env::remove_var("AUTH_LOGIN_EMAIL_DOMAINS");
         assert!(AuthConfig::from_env()
             .unwrap()

@@ -344,17 +344,20 @@ async fn login_email_domains_admit_only_authoritative_listed_addresses() {
         "error_description": "Sign-in is not available for this account."
     });
 
-    for provider in ["google", "github"] {
-        let identity = info(
-            provider,
-            &format!("member-{}@{listed}", uuid::Uuid::new_v4()),
-        );
-        let (response, db) = callback_as(&domains, &identity, None).await;
-        assert_eq!(response.status_code(), 200, "{provider}, listed");
-        assert!(has_identity(&db, &identity).await, "{provider}, listed");
-    }
+    let member = info(
+        "google",
+        &format!("member-{}@{listed}", uuid::Uuid::new_v4()),
+    );
+    let (response, db) = callback_as(&domains, &member, None).await;
+    assert_eq!(response.status_code(), 200, "google, listed");
+    assert!(has_identity(&db, &member).await, "google, listed");
 
     let mut refused = vec![
+        // GitHub never re-checks a verified address, so it is refused even for a listed one.
+        (
+            "github, verified listed address",
+            info("github", &format!("gh-{}@{listed}", uuid::Uuid::new_v4())),
+        ),
         (
             "google, other domain",
             info("google", &format!("x-{}@example.org", uuid::Uuid::new_v4())),
@@ -407,7 +410,7 @@ async fn login_email_domains_admit_only_authoritative_listed_addresses() {
     );
 
     // NEAR: refused before the proof is checked.
-    let (server, _, _, _, _) = fixture_with(domains.clone()).await;
+    let (server, db, _, _, _) = fixture_with(domains.clone()).await;
     let response = server
         .post("/v1/auth/near")
         .add_header("User-Agent", UA)
@@ -415,4 +418,12 @@ async fn login_email_domains_admit_only_authoritative_listed_addresses() {
         .await;
     assert_eq!(response.status_code(), 403);
     assert_eq!(response.json::<serde_json::Value>(), refused_body);
+    assert!(
+        database::UserRepository::new(db.pool().clone())
+            .get_by_provider("near", "refused.near")
+            .await
+            .unwrap()
+            .is_none(),
+        "near: user row"
+    );
 }

@@ -141,6 +141,19 @@ pub async fn check_rate_limit_for_api_key(
     Ok(())
 }
 
+/// Separate OHTTP admission bucket, checked before allocating replay records.
+pub async fn check_ohttp_admission_limit(
+    state: &RateLimitState,
+    api_key_id: &str,
+) -> Result<(), RateLimitedResponse> {
+    let (allowed, count, limit) = state.check_limit(api_key_id).await;
+    if allowed {
+        Ok(())
+    } else {
+        Err(rate_limited_response(count, limit))
+    }
+}
+
 async fn check_rate_limit_for_api_key_in_scope(
     state: &RateLimitState,
     auth_key: &AuthenticatedApiKey,

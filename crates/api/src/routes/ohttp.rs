@@ -16,6 +16,8 @@ use crate::routes::api::AppState;
 /// Simple error type local to this module — maps to HTTP status + OpenAI error envelope.
 pub enum OhttpError {
     NotEnabled,
+    Replayed,
+    RateLimited(Box<Response>),
     BadRequest(String),
     Internal(String),
 }
@@ -23,6 +25,12 @@ pub enum OhttpError {
 impl IntoResponse for OhttpError {
     fn into_response(self) -> Response {
         let (status, msg, kind) = match self {
+            OhttpError::RateLimited(response) => return *response,
+            OhttpError::Replayed => (
+                StatusCode::CONFLICT,
+                "OHTTP encapsulation was already used".to_string(),
+                "invalid_request_error",
+            ),
             OhttpError::NotEnabled => (
                 StatusCode::NOT_FOUND,
                 "OHTTP not enabled".to_string(),
@@ -125,6 +133,7 @@ async fn ohttp_relay_standard(
     let (request_builder, log_path) =
         parse_bhttp_and_build_loopback(state, &bhttp_request, outer_authorization.as_ref())?;
 
+    claim_authenticated_request(state, gateway, enc_request, &request_builder).await?;
     let loopback_response = send_loopback(request_builder).await?;
 
     let response_status = loopback_response.status().as_u16();
@@ -197,6 +206,7 @@ async fn ohttp_relay_chunked(
     let (request_builder, log_path) =
         parse_bhttp_and_build_loopback(state, &bhttp_request, outer_authorization.as_ref())?;
 
+    claim_authenticated_request(state, gateway, enc_request, &request_builder).await?;
     let loopback_response = send_loopback(request_builder).await?;
     let response_status = loopback_response.status().as_u16();
     let response_headers = collect_response_headers(&loopback_response);
@@ -356,6 +366,51 @@ fn collect_response_headers(response: &reqwest::Response) -> Vec<(Vec<u8>, Vec<u
             }
         })
         .collect()
+}
+
+/// Authenticate before allocating durable replay state. Unauthenticated requests
+/// still reach the ordinary middleware, which preserves the endpoint's response.
+async fn claim_authenticated_request(
+    state: &AppState,
+    gateway: &crate::ohttp_gateway::OhttpGateway,
+    encapsulated: &[u8],
+    builder: &reqwest::RequestBuilder,
+) -> Result<(), OhttpError> {
+    let request = builder
+        .try_clone()
+        .ok_or_else(|| OhttpError::Internal("Cannot validate request".into()))?
+        .build()
+        .map_err(|_| OhttpError::BadRequest("Invalid inner request".into()))?;
+    let bearer = request
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "));
+    let sdk_key = request
+        .headers()
+        .get("x-api-key")
+        .and_then(|value| value.to_str().ok());
+    // Check both accepted credential forms. An unrelated invalid header must
+    // not hide a valid credential used by the inner route.
+    for key in [bearer, sdk_key].into_iter().flatten() {
+        let api_key = match state.auth_service.validate_api_key(key.to_owned()).await {
+            Ok(api_key) => api_key,
+            Err(services::auth::AuthError::Unauthorized) => continue,
+            Err(_) => return Err(OhttpError::Internal("Unable to validate request".into())),
+        };
+        crate::middleware::rate_limit::check_ohttp_admission_limit(
+            &gateway.admission_limits,
+            &api_key.id.0,
+        )
+        .await
+        .map_err(|response| OhttpError::RateLimited(Box::new(response.into_response())))?;
+        return match gateway.claim_request(encapsulated).await {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(OhttpError::Replayed),
+            Err(_) => Err(OhttpError::Internal("Replay protection unavailable".into())),
+        };
+    }
+    Ok(())
 }
 
 // ── Shared helpers ───────────────────────────────────────────────────────────

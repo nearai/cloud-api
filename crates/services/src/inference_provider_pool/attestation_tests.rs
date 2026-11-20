@@ -110,6 +110,80 @@ async fn gateway_attestation_collects_all_near_fleets_without_signer_deduplicati
     );
 }
 
+fn near_without_backends() -> Arc<MockProvider> {
+    Arc::new(
+        MockProvider::new()
+            .with_tier(ProviderTier::Near)
+            .with_attestation_reports_handler(|_, _, _, _, _| {
+                Err(AttestationError::ProviderNotFound(MODEL.into()))
+            }),
+    )
+}
+
+fn near_failing() -> Arc<MockProvider> {
+    Arc::new(
+        MockProvider::new()
+            .with_tier(ProviderTier::Near)
+            .with_attestation_reports_handler(|_, _, _, _, _| {
+                Err(AttestationError::FetchError("backend timed out".into()))
+            }),
+    )
+}
+
+#[tokio::test]
+async fn gateway_attestation_skips_near_fleet_without_serving_backends() {
+    let unexpected_third_party = Arc::new(
+        MockProvider::new()
+            .with_tier(ProviderTier::Attested3p)
+            .with_attestation_reports_handler(|_, _, _, _, _| {
+                panic!("a successful NEAR collection must not query another source")
+            }),
+    );
+    // The empty fleet comes first, so it is also the group's first position.
+    let pool = pool_with(vec![
+        near_without_backends(),
+        near(vec![report("base-a"), report("base-b")]),
+        unexpected_third_party,
+    ])
+    .await;
+
+    for filter in [None, Some(ProviderFilter::Near)] {
+        let reports = fetch(&pool, filter, None).await.unwrap();
+        let instances: Vec<_> = reports
+            .iter()
+            .map(|r| r["instance_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(instances, ["base-a", "base-b"]);
+    }
+}
+
+#[tokio::test]
+async fn gateway_attestation_fails_when_every_near_fleet_has_no_serving_backends() {
+    let pool = pool_with(vec![near_without_backends(), near_without_backends()]).await;
+    let error = fetch(&pool, Some(ProviderFilter::Near), None)
+        .await
+        .unwrap_err();
+    match error {
+        AttestationError::FetchError(message) => {
+            assert!(message.contains("No provider found"), "{message}")
+        }
+        other => panic!("unexpected error kind: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn gateway_attestation_no_backends_fleet_does_not_mask_a_real_failure() {
+    let pool = pool_with(vec![
+        near(vec![report("base")]),
+        near_failing(),
+        near_without_backends(),
+    ])
+    .await;
+    assert!(fetch(&pool, Some(ProviderFilter::Near), None)
+        .await
+        .is_err());
+}
+
 #[tokio::test]
 async fn gateway_attestation_collects_fleets_concurrently_in_provider_order() {
     let barrier = Arc::new(tokio::sync::Barrier::new(2));

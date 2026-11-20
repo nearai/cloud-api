@@ -2486,6 +2486,10 @@ impl InferenceProviderPool {
                     return Self::empty_outcome(&fingerprint_state, 0, failure_reasons);
                 }
                 rotation::CountFetch::Ok(n) => n,
+                rotation::CountFetch::NoneRegistered => {
+                    failure_reasons.push(rotation::CountFetch::none_registered_reason());
+                    return Self::empty_outcome(&fingerprint_state, 0, failure_reasons);
+                }
                 rotation::CountFetch::Err(reason) => {
                     failure_reasons.push(reason);
                     return Self::empty_outcome(&fingerprint_state, 0, failure_reasons);
@@ -4472,6 +4476,9 @@ impl InferenceProviderPool {
     /// `long_context_allowed`: when `false`, the model's long-context tier is
     /// left out, as it is for that organization's requests (see
     /// `long_context_gate`).
+    ///
+    /// A NEAR fleet with no serving backends is left out of the report, but any
+    /// other fleet failure still fails the whole NEAR group.
     #[allow(clippy::too_many_arguments)]
     pub async fn get_attestation_report(
         &self,
@@ -4536,6 +4543,7 @@ impl InferenceProviderPool {
             };
             let mut reports = Vec::new();
             let mut failure = None;
+            let mut excluded_by_signer = false;
             // Fleets come from model configuration. Collect them concurrently
             // so their timeouts do not add up, retaining provider order in the
             // response and in failure selection.
@@ -4561,10 +4569,20 @@ impl InferenceProviderPool {
                     Err(AttestationError::SigningAddressNotFound(_))
                         if signing_address.is_some() =>
                     {
+                        excluded_by_signer = true;
                         debug!(
                             model = %model,
                             fleet_index,
                             "Attestation fleet excluded: no backend matches the signing address"
+                        );
+                    }
+                    // A fleet with no serving backends has nothing to attest and
+                    // receives no traffic, so it is left out of the report.
+                    Err(AttestationError::ProviderNotFound(_)) => {
+                        debug!(
+                            model = %model,
+                            fleet_index,
+                            "Attestation fleet skipped: no serving backends"
                         );
                     }
                     result => {
@@ -4582,9 +4600,13 @@ impl InferenceProviderPool {
                 return Ok(reports);
             }
             let error = failure.unwrap_or_else(|| {
-                AttestationError::SigningAddressNotFound(
-                    signing_address.clone().unwrap_or_default(),
-                )
+                if excluded_by_signer {
+                    AttestationError::SigningAddressNotFound(
+                        signing_address.clone().unwrap_or_default(),
+                    )
+                } else {
+                    AttestationError::ProviderNotFound(model.clone())
+                }
             });
             debug!(
                 model = %model,

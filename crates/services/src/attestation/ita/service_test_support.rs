@@ -321,6 +321,7 @@ impl AttestationRepository for NoopAttestationRepository {
 
     async fn get_chat_signature(
         &self,
+        _owner: SignatureOwner,
         _chat_id: &str,
         _signing_algo: &str,
     ) -> Result<ChatSignature, AttestationError> {

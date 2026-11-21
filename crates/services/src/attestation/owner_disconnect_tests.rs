@@ -1,4 +1,4 @@
-//! A stored signature is returned to any caller, whichever workspace stored it.
+//! A stored signature is returned only to its owner; legacy rows remain hidden.
 //! A missing signature is reported as `STREAM_DISCONNECTED` only when the
 //! caller's own usage row for that id ended with a client disconnect; another
 //! workspace's disconnect is not found. The usage fake answers
@@ -277,7 +277,7 @@ async fn usage_lookup_failure_is_not_found() {
 }
 
 #[tokio::test]
-async fn legacy_unowned_signature_is_found_despite_another_owners_disconnect() {
+async fn legacy_unowned_signature_is_hidden_despite_another_owners_disconnect() {
     let chat_id = "chatcmpl-legacy-disconnect";
     let signatures = RecordingRepository::default();
     signatures.insert_legacy(
@@ -293,23 +293,18 @@ async fn legacy_unowned_signature_is_found_despite_another_owners_disconnect() {
     let usage = OwnerUsageRepository::with_row(other_org(), chat_id, StopReason::ClientDisconnect);
     let service = service(signatures, usage.clone());
 
-    match service.get_chat_signature(owner(), chat_id, None).await {
-        Ok(SignatureLookupResult::Found(signature)) => {
-            assert_eq!(signature.signature, "0xlegacy");
-        }
-        other => panic!("expected the legacy signature, got {other:?}"),
-    }
-    assert!(
-        usage.calls().is_empty(),
-        "usage is checked only after a miss"
+    assert_not_found(service.get_chat_signature(owner(), chat_id, None).await);
+    assert_eq!(
+        usage.calls().len(),
+        1,
+        "a hidden signature follows the caller-scoped fallback"
     );
 }
 
 #[tokio::test]
-async fn another_workspaces_signature_is_found_without_a_disconnect_check() {
+async fn another_workspaces_signature_and_disconnect_are_hidden() {
     let chat_id = "chatcmpl-cross-workspace-signed";
-    // The writer's own stream also has a disconnect row; neither caller
-    // should see it, because a signature is stored.
+    // The writer's signature and disconnect row must both remain hidden from other owners.
     let usage = OwnerUsageRepository::with_row(owner(), chat_id, StopReason::ClientDisconnect);
     let service = service(RecordingRepository::default(), usage.clone());
     service
@@ -318,16 +313,12 @@ async fn another_workspaces_signature_is_found_without_a_disconnect_check() {
         .expect("gateway signature stored");
 
     for caller in [other_org(), sibling_workspace()] {
-        match service.get_chat_signature(caller, chat_id, None).await {
-            Ok(SignatureLookupResult::Found(signature)) => {
-                assert_eq!(signature.signature_kind, Some(SignatureKind::Gateway));
-            }
-            other => panic!("expected the stored signature, got {other:?}"),
-        }
+        assert_not_found(service.get_chat_signature(caller, chat_id, None).await);
     }
-    assert!(
-        usage.calls().is_empty(),
-        "usage is checked only after a miss"
+    assert_eq!(
+        usage.calls().len(),
+        2,
+        "each miss checks only the caller's usage"
     );
 }
 

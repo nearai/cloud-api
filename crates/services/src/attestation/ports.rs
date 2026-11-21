@@ -8,9 +8,8 @@ use inference_providers::ProviderFilter;
 
 #[async_trait]
 pub trait AttestationServiceTrait: Send + Sync {
-    /// Get a stored chat signature by id, whichever workspace stored it, so
-    /// any API key can verify it. `owner` (the caller) only scopes the
-    /// disconnect check made when no signature is stored.
+    /// Get a stored chat signature for the calling owner. Rows without an
+    /// owner are unavailable. The owner also scopes the disconnect fallback.
     /// signing_algo: Optional signing algorithm ("ed25519" or "ecdsa"), defaults to "ecdsa" if None.
     async fn get_chat_signature(
         &self,
@@ -143,10 +142,11 @@ pub trait AttestationRepository: Send + Sync {
         Ok(())
     }
 
-    /// The signature stored for `chat_id`, whatever its owner, including rows
-    /// stored before owners were recorded.
+    /// The signature stored for `owner`, `chat_id` and algorithm. Rows without
+    /// an owner and rows belonging to another owner are reported as missing.
     async fn get_chat_signature(
         &self,
+        owner: SignatureOwner,
         chat_id: &str,
         signing_algo: &str,
     ) -> Result<ChatSignature, AttestationError>;

@@ -61,9 +61,8 @@ pub struct SignatureUnavailableResponse {
 /// Get completion or Responses API signature
 ///
 /// Get a cryptographic signature for a chat completion or completed stateless
-/// `resp_*` response. Any valid API key can read a stored signature, whichever
-/// organization or workspace created it, so that third parties can verify a
-/// response; this includes signatures stored before owners were recorded.
+/// `resp_*` response belonging to the calling key's organization and workspace.
+/// Signatures stored without owner metadata are unavailable.
 /// When no signature is stored for the ID but the calling key's own workspace
 /// has a stream for that ID that ended with a client disconnect, the response
 /// is 200 with `error_code` `STREAM_DISCONNECTED`. Any other missing ID,
@@ -77,7 +76,7 @@ pub struct SignatureUnavailableResponse {
         SignatureQuery
     ),
     responses(
-        (status = 200, description = "Signature retrieved (from any workspace), or `STREAM_DISCONNECTED` for the calling workspace's disconnected stream", body = SignatureResponse),
+        (status = 200, description = "Signature retrieved for the calling workspace, or `STREAM_DISCONNECTED` for the calling workspace's disconnected stream", body = SignatureResponse),
         (status = 404, description = "Signature not found", body = ErrorResponse),
         (status = 400, description = "Invalid parameters", body = ErrorResponse)
     ),

@@ -436,13 +436,6 @@ impl AuthServiceTrait for AuthService {
         Ok(new_user)
     }
 
-    async fn cleanup_expired_sessions(&self) -> Result<usize, AuthError> {
-        self.session_repository
-            .cleanup_expired()
-            .await
-            .map_err(|e| AuthError::InternalError(format!("Failed to cleanup sessions: {e}")))
-    }
-
     async fn validate_api_key(&self, api_key: String) -> Result<ApiKey, AuthError> {
         if !is_valid_api_key_format(&api_key) {
             return Err(AuthError::Unauthorized);
@@ -748,14 +741,6 @@ impl AuthService {
             }
         });
     }
-
-    /// Clean up expired sessions
-    pub async fn cleanup_expired_sessions(&self) -> Result<usize, AuthError> {
-        self.session_repository
-            .cleanup_expired()
-            .await
-            .map_err(|e| AuthError::InternalError(format!("Failed to cleanup sessions: {e}")))
-    }
 }
 
 #[cfg(test)]
@@ -1005,9 +990,6 @@ mod tests {
             *self.last_login_updated.lock().unwrap() = true;
             Ok(())
         }
-        async fn update_tokens_revoked_at(&self, _: UserId) -> anyhow::Result<()> {
-            unimplemented!()
-        }
         async fn delete(&self, _: UserId) -> anyhow::Result<bool> {
             unimplemented!()
         }
@@ -1048,9 +1030,6 @@ mod tests {
             unimplemented!()
         }
         async fn revoke(&self, _: SessionId) -> anyhow::Result<bool> {
-            unimplemented!()
-        }
-        async fn cleanup_expired(&self) -> anyhow::Result<usize> {
             unimplemented!()
         }
     }
@@ -1126,9 +1105,6 @@ mod tests {
                 .unwrap()
                 .remove(&session_id.0)
                 .is_some())
-        }
-        async fn cleanup_expired(&self) -> anyhow::Result<usize> {
-            unimplemented!()
         }
     }
 

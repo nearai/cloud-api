@@ -372,29 +372,6 @@ impl SessionRepository {
         Ok(result > 0)
     }
 
-    /// Clean up expired refresh token sessions
-    pub async fn cleanup_expired(&self) -> Result<usize> {
-        let result = retry_db!("clean_up_expried_refresh_token_session", {
-            let client = self
-                .pool
-                .get()
-                .await
-                .context("Failed to get database connection")
-                .map_err(RepositoryError::PoolError)?;
-
-            client
-                .execute(
-                    "DELETE FROM refresh_tokens WHERE expires_at < $1",
-                    &[&Timestamp::now()],
-                )
-                .await
-                .map_err(map_db_error)
-        })?;
-
-        debug!("Cleaned up {} expired refresh token sessions", result);
-        Ok(result as usize)
-    }
-
     // Helper function to convert database row to Session
     fn row_to_session(&self, row: tokio_postgres::Row) -> Result<Session> {
         Ok(Session {
@@ -510,10 +487,6 @@ impl services::auth::SessionRepository for SessionRepository {
         };
 
         Ok((service_session, token))
-    }
-
-    async fn cleanup_expired(&self) -> anyhow::Result<usize> {
-        self.cleanup_expired().await
     }
 }
 

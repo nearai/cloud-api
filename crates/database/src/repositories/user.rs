@@ -394,26 +394,6 @@ impl UserRepository {
         Ok((result, total_count))
     }
 
-    /// Search users by username or email
-    pub async fn search(&self, query: &str, limit: i64) -> Result<Vec<User>> {
-        let pattern = format!("%{query}%");
-        let rows = retry_db!("search_users_by_username_or_email", {
-            let client = self
-                .pool
-                .get()
-                .await
-                .context("Failed to get database connection")
-                .map_err(RepositoryError::PoolError)?;
-
-            client.query(
-            "SELECT * FROM users WHERE is_active = true AND (username ILIKE $1 OR email ILIKE $1) LIMIT $2",
-            &[&pattern, &limit],
-        ).await.map_err(map_db_error)
-        })?;
-
-        rows.into_iter().map(|row| self.row_to_user(row)).collect()
-    }
-
     /// Deactivate a user (soft delete)
     pub async fn deactivate(&self, id: Uuid) -> Result<bool> {
         let rows_affected = retry_db!("deactivate_user_soft_delete", {
@@ -431,28 +411,6 @@ impl UserRepository {
         })?;
 
         Ok(rows_affected > 0)
-    }
-
-    /// Update user's tokens_revoked_at timestamp
-    pub async fn update_tokens_revoked_at(&self, id: Uuid) -> Result<()> {
-        retry_db!("update_user_token_revoked_at_timestamp", {
-            let client = self
-                .pool
-                .get()
-                .await
-                .context("Failed to get database connection")
-                .map_err(RepositoryError::PoolError)?;
-
-            client
-                .execute(
-                    "UPDATE users SET tokens_revoked_at = NOW() WHERE id = $1",
-                    &[&id],
-                )
-                .await
-                .map_err(map_db_error)
-        })?;
-
-        Ok(())
     }
 
     // Helper function to convert database row to User
@@ -673,10 +631,6 @@ impl services::auth::UserRepository for UserRepository {
 
     async fn update_last_login(&self, id: services::auth::UserId) -> anyhow::Result<()> {
         self.update_last_login(id.0).await
-    }
-
-    async fn update_tokens_revoked_at(&self, id: services::auth::UserId) -> anyhow::Result<()> {
-        self.update_tokens_revoked_at(id.0).await
     }
 
     async fn delete(&self, id: services::auth::UserId) -> anyhow::Result<bool> {

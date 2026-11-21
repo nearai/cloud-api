@@ -332,13 +332,6 @@ pub trait OrganizationRepository: Send + Sync {
         invited_by: Uuid,
     ) -> Result<OrganizationMember, RepositoryError>;
 
-    async fn remove_member(
-        &self,
-        org_id: Uuid,
-        user_id: Uuid,
-        requester_user_id: Uuid,
-    ) -> Result<RemoveOrganizationMemberResult, RepositoryError>;
-
     async fn list_members_paginated(
         &self,
         org_id: Uuid,

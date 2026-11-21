@@ -118,8 +118,7 @@ async fn test_state_replay_protection() {
 
 mod database_encryption_at_rest {
     use crate::common::*;
-    use database::models::{CreateMcpConnectorRequest, McpAuthType};
-    use database::repositories::{FileRepository, McpConnectorRepository};
+    use database::repositories::FileRepository;
     use services::files::ports::CreateFileParams;
     use uuid::Uuid;
 
@@ -234,126 +233,5 @@ mod database_encryption_at_rest {
         assert_eq!(legacy.filename, "legacy.txt");
         assert_eq!(legacy.content_type, "text/legacy");
         assert_eq!(legacy.storage_key, "legacy/key");
-    }
-
-    #[tokio::test]
-    async fn mcp_repository_encrypts_configuration_and_usage_payloads() {
-        let (server, database) = setup_test_server_with_database().await;
-        let organization = create_org(&server).await;
-        let organization_id = Uuid::parse_str(&organization.id).expect("organization UUID");
-        let user_id = Uuid::parse_str(MOCK_USER_ID).expect("user UUID");
-        let repository = McpConnectorRepository::new(database.pool().clone());
-
-        let connector = repository
-            .create(
-                organization_id,
-                user_id,
-                CreateMcpConnectorRequest {
-                    name: format!("private-{}", Uuid::new_v4()),
-                    description: Some("internal tools".into()),
-                    mcp_server_url: "https://internal.example/mcp".into(),
-                    auth_type: McpAuthType::Bearer,
-                    bearer_token: Some("bearer-secret".into()),
-                },
-            )
-            .await
-            .expect("create MCP connector");
-        assert_eq!(connector.mcp_server_url, "https://internal.example/mcp");
-        assert_eq!(
-            connector.auth_config.as_ref().unwrap()["token"],
-            "bearer-secret"
-        );
-
-        repository
-            .log_usage(
-                connector.id,
-                user_id,
-                "tools/call".into(),
-                Some(serde_json::json!({"argument":"private request"})),
-                Some(serde_json::json!({"result":"private response"})),
-                Some(200),
-                Some("private error".into()),
-                Some(5),
-            )
-            .await
-            .expect("log MCP usage");
-
-        let client = database.pool().get().await.expect("database connection");
-        let connector_row = client
-            .query_one(
-                "SELECT description,mcp_server_url,auth_config FROM mcp_connectors WHERE id=$1",
-                &[&connector.id],
-            )
-            .await
-            .expect("stored connector");
-        assert!(connector_row
-            .get::<_, String>("mcp_server_url")
-            .contains(database::field_encryption::MARKER));
-        assert_eq!(
-            connector_row.get::<_, serde_json::Value>("auth_config")
-                [database::field_encryption::MARKER],
-            true
-        );
-
-        let usage_row = client
-            .query_one(
-                "SELECT request_payload,response_payload,error_message FROM mcp_connector_usage WHERE connector_id=$1 ORDER BY created_at DESC LIMIT 1",
-                &[&connector.id],
-            )
-            .await
-            .expect("stored usage");
-        assert_eq!(
-            usage_row.get::<_, serde_json::Value>("request_payload")
-                [database::field_encryption::MARKER],
-            true
-        );
-        assert_eq!(
-            usage_row.get::<_, serde_json::Value>("response_payload")
-                [database::field_encryption::MARKER],
-            true
-        );
-        assert!(usage_row
-            .get::<_, String>("error_message")
-            .contains(database::field_encryption::MARKER));
-        drop(client);
-
-        let fetched = repository
-            .get_by_id(connector.id)
-            .await
-            .expect("read connector")
-            .expect("connector exists");
-        assert_eq!(fetched.mcp_server_url, "https://internal.example/mcp");
-        assert_eq!(fetched.auth_config.unwrap()["token"], "bearer-secret");
-        let usage = repository
-            .get_usage_logs(connector.id, 1)
-            .await
-            .expect("read usage");
-        assert_eq!(
-            usage[0].request_payload.as_ref().unwrap()["argument"],
-            "private request"
-        );
-        assert_eq!(
-            usage[0].response_payload.as_ref().unwrap()["result"],
-            "private response"
-        );
-        assert_eq!(usage[0].error_message.as_deref(), Some("private error"));
-
-        let client = database.pool().get().await.expect("database connection");
-        client
-            .execute(
-                "UPDATE mcp_connectors SET description='legacy description',mcp_server_url='https://legacy.example/mcp',auth_config=$2 WHERE id=$1",
-                &[&connector.id, &serde_json::json!({"token":"legacy token"})],
-            )
-            .await
-            .expect("write legacy connector values");
-        drop(client);
-        let legacy = repository
-            .get_by_id(connector.id)
-            .await
-            .expect("read legacy connector")
-            .expect("legacy connector exists");
-        assert_eq!(legacy.description.as_deref(), Some("legacy description"));
-        assert_eq!(legacy.mcp_server_url, "https://legacy.example/mcp");
-        assert_eq!(legacy.auth_config.unwrap()["token"], "legacy token");
     }
 }

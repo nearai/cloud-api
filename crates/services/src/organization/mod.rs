@@ -454,15 +454,6 @@ mod tests {
             unimplemented!()
         }
 
-        async fn remove_member(
-            &self,
-            _: Uuid,
-            _: Uuid,
-            _: Uuid,
-        ) -> Result<RemoveOrganizationMemberResult, RepositoryError> {
-            unimplemented!()
-        }
-
         async fn list_members_paginated(
             &self,
             _: Uuid,

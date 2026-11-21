@@ -131,6 +131,9 @@ fn retired_routes() -> Vec<(Method, String)> {
         (Method::GET, "/v1/staking/farm/config".into()),
         (Method::GET, format!("{org}/staking/farm")),
         (Method::POST, format!("{org}/staking/farm/bind")),
+        (Method::POST, format!("{org}/staking/farm/sync")),
+        (Method::GET, format!("{org}/members")),
+        (Method::POST, format!("{org}/members")),
         (Method::GET, format!("{admin_org}/staking/farm")),
         (Method::POST, format!("{admin_org}/staking/farm/sync")),
         // Organization read, update, delete and settings

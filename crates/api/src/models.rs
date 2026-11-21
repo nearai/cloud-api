@@ -2360,13 +2360,6 @@ pub enum MemberRole {
     Member,
 }
 
-/// Request to add an organization member
-#[derive(Debug, Deserialize, ToSchema)]
-pub struct AddOrganizationMemberRequest {
-    pub user_id: String,
-    pub role: MemberRole,
-}
-
 /// Wrapper type to distinguish between "field not provided" and "field explicitly set to null"
 /// - Outer None = field not in request body (don't modify)
 /// - Some(None) = field explicitly set to null (delete/clear)
@@ -2381,26 +2374,6 @@ where
 {
     // If the field is present, deserialize it as Option<T>
     Ok(Some(Option::deserialize(deserializer)?))
-}
-
-/// Public organization member response (for regular members)
-/// Contains member info with limited user details
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct PublicOrganizationMemberResponse {
-    pub id: String,
-    pub organization_id: String,
-    pub role: MemberRole,
-    pub joined_at: Timestamp,
-    pub user: PublicUserResponse,
-}
-
-/// List organization members response with pagination
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct ListOrganizationMembersResponse {
-    pub members: Vec<PublicOrganizationMemberResponse>,
-    pub total: i64,
-    pub limit: i64,
-    pub offset: i64,
 }
 
 /// Public user response model (for regular members)
@@ -2532,17 +2505,6 @@ pub struct AccessAndRefreshTokenResponse {
     pub access_token: String,
     pub refresh_token: String,
     pub refresh_token_expiration: Timestamp,
-}
-
-/// Organization member response model (non-sensitive)
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct OrganizationMemberResponse {
-    pub id: String,
-    pub organization_id: String,
-    pub user_id: String,
-    pub role: MemberRole,
-    pub joined_at: Timestamp,
-    pub invited_by: Option<String>,
 }
 
 /// Immutable admin-token permission across organizations. Read-only tokens can

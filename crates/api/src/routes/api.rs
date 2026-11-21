@@ -1,10 +1,6 @@
 use crate::middleware::{auth_middleware, AuthState};
 use crate::ohttp_gateway::{OhttpAttestation, OhttpGateway};
-use axum::{
-    middleware::from_fn_with_state,
-    routing::{get, post},
-    Router,
-};
+use axum::{middleware::from_fn_with_state, routing::get, Router};
 use services::{
     attestation::ports::AttestationServiceTrait, auth::AuthServiceTrait,
     completions::CompletionServiceTrait, files::FileServiceTrait, models::ModelsServiceTrait,
@@ -40,18 +36,13 @@ pub struct AppState {
 }
 
 // Import route handlers
-use crate::routes::{organization_members::*, organizations::*, users::create_access_token};
+use crate::routes::{organizations::*, users::create_access_token};
 
 /// Build the complete API router with all management endpoints
 pub fn build_management_router(app_state: AppState, auth_state: AuthState) -> Router {
     // Organization routes
     let org_routes = Router::new()
         .route("/", get(list_organizations).post(create_organization))
-        // Organization member management
-        .route(
-            "/{id}/members",
-            get(list_organization_members).post(add_organization_member),
-        )
         .route(
             "/{id}/usage/balance",
             get(crate::routes::usage::get_organization_balance),
@@ -59,10 +50,6 @@ pub fn build_management_router(app_state: AppState, auth_state: AuthState) -> Ro
         .route(
             "/{id}/usage/history",
             get(crate::routes::usage::get_organization_usage_history),
-        )
-        .route(
-            "/{id}/staking/farm/sync",
-            post(crate::routes::staking_farm::sync_organization_staking_farm),
         )
         .route(
             "/{id}/usage/by-model",

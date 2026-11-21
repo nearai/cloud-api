@@ -1,5 +1,5 @@
 pub mod ports;
-use super::auth::ports::{UserId, UserRepository};
+use super::auth::ports::UserId;
 use super::common::RepositoryError;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -8,18 +8,11 @@ use std::sync::Arc;
 
 pub struct OrganizationServiceImpl {
     repository: Arc<dyn OrganizationRepository>,
-    user_repository: Arc<dyn UserRepository>,
 }
 
 impl OrganizationServiceImpl {
-    pub fn new(
-        repository: Arc<dyn OrganizationRepository>,
-        user_repository: Arc<dyn UserRepository>,
-    ) -> Self {
-        Self {
-            repository,
-            user_repository,
-        }
+    pub fn new(repository: Arc<dyn OrganizationRepository>) -> Self {
+        Self { repository }
     }
 
     /// Convert RepositoryError to OrganizationError
@@ -298,54 +291,6 @@ impl OrganizationServiceTrait for OrganizationServiceImpl {
             .map_err(Self::map_repository_error)
     }
 
-    /// List organization members with full user information (paginated, private helper)
-    async fn get_members_with_users_paginated(
-        &self,
-        organization_id: OrganizationId,
-        requester_id: UserId,
-        limit: i64,
-        offset: i64,
-    ) -> Result<Vec<OrganizationMemberWithUser>, OrganizationError> {
-        // Check if requester is a member
-        let org = self.get_organization(organization_id.clone()).await?;
-        if org.owner_id != requester_id {
-            if let Ok(Some(_)) = self
-                .repository
-                .get_member(organization_id.0, requester_id.0)
-                .await
-            {
-                // User is a member, can view member list
-            } else {
-                return Err(OrganizationError::Unauthorized(
-                    "Only members can view the member list".to_string(),
-                ));
-            }
-        }
-
-        // Get members with pagination
-        let members = self
-            .repository
-            .list_members_paginated(organization_id.0, limit, offset)
-            .await
-            .map_err(Self::map_repository_error)?;
-
-        // Fetch user info for each member
-        let mut members_with_users = Vec::new();
-        for member in members {
-            if let Ok(Some(user)) = self.user_repository.get_by_id(member.user_id.clone()).await {
-                members_with_users.push(OrganizationMemberWithUser {
-                    organization_id: member.organization_id,
-                    user_id: member.user_id,
-                    role: member.role,
-                    joined_at: member.joined_at,
-                    user,
-                });
-            }
-        }
-
-        Ok(members_with_users)
-    }
-
     async fn get_organization_settings(
         &self,
         organization_id: OrganizationId,
@@ -366,27 +311,6 @@ impl OrganizationServiceTrait for OrganizationServiceImpl {
 
         let org = self.get_organization(organization_id).await?;
         Ok(Self::settings_from_organization(&org))
-    }
-
-    /// Add a member by user ID (validates user exists, private helper)
-    async fn add_member_validated(
-        &self,
-        organization_id: OrganizationId,
-        requester_id: UserId,
-        new_member_id: UserId,
-        role: MemberRole,
-    ) -> Result<OrganizationMember, OrganizationError> {
-        // Verify user exists
-        let _user = self
-            .user_repository
-            .get_by_id(new_member_id.clone())
-            .await
-            .map_err(|e| OrganizationError::InternalError(format!("Failed to verify user: {e}")))?
-            .ok_or(OrganizationError::UserNotFound)?;
-
-        // Use existing add_member logic
-        self.add_member(organization_id, requester_id, new_member_id, role)
-            .await
     }
 
     async fn get_fallback_enabled_for_admin(
@@ -436,7 +360,7 @@ impl OrganizationServiceTrait for OrganizationServiceImpl {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::ports::{User, UserRole};
+
     use std::sync::Mutex;
     use uuid::Uuid;
 
@@ -579,78 +503,6 @@ mod tests {
         }
     }
 
-    struct StubUserRepo {
-        inviter: User,
-        get_by_id_calls: Mutex<usize>,
-    }
-
-    #[async_trait]
-    impl UserRepository for StubUserRepo {
-        async fn create(
-            &self,
-            _: String,
-            _: String,
-            _: Option<String>,
-            _: Option<String>,
-        ) -> anyhow::Result<User> {
-            unimplemented!()
-        }
-
-        async fn create_from_oauth(
-            &self,
-            _: String,
-            _: String,
-            _: Option<String>,
-            _: Option<String>,
-            _: String,
-            _: String,
-        ) -> anyhow::Result<User> {
-            unimplemented!()
-        }
-
-        async fn get_by_id(&self, _: UserId) -> anyhow::Result<Option<User>> {
-            *self.get_by_id_calls.lock().unwrap() += 1;
-            Ok(Some(self.inviter.clone()))
-        }
-
-        async fn get_by_email(&self, _: &str) -> anyhow::Result<Option<User>> {
-            Ok(None)
-        }
-
-        async fn get_by_provider(&self, _: &str, _: &str) -> anyhow::Result<Option<User>> {
-            unimplemented!()
-        }
-
-        async fn update_email(&self, _: UserId, _: String) -> anyhow::Result<()> {
-            unimplemented!()
-        }
-
-        async fn update(
-            &self,
-            _: UserId,
-            _: Option<String>,
-            _: Option<String>,
-        ) -> anyhow::Result<Option<User>> {
-            unimplemented!()
-        }
-
-        async fn update_last_login(&self, _: UserId) -> anyhow::Result<()> {
-            unimplemented!()
-        }
-
-        async fn update_tokens_revoked_at(&self, _: UserId) -> anyhow::Result<()> {
-            unimplemented!()
-        }
-
-        async fn delete(&self, _: UserId) -> anyhow::Result<bool> {
-            unimplemented!()
-        }
-
-        async fn list(&self, _: i64, _: i64) -> anyhow::Result<Vec<User>> {
-            unimplemented!()
-        }
-    }
-
     fn make_settings_service(
         role: MemberRole,
         settings: serde_json::Value,
@@ -686,31 +538,8 @@ mod tests {
                 joined_at: now,
             }),
         });
-        let user_repo = Arc::new(StubUserRepo {
-            inviter: User {
-                id: user_id.clone(),
-                email: "settings@example.com".to_string(),
-                username: "settings".to_string(),
-                display_name: Some("Settings User".to_string()),
-                avatar_url: None,
-                auth_provider: "test".to_string(),
-                provider_user_id: "settings-user".to_string(),
-                role: UserRole::User,
-                is_active: true,
-                last_login: None,
-                created_at: now,
-                updated_at: now,
-                tokens_revoked_at: None,
-                contact_email: None,
-                contact_email_verified_at: None,
-                email_opt_in_at: None,
-            },
-            get_by_id_calls: Mutex::new(0),
-        });
-        let service = OrganizationServiceImpl::new(
-            org_repo.clone() as Arc<dyn OrganizationRepository>,
-            user_repo as Arc<dyn UserRepository>,
-        );
+        let service =
+            OrganizationServiceImpl::new(org_repo.clone() as Arc<dyn OrganizationRepository>);
 
         (service, org_repo, organization_id, user_id)
     }

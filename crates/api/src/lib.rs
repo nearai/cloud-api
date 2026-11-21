@@ -190,7 +190,6 @@ pub fn init_auth_services(database: Arc<Database>, config: &ApiConfig) -> AuthCo
     // Create organization service early (needed by AuthService)
     let organization_service = Arc::new(services::organization::OrganizationServiceImpl::new(
         organization_repo.clone() as Arc<dyn services::organization::ports::OrganizationRepository>,
-        user_repository.clone(),
     ))
         as Arc<dyn services::organization::OrganizationServiceTrait + Send + Sync>;
 
@@ -647,27 +646,12 @@ pub async fn init_domain_services_with_pool(
         .expect("Failed to initialize staking farm NEAR RPC client"),
     )
         as Arc<dyn services::staking_farm::StakingFarmContractClient>;
-    let staking_binding = Arc::new(services::staking_farm::binding::StakingBindingService::new(
-        Arc::new(
-            database::repositories::PostgresStakingBindingRepository::new(database.pool().clone()),
-        ),
-        Arc::new(
-            services::staking_farm::binding::NearBindingVerifier::new(&config.auth.near)
-                .expect("Invalid binding RPC config"),
-        ),
-        aml_service.clone(),
+    let staking_farm_service = Arc::new(services::staking_farm::StakingFarmService::new(
+        staking_farm_repository,
+        staking_farm_contract_client,
+        Some(aml_service.clone()),
         config.staking_farm.clone(),
-        config.auth.near.expected_recipient.clone(),
     ));
-    let staking_farm_service = Arc::new(
-        services::staking_farm::StakingFarmService::new(
-            staking_farm_repository,
-            staking_farm_contract_client,
-            Some(aml_service.clone()),
-            config.staking_farm.clone(),
-        )
-        .with_binding(staking_binding),
-    );
 
     DomainServices {
         cloud_platform_check_api_key,

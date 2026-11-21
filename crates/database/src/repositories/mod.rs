@@ -73,9 +73,6 @@ pub use workspace::WorkspaceRepository;
 
 pub mod organization_usage_discount;
 
-pub mod staking_wallet_binding;
-pub use staking_wallet_binding::PostgresStakingBindingRepository;
-
 pub mod credit_transfers;
 
 pub mod organization_credentials;

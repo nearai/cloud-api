@@ -88,7 +88,6 @@ mod responses_stateless;
 mod score;
 mod serving_provider;
 mod signature_verification;
-mod staking_wallet_binding;
 mod systemone;
 mod tinfoil_provider;
 mod unlisted_models;

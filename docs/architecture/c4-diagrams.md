@@ -1288,8 +1288,6 @@ erDiagram
 - `POST /v1/organizations` - Create organization
 
 **Organization Members:**
-- `GET /v1/organizations/{id}/members` - List members
-- `POST /v1/organizations/{id}/members` - Add member
 
 **Workspaces:**
 - `GET /v1/organizations/{org_id}/workspaces` - List workspaces

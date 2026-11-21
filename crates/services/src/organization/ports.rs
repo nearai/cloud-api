@@ -444,30 +444,12 @@ pub trait OrganizationServiceTrait: Send + Sync {
         name: &str,
     ) -> Result<Option<Organization>, OrganizationError>;
 
-    /// List organization members with full user information (paginated)
-    async fn get_members_with_users_paginated(
-        &self,
-        organization_id: OrganizationId,
-        requester_id: UserId,
-        limit: i64,
-        offset: i64,
-    ) -> Result<Vec<OrganizationMemberWithUser>, OrganizationError>;
-
     /// Get the effective organization settings for an organization member.
     async fn get_organization_settings(
         &self,
         organization_id: OrganizationId,
         user_id: UserId,
     ) -> Result<OrganizationSettings, OrganizationError>;
-
-    /// Add a member by user ID (validates user exists)
-    async fn add_member_validated(
-        &self,
-        organization_id: OrganizationId,
-        requester_id: UserId,
-        new_member_id: UserId,
-        role: MemberRole,
-    ) -> Result<OrganizationMember, OrganizationError>;
 
     /// Get the effective fallback policy from an admin-authenticated call path.
     async fn get_fallback_enabled_for_admin(

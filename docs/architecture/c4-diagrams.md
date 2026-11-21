@@ -1281,8 +1281,6 @@ erDiagram
 - `GET /v1/auth/github` - Initiate GitHub OAuth flow
 - `GET /v1/auth/google` - Initiate Google OAuth flow
 - `GET /v1/auth/callback` - OAuth callback handler
-- `POST /v1/auth/logout` - Logout and end session
-- `GET /v1/auth/user` - Get current authenticated user
 
 ### Management Endpoints (Session Auth Only)
 **Organizations:**
@@ -1304,7 +1302,6 @@ erDiagram
 - `PUT /v1/workspaces/{workspace_id}/api-keys/{key_id}/spend-limit` - Update spend limit
 
 **Users:**
-- `GET /v1/users/me` - Get current user profile
 - `GET /v1/users/me/sessions` - List active sessions
 - `DELETE /v1/users/me/sessions` - Revoke all sessions
 - `DELETE /v1/users/me/sessions/{session_id}` - Revoke specific session

@@ -89,7 +89,6 @@ mod responses_native_search;
 mod responses_stateless;
 mod score;
 mod serving_provider;
-mod session_logout;
 mod signature_verification;
 mod staking_wallet_binding;
 mod systemone;

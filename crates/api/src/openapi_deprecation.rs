@@ -38,10 +38,7 @@ pub const MOVED_TO_CLOUD_PLATFORM: &[(&str, &str)] = &[
     ("post", "/v1/organizations/{org_id}/workspaces"),
     ("get", "/v1/services"),
     ("get", "/v1/services/{service_name}"),
-    ("get", "/v1/users/me"),
     ("post", "/v1/users/me/access-tokens"),
-    ("get", "/v1/users/me/refresh-tokens"),
-    ("delete", "/v1/users/me/refresh-tokens/{refresh_token_id}"),
     ("get", "/v1/workspaces/{workspace_id}/api-keys"),
     ("post", "/v1/workspaces/{workspace_id}/api-keys"),
     (

@@ -828,8 +828,6 @@ fn every_registered_route_has_a_model_access_decision() {
         ("GET", "/github"),
         ("GET", "/google"),
         ("GET", "/callback"),
-        ("GET", "/user"),
-        ("POST", "/logout"),
         // Retired response history always returns authenticated 410.
         ("ANY", "/responses/{response_id}"),
         ("ANY", "/responses/{response_id}/cancel"),

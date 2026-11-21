@@ -198,7 +198,7 @@ BASE=http://localhost:3000
 AUTH=(-H "Authorization: Bearer $SESSION" -H "User-Agent: Mock User Agent")
 
 # 1. Confirm the seeded admin is wired up
-curl -s "$BASE/v1/users/me" "${AUTH[@]}" | jq .
+curl -s "$BASE/v1/organizations" "${AUTH[@]}" | jq .
 
 # 2. Create an organization
 ORG_ID=$(curl -s "$BASE/v1/organizations" "${AUTH[@]}" \

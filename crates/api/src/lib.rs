@@ -24,10 +24,7 @@ use crate::{
     routes::{
         api::{build_management_router, AppState},
         attestation::{self, get_attestation_report, get_signature},
-        auth::{
-            current_user, github_login, google_login, login_page, logout, oauth_callback,
-            StateStore,
-        },
+        auth::{github_login, google_login, login_page, oauth_callback, StateStore},
         billing::{get_billing_costs, BillingRouteState},
         completions::{
             audio_transcriptions, chat_completions, completions, embeddings, image_edits,
@@ -118,7 +115,6 @@ pub struct DomainServices {
         Arc<dyn services::organization::OrganizationServiceTrait + Send + Sync>,
     pub workspace_service: Arc<dyn services::workspace::WorkspaceServiceTrait + Send + Sync>,
     pub usage_service: Arc<dyn services::usage::UsageServiceTrait + Send + Sync>,
-    pub user_service: Arc<dyn services::user::UserServiceTrait + Send + Sync>,
     pub files_service: Arc<dyn services::files::FileServiceTrait + Send + Sync>,
     pub object_encryption_state: object_encryption::ObjectEncryptionState,
     pub metrics_service: Arc<dyn services::metrics::MetricsServiceTrait>,
@@ -395,8 +391,6 @@ pub async fn init_domain_services_with_pool(
         database.pool().clone(),
     ))
         as Arc<dyn services::responses::ports::ResponseItemRepositoryTrait>;
-    let user_repo = Arc::new(database::UserRepository::new(database.pool().clone()))
-        as Arc<dyn services::auth::UserRepository>;
     let attestation_repo = Arc::new(database::PgAttestationRepository::new(
         database.pool().clone(),
     ));
@@ -578,14 +572,6 @@ pub async fn init_domain_services_with_pool(
         dyn services::responses::tools::WebContextSearchProviderTrait,
     > = brave_search_provider;
 
-    // Create session repository for user service
-    let session_repo = Arc::new(database::SessionRepository::new(database.pool().clone()))
-        as Arc<dyn services::auth::SessionRepository>;
-
-    // Create user service
-    let user_service = Arc::new(services::user::UserService::new(user_repo, session_repo))
-        as Arc<dyn services::user::UserServiceTrait + Send + Sync>;
-
     // Create S3 storage and FileService for temporary authenticated read views
     // and retained per-file delete operations.
     let object_key_ring = object_storage::resolve_object_ring(&config.s3)
@@ -712,7 +698,6 @@ pub async fn init_domain_services_with_pool(
         organization_service,
         workspace_service,
         usage_service,
-        user_service,
         files_service,
         object_encryption_state,
         metrics_service,
@@ -1178,7 +1163,6 @@ pub fn build_app_with_config_and_options(
         attestation_service: domain_services.attestation_service.clone(),
         usage_service: domain_services.usage_service.clone(),
         service_usage_service: domain_services.service_usage_service.clone(),
-        user_service: domain_services.user_service.clone(),
         files_service: domain_services.files_service.clone(),
         inference_provider_pool: domain_services.inference_provider_pool.clone(),
         metrics_service: domain_services.metrics_service.clone(),
@@ -1209,11 +1193,7 @@ pub fn build_app_with_config_and_options(
     let rate_limit_state = middleware::RateLimitState::default();
 
     // Build individual route groups
-    let auth_routes = build_auth_routes(
-        Arc::new(auth_components.clone()),
-        &auth_components.auth_state_middleware,
-        config.clone(),
-    );
+    let auth_routes = build_auth_routes(Arc::new(auth_components.clone()), config.clone());
 
     let completion_routes = build_completion_routes(
         app_state.clone(),
@@ -1404,11 +1384,7 @@ fn with_app_fallbacks_and_layers(
 }
 
 /// Build authentication routes
-pub fn build_auth_routes(
-    auth_components: Arc<AuthComponents>,
-    auth_state_middleware: &middleware::AuthState,
-    config: Arc<ApiConfig>,
-) -> Router {
+pub fn build_auth_routes(auth_components: Arc<AuthComponents>, config: Arc<ApiConfig>) -> Router {
     use routes::auth::{AuthState, NearAuthState};
 
     let auth_state: AuthState = (
@@ -1430,24 +1406,6 @@ pub fn build_auth_routes(
         .route("/github", get(github_login))
         .route("/google", get(google_login))
         .route("/callback", get(oauth_callback))
-        .route(
-            "/user",
-            get(current_user).layer(from_fn_with_state(
-                auth_state_middleware.clone(),
-                auth_middleware,
-            )),
-        )
-        // Logout authenticates with the refresh token (same middleware as
-        // token refresh) so the handler can revoke that exact server-side
-        // session, invalidating the refresh token and all access tokens
-        // bound to it.
-        .route(
-            "/logout",
-            post(logout).layer(from_fn_with_state(
-                auth_state_middleware.clone(),
-                crate::middleware::auth::refresh_middleware,
-            )),
-        )
         .merge(near_router)
         .with_state(auth_state)
 }

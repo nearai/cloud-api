@@ -202,7 +202,6 @@ impl SessionRepository {
         }
     }
 
-    /// List active refresh token sessions for a specific user (by user ID)
     pub async fn list_by_user(&self, user_id: Uuid) -> Result<Vec<Session>> {
         let rows = retry_db!("list_active_refresh_token_sessions_for_user", {
             let client = self
@@ -470,26 +469,6 @@ impl services::auth::SessionRepository for SessionRepository {
             ip_address: db_session.ip_address,
             user_agent: db_session.user_agent,
         }))
-    }
-
-    async fn list_by_user(
-        &self,
-        user_id: services::auth::UserId,
-    ) -> anyhow::Result<Vec<services::auth::Session>> {
-        let db_sessions = self.list_by_user(user_id.0).await?;
-
-        Ok(db_sessions
-            .into_iter()
-            .map(|db_session| services::auth::Session {
-                id: services::auth::SessionId(db_session.id),
-                user_id: services::auth::UserId(db_session.user_id),
-                token_hash: db_session.token_hash,
-                created_at: db_session.created_at,
-                expires_at: db_session.expires_at,
-                ip_address: db_session.ip_address,
-                user_agent: db_session.user_agent,
-            })
-            .collect())
     }
 
     async fn extend(

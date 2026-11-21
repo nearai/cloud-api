@@ -99,9 +99,6 @@ Operations marked deprecated (account, organization, workspace, API key, usage, 
         crate::routes::workspaces::update_api_key_spend_limit,
         crate::routes::workspaces::update_workspace_api_key,
         // Users endpoints
-        crate::routes::users::get_current_user,
-        crate::routes::users::get_user_refresh_tokens,
-        crate::routes::users::revoke_user_refresh_token,
         crate::routes::users::create_access_token,
         // Usage endpoints
         crate::routes::usage::get_organization_balance,

@@ -1,52 +1,6 @@
 use crate::common::*;
 
 // ============================================
-// Users error message tests
-// ============================================
-
-#[tokio::test]
-async fn test_users_refresh_tokens_missing_authorization_message() {
-    let server = setup_test_server().await;
-
-    let response = server.get("/v1/users/me/refresh-tokens").await;
-
-    assert_eq!(response.status_code(), 401);
-    let err = response.json::<api::models::ErrorResponse>();
-    assert_eq!(err.error.r#type, "unauthorized");
-    assert_eq!(err.error.message, "Missing authorization");
-}
-
-#[tokio::test]
-async fn test_users_me_missing_authorization_message() {
-    let server = setup_test_server().await;
-
-    let response = server.get("/v1/users/me").await;
-
-    assert_eq!(response.status_code(), 401);
-    let err = response.json::<api::models::ErrorResponse>();
-    assert_eq!(err.error.r#type, "unauthorized");
-    assert_eq!(err.error.message, "Missing authorization");
-}
-
-#[tokio::test]
-async fn test_users_me_wrong_bearer_prefix_message() {
-    let server = setup_test_server().await;
-
-    let response = server
-        .get("/v1/users/me")
-        .add_header("Authorization", "Token xyz")
-        .await;
-
-    assert_eq!(response.status_code(), 401);
-    let err = response.json::<api::models::ErrorResponse>();
-    assert_eq!(err.error.r#type, "unauthorized");
-    assert_eq!(
-        err.error.message,
-        "Authorization header does not start with 'Bearer '"
-    );
-}
-
-// ============================================
 // Organization error message tests
 // ============================================
 

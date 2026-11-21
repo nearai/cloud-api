@@ -285,8 +285,6 @@ pub trait SessionRepository: Send + Sync {
 
     async fn get_by_id(&self, session_id: SessionId) -> anyhow::Result<Option<Session>>;
 
-    async fn list_by_user(&self, user_id: UserId) -> anyhow::Result<Vec<Session>>;
-
     async fn extend(&self, session_id: SessionId, additional_hours: i64) -> anyhow::Result<bool>;
 
     async fn rotate(
@@ -367,9 +365,6 @@ pub trait AuthServiceTrait: Send + Sync {
 
     /// Get a user by their ID
     async fn get_user_by_id(&self, user_id: UserId) -> Result<User, AuthError>;
-
-    /// Logout (revoke session)
-    async fn logout(&self, session_id: SessionId) -> Result<bool, AuthError>;
 
     /// Rotate a refresh token session (refresh token rotation)
     /// This atomically updates the token hash and expiration. The immediate
@@ -672,10 +667,6 @@ impl AuthServiceTrait for MockAuthService {
 
     async fn get_user_by_id(&self, _user_id: UserId) -> Result<User, AuthError> {
         Ok(Self::create_mock_user())
-    }
-
-    async fn logout(&self, _session_id: SessionId) -> Result<bool, AuthError> {
-        Ok(true) // Mock logout always succeeds
     }
 
     async fn rotate_session(

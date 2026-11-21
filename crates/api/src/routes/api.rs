@@ -2,7 +2,7 @@ use crate::middleware::{auth_middleware, AuthState};
 use crate::ohttp_gateway::{OhttpAttestation, OhttpGateway};
 use axum::{
     middleware::from_fn_with_state,
-    routing::{delete, get, post},
+    routing::{get, post},
     Router,
 };
 use services::{
@@ -24,7 +24,6 @@ pub struct AppState {
     pub usage_service: Arc<dyn services::usage::UsageServiceTrait + Send + Sync>,
     pub service_usage_service:
         Arc<dyn services::service_usage::ServiceUsageServiceTrait + Send + Sync>,
-    pub user_service: Arc<dyn services::user::UserServiceTrait + Send + Sync>,
     pub files_service: Arc<dyn FileServiceTrait + Send + Sync>,
     pub inference_provider_pool: Arc<services::inference_provider_pool::InferenceProviderPool>,
     pub metrics_service: Arc<dyn services::metrics::MetricsServiceTrait>,
@@ -41,13 +40,7 @@ pub struct AppState {
 }
 
 // Import route handlers
-use crate::routes::{
-    organization_members::*,
-    organizations::*,
-    users::{
-        create_access_token, get_current_user, get_user_refresh_tokens, revoke_user_refresh_token,
-    },
-};
+use crate::routes::{organization_members::*, organizations::*, users::create_access_token};
 
 /// Build the complete API router with all management endpoints
 pub fn build_management_router(app_state: AppState, auth_state: AuthState) -> Router {
@@ -84,15 +77,6 @@ pub fn build_management_router(app_state: AppState, auth_state: AuthState) -> Ro
             get(crate::routes::usage::get_user_organization_timeseries),
         );
 
-    // User routes (require access token authentication)
-    let user_routes = Router::new()
-        .route("/me", get(get_current_user))
-        .route("/me/refresh-tokens", get(get_user_refresh_tokens))
-        .route(
-            "/me/refresh-tokens/{refresh_token_id}",
-            delete(revoke_user_refresh_token),
-        );
-
     // Refresh token routes (require refresh token authentication)
     let refresh_token_routes = Router::new()
         .route(
@@ -108,7 +92,6 @@ pub fn build_management_router(app_state: AppState, auth_state: AuthState) -> Ro
     // Combine all routes with appropriate auth middleware
     Router::new()
         .nest("/organizations", org_routes)
-        .nest("/users", user_routes)
         .with_state(app_state)
         .layer(from_fn_with_state(auth_state, auth_middleware))
         .merge(refresh_token_routes)

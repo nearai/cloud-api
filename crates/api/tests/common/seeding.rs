@@ -412,8 +412,7 @@ pub async fn seed_list_workspaces(org_id: &str) -> Vec<WorkspaceResponse> {
 pub async fn seed_api_key(workspace_id: &str, name: String, session_id: &str) -> ApiKeyResponse {
     let database = seed_database().await;
     let created_by = user_id_for_session(session_id);
-    let (key, api_key) = database
-        .api_keys
+    let (key, api_key) = database::repositories::ApiKeyRepository::new(database.pool().clone())
         .create(services::workspace::CreateApiKeyRequest {
             name,
             workspace_id: services::workspace::WorkspaceId(

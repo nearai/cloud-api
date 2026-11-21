@@ -13,6 +13,7 @@ use database::{
 };
 use jiff::{SignedDuration, Timestamp};
 use serde_json::{json, Value};
+use services::admin::AnalyticsRepository;
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -462,21 +463,18 @@ async fn history_corrects_legacy_and_split_funding_with_reporting_parity() {
             .sum::<i64>(),
         300_000_000
     );
-    let range = format!(
-        "start={}&end={}",
-        hour.strftime("%Y-%m-%dT%H:%M:%SZ"),
-        (hour + SignedDuration::from_hours(1)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    );
     for (filter, cost, count) in [
-        ("", 0.375, 3),
-        ("&credit_type=grant", 0.15, 1),
-        ("&credit_type=postpay", 0.15, 1),
+        (None, 0.375, 3),
+        (Some("grant"), 0.15, 1),
+        (Some("postpay"), 0.15, 1),
     ] {
-        let metrics = get(
-            &f,
-            &format!("/v1/admin/organizations/{}/metrics?{range}{filter}", f.org),
+        let metrics = serde_json::to_value(
+            database::repositories::PgAnalyticsRepository::new(f.db.pool().clone())
+                .get_organization_metrics(f.org, hour, hour + SignedDuration::from_hours(1), filter)
+                .await
+                .unwrap(),
         )
-        .await;
+        .unwrap();
         assert_eq!(metrics["summary"]["total_cost_usd"], cost);
         assert_eq!(metrics["summary"]["total_requests"], count);
     }

@@ -25,8 +25,7 @@ pub(crate) fn admin_operation(method: &Method, matched_path: &str) -> AdminOpera
     if matches!(*method, Method::GET | Method::HEAD)
         && matches!(
             path,
-            "/admin/organizations/{org_id}/metrics"
-                | "/admin/platform/infra-summary"
+            "/admin/platform/infra-summary"
                 | "/admin/database-encryption/jobs/{id}"
                 | "/admin/database-encryption/keys"
                 | "/admin/object-encryption/jobs/{id}"

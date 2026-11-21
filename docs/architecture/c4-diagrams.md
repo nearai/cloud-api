@@ -34,7 +34,7 @@ The NEAR AI Cloud API is a **multi-tenant AI inference platform** running in a *
 | Use Case | Auth Method | Endpoints |
 |----------|-------------|-----------|
 | **Interactive Management** | Session Token (OAuth) | `/v1/organizations/*`, `/v1/workspaces/*`, `/v1/users/*` |
-| **AI Inference** | API Key (Bearer Token) | `/v1/chat/completions`, `/v1/responses`, `/v1/conversations/*` |
+| **AI Inference** | API Key (Bearer Token) | `/v1/chat/completions`, `/v1/responses` |
 
 > **Important**: These authentication methods are **mutually exclusive**. Management operations require OAuth session tokens, while AI operations require workspace-scoped API keys.
 
@@ -1281,8 +1281,6 @@ erDiagram
 - `GET /v1/auth/github` - Initiate GitHub OAuth flow
 - `GET /v1/auth/google` - Initiate Google OAuth flow
 - `GET /v1/auth/callback` - OAuth callback handler
-- `POST /v1/auth/logout` - Logout and end session
-- `GET /v1/auth/user` - Get current authenticated user
 
 ### Management Endpoints (Session Auth Only)
 **Organizations:**
@@ -1290,8 +1288,6 @@ erDiagram
 - `POST /v1/organizations` - Create organization
 
 **Organization Members:**
-- `GET /v1/organizations/{id}/members` - List members
-- `POST /v1/organizations/{id}/members` - Add member
 
 **Workspaces:**
 - `GET /v1/organizations/{org_id}/workspaces` - List workspaces
@@ -1304,7 +1300,6 @@ erDiagram
 - `PUT /v1/workspaces/{workspace_id}/api-keys/{key_id}/spend-limit` - Update spend limit
 
 **Users:**
-- `GET /v1/users/me` - Get current user profile
 - `GET /v1/users/me/sessions` - List active sessions
 - `DELETE /v1/users/me/sessions` - Revoke all sessions
 - `DELETE /v1/users/me/sessions/{session_id}` - Revoke specific session
@@ -1322,13 +1317,6 @@ erDiagram
 - `GET /v1/models` - List available models
 - `GET /v1/model/list` - List models with pricing (public)
 - `GET /v1/model/{model_name}` - Get model details with pricing (public)
-
-**Conversations:**
-- `POST /v1/conversations/batch` - Retrieve known conversations for migration/export
-- `GET /v1/conversations/{id}` - Get a workspace-scoped conversation
-- `GET /v1/conversations/{id}/items` - List a workspace-scoped conversation's items
-- `DELETE /v1/conversations/{id}` - Retained normal deletion for account cleanup
-- All other Conversation methods and legacy descendants - Authenticated `410 Gone`
 
 **Files:**
 - `GET /v1/files` - List workspace-scoped files for migration/export

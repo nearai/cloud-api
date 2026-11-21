@@ -1,9 +1,8 @@
-use crate::middleware::AuthenticatedUser;
 use axum::{
     extract::{Query, Request, State},
     http::{HeaderMap, StatusCode},
     response::{Html, IntoResponse, Redirect, Response},
-    Extension, Json,
+    Json,
 };
 use config::ApiConfig;
 use database::repositories::OAuthStateRepository;
@@ -697,61 +696,6 @@ pub async fn oauth_callback(
                 Json(serde_json::json!({
                     "error": "internal_server_error",
                     "error_description": format!("Session creation failed: {}", e)
-                })),
-            )
-                .into_response()
-        }
-    }
-}
-
-/// Get current user information
-pub async fn current_user(Extension(user): Extension<AuthenticatedUser>) -> Json<AuthResponse> {
-    Json(AuthResponse {
-        message: "Authenticated".to_string(),
-        email: user.0.email.clone(),
-        provider: user.0.auth_provider.clone(),
-    })
-}
-
-/// Logout endpoint
-///
-/// Authenticated with the session's refresh token (via `refresh_middleware`,
-/// like token refresh). Revokes exactly the current server-side refresh-token
-/// session, which immediately invalidates that refresh token and every access
-/// token bound to it through its `sid` claim. Other sessions (devices) of the
-/// same user are not touched.
-///
-/// Idempotent from the caller's perspective: revoking a session that was
-/// already deleted between authentication and revocation still returns 200.
-/// A repeated call with the already-revoked refresh token fails middleware
-/// authentication with 401 and changes nothing.
-pub async fn logout(
-    State((_oauth, _state_store, auth_service, _config)): State<AuthState>,
-    Extension((session, user)): Extension<(services::auth::Session, AuthenticatedUser)>,
-) -> Response {
-    debug!(
-        "Logging out user_id={} session_id={}",
-        user.0.id, session.id
-    );
-
-    match auth_service.logout(session.id).await {
-        Ok(revoked) => {
-            debug!(revoked, user_id = %user.0.id, "Logout completed");
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({
-                    "message": "Logged out successfully"
-                })),
-            )
-                .into_response()
-        }
-        Err(e) => {
-            error!(error = %e, user_id = %user.0.id, "Failed to revoke session on logout");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({
-                    "error": "internal_server_error",
-                    "error_description": "Failed to revoke session"
                 })),
             )
                 .into_response()

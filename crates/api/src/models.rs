@@ -1509,7 +1509,7 @@ fn default_n() -> Option<i64> {
 // Common validation helpers (re-exported)
 // ============================================
 
-use crate::consts::{MAX_DESCRIPTION_LENGTH, MAX_METADATA_SIZE_BYTES, MAX_NAME_LENGTH};
+use crate::consts::{MAX_DESCRIPTION_LENGTH, MAX_NAME_LENGTH};
 use crate::routes::common::{validate_max_length, validate_non_empty_field};
 
 /// Reject non-positive token limits with an error naming the supplied parameter.
@@ -2208,96 +2208,6 @@ pub struct ResponseInputItemList {
     pub has_more: bool,
 }
 
-// ============================================
-// Conversation API Models
-// ============================================
-
-/// Request to create a conversation
-#[derive(Debug, Deserialize, ToSchema)]
-pub struct CreateConversationRequest {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub metadata: Option<serde_json::Value>,
-}
-
-/// Request to update a conversation
-#[derive(Debug, Deserialize, ToSchema)]
-pub struct UpdateConversationRequest {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub metadata: Option<serde_json::Value>,
-}
-
-/// Request to create items in a conversation
-#[derive(Debug, Deserialize, ToSchema)]
-pub struct CreateConversationItemsRequest {
-    pub items: Vec<ConversationInputItem>,
-}
-
-/// Conversation object (follows OpenAI spec)
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct ConversationObject {
-    pub id: String,
-    pub object: String, // "conversation"
-    pub created_at: i64,
-    pub metadata: serde_json::Value,
-}
-
-/// Deleted conversation result
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct ConversationDeleteResult {
-    pub id: String,
-    pub object: String, // "conversation.deleted"
-    pub deleted: bool,
-}
-
-/// Input item for conversations
-#[derive(Debug, Deserialize, ToSchema)]
-#[serde(tag = "type")]
-pub enum ConversationInputItem {
-    #[serde(rename = "message")]
-    Message {
-        role: String,
-        content: ConversationContent,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        metadata: Option<serde_json::Value>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        model: Option<String>,
-    },
-}
-
-/// Content for conversation items
-#[derive(Debug, Deserialize, ToSchema)]
-#[serde(untagged)]
-pub enum ConversationContent {
-    Text(String),
-    Parts(Vec<ConversationContentPart>),
-}
-
-/// Content part for conversations
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-#[serde(tag = "type")]
-pub enum ConversationContentPart {
-    #[serde(rename = "input_text")]
-    InputText { text: String },
-    #[serde(rename = "input_image")]
-    InputImage {
-        image_url: ResponseImageUrl,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        detail: Option<String>,
-    },
-    #[serde(rename = "input_file")]
-    InputFile {
-        file_id: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        detail: Option<String>,
-    },
-    #[serde(rename = "output_text")]
-    OutputText {
-        text: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        annotations: Option<Vec<serde_json::Value>>,
-    },
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct McpDiscoveredTool {
     pub name: String,
@@ -2305,218 +2215,6 @@ pub struct McpDiscoveredTool {
     pub description: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub input_schema: Option<serde_json::Value>,
-}
-
-/// Conversation item (for responses)
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-#[serde(tag = "type")]
-pub enum ConversationItem {
-    #[serde(rename = "message")]
-    Message {
-        id: String,
-        response_id: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        previous_response_id: Option<String>,
-        #[serde(default)]
-        next_response_ids: Vec<String>,
-        created_at: i64,
-        status: ResponseItemStatus,
-        role: String,
-        content: Vec<ConversationContentPart>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        metadata: Option<serde_json::Value>,
-        model: String,
-    },
-    #[serde(rename = "tool_call")]
-    ToolCall {
-        id: String,
-        response_id: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        previous_response_id: Option<String>,
-        #[serde(default)]
-        next_response_ids: Vec<String>,
-        created_at: i64,
-        status: ResponseItemStatus,
-        tool_type: String,
-        function: ConversationItemFunction,
-        model: String,
-    },
-    #[serde(rename = "web_search_call")]
-    WebSearchCall {
-        id: String,
-        response_id: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        previous_response_id: Option<String>,
-        #[serde(default)]
-        next_response_ids: Vec<String>,
-        created_at: i64,
-        status: ResponseItemStatus,
-        action: ConversationItemWebSearchAction,
-        model: String,
-    },
-    #[serde(rename = "reasoning")]
-    Reasoning {
-        id: String,
-        response_id: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        previous_response_id: Option<String>,
-        #[serde(default)]
-        next_response_ids: Vec<String>,
-        created_at: i64,
-        status: ResponseItemStatus,
-        summary: String,
-        content: String,
-        model: String,
-    },
-    #[serde(rename = "mcp_list_tools")]
-    McpListTools {
-        id: String,
-        server_label: String,
-        tools: Vec<McpDiscoveredTool>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        error: Option<String>,
-    },
-    #[serde(rename = "mcp_call")]
-    McpCall {
-        id: String,
-        response_id: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        previous_response_id: Option<String>,
-        #[serde(default)]
-        next_response_ids: Vec<String>,
-        created_at: i64,
-        server_label: String,
-        name: String,
-        arguments: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        output: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        error: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        approval_request_id: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        status: Option<String>,
-        model: String,
-    },
-    #[serde(rename = "mcp_approval_request")]
-    McpApprovalRequest {
-        id: String,
-        response_id: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        previous_response_id: Option<String>,
-        #[serde(default)]
-        next_response_ids: Vec<String>,
-        created_at: i64,
-        server_label: String,
-        name: String,
-        arguments: String,
-        model: String,
-    },
-    /// Function call requiring client execution
-    #[serde(rename = "function_call")]
-    FunctionCall {
-        id: String,
-        response_id: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        previous_response_id: Option<String>,
-        #[serde(default)]
-        next_response_ids: Vec<String>,
-        created_at: i64,
-        /// The LLM's tool_call_id for correlation
-        call_id: String,
-        /// Function name
-        name: String,
-        /// JSON-encoded arguments
-        arguments: String,
-        /// Provider-specific metadata that must be echoed unchanged when
-        /// replaying the function call (for example Gemini's thought signature).
-        #[serde(skip_serializing_if = "Option::is_none")]
-        thought_signature: Option<String>,
-        /// Status: "in_progress" when pending client execution
-        status: String,
-        model: String,
-    },
-    /// Result of a client-executed function call
-    #[serde(rename = "function_call_output")]
-    FunctionCallOutput {
-        id: String,
-        response_id: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        previous_response_id: Option<String>,
-        #[serde(default)]
-        next_response_ids: Vec<String>,
-        created_at: i64,
-        /// The call_id from the FunctionCall this is a response to
-        call_id: String,
-        /// Result of the function execution
-        output: String,
-    },
-}
-
-impl ConversationItem {
-    /// Get the ID of the conversation item
-    pub fn id(&self) -> &str {
-        match self {
-            ConversationItem::Message { id, .. } => id,
-            ConversationItem::ToolCall { id, .. } => id,
-            ConversationItem::WebSearchCall { id, .. } => id,
-            ConversationItem::Reasoning { id, .. } => id,
-            ConversationItem::McpListTools { id, .. } => id,
-            ConversationItem::McpCall { id, .. } => id,
-            ConversationItem::McpApprovalRequest { id, .. } => id,
-            ConversationItem::FunctionCall { id, .. } => id,
-            ConversationItem::FunctionCallOutput { id, .. } => id,
-        }
-    }
-
-    /// Get the role of the conversation item (only for Message items)
-    pub fn role(&self) -> &str {
-        match self {
-            ConversationItem::Message { role, .. } => role,
-            _ => "",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct ConversationItemFunction {
-    pub name: String,
-    pub arguments: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "lowercase", tag = "type")]
-pub enum ConversationItemWebSearchAction {
-    #[serde(rename = "search")]
-    Search { query: String },
-}
-
-/// List of conversation items
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct ConversationItemList {
-    pub object: String, // "list"
-    pub data: Vec<ConversationItem>,
-    pub first_id: String,
-    pub last_id: String,
-    pub has_more: bool,
-}
-
-/// Request for batch retrieving conversations
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
-pub struct BatchConversationsRequest {
-    /// Array of conversation IDs to retrieve (supports both prefixed "conv_" and raw UUID formats)
-    pub ids: Vec<String>,
-}
-
-/// Response for batch conversation retrieval
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
-pub struct ConversationBatchResponse {
-    /// Object type identifier: "list"
-    pub object: String,
-    /// Array of retrieved conversations
-    pub data: Vec<ConversationObject>,
-    /// Array of requested conversation IDs that were not found (always present, may be empty)
-    pub missing_ids: Vec<String>,
 }
 
 // ============================================
@@ -2577,44 +2275,6 @@ impl CreateResponseRequest {
         // Validate mutual exclusivity
         if self.conversation.is_some() && self.previous_response_id.is_some() {
             return Err("Cannot specify both conversation and previous_response_id".to_string());
-        }
-
-        Ok(())
-    }
-}
-
-impl CreateConversationRequest {
-    pub fn validate(&self) -> Result<(), String> {
-        if let Some(metadata) = &self.metadata {
-            // Prevent extremely large metadata blobs from being stored
-            let serialized =
-                serde_json::to_string(metadata).map_err(|_| "Invalid metadata".to_string())?;
-            // Allow reasonably large metadata but cap to protect the database
-            if serialized.len() > MAX_METADATA_SIZE_BYTES {
-                return Err(format!(
-                    "metadata is too large (max {} bytes when serialized)",
-                    MAX_METADATA_SIZE_BYTES
-                ));
-            }
-        }
-
-        Ok(())
-    }
-}
-
-impl UpdateConversationRequest {
-    pub fn validate(&self) -> Result<(), String> {
-        if let Some(metadata) = &self.metadata {
-            // Prevent extremely large metadata blobs from being stored
-            let serialized =
-                serde_json::to_string(metadata).map_err(|_| "Invalid metadata".to_string())?;
-            // Allow reasonably large metadata but cap to protect the database
-            if serialized.len() > MAX_METADATA_SIZE_BYTES {
-                return Err(format!(
-                    "metadata is too large (max {} bytes when serialized)",
-                    MAX_METADATA_SIZE_BYTES
-                ));
-            }
         }
 
         Ok(())
@@ -2700,13 +2360,6 @@ pub enum MemberRole {
     Member,
 }
 
-/// Request to add an organization member
-#[derive(Debug, Deserialize, ToSchema)]
-pub struct AddOrganizationMemberRequest {
-    pub user_id: String,
-    pub role: MemberRole,
-}
-
 /// Wrapper type to distinguish between "field not provided" and "field explicitly set to null"
 /// - Outer None = field not in request body (don't modify)
 /// - Some(None) = field explicitly set to null (delete/clear)
@@ -2721,26 +2374,6 @@ where
 {
     // If the field is present, deserialize it as Option<T>
     Ok(Some(Option::deserialize(deserializer)?))
-}
-
-/// Public organization member response (for regular members)
-/// Contains member info with limited user details
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct PublicOrganizationMemberResponse {
-    pub id: String,
-    pub organization_id: String,
-    pub role: MemberRole,
-    pub joined_at: Timestamp,
-    pub user: PublicUserResponse,
-}
-
-/// List organization members response with pagination
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct ListOrganizationMembersResponse {
-    pub members: Vec<PublicOrganizationMemberResponse>,
-    pub total: i64,
-    pub limit: i64,
-    pub offset: i64,
 }
 
 /// Public user response model (for regular members)
@@ -2872,17 +2505,6 @@ pub struct AccessAndRefreshTokenResponse {
     pub access_token: String,
     pub refresh_token: String,
     pub refresh_token_expiration: Timestamp,
-}
-
-/// Organization member response model (non-sensitive)
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct OrganizationMemberResponse {
-    pub id: String,
-    pub organization_id: String,
-    pub user_id: String,
-    pub role: MemberRole,
-    pub joined_at: Timestamp,
-    pub invited_by: Option<String>,
 }
 
 /// Immutable admin-token permission across organizations. Read-only tokens can

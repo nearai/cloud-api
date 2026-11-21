@@ -30,7 +30,6 @@ use crate::{
             audio_transcriptions, chat_completions, completions, embeddings, image_edits,
             image_generations, models, privacy_classify, privacy_redact, rerank, score,
         },
-        conversations,
         health::health_check,
         models::{get_model_by_name, list_models, ModelsAppState},
         responses,
@@ -105,7 +104,6 @@ pub struct AuthComponents {
 
 #[derive(Clone)]
 pub struct DomainServices {
-    pub conversation_service: Arc<services::ConversationService>,
     pub response_service: Arc<services::ResponseService>,
     pub completion_service: Arc<services::CompletionServiceImpl>,
     pub models_service: Arc<services::models::ModelsServiceImpl>,
@@ -383,14 +381,6 @@ pub async fn init_domain_services_with_pool(
     let reporting_statement_timeout = config.usage_reporting.database_statement_timeout();
 
     // Create shared repositories
-    let conversation_repo = Arc::new(database::PgConversationRepository::new(
-        database.pool().clone(),
-    ));
-    let response_repo = Arc::new(database::PgResponseRepository::new(database.pool().clone()));
-    let response_items_repo = Arc::new(database::PgResponseItemsRepository::new(
-        database.pool().clone(),
-    ))
-        as Arc<dyn services::responses::ports::ResponseItemRepositoryTrait>;
     let attestation_repo = Arc::new(database::PgAttestationRepository::new(
         database.pool().clone(),
     ));
@@ -425,13 +415,6 @@ pub async fn init_domain_services_with_pool(
 
     // Note: inference_url models and external providers are loaded in init_inference_providers.
     // Periodic refresh is also started there.
-
-    // Create conversation service
-    let conversation_service = Arc::new(services::ConversationService::new(
-        conversation_repo.clone(),
-        response_repo.clone(),
-        response_items_repo.clone(),
-    ));
 
     // Prepare usage repository for attestation service (needed to check stop_reason for disconnected streams)
     let usage_repository_for_attestation = Arc::new(
@@ -689,7 +672,6 @@ pub async fn init_domain_services_with_pool(
     DomainServices {
         cloud_platform_check_api_key,
         cloud_platform_catalog,
-        conversation_service,
         response_service,
         completion_service,
         models_service,
@@ -1232,11 +1214,6 @@ pub fn build_app_with_config_and_options(
         rate_limit_state.clone(),
     );
 
-    let conversation_routes = build_conversation_routes(
-        domain_services.conversation_service.clone(),
-        &auth_components.auth_state_middleware,
-    );
-
     let organization_credit_service = build_organization_credit_service(&database, &config);
     let transfer_routes = crate::routes::credit_transfers::routes(
         organization_credit_service,
@@ -1315,7 +1292,6 @@ pub fn build_app_with_config_and_options(
                 .merge(completion_routes)
                 .merge(response_routes)
                 .merge(unsupported_openai_routes)
-                .merge(conversation_routes)
                 .merge(management_routes)
                 .merge(transfer_routes)
                 .merge(workspace_routes)
@@ -1730,74 +1706,6 @@ pub fn build_mcp_routes(
             auth_state_middleware.clone(),
             middleware::auth::auth_middleware_with_workspace_context,
         ))
-}
-
-/// Build the temporary Conversation API migration surface.
-///
-/// Existing conversation data remains available through its original view
-/// routes so chat-api can export it. The existing per-conversation DELETE
-/// route remains available for account deletion; all other mutations and
-/// unsupported legacy paths stay authenticated and return 410 until the
-/// data-retention migration is complete.
-pub fn build_conversation_routes(
-    conversation_service: Arc<services::ConversationService>,
-    auth_state_middleware: &AuthState,
-) -> Router {
-    build_stage_one_conversation_route_layout(
-        post(conversations::batch_get_conversations)
-            .fallback(conversations::conversation_write_disabled),
-        get(conversations::get_conversation)
-            .delete(conversations::delete_conversation)
-            .fallback(conversations::conversation_write_disabled),
-        get(conversations::list_conversation_items)
-            .fallback(conversations::conversation_write_disabled),
-        conversations::conversation_write_disabled,
-    )
-    .with_state(
-        conversation_service as Arc<dyn services::conversations::ports::ConversationServiceTrait>,
-    )
-    .layer(from_fn_with_state(
-        auth_state_middleware.clone(),
-        auth_middleware_with_api_key,
-    ))
-    // Conversation records can contain confidential prompt and completion
-    // data. Apply this outside auth so rejects are no-store as well.
-    .layer(map_response(no_store_response))
-}
-
-/// Install the exact Stage I Conversation API route layout.
-///
-/// Kept separate from service wiring so route precedence can be tested without
-/// a database; production uses this helper directly. It preserves the
-/// existing workspace-scoped DELETE route needed by account deletion, while
-/// per-route fallbacks make every other unsupported method 410.
-fn build_stage_one_conversation_route_layout<S, H, T>(
-    batch: MethodRouter<S>,
-    conversation: MethodRouter<S>,
-    items: MethodRouter<S>,
-    write_disabled: H,
-) -> Router<S>
-where
-    S: Clone + Send + Sync + 'static,
-    H: axum::handler::Handler<T, S>,
-    T: 'static,
-{
-    // Catch-all parameters never match an empty segment, so the trailing-slash
-    // form (which also covers `/batch/`) needs its own 410 route.
-    let descendants = Router::new()
-        .route("/", any(write_disabled.clone()))
-        .route("/batch", batch)
-        .route("/{conversation_id}", conversation)
-        .route("/{conversation_id}/", any(write_disabled.clone()))
-        .route("/{conversation_id}/items", items)
-        .route(
-            "/{conversation_id}/{*legacy_path}",
-            any(write_disabled.clone()),
-        );
-
-    Router::new()
-        .route("/conversations", any(write_disabled))
-        .nest("/conversations/", descendants)
 }
 
 /// Build attestation routes with auth.
@@ -2643,29 +2551,23 @@ mod tests {
             .as_object()
             .expect("OpenAPI paths must be an object");
 
-        for path in ["/v1/conversations/{conversation_id}", "/v1/files/{file_id}"] {
-            let delete = paths
-                .get(path)
-                .and_then(|path_item| path_item.get("delete"));
-            assert!(
-                delete.is_some_and(serde_json::Value::is_object),
-                "OpenAPI must expose the existing DELETE route: {path}"
-            );
-            assert_eq!(
-                delete.unwrap()["security"],
-                serde_json::json!([{ "api_key": [] }]),
-                "{path} DELETE must require an API key"
-            );
-            assert!(
-                delete.unwrap()["responses"]["200"]["headers"]["Cache-Control"].is_object(),
-                "{path} DELETE must document Cache-Control: no-store"
-            );
-        }
-
-        let conversation = paths
-            .get("/v1/conversations/{conversation_id}")
-            .expect("Conversation path must be present");
-        assert!(conversation.get("post").is_none());
+        let path = "/v1/files/{file_id}";
+        let delete = paths
+            .get(path)
+            .and_then(|path_item| path_item.get("delete"));
+        assert!(
+            delete.is_some_and(serde_json::Value::is_object),
+            "OpenAPI must expose the existing DELETE route: {path}"
+        );
+        assert_eq!(
+            delete.unwrap()["security"],
+            serde_json::json!([{ "api_key": [] }]),
+            "{path} DELETE must require an API key"
+        );
+        assert!(
+            delete.unwrap()["responses"]["200"]["headers"]["Cache-Control"].is_object(),
+            "{path} DELETE must document Cache-Control: no-store"
+        );
 
         let files = paths.get("/v1/files").expect("Files path must be present");
         assert!(files.get("post").is_none());
@@ -2688,15 +2590,6 @@ mod tests {
         // These are the production route-layout helpers. Using lightweight
         // handlers here isolates Axum's static/parameter/catch-all matching
         // from database state while proving the exact public layout builds.
-        let conversation_routes = build_stage_one_conversation_route_layout(
-            axum::routing::post(view).fallback(write_disabled),
-            axum::routing::get(view)
-                .delete(view)
-                .fallback(write_disabled),
-            axum::routing::get(view).fallback(write_disabled),
-            write_disabled,
-        )
-        .layer(map_response(no_store_response));
         let file_routes = build_stage_one_file_route_layout(
             axum::routing::get(view).fallback(write_disabled),
             axum::routing::get(view)
@@ -2707,17 +2600,10 @@ mod tests {
         )
         .layer(map_response(no_store_response));
         let app = Router::new()
-            .nest(
-                "/v1",
-                Router::new().merge(conversation_routes).merge(file_routes),
-            )
+            .nest("/v1", Router::new().merge(file_routes))
             .fallback(unrelated_route);
 
         for (method, path) in [
-            ("POST", "/v1/conversations/batch"),
-            ("GET", "/v1/conversations/conv_example"),
-            ("DELETE", "/v1/conversations/conv_example"),
-            ("GET", "/v1/conversations/conv_example/items"),
             ("GET", "/v1/files"),
             ("GET", "/v1/files/file_example"),
             ("DELETE", "/v1/files/file_example"),
@@ -2746,20 +2632,6 @@ mod tests {
         }
 
         for (method, path) in [
-            ("POST", "/v1/conversations"),
-            ("GET", "/v1/conversations/"),
-            ("GET", "/v1/conversations/batch"),
-            ("DELETE", "/v1/conversations/batch"),
-            ("POST", "/v1/conversations/batch/"),
-            ("GET", "/v1/conversations/batch/"),
-            ("POST", "/v1/conversations/conv_example"),
-            ("GET", "/v1/conversations/conv_example/"),
-            ("DELETE", "/v1/conversations/conv_example/"),
-            ("POST", "/v1/conversations/conv_example/items"),
-            ("POST", "/v1/conversations/conv_example/pin"),
-            ("DELETE", "/v1/conversations/conv_example/pin"),
-            ("DELETE", "/v1/conversations/conv_example/unknown"),
-            ("PATCH", "/v1/conversations/conv_example/unknown"),
             ("POST", "/v1/files"),
             ("DELETE", "/v1/files"),
             ("GET", "/v1/files/"),

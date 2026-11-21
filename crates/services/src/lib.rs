@@ -31,7 +31,6 @@ pub mod workspace;
 
 pub use auth::UserId;
 pub use completions::CompletionServiceImpl;
-pub use conversations::service::ConversationServiceImpl as ConversationService;
 pub use responses::service::ResponseServiceImpl as ResponseService;
 
 #[cfg(test)]

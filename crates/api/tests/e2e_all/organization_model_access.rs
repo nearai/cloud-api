@@ -835,13 +835,6 @@ fn every_registered_route_has_a_model_access_decision() {
         // The MCP endpoint serves web search only.
         ("POST", "/mcp"),
         // Stage I migration surfaces take no model name on any method.
-        ("ANY", "/conversations"),
-        ("ANY", "/conversations/"),
-        ("ANY", "/conversations/batch"),
-        ("ANY", "/conversations/{conversation_id}"),
-        ("ANY", "/conversations/{conversation_id}/"),
-        ("ANY", "/conversations/{conversation_id}/items"),
-        ("ANY", "/conversations/{conversation_id}/{*legacy_path}"),
         // Looked up by chat id. The `model` query parameter is not read.
         ("GET", "/signature/{chat_id}"),
         ("GET", "/organizations/{org_id}/workspaces"),

@@ -34,7 +34,7 @@ The NEAR AI Cloud API is a **multi-tenant AI inference platform** running in a *
 | Use Case | Auth Method | Endpoints |
 |----------|-------------|-----------|
 | **Interactive Management** | Session Token (OAuth) | `/v1/organizations/*`, `/v1/workspaces/*`, `/v1/users/*` |
-| **AI Inference** | API Key (Bearer Token) | `/v1/chat/completions`, `/v1/responses`, `/v1/conversations/*` |
+| **AI Inference** | API Key (Bearer Token) | `/v1/chat/completions`, `/v1/responses` |
 
 > **Important**: These authentication methods are **mutually exclusive**. Management operations require OAuth session tokens, while AI operations require workspace-scoped API keys.
 
@@ -1319,13 +1319,6 @@ erDiagram
 - `GET /v1/models` - List available models
 - `GET /v1/model/list` - List models with pricing (public)
 - `GET /v1/model/{model_name}` - Get model details with pricing (public)
-
-**Conversations:**
-- `POST /v1/conversations/batch` - Retrieve known conversations for migration/export
-- `GET /v1/conversations/{id}` - Get a workspace-scoped conversation
-- `GET /v1/conversations/{id}/items` - List a workspace-scoped conversation's items
-- `DELETE /v1/conversations/{id}` - Retained normal deletion for account cleanup
-- All other Conversation methods and legacy descendants - Authenticated `410 Gone`
 
 **Files:**
 - `GET /v1/files` - List workspace-scoped files for migration/export

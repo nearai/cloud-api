@@ -981,7 +981,7 @@ const OTHER_SECURITY_SCHEMES: [&str; 4] = [
 
 /// API-key POST paths under `/v1/` that are not in the inference table, each
 /// with the reason. Anything else the spec lists must have a table row.
-const NON_INFERENCE_API_KEY_POST_PATHS: [(&str, &str); 4] = [
+const NON_INFERENCE_API_KEY_POST_PATHS: [(&str, &str); 3] = [
     (
         "/v1/billing/costs",
         "looks up recorded costs; makes no inference call",
@@ -989,10 +989,6 @@ const NON_INFERENCE_API_KEY_POST_PATHS: [(&str, &str); 4] = [
     (
         "/v1/check_api_key",
         "validates the key; makes no inference call",
-    ),
-    (
-        "/v1/conversations/batch",
-        "reads stored conversations; makes no inference call",
     ),
     (
         "/v1/systemone",

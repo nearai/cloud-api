@@ -6,7 +6,6 @@ pub mod auth;
 pub mod billing;
 pub mod common;
 pub mod completions;
-pub mod conversations;
 pub mod extractors;
 pub mod files;
 pub mod gateway;

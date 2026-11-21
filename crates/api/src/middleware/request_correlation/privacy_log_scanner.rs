@@ -73,10 +73,6 @@ pub(super) fn assert_production_logs_exclude_forbidden_expressions() {
             include_str!("../../routes/auth.rs"),
         ),
         (
-            "crates/api/src/routes/conversations.rs",
-            include_str!("../../routes/conversations.rs"),
-        ),
-        (
             "crates/api/src/routes/users.rs",
             include_str!("../../routes/users.rs"),
         ),

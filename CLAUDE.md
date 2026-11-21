@@ -76,7 +76,7 @@ Organization (tenant root)
 ### Authentication (two mutually exclusive methods)
 
 - **Session-based OAuth** (GitHub, Google) for management: `/v1/organizations/*`, `/v1/workspaces/*`, `/v1/users/*`. The hashed session token is stored in the database and returned as an HTTP-only cookie.
-- **API keys** for inference: `/v1/chat/completions`, `/v1/responses/*`, `/v1/conversations/*`, attestation. `Authorization: Bearer sk-live-...` or `sk-test-...`; SHA-256 hashed, workspace-scoped, with last-used tracking and optional expiry.
+- **API keys** for inference: `/v1/chat/completions`, `/v1/responses/*`, attestation. `Authorization: Bearer sk-live-...` or `sk-test-...`; SHA-256 hashed, workspace-scoped, with last-used tracking and optional expiry.
 
 The separation is deliberate: interactive users manage resources, programs run inference, and each plane has a clear security boundary. Never let one route accept both.
 
@@ -105,11 +105,11 @@ The engine is streaming-first: tokens reach users in real time, usage is tracked
 
 ### Temporary Stage I data access
 
-Existing Conversation/File data remains available through authenticated, workspace-scoped routes with `Cache-Control: no-store`:
+Existing File data remains available through authenticated, workspace-scoped routes with `Cache-Control: no-store`:
 
-- Retrieval: `POST /v1/conversations/batch`, `GET /v1/conversations/{id}`, `GET /v1/conversations/{id}/items`, `GET /v1/files`, `GET /v1/files/{id}`, and `GET /v1/files/{id}/content`.
-- Resource deletion: `DELETE /v1/conversations/{id}` and `DELETE /v1/files/{id}` remain available for the existing account-deletion workflow.
-- Creation, upload, all other mutations, and unsupported legacy Conversation/File paths return `410 Gone`.
+- Retrieval: `GET /v1/files`, `GET /v1/files/{id}`, and `GET /v1/files/{id}/content`.
+- Resource deletion: `DELETE /v1/files/{id}` remains available for the existing account-deletion workflow.
+- Creation, upload, all other mutations, and unsupported legacy File paths return `410 Gone`.
 
 The historical schemas and repositories remain for these bounded routes. Data deletion and schema removal are separate work; retired APIs must not be wired back to them.
 

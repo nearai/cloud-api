@@ -309,7 +309,3 @@ async fn test_refresh_token_rotation_reuses_predecessor_briefly() {
 
     println!("✅ Refresh token rotation reuses the predecessor within the grace window");
 }
-
-// Note: Specific refresh token revocation (DELETE /users/me/refresh-tokens/{id})
-// is difficult to test in the current mock setup because we don't have easy access
-// to actual refresh token IDs. In a real database scenario, these would be testable.

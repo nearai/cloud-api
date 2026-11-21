@@ -1,4 +1,4 @@
-use super::super::auth::ports::{User, UserId};
+use super::super::auth::ports::UserId;
 use super::super::common::RepositoryError;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -270,16 +270,6 @@ pub enum RemoveOrganizationMemberResult {
     NotFound,
     Unauthorized,
     LastOwner,
-}
-
-/// Organization member with full user information
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OrganizationMemberWithUser {
-    pub organization_id: OrganizationId,
-    pub user_id: UserId,
-    pub role: MemberRole,
-    pub joined_at: Timestamp,
-    pub user: User,
 }
 
 #[derive(Debug, Deserialize)]

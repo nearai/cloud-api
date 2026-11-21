@@ -1080,7 +1080,7 @@ pub fn build_app_with_config_and_options(
             }
         });
     }
-    // Create analytics service (shared between user and admin routes)
+    // Create analytics service
     let analytics_repository = Arc::new(database::repositories::PgAnalyticsRepository::new(
         database.pool().clone(),
     ));
@@ -1228,7 +1228,6 @@ pub fn build_app_with_config_and_options(
         build_options,
         AdminRouteServices {
             object_encryption_state: domain_services.object_encryption_state.clone(),
-            analytics_service,
         },
     );
 
@@ -2028,7 +2027,6 @@ fn cache_control_layer(value: &'static str) -> CacheControlLayer {
 /// Build admin routes (authenticated endpoints)
 pub struct AdminRouteServices {
     pub object_encryption_state: object_encryption::ObjectEncryptionState,
-    pub analytics_service: Arc<services::admin::AnalyticsService>,
 }
 
 pub fn build_admin_routes(
@@ -2054,7 +2052,7 @@ fn build_admin_routes_with_options(
     services: AdminRouteServices,
 ) -> Router {
     use crate::middleware::admin_middleware;
-    use crate::routes::admin::{get_infra_summary, get_organization_metrics, AdminAppState};
+    use crate::routes::admin::{get_infra_summary, AdminAppState};
     let infra_service = Arc::new(services::admin::InfraService::new(
         config.infra.machines_url.clone(),
         config.infra.cost_per_host_usd_month,
@@ -2064,10 +2062,7 @@ fn build_admin_routes_with_options(
         config.infra.cost_per_gpu_hour_usd,
     ));
 
-    let admin_app_state = AdminAppState {
-        analytics_service: services.analytics_service,
-        infra_service,
-    };
+    let admin_app_state = AdminAppState { infra_service };
 
     let database_encryption_state =
         crate::database_encryption::DatabaseEncryptionState::new(database.pool().clone())
@@ -2081,10 +2076,6 @@ fn build_admin_routes_with_options(
 
     // Classify read operations in middleware::admin_policy when adding admin routes.
     let admin_routes = Router::new()
-        .route(
-            "/admin/organizations/{org_id}/metrics",
-            axum::routing::get(get_organization_metrics),
-        )
         .route(
             "/admin/platform/infra-summary",
             axum::routing::get(get_infra_summary),

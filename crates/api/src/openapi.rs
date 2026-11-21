@@ -101,7 +101,6 @@ Operations marked deprecated (account, organization, workspace, API key, usage, 
         // Billing endpoints (HuggingFace integration)
         crate::routes::billing::get_billing_costs,
         // Admin endpoints (less frequently used)
-        crate::routes::admin::get_organization_metrics,
         crate::routes::credit_transfers::create,
         crate::routes::credit_transfers::history,
         crate::routes::credit_transfers::capacity,
@@ -194,11 +193,6 @@ Operations marked deprecated (account, organization, workspace, API key, usage, 
             crate::routes::billing::BillingCostsResponse,
             crate::routes::billing::RequestCost,
             // Organization metrics (admin)
-            services::admin::OrganizationMetrics,
-            services::admin::MetricsSummary,
-            services::admin::WorkspaceMetrics,
-            services::admin::ApiKeyMetrics,
-            services::admin::ModelMetrics,
             services::admin::InfraSummary,
             services::admin::ModelGpuAllocation,
         ),
@@ -482,24 +476,20 @@ mod admin_token_permission_tests {
     #[test]
     fn admin_authorization_is_documented() {
         let doc = serde_json::to_value(ApiDoc::openapi()).unwrap();
-        for (path, method) in [
-            ("/v1/admin/organizations/{org_id}/metrics", "get"),
-            ("/v1/admin/platform/infra-summary", "get"),
-        ] {
-            let operation = &doc["paths"][path][method];
-            assert!(
-                operation["description"]
-                    .as_str()
-                    .unwrap()
-                    .contains("read_only token"),
-                "{method} {path}"
-            );
-            assert!(operation["responses"].get("403").is_some());
-            assert!(operation["security"]
-                .as_array()
+        let (path, method) = ("/v1/admin/platform/infra-summary", "get");
+        let operation = &doc["paths"][path][method];
+        assert!(
+            operation["description"]
+                .as_str()
                 .unwrap()
-                .iter()
-                .any(|s| s.get("admin_token").is_some()));
-        }
+                .contains("read_only token"),
+            "{method} {path}"
+        );
+        assert!(operation["responses"].get("403").is_some());
+        assert!(operation["security"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s.get("admin_token").is_some()));
     }
 }

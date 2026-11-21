@@ -18,7 +18,6 @@ pub const DEPRECATION_NOTE: &str = "**Deprecated:** this endpoint is moving to c
 /// Not listed: `/v1/auth/*`, which moves too but has no `#[utoipa::path]`
 /// annotation, so it is not in the generated spec for the hook to mark.
 pub const MOVED_TO_CLOUD_PLATFORM: &[(&str, &str)] = &[
-    ("get", "/v1/admin/organizations/{org_id}/metrics"),
     ("post", "/v1/billing/costs"),
     ("post", "/v1/check_api_key"),
     ("get", "/v1/organizations"),

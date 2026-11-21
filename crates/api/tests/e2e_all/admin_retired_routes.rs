@@ -14,7 +14,8 @@ fn retired_routes() -> Vec<(Method, String)> {
         // Usage discount admin route
         (Method::GET, format!("{admin_org}/usage-discount")),
         (Method::PUT, format!("{admin_org}/usage-discount")),
-        // Organization metrics timeseries and platform reports
+        // Organization metrics, metrics timeseries and platform reports
+        (Method::GET, format!("{admin_org}/metrics")),
         (Method::GET, format!("{admin_org}/metrics/timeseries")),
         (Method::GET, "/v1/admin/platform/metrics".into()),
         (Method::GET, "/v1/admin/platform/metrics/timeseries".into()),

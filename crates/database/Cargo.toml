@@ -37,7 +37,7 @@ thiserror = "2.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 uuid = { version = "1.23", features = ["v4", "serde"] }
-jiff = { version = "0.2.46", default-features = false, features = ["std", "serde"] }
+jiff = { version = "1.0.0", default-features = false, features = ["std", "serde"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 anyhow = "1.0"

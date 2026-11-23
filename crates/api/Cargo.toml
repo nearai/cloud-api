@@ -34,7 +34,7 @@ opentelemetry_sdk = { version = "0.33", features = ["rt-tokio", "trace"] }
 opentelemetry-otlp = { version = "0.33", features = ["metrics", "trace", "grpc-tonic"] }
 tracing-opentelemetry = "0.34"
 url = "2.5"
-jiff = { version = "0.2.46", default-features = false, features = ["std", "serde"] }
+jiff = { version = "1.0.0", default-features = false, features = ["std", "serde"] }
 # For TypedHeader support
 headers = "0.4"
 # OpenAPI documentation generation

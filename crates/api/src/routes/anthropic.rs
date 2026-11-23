@@ -713,7 +713,7 @@ async fn handle_request(
             status_code,
             message,
         }) => {
-            return admission_error(status_code, message);
+            return admission_error(status_code, message).into_response();
         }
         Err(AnthropicRawError::UnsupportedProvider) => {
             return anthropic_error(
@@ -1470,8 +1470,8 @@ fn is_forwardable_upstream_header(name: &header::HeaderName) -> bool {
     matches!(name.as_str(), "content-type" | "request-id" | "retry-after")
 }
 
-fn admission_error(status_code: u16, message: String) -> Response {
-    anthropic_error(
+fn admission_error(status_code: u16, message: String) -> AnthropicRouteError {
+    AnthropicRouteError::new(
         StatusCode::from_u16(status_code).unwrap_or(StatusCode::SERVICE_UNAVAILABLE),
         match status_code {
             400 => "invalid_request_error",
@@ -1548,7 +1548,7 @@ mod tests {
             (429, "rate_limit_error"),
             (503, "api_error"),
         ] {
-            let response = admission_error(code, "admission message".into());
+            let response = admission_error(code, "admission message".into()).into_response();
             assert_eq!(response.status().as_u16(), code);
             let bytes = axum::body::to_bytes(response.into_body(), 4096)
                 .await

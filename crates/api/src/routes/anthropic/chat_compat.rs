@@ -36,6 +36,13 @@ fn upstream(message: &'static str) -> AnthropicRouteError {
 }
 
 fn service_error(error: CompletionError) -> AnthropicRouteError {
+    if let CompletionError::Admission {
+        status_code,
+        message,
+    } = error
+    {
+        return super::admission_error(status_code, message);
+    }
     let status = map_domain_error_to_status(&error);
     let kind = match status {
         StatusCode::TOO_MANY_REQUESTS => "rate_limit_error",

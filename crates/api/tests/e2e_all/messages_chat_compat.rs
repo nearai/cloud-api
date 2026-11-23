@@ -8,10 +8,8 @@ use serde_json::{json, Value};
 
 #[tokio::test]
 async fn messages_runs_a_private_chat_tool_loop_and_bills_each_turn_once() {
-    let (server, pool, _, database) = setup_test_server_with_pool_and_config(|config| {
-        config.external_providers.enable_anthropic_messages = true;
-    })
-    .await;
+    let (server, _, pool, database) =
+        super::usage_admission::server(super::usage_admission::enforcing_settings()).await;
     let model = setup_qwen_model(&server).await;
     let mock = std::sync::Arc::new(
         inference_providers::mock::MockProvider::new_accept_all()
@@ -19,7 +17,7 @@ async fn messages_runs_a_private_chat_tool_loop_and_bills_each_turn_once() {
     );
     pool.register_provider(model.clone(), mock.clone()).await;
     let org = setup_org_with_credits(&server, 10_000_000_000).await;
-    let key = get_api_key_for_org(&server, org.id).await;
+    let key = get_api_key_for_org(&server, org.id.clone()).await;
     mock.when(RequestMatcher::ToolResultCount(0))
         .respond_with(
             ResponseTemplate::new("")
@@ -177,6 +175,33 @@ async fn messages_runs_a_private_chat_tool_loop_and_bills_each_turn_once() {
     assert_eq!(count.status_code(), 404);
     assert_eq!(count.json::<Value>()["error"]["type"], "not_found_error");
     assert_eq!(mock.chat_completion_call_count(), 2);
+    super::usage_admission::assert_clean_settlements(
+        &database,
+        uuid::Uuid::parse_str(&org.id).unwrap(),
+        2,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn chat_backed_messages_return_a_billing_error_before_inference() {
+    let (server, mock, _, _) =
+        super::usage_admission::server(super::usage_admission::enforcing_settings()).await;
+    let model = setup_qwen_model(&server).await;
+    let org = setup_org_with_credits(&server, 1).await;
+    let key = get_api_key_for_org(&server, org.id).await;
+    for stream in [false, true] {
+        let response = server
+            .post("/v1/messages")
+            .add_header("x-api-key", &key)
+            .add_header("anthropic-version", "2023-06-01")
+            .json(&json!({"model":model,"max_tokens":16,"stream":stream,
+                "messages":[{"role":"user","content":"Hello"}]}))
+            .await;
+        assert_eq!(response.status_code(), 402, "{}", response.text());
+        assert_eq!(response.json::<Value>()["error"]["type"], "billing_error");
+    }
+    assert_eq!(mock.chat_completion_call_count(), 0);
 }
 
 #[tokio::test]

@@ -7,6 +7,16 @@ fn request(content: Value) -> Value {
 }
 
 #[test]
+fn unavailable_admission_keeps_its_public_message() {
+    let error = service_error(services::usage::budget::service_error(
+        services::usage::UsageError::InternalError("test storage failure".into()),
+    ));
+    assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(error.error_type, "api_error");
+    assert_eq!(error.message, "Monetary admission unavailable");
+}
+
+#[test]
 fn translates_claude_tool_history_and_images() {
     let mut body = request(json!([
         {"role":"user","content":"Open the file"},

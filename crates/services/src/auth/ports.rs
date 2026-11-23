@@ -510,7 +510,7 @@ impl MockAuthService {
         let access_token = jsonwebtoken::encode(
             &jsonwebtoken::Header::default(),
             &claims,
-            &jsonwebtoken::EncodingKey::from_secret(encoding_key.as_bytes()),
+            &jsonwebtoken::EncodingKey::from_secret(encoding_key.as_bytes()).unwrap(),
         )
         .unwrap();
         // Generate token with same format as real session repository
@@ -573,7 +573,8 @@ impl AuthServiceTrait for MockAuthService {
         jsonwebtoken::encode(
             &jsonwebtoken::Header::default(),
             &claims,
-            &jsonwebtoken::EncodingKey::from_secret(encoding_key.as_bytes()),
+            &jsonwebtoken::EncodingKey::from_secret(encoding_key.as_bytes())
+                .map_err(|e| AuthError::InternalError(format!("Failed to create jwt: {e}")))?,
         )
         .map_err(|e| AuthError::InternalError(format!("Failed to create jwt: {e}")))
     }
@@ -587,11 +588,14 @@ impl AuthServiceTrait for MockAuthService {
         let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::HS256);
         validation.validate_exp = false;
 
-        let claims = if let Ok(claims) = jsonwebtoken::decode::<AccessTokenClaims>(
-            access_token,
-            &jsonwebtoken::DecodingKey::from_secret(encoding_key.as_bytes()),
-            &validation,
-        ) {
+        let Ok(decoding_key) = jsonwebtoken::DecodingKey::from_secret(encoding_key.as_bytes())
+        else {
+            return Ok(None);
+        };
+
+        let claims = if let Ok(claims) =
+            jsonwebtoken::decode::<AccessTokenClaims>(access_token, &decoding_key, &validation)
+        {
             claims
         } else {
             return Ok(None);

@@ -15,7 +15,7 @@ tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.12", features = ["json", "rustls-tls-native-roots"] }
 thiserror = "2.0"
 anyhow = "1.0"
-jiff = { version = "1.0.0", default-features = false, features = ["std", "serde"] }
+jiff = { version = "0.2.46", default-features = false, features = ["std", "serde"] }
 # Sigstore verification lives in `tinfoil_provenance`, the only crate allowed
 # to depend on `sigstore-verify` (enforced by scripts/check_dep_guards.sh); the
 # runtime uses it too. This crate is CI tooling and is never a dependency of

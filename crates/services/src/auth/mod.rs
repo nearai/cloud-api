@@ -101,7 +101,8 @@ impl AuthServiceTrait for AuthService {
         jsonwebtoken::encode(
             &jsonwebtoken::Header::default(),
             &claims,
-            &jsonwebtoken::EncodingKey::from_secret(encoding_key.as_bytes()),
+            &jsonwebtoken::EncodingKey::from_secret(encoding_key.as_bytes())
+                .map_err(|e| AuthError::InternalError(format!("Failed to create jwt: {e}")))?,
         )
         .map_err(|e| AuthError::InternalError(format!("Failed to create jwt: {e}")))
     }
@@ -113,7 +114,8 @@ impl AuthServiceTrait for AuthService {
     ) -> Result<Option<AccessTokenClaims>, AuthError> {
         let claims = jsonwebtoken::decode::<AccessTokenClaims>(
             access_token,
-            &jsonwebtoken::DecodingKey::from_secret(encoding_key.as_bytes()),
+            &jsonwebtoken::DecodingKey::from_secret(encoding_key.as_bytes())
+                .map_err(|_| AuthError::SessionNotFound)?,
             &jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::HS256),
         )
         .map_err(|_| AuthError::SessionNotFound)?;

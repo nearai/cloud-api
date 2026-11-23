@@ -16,7 +16,7 @@ placement = { path = "../placement" }
 async-trait = "0.1"
 base64 = "0.23"
 bytes = "1.11"
-jiff = { version = "1.0.0", default-features = false, features = ["std", "serde"] }
+jiff = { version = "0.2.46", default-features = false, features = ["std", "serde"] }
 uuid = { version = "1", features = ["v4"] }
 futures-core = "0.3"
 http = "1"

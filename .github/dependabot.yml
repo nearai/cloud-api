@@ -18,6 +18,11 @@ updates:
       # compatibility on PoolConfig.queue_mode / Runtime::Tokio1.
       - dependency-name: "deadpool"
         update-types: ["version-update:semver-major", "version-update:semver-minor"]
+      # jiff 1.0 cannot be adopted until postgres-types offers a jiff 1.x
+      # feature (latest only has with-jiff-0_1 / with-jiff-0_2); without it
+      # Timestamp loses its ToSql/FromSql impls in the database crate.
+      - dependency-name: "jiff"
+        update-types: ["version-update:semver-major"]
     commit-message:
       prefix: "deps"
 

@@ -173,8 +173,10 @@ fn strict_and_function_tool_choice() {
     let mut value = tool_params();
     value["tools"][0]["function"]["strict"] = json!(true);
     value["tool_choice"] = json!({"type": "function", "function": {"name": "weather"}});
-    let mut p = params(value.clone());
-    p.original_request = Some(value);
+    // No `original_request`, as after auto-redaction: `strict` comes from the
+    // parsed tool definition.
+    let p = params(value);
+    assert!(p.original_request.is_none());
     let body = build_request(&p, false).unwrap();
     assert_eq!(body["tools"][0]["strict"], true);
     assert_eq!(
@@ -237,6 +239,67 @@ fn rejects_unsupported_inputs() {
     assert!(build_request(&params(ok), false).is_ok());
 }
 
+/// The chat route leaves these options in `extra`, with the typed fields unset.
+#[test]
+fn validates_options_held_in_extra() {
+    for (key, val) in [
+        ("logprobs", json!(true)),
+        ("top_logprobs", json!(2)),
+        ("modalities", json!(["text", "audio"])),
+        ("modalities", json!("text")),
+    ] {
+        let mut p = params(tool_params());
+        p.extra.insert(key.to_string(), val);
+        assert_eq!(
+            status_of(build_request(&p, false).unwrap_err()),
+            400,
+            "{key}"
+        );
+    }
+    let mut p = params(tool_params());
+    for (key, val) in [
+        ("logprobs", json!(false)),
+        ("top_logprobs", Value::Null),
+        ("modalities", json!(["text"])),
+    ] {
+        p.extra.insert(key.to_string(), val);
+    }
+    p.extra
+        .insert("parallel_tool_calls".to_string(), json!(false));
+    let body = build_request(&p, false).unwrap();
+    for key in ["logprobs", "top_logprobs", "modalities"] {
+        assert!(body.get(key).is_none(), "{key} must not reach Responses");
+    }
+    assert_eq!(body["parallel_tool_calls"], false);
+}
+
+/// Parts as the API layer serializes them: `detail` beside `image_url`, and a
+/// flat `file_id`.
+#[test]
+fn converts_api_layer_image_and_file_parts() {
+    let mut v = tool_params();
+    v["messages"] = json!([{"role": "user", "content": [
+        {"type": "image_url", "image_url": {"url": "https://x/a.png"}, "detail": "low"},
+        {"type": "file", "file_id": "file_1"},
+        {"type": "file", "file": {"file_data": "data:application/pdf;base64,AA", "filename": "a.pdf"}}
+    ]}]);
+    let body = build_request(&params(v), false).unwrap();
+    assert_eq!(
+        body["input"][0]["content"],
+        json!([
+            {"type": "input_image", "image_url": "https://x/a.png", "detail": "low"},
+            {"type": "input_file", "file_id": "file_1"},
+            {"type": "input_file", "file_data": "data:application/pdf;base64,AA", "filename": "a.pdf"}
+        ])
+    );
+    let mut v = tool_params();
+    v["messages"] = json!([{"role": "user", "content": [{"type": "file"}]}]);
+    assert_eq!(
+        status_of(build_request(&params(v), false).unwrap_err()),
+        400
+    );
+}
+
 fn usage_json() -> Value {
     json!({"input_tokens": 12, "output_tokens": 7, "total_tokens": 19,
         "input_tokens_details": {"cached_tokens": 4},
@@ -296,6 +359,23 @@ fn converts_tool_call_response_and_error_cases() {
             .as_deref(),
         Some("length")
     );
+    // A tool call cut off by a limit or a filter reports the truncation.
+    for (reason, expected) in [
+        ("max_output_tokens", "length"),
+        ("content_filter", "content_filter"),
+    ] {
+        let truncated = json!({"id": "r", "status": "incomplete",
+            "incomplete_details": {"reason": reason},
+            "output": [{"type": "function_call", "call_id": "c", "name": "weather", "arguments": "{\"a\""}],
+            "usage": usage_json()});
+        assert_eq!(
+            convert_response(&truncated).unwrap().choices[0]
+                .finish_reason
+                .as_deref(),
+            Some(expected),
+            "{reason}"
+        );
+    }
 
     let failed = json!({"id": "r", "status": "failed", "error": {"message": "boom"}});
     assert_eq!(status_of(convert_response(&failed).unwrap_err()), 502);
@@ -457,7 +537,7 @@ async fn streams_text_and_failures() {
     );
 
     let failed = sse(&[
-        ("response.created", created),
+        ("response.created", created.clone()),
         (
             "response.failed",
             json!({"type": "response.failed", "response": {"error": {"message": "nope"}}}),
@@ -467,6 +547,37 @@ async fn streams_text_and_failures() {
     assert_eq!(got.len(), 2);
     assert!(got[0].is_ok());
     assert_eq!(status_of(got[1].clone().unwrap_err()), 502);
+
+    let truncated_call = sse(&[
+        ("response.created", created.clone()),
+        (
+            "response.output_item.added",
+            json!({"type": "response.output_item.added", "output_index": 0, "item": {"type": "function_call", "call_id": "c", "name": "weather"}}),
+        ),
+        (
+            "response.function_call_arguments.delta",
+            json!({"type": "response.function_call_arguments.delta", "output_index": 0, "delta": "{\"a"}),
+        ),
+        (
+            "response.incomplete",
+            json!({"type": "response.incomplete", "response": {"status": "incomplete",
+                "incomplete_details": {"reason": "max_output_tokens"}, "usage": usage_json()}}),
+        ),
+    ]);
+    let got: Vec<String> = run_parser(truncated_call)
+        .await
+        .into_iter()
+        .map(|r| r.unwrap())
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            "role",
+            "start(0,c,weather)",
+            "args(0,{\"a)",
+            "finish(length,12,7)"
+        ]
+    );
 
     let early = sse(&[(
         "response.output_text.delta",

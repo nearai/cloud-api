@@ -1387,6 +1387,7 @@ mod tests {
         let tools = vec![ToolDefinition {
             type_: "function".to_string(),
             function: crate::FunctionDefinition {
+                strict: None,
                 name: "web_search".to_string(),
                 description: Some("Search the web".to_string()),
                 parameters: serde_json::json!({
@@ -1792,6 +1793,7 @@ mod tests {
         let tools = vec![ToolDefinition {
             type_: "function".to_string(),
             function: crate::FunctionDefinition {
+                strict: None,
                 name: "edit".to_string(),
                 description: Some("Edit a file".to_string()),
                 parameters: serde_json::json!({
@@ -1833,6 +1835,7 @@ mod tests {
         let tools = vec![ToolDefinition {
             type_: "function".to_string(),
             function: crate::FunctionDefinition {
+                strict: None,
                 name: "measure".to_string(),
                 description: None,
                 parameters: serde_json::json!({

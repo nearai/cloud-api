@@ -942,6 +942,7 @@ mod tests {
         vec![crate::models::ToolDefinition {
             type_: "function".to_string(),
             function: crate::models::FunctionDefinition {
+                strict: None,
                 name: "bash".to_string(),
                 description: Some("run bash".to_string()),
                 parameters: serde_json::json!({"type": "object", "properties": {}}),

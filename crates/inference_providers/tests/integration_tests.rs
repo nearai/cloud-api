@@ -422,6 +422,7 @@ async fn test_chat_completion_streaming_with_tool_calls() {
     let tools = vec![ToolDefinition {
         type_: "function".to_string(),
         function: FunctionDefinition {
+            strict: None,
             name: "get_weather".to_string(),
             description: Some("Get the current weather for a city".to_string()),
             parameters: weather_params,

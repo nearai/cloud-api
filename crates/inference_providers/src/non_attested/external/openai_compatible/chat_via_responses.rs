@@ -44,12 +44,15 @@ const DROPPED_EXTRA_KEYS: &[&str] = &[
     crate::CACHE_SALT_FIELD,
 ];
 
-/// Keys of `extra` that are translated rather than forwarded.
+/// Keys of `extra` that are translated or validated rather than forwarded.
 const TRANSLATED_EXTRA_KEYS: &[&str] = &[
     "reasoning_effort",
     "reasoning",
     "verbosity",
     "response_format",
+    "logprobs",
+    "top_logprobs",
+    "modalities",
 ];
 
 /// True for `gpt-6-astra` and `gpt-6.<digits>-astra`, each optionally followed
@@ -122,7 +125,7 @@ fn convert_part(part: &Value) -> Result<Value, CompletionError> {
             Ok(json!({"type": "input_text", "text": text}))
         }
         Some("image_url") => {
-            let (url, detail) = match obj.get("image_url") {
+            let (url, nested_detail) = match obj.get("image_url") {
                 Some(Value::String(url)) => (url.as_str(), None),
                 Some(Value::Object(image)) => (
                     image
@@ -133,6 +136,9 @@ fn convert_part(part: &Value) -> Result<Value, CompletionError> {
                 ),
                 _ => return Err(bad_request("invalid image content part")),
             };
+            // The API layer keeps `detail` beside `image_url`; raw OpenAI
+            // requests nest it inside.
+            let detail = obj.get("detail").and_then(Value::as_str).or(nested_detail);
             Ok(json!({
                 "type": "input_image",
                 "image_url": url,
@@ -140,16 +146,22 @@ fn convert_part(part: &Value) -> Result<Value, CompletionError> {
             }))
         }
         Some("file") => {
-            let file = obj
-                .get("file")
-                .and_then(Value::as_object)
-                .ok_or_else(|| bad_request("invalid file content part"))?;
+            // The API layer sends `{"type":"file","file_id":..}`; raw OpenAI
+            // requests nest the fields in a `file` object.
+            let file = match obj.get("file") {
+                Some(Value::Object(file)) => file,
+                None => obj,
+                Some(_) => return Err(bad_request("invalid file content part")),
+            };
             let mut out = Map::new();
             out.insert("type".to_string(), json!("input_file"));
             for key in ["file_data", "file_id", "filename"] {
                 if let Some(value) = file.get(key).filter(|v| !v.is_null()) {
                     out.insert(key.to_string(), value.clone());
                 }
+            }
+            if out.len() == 1 {
+                return Err(bad_request("invalid file content part"));
             }
             Ok(Value::Object(out))
         }
@@ -250,25 +262,14 @@ fn convert_messages(params: &ChatCompletionParams) -> Result<Vec<Value>, Complet
 }
 
 fn convert_tools(params: &ChatCompletionParams) -> Result<Vec<Value>, CompletionError> {
-    let original = params
-        .original_request
-        .as_ref()
-        .and_then(|r| r.get("tools"))
-        .and_then(Value::as_array);
     let mut tools = Vec::new();
-    for (i, tool) in params.tools.iter().flatten().enumerate() {
+    for tool in params.tools.iter().flatten() {
         if tool.type_ != "function" {
             return Err(bad_request("unsupported tool type for this model"));
         }
         // Responses defaults `strict` to true and Chat Completions to false;
         // keep the chat meaning unless the client asked for strict explicitly.
-        let strict = original
-            .and_then(|tools| tools.get(i))
-            .and_then(|t| t.get("function"))
-            .filter(|f| f.get("name").and_then(Value::as_str) == Some(tool.function.name.as_str()))
-            .and_then(|f| f.get("strict"))
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
+        let strict = tool.function.strict.unwrap_or(false);
         let mut out = Map::new();
         out.insert("type".to_string(), json!("function"));
         out.insert("name".to_string(), json!(tool.function.name));
@@ -340,13 +341,24 @@ fn build_request(params: &ChatCompletionParams, stream: bool) -> Result<Value, C
     if params.stop.as_ref().is_some_and(|s| !s.is_empty()) {
         return Err(bad_request("stop is not supported for this model"));
     }
-    if params.logprobs == Some(true) || params.top_logprobs.is_some() {
+    // The chat route leaves these in `extra`; internal callers use the typed
+    // fields. Check both.
+    let extra = |key: &str| params.extra.get(key).filter(|v| !v.is_null());
+    if params.logprobs == Some(true)
+        || params.top_logprobs.is_some()
+        || extra("logprobs").is_some_and(|v| v != &Value::Bool(false))
+        || extra("top_logprobs").is_some()
+    {
         return Err(bad_request("logprobs is not supported for this model"));
     }
-    if let Some(modalities) = &params.modalities {
-        if modalities.len() != 1 || modalities.first().map(String::as_str) != Some("text") {
-            return Err(bad_request("modalities is not supported for this model"));
-        }
+    let text_only = |modalities: &[Value]| modalities == [json!("text")];
+    if params
+        .modalities
+        .as_ref()
+        .is_some_and(|m| m.len() != 1 || m.first().map(String::as_str) != Some("text"))
+        || extra("modalities").is_some_and(|v| !v.as_array().is_some_and(|m| text_only(m)))
+    {
+        return Err(bad_request("modalities is not supported for this model"));
     }
 
     let mut body = Map::new();
@@ -495,10 +507,9 @@ fn error_message(resp: &Value) -> Option<&str> {
 }
 
 /// Finish reason for a terminal response object.
+/// Truncation wins over tool calls: a call cut off by the output limit has
+/// incomplete arguments.
 fn finish_reason(resp: &Value, saw_tool_call: bool) -> FinishReason {
-    if saw_tool_call {
-        return FinishReason::ToolCalls;
-    }
     if resp.get("status").and_then(Value::as_str) == Some("incomplete") {
         match resp
             .get("incomplete_details")
@@ -510,7 +521,11 @@ fn finish_reason(resp: &Value, saw_tool_call: bool) -> FinishReason {
             _ => {}
         }
     }
-    FinishReason::Stop
+    if saw_tool_call {
+        FinishReason::ToolCalls
+    } else {
+        FinishReason::Stop
+    }
 }
 
 fn finish_reason_str(reason: &FinishReason) -> &'static str {

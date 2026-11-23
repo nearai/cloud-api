@@ -114,6 +114,7 @@ pub fn test_config() -> ApiConfig {
             admin_emails: vec![ADMIN_ALLOWLIST_EMAIL.to_string()],
             require_session_bound_access_tokens: false,
             admin_tokens_only: false,
+            login_email_domains: Vec::new(),
         },
         database: config::DatabaseConfig {
             connection_mode: config::DatabaseConnectionMode::Patroni,

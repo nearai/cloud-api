@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use services::auth::near::NearAuthError;
 use services::auth::{AuthError, AuthServiceTrait, OAuthManager};
 use std::sync::Arc;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 use url::Url;
 
 /// OAuth state storage backed by PostgreSQL for multi-instance support
@@ -84,6 +84,50 @@ fn validate_frontend_callback(
     }
 
     Ok(url)
+}
+
+/// The error of a sign-in that `AUTH_LOGIN_EMAIL_DOMAINS` refuses, and its fixed description: it
+/// names neither the address nor the list.
+const LOGIN_REFUSED_ERROR: &str = "access_denied";
+const LOGIN_REFUSED_DESCRIPTION: &str = "Sign-in is not available for this account.";
+
+fn login_refused_json() -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        Json(serde_json::json!({
+            "error": LOGIN_REFUSED_ERROR,
+            "error_description": LOGIN_REFUSED_DESCRIPTION
+        })),
+    )
+        .into_response()
+}
+
+/// A sign-in the email domain list refuses, before any user or session row is written: 403, or
+/// 307 to a validated frontend callback with the error in the fragment and no tokens.
+fn login_refused_response(frontend_callback: Option<&str>, cors: &config::CorsConfig) -> Response {
+    let Some(frontend_callback) = frontend_callback else {
+        return login_refused_json();
+    };
+    let mut callback_url = match validate_frontend_callback(frontend_callback, cors) {
+        Ok(url) => url,
+        Err(reason) => {
+            error!(reason, "Invalid frontend callback for a refused sign-in");
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "invalid_request",
+                    "error_description": "Invalid frontend callback URL"
+                })),
+            )
+                .into_response();
+        }
+    };
+    let fragment = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("error", LOGIN_REFUSED_ERROR)
+        .append_pair("error_description", LOGIN_REFUSED_DESCRIPTION)
+        .finish();
+    callback_url.set_fragment(Some(&fragment));
+    Redirect::temporary(callback_url.as_str()).into_response()
 }
 
 /// Only the known account conflict is redirected here; general OAuth callback
@@ -486,8 +530,8 @@ pub async fn oauth_callback(
             )
                 .into_response();
         }
-        Err(e) => {
-            error!("Database error retrieving OAuth state: {}", e);
+        Err(_) => {
+            error!("Database error retrieving OAuth state");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({
@@ -561,6 +605,18 @@ pub async fn oauth_callback(
                 .into_response();
         }
     };
+
+    if !config.auth.admits_login_email(
+        &oauth_user_info.provider,
+        &oauth_user_info.email,
+        oauth_user_info.email_authoritative,
+    ) {
+        warn!(
+            provider = %oauth_state_row.provider,
+            "OAuth sign-in refused by the email domain list"
+        );
+        return login_refused_response(oauth_state_row.frontend_callback.as_deref(), &config.cors);
+    }
 
     // Get or create user from OAuth info
     let user = match auth_service.get_or_create_oauth_user(oauth_user_info).await {
@@ -709,6 +765,11 @@ pub async fn near_login(
     headers: HeaderMap,
     Json(auth_request): Json<NearAuthRequest>,
 ) -> Response {
+    // A wallet proves no mailbox, so a domain list refuses every wallet sign-in.
+    if config.auth.restricts_login() {
+        warn!("NEAR sign-in refused by the email domain list");
+        return login_refused_json();
+    }
     let account_id_str = auth_request.signed_message.account_id.clone();
     debug!("NEAR authentication attempt");
 

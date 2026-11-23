@@ -2961,6 +2961,7 @@ mod tests {
                 admin_emails: vec![],
                 require_session_bound_access_tokens: false,
                 admin_tokens_only: false,
+                login_email_domains: Vec::new(),
             },
             database: config::DatabaseConfig {
                 connection_mode: config::DatabaseConnectionMode::Patroni,
@@ -3089,6 +3090,7 @@ mod tests {
                 admin_emails: vec![],
                 require_session_bound_access_tokens: false,
                 admin_tokens_only: false,
+                login_email_domains: Vec::new(),
             },
             database: config::DatabaseConfig {
                 connection_mode: config::DatabaseConnectionMode::Patroni,

@@ -3097,6 +3097,7 @@ mod tests {
                     }),
                     logprobs: None,
                     finish_reason,
+                    stop_reason: None,
                     token_ids: None,
                 }],
                 usage,
@@ -4091,6 +4092,7 @@ mod tests {
                     delta: None,
                     logprobs: None,
                     finish_reason: Some(FinishReason::Stop),
+                    stop_reason: None,
                     token_ids: None,
                 }],
                 usage: Some(TokenUsage {
@@ -4276,6 +4278,7 @@ mod tests {
                     delta: None,
                     logprobs: None,
                     finish_reason: Some(FinishReason::Stop),
+                    stop_reason: None,
                     token_ids: None,
                 }],
                 usage: Some(TokenUsage {
@@ -4431,6 +4434,7 @@ mod tests {
                     delta: None,
                     logprobs: None,
                     finish_reason: Some(FinishReason::Stop),
+                    stop_reason: None,
                     token_ids: None,
                 }],
                 usage: Some(TokenUsage {
@@ -4571,6 +4575,7 @@ mod tests {
                     delta: None,
                     logprobs: None,
                     finish_reason: Some(FinishReason::Stop),
+                    stop_reason: None,
                     token_ids: None,
                 }],
                 usage: Some(TokenUsage {

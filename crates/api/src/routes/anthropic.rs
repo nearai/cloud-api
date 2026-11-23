@@ -1,6 +1,6 @@
-//! Native Anthropic Messages routes.
+//! Anthropic Messages routes with native forwarding and Chat Completions translation.
 //!
-//! The request body stays schema-free on purpose. Cloud API validates only the
+//! The native request body stays schema-free on purpose. Cloud API validates only the
 //! fields needed for routing, billing, and explicit feature gates, then the raw
 //! transport rewrites `model` and forwards the rest to Anthropic.
 //!
@@ -13,12 +13,13 @@
 //! work. `ANTHROPIC_DENIED_BETAS` is the global operator kill-switch for these
 //! cases; model-specific pricing restrictions need separate policy.
 
+mod chat_compat;
 mod signatures;
 #[cfg(test)]
 mod usage_tests;
 
 use crate::middleware::auth::AuthenticatedApiKey;
-use crate::middleware::{RequestBodyHash, RequestedModel};
+use crate::middleware::{RequestBodyHash, RequestCorrelation, RequestedModel};
 use crate::models::AnthropicErrorResponse;
 use crate::routes::api::AppState;
 use crate::routes::common::{
@@ -78,10 +79,10 @@ struct PreparedRequest {
     headers: AnthropicRawHeaders,
 }
 
-struct NativeRequestContext {
+struct MessagesRequestContext {
     endpoint: AnthropicRawEndpoint,
     requested_model: RequestedModel,
-    signing: Option<MessageSigningContext>,
+    signing: Option<(Uuid, MessageSigningContext)>,
 }
 
 #[derive(Debug)]
@@ -524,10 +525,10 @@ pub async fn messages(
     State(app_state): State<AppState>,
     Extension(api_key): Extension<AuthenticatedApiKey>,
     Extension(body_hash): Extension<RequestBodyHash>,
+    Extension(correlation): Extension<RequestCorrelation>,
     RawQuery(query): RawQuery,
     headers: HeaderMap,
     requested_model: RequestedModel,
-    body: Bytes,
 ) -> Response {
     let signing = MessageSigningContext::new(
         app_state.attestation_service.clone(),
@@ -539,11 +540,11 @@ pub async fn messages(
         api_key,
         query,
         headers,
-        body,
-        NativeRequestContext {
+        body_hash.body_bytes,
+        MessagesRequestContext {
             endpoint: AnthropicRawEndpoint::Messages,
             requested_model,
-            signing: Some(signing),
+            signing: Some((correlation.request_id, signing)),
         },
     )
     .await
@@ -562,7 +563,7 @@ pub async fn count_tokens(
         query,
         headers,
         body,
-        NativeRequestContext {
+        MessagesRequestContext {
             endpoint: AnthropicRawEndpoint::CountTokens,
             // Token counting is not inference: nothing reads this slot.
             requested_model: RequestedModel::default(),
@@ -578,9 +579,9 @@ async fn handle_request(
     query: Option<String>,
     headers: HeaderMap,
     body: Bytes,
-    context: NativeRequestContext,
+    context: MessagesRequestContext,
 ) -> Response {
-    let NativeRequestContext {
+    let MessagesRequestContext {
         endpoint,
         requested_model,
         signing,
@@ -610,6 +611,33 @@ async fn handle_request(
     // The canonical name: the client's spelling may have been normalized
     // before it resolved.
     requested_model.set(&model.model_name);
+
+    if !model.is_anthropic_backend() {
+        let Some((request_id, signing)) = signing else {
+            return anthropic_error(
+                StatusCode::NOT_FOUND,
+                "not_found_error",
+                "Token counting is unavailable for this model",
+            );
+        };
+        if let Err(message) =
+            model.validate_endpoint(services::models::InferenceEndpoint::ChatCompletions)
+        {
+            return anthropic_error(StatusCode::BAD_REQUEST, "invalid_request_error", message);
+        }
+        return chat_compat::respond(
+            &app_state,
+            &api_key,
+            prepared.body,
+            &model,
+            request_id,
+            signing,
+            &headers,
+            alias_from,
+        )
+        .await
+        .unwrap_or_else(IntoResponse::into_response);
+    }
 
     let billing_seed = match prepare_billing_seed(
         endpoint,
@@ -685,7 +713,7 @@ async fn handle_request(
             status_code,
             message,
         }) => {
-            return admission_error(status_code, message);
+            return admission_error(status_code, message).into_response();
         }
         Err(AnthropicRawError::UnsupportedProvider) => {
             return anthropic_error(
@@ -744,7 +772,7 @@ async fn handle_request(
         billing,
         concurrent_slot,
         alias_from,
-        signing,
+        signing.map(|(_, signing)| signing),
     )
     .await
 }
@@ -1098,41 +1126,27 @@ async fn resolve_model(
     headers: &HeaderMap,
     requested: &str,
 ) -> Result<(ModelWithPricing, Option<String>), Response> {
-    let normalized = if requested.starts_with("anthropic/") {
-        requested.to_string()
+    let normalized = if requested.contains('/') {
+        requested.to_owned()
     } else {
         format!("anthropic/{requested}")
     };
-
-    let model = match models_service
+    let (model, matched_name) = match models_service
         .resolve_and_get_model(&normalized, caller)
         .await
     {
-        Ok(model) => model,
-        Err(ModelsError::NotFound(_)) if normalized != requested => models_service
-            .resolve_and_get_model(requested, caller)
-            .await
-            .map_err(model_resolution_error)?,
+        Ok(model) => (model, normalized.as_str()),
+        Err(ModelsError::NotFound(_)) if normalized != requested => (
+            models_service
+                .resolve_and_get_model(requested, caller)
+                .await
+                .map_err(model_resolution_error)?,
+            requested,
+        ),
         Err(error) => return Err(model_resolution_error(error)),
     };
 
-    let anthropic_backend = model.provider_type == "external"
-        && model.model_name.starts_with("anthropic/")
-        && model
-            .provider_config
-            .as_ref()
-            .and_then(|config| config.get("backend"))
-            .and_then(serde_json::Value::as_str)
-            == Some("anthropic");
-    if !anthropic_backend {
-        return Err(anthropic_error(
-            StatusCode::BAD_REQUEST,
-            "invalid_request_error",
-            "The native Messages endpoint accepts Anthropic-backed models only",
-        ));
-    }
-
-    let resolved_from_alias = model.model_name != normalized;
+    let resolved_from_alias = model.model_name != matched_name;
     if resolved_from_alias && no_aliasing_requested(headers) {
         return Err(anthropic_error(
             StatusCode::BAD_REQUEST,
@@ -1143,7 +1157,8 @@ async fn resolve_model(
             ),
         ));
     }
-    let alias_header = resolved_from_alias.then(|| format!("{normalized} -> {}", model.model_name));
+    let alias_header =
+        resolved_from_alias.then(|| format!("{matched_name} -> {}", model.model_name));
     Ok((model, alias_header))
 }
 
@@ -1430,6 +1445,15 @@ fn response_from_body(
         "x-serving-provider",
         HeaderValue::from_static("non-attested"),
     );
+    add_model_headers(&mut response, alias_from, inference_id);
+    response
+}
+
+fn add_model_headers(
+    response: &mut Response,
+    alias_from: Option<String>,
+    inference_id: Option<Uuid>,
+) {
     if let Some(inference_id) = inference_id {
         if let Ok(value) = HeaderValue::from_str(&inference_id.to_string()) {
             response.headers_mut().insert(HEADER_INFERENCE_ID, value);
@@ -1440,15 +1464,14 @@ fn response_from_body(
             .headers_mut()
             .insert(HEADER_MODEL_ALIAS_RESOLVED, alias);
     }
-    response
 }
 
 fn is_forwardable_upstream_header(name: &header::HeaderName) -> bool {
     matches!(name.as_str(), "content-type" | "request-id" | "retry-after")
 }
 
-fn admission_error(status_code: u16, message: String) -> Response {
-    anthropic_error(
+fn admission_error(status_code: u16, message: String) -> AnthropicRouteError {
+    AnthropicRouteError::new(
         StatusCode::from_u16(status_code).unwrap_or(StatusCode::SERVICE_UNAVAILABLE),
         match status_code {
             400 => "invalid_request_error",
@@ -1525,7 +1548,7 @@ mod tests {
             (429, "rate_limit_error"),
             (503, "api_error"),
         ] {
-            let response = admission_error(code, "admission message".into());
+            let response = admission_error(code, "admission message".into()).into_response();
             assert_eq!(response.status().as_u16(), code);
             let bytes = axum::body::to_bytes(response.into_body(), 4096)
                 .await

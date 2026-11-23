@@ -78,11 +78,11 @@ impl Default for OpenAiCompatibleBackend {
 ///
 /// The proper fix is to route tools+reasoning_effort requests through OpenAI's
 /// Responses API; that is a larger effort. As an interim, GPT-5.6 and GPT-6
-/// Sol/Luna must receive an explicit `reasoning_effort: "none"` because their
-/// omitted default still reasons and is rejected with tools. Older models
-/// continue to work when the field is removed. GPT-6 Astra is excluded because
-/// it does not support `none`. We log a warn when a caller's selector is
-/// degraded.
+/// Sol/Luna (every GPT-6 minor version, e.g. `gpt-6.2-sol`) must receive an
+/// explicit `reasoning_effort: "none"` because their omitted default still
+/// reasons and is rejected with tools. Older models continue to work when the
+/// field is removed. GPT-6 Astra models are excluded because they do not
+/// support `none`. We log a warn when a caller's selector is degraded.
 ///
 /// Scoped to OpenAI proper (`api.openai.com`, `api.openai.azure.com` family)
 /// because we cannot assume the same restriction applies to other
@@ -101,9 +101,7 @@ fn normalize_reasoning_effort_for_openai_tools(
     }
     let supports_none = |name: &str| {
         let name = name.rsplit('/').next().unwrap_or(name);
-        name.starts_with("gpt-5.6")
-            || name.starts_with("gpt-6-sol")
-            || name.starts_with("gpt-6-luna")
+        name.starts_with("gpt-5.6") || is_gpt_6_sol_or_luna(name)
     };
     if supports_none(model) || catalog_model.is_some_and(supports_none) {
         let previous = params
@@ -125,6 +123,29 @@ fn normalize_reasoning_effort_for_openai_tools(
             "Stripped `reasoning_effort` from OpenAI request: combination with `tools` is rejected by /v1/chat/completions"
         );
     }
+}
+
+/// Matches GPT-6 Sol and Luna at any minor version, with or without a dated
+/// snapshot suffix: `gpt-6-sol`, `gpt-6.2-sol`, `gpt-6.1-luna-2026-10-01`.
+/// Does not match Astra or names such as `gpt-60-sol` or `gpt-6-solar`.
+fn is_gpt_6_sol_or_luna(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix("gpt-6") else {
+        return false;
+    };
+    let rest = match rest.strip_prefix('.') {
+        Some(minor) => {
+            let family = minor.trim_start_matches(|c: char| c.is_ascii_digit());
+            if family.len() == minor.len() {
+                return false;
+            }
+            family
+        }
+        None => rest,
+    };
+    ["-sol", "-luna"].iter().any(|family| {
+        rest.strip_prefix(family)
+            .is_some_and(|suffix| suffix.is_empty() || suffix.starts_with('-'))
+    })
 }
 
 /// Returns true for OpenAI proper (`api.openai.com`) and Azure OpenAI
@@ -975,6 +996,11 @@ mod tests {
             "gpt-6-sol-2026-09-22",
             "gpt-6-luna",
             "gpt-6-luna-2026-09-22",
+            "gpt-6.1-sol",
+            "gpt-6.2-sol",
+            "gpt-6.2-sol-2026-11-12",
+            "gpt-6.2-luna",
+            "gpt-6.10-luna",
         ] {
             let mut params = make_chat_params(Some(bash_tool()), Some("high"));
             normalize_reasoning_effort_for_openai_tools(
@@ -993,7 +1019,13 @@ mod tests {
 
     #[test]
     fn test_supported_openai_families_disable_omitted_reasoning_effort() {
-        for model in ["gpt-5.6-sol", "gpt-6-sol", "gpt-6-luna"] {
+        for model in [
+            "gpt-5.6-sol",
+            "gpt-6-sol",
+            "gpt-6-luna",
+            "gpt-6.1-sol",
+            "gpt-6.2-sol",
+        ] {
             let mut params = make_chat_params(Some(bash_tool()), None);
             normalize_reasoning_effort_for_openai_tools(
                 &mut params,
@@ -1011,14 +1043,63 @@ mod tests {
 
     #[test]
     fn test_gpt_6_astra_does_not_force_unsupported_none_reasoning_effort() {
-        let mut params = make_chat_params(Some(bash_tool()), Some("high"));
+        for model in ["gpt-6-astra", "gpt-6.2-astra"] {
+            let mut params = make_chat_params(Some(bash_tool()), Some("high"));
+            normalize_reasoning_effort_for_openai_tools(
+                &mut params,
+                "https://api.openai.com/v1",
+                model,
+                None,
+            );
+            assert!(
+                !params.extra.contains_key("reasoning_effort"),
+                "reasoning effort should be stripped, not forced to none, for {model}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_gpt_6_sol_or_luna_name_matching() {
+        for name in [
+            "gpt-6-sol",
+            "gpt-6-luna",
+            "gpt-6-sol-2026-09-22",
+            "gpt-6.1-sol",
+            "gpt-6.2-sol",
+            "gpt-6.2-sol-2026-11-12",
+            "gpt-6.2-luna",
+            "gpt-6.10-luna",
+        ] {
+            assert!(is_gpt_6_sol_or_luna(name), "{name} should match");
+        }
+        for name in [
+            "gpt-6-astra",
+            "gpt-6.2-astra",
+            "gpt-6.-sol",
+            "gpt-6x-sol",
+            "gpt-60-sol",
+            "gpt-6-solar",
+            "gpt-6.2-lunar",
+            "gpt-5.5-sol",
+            "openai/gpt-6.2-sol",
+        ] {
+            assert!(!is_gpt_6_sol_or_luna(name), "{name} should not match");
+        }
+    }
+
+    #[test]
+    fn test_catalog_model_gpt_6_2_sol_forces_none_for_azure_deployment() {
+        let mut params = make_chat_params(Some(bash_tool()), None);
         normalize_reasoning_effort_for_openai_tools(
             &mut params,
-            "https://api.openai.com/v1",
-            "gpt-6-astra",
-            None,
+            "https://my-resource.openai.azure.com",
+            "sol-62-prod",
+            Some("openai/gpt-6.2-sol"),
         );
-        assert!(!params.extra.contains_key("reasoning_effort"));
+        assert_eq!(
+            params.extra.get("reasoning_effort"),
+            Some(&serde_json::json!("none"))
+        );
     }
 
     #[test]

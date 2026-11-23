@@ -221,6 +221,9 @@ impl Fleet {
 async fn read_backend_count(client: &Client, parts: &UrlParts) -> Result<usize, AttestationError> {
     match rotation::fetch_backend_count(client, parts, COUNT_TIMEOUT).await {
         CountFetch::Ok(count) => Ok(count),
+        // No backends registered: nothing to attest, reported as ProviderNotFound
+        // by the caller's zero-count path.
+        CountFetch::NoneRegistered => Ok(0),
         CountFetch::Err(reason) => Err(AttestationError::FetchError(reason)),
     }
 }
